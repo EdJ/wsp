@@ -121,6 +121,10 @@ pub fn run(store: &Store, args: &Args) -> i32 {
     if args.has("verify-rows") {
         return crate::verification::migrate(store, args);
     }
+    // `wsp-230`: the Barrier rows, moved onto their groups' `checks:`.
+    if args.has("barrier-rows") {
+        return crate::barrier::migrate(store, args);
+    }
 
     let p = Paint::new();
     let (map, tops) = plan(store);

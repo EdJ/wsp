@@ -1506,6 +1506,9 @@ pub struct Group {
     /// and started a verifier on the verifier. `wsp install` after the land is
     /// what makes a list carrying one safe to run.
     pub member_agents: BTreeMap<String, String>,
+    /// Every check of the barrier after this group, oldest first: `wsp-230`'s
+    /// record of a check that has no row. See [`crate::barrier`].
+    pub checks: Vec<crate::barrier::Check>,
 }
 
 /// Who a group runs on: the kind, and optionally the model and the effort,
@@ -1692,6 +1695,7 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         Stop,
         Verdict,
         Landed,
+        Checks,
     }
 
     let mut out: Vec<Group> = Vec::new();
@@ -1724,6 +1728,10 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
                 }
                 Cont::Landed => {
                     landed_push(&mut last.landed, trimmed);
+                    continue;
+                }
+                Cont::Checks => {
+                    crate::barrier::push(&mut last.checks, trimmed);
                     continue;
                 }
                 Cont::Members => {}
@@ -1767,11 +1775,17 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
             landed_push(&mut last.landed, rest);
             cont = Cont::Landed;
             label_indent = indent;
+        } else if let Some(rest) = trimmed.strip_prefix("checks:") {
+            last.checks.clear();
+            crate::barrier::push(&mut last.checks, rest);
+            cont = Cont::Checks;
+            label_indent = indent;
         } else {
             match cont {
                 Cont::Stop => join(&mut last.stop, trimmed),
                 Cont::Verdict => join(&mut last.verdict, trimmed),
                 Cont::Landed => landed_push(&mut last.landed, trimmed),
+                Cont::Checks => crate::barrier::push(&mut last.checks, trimmed),
                 Cont::Members => {
                     last.members.extend(trimmed.split_whitespace().map(|t| t.to_string()))
                 }
@@ -1877,6 +1891,7 @@ pub fn render_groups(groups: &[Group]) -> String {
         }
         block(&mut out, "stop", &g.stop);
         block(&mut out, "verdict", &g.verdict);
+        block(&mut out, "checks", &crate::barrier::text(&g.checks));
         block(&mut out, "landed", &landed_text(&g.landed));
     }
     out

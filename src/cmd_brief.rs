@@ -324,6 +324,9 @@ pub(crate) struct Briefing {
     /// unless this pane is a custodian and the thing it is custodian of is a
     /// list, which is one pane on the machine on the nights there is one at all.
     pub seat_at: Option<crate::worklist::Position>,
+    /// The list and group this pane is checking the barrier of, when it is a
+    /// run's barrier check — which holds no claim and has no row (`wsp-230`).
+    pub checking: Option<(String, usize)>,
     /// The store's own rules, already capped.
     pub rules: Option<String>,
     /// Where this pane resolved to. Taken in rather than worked out here: the
@@ -413,7 +416,9 @@ impl Briefing {
         // claim that landed before this call minted it (`compound-092`
         // stage B) — so this is a plain lookup, never a mint.
         let agent = seat.pane.and_then(|p| store.agent_in_seat(p));
+        let checking = seat.pane.and_then(|p| crate::barrier::seat_of(store, p));
         Briefing {
+            checking,
             project: seat.project.map(str::to_string),
             mandate: cmd_mandate::current(store, agent.as_deref(), seat.workspace),
             lists: crate::worklist::Running::read(store),
@@ -457,7 +462,9 @@ impl Briefing {
             .or_else(|| incoming.as_ref().map(|(scope, _)| scope.clone()))
             .and_then(|scope| crate::worklist::running_position(store, &scope));
         let agent = pane.as_deref().and_then(|p| store.agent_in_seat(p));
+        let checking = pane.as_deref().and_then(|p| crate::barrier::seat_of(store, p));
         Briefing {
+            checking,
             project: current_project(store, args, &world.index).unwrap_or(None),
             mandate: cmd_mandate::current(store, agent.as_deref(), env.workspace_id.as_deref()),
             lists: crate::worklist::Running::read(store),
@@ -513,6 +520,8 @@ pub(crate) struct Brief {
     /// holds no claim, so `mine` is empty, and without this the brief would
     /// tell it to go and claim something (`wsp-188`).
     pub verifying: Option<Task>,
+    /// The list and group this seat is checking — see [`Briefing::checking`].
+    pub checking: Option<(String, usize)>,
     pub parent: Option<Task>,
     pub under_mine: usize,
     /// The backlog, each with its own count of open sub-tasks. Whole, because
@@ -820,6 +829,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     let is_verifier = verifying.is_some();
     Brief {
         verifying,
+        checking: b.checking.clone().filter(|_| mine.is_none()),
         handbook,
         parent_decided,
         mine_log,
@@ -868,7 +878,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         own_tree: b
             .cwd
             .as_deref()
-            .filter(|_| !is_verifier)
+            .filter(|_| !is_verifier && b.checking.is_none())
             .and_then(|c| crate::cmd_checkout::worktree_of(&util::expand(c)))
             .and_then(|d| d.file_name().and_then(|s| s.to_str()).map(str::to_string)),
         under_mine: mine.map(|t| resolve::counts_under(tasks, &t.id).open).unwrap_or(0),
@@ -1358,6 +1368,19 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                 .to_string(),
             );
         }
+        // And a barrier check (`wsp-230`), for the same reason: its whole job is
+        // one group and one of three verbs.
+        None if r.checking.is_some() => {
+            let (list, at) = r.checking.as_ref().expect("matched");
+            row("you", format!("checking {}", p.bold(&crate::barrier::seat_label(list, *at))));
+            row(
+                "",
+                p.dim(&format!(
+                    "read-only · finish with `wsp worklist go|hold|followup {list} … --from FILE` · the order you were handed is the whole job"
+                ))
+                .to_string(),
+            );
+        }
         // A custodian holding nothing is not an agent that has failed to claim
         // anything: it is an agent doing its job. The default line below tells
         // it to go and claim something, which is the one instruction that would
@@ -1623,6 +1646,7 @@ mod tests {
             // measured against.
             lists: crate::worklist::Running::default(),
             seat_at: None,
+            checking: None,
             daemon: None,
             // Nobody coordinating. The ordinary state, and the baseline the
             // seat tests below add a seat to: the brief has to be identical
@@ -2048,6 +2072,7 @@ mod tests {
             lists: crate::worklist::Running::default(),
             daemon: None,
             seat_at: None,
+            checking: None,
             governors: std::collections::BTreeMap::new(),
             rules: None,
             project: None,

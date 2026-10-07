@@ -274,6 +274,12 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     if !ended.is_empty() {
         stamp(store, &format!("verifier seat(s) with nothing left to do, ended: {}", ended.join(" ")));
     }
+    // And every barrier check whose verdict is in (`wsp-230`): it holds no
+    // claim either, so the claim-keyed ending above never sees one.
+    let ended = crate::cycle::checks_finished(store, seats);
+    if !ended.is_empty() {
+        stamp(store, &format!("barrier check seat(s) with nothing left to do, ended: {}", ended.join(" ")));
+    }
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);
@@ -3014,12 +3020,13 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             .collect()
     }
 
+    /// Every barrier check the run has opened, on any group of any list —
+    /// entries since `wsp-230`, never rows.
     fn barriers(store: &Store) -> Vec<String> {
         store
-            .tasks()
-            .into_iter()
-            .filter(|t| t.tags.iter().any(|g| g == crate::cycle::BARRIER_TAG))
-            .map(|t| t.id)
+            .worklists()
+            .iter()
+            .flat_map(|w| w.groups().into_iter().enumerate().flat_map(|(i, g)| g.checks.into_iter().map(move |c| (i, c))).map(|(i, c)| format!("{} {} {}", w.id, i + 1, c.at)).collect::<Vec<_>>())
             .collect()
     }
 

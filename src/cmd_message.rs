@@ -140,13 +140,18 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     if args.text(1).trim().is_empty() && args.get("from").is_none() && needle.starts_with("m-") {
         return whole(store, &needle, args);
     }
+    // A task, or — for a barrier check, which holds none (`wsp-230`) — the
+    // worklist it is checking, whose log is then where the answer lives.
     let subject = match store.task_or_why(&needle) {
-        Ok(t) => t,
-        Err(why) => {
-            eprintln!("{why}");
-            eprintln!("     a question needs a task to land its answer on · `wsp tell` is for prose");
-            return 1;
-        }
+        Ok(t) => Ok(t),
+        Err(why) => match store.worklist(&needle) {
+            Some(w) => Err(w),
+            None => {
+                eprintln!("{why}");
+                eprintln!("     a question needs a task or a worklist to land its answer on · `wsp tell` is for prose");
+                return 1;
+            }
+        },
     };
     let text = match crate::cmd_agent::prose(args, 1) {
         Ok(t) => t,
@@ -173,20 +178,43 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         None => Kind::Note,
     };
 
+    // About the list's group when it can say which: `--group N`, or the group
+    // the asking seat is checking.
+    let (about, subject_id, seat, to) = match &subject {
+        Ok(t) => (About::Task(t.id.clone()), t.id.clone(), crate::cmd_govern::answering_seat(store, t), addressed(store, t)),
+        Err(w) => {
+            let group = args.get("group").and_then(|g| g.parse::<usize>().ok()).or_else(|| {
+                pane.as_deref().and_then(|p| crate::barrier::seat_of(store, p)).filter(|(l, _)| *l == w.id).map(|(_, at)| at)
+            });
+            let about = match group {
+                Some(g) => About::Group { scope: w.id.clone(), group: g },
+                None => About::Scope(w.id.clone()),
+            };
+            let governors = store.governors();
+            let index = crate::resolve::Index::new(store.projects());
+            let seat = crate::cmd_govern::seat_for(&governors, &index, Some(&w.id), None);
+            let to = match &seat {
+                Some(s) => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::room_of(&governors, &s.scope)),
+                None => "asked of every panel — no governor above it".into(),
+            };
+            (about, w.id.clone(), seat, to)
+        }
+    };
+
     let q = Message::question(
         me.clone(),
         kind,
         &text,
         Waiting::new(pane.as_deref().unwrap_or_default(), &held),
     )
-    .about(About::Task(subject.id.clone()));
+    .about(about);
 
     // The guarantee this verb makes, checked before the record exists rather
     // than reported after it does: there is no path here by which an answer can
     // be written and not routed.
     if message::homes_to(store, &q).is_none() {
         eprintln!("wsp: an answer to that would have nowhere to live");
-        eprintln!("     {} is not a task this store holds", subject.id);
+        eprintln!("     {subject_id} is not a task or a worklist this store holds");
         return 1;
     }
 
@@ -209,7 +237,6 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     // says so, which is the one case where *asked of every panel* is the whole
     // answer — nothing is lost, because a level nobody is addressee of is the
     // hook's audience and every panel draws it.
-    let seat = crate::cmd_govern::answering_seat(store, &subject);
     // `map`, not `and_then`: `wake::say` no longer answers "is there a seat
     // here" — it spools and reports, because a vacancy is later, not nowhere.
     let report = seat.as_ref().map(|s| {
@@ -220,7 +247,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     if args.json() {
         println!(
             "{}",
-            json!({ "id": q.id, "about": subject.id, "waiting": held, "pane": pane, "lands_on": home,
+            json!({ "id": q.id, "about": subject_id, "waiting": held, "pane": pane, "lands_on": home,
                     "seat": seat.as_ref().map(|s| &s.scope),
                     "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why.clone()) })
         );
@@ -228,8 +255,8 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     }
     let p = Paint::new();
     println!("{} {}  {}", p.red("?"), p.bold(&q.id), q.title());
-    println!("  {}", p.dim(&format!("about {} · answered onto {home}", subject.id)));
-    println!("  {}", p.dim(&addressed(store, &subject)));
+    println!("  {}", p.dim(&format!("about {subject_id} · answered onto {home}")));
+    println!("  {}", p.dim(&to));
     println!("  {}", p.dim(&format!("wsp answer {} \"…\" closes it and comes back here", q.id)));
     // Where it went, and when it will arrive — `wsp-146`'s receipt. A verb whose
     // whole effect is on somebody else's screen has to name the screen; the part
@@ -256,7 +283,12 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
 /// the one with a return path. Every other spelling still works and lands in the
 /// same spool; this line is what a governor reads to learn which one to reach for.
 pub(crate) fn for_a_governor(q: &Message) -> String {
-    let about = q.about.task().unwrap_or("this work");
+    let about = match &q.about {
+        About::Task(t) => t.clone(),
+        About::Group { scope, group } => format!("barrier {group} of {scope}"),
+        About::Scope(s) => s.clone(),
+        About::Nothing => "this work".into(),
+    };
     format!(
         "{by} asked about {about}:\n\n{body}\n\n\
          answer with `wsp answer {id} \"…\"` — it lands on the asker's task and closes this\n\
@@ -580,6 +612,7 @@ fn waiting_line(m: &Message) -> String {
 fn landed_line(landed: &Landed) -> String {
     match landed {
         Landed::Task(id) => format!("on {id}'s log"),
+        Landed::List(id) => format!("on the {id} list's log"),
         Landed::RecordOnly(why) => format!("on the message record only — {why}"),
     }
 }
@@ -758,6 +791,7 @@ fn deliver_held_through(store: &Store, seats: &dyn crate::cycle::Seats, type_at:
             continue;
         }
         let landed = match message::homes_to(store, &question) {
+            Some(list) if store.task(&list).is_none() => Landed::List(list),
             Some(task) => Landed::Task(task),
             None => Landed::RecordOnly(String::new()),
         };
@@ -795,8 +829,10 @@ fn wire(closed: &message::Closed) -> String {
         closed.reply.text.trim()
     );
     out.push_str(&format!("\n\nyou asked: {}", closed.question.title()));
-    if let Landed::Task(id) = &closed.landed {
-        out.push_str(&format!("\nthis is also on {id}'s log, so it survives this pane"));
+    match &closed.landed {
+        Landed::Task(id) => out.push_str(&format!("\nthis is also on {id}'s log, so it survives this pane")),
+        Landed::List(id) => out.push_str(&format!("\nthis is also on the {id} list's log, so it survives this pane")),
+        Landed::RecordOnly(_) => {}
     }
     out.push_str(&format!("\n`wsp ack {}` when you have read it", closed.reply.id));
     out

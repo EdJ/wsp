@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 mod agent_commands;
+mod barrier;
 mod arrange;
 mod attention;
 mod cmd_agent;
@@ -186,7 +187,7 @@ const BOOL_FLAGS: &[&str] = &[
     // `wsp verified <member> --holds|--blocks`, `wsp spawn <member> --verify`
     // and `wsp migrate --verify-rows -n`: none takes a value, and each is
     // followed by a positional or a stream it must not eat.
-    "holds", "blocks", "verify", "verify-rows",
+    "holds", "blocks", "verify", "verify-rows", "barrier-rows",
     // `wsp worklist followup <slug> <task>… --blocking|--next`: the rows are
     // positionals, and a flag between them must not eat the one after it.
     "blocking", "next",

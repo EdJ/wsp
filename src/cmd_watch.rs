@@ -2462,6 +2462,7 @@ impl Source for Poll<'_> {
             answered_by: Default::default(),
             // Nor a direction: rows here are read for state, never published.
             mandates: Default::default(),
+            checking: Default::default(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any

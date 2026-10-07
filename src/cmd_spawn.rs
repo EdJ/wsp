@@ -831,7 +831,7 @@ fn seat_env_over(
 /// works in `.worktrees/<id>` beneath it.
 ///
 /// `None` when no member has a project with a root, which [`grounded`] refuses.
-fn list_root(store: &Store, index: &Index, list: &str) -> Option<String> {
+pub(crate) fn list_root(store: &Store, index: &Index, list: &str) -> Option<String> {
     let mut tally: Vec<(String, usize)> = Vec::new();
     let members = store.worklist(list).map(|l| l.groups()).unwrap_or_default();
     for id in members.iter().flat_map(|g| g.members.iter()) {
@@ -1744,7 +1744,7 @@ fn resolve_needle(
     needle: &str,
     index: &Index,
 ) -> Option<Result<Work, String>> {
-    if args.has("govern") {
+    if args.has("govern") || args.get("check").is_some() {
         if let Some(w) = store.worklist(needle) {
             return Some(Ok(Work {
                 task: None,
@@ -2026,6 +2026,25 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         false => work,
     };
 
+    // A barrier check (`wsp-230`): an agent on a list's group that holds no
+    // claim and has no row, recorded on the group's open check instead. On a
+    // list, with an agent, and never with `--govern` or `--verify` — a check
+    // is told it reads a group, and either of those would tell it otherwise.
+    let checking: Option<(String, usize)> = match args.get("check") {
+        None => None,
+        Some(n) => match (n.parse::<usize>().ok().filter(|n| *n > 0), work.list.clone()) {
+            (Some(at), Some(list)) if args.has("agent") && !args.has("govern") && !verifying => Some((list, at)),
+            _ => {
+                eprintln!("wsp: --check starts a barrier check on a list's group: `wsp spawn <list> --agent --check <N>`, never with --govern or --verify");
+                return 2;
+            }
+        },
+    };
+    let work = match &checking {
+        Some((list, at)) => Work { label: crate::barrier::seat_label(list, *at), ..work },
+        None => work,
+    };
+
     // A slot is on a project, so `--govern` on a task is a sentence with no
     // meaning rather than a near miss — and the near miss it would otherwise
     // become is the expensive one: an agent claimed onto a task and told it is
@@ -2073,7 +2092,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // never reaches this arm, so asking down one branch only would refuse the
     // word on the other.
     let no_tree = args.has("no-tree");
-    let cwd = match (&work.task, &cwd) {
+    // A check has no task, and reads the trunk: a tree of its own, named for
+    // the check, so its builds are nobody else's and `despawn` can take it away.
+    let tree_name = work.task.clone().or_else(|| checking.as_ref().map(|(l, at)| crate::barrier::subject(l, *at)));
+    let cwd = match (&tree_name, &cwd) {
         (Some(task), Some(root)) if !no_tree => {
             Some(crate::cmd_checkout::tree_for(root, task).unwrap_or_else(|| {
                 eprintln!("wsp: no tree of its own for {task} — opening in {root}");
@@ -2123,6 +2145,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         .task
         .clone()
         .map(|t| if verifying { format!("{t}-verify") } else { t })
+        .or_else(|| checking.as_ref().map(|(l, at)| crate::barrier::subject(l, *at)))
         .or_else(|| work.list.clone())
         .or_else(|| work.project.clone())
         .unwrap_or_default();
@@ -2205,8 +2228,19 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             flags.extend(backend_flag(chosen(args)));
             cmd_agent_claim(store, t, &flags) == 0
         }
-        None => false,
+        // The check's seat goes on its open entry, for the verifier's reason.
+        None => match &checking {
+            Some((list, at)) => crate::barrier::name_seat(store, list, *at, seat.as_str()),
+            None => false,
+        },
     };
+    if let (Some((list, at)), false) = (&checking, claimed) {
+        eprintln!(
+            "wsp: opened {seat} — but no check is open on group {at} of {list}, so no agent was started; \
+             `wsp worklist advance {list}` opens one when it is owed"
+        );
+        return 1;
+    }
     if work.task.is_some() && !claimed {
         match verifying {
             true => eprintln!(
@@ -2299,11 +2333,16 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // Written here rather than before the seat opened, because this is the
         // first moment there is anything to say: the claim has landed, so the
         // brief is about this task rather than about an empty seat.
-        let laid = match (&brief_at, work.task.is_some() || governing.is_some()) {
+        let laid = match (&brief_at, work.task.is_some() || governing.is_some() || checking.is_some()) {
             (Some(path), true) => lay_brief(place, store, &work, &seat, cwd.as_deref(), path),
             _ => Laid::Elsewhere,
         };
         let order = match (&work.task, &governing) {
+            // A check's order, folded for the verifier's reasons below.
+            _ if checking.is_some() => checking
+                .as_ref()
+                .and_then(|(l, at)| crate::cycle::check_order(store, l, *at))
+                .map(|o| crate::cmd_task::fold(&o)),
             // The whole order, folded to one line: it is self-contained, so a
             // kind with an empty context needs no second fetch, and one line is
             // what a kind taking its order in argv can carry at all.
@@ -3913,11 +3952,19 @@ fn end_work(
     if let Some(member) = crate::verification::seats(&store.tasks()).get(seat.as_str()) {
         let _ = std::fs::remove_file(brief_path(store, &format!("{member}-verify")));
     }
+    // A barrier check's (`wsp-230`): no task either, so its brief and its tree
+    // are named for the check — and its entry on the group says it was ended,
+    // however this despawn came to be run.
+    let check = crate::barrier::seat_of(store, seat.as_str()).map(|(l, at)| crate::barrier::subject(&l, at));
+    if let Some(subject) = &check {
+        let _ = std::fs::remove_file(brief_path(store, subject));
+        crate::barrier::mark_ended(store, seat.as_str(), true);
+    }
 
     // Last, and only now: the tree is the one step a person can still do by
     // hand afterwards, so it must not be the step that stops the claim being
     // released. Everything before this line is what `despawn` has always done.
-    let Leftovers { tree, builds } = tidy(&seat, task.as_deref(), workspace.as_deref());
+    let Leftovers { tree, builds } = tidy(&seat, task.as_deref().or(check.as_deref()), workspace.as_deref());
 
     if args.json() {
         println!(
@@ -4850,6 +4897,7 @@ mod tests {
             landed: Vec::new(),
             agent: String::new(),
             member_agents: Default::default(),
+            checks: Vec::new(),
         }]);
         store.save_worklist(&w).unwrap();
     }
@@ -7394,6 +7442,7 @@ mod tests {
                 landed: Vec::new(),
                 agent: String::new(),
                 member_agents: Default::default(),
+                checks: Vec::new(),
             }]);
             store.save_worklist(&w).unwrap();
             cmd_govern::take(&store, "batch", "w1", "w1:p9").unwrap();
@@ -7449,6 +7498,7 @@ mod tests {
                 landed: Vec::new(),
                 agent: String::new(),
                 member_agents: Default::default(),
+                checks: Vec::new(),
             },
             Group {
                 members: vec!["t-2".into()],
@@ -7458,6 +7508,7 @@ mod tests {
                 landed: Vec::new(),
                 agent: String::new(),
                 member_agents: Default::default(),
+                checks: Vec::new(),
             },
         ]);
         store.save_worklist(&w).unwrap();

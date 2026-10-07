@@ -222,6 +222,14 @@ pub(crate) fn trunk(dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(line.trim()))
 }
 
+/// The commit the trunk branch of the repository at `root` points at, in full.
+pub(crate) fn trunk_tip(root: &str) -> Option<String> {
+    let repo = toplevel(Path::new(&util::expand(root)))?;
+    let trunk = trunk(&repo)?;
+    let branch = trunk_branch(&trunk)?;
+    git(&trunk, &["rev-parse", &branch]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// The branch the trunk has checked out, or `None` if it is detached.
 ///
 /// What `land` fast-forwards, and what a new task branch starts from. Read from
@@ -1509,6 +1517,12 @@ pub(crate) fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> 
                 add(toplevel(&util::expand(&r)));
             }
         }
+    }
+    // A barrier check's tree (`wsp-230`) is named for the check and not for a
+    // task, and lives in the repository its list is run in.
+    if let Some((list, _)) = crate::barrier::parse_subject(task) {
+        let index = crate::resolve::Index::new(store.projects());
+        add(crate::cmd_spawn::list_root(store, &index, list).and_then(|r| toplevel(&util::expand(&r))));
     }
     out
 }

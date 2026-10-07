@@ -1032,15 +1032,9 @@ fn amend_running_stop(store: &Store, args: &Args, id: &str, ordinal: usize, text
         if win.at != Some(ordinal) {
             return Err(win.refuse(ordinal, "will not amend the stop of"));
         }
-        let open = store.tasks().into_iter().find(|t| {
-            crate::cycle::is_barrier(t, &w.id, ordinal)
-                && !matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done)
-        });
-        if let Some(b) = open {
+        if let Some(b) = open_check(store, &w, ordinal) {
             eprintln!(
-                "wsp: will not amend group {ordinal}'s stop — its barrier is open on {} ({}), which was handed the stop as it stands",
-                b.id,
-                b.status().as_str()
+                "wsp: will not amend group {ordinal}'s stop — its barrier is open on {b}, which was handed the stop as it stands"
             );
             eprintln!("     if that stop is wrong, the barrier holds; its recheck is handed the stop as amended then");
             return Err(1);
@@ -1144,20 +1138,12 @@ fn drop_group(store: &Store, args: &Args, id: &str, ordinal: usize, why: Option<
                 eprintln!("     `wsp worklist group {} {ordinal} --drop --why -` — the reason on stdin", w.id);
                 return Err(2);
             }
-            let tasks = store.tasks();
-            let open = tasks.iter().find(|t| {
-                crate::cycle::is_barrier(t, &w.id, ordinal)
-                    && !matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done)
-            });
-            if let Some(b) = open {
-                eprintln!(
-                    "wsp: will not drop group {ordinal} — its barrier is open on {} ({}), which is checking it",
-                    b.id,
-                    b.status().as_str()
-                );
+            if let Some(b) = open_check(store, &w, ordinal) {
+                eprintln!("wsp: will not drop group {ordinal} — its barrier is open on {b}, which is checking it");
                 eprintln!("     the barrier holds or passes it; a group that should not be there is a hold, then a drop");
                 return Err(1);
             }
+            let tasks = store.tasks();
             let claims = store.claims();
             let in_flight = |m: &String| {
                 claims.contains_key(m)
@@ -1961,6 +1947,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             // member's row, which is what the barrier is gated on (`wsp-188`).
             if args.has("verdicts") {
                 for line in pass_lines(&p, &tasks_now, g) {
+                    println!("{indent}{line}");
+                }
+                // And each check of the barrier after it, which has no row of
+                // its own to be read from (`wsp-230`).
+                for line in crate::barrier::lines(&p, g) {
                     println!("{indent}{line}");
                 }
             }
@@ -3081,12 +3072,14 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
-    go_with(store, args, w, said, seat)
+    go_with(store, args, w, said, seat, crate::barrier::State::Passes)
 }
 
 /// `go` once the list and the sentence are in hand. [`followup`]'s non-blocking
 /// form passes the barrier through here, with a verdict it composes itself.
-fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool) -> i32 {
+/// `said_as` is what the check open on the passed barrier is recorded as having
+/// said: a pass, or a pass with follow-ups.
+fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool, said_as: crate::barrier::State) -> i32 {
     if w.status() == WorklistStatus::Done {
         eprintln!("wsp: `{}` is done — nothing in it is waiting to start", w.id);
         return 1;
@@ -3149,23 +3142,11 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
             for s in &held {
                 println!("  {}  {}", s.id, Paint::new().dim(&s.note()));
             }
-            if let Some(at) = pos.at {
-                let tasks = store.tasks();
-                let open: Vec<&str> = tasks
-                    .iter()
-                    .filter(|t| crate::cycle::is_barrier(t, &w.id, at))
-                    .filter(|t| matches!(t.status(), crate::model::Status::Doing))
-                    .map(|t| t.id.as_str())
-                    .collect();
-                if !open.is_empty() {
-                    println!(
-                        "  {}",
-                        Paint::new().dim(&format!(
-                            "{} opened before this — its agent has been told what changed",
-                            open.join(" ")
-                        ))
-                    );
-                }
+            if let Some(open) = pos.at.and_then(|at| open_check(store, &w, at)) {
+                println!(
+                    "  {}",
+                    Paint::new().dim(&format!("{open} opened before this — its agent has been told what changed"))
+                );
             }
             println!(
                 "{}",
@@ -3312,11 +3293,14 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
         );
         crate::cycle::poke_list(store, &w.id, "go", crossed);
     }
-    // The check whose verdict this is has nothing left once its turn ends,
-    // and nothing after this verb could end it on time. See
-    // [`crate::cycle::end_checks_when_idle`].
+    // The check whose verdict this is is recorded on the group, and has
+    // nothing left once its turn ends — and nothing after this verb could end
+    // it on time. See [`crate::cycle::end_checks_when_idle`].
     let ending = match (dry, crossed) {
-        (false, Some(n)) => crate::cycle::end_checks_when_idle(store, &w.id, n),
+        (false, Some(n)) => {
+            crate::barrier::settle(store, &w.id, n, said_as);
+            crate::cycle::end_checks_when_idle(store, &w.id, n)
+        }
         _ => Vec::new(),
     };
 
@@ -3686,6 +3670,11 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
         return code;
     }
     store.log_event("worklist-held", json!({ "id": w.id, "why": said }));
+    // The check on the barrier the run stands at, if one is open, held it —
+    // or was overruled by whoever did. Its seat is ended by the tick.
+    if let Some(at) = pos.at {
+        crate::barrier::settle(store, &w.id, at, crate::barrier::State::Holds);
+    }
     crate::cycle::poke_list(store, &w.id, "hold", None);
     // `wsp-158`: a `hold` stops nothing that is already in flight, and says so
     // above. What it must not leave behind is an agent with nothing left to do —
@@ -3779,7 +3768,10 @@ const FOLLOWUP_MAX: usize = 4;
 ///   composing verbs.
 /// - **Logged**, naming the check row that added them.
 pub fn followup(store: &Store, args: &Args) -> i32 {
-    followup_by(store, args, &rows_here(store))
+    let mut here = rows_here(store);
+    // And the seat itself, which is what names a check with no row.
+    here.extend(crate::cmd_agent::my_pane());
+    followup_by(store, args, &here)
 }
 
 /// The rows this process's seat holds: the binding on its pane, and every claim
@@ -3839,6 +3831,8 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
     let pos = worklist::position(store, &w, Reading::Landed);
     let tasks = store.tasks();
     let at = pos.at.filter(|_| w.status() == WorklistStatus::Running && pos.at_barrier());
+    // A check is named by its seat since `wsp-230` — it has no row — and by
+    // its row before that. Either is one token in the log's follow-up line.
     let row = at.and_then(|at| {
         tasks
             .iter()
@@ -3846,6 +3840,10 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
             .filter(|t| matches!(t.status(), crate::model::Status::Doing | crate::model::Status::Blocked))
             .find(|t| here.contains(&t.id))
             .map(|t| t.id.clone())
+            .or_else(|| {
+                let g = w.groups().into_iter().nth(at - 1)?;
+                crate::barrier::running(&g)?.pane.clone().filter(|p| here.contains(p))
+            })
     });
     let (Some(at), Some(row)) = (at, row) else {
         match at {
@@ -3858,7 +3856,8 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
 
     if typed.len() > FOLLOWUP_MAX {
         eprintln!("wsp: at most {FOLLOWUP_MAX} follow-ups in one call, and this names {}", typed.len());
-        eprintln!("     a tail that size, or one that needs a design call, is the governor's: `wsp ask {row} -`");
+        let ask = if store.task(&row).is_some() { row.clone() } else { w.id.clone() };
+        eprintln!("     a tail that size, or one that needs a design call, is the governor's: `wsp ask {ask} -`");
         return 2;
     }
     let members = match resolve_members(store, &typed) {
@@ -3957,6 +3956,7 @@ fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str,
     crate::cycle::poke_list(store, &w.id, "followup", None);
     // A fresh check reads the group once the follow-ups land, so this one has
     // said all it will. `wsp-230`.
+    crate::barrier::settle(store, &w.id, at, crate::barrier::State::Blocking);
     let ending = crate::cycle::end_checks_when_idle(store, &w.id, at);
 
     if args.json() {
@@ -4025,7 +4025,7 @@ fn followup_next(store: &Store, args: &Args, id: &str, at: usize, row: &str, mem
     // The pass is `go`'s own, so it is the ordinary one in every respect, and
     // the verdict on the group says the follow-ups were part of it.
     let said = format!("passes, with follow-ups {} as group {} — {verdict}", members.join(" "), at + 1);
-    let code = go_with(store, args, w.clone(), said, false);
+    let code = go_with(store, args, w.clone(), said, false, crate::barrier::State::Next);
     if code != 0 {
         eprintln!(
             "wsp: {} are group {} of `{}`, but its barrier was not passed — `wsp worklist go {} --from FILE` passes it",
@@ -4038,12 +4038,30 @@ fn followup_next(store: &Store, args: &Args, id: &str, at: usize, row: &str, mem
     code
 }
 
+/// The check open on group `at`'s barrier, named for a sentence: a Barrier row
+/// filed before `wsp-230` that has not settled, or the open entry on the group.
+fn open_check(store: &Store, w: &Worklist, at: usize) -> Option<String> {
+    let row = store.tasks().into_iter().find(|t| {
+        crate::cycle::is_barrier(t, &w.id, at) && !matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done)
+    });
+    if let Some(b) = row {
+        return Some(format!("{} ({})", b.id, b.status().as_str()));
+    }
+    let g = w.groups().into_iter().nth(at - 1)?;
+    let c = crate::barrier::running(&g)?;
+    Some(match &c.pane {
+        Some(p) => format!("the check in {p}"),
+        None => "a check still starting".to_string(),
+    })
+}
+
 /// Whether the barrier a check is answering is still the one in front: its
 /// row open, and no verdict on the group. Asked inside the lock.
 fn still_this_barrier(store: &Store, w: &Worklist, groups: &[Group], at: usize, row: &str) -> Option<i32> {
     let open = store
         .find_task(row)
-        .is_some_and(|t| matches!(t.status(), crate::model::Status::Doing | crate::model::Status::Blocked));
+        .is_some_and(|t| matches!(t.status(), crate::model::Status::Doing | crate::model::Status::Blocked))
+        || groups.get(at - 1).and_then(crate::barrier::running).is_some_and(|c| c.pane.as_deref() == Some(row));
     let unpassed = groups.get(at - 1).is_some_and(|g| g.verdict.trim().is_empty());
     if open && unpassed && w.status() == WorklistStatus::Running {
         return None;

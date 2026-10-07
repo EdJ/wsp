@@ -1277,6 +1277,9 @@ fn hop_locked(
 pub enum Landed {
     /// On the asker's task log. The normal case, and the one that has no drop.
     Task(String),
+    /// On a worklist's log: a barrier check holds no task (`wsp-230`), so the
+    /// list it is checking is where its answer is kept.
+    List(String),
     /// The record only, and why. The asker's task is gone — not the asker,
     /// which is fine and expected, but the task itself.
     RecordOnly(String),
@@ -1319,8 +1322,13 @@ pub fn homes_to(store: &Store, q: &Message) -> Option<String> {
     if !mine.is_empty() && store.task(mine).is_some() {
         return Some(mine.to_string());
     }
-    let about = q.about.task()?;
-    store.task(about).map(|_| about.to_string())
+    if let Some(about) = q.about.task() {
+        return store.task(about).map(|_| about.to_string());
+    }
+    // A question about a worklist — a barrier check's, which holds no task —
+    // lands on the list's own log, where its run's history is read.
+    let list = q.about.scope()?;
+    store.worklist(list).map(|_| list.to_string())
 }
 
 /// A question closed, and the two things a caller then has in hand.
@@ -1406,7 +1414,17 @@ fn close_locked(
 
     // The task log FIRST. Everything after this point is best-effort delivery;
     // this is the part that is not.
-    let landed = match homes_to(store, &q).and_then(|id| store.task(&id)) {
+    let home = homes_to(store, &q);
+    let list = home.as_deref().filter(|h| store.task(h).is_none()).and_then(|h| store.worklist(h));
+    let landed = match home.as_deref().and_then(|id| store.task(id)) {
+        None if list.is_some() => {
+            let mut w = list.expect("matched");
+            w.log(&format!("{} by {}: {text}", act.as_str(), by.byline()));
+            match store.save_worklist(&w) {
+                Ok(()) => Landed::List(w.id.clone()),
+                Err(e) => Landed::RecordOnly(format!("could not write {}: {e}", w.id)),
+            }
+        }
         Some(mut t) => {
             t.log(&format!("{} by {}: {text}", act.as_str(), by.byline()));
             t.touch();

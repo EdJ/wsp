@@ -3815,6 +3815,27 @@ pub(crate) struct Wip {
     /// `mandates.json`, read once — the standing direction each row publishes
     /// as `direction`.
     pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
+    /// seat -> what a barrier check standing there is checking, and the
+    /// project its group's work is in (`wsp-230`): it holds no claim and no
+    /// binding, so this is the only reading that names it.
+    pub checking: std::collections::BTreeMap<String, (String, Option<String>)>,
+}
+
+/// Every standing barrier check's seat, named against its list and placed in
+/// the project its group's first member lives in.
+fn checking(store: &Store, tasks: &[Task]) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+    let lists = store.worklists();
+    crate::barrier::seats(&lists)
+        .into_iter()
+        .map(|(seat, (list, at))| {
+            let project = lists
+                .iter()
+                .find(|w| w.id == list)
+                .and_then(|w| w.groups().into_iter().nth(at - 1))
+                .and_then(|g| g.members.iter().find_map(|m| tasks.iter().find(|t| &t.id == m)?.project.clone()));
+            (seat, (crate::barrier::seat_label(&list, at), project))
+        })
+        .collect()
 }
 
 impl Wip {
@@ -3841,12 +3862,14 @@ impl Wip {
         let agents_held = store.agents_held();
         let now = util::epoch_secs();
         let verifying = crate::verification::seats(&tasks);
+        let checking = checking(store, &tasks);
         let agents = agents
             .into_iter()
             .filter(|(s, quiet)| {
                 let held = holding(&tasks, &bindings, &claims, &agents_held, s.seat.as_str()).is_some()
                     || governs_seat(&governors, s.seat.as_str())
-                    || verifying.contains_key(s.seat.as_str());
+                    || verifying.contains_key(s.seat.as_str())
+                    || checking.contains_key(s.seat.as_str());
                 !forgotten(s.state, *quiet, now, held)
             })
             .map(|(s, _)| s)
@@ -3865,6 +3888,7 @@ impl Wip {
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
             asks: crate::waiting::Asks::read(store),
             mandates: store.mandates(),
+            checking,
         }
     }
 }
@@ -4042,9 +4066,12 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             &w.index,
             &w.pins,
             resolve::Held {
-                binding: bound.and_then(|t| t.project.clone()).or_else(|| {
-                    verifying.get(seat).and_then(|m| w.tasks.iter().find(|t| &t.id == m)).and_then(|t| t.project.clone())
-                }),
+                binding: bound
+                    .and_then(|t| t.project.clone())
+                    .or_else(|| {
+                        verifying.get(seat).and_then(|m| w.tasks.iter().find(|t| &t.id == m)).and_then(|t| t.project.clone())
+                    })
+                    .or_else(|| w.checking.get(seat).and_then(|(_, p)| p.clone())),
                 claim: resolve::claimed_project(&w.claims, &w.tasks, agent.as_deref(), Some(workspace_id), None),
             },
             agent.as_deref(),
@@ -4067,6 +4094,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             task: bound
                 .map(|t| t.title.clone())
                 .or_else(|| verifying.get(seat).map(|m| crate::verification::seat_label(m)))
+                .or_else(|| w.checking.get(seat).map(|(label, _)| label.clone()))
                 .unwrap_or_else(|| if a.label.is_empty() { "(unbound)".into() } else { format!("({})", a.label) }),
             task_id: bound.map(|t| t.id.clone()).unwrap_or_default(),
             pane: seat.to_string(),
@@ -7360,6 +7388,7 @@ mod tests {
             asks: Default::default(),
             answered_by: Default::default(),
             mandates: Default::default(),
+            checking: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -7546,6 +7575,7 @@ mod tests {
             asks: Default::default(),
             answered_by: Default::default(),
             mandates: Default::default(),
+            checking: Default::default(),
         }
     }
 
