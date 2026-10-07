@@ -481,7 +481,10 @@ fn no_project(store: &Store, needle: &str) -> String {
     let archived = store.archived_projects();
     let index = Index::new(archived.iter().map(|(p, _)| p.clone()).collect());
     let Some(found) = index.find(needle) else {
-        return format!("wsp: no project matching `{needle}`{}", util::dash_hint(needle));
+        return match util::flag_read_as_value(needle) {
+            Some(why) => format!("wsp: {why}"),
+            None => format!("wsp: no project matching `{needle}`"),
+        };
     };
     let path = archived
         .iter()

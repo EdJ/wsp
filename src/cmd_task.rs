@@ -1640,7 +1640,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         Some(p) => match index.find(&p) {
             Some(found) => Some(Some(found.id.clone())),
             None => {
-                eprintln!("wsp: no such project `{p}`{}", util::dash_hint(&p));
+                eprintln!("{}", util::no_such("project", &p));
                 return 1;
             }
         },

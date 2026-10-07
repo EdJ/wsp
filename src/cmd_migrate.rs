@@ -568,7 +568,7 @@ pub fn code(store: &Store, args: &Args) -> i32 {
         return 0;
     };
     let Some(found) = index.find(needle) else {
-        eprintln!("wsp: no such project `{needle}`{}", crate::util::dash_hint(&needle));
+        eprintln!("{}", crate::util::no_such("project", &needle));
         return 1;
     };
     let mut proj: Project = match store.project(&found.id) {

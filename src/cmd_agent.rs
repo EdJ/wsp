@@ -205,19 +205,28 @@ pub fn current_project(
     args: &Args,
     index: &Index,
 ) -> Result<Option<String>, i32> {
-    if let Some(p) = args.get("project") {
-        if p == "none" || p == "inbox" {
-            return Ok(None);
+    match named_project(args, index) {
+        Some(Ok(p)) => Ok(p),
+        Some(Err(said)) => {
+            eprintln!("{said}");
+            Err(1)
         }
-        return match index.find(&p) {
-            Some(found) => Ok(Some(found.id.clone())),
-            None => {
-                eprintln!("wsp: no such project `{p}`{}", crate::util::dash_hint(&p));
-                Err(1)
-            }
-        };
+        None => Ok(standing_in(&Here::live(store, index))),
     }
-    Ok(standing_in(&Here::live(store, index)))
+}
+
+/// What `-p` names, or why it cannot: `None` when it was not given. Split from
+/// [`current_project`] so the refusal is a string a test can read — the verbs
+/// that print it are all `eprintln!` and an exit code.
+pub(crate) fn named_project(args: &Args, index: &Index) -> Option<Result<Option<String>, String>> {
+    let p = args.get("project")?;
+    if p == "none" || p == "inbox" {
+        return Some(Ok(None));
+    }
+    Some(match index.find(&p) {
+        Some(found) => Ok(Some(found.id.clone())),
+        None => Err(crate::util::no_such("project", &p)),
+    })
 }
 
 fn pane_id(args: &Args) -> Option<String> {
@@ -3486,7 +3495,7 @@ pub fn pin(store: &Store, args: &Args) -> i32 {
     };
     let index = Index::new(store.projects());
     let Some(proj) = index.find(&needle) else {
-        eprintln!("wsp: no such project `{needle}`{}", crate::util::dash_hint(&needle));
+        eprintln!("{}", crate::util::no_such("project", &needle));
         return 1;
     };
 
@@ -5871,6 +5880,34 @@ mod tests {
         let store = Store::open();
         store.ensure_dirs().unwrap();
         (env, store)
+    }
+
+    /// The row's own line, `wsp add "-p" -p demo`: the first `-p` takes the
+    /// second as its value, and the refusal has to say that rather than blame
+    /// a project. Driven through the parser and through `add` itself, so a
+    /// site that stopped calling `util::no_such` fails here, not in review.
+    #[test]
+    fn a_title_a_flag_ate_is_reported_as_a_flag_and_files_nothing() {
+        let (_env, store) = scratch("dash-title");
+        let mut demo = crate::model::Project::new("demo");
+        demo.name = "demo".into();
+        store.save_project(&demo).unwrap();
+        let index = Index::new(store.projects());
+
+        let argv: Vec<String> = ["add", "-p", "-p", "demo"].iter().map(|s| s.to_string()).collect();
+        let args = crate::Args::parse(argv);
+        let said = named_project(&args, &index).expect("-p was given").unwrap_err();
+        assert!(said.contains("`--`"), "{said}");
+        assert!(said.contains("looks like a flag"), "{said}");
+        assert!(!said.contains("no such"), "must not blame the project: {said}");
+
+        let rest = Args::synth("add", &["demo"], &[("project", "-p")]);
+        assert_eq!(crate::cmd_task::add(&store, &rest), 1, "refused, not filed");
+        assert!(store.tasks().is_empty(), "nothing was filed: {:?}", store.tasks());
+
+        // A real typo is told what it always was.
+        let typo = crate::Args::parse(["add", "x", "-p", "dmeo"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(named_project(&typo, &index).unwrap().unwrap_err(), "wsp: no such project `dmeo`");
     }
 
     /// A pin is a mandate with a different word on it (`compound-106`), and

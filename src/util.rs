@@ -289,21 +289,30 @@ impl Clock for Dial<'_> {
     }
 }
 
-/// What to add to "no such project `X`" when `X` starts with a dash.
+/// The sentence for a name that starts with a dash and was not found, or
+/// `None` for any other name.
 ///
-/// A name that is not found is reported as a missing name, which is the one
-/// thing a caller can check — and for `wsp add "-p" -p demo` it is the wrong
-/// thing to check: the word was the *title*, the short flag read it as its own
-/// value, and the project that follows is the one argument that was right.
-/// Nobody names a project `-p`, so a dash-led needle is nearly always a value
-/// that a flag ate, and the sentence that fixes it is `--`. Empty for every
-/// other needle, so the message a real typo gets is unchanged. One line, because
-/// the panel shows only the first line of a refusal.
-pub fn dash_hint(needle: &str) -> &'static str {
-    if needle.starts_with('-') && needle.len() > 1 {
-        " — it starts with a dash, so it may be a value that a flag read as its own; a value like that goes after `--`"
-    } else {
-        ""
+/// Nobody names a project `-p`, so a dash-led needle that matched nothing is
+/// nearly always a value a flag ate: `wsp add "-p" -p demo` hands the first `-p`
+/// the second as its value, and the lookup then fails on the one word that was
+/// the title. Saying "no such project" there blames the argument that was right
+/// and sends the caller to their projects — a confident error about the wrong
+/// thing — so the sentence leads with the flag reading instead and does not
+/// say the name is missing. One line, because the panel shows only the first
+/// line of a refusal. A bare `-` is the stream spelling, not a flag.
+pub fn flag_read_as_value(needle: &str) -> Option<String> {
+    (needle.starts_with('-') && needle.len() > 1).then(|| {
+        format!("`{needle}` looks like a flag that was taken as a value — put a value that starts with a dash after `--`")
+    })
+}
+
+/// The refusal for a name nothing matches: `what` is "project" or "project or
+/// worklist". The one place the wording lives, so a dash-led needle gets
+/// [`flag_read_as_value`] at every site that looks a name up.
+pub fn no_such(what: &str, needle: &str) -> String {
+    match flag_read_as_value(needle) {
+        Some(why) => format!("wsp: {why}"),
+        None => format!("wsp: no such {what} `{needle}`"),
     }
 }
 
@@ -990,13 +999,14 @@ mod tests {
     /// `wsp add "-p" -p demo` reported "no such project `-p`", which sent the
     /// caller to their projects when the project was the one right word.
     #[test]
-    fn a_dash_led_needle_says_it_may_be_a_value_and_names_the_escape() {
-        let said = dash_hint("-p");
-        assert!(said.contains("--"), "{said}");
-        assert!(said.contains("value"), "{said}");
+    fn a_dash_led_needle_is_a_flag_read_as_a_value_not_a_missing_name() {
+        let said = no_such("project", "-p");
+        assert!(said.contains("`--`"), "{said}");
+        assert!(!said.contains("no such"), "it must not blame the name: {said}");
         assert!(!said.contains('\n'), "the panel shows only the first line");
-        assert_eq!(dash_hint("demo"), "", "an ordinary typo is told what it always was");
-        assert_eq!(dash_hint("-"), "", "a bare dash is the stream spelling, not a flag");
+        assert_eq!(no_such("project", "demo"), "wsp: no such project `demo`");
+        assert_eq!(no_such("project or worklist", "demo"), "wsp: no such project or worklist `demo`");
+        assert!(flag_read_as_value("-").is_none(), "a bare dash is the stream spelling");
     }
 
     /// What a paragraph is made of, against what a terminal emits.
