@@ -3312,6 +3312,13 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
         );
         crate::cycle::poke_list(store, &w.id, "go", crossed);
     }
+    // The check whose verdict this is has nothing left once its turn ends,
+    // and nothing after this verb could end it on time. See
+    // [`crate::cycle::end_checks_when_idle`].
+    let ending = match (dry, crossed) {
+        (false, Some(n)) => crate::cycle::end_checks_when_idle(store, &w.id, n),
+        _ => Vec::new(),
+    };
 
     // Read here rather than at the top, because `go` is what puts the list
     // into `running` and a list is only asked ahead of a project chain once it
@@ -3359,6 +3366,7 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
                     "earlier": s.earlier,
                 })),
                 "dangling": gone,
+                "ending": ending,
             });
         // The far side, under the key the `next` reader already parses — same
         // shape, same omissions (no evidence walk ran here, so `same_file` and
@@ -3388,6 +3396,9 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
         if let Some(line) = verdict_notice(&w.id, &said, groups.len()) {
             println!("{}", p.dim(&line));
         }
+    }
+    if !ending.is_empty() {
+        println!("{}", p.dim(&ending_line(&ending)));
     }
     if !gone.is_empty() {
         println!("{}  {}", p.bold("gone"), gone.join("  "));
@@ -3944,6 +3955,9 @@ fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str,
         ),
     );
     crate::cycle::poke_list(store, &w.id, "followup", None);
+    // A fresh check reads the group once the follow-ups land, so this one has
+    // said all it will. `wsp-230`.
+    let ending = crate::cycle::end_checks_when_idle(store, &w.id, at);
 
     if args.json() {
         println!("{}", worklist_json(store, &w));
@@ -3957,7 +3971,16 @@ fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str,
             "wsp starts and verifies them, and a fresh check reads the group once they land — finish with `wsp review {row} -`"
         ))
     );
+    if !ending.is_empty() {
+        println!("  {}", p.dim(&ending_line(&ending)));
+    }
     0
+}
+
+/// What a settling verb says about the checks it arranged the ending of —
+/// the caller's own, nearly always, so it is told its pane is not left open.
+fn ending_line(ids: &[String]) -> String {
+    format!("ending {} once its turn is over: wsp ends the pane, the claim and the tree", ids.join(" "))
 }
 
 /// The rows become the next group, and the barrier is passed.
@@ -4989,6 +5012,104 @@ mod tests {
         checking(&store, "batch", 3, "wl-900");
         assert_eq!(flagged(&store, &["group", "batch", "3"], &drop), 1, "its barrier agent is reading it");
         assert_eq!(groups_of(&store, "batch").len(), 3);
+    }
+
+    // ---- a settled barrier ends its own check (`wsp-230`) ----
+
+    fn claimed(store: &Store, id: &str) {
+        store.set_claim(id, json!({ "agent_id": format!("agent-{id}") }));
+    }
+
+    fn checks_ending() -> Vec<String> {
+        crate::cycle::tests::CHECKS_ENDING.with(|s| s.borrow_mut().drain(..).collect())
+    }
+
+    /// A run of two groups, standing at barrier 1 with its check claimed.
+    fn at_barrier_one(tag: &str) -> Store {
+        let store = scratch(tag);
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        task(&store, "wl-003", "todo");
+        run(&store, &["new", "run", "r"]);
+        run(&store, &["add", "run", "wl-001"]);
+        run(&store, &["add", "run", "wl-002"]);
+        started(&store, "run");
+        checking(&store, "run", 1, "wl-900");
+        claimed(&store, "wl-900");
+        checks_ending();
+        store
+    }
+
+    /// On `gpui-migration` every barrier agent sat idle, holding its claim and
+    /// its tree, until the *next* pass ended it, and the last until a person
+    /// did. The pass is where its job ended, so the pass arranges its ending —
+    /// this barrier's check, and not the next barrier's.
+    #[test]
+    fn a_go_that_passes_a_barrier_ends_the_check_whose_verdict_it_is() {
+        let _env = util::isolated("check-ends-go");
+        let store = at_barrier_one("check-ends-go");
+        checking(&store, "run", 2, "wl-901");
+        claimed(&store, "wl-901");
+
+        assert_eq!(flagged(&store, &["go", "run", "it", "holds"], &[("dry-run", "true")]), 0);
+        assert!(checks_ending().is_empty(), "-n passes nothing, so it ends nothing");
+
+        assert_eq!(run(&store, &["go", "run", "it", "holds"]), 0);
+        assert_eq!(checks_ending(), vec!["wl-900"], "barrier 1's check, and not barrier 2's");
+    }
+
+    /// The pass with no next pass behind it, which `end_behind` could never
+    /// reach.
+    #[test]
+    fn the_last_pass_of_a_list_ends_its_own_check() {
+        let _env = util::isolated("check-ends-last");
+        let store = at_barrier_one("check-ends-last");
+        assert_eq!(run(&store, &["go", "run", "it", "holds"]), 0);
+        checks_ending();
+        task(&store, "wl-002", "review");
+        checking(&store, "run", 2, "wl-901");
+        claimed(&store, "wl-901");
+
+        assert_eq!(run(&store, &["go", "run", "the", "last", "holds"]), 0);
+        assert_eq!(checks_ending(), vec!["wl-901"]);
+    }
+
+    /// `--next` is a pass like `go`, and `--blocking` hands the barrier to a
+    /// fresh check once the follow-ups land, so the one that found them is
+    /// finished either way — and so is that re-check, at its own pass.
+    #[test]
+    fn a_follow_up_ends_the_check_that_filed_it_and_a_re_check_ends_at_its_pass() {
+        let _env = util::isolated("check-ends-followup");
+        let store = at_barrier_one("check-ends-followup");
+        let from = verdict("ends-next", "holds, with a tail");
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("next", "true"), ("from", &from)], &["wl-900"]), 0);
+        assert_eq!(checks_ending(), vec!["wl-900"], "--next");
+
+        let store = at_barrier_one("check-ends-blocking");
+        let from = verdict("ends-blocking", "not yet: one fix first");
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("blocking", "true"), ("from", &from)], &["wl-900"]), 0);
+        assert_eq!(checks_ending(), vec!["wl-900"], "--blocking");
+
+        // The ending ran; the follow-up landed; the re-check reads the group.
+        store.clear_claim("wl-900");
+        task(&store, "wl-003", "review");
+        let mut t = Task::new(&format!("{} (recheck 1)", crate::cycle::barrier_title("run", 1)), "wl-902");
+        t.tags = vec![crate::cycle::BARRIER_TAG.to_string()];
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        claimed(&store, "wl-902");
+        assert_eq!(run(&store, &["go", "run", "the", "fix", "holds"]), 0);
+        assert_eq!(checks_ending(), vec!["wl-902"], "the re-check's pass");
+    }
+
+    /// A hold is not where a check's job ends — wsp-158 item 3's tick ends
+    /// what a hold leaves with nothing to do — so it arranges nothing.
+    #[test]
+    fn a_hold_leaves_its_check_where_it_was() {
+        let store = at_barrier_one("check-holds");
+        assert_eq!(run(&store, &["hold", "run", "not", "yet"]), 0);
+        assert!(checks_ending().is_empty());
+        assert!(store.claims().contains_key("wl-900"));
     }
 
     // ---- followup (`wsp-210`) ----

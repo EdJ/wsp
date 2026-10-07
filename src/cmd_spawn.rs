@@ -3413,7 +3413,7 @@ fn wait_until_idle(store: &Store, scope: &str) {
 
 /// [`wait_until_idle`] on a pane named outright — [`end_seat_when_idle`]'s,
 /// which has no handover record to read it from.
-fn wait_for_pane(from: &str) {
+pub(crate) fn wait_for_pane(from: &str) {
     let deadline = Instant::now() + Duration::from_secs(20 * 60);
     let backends = local_backends();
     while Instant::now() < deadline {

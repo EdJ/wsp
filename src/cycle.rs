@@ -379,6 +379,13 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
     let named = args.rest.get(1).cloned();
     stamp(&format!("advance {}", args.rest[1..].join(" ")));
 
+    // An ending and nothing else: the verb that arranged it poked the run's
+    // own step separately, and this process spends most of its life waiting.
+    if let (Some(list), Some(id)) = (named.as_deref(), args.get("end-check")) {
+        end_check(store, list, &id);
+        return 0;
+    }
+
     if let (Some(id), Some(verb)) = (args.get("task"), args.get("verb")) {
         told_about_task(store, &id, &verb);
     }
@@ -1497,7 +1504,10 @@ fn failed(store: &Store, w: &Worklist, id: &str) {
 ///
 /// Not this barrier's own check. Its agent is the one running the `go` that
 /// got us here, and ending it now would cut the turn in which it reviews its
-/// own row; it is ended at the next pass instead, when it has long been idle.
+/// own row; that `go` arranged its ending for when its turn is over
+/// ([`end_checks_when_idle`], `wsp-230`). Until then it was ended here, at the
+/// next pass — a whole group late, and the last one never. Here it is only the
+/// backstop for an arranged ending that did not happen.
 /// The governor used to do all of this by hand, and a run wsp starts has to be
 /// a run wsp tidies, or every group leaves its agents standing.
 fn end_behind(store: &Store, seats: &dyn Seats, w: &Worklist, passed: usize) {
@@ -1523,8 +1533,8 @@ fn end_behind(store: &Store, seats: &dyn Seats, w: &Worklist, passed: usize) {
 ///
 /// **The barrier check behind the pass, not the one in front of it.** The check
 /// in front is running the `go` that got us here, and ending it now would cut
-/// the turn in which it reviews its own row. [`crate::repair`] ends that one a
-/// tick later, when it has long been idle.
+/// the turn in which it reviews its own row. That `go` arranged its ending
+/// once the turn is over ([`end_checks_when_idle`]).
 ///
 /// Every row of the previous barrier, not the one with the bare title: a group
 /// that held twice has two rows (`wsp-136` item 2), and a re-check is an agent
@@ -1590,8 +1600,8 @@ fn owned_by<'a>(tasks: impl Iterator<Item = &'a Task>, list: &str, group: usize)
 /// left holding a claim for ever (`wsp-136` item 3). Ending it from inside the
 /// `go` is not available either: that is the turn in which it reviews its own
 /// row. So it is ended on the tick *after* the run has nothing left to govern,
-/// which is [`crate::repair`]'s call and the only place where "the last barrier
-/// is finished" is knowable without cutting a turn short.
+/// which is [`crate::repair`]'s call. Since `wsp-230` the `go` arranges that
+/// ending itself ([`end_checks_when_idle`]), and the tick is the backstop.
 ///
 /// **The claim is the test, and `wsp despawn` is the whole ending**: agent,
 /// claim and tree, keeping the tree when it has uncommitted work in it, which
@@ -1601,6 +1611,58 @@ pub(crate) fn end_all(store: &Store, ids: Vec<String>) {
     for id in ids.iter().filter(|id| claims.contains_key(*id)) {
         despawn(store, id);
     }
+}
+
+/// The checks on group `at`'s barrier, each ended once its turn is over —
+/// arranged by the verb that settled the barrier. `wsp-230`.
+///
+/// **From the verb, because nothing after it could do this on time.** The
+/// check runs `go` or `followup` from inside its own pane, so the pass that
+/// verb pokes cannot end it there and then — that cuts the turn in which it
+/// reviews its row — and so `end_behind` left it for the *next* pass. On
+/// `gpui-migration` that was every barrier agent seated, idle and holding its
+/// tree for a whole group, and the last one left to a repair tick that may not
+/// come. `govern --rotate` solved
+/// the same problem for a governor: a process outside the pane waits for its
+/// turn to end, then ends it. This is that, with `despawn`'s whole ending.
+///
+/// **Every claimed check on the barrier, not the caller's alone**, so a
+/// governor passing a barrier by hand ends the check it overruled, and a
+/// `followup --blocking` re-check's pass ends the re-check. The idle wait is
+/// what makes the issuer safe to include: until its command exits and its
+/// turn ends, nothing is touched.
+///
+/// The ending runs in a launched `worklist advance --end-check`, so what it
+/// did, and a tree kept for uncommitted work, is said in `cycle.log`.
+pub(crate) fn end_checks_when_idle(store: &Store, list: &str, at: usize) -> Vec<String> {
+    let claims = store.claims();
+    let ids: Vec<String> = store
+        .tasks()
+        .into_iter()
+        .filter(|t| claims.contains_key(&t.id) && is_barrier(t, list, at))
+        .map(|t| t.id)
+        .collect();
+    for id in &ids {
+        #[cfg(test)]
+        tests::CHECKS_ENDING.with(|s| s.borrow_mut().push(id.clone()));
+        launch(store, &["worklist", "advance", list, "--end-check", id]);
+    }
+    ids
+}
+
+/// `worklist advance <list> --end-check <id>`: wait for the check's turn to
+/// end, then end it. [`end_checks_when_idle`] launches it.
+fn end_check(store: &Store, list: &str, id: &str) {
+    let pane = store.panes_for_task(id).into_iter().next();
+    if let Some(pane) = pane.as_deref().filter(|_| !cfg!(test)) {
+        crate::cmd_spawn::wait_for_pane(pane);
+    }
+    if !store.claims().contains_key(id) {
+        stamp(&format!("{list}: {id} settled its barrier and has already gone — nothing to end"));
+        return;
+    }
+    stamp(&format!("{list}: {id} settled its barrier and its turn is over — ending it"));
+    despawn(store, id);
 }
 
 /// The lists that have a barrier check holding a claim right now.
@@ -2436,6 +2498,9 @@ pub(crate) mod tests {
         pub(crate) static RESEATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// Set, and every despawn in this thread is refused with it.
         pub(crate) static DESPAWN_FAILS: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// The barrier checks whose ending a verb arranged on this thread
+        /// (`wsp-230`) — a launched process each, which a test cannot run.
+        pub(crate) static CHECKS_ENDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
     fn spawned() -> Vec<(String, String)> {
@@ -3760,6 +3825,31 @@ fn only_a_working_screen_is_ever_overruled() {
         // comes out in is not a fact anybody should be asserting.
         ended.sort();
         assert_eq!(ended, vec!["b-1", "m-2", "v-1"]);
+    }
+
+    /// The process a settling verb launches (`wsp-230`): the check is ended
+    /// through `despawn`, said in `cycle.log`, and only while it still holds
+    /// its claim — a check somebody ended first is left alone, and said so.
+    #[test]
+    fn an_arranged_check_ending_despawns_the_check_and_says_so_once_and_only_while_it_is_claimed() {
+        let (_env, store) = scratch("end-check");
+        let mut b = Task::new(&barrier_title("run", 1), "b-1");
+        b.tags = vec![BARRIER_TAG.into()];
+        store.save_task(&b).unwrap();
+        store.set_claim("b-1", serde_json::json!({ "workspace": "w" }));
+        drained(&ENDED);
+        drained(&SAID);
+        let args = Args::synth("worklist", &["advance", "run"], &[("end-check", "b-1")]);
+
+        assert_eq!(advance(&store, &args), 0);
+        assert_eq!(drained(&ENDED), vec!["b-1"]);
+        assert!(drained(&SAID).iter().any(|l| l.contains("b-1 settled its barrier") && l.contains("ending it")));
+        assert!(drained(&SPAWNED).is_empty(), "an ending and nothing else: the run's step was the verb's own poke");
+
+        store.clear_claim("b-1");
+        assert_eq!(advance(&store, &args), 0);
+        assert!(drained(&ENDED).is_empty(), "already gone");
+        assert!(drained(&SAID).iter().any(|l| l.contains("already gone")));
     }
 
     fn drained<T>(k: &'static std::thread::LocalKey<RefCell<Vec<T>>>) -> Vec<T> {
