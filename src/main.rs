@@ -705,7 +705,7 @@ fn die_on_broken_pipe() {
 /// need. It is short because the property it describes is rare, and it going
 /// stale is the one failure here that costs nothing but a wrong signpost.
 const LOOKS_FIRST: &str =
-    "archive, checkout, install, migrate, project rm, sandbox rm, verify --rm, worklist go, worklist rm";
+    "archive, checkout, install, migrate, project rm, sandbox rm, verify --rm, worklist go, worklist group --drop, worklist rm";
 
 /// Whether this invocation reads `-n`, and what to call it if it does not.
 ///
@@ -795,7 +795,11 @@ fn dry_run(args: &Args) -> (bool, String) {
         "migrate" | "install" | "archive" | "checkout" => (true, args.cmd.clone()),
         "project" | "proj" | "p" => named(matches!(sub, "rm" | "remove" | "delete")),
         "sandbox" => named(matches!(sub, "rm" | "remove" | "stop")),
-        "worklist" | "wl" => named(matches!(sub, "go" | "start" | "rm" | "remove")),
+        // `group` the way `verify` is: only its removing branch, `--drop`,
+        // has anything to look at first.
+        "worklist" | "wl" => {
+            named(matches!(sub, "go" | "start" | "rm" | "remove") || (sub == "group" && args.given("drop")))
+        }
         // The one arm that turns on a flag rather than a word, because that is
         // where `verify` keeps the difference: `wsp verify` is a build and has
         // nothing to look at first, `wsp verify --rm` removes trees nothing
@@ -1842,12 +1846,14 @@ fn help_text() -> String {
                                     and -n says which before anything moves
   wsp worklist mv <slug> <task> --group N   between groups, or --after N for a
                                     new one between two that exist
-  wsp worklist group <slug> N [--parallel N|none] [--agent "kind [model] [effort]"|manual] [--stop "…"|-] [--why "…"|-]
+  wsp worklist group <slug> N [--parallel N|none] [--agent "kind [model] [effort]"|manual] [--stop "…"|-] [--drop] [--why "…"|-]
                                     a cap on the work, and the prose read at
                                     the barrier after that group — `-` reads it
                                     from a stream and --stop --from FILE out of
                                     a file, where a shell never sees it. --why
-                                    is logged with the edit
+                                    is logged with the edit. --drop [-n] takes
+                                    the group out whole: the running one too,
+                                    with --why, until its barrier opens
   wsp worklist member <slug> <task> --agent "kind [model] [effort]"|none
                                     one member on its own line beside the
                                     group's — its spawn and its verifier run
@@ -2679,6 +2685,7 @@ mod tests {
             &["wl", "start", "night"][..],
             &["worklist", "rm", "night", "t-1"][..],
             &["wl", "remove", "night", "t-1"][..],
+            &["worklist", "group", "night", "2", "--drop"][..],
         ] {
             let a = args(argv);
             assert!(super::dry_run(&a).0, "`wsp {}` reads -n and was refused it", argv.join(" "));

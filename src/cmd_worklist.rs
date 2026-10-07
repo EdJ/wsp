@@ -4974,6 +4974,8 @@ mod tests {
         assert_eq!(flagged(&store, &["group", "batch", "2"], &drop), 1, "wl-002 is doing and in no other group");
         assert_eq!(groups_of(&store, "batch").len(), 4);
 
+        assert_eq!(flagged(&store, &["group", "batch", "4"], &[("drop", "true"), ("dry-run", "true")]), 0);
+        assert_eq!(groups_of(&store, "batch").len(), 4, "-n looks and moves nothing");
         assert_eq!(flagged(&store, &["group", "batch", "4"], &[("drop", "true")]), 0, "ahead of the run, no reason owed");
         assert_eq!(groups_of(&store, "batch").len(), 3);
 
