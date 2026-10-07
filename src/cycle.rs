@@ -2149,8 +2149,11 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
 pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     let mut out = Vec::new();
     for w in store.worklists() {
+        // A list closed by `done` while a check was still reading has nothing
+        // left for that check to decide, settled or not.
+        let over = w.status() == WorklistStatus::Done;
         for (i, g) in w.groups().iter().enumerate() {
-            for c in g.checks.iter().filter(|c| !c.open()) {
+            for c in g.checks.iter().filter(|c| !c.open() || over) {
                 let Some(seat) = c.standing() else { continue };
                 if seats.state(seat).is_some_and(|s| s.turn_in_flight()) {
                     continue;
@@ -3882,6 +3885,26 @@ fn only_a_working_screen_is_ever_overruled() {
         crate::repair::tick(&store, &Blind, &mut Pass::new());
         assert!(tests::ENDED.with(|e| e.borrow().is_empty()), "an ended check is not ended twice");
         assert_eq!(checks(&store, 1)[0].ending, crate::barrier::Ending::Ended);
+    }
+
+    /// A list closed by `done` while its check was still reading: nothing is
+    /// left for the check to decide, so its seat is ended though it never
+    /// settled — or it would stand for ever, since only a verb settles one.
+    #[test]
+    fn a_check_still_reading_when_its_list_is_done_is_ended_by_the_tick() {
+        let (_env, store) = scratch("donecheck");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        check_seated(&store, 1, "cpd-open");
+        assert!(checks_finished(&store, &Blind).is_empty(), "a running list's open check is still deciding");
+        let mut l = store.worklist("run").unwrap();
+        l.set_status(WorklistStatus::Done);
+        store.save_worklist(&l).unwrap();
+        assert_eq!(checks_finished(&store, &Blind), vec!["cpd-open".to_string()]);
     }
 
     /// Everything written before `wsp-134`, and a group somebody turned off,
