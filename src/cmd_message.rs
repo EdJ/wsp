@@ -741,7 +741,7 @@ pub(crate) fn deliver_held(store: &Store, seats: &dyn crate::cycle::Seats) -> Ve
 
 /// The typing, over every backend here: `None` where nothing answers for the
 /// pane or nothing in it is an agent, which a later tick asks again.
-fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
+pub(crate) fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
     let backends = crate::cmd_spawn::local_backends();
     let (place, found) = crate::cmd_agent::locate_seat(&backends, pane)?;
     if found.agent.kind.trim().is_empty() {

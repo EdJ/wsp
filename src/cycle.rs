@@ -162,6 +162,24 @@ pub(crate) trait Seats {
         None
     }
 
+    /// Whether the seat's prompt is holding typed text —
+    /// [`crate::place::Place::typed`]. `None` is nobody can say, and holds.
+    fn typed(&self, _seat: &str) -> Option<bool> {
+        None
+    }
+
+    /// Press submit at the seat — [`crate::place::Place::nudge`]. Whether a
+    /// backend took the press.
+    fn press(&self, _seat: &str) -> bool {
+        false
+    }
+
+    /// Type a sentence at the seat the way `wsp tell` does, through its kind.
+    /// `None` is nothing here answers for it.
+    fn resend(&self, _seat: &str, _text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
+        None
+    }
+
     /// The processes that are this seat's agent, read now —
     /// [`crate::place::Place::pids`]. `None` is no backend can name one.
     fn pids(&self, _seat: &str) -> Option<Vec<u32>> {
@@ -241,6 +259,22 @@ impl Seats for Fleet {
     fn pids(&self, seat: &str) -> Option<Vec<u32>> {
         let seat_id = Seat::new(seat);
         Fleet::here(seat).find_map(|b| b.pids(&seat_id))
+    }
+
+    fn typed(&self, seat: &str) -> Option<bool> {
+        let seat_id = Seat::new(seat);
+        Fleet::here(seat).find_map(|b| b.typed(&seat_id))
+    }
+
+    /// Pressed by the backend that holds the seat, and no other: a press is a
+    /// keystroke, and every backend that is not this seat's answers `NoSeat`.
+    fn press(&self, seat: &str) -> bool {
+        let seat_id = Seat::new(seat);
+        Fleet::here(seat).find(|b| b.state(&seat_id).is_ok()).is_some_and(|b| b.nudge(&seat_id).is_ok())
+    }
+
+    fn resend(&self, seat: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
+        crate::cmd_message::type_at(seat, text)
     }
 }
 
@@ -658,15 +692,27 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
         }
     }
 
+    // 1a. Every seat the group is waiting on a first turn from, whose order
+    // went in and started nothing (`wsp-252`). Before the verifiers and the
+    // barrier, so a seat replaced here is opened again below.
+    crate::untaken::look(store, seats, &w, at, g, &pos);
+
     // 2. A verifier for each member that is finished — reviewed and landed.
     // No row: the pass is written on the member, and the agent is started on
     // the member with `--verify` (`wsp-188`).
+    let gone = |seat: &str| seats.absent(seat) || seats.state(seat) == Some(State::Gone);
     for s in pos.members.iter().filter(|s| s.finished()) {
         let Some(member) = store.find_task(&s.id) else { continue };
         // On the kind the work ran on — `wsp-134` d1 (C) — which in a
         // mixed group is the member's own line and not the group's.
         let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
-        if let Some(opened) = open_verifier(store, &member, &on) {
+        if let Some(opened) = open_verifier(store, &member, &on, &gone) {
+            if let Some(seat) = &opened.lost {
+                stamp(&format!(
+                    "{} group {at}: {}'s verifier in {seat} is gone with no verdict — starting another",
+                    w.id, member.id
+                ));
+            }
             if let Some(seat) = &opened.superseded {
                 stamp(&format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id));
                 end_passes(store, seats, &member.id, |p| p.state == crate::verification::State::Superseded);
@@ -705,7 +751,6 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
                     }
             }) => {}
             None => {
-                let gone = |seat: &str| seats.absent(seat) || seats.state(seat) == Some(State::Gone);
                 let on = Some(policy.label());
                 if let Some(o) = crate::barrier::open(store, &w, at, trunk_tip(store, &w.id), on, &gone) {
                     let label = crate::barrier::seat_label(&w.id, at);
@@ -1099,6 +1144,14 @@ pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
 /// advance leaves it to this one. One whose seat was ended without a verdict
 /// (a run that closed over it, then resumed) is superseded like any other.
 ///
+/// **And so is one whose seat is `gone` without wsp having ended it**
+/// (`wsp-252`, ux-kit group 2). A park closed cpd-615 and cpd-608 under two
+/// passes and wrote nothing on them, so both read `running` on panes that no
+/// longer existed, this returned `None` for both, and the run, its resume and a
+/// `spawn --verify` by hand all waited on two agents that would never answer.
+/// The barrier check has had the same reading since `wsp-230`
+/// ([`crate::barrier::open`]); this is the verifier's half of it.
+///
 /// # Keyed on the landing, not on `updated` (`wsp-136` item 1)
 ///
 /// Any write moves `updated` — a governor's `wsp note`, an edit to the
@@ -1109,7 +1162,7 @@ pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
 /// deliberately: design-only work has no repository, and a member whose fix is
 /// prose has genuinely changed when it is touched. That is also why a pass's
 /// own bookkeeping never touches the member — see [`crate::verification`].
-fn open_verifier(store: &Store, member: &Task, on: &Policy) -> Option<Opened> {
+fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::landed(member);
     let landed_again = |read: &Option<String>| match (&now_landing, read) {
@@ -1121,24 +1174,31 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy) -> Option<Opened> {
         let mut m = store.find_task(&member.id)?;
         let mut own = v::passes(&m);
         let mut superseded = None;
+        let mut lost = None;
         match v::all(&tasks, &m).last() {
             None => {}
             // A Verify row still open is the old shape's own to finish.
             Some(p) if p.state == State::Running && p.was.is_some() => return None,
             Some(p) if p.state == State::Running => {
                 let i = own.len().checked_sub(1)?;
-                let gone = own[i].ending != Ending::Standing;
+                let ended = own[i].ending != Ending::Standing;
                 if own[i].pane.is_none() && util::epoch_secs() - util::epoch_of(&own[i].at) > WEDGED_AFTER {
                     own[i].at = util::now_iso();
                     v::write(&mut m, &own);
                     store.save_task(&m).ok()?;
-                    return Some(Opened { superseded: None, again: true });
+                    return Some(Opened { superseded: None, again: true, lost: None });
                 }
-                if !gone && !landed_again(&p.read) {
+                let dead = !ended && own[i].pane.as_deref().is_some_and(gone);
+                if !ended && !dead && !landed_again(&p.read) {
                     return None;
                 }
                 own[i].state = State::Superseded;
-                superseded = own[i].pane.clone().filter(|_| !gone);
+                if dead {
+                    // Nothing left to end: the seat went without wsp.
+                    own[i].ending = Ending::Ended;
+                    lost = own[i].pane.clone();
+                }
+                superseded = own[i].pane.clone().filter(|_| !ended && !dead);
             }
             Some(p) if p.state == State::Holds => {
                 if !landed_again(&p.read) {
@@ -1157,10 +1217,11 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy) -> Option<Opened> {
         own.push(v::Pass::opened(now_landing.clone(), Some(on.label())));
         v::write(&mut m, &own);
         store.save_task(&m).ok()?;
-        Some(Opened { superseded, again: false })
+        Some(Opened { superseded, again: false, lost })
     })?;
     let why = match (&made.superseded, made.again) {
         (_, true) => "again: the last start never arrived".to_string(),
+        (_, _) if made.lost.is_some() => format!("the pass in {} lost its seat", made.lost.as_deref().unwrap_or_default()),
         (Some(seat), _) => format!("a new landing supersedes the pass in {seat}"),
         (None, _) => "a pass opens".to_string(),
     };
@@ -1173,6 +1234,8 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy) -> Option<Opened> {
 struct Opened {
     superseded: Option<String>,
     again: bool,
+    /// The seat of a running pass that went without wsp ending it.
+    lost: Option<String>,
 }
 
 /// Whether the member's work has moved since this verifier read it.
@@ -2177,7 +2240,7 @@ pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
 
 /// `wsp despawn --pane <seat>`, as a process — a verifier holds no claim, so
 /// its seat is the only handle there is.
-fn despawn_seat(seat: &str) -> Result<(), String> {
+pub(crate) fn despawn_seat(seat: &str) -> Result<(), String> {
     if cfg!(test) {
         #[cfg(test)]
         return tests::ENDED.with(|s| {
@@ -3836,6 +3899,166 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(c[0].state, crate::barrier::State::Abandoned);
         assert!(c[1].open());
         assert_eq!(spawned(), vec![("run · barrier 1".to_string(), "claude".into())]);
+    }
+
+    /// **A verifier whose seat has gone is superseded, and a fresh one starts**
+    /// (`wsp-252`, ux-kit group 2). A park closed cpd-615 and cpd-608 under
+    /// their passes and wrote nothing on them; both read `running` on panes
+    /// that no longer existed, and advance, resume and `spawn --verify` all
+    /// started nothing. The check has had this since `wsp-230` (the test
+    /// above); this is the verifier's half.
+    #[test]
+    fn a_verifier_whose_seat_has_gone_is_superseded_and_a_fresh_one_starts() {
+        use crate::verification::{Ending, State as V};
+        struct Gone;
+        impl Seats for Gone {
+            fn state(&self, _seat: &str) -> Option<State> {
+                None
+            }
+            fn absent(&self, seat: &str) -> bool {
+                seat == "cpd-615"
+            }
+        }
+        let (_env, store) = scratch("verifiergone");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        crate::verification::name_seat(&store, "m-1", "cpd-615");
+        assert_eq!(spawned().len(), 1);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "a reader that cannot see the seat waits");
+
+        step(&store, &w, &Gone);
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.iter().map(|p| p.state).collect::<Vec<_>>(), vec![V::Superseded, V::Running]);
+        assert_eq!(ps[0].ending, Ending::Ended, "nothing is left to end, and nothing tries");
+        assert!(drained(&ENDED).is_empty(), "a seat that went is not despawned");
+        assert_eq!(spawned(), vec![("m-1 · verifying".to_string(), "claude".to_string())]);
+    }
+
+    /// A seat that is idle, has taken no turn, and answers what its prompt holds.
+    struct Untaken {
+        typed: Option<bool>,
+        pressed: RefCell<Vec<String>>,
+        resent: RefCell<Vec<(String, String)>>,
+    }
+
+    impl Untaken {
+        fn holding(typed: Option<bool>) -> Untaken {
+            Untaken { typed, pressed: RefCell::new(Vec::new()), resent: RefCell::new(Vec::new()) }
+        }
+    }
+
+    impl Seats for Untaken {
+        fn state(&self, _seat: &str) -> Option<State> {
+            Some(State::Idle)
+        }
+        fn turn_began_since(&self, _seat: &str, _since: i64) -> Option<bool> {
+            Some(false)
+        }
+        fn typed(&self, _seat: &str) -> Option<bool> {
+            self.typed
+        }
+        fn press(&self, seat: &str) -> bool {
+            self.pressed.borrow_mut().push(seat.to_string());
+            true
+        }
+        fn resend(&self, seat: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
+            self.resent.borrow_mut().push((seat.to_string(), text.to_string()));
+            Some(Ok(crate::place::Delivery::Unconfirmed))
+        }
+        /// A pid that is not running, so the ending is confirmed.
+        fn pids(&self, _seat: &str) -> Option<Vec<u32>> {
+            Some(vec![u32::MAX - 1])
+        }
+    }
+
+    /// A member under review with its verifier seated in `seat`, the pass
+    /// opened five minutes ago.
+    fn verifier_waiting(store: &Store, seat: &str) -> Worklist {
+        task(store, "m-1", Status::Review);
+        let w = list(store, &[(&["m-1"], "claude")]);
+        step(store, &w, &Blind);
+        crate::verification::name_seat(store, "m-1", seat);
+        let _ = spawned();
+        let mut m = store.find_task("m-1").unwrap();
+        let mut ps = crate::verification::passes(&m);
+        ps[0].at = util::iso_at(util::epoch_secs() - 300);
+        crate::verification::write(&mut m, &ps);
+        store.save_task(&m).unwrap();
+        w
+    }
+
+    /// Every `cycle.log` line dated five minutes back, which is what the
+    /// next step waits out.
+    fn age_the_log(store: &Store) {
+        let path = store.state_file("cycle.log");
+        let then = util::iso_at(util::epoch_secs() - 300);
+        let aged: String = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| format!("{then} {}\n", l.split_once(' ').map_or(l, |(_, r)| r)))
+            .collect();
+        std::fs::write(&path, aged).unwrap();
+    }
+
+    /// **An order sitting typed in a seat the run is waiting on is pressed —
+    /// once — and a seat that still takes no turn is replaced** (`wsp-252`).
+    /// compound-415's verifier sat with its order in the prompt from 04:56
+    /// until Ed pressed Enter at 06:17; here the run presses it at the first
+    /// look past two minutes, does not press again while the press is fresh,
+    /// and ends the seat and starts another when the press bought nothing.
+    #[test]
+    fn an_order_typed_and_unsent_is_pressed_once_and_then_the_seat_is_replaced() {
+        use crate::verification::State as V;
+        let (_env, store) = scratch("untakenpress");
+        let w = verifier_waiting(&store, "cpd-627");
+        let seats = Untaken::holding(Some(true));
+
+        step(&store, &w, &seats);
+        assert_eq!(*seats.pressed.borrow(), vec!["cpd-627".to_string()], "pressed");
+        assert!(spawned().is_empty() && drained(&ENDED).is_empty(), "and nothing else");
+        step(&store, &w, &seats);
+        assert_eq!(seats.pressed.borrow().len(), 1, "not again while the press is fresh");
+
+        age_the_log(&store);
+        step(&store, &w, &seats);
+        assert_eq!(seats.pressed.borrow().len(), 1, "a press is taken once");
+        assert_eq!(drained(&ENDED), vec!["cpd-627".to_string()], "the seat that took nothing is ended");
+        assert_eq!(spawned(), vec![("m-1 · verifying".to_string(), "claude".to_string())], "and another starts");
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.iter().map(|p| p.state).collect::<Vec<_>>(), vec![V::Superseded, V::Running]);
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
+        assert!(log.contains("pressed submit in cpd-627,") && log.contains("replacing cpd-627:"), "{log}");
+    }
+
+    /// An empty prompt and no turn is an order that never arrived: the run
+    /// sends it again, the verifier's own order, to the seat — once.
+    #[test]
+    fn an_order_that_never_reached_the_prompt_is_sent_again_once() {
+        let (_env, store) = scratch("untakenresend");
+        let w = verifier_waiting(&store, "cpd-609");
+        let seats = Untaken::holding(Some(false));
+        step(&store, &w, &seats);
+        step(&store, &w, &seats);
+        let resent = seats.resent.borrow();
+        assert_eq!(resent.len(), 1, "once: {resent:?}");
+        assert_eq!(resent[0].0, "cpd-609", "to the seat, not to the member's holder");
+        assert!(resent[0].1.contains("m-1"), "the verifier's own order: {}", resent[0].1);
+        assert!(seats.pressed.borrow().is_empty(), "nothing in the prompt to press");
+    }
+
+    /// A prompt nobody can read is left alone: no press, no resend, no line.
+    #[test]
+    fn a_seat_whose_prompt_cannot_be_read_is_left_alone() {
+        let (_env, store) = scratch("untakenblind");
+        let w = verifier_waiting(&store, "cpd-1");
+        let seats = Untaken::holding(None);
+        step(&store, &w, &seats);
+        age_the_log(&store);
+        step(&store, &w, &seats);
+        assert!(seats.pressed.borrow().is_empty() && seats.resent.borrow().is_empty());
+        assert!(drained(&ENDED).is_empty() && spawned().is_empty());
     }
 
     /// `wsp-136` item 3. `end_behind` ends the check on the barrier *before* the

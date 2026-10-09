@@ -414,6 +414,26 @@ pub(crate) fn name_seat(store: &Store, member: &str, seat: &str) -> bool {
     wrote
 }
 
+/// Mark the running pass in `seat` superseded, so the next pass opens a fresh
+/// one and [`crate::cycle::end_passes`] ends this one's seat. Bookkeeping, so
+/// the member's `updated` does not move. Whether it wrote.
+pub(crate) fn supersede(store: &Store, member: &str, seat: &str) -> bool {
+    let wrote = store.locked(|| {
+        let Some(mut t) = store.find_task(member) else { return false };
+        let mut ps = passes(&t);
+        let Some(p) = ps.iter_mut().rev().find(|p| p.state == State::Running && p.pane.as_deref() == Some(seat)) else {
+            return false;
+        };
+        p.state = State::Superseded;
+        write(&mut t, &ps);
+        store.save_task(&t).is_ok()
+    });
+    if wrote {
+        store.git_commit(&format!("wsp: {member}'s pass in {seat} took no turn — superseded"));
+    }
+    wrote
+}
+
 /// `wsp verified <member> --holds|--blocks --from FILE` — a verifier's verdict,
 /// recorded on the member it read.
 ///

@@ -840,7 +840,7 @@ fn noticed(t: &Task) -> Option<i64> {
 }
 
 /// When this member last had a new agent put on it, off the line that says so.
-fn started_at(t: &Task) -> Option<i64> {
+pub(crate) fn started_at(t: &Task) -> Option<i64> {
     t.section("Log")?.lines().filter(|l| fresh_start(l)).last().and_then(stamp_of)
 }
 
