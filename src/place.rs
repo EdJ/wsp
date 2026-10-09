@@ -1304,7 +1304,8 @@ impl Default for Pressing<'static> {
 /// and calling that a delivery is the false success this replaces.
 ///
 /// **What is pressed, and only then.** The prompt read back holding text
-/// ([`Place::typed`] is `Some(true)`) at the end of a window. A backend that
+/// ([`Place::typed`] is `Some(true)`) at the end of a window, at an agent that
+/// was idle when it was typed at. A backend that
 /// cannot read its prompt gets no press at all and its own answer back, as
 /// before: a return into a prompt nobody has read may submit somebody's draft.
 ///
@@ -1345,6 +1346,13 @@ pub(crate) fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing)
                 break;
             }
             how.clock.rest(how.poll);
+        }
+        // A sentence behind a turn is the agent's to take when the turn ends,
+        // and a prompt that holds it meanwhile is not a lost submit: every
+        // failure this was written for was an idle seat, and a press into a
+        // turn is a keystroke at somebody's work.
+        if busy {
+            return first;
         }
         match place.typed(seat) {
             Some(true) if i + 1 < how.windows.len() => {
@@ -1649,6 +1657,8 @@ mod tests {
     struct Prompt {
         readable: bool,
         busy: bool,
+        /// A turn in flight keeps a queued sentence in the prompt box.
+        keeps: bool,
         takes_on: Option<u32>,
         holding: std::cell::Cell<bool>,
         turned: std::cell::Cell<bool>,
@@ -1661,6 +1671,7 @@ mod tests {
             Prompt {
                 readable: true,
                 busy: false,
+                keeps: false,
                 takes_on,
                 holding: std::cell::Cell::new(false),
                 turned: std::cell::Cell::new(false),
@@ -1673,7 +1684,7 @@ mod tests {
         /// one that takes, or straight away behind a turn already running.
         fn enter(&self, n: u32) {
             if self.busy {
-                self.holding.set(false);
+                self.holding.set(self.keeps);
             } else if self.takes_on == Some(n) {
                 self.holding.set(false);
                 self.turned.set(true);
@@ -1772,6 +1783,17 @@ mod tests {
     fn a_sentence_queued_behind_a_turn_is_delivered_when_the_prompt_empties_and_never_pressed() {
         let clock = crate::util::Dial::new();
         let place = Prompt { busy: true, ..Prompt::new(None) };
+        assert_eq!(submit(&place, &Seat::new("cpd-2"), "the barrier is open", &pressing(&clock)), Ok(Delivery::Unconfirmed));
+        assert_eq!(place.pressed.get(), 0);
+    }
+
+    /// And one whose prompt holds it until the turn ends is not pressed
+    /// either, nor called unsubmitted: a press into a turn is a keystroke at
+    /// somebody's work, and every lost submit on record was at an idle seat.
+    #[test]
+    fn a_sentence_held_in_the_prompt_behind_a_turn_is_not_pressed() {
+        let clock = crate::util::Dial::new();
+        let place = Prompt { busy: true, keeps: true, ..Prompt::new(None) };
         assert_eq!(submit(&place, &Seat::new("cpd-2"), "the barrier is open", &pressing(&clock)), Ok(Delivery::Unconfirmed));
         assert_eq!(place.pressed.get(), 0);
     }
