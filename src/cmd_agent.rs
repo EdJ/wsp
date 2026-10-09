@@ -1669,6 +1669,14 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
             eprintln!("     `wsp peek {peek}` shows which; if it is sitting there, a return in the pane sends it");
             1
         }
+        // Read off the screen, so said flat: it is there (`wsp-252`). The
+        // return is the repair; a second `wsp tell` also works, and leaves
+        // the sentence in the prompt twice.
+        Err(Refusal::Unsubmitted(_)) => {
+            eprintln!("wsp: {what} has the text typed in its prompt and not submitted — wsp pressed submit again and it stayed");
+            eprintln!("     a return in {pane} sends it; `wsp peek {peek}` shows it waiting");
+            1
+        }
         Err(e) => {
             eprintln!("wsp: {what} was not told: {e}");
             1

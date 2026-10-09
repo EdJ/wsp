@@ -300,6 +300,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// The environment variable a seat's occupant finds its own handle in, for a
 /// backend that has no name of its own for it.
@@ -947,6 +948,16 @@ pub enum Refusal {
     /// the work order is sitting where the agent can see it, and a submit is
     /// what it is waiting for.
     NotTaken,
+    /// Typed, read back off the seat's screen, and still sitting in its prompt
+    /// after [`submit`] pressed submit again — `wsp-252`.
+    ///
+    /// [`Refusal::NotTaken`] said from a backend that **looked**, which is the
+    /// half of that answer it never had: where the text went. Every spawn that
+    /// failed this way on 2026-10-08 was reported as "either sitting unsent or
+    /// dropped — wsp cannot see which", and every one of them, looked at, was
+    /// sitting there. The repair is a return in the seat, and not a resend,
+    /// which would put a second copy behind the first.
+    Unsubmitted(Seat),
     /// This backend cannot do that at all — a seat for a person on a backend
     /// with no terminal, say. Distinct from a failure, and not a bug.
     Unsupported(&'static str),
@@ -997,6 +1008,7 @@ impl std::fmt::Display for Refusal {
             Refusal::NoSeat(s) => write!(f, "no seat {s}"),
             Refusal::NotReady(s) => write!(f, "not ready — {}", s.as_str()),
             Refusal::NotTaken => write!(f, "the sentence arrived and no turn started"),
+            Refusal::Unsubmitted(s) => write!(f, "typed into {s} and not submitted — it is sitting in the prompt"),
             Refusal::Unsupported(w) => write!(f, "this backend cannot {w}"),
             Refusal::Backend(w) => write!(f, "{w}"),
         }
@@ -1133,6 +1145,21 @@ pub trait Place {
         Err(Refusal::Unsupported("submit a prompt that arrived and was not taken"))
     }
 
+    /// Whether the agent's input line is holding typed text, read off its
+    /// screen: `Some(true)` it is, `Some(false)` it is empty, `None` this
+    /// backend cannot read it — no screen, or an agent whose prompt it does
+    /// not know the shape of.
+    ///
+    /// **The reading [`Place::nudge`]'s rescue was missing** (`wsp-252`).
+    /// Without it, a submit that did not start a turn left two stories wsp
+    /// could not choose between — the text in the composer, or the text
+    /// dropped — and the two have opposite repairs: a return for the first,
+    /// a resend for the second, and a resend into the first leaves the order
+    /// in the prompt twice. [`submit`] presses only on `Some(true)`.
+    fn typed(&self, _seat: &Seat) -> Option<bool> {
+        None
+    }
+
     /// End whatever agent is in a seat, and let the seat go.
     ///
     /// **Not the arrange-panes port's `close`.** They are spelled with the same
@@ -1229,6 +1256,109 @@ pub trait Place {
     /// The only way to learn that an agent stopped. A backend that cannot push
     /// polls in here.
     fn watch(&self, f: &mut dyn FnMut(Event) -> bool) -> Result<()>;
+}
+
+/// How long [`submit`] watches a typed sentence, and how often it presses again.
+pub(crate) struct Pressing<'a> {
+    /// How long each look lasts before the next press, in order. One more
+    /// window than presses: the last is the look after the last press.
+    ///
+    /// Growing, because what a press is waiting on is the TUI getting to it,
+    /// and a TUI that was not there at two seconds is more likely there at
+    /// five than at four. Eighteen seconds in all, paid only by a seat that is
+    /// holding the text unsent the whole way through; a turn that starts ends
+    /// the wait at the next poll.
+    pub windows: &'a [Duration],
+    pub poll: Duration,
+    pub clock: &'a dyn crate::util::Clock,
+}
+
+impl Default for Pressing<'static> {
+    fn default() -> Pressing<'static> {
+        const WINDOWS: [Duration; 4] = [
+            Duration::from_millis(2_000),
+            Duration::from_millis(3_000),
+            Duration::from_millis(5_000),
+            Duration::from_millis(8_000),
+        ];
+        Pressing { windows: &WINDOWS, poll: Duration::from_millis(150), clock: &crate::util::Wall }
+    }
+}
+
+/// [`Place::tell`], and then make sure the sentence was submitted: the one
+/// path every send takes — a spawn's work order, `wsp tell`, `govern --tell`,
+/// a wake — because each `Kind::tell` that types at a seat comes through here.
+///
+/// **Why this exists** (`wsp-252`, with `wsp-251` and `wsp-257` folded in).
+/// On 2026-10-08 the run's own spawns came up with their work orders typed
+/// into the prompt and not submitted, ten times in one list and three in
+/// another, at loads from 3 to 540, and once until Ed pressed Enter by hand
+/// an hour later. The backend underneath is compound, which types and presses
+/// and cannot watch, so `Ok` said *delivered* and nothing looked again.
+///
+/// **What counts as taken.** A turn that began at the seat since the send
+/// ([`Place::turn_began_since`], or a turn in flight where the backend keeps no
+/// record), or — for an agent that was already mid-turn, whose sentence is
+/// queued and starts nothing — the prompt reading empty. An idle agent's empty
+/// prompt is not taken on its own: the screen may not have drawn the text yet,
+/// and calling that a delivery is the false success this replaces.
+///
+/// **What is pressed, and only then.** The prompt read back holding text
+/// ([`Place::typed`] is `Some(true)`) at the end of a window. A backend that
+/// cannot read its prompt gets no press at all and its own answer back, as
+/// before: a return into a prompt nobody has read may submit somebody's draft.
+///
+/// `Err(Refusal::Unsubmitted)` is the text still sitting there after the last
+/// press, and a backend's [`Refusal::NotTaken`] is treated as the first look
+/// rather than as an answer, because it is the same story told earlier.
+pub(crate) fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing) -> Result<Delivery> {
+    // A backend that cannot read the prompt takes the path it always took,
+    // call for call: nothing below has anything to go on without the reading.
+    if place.typed(seat).is_none() {
+        return place.tell(seat, text);
+    }
+    let busy = place.state(seat).is_ok_and(|s| s.turn_in_flight());
+    // Taken before the type: a turn's start is stamped in whole seconds while
+    // the type is still returning, so a stamp taken after could postdate the
+    // very turn it is looking for. `wake` takes its own the same way.
+    let since = crate::util::epoch_secs();
+    let first = match place.tell(seat, text) {
+        Ok(Delivery::Started) => return Ok(Delivery::Started),
+        Ok(Delivery::Unconfirmed) => Ok(Delivery::Unconfirmed),
+        Err(Refusal::NotTaken) => Err(Refusal::NotTaken),
+        Err(e) => return Err(e),
+    };
+    let turned = || match place.turn_began_since(seat, since) {
+        Some(began) => began,
+        None => !busy && place.state(seat).is_ok_and(|s| s.turn_in_flight()),
+    };
+    for (i, window) in how.windows.iter().enumerate() {
+        let deadline = how.clock.now() + *window;
+        loop {
+            if turned() {
+                return Ok(Delivery::Started);
+            }
+            if busy && place.typed(seat) == Some(false) {
+                return Ok(Delivery::Unconfirmed);
+            }
+            if how.clock.now() >= deadline {
+                break;
+            }
+            how.clock.rest(how.poll);
+        }
+        match place.typed(seat) {
+            Some(true) if i + 1 < how.windows.len() => {
+                if place.nudge(seat).is_err() {
+                    return Err(Refusal::Unsubmitted(seat.clone()));
+                }
+            }
+            Some(true) => return Err(Refusal::Unsubmitted(seat.clone())),
+            // Empty, or no longer readable, and no turn: the backend's own
+            // answer is all there is, and pressing at nothing is not a rescue.
+            _ => return first,
+        }
+    }
+    first
 }
 
 #[cfg(test)]
@@ -1508,5 +1638,180 @@ mod tests {
         let world = Census::heard("", Vec::new());
         assert!(world.was_heard(), "an answer of nothing is an answer");
         assert_eq!(world.seats().count(), 0);
+    }
+
+    /// A prompt, and an agent behind it that may or may not take a return.
+    ///
+    /// What `wsp-252` needed a fake to say and none could: the text arrives,
+    /// the submit is lost, and the text stays in the prompt where a reader can
+    /// see it. `takes_on` is which press starts the turn — `Some(0)` is the
+    /// order's own, `Some(1)` the first press after it, `None` never.
+    struct Prompt {
+        readable: bool,
+        busy: bool,
+        takes_on: Option<u32>,
+        holding: std::cell::Cell<bool>,
+        turned: std::cell::Cell<bool>,
+        pressed: std::cell::Cell<u32>,
+        asked: std::cell::Cell<u32>,
+    }
+
+    impl Prompt {
+        fn new(takes_on: Option<u32>) -> Prompt {
+            Prompt {
+                readable: true,
+                busy: false,
+                takes_on,
+                holding: std::cell::Cell::new(false),
+                turned: std::cell::Cell::new(false),
+                pressed: std::cell::Cell::new(0),
+                asked: std::cell::Cell::new(0),
+            }
+        }
+
+        /// A return, the order's own or a press: the text goes if this is the
+        /// one that takes, or straight away behind a turn already running.
+        fn enter(&self, n: u32) {
+            if self.busy {
+                self.holding.set(false);
+            } else if self.takes_on == Some(n) {
+                self.holding.set(false);
+                self.turned.set(true);
+            }
+        }
+    }
+
+    impl Place for Prompt {
+        fn open(&self, _: &Order) -> Result<Seat> {
+            unreachable!()
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> Result<()> {
+            unreachable!()
+        }
+        fn tell(&self, _: &Seat, _: &str) -> Result<Delivery> {
+            self.holding.set(true);
+            self.enter(0);
+            Ok(Delivery::Unconfirmed)
+        }
+        fn nudge(&self, _: &Seat) -> Result<()> {
+            self.pressed.set(self.pressed.get() + 1);
+            self.enter(self.pressed.get());
+            Ok(())
+        }
+        fn typed(&self, _: &Seat) -> Option<bool> {
+            self.readable.then(|| self.holding.get())
+        }
+        fn turn_began_since(&self, _: &Seat, _: i64) -> Option<bool> {
+            Some(self.turned.get())
+        }
+        fn stop(&self, _: &Seat) -> Result<()> {
+            unreachable!()
+        }
+        fn state(&self, _: &Seat) -> Result<State> {
+            self.asked.set(self.asked.get() + 1);
+            Ok(if self.busy || self.turned.get() { State::Working } else { State::Idle })
+        }
+        fn census(&self) -> Result<Census> {
+            unreachable!()
+        }
+        fn watch(&self, _: &mut dyn FnMut(Event) -> bool) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn pressing<'a>(clock: &'a crate::util::Dial<'_>) -> Pressing<'a> {
+        Pressing { clock, ..Pressing::default() }
+    }
+
+    /// **The order's own submit is lost, and the press after it starts the
+    /// turn** — gpui-migration's ten seats on 2026-10-08, and compound-415's
+    /// verifier that sat until Ed pressed Enter. Started, and pressed once.
+    #[test]
+    fn a_submit_lost_the_first_time_is_pressed_again_and_the_turn_starts() {
+        let clock = crate::util::Dial::new();
+        let place = Prompt::new(Some(1));
+        let said = submit(&place, &Seat::new("cpd-627"), "Verify compound-415", &pressing(&clock));
+        assert_eq!(said, Ok(Delivery::Started), "the retry submitted it");
+        assert_eq!(place.pressed.get(), 1, "one press was the whole of the repair");
+        assert!(!place.holding.get(), "and the prompt is empty again");
+    }
+
+    /// A submit that takes is watched for one poll and never pressed: the
+    /// healthy send pays a reading, not a wait.
+    #[test]
+    fn an_order_that_takes_is_not_pressed() {
+        let clock = crate::util::Dial::new();
+        let place = Prompt::new(Some(0));
+        assert_eq!(submit(&place, &Seat::new("cpd-1"), "go", &pressing(&clock)), Ok(Delivery::Started));
+        assert_eq!(place.pressed.get(), 0);
+        assert_eq!(clock.elapsed(), Duration::ZERO, "the turn was there at the first look");
+    }
+
+    /// **Bounded, and said as what it is.** Text that no press sends is
+    /// `Unsubmitted` — typed, read back, still there — after three presses
+    /// spaced across the windows, and not the old "sitting unsent or dropped".
+    #[test]
+    fn text_that_stays_in_the_prompt_is_unsubmitted_after_three_spaced_presses() {
+        let clock = crate::util::Dial::new();
+        let place = Prompt::new(None);
+        let how = pressing(&clock);
+        let said = submit(&place, &Seat::new("cpd-616"), "Check barrier 14", &how);
+        assert_eq!(said, Err(Refusal::Unsubmitted(Seat::new("cpd-616"))));
+        assert_eq!(place.pressed.get() as usize, how.windows.len() - 1, "a press between each pair of looks");
+        assert!(clock.elapsed() >= how.windows.iter().sum(), "every window was waited out: {:?}", clock.elapsed());
+        assert!(clock.elapsed() < Duration::from_secs(20), "and no longer");
+    }
+
+    /// A sentence queued behind a turn starts nothing and is still taken:
+    /// the prompt empties, and that is the answer. `govern --tell` is this
+    /// case, and pressing at a governor mid-turn would be pressing at its work.
+    #[test]
+    fn a_sentence_queued_behind_a_turn_is_delivered_when_the_prompt_empties_and_never_pressed() {
+        let clock = crate::util::Dial::new();
+        let place = Prompt { busy: true, ..Prompt::new(None) };
+        assert_eq!(submit(&place, &Seat::new("cpd-2"), "the barrier is open", &pressing(&clock)), Ok(Delivery::Unconfirmed));
+        assert_eq!(place.pressed.get(), 0);
+    }
+
+    /// No reading, no press, and not even the state asked: the path a
+    /// backend that cannot see its prompt always took, call for call. A
+    /// return into a prompt nobody has read may submit a person's draft.
+    #[test]
+    fn a_prompt_nobody_can_read_is_never_pressed() {
+        let clock = crate::util::Dial::new();
+        let place = Prompt { readable: false, ..Prompt::new(None) };
+        assert_eq!(submit(&place, &Seat::new("w1:p1"), "go", &pressing(&clock)), Ok(Delivery::Unconfirmed));
+        assert_eq!(place.pressed.get(), 0);
+        assert_eq!(place.asked.get(), 0, "nothing beyond the tell itself");
+    }
+
+    /// An empty prompt and no turn is the backend's own answer, not a press:
+    /// there is nothing there to submit, and the run's repair for a dropped
+    /// order is a resend, which is not this function's to make.
+    #[test]
+    fn an_empty_prompt_with_no_turn_is_passed_back_and_not_pressed() {
+        let clock = crate::util::Dial::new();
+        let place = Prompt::new(None);
+        // Dropped: the text never reached the prompt.
+        struct Dropped(Prompt);
+        let dropped = Dropped(place);
+        impl Place for Dropped {
+            fn open(&self, o: &Order) -> Result<Seat> { self.0.open(o) }
+            fn here(&self) -> Option<Seat> { None }
+            fn start(&self, s: &Seat, a: &Agent) -> Result<()> { self.0.start(s, a) }
+            fn tell(&self, _: &Seat, _: &str) -> Result<Delivery> { Ok(Delivery::Unconfirmed) }
+            fn nudge(&self, s: &Seat) -> Result<()> { self.0.nudge(s) }
+            fn typed(&self, s: &Seat) -> Option<bool> { self.0.typed(s) }
+            fn turn_began_since(&self, s: &Seat, t: i64) -> Option<bool> { self.0.turn_began_since(s, t) }
+            fn stop(&self, s: &Seat) -> Result<()> { self.0.stop(s) }
+            fn state(&self, s: &Seat) -> Result<State> { self.0.state(s) }
+            fn census(&self) -> Result<Census> { self.0.census() }
+            fn watch(&self, f: &mut dyn FnMut(Event) -> bool) -> Result<()> { self.0.watch(f) }
+        }
+        assert_eq!(submit(&dropped, &Seat::new("cpd-3"), "go", &pressing(&clock)), Ok(Delivery::Unconfirmed));
+        assert_eq!(dropped.0.pressed.get(), 0);
     }
 }

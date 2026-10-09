@@ -331,6 +331,50 @@ fn trust_prompt(seat: &Seat, screen: &str) -> Option<String> {
     ))
 }
 
+/// How long after a start a Claude Code seat that has fired no hook of its own
+/// is read as [`State::Starting`] rather than off its screen (`wsp-252`).
+///
+/// **The screen says idle before Claude Code will take a submit.** Two of the
+/// seats that came up on 2026-10-08 with their work orders typed and unsent
+/// were looked at afterwards: cpd-616 started at 17:53:51 and fired
+/// `SessionStart` at 17:54:22, and cpd-627 started at 04:55:44 and fired it at
+/// 04:56:15 — thirty-one seconds both, where a healthy seat takes one or two.
+/// Through the whole of that the composer was drawn and the screen read idle,
+/// so `wait_ready` passed, the order was typed, and every Enter wsp pressed in
+/// those thirty seconds was lost; the text stayed. [`VOUCH_SECS`]'s own doc
+/// already assumed "a work order goes out seconds after `SessionStart`" —
+/// what let it go out before was the screen answering for a seat whose hooks
+/// had not spoken yet.
+///
+/// Two minutes, the same as the trust prompt's window: past it the screen
+/// answers again, so a Claude Code whose hooks never fire is late rather than
+/// never told.
+const STARTING_WINDOW: i64 = 120;
+
+/// Whether Claude Code's prompt is holding typed text, read off its screen —
+/// [`Place::typed`] for a `claude` seat. `None` when the screen holds no
+/// prompt this recognises.
+///
+/// The prompt is the last box on the screen: the line after the second-last
+/// horizontal rule, starting `❯`, up to the last rule. A sentence queued
+/// behind a turn is drawn above that box and is not in it, which is why the
+/// box and not the screen is read. Claude Code's greyed suggestion in an empty
+/// prompt (`Try "…"`) reads as text on a screen with no colour in it, and is
+/// not.
+fn composer(screen: &str) -> Option<bool> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let rule = |l: &str| {
+        let t = l.trim();
+        let n = t.chars().count();
+        n >= 20 && t.chars().filter(|c| *c == '─').count() * 10 >= n * 9
+    };
+    let rules: Vec<usize> = (0..lines.len()).filter(|&i| rule(lines[i])).collect();
+    let [.., top, bottom] = rules[..] else { return None };
+    let held: String = lines[top + 1..bottom].iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+    let held = held.trim_start_matches(['❯', '>']).trim();
+    Some(!held.is_empty() && !held.starts_with("Try \""))
+}
+
 impl Compound<'_> {
     pub(crate) fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
         let id = seat.as_str();
@@ -504,6 +548,14 @@ impl Compound<'_> {
         // re-arms without either caller changing; it just has a floor under
         // it now instead of a bare fallback (`compound-109`).
         let at = util::epoch_of(&str_of(&said, "at"));
+        // A Claude Code that has not said anything since this start is still
+        // starting, whatever its screen draws — see [`STARTING_WINDOW`]. A
+        // record older than the start is the last agent's, in a seat reused.
+        let started = util::epoch_of(&str_of(rec, "started_at"));
+        let kind = rec.get("agent").map(|a| str_of(a, "kind")).unwrap_or_default();
+        if kind == "claude" && started > 0 && at < started && util::epoch_secs() - started < STARTING_WINDOW {
+            return State::Starting;
+        }
         if at == 0 || util::epoch_secs().saturating_sub(at) > VOUCH_SECS {
             return self.detected_state(seat, rec).unwrap_or(State::Unknown);
         }
@@ -1313,6 +1365,18 @@ impl Place for Compound<'_> {
         Ok(())
     }
 
+    /// Claude Code's prompt, read off the renderer's screen — see [`composer`].
+    /// Only for `claude`: opencode's prompt is another shape, and a reading
+    /// this cannot vouch for is `None`, which [`crate::place::submit`] takes
+    /// as "do not press".
+    fn typed(&self, seat: &Seat) -> Option<bool> {
+        let rec = self.record(seat).ok()?;
+        if rec.get("agent").map(|a| str_of(a, "kind")).as_deref() != Some("claude") {
+            return None;
+        }
+        composer(&self.read_screen(seat).ok()?)
+    }
+
     /// End the session and let the seat go. `SIGTERM` the group (which is
     /// the compound-sup pid itself — see the module docs), a short wait for
     /// its own `SessionEnd`-on-the-way-out the same as `place_super`
@@ -1692,6 +1756,69 @@ mod tests {
             vec!["SessionStart", "UserPromptSubmit", "Stop", "UserPromptSubmit", "Stop"],
             "every call this seat was ever heard from, in the order it happened"
         );
+    }
+
+    /// **A Claude Code seat is starting until its own `SessionStart`, whatever
+    /// its screen draws** (`wsp-252`).
+    ///
+    /// cpd-616 and cpd-627 drew an idle composer thirty-one seconds before
+    /// they fired `SessionStart`, the screen said ready, and every Enter wsp
+    /// pressed in that window was lost with the order left typed. So a seat
+    /// with no word of its own since its start is `Starting`, which no tell
+    /// is typed at — and a word left by the last agent in a reused seat is
+    /// not its own. Past [`STARTING_WINDOW`] the screen answers again, so a
+    /// Claude Code whose hooks never fire is late rather than never told.
+    #[test]
+    fn a_claude_seat_is_starting_until_its_own_session_start_whatever_its_screen_says() {
+        let scratch = Scratch::new("starting");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
+        let now = util::epoch_secs();
+        let started = |at: i64, kind: &str| {
+            json!({
+                "pid": std::process::id(),
+                "started_at": util::iso_at(at),
+                "agent": { "kind": kind, "name": "a", "args": [] },
+            })
+            .to_string()
+        };
+        let _ = write_atomic(&dir.join(SEAT_FILE), &started(now, "claude"));
+        assert_eq!(place.state(&seat).unwrap(), State::Starting, "nothing said since the start");
+        assert!(!place.state(&seat).unwrap().will_take_a_prompt(), "so nothing is typed at it");
+
+        let last = json!({ "state": "idle", "hook": "SessionStart", "at": util::iso_at(now - 30) });
+        let _ = write_atomic(&dir.join(SAID_FILE), &last.to_string());
+        assert_eq!(place.state(&seat).unwrap(), State::Starting, "the last agent's word is not this one's");
+
+        place.heard(&seat, "SessionStart", said_by("SessionStart").unwrap(), &json!({}));
+        assert_eq!(place.state(&seat).unwrap(), State::Idle, "its own SessionStart, and the order can go");
+
+        let _ = std::fs::remove_file(dir.join(SAID_FILE));
+        let _ = write_atomic(&dir.join(SEAT_FILE), &started(now - STARTING_WINDOW - 10, "claude"));
+        assert_ne!(place.state(&seat).unwrap(), State::Starting, "past the window the screen answers again");
+
+        let _ = write_atomic(&dir.join(SEAT_FILE), &started(now, "opencode"));
+        assert_ne!(place.state(&seat).unwrap(), State::Starting, "opencode fires no hooks to wait for");
+    }
+
+    /// Claude Code's prompt is the box under the last rule, and a sentence
+    /// queued behind a turn is drawn above it — so the box is read and the
+    /// screen is not. The greyed suggestion an empty prompt shows reads as text
+    /// on a screen with no colour in it, and is not.
+    #[test]
+    fn the_prompt_is_read_from_the_box_under_the_last_rule() {
+        let rule = "─".repeat(60);
+        let screen = |inside: &str| format!("⏺ an earlier answer\n\n{rule}\n{inside}\n{rule}\n  ⏵⏵ auto mode on\n");
+        assert_eq!(composer(&screen("❯ ")), Some(false), "empty");
+        assert_eq!(composer(&screen("❯ Verify **compound-415** (reattach is flaky")), Some(true), "the order, typed");
+        assert_eq!(composer(&screen("❯ Verify compound-415 and read\n  the rest of the order")), Some(true), "wrapped");
+        assert_eq!(composer(&screen("❯ [Pasted text #1 +12 lines]")), Some(true), "pasted");
+        assert_eq!(composer(&screen("❯ Try \"fix lint errors\"")), Some(false), "the suggestion");
+        let queued = format!("⏺ working\n  ⎿ the barrier is open — start group 2\n{rule}\n❯ \n{rule}\n");
+        assert_eq!(composer(&queued), Some(false), "queued above the box is not in it");
+        assert_eq!(composer("$ claude\nWelcome to Claude Code"), None, "no prompt drawn yet");
     }
 
     /// **A hook's word expires, and the guard it feeds comes back with it**

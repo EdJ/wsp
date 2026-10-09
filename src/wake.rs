@@ -925,7 +925,9 @@ impl Sink for Tell<'_> {
         let before = util::epoch_secs();
         match how.tell(place.as_ref(), &addressee, &text) {
             Ok(crate::place::Delivery::Started) => true,
-            Ok(crate::place::Delivery::Unconfirmed) | Err(crate::place::Refusal::NotTaken) => {
+            Ok(crate::place::Delivery::Unconfirmed)
+            | Err(crate::place::Refusal::NotTaken)
+            | Err(crate::place::Refusal::Unsubmitted(_)) => {
                 // Typed, and nothing read it. Returning false puts the whole
                 // batch back, and the stamp is what tells the next tick to look
                 // for a turn rather than to type again.

@@ -1135,6 +1135,12 @@ struct Patience<'a> {
     /// what has to be retried to get there and how long any of it takes are the
     /// backend's, and live in `place_herdr` — this is only how long the caller
     /// is prepared to wait.
+    ///
+    /// **Sixty since `wsp-252`.** A compound seat now reads ready at its own
+    /// `SessionStart` rather than at the first idle frame, and two seats on
+    /// 2026-10-08 took thirty-one seconds to fire it — a thirty-second wait
+    /// would have failed both a second early, where before they failed later
+    /// with their orders typed and unsent. Paid only by a start that slow.
     ready: Duration,
     /// How long a turn has to start, once the work order has been sent.
     ///
@@ -1262,7 +1268,7 @@ struct Patience<'a> {
 impl Default for Patience<'static> {
     fn default() -> Patience<'static> {
         Patience {
-            ready: Duration::from_millis(30_000),
+            ready: Duration::from_millis(60_000),
             taken: Duration::from_millis(5_000),
             nudges: 2,
             poll: Duration::from_millis(150),
@@ -1531,7 +1537,9 @@ fn hand_over(
         // function is strict about which — see the paragraph above on
         // `Blocked` — so the confirmation stays wsp's own.
         Ok(_) => true,
-        Err(Refusal::NotTaken) => false,
+        // `Unsubmitted` is `NotTaken` from a backend that looked, and has
+        // already pressed: the loop below presses on, at its own spacing.
+        Err(Refusal::NotTaken) | Err(Refusal::Unsubmitted(_)) => false,
         Err(e) => return Err(e.to_string()),
     };
     for pressed in 0..=wait.nudges {
@@ -1552,21 +1560,43 @@ fn hand_over(
             Err(e) => return Err(format!("{seat} did not take the work order: {e}")),
         }
     }
-    // Where the work order now sits, said as the unknown it is. herdr wrote
-    // the keystrokes either way — both of this function's endings are reached
-    // only after a delivery — but whether the TUI took them into a composer or
-    // dropped them on its floor is inside the application, and wsp has no
-    // reading of that. The first spawn to report this asserted "sitting in
-    // {seat} unsent", and the composer was empty when somebody looked three
-    // seconds later; twice more that week read the same way, and all three
-    // were recovered not by pressing return but by sending the order again,
-    // which is the one repair that works on either half of the uncertainty.
-    // Naming it is left to the caller, because the command is spelled with
-    // the task id and only the caller has one.
-    Err(format!(
-        "no turn started in {seat}: the work order went to the pane, and \
-         is either sitting unsent or was dropped — wsp cannot see which"
-    ))
+    Err(unhanded(place, seat))
+}
+
+/// Where a work order that started no turn now sits — read off the seat where
+/// the backend can read its prompt, and said as the unknown it is where not.
+///
+/// The unknown came first, and was earned: the first spawn to report this
+/// asserted "sitting in {seat} unsent", and the composer was empty when
+/// somebody looked three seconds later. Since `wsp-252` a backend that can read
+/// the prompt answers it, because the guess had gone the other way ten times in
+/// a day — every one of them sitting there, reported as "unsent or dropped",
+/// and repaired by a return.
+fn unhanded(place: &dyn Place, seat: &Seat) -> String {
+    match place.typed(seat) {
+        Some(true) => format!(
+            "typed into {seat} and not submitted: the work order is sitting in its prompt, \
+             and pressing submit again did not send it"
+        ),
+        Some(false) => format!("no turn started in {seat}, and its prompt is empty: the work order was dropped"),
+        None => format!(
+            "no turn started in {seat}: the work order went to the pane, and \
+             is either sitting unsent or was dropped — wsp cannot see which"
+        ),
+    }
+}
+
+/// The repair for an order [`unhanded`] described, addressed to the seat.
+///
+/// **The seat and not the task**, which is the half of `wsp-252` a governor hit
+/// first: `wsp tell compound-351 -` reaches the task's *holder*, and for a
+/// verifier that is the member it is verifying, not the pane holding the order.
+/// The pane id is the one name that always means the seat that failed.
+pub(crate) fn repair_line(place: &dyn Place, seat: &Seat) -> String {
+    match place.typed(seat) {
+        Some(true) => format!("a return in {seat} sends it — `wsp peek {seat}` shows it waiting"),
+        _ => format!("send it again with `wsp tell {seat} -` — that repairs either"),
+    }
 }
 
 /// Whether a turn started inside [`Patience::taken`].
@@ -1610,6 +1640,8 @@ fn confirm_turn(
 ) -> Result<(), String> {
     match hand_over(place, how, spawn, text, wait) {
         Ok(()) => Ok(()),
+        // Still in the prompt: a resend would put a second copy behind it.
+        Err(first) if place.typed(spawn.seat) == Some(true) => Err(first),
         Err(first) => {
             eprintln!("wsp: no turn started - sending the work order once more");
             hand_over(place, how, spawn, text, wait)
@@ -2416,16 +2448,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                             Err(e) => {
                                 eprintln!("wsp: agent started but not working on it: {e}");
                                 // The repair first, and spelled so it can be
-                                // pasted: `wsp tell` takes a task id or a pane
-                                // id, and `-` reads the order from a stream —
-                                // the same prose this spawn was given. A task
-                                // is the readable form; a custodian has no
-                                // task, but the seat contains `:` and resolves
-                                // as the pane it is.
-                                eprintln!(
-                                    "wsp: send it again with `wsp tell {} -` — that repairs either",
-                                    work.task.as_deref().unwrap_or(seat.as_str())
-                                );
+                                // pasted. The pane, not the task: a task names
+                                // its holder, and a verifier's task is held by
+                                // the member it reads (`wsp-252`).
+                                eprintln!("wsp: {}", repair_line(place, &seat));
                                 unreached(how, place, &spawn);
                             }
                         },
@@ -3160,7 +3186,7 @@ fn rotate_as(
                 put_back(store, place, &scope, &seat, vacated.as_ref(), &brief_at, &e);
             } else {
                 store.clear_handover(&scope);
-                eprintln!("wsp: send the order again with `wsp tell {} -`", seat.as_str());
+                eprintln!("wsp: {}", repair_line(place, &seat));
                 unreached(how, place, &spawn);
                 eprintln!(
                     "wsp: nothing moved - the {scope} seat is still yours, and {} sits idle",
@@ -5686,6 +5712,9 @@ mod tests {
         /// the handover should reach the same end from both — what differs is
         /// how long it spends finding out, which is what the test below is for.
         watches: bool,
+        /// What [`Place::typed`] answers about the prompt: `None` is a backend
+        /// that cannot read it, which is every one before `wsp-252`.
+        reads: Option<bool>,
         pressed: std::cell::Cell<u32>,
         heard: std::cell::RefCell<Vec<String>>,
     }
@@ -5696,6 +5725,7 @@ mod tests {
                 starts_after,
                 can_press,
                 watches: false,
+                reads: None,
                 pressed: std::cell::Cell::new(0),
                 heard: std::cell::RefCell::new(Vec::new()),
             }
@@ -5720,6 +5750,9 @@ mod tests {
             }
             self.pressed.set(self.pressed.get() + 1);
             Ok(())
+        }
+        fn typed(&self, _: &Seat) -> Option<bool> {
+            self.reads
         }
         fn state(&self, _: &Seat) -> crate::place::Result<State> {
             Ok(match self.starts_after {
@@ -5797,6 +5830,43 @@ mod tests {
         // retry's numbers move, for a wait that never reads them.
         let wait = Patience { ready: READY, taken: TAKEN, nudges: PRESSES, poll: STEP, gone: GRACE, clock, ..retrying(clock) };
         hand_over(place, &Speaks, &spawn, "you have been claimed onto robustness-035", &wait)
+    }
+
+    /// **Where the order is, said where it can be read** (`wsp-252`). Ten
+    /// spawns in a day were reported as "either sitting unsent or dropped",
+    /// and every one looked at was sitting there; the repair named the task,
+    /// which for a verifier is the member's holder and not the pane holding
+    /// the order. A backend that reads its prompt answers both now, and the
+    /// rescue does not resend an order that is still in the prompt, which
+    /// would leave it there twice.
+    #[test]
+    fn an_order_left_in_a_readable_prompt_is_reported_as_typed_and_not_resent() {
+        let seat = Seat::new("w3M:p1");
+        let place = Composer { reads: Some(true), ..Composer::of(None, true) };
+        let e = handing_over(&place, &util::Dial::new()).unwrap_err();
+        assert!(e.starts_with("typed into w3M:p1 and not submitted"), "{e}");
+        assert!(repair_line(&place, &seat).starts_with("a return in w3M:p1"), "{}", repair_line(&place, &seat));
+
+        let dial = util::Dial::new();
+        let spawn = agent_commands::Spawn {
+            full: false,
+            subagents: false,
+            name: "robustness-035",
+            seat: &seat,
+            model: None,
+            effort: None,
+            order: None,
+            resume: None,
+        };
+        let wait = Patience { ready: READY, taken: TAKEN, nudges: PRESSES, poll: STEP, gone: GRACE, clock: &dial, ..retrying(&dial) };
+        let place = Composer { reads: Some(true), ..Composer::of(None, true) };
+        assert!(confirm_turn(&place, &Speaks, &spawn, "the order", &wait).is_err());
+        assert_eq!(place.heard.borrow().len(), 1, "typed once, and not again behind itself");
+
+        let dropped = Composer { reads: Some(false), ..Composer::of(None, true) };
+        let e = handing_over(&dropped, &util::Dial::new()).unwrap_err();
+        assert!(e.ends_with("its prompt is empty: the work order was dropped"), "{e}");
+        assert!(repair_line(&dropped, &seat).contains("`wsp tell w3M:p1 -`"), "the pane, not the task");
     }
 
     /// The healthy handover, and the assertion is that nothing else happens: an

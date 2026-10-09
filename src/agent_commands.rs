@@ -856,7 +856,7 @@ impl Kind for Plain {
     }
 
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        place.tell(seat, text)
+        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
     }
 
     /// Nothing to ask. An agent wsp knows nothing about beyond its name is one
@@ -1435,7 +1435,7 @@ impl Kind for OpenCode {
     /// The argument is on that method, which is where a later kind will read
     /// it.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        place.tell(seat, text)
+        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
     }
 
     /// Nothing to ask. The backend is the only witness, as for [`Plain`].
@@ -1983,7 +1983,7 @@ impl Kind for Claude {
     /// thing to do inside a spawn verb, so this delegates, and the failure path
     /// in `cmd_spawn` reports the address instead.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        place.tell(seat, text)
+        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
     }
 
     /// The census, asked about the handle wsp minted — which is why minting had
