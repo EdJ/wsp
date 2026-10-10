@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 mod agent_commands;
 mod barrier;
+mod caption;
 mod arrange;
 mod attention;
 mod cmd_agent;
@@ -243,6 +244,9 @@ const LITERAL_AFTER: &[Literal] = &[
     // line, and was told nothing.
     Literal { cmd: "say", subject: 0, payload: "status line", stream: true },
     Literal { cmd: "rename", subject: 1, payload: "title", stream: false },
+    // A caption is one line, but the spec gives every prose intake `-`, and a
+    // caption beginning with a flag-shaped word is still the caption.
+    Literal { cmd: "caption", subject: 1, payload: "caption", stream: true },
     Literal { cmd: "tag", subject: 1, payload: "tag edits", stream: false },
     // `wsp ref <id> -~/claude/spec.md` is the same `+`/`-` payload as `tag`,
     // and a path that begins with `-` here would be read as a flag for exactly
@@ -306,6 +310,9 @@ const OWNED_AFTER: &[(&str, &str)] = &[
     ("say", "pane"),
     ("say", "clear"),
     ("say", "json"),
+    // `wsp caption <id> --clear` is the verb's other half, and the subject
+    // comes first as often as not.
+    ("caption", "clear"),
 ];
 
 /// Verbs on which a [`BOOL_FLAGS`] name takes a value instead.
@@ -1092,6 +1099,7 @@ fn main() {
         "next" => cmd_task::next(&store, &args),
         "edit" => cmd_task::edit(&store, &args),
         "rename" => cmd_task::rename(&store, &args),
+        "caption" => cmd_task::caption(&store, &args),
         "rm" | "remove" => cmd_task::rm(&store, &args),
         "archive" => cmd_task::archive(&store, &args),
 
@@ -1532,6 +1540,7 @@ fn help_text() -> String {
 {tasks}
   wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]
   wsp add "title" --parent <id>     a sub-task, filed where its parent is
+  wsp add "title" --caption "…"     …with the line a glance reads, under 60
   wsp ls [-p proj] [-t tag] [-s status] [--all]
   wsp find <text> [-p proj] [--all] [--full]
                                     every task the words are in — the title or
@@ -1576,6 +1585,9 @@ fn help_text() -> String {
   wsp edit <id> [--overview|--details|--decisions]  prose, in $EDITOR
   wsp edit <id> --overview --from F|-    …or from a file, or stdin
   wsp rename <id> "title"           retitle it; the old title goes in the log
+  wsp caption <id|slug> "…"|-|--clear   the line a glance reads, refused past
+                                    60; with none, the title's first clause.
+                                    `wsp review` asks for one
   wsp mv <id> -p proj               reassign, sub-tree and all
   wsp mv <id> --parent <id>|none    re-parent it, or detach it
   wsp tag <id> +dsp -ui             adjust tags
@@ -1839,14 +1851,17 @@ fn help_text() -> String {
 {worklists}
   wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,
                                     outside the projects its members live in —
-                                    it references them, nothing moves
+                                    it references them, nothing moves.
+                                    --caption "…" is its line for a glance
   wsp worklist add <slug> <task>…   one call, one group; its members run at
                                     the same time. --group N joins a group
                                     that exists instead of making one;
                                     --agent "kind [model] [effort]" says who
                                     runs a new group, and it is otherwise the
                                     group before's, or claude. Joining one,
-                                    it is those members' own line instead
+                                    it is those members' own line instead.
+                                    --caption "…" names a new group; without
+                                    one, its first member's caption names it
   wsp worklist add <slug> <parent> --sub   …or that parent's open sub-tasks as
                                     one group, resolved now and not live
   wsp worklist rm <slug> <task>… [-n]
@@ -1861,7 +1876,8 @@ fn help_text() -> String {
                                     a file, where a shell never sees it. --why
                                     is logged with the edit. --drop [-n] takes
                                     the group out whole: the running one too,
-                                    with --why, until its barrier opens
+                                    with --why, until its barrier opens.
+                                    --caption "…"|none renames it, run or not
   wsp worklist member <slug> <task> --agent "kind [model] [effort]"|none
                                     one member on its own line beside the
                                     group's — its spawn and its verifier run

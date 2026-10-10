@@ -1355,6 +1355,16 @@ five on a project:
 | `## Verification` | *members of a run* — one entry per verifier pass; `wsp verified` writes it |
 | `## Log` | dated, append-only, one entry per line; `wsp note` writes it, nothing edits it |
 
+One optional field in the frontmatter of a task and a worklist, and a line in a
+worklist group's block: `caption:`, the line a person glancing reads instead of
+the title (compound's `docs/ux-design.md` §17). `wsp caption <id|slug> "…"` sets
+it and `--clear` takes it off; `--caption` on `add`, `worklist new`, `worklist
+add` and `worklist group` gives one at the verb. Refused past 60 characters,
+noted past 40. With none, `--json` carries the title's first clause, or a
+group's first member's caption and `and N more`, with `from` saying which —
+`src/caption.rs` has the rule. `wsp review` refuses a row with none and prints
+the derived one as the command that takes it (Ed, 2026-10-09, E-1).
+
 Both dated sections store the *instant*, in UTC — `- 2026-08-16T23:15:00Z …` —
 and every command that shows one converts it to the reader's own date, so a
 decision taken at 01:15 CEST reads as the day it was taken rather than the day
@@ -4418,6 +4428,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/store.rs` | atomic writes, `O_EXCL` id allocation, git, state, hooks |
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
+| `src/caption.rs` | the line a glance reads for a task, a worklist and a group: authored and checked at the verb, or derived from the title or the members — one derivation, so `ls` and the chrome never disagree |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back |
 | `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, the sweep a passed group licenses, what a landed group touched, and — one storey up — which of all the lists there have ever been still want somebody |

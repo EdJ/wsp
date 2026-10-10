@@ -4924,6 +4924,7 @@ mod tests {
             agent: String::new(),
             member_agents: Default::default(),
             checks: Vec::new(),
+            caption: String::new(),
         }]);
         store.save_worklist(&w).unwrap();
     }
@@ -7565,6 +7566,7 @@ mod tests {
                 agent: String::new(),
                 member_agents: Default::default(),
                 checks: Vec::new(),
+                caption: String::new(),
             }]);
             store.save_worklist(&w).unwrap();
             cmd_govern::take(&store, "batch", "w1", "w1:p9").unwrap();
@@ -7621,6 +7623,7 @@ mod tests {
                 agent: String::new(),
                 member_agents: Default::default(),
                 checks: Vec::new(),
+                caption: String::new(),
             },
             Group {
                 members: vec!["t-2".into()],
@@ -7631,6 +7634,7 @@ mod tests {
                 agent: String::new(),
                 member_agents: Default::default(),
                 checks: Vec::new(),
+                caption: String::new(),
             },
         ]);
         store.save_worklist(&w).unwrap();

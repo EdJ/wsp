@@ -914,6 +914,15 @@ pub struct Task {
     pub created: String,
     pub updated: String,
     pub refs: Vec<String>,
+    /// The line a glance reads, when somebody wrote one — `wsp caption`,
+    /// `wsp add --caption`. Absent is not blank: [`crate::caption::of_task`]
+    /// derives one from the title, and every reader goes through it.
+    ///
+    /// Optional in the front matter, so the schema stays 1. A wsp from before
+    /// this reads past it and **drops it on its next write** of the task, since
+    /// `to_doc` writes the fields it knows; `wsp install` after the land is
+    /// what keeps an authored caption.
+    pub caption: Option<String>,
     pub body: String,
 }
 
@@ -1062,6 +1071,7 @@ impl Task {
             created: doc.str("created"),
             updated: doc.str("updated"),
             refs: doc.list("refs"),
+            caption: doc.opt("caption"),
             body: doc.body.clone(),
         }
     }
@@ -1080,6 +1090,9 @@ impl Task {
         d.set_str("created", &self.created);
         d.set_str("updated", &self.updated);
         d.set(fm_key_refs(), Val::L(self.refs.clone()));
+        if let Some(c) = self.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+            d.set_str("caption", c);
+        }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
@@ -1101,6 +1114,7 @@ impl Task {
             "created": self.created,
             "updated": self.updated,
             "refs": self.refs,
+            "caption": crate::caption::of_task(self).json(),
         })
     }
 }
@@ -1408,6 +1422,16 @@ pub struct Group {
     /// one. The `batch` moved 26 tasks into a project and back out again for
     /// want of this.
     pub members: Vec<String>,
+    /// `caption:` — the group's line for a glance, empty where nobody wrote
+    /// one and [`crate::caption::of_group`] names it by its members. One line
+    /// and never wrapped: [`crate::caption::LIMIT`] fits the column, and a
+    /// continuation would be read back as more members.
+    ///
+    /// **A wsp from before this reads the line as more members**, the hazard
+    /// [`Self::member_agents`] documents: `caption:` and every word after it
+    /// would become ids. `wsp install` after the land, before a caption is
+    /// written on a list an older binary still runs.
+    pub caption: String,
     /// `xN`: a cap on *the work*, not a budget — "only two of these at once,
     /// they sit near each other". Absent means as many as the machine allows,
     /// which is what every group in all three hand-run lists actually wanted.
@@ -1795,6 +1819,9 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
             last.verdict = rest.trim().to_string();
             cont = Cont::Verdict;
             label_indent = indent;
+        } else if let Some(rest) = trimmed.strip_prefix("caption:") {
+            last.caption = rest.trim().to_string();
+            cont = Cont::Members;
         } else if let Some(rest) = trimmed.strip_prefix("agent:") {
             // One line, never wrapped: a policy is three words.
             last.agent = rest.trim().to_string();
@@ -1911,6 +1938,9 @@ pub fn render_groups(groups: &[Group]) -> String {
             out.push_str(m);
         }
         out.push('\n');
+        if !g.caption.trim().is_empty() {
+            out.push_str(&format!("  caption: {}\n", g.caption.trim()));
+        }
         block(&mut out, "agent", &g.agent);
         // In member order, and only for members still in the group: a line
         // left behind by a member that was removed is dropped on the next
@@ -1996,6 +2026,9 @@ pub struct Worklist {
     /// its own — see `Store::scope_taken`, which is where that is enforced.
     pub id: String,
     pub title: String,
+    /// As [`Task::caption`]: authored, or derived from the title by
+    /// [`crate::caption::of_worklist`].
+    pub caption: Option<String>,
     pub status_raw: String,
     pub created: String,
     pub body: String,
@@ -2006,6 +2039,7 @@ impl Worklist {
         Worklist {
             id: id.to_string(),
             title: title.to_string(),
+            caption: None,
             status_raw: WorklistStatus::Draft.as_str().to_string(),
             created: util::now_iso(),
             body: String::new(),
@@ -2032,6 +2066,7 @@ impl Worklist {
         let id = doc.opt("id").unwrap_or_else(|| fallback_id.to_string());
         Worklist {
             title: doc.opt("title").unwrap_or_else(|| id.clone()),
+            caption: doc.opt("caption"),
             id,
             status_raw: doc.opt("status").unwrap_or_else(|| "draft".into()),
             created: doc.str("created"),
@@ -2045,6 +2080,9 @@ impl Worklist {
         d.set_str("title", &self.title);
         d.set_str("status", &self.status_raw);
         d.set_str("created", &self.created);
+        if let Some(c) = self.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+            d.set_str("caption", c);
+        }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
@@ -2091,6 +2129,32 @@ impl Worklist {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wsp-240`: a caption survives the file both ways — in a task's and a
+    /// worklist's front matter, and as a group's `caption:` line, which is
+    /// read as the caption and not as more members — and absent is written as
+    /// absent, so a file nobody captioned does not change shape.
+    #[test]
+    fn a_caption_round_trips_through_a_task_a_worklist_and_a_group() {
+        let mut t = Task::new("A title", "c-1");
+        assert!(!t.render().contains("caption:"), "absent is not written");
+        t.caption = Some("Close the gaps: six of them".into());
+        let back = Task::from_doc(&fm::parse(&t.render()), "c-1");
+        assert_eq!(back.caption.as_deref(), Some("Close the gaps: six of them"));
+        assert_eq!(back.json()["caption"], serde_json::json!({ "text": "Close the gaps: six of them", "from": "authored" }));
+
+        let mut w = Worklist::new("wl", "A list");
+        w.caption = Some("Move the chrome".into());
+        let groups = vec![
+            Group { members: vec!["c-1".into(), "c-2".into()], caption: "Three spikes".into(), stop: "flag and stop".into(), ..Default::default() },
+            Group { members: vec!["c-3".into()], ..Default::default() },
+        ];
+        w.set_groups(&groups);
+        let back = Worklist::from_doc(&fm::parse(&w.render()), "wl");
+        assert_eq!(back.caption.as_deref(), Some("Move the chrome"));
+        assert_eq!(back.groups(), groups);
+        assert!(back.section("Groups").unwrap().contains("  caption: Three spikes\n"));
+    }
 
     /// The distinction the vocabulary went without: `blocked` and `parked` are
     /// both stopped and they ask for opposite things. This pins the three

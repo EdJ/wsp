@@ -328,8 +328,13 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {why}");
         return 2;
     }
+    let caption = match crate::caption::flag(args, true) {
+        Ok(c) => c.filter(|c| !c.is_empty()),
+        Err(code) => return code,
+    };
 
-    let w = Worklist::new(&slug, &title);
+    let mut w = Worklist::new(&slug, &title);
+    w.caption = caption;
     if let Err(e) = store.save_worklist(&w) {
         eprintln!("wsp: write failed: {e}");
         return 1;
@@ -401,12 +406,22 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     }
 
     let new_group = ordinal > groups.len();
+    // A caption names a group, so it is given where the group is made; one
+    // that exists is captioned by `group`, which says which group it means.
+    if !new_group && args.has("caption") {
+        eprintln!("wsp: --caption names a new group — `wsp worklist group {} {ordinal} --caption \"…\"` captions this one", w.id);
+        return 2;
+    }
+    let caption = match crate::caption::flag(args, true) {
+        Ok(c) => c.unwrap_or_default(),
+        Err(code) => return code,
+    };
     if new_group {
         let agent = match agent_for_new(args, &groups, groups.len()) {
             Ok(a) => a,
             Err(code) => return code,
         };
-        groups.push(Group { members: members.clone(), agent, ..Group::default() });
+        groups.push(Group { members: members.clone(), agent, caption, ..Group::default() });
     } else {
         groups[ordinal - 1].members.extend(members.iter().cloned());
         // Joining a group, `--agent` is who runs what was just added — its
@@ -853,7 +868,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
 
 pub fn group(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
-        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--drop] [--why \"…\"|-]";
+        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--caption \"…\"|none] [--drop] [--why \"…\"|-]";
     let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
@@ -880,21 +895,34 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     // the shape rather than guessed at. The guess is cheap to make today, while
     // `--stop` is the only prose on this verb; it is a reading that would have
     // to be taken back the first time there is a second sentence to give.
-    if args.has("from") && !args.has("stop") {
+    //
+    // `--caption` is the second sentence, and the reading is the narrow one:
+    // `--from` is the stop's whenever `--stop` is given, and the caption's
+    // only when it is the one prose flag here.
+    if args.has("from") && !args.has("stop") && !args.has("caption") {
         eprintln!("wsp: --from is where a stop condition is read from — `wsp worklist group <slug> N --stop --from FILE`");
         return 2;
     }
     let drop = args.has("drop");
-    if !drop && !args.has("parallel") && !args.has("stop") && !args.has("agent") {
+    if !drop && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") {
         eprintln!("{USAGE}");
         eprintln!("       --parallel caps the work; --agent says who runs it; --stop is the prose read at the barrier after it");
-        eprintln!("       --drop takes the group out whole");
+        eprintln!("       --caption is the line a glance reads for it; --drop takes the group out whole");
         return 2;
     }
-    if drop && (args.has("parallel") || args.has("stop") || args.has("agent")) {
+    if drop && (args.has("parallel") || args.has("stop") || args.has("agent") || args.has("caption")) {
         eprintln!("wsp: --drop takes the group out whole, so there is nothing of it left to set");
         return 2;
     }
+    let streams = |name: &str| args.get(name).is_some_and(|v| matches!(v.trim(), "-" | "true"));
+    if streams("caption") && (args.has("stop") || streams("why")) {
+        eprintln!("wsp: one stream per call, and a caption is the short sentence — type it, or give it a call of its own");
+        return 2;
+    }
+    // A caption alone is the one edit any group takes, run or not: it is
+    // what the group is called, and nothing a member, a verifier or the
+    // barrier reads. The window guards what is in flight.
+    let caption_only = args.has("caption") && !args.has("parallel") && !args.has("stop") && !args.has("agent");
 
     // The reason is settled before any prose is read, since both may want the
     // stream and only one of them can have it.
@@ -905,9 +933,13 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     if drop {
         return drop_group(store, args, &w.id, ordinal, why);
     }
+    let caption = match crate::caption::flag(args, !args.has("stop")) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
 
     let win = window(store, &w);
-    if !win.allows(ordinal) {
+    if !caption_only && !win.allows(ordinal) {
         // The one edit the group being run still takes: its stop, which
         // nothing has read as a barrier yet. See [`amend_running_stop`].
         let only_stop = args.has("stop") && !args.has("parallel") && !args.has("agent");
@@ -981,6 +1013,10 @@ pub fn group(store: &Store, args: &Args) -> i32 {
             }
             Err(code) => return code,
         }
+    }
+    if let Some(c) = caption {
+        said.push(if c.is_empty() { "no caption".into() } else { format!("caption: {c}") });
+        groups[ordinal - 1].caption = c;
     }
 
     let because = why.map(|y| format!(" — why: {y}")).unwrap_or_default();
@@ -1807,8 +1843,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "worklist": worklist_json(store, &w),
-                "groups": groups.iter().enumerate().map(|(i, g)| json!({
+                "groups": groups.iter().zip(group_captions(store, &groups)).enumerate().map(|(i, (g, caption))| json!({
                     "ordinal": i + 1,
+                    "caption": caption.json(),
                     "parallel": g.cap,
                     "agent": g.agent,
                     "member_agents": g.member_agents,
@@ -4537,6 +4574,28 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
     )
 }
 
+/// Every group's caption, its members looked up in the store — the archive
+/// too, since a list that has run is mostly members somebody has since
+/// archived, and a group of them is still named by them.
+///
+/// By exact id, the file first: a member is an id already, and the fuzzy
+/// resolution a person's needle gets would read every task on each miss. The
+/// archive is read once, and only if a member is not live.
+fn group_captions(store: &Store, groups: &[Group]) -> Vec<crate::caption::Caption> {
+    let archive = std::cell::OnceCell::new();
+    groups
+        .iter()
+        .map(|g| {
+            crate::caption::of_group(g, |id| {
+                let t = store.task(id).or_else(|| {
+                    archive.get_or_init(|| store.archived_tasks()).iter().rev().find(|t: &&crate::model::Task| t.id == id).cloned()
+                })?;
+                Some(crate::caption::of_task(&t))
+            })
+        })
+        .collect()
+}
+
 /// One worklist, for `--json`: what it is, and where it is up to.
 fn worklist_json(store: &Store, w: &Worklist) -> serde_json::Value {
     worklist_json_at(w, &worklist::position(store, w, Reading::Settled))
@@ -4552,6 +4611,7 @@ fn worklist_json_at(w: &Worklist, at: &Position) -> serde_json::Value {
     json!({
         "id": w.id,
         "title": w.title,
+        "caption": crate::caption::of_worklist(w).json(),
         "status": w.status().as_str(),
         "created": w.created,
         "groups": at.of,
@@ -4636,6 +4696,65 @@ mod tests {
 
     fn groups_of(store: &Store, id: &str) -> Vec<Group> {
         store.worklist(id).expect("the list").groups()
+    }
+
+    /// `wsp-240`: a caption on the list at `new`, on a group where `add`
+    /// makes one, and through `group` on a group the run has already passed —
+    /// a caption is what the group is called and nothing the run reads, so
+    /// the window that freezes its members does not freeze its name.
+    #[test]
+    fn a_caption_is_given_at_new_at_add_and_on_any_group_run_or_not() {
+        let store = scratch("caption");
+        for id in ["k-1", "k-2", "k-3", "k-4"] {
+            task(&store, id, "todo");
+        }
+        assert_eq!(flagged(&store, &["new", "cap", "gpui migration: the chrome leaves imgui"], &[("caption", "Move the chrome to gpui")]), 0);
+        assert_eq!(store.worklist("cap").unwrap().caption.as_deref(), Some("Move the chrome to gpui"));
+        assert_eq!(flagged(&store, &["add", "cap", "k-1", "k-2"], &[("caption", "Three spikes: go or no-go")]), 0);
+        assert_eq!(run(&store, &["add", "cap", "k-3"]), 0);
+        assert_eq!(flagged(&store, &["add", "cap", "k-4"], &[("group", "1"), ("caption", "Joined")]), 2, "a caption names a new group");
+        let g = groups_of(&store, "cap");
+        assert_eq!(g[0].caption, "Three spikes: go or no-go");
+        assert_eq!(g[1].caption, "");
+
+        started(&store, "cap");
+        crossed(&store, "cap", 1);
+        assert_ne!(flagged(&store, &["group", "cap", "1"], &[("parallel", "2")]), 0, "group 1 has run");
+        assert_eq!(flagged(&store, &["group", "cap", "1"], &[("caption", "Spikes decided gpui")]), 0, "and is still renamed");
+        assert_eq!(groups_of(&store, "cap")[0].caption, "Spikes decided gpui");
+        assert_eq!(flagged(&store, &["group", "cap", "1"], &[("caption", "none")]), 0);
+        assert_eq!(groups_of(&store, "cap")[0].caption, "", "none takes it off");
+        assert_eq!(flagged(&store, &["group", "cap", "2"], &[("caption", &"x".repeat(61))]), 2, "past sixty");
+    }
+
+    /// What `worklist show --json` and `ls --json` carry: the list's caption,
+    /// and each group's, an unnamed group named by its members.
+    #[test]
+    fn the_json_carries_the_lists_caption_and_every_groups() {
+        let store = scratch("caption-json");
+        let mut t = Task::new("gpui: IME preedit (marked text) is not drawn in a pane — the wire has none", "k-392");
+        t.caption = None;
+        store.save_task(&t).unwrap();
+        task(&store, "k-393", "todo");
+        let mut w = Worklist::new("cj", "The chrome leaves imgui for gpui (compound-332)");
+        w.set_groups(&[
+            Group { members: vec!["k-392".into()], ..Group::default() },
+            Group { members: vec!["k-392".into(), "k-393".into()], caption: "Close the gaps".into(), ..Group::default() },
+            Group { members: vec!["k-392".into(), "k-393".into()], ..Group::default() },
+        ]);
+        store.save_worklist(&w).unwrap();
+
+        let w = store.worklist("cj").unwrap();
+        assert_eq!(worklist_json(&store, &w)["caption"], json!({ "text": "The chrome leaves imgui for gpui", "from": "title" }));
+        let got: Vec<_> = group_captions(&store, &w.groups()).iter().map(|c| c.json()).collect();
+        assert_eq!(
+            got,
+            vec![
+                json!({ "text": "IME preedit is not drawn in a pane", "from": "member" }),
+                json!({ "text": "Close the gaps", "from": "authored" }),
+                json!({ "text": "IME preedit is not drawn in a pane and 1 more", "from": "members" }),
+            ]
+        );
     }
 
     fn started(store: &Store, id: &str) {

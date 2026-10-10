@@ -31,6 +31,15 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {why}");
         return 2;
     }
+    if let Some(tail) = (!args.escaped).then(|| flag_in_title(&title)).flatten() {
+        eprintln!("wsp: the title ends in `{tail}`, which is one of add's own flags — inside the quotes it would be filed as words of the title");
+        eprintln!("     put it after the closing quote; a title that means those words goes after `--`");
+        return 2;
+    }
+    let caption = match crate::caption::flag(args, true) {
+        Ok(c) => c.filter(|c| !c.is_empty()),
+        Err(code) => return code,
+    };
 
     let index = Index::new(store.projects());
 
@@ -83,6 +92,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     };
 
     let mut t = Task::new(title.trim(), &id);
+    t.caption = caption;
     t.project = project.clone();
     t.tags = args.all("tag");
     t.refs = args.all("ref").iter().map(|r| util::contract(&util::expand(r))).collect();
@@ -136,6 +146,31 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         );
     }
     0
+}
+
+/// One of `add`'s own flags, with its value, on the end of a title.
+///
+/// Found while measuring for `wsp-240`: compound-404 to -407 were filed with
+/// titles ending in a literal ` --parent compound-403`, so the flag went into
+/// the title and the parent was never set — four rows at the top level that
+/// meant to be children, and four titles carrying the bookkeeping. Only the
+/// tail, and only `add`'s own names: a title that *mentions* a flag mid-way is
+/// about the CLI, which titles here usually are.
+fn flag_in_title(title: &str) -> Option<String> {
+    const VALUED: [&str; 11] =
+        ["parent", "project", "p", "tag", "t", "ref", "prio", "priority", "status", "s", "caption"];
+    let name = |tok: &str| tok.strip_prefix("--").or_else(|| tok.strip_prefix('-')).map(str::to_string);
+    let toks: Vec<&str> = title.split_whitespace().collect();
+    let last = *toks.last()?;
+    if let Some((n, v)) = last.strip_prefix("--").and_then(|t| t.split_once('=')) {
+        return (VALUED.contains(&n) && !v.is_empty()).then(|| last.to_string());
+    }
+    if last == "--inbox" {
+        return Some(last.to_string());
+    }
+    let [.., flag, value] = toks.as_slice() else { return None };
+    let n = name(flag)?;
+    (VALUED.contains(&n.as_str()) && !value.starts_with('-')).then(|| format!("{flag} {value}"))
 }
 
 fn filtered(store: &Store, args: &Args, index: &Index, scope: Option<String>) -> Vec<Task> {
@@ -1263,6 +1298,12 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         }
         return 2;
     }
+    if let Some(lines) = args.rest.first().and_then(|n| store.find_task(n)).as_ref().and_then(uncaptioned) {
+        for line in lines {
+            eprintln!("{line}");
+        }
+        return 2;
+    }
     let (account, from) = match prose_payload(args, USAGE) {
         Ok(v) => v,
         Err(code) => return code,
@@ -2163,6 +2204,125 @@ pub fn rename(store: &Store, args: &Args) -> i32 {
     })
 }
 
+/// `wsp caption <id|slug> "…"`: the line a glance reads, on a task or a
+/// worklist. `--clear` takes it off, and the derived one is read again.
+///
+/// Logged like a rename, with what it replaced, because a caption is what a
+/// person reads instead of the title and changing it is changing what the row
+/// is called. Both the task and the worklist answer to this one verb rather
+/// than `worklist caption` beside it: the spec names one verb, and the two key
+/// spaces only meet on an exact slug, which is asked first. A group's caption
+/// is `wsp worklist group <slug> N --caption`, since a group has no name of
+/// its own to give here.
+pub fn caption(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str =
+        "wsp caption <id|slug> \"one line, under 60\"   (or `-` to read it from stdin; --clear takes it off)";
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: {USAGE}");
+        return 2;
+    };
+    let text = if args.has("clear") {
+        if args.rest.len() > 1 {
+            eprintln!("wsp: --clear takes the caption off, so there is no caption to give with it");
+            return 2;
+        }
+        None
+    } else {
+        let (raw, _) = match prose_payload(args, USAGE) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        match crate::caption::check(&raw) {
+            Ok((text, note)) => {
+                if let Some(note) = note {
+                    eprintln!("  {}", Paint::new().dim(&note));
+                }
+                Some(text)
+            }
+            Err(why) => {
+                eprintln!("wsp: {why}");
+                return 2;
+            }
+        }
+    };
+    let entry = |old: Option<&str>| -> String {
+        let was = old.map(|o| format!(" (was \"{o}\")")).unwrap_or_default();
+        match &text {
+            Some(t) => format!("captioned \"{t}\"{was}"),
+            None => format!("caption cleared{was}"),
+        }
+    };
+
+    if let Some(mut w) = store.worklist(&needle) {
+        let line = entry(w.caption.as_deref());
+        w.caption = text.clone();
+        w.log(&line);
+        if let Err(e) = store.save_worklist(&w) {
+            eprintln!("wsp: write failed: {e}");
+            return 1;
+        }
+        let c = crate::caption::of_worklist(&w);
+        store.log_event("worklist-captioned", json!({ "id": w.id, "caption": c.text }));
+        store.git_commit(&format!("wsp: caption {} — {}", w.id, c.text));
+        if args.json() {
+            println!("{}", json!({ "id": w.id, "title": w.title, "caption": c.json() }));
+        } else {
+            let p = Paint::new();
+            println!("{} {}  {}", p.dim("·"), p.bold(&w.id), c.text);
+            if !c.authored() {
+                println!("  {}", p.dim("no caption: a glance reads its title's first clause"));
+            }
+        }
+        return 0;
+    }
+
+    let said = match &text {
+        Some(t) => format!("caption  {t}"),
+        None => match store.task_or_why(&needle) {
+            Ok(t) => format!("no caption: a glance reads \"{}\"", crate::caption::title(&t.title)),
+            Err(why) => {
+                eprintln!("{why}");
+                return 1;
+            }
+        },
+    };
+    mutate_saying(store, args, "caption", Some(&said), |t| {
+        t.log(&entry(t.caption.as_deref()));
+        t.caption = text.clone();
+    })
+}
+
+/// E-1 (Ed, 2026-10-09, compound-405): `wsp review` refuses a row with no
+/// caption, printing the derived line so taking it is one paste.
+///
+/// Review is the moment a row starts wanting a person, which is when a glance
+/// happens; and optional everywhere, the 13 of gpui-migration's 44 whose
+/// derived line is still over 60 would stay that way. The derived line is
+/// printed as the command that takes it, quoted for a shell, unless it is
+/// over the limit — then pasting it would only be refused a second time, so
+/// the refusal says to write one instead. Before the account is read, so a
+/// stream given to `review` is not spent on a refusal.
+fn uncaptioned(t: &Task) -> Option<Vec<String>> {
+    if t.caption.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+        return None;
+    }
+    let derived = crate::caption::title(&t.title);
+    let n = derived.chars().count();
+    let mut out = vec![format!(
+        "wsp: {} has no caption — the line a person reads once the row wants one, so review asks for it",
+        t.id
+    )];
+    if n <= crate::caption::LIMIT {
+        out.push(format!("     its title gives: {derived}"));
+        out.push(format!("     wsp caption {} {}", t.id, util::shell_quote(&derived)));
+        out.push("     then review again — or caption it in your own words, under 60".into());
+    } else {
+        out.push(format!("     its title gives {n} characters, past the {}: {derived}", crate::caption::LIMIT));
+        out.push(format!("     wsp caption {} \"…\"   in your own words, then review again", t.id));
+    }
+    Some(out)
+}
+
 /// Retire a task. The file moves to the archive rather than being deleted:
 /// the store is a git repo, and a task carrying a decision log is worth more
 /// recoverable than gone.
@@ -2789,6 +2949,7 @@ mod tests {
         let store = scratch("review-account");
         let mut t = Task::new("wsp review looks like the last step", "wsp-101");
         t.status_raw = "doing".into();
+        t.caption = Some("Review takes the account".into());
         store.save_task(&t).unwrap();
 
         let said = "the gate is on the account, not on what landed — ui-007 had nothing to land";
@@ -2819,6 +2980,7 @@ mod tests {
         let store = scratch("review-no-diff");
         let mut t = Task::new("the worklists zones prove their fit", "ui-007");
         t.status_raw = "doing".into();
+        t.caption = Some("The zones prove their fit".into());
         store.save_task(&t).unwrap();
 
         assert_eq!(review(&store, &parse(&["review", "ui-007"])), 2, "no diff is not no account");
@@ -2828,6 +2990,116 @@ mod tests {
             "and having said so, it goes to review with nothing landed and no argument"
         );
         assert_eq!(store.task("ui-007").unwrap().status_raw, "review");
+    }
+
+    /// E-1, Ed's answer of 2026-10-09: a row with no caption is refused at
+    /// review, and the refusal carries the derived line as the command that
+    /// takes it — so the paste is the whole of the fix, and the review after
+    /// it goes through with the caption the title gave.
+    #[test]
+    fn review_refuses_a_row_with_no_caption_and_hands_over_the_derived_one() {
+        let _iso = crate::util::isolated("review-no-caption");
+        let store = scratch("review-no-caption");
+        let mut t = Task::new(
+            "gpui: IME preedit (marked text) is not drawn in a pane — the wire has no preedit message",
+            "wsp-101",
+        );
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+
+        let account = "preedit drawn; the wire carries it now";
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", account])), 2);
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing", "refused before anything moved");
+
+        let lines = uncaptioned(&store.task("wsp-101").unwrap()).expect("no caption is refused");
+        let paste = lines.iter().find(|l| l.trim_start().starts_with("wsp caption")).expect("the paste is printed");
+        assert_eq!(paste.trim(), "wsp caption wsp-101 'IME preedit is not drawn in a pane'");
+
+        assert_eq!(caption(&store, &parse(&["caption", "wsp-101", "IME preedit is not drawn in a pane"])), 0);
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", account])), 0);
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "review");
+    }
+
+    /// A derived line past the limit would be refused when pasted, so the
+    /// refusal does not offer it as a paste: it asks for the author's words.
+    #[test]
+    fn a_derived_caption_past_sixty_is_not_offered_as_the_paste() {
+        let t = Task::new(
+            "Parity audit: every golden, gallery, ctl act and accelerator the imgui window has, checked on gpui",
+            "c-1",
+        );
+        let lines = uncaptioned(&t).unwrap();
+        assert!(lines.iter().all(|l| !l.contains("wsp caption c-1 '")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("in your own words")), "{lines:?}");
+    }
+
+    /// `wsp caption` sets, replaces and clears, and every one is in the log
+    /// with what it replaced — the shape `rename` gives a title. Past sixty
+    /// is refused and nothing is written.
+    #[test]
+    fn a_caption_is_set_replaced_and_cleared_and_each_is_logged_like_a_rename() {
+        let _iso = crate::util::isolated("caption-verb");
+        let store = scratch("caption-verb");
+        store.save_task(&Task::new("The chrome leaves imgui for gpui (compound-332)", "c-332")).unwrap();
+
+        assert_eq!(caption(&store, &parse(&["caption", "c-332", "Leave imgui"])), 0);
+        assert_eq!(caption(&store, &parse(&["caption", "c-332", "The chrome on gpui"])), 0);
+        assert_eq!(caption(&store, &parse(&["caption", "c-332", &"x".repeat(61)])), 2, "past sixty");
+        let t = store.task("c-332").unwrap();
+        assert_eq!(t.caption.as_deref(), Some("The chrome on gpui"), "and the refusal wrote nothing");
+        assert_eq!(crate::caption::of_task(&t).json(), json!({ "text": "The chrome on gpui", "from": "authored" }));
+
+        assert_eq!(caption(&store, &parse(&["caption", "c-332", "--clear"])), 0);
+        let t = store.task("c-332").unwrap();
+        assert_eq!(t.caption, None);
+        assert_eq!(crate::caption::of_task(&t).json(), json!({ "text": "The chrome leaves imgui for gpui", "from": "title" }));
+        let log = t.section("Log").unwrap();
+        assert!(log.contains("captioned \"Leave imgui\""), "{log}");
+        assert!(log.contains("captioned \"The chrome on gpui\" (was \"Leave imgui\")"), "{log}");
+        assert!(log.contains("caption cleared (was \"The chrome on gpui\")"), "{log}");
+    }
+
+    /// The same verb names a worklist by its slug, and the slug is asked
+    /// first: a task whose title mentions the slug is not what was meant.
+    #[test]
+    fn caption_takes_a_worklist_by_its_exact_slug() {
+        let _iso = crate::util::isolated("caption-worklist");
+        let store = scratch("caption-worklist");
+        store.save_task(&Task::new("gpui-migration leftovers", "c-1")).unwrap();
+        store.save_worklist(&crate::model::Worklist::new("gpui-migration", "gpui migration: the chrome leaves imgui")).unwrap();
+
+        assert_eq!(caption(&store, &parse(&["caption", "gpui-migration", "Move the chrome to gpui"])), 0);
+        assert_eq!(store.worklist("gpui-migration").unwrap().caption.as_deref(), Some("Move the chrome to gpui"));
+        assert_eq!(store.task("c-1").unwrap().caption, None, "the task that mentions it is untouched");
+    }
+
+    /// `add --caption` stores it, and a title ending in one of add's own
+    /// flags is refused before an id is spent — compound-404 to -407, whose
+    /// titles end in a literal ` --parent compound-403`.
+    #[test]
+    fn add_takes_a_caption_and_refuses_a_flag_swallowed_into_the_title() {
+        let _iso = crate::util::isolated("add-caption");
+        let store = scratch("add-caption");
+        assert_eq!(add(&store, &parse(&["add", "Close the gaps blocking cutover — six of them", "--inbox", "--caption", "Close the gaps"])), 0);
+        let made = store.tasks();
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].caption.as_deref(), Some("Close the gaps"));
+
+        assert_eq!(add(&store, &parse(&["add", "Agents view as a hierarchy --parent compound-403", "--inbox"])), 2);
+        assert_eq!(store.tasks().len(), 1, "refused before anything was filed");
+        assert_eq!(add(&store, &parse(&["add", "--inbox", "--caption", &"x".repeat(61), "Too long a caption"])), 2);
+        assert_eq!(store.tasks().len(), 1);
+    }
+
+    #[test]
+    fn only_adds_own_flags_on_the_end_of_a_title_are_read_as_swallowed() {
+        assert_eq!(flag_in_title("Agents view --parent compound-403").as_deref(), Some("--parent compound-403"));
+        assert_eq!(flag_in_title("A row -p wsp").as_deref(), Some("-p wsp"));
+        assert_eq!(flag_in_title("A row --prio=high").as_deref(), Some("--prio=high"));
+        assert_eq!(flag_in_title("A row --inbox").as_deref(), Some("--inbox"));
+        assert_eq!(flag_in_title("--parent is add-only, and mv takes it too"), None, "a title about the flag");
+        assert_eq!(flag_in_title("spawn --headless leaves no pane"), None, "not one of add's");
+        assert_eq!(flag_in_title("Ends in a range 3 -5"), None);
     }
 
     /// The `under` line did not go wrong when its parent was swept — it went
