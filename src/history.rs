@@ -133,6 +133,9 @@ struct Making {
     maker: Maker,
     /// Made after the start of a member that was not planned then.
     new_work: bool,
+    /// Made after the start, by the log's order: a list's first group and
+    /// its start are often written in the same second.
+    late: bool,
 }
 
 /// A drop, with the handle of the group before it still unresolved.
@@ -201,8 +204,8 @@ pub(crate) fn of(w: &Worklist, groups: &[Group]) -> History {
     let mut drops: Vec<Drop> = Vec::new();
 
     // A group made by the replay: a handle for it, and what made it.
-    let mut make = |slots: &mut Vec<Slot>, at: usize, members: Vec<String>, maker: Option<Maker>, fresh: bool| {
-        makings.push(maker.map(|maker| Making { maker, new_work: fresh }));
+    let mut make = |slots: &mut Vec<Slot>, at: usize, members: Vec<String>, maker: Option<Maker>, fresh: bool, running: bool| {
+        makings.push(maker.map(|maker| Making { maker, new_work: fresh, late: running }));
         slots.insert(at.min(slots.len()), Slot { handle: makings.len() - 1, members });
     };
 
@@ -251,7 +254,7 @@ pub(crate) fn of(w: &Worklist, groups: &[Group]) -> History {
                 }
                 false => {
                     if let Some((n, _)) = place.strip_prefix("group ").and_then(ordinal) {
-                        make(&mut slots, n - 1, rows.clone(), Some(maker.clone()), true);
+                        make(&mut slots, n - 1, rows.clone(), Some(maker.clone()), true, running);
                     }
                 }
             }
@@ -304,7 +307,7 @@ pub(crate) fn of(w: &Worklist, groups: &[Group]) -> History {
             }
             if rest.trim_start().starts_with("(new)") {
                 let fresh = running && named.iter().any(|id| !planned.contains(id));
-                make(&mut slots, n - 1, named, Some(maker), fresh);
+                make(&mut slots, n - 1, named, Some(maker), fresh, running);
             } else if let Some(s) = slots.get_mut(n - 1) {
                 s.members.extend(named);
             }
@@ -371,6 +374,7 @@ pub(crate) fn of(w: &Worklist, groups: &[Group]) -> History {
         .collect();
 
     let mut out: Vec<Of> = vec![Of::default(); groups.len()];
+    let mut late: BTreeMap<usize, String> = BTreeMap::new();
     for e in events {
         let gone = dropped.iter().zip(&arrived).position(|(d, a)| a.as_str() < e.at.as_str() && e.at < d.at);
         match (gone, standing(&e.at)) {
@@ -382,21 +386,20 @@ pub(crate) fn of(w: &Worklist, groups: &[Group]) -> History {
     for (handle, making) in makings.into_iter().enumerate() {
         let (Some(i), Some(making)) = (at_of.get(&handle).copied(), making) else { continue };
         let barrier = standing(&making.maker.at).filter(|_| making.new_work).and_then(id_of);
+        if making.late {
+            late.insert(i, making.maker.at.clone());
+        }
         out[i].made = Some(Made { maker: making.maker, barrier });
     }
-    for (g, of) in groups.iter().zip(out.iter_mut()) {
+    for (i, (g, of)) in groups.iter().zip(out.iter_mut()).enumerate() {
         // Only a group made once the run had started: one planned before it
         // has no `+`, and a member that joined it in the second it was made
         // — which a test does in every run — joined all the same.
-        let made_at = of
-            .made
-            .as_ref()
-            .map(|m| m.maker.at.clone())
-            .filter(|at| started.as_deref().is_some_and(|s| at.as_str() >= s));
+        let made_at = late.get(&i);
         for m in &g.members {
             // Put on with the group itself — in the line that made it, or in
             // the same second — is the group's `+`, not the member's.
-            if let Some(e) = entered.get(m).filter(|e| made_at.as_deref() != Some(e.at.as_str())) {
+            if let Some(e) = entered.get(m).filter(|e| made_at != Some(&e.at)) {
                 of.joined.insert(m.clone(), e.clone());
             }
         }
