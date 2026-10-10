@@ -269,9 +269,10 @@ prose. Each group carries:
 - `checks`: `[{at, verdict, read, pane, on, ended, end_failed, was}]`, off
   `checks:`. A check that held says `hold`, never `holds`: in a member's
   verification `holds` means it passes.
-- `events`: `[{at, kind, why}]`, `kind` one of `started`, `held`,
-  `started_again`, `passed`, `stop_amended` and `followup`. A follow-up also
-  has `by`, `members` and `blocking`.
+- `events`: `[{at, kind, why, caption}]`, `kind` one of `started`, `held`,
+  `started_again`, `passed`, `stop_amended` and `followup`. `caption` is the
+  verdict's caption where the line carries one. A follow-up also has `by`,
+  `members` and `blocking`.
 - `made`: `{at, by, via, barrier}`. `via` is `add`, `mv` or `followup`, and
   `by` is the check that filed it or whoever ran the verb (`null` on a line
   from before this recorded it). `barrier` is the id of the group the run

@@ -2309,7 +2309,7 @@ fn with_caption(entry: &str, caption: Option<&str>) -> String {
     }
 }
 
-fn uncaptioned(rest: &str) -> (&str, Option<&str>) {
+pub(crate) fn uncaptioned(rest: &str) -> (&str, Option<&str>) {
     match rest.rsplit_once(LOGGED_CAPTION) {
         Some((said, c)) => (said, Some(c.trim())),
         None => (rest, None),
@@ -6642,7 +6642,7 @@ mod tests {
         let raw = std::fs::read_to_string(store.root.join("worklists/batch.md")).unwrap();
         assert!(raw.contains("\n  verdict-caption: the fix is in and it builds\n"), "{raw}");
         let w = store.worklist("batch").unwrap();
-        let g = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks());
+        let g = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks(), &History::default());
         assert!(g[0]["verdict"].as_str().unwrap().ends_with("`wl-001` carries the fix."), "the verdict is still its string");
         assert_eq!(g[0]["verdict_caption"]["text"], "Passed — the fix is in and it builds");
         assert_eq!(g[0]["verdict_caption"]["word"], "passed");
@@ -6656,7 +6656,7 @@ mod tests {
         w.set_groups(&groups);
         store.save_worklist(&w).unwrap();
         let w = store.worklist("batch").unwrap();
-        let g = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks());
+        let g = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks(), &History::default());
         let lines = util::wrap(groups[0].verdict.split_once(' ').unwrap().1, prose_width(3)).len();
         let want = format!("Passed · {} · {lines} lines", util::local_ymd("2026-10-08T07:16:00Z"));
         assert_eq!(g[0]["verdict_caption"]["text"], want.as_str(), "never `PASSES. checked 55c4839…`");

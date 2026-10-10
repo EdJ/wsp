@@ -84,6 +84,9 @@ pub(crate) struct Event {
     /// `followup`.
     pub kind: &'static str,
     pub why: String,
+    /// The verdict's caption, where the line carries one (`wsp-241`): kept
+    /// off `why`, which reads as it did before there were captions.
+    pub caption: Option<String>,
     /// A follow-up's: the check that filed it, the rows, and whether they
     /// joined the group and held its barrier or became the next group.
     pub followup: Option<(String, Vec<String>, bool)>,
@@ -213,11 +216,15 @@ pub(crate) fn of(w: &Worklist, groups: &[Group]) -> History {
         if at.is_empty() {
             continue;
         }
-        let event = |kind: &'static str, why: &str| Event {
-            at: at.clone(),
-            kind,
-            why: why.trim().to_string(),
-            followup: None,
+        let event = |kind: &'static str, why: &str| {
+            let (why, caption) = crate::cmd_worklist::uncaptioned(why);
+            Event {
+                at: at.clone(),
+                kind,
+                why: why.trim().to_string(),
+                caption: caption.filter(|c| !c.is_empty()).map(str::to_string),
+                followup: None,
+            }
         };
         let running = started.as_deref().is_some_and(|s| at.as_str() >= s);
         if let Some(why) = text.strip_prefix("started again") {
@@ -430,7 +437,12 @@ pub(crate) fn maker_json(m: &Maker) -> serde_json::Value {
 }
 
 pub(crate) fn event_json(e: &Event) -> serde_json::Value {
-    let mut v = json!({ "at": e.at, "kind": e.kind, "why": (!e.why.is_empty()).then_some(&e.why) });
+    let mut v = json!({
+        "at": e.at,
+        "kind": e.kind,
+        "why": (!e.why.is_empty()).then_some(&e.why),
+        "caption": e.caption,
+    });
     if let Some((by, rows, joins)) = &e.followup {
         v["by"] = json!(by);
         v["members"] = json!(rows);
@@ -515,7 +527,7 @@ mod tests {
 - 2026-10-07T21:00:43Z group 4 dropped while it runs — Keystrokes in a field — why: Made by wsp-232's parser bug.
 - 2026-10-07T22:21:23Z follow-up by c-388 holds: c-9 · join group 4 · Group HOLDS, pending one follow-up.
 - 2026-10-07T22:21:59Z group 4 stop amended while it runs — why: the re-check is told both · now: the whole stop
-- 2026-10-07T22:42:04Z held — HOLDS, on one clause only.
+- 2026-10-07T22:42:04Z held — HOLDS, on one clause only. · caption: a person's keyboard check
 - 2026-10-08T04:30:50Z c-10 → group 5 · by wsp-for-ux
 - 2026-10-08T04:31:10Z started again · Group passes.
 - 2026-10-08T08:10:46Z held — Group 5 barrier: HOLD.
@@ -552,6 +564,8 @@ mod tests {
             ],
             "every line about the barrier the run stood at, by time, since `held` names no group"
         );
+        let held = &h.groups[3].events[2];
+        assert_eq!((held.why.as_str(), held.caption.as_deref()), ("HOLDS, on one clause only.", Some("a person's keyboard check")));
         let j = &h.groups[3].joined["c-9"];
         assert_eq!((j.at.as_str(), j.by.as_deref(), j.via), ("2026-10-07T22:21:23Z", Some("c-388"), "followup"));
         assert!(h.filed.contains("c-9") && h.filed.contains("c-8"), "both kinds of follow-up are a check's filing");
