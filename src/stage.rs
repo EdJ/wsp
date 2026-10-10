@@ -24,6 +24,12 @@
 //! that makes it. [`census`] is the one live read — whether an agent is
 //! turning — and a caller that has none passes [`Agent::Unknown`], which
 //! reads the say as the only evidence there is.
+//!
+//! **And when** (`wsp-255`, §19.3 and §19.9): [`history`] replays a member's
+//! log and passes into the stages it went through, each at the instant of
+//! the line or entry that moved it, and [`times`] gives a group when it was
+//! reached, settled and decided. The same rule: nothing is written for it,
+//! so a timeline is never behind the records a tooltip would otherwise read.
 
 use std::collections::BTreeMap;
 
@@ -255,6 +261,187 @@ fn heads(t: &Task) -> Vec<(String, String)> {
         .collect()
 }
 
+/// One step of a member's timeline: the stage word it entered, and when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Step {
+    pub word: &'static str,
+    /// Empty where nothing dated it.
+    pub at: String,
+    /// Only a tail wsp itself derives — `again`, `workspace closed`. The
+    /// prose tails are the current stage's, and each verdict's own entry has
+    /// its caption; a timeline repeating them is the same sentence twice per
+    /// step in a payload carrying every member of every group.
+    pub tail: Option<&'static str>,
+}
+
+impl Step {
+    pub fn json(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({ "word": self.word });
+        if !self.at.is_empty() {
+            v["at"] = serde_json::json!(self.at);
+        }
+        if let Some(t) = self.tail {
+            v["tail"] = serde_json::json!(t);
+        }
+        v
+    }
+}
+
+/// When a member entered each stage, oldest first: `wsp-255`, for "verifying
+/// since 10:36" and "sent back 09:13, held 09:16".
+///
+/// **Read off the records each step already wrote**, as [`of_member`] is:
+/// the `## Log` (claims, starts, landings, reviews, blocks, parks, reopens,
+/// put-backs, releases) and the `## Verification` entries (a pass opens at
+/// its header's instant and is decided at its `decided`). A verifier's block
+/// is dated by its entry, not by the `sent back:` line `cycle` writes beside
+/// it at the same second, so a verdict is one step and not two.
+///
+/// **`dropped` is a word only history has.** An agent let go of the work
+/// before it reached review — a release, or `repair` putting it back — and
+/// the task is `not started` again until somebody takes it up; the live
+/// stage reads the second half, and the timeline keeps both, so a member
+/// with two attempts shows both (compound-395).
+///
+/// **The say is not dated**, so a claim dates the whole of being on it: the
+/// claim is `working`, and the last step takes the live word where that is
+/// `started` (nothing said since) — a timeline ending in a word the node does
+/// not show is two answers to one question. `wants you` is appended at the
+/// stage's own instant, since when the agent stopped is in no record.
+pub(crate) fn history(t: &Task, passes: &[Pass], now: Option<&Told>) -> Vec<Step> {
+    // (at, word, tail), the log's then the passes', merged by a stable sort
+    // so a tie keeps the log first: the review a pass was opened on.
+    let mut events: Vec<(String, &'static str, Option<&'static str>)> = Vec::new();
+    let mut claimed = false;
+    // What the log alone says the member is at, so a release can tell work
+    // put down from work handed in.
+    let mut state = "not started";
+    for (at, head) in heads(t) {
+        if at.is_empty() {
+            continue;
+        }
+        let h = head.as_str();
+        let word = if h.starts_with("claimed by pane ") || h.starts_with("taken over from pane ") {
+            claimed = true;
+            Some(("working", None))
+        } else if h.starts_with(crate::cycle::STARTED_BY) || h.starts_with("wsp: started by this run") || h == "→ doing" {
+            Some((if claimed { "working" } else { "started" }, None))
+        } else if h == "→ todo" {
+            Some(("not started", None))
+        } else if h == "→ review" || h.starts_with("review:") {
+            Some(("at review", None))
+        } else if h == "→ done" {
+            Some(("done", None))
+        } else if h == "blocked" || h.starts_with("blocked:") {
+            Some(("blocked", None))
+        } else if h.starts_with("parked:") {
+            Some(("parked", None))
+        } else if h.starts_with("wsp: landed ") {
+            Some(("landed", None))
+        } else if let Some(why) = h.strip_prefix(crate::cycle::SENT_BACK) {
+            // The verifier's is its pass's; only the state moves here.
+            if why.contains("the verifier blocked") {
+                state = "sent back";
+                None
+            } else {
+                Some(("sent back", None))
+            }
+        } else if h.starts_with("wsp put this back") {
+            claimed = false;
+            Some(("dropped", None))
+        } else if h.starts_with("released") {
+            claimed = false;
+            let put_down = matches!(state, "started" | "working" | "landed" | "sent back");
+            let reaped = h.split(" · ").any(|c| c.trim() == "workspace closed");
+            put_down.then_some(("dropped", reaped.then_some("workspace closed")))
+        } else {
+            None
+        };
+        if let Some((w, tail)) = word {
+            state = w;
+            events.push((at, w, tail));
+        }
+    }
+    let mut ordered: Vec<&Pass> = passes.iter().collect();
+    ordered.sort_by(|a, b| a.at.cmp(&b.at));
+    let mut answered = false;
+    for p in ordered {
+        events.push((p.at.clone(), "verifying", answered.then_some("again")));
+        let decided = || p.decided.clone().unwrap_or_else(|| p.at.clone());
+        match p.state {
+            Verdict::Holds => events.push((decided(), "holds", None)),
+            Verdict::Blocks => events.push((decided(), "sent back", None)),
+            _ => {}
+        }
+        answered |= matches!(p.state, Verdict::Holds | Verdict::Blocks);
+    }
+    events.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = vec![Step { word: "not started", at: t.created.clone(), tail: None }];
+    for (at, word, tail) in events {
+        if out.last().is_some_and(|s| s.word == word && s.tail == tail) {
+            continue;
+        }
+        out.push(Step { word, at, tail });
+    }
+    if let (Some(now), Some(last)) = (now, out.last_mut()) {
+        let on_it = |w: &str| matches!(w, "started" | "working");
+        if on_it(last.word) && on_it(now.word) {
+            last.word = now.word;
+        } else if on_it(last.word) && now.word == "wants you" {
+            let at = now.at.clone().max(last.at.clone());
+            out.push(Step { word: "wants you", at, tail: None });
+        }
+    }
+    out
+}
+
+/// When a group started, settled and was decided (`wsp-255`). Each is `None`
+/// until it has happened, and none is a record of its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Times {
+    pub started: Option<String>,
+    pub settled: Option<String>,
+    pub decided: Option<String>,
+}
+
+impl Times {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "started_at": self.started, "settled_at": self.settled, "decided_at": self.decided })
+    }
+}
+
+/// A group's times, off records the walk already has.
+///
+/// - **started**: when the run reached it — the pass of the barrier before
+///   it, or the list's start for the first group — or when it was made, if
+///   that is later. Not the first member's claim, which is the run's spawn
+///   and seconds behind; and not its making, which for a planned group is
+///   long before (gpui-migration's group 13 was made at 08:47:14 and reached
+///   at 08:48:01).
+/// - **settled**: when the last member to reach review did, while every
+///   member is there — a member sent back unsettles the group, and the
+///   instant it returns is the one that counts.
+/// - **decided**: the barrier's last word — its pass, or a hold nothing has
+///   come after — exactly what `stage`'s `passed` and `held` read.
+///
+/// `members` is each member's status and timeline; `None` for one no task
+/// answers to, which settles nothing and holds nothing up, since nothing it
+/// does can be recorded.
+pub(crate) fn times(arrived: Option<&str>, made: Option<&str>, members: &[Option<(Status, &[Step])>], decided: Option<&str>) -> Times {
+    let started = arrived.filter(|a| !a.is_empty()).map(|a| made.filter(|m| *m > a).unwrap_or(a).to_string());
+    let known: Vec<&(Status, &[Step])> = members.iter().flatten().collect();
+    let settled = match !known.is_empty() && known.iter().all(|(s, _)| matches!(s, Status::Review | Status::Done)) {
+        true => known
+            .iter()
+            .map(|(_, steps)| steps.iter().rev().find(|s| matches!(s.word, "at review" | "done")).map(|s| s.at.as_str()))
+            .collect::<Option<Vec<&str>>>()
+            .and_then(|ats| ats.into_iter().max().filter(|a| !a.is_empty()).map(str::to_string)),
+        false => None,
+    };
+    Times { started, settled, decided: decided.filter(|d| !d.is_empty()).map(str::to_string) }
+}
+
 /// The sentence each task's agent last said about it, by task id: the seat
 /// bound to the task first, else any seat whose say was about it.
 pub(crate) fn sayings(store: &Store) -> BTreeMap<String, String> {
@@ -320,6 +507,17 @@ pub(crate) fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> 
 /// Every stage `ls` and `show` give, for the tasks asked about: one read of
 /// each source for the whole set.
 pub(crate) fn of_tasks(store: &Store, asked: &[&Task]) -> BTreeMap<String, Told> {
+    read(store, asked, false).into_iter().map(|(id, (now, _))| (id, now)).collect()
+}
+
+/// [`of_tasks`] and each task's [`history`] beside it, off the same reads —
+/// for `show` and `worklist show --json`, and not `ls`, which carries a stage
+/// and no timeline.
+pub(crate) fn with_history(store: &Store, asked: &[&Task]) -> BTreeMap<String, (Told, Vec<Step>)> {
+    read(store, asked, true)
+}
+
+fn read(store: &Store, asked: &[&Task], timed: bool) -> BTreeMap<String, (Told, Vec<Step>)> {
     let all = store.tasks();
     let claims = store.claims();
     let said = sayings(store);
@@ -345,7 +543,9 @@ pub(crate) fn of_tasks(store: &Store, asked: &[&Task]) -> BTreeMap<String, Told>
                 claimed: claims.contains_key(&t.id),
                 agent: agents.get(&t.id).copied().unwrap_or_default(),
             };
-            (t.id.clone(), of_member(&m))
+            let now = of_member(&m);
+            let steps = if timed { history(t, &passes, Some(&now)) } else { Vec::new() };
+            (t.id.clone(), (now, steps))
         })
         .collect()
 }
@@ -608,5 +808,198 @@ mod tests {
         assert_eq!(caption::say("surveying", None), "Surveying");
         assert_eq!(caption::say("parity.md lists every gap. measured twice", None), "parity.md lists every gap", "a name keeps its case");
         assert_eq!(caption::say("first line — rest\nsecond line", None), "First line");
+    }
+
+    // --- `wsp-255`: when each stage was entered ---
+
+    fn steps(t: &Task, passes: &[Pass], now: Option<&Told>) -> Vec<(&'static str, String, Option<&'static str>)> {
+        history(t, passes, now).into_iter().map(|s| (s.word, s.at, s.tail)).collect()
+    }
+
+    fn at(word: &'static str, at: &str) -> (&'static str, String, Option<&'static str>) {
+        (word, at.to_string(), None)
+    }
+
+    fn step(word: &'static str, at: &str) -> Step {
+        Step { word, at: at.into(), tail: None }
+    }
+
+    fn decided(state: &str, at: &str, decided: &str) -> Pass {
+        let mut p = pass(state, None);
+        p.at = at.into();
+        p.decided = Some(decided.into());
+        p
+    }
+
+    /// compound-393 on gpui-migration, at its own instants: worked, landed,
+    /// reviewed, verified and sent back, landed again, verified again and
+    /// held. The verifier's block is one step dated by its entry, not two
+    /// with the `sent back:` line `cycle` wrote at the same second.
+    #[test]
+    fn a_member_s_timeline_is_each_stage_it_entered_at_the_instant_its_record_gives() {
+        let t = task(
+            "review",
+            &[
+                "2026-10-08T08:48:08Z started by wsp: gpui-migration group 13",
+                "2026-10-08T08:48:10Z claimed by pane cpd-574 · spawned at sonnet/high",
+                "2026-10-08T08:48:10Z wsp: started by this run gpui-migration group 13",
+                "2026-10-08T09:00:31Z wsp: this member's seat reads idle with this row still at doing — told it to finish",
+                "2026-10-08T09:00:38Z wsp: landed eb277994f233",
+                "2026-10-08T09:00:49Z review: The IME candidate window now anchors to the cursor",
+                "2026-10-08T09:13:08Z sent back: the verifier blocked at eb277994f233: Blocks, on one thing",
+                "2026-10-08T09:14:58Z wsp: landed 2d7ed5bdf13e",
+                "2026-10-08T09:15:03Z review: Addressed the block",
+                "2026-10-08T09:16:54Z released after 28m · ran sonnet-5-5/high · 40 turns",
+            ],
+        );
+        let passes = [
+            decided("blocks", "2026-10-08T09:01:01Z", "2026-10-08T09:13:08Z"),
+            decided("holds", "2026-10-08T09:15:12Z", "2026-10-08T09:16:18Z"),
+        ];
+        // `verification::all` puts a migrated pass after the body's own,
+        // whatever its instant.
+        let shuffled = [passes[1].clone(), passes[0].clone()];
+        let mut want = vec![
+            at("not started", "2026-10-01T08:00:00Z"),
+            at("started", "2026-10-08T08:48:08Z"),
+            at("working", "2026-10-08T08:48:10Z"),
+            at("landed", "2026-10-08T09:00:38Z"),
+            at("at review", "2026-10-08T09:00:49Z"),
+            at("verifying", "2026-10-08T09:01:01Z"),
+            at("sent back", "2026-10-08T09:13:08Z"),
+            at("landed", "2026-10-08T09:14:58Z"),
+            at("at review", "2026-10-08T09:15:03Z"),
+            ("verifying", "2026-10-08T09:15:12Z".into(), Some("again")),
+            at("holds", "2026-10-08T09:16:18Z"),
+        ];
+        assert_eq!(steps(&t, &passes, None), want);
+        assert_eq!(steps(&t, &shuffled, None), want, "the passes are read in time order, whatever order they come in");
+        // A release after review is the agent stepping away from work it
+        // handed in, not putting it down.
+        assert!(!steps(&t, &passes, None).iter().any(|s| s.0 == "dropped"));
+        // And the timeline ends where the stage says it is.
+        let now = of_member(&member(&t, &passes));
+        assert_eq!((now.word, want.pop().map(|s| s.0)), ("holds", Some("holds")));
+    }
+
+    /// compound-395: the first agent went and the run put it back, and the
+    /// second finished it. Both attempts are in the timeline, and the drop
+    /// is dated by the put-back, the record that it happened.
+    #[test]
+    fn an_attempt_put_down_before_review_is_dropped_and_the_next_one_follows_it() {
+        let t = task(
+            "review",
+            &[
+                "2026-10-08T08:48:24Z started by wsp: gpui-migration group 13",
+                "2026-10-08T08:48:25Z claimed by pane cpd-576 · spawned at sonnet/high",
+                "2026-10-08T09:14:00Z wsp put this back: the agent it was started on is gone, and the run will start it again",
+                "2026-10-08T09:14:01Z released after 25m · ran sonnet-5-5/high · 48 turns",
+                "2026-10-08T09:15:02Z started by wsp: gpui-migration group 13",
+                "2026-10-08T09:15:03Z claimed by pane cpd-580 · spawned at sonnet/high",
+                "2026-10-08T09:55:37Z review: A held submenu is now named",
+            ],
+        );
+        let words: Vec<(&str, String)> = steps(&t, &[], None).into_iter().map(|s| (s.0, s.1)).collect();
+        assert_eq!(
+            words[1..],
+            [
+                ("started", "2026-10-08T08:48:24Z".to_string()),
+                ("working", "2026-10-08T08:48:25Z".into()),
+                ("dropped", "2026-10-08T09:14:00Z".into()),
+                ("started", "2026-10-08T09:15:02Z".into()),
+                ("working", "2026-10-08T09:15:03Z".into()),
+                ("at review", "2026-10-08T09:55:37Z".into()),
+            ],
+            "the release a second after the put-back is the same drop: {words:?}"
+        );
+    }
+
+    /// A release with nothing handed in is a drop even with no put-back, and
+    /// one whose workspace was closed under it says so — the agent did not
+    /// put it down, which `wsp attempts` keeps apart as `reaped`.
+    #[test]
+    fn a_release_before_review_is_a_drop_and_a_closed_workspace_says_so() {
+        let t = task(
+            "todo",
+            &[
+                "2026-10-08T08:00:00Z claimed by pane w1:p1",
+                "2026-10-08T08:30:00Z released after 30m",
+                "2026-10-08T09:00:00Z claimed by pane w1:p2",
+                "2026-10-08T09:30:00Z released after 30m · workspace closed",
+            ],
+        );
+        let h = steps(&t, &[], None);
+        assert_eq!(h[2], at("dropped", "2026-10-08T08:30:00Z"));
+        assert_eq!(h[4], ("dropped", "2026-10-08T09:30:00Z".into(), Some("workspace closed")));
+    }
+
+    /// Blocks, parks, a reopen and the verbs' bare status moves are steps
+    /// too, each at its own line; a reopen's `sent back:` is one, because no
+    /// pass dates it.
+    #[test]
+    fn a_block_a_park_a_reopen_and_done_are_steps_at_their_own_lines() {
+        let t = task(
+            "done",
+            &[
+                "2026-10-08T08:00:00Z claimed by pane w1:p1",
+                "2026-10-08T08:10:00Z blocked: which socket?",
+                "2026-10-08T08:20:00Z → doing",
+                "2026-10-08T08:30:00Z review: built it",
+                "2026-10-08T08:40:00Z sent back: the second half is missing",
+                "2026-10-08T08:50:00Z parked: until the fixture exists",
+                "2026-10-08T09:00:00Z → doing",
+                "2026-10-08T09:05:00Z → review",
+                "2026-10-08T09:10:00Z → done",
+            ],
+        );
+        let words: Vec<&str> = steps(&t, &[], None).into_iter().map(|s| s.0).collect();
+        assert_eq!(
+            words,
+            ["not started", "working", "blocked", "working", "at review", "sent back", "parked", "working", "at review", "done"],
+            "an unblock by an agent still holding the claim is it working again"
+        );
+    }
+
+    /// The say is not dated, so the claim dates being on it; the timeline's
+    /// last word agrees with the stage the node shows.
+    #[test]
+    fn the_timeline_ends_in_the_word_the_stage_shows_while_an_agent_is_on_it() {
+        let t = task("doing", &["2026-10-08T08:00:00Z claimed by pane w1:p1"]);
+        let mut m = member(&t, &[]);
+        m.claimed = true;
+        let quiet = of_member(&m);
+        assert_eq!(steps(&t, &[], Some(&quiet)).last(), Some(&at("started", "2026-10-08T08:00:00Z")), "claimed, nothing said");
+
+        m.agent = Agent::WantsYou;
+        m.said = Some("which socket?");
+        let waiting = of_member(&m);
+        let h = steps(&t, &[], Some(&waiting));
+        assert_eq!(h[h.len() - 2], at("working", "2026-10-08T08:00:00Z"));
+        assert_eq!(h.last().map(|s| s.0), Some("wants you"), "appended, since when it stopped is in no record: {h:?}");
+    }
+
+    /// group 13's three times, in its shapes: reached when group 12 passed,
+    /// not when it was made; settled when the follow-up that joined it last
+    /// reached review; decided at the pass.
+    #[test]
+    fn a_group_starts_when_the_run_reaches_it_settles_at_its_last_review_and_is_decided_at_its_barrier() {
+        let first = [step("at review", "2026-10-08T09:15:03Z")];
+        let last = [step("at review", "2026-10-08T09:00:00Z"), step("sent back", "2026-10-08T09:30:00Z"), step("at review", "2026-10-08T10:45:18Z")];
+        let members = [Some((Status::Review, &first[..])), Some((Status::Done, &last[..])), None];
+        let t = times(Some("2026-10-08T08:48:01Z"), Some("2026-10-08T08:47:14Z"), &members, Some("2026-10-08T11:01:30Z"));
+        assert_eq!(
+            t,
+            Times {
+                started: Some("2026-10-08T08:48:01Z".into()),
+                settled: Some("2026-10-08T10:45:18Z".into()),
+                decided: Some("2026-10-08T11:01:30Z".into()),
+            },
+            "the last return to review counts, and a member no task answers to holds nothing up"
+        );
+        assert_eq!(times(Some("2026-10-08T08:48:01Z"), Some("2026-10-08T09:00:00Z"), &members, None).started.as_deref(), Some("2026-10-08T09:00:00Z"), "a group put in after the run reached its place started when it was made");
+
+        let working = [step("working", "2026-10-08T09:00:00Z")];
+        let unsettled = [Some((Status::Review, &first[..])), Some((Status::Doing, &working[..]))];
+        assert_eq!(times(None, None, &unsettled, None), Times::default(), "not reached, a member still out, and nothing decided");
     }
 }

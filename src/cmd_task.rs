@@ -726,7 +726,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         v["verification"] = crate::verification::json(&t);
         // `wsp-242`: where it is, as a word wsp derives and the tail the step
         // that put it there was given.
-        v["stage"] = json!(crate::stage::of_tasks(store, &[&t]).get(&t.id).map(|s| s.json()));
+        // `wsp-255`: and when it entered each stage it has been in.
+        let staged = crate::stage::with_history(store, &[&t]);
+        let staged = staged.get(&t.id);
+        v["stage"] = json!(staged.map(|(s, _)| s.json()));
+        v["stages"] = json!(staged.map(|(_, h)| h.iter().map(|s| s.json()).collect::<Vec<_>>()));
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;
     }

@@ -88,7 +88,7 @@ use serde_json::json;
 // `pub(crate)` for its second caller; this is the third.
 use crate::cmd_task::fold;
 use crate::history::{self, History};
-use crate::model::{Group, Landed, Worklist, WorklistStatus, DEFAULT_POLICY, MANUAL};
+use crate::model::{Group, Landed, Status, Worklist, WorklistStatus, DEFAULT_POLICY, MANUAL};
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::worklist::{self, Landing, Position, Reading, Segment, Standing};
@@ -1811,7 +1811,7 @@ fn held_caption(of: &history::Of, groups: usize) -> Option<crate::caption::Told>
 /// Every member's stage, by id, for `worklist show --json` — the live tasks
 /// and, for a member somebody has since archived, the archive, read once and
 /// only if a member is not live.
-fn member_stages(store: &Store, groups: &[Group], tasks: &[crate::model::Task]) -> BTreeMap<String, crate::caption::Told> {
+fn member_stages(store: &Store, groups: &[Group], tasks: &[crate::model::Task]) -> BTreeMap<String, (crate::caption::Told, Vec<crate::stage::Step>, Status)> {
     let archive = std::cell::OnceCell::new();
     let mut found: Vec<crate::model::Task> = Vec::new();
     for id in groups.iter().flat_map(|g| &g.members) {
@@ -1821,7 +1821,38 @@ fn member_stages(store: &Store, groups: &[Group], tasks: &[crate::model::Task]) 
         found.extend(t);
     }
     let asked: Vec<&crate::model::Task> = found.iter().collect();
-    crate::stage::of_tasks(store, &asked)
+    let status: BTreeMap<&str, Status> = found.iter().map(|t| (t.id.as_str(), t.status())).collect();
+    crate::stage::with_history(store, &asked)
+        .into_iter()
+        .map(|(id, (now, steps))| {
+            let s = status.get(id.as_str()).copied().unwrap_or(Status::Todo);
+            (id, (now, steps, s))
+        })
+        .collect()
+}
+
+/// The instant a group's verdict opens with: when its barrier was passed.
+fn passed_at(g: &Group) -> Option<&str> {
+    g.verdict.split_whitespace().next().filter(|t| util::is_stamp(t))
+}
+
+/// A group's [`crate::stage::Times`], off what `groups_json` already holds.
+fn group_times(groups: &[Group], i: usize, h: &History, stages: &BTreeMap<String, (crate::caption::Told, Vec<crate::stage::Step>, Status)>) -> crate::stage::Times {
+    let g = &groups[i];
+    let of = h.groups.get(i);
+    // The first group is reached by the list's start: the oldest `started`
+    // line wherever the replay placed it, since a group put in front of the
+    // first since then was reached by the same start.
+    let arrived = match i {
+        0 => h.groups.iter().flat_map(|o| &o.events).filter(|e| e.kind == "started").map(|e| e.at.as_str()).min(),
+        _ => passed_at(&groups[i - 1]),
+    };
+    let made = of.and_then(|o| o.made.as_ref()).map(|m| m.maker.at.as_str());
+    let members: Vec<Option<(Status, &[crate::stage::Step])>> =
+        g.members.iter().map(|m| stages.get(m).map(|(_, steps, s)| (*s, steps.as_slice()))).collect();
+    let held = of.and_then(|o| o.events.iter().rev().find(|e| e.kind != "stop_amended")).filter(|e| e.kind == "held");
+    let decided = passed_at(g).or_else(|| held.map(|e| e.at.as_str()));
+    crate::stage::times(arrived, made, &members, decided)
 }
 
 /// The newest hold's caption, the same way: `Held — <tail>`, or its date and
@@ -1841,7 +1872,7 @@ fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::mode
         .zip(group_captions(store, &groups))
         .enumerate()
         .map(|(i, (g, caption))| {
-            let of: Vec<Option<&crate::caption::Told>> = g.members.iter().map(|m| stages.get(m)).collect();
+            let of: Vec<Option<&crate::caption::Told>> = g.members.iter().map(|m| stages.get(m).map(|(s, _, _)| s)).collect();
             let stage = crate::stage::of_group(&crate::stage::Group {
                 ordinal: i + 1,
                 pos,
@@ -1860,6 +1891,9 @@ fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::mode
             // task answers to has no stage, and is the group's `gone` instead.
             "stage": stage.json(),
             "stages": g.members.iter().zip(&of).filter_map(|(m, s)| Some((m.clone(), (*s)?.json()))).collect::<serde_json::Map<_, _>>(),
+            // `wsp-255`: when each member entered each stage, and when the
+            // group started, settled and was decided.
+            "member_stages": g.members.iter().filter_map(|m| Some((m.clone(), json!(stages.get(m)?.1.iter().map(|s| s.json()).collect::<Vec<_>>())))).collect::<serde_json::Map<_, _>>(),
             "parallel": g.cap,
             "agent": g.agent,
             "member_agents": g.member_agents,
@@ -1880,6 +1914,9 @@ fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::mode
             });
             // The barrier's history and the list's edits, `wsp-254`: `made`,
             // `checks`, `events`, `joined` and `follow_up_of`.
+            if let (serde_json::Value::Object(o), serde_json::Value::Object(t)) = (&mut v, group_times(&groups, i, h, &stages).json()) {
+                o.extend(t);
+            }
             if let (Some(of), serde_json::Value::Object(o)) = (h.groups.get(i), &mut v) {
                 if let serde_json::Value::Object(more) = history::group_json(g, of, &h.filed, tasks) {
                     o.extend(more);
@@ -5029,6 +5066,57 @@ mod tests {
         assert_eq!(v[0]["stages"]["s-1"]["word"], "at review");
         assert_eq!(v[1]["stage"]["word"], "not reached");
         assert_eq!(v[1]["stages"], json!({ "s-2": { "word": "not started", "text": "Not started", "from": "status", "at": store.task("s-2").unwrap().created } }));
+    }
+
+    /// `wsp-255`: each member's timeline, and each group's three times, in
+    /// the same call — a passed group started at the list's start, settled
+    /// at its member's review and was decided at its verdict's instant; the
+    /// group after it started at that instant and has neither of the others.
+    #[test]
+    fn show_json_gives_each_member_its_timeline_and_each_group_its_times() {
+        let store = scratch("times");
+        task(&store, "s-1", "review");
+        task(&store, "s-2", "doing");
+        for (id, log) in [
+            ("s-1", "- 2026-10-08T08:00:00Z claimed by pane w1:p1\n- 2026-10-08T08:30:00Z review: built it\n"),
+            ("s-2", "- 2026-10-08T09:01:00Z claimed by pane w1:p2\n"),
+        ] {
+            let mut t = store.task(id).unwrap();
+            crate::model::set_section_in(&mut t.body, "Log", log);
+            store.save_task(&t).unwrap();
+        }
+        assert_eq!(run(&store, &["new", "tms", "Tms"]), 0);
+        assert_eq!(run(&store, &["add", "tms", "s-1"]), 0);
+        assert_eq!(run(&store, &["add", "tms", "s-2"]), 0);
+        let mut w = store.worklist("tms").unwrap();
+        let mut groups = w.groups();
+        groups[0].verdict = "2026-10-08T09:00:00Z Group passes.".into();
+        w.set_groups(&groups);
+        crate::model::set_section_in(&mut w.body, "Log", "- 2026-10-08T07:55:00Z started · go\n- 2026-10-08T09:00:00Z passed s-1 · Group passes.\n");
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        let w = store.worklist("tms").unwrap();
+        let h = history::of(&w, &w.groups());
+        let v = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks(), &h);
+
+        let words: Vec<(&str, &str)> = v[0]["member_stages"]["s-1"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["word"].as_str().unwrap(), s["at"].as_str().unwrap_or("")))
+            .collect();
+        assert_eq!(words[1..], [("working", "2026-10-08T08:00:00Z"), ("at review", "2026-10-08T08:30:00Z")], "{v}");
+        assert_eq!(
+            (&v[0]["started_at"], &v[0]["settled_at"], &v[0]["decided_at"]),
+            (&json!("2026-10-08T07:55:00Z"), &json!("2026-10-08T08:30:00Z"), &json!("2026-10-08T09:00:00Z"))
+        );
+        assert_eq!(
+            (&v[1]["started_at"], &v[1]["settled_at"], &v[1]["decided_at"]),
+            (&json!("2026-10-08T09:00:00Z"), &json!(null), &json!(null)),
+            "a member still working settles nothing, and nobody has written at its barrier"
+        );
+        assert_eq!(v[1]["stages"]["s-2"]["word"], "started", "wsp-242's map is as it was: {v}");
+        assert_eq!(v[1]["member_stages"]["s-2"][1], json!({ "word": "started", "at": "2026-10-08T09:01:00Z" }), "claimed, nothing said, and the timeline ends there too");
     }
 
     /// The list half of the refusals, through the verbs: a member may not be
