@@ -1524,6 +1524,12 @@ pub struct Policy {
     pub effort: Option<String>,
 }
 
+/// Whether a word is one of the five efforts — the closed set a tier is
+/// read by, since model names are open-ended.
+pub fn is_effort(word: &str) -> bool {
+    matches!(word, "low" | "medium" | "high" | "xhigh" | "max")
+}
+
 /// The word a group's `agent:` line uses to say wsp does not run it.
 pub const MANUAL: &str = "manual";
 
@@ -1548,9 +1554,9 @@ impl Policy {
         }
         let mut p = Policy { kind: kind.to_string(), model: None, effort: None };
         for t in toks {
-            match t {
-                "low" | "medium" | "high" | "xhigh" | "max" => p.effort = Some(t.to_string()),
-                _ => p.model = Some(t.to_string()),
+            match is_effort(t) {
+                true => p.effort = Some(t.to_string()),
+                false => p.model = Some(t.to_string()),
             }
         }
         Some(p)
@@ -1570,6 +1576,32 @@ impl Policy {
             out.push_str(e);
         }
         out
+    }
+
+    /// The inverse of [`Policy::label`]: what a verification pass or a barrier
+    /// check records it ran on, read back into its three halves for `wip`
+    /// (`wsp-248`).
+    ///
+    /// Not [`Policy::parse`], whose line keeps the effort a word of its own:
+    /// `label` joins it to the model with `/`, and an opencode model has `/`
+    /// in it already (`openrouter/some-model`). So the effort is taken off
+    /// the last `/` only when what follows is one of the five words, which
+    /// leaves a slashed model with no effort whole. A space-separated effort
+    /// is read too — it is what `parse` writes, and a hand-made entry would.
+    pub fn of_label(label: &str) -> Option<Policy> {
+        let mut toks = label.split_whitespace();
+        let mut p = Policy { kind: toks.next()?.to_string(), model: None, effort: None };
+        for t in toks {
+            match t.rsplit_once('/') {
+                _ if is_effort(t) => p.effort = Some(t.to_string()),
+                Some((m, e)) if is_effort(e) => {
+                    p.model = Some(m.to_string());
+                    p.effort = Some(e.to_string());
+                }
+                _ => p.model = Some(t.to_string()),
+            }
+        }
+        Some(p)
     }
 
     pub fn spawn_flags(&self) -> Vec<String> {
@@ -2802,5 +2834,25 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         w.status_raw = "abandoned".into();
         assert_eq!(w.status(), WorklistStatus::Draft, "an unknown word reads as the default");
         assert!(w.render().contains("status: abandoned"), "and is still on disk to be seen");
+    }
+
+    /// `wsp-248`: what a pass or a check records it ran on reads back into the
+    /// policy that wrote it, for every shape `label` has — the effort alone,
+    /// and a model with its own `/` and no effort, which must not lose its
+    /// last segment to the effort.
+    #[test]
+    fn a_policy_label_reads_back_into_the_policy_that_wrote_it() {
+        for (kind, model, effort) in [
+            ("claude", None, None),
+            ("claude", Some("opus[1m]"), None),
+            ("claude", Some("opus"), Some("high")),
+            ("claude", None, Some("low")),
+            ("opencode", Some("openrouter/some-model"), None),
+            ("opencode", Some("openrouter/some-model"), Some("max")),
+        ] {
+            let p = Policy { kind: kind.into(), model: model.map(String::from), effort: effort.map(String::from) };
+            assert_eq!(Policy::of_label(&p.label()), Some(p.clone()), "{}", p.label());
+        }
+        assert_eq!(Policy::of_label(""), None);
     }
 }

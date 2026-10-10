@@ -3827,13 +3827,16 @@ pub(crate) struct Wip {
     /// project its group's work is in (`wsp-230`): it holds no claim and no
     /// binding, so this is the only reading that names it.
     pub checking: std::collections::BTreeMap<String, (String, Option<String>)>,
+    /// seat -> what the check standing there records it ran on, for its row's
+    /// kind, model and effort. Beside `checking` rather than in its tuple,
+    /// because that tuple is what names the seat and this is what it runs.
+    pub check_on: std::collections::BTreeMap<String, String>,
 }
 
 /// Every standing barrier check's seat, named against its list and placed in
 /// the project its group's first member lives in.
-fn checking(store: &Store, tasks: &[Task]) -> std::collections::BTreeMap<String, (String, Option<String>)> {
-    let lists = store.worklists();
-    crate::barrier::seats(&lists)
+fn checking(lists: &[crate::model::Worklist], tasks: &[Task]) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+    crate::barrier::seats(lists)
         .into_iter()
         .map(|(seat, (list, at))| {
             let project = lists
@@ -3870,7 +3873,8 @@ impl Wip {
         let agents_held = store.agents_held();
         let now = util::epoch_secs();
         let verifying = crate::verification::seats(&tasks);
-        let checking = checking(store, &tasks);
+        let lists = store.worklists();
+        let checking = checking(&lists, &tasks);
         let agents = agents
             .into_iter()
             .filter(|(s, quiet)| {
@@ -3897,6 +3901,7 @@ impl Wip {
             asks: crate::waiting::Asks::read(store),
             mandates: store.mandates(),
             checking,
+            check_on: crate::barrier::ran_on(&lists),
         }
     }
 }
@@ -4044,6 +4049,79 @@ pub(crate) struct WipRow {
     /// facts and both are published; a reader that wants "only when they
     /// differ" compares them. Published as `direction`.
     pub(crate) direction: Option<String>,
+    /// What runs in the seat. Published as `kind`, `model` and `effort`.
+    pub(crate) runs: Runs,
+}
+
+/// What runs in a seat — the kind (`claude`, `opencode`), the model as it was
+/// spawned (`opus`, `sonnet[1m]`, an opencode `provider/model`) and the effort
+/// (`high`) — read off the record the seat was started by (`wsp-248`).
+///
+/// **Each half is `None` when that record does not state it, never guessed.**
+/// A spawn that named no tier writes none, and `default` in `spawned at` is
+/// the record of a half nobody stated — what the settings file said, which
+/// wsp never knew. Filling either from the kind's usual model would be a
+/// census that agrees with itself and not with the seat; the model that
+/// actually *served* is a different fact, read off the transcript when the
+/// claim ends (`cmd_attempts`), and is not this one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Runs {
+    pub(crate) kind: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+}
+
+impl Runs {
+    /// A verification pass's or a barrier check's `on`, which is a
+    /// [`crate::model::Policy::label`].
+    fn of_label(on: &str) -> Runs {
+        crate::model::Policy::of_label(on)
+            .map(|p| Runs { kind: Some(p.kind), model: p.model, effort: p.effort })
+            .unwrap_or_default()
+    }
+
+    /// The tier [`spawned_at`] wrote on a claim line, and the kind beside it.
+    /// The effort is after the *last* `/`, since an opencode model has its
+    /// own (`cmd_attempts::agrees` argues the same split).
+    fn of_spawned(kind: Option<String>, tier: &str) -> Runs {
+        let stated = |s: &str| Some(s.to_string()).filter(|s| !s.is_empty() && s != "default");
+        let (model, effort) = match tier.rsplit_once('/') {
+            Some((m, e)) => (stated(m), stated(e)),
+            None => (stated(tier), None),
+        };
+        Runs { kind, model, effort }
+    }
+}
+
+/// What runs in `seat`, by what the seat is: a governor's from its record in
+/// `governors.json`, a verifier's from its pass, a check's from its entry, and
+/// a member's from its claim — the kind on the claim (or, for a claim made
+/// before it carried one, the binding) and the tier on the claim's log line.
+///
+/// The governor first because its record is rewritten by the two verbs that
+/// start a governor's agent (`cmd_govern::note_started`); a claim made from a
+/// governor's seat afterwards did not start anything. Where wsp-117 left a
+/// governor's tier unwritten the record says `""`, which is `None` here too.
+fn runs(w: &Wip, seat: &str, governs: Option<&str>, held: Option<&Task>) -> Runs {
+    let text = |v: Option<&Value>, k: &str| {
+        v.and_then(|v| v.get(k)).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
+    };
+    if let Some(rec) = governs.and_then(|g| w.governors.get(g)) {
+        return Runs { kind: text(Some(rec), "kind"), model: text(Some(rec), "model"), effort: text(Some(rec), "effort") };
+    }
+    if let Some(on) = crate::verification::ran_on(&w.tasks, seat).or_else(|| w.check_on.get(seat).cloned()) {
+        return Runs::of_label(&on);
+    }
+    let Some(t) = held else { return Runs::default() };
+    let kind = text(w.claims.get(&t.id), "agent_kind").or_else(|| text(w.bindings.get(seat), "agent_kind"));
+    // The newest claim line, and only when it is this seat's: an older line,
+    // or one another pane wrote, is somebody else's start.
+    let tier = crate::cmd_attempts::attempts_of(t)
+        .pop()
+        .filter(|a| a.pane == seat)
+        .map(|a| a.spawned)
+        .unwrap_or_default();
+    Runs::of_spawned(kind, &tier)
 }
 
 /// The agents, resolved and in reading order: by project, then by pane.
@@ -4096,6 +4174,11 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
         let seat_of_project = cmd_govern::governs(&w.governors, &cmd_govern::seat_query(workspace_id, Some(seat)));
         let needs_you = cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some());
+        // The task whose claim started this seat: its binding's, or — once the
+        // binding has gone with a reseat — the open one its agent claimed.
+        let held = bound.or_else(|| {
+            holding(&w.tasks, &w.bindings, &w.claims, &w.agents_held, seat).and_then(|id| w.tasks.iter().find(|t| t.id == id))
+        });
 
         rows.push(WipRow {
             project: r.project.unwrap_or_else(|| "—".into()),
@@ -4111,7 +4194,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             state_typed: a.state,
             turning: a.state.turn_in_flight(),
             needs_you,
-            seat: seat_of_project,
+            seat: seat_of_project.clone(),
             said: sentence(&w.said, seat, bound.map(|t| t.id.as_str())),
             waiting: crate::waiting::reading(Some(a.state), &w.asks, seat, bound.map(|t| t.id.as_str()).unwrap_or("")),
             members_waiting: 0,
@@ -4127,6 +4210,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             // mandate on one that has since been removed points nowhere.
             direction: crate::cmd_mandate::from_map(&w.mandates, agent.as_deref(), Some(workspace_id))
                 .filter(|p| w.index.get(p).is_some()),
+            runs: runs(w, seat, seat_of_project.as_deref(), held),
         });
     }
     // A governor's count, once every row has its own reading.
@@ -4167,6 +4251,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "direction": r.direction,
             "waiting": r.waiting.as_ref().map(|w| w.json()),
             "members_waiting": r.seat.as_ref().map(|_| r.members_waiting),
+            "kind": r.runs.kind, "model": r.runs.model, "effort": r.runs.effort,
         })).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
@@ -7397,6 +7482,7 @@ mod tests {
             answered_by: Default::default(),
             mandates: Default::default(),
             checking: Default::default(),
+            check_on: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -7584,6 +7670,7 @@ mod tests {
             answered_by: Default::default(),
             mandates: Default::default(),
             checking: Default::default(),
+            check_on: Default::default(),
         }
     }
 
@@ -7618,6 +7705,79 @@ mod tests {
         assert_eq!(row.task, "gpui-migration · barrier 4");
         assert!(row.task_id.is_empty(), "it holds no row");
         assert_eq!(row.project, "wsp");
+    }
+
+    /// `wsp-248`. Each seat's kind, model and effort, read off the record that
+    /// started it — and each fixture written in that record's own spelling, so
+    /// a change to how one is written fails here rather than reading as `null`
+    /// in compound's Agents view: a member's claim (`agent_kind`, and `spawned
+    /// at` on its log line), a verifier's pass (`on claude opus/high`), a
+    /// check's entry (`on:` with its spaces as `+`), a governor's record in
+    /// `governors.json`. A seat with none of them, a governor whose tier
+    /// wsp-117 left unwritten, and a member whose newest claim line is another
+    /// pane's give `null` rather than a guess.
+    #[test]
+    fn wip_json_says_what_runs_in_each_seat_from_the_record_that_started_it() {
+        let mut w = wip_world();
+        let log = |t: &mut Task, line: &str| t.body = format!("## Log\n- {line}\n");
+        for t in w.tasks.iter_mut() {
+            match t.id.as_str() {
+                "t-001" => log(t, "2026-10-10T09:00:00Z claimed by pane w1:p1 · spawned at sonnet[1m]/high"),
+                "t-002" => log(t, "2026-10-10T09:00:00Z claimed by pane w2:p1 · spawned at opencode/x-preview-f-free/default"),
+                "t-003" => log(t, "2026-10-10T09:00:00Z claimed by pane w9:p1 · spawned at opus/high"),
+                "t-004" => {
+                    t.body = "## Verification\n- 2026-10-10T09:10:00Z running · read abc1234 · pane cpd-485 · on claude opus/high\n".into()
+                }
+                _ => {}
+            }
+        }
+        w.claims.insert("t-001".into(), json!({ "agent_kind": "claude", "claimed_at": "2026-10-10T09:00:00Z" }));
+        // A claim from before the claim carried a kind: the binding has it.
+        w.claims.insert("t-002".into(), json!({ "claimed_at": "2026-10-10T09:00:00Z" }));
+        w.bindings.get_mut("w2:p1").unwrap()["agent_kind"] = json!("opencode");
+        // t-003 is bound here, but its newest claim line is another pane's.
+        w.bindings.insert("w7:p1".into(), json!({ "task_id": "t-003", "agent_kind": "claude" }));
+        let groups = crate::model::parse_groups(
+            "- 1  m-1\n  checks: 2026-10-10T09:20:00Z running read:55c4839abcde pane:cpd-486\n          on:opencode+openrouter/some-model/high\n",
+        );
+        let mut list = crate::model::Worklist::new("gpui-migration", "the list");
+        list.set_groups(&groups);
+        w.check_on = crate::barrier::ran_on(&[list]);
+        w.governors.insert(
+            "wsp".into(),
+            json!({ "workspace": "w5", "pane": "w5:p1", "kind": "claude", "model": "opus", "effort": "xhigh" }),
+        );
+        w.governors.insert("run".into(), json!({ "workspace": "w6", "pane": "w6:p1", "kind": "claude", "model": "", "effort": "" }));
+        for seat in ["cpd-485", "cpd-486", "w5:p1", "w6:p1", "w7:p1"] {
+            w.agents.push(seated_agent(seat, "working", seat));
+        }
+
+        let j = wip_json(&w);
+        let runs = |pane: &str| {
+            let r = j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap_or_else(|| panic!("no row {pane}"));
+            (r["kind"].clone(), r["model"].clone(), r["effort"].clone())
+        };
+        let n = serde_json::Value::Null;
+        assert_eq!(runs("w1:p1"), (json!("claude"), json!("sonnet[1m]"), json!("high")), "a member, off its claim");
+        assert_eq!(
+            runs("w2:p1"),
+            (json!("opencode"), json!("opencode/x-preview-f-free"), n.clone()),
+            "the effort is after the last `/`, and `default` is nobody having said"
+        );
+        assert_eq!(runs("cpd-485"), (json!("claude"), json!("opus"), json!("high")), "a verifier, off its pass");
+        assert_eq!(
+            runs("cpd-486"),
+            (json!("opencode"), json!("openrouter/some-model"), json!("high")),
+            "a check, off its entry, the model's own `/` kept"
+        );
+        assert_eq!(runs("w5:p1"), (json!("claude"), json!("opus"), json!("xhigh")), "a governor, off its record");
+        assert_eq!(runs("w6:p1"), (json!("claude"), n.clone(), n.clone()), "wsp-117's empty tier is not a tier");
+        assert_eq!(runs("w7:p1"), (json!("claude"), n.clone(), n.clone()), "another pane's claim line is not this seat's tier");
+        assert_eq!(runs("w3:p1"), (n.clone(), n.clone(), n.clone()), "no record, nothing guessed");
+        let bare = j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == "w3:p1").unwrap();
+        for k in ["kind", "model", "effort"] {
+            assert!(bare.get(k).is_some(), "the key `{k}` is always present, as `null`");
+        }
     }
 
     /// `wsp-145`. The heading counts agents and turns, which is a true

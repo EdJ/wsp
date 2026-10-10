@@ -2056,6 +2056,18 @@ handed one wsp cannot spell.
 `--on <machine>` is orthogonal. The flag states the tier; it does not guarantee
 the remote seat can honour it.
 
+`wsp wip --json` says what each seat was started at, as `kind`, `model` and
+`effort` on every `agents[]` row (`wsp-248`): `"claude"`, `"sonnet[1m]"`,
+`"high"`, or an opencode `"opencode"`, `"openrouter/some-model"`, `null`. Each
+is read off the record that started the seat — a member's claim (`agent_kind`,
+and `spawned at` on its log line), a verifier's pass (`on claude opus/high`),
+a barrier check's entry (`on:claude+opus/high`), a governor's record in
+`governors.json` — and each is `null` where that record does not say, never
+filled in: a spawn that named no tier, `default` in `spawned at`, a governor
+whose tier was never written (wsp-117), and a seat with no record at all. The
+model is the alias as typed; what actually served is `wsp attempts`' column,
+read off the transcript when the claim ends.
+
 ### Looking at a pane
 
 ```sh

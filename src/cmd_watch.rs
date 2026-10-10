@@ -2463,6 +2463,7 @@ impl Source for Poll<'_> {
             // Nor a direction: rows here are read for state, never published.
             mandates: Default::default(),
             checking: Default::default(),
+            check_on: Default::default(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -4562,6 +4563,7 @@ mod tests {
             members_waiting: 0,
             held: None,
             direction: None,
+            runs: Default::default(),
         }
     }
 
@@ -5616,6 +5618,7 @@ mod tests {
             members_waiting: 0,
             held: None,
             direction: None,
+            runs: Default::default(),
         }
     }
 

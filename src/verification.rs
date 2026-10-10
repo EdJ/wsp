@@ -357,6 +357,19 @@ pub(crate) fn seats(tasks: &[Task]) -> BTreeMap<String, String> {
     out
 }
 
+/// What the pass standing in `seat` records it ran on — its `on` clause, a
+/// [`crate::model::Policy::label`] — for `wip`'s kind, model and effort
+/// (`wsp-248`). `None` when no pass stands there or it recorded nothing.
+pub(crate) fn ran_on(tasks: &[Task], seat: &str) -> Option<String> {
+    tasks
+        .iter()
+        .filter(|t| t.body.contains("## Verification"))
+        .flat_map(passes)
+        .filter(|p| p.standing() && p.pane.as_deref() == Some(seat))
+        .last()
+        .and_then(|p| p.on)
+}
+
 /// The member a seat has ever verified, and the pass it did it in: the newest
 /// one, of any state and any ending. `wsp-197`.
 ///

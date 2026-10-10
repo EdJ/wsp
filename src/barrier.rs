@@ -259,6 +259,21 @@ pub(crate) fn seats(lists: &[Worklist]) -> BTreeMap<String, (String, usize)> {
     out
 }
 
+/// Every standing check seat, by pane, to what its entry records it ran on —
+/// the policy's label with its spaces back — for `wip`'s kind, model and
+/// effort (`wsp-248`). A seat whose entry recorded nothing is absent.
+pub(crate) fn ran_on(lists: &[Worklist]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for g in lists.iter().flat_map(|w| w.groups()) {
+        for c in &g.checks {
+            if let (Some(p), Some(on)) = (c.standing(), &c.on) {
+                out.insert(p.to_string(), on.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The list and group a seat is checking, if it is one.
 pub(crate) fn seat_of(store: &Store, seat: &str) -> Option<(String, usize)> {
     seats(&store.worklists()).remove(seat)
