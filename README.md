@@ -2473,6 +2473,18 @@ on sitting in a **later** group, or a same-group edge added or taken away in a
 group the run has started. The last two are checked again when a list is edited
 (`worklist add`, `mv`, `followup`), and only for what the edit changes.
 
+In JSON, for compound and any other client: `wsp show <id> --json` carries
+`"after": ["<on>", …]`, always present and `[]` when the task rests on nothing;
+`wsp after <id> --json` prints `{"id", "after"}` in the same shape. `wsp
+worklist show --json` gives each group two maps keyed by member. `"after":
+{"<member>": ["<on>", …]}` is every edge of every member that has one, an
+off-list edge included, so a client can draw those as such; a member with no
+edge is absent, and a group with none is `{}`. `"waiting": {"<member>": ["<on>",
+…]}` is the live run's holds: each member not yet started (`todo`, unclaimed)
+and the members of its own group it rests on that have not landed. It is `{}` on
+every group but the one the list stands at, and on every group of a draft or a
+closed list (a held or parked one still reports its holds).
+
 ## Stopped, and the two reasons
 
 ```sh
