@@ -1365,6 +1365,21 @@ group's first member's caption and `and N more`, with `from` saying which —
 `src/caption.rs` has the rule. `wsp review` refuses a row with none and prints
 the derived one as the command that takes it (Ed, 2026-10-09, E-1).
 
+A verdict carries a caption too, and it is **required** (`wsp-241`): `wsp
+verified`, `worklist go`, `hold` and `followup` refuse a verdict without
+`--caption "…"`, the reason read after the word wsp puts in front of it itself
+(`holds`, `blocks`, `passed`, `held`). At the barrier's verbs a verdict of one
+sentence under 60 characters is its own caption. Where it is kept: ` · caption
+…` last on the `## Verification` entry's header line, a `verdict-caption:` line
+under a group's `verdict:`, and ` · caption: …` at the end of the log's `held —`
+and `follow-up by` lines and a `go` that started the list. In `--json`: `show`
+has `verification: [{state, verdict, caption, at, decided, read, pane}]`, and
+`worklist show` each group's `verdict_caption` beside `verdict` (still a
+string) and `hold_caption` for the newest hold — each in §17.6's shape, `{word,
+tail, text, from, at}`. A verdict written before captions is never captioned
+with its own first sentence: a pass reads `Holds · 09:16`, a barrier `Passed ·
+2026-10-08 · 11 lines`, with `from: "stage"`.
+
 Both dated sections store the *instant*, in UTC — `- 2026-08-16T23:15:00Z …` —
 and every command that shows one converts it to the reader's own date, so a
 decision taken at 01:15 CEST reads as the day it was taken rather than the day
@@ -4469,7 +4484,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/store.rs` | atomic writes, `O_EXCL` id allocation, git, state, hooks |
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
-| `src/caption.rs` | the line a glance reads for a task, a worklist and a group: authored and checked at the verb, or derived from the title or the members — one derivation, so `ls` and the chrome never disagree |
+| `src/caption.rs` | the line a glance reads for a task, a worklist and a group: authored and checked at the verb, or derived from the title or the members — one derivation, so `ls` and the chrome never disagree; and a verdict's, a word wsp derives and a tail the verb requires |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back |
 | `src/after.rs` | member dependencies: `after:` on a task, `wsp after`, its five refusals, and the run's hold on a member until the member of its own group it rests on has landed |

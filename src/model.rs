@@ -1494,6 +1494,15 @@ pub struct Group {
     /// decision to pass it is the list's `status` moving off `draft`. One
     /// written fact per barrier, and no barrier with two.
     pub verdict: String,
+    /// `verdict-caption:` — the verdict's tail, the reason a glance reads
+    /// after the `passed` wsp puts in front (`wsp-241`). Written with
+    /// [`Self::verdict`] and never alone; empty on every verdict written
+    /// before captions, which reads as its date and length instead.
+    ///
+    /// A line of its own rather than a clause inside `verdict:`, which is a
+    /// paragraph that wraps: a caption is one line and is read without it.
+    /// An older binary reads the line as members, as it does `caption:`.
+    pub verdict_caption: String,
     /// What each member put on the trunk, recorded by `wsp worklist go` at the
     /// moment it passed the barrier — one entry per member, in member order:
     /// the merge commit, the files that land touched, and [`Landed::commit`]
@@ -1845,6 +1854,9 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         } else if let Some(rest) = trimmed.strip_prefix("caption:") {
             last.caption = rest.trim().to_string();
             cont = Cont::Members;
+        } else if let Some(rest) = trimmed.strip_prefix("verdict-caption:") {
+            last.verdict_caption = rest.trim().to_string();
+            cont = Cont::Members;
         } else if let Some(rest) = trimmed.strip_prefix("agent:") {
             // One line, never wrapped: a policy is three words.
             last.agent = rest.trim().to_string();
@@ -1976,6 +1988,10 @@ pub fn render_groups(groups: &[Group]) -> String {
         }
         block(&mut out, "stop", &g.stop);
         block(&mut out, "verdict", &g.verdict);
+        // Never wrapped: a caption is refused past sixty at the verb.
+        if !g.verdict_caption.trim().is_empty() {
+            out.push_str(&format!("  verdict-caption: {}\n", g.verdict_caption.trim()));
+        }
         block(&mut out, "checks", &crate::barrier::text(&g.checks));
         block(&mut out, "landed", &landed_text(&g.landed));
     }

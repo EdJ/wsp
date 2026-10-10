@@ -1774,6 +1774,31 @@ fn holds(store: &Store, w: &Worklist, pos: &Position, ordinal: usize, g: &Group)
     }
 }
 
+/// A passed barrier's caption: `Passed — <tail>`, or with no tail its date
+/// and how many lines `show` draws the verdict in. `None` on a barrier nobody
+/// has passed — a stage is `wsp-242`'s, and this is the verdict's own line.
+fn verdict_caption(g: &Group, groups: usize) -> Option<crate::caption::Told> {
+    let v = g.verdict.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let (at, said) = match v.split_once(' ') {
+        Some((at, said)) if util::is_stamp(at) => (at, said),
+        _ => ("", v),
+    };
+    let lines = util::wrap(said.trim(), prose_width(groups)).len();
+    let tail = Some(g.verdict_caption.as_str());
+    Some(crate::caption::of_barrier("passed", tail, at, lines, "verdict"))
+}
+
+/// The newest hold's caption, the same way: `Held — <tail>`, or its date and
+/// length. `None` for a list never held.
+fn hold_caption(w: &Worklist) -> Option<crate::caption::Told> {
+    let (date, why, caption) = last_entry(w, HELD)?;
+    let lines = util::wrap(&why, prose_width(w.groups().len())).len();
+    Some(crate::caption::of_barrier("held", caption.as_deref(), &date, lines, "hold"))
+}
+
 /// `worklist show --json`'s groups.
 fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::model::Task]) -> serde_json::Value {
     let groups = w.groups();
@@ -1788,7 +1813,10 @@ fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::mode
             "agent": g.agent,
             "member_agents": g.member_agents,
             "stop": g.stop,
+            // Still the string it always was, so no reader of it breaks; the
+            // caption is beside it (`wsp-241`), null until the barrier passes.
             "verdict": g.verdict,
+            "verdict_caption": verdict_caption(g, groups.len()).map(|c| c.json()),
             "members": g.members,
             // Whole, where the plan drawing draws a count: an
             // abridgement is a thing done for a reader, and a parser
@@ -1937,6 +1965,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                 "behind": behind_json(&pos.slipped),
                 "unwritten": pos.unwritten,
                 "dangling": dangling,
+                // The newest hold's caption, whether or not the list is still
+                // held: it is the last thing said about why it stopped.
+                "hold_caption": hold_caption(&w).map(|c| c.json()),
             }))
             .unwrap_or_default()
         );
@@ -2228,12 +2259,41 @@ const HELD: &str = "held —";
 const PARKED: &str = "parked —";
 
 fn last_logged(w: &Worklist, mark: &str) -> Option<String> {
+    last_entry(w, mark).map(|(_, said, _)| said)
+}
+
+/// The newest entry under `mark`: its date, its sentence, and the caption
+/// written on it, if one was.
+fn last_entry(w: &Worklist, mark: &str) -> Option<(String, String, Option<String>)> {
     let log = w.section("Log").unwrap_or_default();
     log.lines()
         .rev()
         .filter_map(|l| l.trim().strip_prefix("- "))
-        .filter_map(|l| l.split_once(' ').map(|(_, rest)| rest.trim()))
-        .find_map(|rest| rest.strip_prefix(mark).map(|s| s.trim().to_string()))
+        .filter_map(|l| l.split_once(' ').map(|(date, rest)| (date, rest.trim())))
+        .find_map(|(date, rest)| {
+            let (said, caption) = uncaptioned(rest.strip_prefix(mark)?);
+            Some((date.to_string(), said.trim().to_string(), caption.map(str::to_string)))
+        })
+}
+
+/// How a log line carries its verdict's caption (`wsp-241`): last, under a
+/// key, so the sentence before it reads back exactly as it did before there
+/// were captions. Last because the sentence is somebody's paragraph, folded,
+/// and the key is found from the end.
+const LOGGED_CAPTION: &str = " · caption: ";
+
+fn with_caption(entry: &str, caption: Option<&str>) -> String {
+    match caption.filter(|c| !c.is_empty()) {
+        Some(c) => format!("{entry}{LOGGED_CAPTION}{c}"),
+        None => entry.to_string(),
+    }
+}
+
+fn uncaptioned(rest: &str) -> (&str, Option<&str>) {
+    match rest.rsplit_once(LOGGED_CAPTION) {
+        Some((said, c)) => (said, Some(c.trim())),
+        None => (rest, None),
+    }
 }
 
 /// The column a group's prose is wrapped to in [`show`], off the widest
@@ -3217,14 +3277,25 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
-    go_with(store, args, w, said, seat, crate::barrier::State::Passes)
+    go_with(store, args, w, said, seat, crate::barrier::State::Passes, None)
 }
 
 /// `go` once the list and the sentence are in hand. [`followup`]'s non-blocking
 /// form passes the barrier through here, with a verdict it composes itself.
 /// `said_as` is what the check open on the passed barrier is recorded as having
-/// said: a pass, or a pass with follow-ups.
-fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool, said_as: crate::barrier::State) -> i32 {
+/// said: a pass, or a pass with follow-ups. `caption` is the verdict's tail
+/// when the caller has already read it, and `None` for `go`'s own `--caption`,
+/// which is asked for only once there is a barrier to pass — a second `go`
+/// that passes nothing is not refused for the want of one.
+fn go_with(
+    store: &Store,
+    args: &Args,
+    mut w: Worklist,
+    said: String,
+    seat: bool,
+    said_as: crate::barrier::State,
+    caption: Option<String>,
+) -> i32 {
     if w.status() == WorklistStatus::Done {
         eprintln!("wsp: `{}` is done — nothing in it is waiting to start", w.id);
         return 1;
@@ -3319,6 +3390,14 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
         eprintln!("     {} \"why\"                stops instead", how("hold", &w, seat));
         return 1;
     }
+    // `wsp-241`: the verdict's tail, before anything is swept or written.
+    let caption = match caption {
+        Some(c) => Some(c),
+        None => match crate::caption::required(args, &said, "passed") {
+            Ok(c) => c,
+            Err(code) => return code,
+        },
+    };
 
     let mut groups = w.groups();
     let resuming = matches!(shut, Some((Gate::Held, _)));
@@ -3394,6 +3473,7 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
         false => {
             if let Some(n) = crossed {
                 groups[n - 1].verdict = verdict_of(&said);
+                groups[n - 1].verdict_caption = caption.clone().unwrap_or_default();
                 // The association between member and commits, written while it
                 // is still in hand: the sweep this call just ran deletes the
                 // branch that was the only other place it lived, and what
@@ -3417,7 +3497,13 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
         (_, _, Some(n)) => format!("passed {} · {}", groups[n - 1].members.join(" "), said.trim()),
         _ => format!("go · {}", said.trim()),
     };
-    w.log(entry.trim_end_matches(" · ").trim_end());
+    let mut entry = entry.trim_end_matches(" · ").trim_end().to_string();
+    // A start crosses no barrier, so there is no group to carry its caption,
+    // and the log line is the only record of the verdict there is.
+    if crossed.is_none() {
+        entry = with_caption(&entry, caption.as_deref());
+    }
+    w.log(&entry);
 
     // Written here rather than by `next`, which a governor polls: once per
     // barrier is a record and once per poll is a log made of its own polling.
@@ -3483,6 +3569,7 @@ fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool
                 "started": starting,
                 "passed": crossed,
                 "verdict": said,
+                "verdict_caption": caption,
                 "same_file": touched.as_ref().map(|t| t.overlap.shared.iter().map(|(f, who)| json!({ "file": f, "members": who })).collect::<Vec<_>>()).unwrap_or_default(),
                 "unread": touched.as_ref().map(|t| t.overlap.unread.clone()).unwrap_or_default(),
                 // The record itself, whole: a parser is not the reader the
@@ -3803,18 +3890,23 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
         return 1;
     }
 
+    let caption = match crate::caption::required(args, &said, "held") {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+
     let pos = worklist::position(store, &w, Reading::Landed);
     let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members, &BTreeMap::new());
 
     w.set_status(WorklistStatus::Held);
-    w.log(&format!("{HELD} {}", said.trim()));
+    w.log(&with_caption(&format!("{HELD} {}", said.trim()), caption.as_deref()));
     let groups = w.groups();
     let msg = format!("hold {}", w.id);
     let code = save(store, &mut w, &groups, "hold", &msg);
     if code != 0 {
         return code;
     }
-    store.log_event("worklist-held", json!({ "id": w.id, "why": said }));
+    store.log_event("worklist-held", json!({ "id": w.id, "why": said, "caption": caption }));
     // The check on the barrier the run stands at, if one is open, held it —
     // or was overruled by whoever did. Its seat is ended by the tick.
     if let Some(at) = pos.at {
@@ -3836,6 +3928,7 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
                 "worklist": w.id,
                 "status": w.status().as_str(),
                 "why": said,
+                "caption": caption,
                 "in_flight": flight.waiting.iter().map(|(s, _)| s.id.clone()).collect::<Vec<_>>(),
             })
         );
@@ -4040,6 +4133,12 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
         }
         Err(code) => return code,
     };
+    // Its word is the one the barrier will read as: `passed` for `--next`,
+    // which is a pass, and `held` for `--blocking`, which is not yet.
+    let caption = match crate::caption::required(args, &verdict, if blocking { "held" } else { "passed" }) {
+        Ok(c) => c.unwrap_or_default(),
+        Err(code) => return code,
+    };
 
     // One round. Refused, but not dropped: the check found work, and what it
     // found reaches the governor as a decision.
@@ -4048,16 +4147,25 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
         return refuse_round(store, w, at, &row, &prior, &members, &verdict);
     }
 
+    let said = Said { verdict: &verdict, caption: &caption };
     if blocking {
-        followup_blocking(store, args, &w.id, at, &row, &members, &verdict)
+        followup_blocking(store, args, &w.id, at, &row, &members, said)
     } else {
-        followup_next(store, args, &w.id, at, &row, &members, &verdict)
+        followup_next(store, args, &w.id, at, &row, &members, said)
     }
+}
+
+/// A follow-up's verdict and its caption, which travel together.
+#[derive(Clone, Copy)]
+struct Said<'a> {
+    verdict: &'a str,
+    caption: &'a str,
 }
 
 /// The rows join the group being run, and the barrier is checked again once
 /// they land.
-fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str, members: &[String], verdict: &str) -> i32 {
+fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str, members: &[String], said: Said) -> i32 {
+    let verdict = said.verdict;
     // Under the lock, re-read: a `go` from elsewhere, or a second call by
     // this check, may have moved the list since it was first read.
     let outcome = store.locked(|| -> Result<Worklist, i32> {
@@ -4073,7 +4181,10 @@ fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str,
         if let Some(code) = refuse_edges(store, &w, &groups) {
             return Err(code);
         }
-        w.log(&format!("{FOLLOWUP} {row} holds: {} · join group {at} · {verdict}", members.join(" ")));
+        w.log(&with_caption(
+            &format!("{FOLLOWUP} {row} holds: {} · join group {at} · {verdict}", members.join(" ")),
+            Some(said.caption),
+        ));
         w.set_groups(&groups);
         if let Err(e) = store.save_worklist(&w) {
             eprintln!("wsp: write failed: {e}");
@@ -4087,7 +4198,7 @@ fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str,
     };
     store.log_event(
         "worklist-followup",
-        json!({ "id": w.id, "by": row, "blocking": true, "members": members, "verdict": verdict }),
+        json!({ "id": w.id, "by": row, "blocking": true, "members": members, "verdict": verdict, "caption": said.caption }),
     );
     store.git_commit(&format!("wsp: worklist {} group {at} holds pending follow-ups {}", w.id, members.join(" ")));
     crate::cycle::tell(
@@ -4132,7 +4243,8 @@ fn ending_line(ids: &[String]) -> String {
 }
 
 /// The rows become the next group, and the barrier is passed.
-fn followup_next(store: &Store, args: &Args, id: &str, at: usize, row: &str, members: &[String], verdict: &str) -> i32 {
+fn followup_next(store: &Store, args: &Args, id: &str, at: usize, row: &str, members: &[String], said: Said) -> i32 {
+    let verdict = said.verdict;
     let stop = followup_stop(store, row, at, members);
     let outcome = store.locked(|| -> Result<Worklist, i32> {
         let mut w = store.worklist(id).ok_or(1)?;
@@ -4169,14 +4281,14 @@ fn followup_next(store: &Store, args: &Args, id: &str, at: usize, row: &str, mem
     };
     store.log_event(
         "worklist-followup",
-        json!({ "id": w.id, "by": row, "blocking": false, "members": members, "verdict": verdict }),
+        json!({ "id": w.id, "by": row, "blocking": false, "members": members, "verdict": verdict, "caption": said.caption }),
     );
     store.git_commit(&format!("wsp: worklist {} follow-ups {} are group {}", w.id, members.join(" "), at + 1));
 
     // The pass is `go`'s own, so it is the ordinary one in every respect, and
     // the verdict on the group says the follow-ups were part of it.
-    let said = format!("passes, with follow-ups {} as group {} — {verdict}", members.join(" "), at + 1);
-    let code = go_with(store, args, w.clone(), said, false, crate::barrier::State::Next);
+    let passed = format!("passes, with follow-ups {} as group {} — {verdict}", members.join(" "), at + 1);
+    let code = go_with(store, args, w.clone(), passed, false, crate::barrier::State::Next, Some(said.caption.to_string()));
     if code != 0 {
         eprintln!(
             "wsp: {} are group {} of `{}`, but its barrier was not passed — `wsp worklist go {} --from FILE` passes it",
@@ -6355,7 +6467,7 @@ mod tests {
         let file = store.root.join("verdict.md");
         let path = file.to_str().expect("a utf-8 temp dir").to_string();
         std::fs::write(&file, format!("{}\n", said(n))).unwrap();
-        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &path)]), 0);
+        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &path), ("caption", "wl-001 holds, so on")]), 0);
 
         let raw = std::fs::read_to_string(store.root.join("worklists/batch.md")).unwrap();
         assert!(
@@ -6396,7 +6508,9 @@ mod tests {
         );
         assert_eq!(verdicts(&store, "batch")[0], "", "and neither of them was written");
 
-        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &path)]), 0);
+        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &path)]), 2, "two sentences, and no caption");
+        assert_eq!(verdicts(&store, "batch")[0], "", "and nothing was written for it");
+        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &path), ("caption", "all three landed")]), 0);
         assert!(
             verdicts(&store, "batch")[0]
                 .ends_with("All three landed. `worklist-045` carries the fix."),
@@ -6421,6 +6535,91 @@ mod tests {
             "held wl-002 is blocked on a decision that is Ed's.",
             "the reason somebody walking up hours later reads"
         );
+    }
+
+    /// `wsp-241`: `go` and `hold` refuse a verdict longer than one short
+    /// sentence without `--caption`, before anything is written. With one, it
+    /// is beside the verdict on the group and on the hold's log line, the
+    /// hold's sentence reads back without it, and `show --json` carries both —
+    /// a verdict written before captions as its date and length.
+    #[test]
+    fn a_barrier_verdict_needs_a_caption_and_it_is_kept_beside_the_verdict() {
+        let (_env, store) = running("caption");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        task(&store, "wl-003", "todo");
+        run(&store, &["new", "batch", "b"]);
+        for m in ["wl-001", "wl-002", "wl-003"] {
+            run(&store, &["add", "batch", m]);
+        }
+        flagged(&store, &["group", "batch", "1"], &[("stop", "it has to land clean")]);
+        started(&store, "batch");
+
+        let long = verdict("caption-go", "All three landed at 55c4839. `wl-001` carries the fix.");
+        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &long)]), 2, "two sentences and no caption");
+        assert_eq!(verdicts(&store, "batch")[0], "", "and the barrier was not passed");
+        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &long), ("caption", "the fix is in and it builds")]), 0);
+        let raw = std::fs::read_to_string(store.root.join("worklists/batch.md")).unwrap();
+        assert!(raw.contains("\n  verdict-caption: the fix is in and it builds\n"), "{raw}");
+        let w = store.worklist("batch").unwrap();
+        let g = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks());
+        assert!(g[0]["verdict"].as_str().unwrap().ends_with("`wl-001` carries the fix."), "the verdict is still its string");
+        assert_eq!(g[0]["verdict_caption"]["text"], "Passed — the fix is in and it builds");
+        assert_eq!(g[0]["verdict_caption"]["word"], "passed");
+        assert!(g[1]["verdict_caption"].is_null(), "a barrier nobody passed has no verdict to caption");
+
+        // A verdict from before captions: its date and the lines `show` draws.
+        let mut w = store.worklist("batch").unwrap();
+        let mut groups = w.groups();
+        groups[0].verdict = format!("2026-10-08T07:16:00Z PASSES. {}", "checked 55c4839 and it holds. ".repeat(12));
+        groups[0].verdict_caption.clear();
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+        let w = store.worklist("batch").unwrap();
+        let g = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks());
+        let lines = util::wrap(groups[0].verdict.split_once(' ').unwrap().1, prose_width(3)).len();
+        let want = format!("Passed · {} · {lines} lines", util::local_ymd("2026-10-08T07:16:00Z"));
+        assert_eq!(g[0]["verdict_caption"]["text"], want.as_str(), "never `PASSES. checked 55c4839…`");
+
+        let why = verdict("caption-hold", "wl-002 needs a design call. Ed has the question.");
+        assert_eq!(flagged(&store, &["hold", "batch"], &[("from", &why)]), 2);
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running, "and it was not held");
+        assert!(hold_caption(&store.worklist("batch").unwrap()).is_none());
+        let cap = [("from", why.as_str()), ("caption", "waiting on Ed's read of the design")];
+        assert_eq!(flagged(&store, &["hold", "batch"], &cap), 0);
+        let w = store.worklist("batch").unwrap();
+        assert!(w.section("Log").unwrap().contains("Ed has the question. · caption: waiting on Ed's read of the design"));
+        assert_eq!(gate_of(&store, "batch"), "held wl-002 needs a design call. Ed has the question.", "the sentence without its caption");
+        let held = hold_caption(&w).unwrap();
+        assert_eq!(held.text, "Held — waiting on Ed's read of the design");
+        assert_eq!(held.from, "hold");
+
+        // One short sentence is its own caption, at a terminal.
+        assert_eq!(run(&store, &["go", "batch", "Ed", "settled", "it"]), 0);
+        assert!(store.worklist("batch").unwrap().section("Log").unwrap().contains("started again · Ed settled it · caption: Ed settled it"));
+    }
+
+    /// And `followup`, the barrier check's third answer, the same way: refused
+    /// before the rows are attached, and its caption on the log line.
+    #[test]
+    fn a_follow_up_needs_a_caption_before_anything_is_attached() {
+        let store = scratch("followup-caption");
+        task(&store, "wl-001", "review");
+        row_with(&store, "wl-002", "Fix it.\n\n**Done when:** it prints hello");
+        run(&store, &["new", "run", "r"]);
+        flagged(&store, &["add", "run", "wl-001"], &[("agent", "claude")]);
+        started(&store, "run");
+        checking(&store, "run", 1, "wl-900");
+
+        let from = verdict("caption-follow", "wl-001 is short of its done-when. wl-002 closes it.");
+        let argv = ["followup", "run", "wl-002"];
+        assert_eq!(follow(&store, &argv, &[("blocking", "true"), ("from", &from)], &["wl-900"]), 2);
+        assert_eq!(groups_of(&store, "run")[0].members, vec!["wl-001"], "nothing attached");
+        let cap = [("blocking", "true"), ("from", from.as_str()), ("caption", "one small fix is owed first")];
+        assert_eq!(follow(&store, &argv, &cap, &["wl-900"]), 0);
+        let log = store.worklist("run").unwrap().section("Log").unwrap();
+        assert!(log.contains("wl-002 closes it. · caption: one small fix is owed first"), "{log}");
+        assert_eq!(followups(&store.worklist("run").unwrap()), vec![("wl-900".to_string(), vec!["wl-002".to_string()])]);
     }
 
     /// `-n` is a dry run of the whole verb. Half a dry run — the verdict

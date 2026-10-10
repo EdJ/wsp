@@ -590,7 +590,7 @@ fn told_verdict(store: &Store, w: &Worklist, t: &Task) {
     tell(store, w, &format!(
         "A verifier found a problem in the {} run: {} ({}) was sent back to doing{}. \
          `wsp show {}` has the verdict under ## Verification. The run waits for it to land again; \
-         if the finding is wrong, `wsp verified {} --holds --from FILE` records why, in your name.",
+         if the finding is wrong, `wsp verified {} --holds --from FILE --caption \"…\"` records why, in your name.",
         w.id,
         t.id,
         util::truncate(&t.title, 60),
@@ -1378,15 +1378,26 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
          debug for what it touched, never `wsp verify` or a release build.{stop}\n\n\
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
-         - it holds: `wsp verified {m} --holds --from FILE`;\n\
-         - it does not: `wsp verified {m} --blocks --from FILE`. {m} goes back to doing with \
+         - it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`;\n\
+         - it does not: `wsp verified {m} --blocks --from FILE --caption \"…\"`. {m} goes back to doing with \
          your verdict as what is owed, and its governor is told.\n\n\
+         {caption}\n\n\
          There is no row of your own: the verdict is recorded on {m} under `## Verification`, \
          and wsp ends this seat once it is in.",
         m = member.id,
         title = util::truncate(&member.title, 80),
+        caption = CAPTION_ORDER,
     )
 }
+
+/// How to write a verdict's caption, in both work orders that end in one
+/// (`wsp-241`). The examples are tails from gpui-migration, compound's
+/// `docs/ux-design.md` §17: each reads whole after `holds` or `passed`.
+const CAPTION_ORDER: &str = "**The caption is required**, and it is what a person reads at a glance: the \
+     reason in under 60 characters, written to follow the verdict word wsp puts in front of it \
+     (`holds`, `blocks`, `passed`, `held`). Plain words, no commit hashes, no ids. Like: \
+     `the wiring between the two has no test`, `the wiring is tested now`, \
+     `all six hold; Ed settled his two items`, `waiting on Ed's read of the design`.";
 
 /// A check's work order, composed from the list as it stands when it is asked,
 /// since a check has no row to keep it on: what `wsp spawn --check` hands the
@@ -1412,9 +1423,9 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group) -> String {
             "\n\n**Small work found at this barrier can be attached, not just reported.** File each row with \
              `wsp add \"…\" --parent <member>`, with a **Done when:** line in its overview, then run one of \
              these in place of `go` or `hold`:\n\
-             - it passes, with follow-ups: `wsp worklist followup {list} <id>… --next --from FILE`. The rows \
+             - it passes, with follow-ups: `wsp worklist followup {list} <id>… --next --from FILE --caption \"…\"`. The rows \
              become the next group, ahead of anything planned, on this group's agent line;\n\
-             - it holds, pending follow-ups: `wsp worklist followup {list} <id>… --blocking --from FILE`. The \
+             - it holds, pending follow-ups: `wsp worklist followup {list} <id>… --blocking --from FILE --caption \"…\"`. The \
              rows join this group, and a fresh check reads it again once they land.\n\
              At most four rows, and one round: a follow-up group cannot add its own. Anything larger, or \
              anything that needs a design call, is `wsp ask {list} -`, not a follow-up.",
@@ -1436,15 +1447,17 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group) -> String {
          undid each other — and whether the next group has what it depends on.\n\n\
          **Then decide, and wsp does the rest.** Write the verdict in under 300 words to a \
          file, then:\n\
-         - it passes: `wsp worklist go {list} --from FILE`. wsp starts the next group and \
+         - it passes: `wsp worklist go {list} --from FILE --caption \"…\"`. wsp starts the next group and \
          rotates the governor;\n\
-         - it does not: `wsp worklist hold {list} --from FILE`, saying what has to happen. \
+         - it does not: `wsp worklist hold {list} --from FILE --caption \"…\"`, saying what has to happen. \
          The governor is told.{tail}\n\n\
+         {caption}\n\n\
          A question for the governor before you decide is `wsp ask {list} -`; its answer comes back here.\n\n\
          There is no row of your own: the verb you finish with records this check on group {at}, \
          and wsp ends this seat once your turn is over.",
         list = w.id,
         members = g.members.join(" "),
+        caption = CAPTION_ORDER,
     )
 }
 
@@ -2740,7 +2753,7 @@ pub(crate) mod tests {
     fn verdict_all(store: &Store, state: crate::verification::State) {
         for m in reading(store) {
             let pane = passes_on(store, &m).last().and_then(|p| p.pane.clone());
-            crate::verification::record(store, &m, state, "checked it on the trunk", pane.as_deref()).unwrap();
+            crate::verification::record(store, &m, state, "checked it on the trunk", pane.as_deref(), None).unwrap();
         }
     }
 
@@ -2775,6 +2788,8 @@ pub(crate) mod tests {
         assert_eq!(passes_on(&store, "m-1")[0].on.as_deref(), Some("opencode some/model"), "what it runs on, recorded");
         let order = verifier_order(&store, &store.find_task("m-1").unwrap());
         assert!(order.contains("read-only") && order.contains("wsp verified m-1 --holds --from FILE"), "{order}");
+        // `wsp-241`: and how to write the caption the verb now requires.
+        assert!(order.contains("--holds --from FILE --caption") && order.contains("under 60 characters") && order.contains("no commit hashes"), "{order}");
         assert_eq!(spawned(), vec![("m-1 · verifying".into(), "opencode".into())], "on the same policy: the floor holds");
         step(&store, &w, &Blind);
         assert!(spawned().is_empty() && passes_on(&store, "m-1").len() == 1, "and only once");
@@ -2790,7 +2805,9 @@ pub(crate) mod tests {
         assert_eq!(c.len(), 1, "every member verified: one barrier check");
         assert!(c[0].open() && c[0].on.as_deref() == Some("opencode some/model"), "open, and on what: {c:?}");
         assert!(tagged(&store, BARRIER_TAG).is_empty(), "and no row for it: the check is on the group (wsp-230)");
-        assert!(check_order(&store, "run", 1).unwrap().contains("wsp worklist go run --from FILE"));
+        let order = check_order(&store, "run", 1).unwrap();
+        assert!(order.contains("wsp worklist go run --from FILE --caption") && order.contains("hold run --from FILE --caption"), "{order}");
+        assert!(order.contains("`the wiring is tested now`"), "with the examples: {order}");
         assert_eq!(spawned(), vec![("run · barrier 1".into(), "opencode".into())], "started on the list, as its check");
         step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "the open entry is the key; nothing starts twice");
@@ -3408,7 +3425,7 @@ fn only_a_working_screen_is_ever_overruled() {
         crate::repair::tick(&store, &Exits, &mut Pass::new());
         assert!(drained(&ENDED).is_empty(), "a verifier still reading is not ended by a tick");
 
-        crate::verification::record(&store, "m-1", V::Holds, "it holds", Some("cpd-9")).unwrap();
+        crate::verification::record(&store, "m-1", V::Holds, "it holds", Some("cpd-9"), None).unwrap();
         crate::repair::tick(&store, &Exits, &mut Pass::new());
         assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "a verdict is the last thing a verifier is asked for");
         assert_eq!(passes_on(&store, "m-1")[0].ending, Ending::Ended, "and the pass says so");
@@ -3432,7 +3449,7 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         let _ = spawned();
         crate::verification::name_seat(&store, "m-1", "cpd-9");
-        crate::verification::record(&store, "m-1", V::Blocks, "the second half does not hold", Some("cpd-9")).unwrap();
+        crate::verification::record(&store, "m-1", V::Blocks, "the second half does not hold", Some("cpd-9"), None).unwrap();
         let _ = drained(&TOLD);
 
         END_FAIL.with(|f| *f.borrow_mut() = Some("cpd-9 is still standing: no answer".into()));
@@ -3806,11 +3823,11 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(ps.iter().map(|p| p.state).collect::<Vec<_>>(), vec![V::Superseded, V::Running]);
         assert_eq!(ps[1].read.as_deref(), Some("def5678"));
 
-        let late = crate::verification::record(&store, "m-1", V::Holds, "abc1234 holds", Some("cpd-1"));
+        let late = crate::verification::record(&store, "m-1", V::Holds, "abc1234 holds", Some("cpd-1"), None);
         assert!(late.unwrap_err().contains("superseded"), "a verdict on the old commit is refused");
         assert!(!verified(&store.tasks(), "m-1"), "and the barrier still waits on the fresh pass");
         crate::verification::name_seat(&store, "m-1", "cpd-2");
-        crate::verification::record(&store, "m-1", V::Holds, "def5678 holds", Some("cpd-2")).unwrap();
+        crate::verification::record(&store, "m-1", V::Holds, "def5678 holds", Some("cpd-2"), None).unwrap();
         assert!(verified(&store.tasks(), "m-1"), "the newest pass is what the barrier reads");
     }
 
@@ -4439,7 +4456,7 @@ fn only_a_working_screen_is_ever_overruled() {
         store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-2" }));
         let _ = drained(&TOLD);
 
-        crate::verification::record(&store, "m-1", V::Holds, "both halves hold", None).unwrap();
+        crate::verification::record(&store, "m-1", V::Holds, "both halves hold", None, None).unwrap();
         told_about_task(&store, "m-1", "verified");
         let m1 = store.find_task("m-1").unwrap();
         assert_eq!(m1.status(), Status::Review, "a holds verdict leaves the member where it is");
@@ -4448,7 +4465,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(drained(&TOLD).is_empty(), "and is nobody's news");
 
         let verdict = "the second half does not hold\n1. wake::say must spool first";
-        crate::verification::record(&store, "m-2", V::Blocks, verdict, None).unwrap();
+        crate::verification::record(&store, "m-2", V::Blocks, verdict, None, None).unwrap();
         crate::cmd_task::deliver_reason(&store, "m-2", verdict);
         told_about_task(&store, "m-2", "verified");
         let m2 = store.find_task("m-2").unwrap();

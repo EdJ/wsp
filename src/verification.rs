@@ -125,6 +125,10 @@ pub(crate) struct Pass {
     pub decided: Option<String>,
     /// The verdict, in the verifier's words.
     pub text: String,
+    /// The verdict's tail (`wsp-241`): the reason a glance reads after the
+    /// `holds` or `blocks` wsp puts in front. `None` on every pass written
+    /// before captions, which reads as the word and its time.
+    pub caption: Option<String>,
 }
 
 impl Pass {
@@ -140,6 +144,7 @@ impl Pass {
             ending: Ending::Standing,
             decided: None,
             text: String::new(),
+            caption: None,
         }
     }
 
@@ -167,6 +172,12 @@ impl Pass {
             // break inside a clause would end the entry.
             Ending::Failed(why) => out.push_str(&format!(" · end failed: {}", crate::cmd_task::fold(why))),
         }
+        // Last, because it is the one clause made of somebody's words: a ` · `
+        // inside a caption would otherwise end it and start a clause nobody
+        // wrote. [`Pass::parse`] takes everything after the key.
+        if let Some(c) = self.caption.as_deref().filter(|c| !c.is_empty()) {
+            out.push_str(&format!(" · {CAPTION}{c}"));
+        }
         for l in self.text.trim().lines() {
             out.push_str("\n  ");
             out.push_str(l.trim_end());
@@ -177,6 +188,10 @@ impl Pass {
     fn parse(line: &str) -> Option<Pass> {
         let rest = line.strip_prefix("- ")?;
         let (at, rest) = rest.split_once(' ')?;
+        let (rest, caption) = match rest.split_once(&format!(" · {CAPTION}")) {
+            Some((head, c)) => (head, Some(c.trim().to_string())),
+            None => (rest, None),
+        };
         let mut clauses = rest.split(" · ");
         let state = State::parse(clauses.next()?.trim())?;
         let mut p = Pass {
@@ -189,6 +204,7 @@ impl Pass {
             ending: Ending::Standing,
             decided: None,
             text: String::new(),
+            caption,
         };
         for c in clauses {
             let c = c.trim();
@@ -211,6 +227,9 @@ impl Pass {
         Some(p)
     }
 }
+
+/// The key the caption clause is written under, space included.
+const CAPTION: &str = "caption ";
 
 /// A commit as an entry writes it: twelve characters, which is unambiguous in
 /// any repository wsp works in and short enough to read in `wsp show`.
@@ -241,6 +260,31 @@ pub(crate) fn passes(t: &Task) -> Vec<Pass> {
         }
     }
     out
+}
+
+/// The passes as `wsp show --json` gives them (`wsp-241`), oldest first.
+///
+/// `verdict` is the verifier's words and `state` the word, as the entry has
+/// them. `caption` is §17.6's shape on a pass that has a verdict, and null on
+/// one still reading or superseded: those have no verdict to caption, and
+/// what they are is `wsp-242`'s stage.
+pub(crate) fn json(t: &Task) -> serde_json::Value {
+    serde_json::json!(passes(t)
+        .iter()
+        .map(|p| {
+            let decided = matches!(p.state, State::Holds | State::Blocks);
+            let at = p.decided.as_deref().unwrap_or(&p.at);
+            serde_json::json!({
+                "state": p.state.as_str(),
+                "verdict": p.text,
+                "caption": decided.then(|| crate::caption::of_pass(p.state.as_str(), p.caption.as_deref(), at).json()),
+                "at": p.at,
+                "decided": p.decided,
+                "read": p.read,
+                "pane": p.pane,
+            })
+        })
+        .collect::<Vec<_>>())
 }
 
 /// Write the passes back under the heading, in time order.
@@ -294,6 +338,7 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         // The row's last touch: for a row at its verdict, the verdict.
         decided: (state != State::Running).then(|| row.updated.clone()),
         text: verdict_of(row),
+        caption: None,
     }
 }
 
@@ -447,8 +492,13 @@ pub(crate) fn supersede(store: &Store, member: &str, seat: &str) -> bool {
     wrote
 }
 
-/// `wsp verified <member> --holds|--blocks --from FILE` — a verifier's verdict,
-/// recorded on the member it read.
+/// `wsp verified <member> --holds|--blocks --from FILE --caption "…"` — a
+/// verifier's verdict, recorded on the member it read.
+///
+/// **The caption is required, with no exemption** (`wsp-241`). Only an agent
+/// wsp spawned runs this, its work order says how to write one, and a verdict
+/// is long and opens with bookkeeping, so there is no sentence of it to stand
+/// in. It is refused before anything is read or written.
 ///
 /// **Onto the caller's own pass**: the newest `running` entry whose seat is
 /// this pane, or the newest `running` entry at all for a caller with no seat.
@@ -463,7 +513,7 @@ pub(crate) fn supersede(store: &Store, member: &str, seat: &str) -> bool {
 /// as what is owed — the member goes back to `doing`, and its pane is told —
 /// and the run tells its governor once, as the decision it is.
 pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "wsp verified <member> --holds|--blocks --from FILE   (or `-` for stdin)";
+    const USAGE: &str = "wsp verified <member> --holds|--blocks --from FILE --caption \"…\"   (or `-` for stdin)";
     let state = match (args.has("holds"), args.has("blocks")) {
         (true, false) => State::Holds,
         (false, true) => State::Blocks,
@@ -477,6 +527,11 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: {USAGE}");
         return 2;
     };
+    let caption = match crate::caption::flag(args, false) {
+        Ok(Some(c)) if !c.is_empty() => c,
+        Ok(_) => return crate::caption::refuse(state.as_str()),
+        Err(code) => return code,
+    };
     let text = match crate::cmd_task::prose_kept(args, USAGE) {
         Ok(t) => t,
         Err(code) => return code,
@@ -489,7 +544,7 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         }
     };
     let me = crate::cmd_agent::my_pane();
-    let recorded = record(store, &member.id, state, &text, me.as_deref());
+    let recorded = record(store, &member.id, state, &text, me.as_deref(), Some(&caption));
     let pass = match recorded {
         Ok(p) => p,
         Err(why) => {
@@ -499,7 +554,7 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
     };
     store.log_event(
         "task-verified",
-        serde_json::json!({ "id": member.id, "verdict": state.as_str(), "read": pass.read, "pane": pass.pane }),
+        serde_json::json!({ "id": member.id, "verdict": state.as_str(), "caption": caption, "read": pass.read, "pane": pass.pane }),
     );
     store.git_commit(&format!("wsp: verified {} {} — {}", member.id, state.as_str(), member.title));
     if state == State::Blocks {
@@ -513,7 +568,7 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         _ => p.red("■"),
     };
     let read = pass.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default();
-    println!("{mark} {}  {}{read}", p.bold(&member.id), state.as_str());
+    println!("{mark} {}  {}{read}  {}", p.bold(&member.id), state.as_str(), p.dim(&crate::caption::of_pass(state.as_str(), Some(&caption), "").text));
     if state == State::Blocks {
         println!("  {}", p.dim("sent back to doing with your verdict as what is owed; its governor is told"));
     }
@@ -523,7 +578,7 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
 /// The store half of [`verified`]: the pass written, and the member moved when
 /// the verdict blocks. Separate so the choice of pass can be tested without a
 /// process environment to read a pane out of.
-pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: Option<&str>) -> Result<Pass, String> {
+pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: Option<&str>, caption: Option<&str>) -> Result<Pass, String> {
     store.locked(|| {
         let Some(mut t) = store.find_task(member) else { return Err(format!("no task {member}")) };
         let mut ps = passes(&t);
@@ -557,6 +612,7 @@ pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: 
         ps[at].state = state;
         ps[at].decided = Some(now.clone());
         ps[at].text = text.trim().to_string();
+        ps[at].caption = caption.map(str::to_string);
         let pass = ps[at].clone();
         write(&mut t, &ps);
         if state == State::Blocks {
@@ -726,6 +782,8 @@ mod tests {
             ending: Ending::Failed("cpd-12 is still standing".into()),
             decided: Some("2026-10-06T10:20:00Z".into()),
             text: "the second half does not hold\n1. spool first\n2. then deliver".into(),
+            // A ` · ` of its own, which must not end the caption at it.
+            caption: Some("spool first · then deliver".into()),
         };
         let bare = Pass { at: "2026-10-06T11:00:00Z".into(), ..Pass::opened(None, None) };
         write(&mut t, &[bare.clone(), full.clone()]);
@@ -883,11 +941,66 @@ mod tests {
         let mut m = Task::new("a member", "m-1");
         m.status_raw = Status::Review.as_str().into();
         store.save_task(&m).unwrap();
-        record(&store, "m-1", State::Holds, "the finding was about code nobody shipped", Some("w1:p1")).unwrap();
+        record(&store, "m-1", State::Holds, "the finding was about code nobody shipped", Some("w1:p1"), None).unwrap();
         let ps = passes(&store.find_task("m-1").unwrap());
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].pane.as_deref(), Some("w1:p1"));
         assert_eq!(ps[0].ending, Ending::Ended, "nothing for the tick to end: wsp started no agent for it");
         assert!(seats(&store.tasks()).is_empty(), "and the governor's seat is not named a verifier's");
+    }
+
+    /// `wsp-241`: `verified` is refused without a caption, before anything is
+    /// read or written; and the parser hands `--caption` to the verb when it
+    /// is typed after the member, where the payload's flags otherwise stop.
+    #[test]
+    fn a_verdict_with_no_caption_is_refused_and_nothing_is_written() {
+        let (_env, store) = scratch("no-caption");
+        let mut t = Task::new("a member", "m-1");
+        t.status_raw = "review".into();
+        store.save_task(&t).unwrap();
+        let from = store.root.join("verdict.md");
+        std::fs::write(&from, "checked 55c4839 on the trunk; it holds").unwrap();
+        let from = from.display().to_string();
+        let args = Args::synth("verified", &["m-1"], &[("holds", "true"), ("from", &from)]);
+        assert_eq!(cmd_verified(&store, &args), 2);
+        assert!(passes(&store.find_task("m-1").unwrap()).is_empty(), "no pass opened for a refused verdict");
+        let none = Args::synth("verified", &["m-1"], &[("holds", "true"), ("from", &from), ("caption", "none")]);
+        assert_eq!(cmd_verified(&store, &none), 2, "`none` takes a caption off; it is not one");
+
+        let line = ["verified", "m-1", "--holds", "--from", "v.md", "--caption", "the wiring is tested now"];
+        let parsed = Args::parse(line.iter().map(|s| s.to_string()).collect());
+        assert_eq!(parsed.get("caption").as_deref(), Some("the wiring is tested now"));
+        // `--from` stays a positional on a stream verb, by design (`Literal::stream`).
+        assert_eq!(parsed.rest, vec!["m-1", "--from", "v.md"], "and the caption did not become the verdict");
+    }
+
+    /// The caption is on the entry's header line and back out of it, and
+    /// `show --json` gives every pass with §17.6's caption — a pass written
+    /// before captions as its word and its clock, never its first sentence.
+    #[test]
+    fn a_passes_caption_is_on_its_entry_and_in_show_json_and_an_old_one_reads_as_its_word_and_time() {
+        let (_env, store) = scratch("caption-json");
+        let mut t = Task::new("a member", "m-1");
+        t.status_raw = "review".into();
+        let old = "- 2026-10-08T07:10:00Z holds · read 55c4839abcde · decided 2026-10-08T07:16:00Z · ended\n  55c4839 holds: both halves";
+        t.body = format!("## Overview\nthe work\n\n## Verification\n{old}\n");
+        store.save_task(&t).unwrap();
+        record(&store, "m-1", State::Blocks, "def5678 does not hold", None, Some("the wiring between the two has no test")).unwrap();
+
+        let t = store.find_task("m-1").unwrap();
+        assert!(t.body.contains(" · caption the wiring between the two has no test\n"), "{}", t.body);
+        let v = json(&t);
+        let first = &v[0];
+        assert_eq!(first["state"], "holds");
+        assert_eq!(first["verdict"], "55c4839 holds: both halves");
+        assert_eq!(first["read"], "55c4839abcde");
+        let clock = util::local_hm(util::epoch_of("2026-10-08T07:16:00Z"));
+        assert_eq!(first["caption"]["text"], format!("Holds · {clock}"), "the word and when, not `55c4839 holds`");
+        assert_eq!(first["caption"]["from"], "stage");
+        let newest = &v[1];
+        assert_eq!(newest["caption"]["text"], "Blocks — the wiring between the two has no test");
+        assert_eq!(newest["caption"]["word"], "blocks");
+        assert_eq!(newest["caption"]["tail"], "the wiring between the two has no test");
+        assert_eq!(newest["caption"]["at"], newest["decided"], "a verdict's caption is dated by the verdict");
     }
 }

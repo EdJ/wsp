@@ -1362,7 +1362,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             row(
                 "",
                 p.dim(&format!(
-                    "read-only · finish with `wsp verified {} --holds|--blocks --from FILE` · the order you were handed is the whole job",
+                    "read-only · finish with `wsp verified {} --holds|--blocks --from FILE --caption \"…\"` · the order you were handed is the whole job",
                     m.id
                 ))
                 .to_string(),
@@ -1376,7 +1376,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             row(
                 "",
                 p.dim(&format!(
-                    "read-only · finish with `wsp worklist go|hold|followup {list} … --from FILE` · the order you were handed is the whole job"
+                    "read-only · finish with `wsp worklist go|hold|followup {list} … --from FILE --caption \"…\"` · the order you were handed is the whole job"
                 ))
                 .to_string(),
             );

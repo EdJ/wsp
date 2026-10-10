@@ -1,5 +1,7 @@
 //! Identity captions: one line of plain words for a task, a worklist and a
 //! group, authored or derived — compound's `docs/ux-design.md` §17, `wsp-240`.
+//! And verdict captions, [`Told`]: a word wsp derives and a tail written at
+//! `verified`, `worklist go`, `hold` and `followup` — `wsp-241`.
 //!
 //! **Why a field and not a cut title.** gpui-migration's titles have a median
 //! of 96 characters and a sidebar row shows 26–36, so what a glance reads
@@ -267,6 +269,122 @@ pub fn flag(args: &crate::Args, from_is_ours: bool) -> Result<Option<String>, i3
     }
 }
 
+/// A verdict's caption (§17.2): a **word** wsp derives from the record and a
+/// **tail** written at the verb that gave the verdict — `wsp-241`.
+///
+/// The word is never authored, so an authored `passed` on a barrier that held
+/// cannot be said: `verified --holds`, `worklist go` and `hold` each put their
+/// own word in front, and `--caption` is only ever the reason after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Told {
+    /// `holds`, `blocks`, `passed`, `held` — lowercase, as §17.5 lists it.
+    pub word: &'static str,
+    pub tail: Option<String>,
+    pub text: String,
+    /// `verdict` or `hold` with a tail; `stage` when there is none and the
+    /// text is the word with its time, which is wsp's own and nobody's words.
+    pub from: &'static str,
+    pub at: String,
+}
+
+impl Told {
+    pub fn json(&self) -> Value {
+        let mut v = json!({ "word": self.word, "text": self.text, "from": self.from, "at": self.at });
+        if let Some(t) = &self.tail {
+            v["tail"] = json!(t);
+        }
+        v
+    }
+}
+
+/// The word and the tail, or the word and what can be said without one.
+///
+/// **Never the verdict's first sentence.** §17.4 measured gpui-migration's 57
+/// verifier verdicts: 45 open with the verdict word and 48 name a commit within
+/// their first 110 characters, so a verdict's opening is bookkeeping. A verdict
+/// written before captions existed reads as its word and when — every one of
+/// them, which is honest about what nobody wrote.
+fn told(word: &'static str, tail: Option<&str>, at: &str, from: &'static str, untold: String) -> Told {
+    match tail.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => Told { word, tail: Some(t.to_string()), text: format!("{} — {t}", capital(word)), from, at: at.to_string() },
+        None => Told { word, tail: None, text: untold, from: "stage", at: at.to_string() },
+    }
+}
+
+/// A verifier's pass: `Holds — the wiring is tested now`, and with no tail the
+/// word and its clock, `Holds · 09:16` (§17.3 A-4) — a member's stage is read
+/// beside a run that is happening today, and the hour is what places it.
+pub fn of_pass(word: &'static str, tail: Option<&str>, at: &str) -> Told {
+    let untold = match util::epoch_of(at) {
+        0 => capital(word),
+        secs => format!("{} · {}", capital(word), util::local_hm(secs)),
+    };
+    told(word, tail, at, "verdict", untold)
+}
+
+/// A barrier's verdict or hold: with no tail, the word, its date and how long
+/// the verdict runs, `Passed · 2026-10-08 · 11 lines` (§17.3 A-5) — the length
+/// being the one thing a glance can say about a paragraph it will not quote.
+/// `lines` is the caller's count, at the width it draws the verdict, so the
+/// number is the one `show` would draw.
+pub fn of_barrier(word: &'static str, tail: Option<&str>, at: &str, lines: usize, from: &'static str) -> Told {
+    let mut untold = capital(word);
+    if !at.is_empty() {
+        untold.push_str(&format!(" · {}", util::local_ymd(at)));
+    }
+    if lines > 0 {
+        untold.push_str(&format!(" · {lines} line{}", if lines == 1 { "" } else { "s" }));
+    }
+    told(word, tail, at, from, untold)
+}
+
+/// A verdict that is its own caption: one sentence, under [`LIMIT`].
+///
+/// §17.3: a person typing `go "start"` at a terminal is not asked twice. One
+/// sentence is the test and not the length alone, because two short sentences
+/// are a verdict whose second half a glance would read as the reason — and the
+/// cut that would choose between them is the first-sentence fallback §17.7
+/// rules out. A closing full stop is dropped: a caption is a line, not prose.
+pub fn own(verdict: &str) -> Option<String> {
+    let text = verdict.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = text.trim_end_matches('.');
+    // A semicolon joins two clauses of one sentence, and a sentence a file
+    // wrapped over two lines is still one: neither is a second sentence.
+    let one = !text.is_empty() && ![". ", "? ", "! "].iter().any(|s| text.contains(s));
+    (one && text.chars().count() < LIMIT && util::terminal_output(text).is_none()).then(|| text.to_string())
+}
+
+/// `--caption` on a verb that gives a verdict, where it is **required**: the
+/// tail to store, or `None` for a verdict with no words, which has nothing to
+/// give a reason for.
+///
+/// For the barrier's verbs, where a person types, so [`own`] may stand in.
+/// `verified` reads [`flag`] itself and has no exemption: only an agent wsp
+/// spawned runs it. `word` is what wsp puts in front (`passed`, `held`), so
+/// the refusal says what a caption is in terms of the line it will make.
+pub fn required(args: &crate::Args, verdict: &str, word: &str) -> Result<Option<String>, i32> {
+    match flag(args, false)? {
+        Some(c) if !c.is_empty() => return Ok(Some(c)),
+        _ => {}
+    }
+    if verdict.trim().is_empty() {
+        return Ok(None);
+    }
+    match own(verdict) {
+        Some(c) => Ok(Some(c)),
+        None => Err(refuse(word)),
+    }
+}
+
+/// The refusal, in one line: what a caption is, in terms of the word it will
+/// follow. The exit code, so a verb can return it.
+pub fn refuse(word: &str) -> i32 {
+    eprintln!(
+        "wsp: a verdict needs --caption \"…\": the reason in under {LIMIT} characters, read after the `{word}` wsp puts in front — no commit hashes"
+    );
+    2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +467,42 @@ mod tests {
         assert_eq!(of_group(&group(&["c-9"], ""), look).text, "c-9", "a member nobody can find is its id");
         assert_eq!(of_group(&group(&["c-1"], "Go or no-go on gpui"), look).from, "authored");
         assert!(!of_group(&group(&[], ""), look).text.is_empty());
+    }
+
+    /// `wsp-241`'s exemption: one sentence under sixty is its own caption,
+    /// a semicolon or a wrapped line notwithstanding, and its full stop goes;
+    /// two sentences, or sixty characters, are not — whatever their length.
+    #[test]
+    fn a_verdict_of_one_short_sentence_is_its_own_caption_and_nothing_longer_is() {
+        assert_eq!(own("start").as_deref(), Some("start"));
+        assert_eq!(own("the three landed clean.").as_deref(), Some("the three landed clean"));
+        assert_eq!(own("m-1 is short; m-2 closes it").as_deref(), Some("m-1 is short; m-2 closes it"));
+        assert_eq!(own("wl-002 is blocked on a decision\nthat is Ed's.").as_deref(), Some("wl-002 is blocked on a decision that is Ed's"));
+        assert_eq!(own("All three landed. It builds."), None, "two sentences");
+        assert_eq!(own(&"x".repeat(60)), None, "under sixty, not at it");
+        assert_eq!(own("   "), None);
+    }
+
+    /// The word is wsp's and the tail the verb's; with no tail, a pass is its
+    /// word and its clock and a barrier its word, date and length — and never
+    /// a sentence of the verdict, which was the measured reason for both.
+    #[test]
+    fn a_verdict_with_no_tail_is_its_word_and_when_never_its_first_sentence() {
+        let at = "2026-10-08T07:16:00Z";
+        let told = of_pass("holds", Some("the wiring is tested now"), at);
+        assert_eq!(told.text, "Holds — the wiring is tested now");
+        assert_eq!((told.word, told.from, told.at.as_str()), ("holds", "verdict", at));
+        let bare = of_pass("holds", None, at);
+        assert_eq!(bare.text, format!("Holds · {}", util::local_hm(util::epoch_of(at))));
+        assert_eq!((bare.from, bare.tail.as_deref()), ("stage", None));
+        assert_eq!(of_pass("blocks", Some("  "), "").text, "Blocks", "a blank tail is no tail, and no instant is no clock");
+
+        let passed = of_barrier("passed", None, at, 11, "verdict");
+        assert_eq!(passed.text, format!("Passed · {} · 11 lines", util::local_ymd(at)));
+        assert_eq!(of_barrier("held", None, "2026-10-08", 1, "hold").text, "Held · 2026-10-08 · 1 line");
+        let held = of_barrier("held", Some("waiting on Ed's read of the design"), "2026-10-08", 3, "hold");
+        assert_eq!(held.json()["text"], "Held — waiting on Ed's read of the design");
+        assert_eq!(held.json()["from"], "hold");
+        assert!(passed.json().get("tail").is_none(), "absent, not null, where nobody wrote one");
     }
 }

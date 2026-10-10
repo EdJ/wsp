@@ -2789,7 +2789,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         // a governor who has not yet decided whether the finding stands.
         tick(&store, &Fake::empty(), &mut Pass::new());
         let _ = stamped();
-        let blocked = crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "it does not hold", None).unwrap();
+        let blocked = crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "it does not hold", None, None).unwrap();
         assert!(blocked.read.is_some(), "the pass reads the landing the tick recorded before opening it");
         // Past a second boundary, so the hand move is unambiguously later than
         // the verdict: the answer must come from the commits, not the clock.
@@ -2980,7 +2980,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert_eq!(verifiers(&store).len(), 2, "each member gets its verifier, on the recorded landing");
         for m in verifiers(&store) {
-            crate::verification::record(&store, &m, crate::verification::State::Holds, "holds", None).unwrap();
+            crate::verification::record(&store, &m, crate::verification::State::Holds, "holds", None, None).unwrap();
         }
         let _ = spawned();
 

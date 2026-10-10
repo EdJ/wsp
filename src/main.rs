@@ -302,6 +302,9 @@ const OWNED_AFTER: &[(&str, &str)] = &[
     // The verdict's own two words, which come after the member as often as not.
     ("verified", "holds"),
     ("verified", "blocks"),
+    // And its caption (`wsp-241`), required, and typed after the verdict's
+    // `--from FILE` more often than not.
+    ("verified", "caption"),
     // `say` is the first row with `subject: 0`, so the payload begins at the
     // word after the verb and *every* flag it reads falls inside it. These
     // three are the whole of what `say` reads — `--pane` names the seat when
@@ -1563,12 +1566,14 @@ fn help_text() -> String {
                                 send work back: moves the row, tells
                                 its pane, and stops the run reading it as
                                 finished (`todo` sets the status and takes no prose)
-  wsp verified <member> --holds|--blocks --from FILE
+  wsp verified <member> --holds|--blocks --from FILE --caption "…"
                                     a verifier's verdict, recorded on the member
                                     under ## Verification. --blocks sends it back
                                     with the verdict as what is owed, and its
                                     governor is told; a governor answering a
-                                    block by hand writes --holds in their name
+                                    block by hand writes --holds in their name.
+                                    --caption is required: the reason in under
+                                    60, read after the holds/blocks wsp adds
   wsp done <id> [--force]           complete; --force over open sub-tasks
   wsp block <id> "reason"           stop it: somebody owes you an answer
   wsp park <id> "reason"            not yet, deliberately — say what brings
@@ -1924,7 +1929,10 @@ fn help_text() -> String {
                                     barrier: records the verdict, sweeps the
                                     trees of the groups behind it, and says
                                     which members of the group that just landed
-                                    touched one file
+                                    touched one file. --caption "…" is required
+                                    on a verdict, unless it is one sentence
+                                    under 60 and so its own; hold and followup
+                                    take it the same way
   wsp worklist hold [<slug>] "why"|-|--from FILE   the barrier's "does not
                                     pass": start nothing more. What is already
                                     running is left to finish — work in flight

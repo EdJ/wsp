@@ -708,6 +708,8 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         // asking exactly this, and the alternative is the one it actually
         // reached for — reading a state file by hand.
         v["raised"] = json!(raised_about(store, &t.id).iter().map(|m| m.to_json()).collect::<Vec<_>>());
+        // `wsp-241`: the passes, which were only ever inside `body`.
+        v["verification"] = crate::verification::json(&t);
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;
     }
