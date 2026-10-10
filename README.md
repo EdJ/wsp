@@ -1366,8 +1366,9 @@ entry on the task it is about, or a line on the list's log, and the list's seat
 is told. While one about a group, or about a member of it, is open, `wsp
 worklist go` refuses that group's barrier: a governor passing it would be
 answering for Ed. The refusal
-is the line itself: a seat, or a pane holding an agent, may raise one and is
-refused when it answers or abandons one. The person typing in an agent's pane
+is the line itself: a seat, a pane holding an agent, or a process under Claude
+or opencode (`CLAUDECODE`, `OPENCODE`) may raise one and is refused when it
+answers or abandons one. The person typing in an agent's pane
 says so with `--as-person`. It is a guard against habit, not identity. The
 design, with what each of today's prose clauses becomes, is on `wsp-233`.
 

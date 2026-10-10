@@ -427,7 +427,8 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         true => {
             let caller = Caller {
                 seat: me.scope().is_some(),
-                agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)),
+                agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p))
+                    || an_agent_process(|k| std::env::var_os(k)),
                 as_person: args.has("as-person"),
             };
             if let Err(why) = the_person(&caller) {
@@ -511,6 +512,17 @@ fn the_person(c: &Caller) -> Result<(), String> {
 /// Does this pane hold an agent: bound to a task, or a seat wsp started one in?
 fn holds_an_agent(store: &Store, pane: &str) -> bool {
     store.bindings().contains_key(pane) || store.agent_in_seat(pane).is_some()
+}
+
+/// Is this wsp running under an agent, whatever pane it is in?
+///
+/// The pane only knows the agents wsp put there. Claude started by hand in a
+/// plain pane, or a governor's subagent, holds no binding and would pass as the
+/// person; both harnesses mark their children (`CLAUDECODE`, and opencode's
+/// `OPENCODE=1`), so the same habit-guard reaches them. Ed's `! wsp answer`
+/// from inside a session carries the marker too, and `--as-person` is for that.
+fn an_agent_process(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["CLAUDECODE", "OPENCODE"].iter().any(|k| var(k).is_some_and(|v| !v.is_empty()))
 }
 
 /// Raising one writes a line on its subject, so the committed record says it
@@ -1565,6 +1577,20 @@ mod tests {
         assert!(the_person(&c(true, false, false)).unwrap_err().contains("governor seat"));
         assert!(the_person(&c(false, true, false)).unwrap_err().contains("agent's pane"));
         assert!(the_person(&c(true, false, true)).is_ok(), "`--as-person`: Ed typing `!` into a seat's pane");
+    }
+
+    /// An agent in a pane wsp never bound still reads as an agent: the guard
+    /// is meant for the governor in the conversation, and that one may be a
+    /// hand-started session or a subagent no binding knows about.
+    #[test]
+    fn an_agent_in_a_pane_wsp_never_bound_is_still_an_agent() {
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |k: &str| set.iter().find(|(n, _)| *n == k).map(|(_, v)| std::ffi::OsString::from(*v))
+        };
+        assert!(an_agent_process(env(&[("CLAUDECODE", "1")])), "a Claude session");
+        assert!(an_agent_process(env(&[("OPENCODE", "1")])), "an opencode session");
+        assert!(!an_agent_process(env(&[("CLAUDECODE", "")])), "an emptied marker is a person");
+        assert!(!an_agent_process(env(&[("HOME", "/Users/ed")])), "a person at a shell");
     }
 
     /// Answered **in place**: on the row the question is about, as a decision,
