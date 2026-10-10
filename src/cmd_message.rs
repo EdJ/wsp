@@ -201,13 +201,17 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         }
     };
 
-    let q = Message::question(
+    let for_person = args.has("person");
+    let mut q = Message::question(
         me.clone(),
         kind,
         &text,
         Waiting::new(pane.as_deref().unwrap_or_default(), &held),
     )
     .about(about);
+    if for_person {
+        q = q.for_the_person();
+    }
 
     // The guarantee this verb makes, checked before the record exists rather
     // than reported after it does: there is no path here by which an answer can
@@ -221,6 +225,9 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     if let Err(e) = message::raise(store, &q) {
         eprintln!("wsp: {e}");
         return 1;
+    }
+    if for_person {
+        asked_of_the_person(store, &q, &subject_id);
     }
 
     // **The seat, now, and not on the next pass.** `wsp-146`: the record being
@@ -239,7 +246,12 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     // hook's audience and every panel draws it.
     // `map`, not `and_then`: `wake::say` no longer answers "is there a seat
     // here" — it spools and reports, because a vacancy is later, not nowhere.
-    let report = seat.as_ref().map(|s| {
+    //
+    // A question for the person still goes to the seat, because a governor
+    // that does not know Ed owes something cannot say so when he is talking to
+    // it — unless that seat is the one asking, which would wake it on its own
+    // words.
+    let report = seat.as_ref().filter(|s| !(for_person && me.scope() == Some(s.scope.as_str()))).map(|s| {
         crate::wake::say(store, &s.scope, &for_a_governor(&q), Some(&q.id))
     });
 
@@ -248,7 +260,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         println!(
             "{}",
             json!({ "id": q.id, "about": subject_id, "waiting": held, "pane": pane, "lands_on": home,
-                    "seat": seat.as_ref().map(|s| &s.scope),
+                    "seat": seat.as_ref().map(|s| &s.scope), "for": if for_person { Some("person") } else { None },
                     "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why.clone()) })
         );
         return 0;
@@ -256,8 +268,18 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     println!("{} {}  {}", p.red("?"), p.bold(&q.id), q.title());
     println!("  {}", p.dim(&format!("about {subject_id} · answered onto {home}")));
-    println!("  {}", p.dim(&to));
-    println!("  {}", p.dim(&format!("wsp answer {} \"…\" closes it and comes back here", q.id)));
+    match for_person {
+        true => {
+            println!("  {}", p.dim("asked of the person · `wsp yours` lists it · only the person may answer it"));
+            if let Some(holds) = unblocks(store, &q) {
+                println!("  {}", p.dim(&format!("holds {holds}")));
+            }
+        }
+        false => {
+            println!("  {}", p.dim(&to));
+            println!("  {}", p.dim(&format!("wsp answer {} \"…\" closes it and comes back here", q.id)));
+        }
+    }
     // Where it went, and when it will arrive — `wsp-146`'s receipt. A verb whose
     // whole effect is on somebody else's screen has to name the screen; the part
     // that is new here is the *when*, because for the first time the honest
@@ -397,7 +419,25 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
     let giving_up = args.has("abandon");
-    let (me, _) = whoami(store);
+    let (me, pane) = whoami(store);
+    // `wsp-233`: a governor can add to the person's list and never answer it.
+    // Past this check the closer is the person, and is recorded as one.
+    let me = match q.for_person {
+        false => me,
+        true => {
+            let caller = Caller {
+                seat: me.scope().is_some(),
+                agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)),
+                as_person: args.has("as-person"),
+            };
+            if let Err(why) = the_person(&caller) {
+                eprintln!("wsp: {why}");
+                eprintln!("     a seat or an agent says what it knows with `wsp note`, and the person answers it here");
+                return 1;
+            }
+            Party::Human
+        }
+    };
 
     let closed = match giving_up {
         false => message::answer(store, &q.id, &me, &text),
@@ -422,9 +462,234 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
             true => "abandoned",
         };
         println!("{} {}  {}", p.dim("·"), p.bold(&closed.question.id), p.dim(verb));
-        println!("  {}", p.dim(&landed_line(&closed.landed)));
+        let landed = match (&closed.landed, closed.question.for_person && !giving_up) {
+            (Landed::Task(id), true) => format!("as a decision on {id}"),
+            (other, _) => landed_line(other),
+        };
+        println!("  {}", p.dim(&landed));
+    }
+    if closed.question.for_person {
+        tell_the_list(store, &closed, args);
     }
     deliver(store, &closed, args)
+}
+
+// ---- the person's list: `wsp-233` -----------------------------------------
+
+/// Who is running `wsp answer` on a person's item, as far as wsp can tell.
+#[derive(Debug, Clone, Copy, Default)]
+struct Caller {
+    /// The pane holds a governor seat.
+    seat: bool,
+    /// The pane holds an agent wsp started, or work it is bound to.
+    agent: bool,
+    /// `--as-person`: the person typing in an agent's pane, saying so.
+    as_person: bool,
+}
+
+/// Whether this caller may close a question only the person may close.
+///
+/// **A guard against habit, not identity.** wsp reads its caller off the
+/// environment, and an agent that lies about it can pass; nothing here can stop
+/// that. What it stops is the case `wsp-233` was filed for: a governor closing
+/// the loop on Ed's behalf because it was the one in the conversation. A person
+/// at a shell passes, in a herdr pane or out of one. `--as-person` is for Ed
+/// typing `! wsp answer …` into an agent's own pane, which inherits that pane's
+/// environment, and it is a statement an agent would have to make falsely
+/// rather than a default it fell into.
+fn the_person(c: &Caller) -> Result<(), String> {
+    match (c.seat || c.agent, c.as_person) {
+        (false, _) | (true, true) => Ok(()),
+        (true, false) => Err(format!(
+            "that question is the person's to answer, and this is {} — a seat or an agent may raise one and never close one\n     \
+             the person typing in this pane: `--as-person` says so",
+            if c.seat { "a governor seat" } else { "an agent's pane" }
+        )),
+    }
+}
+
+/// Does this pane hold an agent: bound to a task, or a seat wsp started one in?
+fn holds_an_agent(store: &Store, pane: &str) -> bool {
+    store.bindings().contains_key(pane) || store.agent_in_seat(pane).is_some()
+}
+
+/// Raising one writes a line on its subject, so the committed record says it
+/// was asked even when the machine-local `messages.json` is gone, and an agent
+/// on that row reads it in its brief.
+fn asked_of_the_person(store: &Store, q: &Message, subject: &str) {
+    let line = format!("asked of the person by {}: {} · {}", q.from.byline(), util::truncate(q.title(), 160), q.id);
+    let saved = match store.task(subject) {
+        Some(mut t) => {
+            t.log(&line);
+            store.save_task(&t).is_ok()
+        }
+        None => match store.worklist(subject) {
+            Some(mut w) => {
+                w.log(&line);
+                store.save_worklist(&w).is_ok()
+            }
+            None => false,
+        },
+    };
+    if saved {
+        store.git_commit(&format!("wsp: ask the person about {subject} — {}", util::truncate(q.title(), 60)));
+    }
+}
+
+/// What answering this unblocks, derived from what it is about. Never stored:
+/// a member moved between groups would leave a stored one lying.
+fn unblocks(store: &Store, q: &Message) -> Option<String> {
+    match &q.about {
+        About::Group { scope, group } => Some(format!("{scope} group {group}")),
+        About::Scope(s) => Some(s.clone()),
+        About::Task(t) => match crate::worklist::Running::read(store).of(t) {
+            Some(at) => Some(format!("{} group {}", at.list, at.group)),
+            None => Some(t.clone()),
+        },
+        About::Nothing => None,
+    }
+}
+
+/// The project an item belongs to: its task's, or for a list its first
+/// member's that still exists — a list has no project of its own.
+fn project_of(store: &Store, about: &About) -> Option<String> {
+    let task = match about {
+        About::Task(t) => store.task(t),
+        About::Scope(l) | About::Group { scope: l, .. } => store
+            .worklist(l)
+            .and_then(|w| w.groups().iter().flat_map(|g| g.members.clone()).find_map(|m| store.task(&m))),
+        About::Nothing => None,
+    }?;
+    task.project.clone().filter(|p| !p.is_empty())
+}
+
+/// An item, as `wsp yours --json` gives it.
+fn item_json(store: &Store, q: &Message) -> serde_json::Value {
+    json!({
+        "id": q.id,
+        "asked": q.title(),
+        "text": q.text,
+        "about": q.to_json()["about"],
+        "project": project_of(store, &q.about),
+        "from": q.from.byline(),
+        "at": q.at,
+        "unblocks": unblocks(store, q),
+        "waiting": q.to_json()["waiting"],
+    })
+}
+
+/// The person's items in one project and every project under it, or in all.
+pub(crate) fn yours_in(store: &Store, project: Option<&str>) -> Vec<Message> {
+    let index = crate::resolve::Index::new(store.projects());
+    message::for_the_person(store)
+        .into_iter()
+        .filter(|q| match project {
+            None => true,
+            Some(p) => project_of(store, &q.about)
+                .is_some_and(|mine| mine == p || index.ancestors(&mine).iter().any(|a| a == p)),
+        })
+        .collect()
+}
+
+/// Every person item as `(project, headline)`, oldest first — what the brief
+/// composes its one line from.
+pub(crate) fn census(store: &Store) -> Vec<(Option<String>, String)> {
+    message::for_the_person(store).iter().map(|q| (project_of(store, &q.about), q.title().to_string())).collect()
+}
+
+/// `wsp yours [-p proj] [--json]` — what waits on the person.
+///
+/// The questions only the person may answer, oldest first, and then how many
+/// `review` rows wait on `wsp done` as one count. Review rows are not items:
+/// there are hundreds and almost none needs a judgement, and listing them is
+/// the attention pass's failure — the few that matter buried. A review row
+/// that needs a judgement is raised as an item by whoever saw it.
+pub fn yours(store: &Store, args: &Args) -> i32 {
+    let index = crate::resolve::Index::new(store.projects());
+    let project = match args.get("project") {
+        Some(p) => match index.find(&p) {
+            Some(found) => Some(found.id.clone()),
+            None => {
+                eprintln!("wsp: no project matching `{p}`");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let items = yours_in(store, project.as_deref());
+    let review = store
+        .tasks()
+        .iter()
+        .filter(|t| t.status() == crate::model::Status::Review)
+        .filter(|t| match &project {
+            None => true,
+            Some(p) => t.project.as_deref().is_some_and(|tp| tp == p || index.ancestors(tp).iter().any(|a| a == p)),
+        })
+        .count();
+
+    if args.json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "project": project,
+                "items": items.iter().map(|q| item_json(store, q)).collect::<Vec<_>>(),
+                "review": review,
+            }))
+            .unwrap_or_default()
+        );
+        return 0;
+    }
+    let p = Paint::new();
+    if items.is_empty() {
+        println!("{}", p.dim("nothing waits on the person"));
+    }
+    for q in &items {
+        println!("{} {}  {}", p.red("?"), p.bold(&q.id), q.title());
+        for line in q.body().lines() {
+            println!("  {line}");
+        }
+        let mut parts = vec![format!("from {}", q.from.byline())];
+        if let Some(u) = unblocks(store, q) {
+            parts.push(format!("holds {u}"));
+        }
+        let held = util::since(&q.at);
+        if held > 0 {
+            parts.push(util::duration_human(held));
+        }
+        println!("  {}", p.dim(&parts.join(" · ")));
+    }
+    if !items.is_empty() {
+        println!("{}", p.dim("wsp answer <id> \"…\" — it lands as a decision on the row, and whoever waited is told"));
+    }
+    if review > 0 {
+        println!("{}", p.dim(&format!("{review} at review, waiting on `wsp done` — not items")));
+    }
+    0
+}
+
+/// An answer about a list or one of its groups is told to the list's seat:
+/// a barrier held on the person is now the seat's to read again.
+fn tell_the_list(store: &Store, closed: &message::Closed, args: &Args) {
+    let Some(list) = closed.question.about.scope() else { return };
+    if store.worklist(list).is_none() {
+        return;
+    }
+    let governors = store.governors();
+    let index = crate::resolve::Index::new(store.projects());
+    let Some(seat) = crate::cmd_govern::seat_for(&governors, &index, Some(list), None) else { return };
+    let what = match &closed.question.about {
+        About::Group { group, .. } => format!("barrier {group} of {list}"),
+        _ => list.to_string(),
+    };
+    let text = format!(
+        "the person answered {id} about {what}:\n\n{answer}\n\n         nothing more of theirs holds it unless `wsp yours` says so — read the answer, then go, hold or follow up as the stop says",
+        id = closed.question.id,
+        answer = closed.question.via.last().map(|h| h.note.as_str()).unwrap_or_default(),
+    );
+    let r = crate::wake::say(store, &seat.scope, &text, Some(&closed.question.id));
+    if !args.json() {
+        println!("  {}", r.said(&format!("the {} seat", r.scope), &Paint::new()));
+    }
 }
 
 /// `wsp ack <message-id>` — *I have this and I am not passing it on.*
@@ -1230,5 +1495,135 @@ mod tests {
         let closed = answered_mid_turn(&store);
         assert_eq!(asker(&closed), "cpd-380");
         assert_eq!(whose(&closed), "wsp-process seat", "the byline is still the answerer's");
+    }
+
+
+    fn for_the_person_about(store: &Store, from: Party, about: About) -> Message {
+        let q = Message::question(from, Kind::Note, "accept +190 ms startup, or file rows?", Waiting::new("w3R:p1", ""))
+            .about(about)
+            .for_the_person();
+        message::raise(store, &q).unwrap();
+        q
+    }
+
+    /// `wsp-233`'s item is a question with one stored word on it, and it has to
+    /// survive the file: an item that came back as an ordinary question would
+    /// be one a governor could close.
+    #[test]
+    fn a_question_for_the_person_comes_back_for_the_person_and_only_it_is_listed() {
+        let store = scratch("yours-round");
+        task(&store, "wsp-095");
+        let mine = for_the_person_about(&store, Party::seat("worklist"), About::Task("wsp-095".into()));
+        let theirs = a_question(&store, "wsp-095");
+
+        let back = store.message(&mine.id).unwrap();
+        assert!(back.for_person, "the word survives messages.json");
+        assert_eq!(back.to_json()["for"], "person");
+        assert!(!store.message(&theirs.id).unwrap().for_person, "and an ordinary question does not grow one");
+        let listed: Vec<String> = message::for_the_person(&store).into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, vec![mine.id], "the person's list is the person's questions and nothing else");
+    }
+
+    /// **A governor can add to it but never answer for Ed** — the line the
+    /// 2026-10-07/08 session kept drawing by hand. The record refuses a seat
+    /// whichever verb reaches it, answer or abandon, and leaves it open.
+    #[test]
+    fn a_seat_may_raise_the_persons_question_and_is_refused_when_it_closes_one() {
+        let store = scratch("yours-seat");
+        task(&store, "wsp-095");
+        let q = for_the_person_about(&store, Party::seat("worklist"), About::Task("wsp-095".into()));
+
+        for refused in [
+            message::answer(&store, &q.id, &Party::seat("worklist"), "accepted"),
+            message::abandon(&store, &q.id, &Party::seat("worklist"), "not needed"),
+        ] {
+            assert!(matches!(refused, Err(message::Refused::NotThePersons(_))), "{refused:?}");
+        }
+        assert!(store.message(&q.id).unwrap().is_open(), "still the person's, still open");
+        assert!(message::answer(&store, &q.id, &Party::Human, "accepted: +190 ms is the cost of gpui").is_ok());
+    }
+
+    /// The verb's half of the refusal, which only the caller's environment can
+    /// tell: a seat and an agent's pane are refused, a person at a shell is
+    /// not, and the person typing into an agent's pane says so in a word an
+    /// agent would have to choose falsely.
+    #[test]
+    fn only_a_caller_that_is_no_seat_and_no_agent_or_says_it_is_the_person_may_answer() {
+        let c = |seat, agent, as_person| Caller { seat, agent, as_person };
+        assert!(the_person(&c(false, false, false)).is_ok(), "a person at a shell");
+        assert!(the_person(&c(true, false, false)).unwrap_err().contains("governor seat"));
+        assert!(the_person(&c(false, true, false)).unwrap_err().contains("agent's pane"));
+        assert!(the_person(&c(true, false, true)).is_ok(), "`--as-person`: Ed typing `!` into a seat's pane");
+    }
+
+    /// Answered **in place**: on the row the question is about, as a decision,
+    /// because what the person settles binds every later agent on that row and
+    /// a decision is what a brief carries. The asker's own row, a different
+    /// one, still gets its line, as an answer always has.
+    #[test]
+    fn the_persons_answer_lands_as_a_decision_on_the_row_it_is_about() {
+        let store = scratch("yours-decide");
+        task(&store, "compound-392");
+        task(&store, "compound-397");
+        let q = Message::question(
+            Party::pane("w9:p1", "w9"),
+            Kind::Note,
+            "the wire's new message is a VERSION bump — keep it?",
+            Waiting::new("w9:p1", "compound-397"),
+        )
+        .about(About::Task("compound-392".into()))
+        .for_the_person();
+        message::raise(&store, &q).unwrap();
+
+        let closed = message::answer(&store, &q.id, &Party::Human, "keep the bump; old hosts refuse cleanly").unwrap();
+        assert_eq!(closed.landed, Landed::Task("compound-392".into()));
+        let decided = crate::model::decisions(&store.task("compound-392").unwrap().body);
+        assert_eq!(decided.len(), 1, "one decision: {decided:?}");
+        assert!(decided[0].1.contains("keep the bump") && decided[0].1.contains(&q.id), "{decided:?}");
+        let asker = store.task("compound-397").unwrap();
+        assert!(asker.body.contains("keep the bump"), "the asker's own row still hears it");
+        assert!(crate::model::decisions(&asker.body).is_empty(), "…as a line, not a decision about work it is not");
+        assert!(message::for_the_person(&store).is_empty(), "and the item is gone from the list");
+    }
+
+    /// The barrier gate's population: about that group exactly. A question
+    /// about the whole list names no barrier, and a gate that guessed one would
+    /// stop a run on a question that was never about it.
+    #[test]
+    fn a_question_for_the_person_holds_the_barrier_of_the_group_it_names_and_no_other() {
+        let store = scratch("yours-gate");
+        let list = || "gpui-migration".to_string();
+        let g13 = for_the_person_about(&store, Party::seat("gpui-migration"), About::Group { scope: list(), group: 13 });
+        for_the_person_about(&store, Party::seat("gpui-migration"), About::Scope(list()));
+        let held: Vec<String> = message::holding_group(&store, "gpui-migration", 13).into_iter().map(|m| m.id).collect();
+        assert_eq!(held, vec![g13.id.clone()]);
+        assert!(message::holding_group(&store, "gpui-migration", 12).is_empty());
+        assert!(message::holding_group(&store, "ux-build", 13).is_empty());
+        message::answer(&store, &g13.id, &Party::Human, "read parity.md §1–§7").unwrap();
+        assert!(message::holding_group(&store, "gpui-migration", 13).is_empty(), "answered, it holds nothing");
+    }
+
+    /// Per project, through the tree: an item about a row in a child project
+    /// is in its parent's list, and not in a sibling's.
+    #[test]
+    fn the_persons_list_is_read_per_project_and_through_its_children() {
+        let store = scratch("yours-project");
+        store.save_project(&crate::model::Project::new("meta")).unwrap();
+        let mut child = crate::model::Project::new("worklist");
+        child.parent = Some("meta".into());
+        store.save_project(&child).unwrap();
+        store.save_project(&crate::model::Project::new("render")).unwrap();
+        task(&store, "worklist-001");
+        let q = for_the_person_about(&store, Party::seat("worklist"), About::Task("worklist-001".into()));
+
+        let ids = |p: Option<&str>| yours_in(&store, p).into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(Some("worklist")), vec![q.id.clone()]);
+        assert_eq!(ids(Some("meta")), vec![q.id.clone()], "a parent sees its child's");
+        assert!(ids(Some("render")).is_empty(), "a sibling does not");
+        assert_eq!(unblocks(&store, &q).as_deref(), Some("worklist-001"), "a row in no running list unblocks itself");
+        let v = item_json(&store, &q);
+        assert_eq!(v["project"], "worklist");
+        assert_eq!(v["asked"], "accept +190 ms startup, or file rows?");
+        assert_eq!(v["about"]["task"], "worklist-001");
     }
 }

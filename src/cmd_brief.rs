@@ -358,6 +358,10 @@ pub(crate) struct Briefing {
     /// own job. Six days of a dead daemon on a machine that looked busy are
     /// what this is for; see [`crate::launchd`].
     pub daemon: Option<String>,
+    /// What waits on the person (`wsp-233`), as `(project, headline)`, oldest
+    /// first. Read here because `compose` reads nothing outside this struct;
+    /// it is one small state file, and empty on most nights.
+    pub yours: Vec<(Option<String>, String)>,
 }
 
 /// Where a brief is *for*, when that is not where the process is.
@@ -434,6 +438,7 @@ impl Briefing {
             // is here before asking whether it is a checkout.
             cwd: seat.cwd.map(|c| util::contract(&util::expand(c))),
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered()),
+            yours: crate::cmd_message::census(store),
             world,
         }
     }
@@ -483,6 +488,7 @@ impl Briefing {
             ending_failed,
             cwd: std::env::current_dir().ok().map(|c| util::contract(&c)),
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered()),
+            yours: crate::cmd_message::census(store),
             world,
         }
     }
@@ -532,6 +538,10 @@ pub(crate) struct Brief {
     /// not in it. [`Brief::dropped`] is how many of the record are not here.
     pub decided: Vec<(String, String)>,
     pub dropped: usize,
+    /// The headlines of what waits on the person in this project's subtree, or
+    /// everywhere when the brief has no project. Drawn as one line, and only
+    /// when there is any: the brief is paid for on every spawn.
+    pub yours: Vec<String>,
     /// Panes that can reach the files under your hands, and everyone else.
     pub near: Vec<overlap::Standing>,
     pub far: Vec<overlap::Standing>,
@@ -827,7 +837,17 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     };
 
     let is_verifier = verifying.is_some();
+    let yours: Vec<String> = b
+        .yours
+        .iter()
+        .filter(|(proj, _)| match &scope {
+            None => true,
+            Some(under) => proj.as_ref().is_some_and(|p| under.contains(p)),
+        })
+        .map(|(_, headline)| headline.clone())
+        .collect();
     Brief {
+        yours,
         verifying,
         checking: b.checking.clone().filter(|_| mine.is_none()),
         handbook,
@@ -937,6 +957,10 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
     // benefit of none.
     if let Some(l) = &r.list {
         v["list"] = json!({ "list": l.list, "group": l.group, "of": l.of });
+    }
+    // Written in only when something waits, for the rule `list` follows.
+    if !r.yours.is_empty() {
+        v["yours"] = json!(r.yours);
     }
     // The rotation in flight that names this pane, written in rather than
     // always-present: a brief with no handover is byte-for-byte the brief it
@@ -1430,6 +1454,19 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         let leaf = r.project.as_deref().unwrap_or("");
         row("", p.dim(&format!("{} earlier · wsp project show {leaf}", r.dropped)).to_string());
     }
+    // What only the person can answer, after what is settled: it is the other
+    // half of what binds work here, the half still owed.
+    if let Some(oldest) = r.yours.first() {
+        row(
+            "yours",
+            format!(
+                "{} waiting on the person  {}  {}",
+                r.yours.len(),
+                p.dim(&util::truncate(oldest, 40)),
+                p.dim("wsp yours")
+            ),
+        );
+    }
 
     if r.shown > 0 {
         for (i, (t, under)) in r.open.iter().take(r.shown).enumerate() {
@@ -1648,6 +1685,7 @@ mod tests {
             seat_at: None,
             checking: None,
             daemon: None,
+            yours: Vec::new(),
             // Nobody coordinating. The ordinary state, and the baseline the
             // seat tests below add a seat to: the brief has to be identical
             // without one.
@@ -1973,6 +2011,31 @@ mod tests {
         assert!(text.contains("take work here without asking"), "{text}");
     }
 
+    /// `wsp-233`: what waits on the person is one line, after what is settled
+    /// and before the backlog, scoped to this project's subtree — and absent,
+    /// in text and in `--json`, on the ordinary night when nothing waits.
+    #[test]
+    fn what_waits_on_the_person_is_one_line_here_and_nothing_when_nothing_waits() {
+        let quiet = briefing();
+        let r = compose(&quiet);
+        assert!(r.yours.is_empty());
+        assert!(!brief_lines(&r, &plain(), Depth::Terse).join("\n").contains("yours"));
+
+        let mut b = briefing();
+        b.yours = vec![
+            (Some("robustness".into()), "accept +190 ms startup, or file rows?".into()),
+            (Some("render".into()), "somebody else's project".into()),
+            (Some("wsp".into()), "keep the VERSION bump?".into()),
+        ];
+        let r = compose(&b);
+        assert_eq!(r.yours.len(), 2, "wsp and the robustness under it, not render: {:?}", r.yours);
+        let text = brief_lines(&r, &plain(), Depth::Terse).join("\n");
+        let line = |needle: &str| text.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle} in:\n{text}"));
+        assert_eq!(text.lines().filter(|l| l.contains("waiting on the person")).count(), 1, "{text}");
+        assert!(text.contains("2 waiting on the person") && text.contains("accept +190 ms"), "the oldest, by its headline: {text}");
+        assert!(line("decided") < line("yours") && line("yours") < line("open"), "{text}");
+    }
+
     /// A row that names a file outside the tree says so in the brief, because
     /// a path the agent may reach and is never told about is no mechanism.
     ///
@@ -2071,6 +2134,7 @@ mod tests {
             mandate: None,
             lists: crate::worklist::Running::default(),
             daemon: None,
+            yours: Vec::new(),
             seat_at: None,
             checking: None,
             governors: std::collections::BTreeMap::new(),

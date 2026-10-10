@@ -1355,6 +1355,21 @@ when the answer comes is not typed at and not dropped: the reply is held on its
 own record (a `held` hop), and the daemon's repair tick types it at the asker's
 next idle and says so in `cycle.log` (`wsp-204`).
 
+**What waits on the person is a question only the person may close**
+(`wsp-233`). `wsp ask <id|list> --person "…"` raises one: a member flagging a
+design call, a barrier check whose stop names Ed, a governor that has found
+something only Ed can settle. `wsp yours [-p proj] [--json]` lists them per
+project, oldest first, each with what it holds (`gpui-migration group 13`), and
+counts the rows waiting at `review` on one line rather than listing them. The
+answer is `wsp answer` as ever, and it lands **in place**: a `## Decisions`
+entry on the task it is about, or a line on the list's log, and the list's seat
+is told. While one about a group is open, `wsp worklist go` refuses that
+group's barrier: a governor passing it would be answering for Ed. The refusal
+is the line itself: a seat, or a pane holding an agent, may raise one and is
+refused when it answers or abandons one. The person typing in an agent's pane
+says so with `--as-person`. It is a guard against habit, not identity. The
+design, with what each of today's prose clauses becomes, is on `wsp-233`.
+
 Something louder is a hook away, the same seam `review` uses:
 
 ```sh
@@ -4555,7 +4570,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, the three reasons one is finished with, and the branches a removed tree leaves behind |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
-| `src/cmd_message.rs` | the return path: a question raised with somewhere for the answer to land, and an answer that reaches the record and the asker |
+| `src/cmd_message.rs` | the return path: a question raised with somewhere for the answer to land, and an answer that reaches the record and the asker — and `wsp yours`, the questions only the person may close |
 | `src/cmd_watch.rs` | how a governor asks to be told: the named predicates, the level read under them, who each one is addressed to, and the six ways silence lies |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it and both ended again — and `govern --rotate`/`--reseat`, the custodial handover as one verb and the same verb with no predecessor to hand over from |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on — in a seat that can carry what their kind needs |

@@ -3440,6 +3440,28 @@ fn go_with(
     }
     let prose = shut.as_ref().map(|(_, prose)| prose.clone()).unwrap_or_default();
 
+    // `wsp-233`: **held on you.** A question only the person may answer, about
+    // the group this barrier closes, holds it until the person answers — or a
+    // governor passing it would be answering for them, which is the one thing
+    // a governor may not do with the person's list.
+    let passing = match shut.as_ref().map(|(gate, _)| *gate) {
+        Some(Gate::After(at)) => Some(*at),
+        Some(Gate::Held) => pos.at,
+        _ => None,
+    };
+    if let Some(at) = passing {
+        let owed = crate::message::holding_group(store, &w.id, at);
+        if !owed.is_empty() {
+            let p = Paint::new();
+            eprintln!("wsp: barrier {at} of {} is held on the person — {} open", w.id, owed.len());
+            for q in &owed {
+                eprintln!("  {}  {}", p.bold(&q.id), q.title());
+            }
+            eprintln!("     the person answers each with `wsp answer <id> \"…\"`; `wsp yours` lists them");
+            return 1;
+        }
+    }
+
     // **The design's one piece of machinery around judgement.** Where there is
     // prose, the next group is not named until somebody has written a sentence
     // about it, and the sentence is dated into the record.
@@ -6812,6 +6834,33 @@ mod tests {
 
         assert_eq!(gate_of(&store, "batch"), "after 1 ", "shut, with nothing to read at it");
         assert_eq!(run(&store, &["go", "batch"]), 0, "and three words pass it");
+        assert_eq!(gate_of(&store, "batch"), "ready wl-002");
+    }
+
+    /// `wsp-233`: **held on you.** A question only the person may answer,
+    /// about the group a barrier closes, holds that barrier against `go` —
+    /// a governor passing it would be answering for the person — and the
+    /// person's answer is what lets the same `go` through.
+    #[test]
+    fn a_barrier_with_the_persons_question_open_on_its_group_refuses_go_until_it_is_answered() {
+        use crate::message::{self, About, Kind, Message, Party, Waiting};
+        let (_env, store) = running("held-on-you");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        started(&store, "batch");
+        let q = Message::question(Party::seat("batch"), Kind::Note, "read parity.md first", Waiting::new("w1:p1", ""))
+            .about(About::Group { scope: "batch".into(), group: 1 })
+            .for_the_person();
+        message::raise(&store, &q).unwrap();
+
+        assert_eq!(gate_of(&store, "batch"), "after 1 ");
+        assert_eq!(run(&store, &["go", "batch"]), 1, "held on the person");
+        assert_eq!(gate_of(&store, "batch"), "after 1 ", "and still shut");
+        message::answer(&store, &q.id, &Party::Human, "read it; go").unwrap();
+        assert_eq!(run(&store, &["go", "batch"]), 0, "answered, the same go passes");
         assert_eq!(gate_of(&store, "batch"), "ready wl-002");
     }
 

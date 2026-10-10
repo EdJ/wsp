@@ -196,6 +196,9 @@ const BOOL_FLAGS: &[&str] = &[
     // `wsp worklist followup <slug> <task>… --blocking|--next`: the rows are
     // positionals, and a flag between them must not eat the one after it.
     "blocking", "next",
+    // `wsp ask <id> --person "…"` and `wsp answer <id> --as-person "…"`
+    // (`wsp-233`): each is followed by the sentence, which it must not eat.
+    "person", "as-person",
 ];
 
 /// Flags that keep their meaning inside a command's payload.
@@ -1161,6 +1164,7 @@ fn main() {
         // answer is a record before it is a sentence in somebody's pane.
         "ask" => cmd_message::ask(&store, &args),
         "answer" => cmd_message::answer(&store, &args),
+        "yours" => cmd_message::yours(&store, &args),
         "ack" => cmd_message::ack(&store, &args),
         "reconcile" => {
             let r = cmd_agent::reconcile(&store, args.has("reap"));
@@ -2025,6 +2029,12 @@ fn help_text() -> String {
   wsp answer <mid> "…"|-|--from F   close one: the log first, then whoever asked
   wsp answer <mid> --abandon "…"    the other ending, and it also goes home
   wsp ack <mid>                     an answer read, or a notification taken on
+  wsp ask <id|list> --person "…"    a question only the person may answer: it is
+                                    in `wsp yours`, holds the barrier of the
+                                    group it names, and a seat or an agent may
+                                    raise one and never close one
+  wsp yours [-p <proj>] [--json]    what waits on the person, and how many rows
+                                    wait at review (a count, not items)
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
                                     --reap ends claims whose workspace is gone
   wsp adopt [--yes]                 turn live workspaces into tasks
@@ -2395,6 +2405,12 @@ mod tests {
         assert!(a.has("all") && a.get("project").as_deref() == Some("wsp"));
         let a = parse(&["flag", "028", "why this stopped", "--seen"]);
         assert!(a.has("seen") && a.text(1) == "why this stopped");
+        // `wsp-233`: the person's flags sit before the sentence, which they
+        // must not eat — a question refused for want of the words it was given.
+        let a = parse(&["ask", "compound-392", "--person", "keep the VERSION bump?"]);
+        assert!(a.has("person") && a.text(1) == "keep the VERSION bump?");
+        let a = parse(&["answer", "m-1", "--as-person", "keep it"]);
+        assert!(a.has("as-person") && a.text(1) == "keep it");
 
         // A value may hold spaces — it is the *name* that never does.
         assert_eq!(parse(&["project", "add", "verb", "--name=Reverb Lab"]).get("name").as_deref(), Some("Reverb Lab"));

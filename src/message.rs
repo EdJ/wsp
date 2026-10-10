@@ -712,6 +712,16 @@ pub struct Message {
     /// On an answer: the id of the question it closes. The presence of this is
     /// what makes a message a reply, which is how [`replies_for`] finds them.
     pub reply_to: Option<String>,
+    /// **Only the person may close this** — a question in `wsp yours`
+    /// (`wsp-233`), written `"for": "person"`.
+    ///
+    /// Stored, where `to` deliberately is not, because the argument against
+    /// `to` is that a seat is a post that moves and whoever holds it later must
+    /// answer for it. The person does not move, and *who may close this* is a
+    /// property of the question rather than a route. The route is still
+    /// derived: the item reaches the governor as `unanswered` like any other
+    /// question, so the governor knows Ed owes it and cannot close it.
+    pub for_person: bool,
 }
 
 impl Message {
@@ -733,6 +743,7 @@ impl Message {
             seen: false,
             waiting: None,
             reply_to: None,
+            for_person: false,
         }
     }
 
@@ -784,6 +795,11 @@ impl Message {
     }
     pub fn about(mut self, about: About) -> Message {
         self.about = about;
+        self
+    }
+    /// A question only the person may close — see [`Message::for_person`].
+    pub fn for_the_person(mut self) -> Message {
+        self.for_person = true;
         self
     }
 
@@ -948,6 +964,7 @@ impl Message {
             "seen": self.seen,
             "waiting": self.waiting.as_ref().map(Waiting::to_json).unwrap_or(Value::Null),
             "reply_to": self.reply_to.clone().map(Value::from).unwrap_or(Value::Null),
+            "for": if self.for_person { Value::from("person") } else { Value::Null },
         })
     }
 
@@ -985,6 +1002,7 @@ impl Message {
                 .and_then(Value::as_str)
                 .filter(|r| !r.is_empty())
                 .map(str::to_string),
+            for_person: v.get("for").and_then(Value::as_str) == Some("person"),
         }
     }
 }
@@ -1051,6 +1069,11 @@ pub enum Refused {
     /// agent sitting still while it is open; a question that names nobody
     /// cannot be answered home and cannot become a signal.
     NobodyWaiting,
+    /// A question for the person, closed by a party that is not one. `wsp-233`:
+    /// *a governor can add to it but never answer for Ed.* Here a seat is
+    /// refused; the verb also refuses an agent's pane, which only the caller's
+    /// environment can tell apart from a person's.
+    NotThePersons(String),
 }
 
 impl std::fmt::Display for Refused {
@@ -1072,6 +1095,11 @@ impl std::fmt::Display for Refused {
             ),
             Refused::NeedsASentence => write!(f, "that needs a sentence, not a keystroke"),
             Refused::NobodyWaiting => write!(f, "a question has to name who is waiting on it"),
+            Refused::NotThePersons(who) => write!(
+                f,
+                "that question is the person's to answer, and {who} is not the person — \
+                 a seat or an agent may raise one and never close one"
+            ),
         }
     }
 }
@@ -1410,10 +1438,37 @@ fn close_locked(
     if !q.is_open() {
         return Err(Refused::NotOpen(q.state_raw.clone()));
     }
+    if q.for_person && matches!(by, Party::Seat(_) | Party::Agent(_)) {
+        return Err(Refused::NotThePersons(by.byline()));
+    }
     let waiting = q.waiting.clone().ok_or(Refused::NobodyWaiting)?;
 
     // The task log FIRST. Everything after this point is best-effort delivery;
     // this is the part that is not.
+    //
+    // A question for the person is answered **in place**: on the row it is
+    // about, as a decision, because what the person settles is a decision about
+    // that work and every later agent on the row reads decisions in its brief
+    // (`wsp-233`). The asker's own task, if it is another, still gets its line
+    // below, so the asker is answered where it will be handed its work again.
+    if q.for_person && act == Act::Answered {
+        if let Some(mut t) = q.about.task().and_then(|id| store.task(id)) {
+            crate::model::append_decision(&mut t.body, &format!("answering {}: {}", q.id, text.trim()), &[]);
+            t.touch();
+            let landed = match store.save_task(&t) {
+                Ok(()) => Landed::Task(t.id.clone()),
+                Err(e) => Landed::RecordOnly(format!("could not write {}: {e}", t.id)),
+            };
+            let mine = waiting.task.as_str();
+            if !mine.is_empty() && mine != t.id {
+                if let Some(mut own) = store.task(mine) {
+                    own.log(&format!("{} by {} on {}: {text}", act.as_str(), by.byline(), t.id));
+                    let _ = store.save_task(&own);
+                }
+            }
+            return finish(store, id, by, act, text, waiting, landed);
+        }
+    }
     let home = homes_to(store, &q);
     let list = home.as_deref().filter(|h| store.task(h).is_none()).and_then(|h| store.worklist(h));
     let landed = match home.as_deref().and_then(|id| store.task(id)) {
@@ -1445,6 +1500,19 @@ fn close_locked(
         }),
     };
 
+    finish(store, id, by, act, text, waiting, landed)
+}
+
+/// The hop that ends the question, and the reply addressed to whoever waited.
+fn finish(
+    store: &Store,
+    id: &str,
+    by: &Party,
+    act: Act,
+    text: &str,
+    waiting: Waiting,
+    landed: Landed,
+) -> Result<Closed, Refused> {
     let question = hop(store, id, by, act, text)?;
 
     let mut reply = Message::new(by.clone(), Kind::Direction, text);
@@ -1454,6 +1522,29 @@ fn close_locked(
     raise(store, &reply)?;
 
     Ok(Closed { question, reply, landed })
+}
+
+/// Every open question only the person may close: `wsp yours`'s population.
+///
+/// [`Message::wants_answering`] narrowed to [`Message::for_person`], oldest
+/// first, so the verb, the brief's line and the barrier gate count one set.
+pub fn for_the_person(store: &Store) -> Vec<Message> {
+    let mut out: Vec<Message> =
+        store.messages().into_values().filter(|m| m.for_person && m.wants_answering() && !m.is_reply()).collect();
+    out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// The open person items that hold one group's barrier.
+///
+/// About that group exactly. An item about the whole list holds no barrier:
+/// it says nothing about which one it is owed before, and a gate that guessed
+/// would stop a run on a question that was never about that group.
+pub fn holding_group(store: &Store, list: &str, group: usize) -> Vec<Message> {
+    for_the_person(store)
+        .into_iter()
+        .filter(|m| matches!(&m.about, About::Group { scope, group: g } if scope == list && *g == group))
+        .collect()
 }
 
 /// Every open question, with who is waiting on each.
