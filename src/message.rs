@@ -1449,20 +1449,38 @@ fn close_locked(
     // A question for the person is answered **in place**: on the row it is
     // about, as a decision, because what the person settles is a decision about
     // that work and every later agent on the row reads decisions in its brief
-    // (`wsp-233`). The asker's own task, if it is another, still gets its line
-    // below, so the asker is answered where it will be handed its work again.
+    // (`wsp-233`). About a list or a group, it is a line on the list's log,
+    // which is the run's history and has no decisions — even when a member
+    // holding a task asked, because what the person settled about a barrier is
+    // the list's, not one member's. The asker's own task, if it is another,
+    // still gets its line, so the asker is answered where it will be handed its
+    // work again.
     if q.for_person && act == Act::Answered {
-        if let Some(mut t) = q.about.task().and_then(|id| store.task(id)) {
+        let landed = if let Some(mut t) = q.about.task().and_then(|id| store.task(id)) {
             crate::model::append_decision(&mut t.body, &format!("answering {}: {}", q.id, text.trim()), &[]);
             t.touch();
-            let landed = match store.save_task(&t) {
+            Some(match store.save_task(&t) {
                 Ok(()) => Landed::Task(t.id.clone()),
                 Err(e) => Landed::RecordOnly(format!("could not write {}: {e}", t.id)),
+            })
+        } else if let Some(mut w) = q.about.scope().and_then(|l| store.worklist(l)) {
+            w.log(&format!("answered by a person, {}: {}", q.id, text.trim()));
+            Some(match store.save_worklist(&w) {
+                Ok(()) => Landed::List(w.id.clone()),
+                Err(e) => Landed::RecordOnly(format!("could not write {}: {e}", w.id)),
+            })
+        } else {
+            None
+        };
+        if let Some(landed) = landed {
+            let on = match &landed {
+                Landed::Task(s) | Landed::List(s) => s.as_str(),
+                Landed::RecordOnly(_) => "",
             };
             let mine = waiting.task.as_str();
-            if !mine.is_empty() && mine != t.id {
+            if !mine.is_empty() && mine != on {
                 if let Some(mut own) = store.task(mine) {
-                    own.log(&format!("{} by {} on {}: {text}", act.as_str(), by.byline(), t.id));
+                    own.log(&format!("{} by {} on {}: {text}", act.as_str(), by.byline(), q.about.task().or(q.about.scope()).unwrap_or(on)));
                     let _ = store.save_task(&own);
                 }
             }
@@ -1537,13 +1555,25 @@ pub fn for_the_person(store: &Store) -> Vec<Message> {
 
 /// The open person items that hold one group's barrier.
 ///
-/// About that group exactly. An item about the whole list holds no barrier:
-/// it says nothing about which one it is owed before, and a gate that guessed
-/// would stop a run on a question that was never about that group.
+/// About that group, or about a row that is one of its members: a member's
+/// question for the person is a question its group owes before the barrier
+/// (compound-391's Touch Bar close, owed by gpui-migration group 12), and
+/// `wsp yours` says it holds that group, so a gate that let it through would
+/// make the list lie. An item about the whole list holds no barrier: it says
+/// nothing about which one it is owed before, and a gate that guessed would
+/// stop a run on a question that was never about that group.
 pub fn holding_group(store: &Store, list: &str, group: usize) -> Vec<Message> {
+    let members: Vec<String> = store
+        .worklist(list)
+        .and_then(|w| w.groups().get(group.wrapping_sub(1)).map(|g| g.members.clone()))
+        .unwrap_or_default();
     for_the_person(store)
         .into_iter()
-        .filter(|m| matches!(&m.about, About::Group { scope, group: g } if scope == list && *g == group))
+        .filter(|m| match &m.about {
+            About::Group { scope, group: g } => scope == list && *g == group,
+            About::Task(t) => members.contains(t),
+            _ => false,
+        })
         .collect()
 }
 

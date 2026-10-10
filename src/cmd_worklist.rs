@@ -6864,6 +6864,36 @@ mod tests {
         assert_eq!(gate_of(&store, "batch"), "ready wl-002");
     }
 
+    /// `wsp-233`: a member's question for the person holds its group too —
+    /// `wsp yours` says it does (compound-391's Touch Bar close, owed by
+    /// gpui-migration group 12), and a `go` that passed it would make that
+    /// line a lie. A question about a row in a later group holds nothing yet.
+    #[test]
+    fn a_members_question_for_the_person_holds_its_groups_barrier_and_no_earlier_one() {
+        use crate::message::{self, About, Kind, Message, Party, Waiting};
+        let (_env, store) = running("held-on-a-member");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        started(&store, "batch");
+        let later = Message::question(Party::pane("w1:p2", "w1"), Kind::Note, "keep the VERSION bump?", Waiting::new("w1:p2", "wl-002"))
+            .about(About::Task("wl-002".into()))
+            .for_the_person();
+        message::raise(&store, &later).unwrap();
+        assert!(message::holding_group(&store, "batch", 1).is_empty(), "wl-002 is group 2's, not barrier 1's");
+
+        let q = Message::question(Party::pane("w1:p1", "w1"), Kind::Note, "close it on the Touch Bar", Waiting::new("w1:p1", "wl-001"))
+            .about(About::Task("wl-001".into()))
+            .for_the_person();
+        message::raise(&store, &q).unwrap();
+        assert_eq!(run(&store, &["go", "batch"]), 1, "held on the person, through its member");
+        assert_eq!(gate_of(&store, "batch"), "after 1 ");
+        message::answer(&store, &q.id, &Party::Human, "closed clean").unwrap();
+        assert_eq!(run(&store, &["go", "batch"]), 0, "answered, the same go passes");
+    }
+
     /// The far side of a barrier is answered where the barrier is passed, not
     /// pointed at (`core-049`). Every turn an agent spends polling is a whole
     /// context re-read, and `go` runs exactly when "what may start now"

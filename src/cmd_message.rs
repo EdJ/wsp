@@ -667,19 +667,30 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
     0
 }
 
-/// An answer about a list or one of its groups is told to the list's seat:
-/// a barrier held on the person is now the seat's to read again.
+/// An answer about a list, one of its groups, or a member of a running list
+/// is told to the list's seat: a barrier held on the person is now the seat's
+/// to read again. A member's item holds its group ([`message::holding_group`]),
+/// so its answer is news to the seat as much as to the member that asked.
 fn tell_the_list(store: &Store, closed: &message::Closed, args: &Args) {
-    let Some(list) = closed.question.about.scope() else { return };
-    if store.worklist(list).is_none() {
+    let (list, group) = match &closed.question.about {
+        About::Group { scope, group } => (scope.clone(), Some(*group)),
+        About::Scope(scope) => (scope.clone(), None),
+        About::Task(t) => match crate::worklist::Running::read(store).of(t) {
+            Some(at) => (at.list.clone(), Some(at.group)),
+            None => return,
+        },
+        About::Nothing => return,
+    };
+    if store.worklist(&list).is_none() {
         return;
     }
     let governors = store.governors();
     let index = crate::resolve::Index::new(store.projects());
-    let Some(seat) = crate::cmd_govern::seat_for(&governors, &index, Some(list), None) else { return };
-    let what = match &closed.question.about {
-        About::Group { group, .. } => format!("barrier {group} of {list}"),
-        _ => list.to_string(),
+    let Some(seat) = crate::cmd_govern::seat_for(&governors, &index, Some(&list), None) else { return };
+    let what = match (&closed.question.about, group) {
+        (About::Task(t), Some(g)) => format!("{t}, a member of group {g} of {list}"),
+        (_, Some(g)) => format!("barrier {g} of {list}"),
+        _ => list.clone(),
     };
     let text = format!(
         "the person answered {id} about {what}:\n\n{answer}\n\n         nothing more of theirs holds it unless `wsp yours` says so — read the answer, then go, hold or follow up as the stop says",
@@ -1584,6 +1595,29 @@ mod tests {
         assert!(asker.body.contains("keep the bump"), "the asker's own row still hears it");
         assert!(crate::model::decisions(&asker.body).is_empty(), "…as a line, not a decision about work it is not");
         assert!(message::for_the_person(&store).is_empty(), "and the item is gone from the list");
+    }
+
+    /// About a group, the person's answer is the list's: a line on its log,
+    /// where the run's history is read — even when a member holding a task
+    /// asked, which on an ordinary question would land it on that task alone.
+    /// The member still hears it on its own row.
+    #[test]
+    fn the_persons_answer_about_a_group_lands_on_the_list_though_a_member_asked() {
+        let store = scratch("yours-list");
+        task(&store, "m-1");
+        let mut w = crate::model::Worklist::new("run", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        let q = Message::question(Party::pane("w9:p1", "w9"), Kind::Note, "+190 ms: accept, or file rows?", Waiting::new("w9:p1", "m-1"))
+            .about(About::Group { scope: "run".into(), group: 1 })
+            .for_the_person();
+        message::raise(&store, &q).unwrap();
+
+        let closed = message::answer(&store, &q.id, &Party::Human, "accepted; gpui costs that").unwrap();
+        assert_eq!(closed.landed, Landed::List("run".into()));
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("answered by a person") && log.contains("accepted; gpui costs that"), "{log}");
+        assert!(store.task("m-1").unwrap().body.contains("accepted; gpui costs that"), "the member asked, and hears it");
     }
 
     /// The barrier gate's population: about that group exactly. A question
