@@ -285,7 +285,10 @@ impl Ask {
 pub enum Source {
     /// An agent raised it.
     Agent,
-    /// wsp derived it. Always a [`Shape::Signal`].
+    /// wsp put it there: a level it derived, which is always a
+    /// [`Shape::Signal`], or a notice it wrote itself — the run's, from
+    /// [`Party::wsp`] (`wsp-272`). Which of the two is the shape's to say, and
+    /// so is what `x` may do: a level comes back if cleared, a notice does not.
     Wsp,
     /// A person typed it.
     Human,
@@ -535,6 +538,16 @@ impl Party {
     pub fn seat(scope: &str) -> Party {
         Party::Seat(scope.to_string())
     }
+    /// wsp itself — the run, the barrier check's aftermath, the daemon noticing
+    /// a restart. An [`Party::Agent`] by the handle `wsp`, which is what the
+    /// restart notice already wrote, so the two read alike and an older build
+    /// parses both.
+    pub fn wsp() -> Party {
+        Party::Agent("wsp".into())
+    }
+    pub fn is_wsp(&self) -> bool {
+        matches!(self, Party::Agent(h) if h == "wsp")
+    }
 
     /// One line, for a byline. `wsp-095` Part 4's whole point is that this
     /// exists at all: the seat had already adopted the rule by hand — *every
@@ -722,6 +735,20 @@ pub struct Message {
     /// derived: the item reaches the governor as `unanswered` like any other
     /// question, so the governor knows Ed owes it and cannot close it.
     pub for_person: bool,
+    /// **Written for a seat, and so not the person's** (`wsp-272`), written
+    /// `"for": {"seat": scope}`.
+    ///
+    /// What the run tells a governor and has nowhere better to put than a hand
+    /// on a member: every one of them used to read `from: human, for: null`, so
+    /// compound's raised hand and the panel showed the person six barrier
+    /// passes that had already gone to the seat that runs the list. The scope
+    /// and not the occupant, for [`Message::for_person`]'s reason — a seat is
+    /// a post, and whoever holds it next reads the same spool.
+    ///
+    /// The seat raises one to the person by raising a hand of its own, which is
+    /// a record for the person by default; this one stays the seat's, for it to
+    /// mark seen or take down. See [`Message::is_the_persons`].
+    pub for_seat: Option<String>,
 }
 
 impl Message {
@@ -744,6 +771,7 @@ impl Message {
             waiting: None,
             reply_to: None,
             for_person: false,
+            for_seat: None,
         }
     }
 
@@ -758,7 +786,7 @@ impl Message {
     /// A level wsp derived. Never stored — see [`raise`] and
     /// [`Store::save_message`], both of which refuse one.
     pub fn signal(kind: Kind, text: &str) -> Message {
-        let mut m = Message::new(Party::Agent("wsp".into()), kind, text);
+        let mut m = Message::new(Party::wsp(), kind, text);
         m.shape_raw = Shape::Signal.as_str().into();
         m
     }
@@ -776,6 +804,7 @@ impl Message {
     pub fn source(&self) -> Source {
         match (self.shape(), &self.from) {
             (Some(Shape::Signal), _) => Source::Wsp,
+            (_, from) if from.is_wsp() => Source::Wsp,
             (_, Party::Human) => Source::Human,
             _ => Source::Agent,
         }
@@ -937,6 +966,20 @@ impl Message {
     /// Keyed on [`Party::seat`] and on nothing else, because a hop by a *pane*
     /// is a person having looked at it — which says nothing about which post is
     /// holding the words now.
+    /// Is this one of the person's — in their open set, on their panel and in
+    /// compound's raised hand — or a notice wsp wrote for a seat?
+    ///
+    /// **Everything but [`Message::for_seat`]**, so the default reading stays
+    /// the one this record was built on: a hand an agent raises is for whoever
+    /// answers for its subject *and* for the person looking at the panel, and
+    /// being handed to the seat as well does not take it off the panel. Only a
+    /// record that says it was written for a seat leaves — keyed on what the
+    /// writer said, never on a `Sent` hop, because a hop says where words went
+    /// and an agent's hand goes to the seat too.
+    pub fn is_the_persons(&self) -> bool {
+        self.for_seat.is_none()
+    }
+
     pub fn handed_to(&self, scope: &str) -> bool {
         self.via
             .iter()
@@ -964,7 +1007,11 @@ impl Message {
             "seen": self.seen,
             "waiting": self.waiting.as_ref().map(Waiting::to_json).unwrap_or(Value::Null),
             "reply_to": self.reply_to.clone().map(Value::from).unwrap_or(Value::Null),
-            "for": if self.for_person { Value::from("person") } else { Value::Null },
+            "for": match (&self.for_seat, self.for_person) {
+                (_, true) => Value::from("person"),
+                (Some(scope), false) => json!({ "seat": scope }),
+                (None, false) => Value::Null,
+            },
         })
     }
 
@@ -1003,6 +1050,12 @@ impl Message {
                 .filter(|r| !r.is_empty())
                 .map(str::to_string),
             for_person: v.get("for").and_then(Value::as_str) == Some("person"),
+            for_seat: v
+                .get("for")
+                .and_then(|f| f.get("seat"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         }
     }
 }
@@ -1163,6 +1216,10 @@ fn raise_locked(store: &Store, m: &Message) -> Result<(), Refused> {
             // a reader.
             "title": m.title(),
             "reply_to": m.reply_to,
+            // Who it is for, in the record's own spelling, so a doorbell can
+            // stay quiet for a notice wsp wrote for a seat (`wsp-272`) without
+            // opening `messages.json` to find out.
+            "for": m.to_json().get("for").cloned().unwrap_or(Value::Null),
         }),
     );
     Ok(())
@@ -1822,6 +1879,57 @@ pub fn adopt_legacy_flags(store: &Store) -> Vec<Message> {
     })
 }
 
+/// The run's notices written before `wsp-272`, which read as a person's hands.
+///
+/// **Recognised by the run's wording, because nothing else on them differs.**
+/// They came through `wsp flag` with no pane, so `from` is the person exactly as
+/// a shell's hand is. What is left is the sentence: every one the run says names
+/// the list it is about — `Barrier 2 of ux-build passed.`, `ux-build started.`,
+/// `the ux-build run`, `ux-build run's` — and that is checked against lists
+/// this store actually has, so a person's hand that merely says "run" is not
+/// taken. A one-off: nothing writes these any more, and `wsp migrate
+/// --run-notices -n` prints what it would take before anything is written.
+pub fn legacy_run_notices(store: &Store) -> Vec<Message> {
+    let lists: Vec<String> = store.worklists().into_iter().map(|w| w.id).collect();
+    let says_a_run = |text: &str| {
+        let head = text.lines().next().unwrap_or_default();
+        lists.iter().any(|w| {
+            let barrier = head
+                .strip_prefix("Barrier ")
+                .and_then(|r| r.split_once(" of "))
+                .is_some_and(|(n, rest)| n.parse::<usize>().is_ok() && rest.starts_with(&format!("{w} passed.")));
+            barrier
+                || head.starts_with(&format!("{w} started."))
+                || head.contains(&format!("the {w} run"))
+                || head.contains(&format!("{w} run's"))
+        })
+    };
+    raised(store)
+        .into_iter()
+        .filter(|m| m.from == Party::Human && m.shape() == Some(Shape::Notification) && m.about.task().is_some())
+        .filter(|m| says_a_run(&m.text))
+        .collect()
+}
+
+/// Rewrite one of [`legacy_run_notices`] as the run's: from wsp, and for the
+/// seat its `Sent` hop says it went to. One that never reached a seat had no
+/// reader but the person and stays theirs, now saying who wrote it.
+pub fn adopt_run_notice(store: &Store, id: &str) -> Result<Message, Refused> {
+    store.locked(|| {
+        let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        m.from = Party::wsp();
+        m.for_seat = m
+            .via
+            .iter()
+            .rev()
+            .find(|h| h.act == Act::Sent)
+            .and_then(|h| h.by.scope())
+            .map(str::to_string);
+        store.save_message(&m)?;
+        Ok(m)
+    })
+}
+
 /// Every stored message, newest last. A convenience over [`Store::messages`]
 /// for the surfaces that draw a list rather than look one up.
 pub fn all(store: &Store) -> Vec<Message> {
@@ -2305,6 +2413,61 @@ mod tests {
         assert!(store.flags().is_empty(), "the old file was left holding the same hand");
         assert!(adopt_legacy_flags(&store).is_empty());
         assert_eq!(about_task(&store, "worklist-011").len(), 1);
+    }
+
+    /// `for` survives `messages.json` in all three spellings, and an older
+    /// build's reading of the seat's — `as_str() == "person"` — is false, so it
+    /// does not mistake a seat's notice for a question only the person closes.
+    #[test]
+    fn who_a_record_is_for_round_trips_and_a_seats_notice_is_not_the_persons() {
+        let store = scratch("for-seat");
+        let mut notice = Message::new(Party::wsp(), Kind::Note, "Barrier 2 of ux-build passed.");
+        notice.for_seat = Some("compound".into());
+        let hand = Message::new(Party::Human, Kind::Note, "look at this");
+        raise(&store, &notice).unwrap();
+        raise(&store, &hand).unwrap();
+
+        let back = store.message(&notice.id).unwrap();
+        assert_eq!(back.for_seat.as_deref(), Some("compound"));
+        assert!(!back.for_person && !back.is_the_persons());
+        assert_eq!(back.source(), Source::Wsp, "the run wrote it");
+        assert_eq!(back.to_json()["source"], "wsp");
+        let theirs = store.message(&hand.id).unwrap();
+        assert!(theirs.is_the_persons() && theirs.to_json()["for"].is_null(), "unaddressed is still the person's");
+    }
+
+    /// **The existing hands, `wsp-272`'s last item.** The 2026-10-10 shape: a
+    /// barrier pass from `human` handed to a seat, one never handed anywhere,
+    /// and a person's own hand that happens to say "run" — only the first two
+    /// are the run's, and only the first is the seat's.
+    #[test]
+    fn the_runs_old_notices_become_wsps_and_the_seats_and_a_persons_hand_is_left() {
+        let store = scratch("run-notices");
+        let mut w = crate::model::Worklist::new("ux-build", "u");
+        w.set_groups(&[crate::model::Group { members: vec!["compound-474".into()], ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        let on = |text: &str| {
+            let mut m = Message::new(Party::Human, Kind::Note, text);
+            m.about = About::Task("compound-474".into());
+            raise(&store, &m).unwrap();
+            m.id
+        };
+        let handed = on("Barrier 22 of ux-build passed. The verdict: holds. Nothing is left in the run.");
+        sent(&store, &handed, "compound").unwrap();
+        let unhanded = on("ux-build started. wsp is running group 1: compound-474.");
+        let persons = on("the build run is slow today, have a look");
+        let other_list = on("Barrier 3 of no-such-list passed.");
+
+        let found: Vec<String> = legacy_run_notices(&store).into_iter().map(|m| m.id).collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.contains(&handed) && found.contains(&unhanded));
+        assert!(!found.contains(&persons) && !found.contains(&other_list), "a list this store has, named the run's way");
+
+        let a = adopt_run_notice(&store, &handed).unwrap();
+        assert!(a.from.is_wsp() && a.for_seat.as_deref() == Some("compound") && !a.is_the_persons());
+        let b = adopt_run_notice(&store, &unhanded).unwrap();
+        assert!(b.from.is_wsp() && b.is_the_persons(), "nobody but the person was told, so it stays theirs");
+        assert!(legacy_run_notices(&store).is_empty(), "and a second run finds nothing");
     }
 
     /// The renumbering hazard, from the record's side. `Store::rename_tasks`

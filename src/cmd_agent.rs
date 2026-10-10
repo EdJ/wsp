@@ -781,9 +781,17 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         eprintln!("     `wsp flag {} --body -` reads a paragraph from a stream", task.id);
         return 2;
     }
-    let env = herdr::Env::read();
-    let pane = args.get("pane").or(env.pane_id).unwrap_or_default();
-    let workspace = env.workspace_id.unwrap_or_default();
+    // Who is raising it: `whoami`'s reading, the one `wsp ask` already makes —
+    // the post a seat holds, else the pane, else a person at a shell. It read
+    // herdr's `HERDR_PANE_ID` alone, which a compound-hosted agent does not
+    // have, so every hand one raised was recorded as the person's (`wsp-272`:
+    // three of the eight up on 2026-10-10 were agents' and seats', reading
+    // `from: human`). `--pane` still names one outright.
+    let (me, here) = match args.get("pane") {
+        Some(p) => (Party::pane(&p, herdr::Env::read().workspace_id.as_deref().unwrap_or_default()), Some(p)),
+        None => crate::cmd_message::whoami(store),
+    };
+    let pane = here.unwrap_or_default();
 
     // The card's three parts, and each is optional because the cheap version of
     // this has to stay cheap: `wsp flag <id>` on its own still works and the
@@ -885,13 +893,10 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
     // [`message::compose`], which is where the invariant that keeps
     // `worklist-018` shut lives.
     let mut raised = Message::new(
-        match pane.is_empty() {
-            // No pane is a person at a shell, and that is the correct reading:
-            // the one channel wsp does not control is a human keyboard, so
-            // unattributed is a person rather than an unknown.
-            true => Party::Human,
-            false => Party::pane(&pane, &workspace),
-        },
+        // No pane is a person at a shell, and that is the correct reading: the
+        // one channel wsp does not control is a human keyboard, so unattributed
+        // is a person rather than an unknown.
+        me.clone(),
         // `wsp-095` Part 4: every verb's default is the quietest kind that verb
         // can honestly be, and `wsp flag` is `note`. A raised hand is read at
         // the reader's next turn boundary; nothing but `stop` interrupts.
@@ -941,7 +946,9 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
     // hook. So the words go in the spool directly, where
     // `Class::Message` dispositions them to a wake, and the flag level still
     // goes everywhere else it always did.
-    let seat = cmd_govern::answering_seat(store, &task);
+    // Not to the seat raising it: a seat's own hand is for the person, and
+    // spooling it back to the seat that typed it is a wake to read itself.
+    let seat = cmd_govern::answering_seat(store, &task).filter(|s| me.scope() != Some(s.scope.as_str()));
     // `map`, not `and_then`: `wake::say` no longer answers "is there a seat
     // here" — it spools and reports, because a vacancy is later, not nowhere.
     let report = seat.as_ref().map(|s| {
@@ -979,6 +986,50 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         }
     }
     0
+}
+
+/// A notice the run writes on a task, for the seat that answers for it.
+///
+/// **Not `wsp flag` with made-up arguments, which is what it was** (`wsp-272`).
+/// [`crate::cycle::tell`] fell back to synthesising a `flag` call when a run
+/// had no governor of its own — a list just closed, a seat stood down — and the
+/// verb did what it does for a caller with no pane: wrote `from: human` and no
+/// `for`. So every barrier pass that reached a project's seat this way also
+/// went up on the person's panel and in compound's hand, reading as something
+/// a person typed and still owed, after the seat it was for had it.
+///
+/// Now it says who wrote it ([`Party::wsp`]) and who it is for — the scope
+/// [`cmd_govern::answering_seat`] reaches, the same walk `flag` hands to — and
+/// the words go into that seat's spool with the `Sent` hop, as `flag`'s do.
+/// With no seat anywhere the person is the only reader there is, so it is
+/// theirs, as an unaddressed hand always was.
+///
+/// Returns the record, or `None` when the task is gone or the record refused.
+pub(crate) fn notice(store: &Store, task: &str, text: &str) -> Option<Message> {
+    let task = store.task(task)?;
+    let seat = cmd_govern::answering_seat(store, &task);
+    let mut m = Message::new(Party::wsp(), Kind::Note, text);
+    m.about = About::Task(task.id.clone());
+    m.for_seat = seat.as_ref().map(|s| s.scope.clone());
+    message::raise(store, &m).ok()?;
+    if let Some(s) = &seat {
+        crate::wake::say(store, &s.scope, &for_its_seat(&m, &task), Some(&m.id));
+    }
+    Some(m)
+}
+
+/// A run notice as its seat reads it: the words, and that it is this seat's
+/// to dispose of rather than the person's. Shorter than [`for_a_governor`]
+/// because nobody raised a hand — wsp is telling the seat about its own run.
+fn for_its_seat(m: &Message, task: &Task) -> String {
+    format!(
+        "{text}\n\n\
+         wsp's notice on {task} ({id}), for this seat and not on the person's panel · \
+         `wsp flag {id} --clear` takes it down · `wsp flag {task} \"…\"` puts it in front of the person",
+        text = m.text,
+        task = task.id,
+        id = m.id,
+    )
 }
 
 /// The hand as it goes to the seat, in the words its reader has to act on.
@@ -1078,13 +1129,9 @@ fn dispose(store: &Store, args: &Args, needle: &str, clearing: bool) -> i32 {
         return 0;
     }
 
-    let env = herdr::Env::read();
-    let by = match env.pane_id {
-        Some(pane) if !pane.is_empty() => {
-            Party::pane(&pane, &env.workspace_id.unwrap_or_default())
-        }
-        _ => Party::Human,
-    };
+    // `whoami`, as the raising side reads it: a compound-hosted seat taking a
+    // hand down was recorded as the person doing it.
+    let (by, _) = crate::cmd_message::whoami(store);
     if let Err(why) = message::acknowledge(store, &one.id, &by) {
         eprintln!("wsp: {why}");
         // The sentence `Refused::WrongShape` prints is true and short; this is
@@ -1175,6 +1222,11 @@ fn hand_aside(
     if m.ask() == Some(Ask::Claim) {
         out.push("asks to take it".into());
     }
+    // Said on the row, because the text listing shows every hand and a seat's
+    // notice must not read as one the person owes (`wsp-272`).
+    if let Some(scope) = &m.for_seat {
+        out.push(format!("for the {scope} seat, not the person"));
+    }
     // Nothing when there is no seat above it, which is the ordinary case and
     // already reads as "this is yours" to the person looking at it.
     if let Some(s) = seat {
@@ -1245,8 +1297,18 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     // were reading the last one is the one you have not seen. The record is
     // kept oldest-first, because which end of a queue an interruption is read
     // from is a decision about a surface.
-    let rows: Vec<Message> =
-        message::raised(store).into_iter().filter(|m| !m.is_reply()).rev().collect();
+    //
+    // `--person` is the person's open set and nothing else: what a panel or
+    // compound's raised hand should draw, asked of wsp rather than guessed from
+    // `via` or the wording (`wsp-272`). Not `--for person` after the JSON
+    // field, because the spell check would then offer `--for` for `--form`,
+    // which is the slip `--from` is there to catch.
+    let only_the_person = args.has("person");
+    let rows: Vec<Message> = message::raised(store)
+        .into_iter()
+        .filter(|m| !m.is_reply() && (!only_the_person || m.is_the_persons()))
+        .rev()
+        .collect();
     if args.json() {
         let out: Vec<serde_json::Value> = rows.iter().map(Message::to_json).collect();
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
@@ -6174,6 +6236,70 @@ mod tests {
             crate::message::raised(&store)[0].handed_to("wsp"),
             "and the record knows the seat was handed it, so the pass does not announce it twice"
         );
+    }
+
+    /// **`wsp-272`: a notice the run writes is wsp's, for the seat it went to,
+    /// and off the person's panel.** The 2026-10-10 shape was `from: human,
+    /// for: null` on six barrier passes already handed to a seat, so compound's
+    /// hand and the panel showed the person what the governor had been told.
+    #[test]
+    fn a_run_notice_says_it_is_wsps_and_for_the_seat_and_is_not_the_persons() {
+        let (_env, store) = scratch("run-notice");
+        a_task(&store, "wsp-001");
+        store.set_governor(
+            "wsp",
+            json!({ "workspace": "w1", "pane": "w1:p1", "host": util::hostname(), "since": util::iso_at(1_000) }),
+        );
+
+        let m = notice(&store, "wsp-001", "Barrier 4 of wsp-for-ux passed. The verdict: holds.").expect("raised");
+        let back = store.message(&m.id).expect("stored");
+        assert!(back.from.is_wsp(), "written by the run, not a keyboard: {:?}", back.from);
+        assert_eq!(back.source(), message::Source::Wsp);
+        assert_eq!(back.for_seat.as_deref(), Some("wsp"), "for the seat that answers for the member");
+        assert_eq!(back.to_json()["for"], json!({ "seat": "wsp" }), "and the JSON says so");
+        assert!(back.handed_to("wsp"), "the words went into that seat's spool");
+        assert!(!back.is_the_persons(), "so the person's open set leaves it out");
+        let said = store.watches()[&crate::wake::key_for("wsp")]["spool"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(said.contains("Barrier 4 of wsp-for-ux passed") && said.contains(&m.id), "{said}");
+    }
+
+    /// With no seat anywhere above the member, nobody but the person can read
+    /// it — so it is theirs, as an unaddressed hand always was, and it still
+    /// says who wrote it.
+    #[test]
+    fn a_run_notice_with_no_seat_to_take_it_is_the_persons_and_still_wsps() {
+        let (_env, store) = scratch("run-notice-no-seat");
+        a_task(&store, "wsp-001");
+        let m = notice(&store, "wsp-001", "Barrier 1 of solo passed.").expect("raised");
+        assert!(m.from.is_wsp());
+        assert_eq!(m.for_seat, None);
+        assert!(m.is_the_persons(), "the only reader there is");
+    }
+
+    /// A compound-hosted seat has `WSP_SEAT_ID` and no `HERDR_PANE_ID`, and
+    /// `wsp flag` read only herdr's variable — so a hand a compound seat raised
+    /// was recorded as the person's (three of the eight up on 2026-10-10).
+    #[test]
+    fn a_hand_raised_from_a_compound_seat_is_not_recorded_as_the_person() {
+        let (_env, store) = scratch("flag-compound-seat");
+        a_task(&store, "wsp-001");
+        // A compound seat's record names the seat as its room as well as its pane.
+        store.set_governor("tooling", json!({ "workspace": "cpd-41", "pane": "cpd-41", "host": util::hostname() }));
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-41");
+        let governs = raise_one(&store, &["wsp-001", "possibly moot"], &[]);
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-42");
+        let agent = raise_one(&store, &["wsp-001", "found something"], &[]);
+        std::env::remove_var(crate::place::SEAT_ENV);
+        assert_eq!((governs, agent), (0, 0));
+
+        let up = crate::message::raised(&store);
+        assert_eq!(up[0].from, Party::seat("tooling"), "the seat's post, as `wsp ask` already records it");
+        assert_eq!(up[1].from, Party::pane("cpd-42", ""), "an agent in a seat it does not govern is its pane");
+        assert!(up.iter().all(|m| m.is_the_persons()), "a hand is still for the person: only the run's notices leave");
     }
 
     /// **The fault this whole change exists for**, driven through the verb

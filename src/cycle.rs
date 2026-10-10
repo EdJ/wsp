@@ -2459,8 +2459,10 @@ pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
     let groups = w.groups();
     let here = groups.iter().find(|g| g.verdict.trim().is_empty()).or_else(|| groups.last());
     let Some(first) = here.and_then(|g| g.members.first()).cloned() else { return };
-    let args = Args::synth("flag", &[first.as_str(), text], &[]);
-    let _ = crate::cmd_agent::flag(store, &args);
+    // wsp's own notice, for the seat that answers for the member — not a
+    // `wsp flag` with no pane behind it, which recorded the run as a person
+    // and put every barrier pass on the person's panel (`wsp-272`).
+    let _ = crate::cmd_agent::notice(store, &first, text);
 }
 
 /// The half of [`tell`] that decides where a verdict goes, and whether a post

@@ -1168,7 +1168,7 @@ fn addressed(store: &Store, task: &crate::model::Task) -> String {
 /// than one from a pane id nobody can place. The pane is still returned beside
 /// it, because a question asked from a seat still has to be answered back into
 /// the workspace the seat is sitting in.
-fn whoami(store: &Store) -> (Party, Option<String>) {
+pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
     // Off `my_pane()` and not `HERDR_WORKSPACE_ID`: after `compound-092` there
     // is no workspace to ask, only the seat, and `my_pane()` is already the
     // one place that picks it — a supervisor's `WSP_SEAT_ID` first, herdr's

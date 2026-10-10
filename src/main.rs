@@ -192,7 +192,7 @@ const BOOL_FLAGS: &[&str] = &[
     // `wsp verified <member> --holds|--blocks`, `wsp spawn <member> --verify`
     // and `wsp migrate --verify-rows -n`: none takes a value, and each is
     // followed by a positional or a stream it must not eat.
-    "holds", "blocks", "verify", "verify-rows", "barrier-rows",
+    "holds", "blocks", "verify", "verify-rows", "barrier-rows", "run-notices",
     // `wsp worklist followup <slug> <task>… --blocking|--next`: the rows are
     // positionals, and a flag between them must not eat the one after it.
     "blocking", "next",
@@ -2014,11 +2014,12 @@ fn help_text() -> String {
   wsp flag <id> --from FILE         …with that paragraph out of a file, the
                                     spelling every other prose verb takes
   wsp flag <id> --ask claim         …and a question a keypress answers
-  wsp flag [--clear <id>] [--seen <id>] [--seat]
+  wsp flag [--clear <id>] [--seen <id>] [--seat] [--person]
                                     what is raised, and whose it is; --seat
-                                    narrows it to this seat's own; --clear lowers
-                                    one, and --seen puts the card away and
-                                    leaves the hand up
+                                    narrows it to this seat's own, --person to
+                                    the person's (no notice wsp wrote for a
+                                    seat); --clear lowers one, and --seen puts
+                                    the card away and leaves the hand up
   wsp ask <id> ["…"|-|--from F]     a question about a task, with a return path:
                                     the answer comes back to you and lands on a
                                     task's log. `wsp tell` is still for prose
@@ -2052,6 +2053,9 @@ fn help_text() -> String {
   wsp migrate --barrier-rows [-n]   every settled Barrier row wsp filed, moved
                                     onto its group's checks: and archived; open
                                     rows and hand-made ones are named and left
+  wsp migrate --run-notices [-n]    the run's notices raised before wsp-272 as
+                                    a person's hands: from wsp, and for the
+                                    seat they were handed to
 
 Ids are `<project>-NNN`, continuous within a project rather than within a day,
 and a task filed nowhere is `inbox-NNN` until `wsp mv -p` files it — the one
@@ -2373,6 +2377,15 @@ mod tests {
         assert_eq!(caught(&["note", "028", "--from=/tmp/x.md"]), None);
         // …and nothing else is exempted by being near it.
         assert!(caught(&["note", "028", "--form", "-"]).is_some());
+    }
+
+    /// `wsp flag --person --json` is what compound's hand asks (`wsp-272`):
+    /// `person` is a global boolean, so it eats no task id and the verb lists.
+    #[test]
+    fn flag_person_lists_rather_than_raising() {
+        let a = super::Args::parse(["flag", "--person", "--json"].iter().map(|s| (*s).to_string()).collect());
+        assert!(a.has("person") && a.json());
+        assert!(a.rest.is_empty(), "no task named, so it lists: {:?}", a.rest);
     }
 
     /// The other half of the same change: nothing that used to parse may stop.

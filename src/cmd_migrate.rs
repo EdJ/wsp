@@ -125,6 +125,10 @@ pub fn run(store: &Store, args: &Args) -> i32 {
     if args.has("barrier-rows") {
         return crate::barrier::migrate(store, args);
     }
+    // `wsp-272`: the run's notices that read as the person's hands.
+    if args.has("run-notices") {
+        return run_notices(store, args);
+    }
 
     let p = Paint::new();
     let (map, tops) = plan(store);
@@ -739,4 +743,48 @@ mod tests {
         let sql = "-- t-260815-001\nselect 't-260815-002';\n";
         assert_eq!(brought_forward("queries.sql", sql), sql);
     }
+}
+
+/// `wsp migrate --run-notices [-n]` — every notice the run raised before
+/// `wsp-272`, said to be wsp's and the seat's it went to. Machine state, not the
+/// store's history, so nothing is committed: see [`crate::message`] on why a
+/// raised hand is not in git.
+fn run_notices(store: &Store, args: &Args) -> i32 {
+    let dry = args.has("n") || args.has("dry-run");
+    let p = Paint::new();
+    let found = crate::message::legacy_run_notices(store);
+    for m in &found {
+        let to = m
+            .via
+            .iter()
+            .rev()
+            .find(|h| h.act == crate::message::Act::Sent)
+            .and_then(|h| h.by.scope())
+            .map(|s| format!("for the {s} seat"))
+            .unwrap_or_else(|| "never handed to a seat · stays the person's".into());
+        println!(
+            "{}  {}  {}  {}",
+            p.bold(&m.id),
+            m.about.task().unwrap_or_default(),
+            p.dim(&to),
+            crate::util::truncate(&m.title(), 60)
+        );
+    }
+    println!("\n{} run notice(s) raised as a person's", found.len());
+    if found.is_empty() {
+        return 0;
+    }
+    if dry {
+        println!("{}", p.dim("nothing written — drop -n to apply"));
+        return 0;
+    }
+    let mut done = 0;
+    for m in &found {
+        match crate::message::adopt_run_notice(store, &m.id) {
+            Ok(_) => done += 1,
+            Err(e) => eprintln!("wsp: {}: {e}", m.id),
+        }
+    }
+    println!("rewrote {done}");
+    if done == found.len() { 0 } else { 1 }
 }
