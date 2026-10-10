@@ -1440,6 +1440,19 @@ impl WorklistStatus {
 /// primitive to keep saying so.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Group {
+    /// `id:` — the group's name for good, `wsp-254`: given when the group is
+    /// made, never given to another, and unchanged by a group put in ahead of
+    /// it. The ordinal is a position and is not one: compound-370's follow-up
+    /// made gpui-migration's planned group 4 into group 5, so a selection
+    /// saved as group 4 named the wrong group a minute later.
+    ///
+    /// `None` only between a parse and [`Worklist::groups`], which numbers
+    /// what the file does not, and on a group a verb has just built, which
+    /// [`Worklist::set_groups`] numbers on the way out. See [`number`].
+    ///
+    /// **A wsp from before this reads the line as more members**, the hazard
+    /// [`Self::member_agents`] documents.
+    pub id: Option<u32>,
     /// Task ids, referenced and not owned: a member stays in whatever project
     /// it lives in, which is the whole point of a worklist sitting outside
     /// one. The `batch` moved 26 tasks into a project and back out again for
@@ -1851,6 +1864,12 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
             last.verdict = rest.trim().to_string();
             cont = Cont::Verdict;
             label_indent = indent;
+        } else if let Some(rest) = trimmed.strip_prefix("id:") {
+            // Never a member: an id is `<project>-NNN`, and no task is named
+            // with a colon. A value that is not a number is dropped rather
+            // than read as two members, and the group is numbered afresh.
+            last.id = rest.trim().parse().ok();
+            cont = Cont::Members;
         } else if let Some(rest) = trimmed.strip_prefix("caption:") {
             last.caption = rest.trim().to_string();
             cont = Cont::Members;
@@ -1973,6 +1992,9 @@ pub fn render_groups(groups: &[Group]) -> String {
             out.push_str(m);
         }
         out.push('\n');
+        if let Some(id) = g.id {
+            out.push_str(&format!("  id: {id}\n"));
+        }
         if !g.caption.trim().is_empty() {
             out.push_str(&format!("  caption: {}\n", g.caption.trim()));
         }
@@ -1996,6 +2018,40 @@ pub fn render_groups(groups: &[Group]) -> String {
         block(&mut out, "landed", &landed_text(&g.landed));
     }
     out
+}
+
+/// Give every group without an id one, and return the highest id given.
+///
+/// **A list from before ids is numbered by position**, once: with nothing
+/// written and nothing ever made, the ordinal is the only name a reader has
+/// used for each group, so it becomes the id, and the next write keeps it.
+/// That is what keeps a saved `g:gpui-migration/13` pointing at group 13.
+///
+/// Otherwise a group with no id — one a verb has just built, or a line typed
+/// into the file by hand — takes the next number past both the highest id
+/// on the list and `made`, the list's count of every id it has given out. So
+/// an id freed by a removal is not given again. A repeated id is a copied
+/// block, and the second copy is numbered afresh.
+pub fn number(groups: &mut [Group], made: u32) -> u32 {
+    if made == 0 && groups.iter().all(|g| g.id.is_none()) {
+        for (i, g) in groups.iter_mut().enumerate() {
+            g.id = Some(i as u32 + 1);
+        }
+        return groups.len() as u32;
+    }
+    let mut next = groups.iter().filter_map(|g| g.id).max().unwrap_or(0).max(made);
+    let mut seen = std::collections::BTreeSet::new();
+    for g in groups.iter_mut() {
+        match g.id {
+            Some(id) if seen.insert(id) => {}
+            _ => {
+                next += 1;
+                g.id = Some(next);
+                seen.insert(next);
+            }
+        }
+    }
+    next
 }
 
 /// One of a group's prose blocks, wrapped to the column its continuations
@@ -2070,6 +2126,10 @@ pub struct Worklist {
     pub caption: Option<String>,
     pub status_raw: String,
     pub created: String,
+    /// `groups_made:` — how many group ids this list has given out, so a
+    /// removed group's id is never given to the next one. `0` on a list
+    /// from before ids. See [`number`].
+    pub groups_made: u32,
     pub body: String,
 }
 
@@ -2081,6 +2141,7 @@ impl Worklist {
             caption: None,
             status_raw: WorklistStatus::Draft.as_str().to_string(),
             created: util::now_iso(),
+            groups_made: 0,
             body: String::new(),
         }
     }
@@ -2109,6 +2170,7 @@ impl Worklist {
             id,
             status_raw: doc.opt("status").unwrap_or_else(|| "draft".into()),
             created: doc.str("created"),
+            groups_made: doc.opt("groups_made").and_then(|n| n.trim().parse().ok()).unwrap_or(0),
             body: doc.body.clone(),
         }
     }
@@ -2122,6 +2184,9 @@ impl Worklist {
         if let Some(c) = self.caption.as_deref().filter(|c| !c.trim().is_empty()) {
             d.set_str("caption", c);
         }
+        if self.groups_made > 0 {
+            d.set_str("groups_made", &self.groups_made.to_string());
+        }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
@@ -2131,7 +2196,9 @@ impl Worklist {
     /// so there is one copy of the membership and a hand-edit ahead of the
     /// work is simply read.
     pub fn groups(&self) -> Vec<Group> {
-        parse_groups(&self.section("Groups").unwrap_or_default())
+        let mut groups = parse_groups(&self.section("Groups").unwrap_or_default());
+        number(&mut groups, self.groups_made);
+        groups
     }
 
     /// Whether wsp runs any of this list: a group with an `agent:` line that
@@ -2146,7 +2213,9 @@ impl Worklist {
     /// group at or behind it is frozen — and that is the verbs' question, at
     /// the moment a person can be told which group is running.
     pub fn set_groups(&mut self, groups: &[Group]) {
-        set_section_in_order(&mut self.body, "Groups", &render_groups(groups), &WORKLIST_SECTIONS);
+        let mut groups = groups.to_vec();
+        self.groups_made = self.groups_made.max(number(&mut groups, self.groups_made));
+        set_section_in_order(&mut self.body, "Groups", &render_groups(&groups), &WORKLIST_SECTIONS);
     }
 
     /// The text under `## <name>`, heading excluded.
@@ -2185,8 +2254,8 @@ mod tests {
         let mut w = Worklist::new("wl", "A list");
         w.caption = Some("Move the chrome".into());
         let groups = vec![
-            Group { members: vec!["c-1".into(), "c-2".into()], caption: "Three spikes".into(), stop: "flag and stop".into(), ..Default::default() },
-            Group { members: vec!["c-3".into()], ..Default::default() },
+            Group { id: Some(1), members: vec!["c-1".into(), "c-2".into()], caption: "Three spikes".into(), stop: "flag and stop".into(), ..Default::default() },
+            Group { id: Some(2), members: vec!["c-3".into()], ..Default::default() },
         ];
         w.set_groups(&groups);
         let back = Worklist::from_doc(&fm::parse(&w.render()), "wl");
@@ -2698,6 +2767,53 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert_eq!((p.kind.as_str(), p.model.as_deref(), p.effort.as_deref()), ("opencode", Some("some/model-free"), Some("high")));
         assert_eq!(p.spawn_flags(), vec!["--kind", "opencode", "--model", "some/model-free", "--effort", "high"]);
         assert!(groups[1].policy().is_none() && groups[2].policy().is_none());
+    }
+
+    /// `wsp-254`: a group's id survives the file, is never read as a member,
+    /// and is not the ordinal once a group has gone in ahead of it.
+    #[test]
+    fn a_groups_id_round_trips_and_is_not_a_member() {
+        let text = "- 1  a-1\n  id: 4\n- 2  a-2  a-3\n  id: 2\n  stop: look\n";
+        let groups = parse_groups(text);
+        assert_eq!((groups[0].id, groups[1].id), (Some(4), Some(2)));
+        assert_eq!(groups[1].members, vec!["a-2", "a-3"], "the line is not a member");
+        assert_eq!(parse_groups(&render_groups(&groups)), groups);
+    }
+
+    /// A list from before ids is numbered by position, which is the name its
+    /// readers already used for each group, and the next write keeps it; a
+    /// group put in after that takes a number nobody has had.
+    #[test]
+    fn a_list_from_before_ids_is_numbered_where_it_stands_and_keeps_it() {
+        let mut w = Worklist::new("l", "l");
+        set_section_in_order(&mut w.body, "Groups", "- 1  a-1\n- 2  a-2\n- 3  a-3\n", &WORKLIST_SECTIONS);
+        let mut groups = w.groups();
+        assert_eq!(groups.iter().map(|g| g.id).collect::<Vec<_>>(), [Some(1), Some(2), Some(3)]);
+        groups.insert(1, Group { members: vec!["a-9".into()], ..Group::default() });
+        w.set_groups(&groups);
+        let back = Worklist::from_doc(&fm::parse(&w.render()), "l");
+        let ids: Vec<_> = back.groups().iter().map(|g| (g.members[0].clone(), g.id)).collect();
+        assert_eq!(ids, [("a-1".into(), Some(1)), ("a-9".into(), Some(4)), ("a-2".into(), Some(2)), ("a-3".into(), Some(3))]);
+        assert_eq!(back.groups_made, 4);
+    }
+
+    /// An id freed by a removal is not given again: a saved selection that
+    /// named the removed group must not come to name its successor.
+    #[test]
+    fn an_id_a_removed_group_had_is_never_given_again() {
+        let mut w = Worklist::new("l", "l");
+        w.set_groups(&[
+            Group { members: vec!["a-1".into()], ..Group::default() },
+            Group { members: vec!["a-2".into()], ..Group::default() },
+        ]);
+        let mut groups = w.groups();
+        groups.pop();
+        w.set_groups(&groups);
+        let back = Worklist::from_doc(&fm::parse(&w.render()), "l");
+        let mut groups = back.groups();
+        groups.push(Group { members: vec!["a-3".into()], ..Group::default() });
+        assert_eq!(number(&mut groups, back.groups_made), 3);
+        assert_eq!(groups[1].id, Some(3), "not 2, which group 2 had");
     }
 
     /// `wsp-150`: one member on claude beside opencode ones, in one group.

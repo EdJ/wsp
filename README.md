@@ -257,6 +257,40 @@ What a run did is in four places: `cycle.log` in the state directory (each
 step and why), `wsp watch --status` (the daemon and every delivery register),
 the member's `## Verification`, and the group's `verdict:` and `checks:`.
 
+**For a client, `wsp worklist show --json` reads that history back as data**
+(`wsp-254`), so the graph's gate badges, `+` marks and tombstones never parse
+prose. Each group carries:
+
+- `id`: given when the group is made and never given again. The ordinal is a
+  position and changes when a group goes in ahead; the id does not. It is the
+  `id:` line under the group, and `groups_made:` in the front matter counts
+  the ids given out. A list from before ids is numbered where it stands, so
+  its ids are its ordinals at that moment.
+- `checks`: `[{at, verdict, read, pane, on, ended, end_failed, was}]`, off
+  `checks:`. A check that held says `hold`, never `holds`: in a member's
+  verification `holds` means it passes.
+- `events`: `[{at, kind, why}]`, `kind` one of `started`, `held`,
+  `started_again`, `passed`, `stop_amended` and `followup`. A follow-up also
+  has `by`, `members` and `blocking`.
+- `made`: `{at, by, via, barrier}`. `via` is `add`, `mv` or `followup`, and
+  `by` is the check that filed it or whoever ran the verb (`null` on a line
+  from before this recorded it). `barrier` is the id of the group the run
+  stood at, for a follow-up group and for one put in after the start. It is
+  `null` for a group of members already planned, which is the list
+  rearranged.
+- `joined`: `{"<member>": {at, by, via}}`, each member that came on after the
+  run started, other than in the group's own making.
+- `follow_up_of`: `{"<member>": "<parent>"}`, each member a barrier check
+  filed.
+
+The list carries `dropped`: `[{after, at, why, members, events}]`, one per
+group dropped while the run stood at it, with `after` the id of the group
+before it. All of it is read off the `## Log`, which already records every
+edit by the ordinal it was made at. Membership is replayed line by line. An
+event is placed on the group the run stood at, which is the first group whose
+verdict's instant had not yet passed. A group dropped while it ran keeps the
+events from its window.
+
 A group with `--agent manual`, or a list from before groups had a line, is run
 by hand. `wsp worklist next` names what may start; the governor spawns it,
 passes the barrier with `go`, and makes `wsp govern <slug> --rotate` its last
@@ -4527,6 +4561,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor — or, past the last barrier, the list closed and its own seat stood down and ended |
 | `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified`, and the one-off migration off Verify rows |
+| `src/history.rs` | a list's history as data, off its `## Log` and `checks:`: membership replayed by ordinal, events placed on the group the run stood at by time, each group's maker and joins, and the groups dropped while they ran |
 | `src/barrier.rs` | a barrier check, on the group it checks: the `checks:` entries, opened before its agent starts, settled by `go`/`hold`/`followup`, the seats `wip` and the brief name, and the one-off migration off Barrier rows |
 | `src/repair.rs` | the same steps on the daemon's tick, plus the states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, a member `advance` skipped, and a governor seat standing empty on a running list. Each is keyed on a record the member's own `## Log` or the seat's own governor entry, and each says why in `cycle.log` and to the seat |
 | `src/untaken.rs` | a work order the run typed at a seat and no turn came of: pressed once if it sits in the prompt, sent again once if it never reached it, and the seat replaced if neither starts a turn — each step a `cycle.log` line the next one reads back |

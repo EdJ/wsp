@@ -87,6 +87,7 @@ use serde_json::json;
 // be a divergence in what each section can hold. `worklist-045` made it
 // `pub(crate)` for its second caller; this is the third.
 use crate::cmd_task::fold;
+use crate::history::{self, History};
 use crate::model::{Group, Landed, Worklist, WorklistStatus, DEFAULT_POLICY, MANUAL};
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -448,11 +449,15 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     // The log names the members and the ordinal names itself. Ordinals are
     // positions, rewritten on every write, so "added to group 3" is a sentence
     // that stops being true the moment a group is inserted above it — the ids
-    // are the half that stays true, and they lead.
+    // are the half that stays true, and they lead. Who ran it is the `by` of
+    // a group made or a member joined while the run stands (`wsp-254`): Ed's
+    // group 13 of gpui-migration, put in at barrier 12's hold, said nothing of
+    // who put it there.
     w.log(&format!(
-        "{} → group {ordinal}{}",
+        "{} → group {ordinal}{} · by {}",
         members.join(" "),
-        if new_group { " (new)" } else { "" }
+        if new_group { " (new)" } else { "" },
+        crate::cmd_message::caller(store)
     ));
     if args.has("sub") {
         // Said out loud because `--sub` is a resolution and not a rule: what
@@ -865,7 +870,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     if let Some(code) = refuse_edges(store, &w, &groups) {
         return code;
     }
-    w.log(&format!("{id} → group {at}{}", if fresh { " (new)" } else { "" }));
+    w.log(&format!("{id} → group {at}{} · by {}", if fresh { " (new)" } else { "" }, crate::cmd_message::caller(store)));
     save(store, &mut w, &groups, "mv", &format!("mv {id} to group {at}"));
 
     if args.json() {
@@ -1800,13 +1805,15 @@ fn hold_caption(w: &Worklist) -> Option<crate::caption::Told> {
 }
 
 /// `worklist show --json`'s groups.
-fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::model::Task]) -> serde_json::Value {
+fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::model::Task], h: &History) -> serde_json::Value {
     let groups = w.groups();
     json!(groups
         .iter()
         .zip(group_captions(store, &groups))
         .enumerate()
-        .map(|(i, (g, caption))| json!({
+        .map(|(i, (g, caption))| {
+            let mut v = json!({
+            "id": g.id,
             "ordinal": i + 1,
             "caption": caption.json(),
             "parallel": g.cap,
@@ -1826,7 +1833,16 @@ fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::mode
             // it (`wsp-256`): a client draws the off-list ones as such.
             "after": crate::after::of_group(tasks, g),
             "waiting": holds(store, w, pos, i + 1, g),
-        }))
+            });
+            // The barrier's history and the list's edits, `wsp-254`: `made`,
+            // `checks`, `events`, `joined` and `follow_up_of`.
+            if let (Some(of), serde_json::Value::Object(o)) = (h.groups.get(i), &mut v) {
+                if let serde_json::Value::Object(more) = history::group_json(g, of, &h.filed, tasks) {
+                    o.extend(more);
+                }
+            }
+            v
+        })
         .collect::<Vec<_>>())
 }
 
@@ -1941,13 +1957,17 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // `after:` edges, read off the members' tasks, and the run's holds.
     let tasks = store.tasks();
     let held = |ordinal: usize, g: &Group| holds(store, &w, &pos, ordinal, g);
+    let past = history::of(&w, &groups);
 
     if args.json() {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "worklist": worklist_json(store, &w),
-                "groups": groups_json(store, &w, &pos, &tasks),
+                "groups": groups_json(store, &w, &pos, &tasks, &past),
+                // One per group dropped while the run stood at it, which the
+                // graph draws as a cut branch under the gate it left from.
+                "dropped": past.dropped.iter().map(history::dropped_json).collect::<Vec<_>>(),
                 "at": pos.at,
                 // The third state, for the reader that cannot see the `at`
                 // line. `waiting_on` being empty is the same fact only if you
@@ -4909,13 +4929,13 @@ mod tests {
         assert_eq!(run(&store, &["add", "dep", "e-1", "e-2", "e-3"]), 0);
         assert_eq!(run(&store, &["add", "dep", "e-4"]), 0);
         let mut w = store.worklist("dep").unwrap();
-        let draft = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks());
+        let draft = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks(), &History::default());
         assert_eq!(draft[0]["after"], json!({ "e-2": ["e-1"], "e-3": ["x-9"] }), "{draft}");
         assert_eq!(draft[0]["waiting"], json!({}), "a draft holds nothing");
 
         w.set_status(WorklistStatus::Running);
         store.save_worklist(&w).unwrap();
-        let v = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks());
+        let v = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks(), &History::default());
         assert_eq!(v[0]["waiting"], json!({ "e-2": ["e-1"] }), "not e-3, whose edge is off the list: {v}");
         assert_eq!(v[1]["after"], json!({ "e-4": ["e-1"] }), "a cross-group edge is carried");
         assert_eq!(v[1]["waiting"], json!({}), "and held by the barrier, not by this");
@@ -5584,6 +5604,66 @@ mod tests {
         assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("blocking", "true"), ("from", &from)], &["cpd-9"]), 0);
         assert_eq!(checks_on(&store, 1)[0].state, crate::barrier::State::Blocking);
         assert_eq!(checks_ending(), vec!["cpd-9"]);
+    }
+
+    /// `wsp-254`: a follow-up group goes in ahead of a planned one, which is
+    /// renumbered and keeps its id, and `show --json` says who made the new
+    /// group, at which barrier, and what each of its rows follows up.
+    #[test]
+    fn a_follow_up_group_put_in_ahead_leaves_every_id_as_it_was_and_says_who_made_it() {
+        let _env = util::isolated("id-followup");
+        let store = at_barrier_one_seated("id-followup");
+        let mut t = store.task("wl-003").unwrap();
+        t.parent = Some("wl-001".into());
+        store.save_task(&t).unwrap();
+        let before: Vec<_> = groups_of(&store, "run").iter().map(|g| (g.members.clone(), g.id)).collect();
+        let from = verdict("id-followup", "holds, with a tail");
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("next", "true"), ("from", &from)], &["cpd-9"]), 0);
+
+        let after = groups_of(&store, "run");
+        assert_eq!(after[2].members, ["wl-002"], "the planned group is renumbered from 2 to 3");
+        assert_eq!((after[0].id, after[2].id), (before[0].1, before[1].1), "and keeps the id it had");
+        assert!(after[1].id.is_some_and(|id| id > 2), "the new group has a number nobody had: {:?}", after[1].id);
+
+        let w = store.worklist("run").unwrap();
+        let past = history::of(&w, &after);
+        let v = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks(), &past);
+        assert_eq!(v[2]["id"], json!(before[1].1));
+        assert_eq!(v[1]["made"]["by"], "cpd-9");
+        assert_eq!(v[1]["made"]["via"], "followup");
+        assert_eq!(v[1]["made"]["barrier"], json!(after[0].id), "made at the barrier after group 1");
+        assert_eq!(v[1]["follow_up_of"], json!({ "wl-003": "wl-001" }));
+        assert_eq!(v[0]["checks"][0]["verdict"], "next");
+        assert_eq!(v[0]["events"][0]["kind"], "followup", "{}", v[0]["events"]);
+        assert_eq!(v[0]["events"][0]["by"], "cpd-9");
+    }
+
+    /// Q-6: who joined a member to a running list is on the line `add`
+    /// writes, so `joined.by` names them; with no seat at all it is a person.
+    #[test]
+    fn a_member_added_to_a_running_list_is_joined_by_whoever_ran_add() {
+        let _env = util::isolated("id-joined");
+        let store = at_barrier_one_seated("id-joined");
+        // `go` writes the start; the fixture only sets the status.
+        let mut w = store.worklist("run").unwrap();
+        w.log("started · go");
+        store.save_worklist(&w).unwrap();
+        task(&store, "wl-004", "todo");
+        task(&store, "wl-005", "todo");
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-77");
+        assert_eq!(flagged(&store, &["add", "run", "wl-004"], &[("group", "2")]), 0);
+        std::env::remove_var(crate::place::SEAT_ENV);
+        let herdr = std::env::var_os("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_PANE_ID");
+        assert_eq!(flagged(&store, &["add", "run", "wl-005"], &[("group", "2")]), 0);
+        if let Some(h) = herdr {
+            std::env::set_var("HERDR_PANE_ID", h);
+        }
+        let w = store.worklist("run").unwrap();
+        let groups = w.groups();
+        let joined = &history::of(&w, &groups).groups[1].joined;
+        let by = |m: &str| joined.get(m).and_then(|j| j.by.clone());
+        assert_eq!((by("wl-004").as_deref(), by("wl-005").as_deref()), (Some("cpd-77"), Some("person")), "{joined:?}");
     }
 
     /// A hold is recorded on the group and leaves the seat to the tick.

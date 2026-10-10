@@ -44,6 +44,7 @@ mod draw;
 mod ending;
 mod fake;
 mod fm;
+mod history;
 mod guard;
 mod herdr;
 mod input;
@@ -1913,7 +1914,13 @@ fn help_text() -> String {
                                     where it is up to a long stop condition is
                                     counted the same way — the one at the live
                                     barrier always reads whole; --stops draws
-                                    every block back
+                                    every block back. --json gives each group
+                                    an id no renumbering changes, and the
+                                    history the log holds: made, checks,
+                                    events, joined, follow_up_of, and the
+                                    list's dropped groups. A check that held
+                                    says `hold` there, never `holds`, which in
+                                    a member's verification means it passes
   Editing is write-ahead-only: a group at or behind where the list is up to has
   either run or is running, and is refused with what may be edited instead. Two
   exceptions: a member's own agent line may change until that member starts,

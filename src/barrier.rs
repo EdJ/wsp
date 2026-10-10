@@ -150,7 +150,7 @@ impl Check {
 }
 
 /// Whether a token starts an entry: an instant as `now_iso` writes one.
-fn instant(tok: &str) -> bool {
+pub(crate) fn instant(tok: &str) -> bool {
     let b = tok.as_bytes();
     b.len() == 20 && b[4] == b'-' && b[10] == b'T' && b[19] == b'Z' && b[0].is_ascii_digit()
 }

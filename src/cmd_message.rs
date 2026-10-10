@@ -905,6 +905,23 @@ fn whoami(store: &Store) -> (Party, Option<String>) {
     }
 }
 
+/// Who is running this verb, as one token for a record's `by`: the post a
+/// seat holds, else the pane, else `person` — [`whoami`]'s reading, where a
+/// caller outside any pane is a person at a shell.
+///
+/// The seat is read off the environment in `my_pane()`'s order rather than
+/// through it: building its backends opens the default store, which a verb
+/// writing one log line has no other reason to touch.
+pub(crate) fn caller(store: &Store) -> String {
+    let pane = crate::place::seat_from_env()
+        .map(|s| s.to_string())
+        .or_else(|| herdr::Env::read().pane_id.filter(|p| !p.is_empty()));
+    match pane {
+        Some(p) => crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
+        None => "person".into(),
+    }
+}
+
 /// The record a needle names: an id, or an unambiguous prefix of one.
 ///
 /// A message id is minted from a clock and a pid and nobody types one whole.
