@@ -2173,6 +2173,13 @@ struct Front {
     /// The members something is already doing, and the one thing worth saying
     /// about each — who is holding it, or what git says is outstanding.
     waiting: Vec<(Standing, String)>,
+    /// The members nothing is doing because the run holds them: an `after:`
+    /// edge on a member of their own group that has not landed (`wsp-256`).
+    /// Kept apart from `waiting` because every other reader of a front means
+    /// that field as *in flight* — `hold` and `park` name it as work that will
+    /// land anyway, and the cap counts it as a slot taken — and a held member
+    /// is neither. `next` is the one place both are printed as waiting.
+    held: Vec<(Standing, String)>,
     /// How many more would be ready but for the cap. Reported because a
     /// governor told "2 may start now" about a group of five otherwise goes
     /// looking for the three that are missing.
@@ -2596,7 +2603,7 @@ fn seated(store: &Store, args: &Args) -> Option<Worklist> {
 fn state(store: &Store, w: &Worklist, p: &Position) -> State {
     let groups = w.groups();
     if w.status() == WorklistStatus::Parked {
-        let flight = front(store, groups.get(p.at.unwrap_or(1) - 1), &p.members).waiting.len();
+        let flight = front(store, groups.get(p.at.unwrap_or(1) - 1), &p.members, &BTreeMap::new()).waiting.len();
         return State::Shut {
             gate: Gate::Parked,
             prose: last_logged(w, PARKED).unwrap_or_default(),
@@ -2604,7 +2611,7 @@ fn state(store: &Store, w: &Worklist, p: &Position) -> State {
         };
     }
     if w.status() == WorklistStatus::Held {
-        let flight = front(store, groups.get(p.at.unwrap_or(1) - 1), &p.members).waiting.len();
+        let flight = front(store, groups.get(p.at.unwrap_or(1) - 1), &p.members, &BTreeMap::new()).waiting.len();
         return State::Shut {
             gate: Gate::Held,
             prose: last_logged(w, HELD).unwrap_or_default(),
@@ -2653,7 +2660,12 @@ fn state(store: &Store, w: &Worklist, p: &Position) -> State {
     match p.at {
         None => State::Nothing,
         Some(at) => {
-            let f = front(store, groups.get(at - 1), &p.members);
+            // The run's holds, read as `worklist show` reads them, so that the
+            // two verbs cannot disagree about one member: a hand-run group,
+            // where a governor runs this and then `wsp spawn`, has no other
+            // place the hold is kept (`wsp-269`).
+            let held = groups.get(at - 1).map(|g| holds(store, w, p, at, g)).unwrap_or_default();
+            let f = front(store, groups.get(at - 1), &p.members, &held);
             match f.ready.is_empty() {
                 true => State::Waiting(f),
                 false => State::Ready(f),
@@ -2670,10 +2682,15 @@ fn state(store: &Store, w: &Worklist, p: &Position) -> State {
 /// no branch has either never been started or has an agent on it that has not
 /// committed yet, and spawning the second one twice is two agents in one tree.
 /// Everything git can say comes after that.
-fn front(store: &Store, g: Option<&Group>, members: &[Standing]) -> Front {
+///
+/// `holds` is [`holds`]'s answer for this group, and a member in it is set
+/// aside before it can be counted ready. The callers that only want what is in
+/// flight pass none, and read nothing but `waiting`.
+fn front(store: &Store, g: Option<&Group>, members: &[Standing], holds: &BTreeMap<String, Vec<String>>) -> Front {
     let claims = store.claims();
     let mut ready: Vec<String> = Vec::new();
     let mut waiting: Vec<(Standing, String)> = Vec::new();
+    let mut held: Vec<(Standing, String)> = Vec::new();
     for s in members.iter().filter(|s| !s.finished()) {
         if let Some(c) = claims.get(&s.id) {
             // Except that a member already reviewed is waiting on its landing,
@@ -2684,6 +2701,9 @@ fn front(store: &Store, g: Option<&Group>, members: &[Standing]) -> Front {
                 false => crate::cmd_agent::claim_where(c),
             };
             waiting.push((s.clone(), why));
+        } else if let Some(on) = holds.get(&s.id) {
+            // The words `worklist show` prints beside the same member.
+            held.push((s.clone(), format!("waiting on {}", on.join(" "))));
         } else if matches!(
             s.landing,
             None | Some(Landing::Nothing | Landing::NoBranch | Landing::NoRepo)
@@ -2717,7 +2737,7 @@ fn front(store: &Store, g: Option<&Group>, members: &[Standing]) -> Front {
     let room = cap.map(|n| n.saturating_sub(waiting.len())).unwrap_or(ready.len()).min(ready.len());
     let capped = ready.len() - room;
     ready.truncate(room);
-    Front { ready, waiting, capped, cap }
+    Front { ready, waiting, held, capped, cap }
 }
 
 // ---- next -------------------------------------------------------------
@@ -2843,6 +2863,50 @@ fn how(verb: &str, w: &Worklist, seat: bool) -> String {
     }
 }
 
+/// `next`'s two answers about a group being run: what may start, or what it
+/// is waiting on.
+///
+/// A member the run holds by `after:` is waiting, and said with the member it
+/// waits on. On a group that is ready it rides the first line by id, since the
+/// second is the ids to `wsp spawn` and nothing else may be on it; on one that
+/// is waiting it is a row like any other, after the work in flight.
+fn front_lines(p: &Paint, w: &Worklist, pos: &Position, f: &Front, seat: bool) -> Vec<String> {
+    let of = pos.of;
+    let at = pos.at.unwrap_or(0);
+    if f.ready.is_empty() {
+        let tail = match (f.capped, f.cap) {
+            (0, _) | (_, None) => String::new(),
+            (n, Some(cap)) => format!(" · x{cap} holds {n} back"),
+        };
+        let rows: Vec<&(Standing, String)> = f.waiting.iter().chain(&f.held).collect();
+        let mut out = vec![format!("group {at} of {of} — waiting on {}{tail}", rows.len())];
+        let w_id = rows.iter().map(|(s, _)| s.id.chars().count()).max().unwrap_or(8);
+        for (s, note) in rows {
+            out.push(format!("{}  {}  {}", util::pad(&s.id, w_id), util::pad(s.settlement.word(), 7), p.dim(note)));
+        }
+        return out;
+    }
+    let mut tail = String::new();
+    if !f.waiting.is_empty() {
+        tail.push_str(&format!(" · {} in flight", f.waiting.len()));
+    }
+    for (s, note) in &f.held {
+        tail.push_str(&format!(" · {} {note}", s.id));
+    }
+    if f.capped > 0 {
+        if let Some(cap) = f.cap {
+            tail.push_str(&format!(" · x{cap} holds {} back", f.capped));
+        }
+    }
+    // A list nobody has started: the ids are what group 1 *is*, and the
+    // command is `go` and not `spawn`. Spawning here would leave the run at
+    // `draft`, where routing does not find it and no barrier exists to wait at.
+    if w.status() == WorklistStatus::Draft {
+        tail.push_str(&format!(" · {} starts the list", how("go", w, seat)));
+    }
+    vec![format!("group {at} of {of} — {} may start now{tail}", f.ready.len()), f.ready.join("  ")]
+}
+
 /// Four states, and the line each of them ends on is the command to run next.
 ///
 /// The shut-barrier state carries the evidence block when one was read — see
@@ -2882,44 +2946,9 @@ fn report(
     }
 
     match st {
-        State::Ready(f) => {
-            let mut tail = String::new();
-            if !f.waiting.is_empty() {
-                tail.push_str(&format!(" · {} in flight", f.waiting.len()));
-            }
-            if f.capped > 0 {
-                if let Some(cap) = f.cap {
-                    tail.push_str(&format!(" · x{cap} holds {} back", f.capped));
-                }
-            }
-            // A list nobody has started: the ids are what group 1 *is*, and the
-            // command is `go` and not `spawn`. Spawning here would leave the
-            // run at `draft`, where routing does not find it and no barrier
-            // exists to wait at.
-            if w.status() == WorklistStatus::Draft {
-                tail.push_str(&format!(" · {} starts the list", how("go", w, seat)));
-            }
-            println!(
-                "group {} of {of} — {} may start now{tail}",
-                pos.at.unwrap_or(0),
-                f.ready.len()
-            );
-            println!("{}", f.ready.join("  "));
-        }
-        State::Waiting(f) => {
-            let tail = match (f.capped, f.cap) {
-                (0, _) | (_, None) => String::new(),
-                (n, Some(cap)) => format!(" · x{cap} holds {n} back"),
-            };
-            println!("group {} of {of} — waiting on {}{tail}", pos.at.unwrap_or(0), f.waiting.len());
-            let w_id = f.waiting.iter().map(|(s, _)| s.id.chars().count()).max().unwrap_or(8);
-            for (s, note) in &f.waiting {
-                println!(
-                    "{}  {}  {}",
-                    util::pad(&s.id, w_id),
-                    util::pad(s.settlement.word(), 7),
-                    p.dim(note)
-                );
+        State::Ready(f) | State::Waiting(f) => {
+            for line in front_lines(&p, w, pos, f, seat) {
+                println!("{line}");
             }
         }
         State::Shut { gate, prose, flight } => {
@@ -3093,9 +3122,12 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
             v["start"] = json!(f.ready);
             v["cap"] = json!(f.cap);
             v["held_back"] = json!(f.capped);
+            // Held members are waiting too, with the member they wait on in
+            // the note — the answer `worklist show --json` gives as `waiting`.
             v["waiting"] = json!(f
                 .waiting
                 .iter()
+                .chain(&f.held)
                 .map(|(s, note)| json!({ "id": s.id, "status": s.settlement.word(), "note": note }))
                 .collect::<Vec<_>>());
         }
@@ -3772,7 +3804,7 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
     }
 
     let pos = worklist::position(store, &w, Reading::Landed);
-    let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members);
+    let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members, &BTreeMap::new());
 
     w.set_status(WorklistStatus::Held);
     w.log(&format!("{HELD} {}", said.trim()));
@@ -4356,7 +4388,7 @@ pub fn park(store: &Store, args: &Args) -> i32 {
     }
     let was_held = w.status() == WorklistStatus::Held;
     let pos = worklist::position(store, &w, Reading::Landed);
-    let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members);
+    let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members, &BTreeMap::new());
 
     w.set_status(WorklistStatus::Parked);
     w.log(&format!("{PARKED} {}", said.trim()));
@@ -7067,6 +7099,57 @@ mod tests {
         let State::Ready(f) = state(&store, &w, &p) else { panic!("nothing has started") };
         assert_eq!(f.ready, ["wl-001"], "one at a time, in the order the group names them");
         assert_eq!(f.capped, 2, "and the other two are said to be held back, not lost");
+    }
+
+    /// `wsp-269`: a member resting on one of its own group that has not landed
+    /// is not something `next` may hand to `wsp spawn`. It is waiting, in the
+    /// words `worklist show` uses for it, on both surfaces — and it takes no
+    /// slot of the cap, which is for work in flight.
+    #[test]
+    fn next_lists_a_member_held_by_after_as_waiting_on_it_until_it_lands() {
+        let (_env, store) = running("held");
+        for id in ["h-1", "h-2", "h-3"] {
+            task(&store, id, "todo");
+        }
+        let mut t = store.find_task("h-2").unwrap();
+        t.after = vec!["h-1".into()];
+        store.save_task(&t).unwrap();
+        run(&store, &["new", "dep", "d"]);
+        run(&store, &["add", "dep", "h-1", "h-2", "h-3"]);
+        flagged(&store, &["group", "dep", "1"], &[("parallel", "2")]);
+        run(&store, &["go", "dep"]);
+        let read = |store: &Store| {
+            let w = store.worklist("dep").unwrap();
+            let pos = worklist::position(store, &w, Reading::Landed);
+            let st = state(store, &w, &pos);
+            let v = next_json(&w, &pos, &st, &[], None);
+            let (State::Ready(f) | State::Waiting(f)) = st else { panic!("a group is being run: {v}") };
+            (front_lines(&Paint::plain(), &w, &pos, &f, true), v)
+        };
+
+        let (lines, v) = read(&store);
+        assert_eq!(v["start"], json!(["h-1", "h-3"]), "not h-2, and the cap of two is not spent on it: {v}");
+        assert_eq!(v["waiting"], json!([{ "id": "h-2", "status": "todo", "note": "waiting on h-1" }]));
+        assert!(lines[0].contains("h-2 waiting on h-1"), "{lines:?}");
+        assert_eq!(lines[1], "h-1  h-3", "the spawn line names only what may start");
+
+        // h-1 going is not h-1 landed: h-2 is still held, beside it in flight.
+        store.set_claim("h-1", json!({ "agent_id": "agent-h-1" }));
+        store.set_claim("h-3", json!({ "agent_id": "agent-h-3" }));
+        let (lines, v) = read(&store);
+        assert_eq!(v["state"], "waiting", "{v}");
+        assert_eq!(v["waiting"][2], json!({ "id": "h-2", "status": "todo", "note": "waiting on h-1" }), "{v}");
+        assert!(lines[0].contains("waiting on 3"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("h-2") && l.ends_with("waiting on h-1")), "{lines:?}");
+
+        // Landed, and it is ready.
+        let mut t = store.find_task("h-1").unwrap();
+        t.status_raw = "review".into();
+        t.log(&format!("{} 1234567abc on master", crate::repair::LANDED));
+        store.save_task(&t).unwrap();
+        let (_, v) = read(&store);
+        assert_eq!(v["start"], json!(["h-2"]), "{v}");
+        assert!(v["waiting"].as_array().unwrap().iter().all(|m| m["id"] != "h-2"), "{v}");
     }
 
     /// `done` is somebody's decision that there is nothing left to want, not a
