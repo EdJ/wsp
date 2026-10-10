@@ -149,6 +149,28 @@ pub fn title(t: &str) -> String {
     }
 }
 
+/// A `wsp say` line, or a reason `block`, `park` or `reopen` took, cut to its
+/// first clause: the prototype's `say()`, which §17.3 names for both.
+///
+/// The first line only, cleaned as a title is; the speaker's own id or slug
+/// taken off the front (`wsp-242: wiring the stages` is the seat saying its
+/// name, which a caption beside that seat already shows); then cut at the
+/// first `. `, `; ` or ` — `, whichever comes soonest. **Any length**, unlike
+/// [`title`]'s three words: `surveying` is a whole answer, and the first
+/// clause of a say is what its author put first because it is the answer.
+/// Only a plain lowercase word is capitalised, as in [`title`].
+pub fn say(t: &str, own: Option<&str>) -> String {
+    let first = t.lines().next().unwrap_or_default();
+    let mut t = clean(first);
+    if let Some(rest) = own.and_then(|o| t.strip_prefix(&format!("{o}: "))) {
+        t = rest.to_string();
+    }
+    if let Some(i) = [". ", "; ", " — "].iter().filter_map(|c| t.find(c)).filter(|&i| i > 0).min() {
+        t.truncate(i);
+    }
+    capital(t.trim_end_matches([' ', '.', ',', ';', ':']))
+}
+
 /// Step 1: the prototype's `clean`. Surrounding quotes and escaped quotes, as
 /// a title pasted from a shell carries them; then every `(…)` with the space
 /// in front of it; then the markdown a title is sometimes written in.
@@ -182,7 +204,7 @@ fn strip_tag(t: &str) -> Option<&str> {
 /// Capitalise a plain lowercase word, and only that: `gpui`, `host-gpui`,
 /// `parity.md` and `docs/AGENTS` are names and keep their case. The
 /// prototype's `^[a-z]+(?![-._/\w])`.
-fn capital(t: &str) -> String {
+pub(crate) fn capital(t: &str) -> String {
     let run = t.bytes().take_while(|b| b.is_ascii_lowercase()).count();
     let next = t[run..].chars().next();
     let plain = run > 0 && !next.is_some_and(|c| c.is_alphanumeric() || "_-./".contains(c));
@@ -289,7 +311,12 @@ pub struct Told {
 
 impl Told {
     pub fn json(&self) -> Value {
-        let mut v = json!({ "word": self.word, "text": self.text, "from": self.from, "at": self.at });
+        let mut v = json!({ "word": self.word, "text": self.text, "from": self.from });
+        // Absent where nothing dates the step (`wsp-242`: a stage read off a
+        // status nobody stamped), on the same rule as `tail` below.
+        if !self.at.is_empty() {
+            v["at"] = json!(self.at);
+        }
         if let Some(t) = &self.tail {
             v["tail"] = json!(t);
         }

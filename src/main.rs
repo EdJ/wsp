@@ -62,6 +62,7 @@ mod place_super;
 mod repair;
 mod resolve;
 mod sharing;
+mod stage;
 mod story;
 mod store;
 mod sync;

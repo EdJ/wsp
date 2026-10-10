@@ -4520,6 +4520,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
 | `src/caption.rs` | the line a glance reads for a task, a worklist and a group: authored and checked at the verb, or derived from the title or the members — one derivation, so `ls` and the chrome never disagree; and a verdict's, a word wsp derives and a tail the verb requires |
+| `src/stage.rs` | where a task or a group is, as a caption: a word from §17.5's closed list, derived from records wsp already keeps, and the tail the step that put it there was given — `stage` on `show`, `ls` and every group and member in `worklist show --json` |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back |
 | `src/after.rs` | member dependencies: `after:` on a task, `wsp after`, its five refusals, and the run's hold on a member until the member of its own group it rests on has landed |

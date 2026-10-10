@@ -248,7 +248,16 @@ pub fn list(store: &Store, args: &Args) -> i32 {
 
     let tasks = filtered(store, args, &index, scope.clone());
     if args.json() {
-        let out: Vec<_> = tasks.iter().map(|t| t.json()).collect();
+        // `wsp-242`: each row's stage, every source read once for all of them.
+        let stages = crate::stage::of_tasks(store, &tasks.iter().collect::<Vec<_>>());
+        let out: Vec<_> = tasks
+            .iter()
+            .map(|t| {
+                let mut v = t.json();
+                v["stage"] = json!(stages.get(&t.id).map(|s| s.json()));
+                v
+            })
+            .collect();
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -354,6 +363,10 @@ pub fn find(store: &Store, args: &Args) -> i32 {
         // On every row, not just the archived ones: a caller that has to know
         // the key is sometimes absent is being asked to guess at the half of
         // the answer that matters most.
+        // `wsp-242`: one read of each source the stages stand on, for every
+        // row at once, rather than a walk of the store per row.
+        let asked: Vec<&Task> = hits.iter().chain(archived.iter()).collect();
+        let stages = crate::stage::of_tasks(store, &asked);
         let out: Vec<_> = hits
             .iter()
             .map(|t| (t, false))
@@ -361,6 +374,7 @@ pub fn find(store: &Store, args: &Args) -> i32 {
             .map(|(t, filed)| {
                 let mut v = t.json();
                 v["archived"] = json!(filed);
+                v["stage"] = json!(stages.get(&t.id).map(|s| s.json()));
                 v
             })
             .collect();
@@ -710,6 +724,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         v["raised"] = json!(raised_about(store, &t.id).iter().map(|m| m.to_json()).collect::<Vec<_>>());
         // `wsp-241`: the passes, which were only ever inside `body`.
         v["verification"] = crate::verification::json(&t);
+        // `wsp-242`: where it is, as a word wsp derives and the tail the step
+        // that put it there was given.
+        v["stage"] = json!(crate::stage::of_tasks(store, &[&t]).get(&t.id).map(|s| s.json()));
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;
     }

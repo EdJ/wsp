@@ -1796,6 +1796,34 @@ fn verdict_caption(g: &Group, groups: usize) -> Option<crate::caption::Told> {
     Some(crate::caption::of_barrier("passed", tail, at, lines, "verdict"))
 }
 
+/// The group's hold, when the newest thing that happened at its barrier is
+/// one: §17.5's `held` is "the last barrier event", so a hold the run has
+/// since started again from, or passed, is not. An amended stop is not a
+/// barrier event — it is the question being rewritten, not answered.
+fn held_caption(of: &history::Of, groups: usize) -> Option<crate::caption::Told> {
+    let e = of.events.iter().rev().find(|e| e.kind != "stop_amended")?;
+    (e.kind == "held").then(|| {
+        let lines = util::wrap(e.why.trim(), prose_width(groups)).len();
+        crate::caption::of_barrier("held", e.caption.as_deref(), &e.at, lines, "hold")
+    })
+}
+
+/// Every member's stage, by id, for `worklist show --json` — the live tasks
+/// and, for a member somebody has since archived, the archive, read once and
+/// only if a member is not live.
+fn member_stages(store: &Store, groups: &[Group], tasks: &[crate::model::Task]) -> BTreeMap<String, crate::caption::Told> {
+    let archive = std::cell::OnceCell::new();
+    let mut found: Vec<crate::model::Task> = Vec::new();
+    for id in groups.iter().flat_map(|g| &g.members) {
+        let t = tasks.iter().find(|t| &t.id == id).cloned().or_else(|| {
+            archive.get_or_init(|| store.archived_tasks()).iter().rev().find(|t: &&crate::model::Task| &t.id == id).cloned()
+        });
+        found.extend(t);
+    }
+    let asked: Vec<&crate::model::Task> = found.iter().collect();
+    crate::stage::of_tasks(store, &asked)
+}
+
 /// The newest hold's caption, the same way: `Held — <tail>`, or its date and
 /// length. `None` for a list never held.
 fn hold_caption(w: &Worklist) -> Option<crate::caption::Told> {
@@ -1807,15 +1835,31 @@ fn hold_caption(w: &Worklist) -> Option<crate::caption::Told> {
 /// `worklist show --json`'s groups.
 fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::model::Task], h: &History) -> serde_json::Value {
     let groups = w.groups();
+    let stages = member_stages(store, &groups, tasks);
     json!(groups
         .iter()
         .zip(group_captions(store, &groups))
         .enumerate()
         .map(|(i, (g, caption))| {
+            let of: Vec<Option<&crate::caption::Told>> = g.members.iter().map(|m| stages.get(m)).collect();
+            let stage = crate::stage::of_group(&crate::stage::Group {
+                ordinal: i + 1,
+                pos,
+                draft: w.status() == WorklistStatus::Draft,
+                checking: crate::barrier::running(g).is_some(),
+                held: h.groups.get(i).and_then(|of| held_caption(of, groups.len())),
+                verdict: verdict_caption(g, groups.len()),
+                members: of.iter().map(|s| s.map(|s| s.word)).collect(),
+            });
             let mut v = json!({
             "id": g.id,
             "ordinal": i + 1,
             "caption": caption.json(),
+            // `wsp-242`: where the group and its barrier are, and where each
+            // member is, so a graph reads every node in one call. A member no
+            // task answers to has no stage, and is the group's `gone` instead.
+            "stage": stage.json(),
+            "stages": g.members.iter().zip(&of).filter_map(|(m, s)| Some((m.clone(), (*s)?.json()))).collect::<serde_json::Map<_, _>>(),
             "parallel": g.cap,
             "agent": g.agent,
             "member_agents": g.member_agents,
@@ -4939,6 +4983,30 @@ mod tests {
         assert_eq!(v[0]["waiting"], json!({ "e-2": ["e-1"] }), "not e-3, whose edge is off the list: {v}");
         assert_eq!(v[1]["after"], json!({ "e-4": ["e-1"] }), "a cross-group edge is carried");
         assert_eq!(v[1]["waiting"], json!({}), "and held by the barrier, not by this");
+    }
+
+    /// `wsp-242`: every group has a stage and every member one, in the one
+    /// call a graph makes — the barrier the run stands at with its work done
+    /// is `standing` and says nobody has written, never its stop condition.
+    #[test]
+    fn show_json_gives_each_group_a_stage_and_each_member_one() {
+        let store = scratch("stages");
+        task(&store, "s-1", "review");
+        task(&store, "s-2", "todo");
+        assert_eq!(run(&store, &["new", "stg", "Stg"]), 0);
+        assert_eq!(run(&store, &["add", "stg", "s-1"]), 0);
+        assert_eq!(run(&store, &["add", "stg", "s-2"]), 0);
+        let mut w = store.worklist("stg").unwrap();
+        let mut groups = w.groups();
+        groups[0].stop = "if the spike goes badly, flag Ed".into();
+        w.set_groups(&groups);
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        let v = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks(), &History::default());
+        assert_eq!(v[0]["stage"]["text"], "Standing — nobody has written", "{v}");
+        assert_eq!(v[0]["stages"]["s-1"]["word"], "at review");
+        assert_eq!(v[1]["stage"]["word"], "not reached");
+        assert_eq!(v[1]["stages"], json!({ "s-2": { "word": "not started", "text": "Not started", "from": "status", "at": store.task("s-2").unwrap().created } }));
     }
 
     /// The list half of the refusals, through the verbs: a member may not be
