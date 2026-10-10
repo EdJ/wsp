@@ -2444,6 +2444,35 @@ prevent. `counts_under` and the carry walk the tree through one shared function
 for the same reason `tally` is shared: two walks are two chances to disagree
 about what "beneath" means.
 
+## What a task rests on
+
+```sh
+wsp after 357 351            # 357 rests on 351: replaces what it rested on
+wsp after 357 --clear        # rests on nothing
+wsp add "…" --after 351,352  # set at filing
+wsp after 357                # what it rests on now
+```
+
+`after:` is the other edge a task has, beside `parent`, and it is **a wait,
+never provenance** (`wsp-256`; compound `docs/ux-design.md` §19.8). Where a task
+came from is `parent`; `after` says which finished work it needs before it
+starts. It is a field on the task, so every worklist that holds both ends reads
+the one edge.
+
+On a worklist, group order already makes every member wait on the barrier
+before it. An edge to an earlier group says which member, and changes only the
+picture. An edge **inside one group** is a hold: the run starts that member
+only once the one it rests on has **landed** — a `wsp land`, not a verifier's
+pass and not `done`. A held member is left at `todo`, so it does not count
+against the group's `parallel`, and `worklist show` says `waiting on` beside it.
+An edge to a task the list does not hold is kept, shown, and ignored by the run.
+
+Refused, each naming the edge: a task on itself; a task that does not exist; a
+cycle; and, on any list that is not closed and holds both ends, the task rested
+on sitting in a **later** group, or a same-group edge added or taken away in a
+group the run has started. The last two are checked again when a list is edited
+(`worklist add`, `mv`, `followup`), and only for what the edit changes.
+
 ## Stopped, and the two reasons
 
 ```sh
@@ -4431,6 +4460,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/caption.rs` | the line a glance reads for a task, a worklist and a group: authored and checked at the verb, or derived from the title or the members — one derivation, so `ls` and the chrome never disagree |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back |
+| `src/after.rs` | member dependencies: `after:` on a task, `wsp after`, its five refusals, and the run's hold on a member until the member of its own group it rests on has landed |
 | `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, the sweep a passed group licenses, what a landed group touched, and — one storey up — which of all the lists there have ever been still want somebody |
 | `src/guard.rs` | the stash guard: one stack per repository however many worktrees, and the git hook that refuses it inside the command that would have taken it |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |

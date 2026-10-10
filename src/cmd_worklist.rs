@@ -77,7 +77,7 @@
 //! caller is about to run `wsp spawn <id>`, which prints the title itself — and
 //! `--json` carries the rest for whatever would rather parse it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 
@@ -206,6 +206,13 @@ fn window(store: &Store, w: &Worklist) -> Window {
         of: p.of,
         members: p.members,
     }
+}
+
+/// How many of a list's groups its run has started: every group before the
+/// first a hand may still edit. [`crate::after`] asks it, because a same-group
+/// `after:` edge is a hold the run has already read in each of them.
+pub(crate) fn started_groups(store: &Store, w: &Worklist) -> usize {
+    window(store, w).first_open() - 1
 }
 
 impl Window {
@@ -453,6 +460,9 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         // under that parent tomorrow is not in this list. A group that grows
         // under a governor at 3am is the stale-plan failure inverted.
         w.log(&format!("--sub {} resolved to the {} open now, not live", typed[0], members.len()));
+    }
+    if let Some(code) = refuse_edges(store, &w, &groups) {
+        return code;
     }
     save(store, &mut w, &groups, "add", &format!("add {}", members.join(" ")));
 
@@ -852,6 +862,9 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         groups[at - 1].member_agents.insert(id.clone(), a);
     }
 
+    if let Some(code) = refuse_edges(store, &w, &groups) {
+        return code;
+    }
     w.log(&format!("{id} → group {at}{}", if fresh { " (new)" } else { "" }));
     save(store, &mut w, &groups, "mv", &format!("mv {id} to group {at}"));
 
@@ -1557,6 +1570,15 @@ fn typed_stop(raw: &str) -> Result<String, i32> {
     Ok(fold(raw))
 }
 
+/// [`crate::after::refuse_membership`], said: `None` when the edit keeps every
+/// `after:` edge its members carry in order and every started group's holds
+/// as they were read.
+fn refuse_edges(store: &Store, w: &Worklist, groups: &[Group]) -> Option<i32> {
+    let why = crate::after::refuse_membership(store, w, groups).err()?;
+    eprintln!("wsp: {why}");
+    Some(1)
+}
+
 /// Write the queue back and record it: the file, the event, the commit.
 ///
 /// One place, because every editing verb owes the same four things and a verb
@@ -1741,6 +1763,57 @@ const BEHIND: &str = "in a group already passed, and not finished — the run do
 const UNWRITTEN: &str =
     "a barrier somebody crossed without writing at it — no stop condition was read, and nothing records what was decided";
 
+/// The run's holds on group `ordinal` (`wsp-256`): only on the group a live
+/// run stands at, which is the only group whose holds are anybody's now. Not
+/// on a draft, which holds nothing, nor on a closed list.
+fn holds(store: &Store, w: &Worklist, pos: &Position, ordinal: usize, g: &Group) -> BTreeMap<String, Vec<String>> {
+    let live = !matches!(w.status(), WorklistStatus::Draft | WorklistStatus::Done);
+    match live && pos.at == Some(ordinal) {
+        true => crate::after::waiting(store, g),
+        false => BTreeMap::new(),
+    }
+}
+
+/// `worklist show --json`'s groups.
+fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::model::Task]) -> serde_json::Value {
+    let groups = w.groups();
+    json!(groups
+        .iter()
+        .zip(group_captions(store, &groups))
+        .enumerate()
+        .map(|(i, (g, caption))| json!({
+            "ordinal": i + 1,
+            "caption": caption.json(),
+            "parallel": g.cap,
+            "agent": g.agent,
+            "member_agents": g.member_agents,
+            "stop": g.stop,
+            "verdict": g.verdict,
+            "members": g.members,
+            // Whole, where the plan drawing draws a count: an
+            // abridgement is a thing done for a reader, and a parser
+            // is not one.
+            "landed": landed_json(&g.landed),
+            // Every edge of every member that has one, on the list or off
+            // it (`wsp-256`): a client draws the off-list ones as such.
+            "after": crate::after::of_group(tasks, g),
+            "waiting": holds(store, w, pos, i + 1, g),
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// ` · after 351 · waiting on 357`, or nothing for a member with no edge.
+fn edge_note(edges: Option<&Vec<String>>, waits: Option<&Vec<String>>) -> String {
+    let mut out = String::new();
+    if let Some(e) = edges.filter(|e| !e.is_empty()) {
+        out.push_str(&format!(" · after {}", e.join(" ")));
+    }
+    if let Some(w) = waits.filter(|w| !w.is_empty()) {
+        out.push_str(&format!(" · waiting on {}", w.join(" ")));
+    }
+    out
+}
+
 /// The `behind` block, in the caller's own label column.
 ///
 /// `head` is the label already painted and `indent` the column the sentence
@@ -1837,26 +1910,16 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     let pos = worklist::position(store, &w, Reading::Settled);
     let groups = w.groups();
     let dangling = worklist::dangling(store, &w);
+    // `after:` edges, read off the members' tasks, and the run's holds.
+    let tasks = store.tasks();
+    let held = |ordinal: usize, g: &Group| holds(store, &w, &pos, ordinal, g);
 
     if args.json() {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "worklist": worklist_json(store, &w),
-                "groups": groups.iter().zip(group_captions(store, &groups)).enumerate().map(|(i, (g, caption))| json!({
-                    "ordinal": i + 1,
-                    "caption": caption.json(),
-                    "parallel": g.cap,
-                    "agent": g.agent,
-                    "member_agents": g.member_agents,
-                    "stop": g.stop,
-                    "verdict": g.verdict,
-                    "members": g.members,
-                    // Whole, where the plan drawing draws a count: an
-                    // abridgement is a thing done for a reader, and a parser
-                    // is not one.
-                    "landed": landed_json(&g.landed),
-                })).collect::<Vec<_>>(),
+                "groups": groups_json(store, &w, &pos, &tasks),
                 "at": pos.at,
                 // The third state, for the reader that cannot see the `at`
                 // line. `waiting_on` being empty is the same fact only if you
@@ -1956,10 +2019,23 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             // a word each, because that is the only group anybody is standing
             // in front of. Doing it for all of them is 26 lines of a list read
             // several times a session.
+            //
+            // And a member that rests on another gets its line wherever it is,
+            // because an edge is a fact about the plan and not only about the
+            // group being run; `waiting on` is the run's hold, said while it is.
+            let edges = crate::after::of_group(&tasks, g);
+            let waits = held(ordinal, g);
+            let mut named = BTreeSet::new();
             if pos.at == Some(ordinal) {
                 for s in pos.holding() {
-                    println!("{}{}  {}", " ".repeat(members_at), s.id, p.dim(s.settlement.word()));
+                    let note = edge_note(edges.get(&s.id), waits.get(&s.id));
+                    println!("{}{}  {}", " ".repeat(members_at), s.id, p.dim(&format!("{}{note}", s.settlement.word())));
+                    named.insert(s.id.clone());
                 }
+            }
+            for m in g.members.iter().filter(|m| edges.contains_key(*m) && !named.contains(*m)) {
+                let note = edge_note(edges.get(m), waits.get(m));
+                println!("{}{m}  {}", " ".repeat(members_at), p.dim(note.trim_start_matches(" · ")));
             }
             let indent = " ".repeat(members_at);
             // Only where it was written: a group from before `wsp-134` has no
@@ -3962,6 +4038,9 @@ fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str,
             return Err(code);
         }
         groups[at - 1].members.extend(members.iter().cloned());
+        if let Some(code) = refuse_edges(store, &w, &groups) {
+            return Err(code);
+        }
         w.log(&format!("{FOLLOWUP} {row} holds: {} · join group {at} · {verdict}", members.join(" ")));
         w.set_groups(&groups);
         if let Err(e) = store.save_worklist(&w) {
@@ -4037,6 +4116,9 @@ fn followup_next(store: &Store, args: &Args, id: &str, at: usize, row: &str, mem
         let planned = groups.len() - at;
         let agent = groups[at - 1].agent.clone();
         groups.insert(at, Group { members: members.to_vec(), agent, stop: stop.clone(), ..Group::default() });
+        if let Some(code) = refuse_edges(store, &w, &groups) {
+            return Err(code);
+        }
         w.log(&format!(
             "{FOLLOWUP} {row} passes: {} · group {} (new), ahead of {planned} planned",
             members.join(" "),
@@ -4666,6 +4748,50 @@ mod tests {
         assert_eq!(g[2].agent, "opencode m/x", "inherited from the group before");
         assert_eq!(flagged(&store, &["group", "pol", "3"], &[("agent", MANUAL)]), 0);
         assert!(store.worklist("pol").unwrap().groups()[2].policy().is_none(), "and turned off");
+    }
+
+    /// `wsp-256`: each group carries its members' `after:` edges whole, an
+    /// off-list one included, and `waiting` is only the run's holds — the
+    /// same-group edges of members not yet started, on the group it stands at.
+    #[test]
+    fn show_json_carries_each_groups_edges_and_the_runs_holds() {
+        let store = scratch("after-json");
+        for (id, on) in [("e-1", vec![]), ("x-9", vec![]), ("e-2", vec!["e-1"]), ("e-3", vec!["x-9"]), ("e-4", vec!["e-1"])] {
+            let mut t = Task::new(id, id);
+            t.after = on.into_iter().map(String::from).collect();
+            store.save_task(&t).unwrap();
+        }
+        assert_eq!(run(&store, &["new", "dep", "Dep"]), 0);
+        assert_eq!(run(&store, &["add", "dep", "e-1", "e-2", "e-3"]), 0);
+        assert_eq!(run(&store, &["add", "dep", "e-4"]), 0);
+        let mut w = store.worklist("dep").unwrap();
+        let draft = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks());
+        assert_eq!(draft[0]["after"], json!({ "e-2": ["e-1"], "e-3": ["x-9"] }), "{draft}");
+        assert_eq!(draft[0]["waiting"], json!({}), "a draft holds nothing");
+
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        let v = groups_json(&store, &w, &worklist::position(&store, &w, Reading::Settled), &store.tasks());
+        assert_eq!(v[0]["waiting"], json!({ "e-2": ["e-1"] }), "not e-3, whose edge is off the list: {v}");
+        assert_eq!(v[1]["after"], json!({ "e-4": ["e-1"] }), "a cross-group edge is carried");
+        assert_eq!(v[1]["waiting"], json!({}), "and held by the barrier, not by this");
+    }
+
+    /// The list half of the refusals, through the verbs: a member may not be
+    /// put after a task that rests on it.
+    #[test]
+    fn add_and_mv_refuse_to_put_a_rested_on_task_in_a_later_group() {
+        let store = scratch("after-order");
+        task(&store, "o-1", "todo");
+        let mut t = Task::new("o-2", "o-2");
+        t.after = vec!["o-1".into()];
+        store.save_task(&t).unwrap();
+        assert_eq!(run(&store, &["new", "ord", "Ord"]), 0);
+        assert_eq!(run(&store, &["add", "ord", "o-2"]), 0);
+        assert_eq!(run(&store, &["add", "ord", "o-1"]), 1, "o-1 would be in group 2, after o-2");
+        assert_eq!(flagged(&store, &["add", "ord", "o-1"], &[("group", "1")]), 0, "one group is in order");
+        assert_eq!(flagged(&store, &["mv", "ord", "o-1"], &[("after", "1")]), 1);
+        assert_eq!(store.worklist("ord").unwrap().groups().len(), 1, "refused, so unwritten");
     }
 
     /// A list from before groups had a line stays run by hand when it grows,

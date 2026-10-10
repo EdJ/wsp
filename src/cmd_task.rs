@@ -14,7 +14,7 @@ use crate::Args;
 pub fn add(store: &Store, args: &Args) -> i32 {
     let title = args.text(0);
     if title.trim().is_empty() {
-        eprintln!("usage: wsp add \"title\" [-p project] [-t tag]… [--prio high]");
+        eprintln!("usage: wsp add \"title\" [-p project] [-t tag]… [--prio high] [--parent id] [--after id,…]");
         // A title that begins with a dash is read as a flag, and then there is
         // no title — the usage line alone says nothing about why.
         if !args.flag_names().is_empty() {
@@ -56,6 +56,17 @@ pub fn add(store: &Store, args: &Args) -> i32 {
             }
         },
         None => None,
+    };
+    // And what it rests on, for the same reason: resolved while there is no id
+    // for a typo to match. A task nobody has filed yet is on no list and
+    // nothing rests on it, so of `wsp after`'s refusals only "no such task"
+    // can apply here.
+    let after = match crate::after::resolve(store, "the new task", &args.all("after")) {
+        Ok(on) => on,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
     };
 
     // A sub-task belongs where its parent belongs. Filing it anywhere else
@@ -118,6 +129,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         t.status_raw = "inbox".into();
     }
     t.parent = parent.as_ref().map(|p| p.id.clone());
+    t.after = after;
 
     if let Err(e) = store.save_task(&t) {
         eprintln!("wsp: write failed: {e}");
@@ -749,6 +761,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             util::truncate(&parent.title, 56),
             if filed { p.dim("  · archived") } else { String::new() }
         );
+    }
+    // What it rests on, beside what it is under: the two are the two edges a
+    // task has, and `after` is the one a run waits on.
+    if !t.after.is_empty() {
+        println!("{} {}", p.dim(&util::pad("after", 9)), t.after.join("  "));
     }
     let kids = crate::resolve::children_of(&all, &t.id);
     for (i, k) in kids.iter().enumerate() {

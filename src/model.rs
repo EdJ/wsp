@@ -911,6 +911,22 @@ pub struct Task {
     pub status_raw: String,
     pub priority_raw: String,
     pub parent: Option<String>,
+    /// `after:` — the tasks this one rests on: a **wait**, and never
+    /// provenance. Who made a task is [`Self::parent`]; this says which
+    /// finished work it needs before it starts. Read by the run to hold a
+    /// member behind a member of its own group (`wsp-256`, compound
+    /// `docs/ux-design.md` §19.8), and set, with its refusals, in
+    /// [`crate::after`].
+    ///
+    /// On the task rather than on a list's membership, against the
+    /// recommendation, because Ed asked for it there (compound-425 d6 Q-9):
+    /// one edge, read by every list that holds both ends. The price is that a
+    /// list ordering the two ends the other way refuses the edge.
+    ///
+    /// Optional in the front matter, as `caption` is, and with its cost: a
+    /// wsp from before this drops it on its next write of the task, so the
+    /// edge holds only once `wsp install` has followed the land.
+    pub after: Vec<String>,
     pub created: String,
     pub updated: String,
     pub refs: Vec<String>,
@@ -1068,6 +1084,7 @@ impl Task {
             status_raw: doc.opt("status").unwrap_or_else(|| "todo".into()),
             priority_raw: doc.opt("priority").unwrap_or_else(|| "normal".into()),
             parent: doc.opt("parent"),
+            after: doc.list("after"),
             created: doc.str("created"),
             updated: doc.str("updated"),
             refs: doc.list("refs"),
@@ -1086,6 +1103,11 @@ impl Task {
         d.set_str("priority", &self.priority_raw);
         if let Some(p) = &self.parent {
             d.set_str("parent", p);
+        }
+        // Only where there is one, as `parent`: nearly every task has none,
+        // and an empty line in each of them is noise in every diff of the store.
+        if !self.after.is_empty() {
+            d.set_list("after", &self.after);
         }
         d.set_str("created", &self.created);
         d.set_str("updated", &self.updated);
@@ -1111,6 +1133,7 @@ impl Task {
             "status": self.status().as_str(),
             "priority": self.priority().as_str(),
             "parent": self.parent,
+            "after": self.after,
             "created": self.created,
             "updated": self.updated,
             "refs": self.refs,

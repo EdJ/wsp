@@ -679,8 +679,19 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
     // 1. Members nobody has started, up to the cap — counted again inside
     // the lock by `take_member`, because the two advances a pass can start
     // (the barrier agent's `go` and its own `review`) both read this list.
+    //
+    // A member that rests on a member of its own group (`after:`, `wsp-256`)
+    // is not started until that one has landed. It is left at `todo` and
+    // unclaimed, so `take_member` never counts it against the cap, and the
+    // land that frees it pokes this step. Said every pass, as the barrier's
+    // waits are, because a member nobody started is otherwise a silence.
     let cap = g.parallelism(None);
+    let holds = crate::after::waiting(store, g);
     for s in &pos.members {
+        if let Some(on) = holds.get(&s.id) {
+            stamp(&format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
+            continue;
+        }
         let Some(t) = store.find_task(&s.id) else { continue };
         if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap) {
             stamp(&format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
@@ -4160,6 +4171,71 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(spawned().len(), 2);
         step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "two are going, and the cap is two");
+    }
+
+    /// `after:` (`wsp-256`, §19.8 Q-7): a member resting on one of its own
+    /// group is held until that one has **landed** — not reviewed, not held by
+    /// its verifier — and is started by the step after the land.
+    #[test]
+    fn a_member_is_not_started_until_the_same_group_member_it_rests_on_has_landed() {
+        let (_env, store) = scratch("after-hold");
+        task(&store, "m-1", Status::Todo);
+        task(&store, "m-2", Status::Todo);
+        let mut t = store.find_task("m-2").unwrap();
+        t.after = vec!["m-1".into()];
+        store.save_task(&t).unwrap();
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+
+        step(&store, &w, &Blind);
+        let ids: Vec<String> = spawned().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["m-1"], "m-2 rests on m-1");
+        assert_eq!(store.find_task("m-2").unwrap().status(), Status::Todo, "held, so left as it was");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "m-1 is going and has not landed");
+
+        let mut m1 = store.find_task("m-1").unwrap();
+        m1.log(&format!("{} 1234567abc on master", crate::repair::LANDED));
+        store.save_task(&m1).unwrap();
+        step(&store, &w, &Blind);
+        let ids: Vec<String> = spawned().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["m-2"], "landed is what frees it");
+    }
+
+    /// A held member is not running, so it does not take a place under the
+    /// group's `parallel`: with a cap of two and one held, two others start.
+    #[test]
+    fn a_held_member_does_not_count_against_the_groups_parallel() {
+        let (_env, store) = scratch("after-cap");
+        for m in ["m-1", "m-2", "m-3"] {
+            task(&store, m, Status::Todo);
+        }
+        let mut t = store.find_task("m-2").unwrap();
+        t.after = vec!["m-1".into()];
+        store.save_task(&t).unwrap();
+        let mut w = list(&store, &[(&["m-2", "m-1", "m-3"], "claude")]);
+        let mut g = w.groups();
+        g[0].cap = Some(2);
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        step(&store, &w, &Blind);
+        let mut ids: Vec<String> = spawned().into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, ["m-1", "m-3"]);
+    }
+
+    /// An edge to a task the list does not hold is carried and never held on:
+    /// the run cannot see that task land, and the barrier is not its to read.
+    #[test]
+    fn an_edge_off_the_list_holds_nothing() {
+        let (_env, store) = scratch("after-off");
+        task(&store, "m-1", Status::Todo);
+        task(&store, "x-9", Status::Todo);
+        let mut t = store.find_task("m-1").unwrap();
+        t.after = vec!["x-9".into()];
+        store.save_task(&t).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().len(), 1);
     }
 
     /// A pass ends what the group needed and nothing the run still does: the

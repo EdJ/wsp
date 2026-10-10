@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+mod after;
 mod agent_commands;
 mod barrier;
 mod caption;
@@ -1093,6 +1094,7 @@ fn main() {
         "verified" => verification::cmd_verified(&store, &args),
         "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
+        "after" => after::run(&store, &args),
         "tag" => cmd_task::tag(&store, &args),
         "ref" => cmd_task::reference(&store, &args),
         "prio" | "priority" => cmd_task::prio(&store, &args),
@@ -1541,6 +1543,7 @@ fn help_text() -> String {
   wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]
   wsp add "title" --parent <id>     a sub-task, filed where its parent is
   wsp add "title" --caption "…"     …with the line a glance reads, under 60
+  wsp add "title" --after <id>[,<id>…]   …that rests on those, as `wsp after`
   wsp ls [-p proj] [-t tag] [-s status] [--all]
   wsp find <text> [-p proj] [--all] [--full]
                                     every task the words are in — the title or
@@ -1590,6 +1593,12 @@ fn help_text() -> String {
                                     `wsp review` asks for one
   wsp mv <id> -p proj               reassign, sub-tree and all
   wsp mv <id> --parent <id>|none    re-parent it, or detach it
+  wsp after <id> <on>…              it rests on those: a wait, never where it
+                                    came from (that is --parent). A run starts
+                                    it once each one in its own group has
+                                    landed; --clear empties it, bare reads it.
+                                    Refused on itself, a cycle, or a list with
+                                    <on> in a later group or this group started
   wsp tag <id> +dsp -ui             adjust tags
   wsp ref <id> +PATH -PATH          the files this row names outside its own
                                     tree. A spawned agent may reach them
