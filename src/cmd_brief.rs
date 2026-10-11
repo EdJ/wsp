@@ -64,6 +64,14 @@ const MAX_DECISIONS: usize = 4;
 /// anyway. Handing it over at request 0 costs about half that and removes the
 /// round-trips. The same arithmetic run backwards is why `Normal` must not
 /// grow, and why this is a separate mode rather than a better default.
+///
+/// **What it adds is the task's own prose, and what it takes away is
+/// everything that is the same for every session** (`core-059`). It printed
+/// 10.8 KB into a compound session — over Claude Code's inline limit, so the
+/// agent saw a preview and a file path — and most of it was the project's
+/// decisions, its open rows, the handbook chain and the how-to list: text no
+/// task asked for, re-read by every request. Those are one pointer line each
+/// here; `Normal` still prints them for the caller who runs it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Depth {
     Session,
@@ -103,16 +111,11 @@ const MAX_TASK_LINES: usize = 120;
 /// hundred. Twenty-four keeps every ordinary task byte-for-byte what it was,
 /// points at the rest, and takes roughly half of every capped payload.
 const MAX_DETAILS_LINES: usize = 24;
-/// The handbook, over the whole project chain.
-const MAX_HANDBOOK_LINES: usize = 120;
-/// Where an **ancestor's** handbook stops in the payload. A handbook above the
-/// project being worked is the same text for every agent under that ancestor —
-/// paid for by every spawn beneath it, whatever it says — while what it carries
-/// is standing rules: needed before acting on them, not needed at request 0.
-/// Its first paragraph says what the place is; [`block`] prints where the rest
-/// lives. The nearest project's handbook stays under [`MAX_HANDBOOK_LINES`]
-/// whole, because that one was written for exactly this work.
-const MAX_HANDBOOK_LEAD: usize = 8;
+/// How much of the nearest handbook a session with nothing claimed is handed:
+/// its opening, which says what the place is. Was 120 over the whole chain,
+/// with each ancestor cut to an eight-line lead — and a session holding a
+/// task now gets none of it, only where it lives (`core-059`).
+const MAX_HANDBOOK_LINES: usize = 10;
 /// Decisions on the parent, most recent last. The parent is where direction
 /// lands, so these are the constraints on the piece in hand.
 const MAX_PARENT_DECISIONS: usize = 6;
@@ -1142,21 +1145,23 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
         ));
     }
 
-    // The handbook, last, and the whole chain of it. It is the part that is the
-    // same for every agent in this project rather than particular to this task,
-    // which is why it reads after the work rather than before it — and why it
-    // is a pointer to the repository's own documentation rather than a copy of
-    // it.
-    let mut left = MAX_HANDBOOK_LINES;
-    let last = r.handbook.len().saturating_sub(1);
-    for (i, (proj, text)) in r.handbook.iter().enumerate() {
-        if left == 0 {
-            break;
-        }
-        let max = if i == last { left } else { MAX_HANDBOOK_LEAD };
+    // The handbook, last. It is the same for every agent in this project rather
+    // than particular to this task, so a session holding a task gets where it
+    // lives and nothing more (`core-059`: wsp's alone was ~5 KB of the 10.8 KB
+    // a compound session was handed). A session with nothing claimed has no
+    // task prose to spend on, so it gets the nearest handbook's opening — what
+    // this place is — and the same pointer for the rest.
+    if let Some((near, text)) = r.handbook.last() {
         out.push(String::new());
-        block(&mut out, p, "read", text, max, &format!("wsp project show {proj} --handbook"));
-        left = left.saturating_sub(text.lines().count().min(max));
+        if r.mine.is_none() {
+            block(&mut out, p, "read", text, MAX_HANDBOOK_LINES, &format!("wsp project show {near} --handbook"));
+        }
+        let all: Vec<&str> = r.handbook.iter().map(|(proj, _)| proj.as_str()).collect();
+        out.push(format!(
+            "{} {}",
+            p.dim(&util::pad(if r.mine.is_none() { "" } else { "read" }, 6)),
+            p.dim(&format!("handbook of {} · wsp project show <p> --handbook", all.join(", ")))
+        ));
     }
     out
 }
@@ -1170,6 +1175,7 @@ const SEAT_JOB: &str = "yours to decide and direct; wsp runs the steps · wsp fl
 /// The brief as text, one line per element and nothing printed.
 fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     let terse = depth == Depth::Terse;
+    let session = depth.session();
     let mut out: Vec<String> = Vec::new();
     let mut row = |label: &str, body: String| out.push(format!("{} {}", p.dim(&util::pad(label, 6)), body));
 
@@ -1325,10 +1331,14 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // thing worth noticing, since claiming one is the first move.
     match &r.mine {
         Some(t) => {
-            row(
-                "you",
-                format!("{}  {}  {}", p.bold(&t.id), p.dim(t.status().as_str()), util::truncate(&t.title, 52)),
-            );
+            // The caption in a session rather than a cut title: the overview
+            // below says the rest, and a caption is the line written to be read
+            // in one look (`core-059`).
+            let named = match session {
+                true => crate::caption::of_task(t).text,
+                false => util::truncate(&t.title, 52),
+            };
+            row("you", format!("{}  {}  {}", p.bold(&t.id), p.dim(t.status().as_str()), named));
             // What it is part of. Direction lands on a parent and the work
             // happens a sub-task at a time, so the piece in hand is rarely the
             // reason it is being done.
@@ -1442,16 +1452,30 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // The whole chain, not just this project: a decision made on `wsp` binds
     // what is picked up in `data`, exactly as a tag does, and for the same
     // reason — the work is inside it.
-    for (i, (when, what)) in
-        r.decided.iter().skip(r.decided.len().saturating_sub(MAX_DECISIONS)).enumerate()
+    //
+    // Not in a session (`core-059`): there they are a count and where they
+    // are. The work in hand carries its own and its parent's, below; the
+    // project's are the same for every session and a seat that needs them asks.
+    let leaf = r.project.as_deref().unwrap_or("");
+    if session && !r.decided.is_empty() {
+        row(
+            "decided",
+            p.dim(&format!("{} in force · wsp project show {leaf} --decisions", r.decided.len())).to_string(),
+        );
+    }
+    for (i, (when, what)) in r
+        .decided
+        .iter()
+        .skip(r.decided.len().saturating_sub(MAX_DECISIONS))
+        .filter(|_| !session)
+        .enumerate()
     {
         row(
             if i == 0 { "decided" } else { "" },
             format!("{} {}", p.dim(when), util::truncate(what, 56)),
         );
     }
-    if r.dropped > 0 {
-        let leaf = r.project.as_deref().unwrap_or("");
+    if r.dropped > 0 && !session {
         row("", p.dim(&format!("{} earlier · wsp project show {leaf}", r.dropped)).to_string());
     }
     // What only the person can answer, after what is settled: it is the other
@@ -1468,7 +1492,11 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         );
     }
 
-    if r.shown > 0 {
+    // The backlog, likewise a pointer in a session: the next move of a session
+    // with a task is that task, and one under a mandate has its `next` above.
+    if session && !r.open.is_empty() {
+        row("open", p.dim(&format!("{} · wsp ls", r.open.len())).to_string());
+    } else if r.shown > 0 {
         for (i, (t, under)) in r.open.iter().take(r.shown).enumerate() {
             let prio = crate::cmd_task::paint_prio(p, t.priority());
             let kids = if *under > 0 { p.dim(&format!("  ({under} open)")) } else { String::new() };
@@ -1508,7 +1536,10 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         );
     }
 
-    for (i, o) in r.others.iter().enumerate() {
+    // Who is merely elsewhere on the machine is a count in a session; `here`,
+    // above, is the half that can clobber you and stays named.
+    let quiet = r.hidden + if session { r.others.len() } else { 0 };
+    for (i, o) in r.others.iter().filter(|_| !session).enumerate() {
         let flag = if o.needs_you() { p.yellow("  ← wants a decision") } else { String::new() };
         row(
             if i == 0 { "others" } else { "" },
@@ -1523,10 +1554,10 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // The quiet ones get a number, not names. A shell that has been standing
     // in a directory since Tuesday is worth knowing the count of and nothing
     // more.
-    if r.hidden > 0 {
+    if quiet > 0 {
         row(
-            if r.others.is_empty() { "others" } else { "" },
-            p.dim(&format!("{} more · wsp overlap", r.hidden)).to_string(),
+            if r.others.is_empty() || session { "others" } else { "" },
+            p.dim(&format!("{quiet} {} · wsp overlap", if session { "panes" } else { "more" })).to_string(),
         );
     }
 
@@ -1549,7 +1580,16 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // Named rather than dropped. A brief that quietly stops before the rules
     // reads like a store with no rules in it, which is the failure MAX_RULES is
     // written against, arriving by a different door.
+    //
+    // A session gets the verbs and where the how lives (`core-059`): the full
+    // list was ~2 KB of every session, the same in all of them.
     match &r.rules {
+        Some(_) if session => {
+            out.push(String::new());
+            out.push(p.dim(
+                "verbs  wsp say · edit --overview - · review · block · park · note · flag · add --parent · commit-help — wsp brief prints how",
+            ));
+        }
         Some(_) if terse => {
             out.push(String::new());
             out.push(p.dim("(rules omitted — wsp brief, without --terse)"));
@@ -2386,21 +2426,63 @@ mod tests {
             "do the small half first",      // what it has already settled
             "measure it, do not assume it", // what its parent binds it to
             "t-260815-007",                 // the sibling its prose names
-            "architecture.md",              // the handbook's pointer at the code
-            "nothing lands here without a test",
         ] {
             assert!(session.contains(needle), "missing from --session: {needle}\n{session}");
             assert!(!normal.contains(needle), "leaked into plain brief: {needle}\n{normal}");
             assert!(!terse.contains(needle), "leaked into --terse: {needle}\n{terse}");
         }
 
-        // What the default already said, it still says. A mode that added
-        // context by moving it would be a regression wearing a saving's
-        // clothes.
-        for needle in ["the task in hand", "next up", "same tree"] {
+        // What the default already said, a session says or points at — and
+        // what it points at is the half that is the same in every session
+        // (`core-059`): the backlog and the rules. The claim and the pane that
+        // can clobber this one are particular to it and stay named.
+        for needle in ["the task in hand", "same tree"] {
             assert!(normal.contains(needle), "{normal}");
             assert!(session.contains(needle), "{session}");
         }
+        for (said, pointer) in [("next up", "· wsp ls"), ("commit through your own index", "wsp brief prints how")] {
+            assert!(normal.contains(said), "{normal}");
+            assert!(!session.contains(said), "{session}");
+            assert!(session.contains(pointer), "{session}");
+        }
+    }
+
+    /// The bound the session brief is held to, on the shape `core-059` was
+    /// filed from: nothing claimed, a project with a long record of decisions,
+    /// a long backlog, a long handbook at two levels and the full rules. It was
+    /// 10.8 KB there, over Claude Code's inline limit, so what the agent saw
+    /// was a preview and a file path.
+    #[test]
+    fn a_session_brief_with_nothing_claimed_fits_in_two_kilobytes() {
+        let mut b = with_work();
+        b.world.bindings.remove("w1:p1");
+        let long = |head: &str| {
+            let mut t = format!("## Handbook\n{head}\n");
+            for i in 0..150 {
+                t += &format!("a standing rule that every session would otherwise re-read, number {i}\n");
+            }
+            t
+        };
+        let mut decisions = String::from("## Decisions\n");
+        for i in 0..40 {
+            decisions += &format!("- 2026-09-{:02} decision {i}, which binds what is picked up here\n", 1 + i % 28);
+        }
+        for p in b.world.index.projects.iter_mut() {
+            match p.id.as_str() {
+                "wsp" => p.body = long("the root handbook opens here"),
+                _ => p.body = format!("{decisions}\n{}", long("the near handbook opens here")),
+            }
+        }
+        for i in 0..150 {
+            b.world.tasks.push(task(&format!("t-260901-{i:03}"), "a row in a long backlog", Some("robustness"), "todo"));
+        }
+        b.rules = Some("Work lives in wsp.\n".repeat(60));
+
+        let session = brief_lines(&compose(&b), &plain(), Depth::Session).join("\n");
+        assert!(session.len() <= 2048, "{} bytes:\n{session}", session.len());
+        assert!(session.contains("the near handbook opens here"), "{session}");
+        assert!(!session.contains("the root handbook opens here"), "{session}");
+        assert!(session.contains("wsp project show robustness --decisions"), "{session}");
     }
     /// A log entry is bounded per entry, and the bound is stated rather than
     /// silent. A review note that ran to 2,000 characters arrives looking
@@ -2470,43 +2552,39 @@ mod tests {
         );
     }
 
-    /// And the split across the chain: an ancestor's handbook arrives as its
-    /// lead and a pointer, because it is text every sibling spawn under that
-    /// ancestor repeats; the nearest project's handbook is what the budget was
-    /// for. Both halves still arrive — an agent that needs the rules above it
-    /// is told exactly where they live — but only once per session rather than
-    /// eagerly at every level.
+    /// The handbook is the same for every agent in the project, so a session
+    /// holding a task is told where it lives and handed none of it — the task's
+    /// own prose is what that session's budget is for (`core-059`). One holding
+    /// nothing has no prose to spend on, and reads the nearest handbook's
+    /// opening: what this place is, cut where the pointer says.
     #[test]
-    fn an_ancestor_handbook_arrives_as_a_lead_and_the_nearest_one_whole() {
+    fn a_session_holding_a_task_is_pointed_at_the_handbook_and_not_handed_it() {
         let mut b = with_work();
         for p in b.world.index.projects.iter_mut() {
-            match p.id.as_str() {
-                "wsp" => {
-                    let mut hb = String::from("## Handbook\nthe root handbook opens here\n");
-                    for i in 0..20 {
-                        hb += &format!("root rule line {i}\n");
-                    }
-                    p.body = hb.into();
+            if p.id == "robustness" {
+                let mut hb = String::from("## Handbook\nnothing lands here without a test\n");
+                for i in 0..20 {
+                    hb += &format!("near rule line {i}\n");
                 }
-                "robustness" => {
-                    p.body = "## Handbook\nnothing lands here without a test\n".into();
-                }
-                _ => {}
+                p.body = hb;
             }
         }
-        b.project = Some("robustness".into());
 
-        let handed = session_text(&b);
-        assert!(handed.contains("the root handbook opens here"), "the lead still orients:\n{handed}");
-        assert!(!handed.contains("root rule line 7"), "{handed}");
+        let holding = session_text(&b);
+        assert!(holding.contains("the shape of it"), "{holding}");
+        assert!(!holding.contains("nothing lands here without a test"), "{holding}");
+        assert!(!holding.contains("architecture.md"), "{holding}");
+        assert!(holding.contains("handbook of wsp, robustness · wsp project show <p> --handbook"), "{holding}");
+
+        b.world.bindings.remove("w1:p1");
+        let idle = session_text(&b);
+        assert!(idle.contains("nothing lands here without a test"), "the opening orients:\n{idle}");
+        assert!(idle.contains("near rule line 8") && !idle.contains("near rule line 9"), "{idle}");
         assert!(
-            handed.contains(&format!("({} more lines — wsp project show wsp --handbook)", 21 - 8)),
-            "and says where the rest lives:\n{handed}"
+            idle.contains(&format!("({} more lines — wsp project show robustness --handbook)", 21 - 10)),
+            "and says where the rest lives:\n{idle}"
         );
-        assert!(
-            handed.contains("nothing lands here without a test"),
-            "the nearest handbook is not the thing that gets cut:\n{handed}"
-        );
+        assert!(!idle.contains("architecture.md"), "an ancestor's is a pointer:\n{idle}");
     }
 
     /// A parent decision binds as its *rule* — the first sentence, the same cut
@@ -2661,7 +2739,7 @@ mod tests {
         assert!(r.mine.is_none() && r.refs.is_empty() && r.mine_log.is_empty());
 
         let session = brief_lines(&r, &plain(), Depth::Session).join("\n");
-        assert!(session.contains("architecture.md"), "{session}");
+        assert!(session.contains("nothing lands here without a test"), "{session}");
         assert!(!session.contains("the shape of it"), "no task, so no task prose:\n{session}");
     }
 

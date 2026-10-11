@@ -6130,7 +6130,10 @@ mod tests {
 
         // The brief, and the task it is about.
         assert!(brief.contains("compose the brief into the order"), "no overview: {brief}");
-        assert!(brief.contains("read the source map first"), "no handbook: {brief}");
+        // The handbook as where it lives, as a session holding a task is told
+        // it (`core-059`), rather than its text.
+        assert!(brief.contains("handbook of core · wsp project show <p> --handbook"), "no handbook: {brief}");
+        assert!(!brief.contains("read the source map first"), "{brief}");
         assert!(brief.contains("t-1"), "{brief}");
         // And not the other one. A brief composed for this process rather than
         // for the seat would have named whatever the caller was holding.

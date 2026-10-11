@@ -1942,8 +1942,7 @@ Measured across the two agents spawned on 2026-08-16: nineteen `wsp show` calls,
 because every request re-reads the whole context, arriving over requests 4–16
 meant paying for it another ~86 times.
 
-So the hook hands it over instead. `--session` adds, after the roster and before
-the rules:
+So the hook hands it over instead. `--session` adds, after the roster:
 
 ```
 overview <the claimed task's own prose, as written>
@@ -1951,14 +1950,17 @@ settled  <what the task has already decided>
 log      <the tail of its log — where direction dropped on it later arrives>
 binds    <the parent's decisions: direction lands on a parent>
 names    <the siblings its prose mentions by id, with title and status>
-read     <the handbook, down the project chain, root first>
+read     <where the handbook lives; with nothing claimed, the nearest one's first 10 lines>
 ```
 
-Measured on this repo, on a real task: plain `wsp brief` is ~700 tokens and the
-payload is ~3,300 — ~1,150 of it the handbook, which is constant per project,
-and the rest the task. Against 14,450 fetched late, that is roughly 4:1 in
-favour, and it removes nineteen round-trips as well, each of which is itself a
-full context re-read.
+**And it takes away what is the same in every session** (`core-059`). The
+project's decisions, its open rows, the agents elsewhere on the machine and the
+rules are one line each — a count and the command that prints them — and the
+claimed task is named by its caption. It used to carry all of them and the
+whole handbook chain: 10.8 KB in a compound session, over Claude Code's inline
+limit, so the agent was shown a preview and a file path. Now 1.4 KB there with
+nothing claimed; a claimed session is ~0.6 KB plus the task's own prose. Plain
+`wsp brief` still prints the decisions, the backlog and the rules.
 
 Two of those blocks are bounded as well as capped, because caps that count
 entries stopped being enough once review notes started landing in logs: a
