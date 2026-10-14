@@ -3650,9 +3650,25 @@ for a real client attached to that server.
 ### How many agents a machine will bear
 
 ```sh
+wsp machine set seat agents=4     # four at once on the box you are sitting at
+wsp machine show seat             # the cap, and what is counted against it now
 wsp machine set mb2 agents=4      # four at once on that box
 wsp machine set mb2 agents=       # and back to no cap
 ```
+
+The seat's number is the one the run honours (`wsp-231`). Before `cycle` starts
+a member, a verifier or a barrier check it counts the working agents already on
+this machine — members, verifiers, barrier checks and `wsp spawn`ed helpers,
+across every list and every project — and anything over the cap waits for a
+later pass, said once in `cycle.log` and not on every tick. **Governors are not
+counted**, nor a seat that is gone, nor one idle with its work finished: a
+member at `review`, a pass with its verdict, a check that has settled. A
+verifier counts because it builds and runs tests like a member. When the seat is
+full, a verifier or a barrier check goes ahead of a new member, on any list, so
+a group can finish before the next work fans out. `wsp spawn` by hand says the
+seat is at its cap and starts anyway: a person or a governor asking explicitly
+is not a run. The seat's number lives in `seat.md` at the store's root, not
+under `machines/`, which the daemon dials.
 
 The number is on the **machine** and not on whatever asked for it. The `batch`
 and `fork` governors were told *4 local, 4 remote, shared between two* by hand
@@ -3671,11 +3687,9 @@ an executor nobody is sitting at.
 
 Two things it does not do, both worth knowing before the number is trusted:
 
-- **The seat has no record**, because the seat is not an executor of itself, so
-  today the cap can only be set for a far machine — while the box that runs
-  almost everything is the one you are sitting at. Every reader takes the cap as
-  an optional number rather than a machine, so wherever the seat's own number
-  ends up living, the rule above is unchanged.
+- **A far machine's number is written down and not yet counted.** The run
+  starts its agents on the seat, so the seat's cap is the one it holds them to;
+  an agent on an executor is that machine's, and nothing counts those yet.
 - **It counts agents, and builds are what saturate.** `data-018` measured it:
   three heavy builds started independently, two governors and one agent each
   deciding correctly and none able to see the other two, and `wsp spawn` began

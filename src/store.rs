@@ -381,6 +381,7 @@ impl Store {
         &[
             "agents.json",
             "bindings.json",
+            "capped.json",
             "claims.json",
             "daemon.json",
             "detail.json",
@@ -582,6 +583,63 @@ impl Store {
         write_atomic(&path, &m.render())?;
         self.wrote(path);
         Ok(())
+    }
+
+    // ---- the seat ----------------------------------------------------------
+    //
+    // The machine everything runs on, which has no record in `machines/`
+    // because it is not an executor of itself — and everything there is
+    // dialled by the daemon. `wsp-231`: it has one number, how many agents it
+    // bears at once, and a file of its own to keep it in. Committed, like a
+    // machine's, because it is a decision somebody made and not a reading.
+
+    pub fn seat_path(&self) -> PathBuf {
+        self.root.join("seat.md")
+    }
+
+    /// How many agents may be working on this seat at once. `None` is no
+    /// number, read the way [`Machine::agents`] is: absent, empty, zero and
+    /// unreadable all mean nobody has decided.
+    pub fn seat_cap(&self) -> Option<usize> {
+        let text = fs::read_to_string(self.seat_path()).ok()?;
+        fm::parse(&text).opt("agents").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0)
+    }
+
+    /// Write the seat's cap, or take it off with `None`, keeping whatever
+    /// else a hand put in the file.
+    pub fn set_seat_cap(&self, n: Option<usize>) -> std::io::Result<()> {
+        let path = self.seat_path();
+        let mut doc = fs::read_to_string(&path).map(|t| fm::parse(&t)).unwrap_or_default();
+        doc.fields.retain(|(k, _)| k != "agents");
+        if let Some(n) = n {
+            doc.set_str("agents", &n.to_string());
+        }
+        if doc.get("schema").is_none() {
+            doc.set_str("schema", crate::model::SCHEMA);
+        }
+        write_atomic(&path, &fm::emit(&doc))?;
+        self.wrote(path);
+        Ok(())
+    }
+
+    /// list -> what the run is holding back at the seat's cap, and since when:
+    /// so `cycle.log` says each one once and not on every tick. `wsp-231`.
+    pub fn capped(&self) -> BTreeMap<String, Value> {
+        match self.read_json("capped.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_capped(&self, list: &str, value: Option<Value>) {
+        self.update_json("capped.json", |m| match value {
+            Some(v) => {
+                m.insert(list.to_string(), v);
+            }
+            None => {
+                m.remove(list);
+            }
+        });
     }
 
     // ---- worklists --------------------------------------------------------

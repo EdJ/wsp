@@ -159,6 +159,13 @@ pub(crate) struct Fleet {
     /// whichever box the test ran on, which is a frame that differs between two
     /// machines for a reason that has nothing to do with the code.
     pub seat: String,
+    /// The seat's own cap (`wsp-231`), from `seat.md`: the one number this
+    /// box has, since it has no machine record.
+    pub seat_cap: Option<usize>,
+    /// The agents the run counts against that cap, as `cycle.log` names
+    /// them — see [`crate::room`]. Read only when there is a cap to count
+    /// against, like the run's own reading.
+    pub seat_working: Vec<String>,
 }
 
 impl Fleet {
@@ -175,7 +182,33 @@ impl Fleet {
             bindings: store.bindings(),
             tasks: store.tasks(),
             seat: util::hostname(),
+            seat_cap: store.seat_cap(),
+            seat_working: seat_working(store),
         }
+    }
+}
+
+/// The working agents the seat's cap is held against, named. Empty with no
+/// cap: nothing counts against a number nobody set, and the reading asks
+/// every seat's backend.
+fn seat_working(store: &Store) -> Vec<String> {
+    match store.seat_cap() {
+        None => Vec::new(),
+        Some(_) => crate::room::Gate::new(store, &crate::cycle::Fleet).working().iter().map(|c| c.said()).collect(),
+    }
+}
+
+/// Whether a typed name means this seat: `seat`, or its own short name.
+fn names_seat(needle: &str) -> bool {
+    needle == "seat" || needle == seat_name()
+}
+
+/// The seat's cap as one cell: the number and how many it holds now, or how
+/// to set one.
+fn seat_cap_line(cap: Option<usize>, working: usize) -> String {
+    match cap {
+        Some(n) => format!("{n} agents at once · {working} working"),
+        None => "no cap — wsp machine set seat agents=4".into(),
     }
 }
 
@@ -267,6 +300,9 @@ fn list_json(f: &Fleet) -> Value {
         .collect();
     json!({
         "seat": f.seat,
+        // Null and not 0 with no cap, for `machine_json`'s reason.
+        "seat_cap": f.seat_cap,
+        "seat_working": f.seat_working,
         "machines": rows,
         "seat_agents": agents_json(&agents_on(&here, "")),
     })
@@ -306,7 +342,13 @@ fn list_lines(f: &Fleet, p: &Paint) -> Vec<String> {
     // you reach — but a list of machines that leaves out the one you are on
     // reads as if it were missing, and the agents on it are half of what this
     // list is for.
-    let seat = |out: &mut Vec<String>| out.push(p.bold(&format!("seat  {}", f.seat)));
+    let seat = |out: &mut Vec<String>| {
+        out.push(format!(
+            "{}  {}",
+            p.bold(&format!("seat  {}", f.seat)),
+            p.dim(&seat_cap_line(f.seat_cap, f.seat_working.len()))
+        ))
+    };
 
     if f.machines.is_empty() {
         out.push(p.dim("no machines — this seat only"));
@@ -346,6 +388,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp machine show <name>");
         return 2;
     };
+    if names_seat(&needle) && find(store, &needle).is_none() {
+        return show_seat(store, args);
+    }
     let Some(m) = find(store, &needle) else {
         eprintln!("wsp: no machine matching `{needle}`");
         return 1;
@@ -413,6 +458,9 @@ pub fn set(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp machine set <name> ssh=… backend_at=… os=… arch=… agents=N status=active|retired");
         return 2;
     };
+    if names_seat(&needle) && find(store, &needle).is_none() {
+        return set_seat(store, args);
+    }
     let Some(mut m) = find(store, &needle) else {
         eprintln!("wsp: no machine matching `{needle}`");
         return 1;
@@ -441,27 +489,9 @@ pub fn set(store: &Store, args: &Args) -> i32 {
             // wants it is on `Machine::agents`, and so is what it does not
             // cover — it counts agents, and `data-018` measured that builds
             // are what saturate.
-            "agents" => match v.trim() {
-                // `agents=` is how a number is taken back off. Absent is a
-                // real state and not a zero: it means nobody has decided,
-                // which is where every machine starts.
-                "" | "none" | "-" => m.agents = None,
-                // Rejected rather than read as either of its two meanings.
-                // "drain this machine" is a plausible reading and so is "no
-                // cap", and a machine silently taking one of them is how you
-                // find out at 3am which one this build chose. Retiring is how
-                // a machine is taken out of use, and it is already a verb.
-                "0" => {
-                    eprintln!("wsp: agents=0 would mean either `no cap` or `drain it`, so it means neither — `agents=` clears the cap, `wsp machine rm {}` retires the machine", m.name);
-                    return 2;
-                }
-                n => match n.parse::<usize>() {
-                    Ok(n) => m.agents = Some(n),
-                    Err(_) => {
-                        eprintln!("wsp: agents is a count, not `{n}`");
-                        return 2;
-                    }
-                },
+            "agents" => match agents(v, &format!("`wsp machine rm {}` retires the machine", m.name)) {
+                Ok(n) => m.agents = n,
+                Err(code) => return code,
             },
             "status" => match v {
                 "active" | "retired" => m.status = v.to_string(),
@@ -493,6 +523,98 @@ pub fn set(store: &Store, args: &Args) -> i32 {
         println!("{}", machine_json(&m, store.machine_live(&m.name).as_ref()));
     } else {
         println!("{} {}", m.name, Paint::new().dim(&changed.join(" ")));
+    }
+    0
+}
+
+/// An `agents=` value: a count, or nothing to take the number off. `Err` is
+/// the exit code, the refusal already said. `out` is how this box is taken
+/// out of use, for the refusal of zero.
+fn agents(v: &str, out: &str) -> Result<Option<usize>, i32> {
+    match v.trim() {
+        // `agents=` is how a number is taken back off. Absent is a real state
+        // and not a zero: it means nobody has decided, which is where every
+        // machine starts.
+        "" | "none" | "-" => Ok(None),
+        // Rejected rather than read as either of its two meanings. "drain
+        // this machine" is a plausible reading and so is "no cap", and a
+        // machine silently taking one of them is how you find out at 3am which
+        // one this build chose.
+        "0" => {
+            eprintln!("wsp: agents=0 would mean either `no cap` or `drain it`, so it means neither — `agents=` clears the cap, {out}");
+            Err(2)
+        }
+        n => n.parse::<usize>().map(Some).map_err(|_| {
+            eprintln!("wsp: agents is a count, not `{n}`");
+            2
+        }),
+    }
+}
+
+/// `wsp machine set seat agents=N` — the one thing the seat has to set.
+/// `wsp-231`: Ed's four, on the box that runs almost everything.
+///
+/// **Only `agents`.** Everything else a machine record carries is about
+/// reaching it, and the seat is where you are.
+fn set_seat(store: &Store, args: &Args) -> i32 {
+    let mut cap = store.seat_cap();
+    let mut changed = false;
+    for kv in args.rest.iter().skip(2) {
+        let Some((k, v)) = kv.split_once('=') else {
+            eprintln!("wsp: `{kv}` is not key=value");
+            return 2;
+        };
+        if k != "agents" {
+            eprintln!("wsp: the seat has only `agents` — it is where you are, so there is nothing about reaching it to set");
+            return 2;
+        }
+        match agents(v, "`wsp worklist park <list>` stops a run") {
+            Ok(n) => cap = n,
+            Err(code) => return code,
+        }
+        changed = true;
+    }
+    if !changed {
+        eprintln!("wsp: nothing to set — wsp machine set seat agents=4");
+        return 2;
+    }
+    if let Err(e) = store.set_seat_cap(cap) {
+        eprintln!("wsp: write failed: {e}");
+        return 1;
+    }
+    store.log_event("seat-set", json!({ "agents": cap }));
+    store.git_commit(&format!(
+        "wsp: seat agents={}",
+        cap.map(|n| n.to_string()).unwrap_or_default()
+    ));
+    if args.json() {
+        println!("{}", json!({ "seat": util::hostname(), "agents": cap }));
+    } else {
+        println!("seat {}", Paint::new().dim(&seat_cap_line(cap, seat_working(store).len())));
+    }
+    0
+}
+
+/// `wsp machine show seat`: the cap, and what is counted against it.
+fn show_seat(store: &Store, args: &Args) -> i32 {
+    let cap = store.seat_cap();
+    let working = seat_working(store);
+    if args.json() {
+        println!("{}", json!({ "seat": util::hostname(), "agents": cap, "working": working }));
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{}  {}", p.bold("seat"), util::hostname());
+    println!();
+    match cap {
+        Some(n) => println!("agents    {n} at once — the run starts no more; governors are not counted"),
+        None => println!("agents    {}", p.dim("no cap — wsp machine set seat agents=4")),
+    }
+    if cap.is_some() {
+        println!("working   {}", working.len());
+        for w in &working {
+            println!("  {}", p.dim(w));
+        }
     }
     0
 }
@@ -700,6 +822,8 @@ mod tests {
             bindings,
             tasks: vec![crate::model::Task::new("lift the machines view off herdr", "t-001")],
             seat: "seat-under-test".into(),
+            seat_cap: None,
+            seat_working: Vec::new(),
         }
     }
 
@@ -790,6 +914,40 @@ mod tests {
         assert_eq!(set_to("four"), 2, "a count is a count");
         assert_eq!(set_to(""), 0, "`agents=` is how the number is taken back off");
         assert_eq!(store.machine("mb2").unwrap().agents, None, "back to nobody having decided");
+    }
+
+    /// The seat takes a cap of its own (`wsp-231`) — the box that runs almost
+    /// everything, which has no machine record — and only that: everything
+    /// else a record carries is about reaching it.
+    #[test]
+    fn the_seat_takes_an_agent_cap_and_nothing_else() {
+        let store = scratch("seat-agents");
+        let set_to = |kv: &str| set(&store, &Args::synth("machine", &["set", "seat", kv], &[]));
+
+        assert_eq!(set_to("agents=4"), 0);
+        assert_eq!(store.seat_cap(), Some(4), "and it is on the seat's file");
+        assert!(store.machines().is_empty(), "not a machine record, which the daemon would dial");
+
+        assert_eq!(set_to("agents=0"), 2, "zero is refused here too");
+        assert_eq!(set_to("ssh=here"), 2, "the seat is where you are");
+        assert_eq!(store.seat_cap(), Some(4));
+        assert_eq!(set_to("agents="), 0);
+        assert_eq!(store.seat_cap(), None, "and taken back off");
+    }
+
+    /// `wsp machine` shows the seat's cap, and how many it is holding now; with
+    /// none, how to set one.
+    #[test]
+    fn the_machines_view_shows_the_seats_cap() {
+        let mut f = fleet();
+        let text = list_lines(&f, &plain()).join("\n");
+        assert!(text.contains("no cap — wsp machine set seat agents=4"), "{text}");
+
+        f.seat_cap = Some(4);
+        f.seat_working = vec!["m-1 in w0:p6".into(), "m-2 starting".into()];
+        let text = list_lines(&f, &plain()).join("\n");
+        assert!(text.contains("seat  seat-under-test  4 agents at once · 2 working"), "{text}");
+        assert_eq!(list_json(&f)["seat_cap"], 4);
     }
 
     /// No machines at all is the common case — one seat, and whatever is on it

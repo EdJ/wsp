@@ -1229,10 +1229,11 @@ pub struct Machine {
     /// on `data-018`.
     ///
     /// The seat has no record here — see [`valid_machine_name`]'s caller in
-    /// `cmd_machine::add` — so today the number can only be set for an
-    /// executor. That is why every reader takes the cap as an
-    /// [`Option<usize>`] rather than a [`Machine`]: wherever the seat's own
-    /// number ends up living, [`Group::parallelism`] is unchanged.
+    /// `cmd_machine::add` — so its own number lives in `seat.md`
+    /// ([`crate::store::Store::seat_cap`], `wsp-231`), and that is the one the
+    /// run honours: [`crate::room`] counts the seat's working agents against
+    /// it. Every reader takes the cap as an [`Option<usize>`] rather than a
+    /// [`Machine`] for that reason.
     pub agents: Option<usize>,
     pub added: String,
     pub body: String,
@@ -1741,12 +1742,12 @@ impl Group {
     ///
     /// The machine's cap is passed in rather than read from a [`Machine`]
     /// because the machine everything runs on today — the seat — has no
-    /// record to read it off. See [`Machine::agents`].
+    /// machine record to read it off. See [`Machine::agents`].
     ///
-    /// Still waiting for its caller, which is the barrier: nothing computes an
-    /// effective parallelism until something is deciding how many of a group to
-    /// start, and `wsp worklist next` is where that happens. The editing verbs
-    /// only ever write the number down.
+    /// `wsp worklist next` passes the seat's number, against this group's own
+    /// work in flight. The run does not: it passes `None` here and holds the
+    /// seat's number across every list, in [`crate::room`] (`wsp-231`), since
+    /// a group's `xN` counts its own members and the seat counts everything.
     pub fn parallelism(&self, machine_cap: Option<usize>) -> Option<usize> {
         match (self.cap, machine_cap) {
             (Some(group), Some(machine)) => Some(group.min(machine)),

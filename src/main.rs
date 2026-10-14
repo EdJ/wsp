@@ -61,6 +61,7 @@ mod place_herdr;
 mod place_super;
 mod repair;
 mod resolve;
+mod room;
 mod sharing;
 mod stage;
 mod story;
@@ -1865,7 +1866,8 @@ fn help_text() -> String {
                                     a Host alias from ~/.ssh/config, not an address
   wsp machine ls|machines           what exists, and whether it is answering
   wsp machine show <name>           ssh target, tunnel, last seen, why not
-  wsp machine set <name> k=v…       ssh/backend_at/os/arch/status
+  wsp machine set <name> k=v…       ssh/backend_at/os/arch/agents/status
+  wsp machine set seat agents=N     how many agents the run starts on this box
   wsp machine rm <name> [--force]   retire it; --force removes the record
 
 {worklists}

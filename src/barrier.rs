@@ -317,23 +317,47 @@ const WEDGED_AFTER: i64 = 10 * 60;
 /// gone, when it is marked abandoned and a fresh one opens, rather than the run
 /// waiting on an agent that will never answer. An open entry with no seat after
 /// [`WEDGED_AFTER`] is a start that never arrived, and is taken again.
+#[cfg(test)]
 pub(crate) fn open(store: &Store, w: &Worklist, at: usize, read: Option<String>, on: Option<String>, gone: &dyn Fn(&str) -> bool) -> Option<Opened> {
+    open_within(store, w, at, read, on, gone, &|| true)
+}
+
+/// [`open`], asking `admit` whether the machine has room for one more agent
+/// (`wsp-231`) — once a check is owed and before it is written, inside the
+/// same lock, so a check the seat's cap holds back leaves no record behind.
+pub(crate) fn open_within(
+    store: &Store,
+    w: &Worklist,
+    at: usize,
+    read: Option<String>,
+    on: Option<String>,
+    gone: &dyn Fn(&str) -> bool,
+    admit: &dyn Fn() -> bool,
+) -> Option<Opened> {
     let mut opened = None;
     let changed = change(store, &w.id, at, |g| {
         if let Some(c) = g.checks.iter_mut().rev().find(|c| c.open()) {
             match c.pane.as_deref() {
                 Some(p) if gone(p) => {
+                    if !admit() {
+                        return false;
+                    }
                     c.state = State::Abandoned;
                     c.ending = Ending::Ended;
                 }
                 Some(_) => return false,
                 None if util::epoch_secs() - util::epoch_of(&c.at) > WEDGED_AFTER => {
+                    if !admit() {
+                        return false;
+                    }
                     c.at = util::now_iso();
                     opened = Some(Opened { retaken: true });
                     return true;
                 }
                 None => return false,
             }
+        } else if !admit() {
+            return false;
         }
         g.checks.push(Check::opened(read, on));
         opened = Some(Opened { retaken: false });

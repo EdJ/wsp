@@ -4025,7 +4025,7 @@ pub(crate) fn holding(
 
 /// Whether `seat` is a project's governor seat, through the same query `wip`
 /// draws its `▣` from.
-fn governs_seat(governors: &BTreeMap<String, Value>, seat: &str) -> bool {
+pub(crate) fn governs_seat(governors: &BTreeMap<String, Value>, seat: &str) -> bool {
     let workspace = seat.split(':').next().unwrap_or(seat);
     cmd_govern::governs(governors, &cmd_govern::seat_query(workspace, Some(seat))).is_some()
 }

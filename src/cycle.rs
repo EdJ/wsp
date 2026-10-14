@@ -33,7 +33,10 @@
 //!
 //! 1. Members not yet started are spawned, up to the group's cap, each on its
 //!    own `agent <id>:` line where it has one and the group's otherwise
-//!    ([`Group::policy_for`], `wsp-150`).
+//!    ([`Group::policy_for`], `wsp-150`). Taken last in a step since
+//!    `wsp-231`, and under the seat's cap ([`crate::room`]) after every other
+//!    running list's verifiers and checks: a group finishes before the next
+//!    work fans out.
 //! 2. A member that has reached `review` **and landed** gets a read-only
 //!    verifier, on the member's policy. Since `wsp-188` it has no row: a
 //!    `running` pass is written on the member's `## Verification`, and the
@@ -662,6 +665,22 @@ fn list_of(store: &Store, t: &Task) -> Option<Worklist> {
 /// about what is owed, and the tick has to reach them without a process per
 /// running list every minute.
 pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String> {
+    step_in(store, w, seats, Starts::All)
+}
+
+/// Which of a step's starts to take. `wsp-231`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Starts {
+    All,
+    /// Verifiers and the barrier only: what finishes a group, taken on every
+    /// other running list before a member on this one may have a place under
+    /// the seat's cap. Nothing else a step does — the untaken orders, the
+    /// unlanded notes, a group sent back — is about who goes first, so none of
+    /// it is done twice.
+    Finishing,
+}
+
+fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Vec<String> {
     let mut started = Vec::new();
     let w = match store.worklist(&w.id) {
         Some(w) => w,
@@ -675,49 +694,35 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
     let Some(at) = pos.at else { return started };
     let Some(g) = groups.get(at - 1) else { return started };
     let Some(policy) = g.policy() else { return started };
-
-    // 1. Members nobody has started, up to the cap — counted again inside
-    // the lock by `take_member`, because the two advances a pass can start
-    // (the barrier agent's `go` and its own `review`) both read this list.
-    //
-    // A member that rests on a member of its own group (`after:`, `wsp-256`)
-    // is not started until that one has landed. It is left at `todo` and
-    // unclaimed, so `take_member` never counts it against the cap, and the
-    // land that frees it pokes this step. Said every pass, as the barrier's
-    // waits are, because a member nobody started is otherwise a silence.
-    let cap = g.parallelism(None);
-    let holds = crate::after::waiting(store, g);
-    for s in &pos.members {
-        if let Some(on) = holds.get(&s.id) {
-            stamp(&format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
-            continue;
-        }
-        let Some(t) = store.find_task(&s.id) else { continue };
-        if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap) {
-            stamp(&format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
-            if spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string())) {
-                started.push(s.id.clone());
-            } else {
-                failed(store, &w, &s.id);
-            }
-        }
-    }
+    let all = starts == Starts::All;
+    // The seat's cap (`wsp-231`), asked by each of the three starts below
+    // inside the lock its record is written under. With no cap it reads
+    // nothing and admits everything.
+    let gate = crate::room::Gate::new(store, seats);
 
     // 1a. Every seat the group is waiting on a first turn from, whose order
     // went in and started nothing (`wsp-252`). Before the verifiers and the
     // barrier, so a seat replaced here is opened again below.
-    crate::untaken::look(store, seats, &w, at, g, &pos);
+    if all {
+        crate::untaken::look(store, seats, &w, at, g, &pos);
+    }
 
     // 2. A verifier for each member that is finished — reviewed and landed.
     // No row: the pass is written on the member, and the agent is started on
     // the member with `--verify` (`wsp-188`).
+    //
+    // **Before the members** since `wsp-231`: under the seat's cap a verifier
+    // goes ahead of a new member, so a group can finish before the next work
+    // fans out. With no cap the order changes nothing — each start is keyed on
+    // its own record.
     let gone = |seat: &str| seats.absent(seat) || seats.state(seat) == Some(State::Gone);
     for s in pos.members.iter().filter(|s| s.finished()) {
         let Some(member) = store.find_task(&s.id) else { continue };
         // On the kind the work ran on — `wsp-134` d1 (C) — which in a
         // mixed group is the member's own line and not the group's.
         let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
-        if let Some(opened) = open_verifier(store, &member, &on, &gone) {
+        let label = crate::verification::seat_label(&member.id);
+        if let Some(opened) = open_verifier(store, &member, &on, &gone, &|| gate.admits(&label)) {
             if let Some(seat) = &opened.lost {
                 stamp(&format!(
                     "{} group {at}: {}'s verifier in {seat} is gone with no verdict — starting another",
@@ -729,7 +734,7 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
                 end_passes(store, seats, &member.id, |p| p.state == crate::verification::State::Superseded);
             }
             if spawn(store, &member.id, &on, Undo::Verifier, (&w.id, &at.to_string())) {
-                started.push(crate::verification::seat_label(&member.id));
+                started.push(label);
             } else {
                 failed(store, &w, &member.id);
             }
@@ -740,8 +745,10 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
     // log has to say: tokenhub-003 went to review with its commit still on
     // its branch, this started nothing and wrote nothing, and its governor
     // went looking for the cause in the wrong record (`wsp-142`).
-    for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
-        stamp(&format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
+    if all {
+        for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
+            stamp(&format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
+        }
     }
 
     // 3. The barrier, once every member is landed, every verdict is in, and
@@ -763,8 +770,9 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
             }) => {}
             None => {
                 let on = Some(policy.label());
-                if let Some(o) = crate::barrier::open(store, &w, at, trunk_tip(store, &w.id), on, &gone) {
-                    let label = crate::barrier::seat_label(&w.id, at);
+                let label = crate::barrier::seat_label(&w.id, at);
+                let admit = || gate.admits(&label);
+                if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, &gone, &admit) {
                     if o.retaken {
                         stamp(&format!("{} group {at}: starting its check again — the last start never arrived", w.id));
                     }
@@ -777,14 +785,57 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
                     }
                 }
             }
-            Some(waiting) => {
-                // Said every pass, never silently. `wsp-142`'s lesson is that a
-                // no-op which writes nothing is indistinguishable from a stall
-                // with no cause, and the cause here is a fact about a pane.
-                stamp(&format!("{} group {at}: barrier waits: {}", w.id, waiting.join("; ")));
+            // Said every pass, never silently. `wsp-142`'s lesson is that a
+            // no-op which writes nothing is indistinguishable from a stall
+            // with no cause, and the cause here is a fact about a pane.
+            Some(waiting) if all => stamp(&format!("{} group {at}: barrier waits: {}", w.id, waiting.join("; "))),
+            Some(_) => {}
+        }
+    }
+
+    // 1. Members nobody has started, up to the group's cap — counted inside
+    // the lock by `take_member`, because the two advances a pass can start
+    // (the barrier agent's `go` and its own `review`) both read this list.
+    //
+    // A member that rests on a member of its own group (`after:`, `wsp-256`)
+    // is not started until that one has landed. It is left at `todo` and
+    // unclaimed, so `take_member` never counts it against the cap, and the
+    // land that frees it pokes this step. Said every pass, as the barrier's
+    // waits are, because a member nobody started is otherwise a silence.
+    //
+    // **Last**, and under the seat's cap after every other running list's
+    // verifiers and checks as well (`wsp-231`): a group anywhere on the
+    // machine finishes before the next work fans out.
+    if all {
+        let holds = crate::after::waiting(store, g);
+        let unstarted = pos.members.iter().any(|s| {
+            !holds.contains_key(&s.id) && store.find_task(&s.id).is_some_and(|t| t.status() == Status::Todo)
+        });
+        if gate.cap.is_some() && unstarted {
+            for other in store.worklists().iter().filter(|o| o.id != w.id && o.status() == WorklistStatus::Running) {
+                let _ = step_in(store, other, seats, Starts::Finishing);
+            }
+        }
+        let cap = g.parallelism(None);
+        for s in &pos.members {
+            if let Some(on) = holds.get(&s.id) {
+                stamp(&format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
+                continue;
+            }
+            let Some(t) = store.find_task(&s.id) else { continue };
+            if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap, &gate) {
+                stamp(&format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
+                if spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string())) {
+                    started.push(s.id.clone());
+                } else {
+                    failed(store, &w, &s.id);
+                }
             }
         }
     }
+
+    say_capped(store, &w.id, at, gate.cap, gate.take_held(), all);
+
     // 3a. And the one `wsp-164`'s gate cannot reach: **a barrier that already
     // opened**, before the member was sent back. `wsp-163` found the gap — a
     // governor `wsp tell`ed its verifier to install and drive delivery live, the
@@ -797,11 +848,54 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
     // moved — it is mid-check and the run owns that turn. `wsp worklist go`
     // refuses while a member holds, so the race cannot be lost; what this
     // prevents is the check *finishing* on a group it was not given.
-    sent_back_holding(store, &w, at, g);
+    if all {
+        sent_back_holding(store, &w, at, g);
+    }
     if !started.is_empty() {
         stamp(&format!("{} group {at}: started {}", w.id, started.join(" ")));
     }
     started
+}
+
+/// What the seat's cap held back on a list this pass, said once in `cycle.log`
+/// and not on every tick (`wsp-231`). The record of what has been said is
+/// `capped.json`, one entry per list: a step that takes every start replaces
+/// its list's entry with what it held now, so a start that went ahead and was
+/// held again later is said again; a [`Starts::Finishing`] pass only adds.
+fn say_capped(store: &Store, list: &str, at: usize, cap: Option<usize>, held: Vec<(String, Vec<crate::room::Counted>)>, all: bool) {
+    let Some(cap) = cap else {
+        if all && store.capped().contains_key(list) {
+            store.set_capped(list, None);
+        }
+        return;
+    };
+    let before = store.capped().get(list).and_then(|v| v.as_object().cloned()).unwrap_or_default();
+    let mut now = match all {
+        true => serde_json::Map::new(),
+        false => before.clone(),
+    };
+    for (what, room) in held {
+        if now.contains_key(&what) {
+            continue;
+        }
+        match before.get(&what) {
+            Some(since) => {
+                now.insert(what, since.clone());
+            }
+            // `log_line` and not `stamp`: the daemon's tick takes this step
+            // too, and its stdout is not `cycle.log`.
+            None => {
+                log_line(store, &format!(
+                    "{list} group {at}: {what} waits — the seat is at its cap of {cap}: {}",
+                    crate::room::names(&room)
+                ));
+                now.insert(what, serde_json::Value::String(util::now_iso()));
+            }
+        }
+    }
+    if now != before {
+        store.set_capped(list, (!now.is_empty()).then_some(serde_json::Value::Object(now)));
+    }
 }
 
 /// The open barrier check of a group with a member that is no longer settled,
@@ -1074,6 +1168,7 @@ fn take_member(
     at: usize,
     members: &[String],
     cap: Option<usize>,
+    gate: &crate::room::Gate,
 ) -> Option<(&'static str, Policy)> {
     let id = t.id.clone();
     let took = store.locked(|| {
@@ -1093,6 +1188,11 @@ fn take_member(
             .filter(|m| m.status() == Status::Doing || claims.contains_key(&m.id))
             .count();
         if cap.is_some_and(|c| going >= c) {
+            return None;
+        }
+        // The seat's cap, after the group's: a group under its own `xN` may
+        // still find the machine full, and what is said is the machine.
+        if !gate.admits(&id) {
             return None;
         }
         let policy = store.worklist(list)?.groups().get(at - 1)?.policy_for(&id)?;
@@ -1173,7 +1273,7 @@ pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
 /// deliberately: design-only work has no repository, and a member whose fix is
 /// prose has genuinely changed when it is touched. That is also why a pass's
 /// own bookkeeping never touches the member — see [`crate::verification`].
-fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool) -> Option<Opened> {
+fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::landed(member);
     let landed_again = |read: &Option<String>| match (&now_landing, read) {
@@ -1194,6 +1294,9 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) 
                 let i = own.len().checked_sub(1)?;
                 let ended = own[i].ending != Ending::Standing;
                 if own[i].pane.is_none() && util::epoch_secs() - util::epoch_of(&own[i].at) > WEDGED_AFTER {
+                    if !admit() {
+                        return None;
+                    }
                     own[i].at = util::now_iso();
                     v::write(&mut m, &own);
                     store.save_task(&m).ok()?;
@@ -1224,6 +1327,12 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) 
             // The newest was superseded and nothing opened after it — a start
             // that failed — so this is the fresh pass it was waiting for.
             Some(_) => {}
+        }
+        // Owed, and only now asked whether the seat has room (`wsp-231`): a
+        // pass the cap holds back is not written, so the next step finds it
+        // owed again rather than in flight.
+        if !admit() {
+            return None;
         }
         own.push(v::Pass::opened(now_landing.clone(), Some(on.label())));
         v::write(&mut m, &own);
@@ -4192,6 +4301,136 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(spawned().is_empty(), "two are going, and the cap is two");
     }
 
+    // ---- the seat's cap (`wsp-231`) --------------------------------------
+
+    fn ids(started: Vec<(String, String)>) -> Vec<String> {
+        started.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn said_capped() -> Vec<String> {
+        drained(&SAID).into_iter().filter(|l| l.contains("the seat is at its cap")).collect()
+    }
+
+    /// A second running list beside `run`, for the cases where two share the
+    /// machine.
+    fn list_named(store: &Store, id: &str, members: &[&str], agent: &str) -> Worklist {
+        let mut w = Worklist::new(id, id);
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[Group { members: members.iter().map(|x| x.to_string()).collect(), agent: agent.into(), ..Group::default() }]);
+        store.save_worklist(&w).unwrap();
+        w
+    }
+
+    /// gpui-migration's group 10, under Ed's four: seven members and no `xN`
+    /// start four, and the rest start as members finish — after the verifier
+    /// each finished member is owed, which goes first. What is held back is
+    /// said once in `cycle.log` and not on every pass.
+    #[test]
+    fn under_the_seats_cap_a_seven_member_group_starts_four_and_a_verifier_goes_before_the_fifth() {
+        let (_env, store) = scratch("seat-cap");
+        let members = ["m-1", "m-2", "m-3", "m-4", "m-5", "m-6", "m-7"];
+        for m in members {
+            task(&store, m, Status::Todo);
+        }
+        store.set_seat_cap(Some(4)).unwrap();
+        let w = list(&store, &[(&members, "claude")]);
+        let _ = drained(&SAID);
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1", "m-2", "m-3", "m-4"], "four, in the order the group names them");
+        let said = said_capped();
+        assert_eq!(said.len(), 3, "each member held back is said: {said:?}");
+        assert!(said[0].contains("m-5 waits — the seat is at its cap of 4: m-1 starting"), "{said:?}");
+
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "four are going and the seat bears four");
+        assert!(said_capped().is_empty(), "and what was said is not said again");
+
+        set(&store, "m-1", Status::Review);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · verifying"], "the finished member's verifier takes its place, not m-5");
+
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-5"], "and the verdict frees the place for the next member");
+    }
+
+    /// The seat's number and a group's `xN` are both caps, and the smaller
+    /// wins: a group asking for two gets two on a seat that bears four.
+    #[test]
+    fn a_groups_cap_under_the_seats_is_the_smaller_of_the_two() {
+        let (_env, store) = scratch("seat-cap-x2");
+        for m in ["m-1", "m-2", "m-3"] {
+            task(&store, m, Status::Todo);
+        }
+        store.set_seat_cap(Some(4)).unwrap();
+        let mut w = list(&store, &[(&["m-1", "m-2", "m-3"], "claude")]);
+        let mut g = w.groups();
+        g[0].cap = Some(2);
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().len(), 2);
+        assert!(said_capped().is_empty(), "the group's own cap held the third, not the seat's");
+    }
+
+    /// Two lists running together share the seat's number, and a barrier check
+    /// owed on one goes ahead of a new member on the other.
+    #[test]
+    fn two_lists_share_the_seats_cap_and_a_barrier_check_goes_before_a_new_member() {
+        let (_env, store) = scratch("seat-cap-two");
+        task(&store, "m-1", Status::Todo);
+        for n in ["n-1", "n-2", "n-3"] {
+            task(&store, n, Status::Todo);
+        }
+        let run = list(&store, &[(&["m-1"], "claude"), (&["m-2"], "claude")]);
+        task(&store, "m-2", Status::Todo);
+        step(&store, &run, &Blind);
+        set(&store, "m-1", Status::Review);
+        step(&store, &run, &Blind);
+        hold_all(&store);
+        let _ = spawned();
+
+        // `run` is at its barrier, owed a check; `two` has three members.
+        store.set_seat_cap(Some(2)).unwrap();
+        let two = list_named(&store, "two", &["n-1", "n-2", "n-3"], "claude");
+        let _ = drained(&SAID);
+        step(&store, &two, &Blind);
+        assert_eq!(
+            ids(spawned()),
+            ["run · barrier 1".to_string(), "n-1".to_string()],
+            "the other list's check first, then one member: two places between the two lists"
+        );
+        let said = said_capped();
+        assert!(said.iter().any(|l| l.starts_with("two group 1: n-2 waits")), "{said:?}");
+
+        step(&store, &run, &Blind);
+        assert!(spawned().is_empty(), "the check is already open: nothing owed twice");
+    }
+
+    /// A governor is not one of the four: a seat it sits in, even one holding
+    /// a row, leaves the count where it was. A helper `wsp spawn`ed onto a row
+    /// is one of them.
+    #[test]
+    fn a_governor_seat_is_not_counted_and_a_helper_is() {
+        let (_env, store) = scratch("seat-cap-gov");
+        let members = ["m-1", "m-2", "m-3", "m-4", "m-5"];
+        for m in members {
+            task(&store, m, Status::Todo);
+        }
+        task(&store, "h-1", Status::Doing);
+        task(&store, "g-1", Status::Doing);
+        store.set_governor("run", serde_json::json!({ "workspace": "w9", "pane": "w9:p1" }));
+        store.set_binding("w9:p1", serde_json::json!({ "task_id": "g-1" }));
+        store.set_binding("w2:p1", serde_json::json!({ "task_id": "h-1" }));
+        store.set_seat_cap(Some(4)).unwrap();
+        let w = list(&store, &[(&members, "claude")]);
+        let seats = Fixed::new(&[("w9:p1", State::Working), ("w2:p1", State::Working)]);
+
+        step(&store, &w, &seats);
+        assert_eq!(ids(spawned()), ["m-1", "m-2", "m-3"], "the helper takes a place and the governor takes none");
+    }
+
     /// `after:` (`wsp-256`, §19.8 Q-7): a member resting on one of its own
     /// group is held until that one has **landed** — not reviewed, not held by
     /// its verifier — and is started by the step after the land.
@@ -4381,7 +4620,8 @@ fn only_a_working_screen_is_ever_overruled() {
         list(&store, &[(&["m-1", "m-2"], "claude")]);
         let members = vec!["m-1".to_string(), "m-2".to_string()];
         let m2 = store.find_task("m-2").unwrap();
-        let took = |cap| take_member(&store, &m2, "run", 1, &members, cap).map(|(why, _)| why);
+        let gate = crate::room::Gate::new(&store, &Blind);
+        let took = |cap| take_member(&store, &m2, "run", 1, &members, cap, &gate).map(|(why, _)| why);
         assert_eq!(took(Some(1)), None, "one going, cap one");
         assert_eq!(took(Some(2)), Some("new"));
         assert_eq!(took(Some(2)), None, "taken already");

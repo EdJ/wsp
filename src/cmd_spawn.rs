@@ -2086,6 +2086,21 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         return 2;
     }
 
+    // The seat's cap (`wsp-231`) holds the run and not a hand: a person or a
+    // governor asking for an agent explicitly is not a run, so this is said
+    // and the agent starts anyway. What the run starts carries its list in
+    // the environment, or is a verifier or a check; a governor is not counted
+    // at all; and an agent on another machine is that machine's to count.
+    let by_hand = std::env::var_os(crate::cycle::OWNED_LIST).is_none() && !verifying && checking.is_none();
+    if by_hand && args.has("agent") && !args.has("govern") && args.get("on").is_none() {
+        if let Some((cap, now)) = crate::room::full(store, &crate::cycle::Fleet) {
+            eprintln!(
+                "wsp: the seat is at its cap of {cap} ({}) — starting this anyway: a hand spawn is not the run",
+                crate::room::names(&now)
+            );
+        }
+    }
+
     // Still this machine's paths, deliberately. A project root is a path in the
     // store and `~` expands here, which is right while the machines mirror each
     // other and is exactly what the Linux box breaks; host-qualified roots are

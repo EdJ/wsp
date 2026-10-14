@@ -2317,6 +2317,21 @@ struct Front {
     /// looking for the three that are missing.
     capped: usize,
     cap: Option<usize>,
+    /// The cap is the seat's and not the group's `xN` (`wsp-231`), so it is
+    /// said as the seat's: an `x4` on a group nobody wrote one on reads as a
+    /// typo in the list.
+    by_seat: bool,
+}
+
+impl Front {
+    /// What holds the rest back, in the words `next` says it in.
+    fn holder(&self) -> Option<String> {
+        let cap = self.cap?;
+        Some(match self.by_seat {
+            true => format!("the seat's cap of {cap}"),
+            false => format!("x{cap}"),
+        })
+    }
 }
 
 /// What `next` has to say, which is one of four things and never a fifth.
@@ -2888,17 +2903,18 @@ fn front(store: &Store, g: Option<&Group>, members: &[Standing], holds: &BTreeMa
         }
     }
 
-    // The machine's half of the cap is `None` and that is not an oversight: it
-    // is set per executor and the seat — the machine all of this actually runs
-    // on — has no record to carry one (see `Machine::agents`). It goes through
-    // `parallelism` rather than being ignored so that the day the seat gets a
-    // record, this line is the only one that changes and the rule stays where
-    // the rule is.
-    let cap = g.and_then(|g| g.parallelism(None));
+    // The machine's half of the cap is the seat's own (`wsp-231`), and the
+    // smaller of the two wins. Counted here against this group's own work in
+    // flight and not the machine's: `next` is what a governor reads before a
+    // `wsp spawn` by hand, which the cap does not hold — the run's count, across
+    // every list, is `crate::room`'s.
+    let seat = store.seat_cap();
+    let cap = g.and_then(|g| g.parallelism(seat));
+    let by_seat = seat.is_some() && cap != g.and_then(|g| g.cap);
     let room = cap.map(|n| n.saturating_sub(waiting.len())).unwrap_or(ready.len()).min(ready.len());
     let capped = ready.len() - room;
     ready.truncate(room);
-    Front { ready, waiting, held, capped, cap }
+    Front { ready, waiting, held, capped, cap, by_seat }
 }
 
 // ---- next -------------------------------------------------------------
@@ -3035,9 +3051,9 @@ fn front_lines(p: &Paint, w: &Worklist, pos: &Position, f: &Front, seat: bool) -
     let of = pos.of;
     let at = pos.at.unwrap_or(0);
     if f.ready.is_empty() {
-        let tail = match (f.capped, f.cap) {
+        let tail = match (f.capped, f.holder()) {
             (0, _) | (_, None) => String::new(),
-            (n, Some(cap)) => format!(" · x{cap} holds {n} back"),
+            (n, Some(cap)) => format!(" · {cap} holds {n} back"),
         };
         let rows: Vec<&(Standing, String)> = f.waiting.iter().chain(&f.held).collect();
         let mut out = vec![format!("group {at} of {of} — waiting on {}{tail}", rows.len())];
@@ -3055,8 +3071,8 @@ fn front_lines(p: &Paint, w: &Worklist, pos: &Position, f: &Front, seat: bool) -
         tail.push_str(&format!(" · {} {note}", s.id));
     }
     if f.capped > 0 {
-        if let Some(cap) = f.cap {
-            tail.push_str(&format!(" · x{cap} holds {} back", f.capped));
+        if let Some(cap) = f.holder() {
+            tail.push_str(&format!(" · {cap} holds {} back", f.capped));
         }
     }
     // A list nobody has started: the ids are what group 1 *is*, and the
