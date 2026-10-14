@@ -4320,7 +4320,6 @@ fn runs(w: &Wip, seat: &str, governs: Option<&str>, held: Option<&Task>) -> Runs
     Runs::of_spawned(kind, &tier)
 }
 
-/// The agents, resolved and in reading order: by project, then by pane.
 /// [`crate::waiting::Shells`] for the seats `needs_you` is asked of: idle, and
 /// bound to a task. Only those, because the reading is a `ps` and `wip` is
 /// polled — a seat in a turn, or one holding nothing, is never stalled work.
@@ -4330,6 +4329,7 @@ pub(crate) fn idle_members_shells(agents: &[crate::place::Seated], bindings: &BT
     )
 }
 
+/// The agents, resolved and in reading order: by project, then by pane.
 pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     let mut rows: Vec<WipRow> = Vec::new();
     // A verifier holds no claim and no binding (`wsp-188`): its seat is named
