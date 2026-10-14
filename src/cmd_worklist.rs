@@ -7136,6 +7136,56 @@ mod tests {
         assert_eq!(run(&store, &["go", "batch"]), 0, "answered, the same go passes");
     }
 
+    /// **A list governor's own question, with nobody seated above it, is the
+    /// person's — and holds its group** (`wsp-283`). `wsp-263` sends a seat's
+    /// question about its own work one step up the walk; this is the end of the
+    /// walk, where the list's home project has no governor. The asker is not
+    /// woken on its own words, and the question is a member's item for the
+    /// person, so `go` refuses the barrier it is owed before — where before
+    /// `wsp-275` a governor's plain ask held nothing.
+    #[test]
+    fn a_list_governors_own_question_with_nobody_seated_above_is_the_persons_and_holds_its_group() {
+        use crate::message::{self, About};
+        let (_env, store) = running("own-at-the-top");
+        for (id, status) in [("wl-001", "review"), ("wl-002", "todo")] {
+            let mut t = Task::new(id, id);
+            t.status_raw = status.into();
+            t.project = Some("wsp".into());
+            store.save_task(&t).unwrap();
+        }
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        started(&store, "batch");
+        store.set_governor("batch", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+        assert_eq!(worklist::home_of_scope(&store, "batch").as_deref(), Some("wsp"), "the walk has a home to climb");
+        assert!(crate::cmd_govern::seat_above_in(&store, "batch").is_none(), "and nobody seated on it");
+
+        std::env::set_var(crate::place::SEAT_ENV, "w1:p1");
+        let asked = crate::cmd_message::ask(&store, &Args::synth("ask", &["wl-001", "ship it with the panic unexplained?"], &[]));
+        std::env::remove_var(crate::place::SEAT_ENV);
+        assert_eq!(asked, 0);
+
+        let q = message::raised(&store).pop().expect("the question");
+        assert_eq!(q.from.scope(), Some("batch"), "asked from the list's seat");
+        assert_eq!(q.about, About::Task("wl-001".into()));
+        assert_eq!(q.to_json()["for"], "person", "nobody above, so the person");
+        assert_eq!(q.for_seat, None);
+        assert!(q.for_person);
+        let ids = |v: Vec<message::Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(message::raised_to_the_person(&store)), vec![q.id.clone()], "flag --person lists it");
+        assert_eq!(ids(crate::cmd_message::yours_in(&store, None)), vec![q.id.clone()], "and so does yours");
+        assert!(crate::wake::scopes_owed(&store).is_empty(), "no spool woken, the asker's least of all");
+        assert!(!q.handed_to("batch"));
+
+        assert_eq!(ids(message::holding_group(&store, "batch", 1)), vec![q.id.clone()]);
+        assert_eq!(gate_of(&store, "batch"), "after 1 ");
+        assert_eq!(run(&store, &["go", "batch"]), 1, "held on the person, through the governor's own member");
+        assert_eq!(gate_of(&store, "batch"), "after 1 ", "and still shut");
+        message::answer(&store, &q.id, &message::Party::Human, "explain it in the log; ship").unwrap();
+        assert_eq!(run(&store, &["go", "batch"]), 0, "answered, the same go passes");
+    }
+
     /// The far side of a barrier is answered where the barrier is passed, not
     /// pointed at (`core-049`). Every turn an agent spends polling is a whole
     /// context re-read, and `go` runs exactly when "what may start now"
