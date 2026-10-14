@@ -2190,6 +2190,19 @@ or a list's home — so "no governor seated" is said, not guessed; it is `null`
 wherever `answers_to` is not. A governor's `members_waiting` counts the waiting
 rows whose `answers_to` is its scope.
 
+And since when each seat has been in its `state`, as `since` (`wsp-250`), an
+RFC 3339 time: the turn's start while it turns, the stop while it is idle or
+blocked, the death once it is gone. Neither backend dates a state change —
+herdr numbers one and compound dates only its seat directory's last write — so
+wsp dates it itself, the first time a census it reads sees the change: every
+`wsp wip` and every tick of the watch, kept in `seat-since.json`. It is "first
+seen", at most one tick late, and on a seat no census has read before it is
+that first reading. A different agent session in the same seat starts its
+clock again; a seat missing from a census every backend answered in full loses
+its entry, and one on a machine that was quiet does not. `held` is a different
+clock — the claim's age — and only a member has one; every seat has a `since`.
+`wsp wip` draws it on a waiting seat: `waiting 12m · person`.
+
 ### Looking at a pane
 
 ```sh

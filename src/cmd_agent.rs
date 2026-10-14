@@ -3909,6 +3909,29 @@ pub(crate) struct Wip {
     /// project, and which running list's group a member is in, for each row's
     /// `role` (`wsp-246`).
     pub lists: Vec<crate::model::Worklist>,
+    /// seat -> since when it has been in its state, as [`seat_clocks`] noted
+    /// it on this reading. Published as `since` (`wsp-250`).
+    pub since: std::collections::BTreeMap<String, String>,
+}
+
+/// Note this census's seats against `seat-since.json` and say since when each
+/// has been in its state — [`Store::note_seat_states`], fed the seats `wip`
+/// draws (a seat with nobody in it has no state worth a clock). `complete` is
+/// whether every backend answered in full, the only reading on which a seat
+/// missing from it may lose its entry; `at` is now, the time a change is
+/// first seen.
+pub(crate) fn seat_clocks<'a>(
+    store: &Store,
+    seats: impl IntoIterator<Item = &'a crate::place::Seated>,
+    complete: bool,
+    at: i64,
+) -> std::collections::BTreeMap<String, String> {
+    let seen: Vec<(String, String, String)> = seats
+        .into_iter()
+        .filter(|s| s.state != State::Empty)
+        .map(|s| (s.seat.as_str().to_string(), s.state.as_str().to_string(), s.session.clone()))
+        .collect();
+    store.note_seat_states(&seen, at, complete)
 }
 
 /// Every standing barrier check's seat, named against its list and placed in
@@ -3932,18 +3955,25 @@ impl Wip {
         let backends = crate::cmd_spawn::local_backends();
         let mut agents = Vec::new();
         let mut heard = false;
+        let mut complete = true;
         for backend in &backends {
-            if let Ok(census) = backend.census() {
-                heard = true;
-                // Each gone seat is dated by the backend that holds it: the
-                // clock lives in that backend's record of the seat, and
-                // nothing above the port may read it off a path.
-                agents.extend(census.seats().filter(|s| s.state != State::Empty).map(|s| {
-                    let quiet = (s.state == State::Gone).then(|| backend.quiet_since(&s.seat)).flatten();
-                    (s.clone(), quiet)
-                }));
-            }
+            let Ok(census) = backend.census() else {
+                complete = false;
+                continue;
+            };
+            heard = true;
+            complete &= census.unheard().next().is_none();
+            // Each gone seat is dated by the backend that holds it: the
+            // clock lives in that backend's record of the seat, and
+            // nothing above the port may read it off a path.
+            agents.extend(census.seats().filter(|s| s.state != State::Empty).map(|s| {
+                let quiet = (s.state == State::Gone).then(|| backend.quiet_since(&s.seat)).flatten();
+                (s.clone(), quiet)
+            }));
         }
+        // Before the gone seats are forgotten below, so a seat that is still
+        // in the census keeps its clock while `wip` stops drawing it.
+        let since = seat_clocks(store, agents.iter().map(|(s, _)| s), complete, util::epoch_secs());
         let tasks = store.tasks();
         let bindings = store.bindings();
         let claims = store.claims();
@@ -3980,6 +4010,7 @@ impl Wip {
             checking,
             check_on: crate::barrier::ran_on(&lists),
             lists,
+            since,
         }
     }
 }
@@ -4108,6 +4139,13 @@ pub(crate) struct WipRow {
     /// when it holds no claim or the claim predates the clock. Published as
     /// `held`.
     pub(crate) held: Option<String>,
+    /// Since when the seat has been in its `state`, RFC 3339: the turn's start
+    /// while it turns, the stop while it is idle or blocked, the death once it
+    /// is gone — the first census wsp read it in that state, so at most one
+    /// tick late ([`Store::note_seat_states`]). Unlike `held` every seat has
+    /// one: a verifier, a check and a governor hold no claim. `None` only on
+    /// a reading that noted nothing. Published as `since` (`wsp-250`).
+    pub(crate) since: Option<String>,
     /// The project its mandate points it at — what a verb would send it to
     /// work on, as against `project`, where it stands. The two are separate
     /// facts and both are published; a reader that wants "only when they
@@ -4332,6 +4370,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
                 .map(|c| util::since(c))
                 .filter(|&secs| secs > 0)
                 .map(util::duration_human),
+            since: w.since.get(seat).cloned(),
             // Only a project the index knows, as the panel reads it: a
             // mandate on one that has since been removed points nowhere.
             direction: crate::cmd_mandate::from_map(&w.mandates, agent.as_deref(), Some(workspace_id))
@@ -4427,6 +4466,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "turning": r.turning, "needs_you": r.needs_you, "seat": r.seat,
             "said": r.said,
             "held": r.held,
+            "since": r.since,
             "direction": r.direction,
             "waiting": r.waiting.as_ref().map(|w| w.json()),
             "members_waiting": r.seat.as_ref().map(|_| r.members_waiting),
@@ -4510,11 +4550,17 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             p.dim(&util::pad("PANE", 7)),
             p.dim("STATE")
         ));
+        // A waiting seat says for how long, off `since` (`wsp-250`): the
+        // stop it is waiting from, which `held` — the claim's age — is not.
+        let waited = |r: &WipRow, w: &crate::waiting::Wait| match r.since.as_deref().map(util::since) {
+            Some(secs) if secs > 0 => w.word().replacen("waiting", &format!("waiting {}", util::duration_human(secs)), 1),
+            _ => w.word(),
+        };
         // Wide enough for the longest word drawn, so a `waiting · wsp-process`
         // does not push the flag after it out of line with everybody else's.
         let sw = rows
             .iter()
-            .map(|r| r.waiting.as_ref().map(|w| w.word().chars().count()).unwrap_or(0))
+            .map(|r| r.waiting.as_ref().map(|w| waited(r, w).chars().count()).unwrap_or(0))
             .max()
             .unwrap_or(0)
             .max(8);
@@ -4522,7 +4568,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             let state = match (&r.waiting, r.state.as_str()) {
                 // Before the word, and in place of it: a waiting seat reads
                 // `idle` on its screen, and `idle` is what got one ended.
-                (Some(w), _) => p.yellow(&util::pad(&w.word(), sw)),
+                (Some(w), _) => p.yellow(&util::pad(&waited(r, w), sw)),
                 (None, "working") => p.green(&util::pad("working", sw)),
                 (None, "idle") => p.dim(&util::pad("idle", sw)),
                 (None, other) => p.dim(&util::pad(other, sw)),
@@ -7750,6 +7796,7 @@ mod tests {
             checking: Default::default(),
             check_on: Default::default(),
             lists: Vec::new(),
+            since: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -7938,6 +7985,7 @@ mod tests {
             checking: Default::default(),
             check_on: Default::default(),
             lists: Vec::new(),
+            since: Default::default(),
         }
     }
 
@@ -8578,6 +8626,71 @@ mod tests {
         assert_eq!(row("w2:p1")["direction"], serde_json::Value::Null, "an unknown project is no direction");
         assert_eq!(row("w3:p1")["direction"], serde_json::Value::Null, "no mandate, no direction");
         assert!(row("w3:p1").get("held").is_some(), "the keys are always present");
+    }
+
+    /// `wsp-250`. `since` is when the seat entered its current state, dated by
+    /// the census that first saw it there: one seat driven working → idle →
+    /// working → gone through four readings a few minutes apart, each read
+    /// twice, moves its clock at every change and at no other reading. `held`,
+    /// the claim's age, is a different clock and is not touched; and a seat
+    /// stopped on a prompt says how long it has been waiting.
+    #[test]
+    fn wip_json_says_since_when_each_seat_has_been_in_its_state() {
+        let (_iso, store) = scratch("seat-since");
+        let mut w = wip_world();
+        let claimed = util::iso_at(util::epoch_secs() - 3 * 3600);
+        w.claims.insert("t-001".into(), json!({ "claimed_at": claimed }));
+        let t0 = util::epoch_secs() - 3600;
+        let read_at = |w: &mut Wip, state: State, at: i64| {
+            w.agents[0].state = state;
+            w.since = seat_clocks(&store, &w.agents, true, at);
+            let v = wip_json(w);
+            let row = v["agents"].as_array().unwrap().iter().find(|a| a["pane"] == "w1:p1").unwrap().clone();
+            (row["since"].as_str().map(str::to_string), row["held"].clone())
+        };
+        let mut last = None;
+        for (i, (state, moves)) in [
+            (State::Working, true),
+            (State::Working, false),
+            (State::Idle, true),
+            (State::Idle, false),
+            (State::Working, true),
+            (State::Working, false),
+            (State::Gone, true),
+            (State::Gone, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = t0 + 300 * i as i64;
+            let (since, held) = read_at(&mut w, state, at);
+            let expected = if moves { Some(util::iso_at(at)) } else { last.clone() };
+            assert_eq!(since, expected, "reading {i}, {state:?}: moves only on a change");
+            assert_eq!(held, "3h", "the claim's clock is its own");
+            last = since;
+        }
+        // Every seat in the census has one, the ones holding no claim too.
+        let v = wip_json(&w);
+        assert!(v["agents"].as_array().unwrap().iter().all(|a| a["since"].is_string()), "{v:#}");
+
+        // A different agent in a reused seat id starts again, in the same state.
+        w.agents[0].session = "another".into();
+        let (since, _) = read_at(&mut w, State::Gone, t0 + 3000);
+        assert_eq!(since, Some(util::iso_at(t0 + 3000)));
+
+        // A seat missing from a partial census keeps its clock; from a whole
+        // one it is forgotten.
+        let held_on = store.note_seat_states(&[], t0 + 3300, false);
+        assert_eq!(held_on.get("w1:p1"), Some(&util::iso_at(t0 + 3000)), "a quiet machine is not a gone seat");
+        assert!(store.note_seat_states(&[], t0 + 3600, true).is_empty());
+
+        // On the TUI: a seat on a prompt, stopped twelve minutes ago.
+        let twelve = util::epoch_secs() - 12 * 60 - 5;
+        w.agents[0].state = State::Blocked;
+        w.since = seat_clocks(&store, &w.agents, true, twelve);
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        let line = text.lines().find(|l| l.contains("w1:p1")).unwrap_or_default();
+        assert!(line.contains("waiting 12m · person"), "{text}");
     }
 
     /// `wsp-172`. Both kinds of waiting are drawn where `idle` used to be: a

@@ -2464,6 +2464,10 @@ impl Source for Poll<'_> {
             checking: Default::default(),
             check_on: Default::default(),
             lists: Vec::new(),
+            // Read for state, never published — but this is the reading that
+            // ticks, so it is the one that dates a seat's change when nobody
+            // runs `wsp wip` (`wsp-250`).
+            since: cmd_agent::seat_clocks(self.store, &seats, census.unheard().next().is_none(), crate::util::epoch_secs()),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -4567,6 +4571,7 @@ mod tests {
             answers_to: None,
             answers_to_empty: None,
             held: None,
+            since: None,
             direction: None,
             runs: Default::default(),
             role: Default::default(),
@@ -5626,6 +5631,7 @@ mod tests {
             answers_to: None,
             answers_to_empty: None,
             held: None,
+            since: None,
             direction: None,
             runs: Default::default(),
             role: Default::default(),

@@ -321,8 +321,8 @@ impl Store {
     /// and an exclusion is not.
     ///
     /// Files that hold no id are deliberately absent rather than harmless
-    /// passengers — `daemon.json`, `said.json`, `.lock`. Adding one costs a
-    /// read and a token scan of a file that can never match.
+    /// passengers — `daemon.json`, `said.json`, `seat-since.json`, `.lock`.
+    /// Adding one costs a read and a token scan of a file that can never match.
     ///
     /// `watches.json` is here for what is *nested* in it rather than for its
     /// own keys, which are watch names and scopes. The daemon's attention
@@ -398,6 +398,7 @@ impl Store {
             "resumable.json",
             "resume-held.json",
             "said.json",
+            "seat-since.json",
             "watches.json",
             "worked.json",
         ]
@@ -2357,6 +2358,57 @@ impl Store {
             dropped = before - s.len();
         });
         dropped
+    }
+
+    // ---- since when a seat has been in its state -----------------------
+    //
+    // `wsp-250`. herdr numbers a state change (`state_change_seq`) and does
+    // not date it, and compound's seat directory dates only its last write, so
+    // nothing on the port says when a seat began its turn or stopped. wsp
+    // dates it itself, the first time a census it reads sees the change: every
+    // `wsp wip` and every tick of the watch. So `since` is "first seen", at
+    // most one tick late — and on a seat wsp has not read before it is the
+    // first reading, not the start of the state.
+
+    /// seat -> `{ state, session, since }`, the time the seat was first seen
+    /// in its current state. A different `session` is a different agent in a
+    /// seat whose id was reused, and starts its clock again even in the same
+    /// state.
+    ///
+    /// `complete` is whether every backend answered in full: only then is a
+    /// seat missing from `seen` gone from the census rather than on a machine
+    /// that was quiet this once, and only then is its entry dropped — so a far
+    /// machine's silence does not restart every clock on it.
+    pub fn note_seat_states(&self, seen: &[(String, String, String)], at: i64, complete: bool) -> BTreeMap<String, String> {
+        let stamp = crate::util::iso_at(at);
+        self.locked(|| {
+            let mut m = match self.read_json("seat-since.json") {
+                Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            let mut moved = false;
+            if complete {
+                let before = m.len();
+                m.retain(|seat, _| seen.iter().any(|(s, ..)| s == seat));
+                moved |= m.len() != before;
+            }
+            for (seat, state, session) in seen {
+                let same = m.get(seat).is_some_and(|e| {
+                    e.get("state").and_then(Value::as_str) == Some(state.as_str())
+                        && e.get("session").and_then(Value::as_str).unwrap_or("") == session
+                });
+                if !same {
+                    m.insert(seat.clone(), json!({ "state": state, "session": session, "since": stamp }));
+                    moved = true;
+                }
+            }
+            if moved {
+                self.write_json("seat-since.json", &Value::Object(m.clone()));
+            }
+            m.into_iter()
+                .filter_map(|(seat, e)| Some((seat, e.get("since")?.as_str()?.to_string())))
+                .collect()
+        })
     }
 
     // ---- pins ---------------------------------------------------------
