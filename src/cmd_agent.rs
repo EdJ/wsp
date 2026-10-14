@@ -1278,7 +1278,7 @@ fn addressed(store: &Store, task: &Task) -> String {
         Some(s) => format!(
             "raised to the {} governor · {} · x there lowers it",
             s.scope,
-            cmd_govern::room_of(&governors, &s.scope)
+            cmd_govern::whereabouts(&governors, &s)
         ),
         None => "raised on every panel · x there lowers it".into(),
     }
@@ -4533,6 +4533,9 @@ fn answers_to(
         Role::Agent | Role::Helper { task: None, .. } => (None, project),
     };
     match cmd_govern::seat_for(&w.governors, &w.index, list, project) {
+        // A post wsp is filling is where the row's ask waits, and it is empty:
+        // the walk's start with nobody in it (`wsp-216`).
+        Some(s) if s.vacant => (None, Some(s.scope)),
         Some(s) => (Some(s.scope), None),
         None => (None, list.or(project).map(str::to_string)),
     }

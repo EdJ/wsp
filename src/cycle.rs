@@ -587,6 +587,13 @@ fn after_pass(store: &Store, seats: &dyn Seats, w: &Worklist, n: usize) {
     let _ = crate::cmd_worklist::close(store, &Args::synth("worklist", &["done", &w.id], &[]), now, Closing::Passed);
 }
 
+/// Whether passing barrier `n` closes the list: it is the last, and wsp ran its
+/// group, so the step `go` pokes takes [`after_pass`]'s close. `go` says so
+/// rather than offering a `done` the pass has already typed (`wsp-216`).
+pub(crate) fn closes_on_pass(w: &Worklist, n: usize) -> bool {
+    n == w.groups().len() && ran_by_wsp(w, Some(n))
+}
+
 /// Whether the group a `go` concerns is one wsp runs: the group just passed,
 /// or on a start, the first group the run stands at.
 fn ran_by_wsp(w: &Worklist, passed: Option<usize>) -> bool {
@@ -2259,8 +2266,25 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
 /// **When idle**, because the turn that closed the list is often this seat's
 /// own — `wsp worklist done`, typed by the governor, is how `wsp-unattended`
 /// ended.
+///
+/// **A post with nobody in it is stood down too** (`wsp-216`). A reseat that
+/// failed leaves a record with its markers and no workspace, and this used to
+/// return at the seat lookup: `wsp-acceptance-fixes` closed with its post not
+/// stood down, and `wsp govern` went on saying a successor was being seated on
+/// a done list. One held from another machine is left alone, as the reconciler
+/// leaves it.
 fn stand_down_own_seat(store: &Store, list: &str) {
-    let Some(seat) = crate::cmd_govern::seat_of_scope(list, &store.governors()) else { return };
+    let governors = store.governors();
+    let Some(seat) = crate::cmd_govern::seat_of_scope(list, &governors) else {
+        let empty = governors
+            .get(list)
+            .is_some_and(|rec| rec.get("workspace").and_then(serde_json::Value::as_str).unwrap_or_default().is_empty());
+        if empty && crate::cmd_govern::stood_at(&governors, list).is_none() {
+            crate::cmd_govern::mark_stood_down(store, list);
+            log_line(store, &format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
+        }
+        return;
+    };
     // Read before the vacate: the room a compound seat is found by is on the
     // record the vacate empties.
     let sitting = occupied(store, &seat);
@@ -2661,19 +2685,100 @@ pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
         return;
     }
     log_line(store, &format!("tell {}: {}", w.id, util::truncate(text, 120)));
+    tell_now(store, w, text);
+}
+
+/// [`tell`]'s delivery, which [`hand_on_what_done_lists_held`] takes too:
+/// returns whether anybody, or the record on a member, took it.
+///
+/// **A list wsp runs with nobody coming to its post says so** (`wsp-216`).
+/// The notice on a member reaches the nearest filled seat above, which is not
+/// the seat the sentence was written for — so it is told whose it was, and
+/// why it has it.
+fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     if hand_it_to_the_governor(store, w, text) {
-        return;
+        return true;
     }
     // On a member of the group the run stands at, where a person looking at
     // the run is looking — not group 1's, long since finished.
     let w = store.worklist(&w.id).unwrap_or_else(|| w.clone());
     let groups = w.groups();
     let here = groups.iter().find(|g| g.verdict.trim().is_empty()).or_else(|| groups.last());
-    let Some(first) = here.and_then(|g| g.members.first()).cloned() else { return };
+    let Some(first) = here.and_then(|g| g.members.first()).cloned() else { return false };
+    let text = match w.runs_itself().then(|| nobody_coming(store, &w.id)).flatten() {
+        Some(why) => format!("Meant for the {} list's own seat, and nobody is coming to it: {why}.\n\n{text}", w.id),
+        None => text.to_string(),
+    };
     // wsp's own notice, for the seat that answers for the member — not a
     // `wsp flag` with no pane behind it, which recorded the run as a person
     // and put every barrier pass on the person's panel (`wsp-272`).
-    let _ = crate::cmd_agent::notice(store, &first, text);
+    crate::cmd_agent::notice(store, &first, &text).is_some()
+}
+
+/// Why nobody is coming to a list's own post, or `None` while somebody is in
+/// it or on the way.
+///
+/// **The governor's rule for where a self-run list's sentences go**
+/// (`wsp-216`, cpd-413's call). While the post is seated or a reseat is in
+/// flight, they wait on the list's scope — `wsp-202`, and
+/// [`crate::cmd_govern::seat_for`] for a member's ask. Once nobody is coming —
+/// the list is done, its post was stood down, or its reseat failed and backed
+/// off — they go to the nearest filled seat above, saying whose they were.
+/// A late answer from the project's seat beats none; that seat is still never
+/// rotated, refilled or ended for the run. A held or parked list is coming: a
+/// `go` or a `resume` puts it back where the reconciler seats it.
+pub(crate) fn nobody_coming(store: &Store, list: &str) -> Option<String> {
+    if store.worklist(list).is_some_and(|w| w.status() == WorklistStatus::Done) {
+        return Some("the list is done".into());
+    }
+    let governors = store.governors();
+    if let Some(at) = crate::cmd_govern::stood_at(&governors, list) {
+        return Some(format!("its seat was stood down at {}", util::local_hm(at)));
+    }
+    if crate::cmd_govern::vacancy(&governors, list).backed_off() {
+        let why = crate::cmd_govern::reseat_why(&governors, list).map(|w| format!(" — {}", util::truncate(&w, 120)));
+        return Some(format!("its reseat failed{}", why.unwrap_or_default()));
+    }
+    None
+}
+
+/// What a done list's own post was still holding, handed on (`wsp-216`).
+///
+/// **A sentence held on a post nobody is coming to is a sentence for nobody.**
+/// `wsp-acceptance-fixes` closed with two held on its scope — a member left at
+/// `doing`, and the barrier-3 verdict — and its spool read `the list is done,
+/// so nobody is coming` for a week. Each is said again through [`tell_now`],
+/// which for a done list is the notice on a member, reaching the nearest filled
+/// seat above it or the person, and taken off the spool once something has it.
+/// Messages only: the news beside them is the attention pass's, about members
+/// long settled, and is withheld from a seat anyway (`wsp-166`).
+///
+/// Read off the spools rather than the lists, so a tick costs one read of
+/// `watches.json` and a list only where a spool holds a message.
+pub(crate) fn hand_on_what_done_lists_held(store: &Store) {
+    for key in store.watches().keys() {
+        let Some(scope) = key.strip_prefix("wake:") else { continue };
+        let held = crate::wake::messages_held(store, scope);
+        if held.is_empty() {
+            continue;
+        }
+        let Some(w) = store.worklist(scope) else { continue };
+        if !w.runs_itself() || w.status() != WorklistStatus::Done {
+            continue;
+        }
+        let mut handed = Vec::new();
+        for (seq, at, text) in &held {
+            if tell_now(store, &w, &format!("(Held on its scope since {}.) {text}", util::local_hm(*at))) {
+                handed.push(*seq);
+            }
+        }
+        crate::wake::settle_held(store, scope, &handed);
+        log_line(store, &format!(
+            "{scope} is done and its own seat with it — handed on {} of the {} sentence(s) held for it",
+            handed.len(),
+            held.len()
+        ));
+    }
 }
 
 /// The line the governor above a list hears for one of its events, or `None`
@@ -2768,8 +2873,10 @@ pub(crate) fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -
     // **A list wsp runs has a post the reconciler is about to fill**, so with
     // nobody in it yet the verdict waits there — the first tick after `go`
     // seats it, and a hand on a member would route to the project's seat this
-    // list no longer answers to. Stood down is still nowhere, as above.
-    let own = || (w.runs_itself() && crate::cmd_govern::stood_at(&store.governors(), &w.id).is_none()).then(|| w.id.clone());
+    // list no longer answers to. **Only while somebody is coming to it**
+    // (`wsp-216`): stood down, done, or a reseat failed and backed off is
+    // nowhere, and the caller's hand on a member reaches the seat above.
+    let own = || (w.runs_itself() && nobody_coming(store, &w.id).is_none()).then(|| w.id.clone());
     let Some(scope) = governing_scope(store, w).or_else(own) else { return false };
     let report = crate::wake::say(store, &scope, text, None);
     // Said as well as returned, because `cycle.log` is how a governor reads what
@@ -3974,6 +4081,158 @@ fn only_a_working_screen_is_ever_overruled() {
             "and recorded as stood down, so the reconciler does not fill it again"
         );
         assert!(crate::cmd_govern::seat_of_scope("p", &governors).is_some(), "the project's seat is still held");
+    }
+
+    /// The record a failed reseat leaves on a list's post: its markers and no
+    /// workspace — `wsp-acceptance-fixes`' own on 2026-10-06, down to the count.
+    fn a_failed_reseat(store: &Store, scope: &str) {
+        store.set_governor(
+            scope,
+            serde_json::json!({
+                "reseat_why": "cpd-420 did not take the work order",
+                "reseating": "2026-10-06T13:16:42Z",
+                "reseating_failed": "2026-10-06T13:16:55Z",
+                "unseated": 1,
+            }),
+        );
+    }
+
+    /// `wsp-216`. `wsp-acceptance-fixes` closed past its last barrier with its
+    /// post holding a failed reseat's record and nobody in it. The close
+    /// returned at the seat lookup, so the post was never stood down; the
+    /// closing verdict was then held on the list's own scope, with nobody coming
+    /// to it, and reached nobody.
+    ///
+    /// Now the empty post is stood down at the close, and the verdict goes on a
+    /// member, whose notice reaches the project's seat — saying which list's it
+    /// was and why the project has it.
+    #[test]
+    fn a_close_over_a_post_nobody_is_in_stands_it_down_and_the_verdict_reaches_the_seat_above() {
+        let (_env, store, w) = passed_with_seats("emptypost");
+        a_failed_reseat(&store, "run");
+        let _ = drained(&SAID);
+
+        after_pass(&store, &Exits, &w, 1);
+
+        let governors = store.governors();
+        assert!(crate::cmd_govern::stood_at(&governors, "run").is_some(), "the empty post is stood down: {governors:?}");
+        let said = drained(&SAID);
+        assert!(
+            said.iter().any(|l| l == "run is closing — stood its own seat down; nobody was sitting in it"),
+            "and says so: {said:?}"
+        );
+        assert!(drained(&ENDED).iter().all(|s| s != "cpd-7"), "there was nobody in it to end");
+
+        let now = store.worklist("run").unwrap();
+        assert_eq!(nobody_coming(&store, "run").as_deref(), Some("the list is done"));
+        assert!(!hand_it_to_the_governor(&store, &now, "Barrier 1 of run passed."), "not held on its own scope");
+        assert!(tell_now(&store, &now, "Barrier 1 of run passed."), "somebody has it");
+        assert!(crate::wake::messages_held(&store, "run").is_empty(), "nothing waits on the list's post");
+        let to_p = crate::wake::messages_held(&store, "p");
+        assert!(
+            to_p.iter().any(|(_, _, t)| t.starts_with("Meant for the run list's own seat, and nobody is coming to it: the list is done.")
+                && t.contains("Barrier 1 of run passed.")),
+            "the project's seat has it, and is told whose it was: {to_p:?}"
+        );
+    }
+
+    /// `wsp-216`, the governor's rule: a member's ask waits on its list's post
+    /// while a successor is on the way, and goes to the project's seat once
+    /// nobody is coming.
+    #[test]
+    fn a_members_ask_waits_on_a_post_being_reseated_and_goes_up_once_nobody_is_coming() {
+        let (_env, store) = scratch("ask-route");
+        let mut m = Task::new("m-1", "m-1");
+        m.project = Some("p".into());
+        m.set_status(Status::Doing);
+        store.save_task(&m).unwrap();
+        list(&store, &[(&["m-1"], "claude")]);
+        seated(&store, "p", "cpd-340");
+        let ask = |store: &Store| crate::cmd_govern::answering_seat(store, &store.find_task("m-1").unwrap());
+
+        // Its governor died and the reconciler has claimed the reseat.
+        store.set_governor(
+            "run",
+            serde_json::json!({ "vacated": util::now_iso(), "last": { "workspace": "cpd-7" }, "reseating": util::now_iso() }),
+        );
+        let s = ask(&store).expect("a seat answers");
+        assert_eq!((s.scope.as_str(), s.vacant), ("run", true), "it waits on the list's post, empty and being filled");
+
+        // Not yet claimed: the reconciler has counted the vacancy, and is coming.
+        store.set_governor("run", serde_json::json!({ "unseated": 1 }));
+        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("run"));
+
+        // The reseat failed and backed off: nobody is coming.
+        a_failed_reseat(&store, "run");
+        let s = ask(&store).expect("a seat answers");
+        assert_eq!((s.scope.as_str(), s.vacant), ("p", false), "the project's seat, which is somebody");
+        let now = store.worklist("run").unwrap();
+        assert!(nobody_coming(&store, "run").is_some_and(|why| why.starts_with("its reseat failed")));
+        assert!(!hand_it_to_the_governor(&store, &now, "a verdict"), "nor does the run's own tell wait there");
+
+        // Retried: a claim after the failure is a successor on the way again.
+        store.edit_governor("run", |rec| {
+            rec["reseating"] = serde_json::json!("2026-10-06T13:40:00Z");
+            true
+        });
+        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("run"));
+
+        // Stood down, and done: nobody, and the list is not a running one.
+        crate::cmd_govern::mark_stood_down(&store, "run");
+        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("p"));
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        store.edit_governor("run", |rec| rec.as_object_mut().is_some_and(|o| o.remove(crate::cmd_govern::STOOD_DOWN).is_some()));
+        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("p"), "a done list answers for nothing");
+    }
+
+    /// `wsp-216`'s live repair: what was already held on a done list's post
+    /// when it closed — `wsp-acceptance-fixes`' two, the barrier-3 verdict among
+    /// them — is handed on by a tick, and taken off the post. A running list's
+    /// held sentences are its own, and stay.
+    #[test]
+    fn a_tick_hands_on_what_a_done_lists_post_was_holding() {
+        let (_env, store, _w) = passed_with_seats("handon");
+        a_failed_reseat(&store, "run");
+        crate::wake::say(&store, "run", "m-1 is at doing with nothing working on it", None);
+        crate::wake::say(&store, "run", "Barrier 1 of run passed.", None);
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        let mut other = Worklist::new("other", "other");
+        other.set_status(WorklistStatus::Running);
+        other.set_groups(&[Group { members: vec!["m-2".into()], agent: "claude".into(), ..Group::default() }]);
+        store.save_worklist(&other).unwrap();
+        crate::wake::say(&store, "other", "for a list still running", None);
+        let _ = drained(&SAID);
+
+        hand_on_what_done_lists_held(&store);
+
+        assert!(crate::wake::messages_held(&store, "run").is_empty(), "taken off the done list's post");
+        assert_eq!(crate::wake::messages_held(&store, "other").len(), 1, "a running list keeps its own");
+        let to_p: Vec<String> = crate::wake::messages_held(&store, "p").into_iter().map(|(_, _, t)| t).collect();
+        assert_eq!(to_p.len(), 2, "{to_p:?}");
+        assert!(to_p.iter().all(|t| t.contains("Meant for the run list's own seat") && t.contains("(Held on its scope since ")));
+        assert!(to_p[1].contains("Barrier 1 of run passed."), "{to_p:?}");
+        let said = drained(&SAID);
+        assert!(said.iter().any(|l| l.contains("handed on 2 of the 2")), "{said:?}");
+
+        hand_on_what_done_lists_held(&store);
+        assert_eq!(crate::wake::messages_held(&store, "p").len(), 2, "once");
+    }
+
+    /// `wsp-216`: `go` on the last barrier of a group wsp ran is the close, and
+    /// says so rather than offering `done` or promising a seat. A barrier short
+    /// of the end, or a last group run by hand, is not.
+    #[test]
+    fn only_the_last_barrier_of_a_group_wsp_ran_closes_the_list() {
+        let (_env, store) = scratch("closes");
+        let w = list(&store, &[(&["a"], "claude"), (&["b"], "claude")]);
+        assert!(!closes_on_pass(&w, 1));
+        assert!(closes_on_pass(&w, 2));
+        let w = list(&store, &[(&["a"], "claude"), (&["b"], crate::model::MANUAL)]);
+        assert!(!closes_on_pass(&w, 2), "a hand-run last group is closed by whoever runs it");
     }
 
     /// A pass that is not the last rotates the list's seat and closes nothing.

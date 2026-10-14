@@ -2408,7 +2408,9 @@ And it says whom each seat answers to, as `answers_to` (`wsp-247`): the scope
 of the governor the seat hangs under, walked the way the seat's own `wsp ask`
 would go, so a reader draws the tree from it and walks nothing itself. A member
 answers to its running list's seat, else the nearest seated project at or above
-its own; a verifier to whomever its member does; a barrier check to its list's
+its own — except while wsp is filling that list's post, when its ask waits
+there: `answers_to` is `null` and `answers_to_empty` names the list
+(`wsp-216`); a verifier to whomever its member does; a barrier check to its list's
 seat, else its group's project's walk; a list's governor to its home project's
 (`wsp-263`); a helper to its row's walk, else its project's — which is where
 its `wsp ask` goes, not always who spawned it; any other seat to its project's
@@ -3165,6 +3167,15 @@ three stands nowhere, and `worklist show` says so.
   nearest seated one above it — the person only when nobody on that walk is
   seated. A project governor answers or raises it with the verbs it already
   has. Members' questions are unchanged: they reach the list's seat first.
+- **Nobody coming** (`wsp-216`): while a list's post is seated, or wsp is
+  reseating it, what is said to it — the run's tells, a member's `ask` or
+  `flag` — waits on the list's scope. Once nobody is coming to it — the list
+  is done, its seat was stood down, or a reseat failed and backed off — an
+  ask or a flag walks on to the nearest seated project, and a run's tell goes
+  there as a notice on a member, opening with the list it was meant for and
+  why; the person has it only when nobody is seated. The daemon's next tick
+  hands on sentences still held on a done list's post the same way. A list
+  that closes stands its post down whether or not anybody is in it.
 - **Downward:** the project's governor is told one line, in its spool, each
   time one of its lists is started, passes, holds or follows up a barrier, is
   parked, resumed or done — so it knows what its lists are doing without

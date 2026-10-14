@@ -195,6 +195,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     for line in crate::cmd_message::deliver_held(store, seats) {
         stamp(store, &line);
     }
+    // And what is held for a post nobody will sit in again: a done list's
+    // (`wsp-216`). Its own lines, through `cycle.log`.
+    crate::cycle::hand_on_what_done_lists_held(store);
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         // **A landing nobody recorded is written down before the step**, so
         // the pass the step opens on that member reads the commit. After it,

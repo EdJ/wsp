@@ -3723,6 +3723,10 @@ fn go_with(
     // is running: this is the state the members about to be named will raise
     // their hands into.
     let list_seat = seat_on(store, &w);
+    // The last barrier of a group wsp ran: the step just poked closes the list,
+    // its agents and its own seat, so there is no seat to promise and no `done`
+    // to offer (`wsp-216`).
+    let closes = crossed.is_some_and(|n| crate::cycle::closes_on_pass(&w, n));
 
     // The state on the far side of what this call just did, so the answer can
     // be given here instead of pointed at (`core-049`). Every turn an agent
@@ -3766,6 +3770,7 @@ fn go_with(
                 })),
                 "dangling": gone,
                 "ending": ending,
+                "closes": closes,
             });
         // The far side, under the key the `next` reader already parses — same
         // shape, same omissions (no evidence walk ran here, so `same_file` and
@@ -3799,6 +3804,13 @@ fn go_with(
     if !ending.is_empty() {
         println!("{}", p.dim(&ending_line(&ending)));
     }
+    if closes {
+        let what = if dry { "would close" } else { "closes" };
+        println!(
+            "{}",
+            p.dim(&format!("that was the last group, so wsp {what} the list — with its agents and its own seat"))
+        );
+    }
     if !gone.is_empty() {
         println!("{}  {}", p.bold("gone"), gone.join("  "));
     }
@@ -3828,6 +3840,7 @@ fn go_with(
     // `go` asked for.
     match &list_seat {
         SeatOn::Held => {}
+        _ if closes => {}
         rest => {
             // `wsp-202`: a list wsp runs is seated by the daemon's next tick, as
             // a post nobody has filled, and until then what it is told waits on
@@ -3856,6 +3869,8 @@ fn go_with(
     // lines above already said it, and `touched` because it did too. A dry run
     // keeps the pointer, since nothing moved to report.
     match &ahead {
+        // Nothing left is what the pass is closing, and said above.
+        Some(_) if closes => {}
         Some((pos, st)) => report(&w, pos, st, &[], seat, None),
         None => println!("{}", p.dim(&format!("{}  what may start now", how("next", &w, seat)))),
     }

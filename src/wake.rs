@@ -503,6 +503,25 @@ fn say_through(store: &Store, seats: &dyn Seats, scope: &str, text: &str, record
     deliver_to(store, seats, scope, &[], at)
 }
 
+/// The sentences held on a scope's spool, oldest first, as `(seq, at, text)`
+/// — messages only, not the news beside them. See [`crate::cmd_watch::Spooled::message`].
+pub(crate) fn messages_held(store: &Store, scope: &str) -> Vec<(u64, i64, String)> {
+    load(store, &key_for(scope))
+        .held
+        .iter()
+        .filter_map(|h| h.message().map(|text| (h.seq, h.at, text.to_string())))
+        .collect()
+}
+
+/// Take these entries off a scope's spool, by identity, inside the lock — for a
+/// caller that has put them somewhere else.
+pub(crate) fn settle_held(store: &Store, scope: &str, seqs: &[u64]) {
+    if seqs.is_empty() {
+        return;
+    }
+    store.update_watch(&key_for(scope), |rec| Spool::settle_these(rec, seqs));
+}
+
 /// A wake, told.
 ///
 /// **The retry refusal is not passed, it is bypassed, and that is the point.**

@@ -200,7 +200,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
             let index = crate::resolve::Index::new(store.projects());
             let seat = crate::cmd_govern::seat_for(&governors, &index, Some(&w.id), None);
             let to = match &seat {
-                Some(s) => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::room_of(&governors, &s.scope)),
+                Some(s) => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::whereabouts(&governors, s)),
                 None => "asked of every panel — no governor above it".into(),
             };
             (about, w.id.clone(), seat, to)
@@ -1213,11 +1213,7 @@ fn asker(closed: &message::Closed) -> String {
 fn addressed(store: &Store, task: &crate::model::Task) -> String {
     let governors = store.governors();
     match crate::cmd_govern::answering_seat(store, task) {
-        Some(s) => format!(
-            "asked of the {} governor · {}",
-            s.scope,
-            crate::cmd_govern::room_of(&governors, &s.scope)
-        ),
+        Some(s) => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::whereabouts(&governors, &s)),
         None => "asked of every panel — no governor above it".into(),
     }
 }

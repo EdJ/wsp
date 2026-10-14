@@ -845,6 +845,15 @@ impl Spooled {
     }
 }
 
+impl Spooled {
+    /// The words, where this is a sentence somebody said to the seat — a tell,
+    /// an ask, a flag, wsp's own notice — rather than news the attention pass
+    /// derived. What [`crate::cycle::hand_on_what_done_lists_held`] moves on.
+    pub(crate) fn message(&self) -> Option<&str> {
+        (self.class == Class::Message.word()).then_some(self.text.as_str())
+    }
+}
+
 impl Spool {
     pub(crate) fn depth(&self) -> usize {
         self.held.len()

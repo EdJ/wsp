@@ -889,7 +889,8 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
             // told the seat above its work was itself — worklist-035. The
             // room comes off the governor record (`cmd_govern::room_of`)
             // rather than a struct field (`compound-096`).
-            let mine = b.workspace.as_deref().is_some_and(|ws| {
+            // Nobody is in a post wsp is filling, this pane included.
+            let mine = !s.vacant && b.workspace.as_deref().is_some_and(|ws| {
                 let room = cmd_govern::room_of(&b.governors, &s.scope);
                 room == ws && (s.pane.is_empty() || b.pane.as_deref().is_none_or(|p| p == s.pane))
             });
@@ -950,7 +951,9 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
             // held to is that with no worklist running every output in this
             // tree is byte-for-byte what it was, and a renamed key breaks a
             // reader for the benefit of a word.
-            "project": s.scope, "workspace": cmd_govern::room_of(&b.governors, &s.scope), "pane": s.pane, "mine": mine,
+            "project": s.scope, "pane": s.pane, "mine": mine,
+            // A post wsp is filling has no room yet (`wsp-216`): empty, as its pane is.
+            "workspace": if s.vacant { String::new() } else { cmd_govern::room_of(&b.governors, &s.scope) },
         })),
         "custodian": r.custodian,
         "task": r.mine.as_ref().map(|t| t.json()),
@@ -1308,6 +1311,9 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                 p.bold(&s.scope),
                 match mine {
                     true => p.dim("yours — wsp flag --seat is your inbox"),
+                    false if s.vacant => p.dim(
+                        "being seated · wsp ask <id> \"…\" waits there for it — later, never lost",
+                    ),
                     // `wsp-146`'s third requirement, and the member's half of it:
                     // the verb that reaches a governor, named where a member
                     // reads it and in the two words that were missing from all

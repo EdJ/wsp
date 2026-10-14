@@ -207,6 +207,11 @@ pub struct Seat {
     /// [`learn_seats`]. Empty until something has seen one, which
     /// [`crate::cmd_spawn::kind_or_default`] reads as the default.
     pub kind: String,
+    /// Nobody is in it yet, and wsp is filling it: the post a running list's
+    /// members are answered from while its successor is on the way, as
+    /// [`seat_for`] hands it back (`wsp-216`). What is said to it waits in its
+    /// spool; there is no pane or room to name, and nobody to *be* it.
+    pub vacant: bool,
 }
 
 /// The room a scope's seat is filed under, read off the governor record
@@ -220,6 +225,15 @@ pub fn room_of(governors: &BTreeMap<String, Value>, scope: &str) -> String {
     match str_at(rec, "workspace") {
         w if !w.is_empty() => w,
         _ => rec.get("last").map(|l| str_at(l, "workspace")).unwrap_or_default(),
+    }
+}
+
+/// Where a seat [`seat_for`] reached is, for a receipt: its room, or that wsp
+/// is filling it and what is said to it waits there ([`Seat::vacant`]).
+pub fn whereabouts(governors: &BTreeMap<String, Value>, seat: &Seat) -> String {
+    match seat.vacant {
+        true => "nobody in it yet — wsp is seating one, and it waits there".to_string(),
+        false => room_of(governors, &seat.scope),
     }
 }
 
@@ -316,6 +330,7 @@ fn seat_of(scope: &str, rec: &Value) -> Option<Seat> {
         session: str_at(rec, "session"),
         cwd: str_at(rec, "cwd"),
         kind: str_at(rec, "kind"),
+        vacant: false,
     })
 }
 
@@ -341,6 +356,17 @@ fn str_at(rec: &Value, key: &str) -> String {
 /// lookup repeated over keys in priority order, and holds no store: one read of
 /// `worklists/` ([`crate::worklist::Running`]) serves every question a command
 /// asks, where a store read inside this would repeat it per raised hand.
+///
+/// **A list's post with a successor on the way is not a level with nobody in
+/// it** (`wsp-216`, settled by the governor over it). The reconciler refills a
+/// running list's post, so a member's ask made while it does waits on the
+/// list's scope, as the run's own tells do (`wsp-202`), and comes back
+/// [`Seat::vacant`]. It used to fall through to the project's seat, which a
+/// self-run list does not answer to. Only where nobody is coming — the post
+/// stood down, or its reseat failed and backed off ([`Vacancy::backed_off`]) —
+/// does the walk go on up. A list with no record at all has no post to wait
+/// on, which is a list run by hand from its project's seat; a list wsp runs
+/// has one from the reconciler's first tick after `go`.
 pub fn seat_for(
     governors: &BTreeMap<String, Value>,
     index: &Index,
@@ -350,13 +376,44 @@ pub fn seat_for(
     if governors.is_empty() {
         return None;
     }
-    let above = project
+    if let Some(list) = list {
+        if let Some(rec) = governors.get(list) {
+            if let Some(seat) = seat_of(list, rec) {
+                return Some(seat);
+            }
+            if being_filled(governors, list) {
+                return Some(Seat {
+                    scope: list.to_string(),
+                    pane: String::new(),
+                    since: String::new(),
+                    session: String::new(),
+                    cwd: String::new(),
+                    kind: String::new(),
+                    vacant: true,
+                });
+            }
+        }
+    }
+    project
         .into_iter()
-        .flat_map(|p| std::iter::once(p.to_string()).chain(index.ancestors(p)));
-    list.map(str::to_string)
-        .into_iter()
-        .chain(above)
+        .flat_map(|p| std::iter::once(p.to_string()).chain(index.ancestors(p)))
         .find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
+}
+
+/// Whether wsp is coming to fill this post, read off its record: nobody in it
+/// on this machine, not stood down, and no reseat that failed and backed off.
+///
+/// The record's half of the question only. Whether the *list* is still one the
+/// reconciler seats — running, held or parked, not done — is the caller's:
+/// [`seat_for`] is handed running lists alone, and the cycle asks it of the
+/// list in hand ([`crate::cycle::nobody_coming`]).
+pub fn being_filled(governors: &BTreeMap<String, Value>, scope: &str) -> bool {
+    let Some(rec) = governors.get(scope) else { return false };
+    let host = str_at(rec, "host");
+    if !host.is_empty() && host != util::hostname() {
+        return false;
+    }
+    seat_of(scope, rec).is_none() && stood_at(governors, scope).is_none() && !Vacancy::of(rec).backed_off()
 }
 
 /// The seat that answers for one task, asked once.
@@ -1011,6 +1068,7 @@ pub fn last_seat(governors: &BTreeMap<String, Value>, scope: &str) -> Option<Sea
             session: str_at(r, "session"),
             cwd: str_at(r, "cwd"),
             kind: str_at(r, "kind"),
+            vacant: false,
         })
     };
     of(rec).or_else(|| rec.get("last").and_then(of))
@@ -1352,6 +1410,14 @@ impl Vacancy {
             reseating: at_of(rec, "reseating"),
             failed: at_of(rec, "reseating_failed"),
         }
+    }
+
+    /// The last reseat failed and nothing has been tried since: the claim
+    /// [`reseat_failed`] kept is the one that failed, so nobody is coming
+    /// until it goes stale and a pass takes it again. A claim taken after the
+    /// failure is a retry in flight, and somebody is coming again.
+    pub fn backed_off(&self) -> bool {
+        self.failed.is_some_and(|failed| self.reseating.is_none_or(|claimed| failed >= claimed))
     }
 
     /// Whether the claim, if there is one, has gone stale.
@@ -2191,7 +2257,8 @@ fn who_is_in(store: &Store, governors: &BTreeMap<String, Value>, s: &Slot) -> St
             // what the machine now does on its own — and would say nothing
             // about the case that matters, which is whether the daemon is the
             // thing that is going to fill it.
-            let auto = store.worklist(&s.scope).is_some_and(|w| w.status().is_running());
+            let list = store.worklist(&s.scope).map(|w| w.status());
+            let auto = list.is_some_and(|st| st.is_running());
             // **A stand-down outranks every other sentence here**, including
             // the one the daemon is about to make true. `wsp-148` gave the
             // reconciler the job of filling a vacancy on a running list, and
@@ -2206,6 +2273,19 @@ fn who_is_in(store: &Store, governors: &BTreeMap<String, Value>, s: &Slot) -> St
                 format!(
                     "stood down at {down} · wsp will not fill it — \
                      `wsp spawn -p <project> --govern` if that changes"
+                )
+            } else if list == Some(crate::model::WorklistStatus::Done) {
+                // **Before the claim, which a done list can still carry**
+                // (`wsp-216`): `wsp-acceptance-fixes` closed with a failed
+                // reseat's claim on its record, and this read "a successor is
+                // being seated" for a week about a list nobody will seat again.
+                "empty · the list is done, so nobody is coming".to_string()
+            } else if let Some(at) = Some(vacancy(governors, &s.scope)).filter(Vacancy::backed_off).and_then(|v| v.reseating) {
+                // Nobody is coming until the claim goes stale, and what is said
+                // to it meanwhile goes to the seat above (`wsp-216`).
+                format!(
+                    "empty · the reseat failed, and wsp tries again after {}",
+                    util::local_hm(at + SEAT_CLAIMED_FOR)
                 )
             } else if vacancy(governors, &s.scope).reseating.is_some() {
                 // **A claim in flight outranks the daemon's own sentence**,
@@ -2341,6 +2421,9 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
         let list = held.as_deref().and_then(|t| store.find_task(t)).and_then(|t| lists.list_for(&t).map(str::to_string));
         let list = list.as_deref();
         match seat_for(&governors, index, list, project.as_deref()) {
+            Some(s) if s.vacant => {
+                println!("{}", p.dim(&format!("work here reaches the {} seat, which wsp is filling", s.scope)))
+            }
             Some(s) => println!("{}", p.dim(&format!("work here reaches the {} seat", s.scope))),
             None => println!("{}", p.dim("no seat above this pane — raised hands reach a person")),
         }
@@ -2487,10 +2570,14 @@ pub(crate) mod tests {
     /// its own — so it does not stop at a list nobody is sitting in.
     ///
     /// Both shapes of "nobody": a list with no record at all, which is a run
-    /// nobody has taken the seat of, and a list whose slot has been vacated,
-    /// which is the governor that stood down at 4am. Either one falls through
-    /// to the project chain, because the alternative is a raised hand delivered
-    /// to an empty room while a seat that would have answered sits one level up.
+    /// nobody has taken the seat of, and a list whose governor stood down at
+    /// 4am. Either one falls through to the project chain, because the
+    /// alternative is a raised hand delivered to an empty room while a seat that
+    /// would have answered sits one level up.
+    ///
+    /// **A governor that died is not the second** (`wsp-216`): its slot is
+    /// vacated and the reconciler refills a running list's post, so a hand
+    /// waits there for its successor rather than going past it.
     #[test]
     fn a_list_with_nobody_in_its_seat_falls_through_to_the_project_chain() {
         let g = seated(&[("robustness", "w1")]);
@@ -2500,9 +2587,13 @@ pub(crate) mod tests {
         let (_env, store) = store("fallthrough");
         take(&store, "batch", "w7", "w7:p1").unwrap();
         take(&store, "robustness", "w1", "w1:p1").unwrap();
-        assert!(vacate(&store, "batch"), "the governor stood down mid-run");
+        assert!(vacate(&store, "batch"), "the governor died mid-run");
         let s = seat_for(&store.governors(), &tree(), Some("batch"), Some("data")).unwrap();
-        assert_eq!(s.scope, "robustness", "an empty list seat routes nothing, as an empty project one does");
+        assert_eq!((s.scope.as_str(), s.vacant), ("batch", true), "its successor is on the way, and it waits for one");
+
+        mark_stood_down(&store, "batch");
+        let s = seat_for(&store.governors(), &tree(), Some("batch"), Some("data")).unwrap();
+        assert_eq!(s.scope, "robustness", "stood down, an empty list seat routes nothing, as an empty project one does");
     }
 
     /// The bar the whole change is held to, as an assertion about the routing:
@@ -3280,5 +3371,39 @@ pub(crate) mod tests {
         assert_eq!(take(&store, "core", "cpd-10", "cpd-10").expect_err("released").member, "t-2");
         assert_eq!(take(&store, "core", "cpd-11", "cpd-11").expect_err("last").member, "t-2");
         assert!(store.governors().is_empty());
+    }
+
+    /// `wsp-216`. `wsp-acceptance-fixes` closed with a failed reseat's claim
+    /// on its record, and `wsp govern wsp-acceptance-fixes` read "a successor
+    /// is being seated - do not reseat by hand" for a week about a done list.
+    /// A done list's empty post says nobody is coming; stood down, it says so.
+    #[test]
+    fn a_done_lists_empty_post_does_not_promise_a_successor() {
+        let (_env, store) = store("done-post");
+        store.set_governor(
+            "run",
+            json!({ "reseating": "2026-10-06T13:16:42Z", "reseating_failed": "2026-10-06T13:16:55Z", "unseated": 1 }),
+        );
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        let read = |store: &Store| {
+            let governors = store.governors();
+            let slot = slots(&governors).into_iter().find(|s| s.scope == "run").expect("a slot");
+            who_is_in(store, &governors, &slot)
+        };
+        assert!(read(&store).starts_with("empty · the reseat failed, and wsp tries again after "), "{}", read(&store));
+        store.edit_governor("run", |rec| {
+            rec["reseating"] = json!("2026-10-06T13:40:00Z");
+            true
+        });
+        assert!(read(&store).contains("a successor is being seated"), "running, a retry is a successor");
+
+        w.set_status(crate::model::WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(read(&store), "empty · the list is done, so nobody is coming");
+
+        mark_stood_down(&store, "run");
+        assert!(read(&store).starts_with("stood down at "), "{}", read(&store));
     }
 }
