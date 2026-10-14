@@ -1309,6 +1309,10 @@ impl Place for Supervisor<'_> {
         last_written(&self.dir_of(seat).ok()?)
     }
 
+    fn root(&self, seat: &Seat) -> Option<u32> {
+        self.record(seat).ok()?.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32)
+    }
+
     fn pids(&self, seat: &Seat) -> Option<Vec<u32>> {
         let rec = self.record(seat).ok()?;
         let pid = rec.get("pid").and_then(|p| p.as_u64())? as u32;

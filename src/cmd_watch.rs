@@ -2438,10 +2438,14 @@ impl Source for Poll<'_> {
         // because "a seat is there and its agent is not" is exactly what it has
         // to report.
         let seats: Vec<crate::place::Seated> = census.seats().cloned().collect();
+        let bindings = self.store.bindings();
+        // (c)'s seat half: a member idle on its own shell is not stopped for a
+        // reason wsp cannot see (`wsp-214`).
+        let shells = cmd_agent::idle_members_shells(&seats, &bindings);
         let wip = Wip {
             tasks: self.store.tasks(),
             index: Index::new(self.store.projects()),
-            bindings: self.store.bindings(),
+            bindings,
             claims: self.store.claims(),
             pins: self.store.pins(),
             governors: self.store.governors(),
@@ -2459,6 +2463,7 @@ impl Source for Poll<'_> {
             // (c) asks every row whether it is waiting — the one reading the
             // reconciler and the barrier ask too.
             asks: crate::waiting::Asks::read(self.store),
+            shells,
             // Nor a direction: rows here are read for state, never published.
             mandates: Default::default(),
             checking: Default::default(),

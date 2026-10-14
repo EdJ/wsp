@@ -189,6 +189,14 @@ pub(crate) trait Seats {
         None
     }
 
+    /// These seats' own shells — [`crate::waiting::Shells::read`]. None by
+    /// default, for [`Seats::absent`]'s reason: a fake that answered from the
+    /// machine's process table would be holding seats out of whatever this
+    /// machine happens to be running.
+    fn shells(&self, _seats: &[&str]) -> crate::waiting::Shells {
+        crate::waiting::Shells::default()
+    }
+
     /// Which of these are still running. A parameter for the same reason
     /// [`Seats::state`] is: a test names pids that were never processes.
     fn running(&self, pids: &[u32]) -> Vec<u32> {
@@ -266,6 +274,10 @@ impl Seats for Fleet {
     fn typed(&self, seat: &str) -> Option<bool> {
         let seat_id = Seat::new(seat);
         Fleet::here(seat).find_map(|b| b.typed(&seat_id))
+    }
+
+    fn shells(&self, seats: &[&str]) -> crate::waiting::Shells {
+        crate::waiting::Shells::read(seats.iter().copied())
     }
 
     /// Pressed by the backend that holds the seat, and no other: a press is a
@@ -1062,7 +1074,11 @@ fn holding_barrier(
         // anything, it has stopped in the middle, and the half-hour report below
         // is for a turn that might be stuck, not for a question somebody owes.
         // Asked only of a seat that answered: `None` still never holds.
-        if let Some(wait) = state.and_then(|st| crate::waiting::reading(Some(st), &asks, &seat, &s.id)) {
+        let shells = match state {
+            Some(State::Idle) => seats.shells(&[&seat]),
+            _ => Default::default(),
+        };
+        if let Some(wait) = state.and_then(|st| crate::waiting::reading(Some(st), &asks, &shells, &seat, &s.id)) {
             waiting.push(format!("{seat} ({}) is {}", s.id, wait.sentence()));
             continue;
         }

@@ -2438,6 +2438,17 @@ nothing. `held` is a different
 clock — the claim's age — and only a member has one; every seat has a `since`.
 `wsp wip` draws it on a waiting seat: `waiting 12m · person`.
 
+A seat's `waiting` is `{why, on, question, word}`: `why` is `prompt`, `answer`
+or `shell`, and `on` is `person`, the scope a question went to, or `itself`.
+`itself` is an idle agent with a shell of its own still running under it — a
+background command or a watch it started, which wakes it when it ends
+(`wsp-214`), with `shells` saying how many. Nobody owes that seat anything:
+its `needs_you` is `false`, and it is not counted in its governor's
+`members_waiting` or in the top-level `waiting`, which count the seats somebody
+has to answer. The run neither tells it to finish nor ends it while it waits.
+A shell running for under five seconds (a hook, the status line) or over an
+hour (a server left running) does not count, and `src/waiting.rs` says why.
+
 ### Looking at a pane
 
 ```sh
@@ -4938,7 +4949,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/barrier.rs` | a barrier check, on the group it checks: the `checks:` entries, opened before its agent starts, settled by `go`/`hold`/`followup`, the seats `wip` and the brief name, and the one-off migration off Barrier rows |
 | `src/repair.rs` | the same steps on the daemon's tick, plus the states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, a member `advance` skipped, and a governor seat standing empty on a running list. Each is keyed on a record the member's own `## Log` or the seat's own governor entry, and each says why in `cycle.log` and to the seat |
 | `src/untaken.rs` | a work order the run typed at a seat and no turn came of: pressed once if it sits in the prompt, sent again once if it never reached it, and the seat replaced if neither starts a turn — each step a `cycle.log` line the next one reads back |
-| `src/waiting.rs` | whether a seat is waiting on somebody and on whom — a prompt on its screen, or its own open `wsp ask` — the one reading the reconciler, the barrier, the watch, `tell` and `wip` all ask, so nothing treats a waiting seat as idle |
+| `src/waiting.rs` | whether a seat is waiting on somebody and on whom — a prompt on its screen, its own open `wsp ask`, or a shell of its own still running, which is waiting on nobody — the one reading the reconciler, the barrier, the watch, `tell` and `wip` all ask, so nothing treats a waiting seat as idle |
 | `src/ending.rs` | a member whose newest pass holds has its agent ended, after `verification`'s tick has ended the verifier: never one in a turn, waiting, typed to since the verdict, or holding a governor seat; confirmed gone by pid, recorded once, and a failure told once; and the pid reading and check `cycle::end_passes` confirms every verifier's ending by |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |

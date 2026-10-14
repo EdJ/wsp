@@ -1242,6 +1242,16 @@ pub trait Place {
         None
     }
 
+    /// The process this backend started for the seat — the root [`Place::pids`]
+    /// walks down from — off its own record, without reading the process table.
+    /// `None` is *this backend cannot name one*.
+    ///
+    /// For a reader that walks many seats over one `ps` rather than one per
+    /// seat: [`crate::waiting::Shells`], asked on every `wsp wip`.
+    fn root(&self, _seat: &Seat) -> Option<u32> {
+        None
+    }
+
     /// Every seat this backend has, and what is in it.
     ///
     /// The one read that stays on this side of the line: what a backend is

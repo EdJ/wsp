@@ -8190,6 +8190,7 @@ mod tests {
             said: store.said(),
             daemon: None,
             asks: Default::default(),
+            shells: Default::default(),
             mandates: Default::default(),
             checking: Default::default(),
             check_on: Default::default(),

@@ -708,18 +708,32 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         // asked from. Said once per spell — the row's marker is what makes it
         // once — and the spell itself clears the told-mark (see [`noticed`]), so
         // a seat that stops waiting is told before it can be ended.
-        if let Some(wait) = crate::waiting::reading(Some(state), &asks, &seat, &t.id) {
+        //
+        // **And a seat waiting on itself is held without a word to the seat**
+        // (`wsp-214`): a member idle on its own background shell was told to
+        // finish and raised to the governor three times in two days, while the
+        // shell that would wake it was still running. The row still gets its
+        // line — it is what restarts the stall clock, so a member told before
+        // its verify is not ended the moment the verify wakes it — and the
+        // governor gets nothing, because nobody owes the seat anything.
+        let shells = match state {
+            State::Idle => seats.shells(&[&seat]),
+            _ => Default::default(),
+        };
+        if let Some(wait) = crate::waiting::reading(Some(state), &asks, &shells, &seat, &t.id) {
             let said = format!("{WAITING} {} — the run will not tell it or end it while it waits", wait.sentence());
             if told_once(store, &t.id, &said) {
                 stamp(store, &format!(
                     "{} group {at}: {} ({seat}) is {} — not told and not ended, and held for as long as it waits",
                     w.id, t.id, wait.sentence()
                 ));
-                crate::cycle::tell(store, w, &format!(
-                    "{} in the {} run is {} ({}). The run holds it with no ceiling: it is not told \
-                     to finish and it is not ended. `wsp peek {}` shows its screen.",
-                    t.id, w.id, wait.sentence(), wait.word(), t.id
-                ));
+                if wait.owed() {
+                    crate::cycle::tell(store, w, &format!(
+                        "{} in the {} run is {} ({}). The run holds it with no ceiling: it is not told \
+                         to finish and it is not ended. `wsp peek {}` shows its screen.",
+                        t.id, w.id, wait.sentence(), wait.word(), t.id
+                    ));
+                }
             }
             continue;
         }
@@ -2482,6 +2496,49 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             said.iter().any(|l| l.contains("not told and not ended") && l.contains(&q)),
             "the log names the question it is waiting on: {said:?}"
         );
+    }
+
+    /// A [`Fake`] whose agent at `.1` has a shell of its own running.
+    struct Shelled(Fake, &'static str);
+
+    impl Seats for Shelled {
+        fn state(&self, seat: &str) -> Option<State> {
+            self.0.state(seat)
+        }
+        fn shells(&self, seats: &[&str]) -> crate::waiting::Shells {
+            match seats.contains(&self.1) {
+                true => crate::waiting::Shells::one(self.1, 1),
+                false => Default::default(),
+            }
+        }
+    }
+
+    /// `wsp-214`, as a test: `wsp-210`'s member landed, started its release
+    /// verify in the background and stopped, and the run told it to finish and
+    /// raised it to the governor. **A member idle on its own shell is neither
+    /// told nor ended, and nobody is told about it** — the row gets the line
+    /// that restarts its clock, and when the shell is done and it is idle with
+    /// nothing running, it is told as any other.
+    #[test]
+    fn a_member_idle_on_its_own_background_shell_is_held_and_nobody_is_told() {
+        let (_env, store) = in_flight("shelled");
+        let verifying = Shelled(Fake::new(&[("cpd-1", Some(State::Idle))]), "cpd-1");
+        for _ in 0..3 {
+            tick(&store, &verifying, &mut Pass::new());
+        }
+        assert!(member_told().is_empty(), "the shell wakes it; a sentence would start a turn it did not need");
+        assert!(governed().is_empty(), "and nobody is owed a person");
+        assert!(ended().is_empty());
+        let said: Vec<String> = stamped().into_iter().filter(|l| l.contains("not told and not ended")).collect();
+        assert_eq!(said.len(), 1, "said once: {said:?}");
+        assert!(said[0].contains("a shell of its own"), "{}", said[0]);
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains(WAITING), "the row says why, and that line restarts its clock: {log}");
+
+        // The verify is done and the agent stopped again with nothing running.
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "now it is told, and not ended on any earlier mark");
+        assert!(ended().is_empty());
     }
 
     /// A seat that *was* waiting and is idle again — the prompt answered — is

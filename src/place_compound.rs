@@ -1406,8 +1406,11 @@ impl Place for Compound<'_> {
     /// `compound-sup` leads the group and the agent is its pty's child, so the
     /// tree under the recorded pid is the agent and its work.
     fn pids(&self, seat: &Seat) -> Option<Vec<u32>> {
-        let pid = self.record(seat).ok()?.get("pid").and_then(|p| p.as_u64())? as u32;
-        Some(crate::place_super::tree_of(pid))
+        Some(crate::place_super::tree_of(self.root(seat)?))
+    }
+
+    fn root(&self, seat: &Seat) -> Option<u32> {
+        self.record(seat).ok()?.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32)
     }
 
     fn turn_began_since(&self, seat: &Seat, since: i64) -> Option<bool> {

@@ -3899,6 +3899,9 @@ pub(crate) struct Wip {
     /// The open questions, read once — the store half of [`crate::waiting`]'s
     /// reading, asked for every row.
     pub asks: crate::waiting::Asks,
+    /// The idle members' own shells, read once — the seat's half
+    /// (`wsp-214`), from [`idle_members_shells`].
+    pub shells: crate::waiting::Shells,
     /// `mandates.json`, read once — the standing direction each row publishes
     /// as `direction`.
     pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
@@ -4019,7 +4022,8 @@ impl Wip {
                 !forgotten(s.state, *quiet, now, held)
             })
             .map(|(s, _)| s)
-            .collect();
+            .collect::<Vec<_>>();
+        let shells = idle_members_shells(&agents, &bindings);
         Wip {
             tasks,
             index: Index::new(store.projects()),
@@ -4032,6 +4036,7 @@ impl Wip {
             said: store.said(),
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
             asks: crate::waiting::Asks::read(store),
+            shells,
             mandates: store.mandates(),
             checking,
             check_on: crate::barrier::ran_on(&lists),
@@ -4316,6 +4321,15 @@ fn runs(w: &Wip, seat: &str, governs: Option<&str>, held: Option<&Task>) -> Runs
 }
 
 /// The agents, resolved and in reading order: by project, then by pane.
+/// [`crate::waiting::Shells`] for the seats `needs_you` is asked of: idle, and
+/// bound to a task. Only those, because the reading is a `ps` and `wip` is
+/// polled — a seat in a turn, or one holding nothing, is never stalled work.
+pub(crate) fn idle_members_shells(agents: &[crate::place::Seated], bindings: &BTreeMap<String, Value>) -> crate::waiting::Shells {
+    crate::waiting::Shells::read(
+        agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),
+    )
+}
+
 pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     let mut rows: Vec<WipRow> = Vec::new();
     // A verifier holds no claim and no binding (`wsp-188`): its seat is named
@@ -4366,7 +4380,12 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         let stopped = a.state.stopped();
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
         let seat_of_project = cmd_govern::governs(&w.governors, &cmd_govern::seat_query(workspace_id, Some(seat)));
-        let needs_you = cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some());
+        let waiting = crate::waiting::reading(Some(a.state), &w.asks, &w.shells, seat, bound.map(|t| t.id.as_str()).unwrap_or(""));
+        // A member waiting on its own shell is stopped on live work and needs
+        // nobody (`wsp-214`): the shell wakes it. Every other wait still
+        // needs somebody — a prompt a person, a question whoever it went to.
+        let needs_you = cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some())
+            && waiting.as_ref().is_none_or(|w| w.owed());
         // The task whose claim started this seat: its binding's, or — once the
         // binding has gone with a reseat — the open one its agent claimed.
         let held = bound.or_else(|| {
@@ -4411,7 +4430,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             needs_you,
             seat: seat_of_project.clone(),
             said: sentence(&w.said, seat, bound.map(|t| t.id.as_str())),
-            waiting: crate::waiting::reading(Some(a.state), &w.asks, seat, bound.map(|t| t.id.as_str()).unwrap_or("")),
+            waiting,
             members_waiting: 0,
             held: bound
                 .and_then(|t| w.claims.get(&t.id))
@@ -4435,8 +4454,13 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     }
     // A governor's count, once every row has its own reading — off the same
     // `answers_to` the row publishes, so the count and the tree agree.
-    let waiting_under: Vec<String> =
-        rows.iter().filter(|r| r.waiting.is_some()).filter_map(|r| r.answers_to.clone()).collect();
+    // Only the waits somebody owes: a member waiting on its own shell is not
+    // one the governor has to answer (`wsp-214`).
+    let waiting_under: Vec<String> = rows
+        .iter()
+        .filter(|r| r.waiting.as_ref().is_some_and(|w| w.owed()))
+        .filter_map(|r| r.answers_to.clone())
+        .collect();
     for r in rows.iter_mut() {
         if let Some(scope) = &r.seat {
             r.members_waiting = waiting_under.iter().filter(|s| *s == scope).count();
@@ -4537,7 +4561,9 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         }).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
-        "waiting": rows.iter().filter(|r| r.waiting.is_some()).count(),
+        // Seats waiting on somebody: one waiting on its own shell says so on
+        // its row and is nobody's to count (`wsp-214`).
+        "waiting": rows.iter().filter(|r| r.waiting.as_ref().is_some_and(|w| w.owed())).count(),
         // The sentence, not a boolean: `doctor`'s is the only other place it is
         // said, and a caller that has to ask "no daemon, or a daemon whose `ps`
         // would not answer?" cannot tell those apart from a flag either.
@@ -4582,7 +4608,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         if needs > 0 {
             head.push_str(&format!("  ·  {}", p.yellow(&format!("{needs} need you"))));
         }
-        let waiting = rows.iter().filter(|r| r.waiting.is_some()).count();
+        let waiting = rows.iter().filter(|r| r.waiting.as_ref().is_some_and(|w| w.owed())).count();
         if waiting > 0 {
             head.push_str(&format!("  ·  {}", p.yellow(&format!("{waiting} waiting"))));
         }
@@ -7855,6 +7881,7 @@ mod tests {
             said,
             daemon: None,
             asks: Default::default(),
+            shells: Default::default(),
             mandates: Default::default(),
             checking: Default::default(),
             check_on: Default::default(),
@@ -8045,6 +8072,7 @@ mod tests {
             said: std::collections::BTreeMap::new(),
             daemon: None,
             asks: Default::default(),
+            shells: Default::default(),
             mandates: Default::default(),
             checking: Default::default(),
             check_on: Default::default(),
@@ -8892,6 +8920,30 @@ mod tests {
         assert_eq!(row("w3:p1")["waiting"], serde_json::Value::Null, "a working seat is not waiting");
         assert_eq!(row("w3:p1")["members_waiting"], 2);
         assert_eq!(v["waiting"], 2);
+    }
+
+    /// `wsp-214`. A member idle at `doing` on its own background shell is drawn
+    /// `waiting · itself`, and is not `needs_you`, not one of its governor's
+    /// waiting members and not in the heading's count: nobody owes it anything.
+    #[test]
+    fn wip_shows_a_member_on_its_own_shell_as_waiting_on_itself_and_nobody_is_needed() {
+        let mut w = wip_world();
+        w.agents[1].state = State::Idle;
+        w.shells = crate::waiting::Shells::one("w2:p1", 1);
+        w.governors.insert("wsp".into(), json!({ "workspace": "w3", "host": util::hostname() }));
+        let v = wip_json(&w);
+        let row = |pane: &str| v["agents"].as_array().unwrap().iter().find(|a| a["pane"] == pane).unwrap().clone();
+        assert_eq!(row("w2:p1")["state"], "idle", "the fixture is an idle member at doing: {v}");
+        assert_eq!(row("w2:p1")["waiting"]["on"], "itself");
+        assert_eq!(row("w2:p1")["waiting"]["why"], "shell");
+        assert_eq!(row("w2:p1")["needs_you"], false, "the shell wakes it");
+        assert_eq!(row("w3:p1")["members_waiting"], 0, "its governor owes it nothing");
+        assert_eq!(v["waiting"], 0);
+
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        let line = text.lines().find(|l| l.contains("w2:p1")).unwrap_or_default();
+        assert!(line.contains("waiting · itself") && !line.contains("needs you"), "{text}");
+        assert!(!text.lines().next().unwrap().contains("waiting"), "the heading counts nothing: {text}");
     }
 
     /// The row that was wrong for a whole night. `w2:p1` is idle on a task that

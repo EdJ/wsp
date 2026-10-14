@@ -247,9 +247,15 @@ fn end_one(store: &Store, seats: &dyn Seats, w: &Worklist, member: &str, h: &Hol
         return false;
     };
     let state = seats.state(&seat);
+    let shells = match state {
+        Some(State::Idle) => seats.shells(&[&seat]),
+        _ => Default::default(),
+    };
     let reading = Reading {
         state,
-        wait: crate::waiting::reading(state, asks, &seat, member),
+        // An agent with a shell of its own still running is not ended under
+        // it: ending is the group signalled, and that is the shell killed.
+        wait: crate::waiting::reading(state, asks, &shells, &seat, member),
         governs: crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(seat.as_str())),
         typed: seats.turn_began_since(&seat, h.at),
         pids: seats.pids(&seat),
