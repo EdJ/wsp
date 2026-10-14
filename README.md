@@ -2147,6 +2147,17 @@ whose tier was never written (wsp-117), and a seat with no record at all. The
 model is the alias as typed; what actually served is `wsp attempts`' column,
 read off the transcript when the claim ends.
 
+It also says what each seat *is*, as `role` (`wsp-246`), so a reader placing a
+seat never parses `task`, which stays display text:
+`{"is": "governor", "of": "project" | "list", "id": "<scope>"}`,
+`{"is": "member", "task": "<id>"}` (with `list` and `group` when the task is a
+running list's member), `{"is": "verifier", "member": "<id>", "pass": N}` (N
+from 1, so a member verified again is `pass > 1`),
+`{"is": "check", "list": "<slug>", "group": N}`, or `{"is": "agent"}`. A seat
+that is two of these is named in the order `task` names it — governor, the
+work it holds, a pass, a check. A helper a governor spawned is not yet a role
+of its own; that waits on the spawn recording who spawned it (`wsp-249`).
+
 ### Looking at a pane
 
 ```sh

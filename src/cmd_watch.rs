@@ -2464,6 +2464,7 @@ impl Source for Poll<'_> {
             mandates: Default::default(),
             checking: Default::default(),
             check_on: Default::default(),
+            lists: Vec::new(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -4564,6 +4565,7 @@ mod tests {
             held: None,
             direction: None,
             runs: Default::default(),
+            role: Default::default(),
         }
     }
 
@@ -5619,6 +5621,7 @@ mod tests {
             held: None,
             direction: None,
             runs: Default::default(),
+            role: Default::default(),
         }
     }
 

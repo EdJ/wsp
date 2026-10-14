@@ -1350,10 +1350,16 @@ pub struct Running {
 
 impl Running {
     pub fn read(store: &Store) -> Running {
+        Running::over(&store.worklists())
+    }
+
+    /// The same reading, of lists already in hand — `wsp wip` has read them
+    /// once for its barrier checks and asks this of the same ones.
+    pub fn over(worklists: &[Worklist]) -> Running {
         let mut at: BTreeMap<String, Placing> = BTreeMap::new();
         let mut lists = std::collections::BTreeSet::new();
         let mut fronts: BTreeMap<String, usize> = BTreeMap::new();
-        for w in store.worklists().iter().filter(|w| w.status().is_running()) {
+        for w in worklists.iter().filter(|w| w.status().is_running()) {
             lists.insert(w.id.clone());
             let groups = w.groups();
             let crossed = floor(&groups);

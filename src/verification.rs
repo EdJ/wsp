@@ -391,11 +391,17 @@ pub(crate) fn blocked(tasks: &[Task], member: &str) -> Option<Pass> {
 /// Every seat a pass still stands in, to the member it is verifying — what
 /// `wsp wip` and `wsp brief` name a verifier's seat by.
 pub(crate) fn seats(tasks: &[Task]) -> BTreeMap<String, String> {
+    seated(tasks).into_iter().map(|(seat, (member, _))| (seat, member)).collect()
+}
+
+/// [`seats`], with which of the member's passes stands there, counting from 1
+/// — so a pass after the first is a member being verified again (`wsp-246`).
+pub(crate) fn seated(tasks: &[Task]) -> BTreeMap<String, (String, usize)> {
     let mut out = BTreeMap::new();
     for t in tasks.iter().filter(|t| t.body.contains("## Verification")) {
-        for p in passes(t).into_iter().filter(Pass::standing) {
+        for (i, p) in passes(t).into_iter().enumerate().filter(|(_, p)| p.standing()) {
             if let Some(pane) = p.pane {
-                out.insert(pane, t.id.clone());
+                out.insert(pane, (t.id.clone(), i + 1));
             }
         }
     }

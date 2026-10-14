@@ -3885,19 +3885,23 @@ pub(crate) struct Wip {
     /// `mandates.json`, read once — the standing direction each row publishes
     /// as `direction`.
     pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
-    /// seat -> what a barrier check standing there is checking, and the
-    /// project its group's work is in (`wsp-230`): it holds no claim and no
-    /// binding, so this is the only reading that names it.
-    pub checking: std::collections::BTreeMap<String, (String, Option<String>)>,
+    /// seat -> the list and group a barrier check standing there is checking,
+    /// and the project its group's work is in (`wsp-230`): it holds no claim
+    /// and no binding, so this is the only reading that names it.
+    pub checking: std::collections::BTreeMap<String, (String, usize, Option<String>)>,
     /// seat -> what the check standing there records it ran on, for its row's
     /// kind, model and effort. Beside `checking` rather than in its tuple,
     /// because that tuple is what names the seat and this is what it runs.
     pub check_on: std::collections::BTreeMap<String, String>,
+    /// Every worklist, read once: whether a governed scope is a list or a
+    /// project, and which running list's group a member is in, for each row's
+    /// `role` (`wsp-246`).
+    pub lists: Vec<crate::model::Worklist>,
 }
 
 /// Every standing barrier check's seat, named against its list and placed in
 /// the project its group's first member lives in.
-fn checking(lists: &[crate::model::Worklist], tasks: &[Task]) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+fn checking(lists: &[crate::model::Worklist], tasks: &[Task]) -> std::collections::BTreeMap<String, (String, usize, Option<String>)> {
     crate::barrier::seats(lists)
         .into_iter()
         .map(|(seat, (list, at))| {
@@ -3906,7 +3910,7 @@ fn checking(lists: &[crate::model::Worklist], tasks: &[Task]) -> std::collection
                 .find(|w| w.id == list)
                 .and_then(|w| w.groups().into_iter().nth(at - 1))
                 .and_then(|g| g.members.iter().find_map(|m| tasks.iter().find(|t| &t.id == m)?.project.clone()));
-            (seat, (crate::barrier::seat_label(&list, at), project))
+            (seat, (list, at, project))
         })
         .collect()
 }
@@ -3964,6 +3968,7 @@ impl Wip {
             mandates: store.mandates(),
             checking,
             check_on: crate::barrier::ran_on(&lists),
+            lists,
         }
     }
 }
@@ -4113,6 +4118,51 @@ pub(crate) struct WipRow {
     pub(crate) direction: Option<String>,
     /// What runs in the seat. Published as `kind`, `model` and `effort`.
     pub(crate) runs: Runs,
+    /// What the seat is. Published as `role`.
+    pub(crate) role: Role,
+}
+
+/// What a seat is, typed, for a reader that places it (`wsp-246`): compound's
+/// Agents view hangs a verifier beside its member and a check under its list's
+/// governor, and before this it could tell them apart only by parsing `task`,
+/// which is display text — [`crate::verification::seat_label`]'s and
+/// [`crate::barrier::seat_label`]'s format strings — with `task_id` empty.
+///
+/// Asked in the order `task` is named in, so the two never disagree about a
+/// seat: a governor's record, then the work it holds, then a pass standing
+/// there, then a check. A helper — a seat a governor spawned — is a role too,
+/// and is not one here until a spawn records who spawned it (`wsp-249`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Role {
+    /// It governs `id`, a project or a worklist — the scope `seat` names.
+    Governor { list: bool, id: String },
+    /// It holds `task`, and `placing` is the running list and group it is a
+    /// member of.
+    Member { task: String, placing: Option<(String, usize)> },
+    /// It is verifying `member`, on the member's `pass`th pass.
+    Verifier { member: String, pass: usize },
+    /// It is checking `list`'s barrier `group`.
+    Check { list: String, group: usize },
+    /// None of the above.
+    #[default]
+    Agent,
+}
+
+impl Role {
+    pub(crate) fn json(&self) -> Value {
+        match self {
+            Role::Governor { list, id } => {
+                json!({ "is": "governor", "of": if *list { "list" } else { "project" }, "id": id })
+            }
+            Role::Member { task, placing: None } => json!({ "is": "member", "task": task }),
+            Role::Member { task, placing: Some((list, group)) } => {
+                json!({ "is": "member", "task": task, "list": list, "group": group })
+            }
+            Role::Verifier { member, pass } => json!({ "is": "verifier", "member": member, "pass": pass }),
+            Role::Check { list, group } => json!({ "is": "check", "list": list, "group": group }),
+            Role::Agent => json!({ "is": "agent" }),
+        }
+    }
 }
 
 /// What runs in a seat — the kind (`claude`, `opencode`), the model as it was
@@ -4191,7 +4241,8 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     let mut rows: Vec<WipRow> = Vec::new();
     // A verifier holds no claim and no binding (`wsp-188`): its seat is named
     // on the member's open pass, and that is where this reads it from.
-    let verifying = crate::verification::seats(&w.tasks);
+    let verifying = crate::verification::seated(&w.tasks);
+    let running = crate::worklist::Running::over(&w.lists);
     for a in &w.agents {
         let seat = a.seat.as_str();
         let bound = w
@@ -4217,9 +4268,9 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
                 binding: bound
                     .and_then(|t| t.project.clone())
                     .or_else(|| {
-                        verifying.get(seat).and_then(|m| w.tasks.iter().find(|t| &t.id == m)).and_then(|t| t.project.clone())
+                        verifying.get(seat).and_then(|(m, _)| w.tasks.iter().find(|t| &t.id == m)).and_then(|t| t.project.clone())
                     })
-                    .or_else(|| w.checking.get(seat).and_then(|(_, p)| p.clone())),
+                    .or_else(|| w.checking.get(seat).and_then(|(_, _, p)| p.clone())),
                 claim: resolve::claimed_project(&w.claims, &w.tasks, agent.as_deref(), Some(workspace_id), None),
             },
             agent.as_deref(),
@@ -4246,8 +4297,8 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             project: r.project.unwrap_or_else(|| "—".into()),
             task: bound
                 .map(|t| t.title.clone())
-                .or_else(|| verifying.get(seat).map(|m| crate::verification::seat_label(m)))
-                .or_else(|| w.checking.get(seat).map(|(label, _)| label.clone()))
+                .or_else(|| verifying.get(seat).map(|(m, _)| crate::verification::seat_label(m)))
+                .or_else(|| w.checking.get(seat).map(|(list, at, _)| crate::barrier::seat_label(list, *at)))
                 .unwrap_or_else(|| if a.label.is_empty() { "(unbound)".into() } else { format!("({})", a.label) }),
             task_id: bound.map(|t| t.id.clone()).unwrap_or_default(),
             pane: seat.to_string(),
@@ -4273,6 +4324,19 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             direction: crate::cmd_mandate::from_map(&w.mandates, agent.as_deref(), Some(workspace_id))
                 .filter(|p| w.index.get(p).is_some()),
             runs: runs(w, seat, seat_of_project.as_deref(), held),
+            role: match (&seat_of_project, held, verifying.get(seat), w.checking.get(seat)) {
+                // A scope is a list when a worklist has its slug, whether or
+                // not it has started — the order `cmd_govern::scope_of` reads
+                // the one key space in.
+                (Some(id), ..) => Role::Governor { list: w.lists.iter().any(|l| &l.id == id), id: id.clone() },
+                (None, Some(t), ..) => Role::Member {
+                    task: t.id.clone(),
+                    placing: running.of(&t.id).map(|p| (p.list.clone(), p.group)),
+                },
+                (None, None, Some((member, pass)), _) => Role::Verifier { member: member.clone(), pass: *pass },
+                (None, None, None, Some((list, at, _))) => Role::Check { list: list.clone(), group: *at },
+                _ => Role::Agent,
+            },
         });
     }
     // A governor's count, once every row has its own reading.
@@ -4314,6 +4378,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "waiting": r.waiting.as_ref().map(|w| w.json()),
             "members_waiting": r.seat.as_ref().map(|_| r.members_waiting),
             "kind": r.runs.kind, "model": r.runs.model, "effort": r.runs.effort,
+            "role": r.role.json(),
         })).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
@@ -7609,6 +7674,7 @@ mod tests {
             mandates: Default::default(),
             checking: Default::default(),
             check_on: Default::default(),
+            lists: Vec::new(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -7797,6 +7863,7 @@ mod tests {
             mandates: Default::default(),
             checking: Default::default(),
             check_on: Default::default(),
+            lists: Vec::new(),
         }
     }
 
@@ -7825,12 +7892,70 @@ mod tests {
     #[test]
     fn wip_names_a_check_seat_against_its_list_and_group() {
         let mut w = wip_world();
-        w.checking.insert("w3:p1".into(), (crate::barrier::seat_label("gpui-migration", 4), Some("wsp".into())));
+        w.checking.insert("w3:p1".into(), ("gpui-migration".into(), 4, Some("wsp".into())));
         let rows = wip_rows(&w);
         let row = rows.iter().find(|r| r.pane == "w3:p1").unwrap();
         assert_eq!(row.task, "gpui-migration · barrier 4");
         assert!(row.task_id.is_empty(), "it holds no row");
         assert_eq!(row.project, "wsp");
+    }
+
+    /// `wsp-246`. Every row says what its seat is, typed, so a reader placing
+    /// it never parses `task` — one seat of each kind, each named off the
+    /// record that makes it that: a project's and a list's governor off
+    /// `governors.json` and the worklists, a member off its binding and the
+    /// running list it is in, a verifier off the member's pass (its second,
+    /// the first one ended), a check off its list's group entry.
+    #[test]
+    fn wip_json_types_each_seats_role() {
+        let mut w = wip_world();
+        let m = w.tasks.iter_mut().find(|t| t.id == "t-004").unwrap();
+        let mut first = crate::verification::Pass::opened(Some("abc1234".into()), None);
+        first.pane = Some("cpd-484".into());
+        first.state = crate::verification::State::Blocks;
+        first.ending = crate::verification::Ending::Ended;
+        let mut again = crate::verification::Pass::opened(Some("def5678".into()), None);
+        again.pane = Some("cpd-485".into());
+        crate::verification::write(m, &[first, again]);
+        // The list's first member lives in another project than the list's
+        // other work: the list is what its governor governs, wherever the row
+        // is drawn.
+        w.tasks.push(wip_task("data-001", "first of the run", Some("data"), "review"));
+        w.index = Index::new(vec![crate::model::Project::new("wsp"), crate::model::Project::new("data")]);
+        let mut list = crate::model::Worklist::new("gpui-migration", "the list");
+        list.set_groups(&crate::model::parse_groups(
+            "- 1  data-001\n  checks: 2026-10-10T09:20:00Z running read:55c4839abcde pane:cpd-486\n- 2  t-001\n",
+        ));
+        list.set_status(crate::model::WorklistStatus::Running);
+        w.checking = checking(std::slice::from_ref(&list), &w.tasks);
+        w.lists = vec![list];
+        w.governors.insert("wsp".into(), json!({ "workspace": "w5", "pane": "w5:p1" }));
+        w.governors.insert("gpui-migration".into(), json!({ "workspace": "w6", "pane": "w6:p1" }));
+        for seat in ["cpd-485", "cpd-486", "w5:p1", "w6:p1"] {
+            w.agents.push(seated_agent(seat, "working", seat));
+        }
+
+        let j = wip_json(&w);
+        let role = |pane: &str| {
+            j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap_or_else(|| panic!("no row {pane}"))
+                ["role"]
+                .clone()
+        };
+        assert_eq!(role("w5:p1"), json!({ "is": "governor", "of": "project", "id": "wsp" }));
+        assert_eq!(role("w6:p1"), json!({ "is": "governor", "of": "list", "id": "gpui-migration" }));
+        assert_eq!(
+            role("w1:p1"),
+            json!({ "is": "member", "task": "t-001", "list": "gpui-migration", "group": 2 }),
+            "a member of a running list says which group"
+        );
+        assert_eq!(role("w2:p1"), json!({ "is": "member", "task": "t-002" }), "and one on no list says none");
+        assert_eq!(role("cpd-485"), json!({ "is": "verifier", "member": "t-004", "pass": 2 }), "verified again");
+        assert_eq!(role("cpd-486"), json!({ "is": "check", "list": "gpui-migration", "group": 1 }));
+        assert_eq!(role("w3:p1"), json!({ "is": "agent" }));
+        // `task` keeps its text for the TUI.
+        let task = |pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap()["task"].clone();
+        assert_eq!(task("cpd-485"), "t-004 · verifying");
+        assert_eq!(task("cpd-486"), "gpui-migration · barrier 1");
     }
 
     /// `wsp-248`. Each seat's kind, model and effort, read off the record that
