@@ -504,22 +504,29 @@ pub(crate) fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> 
     out
 }
 
-/// When the row entered the stage it is at now (`wsp-274`): the newest step
-/// of its [`history`] under the live word — the last one, wherever the two
-/// agree, so a list member's `since` is its last `member_stages` entry.
+/// When the row entered the stage it is at now (`wsp-274`): the timeline's
+/// last step, where that step is under the live word — which [`history`]
+/// makes true of every shape it knows, the `started`/`working` rename and the
+/// appended `wants you` — so a list member's `since` is its last
+/// `member_stages` entry.
 ///
 /// **Not the stage's `at`**, which is the time of the record the word was
 /// read off: a seat that has said three things while working has three `at`s
-/// and one `since`, its claim. Where the timeline has no step under the word
-/// — a status edited by hand, with no `→` line — the record's time is the
-/// best there is, and empty where neither dates it.
+/// and one `since`, its claim.
+///
+/// **Never an older step under the same word.** A row whose live word is not
+/// its timeline's last came to that word with no step of its own, at or after
+/// the last one: released while still `doing`, it reads `started` or
+/// `working` again off its status or its say, and the step under that word
+/// further back is an earlier attempt's. compound-128 walked back that way to
+/// a `→ doing` 3h45m before the release that put it where it is, behind a
+/// park and a second claim. So: the later of the last step and the record.
 pub(crate) fn since(now: &Told, steps: &[Step]) -> String {
-    steps
-        .iter()
-        .rev()
-        .find(|s| s.word == now.word && !s.at.is_empty())
-        .map(|s| s.at.clone())
-        .unwrap_or_else(|| now.at.clone())
+    match steps.last() {
+        Some(last) if last.word == now.word && !last.at.is_empty() => last.at.clone(),
+        Some(last) => last.at.clone().max(now.at.clone()),
+        None => now.at.clone(),
+    }
 }
 
 /// The stage as `ls`, `find`, `show` and `worklist show` give it: the
@@ -1060,5 +1067,27 @@ mod tests {
         let t = task("doing", &[]);
         let now = of_member(&member(&t, &[]));
         assert_eq!((now.word, since(&now, &history(&t, &[], Some(&now))).as_str()), ("started", "2026-10-08T09:00:00Z"));
+
+        // compound-128's shape: claimed, released, claimed again and released
+        // again, `doing` throughout. It reads `started` from the second
+        // release, not from the first claim's `working` renamed, and never
+        // from before the attempt that came between.
+        let mut t = task(
+            "doing",
+            &[
+                "2026-10-08T08:00:00Z → doing",
+                "2026-10-08T08:01:00Z claimed by pane w1:p1",
+                "2026-10-08T08:30:00Z released by pane w1:p1",
+                "2026-10-08T09:00:00Z claimed by pane w1:p2",
+                "2026-10-08T09:40:00Z released by pane w1:p2",
+            ],
+        );
+        t.updated = "2026-10-08T09:40:00Z".into();
+        let now = of_member(&member(&t, &[]));
+        let steps = history(&t, &[], Some(&now));
+        assert_eq!((now.word, since(&now, &steps).as_str()), ("started", "2026-10-08T09:40:00Z"), "{steps:?}");
+        let m = Member { said: Some("picking it back up"), ..member(&t, &[]) };
+        let now = of_member(&m);
+        assert_eq!((now.word, since(&now, &history(&t, &[], Some(&now))).as_str()), ("working", "2026-10-08T09:40:00Z"), "a say left over from the attempt is no older a since");
     }
 }

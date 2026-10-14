@@ -248,18 +248,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
 
     let tasks = filtered(store, args, &index, scope.clone());
     if args.json() {
-        // `wsp-242`: each row's stage, every source read once for all of them.
-        let stages = crate::stage::with_history(store, &tasks.iter().collect::<Vec<_>>());
-        let out: Vec<_> = tasks
-            .iter()
-            .map(|t| {
-                let mut v = t.json();
-                // `wsp-274`: and since when, off the same timeline `show` gives.
-                v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
-                v
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        println!("{}", serde_json::to_string_pretty(&rows_json(store, &tasks)).unwrap_or_default());
         return 0;
     }
 
@@ -2936,6 +2925,21 @@ fn archive_month(t: &Task) -> String {
 /// you to look at the count instead.
 const ARCHIVE_MAX: usize = 20;
 
+/// `ls --json`'s rows: each task's record and its stage.
+fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
+    // `wsp-242`: each row's stage, every source read once for all of them.
+    let stages = crate::stage::with_history(store, &tasks.iter().collect::<Vec<_>>());
+    tasks
+        .iter()
+        .map(|t| {
+            let mut v = t.json();
+            // `wsp-274`: and since when, off the same timeline `show` gives.
+            v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
+            v
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2946,6 +2950,24 @@ mod tests {
         let store = Store::at(root.clone(), root.join("state"));
         store.ensure_dirs().unwrap();
         store
+    }
+
+    /// `wsp-274`, at the verb compound's flight view reads (§24, FL-1): a
+    /// row on no list carries `stage.since`, when it entered its word — its
+    /// claim — beside `at`, the record's time, which is later.
+    #[test]
+    fn ls_json_gives_each_row_since_when_it_has_been_at_its_stage() {
+        let store = scratch("ls-since");
+        let mut t = Task::new("A row on no list", "s-1");
+        t.status_raw = "doing".into();
+        t.created = "2026-10-08T07:00:00Z".into();
+        t.updated = "2026-10-08T09:20:00Z".into();
+        crate::model::set_section_in(&mut t.body, "Log", "- 2026-10-08T08:00:00Z claimed by pane w1:p1\n- 2026-10-08T08:00:00Z → doing\n");
+        store.save_task(&t).unwrap();
+        let rows = rows_json(&store, &store.tasks());
+        let stage = &rows[0]["stage"];
+        assert_eq!((&stage["word"], &stage["since"]), (&json!("started"), &json!("2026-10-08T08:00:00Z")), "{rows:?}");
+        assert_ne!(stage["at"], stage["since"], "at stays the record's time");
     }
 
     /// The occurrence, and it is `render-014`'s exactly: `wsp review render-014`
