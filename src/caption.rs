@@ -217,9 +217,28 @@ pub fn of_message(written: Option<&Caption>, text: &str) -> Caption {
     match written {
         Some(c) if !c.text.trim().is_empty() => c.clone(),
         _ => match message(text) {
-            t if t.is_empty() => Caption { text: "Nothing was said".into(), from: "derived" },
+            t if t.is_empty() => Caption { text: uncleaned(text), from: "derived" },
             t => Caption { text: t, from: "derived" },
         },
+    }
+}
+
+/// A message that [`message`] cleans to nothing — `(pid 1)` — is captioned by
+/// its own first line, cut at the clause `say` cuts at but never cleaned,
+/// since those are still the only words there are (§17.7: a derivation that
+/// comes out empty gives the whole text). Only a text with no words at all
+/// says so.
+fn uncleaned(text: &str) -> String {
+    let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return "Nothing was said".into();
+    };
+    let mut t = first;
+    if let Some(i) = [". ", "; ", " — "].iter().filter_map(|c| t.find(c)).filter(|&i| i > 0).min() {
+        t = &t[..i];
+    }
+    match t.trim_end_matches([' ', '.', ',', ';', ':']) {
+        "" => first.to_string(),
+        t => t.to_string(),
     }
 }
 
@@ -541,6 +560,14 @@ mod tests {
         assert_eq!(of_message(Some(&written), "Ed: the window you run…"), written);
         assert_eq!(of_message(None, "Ed: does it hold?").from, "derived");
         assert_eq!(of_message(None, "  ").text, "Nothing was said");
+        assert_eq!(of_message(None, " \n\t\n").text, "Nothing was said", "whitespace on every line is still nothing");
+        assert_eq!(
+            of_message(None, "(pid 1)"),
+            Caption { text: "(pid 1)".into(), from: "derived" },
+            "a text that cleans to nothing is its own words, not a claim that nothing was said",
+        );
+        assert_eq!(of_message(None, "\n (pid 1). (pid 2)\nmore").text, "(pid 1)", "the first line, cut at its first clause");
+        assert_eq!(of_message(None, "...").text, "...", "a line its cut empties is kept whole");
     }
 
     #[test]
