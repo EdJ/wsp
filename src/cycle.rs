@@ -4408,6 +4408,72 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(spawned().is_empty(), "the check is already open: nothing owed twice");
     }
 
+    /// A verifier owed at a full seat waits: no pass is written, it is said
+    /// once, and it goes ahead of the next member when a place frees.
+    #[test]
+    fn a_verifier_owed_at_a_full_seat_waits_and_writes_no_pass() {
+        let (_env, store) = scratch("seat-cap-verifier-waits");
+        for m in ["m-1", "m-2", "m-3"] {
+            task(&store, m, Status::Todo);
+        }
+        for (h, s) in [("h-1", "w2:p1"), ("h-2", "w2:p2")] {
+            task(&store, h, Status::Doing);
+            store.set_binding(s, serde_json::json!({ "task_id": h }));
+        }
+        store.set_seat_cap(Some(4)).unwrap();
+        let w = list(&store, &[(&["m-1", "m-2", "m-3"], "claude")]);
+        let seats = Fixed::new(&[("w2:p1", State::Working), ("w2:p2", State::Working), ("w2:p3", State::Working)]);
+        let _ = drained(&SAID);
+        step(&store, &w, &seats);
+        assert_eq!(ids(spawned()), ["m-1", "m-2"]);
+        set(&store, "m-1", Status::Review);
+        task(&store, "h-3", Status::Doing);
+        store.set_binding("w2:p3", serde_json::json!({ "task_id": "h-3" }));
+        let _ = said_capped();
+        step(&store, &w, &seats);
+        assert!(spawned().is_empty(), "full: the verifier waits");
+        let said = said_capped();
+        assert!(said.iter().any(|l| l.contains("m-1 · verifying waits")), "{said:?}");
+        let m1 = store.find_task("m-1").unwrap();
+        assert!(crate::verification::passes(&m1).is_empty(), "no pass written for a held verifier");
+        let seats = Fixed::new(&[("w2:p1", State::Working), ("w2:p2", State::Working), ("w2:p3", State::Gone)]);
+        step(&store, &w, &seats);
+        assert_eq!(ids(spawned()), ["m-1 · verifying"], "a place frees, the verifier goes before m-3");
+    }
+
+    /// A barrier check owed at a full seat waits: no check is written, it is
+    /// said once, and it opens when a place frees.
+    #[test]
+    fn a_barrier_check_owed_at_a_full_seat_waits_and_writes_no_check() {
+        let (_env, store) = scratch("seat-cap-check-waits");
+        task(&store, "m-1", Status::Todo);
+        task(&store, "m-2", Status::Todo);
+        let run = list(&store, &[(&["m-1"], "claude"), (&["m-2"], "claude")]);
+        step(&store, &run, &Blind);
+        set(&store, "m-1", Status::Review);
+        step(&store, &run, &Blind);
+        hold_all(&store);
+        let _ = spawned();
+        let mut pairs = Vec::new();
+        for (h, s) in [("h-1", "w2:p1"), ("h-2", "w2:p2"), ("h-3", "w2:p3"), ("h-4", "w2:p4")] {
+            task(&store, h, Status::Doing);
+            store.set_binding(s, serde_json::json!({ "task_id": h }));
+            pairs.push((s, State::Working));
+        }
+        store.set_seat_cap(Some(4)).unwrap();
+        let _ = drained(&SAID);
+        step(&store, &run, &Fixed::new(&pairs));
+        assert!(spawned().is_empty(), "full: the check waits");
+        let said = said_capped();
+        assert!(said.iter().any(|l| l.contains("barrier 1 waits")), "{said:?}");
+        assert!(store.worklist("run").unwrap().groups()[0].checks.is_empty(), "no check written for a held one");
+        step(&store, &run, &Fixed::new(&pairs));
+        assert!(said_capped().is_empty(), "said once");
+        pairs[0].1 = State::Gone;
+        step(&store, &run, &Fixed::new(&pairs));
+        assert_eq!(ids(spawned()), ["run · barrier 1"]);
+    }
+
     /// A governor is not one of the four: a seat it sits in, even one holding
     /// a row, leaves the count where it was. A helper `wsp spawn`ed onto a row
     /// is one of them.
