@@ -341,8 +341,22 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
 
+    // Where it stands (`wsp-263`): `-p`, or nothing stated and the seat that
+    // made it remembered, since at `new` there are no members to ask.
+    let index = crate::resolve::Index::new(store.projects());
+    let (project, made_in) = match crate::cmd_agent::named_project(args, &index) {
+        Some(Ok(p)) => (p, None),
+        Some(Err(said)) => {
+            eprintln!("{said}");
+            return 1;
+        }
+        None => (None, maker(store)),
+    };
+
     let mut w = Worklist::new(&slug, &title);
     w.caption = caption;
+    w.project = project;
+    w.made_in = made_in;
     if let Err(e) = store.save_worklist(&w) {
         eprintln!("wsp: write failed: {e}");
         return 1;
@@ -354,9 +368,34 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         println!("{}", worklist_json(store, &w));
     } else {
         println!("added worklist {} ({})", w.id, w.title);
+        if let Some(p) = &w.project {
+            println!("under {p} — its seat answers to that project's governor");
+        }
         println!("next: wsp worklist add {} <task>…   each call is one group", w.id);
     }
     0
+}
+
+/// The project the seat running `new` stands in: the one it governs, or the
+/// home of the list it governs, or the project of the task it holds. The seat's
+/// and not the shell's — no cwd and no workspace label, which are guesses about
+/// a person, and a person who means a project says `-p`.
+///
+/// Read off the environment in `my_pane()`'s order rather than through it, as
+/// `cmd_message::caller` does: building its backends opens the default store,
+/// and `new` has no other reason to touch one but its own.
+fn maker(store: &Store) -> Option<String> {
+    let pane = crate::place::seat_from_env()
+        .map(|s| s.to_string())
+        .or_else(|| crate::herdr::Env::read().pane_id.filter(|p| !p.is_empty()))?;
+    if let Some(scope) = crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(&pane)) {
+        return match store.worklist(&scope) {
+            Some(list) => worklist::home(store, &list).map(|h| h.project),
+            None => Some(scope),
+        };
+    }
+    let bound = store.bindings().get(&pane)?.get("task_id")?.as_str()?.to_string();
+    store.task(&bound)?.project
 }
 
 // ---- add --------------------------------------------------------------
@@ -2079,6 +2118,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     println!("{}  {}", p.bold(&w.id), p.dim(&w.title));
     println!();
     println!("{}  {}", p.dim(&util::pad("status", 8)), w.status().as_str());
+    // Where its seat stands (`wsp-263`): the project whose governor it answers
+    // to, and which of the three answers that is — a home read off the members
+    // moves when they do, and the reader deciding whether to state one wants to
+    // know it was never stated.
+    println!("{}  {}", p.dim(&util::pad("under", 8)), home_line(&p, &w.id, worklist::home(store, &w).as_ref()));
     // Where it is up to, and — on a list nobody has started — the fact that
     // this is where it *would* start. A plan has no barriers behind its groups
     // and its position says where the run would begin, which is a different
@@ -4854,6 +4898,14 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     // and ending a member's agent on a list somebody meant to come back to is
     // not something to do without saying.
     crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, how);
+    crate::cycle::tell_above(
+        store,
+        &w,
+        &match pos.at {
+            None => format!("The {} list is done: every barrier passed · wsp worklist show {}", w.id, w.id),
+            Some(at) => format!("The {} list was closed at group {at} of {} · wsp worklist show {}", w.id, pos.of, w.id),
+        },
+    );
 
     if args.json() {
         println!(
@@ -4916,7 +4968,7 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
 /// structure sits in.
 pub fn edit(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp worklist edit <slug> [--overview | --decisions] [-]");
+        eprintln!("usage: wsp worklist edit <slug> [--overview | --decisions] [-] | --project <p|none>");
         return 2;
     };
     let w = match worklist_or_why(store, &needle) {
@@ -4926,6 +4978,9 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    if args.get("project").is_some() {
+        return rehome(store, args, w);
+    }
     crate::cmd_task::edit_prose(
         store,
         args,
@@ -4937,6 +4992,52 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
             sections: &crate::model::WORKLIST_PROSE,
         },
     )
+}
+
+/// `wsp worklist edit <slug> --project <p>` — state where a list stands, or
+/// `none` to stop stating it, when it goes back to its members' answer.
+///
+/// Allowed at any point in the run: a home moves who the list's seat answers
+/// to and who hears its barriers, and nothing about the queue, so there is no
+/// window to respect. The next escalation reads the new one.
+fn rehome(store: &Store, args: &Args, w: Worklist) -> i32 {
+    let index = crate::resolve::Index::new(store.projects());
+    let project = match crate::cmd_agent::named_project(args, &index) {
+        Some(Ok(p)) => p,
+        Some(Err(said)) => {
+            eprintln!("{said}");
+            return 1;
+        }
+        None => return 2,
+    };
+    let saved = store.locked(|| -> Result<Worklist, String> {
+        let mut w = store.worklist(&w.id).ok_or_else(|| format!("wsp: `{}` is gone", w.id))?;
+        let was = w.project.clone();
+        w.project = project.clone();
+        w.log(&match (&was, &project) {
+            (_, Some(p)) => format!("under {p}"),
+            (Some(p), None) => format!("no longer stated under {p}"),
+            (None, None) => "no project stated".to_string(),
+        });
+        store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
+        Ok(w)
+    });
+    let w = match saved {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    store.log_event("worklist-edited", json!({ "id": w.id, "what": "project", "project": w.project }));
+    store.git_commit(&format!("wsp: worklist {} under {}", w.id, w.project.as_deref().unwrap_or("no stated project")));
+    let home = worklist::home(store, &w);
+    if args.json() {
+        println!("{}", json!({ "worklist": w.id, "project": home_json(home.as_ref()) }));
+    } else {
+        println!("{}  {}", w.id, home_line(&Paint::new(), &w.id, home.as_ref()));
+    }
+    0
 }
 
 /// Every group's caption, its members looked up in the store — the archive
@@ -4961,9 +5062,39 @@ fn group_captions(store: &Store, groups: &[Group]) -> Vec<crate::caption::Captio
         .collect()
 }
 
-/// One worklist, for `--json`: what it is, and where it is up to.
+/// One worklist, for `--json`: what it is, where it is up to, and where it
+/// stands — `project` is its home and how that was found, or `null` for a list
+/// that stands nowhere.
 fn worklist_json(store: &Store, w: &Worklist) -> serde_json::Value {
-    worklist_json_at(w, &worklist::position(store, w, Reading::Settled))
+    let mut v = worklist_json_at(w, &worklist::position(store, w, Reading::Settled));
+    v["project"] = home_json(worklist::home(store, w).as_ref());
+    v
+}
+
+fn home_json(home: Option<&worklist::Home>) -> serde_json::Value {
+    home.map(|h| json!({ "id": h.project, "from": h.from.as_str() })).unwrap_or(serde_json::Value::Null)
+}
+
+/// `under` on `show`: the home, why it is that one, and on a list with none
+/// the verb that gives it one.
+fn home_line(p: &Paint, id: &str, home: Option<&worklist::Home>) -> String {
+    use worklist::HomeFrom;
+    match home {
+        Some(h) => format!(
+            "{} {}",
+            h.project,
+            p.dim(match h.from {
+                HomeFrom::Stated => "· its seat answers to that project's governor",
+                HomeFrom::Members => "· the project its members share — not stated, so it follows them",
+                HomeFrom::Maker => "· where it was made — not stated, and its members share none",
+            })
+        ),
+        None => format!(
+            "{} {}",
+            p.yellow("nowhere"),
+            p.dim(&format!("· its seat answers to nobody above it · wsp worklist edit {id} --project <p>"))
+        ),
+    }
 }
 
 /// The same object where the position is already in hand.
@@ -7848,5 +7979,130 @@ mod tests {
         task(&store, "wl-001", "done");
         let line = row(&drawn(&store, true), "batch").expect("still drawn").clone();
         assert!(line.contains(" · "), "and none is drawn as nothing, not as a nought: {line}");
+    }
+
+    // ---- where a list stands (`wsp-263`) ----
+
+    fn projects(store: &Store, of: &[(&str, Option<&str>)]) {
+        for (id, parent) in of {
+            let mut p = crate::model::Project::new(id);
+            p.parent = parent.map(str::to_string);
+            store.save_project(&p).unwrap();
+        }
+    }
+
+    fn in_project(store: &Store, id: &str, project: Option<&str>) {
+        let mut t = Task::new(id, id);
+        t.status_raw = "todo".into();
+        t.project = project.map(str::to_string);
+        store.save_task(&t).unwrap();
+    }
+
+    fn home_of(store: &Store, id: &str) -> Option<(String, worklist::HomeFrom)> {
+        worklist::home(store, &store.worklist(id).unwrap()).map(|h| (h.project, h.from))
+    }
+
+    /// `-p` states it, and a stated home is the answer whatever the members
+    /// share — the person who said it knew which custodian the run is for.
+    #[test]
+    fn a_list_made_with_a_project_stands_in_it_whatever_its_members_share() {
+        let store = scratch("home-stated");
+        projects(&store, &[("wsp", None), ("render", Some("wsp")), ("data", Some("wsp"))]);
+        in_project(&store, "d-1", Some("data"));
+        assert_eq!(flagged(&store, &["new", "run", "r"], &[("project", "render")]), 0);
+        assert_eq!(run(&store, &["add", "run", "d-1"]), 0);
+        assert_eq!(home_of(&store, "run"), Some(("render".into(), worklist::HomeFrom::Stated)));
+        let json = worklist_json(&store, &store.worklist("run").unwrap());
+        assert_eq!(json["project"], json!({ "id": "render", "from": "stated" }), "{json}");
+
+        assert_eq!(flagged(&store, &["new", "other", "o"], &[("project", "nosuch")]), 1, "a project nobody has is refused");
+        assert!(store.worklist("other").is_none(), "and nothing is made");
+    }
+
+    /// Unstated, the members say: the deepest project every one of them stands
+    /// in, read as the list is read, so it follows them as they are added — and
+    /// `edit --project` states one later, and `none` hands it back to them.
+    #[test]
+    fn an_unstated_home_is_the_project_its_members_share_and_follows_them() {
+        let store = scratch("home-members");
+        projects(&store, &[("wsp", None), ("render", Some("wsp")), ("data", Some("wsp"))]);
+        in_project(&store, "r-1", Some("render"));
+        in_project(&store, "d-1", Some("data"));
+        assert_eq!(run(&store, &["new", "run", "r"]), 0);
+        assert_eq!(run(&store, &["add", "run", "r-1"]), 0);
+        assert_eq!(home_of(&store, "run"), Some(("render".into(), worklist::HomeFrom::Members)));
+        assert_eq!(run(&store, &["add", "run", "d-1"]), 0);
+        assert_eq!(
+            home_of(&store, "run"),
+            Some(("wsp".into(), worklist::HomeFrom::Members)),
+            "render and data share wsp, the one custodian that answers for both"
+        );
+
+        assert_eq!(flagged(&store, &["edit", "run"], &[("project", "data")]), 0);
+        assert_eq!(home_of(&store, "run"), Some(("data".into(), worklist::HomeFrom::Stated)));
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("under data"), "the move is on the list's record: {log}");
+        assert_eq!(flagged(&store, &["edit", "run"], &[("project", "none")]), 0);
+        assert_eq!(home_of(&store, "run"), Some(("wsp".into(), worklist::HomeFrom::Members)), "back to its members' answer");
+    }
+
+    /// No project stated, no member in one, and nothing to say where it was
+    /// made: it stands nowhere, and `show --json` says so as `null` rather than
+    /// guessing — and `made_in` is the last answer, under a member in no project.
+    #[test]
+    fn a_list_with_no_home_stands_nowhere_and_one_made_by_a_seat_stands_where_it_was_made() {
+        let _env = util::isolated("home-nowhere");
+        let store = scratch("home-nowhere");
+        projects(&store, &[("wsp", None)]);
+        in_project(&store, "i-1", None);
+        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var("HERDR_PANE_ID");
+        assert_eq!(run(&store, &["new", "run", "r"]), 0);
+        assert_eq!(home_of(&store, "run"), None, "nothing to read a home off");
+        assert_eq!(run(&store, &["add", "run", "i-1"]), 0);
+        assert_eq!(home_of(&store, "run"), None, "a member in no project shares none");
+        assert_eq!(worklist_json(&store, &store.worklist("run").unwrap())["project"], serde_json::Value::Null);
+        assert!(home_line(&Paint::plain(), "run", None).contains("nowhere"));
+
+        // The seat that runs `new` is remembered, and answers when nothing else does.
+        store.set_governor("wsp", json!({ "workspace": "w1", "pane": "cpd-1" }));
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-1");
+        assert_eq!(run(&store, &["new", "made", "m"]), 0);
+        std::env::remove_var(crate::place::SEAT_ENV);
+        assert_eq!(store.worklist("made").unwrap().made_in.as_deref(), Some("wsp"));
+        assert_eq!(run(&store, &["add", "made", "i-1"]), 0);
+        assert_eq!(home_of(&store, "made"), Some(("wsp".into(), worklist::HomeFrom::Maker)));
+    }
+
+    fn heard() -> Vec<String> {
+        crate::cycle::tests::HEARD.with(|h| h.borrow_mut().drain(..).collect())
+    }
+
+    /// **The project's governor hears its lists** (`wsp-263`): one line for a
+    /// barrier passed and one for the list closed, each pointing at `show`.
+    #[test]
+    fn a_pass_and_a_done_are_each_one_line_to_the_governor_above_the_list() {
+        let _env = util::isolated("heard-pass");
+        let store = at_barrier_one("heard-pass");
+        heard();
+        assert_eq!(run(&store, &["go", "run", "it", "holds"]), 0);
+        let h = heard();
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(h[0].contains("run list passed barrier 1 of 2") && h[0].contains("it holds"), "{h:?}");
+        assert_eq!(run(&store, &["done", "run"]), 0);
+        let h = heard();
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(h[0].contains("run list was closed at group 2 of 2"), "{h:?}");
+    }
+
+    #[test]
+    fn a_hold_is_one_line_to_the_governor_above_the_list() {
+        let _env = util::isolated("heard-hold");
+        let store = at_barrier_one("heard-hold");
+        heard();
+        assert_eq!(run(&store, &["hold", "run", "not", "yet"]), 0);
+        let h = heard();
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(h[0].contains("run list was held at its barrier"), "{h:?}");
     }
 }

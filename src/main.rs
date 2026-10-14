@@ -1874,7 +1874,10 @@ fn help_text() -> String {
   wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,
                                     outside the projects its members live in —
                                     it references them, nothing moves.
-                                    --caption "…" is its line for a glance
+                                    --caption "…" is its line for a glance;
+                                    -p <project> is where it stands, whose
+                                    governor its seat answers to — unsaid,
+                                    the project its members share
   wsp worklist add <slug> <task>…   one call, one group; its members run at
                                     the same time. --group N joins a group
                                     that exists instead of making one;
@@ -1908,6 +1911,9 @@ fn help_text() -> String {
   wsp worklist edit <slug> --overview -    what has to be true before group 1
                                     starts — there is no barrier in front of it
                                     to carry a stop condition, so the list does
+  wsp worklist edit <slug> --project <p>|none
+                                    move where it stands, at any point in the
+                                    run; none goes back to its members' answer
   wsp worklist ls [--all]           every list, most recently active first, in
                                     three segments: running, unjudged — the run
                                     is over and its rows are not — and closed,

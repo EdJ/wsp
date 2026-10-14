@@ -191,7 +191,9 @@ for anything no verb announces (`src/cycle.rs`, `src/repair.rs`):
 | the run's seat reads empty for two ticks, or no seat in its chain has ever been filled | seats a governor | — |
 
 A list wsp runs, meaning any group whose `agent:` line is not `manual`, is
-governed from its own seat and nothing above it (`wsp-202`). wsp seats it on the
+governed from its own seat (`wsp-202`), which answers to its home project's
+governor (`wsp-263`; see [A list's seat sits under its
+project's](#a-lists-seat-sits-under-its-projects)). wsp seats it on the
 first tick after `go`. A pass rotates that seat, and a dead one is refilled
 there. The project's seat is never rotated, refilled or ended for a run. A list
 run by hand keeps the walk: its own seat, then its first member's project, then
@@ -2848,6 +2850,44 @@ night either (`core-049`): a pass seats its successor. See
 exists to hold the *record*, and the record is in the store; a thread that held
 it too was paying rent on both.
 
+### A list's seat sits under its project's
+
+Ed, 2026-10-09 (`wsp-263`): *lists should be part of a project's hierarchy.* A
+list's seat is its own post — wsp seats it, a pass rotates it, a dead one is
+refilled there, and none of that touches the project's seat (`wsp-202`) — but
+it **answers to the governor of the project the list stands in**. Before this
+nothing stood above a list, so a stalled or asking list governor went straight
+to every panel, past the custodian of the project the run was for.
+
+```sh
+wsp worklist new tonight "…" -p render     # stated: tonight stands in render
+wsp worklist edit tonight --project wsp    # moved; `none` stops stating one
+wsp worklist show tonight                  # under  render · …, or nowhere
+```
+
+Where a list stands, in order: the project `-p` or `edit --project` stated;
+else the deepest project every member stands in, read as the list is read, so
+it follows them as they are added (`wsp/render` and `wsp/data` share `wsp`);
+else the project the seat that ran `new` stood in. A list with none of the
+three stands nowhere, and `worklist show` says so.
+
+- **Upward:** a list governor's own `wsp ask`, a stalled list seat, and a
+  barrier its governor cannot settle reach the home project's governor, or the
+  nearest seated one above it — the person only when nobody on that walk is
+  seated. A project governor answers or raises it with the verbs it already
+  has. Members' questions are unchanged: they reach the list's seat first.
+- **Downward:** the project's governor is told one line, in its spool, each
+  time one of its lists is started, passes, holds or follows up a barrier, is
+  parked, resumed or done — so it knows what its lists are doing without
+  polling them. A list run by hand from the project's own seat is not told
+  twice.
+- **Drawn:** `wsp govern` lists a list's slot under its project's, `wsp tree`
+  draws the seats under each project with its lists' under them, and the panel
+  draws a list's seat one step in from its project's. `wip --json` gives a
+  list governor's row `answers_to` — the seat it answers to, or `null` with
+  `answers_to_empty` naming the home when nobody there is seated — and a
+  project governor's `answers_to` is `null`.
+
 The record is keyed on the **project**, which is the one place this differs
 from the pins, mandates and claims beside it. Those are facts about a workspace
 and there can be many per project; there is one seat per project and one seat
@@ -2974,10 +3014,9 @@ task, so it is addressed where it is built rather than from the map of task
 routing. And its **address escapes its own level**: `cmd_govern::seat_for` stops
 at the first seat it finds, which here is the one that failed, so the news walks
 `seat_above` — the same chain started one step past that scope, terminating at
-`everyone`. A worklist seat always terminates there, and that is the walk's
-shape rather than a gap: the list step is the *front* of `seat_for`'s chain, so
-what lies past a list is the project chain of one member, and a list cutting
-across projects has as many of those as it has members.
+`everyone`. Past a worklist's seat is its home project and that project's
+ancestors (`wsp-263`), so a stalled list governor is the project custodian's to
+hear first, and everyone's only when nobody on that walk is seated.
 
 The same fact fixed a second thing on `worklist-037`'s line. `wsp watch` in a
 seat at `0 standing` used to add *nothing is addressed to this seat — `wsp

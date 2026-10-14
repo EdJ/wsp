@@ -201,6 +201,31 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         }
     };
 
+    // **A seat asking about its own work asks the seat above it** (`wsp-263`).
+    // The walk reaches the asker first — a list governor asking about its list
+    // or a member of it, a project's about its project — and handing it to
+    // itself would wake it on its own words. So the walk goes on one step past
+    // it: a list's seat to its home project's governor, a project's to its
+    // parent's, and the person only when nobody on that walk is seated. Before
+    // this a list governor's question went to the person, past the custodian of
+    // the project the list was run for.
+    let own = seat.as_ref().map(|s| s.scope.clone()).filter(|s| me.scope() == Some(s.as_str()));
+    let (seat, to) = match &own {
+        Some(scope) => {
+            let above = crate::cmd_govern::seat_above_in(store, scope);
+            let to = match &above {
+                Some(s) => format!(
+                    "asked of the {} governor, above {scope} · {}",
+                    s.scope,
+                    crate::cmd_govern::room_of(&store.governors(), &s.scope)
+                ),
+                None => to,
+            };
+            (above, to)
+        }
+        None => (seat, to),
+    };
+
     let for_person = args.has("person");
     let mut q = Message::question(
         me.clone(),
@@ -211,9 +236,9 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     .about(about);
     // **Whose answer it waits on, written now** (`wsp-275`). The seat that
     // answers for the subject, or the person: asked with `--person`, about a
-    // row no seat answers for, or by the only seat there is — a governor
-    // asking about its own work is asking the person, and handing it to
-    // itself would wake it on its own words. `for` was null on every plain ask
+    // row no seat answers for, or by a seat with nobody seated above it — a
+    // governor at the top of its walk asking about its own work is asking the
+    // person (`own`, above, is the step it takes first). `for` was null on every plain ask
     // before this, and the flight view could not tell a governor's question
     // from Ed's (compound-490's, which went to ux-next).
     match seat.as_ref().filter(|s| !for_person && me.scope() != Some(s.scope.as_str())) {
@@ -279,8 +304,8 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     match q.for_person {
         true => {
             if !for_person {
-                let why = match &seat {
-                    Some(_) => "the seat that answers for it is the one asking".to_string(),
+                let why = match &own {
+                    Some(_) => "the seat that answers for it is the one asking, and none above it is seated".to_string(),
                     None => format!("no seat answers for {subject_id}"),
                 };
                 println!("  {}", p.dim(&why));

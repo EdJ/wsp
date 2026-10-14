@@ -1735,11 +1735,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // than a stale pane id. Built once, because the tree walk asks for it per
     // project and this runs four times a second.
     // Keyed on the slot's scope, which since worklists is a project id *or* a
-    // worklist slug — and the tree walk below asks it by project, so a seat on
-    // a worklist is not drawn here at all. That is deliberate for now rather
-    // than missed: the panel's worklist row is phase two, and a list drawn as
-    // if it were a project would put a row in the tree under a parent it has
-    // not got.
+    // worklist slug. The tree walk below asks it by project, and a list's seat
+    // is drawn under its *home* project's (`lists_under`, below): it used to be
+    // drawn nowhere, because a list had no parent to draw it under, and since
+    // `wsp-263` it has one.
     let seats: std::collections::BTreeMap<String, (Option<AgentRef>, bool)> =
         crate::cmd_govern::slots(&snap.governors)
             .into_iter()
@@ -1789,6 +1788,22 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+
+    // A list's seat, under the project its seat answers to (`wsp-263`): every
+    // list with a slot filled here or elsewhere, keyed on its home. A vacant
+    // list post is not drawn — a list nobody is running is a list, not a
+    // position anybody is invited to fill from the tree — and a list with no
+    // home has nowhere to be drawn, which is what `worklist show` says of it.
+    let lists_under: std::collections::BTreeMap<String, Vec<String>> = {
+        let governed = snap.worklists.iter().map(|l| &l.list).filter(|l| {
+            seats.get(&l.id).is_some_and(|(occupant, elsewhere)| occupant.is_some() || *elsewhere)
+        });
+        let mut under: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (list, home) in crate::worklist::homes(governed, &tasks, &index) {
+            under.entry(home).or_default().push(list);
+        }
+        under
+    };
 
     // The panes that are drawn *as* a seat, and are therefore not drawn again
     // as workers. A custodian that borrowed a task to have somewhere to stand
@@ -1972,6 +1987,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             // position folded out of sight is one nobody fills, and the row is
             // also the only way to reach the agent sitting in it.
             || seats.contains_key(id)
+            || lists_under.contains_key(id)
             || (view.show_done && c.done > 0)
             // A project holding nothing at all is not a quiet branch. There is
             // no work behind the row to go and look at, so folding it away
@@ -2033,6 +2049,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         interesting: &dyn Fn(&str) -> bool,
         agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
         seats: &std::collections::BTreeMap<String, (Option<AgentRef>, bool)>,
+        lists_under: &std::collections::BTreeMap<String, Vec<String>>,
         unfinished: &[String],
         shown_counts: &dyn Fn(&str) -> Counts,
     ) {
@@ -2093,17 +2110,26 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             // for the same reason again: a seat is not a task, and cannot be
             // one of the things a phrase was looking for.
             if !view.review_only && view.filter.is_empty() {
-                if let Some((occupant, elsewhere)) = seats.get(&p.id) {
-                    rows.push(Row::Seat {
-                        project: p.id.clone(),
+                let seat = |scope: &str, depth: usize| {
+                    seats.get(scope).map(|(occupant, elsewhere)| Row::Seat {
+                        project: scope.to_string(),
                         state: occupant
                             .as_ref()
                             .map(|a| agent_state(&a.state, None, true))
                             .unwrap_or(AgentState::Seated),
                         agent: occupant.clone(),
                         elsewhere: *elsewhere,
-                        depth: depth + 1,
-                    });
+                        depth,
+                    })
+                };
+                let own = seat(&p.id, depth + 1);
+                // Its lists' seats one step in from its own, which is the
+                // shape `wsp-263` decided: a list's governor answers to this
+                // one. With no seat of its own drawn, they stand where it would.
+                let lists = depth + 1 + usize::from(own.is_some());
+                rows.extend(own);
+                for list in lists_under.get(&p.id).into_iter().flatten() {
+                    rows.extend(seat(list, lists));
                 }
             }
 
@@ -2112,7 +2138,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
 
             walk(
                 index, Some(&p.id), depth + 1, rows, counts, live, view, tasks, loose, interesting,
-                agent_for_task, seats, unfinished, shown_counts,
+                agent_for_task, seats, lists_under, unfinished, shown_counts,
             );
 
             // Then the panes that resolve here but are working on nothing
@@ -2164,6 +2190,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         &interesting,
         &agent_for_task,
         &seats,
+        &lists_under,
         &unfinished,
         &shown_counts,
     );
@@ -3923,6 +3950,47 @@ mod tests {
             ),
             other => panic!("no heading above the agent: {other:?}"),
         }
+    }
+
+    /// `wsp-263`: a list's seat is drawn one step in from its home project's
+    /// seat — it used to be drawn nowhere, having no parent to be drawn under.
+    /// Its home here is read off its member, which stands in `render`.
+    #[test]
+    fn a_lists_seat_is_drawn_under_the_seat_of_the_project_it_stands_in() {
+        let env = crate::util::isolated("panel-list-seat");
+        let store = crate::store::Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_task(&task("render-001", Some("render"), "todo")).unwrap();
+        let mut w = crate::model::Worklist::new("tonight", "tonight");
+        w.set_groups(&[crate::model::Group { members: vec!["render-001".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+
+        let mut snap = tree();
+        snap.worklists = crate::worklist::listing(&store, vec![w]);
+        snap.governors.insert("render".to_string(), serde_json::json!({"workspace": "w1", "pane": "w1:p1"}));
+        snap.governors.insert("tonight".to_string(), serde_json::json!({"workspace": "w2", "pane": "w2:p1"}));
+        for (pane, ws) in [("w1:p1", "w1"), ("w2:p1", "w2")] {
+            snap.panes.push(AgentRef {
+                pane: pane.to_string(),
+                workspace: ws.to_string(),
+                state: "idle".to_string(),
+                agent: true,
+                ..Default::default()
+            });
+        }
+
+        let ui = collect(&snap, &View::default());
+        let seats: Vec<(&str, usize)> = ui
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Seat { project, depth, agent, .. } if agent.is_some() => Some((project.as_str(), *depth)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seats.len(), 2, "both seats drawn: {seats:?}");
+        assert_eq!(seats[0].0, "render");
+        assert_eq!(seats[1], ("tonight", seats[0].1 + 1), "the list's under the project's: {seats:?}");
     }
 
     /// Two agents in the custodian's room, and only one of them draws as the

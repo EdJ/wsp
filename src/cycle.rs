@@ -365,6 +365,9 @@ pub(crate) fn poke_task(store: &Store, id: &str, verb: &str) {
 /// After `go`, `hold`, `park` or `resume` on a list: tell whoever governs it, and take the steps
 /// the new position owes. `passed` is the barrier crossed, if one was.
 pub(crate) fn poke_list(store: &Store, list: &str, event: &str, passed: Option<usize>) {
+    if let Some((w, text)) = store.worklist(list).and_then(|w| heard(&w, event, passed).map(|t| (w, t))) {
+        tell_above(store, &w, &text);
+    }
     let n = passed.map(|n| n.to_string()).unwrap_or_default();
     let mut argv = vec!["worklist", "advance", list, "--event", event];
     if passed.is_some() {
@@ -2490,7 +2493,9 @@ fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
 /// answer is `None` and filling it would put a seat on the list — changing the
 /// shape of a run that was governed from its project's seat, and giving a
 /// project two governors for one question. Since `wsp-202` that shape is only a
-/// list run by hand's: a list wsp runs is its own post and nothing above it.
+/// list run by hand's: a list wsp runs is its own post, and nothing above it governs
+/// the run — its home project's seat is above it only for what it cannot
+/// answer (`wsp-263`, [`crate::cmd_govern::seat_above`]).
 ///
 /// So the chain is walked once and read two ways, and the scope this names is
 /// the one whose record the repair will look at. It is [`governing_scope`] with
@@ -2572,6 +2577,73 @@ pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
     // `wsp flag` with no pane behind it, which recorded the run as a person
     // and put every barrier pass on the person's panel (`wsp-272`).
     let _ = crate::cmd_agent::notice(store, &first, text);
+}
+
+/// The line the governor above a list hears for one of its events, or `None`
+/// for an event it is not told — `drop` is composing, not running.
+///
+/// One line and a pointer, never the verdict in full: the list's own governor
+/// is the one that acts on a barrier, and the project's is being kept current,
+/// so a sentence it has to read twice is a context read spent on somebody
+/// else's decision.
+fn heard(w: &Worklist, event: &str, passed: Option<usize>) -> Option<String> {
+    let id = &w.id;
+    let of = w.groups().len();
+    Some(match (event, passed) {
+        ("go", Some(n)) => {
+            let verdict = w.groups().get(n - 1).map(|g| util::truncate(g.verdict.trim(), 160)).unwrap_or_default();
+            format!("The {id} list passed barrier {n} of {of}: {verdict} · wsp worklist show {id}")
+        }
+        ("go", None) => format!("The {id} list is running ({of} groups) · wsp worklist show {id}"),
+        ("hold", _) => format!("The {id} list was held at its barrier · wsp worklist show {id} says why"),
+        ("followup", _) => {
+            format!("The {id} list's barrier holds pending follow-ups, which wsp runs first · wsp worklist show {id}")
+        }
+        ("park", _) => format!("The {id} list was parked: nothing starts until it is resumed · wsp worklist show {id}"),
+        ("resume", _) => format!("The {id} list was resumed where it was parked · wsp worklist show {id}"),
+        _ => return None,
+    })
+}
+
+/// One line to the governor of the project a list stands in: **the project's
+/// governor hears its lists** (`wsp-263`). A barrier passed, held or followed
+/// up, a list started, parked, resumed or done — so the custodian knows what
+/// its lists are doing without polling them, now that a list's seat answers
+/// to it ([`crate::cmd_govern::seat_above`]).
+///
+/// Spooled, like everything that reaches a seat, so a busy custodian hears it
+/// on its next idle rather than having it typed over a turn. Recorded rather
+/// than said under `cfg(test)`, as [`tell`] is; [`hand_it_up`] is the half that
+/// decides, and is driven on its own.
+pub(crate) fn tell_above(store: &Store, w: &Worklist, text: &str) {
+    if cfg!(test) {
+        #[cfg(test)]
+        tests::HEARD.with(|s| s.borrow_mut().push(text.to_string()));
+        return;
+    }
+    if let Some(scope) = hand_it_up(store, w, text) {
+        stamp(&format!("told {scope}, above {}: {}", w.id, util::truncate(text, 120)));
+    }
+}
+
+/// The scope [`tell_above`] said `text` to, or `None` where nobody above the
+/// list is seated — the person reads a list on the panel, and a line to
+/// everyone about every barrier is the noise `wsp-272` took out.
+///
+/// **Not the seat that already heard it.** A list run by hand from its
+/// project's seat is governed by that seat, and [`tell`] has given it the whole
+/// sentence; and a custodian that typed the verb itself does not need its own
+/// words back.
+pub(crate) fn hand_it_up(store: &Store, w: &Worklist, text: &str) -> Option<String> {
+    let above = crate::cmd_govern::seat_above_in(store, &w.id)?;
+    if governing_scope(store, w).as_deref() == Some(above.scope.as_str()) {
+        return None;
+    }
+    if crate::cmd_message::caller(store) == above.scope {
+        return None;
+    }
+    crate::wake::say(store, &above.scope, text, None);
+    Some(above.scope)
 }
 
 /// The half of [`tell`] that decides where a verdict goes, and whether a post
@@ -2744,6 +2816,9 @@ pub(crate) mod tests {
         pub(crate) static ENDED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         pub(crate) static TOLD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         pub(crate) static ROTATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// What the governor above a list was told (`wsp-263`) — distinct from
+        /// `TOLD`, the list's own seat, as `MEMBER_TOLD` is.
+        pub(crate) static HEARD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// Set, and every start in this thread fails with it.
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.

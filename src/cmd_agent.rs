@@ -4366,11 +4366,37 @@ fn wip_queues(w: &Wip) -> (Vec<&Task>, Vec<&Task>, usize) {
     )
 }
 
+/// Whom a governor's seat answers to, for its `wip --json` row: `answers_to`,
+/// and `answers_to_empty` naming the home when nobody on its walk is seated.
+///
+/// **A list's governor answers to the governor of the project the list stands
+/// in** (`wsp-263`, amending `wsp-247`'s draft, which had it `null` under
+/// `wsp-202`): the nearest seat on its home's walk, which is where its stalls
+/// and its own questions go. A project's governor stays `null` — the census
+/// is a tree of lists under projects, and a project custodian is a root of it.
+///
+/// Governor rows only, until `wsp-247` gives every row the field: a key that
+/// said `null` on a member's row would say it answers to nobody.
+fn governor_answers_to(w: &Wip, role: &Role, homes: &BTreeMap<String, String>) -> Option<(Value, Value)> {
+    let Role::Governor { list, id } = role else { return None };
+    if !*list {
+        return Some((Value::Null, Value::Null));
+    }
+    let home = homes.get(id).map(String::as_str);
+    let above = crate::cmd_govern::seat_above(&w.governors, &w.index, id, home).map(|s| s.scope);
+    Some(match above {
+        Some(scope) => (json!(scope), Value::Null),
+        None => (Value::Null, json!(home)),
+    })
+}
+
 fn wip_json(w: &Wip) -> serde_json::Value {
     let rows = wip_rows(w);
     let (blocked, in_review, inbox) = wip_queues(w);
+    let homes = crate::worklist::homes(w.lists.iter().filter(|l| w.governors.contains_key(&l.id)), &w.tasks, &w.index);
     json!({
-        "agents": rows.iter().map(|r| json!({
+        "agents": rows.iter().map(|r| {
+            let mut row = json!({
             "project": r.project, "task": r.task, "task_id": r.task_id,
             "pane": r.pane, "workspace": r.workspace, "state": r.state,
             "turning": r.turning, "needs_you": r.needs_you, "seat": r.seat,
@@ -4381,7 +4407,13 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "members_waiting": r.seat.as_ref().map(|_| r.members_waiting),
             "kind": r.runs.kind, "model": r.runs.model, "effort": r.runs.effort,
             "role": r.role.json(),
-        })).collect::<Vec<_>>(),
+            });
+            if let Some((to, empty)) = governor_answers_to(w, &r.role, &homes) {
+                row["answers_to"] = to;
+                row["answers_to_empty"] = empty;
+            }
+            row
+        }).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
         "waiting": rows.iter().filter(|r| r.waiting.is_some()).count(),
@@ -7900,6 +7932,42 @@ mod tests {
         assert_eq!(row.task, "gpui-migration · barrier 4");
         assert!(row.task_id.is_empty(), "it holds no row");
         assert_eq!(row.project, "wsp");
+    }
+
+    /// `wsp-263`, amending `wsp-247`: a list's governor answers to the
+    /// governor of the project the list stands in — the nearest seat on its
+    /// home's walk — and a project's governor to nobody. With nobody seated on
+    /// the walk it is `null`, and `answers_to_empty` names the home so the
+    /// chrome can say "no governor seated" rather than guess. Governor rows
+    /// only: a member's row would read a `null` as answering to nobody.
+    #[test]
+    fn wip_json_says_a_list_governor_answers_to_its_projects_governor() {
+        let mut w = wip_world();
+        w.tasks.push(wip_task("data-001", "first of the run", Some("data"), "doing"));
+        let mut data = crate::model::Project::new("data");
+        data.parent = Some("wsp".into());
+        w.index = Index::new(vec![crate::model::Project::new("wsp"), data]);
+        let mut list = crate::model::Worklist::new("tonight", "the list");
+        list.set_groups(&crate::model::parse_groups("- 1  data-001\n"));
+        list.set_status(crate::model::WorklistStatus::Running);
+        w.lists = vec![list];
+        w.governors.insert("wsp".into(), json!({ "workspace": "w5", "pane": "w5:p1" }));
+        w.governors.insert("tonight".into(), json!({ "workspace": "w6", "pane": "w6:p1" }));
+        for seat in ["w5:p1", "w6:p1"] {
+            w.agents.push(seated_agent(seat, "working", seat));
+        }
+        let row = |j: &Value, pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap().clone();
+
+        let j = wip_json(&w);
+        assert_eq!(row(&j, "w6:p1")["answers_to"], "wsp", "its home is data, unseated, and wsp is above it");
+        assert_eq!(row(&j, "w6:p1")["answers_to_empty"], Value::Null);
+        assert_eq!(row(&j, "w5:p1")["answers_to"], Value::Null, "a project's governor answers to nobody in the census");
+        assert!(row(&j, "w1:p1").get("answers_to").is_none(), "and a member's row waits for wsp-247");
+
+        w.governors.remove("wsp");
+        let j = wip_json(&w);
+        assert_eq!(row(&j, "w6:p1")["answers_to"], Value::Null, "nobody seated on the walk");
+        assert_eq!(row(&j, "w6:p1")["answers_to_empty"], "data", "and the home it would answer to");
     }
 
     /// `wsp-246`. Every row says what its seat is, typed, so a reader placing

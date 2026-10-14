@@ -2109,7 +2109,7 @@ pub const WORKLIST_PROSE: [&str; 2] = ["Overview", "Decisions"];
 /// was the only thing that could hold a set, and it cost 26 tasks a move into
 /// it and a move back out.
 ///
-/// Frontmatter is four scalars, which is all `fm` takes, and the groups are in
+/// Frontmatter is scalars, which is all `fm` takes, and the groups are in
 /// the body: a list of groups is richer than `key: scalar`, so this is forced
 /// rather than chosen. It is safe there for the reason `## Decisions` is safe
 /// and the `batch` handbook was not — that table described a structure held
@@ -2131,6 +2131,17 @@ pub struct Worklist {
     /// removed group's id is never given to the next one. `0` on a list
     /// from before ids. See [`number`].
     pub groups_made: u32,
+    /// `project:` — the list's home: the project whose governor its own seat
+    /// answers to (`wsp-263`). Stated with `-p` on `new` or `edit --project`;
+    /// when it is not, [`crate::worklist::home`] reads one off the members and
+    /// then off `made_in`. A list still *references* its members wherever
+    /// they live — a home is where its seat stands, not where its work is.
+    pub project: Option<String>,
+    /// `made_in:` — the project the seat that ran `new` stood in, written when
+    /// no `-p` was given. The last of the three answers to "where does this
+    /// list stand", after the stated one and the members' own, because at
+    /// `new` there are no members to ask and later there may be.
+    pub made_in: Option<String>,
     pub body: String,
 }
 
@@ -2143,6 +2154,8 @@ impl Worklist {
             status_raw: WorklistStatus::Draft.as_str().to_string(),
             created: util::now_iso(),
             groups_made: 0,
+            project: None,
+            made_in: None,
             body: String::new(),
         }
     }
@@ -2172,6 +2185,8 @@ impl Worklist {
             status_raw: doc.opt("status").unwrap_or_else(|| "draft".into()),
             created: doc.str("created"),
             groups_made: doc.opt("groups_made").and_then(|n| n.trim().parse().ok()).unwrap_or(0),
+            project: doc.opt("project").filter(|p| !p.trim().is_empty()),
+            made_in: doc.opt("made_in").filter(|p| !p.trim().is_empty()),
             body: doc.body.clone(),
         }
     }
@@ -2187,6 +2202,12 @@ impl Worklist {
         }
         if self.groups_made > 0 {
             d.set_str("groups_made", &self.groups_made.to_string());
+        }
+        if let Some(p) = &self.project {
+            d.set_str("project", p);
+        }
+        if let Some(p) = &self.made_in {
+            d.set_str("made_in", p);
         }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();

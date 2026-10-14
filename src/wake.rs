@@ -2186,6 +2186,65 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         );
     }
 
+    /// A list `demo`'s members stand in, run by wsp, with its own seat filled in
+    /// `w2:p1` — the shape `wsp-263` puts under `demo`'s governor.
+    fn a_list_under_demo(store: &Store) -> crate::model::Worklist {
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group {
+            members: vec!["wsp-146".into()],
+            agent: "claude".into(),
+            ..crate::model::Group::default()
+        }]);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("run", json!({ "workspace": "w2", "pane": "w2:p1" }));
+        w
+    }
+
+    /// **A list governor's own question reaches its project's governor**
+    /// (`wsp-263`). The walk for a member of the list reaches the list's seat,
+    /// which is the asker; it used to go to the person from there, past the
+    /// custodian of the project the list was run for. Now it goes one step on.
+    #[test]
+    fn a_list_governors_own_question_lands_on_its_projects_governor() {
+        use crate::place::State;
+
+        let (_env, store, _fake) = a_governor("wake-list-asks", State::Working);
+        a_list_under_demo(&store);
+        std::env::set_var("HERDR_PANE_ID", "w2:p1");
+        let asked = Args::synth("ask", &["wsp-146", "the barrier wants a decision I cannot take"], &[]);
+        assert_eq!(crate::cmd_message::ask(&store, &asked), 0);
+        std::env::set_var("HERDR_PANE_ID", "w1:p2");
+
+        assert_eq!(spool_of(&store, "demo").depth(), 1, "the project's governor holds it");
+        assert_eq!(spool_of(&store, "run").depth(), 0, "and the asker is not woken on its own words");
+        let q = crate::message::raised(&store).pop().expect("the question");
+        assert_eq!(q.for_seat.as_deref(), Some("demo"), "and it waits on demo's answer, not the person's");
+        assert!(!q.for_person);
+    }
+
+    /// **The project's governor hears its lists** — the half of
+    /// [`crate::cycle::tell_above`] that decides, driven: a line in `demo`'s
+    /// spool and none in the list's. And not twice for a list run by hand from
+    /// `demo`'s own seat, which `cycle::tell` has already told in full.
+    #[test]
+    fn a_lists_news_goes_to_the_governor_above_it_and_not_to_the_one_already_told() {
+        use crate::place::State;
+
+        let (_env, store, _fake) = a_governor("wake-list-heard", State::Working);
+        let w = a_list_under_demo(&store);
+        assert_eq!(crate::cycle::hand_it_up(&store, &w, "The run list passed barrier 1 of 1").as_deref(), Some("demo"));
+        assert_eq!(spool_of(&store, "demo").depth(), 1);
+        assert_eq!(spool_of(&store, "run").depth(), 0);
+
+        let mut by_hand = crate::model::Worklist::new("byhand", "by hand");
+        by_hand.set_status(crate::model::WorklistStatus::Running);
+        by_hand.set_groups(&[crate::model::Group { members: vec!["wsp-146".into()], ..crate::model::Group::default() }]);
+        store.save_worklist(&by_hand).unwrap();
+        assert_eq!(crate::cycle::hand_it_up(&store, &by_hand, "held"), None, "demo governs it, and heard it from `tell`");
+        assert_eq!(spool_of(&store, "demo").depth(), 1);
+    }
+
     /// **What a verb is told, and what `wsp-146` made it say.**
     ///
     /// Two things a receipt has never had to carry. *Where it went* — a verb

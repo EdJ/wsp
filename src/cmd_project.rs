@@ -198,9 +198,11 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
     }
 
     let p = Paint::new();
+    let seats = seat_lines(store, &p);
     fn walk(
         index: &Index,
         counts: &std::collections::BTreeMap<String, resolve::Counts>,
+        seats: &std::collections::BTreeMap<String, Vec<String>>,
         parent: Option<&str>,
         prefix: &str,
         paint: &Paint,
@@ -235,7 +237,10 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
             println!("{prefix}{branch}{}{}   {}", paint.bold(&kid.id), own_tags, badge);
 
             let next_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
-            walk(index, counts, Some(&kid.id), &next_prefix, paint);
+            for line in seats.get(&kid.id).into_iter().flatten() {
+                println!("{next_prefix}{line}");
+            }
+            walk(index, counts, seats, Some(&kid.id), &next_prefix, paint);
         }
     }
 
@@ -256,7 +261,10 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
             p.dim(&format!("  [{}]", root.tags.join(" ")))
         };
         println!("{}{}   {}", p.bold(&root.id), tags, badge.join(p.dim(" · ").as_str()));
-        walk(&index, &counts, Some(&root.id), "", &p);
+        for line in seats.get(&root.id).into_iter().flatten() {
+            println!("{line}");
+        }
+        walk(&index, &counts, &seats, Some(&root.id), "", &p);
         if i + 1 < roots.len() {
             println!();
         }
@@ -267,6 +275,40 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
         println!("\n{}   {} open", p.bold("(inbox)"), inbox.open);
     }
     0
+}
+
+/// The seats `wsp tree` draws under each project, as lines keyed on it: the
+/// project's own post, and under it the posts of the lists that stand in it
+/// (`wsp-263`) — a list's seat answers to its home project's governor, and the
+/// tree is where a person looks for the shape of who answers to whom. A list
+/// post nobody holds is left out, as the panel leaves it: a list nobody is
+/// running is a plan, not a vacancy.
+fn seat_lines(store: &Store, p: &Paint) -> std::collections::BTreeMap<String, Vec<String>> {
+    let governors = store.governors();
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    if governors.is_empty() {
+        return out;
+    }
+    let who = |s: &crate::cmd_govern::Slot| match (&s.occupant, s.elsewhere()) {
+        (Some(o), _) => p.dim(&o.pane),
+        (None, true) => p.dim("elsewhere"),
+        (None, false) => p.dim("empty"),
+    };
+    let slots = crate::cmd_govern::slots(&governors);
+    let lists: Vec<(&crate::cmd_govern::Slot, String)> = slots
+        .iter()
+        .filter(|s| s.filled() || s.elsewhere())
+        .filter_map(|s| Some((s, crate::worklist::home_of_scope(store, &s.scope)?)))
+        .collect();
+    for s in slots.iter().filter(|s| store.worklist(&s.scope).is_none()) {
+        out.entry(s.scope.clone()).or_default().push(format!("{} {}  {}", p.cyan("◆"), crate::cmd_govern::governor_of(&s.scope), who(s)));
+    }
+    for (s, home) in lists {
+        let indent = if governors.contains_key(&home) { "  └ " } else { "" };
+        let lines = out.entry(home).or_default();
+        lines.push(format!("{indent}{} {}  {}", p.cyan("◇"), crate::cmd_govern::governor_of(&s.scope), who(s)));
+    }
+    out
 }
 
 /// The DECISIONS block of [`show`], as lines. Split out to be asserted on: the

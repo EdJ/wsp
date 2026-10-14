@@ -1313,6 +1313,113 @@ pub struct Placing {
     pub of: usize,
 }
 
+/// Where a list stands: the project whose governor its own seat answers to,
+/// and which of the three answers it came from.
+///
+/// **A list sits under its project's governor, not beside it** — Ed,
+/// 2026-10-09, `wsp-263` (compound-407 d1 Q4). `wsp-202` made a list wsp runs
+/// its own post and left nothing above it, so a stalled or asking list seat
+/// went straight to everyone, past the custodian of the project the work was
+/// for; Ed named that flat shape as a cause of coordination problems. The post
+/// is still the list's own — this is only where it *answers to*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Home {
+    pub project: String,
+    pub from: HomeFrom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeFrom {
+    /// `project:` on the list: `new -p` or `edit --project`.
+    Stated,
+    /// The deepest project every member stands in, itself or under it.
+    Members,
+    /// `made_in:` — the project the seat that made the list stood in.
+    Maker,
+}
+
+impl HomeFrom {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HomeFrom::Stated => "stated",
+            HomeFrom::Members => "members",
+            HomeFrom::Maker => "maker",
+        }
+    }
+}
+
+/// A list's home, with each member's project read through `project_of` —
+/// `None` for a member nobody can find, which is passed over, and
+/// `Some(None)` for one in no project, which no project is shared by.
+///
+/// **Read, not written, for the members' answer.** A list with no stated home
+/// follows its members as they are added, and every list made before this row
+/// — none of which says `project:` — has one the moment it is read. Writing it
+/// at `add` would freeze the first member's answer into a list that later
+/// grew past it.
+///
+/// "Every member shares" in a hierarchy is the deepest project that is the
+/// member's own or above it, for every member: a list across `wsp/render` and
+/// `wsp/data` stands in `wsp`, which is the one custodian that answers for
+/// both.
+pub fn home_with(w: &Worklist, index: &Index, project_of: impl Fn(&str) -> Option<Option<String>>) -> Option<Home> {
+    if let Some(p) = &w.project {
+        return Some(Home { project: p.clone(), from: HomeFrom::Stated });
+    }
+    let mut shared: Option<Vec<String>> = None;
+    for m in w.groups().iter().flat_map(|g| g.members.clone()) {
+        let Some(project) = project_of(&m) else { continue };
+        let Some(project) = project else {
+            shared = Some(Vec::new());
+            break;
+        };
+        let chain: Vec<String> = std::iter::once(project.clone()).chain(index.ancestors(&project)).collect();
+        shared = Some(match shared {
+            None => chain,
+            Some(so_far) => so_far.into_iter().filter(|p| chain.contains(p)).collect(),
+        });
+    }
+    if let Some(p) = shared.and_then(|c| c.into_iter().next()) {
+        return Some(Home { project: p, from: HomeFrom::Members });
+    }
+    w.made_in.as_ref().map(|p| Home { project: p.clone(), from: HomeFrom::Maker })
+}
+
+/// [`home_with`] off the store: each member's own file, and the archive for a
+/// member that has been archived since — a list that has run is mostly those.
+/// The archive is read once, and only if a member is not live.
+pub fn home(store: &Store, w: &Worklist) -> Option<Home> {
+    let index = Index::new(store.projects());
+    let archive = std::cell::OnceCell::new();
+    home_with(w, &index, |id| {
+        let t = store.task(id).or_else(|| {
+            archive.get_or_init(|| store.archived_tasks()).iter().rev().find(|t: &&Task| t.id == id).cloned()
+        })?;
+        Some(t.project)
+    })
+}
+
+/// The home of a scope that is a list, and `None` for one that is not —
+/// so a caller holding only a governor's scope can ask without knowing which
+/// of the one key space's two kinds it holds.
+pub fn home_of_scope(store: &Store, scope: &str) -> Option<String> {
+    store.worklist(scope).and_then(|w| home(store, &w)).map(|h| h.project)
+}
+
+/// Every list's home, of lists and tasks already in hand — the watch's tick
+/// and `wip` have both read them, and a member's project is all this asks of
+/// a task. Live tasks only: a list that routes is a list whose members are.
+pub fn homes<'a>(lists: impl IntoIterator<Item = &'a Worklist>, tasks: &[Task], index: &Index) -> BTreeMap<String, String> {
+    let by_id: HashMap<&str, &Option<String>> = tasks.iter().map(|t| (t.id.as_str(), &t.project)).collect();
+    lists
+        .into_iter()
+        .filter_map(|w| {
+            let h = home_with(w, index, |id| by_id.get(id).map(|p| (*p).clone()))?;
+            Some((w.id.clone(), h.project))
+        })
+        .collect()
+}
+
 /// Every task in a *running* worklist, and where each one sits.
 ///
 /// One read of `worklists/`, asked per task afterwards. Routing wants it once

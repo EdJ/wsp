@@ -2203,6 +2203,7 @@ fn stalled_seats(
     lists: &worklist::Running,
     governors: &BTreeMap<String, Value>,
     index: &Index,
+    homes: &BTreeMap<String, String>,
 ) -> Vec<Signal> {
     // Which seats have something moving under them, read off the same map the
     // levels above were addressed from — so *my scope* means one thing in both.
@@ -2297,7 +2298,7 @@ fn stalled_seats(
         // the first seat it finds, which here is the one that failed;
         // [`cmd_govern::seat_above`] is the same walk started one step past it,
         // terminating at [`EVERYONE`].
-        let above = cmd_govern::seat_above(governors, index, scope)
+        let above = cmd_govern::seat_above(governors, index, scope, homes.get(scope).map(String::as_str))
             .map(|s| s.scope)
             .unwrap_or_else(|| EVERYONE.to_string());
         let detail = format!(
@@ -2703,6 +2704,9 @@ impl Source for Poll<'_> {
                 &lists,
                 &wip.governors,
                 &wip.index,
+                // Only the lists that have a seat to stall: a home is a walk
+                // of every member, and most lists on a machine are long done.
+                &worklist::homes(wip.lists.iter().filter(|l| wip.governors.contains_key(&l.id)), &wip.tasks, &wip.index),
             ));
         }
 
@@ -5599,6 +5603,7 @@ mod tests {
                 &lists,
                 &self.governors,
                 &self.index,
+                &worklist::homes(&self.store.worklists(), &tasks, &self.index),
             )
         }
     }
@@ -5672,13 +5677,29 @@ mod tests {
         assert_eq!(up[0].to, "wsp", "addressed above its own level, never to itself");
     }
 
-    /// And it terminates at *everyone*, which is not a fallback: `seat_for`'s
-    /// chain is `list, project, ancestors`, so the list step is the front of it
-    /// and what lies past a list is the project chain of one member. A list
-    /// cutting across projects — which is what a list is for — has as many of
-    /// those as it has members, so there is no single scope above a run.
+    /// **A list's seat answers to its home project's governor** (`wsp-263`).
+    /// It used to escalate to everyone, on the argument that a list across
+    /// projects has no single scope above it; it has one — its home — and a
+    /// list governor gone quiet is the project custodian's to hear first.
     #[test]
-    fn a_stalled_worklist_seat_escalates_to_everyone_because_a_list_has_nothing_above_it() {
+    fn a_stalled_list_seat_goes_to_the_governor_of_the_project_it_stands_in() {
+        let night = Night::new("list-above")
+            .projects(&[("render", Some("wsp")), ("wsp", None)])
+            .task("r-1", "render", Status::Doing)
+            .running("tonight", &["r-1"])
+            .seat("tonight", "w1:p1", false)
+            .seat("wsp", "w2:p1", true);
+
+        let up = night.read();
+        assert_eq!(up.len(), 1, "{up:?}");
+        assert_eq!(up[0].subject, "tonight");
+        assert_eq!(up[0].to, "wsp", "its home is render, nobody sits there, and the walk goes on up to wsp");
+    }
+
+    /// And it terminates at *everyone* only when nobody on that walk is seated
+    /// — the person is still the governor of last resort.
+    #[test]
+    fn a_stalled_list_seat_reaches_everyone_only_when_no_seat_above_its_home_is_filled() {
         let night = Night::new("everyone")
             .projects(&[("nightly", None)])
             .task("nightly-1", "nightly", Status::Doing)

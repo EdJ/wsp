@@ -390,26 +390,42 @@ pub fn answering_seat(store: &Store, task: &crate::model::Task) -> Option<Seat> 
 /// address in this tree — at [`crate::cmd_watch::EVERYONE`] when nothing above
 /// is filled. `worklist-041`.
 ///
-/// **A worklist has nothing above it, and that is the walk's shape rather than
-/// a gap.** [`seat_for`]'s chain is `list, project, ancestors(project)`, so the
-/// list step is the *front*: what lies past it is the project chain of one
-/// member, and a list that cuts across projects — which is what a list is for —
-/// has as many of those as it has members. There is no single scope above a
-/// run, so a stalled worklist seat escalates to everybody, which is the honest
-/// answer and is also the loudest one available. A project scope walks
-/// [`Index::ancestors`], and `robustness` stalling reaches `wsp` exactly as a
-/// hand raised in `robustness` would while that seat is away.
+/// **A list's seat answers to its home project's governor** — `wsp-263`, Ed,
+/// 2026-10-09, reversing what this said before: that a list has nothing above
+/// it because a list cutting across projects has as many project chains as it
+/// has members. It has one *home* ([`crate::worklist::home`]): stated, or the
+/// project its members share, or the one it was made in. So `home` is the
+/// list's step past itself, and the walk goes on up that project's ancestors
+/// exactly as a project scope's does. A list with no home still has nothing
+/// above it, and escalates to everybody.
 ///
-/// `ancestors` answers empty for anything it has never heard of, so the
-/// worklist case needs no test of its own: one expression covers both.
-pub fn seat_above(governors: &BTreeMap<String, Value>, index: &Index, scope: &str) -> Option<Seat> {
+/// `home` is a parameter, `None` for a project scope, for the reason
+/// [`seat_for`] takes `list`: this holds no store, and a caller that has the
+/// lists and tasks in hand already ([`crate::worklist::homes`]) asks once.
+/// [`seat_above_in`] is the walk with the reads done for it.
+///
+/// Members' own questions are unchanged: [`seat_for`] still asks the list's
+/// seat first. This is only where the list's seat itself is answered for.
+pub fn seat_above(governors: &BTreeMap<String, Value>, index: &Index, scope: &str, home: Option<&str>) -> Option<Seat> {
     if governors.is_empty() {
         return None;
     }
-    index
-        .ancestors(scope)
-        .into_iter()
-        .find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
+    let walk = match home {
+        Some(h) => std::iter::once(h.to_string()).chain(index.ancestors(h)).collect(),
+        None => index.ancestors(scope),
+    };
+    walk.into_iter().find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
+}
+
+/// [`seat_above`], reading what it needs: the governors, the projects, and the
+/// scope's home if it is a list.
+pub fn seat_above_in(store: &Store, scope: &str) -> Option<Seat> {
+    let governors = store.governors();
+    if governors.is_empty() {
+        return None;
+    }
+    let home = crate::worklist::home_of_scope(store, scope);
+    seat_above(&governors, &Index::new(store.projects()), scope, home.as_deref())
 }
 
 /// The scope this workspace is the custodian of — a project or a worklist — if
@@ -2194,12 +2210,19 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
     let mine: Option<String> = workspace.and_then(|ws| governs(&governors, &seat_query(ws, pane)));
 
     let slots = slots(&governors);
+    // Each list's home, for the slots that are lists (`wsp-263`): the roster
+    // draws a list's post under the project's its seat answers to.
+    let homes: BTreeMap<String, String> =
+        slots.iter().filter_map(|s| Some((s.scope.clone(), crate::worklist::home_of_scope(store, &s.scope)?))).collect();
 
     if args.json() {
         let seats: Vec<Value> = slots
             .iter()
             .map(|s| {
                 json!({
+                    // The project a list's post stands under, and `null` for
+                    // a project's or a list with no home.
+                    "under": homes.get(&s.scope),
                     // `project` for the reason the receipt above keeps it: the
                     // key is what a reader was written against and the value is
                     // now a scope.
@@ -2222,11 +2245,30 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
     }
     // Vacant slots draw too, and that is the point of the list: a position
     // nobody is standing in is the row you are reading this to find.
-    for s in &slots {
+    //
+    // A list's post is drawn under the first post on its walk up — its home
+    // project's, or the nearest above that — which is the one it answers to,
+    // filled or not; with none, at the top. Its home is named whenever it is
+    // not the post it hangs from.
+    let row = |s: &Slot, indent: &str, tail: String| {
         let here = mine.as_deref() == Some(s.scope.as_str());
         let mark = if here { p.cyan("▣") } else { p.dim("·") };
         let who = who_is_in(store, &governors, s);
-        println!("{} {}  {}", mark, p.bold(&s.scope), p.dim(&who));
+        println!("{indent}{} {}  {}{}", mark, p.bold(&s.scope), p.dim(&who), p.dim(&tail));
+    };
+    let post_above = |s: &Slot| -> Option<String> {
+        let home = homes.get(&s.scope)?;
+        std::iter::once(home.clone()).chain(index.ancestors(home)).find(|up| governors.contains_key(up))
+    };
+    let under = |s: &Slot, post: Option<&str>| match homes.get(&s.scope) {
+        Some(h) if post != Some(h.as_str()) => format!(" · under {h}"),
+        _ => String::new(),
+    };
+    for s in slots.iter().filter(|s| post_above(s).is_none()) {
+        row(s, "", under(s, None));
+        for l in slots.iter().filter(|l| post_above(l).as_deref() == Some(s.scope.as_str())) {
+            row(l, "  └ ", under(l, Some(&s.scope)));
+        }
     }
     if mine.is_none() {
         // Where a hand raised *here* would go. The question an agent asks is
@@ -2318,6 +2360,21 @@ pub(crate) mod tests {
         let g = seated(&[("wsp", "w9")]);
         let s = seat_for(&g, &tree(), None, Some("data")).unwrap();
         assert_eq!(s.scope, "wsp", "past robustness, which has nobody in it");
+    }
+
+    /// `wsp-263`: the seat above a list is its home project's, or the nearest
+    /// seated one above that — the same walk a project scope makes from its
+    /// parent — and the list's own seat is never on it. A list with no home
+    /// has nothing above it.
+    #[test]
+    fn the_seat_above_a_list_is_its_home_projects_or_the_nearest_above_that() {
+        let g = seated(&[("tonight", "w3"), ("robustness", "w1"), ("wsp", "w9")]);
+        assert_eq!(seat_above(&g, &tree(), "tonight", Some("data")).unwrap().scope, "robustness");
+        assert_eq!(seat_above(&g, &tree(), "tonight", Some("robustness")).unwrap().scope, "robustness", "its home itself first");
+        let g = seated(&[("tonight", "w3"), ("wsp", "w9")]);
+        assert_eq!(seat_above(&g, &tree(), "tonight", Some("data")).unwrap().scope, "wsp", "past an empty home");
+        assert_eq!(seat_above(&g, &tree(), "tonight", None), None, "no home, nothing above");
+        assert_eq!(seat_above(&g, &tree(), "robustness", None).unwrap().scope, "wsp", "a project's is unchanged");
     }
 
     /// The normal state, and the one that has to stay cheap: no seat anywhere
