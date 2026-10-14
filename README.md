@@ -2897,6 +2897,15 @@ three stands nowhere, and `worklist show` says so.
   list governor's row `answers_to` — the seat it answers to, or `null` with
   `answers_to_empty` naming the home when nobody there is seated — and a
   project governor's `answers_to` is `null`.
+- **Read:** `wsp worklist show --json` gives the list's home as
+  `worklist.project` — `{id, from}`, where `id` is the project and `from` says
+  which of the three answered: `stated`, `members` or `maker` (off `made_in:`)
+  — or `null` when the list stands nowhere. The verbs that print the list
+  after changing it (`new`, `add`, `mv`, `group`, …) carry the same field, and
+  `worklist edit --project --json` prints `{worklist, project}` with it.
+  `wsp govern --json` gives each of its `seats` an `under`: the project a
+  list's slot is drawn under, and `null` on a project's slot or a list with no
+  home.
 
 The record is keyed on the **project**, which is the one place this differs
 from the pins, mandates and claims beside it. Those are facts about a workspace
