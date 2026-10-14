@@ -1182,12 +1182,9 @@ fn undated(line: &str) -> &str {
 
 /// One dated line in `cycle.log`.
 ///
-/// Through [`crate::cycle::stamp`], so a repair's lines and the run steps' are
-/// in one file in one order — and **recorded in memory under `cfg(test)`**,
-/// which is the only reason the tests below can assert on what was said. A
-/// repair whose whole contract is "says why, in a file" cannot be tested by
-/// reading a file the code path deliberately does not write when there is no
-/// terminal to write it to.
+/// Through [`crate::cycle::log_line`], so a repair's lines and the run steps' are
+/// in one file in one order — and **recorded in memory under `cfg(test)`** as
+/// well as written, so a test can read what was said from either.
 
 
 #[cfg(test)]
@@ -1250,7 +1247,7 @@ impl Seats for Absent {
 
     /// What `cycle.log` was told, on either path.
     ///
-    /// **One record and not two.** `cycle::stamp` is the only writer — the
+    /// **One record and not two.** `cycle::log_line` is the only writer — the
     /// reconciler logs through it rather than opening the file itself — so a
     /// repair's lines and the run steps' lines come out of one list in one
     /// order, and a test reading "what did the run say" reads both.

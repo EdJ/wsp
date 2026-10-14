@@ -34,7 +34,7 @@
 //! the step is not taken again while it is there, and the step after waits
 //! [`AFTER`] from its date. Not the member's `## Log`, which every future spawn
 //! on the row is handed, and which a check has none of. The lines are written
-//! with [`crate::cycle::log_line`] and never through stdout, because from the
+//! with [`crate::cycle::log_line`], which writes the file whatever stdout is, because from the
 //! daemon's tick stdout is `daemon.log` and a record written there is a record
 //! this would never find — every tick would press again.
 //!

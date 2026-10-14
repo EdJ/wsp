@@ -228,8 +228,7 @@ impl Seats for Fleet {
     /// **The store is not a parameter**, and that is the one thing here worth
     /// stating: this overrule logs, and logging means naming the store whose
     /// `cycle.log` the line goes in. [`Seats::state`] carries only the seat, so
-    /// the line goes through [`stamp`] — stdout — which for the daemon is
-    /// launchd's log. The overrule's own line is therefore said by
+    /// there is no [`log_line`] to call here. The overrule's own line is therefore said by
     /// [`crate::repair`], which has the store and says it once per pass anyway.
     fn state(&self, seat: &str) -> Option<State> {
         let seat_id = Seat::new(seat);
@@ -417,7 +416,7 @@ pub(crate) fn launch_out(store: &Store, argv: &[&str]) {
 /// governor is told: the steps themselves are read off the store.
 pub fn advance(store: &Store, args: &Args) -> i32 {
     let named = args.rest.get(1).cloned();
-    stamp(&format!("advance {}", args.rest[1..].join(" ")));
+    log_line(store, &format!("advance {}", args.rest[1..].join(" ")));
 
     // An ending and nothing else: the verb that arranged it poked the run's
     // own step separately, and this process spends most of its life waiting.
@@ -727,13 +726,13 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         let label = crate::verification::seat_label(&member.id);
         if let Some(opened) = open_verifier(store, &member, &on, &gone, &|| gate.admits(&label)) {
             if let Some(seat) = &opened.lost {
-                stamp(&format!(
+                log_line(store, &format!(
                     "{} group {at}: {}'s verifier in {seat} is gone with no verdict — starting another",
                     w.id, member.id
                 ));
             }
             if let Some(seat) = &opened.superseded {
-                stamp(&format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id));
+                log_line(store, &format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id));
                 end_passes(store, seats, &member.id, |p| p.state == crate::verification::State::Superseded);
             }
             if spawn(store, &member.id, &on, Undo::Verifier, (&w.id, &at.to_string())) {
@@ -750,7 +749,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // went looking for the cause in the wrong record (`wsp-142`).
     if all {
         for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
-            stamp(&format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
+            log_line(store, &format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
         }
     }
 
@@ -777,12 +776,12 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 let admit = || gate.admits(&label);
                 if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, &gone, &admit) {
                     if o.retaken {
-                        stamp(&format!("{} group {at}: starting its check again — the last start never arrived", w.id));
+                        log_line(store, &format!("{} group {at}: starting its check again — the last start never arrived", w.id));
                     }
-                    match start_check(&w.id, at, &policy) {
+                    match start_check(store, &w.id, at, &policy) {
                         None => started.push(label),
                         Some(why) => {
-                            stamp(&format!("FAILED spawn the check on {label}: {why}"));
+                            log_line(store, &format!("FAILED spawn the check on {label}: {why}"));
                             failed(store, &w, &label);
                         }
                     }
@@ -791,7 +790,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
             // Said every pass, never silently. `wsp-142`'s lesson is that a
             // no-op which writes nothing is indistinguishable from a stall
             // with no cause, and the cause here is a fact about a pane.
-            Some(waiting) if all => stamp(&format!("{} group {at}: barrier waits: {}", w.id, waiting.join("; "))),
+            Some(waiting) if all => log_line(store, &format!("{} group {at}: barrier waits: {}", w.id, waiting.join("; "))),
             Some(_) => {}
         }
     }
@@ -822,12 +821,12 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         let cap = g.parallelism(None);
         for s in &pos.members {
             if let Some(on) = holds.get(&s.id) {
-                stamp(&format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
+                log_line(store, &format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
                 continue;
             }
             let Some(t) = store.find_task(&s.id) else { continue };
             if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap, &gate) {
-                stamp(&format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
+                log_line(store, &format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
                 if spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string())) {
                     started.push(s.id.clone());
                 } else {
@@ -855,7 +854,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         sent_back_holding(store, &w, at, g);
     }
     if !started.is_empty() {
-        stamp(&format!("{} group {at}: started {}", w.id, started.join(" ")));
+        log_line(store, &format!("{} group {at}: started {}", w.id, started.join(" ")));
     }
     started
 }
@@ -885,8 +884,6 @@ fn say_capped(store: &Store, list: &str, at: usize, cap: Option<usize>, held: Ve
             Some(since) => {
                 now.insert(what, since.clone());
             }
-            // `log_line` and not `stamp`: the daemon's tick takes this step
-            // too, and its stdout is not `cycle.log`.
             None => {
                 log_line(store, &format!(
                     "{list} group {at}: {what} waits — the seat is at its cap of {cap}: {}",
@@ -958,13 +955,13 @@ fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
             }
         })
         .collect();
-    stamp(&format!(
+    log_line(store, &format!(
         "{} group {at}: {} was opened before {} was sent back — the check is told",
         w.id,
         check,
         names.join(", ")
     ));
-    tell_barrier(w, &check, &names);
+    tell_barrier(store, w, &check, &names);
 }
 
 /// The marker a reopened row carries, so the check can be told what changed
@@ -976,7 +973,7 @@ pub(crate) const SENT_BACK: &str = "sent back:";
 /// **`wsp tell` run as a process, for [`crate::cmd_task::reopen`]'s reason**:
 /// its refusals are the answer worth having, and a second implementation here
 /// would be a second answer that could disagree with the verb.
-fn tell_barrier(w: &Worklist, check: &str, members: &[String]) {
+fn tell_barrier(store: &Store, w: &Worklist, check: &str, members: &[String]) {
     let text = format!(
         "The {} run sent {} back after your barrier check {} opened, so the group is not the one you \
          were given. Read `wsp worklist next {}` again before deciding, and if it already holds, \
@@ -1002,7 +999,7 @@ fn tell_barrier(w: &Worklist, check: &str, members: &[String]) {
     {
         Ok(c) => c,
         Err(e) => {
-            stamp(&format!("tell {check}: could not run `wsp tell` ({e})"));
+            log_line(store, &format!("tell {check}: could not run `wsp tell` ({e})"));
             return;
         }
     };
@@ -1011,12 +1008,12 @@ fn tell_barrier(w: &Worklist, check: &str, members: &[String]) {
         let _ = writeln!(to, "{text}");
     }
     match child.wait_with_output() {
-        Ok(o) if o.status.success() => stamp(&format!("told {check}: the group moved under it")),
-        Ok(o) => stamp(&format!(
+        Ok(o) if o.status.success() => log_line(store, &format!("told {check}: the group moved under it")),
+        Ok(o) => log_line(store, &format!(
             "told {check}: not delivered — {}",
             util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)
         )),
-        Err(e) => stamp(&format!("told {check}: not delivered — {e}")),
+        Err(e) => log_line(store, &format!("told {check}: not delivered — {e}")),
     }
 }
 
@@ -1591,9 +1588,9 @@ enum Undo {
 /// a run that has stopped.
 fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &str)) -> bool {
     let verify = matches!(undo, Undo::Verifier);
-    let failed = start(id, policy, owned, verify);
+    let failed = start(store, id, policy, owned, verify);
     let Some(why) = failed else { return true };
-    stamp(&format!("FAILED spawn {}{id}: {why}", if verify { "a verifier on " } else { "" }));
+    log_line(store, &format!("FAILED spawn {}{id}: {why}", if verify { "a verifier on " } else { "" }));
     let saved = store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return false };
         match undo {
@@ -1619,7 +1616,7 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
 }
 
 /// `wsp spawn <id> --agent …`, and its refusal if it refused.
-fn start(id: &str, policy: &Policy, owned: (&str, &str), verify: bool) -> Option<String> {
+fn start(store: &Store, id: &str, policy: &Policy, owned: (&str, &str), verify: bool) -> Option<String> {
     // A test's binary is the harness: record what would have started instead.
     if cfg!(test) {
         #[cfg(test)]
@@ -1638,7 +1635,7 @@ fn start(id: &str, policy: &Policy, owned: (&str, &str), verify: bool) -> Option
         argv.push("--verify".into());
     }
     argv.extend(policy.spawn_flags());
-    stamp(&format!("spawn {}", argv[1..].join(" ")));
+    log_line(store, &format!("spawn {}", argv[1..].join(" ")));
     let child = Command::new(exe)
         .args(&argv)
         .stdin(Stdio::null())
@@ -1658,7 +1655,7 @@ fn start(id: &str, policy: &Policy, owned: (&str, &str), verify: bool) -> Option
 /// <at>`, which names its seat on the entry [`crate::barrier::open`] wrote.
 /// `Some` is why it did not start; the entry is left open with no seat, and
 /// the next step takes it again once it is wedged.
-fn start_check(list: &str, at: usize, policy: &Policy) -> Option<String> {
+fn start_check(store: &Store, list: &str, at: usize, policy: &Policy) -> Option<String> {
     if cfg!(test) {
         #[cfg(test)]
         return tests::SPAWNED.with(|s| {
@@ -1672,7 +1669,7 @@ fn start_check(list: &str, at: usize, policy: &Policy) -> Option<String> {
     };
     let mut argv: Vec<String> = vec!["spawn".into(), list.into(), "--agent".into(), "--check".into(), at.to_string()];
     argv.extend(policy.spawn_flags());
-    stamp(&format!("spawn {}", argv[1..].join(" ")));
+    log_line(store, &format!("spawn {}", argv[1..].join(" ")));
     let child = Command::new(exe).args(&argv).stdin(Stdio::null()).output();
     match child {
         Ok(o) if o.status.success() => None,
@@ -1873,10 +1870,10 @@ fn end_check(store: &Store, list: &str, id: &str) {
         crate::cmd_spawn::wait_for_pane(pane);
     }
     if !store.claims().contains_key(id) {
-        stamp(&format!("{list}: {id} settled its barrier and has already gone — nothing to end"));
+        log_line(store, &format!("{list}: {id} settled its barrier and has already gone — nothing to end"));
         return;
     }
-    stamp(&format!("{list}: {id} settled its barrier and its turn is over — ending it"));
+    log_line(store, &format!("{list}: {id} settled its barrier and its turn is over — ending it"));
     despawn(store, id);
 }
 
@@ -1887,13 +1884,13 @@ fn end_check_seat(store: &Store, list: &str, seat: &str) {
         crate::cmd_spawn::wait_for_pane(seat);
     }
     if crate::barrier::seat_of(store, seat).is_none() {
-        stamp(&format!("{list}: the check in {seat} settled its barrier and has already gone — nothing to end"));
+        log_line(store, &format!("{list}: the check in {seat} settled its barrier and has already gone — nothing to end"));
         return;
     }
-    stamp(&format!("{list}: the check in {seat} settled its barrier and its turn is over — ending it"));
+    log_line(store, &format!("{list}: the check in {seat} settled its barrier and its turn is over — ending it"));
     let ended = despawn_seat(seat);
     if let Err(why) = &ended {
-        stamp(&format!("{list}: the check in {seat} was not ended: {}", util::truncate(why, 200)));
+        log_line(store, &format!("{list}: the check in {seat} was not ended: {}", util::truncate(why, 200)));
     }
     crate::barrier::mark_ended(store, seat, ended.is_ok());
 }
@@ -1975,7 +1972,7 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
         .map(|t| t.id.clone())
         .collect();
     if !standing.is_empty() {
-        stamp(&format!(
+        log_line(store, &format!(
             "{}: {} and nothing left for them to decide — ending {}",
             w.id,
             if settled || running { "has finished barrier checks still standing" } else { "has nothing left in it" },
@@ -2118,12 +2115,12 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
     let claims = store.claims();
     let standing: Vec<String> = ids.iter().filter(|id| claims.contains_key(*id)).cloned().collect();
     if !passes_ended.is_empty() {
-        stamp(&format!("{list} is closing — ended the verifier seat(s) {}", passes_ended.join(" ")));
+        log_line(store, &format!("{list} is closing — ended the verifier seat(s) {}", passes_ended.join(" ")));
     }
     if standing.is_empty() {
         return;
     }
-    stamp(&format!(
+    log_line(store, &format!(
         "{list} is closing over {} that the run opened and left standing — ending {}",
         standing.len(),
         standing.join(" ")
@@ -2170,12 +2167,12 @@ fn stand_down_own_seat(store: &Store, list: &str) {
     crate::cmd_govern::vacate(store, list);
     crate::cmd_govern::mark_stood_down(store, list);
     let Some(seat) = sitting else {
-        stamp(&format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
+        log_line(store, &format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
         return;
     };
     match end_seat_when_idle(store, &seat) {
-        Ok(()) => stamp(&format!("{list} is closing — stood its own seat {seat} down; it is ended once it is not mid-turn")),
-        Err(why) => stamp(&format!(
+        Ok(()) => log_line(store, &format!("{list} is closing — stood its own seat {seat} down; it is ended once it is not mid-turn")),
+        Err(why) => log_line(store, &format!(
             "{list} is closing — stood its own seat {seat} down, but could not arrange its ending: {why}. \
              `wsp despawn --pane {seat} --keep-tree` ends it"
         )),
@@ -2322,11 +2319,11 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
         }
         match outcome {
             Ok(()) => {
-                stamp(&format!("ended {seat}, which verified {member} ({})", p.state.as_str()));
+                log_line(store, &format!("ended {seat}, which verified {member} ({})", p.state.as_str()));
                 ended.push(seat);
             }
             Err(why) => {
-                stamp(&format!("could not end {seat}, which verified {member}: {why} — not tried again"));
+                log_line(store, &format!("could not end {seat}, which verified {member}: {why} — not tried again"));
                 let list = store.find_task(member).and_then(|t| list_of(store, &t));
                 if let Some(w) = list {
                     tell(store, &w, &format!(
@@ -2359,7 +2356,7 @@ pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
                 }
                 let ended = despawn_seat(seat);
                 if let Err(why) = &ended {
-                    stamp(&format!(
+                    log_line(store, &format!(
                         "{} barrier {}: the check in {seat} was not ended: {}",
                         w.id,
                         i + 1,
@@ -2430,8 +2427,8 @@ pub(crate) fn despawned(store: &Store, id: &str) -> Result<(), String> {
     // closed its group leaving five trees behind is a state a governor has to be
     // able to find, and `cycle.log` is where the run's history is read.
     let kept = said.contains("kept") || said.contains("uncommitted");
-    stamp(&format!("despawn {id}: {said}"));
-    kept.then(|| stamp(&format!("despawn {id}: its tree was kept — `wsp wip` shows what is standing in it")));
+    log_line(store, &format!("despawn {id}: {said}"));
+    kept.then(|| log_line(store, &format!("despawn {id}: its tree was kept — `wsp wip` shows what is standing in it")));
     result
 }
 
@@ -2563,7 +2560,7 @@ pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
         tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
         return;
     }
-    stamp(&format!("tell {}: {}", w.id, util::truncate(text, 120)));
+    log_line(store, &format!("tell {}: {}", w.id, util::truncate(text, 120)));
     if hand_it_to_the_governor(store, w, text) {
         return;
     }
@@ -2622,7 +2619,7 @@ pub(crate) fn tell_above(store: &Store, w: &Worklist, text: &str) {
         return;
     }
     if let Some(scope) = hand_it_up(store, w, text) {
-        stamp(&format!("told {scope}, above {}: {}", w.id, util::truncate(text, 120)));
+        log_line(store, &format!("told {scope}, above {}: {}", w.id, util::truncate(text, 120)));
     }
 }
 
@@ -2677,7 +2674,7 @@ pub(crate) fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -
     // has nobody started my next group" that used to be missing from it. The
     // reason rides in `report.why` now, so a scope with no seat still says so
     // here — it used to be a second, hand-written copy of that sentence.
-    stamp(&format!("told {scope}: {} · {} held", report.why, report.held));
+    log_line(store, &format!("told {scope}: {} · {} held", report.why, report.held));
     true
 }
 
@@ -2691,73 +2688,70 @@ fn rotate(store: &Store, w: &Worklist) {
     }
     let Some(scope) = governing_scope(store, w) else { return };
     let code = crate::cmd_spawn::rotate_on_behalf(store, &scope);
-    stamp(&format!("rotate {scope}: exit {code}"));
+    log_line(store, &format!("rotate {scope}: exit {code}"));
 }
 
-/// One dated line in `cycle.log`, which is this process's stdout.
+/// One dated line in `cycle.log`, **appended to the file**, and the one way a
+/// run or a repair says anything.
 ///
-/// **`pub(crate)` since `wsp-147`**: the reconciler logs through this rather
-/// than opening the file itself, so a repair's lines and the run steps' lines
-/// are in one file in one order with one format — and the record the barrier's
-/// wait keeps under `cfg(test)` is here for the same reason the reconciler's is:
-/// a step whose contract is "says why" cannot be tested by reading a file the
-/// code deliberately does not write with no terminal to write it to.
-pub(crate) fn stamp(line: &str) {
-    // Under test nothing is printed, but what *would* have been is kept in
-    // `STDOUT`, so a test can say a function did not echo (`wsp-217`): the
-    // record in `SAID` is written by `log_line` itself and cannot tell.
-    #[cfg(test)]
-    {
-        tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
-        tests::STDOUT.with(|s| s.borrow_mut().push(line.to_string()));
-    }
-    #[cfg(not(test))]
-    {
-        use std::io::Write;
-        let mut out = std::io::stdout();
-        let _ = writeln!(out, "{} {line}", util::now_iso());
-    }
-}
-
-/// One dated line in `cycle.log`, **appended to the file**.
+/// **The file, whoever is running this.** A run step is taken by three kinds of
+/// process, and stdout is a different place in each: a `wsp worklist advance`
+/// this module [`launch`]es has `cycle.log` as its stdout, the daemon's tick
+/// takes [`step`] inline and its stdout is launchd's `daemon.log`, and a verb a
+/// person or an agent runs has their terminal. There used to be two writers:
+/// `stamp`, stdout only, which every run step used, and this, file only, which
+/// the reconciler used because the daemon's stdout is a file nobody reads for a
+/// run. Then the daemon's tick started a verifier inline (`wsp-222`, on
+/// `wsp-212`'s live proof): its `spawn wsp-217 --agent --verify` and `started
+/// wsp-217` went to `daemon.log`, and a governor reading `cycle.log` saw the
+/// barrier go from waiting to a verdict with nothing started in between. A
+/// `wsp reopen`'s `tell` lines were the same, on the caller's terminal only.
 ///
-/// **Not [`stamp`], and the difference is where this process's stdout goes.** A
-/// run step is taken by a `wsp worklist advance` this module starts, and that
-/// child's stdout *is* `cycle.log` — see [`launch`]. The reconciler is not: it
-/// runs inside the daemon, whose stdout is launchd's `daemon.log`. So the first
-/// version of this row logged every repair to a file nobody reads for a run: the
-/// lines were there, in the wrong place, which is nearly the same as not being
-/// there, and it read as "the reconciler is silent" to anybody who went looking
-/// for exactly that.
-///
-/// Same format and the same prefix as [`stamp`], so the two interleave into one
-/// readable file in the order they happened rather than needing a reader to know
-/// which process wrote which.
+/// **Echoed to stdout only when stdout is not a file** — see [`a_reader`]. A
+/// launched child's stdout *is* `cycle.log`, and echoing there wrote every line
+/// twice (`wsp-217`); the daemon's is `daemon.log`. A terminal or an agent's
+/// pipe is somebody reading what the verb they ran did, which is what `stamp`
+/// gave them and what they still get.
 pub(crate) fn log_line(store: &Store, line: &str) {
-    // **Never echoed to stdout as well** (`wsp-217`). It was, through `stamp`,
-    // and a process this module launches has `cycle.log` *as* its stdout — so
-    // every line said from a reseat or run-step child, `the reseat failed`
-    // among them, landed in the file twice: once through the descriptor, once
-    // through the append below. The daemon's stdout copy went to `daemon.log`,
-    // which nothing reads for a run. The file is the one place this writes.
-    //
     // The in-memory record is for the tests to read what was said; the file is
     // written whatever that says, because a test asserting on a record the same
     // function produced proves nothing about the file. The isolated store a
     // test uses is a throwaway directory, so writing it costs nothing and keeps
-    // this assertion honest.
+    // this assertion honest. Nothing is echoed under test: the harness's stdout
+    // is whatever ran it, and the decision is [`a_reader`]'s, tested alone.
     #[cfg(test)]
     tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
     let at = util::now_iso();
-    let Ok(mut out) = std::fs::OpenOptions::new()
+    if let Ok(mut out) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(store.state_file("cycle.log"))
-    else {
-        return;
-    };
-    use std::io::Write;
-    let _ = writeln!(out, "{at} {line}");
+    {
+        use std::io::Write;
+        let _ = writeln!(out, "{at} {line}");
+    }
+    #[cfg(not(test))]
+    if a_reader(stdout_meta().as_ref()) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "{at} {line}");
+    }
+}
+
+/// Whether this process's stdout is somebody reading, from what it is.
+///
+/// **A regular file is a log, and not one of ours to write twice**: `cycle.log`
+/// itself under [`launch`], `daemon.log` under launchd. Anything else — a
+/// terminal, an agent's pipe, `/dev/null`, or a stdout nobody could look at — is
+/// echoed to, which costs nothing where nobody reads it.
+fn a_reader(stdout: Option<&std::fs::Metadata>) -> bool {
+    !stdout.is_some_and(|m| m.is_file())
+}
+
+#[cfg(not(test))]
+fn stdout_meta() -> Option<std::fs::Metadata> {
+    use std::os::fd::AsFd;
+    let fd = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
+    std::fs::File::from(fd).metadata().ok()
 }
 
 #[cfg(test)]
@@ -2823,9 +2817,6 @@ pub(crate) mod tests {
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.
         pub(super) static END_FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
-        /// What this thread would have printed to stdout — which, in a process
-        /// this module launches, is `cycle.log` itself. Only [`stamp`] writes it.
-        pub(super) static STDOUT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `cycle.log` was told this thread, in order.
         pub(crate) static SAID: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `wsp-147`'s reconciler told a member's seat, as (task, sentence).
@@ -4924,21 +4915,49 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
     }
 
-    /// **One call is one line in `cycle.log`, and none on stdout** (`wsp-217`).
-    /// It was two for any process this module launched: `log_line` echoed
-    /// through [`stamp`], and that child's stdout *is* the file. `stamp` records
-    /// under `cfg(test)` what it would have printed, so an echo that comes back
-    /// puts a line in `STDOUT` and this goes red; the file half is asserted
-    /// against the file itself.
+    /// **One call is one line in `cycle.log`** (`wsp-217`). It was two for any
+    /// process this module launched: `log_line` echoed to stdout, and that
+    /// child's stdout *is* the file. The echo is still there for a reader, so
+    /// what keeps the file at one line is [`a_reader`] saying no to a stdout
+    /// that is a file — asserted on `cycle.log`'s own metadata, which is what a
+    /// launched child's stdout reads as.
     #[test]
-    fn a_line_said_through_log_line_is_in_cycle_log_once_and_not_echoed_to_stdout() {
+    fn a_line_said_through_log_line_is_in_cycle_log_once_and_not_echoed_into_a_log() {
         let (_env, store) = scratch("logonce");
-        tests::STDOUT.with(|s| s.borrow_mut().clear());
         log_line(&store, "core: the reseat failed — the agent never came up");
 
-        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
+        let path = store.state_file("cycle.log");
+        let log = std::fs::read_to_string(&path).unwrap();
         assert_eq!(log.matches("the reseat failed").count(), 1, "{log:?}");
-        let echoed = tests::STDOUT.with(|s| s.borrow().clone());
-        assert!(echoed.is_empty(), "a launched child's stdout is cycle.log, so this is a second copy: {echoed:?}");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(!a_reader(Some(&meta)), "a launched child's stdout is cycle.log, so an echo is a second copy");
+        let null = std::fs::metadata("/dev/null").unwrap();
+        assert!(a_reader(Some(&null)), "a stdout that is not a file is not a log: echo, as `stamp` did to a terminal");
+        assert!(a_reader(None), "and one that cannot be read is echoed to, which costs nothing");
+    }
+
+    /// **A run step the daemon's tick takes inline says itself in `cycle.log`**
+    /// (`wsp-222`). The tick calls [`step`] in-process, and `step` said
+    /// everything to stdout, which in the daemon is `daemon.log`: on `wsp-212`'s
+    /// live proof the first verifier a tick started had its `started` line there
+    /// and nowhere a governor reads. Asserted on the file, not on `SAID`, since
+    /// the record is in memory whichever writer said it.
+    #[test]
+    fn a_verifier_a_tick_starts_inline_is_said_in_cycle_log() {
+        let (_env, store) = scratch("tickinline");
+        task(&store, "m-1", Status::Review);
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{} 323faba83e4ce0ea6ae7253674a1e919cee27f78", crate::repair::LANDED));
+        store.save_task(&t).unwrap();
+        let _ = list(&store, &[(&["m-1"], "claude")]);
+
+        crate::repair::tick(&store, &Blind, &mut crate::repair::Pass::new());
+
+        assert_eq!(spawned().len(), 1, "the tick started the member's verifier itself");
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(
+            log.lines().any(|l| l.contains("run group 1: started m-1")),
+            "the start is in cycle.log, not only on the daemon's stdout: {log:?}"
+        );
     }
 }

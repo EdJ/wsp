@@ -1209,7 +1209,7 @@ pub(crate) fn deliver_reason(store: &Store, id: &str, reason: &str) {
     {
         Ok(c) => c,
         Err(e) => {
-            crate::cycle::stamp(&format!("tell {id}: could not run `wsp tell` ({e})"));
+            crate::cycle::log_line(store, &format!("tell {id}: could not run `wsp tell` ({e})"));
             return;
         }
     };
@@ -1222,9 +1222,9 @@ pub(crate) fn deliver_reason(store: &Store, id: &str, reason: &str) {
         Ok(o) => format!("not delivered — {}", util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)),
         Err(e) => format!("not delivered — {e}"),
     };
-    crate::cycle::stamp(&format!("tell {id}: {said}"));
+    crate::cycle::log_line(store, &format!("tell {id}: {said}"));
     if said.starts_with("not delivered") {
-        crate::cycle::stamp(&format!(
+        crate::cycle::log_line(store, &format!(
             "{id} is at doing with the reason on its row, but its pane did not get it — `wsp tell {id} --anyway -` retries"
         ));
     }
