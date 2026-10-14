@@ -416,6 +416,61 @@ pub fn being_filled(governors: &BTreeMap<String, Value>, scope: &str) -> bool {
     seat_of(scope, rec).is_none() && stood_at(governors, scope).is_none() && !Vacancy::of(rec).backed_off()
 }
 
+/// The words a row is marked with when a governor's work order started it,
+/// followed by that governor's scope and the seat it opened (`wsp-216`).
+pub const ORDERED_BY: &str = "work order from the seat of ";
+
+/// The scope whose governor's work order started this row, off the newest
+/// [`ORDERED_BY`] line in its log — unless a run started it since, which makes
+/// it the run's.
+pub fn started_by(task: &crate::model::Task) -> Option<String> {
+    let log = task.section("Log")?;
+    for line in log.lines().rev() {
+        if line.contains(crate::cycle::STARTED_BY) {
+            return None;
+        }
+        if let Some((_, rest)) = line.split_once(ORDERED_BY) {
+            let scope = rest.split(" · ").next().unwrap_or_default().trim();
+            return (!scope.is_empty()).then(|| scope.to_string());
+        }
+    }
+    None
+}
+
+/// The seat that answers for one task: its running list's, else the seat
+/// whose work order started it while that seat is filled, else `project`'s
+/// walk — the task's own, or the pane's where the caller asked from one
+/// (`wsp-216`).
+///
+/// **The starter before the project.** On 2026-10-07 wsp-224 and wsp-226 were
+/// started by the wsp-process seat, and their review notices went to the wsp
+/// seat — the project's, which had not started them and could not act on them
+/// — until a person relayed them. A row a governor started outside its own
+/// running list is that governor's to read when it lands, so its review, its
+/// hands and its questions go there. **A running list still comes first**: a
+/// member of tonight's run is answered for by whoever runs it, whoever spawned
+/// it. And only while the starter's seat is filled — a seat stood down or
+/// dead hands the row back to the walk, rather than holding a review for
+/// nobody.
+pub fn seat_for_task(
+    governors: &BTreeMap<String, Value>,
+    index: &Index,
+    list: Option<&str>,
+    task: &crate::model::Task,
+    project: Option<&str>,
+) -> Option<Seat> {
+    if governors.is_empty() {
+        return None;
+    }
+    if let Some(seat) = list.and_then(|l| seat_for(governors, index, Some(l), None)) {
+        return Some(seat);
+    }
+    if let Some(seat) = started_by(task).and_then(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec))) {
+        return Some(seat);
+    }
+    seat_for(governors, index, None, project)
+}
+
 /// The seat that answers for one task, asked once.
 ///
 /// **The walk [`seat_for`] makes, with the store reads that feed it, and it
@@ -434,7 +489,7 @@ pub fn answering_seat(store: &Store, task: &crate::model::Task) -> Option<Seat> 
     let index = Index::new(store.projects());
     let lists = crate::worklist::Running::read(store);
     let governors = store.governors();
-    seat_for(&governors, &index, lists.list_for(task), task.project.as_deref())
+    seat_for_task(&governors, &index, lists.list_for(task), task, task.project.as_deref())
 }
 
 /// The same walk, started **one step past** a scope that cannot answer for
@@ -2418,9 +2473,13 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
             workspace,
         );
         let lists = crate::worklist::Running::read(store);
-        let list = held.as_deref().and_then(|t| store.find_task(t)).and_then(|t| lists.list_for(&t).map(str::to_string));
-        let list = list.as_deref();
-        match seat_for(&governors, index, list, project.as_deref()) {
+        let task = held.as_deref().and_then(|t| store.find_task(t));
+        let list = task.as_ref().and_then(|t| lists.list_for(t));
+        let found = match &task {
+            Some(t) => seat_for_task(&governors, index, list, t, project.as_deref()),
+            None => seat_for(&governors, index, None, project.as_deref()),
+        };
+        match found {
             Some(s) if s.vacant => {
                 println!("{}", p.dim(&format!("work here reaches the {} seat, which wsp is filling", s.scope)))
             }
@@ -3405,5 +3464,29 @@ pub(crate) mod tests {
 
         mark_stood_down(&store, "run");
         assert!(read(&store).starts_with("stood down at "), "{}", read(&store));
+    }
+
+    /// `wsp-216`: the walk for one row is its running list, then the seat whose
+    /// work order started it while that is filled, then its project's — and a
+    /// run that starts the row afterwards makes it the run's.
+    #[test]
+    fn a_rows_walk_is_its_list_then_its_starter_then_its_project() {
+        let g = seated(&[("robustness", "w1"), ("proc", "w4"), ("batch", "w7")]);
+        let mut t = crate::model::Task::new("a row", "t-1");
+        t.project = Some("data".into());
+        t.log("claimed by pane w9:p1 · spawned at opus/high");
+        t.log(&format!("{ORDERED_BY}proc · w9:p1"));
+        let walk = |g: &BTreeMap<String, Value>, list: Option<&str>, t: &crate::model::Task| {
+            seat_for_task(g, &tree(), list, t, t.project.as_deref()).map(|s| s.scope)
+        };
+        assert_eq!(walk(&g, None, &t).as_deref(), Some("proc"), "the starter, before data's walk");
+        assert_eq!(walk(&g, Some("batch"), &t).as_deref(), Some("batch"), "a running list first");
+
+        let empty = seated(&[("robustness", "w1")]);
+        assert_eq!(walk(&empty, None, &t).as_deref(), Some("robustness"), "a starter nobody is in routes nothing");
+
+        t.log(&format!("{} batch group 1", crate::cycle::STARTED_BY));
+        assert_eq!(started_by(&t), None, "a run started it since, so it is the run's");
+        assert_eq!(walk(&g, None, &t).as_deref(), Some("robustness"));
     }
 }

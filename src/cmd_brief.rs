@@ -878,12 +878,12 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         // member of tonight's list is answered for by whoever is running the
         // list. With nothing running this is `None` and the walk is the
         // ancestor walk it was.
-        seat: cmd_govern::seat_for(
-            &b.governors,
-            index,
-            mine.and_then(|t| b.lists.list_for(t)),
-            b.project.as_deref(),
-        )
+        seat: match mine {
+            // The row's walk, the seat whose work order started it before its
+            // project's (`wsp-216`) — the one this agent's `wsp ask` reaches.
+            Some(t) => cmd_govern::seat_for_task(&b.governors, index, b.lists.list_for(t), t, b.project.as_deref()),
+            None => cmd_govern::seat_for(&b.governors, index, None, b.project.as_deref()),
+        }
         .map(|s| {
             // The pane's and not the room's: a worker beside a custodian was
             // told the seat above its work was itself — worklist-035. The

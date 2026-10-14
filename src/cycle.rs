@@ -2776,6 +2776,12 @@ pub(crate) fn hand_on_what_done_lists_held(store: &Store) {
             }
         }
         crate::wake::settle_held(store, scope, &handed);
+        // Said when something moved, not every tick something could not: a
+        // done list with no member to put a notice on would otherwise write
+        // this line a minute for ever. What stays is still on `--status`.
+        if handed.is_empty() {
+            continue;
+        }
         log_line(store, &format!(
             "{scope} is done and its own seat with it — handed on {} of the {} sentence(s) held for it",
             handed.len(),

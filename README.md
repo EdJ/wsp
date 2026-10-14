@@ -2407,8 +2407,10 @@ carry it to the seat a herdr restart puts the work in.
 And it says whom each seat answers to, as `answers_to` (`wsp-247`): the scope
 of the governor the seat hangs under, walked the way the seat's own `wsp ask`
 would go, so a reader draws the tree from it and walks nothing itself. A member
-answers to its running list's seat, else the nearest seated project at or above
-its own — except while wsp is filling that list's post, when its ask waits
+answers to its running list's seat, else the seat whose work order started the
+row while that seat is filled (`spawn` writes `work order from the seat of
+<scope>` on the row, so its review reaches that seat after its agent is gone),
+else the nearest seated project at or above its own — except while wsp is filling that list's post, when its ask waits
 there: `answers_to` is `null` and `answers_to_empty` names the list
 (`wsp-216`); a verifier to whomever its member does; a barrier check to its list's
 seat, else its group's project's walk; a list's governor to its home project's

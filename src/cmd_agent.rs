@@ -1366,9 +1366,7 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     for m in &rows {
         let id = m.about.task().unwrap_or_default();
         let task = store.task(id);
-        let seat = task.as_ref().and_then(|t| {
-            cmd_govern::seat_for(&governors, &index, lists.list_for(t), t.project.as_deref())
-        });
+        let seat = task.as_ref().and_then(|t| cmd_govern::seat_for_task(&governors, &index, lists.list_for(t), t, t.project.as_deref()));
         let held_here = seat.as_ref().map(|s| mine.as_deref() == Some(s.scope.as_str())).unwrap_or(false);
         if only_mine && !held_here {
             continue;
@@ -4512,10 +4510,10 @@ fn answers_to(
     homes: &BTreeMap<String, String>,
 ) -> (Option<String>, Option<String>) {
     let task_walk = |id: &str| match w.tasks.iter().find(|t| t.id == id) {
-        Some(t) => (running.list_for(t), t.project.as_deref()),
-        None => (None, None),
+        Some(t) => (running.list_for(t), t.project.as_deref(), Some(t)),
+        None => (None, None, None),
     };
-    let (list, project) = match role {
+    let (list, project, task) = match role {
         // The primary interface answers to the person, which is `null` with
         // nobody named as the walk's start: it is on no walk at all.
         Role::Governor { list: false, .. } | Role::Primary => return (None, None),
@@ -4529,10 +4527,16 @@ fn answers_to(
         Role::Member { task, .. } | Role::Verifier { member: task, .. } | Role::Helper { task: Some(task), .. } => {
             task_walk(task)
         }
-        Role::Check { list, .. } => (Some(list.as_str()), w.checking.get(seat).and_then(|(_, _, p)| p.as_deref())),
-        Role::Agent | Role::Helper { task: None, .. } => (None, project),
+        Role::Check { list, .. } => (Some(list.as_str()), w.checking.get(seat).and_then(|(_, _, p)| p.as_deref()), None),
+        Role::Agent | Role::Helper { task: None, .. } => (None, project, None),
     };
-    match cmd_govern::seat_for(&w.governors, &w.index, list, project) {
+    // A row's walk is the task's (`wsp-216`): the seat that started it comes
+    // before its project's, as its `wsp ask` and its review go.
+    let found = match task {
+        Some(t) => cmd_govern::seat_for_task(&w.governors, &w.index, list, t, project),
+        None => cmd_govern::seat_for(&w.governors, &w.index, list, project),
+    };
+    match found {
         // A post wsp is filling is where the row's ask waits, and it is empty:
         // the walk's start with nobody in it (`wsp-216`).
         Some(s) if s.vacant => (None, Some(s.scope)),

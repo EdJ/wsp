@@ -2583,6 +2583,19 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // reason: a reader that sees the seat should see who put it there.
     let by = spawner(&governors, cmd_agent::my_pane().as_deref());
     record_spawner(store, &seat, work.task.as_deref().filter(|_| claimed && !verifying), by.as_ref());
+    // And on the row, where it outlives the claim (`wsp-216`): a governor's
+    // work order is whose the row's review and hands are, and the claim — the
+    // other copy — is gone once the agent is ended, while the review it left
+    // is still standing.
+    if let (Some(task), Some(scope)) = (
+        work.task.as_deref().filter(|_| claimed && !verifying),
+        by.as_ref().and_then(|b| b.get("scope")).and_then(Value::as_str),
+    ) {
+        if let Some(mut t) = store.task(task) {
+            t.log(&format!("{}{scope} · {seat}", cmd_govern::ORDERED_BY));
+            let _ = store.save_task(&t);
+        }
+    }
 
     // A slot is for an agent. `--govern` without `--agent` would record a
     // position and leave a shell sitting in it, which is a seat that answers
@@ -8239,6 +8252,49 @@ mod tests {
         assert_eq!(row.role.json(), json!({ "is": "helper", "scope": "core", "task": "t-1" }));
         assert_eq!(row.spawned_by, Some(by));
         assert_eq!(row.answers_to.as_deref(), Some("core"), "where its own `wsp ask` goes");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-216`, the Custodian's 2026-10-07 log line: wsp-224 and wsp-226 were
+    /// started by the wsp-process seat, and their review notices came to the
+    /// wsp seat — the project's — which waited, unwoken, until a person
+    /// relayed them.
+    ///
+    /// A list's seat starts a row that is no member of its run. The row says
+    /// whose work order it was, and once at review its notice is addressed to
+    /// that seat and not the project's; so are its `wsp ask` and its place in
+    /// `wip`. With that seat gone the row goes back to its project's walk.
+    #[test]
+    fn a_rows_review_reaches_the_seat_whose_work_order_started_it() {
+        let _guard = no_backend();
+        let store = governed_core("ordered-by");
+        let mut run = crate::model::Worklist::new("proc", "a process list");
+        run.set_status(crate::model::WorklistStatus::Running);
+        run.set_groups(&[crate::model::Group { members: vec!["t-9".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&run).unwrap();
+        store.set_governor("proc", json!({ "workspace": "cpd-8", "pane": "cpd-8", "host": util::hostname() }));
+        standing_in(Some("cpd-8"));
+        let code = place_work(&started(), &store, &Args::synth("spawn", &["t-1"], &AN_AGENT));
+        standing_in(None);
+        assert_eq!(code, 0);
+
+        let t = store.task("t-1").unwrap();
+        assert!(t.body.contains(&format!("{}proc · w9:p1", cmd_govern::ORDERED_BY)), "on the row: {}", t.body);
+        assert_eq!(cmd_govern::started_by(&t).as_deref(), Some("proc"));
+
+        // At review, and its agent ended: the claim's copy goes with the claim.
+        let mut t = t;
+        t.set_status(crate::model::Status::Review);
+        store.save_task(&t).unwrap();
+        store.clear_claim("t-1");
+        let index = crate::resolve::Index::new(store.projects());
+        let lists = crate::worklist::Running::read(&store);
+        let to = |store: &Store| crate::cmd_watch::addressed_to(&index, &store.governors(), &lists, &store.task("t-1").unwrap());
+        assert_eq!(to(&store), "proc", "the review notice goes to the seat that started it, not core's");
+        assert_eq!(cmd_govern::answering_seat(&store, &store.task("t-1").unwrap()).map(|s| s.scope).as_deref(), Some("proc"));
+
+        assert!(cmd_govern::vacate(&store, "proc"));
+        assert_eq!(to(&store), "core", "with that seat empty the row is its project's again");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 

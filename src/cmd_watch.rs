@@ -1951,7 +1951,7 @@ pub(crate) fn addressed_to(
     lists: &worklist::Running,
     task: &Task,
 ) -> String {
-    cmd_govern::seat_for(governors, index, lists.list_for(task), task.project.as_deref())
+    cmd_govern::seat_for_task(governors, index, lists.list_for(task), task, task.project.as_deref())
         .map(|s| s.scope)
         .unwrap_or_else(|| EVERYONE.to_string())
 }
