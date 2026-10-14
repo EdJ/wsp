@@ -2768,7 +2768,10 @@ pub(crate) fn hand_on_what_done_lists_held(store: &Store) {
         }
         let mut handed = Vec::new();
         for (seq, at, text) in &held {
-            if tell_now(store, &w, &format!("(Held on its scope since {}.) {text}", util::local_hm(*at))) {
+            // The date as well as the clock: what a done list was left holding
+            // is days old as often as not, and `15:42` alone reads as today.
+            let since = format!("{} {}", util::local_ymd(&util::iso_at(*at)), util::local_hm(*at));
+            if tell_now(store, &w, &format!("(Held on its scope since {since}.) {text}")) {
                 handed.push(*seq);
             }
         }
@@ -4213,7 +4216,11 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(crate::wake::messages_held(&store, "other").len(), 1, "a running list keeps its own");
         let to_p: Vec<String> = crate::wake::messages_held(&store, "p").into_iter().map(|(_, _, t)| t).collect();
         assert_eq!(to_p.len(), 2, "{to_p:?}");
-        assert!(to_p.iter().all(|t| t.contains("Meant for the run list's own seat") && t.contains("(Held on its scope since ")));
+        let today = util::local_ymd(&util::now_iso());
+        assert!(
+            to_p.iter().all(|t| t.contains("Meant for the run list's own seat") && t.contains(&format!("(Held on its scope since {today} "))),
+            "dated, since a done list's backlog is days old as often as not: {to_p:?}"
+        );
         assert!(to_p[1].contains("Barrier 1 of run passed."), "{to_p:?}");
         let said = drained(&SAID);
         assert!(said.iter().any(|l| l.contains("handed on 2 of the 2")), "{said:?}");
