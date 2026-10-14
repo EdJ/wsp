@@ -725,6 +725,9 @@ impl Store {
         if Some(scope) == excluding {
             return None;
         }
+        if crate::cmd_govern::is_primary(scope) {
+            return Some("the primary interface's seat is keyed on it".into());
+        }
         if self.worklist(scope).is_some() {
             return Some(format!("worklist `{scope}` uses it"));
         }
@@ -3252,6 +3255,7 @@ mod tests {
         assert!(store.scope_taken("sp", None).is_some(), "a project's code names ids and is not free either");
         assert!(store.scope_taken("batch", None).is_some(), "and the other way: a worklist holds its slug");
         assert!(store.scope_taken("fork", None).is_none(), "a name nobody has is free");
+        assert!(store.scope_taken("primary", None).is_some(), "the primary interface's seat holds its name (wsp-279)");
         assert!(
             store.scope_taken("batch", Some("batch")).is_none(),
             "a scope keeping the name it already has is not colliding with itself",

@@ -602,7 +602,41 @@ pub fn needs_a_person(stopped: bool, doing: bool, seat: bool) -> bool {
 /// governor · wsp` in the census at the foot of the panel. herdr's sidebar has
 /// no mark column and gets the words, which is what it had for a task as well.
 pub fn governor_of(project: &str) -> String {
+    // The one slot that governs nothing is not called a governor where a
+    // person reads it (`wsp-279`); [`is_governor_label`] still protects it.
+    if is_primary(project) {
+        return PRIMARY_LABEL.to_string();
+    }
     format!("governor · {project}")
+}
+
+/// What the primary interface's workspace and pane are called — see
+/// [`governor_of`].
+pub const PRIMARY_LABEL: &str = "primary interface";
+
+/// The scope of the primary interface (`wsp-234`, built by `wsp-279`): the one
+/// standing seat that is no project's, where the person talks to the fleet.
+///
+/// **A slot in `governors.json` like any other, and not a project or a list.**
+/// That is what makes it a seat and not a session the window owns (compound-506):
+/// it is on the census, `wsp govern` lists it, `--tell` reaches it, it outlives
+/// the window, and `reconcile` vacates it when its pane goes the way it vacates
+/// any slot. What it is *not* follows from the key being neither a project id nor
+/// a worklist slug: [`seat_for`] walks lists and projects, so no row's question
+/// ever routes to it and no seat's `answers_to` names it — the person is still
+/// the governor of last resort, and this is only where the person reads it.
+///
+/// So the name is reserved in the one key space (`Store::scope_taken`, `project
+/// add`), and the readers that would otherwise treat it as a governor ask
+/// [`is_primary`]: `wip`'s role, the brief, the work order, the ask's routing, and
+/// the reconciler, which never refills it (README, *Does the daemon refill it
+/// unprompted?*).
+pub const PRIMARY: &str = "primary";
+
+/// Whether a scope is the primary interface's — one spelling, so a reader that
+/// special-cases it cannot drift from the constant.
+pub fn is_primary(scope: &str) -> bool {
+    scope == PRIMARY
 }
 
 /// Whether a name is one a slot put there.
@@ -613,7 +647,7 @@ pub fn governor_of(project: &str) -> String {
 /// renames both after the work, which is right for a worker and wrong for a
 /// governor, whose work *is* the position.
 pub fn is_governor_label(label: &str) -> bool {
-    label.trim_start().starts_with("governor · ")
+    label.trim_start().starts_with("governor · ") || label.trim() == PRIMARY_LABEL
 }
 
 /// Put the seat's own name on the workspace and on the agent pane in it, or
@@ -1408,6 +1442,15 @@ pub fn claim_seat(store: &Store, scope: &str) -> bool {
     })
 }
 
+/// Give back a claim [`claim_seat`] took, for a caller whose spawn failed and
+/// that will not be retried on a timer — `wsp spawn --primary`, pressed by a
+/// person. The reconciler keeps its claim on a failure ([`reseat_failed`]) so
+/// that it does not retry every minute; a button pressed again is a person
+/// asking again, and a twenty-minute lock-out would be the answer to nobody.
+pub fn release_seat_claim(store: &Store, scope: &str) {
+    store.edit_governor(scope, |rec| rec.as_object_mut().is_some_and(|o| o.remove("reseating").is_some()));
+}
+
 /// A reseat was attempted under a claim and did not produce a seat.
 ///
 /// **The claim is kept and the failure is recorded against it, and both halves
@@ -1694,6 +1737,12 @@ pub(crate) fn scope_of(store: &Store, index: &Index, needle: &str) -> Option<Str
     if n.is_empty() {
         return None;
     }
+    // Before either half of the key space, which cannot hold it: a reserved
+    // name, so the order decides nothing and the fuzzy match below cannot take
+    // `primary` for a project whose id begins with `pri`.
+    if is_primary(&n) {
+        return Some(n);
+    }
     if store.worklist(&n).is_some() {
         return Some(n);
     }
@@ -1739,7 +1788,10 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         // nothing.**
         if stood_at(&store.governors(), &scope).is_some() {
             eprintln!("wsp: the {scope} seat was stood down - leaving it down");
-            eprintln!("wsp: `wsp spawn -p <project> --govern` fills it if that changes");
+            match is_primary(&scope) {
+                true => eprintln!("wsp: `wsp spawn --primary` fills it if that changes"),
+                false => eprintln!("wsp: `wsp spawn -p <project> --govern` fills it if that changes"),
+            }
             return 1;
         }
         // **Refuses what the reconciler would not have asked about, and that is the

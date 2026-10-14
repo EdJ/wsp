@@ -4204,6 +4204,10 @@ pub(crate) struct WipRow {
 pub(crate) enum Role {
     /// It governs `id`, a project or a worklist — the scope `seat` names.
     Governor { list: bool, id: String },
+    /// It is the primary interface (`wsp-279`): the slot that is no project's,
+    /// where the person talks to the fleet. compound finds the Chat pane by
+    /// this and never by a label; `seat` says `primary` beside it.
+    Primary,
     /// It holds `task`, and `placing` is the running list and group it is a
     /// member of.
     Member { task: String, placing: Option<(String, usize)> },
@@ -4226,6 +4230,7 @@ impl Role {
             Role::Governor { list, id } => {
                 json!({ "is": "governor", "of": if *list { "list" } else { "project" }, "id": id })
             }
+            Role::Primary => json!({ "is": "primary" }),
             Role::Member { task, placing: None } => json!({ "is": "member", "task": task }),
             Role::Member { task, placing: Some((list, group)) } => {
                 json!({ "is": "member", "task": task, "list": list, "group": group })
@@ -4372,6 +4377,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             // A scope is a list when a worklist has its slug, whether or
             // not it has started — the order `cmd_govern::scope_of` reads
             // the one key space in.
+            (Some(id), ..) if cmd_govern::is_primary(id) => Role::Primary,
             (Some(id), ..) => Role::Governor { list: w.lists.iter().any(|l| &l.id == id), id: id.clone() },
             (None, Some(t), ..) => Role::Member {
                 task: t.id.clone(),
@@ -4486,7 +4492,9 @@ fn answers_to(
         None => (None, None),
     };
     let (list, project) = match role {
-        Role::Governor { list: false, .. } => return (None, None),
+        // The primary interface answers to the person, which is `null` with
+        // nobody named as the walk's start: it is on no walk at all.
+        Role::Governor { list: false, .. } | Role::Primary => return (None, None),
         Role::Governor { list: true, id } => {
             let home = homes.get(id).map(String::as_str);
             return match cmd_govern::seat_above(&w.governors, &w.index, id, home) {

@@ -369,8 +369,14 @@ fn seat_scopes(store: &Store) -> Vec<(String, String)> {
     // whose whole spool is withheld owes nothing while `depth() > 0` says it is
     // holding something. `tokenhub-spec-sync` is the live case — three entries,
     // all `edge: left`, reseated every twenty minutes for hours.
+    //
+    // **Never the primary interface's** (`wsp-279`). It is filled on demand,
+    // by the person's press of Chat or `wsp spawn --primary`: what is held for
+    // it waits for the person, and a reconciler that seated it because a
+    // `--tell` landed while it was empty would start an agent at 3am that
+    // nobody talks to (README, *Does the daemon refill it unprompted?*).
     for (scope, owed) in crate::wake::scopes_owed(store) {
-        if governors.contains_key(&scope) && !paused.contains(&scope) {
+        if governors.contains_key(&scope) && !paused.contains(&scope) && !crate::cmd_govern::is_primary(&scope) {
             // The count in the sentence is the count this walk counted, so the
             // line cannot claim a scope owes an answer without a number behind it.
             add(scope, format!("it owes {owed} and nothing is answering it"), &mut out);
@@ -2076,6 +2082,31 @@ fn a_seat_a_person_stood_down_is_never_reseated_however_much_is_held_for_it() {
         "and cycle.log says nothing, because silence is the correct report for it: {:?}",
         stamped()
     );
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+/// **The primary interface is never refilled by the daemon** (`wsp-279`), however
+/// much is held for it: it is filled when the person presses Chat or runs `wsp
+/// spawn --primary`, and what was said to it while it was empty waits for that.
+/// The backlog trigger is the one that would reach it — a `--tell` to an empty
+/// seat — so that is the shape tested.
+#[test]
+fn the_primary_seat_is_never_reseated_by_the_daemon_however_much_is_held_for_it() {
+    // No list at all: a running list's own unfilled post would be seated on
+    // the first pass, and is not what this is about.
+    let (_env, store) = scratch("seat-primary");
+    seated(&store, cmd_govern::PRIMARY, "cpd-1", "cpd-1", "", "");
+    held_for(&store, cmd_govern::PRIMARY, 3);
+    cmd_govern::vacate(&store, cmd_govern::PRIMARY);
+
+    let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+    for _ in 0..(EMPTY_TICKS + 2) {
+        a_pass(&store, &gone);
+    }
+
+    let seated_by_a_tick = reseated();
+    assert!(seated_by_a_tick.is_empty(), "filled on demand, never by a tick: {seated_by_a_tick:?}");
+    assert!(!will_seat(&store, cmd_govern::PRIMARY), "so `--status` says nobody is coming");
     let _ = std::fs::remove_dir_all(&store.root);
 }
 

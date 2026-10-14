@@ -84,11 +84,30 @@ use crate::Args;
 /// A *running* agent handed a slot would be the fourth case and would have to
 /// fetch; nothing in wsp does that yet, and inventing the sentence for it here
 /// would be inventing the flow.
+///
+/// [`Handover::Primary`] is the custodial spelling for the one slot that is no
+/// project's (`wsp-279`): seated the same way, holding nothing the same way, and
+/// a different job — the person's side of the fleet, and nothing of a
+/// project's. [`Handover::of_seat`] picks between the two off the scope, so a
+/// caller that seats a slot cannot hand the primary interface a custodian's
+/// order.
 #[derive(Clone, Copy)]
 pub enum Handover {
     Spawned,
     Running,
     Custodian,
+    Primary,
+}
+
+impl Handover {
+    /// The order a seat on `scope` is handed: the primary interface's for its
+    /// own scope, a custodian's for every other.
+    pub fn of_seat(scope: &str) -> Handover {
+        match cmd_govern::is_primary(scope) {
+            true => Handover::Primary,
+            false => Handover::Custodian,
+        }
+    }
 }
 
 /// How an agent comes to know what it is holding — which is a fact about the
@@ -571,8 +590,39 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              nothing waits on your permission. Say what you are doing with `wsp say`, and when \
              nothing needs you, stop: you are told when it does. A group with no `agent:` line \
              is run by hand (`wsp worklist next` names what may start), and when you pass its \
-             barrier, make `wsp govern {subject} --rotate` your last act."
+             barrier, make `wsp govern {subject} --rotate` your last act. \
+             Work that is not {subject}'s (a row for another project, an agent spawned for the \
+             person, the machine's load, a message for another seat) is the primary \
+             interface's: say so, or with the person's yes pass it on with `wsp govern primary \
+             --tell -`, and go back to {subject}."
         ),
+        // `wsp-234`'s write-up, in the README under *The primary interface*,
+        // is the argument for every clause: its job is the person's side of
+        // the fleet, it governs nothing, and Ed's words are recorded only as
+        // Ed's. The subject is not named because it is always the same seat.
+        // One line, because some kinds take the order in argv, where a control
+        // character is refused.
+        Handover::Primary => "You are the primary interface: the one standing seat that is no \
+             project's, where the person talks to the fleet. You have not been claimed onto a \
+             task and you should not claim one, and you govern nothing: no project, no list, no \
+             step of a run. Your brief is already above. Your job is the person's side of the \
+             fleet. Answer where things are and what is next from `wsp wip`, `wsp worklist next \
+             <list>` for each running list, `wsp yours` and `wsp tree`. Read what waits on the \
+             person (`wsp yours`), oldest first, and say what each one holds. When the person \
+             answers one here, record their words, quoted, with `wsp answer <id> --as-person \
+             \"...\"`, and only for words they typed this turn, never for an answer you worked out. \
+             File work that no project's seat owns with `wsp add -p <project>`, naming the \
+             project every time because you stand in none, and spawn or end an agent when the \
+             person asks. Carry a message to a seat with `wsp govern <scope> --tell -`; the \
+             seat that receives it decides it, not you. A project's decisions are its \
+             custodian's and a list's are its governor's: carry the person's sentence there \
+             rather than making the change, unless the person says you should, and then note on \
+             the row that their word came through this seat. A `wsp ask` from you waits on the \
+             person. Write a standing preference where it binds, as a decision on the project it \
+             is about, and never only in this conversation: this seat is reset, not handed \
+             over. When nothing is asked of you, stop; the person comes to this pane when they \
+             want you."
+            .to_string(),
     }
 }
 
@@ -625,10 +675,10 @@ fn handover(subject: &str, how: Handover, route: Route) -> String {
         // custodial sentence is a job description and this is one instruction
         // before it, which is the fourth case `Handover`'s docs said would have
         // to fetch.
-        (Route::Fetch, Handover::Custodian) => format!(
+        (Route::Fetch, Handover::Custodian | Handover::Primary) => format!(
             "Please run `wsp brief --session` first — your context is empty and \
              nothing has been read to you. {}",
-            work_order(subject, Handover::Custodian)
+            work_order(subject, how)
         ),
         // A claimant with no brief in its context is exactly what
         // `Handover::Running` is the wording for. An existing sentence rather
@@ -826,7 +876,10 @@ fn seat_env_over(
 /// only a governor's spawn makes a helper.
 pub(crate) fn spawner(governors: &BTreeMap<String, Value>, caller: Option<&str>) -> Option<Value> {
     let seat = caller.filter(|s| !s.is_empty())?;
-    let scope = cmd_govern::governs(governors, &Seat::new(seat));
+    // The primary interface spawns at the person's word and governs nothing,
+    // so what it starts is nobody's helper: recorded like a member's spawn,
+    // the seat said and the scope null, and drawn where its own work puts it.
+    let scope = cmd_govern::governs(governors, &Seat::new(seat)).filter(|s| !cmd_govern::is_primary(s));
     Some(json!({ "seat": seat, "scope": scope }))
 }
 
@@ -1743,6 +1796,11 @@ struct Work {
     /// which is precisely the near miss the `--govern` guard below refuses to
     /// make.
     list: Option<String>,
+    /// The **primary interface's** seat (`wsp-279`), the one custodial scope
+    /// that is neither a project nor a list — so a flag of its own rather than
+    /// a name in either field above, for `list`'s reason: each of those is read
+    /// as a place, and this seat stands in no project and runs no list.
+    primary: bool,
     /// The workspace's opening name. A claim renames it after the task a
     /// moment later — to the same thing, for a task, so the window does not
     /// change its name under whoever was already looking at it. A project
@@ -1793,6 +1851,7 @@ fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
                 project: None,
                 label: crate::cmd_govern::governor_of(&w.id),
                 list: Some(w.id),
+                primary: false,
             });
         }
     }
@@ -1802,7 +1861,20 @@ fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
         project: Some(proj.id.clone()),
         label: proj.name.clone(),
         list: None,
+        primary: false,
     })
+}
+
+/// The primary interface's seat, as `spawn` resolves it: no task, no project,
+/// no list, and the label a person reads it by.
+fn primary_work() -> Work {
+    Work {
+        task: None,
+        project: None,
+        list: None,
+        primary: true,
+        label: cmd_govern::governor_of(cmd_govern::PRIMARY),
+    }
 }
 
 /// What the positional names, or `None` when it names nothing this verb can
@@ -1813,6 +1885,11 @@ fn resolve_needle(
     needle: &str,
     index: &Index,
 ) -> Option<Result<Work, String>> {
+    // The name a rotation and a reseat resolve the primary seat by, since both
+    // hand `resolve` the scope they read off the record.
+    if args.has("govern") && cmd_govern::is_primary(needle) {
+        return Some(Ok(primary_work()));
+    }
     if args.has("govern") || args.get("check").is_some() {
         if let Some(w) = store.worklist(needle) {
             return Some(Ok(Work {
@@ -1820,6 +1897,7 @@ fn resolve_needle(
                 project: None,
                 label: crate::cmd_govern::governor_of(&w.id),
                 list: Some(w.id),
+                primary: false,
             }));
         }
     }
@@ -1833,6 +1911,7 @@ fn resolve_needle(
             label: cmd_agent::task_label(&t).unwrap_or_else(|| t.title.clone()),
             task: Some(t.id),
             list: None,
+            primary: false,
         }));
     }
     index.find(needle).map(|proj| {
@@ -1841,6 +1920,7 @@ fn resolve_needle(
             project: Some(proj.id.clone()),
             label: proj.name.clone(),
             list: None,
+            primary: false,
         })
     })
 }
@@ -1881,7 +1961,113 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
     // this and printed a herdr sentence for a herdr fact; a backend that is not
     // answering now says so from the call that wanted it, which arrives at the
     // same moment and names what it stopped.
+    if args.has("primary") {
+        return seat_primary(backend(args).as_ref(), &crate::cycle::Fleet, store, args);
+    }
     place_work(backend(args).as_ref(), store, args)
+}
+
+/// The project whose root the primary interface stands in, absent `--cwd`.
+///
+/// **A project's root because nowhere else may be stood in** ([`grounded`]:
+/// Claude Code's folder-trust prompt exits an agent anywhere it was never told
+/// to trust), and **wsp's because that is the tool the seat works through**: it
+/// reads the fleet with wsp's verbs and files wsp's rows more than any other
+/// project's (the README's gpui-migration table). It holds no claim and gets
+/// no tree, so it stands in the trunk the way a project custodian does, and
+/// changes nothing there.
+pub(crate) const PRIMARY_STANDS_IN: &str = "wsp";
+
+fn primary_root(index: &Index) -> Option<String> {
+    index.root_of(PRIMARY_STANDS_IN)
+}
+
+/// `wsp spawn --primary`: fill the primary interface's seat if nobody is in it,
+/// and say who is if somebody is (`wsp-279`).
+///
+/// **On demand, and idempotent, because the caller is a button.** compound's
+/// Chat and ⌘J call this when the census shows nobody in the seat, and a
+/// second press must not open a second seat — so a held seat is the ordinary
+/// answer and exits 0, naming the seat, and seats nothing. Asked of
+/// [`crate::repair::reading`], the one reading of "is anybody in this seat" the
+/// reconciler and `--reseat` share, so a pane that was killed reads `gone` here
+/// and is refilled, where the record alone would still name it.
+///
+/// **The reseat's claim is the duplicate guard**, taken before anything opens,
+/// for [`cmd_govern::claim_seat`]'s reason: the seat is written only once the
+/// workspace exists, so two presses a second apart would both read it empty.
+/// The claim is overwritten by the seat being taken, and given back by hand
+/// when the spawn fails, so a failed press is not a twenty-minute lock-out.
+///
+/// What it is not: a refill by the daemon (the reconciler leaves this scope
+/// alone, see `repair::seat_scopes`), a second seat on another machine (`--on`
+/// is refused: the seat is the person's, and the person is at this one), or a
+/// claim — it is a custodial spawn, so it is outside the machine's cap the way
+/// a governor is.
+fn seat_primary(place: &dyn Place, seats: &dyn crate::cycle::Seats, store: &Store, args: &Args) -> i32 {
+    let p = Paint::new();
+    let scope = cmd_govern::PRIMARY;
+    if let Some(extra) = args.rest.first() {
+        eprintln!("wsp: --primary seats the primary interface, which is no project's - `{extra}` has no place in it");
+        return 2;
+    }
+    for clash in ["govern", "verify", "project", "check", "on"] {
+        if args.has(clash) {
+            eprintln!("wsp: --primary is its own seat - not with --{clash}");
+            return 2;
+        }
+    }
+    // The custodial spawn, on the one scope it does not name a place for — so
+    // the tier, the kind, the backend and the directory are the caller's, and
+    // the rest is `--govern`'s. Read before anything can answer "held", so a
+    // press that seats nothing does not also report its own flags as unread.
+    let valued: Vec<(&str, String)> = ["kind", "model", "effort", "cwd"]
+        .into_iter()
+        .filter_map(|k| args.get(k).map(|v| (k, v)))
+        .collect();
+    let mut flags: Vec<(&str, &str)> = vec![("govern", "true")];
+    flags.extend(valued.iter().map(|(k, v)| (*k, v.as_str())));
+    for b in ["herdr", "headless", "compound", "json", "focus", "full", "subagents"] {
+        if args.has(b) {
+            flags.push((b, "true"));
+        }
+    }
+    let governors = store.governors();
+    let held = |seat: &str| {
+        let since = governors.get(scope).and_then(|r| r.get("since")).and_then(Value::as_str).unwrap_or_default();
+        match args.json() {
+            true => println!("{}", json!({ "seat": seat, "scope": scope, "seated": false, "held": true, "since": since })),
+            false => {
+                println!("{} {}  {}", p.cyan("▣"), p.bold(scope), p.dim(&format!("held by {seat}")));
+                println!("  {}", p.dim("nothing seated · `wsp govern primary --tell -` speaks to it"));
+            }
+        }
+    };
+    match crate::repair::reading(store, seats, scope) {
+        crate::repair::Occupancy::Occupied => {
+            held(&cmd_govern::seat_held(scope, &governors).map(|s| s.pane).unwrap_or_default());
+            return 0;
+        }
+        // The machine that cannot be seen: a second seat opened on a guess is
+        // the duplicate this verb exists not to make.
+        crate::repair::Occupancy::Unreadable => {
+            eprintln!("wsp: no backend answered for the primary seat's pane, so whether anybody is in it cannot be read - nothing seated");
+            return 1;
+        }
+        crate::repair::Occupancy::Vacant(_) => {}
+    }
+    if !cmd_govern::claim_seat(store, scope) {
+        match args.json() {
+            true => println!("{}", json!({ "seat": null, "scope": scope, "seated": false, "held": false, "seating": true })),
+            false => println!("{} {}  {}", p.cyan("▣"), p.bold(scope), p.dim("already being seated - nothing seated twice")),
+        }
+        return 0;
+    }
+    let code = place_work(place, store, &Args::synth("spawn", &[scope], &flags));
+    if code != 0 {
+        cmd_govern::release_seat_claim(store, scope);
+    }
+    code
 }
 
 /// Which backend places this work: a terminal, a supervisor with none, or a
@@ -2153,7 +2339,8 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let cwd = args
         .get("cwd")
         .or_else(|| work.project.as_deref().and_then(|p| index.root_for(p, &refs)))
-        .or_else(|| work.list.as_deref().and_then(|l| list_root(store, &index, l)));
+        .or_else(|| work.list.as_deref().and_then(|l| list_root(store, &index, l)))
+        .or_else(|| work.primary.then(|| primary_root(&index)).flatten());
 
     // One tree per agent, which is the whole of robustness-010 and is done here
     // rather than asked of the agent. Every softer version of it has been tried
@@ -2220,7 +2407,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // custodial spawn starts an agent too, and it is the one case where there
     // is no `--agent` flag to look at.
     let will_start = args.has("agent")
-        || (args.has("govern") && (work.list.is_some() || work.project.is_some()));
+        || (args.has("govern") && (work.list.is_some() || work.project.is_some() || work.primary));
     // What this seat is about, in one word: the task, or — under `--govern` —
     // the scope it answers for. Worked out here rather than where the agent is
     // named below, because the seat's environment is fixed when the seat opens
@@ -2232,6 +2419,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         .or_else(|| checking.as_ref().map(|(l, at)| crate::barrier::subject(l, *at)))
         .or_else(|| work.list.clone())
         .or_else(|| work.project.clone())
+        .or_else(|| work.primary.then(|| cmd_govern::PRIMARY.to_string()))
         .unwrap_or_default();
     // Where this seat's brief will be written, when the kind is one that reads
     // a brief out of a file. Named now and written later: the environment has
@@ -2347,7 +2535,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // record a seat under and to tell an agent what it is custodian of, and
     // neither of those cares which of the two it is.
     let governing: Option<String> = match args.has("govern") {
-        true => work.list.clone().or_else(|| work.project.clone()),
+        true => work
+            .list
+            .clone()
+            .or_else(|| work.project.clone())
+            .or_else(|| work.primary.then(|| cmd_govern::PRIMARY.to_string())),
         false => None,
     };
     if let Some(project) = &governing {
@@ -2443,7 +2635,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 handover(t, Handover::Spawned, route(how, laid)),
                 inherited(t, cwd.as_deref())
             )),
-            (None, Some(p)) => Some(handover(p, Handover::Custodian, route(how, laid))),
+            (None, Some(p)) => Some(handover(p, Handover::of_seat(p), route(how, laid))),
             (None, None) => None,
         };
         // Only for a kind that takes it that way. Handing it to every kind's
@@ -2557,6 +2749,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 "seat": seat.as_str(),
                 "task": work.task,
                 "project": work.project,
+                // The slot taken, for a custodial spawn: `wsp spawn --primary
+                // --json` is read by a button, and this is the field that says
+                // the seat it pressed for is the one it got.
+                "scope": governing,
                 "cwd": cwd,
                 "agent": started,
                 "told": told,
@@ -3089,7 +3285,8 @@ fn rotate_as(
         .project
         .as_deref()
         .and_then(|proj| index.root_of(proj))
-        .or_else(|| work.list.as_deref().and_then(|l| list_root(store, &index, l)));
+        .or_else(|| work.list.as_deref().and_then(|l| list_root(store, &index, l)))
+        .or_else(|| work.primary.then(|| primary_root(&index)).flatten());
     let cwd = match grounded(&index, cwd.as_deref()) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -3100,7 +3297,12 @@ fn rotate_as(
             return 2;
         }
     };
-    let subject = work.list.clone().or_else(|| work.project.clone()).unwrap_or_default();
+    let subject = work
+        .list
+        .clone()
+        .or_else(|| work.project.clone())
+        .or_else(|| work.primary.then(|| cmd_govern::PRIMARY.to_string()))
+        .unwrap_or_default();
 
     let how = agent_commands::of(&kind);
     let brief_at =
@@ -3191,7 +3393,7 @@ fn rotate_as(
         Some(path) => lay_brief(place, store, &work, &seat, cwd.as_deref(), path),
         None => Laid::Elsewhere,
     };
-    let order_text = handover(&subject, Handover::Custodian, route(how, laid));
+    let order_text = handover(&subject, Handover::of_seat(&subject), route(how, laid));
     // A seat seated into a vacancy is also told what it missed, and told the
     // *size* of it rather than the contents. See `unheld`.
     let text = match vacant {
@@ -4803,6 +5005,7 @@ mod tests {
             project: Some("robustness".into()),
             label: "robustness/004 · a title".into(),
             list: None,
+            primary: false,
         };
         let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false, None, false);
         assert_eq!(o.label, "robustness/004 · a title");
@@ -4818,7 +5021,7 @@ mod tests {
         // A project spawn has no task: absent, or emptied when the caller
         // carried one of its own (`wsp-203`), which is the only strip there is.
         let proj =
-            Work { task: None, project: Some("robustness".into()), label: "robustness".into(), list: None };
+            Work { task: None, project: Some("robustness".into()), label: "robustness".into(), list: None, primary: false };
         let o = order(&proj, None, None, true, None, false);
         assert!(unset(&o.env, "WSP_TASK"));
         assert!(o.on.is_none());
@@ -4841,6 +5044,7 @@ mod tests {
             project: Some("core".into()),
             label: "core/001 · a title".into(),
             list: None,
+            primary: false,
         };
         let brief = std::path::PathBuf::from("/tmp/briefs/oc-001.md");
         let o = order(
@@ -4896,7 +5100,7 @@ mod tests {
     /// incantation the caller has to remember.
     #[test]
     fn a_spawned_agent_is_not_handed_the_spawning_session() {
-        let work = Work { task: None, project: None, label: "probe".into(), list: None };
+        let work = Work { task: None, project: None, label: "probe".into(), list: None, primary: false };
         let o = order(&work, None, None, false, None, false);
         assert_eq!(
             o.env.get(crate::place::CHILD_MARKER).map(String::as_str),
@@ -5224,6 +5428,7 @@ mod tests {
             project: Some("robustness".into()),
             label: "robustness".into(),
             list: None,
+            primary: false,
         };
         // Unset, or emptied when the caller carried one — an empty value is
         // the only strip on the wire, and `Args::terse` reads it as off.
@@ -5252,6 +5457,7 @@ mod tests {
             project: None,
             label: "governor · tuning".into(),
             list: Some("tuning".into()),
+            primary: false,
         };
         let on_list = order(&list, None, None, false, None, true);
         assert_eq!(
@@ -5387,7 +5593,7 @@ mod tests {
 
     #[test]
     fn the_work_order_is_ascii_because_a_spawn_once_hung_on_one_character() {
-        for how in [Handover::Spawned, Handover::Running, Handover::Custodian] {
+        for how in [Handover::Spawned, Handover::Running, Handover::Custodian, Handover::Primary] {
             let text = work_order("t-260815-033", how);
             assert!(
                 text.is_ascii(),
@@ -8095,5 +8301,201 @@ mod tests {
         assert_eq!(row.spawned_by, None, "absent, not a null record");
         assert_eq!(row.role.json(), json!({ "is": "member", "task": "t-1" }));
         let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    // ---- the primary interface (`wsp-279`) --------------------------------
+
+    /// What the census says of the primary seat's recorded pane — the reading
+    /// [`crate::repair::reading`] takes: a state, or none, and whether every
+    /// backend positively lacks the pane.
+    struct Census(Option<State>, bool);
+
+    impl crate::cycle::Seats for Census {
+        fn state(&self, _: &str) -> Option<State> {
+            self.0
+        }
+        fn absent(&self, _: &str) -> bool {
+            self.1
+        }
+    }
+
+    /// Nobody: no pane the census has, which is a seat never filled or one
+    /// whose pane was killed.
+    const NOBODY: Census = Census(None, true);
+
+    const PRIMARY_AGENT: [(&str, &str); 2] = [("primary", "true"), ("kind", "opencode")];
+
+    /// A store with wsp's root, where the seat stands.
+    fn primary_store(tag: &str) -> (Store, String) {
+        let store = seat(tag);
+        let root = rooted(&store, PRIMARY_STANDS_IN);
+        (store, root)
+    }
+
+    fn press(place: &Started, census: &Census, store: &Store) -> i32 {
+        seat_primary(place, census, store, &Args::synth("spawn", &[], &PRIMARY_AGENT))
+    }
+
+    /// The row's done-when, first half: one call seats one agent, standing in
+    /// wsp's root, holding no claim, handed the primary interface's order and
+    /// not a custodian's — and a second call while it lives opens nothing.
+    #[test]
+    fn the_primary_seat_is_filled_once_and_a_second_call_while_it_lives_seats_nothing() {
+        let _guard = no_backend();
+        let (store, root) = primary_store("primary-once");
+        standing_in(None);
+        let place = started();
+        assert_eq!(press(&place, &NOBODY, &store), 0);
+
+        assert_eq!(place.1.borrow().len(), 1, "one seat opened");
+        assert_eq!(place.1.borrow()[0].cwd.as_deref(), Some(root.as_str()), "standing in wsp's root");
+        let order = place.0.borrow()[0].args.join(" ");
+        assert!(order.contains("You are the primary interface"), "its own order: {order}");
+        assert!(!order.contains("custodian of"), "not a custodian's: {order}");
+        let held = cmd_govern::seat_held(cmd_govern::PRIMARY, &store.governors()).expect("the slot is taken");
+        assert_eq!(held.pane, "w9:p1");
+        assert!(store.claims().is_empty() && store.bindings().is_empty(), "it holds no claim");
+        assert!(
+            cmd_govern::vacancy(&store.governors(), cmd_govern::PRIMARY).reseating.is_none(),
+            "the duplicate guard went when the seat was taken"
+        );
+
+        // The census now has somebody at the prompt in that pane.
+        assert_eq!(press(&place, &Census(Some(State::Idle), false), &store), 0, "held is an answer, not a failure");
+        assert_eq!(place.1.borrow().len(), 1, "and nothing was opened for it");
+        assert_eq!(cmd_govern::seat_held(cmd_govern::PRIMARY, &store.governors()).map(|s| s.pane).as_deref(), Some("w9:p1"));
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// The other half: its pane killed, the record still names it, and the
+    /// next call reads it `gone` and seats a fresh one — where the record
+    /// alone would have said somebody is there.
+    #[test]
+    fn a_primary_seat_whose_pane_was_killed_is_filled_again_on_the_next_call() {
+        let _guard = no_backend();
+        let (store, _) = primary_store("primary-gone");
+        standing_in(None);
+        store.set_governor(cmd_govern::PRIMARY, json!({ "workspace": "cpd-3", "pane": "cpd-3", "host": util::hostname() }));
+        let place = started();
+        assert_eq!(press(&place, &NOBODY, &store), 0);
+        assert_eq!(place.1.borrow().len(), 1, "a fresh seat");
+        assert_eq!(cmd_govern::seat_held(cmd_govern::PRIMARY, &store.governors()).map(|s| s.pane).as_deref(), Some("w9:p1"));
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A census that cannot be read is the machine nobody can see, and a seat
+    /// opened on a guess there is the duplicate the verb exists not to make.
+    #[test]
+    fn a_primary_seat_nobody_can_read_is_left_alone() {
+        let _guard = no_backend();
+        let (store, _) = primary_store("primary-unreadable");
+        let rec = json!({ "workspace": "cpd-3", "pane": "cpd-3", "host": util::hostname() });
+        store.set_governor(cmd_govern::PRIMARY, rec.clone());
+        let place = started();
+        assert_eq!(press(&place, &Census(None, false), &store), 1);
+        assert!(place.1.borrow().is_empty(), "nothing opened");
+        assert_eq!(store.governors()[cmd_govern::PRIMARY], rec, "and the record untouched");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// Two presses a second apart: the second finds the first's claim and
+    /// opens nothing, though the seat is not written yet.
+    #[test]
+    fn a_press_while_the_primary_seat_is_being_filled_opens_nothing() {
+        let _guard = no_backend();
+        let (store, _) = primary_store("primary-racing");
+        assert!(cmd_govern::claim_seat(&store, cmd_govern::PRIMARY), "the first press's claim");
+        let place = started();
+        assert_eq!(press(&place, &NOBODY, &store), 0);
+        assert!(place.1.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A press that fails gives its claim back, so the next press is a person
+    /// asking again and not a twenty-minute lock-out.
+    #[test]
+    fn a_failed_primary_seating_gives_its_claim_back() {
+        let _guard = no_backend();
+        let store = seat("primary-failed");
+        standing_in(None);
+        let place = started();
+        assert_eq!(press(&place, &NOBODY, &store), 2, "wsp has no root here, so there is nowhere to stand");
+        assert!(place.1.borrow().is_empty());
+        assert!(
+            cmd_govern::claim_seat(&store, cmd_govern::PRIMARY),
+            "the claim is free for the next press"
+        );
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `--on`, `--govern` and a positional are refused: one seat, on the
+    /// machine the person is at, and no project's.
+    #[test]
+    fn the_primary_seat_takes_no_scope_and_no_machine() {
+        let _guard = no_backend();
+        let (store, _) = primary_store("primary-refused");
+        let place = started();
+        for (rest, extra) in [(vec!["wsp"], None), (vec![], Some(("on", "mb2"))), (vec![], Some(("govern", "true")))] {
+            let mut flags = PRIMARY_AGENT.to_vec();
+            flags.extend(extra);
+            assert_eq!(seat_primary(&place, &NOBODY, &store, &Args::synth("spawn", &rest, &flags)), 2, "{rest:?} {extra:?}");
+        }
+        assert!(place.1.borrow().is_empty() && store.governors().is_empty(), "nothing opened or claimed");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wip --json` names the seat by `role` — the field compound finds the
+    /// Chat pane by — answers to nobody, and is never a seat that needs you.
+    #[test]
+    fn wip_marks_the_primary_seat_by_its_role_and_it_answers_to_nobody() {
+        let _guard = no_backend();
+        let (store, _) = primary_store("primary-wip");
+        standing_in(None);
+        assert_eq!(press(&started(), &NOBODY, &store), 0);
+        let row = wip_row(&store, "w9:p1");
+        assert_eq!(row.role.json(), json!({ "is": "primary" }));
+        assert_eq!(row.seat.as_deref(), Some(cmd_govern::PRIMARY));
+        assert_eq!((row.answers_to, row.answers_to_empty), (None, None), "the person, and no walk named");
+        assert!(!row.needs_you, "idle between asks is the job, as a governor's is");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// What the primary interface spawns at the person's word is nobody's
+    /// helper: the seat is said and the scope is null, as for a member's.
+    #[test]
+    fn a_seat_the_primary_interface_spawns_is_not_its_helper() {
+        let _guard = no_backend();
+        let store = governed_core("primary-spawns");
+        store.set_governor(cmd_govern::PRIMARY, json!({ "workspace": "cpd-1", "pane": "cpd-1", "host": util::hostname() }));
+        standing_in(Some("cpd-1"));
+        let code = place_work(&started(), &store, &Args::synth("spawn", &["t-1"], &AN_AGENT));
+        standing_in(None);
+        assert_eq!(code, 0);
+        assert_eq!(store.spawned().get("w9:p1"), Some(&json!({ "seat": "cpd-1", "scope": null })));
+        assert_eq!(wip_row(&store, "w9:p1").role.json(), json!({ "is": "member", "task": "t-1" }));
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A rotation and a reseat resolve the seat by the scope off its record,
+    /// so `primary` under `--govern` is the primary seat and no project.
+    #[test]
+    fn the_primary_scope_resolves_to_its_own_seat_under_govern() {
+        let (store, _) = primary_store("primary-resolve");
+        let index = Index::new(store.projects());
+        let w = resolve(&store, &Args::synth("spawn", &["primary"], &[("govern", "true")]), &index).expect("a scope");
+        assert!(w.primary && w.project.is_none() && w.list.is_none() && w.task.is_none());
+        assert_eq!(w.label, cmd_govern::PRIMARY_LABEL);
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// The custodian is told where work outside its project goes, and the
+    /// primary interface that it records the person's words only as theirs.
+    #[test]
+    fn the_custodian_sends_outside_work_to_the_primary_interface_which_quotes_the_person() {
+        let custodian = work_order("core", Handover::Custodian);
+        assert!(custodian.contains("`wsp govern primary --tell -`"), "{custodian}");
+        let primary = work_order(cmd_govern::PRIMARY, Handover::of_seat(cmd_govern::PRIMARY));
+        assert!(primary.contains("--as-person") && primary.contains("govern nothing"), "{primary}");
+        assert!(!primary.contains('\n'), "one line, for a kind that takes it in argv");
     }
 }

@@ -375,10 +375,10 @@ there because a stall has more causes than a handover.
 
 Ed, 2026-10-08 (`wsp-234`), and 2026-10-12 on `compound-495` d1: *"The sidebar
 agent is just a normal agent that's always accessible (and should re-open if no
-agent is allocated to that slot)"*. **This is a concept, written for Ed to
-read. It is not built yet. `wsp-279` builds it.** Where this says what a verb
-or field will be, it is what `wsp-279` builds, and nothing here exists until
-that row lands.
+agent is allocated to that slot)"*. `wsp-234` wrote this up as a concept and
+`wsp-279` built it: `wsp spawn --primary` seats it, and [What a client
+reads](#what-a-client-reads) below is the contract compound draws the Chat pane
+from.
 
 A run needs nobody in the middle, but a person still talks to the fleet. A lot
 of what Ed asks belongs to no project: *where are we, what's next*, file this
@@ -487,7 +487,7 @@ When a custodian is talked to directly about work that is not its project's,
 it does not take the work on. It names the primary interface, or with Ed's yes
 it passes the request on itself with `wsp govern primary --tell`, and then it
 goes back to its own project. That is one sentence added to the custodial work
-order (`Handover::Custodian` in `src/cmd_spawn.rs`). What it removes is what
+order (`Handover::Custodian` in `src/cmd_spawn.rs`), and it is there now. What it removes is what
 happened on gpui-migration: exceptions made on Ed's say-so that then rode in
 one custodian's thread for the rest of the run.
 
@@ -506,7 +506,45 @@ one custodian's thread for the rest of the run.
   asks its own seat.
 - **For a client:** `wsp wip --json` marks the seat by `role`, `{"is":
   "primary"}`, in `wsp-246`'s shape, and compound finds its pane by that field
-  and never by a label. `wsp-279` writes the field down here once it exists.
+  and never by a label. See [What a client reads](#what-a-client-reads).
+
+#### What a client reads
+
+The seat is the slot `primary` in `governors.json`, a scope that is neither a
+project nor a list. `wsp project add primary` and `wsp worklist new primary`
+are refused.
+
+- **`wsp wip --json`**: the seat's row in `agents[]` carries `"role": {"is":
+  "primary"}` and `"seat": "primary"`. Find the pane by `role.is == "primary"`
+  and read its `pane`. `answers_to` and `answers_to_empty` are both `null`,
+  because it is on no walk, and `needs_you` is `false`, because idle between
+  asks is its job. No row with that role means nobody is in the seat.
+- **`wsp spawn --primary [--json]`**: fills the seat when it reads empty, and
+  is what Chat and `⌘J` call. It exits 0 both when it seats an agent and when
+  the seat is already held. A held seat seats nothing and prints `{"seat":
+  "<pane>", "scope": "primary", "seated": false, "held": true, "since": …}`.
+  A press while another press is still seating it prints `"seating": true` and
+  seats nothing. A seating prints the ordinary spawn receipt, with `"scope":
+  "primary"`. "Empty" is the reconciler's own reading (`repair::reading`), so a
+  pane that was killed while the record still names it reads `gone` and is
+  refilled. When no backend answers, nobody can say whether the seat is held,
+  so it exits 1 and seats nothing. It takes `--kind`, `--model`, `--effort`,
+  `--cwd` and the backend flags. It refuses a positional, `--govern`, `-p`
+  and `--on`.
+- **Where it stands:** wsp's root (`PRIMARY_STANDS_IN`), or `--cwd`. It holds
+  no claim and gets no tree. Its brief is the no-project one plus a `seat
+  primary interface` line, so it is not handed the handbook of whichever
+  project's root it stands in.
+- **What it is called:** the workspace and pane are labelled `primary
+  interface`, and a claim does not rename them.
+- **What it spawns** is recorded as `spawned_by: {"seat": "<its pane>",
+  "scope": null}`, the way a member's spawn is. So the new seat is an `agent`
+  or a `member`, never a `helper`: it is the person's spawn.
+- **`wsp ask` from it** is always `for: "person"`, including about a row that
+  a seated governor answers for.
+- **`wsp govern primary`** names who holds it, `--tell -` speaks to it, and
+  `--reseat`/`--rotate` work as on any slot. The daemon never refills it, even
+  when something is held for it.
 
 #### The open questions, and what this recommends
 
@@ -524,7 +562,9 @@ one custodian's thread for the rest of the run.
   agents", goes in a short handbook of the primary seat's own, which its brief
   draws, the way `wsp project show <p> --handbook` is drawn for a project. A
   preference that lives only in the thread is lost at the next rotation, and
-  rotation is a reset, not a handover.
+  rotation is a reset, not a handover. That handbook is not built yet
+  (`wsp-279` left it out). Until it is, the work order tells the seat to put a
+  preference on the project it is about.
 - **Does it replace the custodian when no list is running?** No. With no list
   running, a project's decisions are still that project's custodian's, and if
   nobody is seated there they are Ed's. If the primary interface takes them
@@ -2342,6 +2382,8 @@ read off the transcript when the claim ends.
 It also says what each seat *is*, as `role` (`wsp-246`), so a reader placing a
 seat never parses `task`, which stays display text:
 `{"is": "governor", "of": "project" | "list", "id": "<scope>"}`,
+`{"is": "primary"}` (the primary interface's seat, `wsp-279`: see [What a
+client reads](#what-a-client-reads)),
 `{"is": "member", "task": "<id>"}` (with `list` and `group` when the task is a
 running list's member), `{"is": "verifier", "member": "<id>", "pass": N}` (N
 from 1, so a member verified again is `pass > 1`),

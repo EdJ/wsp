@@ -232,7 +232,11 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         None => (seat, to),
     };
 
-    let for_person = args.has("person");
+    // The primary interface's every question is the person's (`wsp-279`): it
+    // is where the person sits, so a seat on the walk that answered it would be
+    // answering the person's own side of the conversation — and it joins
+    // compound's *Require Attention* only as `for: "person"`.
+    let for_person = args.has("person") || me.scope().is_some_and(crate::cmd_govern::is_primary);
     let mut q = Message::question(
         me.clone(),
         kind,
@@ -1750,6 +1754,30 @@ mod tests {
         want.sort();
         assert_eq!(ids(yours_in(&store, None)), want, "yours: the person's two and not the governor's");
         assert_eq!(ids(message::raised_to_the_person(&store)), want, "flag --person: the same ids");
+    }
+
+    /// The primary interface's question is the person's (`wsp-279`), even about
+    /// a row a seated governor answers for: it is where the person sits, and
+    /// the governor is not who it asks.
+    #[test]
+    fn a_question_from_the_primary_interface_waits_on_the_person() {
+        let _env = util::isolated("ask-primary");
+        let store = scratch("ask-primary");
+        task(&store, "m-1");
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+        store.set_governor(crate::cmd_govern::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
+
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-1");
+        assert_eq!(ask(&store, &crate::Args::synth("ask", &["m-1", "which first, 457 or 458?"], &[])), 0);
+        std::env::remove_var(crate::place::SEAT_ENV);
+
+        let q = message::all(&store).into_iter().next().expect("raised");
+        assert_eq!(q.to_json()["for"], "person", "the person's, not ux-next's: {}", q.to_json());
+        assert_eq!(q.from.scope(), Some(crate::cmd_govern::PRIMARY), "and it says who asked");
     }
 
     /// `wsp-276`'s done-when: an authored caption is the question's line in

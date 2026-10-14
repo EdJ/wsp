@@ -473,7 +473,15 @@ impl Briefing {
         let checking = pane.as_deref().and_then(|p| crate::barrier::seat_of(store, p));
         Briefing {
             checking,
-            project: current_project(store, args, &world.index).unwrap_or(None),
+            // The primary interface stands in wsp's root and is no project's
+            // (`wsp-279`), so it gets the no-project brief: the directory would
+            // otherwise resolve to whichever project's root it is, and hand it
+            // that project's handbook, backlog and decisions as though it were
+            // their custodian.
+            project: match governed.as_deref().is_some_and(cmd_govern::is_primary) {
+                true => None,
+                false => current_project(store, args, &world.index).unwrap_or(None),
+            },
             mandate: cmd_mandate::current(store, agent.as_deref(), env.workspace_id.as_deref()),
             lists: crate::worklist::Running::read(store),
             seat_at,
@@ -1172,6 +1180,12 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
 /// every request. Sequencing and review are wsp's and the verifier's now.
 const SEAT_JOB: &str = "yours to decide and direct; wsp runs the steps · wsp flag --seat is your inbox";
 
+/// The same line for the primary interface (`wsp-279`), which holds a slot and
+/// governs nothing: where it reads the fleet, and that the person is who it
+/// answers to. Its work order says the rest once, at spawn.
+const PRIMARY_JOB: &str =
+    "the person's side of the fleet; governs nothing · wsp wip, wsp yours, wsp govern · your asks wait on the person";
+
 /// The brief as text, one line per element and nothing printed.
 fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     let terse = depth == Depth::Terse;
@@ -1248,7 +1262,17 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // draws only under a seat, and the brief is re-read on every request of
     // every session.
     let awake = r.daemon.as_ref().map(|d| format!("  {}", p.yellow(d)));
-    if let Some(scope) = &r.custodian {
+    if r.custodian.as_deref().is_some_and(cmd_govern::is_primary) {
+        row(
+            "seat",
+            format!(
+                "{}  {}{}",
+                p.bold(cmd_govern::PRIMARY_LABEL),
+                p.dim(PRIMARY_JOB),
+                awake.clone().unwrap_or_default(),
+            ),
+        );
+    } else if let Some(scope) = &r.custodian {
         // A seat on a worklist says where the run is, because for the agent
         // holding it that *is* the position: which group is being waited on is
         // the whole state of the thing in its hands, and it is the one fact
@@ -1824,6 +1848,19 @@ mod tests {
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("governor of batch"), "{text}");
         assert!(!text.contains("group"), "{text}");
+    }
+
+    /// The primary interface holds a slot and governs nothing (`wsp-279`), so
+    /// its seat line says that, and not that it is the governor of a scope
+    /// called `primary`.
+    #[test]
+    fn the_primary_interface_is_told_it_governs_nothing() {
+        let mut r = compose(&briefing());
+        r.custodian = Some(cmd_govern::PRIMARY.into());
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("primary interface") && text.contains("governs nothing"), "{text}");
+        assert!(!text.contains("governor of"), "{text}");
+        assert!(!text.contains("wsp claim <id>"), "and it is not sent to claim work: {text}");
     }
 
     /// `wsp-145`. A governor's job is mostly waiting to be handed something, and

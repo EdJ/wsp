@@ -176,6 +176,9 @@ const BOOL_FLAGS: &[&str] = &[
     // the `--ending` a rotation starts behind itself, and `--take`, which
     // `wsp govern core --take` puts after the scope it takes.
     "govern", "remove", "rotate", "ending", "take",
+    // `wsp spawn --primary` takes no positional, and `--primary --kind x`
+    // must not read `--kind` as its value.
+    "primary",
     // And `wsp watch <signal>…`, whose positionals are signal names.
     "now", "once", "status",
     // And `worklist add <slug> <parent> --sub`, whose positionals are the list
@@ -1769,6 +1772,15 @@ fn help_text() -> String {
                                     the project, an agent in it, the seat taken,
                                     and a custodial work order rather than a
                                     claim. For handover, use --rotate above
+  wsp spawn --primary               the primary interface: one standing seat that
+                                    is no project's, where the person talks to
+                                    the fleet. Seats an agent on the compound
+                                    backend if nobody holds it — else names who
+                                    does and seats nothing. Holds no claim, is
+                                    outside the cap, and is never refilled by
+                                    the daemon. Stands in wsp's root; --cwd
+                                    elsewhere. `wsp govern primary` says who
+                                    holds it, --tell speaks to it
   wsp release                       unbind this pane, leaving whatever is in it
   wsp release <id>                  …or end that task's claim, wherever it is
                                     held — including a claim no pane is under
