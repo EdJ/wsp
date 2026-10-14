@@ -1160,8 +1160,27 @@ pub fn reopen(store: &Store, args: &Args) -> i32 {
     });
     if code == 0 {
         deliver_the_reason(store, args, reason.trim());
+        took_back_held_run(store, args, reason.trim());
     }
     code
+}
+
+/// A member of a held run, sent back, takes the run back to its group —
+/// [`crate::cycle::reopened`] says when and why. Said here, after the row's own
+/// line, because the person who typed this is the one who should know their
+/// reopen also un-held a run.
+fn took_back_held_run(store: &Store, args: &Args, reason: &str) {
+    let Some(id) = args.rest.first().and_then(|n| store.task(n)).map(|t| t.id) else { return };
+    let Some((list, at)) = crate::cycle::reopened(store, &id, reason) else { return };
+    if !args.json() {
+        let p = Paint::new();
+        println!(
+            "{}",
+            p.dim(&format!(
+                "{list} was held at barrier {at}: it runs group {at} again, no verdict recorded — wsp seats {id} and checks the barrier afresh once it is back at review"
+            ))
+        );
+    }
 }
 
 /// Put the reason in the member's own pane, through the one delivery path.

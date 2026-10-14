@@ -1968,8 +1968,11 @@ fn help_text() -> String {
   wsp worklist hold [<slug>] "why"|-|--from FILE   the barrier's "does not
                                     pass": start nothing more. What is already
                                     running is left to finish — work in flight
-                                    cannot be unwound. `go` is its way back, and
-                                    `go` passes the barrier
+                                    cannot be unwound. `go` is one way back, and
+                                    `go` passes the barrier; `wsp reopen` of a
+                                    member the check held on is the other: the
+                                    run goes back to that group, reseats the
+                                    member and checks the barrier afresh
   wsp worklist followup <slug> <task>… --blocking|--next --from FILE
                                     the barrier check's verdict with up to four
                                     rows attached: --blocking holds, and they

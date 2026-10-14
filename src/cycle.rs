@@ -387,6 +387,64 @@ pub(crate) fn poke_list(store: &Store, list: &str, event: &str, passed: Option<u
     launch(store, &argv);
 }
 
+/// A member of a held run sent back: the run goes back to its group. `wsp-286`.
+///
+/// **A held run had one way back, and it was the pass.** `hold` starts nothing
+/// more and `go` is what un-holds, so a barrier check that held because a
+/// member still owed work left whoever reopened that member two choices: start
+/// an agent on it by hand, which a custodian's brief forbids, or `go`, which is
+/// read as the pass. On 2026-10-14 at wsp-open-ends' barrier 1, wsp-214 was
+/// reopened for its missing install with its agent gone, and the custodian
+/// started one by hand.
+///
+/// **So the reopen is the way back, and it records no verdict.** The list goes
+/// to `running` at the group it stood at — holding does not move the position —
+/// and `step` does the rest with machinery it already has: the member, at
+/// `doing` with nobody on it, is reseated ([`sent_back_unseated`]); once it is
+/// back at `review` and its verdict holds, the barrier reads finished again and
+/// the check that held is settled, so a fresh one opens.
+///
+/// **Only a hold the barrier's check made**: the newest check on the group is
+/// the one that said `holds`. A hold taken mid-group, or with no check, is a
+/// stop somebody decided on for reasons of their own, and a reopen is not a
+/// word about those — it stays held, and `go` is still its way back.
+///
+/// Returns the list and group it took back, for the verb to say.
+pub(crate) fn reopened(store: &Store, id: &str, reason: &str) -> Option<(String, usize)> {
+    let w = store.worklists().into_iter().find(|w| {
+        w.status() == WorklistStatus::Held && w.groups().iter().any(|g| g.members.iter().any(|m| m == id))
+    })?;
+    let taken = store.locked(|| {
+        let mut w = store.worklist(&w.id)?;
+        if w.status() != WorklistStatus::Held {
+            return None;
+        }
+        let at = worklist::position(store, &w, Reading::Settled).at?;
+        let g = w.groups().into_iter().nth(at - 1)?;
+        let held_by_check = g.checks.last().is_some_and(|c| c.state == crate::barrier::State::Holds);
+        if !g.members.iter().any(|m| m == id) || !held_by_check {
+            return None;
+        }
+        w.set_status(WorklistStatus::Running);
+        w.log(&format!("started again · {id} sent back, no verdict recorded: {}", util::truncate(reason, 200)));
+        store.save_worklist(&w).ok()?;
+        Some((w, at))
+    });
+    let (w, at) = taken?;
+    store.git_commit(&format!("wsp: {} runs group {at} again — {id} was sent back", w.id));
+    store.log_event("worklist-reopened", serde_json::json!({ "id": w.id, "group": at, "member": id, "why": reason }));
+    log_line(store, &format!("{} group {at}: {id} was sent back while the run was held — running the group again", w.id));
+    tell(store, &w, &format!(
+        "The {} run was held at barrier {at}, and {id} has been sent back: {}. The run is running group {at} \
+         again — no verdict was recorded — and wsp seats {id} if nobody is on it and checks the barrier afresh \
+         once it is back at review.",
+        w.id,
+        util::truncate(reason, 200),
+    ));
+    poke_list(store, &w.id, "reopen", None);
+    Some((w.id.clone(), at))
+}
+
 fn launch(store: &Store, argv: &[&str]) {
     // A test's `current_exe` is the test harness, and handing it `worklist
     // advance` would run the suite again from inside itself.
@@ -450,7 +508,9 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
             match event.as_str() {
                 "hold" => tell(store, &w, &format!(
                     "The {} run was held at its barrier: `wsp worklist show {}` has the reason. \
-                     wsp starts nothing more until somebody runs `wsp worklist go {}`.",
+                     wsp starts nothing more until somebody runs `wsp worklist go {}` — or, where the \
+                     check held on a member that still owes work, `wsp reopen <id> \"what is owed\"`, \
+                     which runs its group again and checks the barrier afresh.",
                     w.id, w.id, w.id
                 )),
                 // `wsp-173`: a person's pause, said as one, and said as not a
@@ -1194,6 +1254,7 @@ fn take_member(
         let why = match t.status() {
             Status::Todo if !claims.contains_key(&id) => "new",
             Status::Doing if ours && wedged(&t, &claims) => "again: the last start never claimed it",
+            Status::Doing if sent_back_unseated(store, &t, &claims) => "again: it was sent back and nobody is on it",
             _ => return None,
         };
         let going = members
@@ -1221,6 +1282,29 @@ fn take_member(
     })?;
     store.git_commit(&format!("wsp: {list} group {at} starts {id}"));
     Some(took)
+}
+
+/// Sent back since anybody last started on it, and nobody on it now: a member
+/// `wsp reopen` put at `doing` after its agent had gone. `wsp-286`.
+///
+/// **The sent-back line is the record, as `started by wsp:` is for a start**,
+/// and it has to be the newest of the two: the start `take_member` writes over
+/// it is what keeps a second advance from starting it again. Not the last line
+/// outright, unlike [`STARTED_BY`] — a governor's note on the row after the
+/// reopen is ordinary, and must not strand it.
+///
+/// **No claim and no binding**, because a member sent back with its agent still
+/// in its seat is the ordinary case and that agent was just told what is owed:
+/// starting a second would be two agents in one tree. A claim whose seat went is
+/// [`crate::repair`]'s, which tells it, ends it and puts the row back at `todo`.
+fn sent_back_unseated(store: &Store, t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    if claims.contains_key(&t.id) || !store.panes_for_task(&t.id).is_empty() {
+        return false;
+    }
+    let log = t.section("Log").unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let Some(back) = lines.iter().rposition(|l| l.contains(SENT_BACK)) else { return false };
+    !lines[back + 1..].iter().any(|l| l.contains(STARTED_BY) || l.contains("claimed by pane "))
 }
 
 /// The member's newest pass, when it stopped on a problem rather than holding.
@@ -2614,6 +2698,9 @@ fn heard(w: &Worklist, event: &str, passed: Option<usize>) -> Option<String> {
         }
         ("park", _) => format!("The {id} list was parked: nothing starts until it is resumed · wsp worklist show {id}"),
         ("resume", _) => format!("The {id} list was resumed where it was parked · wsp worklist show {id}"),
+        ("reopen", _) => format!(
+            "The {id} list was held at its barrier and a member was sent back: it runs that group again, with no verdict recorded · wsp worklist show {id}"
+        ),
         _ => return None,
     })
 }
@@ -4827,6 +4914,83 @@ fn only_a_working_screen_is_ever_overruled() {
         b.tags = vec![BARRIER_TAG.into()];
         store.save_task(&b).unwrap();
         assert_eq!(list_of(&store, &b).map(|w| w.id), Some("run".into()));
+    }
+
+    /// `wsp-286`. **A held run's member, reopened, is the way back that is not
+    /// the pass.** The check holds at barrier 1 because m-1 still owes its
+    /// install; m-1's agent is gone. `wsp reopen` takes the run back to group 1
+    /// with no verdict, the step seats m-1 once, and when m-1 is back at review
+    /// the barrier is checked afresh beside the check that held.
+    #[test]
+    fn a_held_runs_member_reopened_is_reseated_and_the_barrier_checked_afresh() {
+        let (_env, store) = scratch("reopenheld");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude"), (&["m-2"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        check_seated(&store, 1, "cpd-chk");
+        let _ = spawned();
+
+        let hold = Args::synth("worklist", &["hold", "run", "m-1 is not installed"], &[]);
+        assert_eq!(crate::cmd_worklist::hold(&store, &hold), 0);
+        assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Held);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "held: nothing starts");
+        let _ = drained(&TOLD);
+        let _ = drained(&HEARD);
+
+        let reopen = Args::synth("reopen", &["m-1", "install it and drive it live"], &[]);
+        assert_eq!(crate::cmd_task::reopen(&store, &reopen), 0);
+        let now = store.worklist("run").unwrap();
+        assert_eq!(now.status(), WorklistStatus::Running, "the reopen takes the run back");
+        assert!(now.groups()[0].verdict.trim().is_empty(), "and records no verdict: {:?}", now.groups()[0].verdict);
+        assert!(now.body.contains("started again · m-1 sent back"), "{}", now.body);
+        assert_eq!(worklist::position(&store, &now, Reading::Settled).at, Some(1), "at the group it stood at");
+        let told = drained(&TOLD);
+        assert!(told.iter().any(|t| t.contains("m-1") && t.contains("no verdict")), "{told:?}");
+        assert!(drained(&HEARD).iter().any(|t| t.contains("sent back")), "and the governor above hears it");
+
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".into(), "claude".into())], "the member is reseated, and m-2 is not started");
+        let m1 = store.find_task("m-1").unwrap();
+        assert_eq!(m1.status(), Status::Doing);
+        assert!(m1.section("Log").unwrap().lines().last().unwrap().contains(STARTED_BY), "{}", m1.body);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "once: the start is the record a second step finds");
+        assert_eq!(checks(&store, 1).len(), 1, "no check while m-1 owes work");
+
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Review);
+        t.log("review: installed and driven live");
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Blind);
+        let c = checks(&store, 1);
+        assert_eq!(
+            c.iter().map(|c| c.state).collect::<Vec<_>>(),
+            [crate::barrier::State::Holds, crate::barrier::State::Running],
+            "a fresh check beside the one that held"
+        );
+        assert_eq!(spawned(), vec![(crate::barrier::seat_label("run", 1), "claude".into())], "and its agent started");
+    }
+
+    /// A reopen is not a word about a hold somebody took for their own reasons:
+    /// with no check that held, the run stays held and `go` is its way back.
+    #[test]
+    fn a_member_reopened_under_a_hold_no_check_made_leaves_the_run_held() {
+        let (_env, store) = scratch("reopenhand");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let hold = Args::synth("worklist", &["hold", "run", "stop for now"], &[]);
+        assert_eq!(crate::cmd_worklist::hold(&store, &hold), 0);
+        set(&store, "m-1", Status::Review);
+
+        let reopen = Args::synth("reopen", &["m-1", "one more thing"], &[]);
+        assert_eq!(crate::cmd_task::reopen(&store, &reopen), 0);
+        assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Held);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "{:?}", spawned());
     }
 
     /// `wsp-188`. A verdict that holds leaves the member at `review` and tells
