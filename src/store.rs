@@ -399,6 +399,7 @@ impl Store {
             "resume-held.json",
             "said.json",
             "seat-since.json",
+            "spawned.json",
             "watches.json",
             "worked.json",
         ]
@@ -2353,6 +2354,59 @@ impl Store {
     pub fn reap_said(&self, live_panes: &[String]) -> usize {
         let mut dropped = 0;
         self.update_json("said.json", |s| {
+            let before = s.len();
+            s.retain(|pane, _| live_panes.iter().any(|p| p == pane));
+            dropped = before - s.len();
+        });
+        dropped
+    }
+
+    // ---- who spawned a seat --------------------------------------------
+    //
+    // `wsp-249`. A seat a governor spawned is a helper, and nothing else says
+    // so: the claim is the task's, and a helper may hold none. So `spawn`
+    // records the seat it was run from, and that seat's scope when it governs
+    // one, here — keyed on the seat, like `said.json`, and reaped on the same
+    // evidence as a binding, so it lasts exactly as long as the seat does.
+    //
+    // **Not on the binding, which is where `wsp-249` first put it.** A binding
+    // is the claim's half in a seat: `release`, `done` and a hand-off clear it
+    // while the agent goes on standing there, and a helper with no row has
+    // none at all. Who spawned an agent is a fact about the seat, and a
+    // binding with no task in it is a state every reader of bindings —
+    // `doctor`'s quiet sweep, `reconcile`, a room's rename — would have to
+    // learn to skip. Where a claim is made, `spawn` copies the record onto it,
+    // which is what carries it to a new seat across a herdr restart
+    // (`cmd_agent::reconcile`) and a `wsp resume`.
+
+    /// seat -> `{ seat, scope }`: the seat a `wsp spawn` was run from, and
+    /// the scope it governed then (`null` when it governed none).
+    pub fn spawned(&self) -> BTreeMap<String, Value> {
+        match self.read_json("spawned.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    /// Record who spawned `seat`, or — `None`, a spawn nobody's seat ran —
+    /// that nobody did. The second is written too, because a seat id can be
+    /// reused and a person's spawn into it must not inherit a helper's record.
+    pub fn set_spawned(&self, seat: &str, by: Option<&Value>) {
+        self.update_json("spawned.json", |s| match by {
+            Some(v) => {
+                s.insert(seat.to_string(), v.clone());
+            }
+            None => {
+                s.remove(seat);
+            }
+        });
+    }
+
+    /// Drop the records of seats that are gone, on the same evidence and with
+    /// the same reservation as [`Store::reap_bindings`].
+    pub fn reap_spawned(&self, live_panes: &[String]) -> usize {
+        let mut dropped = 0;
+        self.update_json("spawned.json", |s| {
             let before = s.len();
             s.retain(|pane, _| live_panes.iter().any(|p| p == pane));
             dropped = before - s.len();

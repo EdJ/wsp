@@ -814,6 +814,43 @@ fn seat_env_over(
     env
 }
 
+/// Who is spawning, as the new seat's record will name it: the seat this
+/// process is standing in, and the scope that seat governs when it governs
+/// one (`wsp-249`). `None` for a spawn run from no seat — a person at a shell,
+/// or a run step, which `cycle::launch` starts with nobody's seat on purpose.
+///
+/// The caller's seat is [`cmd_agent::my_pane`], the reading `wsp say` and
+/// `wsp ask` take, and its scope is [`cmd_govern::governs`], the one that
+/// decides whether a seat is a governor everywhere else. So a member that
+/// spawns is recorded with a `null` scope, and stays an `agent` in `wip`:
+/// only a governor's spawn makes a helper.
+pub(crate) fn spawner(governors: &BTreeMap<String, Value>, caller: Option<&str>) -> Option<Value> {
+    let seat = caller.filter(|s| !s.is_empty())?;
+    let scope = cmd_govern::governs(governors, &Seat::new(seat));
+    Some(json!({ "seat": seat, "scope": scope }))
+}
+
+/// Write [`spawner`]'s answer against the seat it opened, and on the claim it
+/// made there when it made one. The seat's record is what `wip` reads; the
+/// claim's copy is what follows the work to another seat when this one is
+/// taken away (`Store::spawned` says why both).
+///
+/// Written when it is `None` too: a seat id can be reused, and nobody's spawn
+/// must not read as the helper that last stood there.
+pub(crate) fn record_spawner(store: &Store, seat: &Seat, claimed: Option<&str>, by: Option<&Value>) {
+    store.locked(|| {
+        store.set_spawned(seat.as_str(), by);
+        let Some(task) = claimed else { return };
+        let Some(mut claim) = store.claims().get(task).cloned() else { return };
+        let Some(o) = claim.as_object_mut() else { return };
+        match by {
+            Some(v) => o.insert("spawned_by".into(), v.clone()),
+            None => o.remove("spawned_by"),
+        };
+        store.set_claim(task, claim);
+    });
+}
+
 /// Where a worklist's custodian stands: where its project's governor stands,
 /// the root of the project its members are in. Where they span projects, the
 /// one holding most rows, the first-seen on a tie.
@@ -2349,6 +2386,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             ),
         }
     }
+
+    // Who is spawning it (`wsp-249`), before the agent starts for the claim's
+    // reason: a reader that sees the seat should see who put it there.
+    let by = spawner(&governors, cmd_agent::my_pane().as_deref());
+    record_spawner(store, &seat, work.task.as_deref().filter(|_| claimed && !verifying), by.as_ref());
 
     // A slot is for an agent. `--govern` without `--agent` would record a
     // position and leave a shell sitting in it, which is a seat that answers
@@ -7910,6 +7952,148 @@ mod tests {
         assert_eq!(end_owed(&place, &store, "core", &tidied.f()), 0);
         assert!(place.asked.borrow().is_empty());
 
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    // ---- who spawned a seat (`wsp-249`) --------------------------------
+
+    /// Stand this process in `seat`, or in none — the reading [`spawner`]
+    /// takes. The test runner is itself an agent with a seat of its own, so
+    /// each case says which it means rather than inheriting one.
+    fn standing_in(seat: Option<&str>) {
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        match seat {
+            Some(s) => std::env::set_var(crate::place::SEAT_ENV, s),
+            None => std::env::remove_var(crate::place::SEAT_ENV),
+        }
+    }
+
+    /// The row `wip` draws for `seat` off what the spawn wrote — the reading
+    /// compound's Agents view takes.
+    fn wip_row(store: &Store, seat: &str) -> cmd_agent::WipRow {
+        let w = cmd_agent::Wip {
+            tasks: store.tasks(),
+            index: Index::new(store.projects()),
+            bindings: store.bindings(),
+            claims: store.claims(),
+            pins: store.pins(),
+            governors: store.governors(),
+            agents: vec![crate::place::Seated { seat: Seat::new(seat), state: State::Idle, ..Default::default() }],
+            agents_held: store.agents_held(),
+            said: store.said(),
+            daemon: None,
+            asks: Default::default(),
+            mandates: Default::default(),
+            checking: Default::default(),
+            check_on: Default::default(),
+            lists: store.worklists(),
+            since: Default::default(),
+            spawned: store.spawned(),
+        };
+        cmd_agent::wip_rows(&w).into_iter().find(|r| r.pane == seat).expect("the seat is drawn")
+    }
+
+    /// A store with `core` rooted, a row `t-1` in it, and `core`'s governor
+    /// seated in `cpd-7`.
+    fn governed_core(tag: &str) -> Store {
+        let store = seat(tag);
+        rooted(&store, "core");
+        let mut t = Task::new("a row of core's", "t-1");
+        t.project = Some("core".into());
+        store.save_task(&t).unwrap();
+        store.set_governor("core", json!({ "workspace": "cpd-7", "pane": "cpd-7", "host": util::hostname() }));
+        store
+    }
+
+    fn started() -> Started {
+        Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()))
+    }
+
+    const AN_AGENT: [(&str, &str); 3] = [("agent", "true"), ("kind", "opencode"), ("no-tree", "true")];
+
+    /// A governor spawning onto a row: the seat records it, the claim carries
+    /// a copy, and `wip` calls the seat the governor's helper at that row —
+    /// where before it was a member of nothing, indistinguishable from work a
+    /// person had claimed.
+    #[test]
+    fn a_seat_a_governor_spawns_onto_a_row_is_its_helper_at_that_row() {
+        let _guard = no_backend();
+        let store = governed_core("spawned-row");
+        standing_in(Some("cpd-7"));
+        let code = place_work(&started(), &store, &Args::synth("spawn", &["t-1"], &AN_AGENT));
+        standing_in(None);
+        assert_eq!(code, 0);
+
+        let by = json!({ "seat": "cpd-7", "scope": "core" });
+        assert_eq!(store.spawned().get("w9:p1"), Some(&by), "recorded against the seat it opened");
+        assert_eq!(store.claims()["t-1"]["spawned_by"], by, "and on the claim, which a restart carries to the next seat");
+        let row = wip_row(&store, "w9:p1");
+        assert_eq!(row.role.json(), json!({ "is": "helper", "scope": "core", "task": "t-1" }));
+        assert_eq!(row.spawned_by, Some(by));
+        assert_eq!(row.answers_to.as_deref(), Some("core"), "where its own `wsp ask` goes");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp spawn -p core --agent` from the governor's seat: no row, no claim,
+    /// and before this nothing at all said the seat was anybody's. It is the
+    /// governor's helper with no task, drawn under that governor.
+    #[test]
+    fn a_seat_a_governor_spawns_with_no_row_is_its_helper_all_the_same() {
+        let _guard = no_backend();
+        let store = governed_core("spawned-no-row");
+        standing_in(Some("cpd-7"));
+        let flags = [AN_AGENT.as_slice(), &[("project", "core")]].concat();
+        let code = place_work(&started(), &store, &Args::synth("spawn", &[], &flags));
+        standing_in(None);
+        assert_eq!(code, 0);
+
+        assert!(store.claims().is_empty() && store.bindings().is_empty(), "a helper with no row holds nothing");
+        let by = json!({ "seat": "cpd-7", "scope": "core" });
+        assert_eq!(store.spawned().get("w9:p1"), Some(&by));
+        let row = wip_row(&store, "w9:p1");
+        assert_eq!(row.role.json(), json!({ "is": "helper", "scope": "core" }));
+        assert_eq!(row.spawned_by, Some(by));
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A member is a seat too, and what it spawns is recorded with the seat it
+    /// came from — but a member governs nothing, so the scope is `null` and
+    /// the seat is an `agent`, not anybody's helper.
+    #[test]
+    fn a_seat_a_member_spawns_is_recorded_and_stays_an_agent() {
+        let _guard = no_backend();
+        let store = governed_core("spawned-by-member");
+        standing_in(Some("cpd-12"));
+        let flags = [AN_AGENT.as_slice(), &[("project", "core")]].concat();
+        let code = place_work(&started(), &store, &Args::synth("spawn", &[], &flags));
+        standing_in(None);
+        assert_eq!(code, 0);
+
+        let by = json!({ "seat": "cpd-12", "scope": null });
+        assert_eq!(store.spawned().get("w9:p1"), Some(&by));
+        let row = wip_row(&store, "w9:p1");
+        assert_eq!(row.role.json(), json!({ "is": "agent" }), "only a governor's spawn makes a helper");
+        assert_eq!(row.spawned_by, Some(by), "though who spawned it is still said");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A person at a shell has no seat, and their spawn records nothing — and
+    /// clears what a helper that stood in a reused seat id left behind, on the
+    /// seat and on the claim alike.
+    #[test]
+    fn a_persons_spawn_records_nobody_and_inherits_no_helpers_record() {
+        let _guard = no_backend();
+        let store = governed_core("spawned-by-person");
+        store.set_spawned("w9:p1", Some(&json!({ "seat": "cpd-7", "scope": "core" })));
+        standing_in(None);
+        assert_eq!(place_work(&started(), &store, &Args::synth("spawn", &["t-1"], &AN_AGENT)), 0);
+
+        assert_eq!(store.spawned().get("w9:p1"), None, "the reused seat's old record is gone");
+        assert_eq!(store.claims()["t-1"].get("spawned_by"), None);
+        let row = wip_row(&store, "w9:p1");
+        assert_eq!(row.spawned_by, None, "absent, not a null record");
+        assert_eq!(row.role.json(), json!({ "is": "member", "task": "t-1" }));
         let _ = std::fs::remove_dir_all(&store.root);
     }
 }

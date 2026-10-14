@@ -192,6 +192,10 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             // is a count of claims-to-panes and is read as one.
             let said = store.said();
             store.reap_said(&kept_bindings(&live, said.keys(), &answered));
+            // And who spawned each seat (`wsp-249`), which is the seat's and
+            // goes when the seat does — the binding's evidence, not its life.
+            let spawned = store.spawned();
+            store.reap_spawned(&kept_bindings(&live, spawned.keys(), &answered));
             // The one reading of herdr that happens on every tick, and it
             // already carries `agent_session` and `agent` on the rows that have
             // one. A binding cannot record either at the moment it is written —

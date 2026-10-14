@@ -82,7 +82,7 @@ Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` a
 | `~/wsp/archive/projects/` | removed projects, handbook and decisions intact |
 | `~/wsp/ids.json` | retired id → the id it became, so old ones still resolve |
 | `~/wsp/hooks/on-<event>` | executables fed event JSON on stdin |
-| `~/.local/state/wsp/` | claims, bindings, pins, mandates, governors, handovers, `said.json`, `worked.json`, `events.jsonl` — machine-local, not in git |
+| `~/.local/state/wsp/` | claims, bindings, pins, mandates, governors, handovers, `said.json`, `spawned.json`, `worked.json`, `events.jsonl` — machine-local, not in git |
 
 Override the store with `WSP_HOME`, state with `WSP_STATE`, and disable
 autocommit with `WSP_NO_COMMIT=1`.
@@ -2345,10 +2345,22 @@ seat never parses `task`, which stays display text:
 `{"is": "member", "task": "<id>"}` (with `list` and `group` when the task is a
 running list's member), `{"is": "verifier", "member": "<id>", "pass": N}` (N
 from 1, so a member verified again is `pass > 1`),
-`{"is": "check", "list": "<slug>", "group": N}`, or `{"is": "agent"}`. A seat
-that is two of these is named in the order `task` names it — governor, the
-work it holds, a pass, a check. A helper a governor spawned is not yet a role
-of its own; that waits on the spawn recording who spawned it (`wsp-249`).
+`{"is": "check", "list": "<slug>", "group": N}`,
+`{"is": "helper", "scope": "<scope>"}` (with `task` when it holds a row), or
+`{"is": "agent"}`. A seat that is two of these is named in the order `task`
+names it — governor, the work it holds, a pass, a check. A helper is a seat a
+governor spawned that would otherwise be an agent, or a member of no running
+list; a run's member stays a member whoever restarted it.
+
+And who spawned it, as `spawned_by` (`wsp-249`): `{"seat": "<seat>", "scope":
+"<scope>" | null}`, the seat `wsp spawn` was run from and the scope that seat
+governed then. A `null` scope is a member's or any ungoverning seat's spawn;
+`spawned_by` is itself `null` for a spawn run from no seat — a person at a
+shell, or a run step — which records nothing. It is kept in `spawned.json`, keyed on the seat and not on its binding,
+because a binding is the claim's and goes on `release` while the agent stays,
+and a helper with no row has none; it is reaped on a binding's evidence, and
+`spawn` copies it onto the claim it makes, so `reconcile` and `wsp resume`
+carry it to the seat a herdr restart puts the work in.
 
 And it says whom each seat answers to, as `answers_to` (`wsp-247`): the scope
 of the governor the seat hangs under, walked the way the seat's own `wsp ask`
@@ -2356,7 +2368,9 @@ would go, so a reader draws the tree from it and walks nothing itself. A member
 answers to its running list's seat, else the nearest seated project at or above
 its own; a verifier to whomever its member does; a barrier check to its list's
 seat, else its group's project's walk; a list's governor to its home project's
-(`wsp-263`); any other seat to its project's walk; a project's governor to
+(`wsp-263`); a helper to its row's walk, else its project's — which is where
+its `wsp ask` goes, not always who spawned it; any other seat to its project's
+walk; a project's governor to
 nobody, `null`. When nobody on the walk is seated it is `null` too, and
 `answers_to_empty` names the scope the walk starts at — the list, the project,
 or a list's home — so "no governor seated" is said, not guessed; it is `null`

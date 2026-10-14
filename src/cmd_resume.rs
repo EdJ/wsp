@@ -868,9 +868,13 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
                 flags.push(("cwd", &t.cwd));
             }
             flags.extend(cmd_spawn::backend_flag(via));
+            // Who spawned the agent being resumed, off the claim this one
+            // replaces: it is the same agent, so the same helper (`wsp-249`).
+            let by = store.claims().get(task.as_str()).and_then(|c| c.get("spawned_by")).filter(|v| v.is_object()).cloned();
             if cmd_spawn::cmd_agent_claim(store, task, &flags) != 0 {
                 return Err(format!("opened {seat}, but the claim on {task} was refused"));
             }
+            cmd_spawn::record_spawner(store, &seat, Some(task.as_str()), by.as_ref());
         }
         (None, Some(project)) => match place.room(&seat) {
             Some(ws) => {

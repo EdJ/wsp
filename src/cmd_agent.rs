@@ -3295,6 +3295,11 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
                 "reconciled": true,
             }),
         );
+        // Who spawned it, off the claim `spawn` copied it to, since the seat
+        // it was recorded against is the one this restart took away.
+        if let Some(by) = c.get("spawned_by").filter(|v| v.is_object()) {
+            store.set_spawned(&pane.pane_id, Some(by));
+        }
         store.log_event(
             "task-reconciled",
             json!({ "id": task_id, "pane": pane.pane_id, "workspace": ws }),
@@ -3912,6 +3917,10 @@ pub(crate) struct Wip {
     /// seat -> since when it has been in its state, as [`seat_clocks`] noted
     /// it on this reading. Published as `since` (`wsp-250`).
     pub since: std::collections::BTreeMap<String, String>,
+    /// `spawned.json`: seat -> the seat that spawned it and the scope that
+    /// seat governed (`wsp-249`). Published as `spawned_by`, and what makes a
+    /// governor's spawn a `helper`.
+    pub spawned: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Note this census's seats against `seat-since.json` and say since when each
@@ -4028,6 +4037,7 @@ impl Wip {
             check_on: crate::barrier::ran_on(&lists),
             lists,
             since,
+            spawned: store.spawned(),
         }
     }
 }
@@ -4172,6 +4182,10 @@ pub(crate) struct WipRow {
     pub(crate) runs: Runs,
     /// What the seat is. Published as `role`.
     pub(crate) role: Role,
+    /// The seat that spawned it and the scope that seat governed, as `spawn`
+    /// recorded it (`wsp-249`). Published as `spawned_by`; `null` for a seat
+    /// spawned from no seat.
+    pub(crate) spawned_by: Option<Value>,
 }
 
 /// What a seat is, typed, for a reader that places it (`wsp-246`): compound's
@@ -4182,8 +4196,10 @@ pub(crate) struct WipRow {
 ///
 /// Asked in the order `task` is named in, so the two never disagree about a
 /// seat: a governor's record, then the work it holds, then a pass standing
-/// there, then a check. A helper — a seat a governor spawned — is a role too,
-/// and is not one here until a spawn records who spawned it (`wsp-249`).
+/// there, then a check. A seat a governor spawned (`wsp-249`, its
+/// `spawned_by` naming a scope) is a helper where it would otherwise be an
+/// agent, or a member of no running list — a run's member stays a member,
+/// whoever restarted it, because the run is what places it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Role {
     /// It governs `id`, a project or a worklist — the scope `seat` names.
@@ -4195,6 +4211,10 @@ pub(crate) enum Role {
     Verifier { member: String, pass: usize },
     /// It is checking `list`'s barrier `group`.
     Check { list: String, group: usize },
+    /// The governor of `scope` spawned it, and it holds `task` if it holds
+    /// work — compound draws it at that row, or under that governor with none
+    /// (`docs/ux-design.md` §18 rule 6).
+    Helper { scope: String, task: Option<String> },
     /// None of the above.
     #[default]
     Agent,
@@ -4212,6 +4232,8 @@ impl Role {
             }
             Role::Verifier { member, pass } => json!({ "is": "verifier", "member": member, "pass": pass }),
             Role::Check { list, group } => json!({ "is": "check", "list": list, "group": group }),
+            Role::Helper { scope, task: None } => json!({ "is": "helper", "scope": scope }),
+            Role::Helper { scope, task: Some(t) } => json!({ "is": "helper", "scope": scope, "task": t }),
             Role::Agent => json!({ "is": "agent" }),
         }
     }
@@ -4359,6 +4381,12 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             (None, None, None, Some((list, at, _))) => Role::Check { list: list.clone(), group: *at },
             _ => Role::Agent,
         };
+        let spawned_by = w.spawned.get(seat).filter(|v| v.is_object()).cloned();
+        let role = match (role, spawned_by.as_ref().and_then(|b| b.get("scope")).and_then(Value::as_str)) {
+            (Role::Agent, Some(scope)) => Role::Helper { scope: scope.to_string(), task: None },
+            (Role::Member { task, placing: None }, Some(scope)) => Role::Helper { scope: scope.to_string(), task: Some(task) },
+            (role, _) => role,
+        };
         let (answers_to, answers_to_empty) = answers_to(w, &role, seat, r.project.as_deref(), &running, &homes);
 
         rows.push(WipRow {
@@ -4396,6 +4424,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             answers_to,
             answers_to_empty,
             role,
+            spawned_by,
         });
     }
     // A governor's count, once every row has its own reading — off the same
@@ -4439,8 +4468,11 @@ fn wip_queues(w: &Wip) -> (Vec<&Task>, Vec<&Task>, usize) {
 /// - a **project's governor**, nobody: the census is a tree of lists under
 ///   projects, and a project custodian is a root of it, so both halves are
 ///   `None`;
-/// - any **other seat**, its project's walk. A helper a governor spawned is one
-///   of these until a spawn records who spawned it (`wsp-249`).
+/// - a **helper**, its row's walk if it holds one and its project's if not —
+///   where its `wsp ask` goes, which is not always who spawned it: a list's
+///   governor's helper on no row answers to its project's governor, and its
+///   `spawned_by` says the list's, two facts the chrome reads apart;
+/// - any **other seat**, its project's walk.
 fn answers_to(
     w: &Wip,
     role: &Role,
@@ -4462,9 +4494,11 @@ fn answers_to(
                 None => (None, home.map(str::to_string)),
             };
         }
-        Role::Member { task, .. } | Role::Verifier { member: task, .. } => task_walk(task),
+        Role::Member { task, .. } | Role::Verifier { member: task, .. } | Role::Helper { task: Some(task), .. } => {
+            task_walk(task)
+        }
         Role::Check { list, .. } => (Some(list.as_str()), w.checking.get(seat).and_then(|(_, _, p)| p.as_deref())),
-        Role::Agent => (None, project),
+        Role::Agent | Role::Helper { task: None, .. } => (None, project),
     };
     match cmd_govern::seat_for(&w.governors, &w.index, list, project) {
         Some(s) => (Some(s.scope), None),
@@ -4490,6 +4524,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "kind": r.runs.kind, "model": r.runs.model, "effort": r.runs.effort,
             "role": r.role.json(),
             "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
+            "spawned_by": r.spawned_by,
             })
         }).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
@@ -5148,6 +5183,9 @@ pub fn hook(store: &Store, args: &Args) -> i32 {
                 if store.clear_binding(&pane) {
                     store.log_event("pane-exited", json!({ "pane": pane }));
                 }
+                // Who spawned the agent goes with the agent: whatever is
+                // started in this pane next was not (`wsp-249`).
+                store.set_spawned(&pane, None);
             }
         }
         "workspace.created" | "workspace_created" => {
@@ -7814,6 +7852,7 @@ mod tests {
             check_on: Default::default(),
             lists: Vec::new(),
             since: Default::default(),
+            spawned: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -8003,6 +8042,7 @@ mod tests {
             check_on: Default::default(),
             lists: Vec::new(),
             since: Default::default(),
+            spawned: Default::default(),
         }
     }
 
@@ -8448,6 +8488,56 @@ mod tests {
 
         // And it does not disturb the herdr rows already resolved beside it.
         assert!(rows.iter().find(|r| r.pane == "w2:p1").unwrap().needs_you);
+    }
+
+    /// `wsp-249`: who spawned a seat survives a herdr restart the way the
+    /// seat's binding does. A pane that comes back under its own id keeps its
+    /// record, as it keeps its binding; one that comes back renumbered is
+    /// rebound by `reconcile` off the claim, and the claim's copy of who
+    /// spawned it goes to the new seat with it; and `sync` forgets the old
+    /// seat's record on the evidence it forgets a binding on.
+    #[test]
+    fn who_spawned_a_seat_survives_a_herdr_restart_as_its_binding_does() {
+        let (env, store) = scratch("spawned-restart");
+        let by = json!({ "seat": "cpd-7", "scope": "core" });
+        for id in ["t-1", "t-2"] {
+            let mut t = Task::new("a helper's row", id);
+            t.project = Some("core".into());
+            t.status_raw = "doing".into();
+            store.save_task(&t).unwrap();
+        }
+        store.set_governor("core", json!({ "workspace": "cpd-7", "pane": "cpd-7", "host": util::hostname() }));
+        // t-1's helper stood in w1:p1, and herdr came back with it as w1:p2.
+        store.set_claim("t-1", json!({ "workspace_id": "w1", "host": util::hostname(), "spawned_by": by }));
+        store.set_spawned("w1:p1", Some(&by));
+        // t-2's came back under its own id, binding and all.
+        store.set_claim("t-2", json!({ "workspace_id": "w2", "host": util::hostname(), "spawned_by": by }));
+        store.set_binding("w2:p1", json!({ "task_id": "t-2", "pane_id": "w2:p1", "workspace_id": "w2" }));
+        store.set_spawned("w2:p1", Some(&by));
+
+        let stage = crate::fake::Stage::of(vec![
+            crate::fake::Spot::agent("w1:p2", "claude", "t-1", State::Idle).on("w1", "t1"),
+            crate::fake::Spot::agent("w2:p1", "claude", "t-2", State::Idle).on("w2", "t1"),
+        ]);
+        let fake = crate::fake::Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        reconcile(&store, false);
+        assert_eq!(store.bindings()["w1:p2"]["task_id"], "t-1", "the restart's rebinding, which this rides");
+        assert_eq!(store.spawned().get("w1:p2"), Some(&by), "carried to the renumbered seat off the claim");
+        let _ = sync::sync(&store, &mut sync::Cache::default(), true);
+        let spawned = store.spawned();
+        assert_eq!(spawned.get("w1:p1"), None, "the seat herdr no longer lists is forgotten, as its binding would be");
+        assert_eq!(spawned.get("w2:p1"), Some(&by), "and a seat that came back keeps it");
+
+        let w = Wip::live(&store);
+        let rows = wip_rows(&w);
+        for seat in ["w1:p2", "w2:p1"] {
+            let row = rows.iter().find(|r| r.pane == seat).expect("drawn");
+            assert_eq!(row.role, Role::Helper { scope: "core".into(), task: Some(row.task_id.clone()) }, "{seat}");
+            assert_eq!(wip_json(&w)["agents"].as_array().unwrap().iter().find(|r| r["pane"] == seat).unwrap()["spawned_by"], by);
+        }
     }
 
     /// `Wip::live` itself, against a real herdr fake and a real compound seat
