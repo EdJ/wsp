@@ -145,7 +145,10 @@ wsp despawn 003             # end it: the agent, the claim and the worktree
 
 Running a worklist is mostly not yours to do. Compose it, give each group an
 `agent:` line, start it once, and wsp runs the rest. See
-[A run with nobody in the middle](#a-run-with-nobody-in-the-middle).
+[A run with nobody in the middle](#a-run-with-nobody-in-the-middle). Work that
+belongs to no single project, such as the fleet, wsp itself or the machine, is
+for one standing seat that is no project's. See [The primary
+interface](#the-primary-interface-where-a-person-talks-to-the-fleet).
 
 ```sh
 wsp worklist new <slug> "…"  # compose: one `add` per group
@@ -367,6 +370,176 @@ gate it, both of which must hold: `wsp daemon` is up (the wake is typed by the
 daemon's attention pass), and the run has outstanding unattended members. With
 rotation as one verb it should never fire on a handover again; it is still
 there because a stall has more causes than a handover.
+
+### The primary interface: where a person talks to the fleet
+
+Ed, 2026-10-08 (`wsp-234`), and 2026-10-12 on `compound-495` d1: *"The sidebar
+agent is just a normal agent that's always accessible (and should re-open if no
+agent is allocated to that slot)"*. **This is a concept, written for Ed to
+read. It is not built yet. `wsp-279` builds it.** Where this says what a verb
+or field will be, it is what `wsp-279` builds, and nothing here exists until
+that row lands.
+
+A run needs nobody in the middle, but a person still talks to the fleet. A lot
+of what Ed asks belongs to no project: *where are we, what's next*, file this
+against wsp, spawn that, why is the machine slow, tell the other list's
+governor this. Every seat wsp has today is a seat **of** something: a
+project's custodian, a list's governor, a member's task. So a question about
+the fleet goes to whichever seat Ed happens to be talking to, and it is handled
+with that seat's context and that seat's brief.
+
+**The worked example is gpui-migration.** Ed talked to the compound custodian
+(`cpd-459`) for the whole run, and most of what Ed asked it was not compound's:
+
+| Ed asked the compound custodian to… | whose it was | where it would go |
+|---|---|---|
+| file wsp defects: `wsp-230` (barrier seats), `wsp-231` (machine cap), `wsp-232` (a verdict became a group), `wsp-233` (project inbox), and `wsp-234` | wsp's project, filed by nobody in particular | the primary interface files them (`wsp add -p wsp`) |
+| spawn agents on wsp rows and close them | no seat's. A custodian is told it never spawns | the primary interface spawns and ends them, at Ed's word |
+| diagnose the machine's load | the machine's, which no project owns | the primary interface (`wsp wip`, `wsp machine show seat`, `ps`) |
+| carry a hand-run result to another list's governor | that list's governor, but it had to be carried | the primary interface tells that seat (`wsp govern <list> --tell`) |
+
+The custodian's work order says to coordinate one project and not to spawn or
+relay, so each of these was an exception made on Ed's say-so. The exception
+lived in that conversation and on no seat. If Ed had been talking to a
+different governor that afternoon, the same requests would have gone to it,
+with other context and other habits. Nothing was the obvious place to go, so
+whatever seat was nearest became it.
+
+**The primary interface is that place, given a seat.** It is one standing seat
+that is not a seat of any project:
+
+- **It is seated like a governor, not claimed onto a task.** It holds no
+  claim. It has a brief and a work order of its own, it is on the census
+  (`wsp wip`, `wsp govern`), it can be reached by `wsp govern primary --tell`,
+  and it outlives the window it is drawn in. Its scope is named `primary`, so
+  `primary` cannot be a project's name.
+- **It is a normal agent** (Ed, `compound-495` d1). There is no chat program
+  and no transcript view of wsp's or compound's own. It is an agent pane like
+  any other, seated in a slot that is always there.
+- **It is filled again when nobody holds it.** When its agent is gone, the
+  next press of Chat, or `wsp spawn --primary`, seats a fresh one. While it is
+  held, a second call says so and seats nothing.
+
+#### Its job is the person's side of the fleet
+
+- **Answer "where are we" and "what's next" across every project and list.**
+  It reads `wsp wip`, `wsp worklist next` for each running list, `wsp yours`
+  and `wsp tree`. It is the one seat whose brief is the whole fleet and not a
+  single subtree.
+- **Read and route what waits on Ed.** The questions only Ed may close
+  (`wsp-233`, `wsp-275`) are listed by `wsp yours`. The primary interface reads
+  them to Ed, oldest first, and says what each one holds.
+- **Put Ed's decisions on the right rows.** When Ed answers one in this pane,
+  the primary interface records Ed's words, quoted, with `wsp answer <id>
+  --as-person`, so it lands where every answer lands: a `## Decisions` entry on
+  the row, or a line on the list's log. That is the only time it uses
+  `--as-person`: for words Ed typed in this turn, never for an answer it
+  worked out itself. The guard on a person's question is there against an
+  agent answering out of habit. The primary interface quoting Ed is Ed
+  answering.
+- **File and spawn work that no project owns.** It files rows for wsp, for the
+  machine, and for anything that crosses projects. It spawns or ends an agent
+  when Ed asks.
+- **Carry a message from Ed to a seat.** `wsp govern <scope> --tell` to a
+  project's custodian or a list's governor. The seat that receives it answers
+  it. The primary interface does not decide it for them.
+
+#### What it is not
+
+**It is not a governor of anything.** It does not run, verify or land a step,
+and it is not on any run's walk. A project's decisions stay with that
+project's custodian, and a list's stay with that list's governor. The primary
+interface hands a question to that seat and does not answer it there. It does
+not take a project's seat when it is empty, either. A row whose project has
+nobody seated is the person's (`wsp-275`), so it reaches Ed through `wsp
+yours`. The primary interface reads it to Ed. It does not answer it in Ed's
+place.
+
+**It is not where the chain ends.** The person is still the governor of last
+resort (see [The seat](#the-seat)). A question that finds nobody seated on its
+walk is the person's, and the primary interface is only where the person reads
+it. So no seat's `answers_to` ever names `primary`. Its own `answers_to` is
+`null`, the way a project governor's is, and a `wsp ask` from it is
+`for: "person"`, so it joins *Require Attention*.
+
+**It does not take a project's decisions because it is talking to Ed.** The
+custodian's narrowing below only holds if this holds too. When Ed tells the
+primary interface something that is a project's decision, such as "drop group
+4" or "457 goes first", it carries the sentence to that project's seat, and
+that seat makes the change and writes it down. The primary interface makes the
+change itself only when Ed says it should, and then it notes on the row that
+Ed's word came through this seat.
+
+| | a project's custodian | a list's governor | the primary interface |
+|---|---|---|---|
+| a seat of | one project | one worklist | no project: the person's side |
+| seated | `spawn --govern`, `--take` | by wsp, on the first tick after `go` | on demand: Chat, `spawn --primary` |
+| rotated | not for a list wsp runs | at every barrier pass | when Ed or its own context asks for it |
+| refilled | by hand | by wsp, when it reads empty | on the next call, when it reads empty |
+| decides | its project's rows | its list's barriers and members | nothing of a project's, and Ed's words only as Ed's |
+| answers to | nobody (`null`) | its home project's governor | the person |
+| spawns | never | never | when Ed asks |
+| counted in the machine cap | no | no | no |
+
+#### The custodian's brief narrows to match
+
+When a custodian is talked to directly about work that is not its project's,
+it does not take the work on. It names the primary interface, or with Ed's yes
+it passes the request on itself with `wsp govern primary --tell`, and then it
+goes back to its own project. That is one sentence added to the custodial work
+order (`Handover::Custodian` in `src/cmd_spawn.rs`). What it removes is what
+happened on gpui-migration: exceptions made on Ed's say-so that then rode in
+one custodian's thread for the rest of the run.
+
+#### How Ed reaches it
+
+- **In compound:** the Chat button at the top right of the view bar, or `⌘J`.
+  Either slides the seat's own pane over the window's right edge (compound
+  FL-22, `docs/ux-design/24-the-agents-view-as-the-workspace.md` §24.12). It is
+  a regular agent window, typed at its own prompt. When the census shows
+  nobody in the seat, the press seats one first.
+- **From any shell:** `wsp govern primary` says who holds it, and `wsp govern
+  primary --tell "…"` speaks to it.
+- **From any brief:** a custodian's or a list governor's brief can name it in
+  one line, so a seat that is asked about work outside its scope knows where
+  to send the request. A worker's brief does not name it, because a worker
+  asks its own seat.
+- **For a client:** `wsp wip --json` marks the seat by `role`, `{"is":
+  "primary"}`, in `wsp-246`'s shape, and compound finds its pane by that field
+  and never by a label. `wsp-279` writes the field down here once it exists.
+
+#### The open questions, and what this recommends
+
+- **One per person, or one per machine?** One per machine, and only on the
+  seat machine, the box the person sits at (see [Machines](#machines)). The
+  slot is kept in `governors.json` in the state directory, which is per
+  machine, and there is one person. An executor has no person at it, so it
+  gets no primary interface. If there is ever a second person, that is a second
+  slot keyed on the person. It is not a second machine's seat.
+- **Does it remember across rotations, beyond its brief?** Only what is in the
+  store. That is what makes every rotation in wsp safe (see [The seat is reset
+  per batch](#the-seat-is-reset-per-batch)). A standing preference of Ed's is
+  written where it binds. A preference about one project goes in as a decision
+  on that project. A preference about no project, such as "close finished
+  agents", goes in a short handbook of the primary seat's own, which its brief
+  draws, the way `wsp project show <p> --handbook` is drawn for a project. A
+  preference that lives only in the thread is lost at the next rotation, and
+  rotation is a reset, not a handover.
+- **Does it replace the custodian when no list is running?** No. With no list
+  running, a project's decisions are still that project's custodian's, and if
+  nobody is seated there they are Ed's. If the primary interface takes them
+  over, it is the custodian again under another name, the thing this section
+  exists to stop.
+- **Does the daemon refill it unprompted?** No. It is filled on demand, which
+  is all compound asks for (`wsp-279`). A list's seat is refilled because a
+  run waits on it. The primary interface waits on Ed, and with Ed away there is
+  nothing for it to do. What it would have read out is waiting in `wsp yours`
+  when a fresh one is seated. A daemon that refilled it after every death would
+  start an agent at 3am that nobody talks to.
+- **How does it stay out of the agent cap?** The same way a governor does
+  (`wsp-231`). It is a seat and not working agents, so it is not counted. What
+  it spawns at Ed's word is counted, and it is a spawn by hand, so it says the
+  seat is at its cap and starts anyway, as `wsp spawn` already does.
 
 ## The panel
 
