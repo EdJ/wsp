@@ -1360,7 +1360,17 @@ next idle and says so in `cycle.log` (`wsp-204`).
 **What waits on the person is a question only the person may close**
 (`wsp-233`). `wsp ask <id|list> --person "…"` raises one: a member flagging a
 design call, a barrier check whose stop names Ed, a governor that has found
-something only Ed can settle. `wsp yours [-p proj] [--json]` lists them per
+something only Ed can settle. It is one of three ways a question becomes the
+person's (`wsp-275`): `--person`; a plain ask about a row no seat answers for;
+and a seat asking about its own work with nobody seated above it — with a
+seated seat above, the question goes up to that seat instead (`wsp-263`).
+`wsp ask` writes whose answer it waits on as `for` on the question — `"person"`,
+`{"seat": "<scope>"}`, or `null` — in `wsp ask --json`, `wsp flag --json`,
+`wsp flag --person --json` and `wsp yours --json`'s items alike. A question's `for: null`
+comes with `unrouted`, saying why: a question from before `wsp-275` with no
+`Sent` hop to read a seat off, which stays the person's because nobody else has
+it. `yours` and `flag --person` read one predicate, so their questions agree
+item for item. `wsp yours [-p proj] [--json]` lists them per
 project, oldest first, each with what it holds (`gpui-migration group 13`), and
 counts the rows waiting at `review` on one line rather than listing them. The
 answer is `wsp answer` as ever, and it lands **in place**: a `## Decisions`
