@@ -1251,10 +1251,7 @@ impl Snapshot {
             // The person's hands and not a seat's notices: a panel is the
             // person's surface, and a barrier pass wsp wrote for the seat
             // running the list is not theirs to see or clear (`wsp-272`).
-            flags: crate::message::raised(store)
-                .into_iter()
-                .filter(|m| !m.is_reply() && m.is_the_persons())
-                .collect(),
+            flags: crate::message::raised_to_the_person(store),
             said: store.said(),
             governors: store.governors(),
             worklists: crate::worklist::listing(store, store.worklists()),

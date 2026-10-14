@@ -209,8 +209,16 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         Waiting::new(pane.as_deref().unwrap_or_default(), &held),
     )
     .about(about);
-    if for_person {
-        q = q.for_the_person();
+    // **Whose answer it waits on, written now** (`wsp-275`). The seat that
+    // answers for the subject, or the person: asked with `--person`, about a
+    // row no seat answers for, or by the only seat there is — a governor
+    // asking about its own work is asking the person, and handing it to
+    // itself would wake it on its own words. `for` was null on every plain ask
+    // before this, and the flight view could not tell a governor's question
+    // from Ed's (compound-490's, which went to ux-next).
+    match seat.as_ref().filter(|s| !for_person && me.scope() != Some(s.scope.as_str())) {
+        Some(s) => q.for_seat = Some(s.scope.clone()),
+        None => q = q.for_the_person(),
     }
 
     // The guarantee this verb makes, checked before the record exists rather
@@ -226,7 +234,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {e}");
         return 1;
     }
-    if for_person {
+    if q.for_person {
         asked_of_the_person(store, &q, &subject_id);
     }
 
@@ -251,7 +259,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     // that does not know Ed owes something cannot say so when he is talking to
     // it — unless that seat is the one asking, which would wake it on its own
     // words.
-    let report = seat.as_ref().filter(|s| !(for_person && me.scope() == Some(s.scope.as_str()))).map(|s| {
+    let report = seat.as_ref().filter(|s| !(q.for_person && me.scope() == Some(s.scope.as_str()))).map(|s| {
         crate::wake::say(store, &s.scope, &for_a_governor(&q), Some(&q.id))
     });
 
@@ -260,7 +268,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         println!(
             "{}",
             json!({ "id": q.id, "about": subject_id, "waiting": held, "pane": pane, "lands_on": home,
-                    "seat": seat.as_ref().map(|s| &s.scope), "for": if for_person { Some("person") } else { None },
+                    "seat": seat.as_ref().map(|s| &s.scope), "for": q.to_json()["for"],
                     "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why.clone()) })
         );
         return 0;
@@ -268,8 +276,15 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     println!("{} {}  {}", p.red("?"), p.bold(&q.id), q.title());
     println!("  {}", p.dim(&format!("about {subject_id} · answered onto {home}")));
-    match for_person {
+    match q.for_person {
         true => {
+            if !for_person {
+                let why = match &seat {
+                    Some(_) => "the seat that answers for it is the one asking".to_string(),
+                    None => format!("no seat answers for {subject_id}"),
+                };
+                println!("  {}", p.dim(&why));
+            }
             println!("  {}", p.dim("asked of the person · `wsp yours` lists it · only the person may answer it"));
             if let Some(holds) = unblocks(store, &q) {
                 println!("  {}", p.dim(&format!("holds {holds}")));
@@ -577,16 +592,19 @@ fn project_of(store: &Store, about: &About) -> Option<String> {
 
 /// An item, as `wsp yours --json` gives it.
 fn item_json(store: &Store, q: &Message) -> serde_json::Value {
+    let whole = q.to_json();
     json!({
         "id": q.id,
         "asked": q.title(),
         "text": q.text,
-        "about": q.to_json()["about"],
+        "about": whole["about"],
         "project": project_of(store, &q.about),
         "from": q.from.byline(),
         "at": q.at,
         "unblocks": unblocks(store, q),
-        "waiting": q.to_json()["waiting"],
+        "waiting": whole["waiting"],
+        "for": whole["for"],
+        "unrouted": whole["unrouted"],
     })
 }
 
@@ -611,7 +629,8 @@ pub(crate) fn census(store: &Store) -> Vec<(Option<String>, String)> {
 
 /// `wsp yours [-p proj] [--json]` — what waits on the person.
 ///
-/// The questions only the person may answer, oldest first, and then how many
+/// The questions only the person may answer, oldest first — the questions
+/// `wsp flag --person` lists, read off the same predicate — and then how many
 /// `review` rows wait on `wsp done` as one count. Review rows are not items:
 /// there are hundreds and almost none needs a judgement, and listing them is
 /// the attention pass's failure — the few that matter buried. A review row
@@ -884,6 +903,13 @@ fn waiting_line(m: &Message) -> String {
     }
     if let Some(t) = m.about.task() {
         parts.push(format!("about {t}"));
+    }
+    if m.shape() == Some(Shape::Question) {
+        parts.push(match m.route() {
+            message::Route::Person => "for the person".into(),
+            message::Route::Seat(scope) => format!("for the {scope} seat"),
+            message::Route::Unrouted => "unrouted — the person's, nobody else has it".into(),
+        });
     }
     let held = util::since(&m.at);
     if held > 0 {
@@ -1538,6 +1564,7 @@ mod tests {
         task(&store, "wsp-095");
         let mine = for_the_person_about(&store, Party::seat("worklist"), About::Task("wsp-095".into()));
         let theirs = a_question(&store, "wsp-095");
+        message::sent(&store, &theirs.id, "wsp").unwrap();
 
         let back = store.message(&mine.id).unwrap();
         assert!(back.for_person, "the word survives messages.json");
@@ -1644,6 +1671,72 @@ mod tests {
         let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
         assert!(log.contains("answered by a person") && log.contains("accepted; gpui costs that"), "{log}");
         assert!(store.task("m-1").unwrap().body.contains("accepted; gpui costs that"), "the member asked, and hears it");
+    }
+
+    /// `wsp-275`'s done-when, at the verb: a plain ask on a member of a running
+    /// list goes to the list's governor and is not the person's; `--person`, and
+    /// a plain ask on a row no seat answers for, are — in `wsp yours` and in
+    /// `wsp flag --person` alike, because the flight view's badge is one count.
+    /// And `for` names the route on all three, where compound-490's plain ask
+    /// to ux-next read `for: null` and the two verbs disagreed about it.
+    #[test]
+    fn every_ask_names_whose_answer_it_waits_on_and_yours_and_flag_person_agree() {
+        let _env = util::isolated("ask-route");
+        let store = scratch("ask-route");
+        task(&store, "m-1");
+        task(&store, "lone-1");
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-893");
+        let asked = |id: &str, text: &str, flags: &[(&str, &str)]| -> String {
+            let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
+            assert_eq!(ask(&store, &crate::Args::synth("ask", &[id, text], flags)), 0);
+            message::all(&store).into_iter().map(|m| m.id).find(|m| !before.contains(m)).expect("a new question")
+        };
+        let governed = asked("m-1", "could you paste the panic?", &[]);
+        let persons = asked("m-1", "keep the bump?", &[("person", "")]);
+        let lone = asked("lone-1", "which crate?", &[]);
+        std::env::remove_var(crate::place::SEAT_ENV);
+
+        let route = |id: &str| store.message(id).unwrap().to_json()["for"].clone();
+        assert_eq!(route(&governed), serde_json::json!({ "seat": "ux-next" }), "the list's governor answers it");
+        assert_eq!(route(&persons), "person");
+        assert_eq!(route(&lone), "person", "no seat answers for lone-1, so the person does");
+        assert!(store.message(&governed).unwrap().handed_to("ux-next"), "and the seat was handed it");
+
+        let ids = |v: Vec<Message>| -> Vec<String> {
+            let mut v: Vec<String> = v.into_iter().map(|m| m.id).collect();
+            v.sort();
+            v
+        };
+        let mut want = vec![persons.clone(), lone.clone()];
+        want.sort();
+        assert_eq!(ids(yours_in(&store, None)), want, "yours: the person's two and not the governor's");
+        assert_eq!(ids(message::raised_to_the_person(&store)), want, "flag --person: the same ids");
+    }
+
+    /// A question raised before `ask` wrote a route is read off its `Sent` hop,
+    /// and one no seat was handed says so beside its null, and stays the
+    /// person's — nobody else has it.
+    #[test]
+    fn a_question_from_before_routes_is_the_seats_it_was_handed_or_says_it_is_unrouted() {
+        let store = scratch("ask-legacy");
+        task(&store, "wsp-095");
+        let handed = a_question(&store, "wsp-095");
+        message::sent(&store, &handed.id, "worklist").unwrap();
+        let lost = a_question(&store, "wsp-095");
+
+        let handed = store.message(&handed.id).unwrap();
+        assert_eq!(handed.to_json()["for"], serde_json::json!({ "seat": "worklist" }));
+        assert!(handed.to_json().get("unrouted").is_none() && !handed.is_the_persons());
+        let lost = store.message(&lost.id).unwrap().to_json();
+        assert!(lost["for"].is_null() && lost["unrouted"] == message::UNROUTED, "{lost}");
+        let listed: Vec<String> = message::for_the_person(&store).into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, vec![lost["id"].as_str().unwrap().to_string()]);
     }
 
     /// The barrier gate's population: about that group exactly. A question

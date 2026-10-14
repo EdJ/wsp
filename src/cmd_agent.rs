@@ -1300,15 +1300,17 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     //
     // `--person` is the person's open set and nothing else: what a panel or
     // compound's raised hand should draw, asked of wsp rather than guessed from
-    // `via` or the wording (`wsp-272`). Not `--for person` after the JSON
+    // `via` or the wording (`wsp-272`). Its questions are `wsp yours`'s items,
+    // because both read [`message::raised_to_the_person`] (`wsp-275`). Not `--for person` after the JSON
     // field, because the spell check would then offer `--for` for `--form`,
     // which is the slip `--from` is there to catch.
-    let only_the_person = args.has("person");
-    let rows: Vec<Message> = message::raised(store)
-        .into_iter()
-        .filter(|m| !m.is_reply() && (!only_the_person || m.is_the_persons()))
-        .rev()
-        .collect();
+    let rows: Vec<Message> = match args.has("person") {
+        true => message::raised_to_the_person(store),
+        false => message::raised(store).into_iter().filter(|m| !m.is_reply()).collect(),
+    }
+    .into_iter()
+    .rev()
+    .collect();
     if args.json() {
         let out: Vec<serde_json::Value> = rows.iter().map(Message::to_json).collect();
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());

@@ -682,6 +682,24 @@ impl Hop {
 
 // ---- the envelope ---------------------------------------------------------
 
+/// Whose answer a question waits on — [`Message::route`], written `for` on
+/// every `--json` that prints a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Only the person may close it: `wsp yours` and `wsp flag --person`.
+    Person,
+    /// The seat for this scope was handed it and answers it.
+    Seat(String),
+    /// Neither, which for a question is a defect in the routing and is said
+    /// as [`UNROUTED`] beside `for: null`.
+    Unrouted,
+}
+
+/// Why an open question's `for` is null. Every question `wsp ask` raises names
+/// its route, so one without is from a build that did not, or was never
+/// handed to a seat — and stays the person's, because nobody else has it.
+pub const UNROUTED: &str = "no route was written and no seat was handed it — the person's, since nobody else has it";
+
 /// One message. One envelope, three shapes, and a discriminant that is a word.
 ///
 /// The five vocabularies are held as raw strings and parsed on the way out, for
@@ -957,6 +975,52 @@ impl Message {
 
     /// Has the seat for `scope` already been handed this record?
     ///
+    /// Is this one of the person's — in their open set, on their panel and in
+    /// compound's raised hand — or a seat's?
+    ///
+    /// **Everything not routed to a seat** ([`Message::route`]), so the default
+    /// reading stays the one this record was built on: a hand an agent raises
+    /// is for whoever answers for its subject *and* for the person looking at
+    /// the panel, and being handed to the seat as well does not take it off the
+    /// panel. A notification leaves only when its writer said it was for a
+    /// seat. A question leaves when it was asked of one, because a question has
+    /// one answerer and the person is not it (`wsp-275`).
+    ///
+    /// An unrouted question stays: nobody else was given it, and a question
+    /// the person cannot see is one nobody answers.
+    pub fn is_the_persons(&self) -> bool {
+        !matches!(self.route(), Route::Seat(_))
+    }
+
+    /// Whose answer this waits on: the person, a seat, or nobody wsp told.
+    ///
+    /// **Written by `wsp ask` on every question it raises** (`wsp-275`). Before
+    /// that a plain ask wrote neither field: compound-490's question went to
+    /// the ux-next seat and read `for: null`, so `wsp flag --person` counted it
+    /// as the person's and `wsp yours` did not, and the flight view had two
+    /// answers to *what waits on Ed*.
+    ///
+    /// A question from before then is read off its [`Act::Sent`] hop, which
+    /// `ask` writes as it hands the question over. That is the one place a hop
+    /// decides an owner, and only for a question: a hand goes to the seat
+    /// *and* stays the person's, so a notification is keyed on what its writer
+    /// said and nothing else.
+    pub fn route(&self) -> Route {
+        if self.for_person {
+            return Route::Person;
+        }
+        if let Some(scope) = &self.for_seat {
+            return Route::Seat(scope.clone());
+        }
+        let asked_before_routes = self.shape() == Some(Shape::Question);
+        match self.via.iter().find(|h| h.act == Act::Sent).and_then(|h| h.by.scope()) {
+            Some(scope) if asked_before_routes => Route::Seat(scope.to_string()),
+            _ => Route::Unrouted,
+        }
+    }
+
+    /// Has the seat for `scope` already been handed this record?
+    ///
     /// **Whether the words have arrived somewhere, not whether anybody read
     /// them** — that is the whole distinction, and it is why this asks about an
     /// [`Act::Sent`] hop and not about the state. A handed-over question is
@@ -966,20 +1030,6 @@ impl Message {
     /// Keyed on [`Party::seat`] and on nothing else, because a hop by a *pane*
     /// is a person having looked at it — which says nothing about which post is
     /// holding the words now.
-    /// Is this one of the person's — in their open set, on their panel and in
-    /// compound's raised hand — or a notice wsp wrote for a seat?
-    ///
-    /// **Everything but [`Message::for_seat`]**, so the default reading stays
-    /// the one this record was built on: a hand an agent raises is for whoever
-    /// answers for its subject *and* for the person looking at the panel, and
-    /// being handed to the seat as well does not take it off the panel. Only a
-    /// record that says it was written for a seat leaves — keyed on what the
-    /// writer said, never on a `Sent` hop, because a hop says where words went
-    /// and an agent's hand goes to the seat too.
-    pub fn is_the_persons(&self) -> bool {
-        self.for_seat.is_none()
-    }
-
     pub fn handed_to(&self, scope: &str) -> bool {
         self.via
             .iter()
@@ -987,7 +1037,7 @@ impl Message {
     }
 
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "id": self.id,
             "shape": self.shape_raw,
             "kind": self.kind_raw,
@@ -1007,12 +1057,18 @@ impl Message {
             "seen": self.seen,
             "waiting": self.waiting.as_ref().map(Waiting::to_json).unwrap_or(Value::Null),
             "reply_to": self.reply_to.clone().map(Value::from).unwrap_or(Value::Null),
-            "for": match (&self.for_seat, self.for_person) {
-                (_, true) => Value::from("person"),
-                (Some(scope), false) => json!({ "seat": scope }),
-                (None, false) => Value::Null,
+            "for": match self.route() {
+                Route::Person => Value::from("person"),
+                Route::Seat(scope) => json!({ "seat": scope }),
+                Route::Unrouted => Value::Null,
             },
-        })
+        });
+        // Only a question owes a route — a hand with no `for` is the person's
+        // and the seat's both, which is not a defect.
+        if self.route() == Route::Unrouted && self.shape() == Some(Shape::Question) {
+            v["unrouted"] = Value::from(UNROUTED);
+        }
+        v
     }
 
     pub fn from_json(id: &str, v: &Value) -> Message {
@@ -1599,15 +1655,21 @@ fn finish(
     Ok(Closed { question, reply, landed })
 }
 
+/// Every raised hand that is the person's, oldest first: `wsp flag --person`
+/// and the panel's flags section. Replies are not in it — an answer goes home
+/// to whoever asked ([`Message::is_reply`]).
+pub fn raised_to_the_person(store: &Store) -> Vec<Message> {
+    raised(store).into_iter().filter(|m| !m.is_reply() && m.is_the_persons()).collect()
+}
+
 /// Every open question only the person may close: `wsp yours`'s population.
 ///
-/// [`Message::wants_answering`] narrowed to [`Message::for_person`], oldest
-/// first, so the verb, the brief's line and the barrier gate count one set.
+/// [`raised_to_the_person`] less the hands nobody waits on, so the verb, the
+/// brief's line, the barrier gate and `wsp flag --person` count one set of
+/// questions — `wsp-275`, where `flag --person` listed a governor's question
+/// as Ed's and `yours` did not.
 pub fn for_the_person(store: &Store) -> Vec<Message> {
-    let mut out: Vec<Message> =
-        store.messages().into_values().filter(|m| m.for_person && m.wants_answering() && !m.is_reply()).collect();
-    out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
-    out
+    raised_to_the_person(store).into_iter().filter(Message::wants_answering).collect()
 }
 
 /// The open person items that hold one group's barrier.
