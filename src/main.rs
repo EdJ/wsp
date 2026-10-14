@@ -2022,6 +2022,9 @@ fn help_text() -> String {
   wsp flag <id> --from FILE         …with that paragraph out of a file, the
                                     spelling every other prose verb takes
   wsp flag <id> --ask claim         …and a question a keypress answers
+  wsp ask|flag <id> --caption "…"   the line a glance names it by, under 60;
+                                    without one a flag's --title, else the
+                                    first clause with any `Ed:` off
   wsp flag [--clear <id>] [--seen <id>] [--seat] [--person]
                                     what is raised, and whose it is; --seat
                                     narrows it to this seat's own, --person to

@@ -157,6 +157,12 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         Ok(t) => t,
         Err(code) => return code,
     };
+    // The line the flight view names it by (`wsp-276`), checked as `add`'s is.
+    // `--from` is the question's, so the caption has no file of its own.
+    let caption = match crate::caption::flag(args, false) {
+        Ok(c) => c.filter(|c| !c.is_empty()),
+        Err(code) => return code,
+    };
 
     let (me, pane) = whoami(store);
     let held = pane
@@ -234,6 +240,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         Waiting::new(pane.as_deref().unwrap_or_default(), &held),
     )
     .about(about);
+    q.caption = caption.map(|text| crate::caption::Caption { text, from: "authored" });
     // **Whose answer it waits on, written now** (`wsp-275`). The seat that
     // answers for the subject, or the person: asked with `--person`, about a
     // row no seat answers for, or by a seat with nobody seated above it — a
@@ -293,7 +300,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         println!(
             "{}",
             json!({ "id": q.id, "about": subject_id, "waiting": held, "pane": pane, "lands_on": home,
-                    "seat": seat.as_ref().map(|s| &s.scope), "for": q.to_json()["for"],
+                    "seat": seat.as_ref().map(|s| &s.scope), "for": q.to_json()["for"], "caption": q.caption().json(),
                     "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why.clone()) })
         );
         return 0;
@@ -621,6 +628,7 @@ fn item_json(store: &Store, q: &Message) -> serde_json::Value {
     json!({
         "id": q.id,
         "asked": q.title(),
+        "caption": whole["caption"],
         "text": q.text,
         "about": whole["about"],
         "project": project_of(store, &q.about),
@@ -1742,6 +1750,38 @@ mod tests {
         want.sort();
         assert_eq!(ids(yours_in(&store, None)), want, "yours: the person's two and not the governor's");
         assert_eq!(ids(message::raised_to_the_person(&store)), want, "flag --person: the same ids");
+    }
+
+    /// `wsp-276`'s done-when: an authored caption is the question's line in
+    /// `ask --json` and `yours --json`, and survives the file; with none it is
+    /// the first clause, `from: "derived"`; and one past sixty is refused
+    /// before anything is raised.
+    #[test]
+    fn a_question_carries_its_authored_caption_or_its_first_clause() {
+        let _env = util::isolated("ask-caption");
+        let store = scratch("ask-caption");
+        task(&store, "lone-1");
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-977");
+        let asked = |text: &str, flags: &[(&str, &str)]| -> Option<Message> {
+            let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
+            let code = ask(&store, &crate::Args::synth("ask", &["lone-1", text], flags));
+            let new = message::all(&store).into_iter().find(|m| !before.contains(&m.id));
+            assert_eq!(code == 0, new.is_some(), "exit {code}");
+            new
+        };
+        let long = "Ed: the window you run (target/debug/host, pid 63635) was relaunched from the same shell. Could you paste the lines?";
+        let authored = asked(long, &[("caption", "could you paste the panic lines from the window's tab?")]).unwrap();
+        let derived = asked(long, &[]).unwrap();
+        let refused = asked(long, &[("caption", &"x".repeat(61))]);
+        std::env::remove_var(crate::place::SEAT_ENV);
+
+        let caption = |m: &Message| store.message(&m.id).unwrap().to_json()["caption"].clone();
+        assert_eq!(caption(&authored), json!({ "text": "could you paste the panic lines from the window's tab?", "from": "authored" }));
+        assert_eq!(caption(&derived), json!({ "text": "The window you run was relaunched from the same shell", "from": "derived" }));
+        assert!(refused.is_none(), "a caption past sixty raised a question anyway");
+
+        let item = item_json(&store, &store.message(&authored.id).unwrap());
+        assert_eq!(item["caption"]["from"], "authored", "yours --json carries it: {item}");
     }
 
     /// A question raised before `ask` wrote a route is read off its `Sent` hop,

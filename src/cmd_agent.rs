@@ -873,6 +873,19 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
             return 2;
         }
     }
+    // The line the flight view names the hand by (`wsp-276`): `--caption`, or
+    // the `--title` a card already draws as its heading, or — nothing said at
+    // all — the row's own, since *look at this* is about the row. Decided
+    // here, because `compose` is about to join the three into one text.
+    let caption = match crate::caption::flag(args, false) {
+        Ok(Some(c)) if !c.is_empty() => Some(crate::caption::Caption { text: c, from: "authored" }),
+        Ok(_) if !title.trim().is_empty() => Some(crate::caption::Caption { text: crate::caption::title(&title), from: "title" }),
+        Ok(_) if said.is_empty() && body.trim().is_empty() => {
+            Some(crate::caption::Caption { text: crate::caption::of_task(&task).text, from: "task" })
+        }
+        Ok(_) => None,
+        Err(code) => return code,
+    };
     let ask = args.get("ask").unwrap_or_default();
     // A closed vocabulary, because the answer is a key on somebody's panel and
     // that key runs a command. An agent naming its own argv would be an agent
@@ -904,6 +917,7 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         &message::compose(said, &title, &body),
     );
     raised.about = About::Task(task.id.clone());
+    raised.caption = caption;
     if ask == "claim" {
         raised.set_ask(Ask::Claim);
         // An ask is a **question**, and the shape is what makes it one:
@@ -958,7 +972,7 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
     if args.json() {
         println!(
             "{}",
-            json!({ "id": task.id, "flagged": true, "said": said, "pane": pane })
+            json!({ "id": task.id, "flagged": true, "said": said, "pane": pane, "message": raised.id, "caption": raised.caption().json() })
         );
     } else {
         // The rows the seat will see, and not a paraphrase of the arguments.
@@ -6521,6 +6535,27 @@ mod tests {
             "a hand went up wearing a captured progress bar as its heading",
         );
         assert_eq!(raise_one(&store, &["wsp-001", "the tree is shared"], &[("title", "the store is corrupt")]), 0);
+    }
+
+    /// `wsp-276`: a hand's caption is its `--caption`, else its `--title`, else
+    /// its sentence's first clause — and a bare `wsp flag <id>`, which says
+    /// *look at this row*, is the row's own.
+    #[test]
+    fn a_hand_is_captioned_by_its_caption_its_title_its_sentence_or_its_row() {
+        let (_env, store) = scratch("flag-caption");
+        a_task(&store, "wsp-001");
+        let raise = |args: &[&str], flags: &[(&str, &str)]| -> serde_json::Value {
+            let before: Vec<String> = crate::message::all(&store).into_iter().map(|m| m.id).collect();
+            assert_eq!(raise_one(&store, args, flags), 0);
+            let m = crate::message::all(&store).into_iter().find(|m| !before.contains(&m.id)).expect("a hand went up");
+            store.message(&m.id).unwrap().to_json()["caption"].clone()
+        };
+        let said = ["wsp-001", "Ed: the tree is shared. Two agents wrote it"];
+        assert_eq!(raise(&said, &[("caption", "two agents in one tree")]), json!({ "text": "two agents in one tree", "from": "authored" }));
+        assert_eq!(raise(&said, &[("title", "the store is corrupt")]), json!({ "text": "the store is corrupt", "from": "title" }));
+        assert_eq!(raise(&said, &[]), json!({ "text": "The tree is shared", "from": "derived" }));
+        assert_eq!(raise(&["wsp-001"], &[])["from"], "task");
+        assert_eq!(raise_one(&store, &said, &[("caption", &"x".repeat(61))]), 2);
     }
 
     /// A source that was given and came back empty is told about, not raised.

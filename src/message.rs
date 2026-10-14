@@ -118,6 +118,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Value};
 
+use crate::caption::{self, Caption};
 use crate::store::Store;
 use crate::util;
 
@@ -767,6 +768,11 @@ pub struct Message {
     /// a record for the person by default; this one stays the seat's, for it to
     /// mark seen or take down. See [`Message::is_the_persons`].
     pub for_seat: Option<String>,
+    /// **The line a glance reads, when the verb was told it** (`wsp-276`):
+    /// `wsp ask --caption`, `wsp flag --caption`, a flag's `--title`. `None`
+    /// is derived from [`Message::text`] at read time — see
+    /// [`Message::caption`], which is what every surface asks.
+    pub caption: Option<Caption>,
 }
 
 impl Message {
@@ -790,6 +796,7 @@ impl Message {
             reply_to: None,
             for_person: false,
             for_seat: None,
+            caption: None,
         }
     }
 
@@ -868,6 +875,14 @@ impl Message {
     /// decades ago and for the same reason.
     pub fn title(&self) -> &str {
         self.text.lines().next().unwrap_or("").trim()
+    }
+
+    /// The one line the flight view names it by (`wsp-276`, compound's §17
+    /// shape): the caption written on it, else its text's first clause with
+    /// `from: "derived"`. compound-490's question to Ed is 560 characters, and
+    /// [`Message::title`] — its first line — is all of them.
+    pub fn caption(&self) -> Caption {
+        caption::of_message(self.caption.as_ref(), &self.text)
     }
 
     /// Everything after the headline, leading blank lines removed. Empty when
@@ -1057,6 +1072,9 @@ impl Message {
             "seen": self.seen,
             "waiting": self.waiting.as_ref().map(Waiting::to_json).unwrap_or(Value::Null),
             "reply_to": self.reply_to.clone().map(Value::from).unwrap_or(Value::Null),
+            // Derived ones too, for `source`'s reason; `from_json` keeps only
+            // a written one, so a derived line is re-derived on every read.
+            "caption": self.caption().json(),
             "for": match self.route() {
                 Route::Person => Value::from("person"),
                 Route::Seat(scope) => json!({ "seat": scope }),
@@ -1112,6 +1130,16 @@ impl Message {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            caption: v.get("caption").and_then(|c| {
+                let text = c.get("text").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty())?;
+                let from = match c.get("from").and_then(Value::as_str)? {
+                    "authored" => "authored",
+                    "title" => "title",
+                    "task" => "task",
+                    _ => return None,
+                };
+                Some(Caption { text: text.to_string(), from })
+            }),
         }
     }
 }

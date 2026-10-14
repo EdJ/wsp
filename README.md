@@ -1370,7 +1370,14 @@ seated seat above, the question goes up to that seat instead (`wsp-263`).
 comes with `unrouted`, saying why: a question from before `wsp-275` with no
 `Sent` hop to read a seat off, which stays the person's because nobody else has
 it. `yours` and `flag --person` read one predicate, so their questions agree
-item for item. `wsp yours [-p proj] [--json]` lists them per
+item for item. Every message in those four carries a `caption`, the one line
+the flight view names it by, in §17's shape `{text, from}` (`wsp-276`):
+`--caption "…"` on `ask` or `flag` (under 60, as `add`'s) is `authored`; a
+flag's `--title` is `title`, a bare `wsp flag <id>` is its row's (`task`); and
+anything else is its text's first clause — a leading addressee like `Ed:` off,
+cut at `. `, `; `, ` — ` or after a `?` — with `from: "derived"`, worked out on
+every read. compound-490's question to Ed was 560 characters with no line
+break, so its first line was all of it. `wsp yours [-p proj] [--json]` lists them per
 project, oldest first, each with what it holds (`gpui-migration group 13`), and
 counts the rows waiting at `review` on one line rather than listing them. The
 answer is `wsp answer` as ever, and it lands **in place**: a `## Decisions`
@@ -4624,7 +4631,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/caption.rs` | the line a glance reads for a task, a worklist and a group: authored and checked at the verb, or derived from the title or the members — one derivation, so `ls` and the chrome never disagree; and a verdict's, a word wsp derives and a tail the verb requires |
 | `src/stage.rs` | where a task or a group is, as a caption: a word from §17.5's closed list, derived from records wsp already keeps, and the tail the step that put it there was given — `stage` on `show`, `ls` and every group and member in `worklist show --json`; and when each was entered, off the log and the verification entries — `stages` on `show --json`, each group's `member_stages`, `started_at`, `settled_at` and `decided_at`; and `since` on every stage, when the row entered its current word, the timeline's last step under it — `at` is the record's time |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
-| `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back — and whose answer it waits on, `for` the person or a seat, written by `wsp ask` and read the same by `yours`, `flag --person` and the panel |
+| `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back — and whose answer it waits on, `for` the person or a seat, written by `wsp ask` and read the same by `yours`, `flag --person` and the panel; and the `caption` each is named by, written at the verb or derived on read |
 | `src/after.rs` | member dependencies: `after:` on a task, `wsp after`, its five refusals, and the run's hold on a member until the member of its own group it rests on has landed |
 | `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, the sweep a passed group licenses, what a landed group touched, and — one storey up — which of all the lists there have ever been still want somebody |
 | `src/guard.rs` | the stash guard: one stack per repository however many worktrees, and the git hook that refuses it inside the command that would have taken it |

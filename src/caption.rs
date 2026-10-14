@@ -41,7 +41,8 @@ pub const AIM: usize = 40;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caption {
     pub text: String,
-    /// `authored`, `title`, `member` or `members` here. Named in `--json` so a
+    /// `authored`, `title`, `member` or `members` here, and on a message
+    /// `task` or `derived` too ([`of_message`]). Named in `--json` so a
     /// test, and the chrome if Ed ever wants it (E-2 says not), can tell a line
     /// somebody wrote from one wsp worked out.
     pub from: &'static str,
@@ -169,6 +170,57 @@ pub fn say(t: &str, own: Option<&str>) -> String {
         t.truncate(i);
     }
     capital(t.trim_end_matches([' ', '.', ',', ';', ':']))
+}
+
+/// A message's first clause: the caption `wsp ask`, `wsp flag` and `wsp yours`
+/// give a question or a hand nobody captioned (`wsp-276`).
+///
+/// [`say`]'s rule, two steps wider, because a message is written *to*
+/// somebody and a say is not. **A leading addressee is dropped** — `Ed: `,
+/// `ux-next: `, a row's own `compound-490: ` — one word and its colon, which a
+/// line drawn under that person's name or that row already says. And **a
+/// question mark ends the clause and stays**: compound-490's question to Ed
+/// asks its question second, and a caption that kept the `?` off would read
+/// as a statement. The first non-blank line, since `compose` can open with a
+/// blank `said`. Any length, as `say` is: the chrome cuts to width, never
+/// wsp (§17.7).
+pub fn message(text: &str) -> String {
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
+    let mut t = clean(first);
+    if let Some((head, rest)) = t.split_once(": ") {
+        let mut b = head.bytes();
+        let one_word = b.next().is_some_and(|c| c.is_ascii_alphabetic()) && b.all(|c| c.is_ascii_alphanumeric() || c == b'-');
+        if one_word && !rest.trim().is_empty() {
+            t = rest.to_string();
+        }
+    }
+    let stop = [". ", "; ", " — "].iter().filter_map(|c| t.find(c)).filter(|&i| i > 0).min();
+    let asked = t.find("? ").map(|i| i + 1);
+    match (stop, asked) {
+        (Some(s), Some(q)) if q <= s => t.truncate(q),
+        (Some(s), _) => t.truncate(s),
+        (None, Some(q)) => t.truncate(q),
+        (None, None) => {}
+    }
+    capital(t.trim_end_matches([' ', '.', ',', ';', ':']))
+}
+
+/// A message's caption: the one written on it, else [`message`] over its text.
+///
+/// Written means `--caption` (`authored`), a flag's `--title` (`title`), or a
+/// bare `wsp flag <id>`'s row (`task`) — each decided at the verb, because the
+/// verb is the only place that still knows which words were which: `compose`
+/// joins a flag's sentence, title and body into one text. Everything else is
+/// `derived`, here, at read time, so a better rule reaches every message
+/// already raised.
+pub fn of_message(written: Option<&Caption>, text: &str) -> Caption {
+    match written {
+        Some(c) if !c.text.trim().is_empty() => c.clone(),
+        _ => match message(text) {
+            t if t.is_empty() => Caption { text: "Nothing was said".into(), from: "derived" },
+            t => Caption { text: t, from: "derived" },
+        },
+    }
 }
 
 /// Step 1: the prototype's `clean`. Surrounding quotes and escaped quotes, as
@@ -463,6 +515,32 @@ mod tests {
         assert_eq!(title("Spike: three spikes decide gpui — go or no-go"), "Spike: three spikes decide gpui");
         assert_eq!(title("Two words — then a long clause; and the rest of it here"), "Two words — then a long clause");
         assert_eq!(title("Backticks `wsp ls` and **bold** go away"), "Backticks wsp ls and bold go away");
+    }
+
+    #[test]
+    fn a_message_reads_as_its_first_clause_with_its_addressee_off() {
+        // compound-490's question to Ed, 2026-10-10, as `messages.json` holds it.
+        let live = "Ed: the window you run (target/debug/host, pid 63635, started 16:04 in a Ghostty tab, ttys003) was relaunched from the same shell after the last crash, so the panic should still be in that tab's scrollback above it. Could you paste the lines that start at 'thread ... panicked at' (and any 'compound:' lines just before)? No .ips crash report exists.";
+        assert_eq!(
+            message(live),
+            "The window you run was relaunched from the same shell after the last crash, so the panic should still be in that tab's scrollback above it",
+            "`Ed:` and the parenthetical off, cut at the first full stop",
+        );
+        assert_eq!(message("compound-490: the panic is in drop. more"), "The panic is in drop", "a row's own id is an addressee");
+        assert_eq!(message("could you paste the panic? It's in the tab."), "Could you paste the panic?", "a question keeps its mark");
+        assert_eq!(message("keep the VERSION bump?"), "Keep the VERSION bump?");
+        assert_eq!(message("host-gpui stays; gpui goes"), "host-gpui stays", "a name keeps its case");
+        assert_eq!(message("\n\nfirst line\nsecond"), "First line", "compose can open with a blank");
+        assert_eq!(message("Ed: "), "Ed", "an addressee with nothing after it is all there is");
+        assert_eq!(message("see https://x.y/z first. then"), "See https://x.y/z first", "a URL's colon is not an addressee's");
+    }
+
+    #[test]
+    fn a_messages_written_caption_wins_and_one_with_no_words_is_never_blank() {
+        let written = Caption { text: "could you paste the panic lines?".into(), from: "authored" };
+        assert_eq!(of_message(Some(&written), "Ed: the window you run…"), written);
+        assert_eq!(of_message(None, "Ed: does it hold?").from, "derived");
+        assert_eq!(of_message(None, "  ").text, "Nothing was said");
     }
 
     #[test]
