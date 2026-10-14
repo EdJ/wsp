@@ -888,6 +888,14 @@ impl Census {
         self.said.iter().any(|(m, s)| m == machine && s.is_ok())
     }
 
+    /// Every machine that answered, and what it holds — for a caller that
+    /// keeps a record per machine and may drop a seat only when its own
+    /// machine answered without it (`wsp-250`'s clocks). A machine that was
+    /// silent, or never asked, is not here.
+    pub fn answers(&self) -> impl Iterator<Item = (&str, &[Seated])> {
+        self.said.iter().filter_map(|(m, s)| s.as_ref().ok().map(|s| (m.as_str(), s.as_slice())))
+    }
+
     /// Whether anybody answered.
     pub fn was_heard(&self) -> bool {
         self.said.iter().any(|(_, s)| s.is_ok())

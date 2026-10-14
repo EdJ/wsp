@@ -2371,8 +2371,14 @@ wsp dates it itself, the first time a census it reads sees the change: every
 `wsp wip` and every tick of the watch, kept in `seat-since.json`. It is "first
 seen", at most one tick late, and on a seat no census has read before it is
 that first reading. A different agent session in the same seat starts its
-clock again; a seat missing from a census every backend answered in full loses
-its entry, and one on a machine that was quiet does not. `held` is a different
+clock again. Each entry names the source it was read from — `herdr`,
+`herdr@mb2`, `compound` — and a seat is forgotten only when its own source
+answers without it: a far machine that was silent, or not asked because it had
+dropped off, keeps its seats' clocks, so a turn that started two hours before
+the silence still reads two hours after it. Only `wsp wip` forgets, since it
+asks each machine apart; the watch's tick folds every herdr machine into one
+answer and cannot tell whose went quiet, so it dates changes and drops
+nothing. `held` is a different
 clock — the claim's age — and only a member has one; every seat has a `since`.
 `wsp wip` draws it on a waiting seat: `waiting 12m · person`.
 

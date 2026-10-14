@@ -2370,35 +2370,50 @@ impl Store {
     // most one tick late — and on a seat wsp has not read before it is the
     // first reading, not the start of the state.
 
-    /// seat -> `{ state, session, since }`, the time the seat was first seen
-    /// in its current state. A different `session` is a different agent in a
-    /// seat whose id was reused, and starts its clock again even in the same
-    /// state.
+    /// seat -> `{ state, session, since, from }`, the time the seat was first
+    /// seen in its current state. A different `session` is a different agent
+    /// in a seat whose id was reused, and starts its clock again even in the
+    /// same state.
     ///
-    /// `complete` is whether every backend answered in full: only then is a
-    /// seat missing from `seen` gone from the census rather than on a machine
-    /// that was quiet this once, and only then is its entry dropped — so a far
-    /// machine's silence does not restart every clock on it.
-    pub fn note_seat_states(&self, seen: &[(String, String, String)], at: i64, complete: bool) -> BTreeMap<String, String> {
+    /// `from` is the source a seat was read from — a backend, and the machine
+    /// when it is not this one (`herdr`, `herdr@mb2`, `compound`) — and is
+    /// what decides whether a seat missing from `seen` is gone: its entry is
+    /// dropped only when `answered` says its own source answered this reading
+    /// without it. A far machine that was silent, or not asked at all because
+    /// it had dropped off, answered nothing, so its seats keep their clocks.
+    /// A seat in `seen` with no `from` keeps the one it had; one never given a
+    /// source is never dropped.
+    pub fn note_seat_states(
+        &self,
+        seen: &[(String, String, String, Option<String>)],
+        at: i64,
+        answered: &dyn Fn(&str) -> bool,
+    ) -> BTreeMap<String, String> {
         let stamp = crate::util::iso_at(at);
         self.locked(|| {
             let mut m = match self.read_json("seat-since.json") {
                 Value::Object(m) => m,
                 _ => serde_json::Map::new(),
             };
-            let mut moved = false;
-            if complete {
-                let before = m.len();
-                m.retain(|seat, _| seen.iter().any(|(s, ..)| s == seat));
-                moved |= m.len() != before;
-            }
-            for (seat, state, session) in seen {
-                let same = m.get(seat).is_some_and(|e| {
+            let before = m.len();
+            m.retain(|seat, e| {
+                seen.iter().any(|(s, ..)| s == seat) || !e.get("from").and_then(Value::as_str).is_some_and(answered)
+            });
+            let mut moved = m.len() != before;
+            for (seat, state, session, from) in seen {
+                let was = m.get(seat);
+                let same = was.is_some_and(|e| {
                     e.get("state").and_then(Value::as_str) == Some(state.as_str())
                         && e.get("session").and_then(Value::as_str).unwrap_or("") == session
                 });
-                if !same {
-                    m.insert(seat.clone(), json!({ "state": state, "session": session, "since": stamp }));
+                let from = from.clone().or_else(|| was.and_then(|e| e.get("from")?.as_str().map(str::to_string)));
+                let since = match same {
+                    true => was.and_then(|e| e.get("since")).cloned().unwrap_or_else(|| json!(stamp)),
+                    false => json!(stamp),
+                };
+                let entry = json!({ "state": state, "session": session, "since": since, "from": from });
+                if was != Some(&entry) {
+                    m.insert(seat.clone(), entry);
                     moved = true;
                 }
             }

@@ -1,7 +1,7 @@
 //! Agent binding, context resolution, and the views that join the store to
 //! herdr's live panes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
@@ -3916,22 +3916,31 @@ pub(crate) struct Wip {
 
 /// Note this census's seats against `seat-since.json` and say since when each
 /// has been in its state — [`Store::note_seat_states`], fed the seats `wip`
-/// draws (a seat with nobody in it has no state worth a clock). `complete` is
-/// whether every backend answered in full, the only reading on which a seat
-/// missing from it may lose its entry; `at` is now, the time a change is
-/// first seen.
+/// draws (a seat with nobody in it has no state worth a clock), each with the
+/// source it was read from when the caller knows it. `answered` is the
+/// sources that answered this reading in full, the only ones whose missing
+/// seats may lose their entries; `at` is now, the time a change is first seen.
 pub(crate) fn seat_clocks<'a>(
     store: &Store,
-    seats: impl IntoIterator<Item = &'a crate::place::Seated>,
-    complete: bool,
+    seats: impl IntoIterator<Item = (&'a crate::place::Seated, Option<String>)>,
+    answered: &BTreeSet<String>,
     at: i64,
 ) -> std::collections::BTreeMap<String, String> {
-    let seen: Vec<(String, String, String)> = seats
+    let seen: Vec<(String, String, String, Option<String>)> = seats
         .into_iter()
-        .filter(|s| s.state != State::Empty)
-        .map(|s| (s.seat.as_str().to_string(), s.state.as_str().to_string(), s.session.clone()))
+        .filter(|(s, _)| s.state != State::Empty)
+        .map(|(s, from)| (s.seat.as_str().to_string(), s.state.as_str().to_string(), s.session.clone(), from))
         .collect();
-    store.note_seat_states(&seen, at, complete)
+    store.note_seat_states(&seen, at, &|from| answered.contains(from))
+}
+
+/// The name [`seat_clocks`] files a seat's source under: the backend, and the
+/// machine when it is not this one — `herdr`, `herdr@mb2`, `compound`.
+fn clock_source(backend: &str, machine: &str) -> String {
+    match machine {
+        "" => backend.to_string(),
+        m => format!("{backend}@{m}"),
+    }
 }
 
 /// Every standing barrier check's seat, named against its list and placed in
@@ -3955,14 +3964,17 @@ impl Wip {
         let backends = crate::cmd_spawn::local_backends();
         let mut agents = Vec::new();
         let mut heard = false;
-        let mut complete = true;
-        for backend in &backends {
-            let Ok(census) = backend.census() else {
-                complete = false;
-                continue;
-            };
+        // Which source each seat was read from, and which sources answered:
+        // a seat is forgotten only by its own machine answering without it.
+        let mut from: BTreeMap<String, String> = BTreeMap::new();
+        let mut answered: BTreeSet<String> = BTreeSet::new();
+        for (backend, name) in backends.iter().zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES) {
+            let Ok(census) = backend.census() else { continue };
             heard = true;
-            complete &= census.unheard().next().is_none();
+            for (machine, seats) in census.answers() {
+                answered.insert(clock_source(name, machine));
+                from.extend(seats.iter().map(|s| (s.seat.as_str().to_string(), clock_source(name, machine))));
+            }
             // Each gone seat is dated by the backend that holds it: the
             // clock lives in that backend's record of the seat, and
             // nothing above the port may read it off a path.
@@ -3973,7 +3985,12 @@ impl Wip {
         }
         // Before the gone seats are forgotten below, so a seat that is still
         // in the census keeps its clock while `wip` stops drawing it.
-        let since = seat_clocks(store, agents.iter().map(|(s, _)| s), complete, util::epoch_secs());
+        let since = seat_clocks(
+            store,
+            agents.iter().map(|(s, _)| (s, from.get(s.seat.as_str()).cloned())),
+            &answered,
+            util::epoch_secs(),
+        );
         let tasks = store.tasks();
         let bindings = store.bindings();
         let claims = store.claims();
@@ -8490,6 +8507,62 @@ mod tests {
         assert!(panes.contains(&seat.as_str()), "and compound's, folded into the same census: {panes:?}");
     }
 
+    /// `wsp-250`, through the census rather than around it: a far machine
+    /// that goes silent for one reading — and the watch ticking meanwhile —
+    /// leaves its seat's clock where it was, so when the machine answers
+    /// again a turn two hours old still reads two hours. Only that machine
+    /// answering *without* the seat forgets it.
+    #[test]
+    fn a_far_machine_silent_for_a_reading_keeps_its_seats_since() {
+        let env = util::isolated("since-far-silent");
+        let stage = |pane: &str| {
+            crate::fake::Stage::of(vec![crate::fake::Spot::agent(pane, "claude", "t-1", State::Working)])
+        };
+        let here = crate::fake::Fake::bind(env.path("herdr.sock"), stage("w1:p1")).expect("a socket");
+        let (k, v) = here.socket_env();
+        std::env::set_var(k, v);
+        let store = Store::open();
+        store.save_machine(&crate::model::Machine::new("mb2", "mb2.tail")).unwrap();
+        store.set_machine_live("mb2", &crate::store::MachineLive { reachable: true, ..Default::default() });
+        let far = crate::fake::Fake::bind(store.machine_socket("mb2"), stage("w2:p1")).expect("mb2's socket");
+
+        let w = Wip::live(&store);
+        assert!(w.since.contains_key("w1:p1") && w.since.contains_key("w2:p1@mb2"), "both dated: {:?}", w.since);
+        // Two hours in: the clocks the readings to come must keep.
+        let long_ago = util::iso_at(util::epoch_secs() - 7200);
+        let file = env.state().join("seat-since.json");
+        let mut rec: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        for e in rec.as_object_mut().unwrap().values_mut() {
+            e["since"] = json!(long_ago);
+        }
+        std::fs::write(&file, rec.to_string()).unwrap();
+        assert_eq!(rec["w2:p1@mb2"]["from"], "herdr@mb2", "filed under the machine it was read from: {rec:#}");
+
+        // mb2 stops answering. `wip` reads it without the seat; the watch ticks.
+        drop(far);
+        let w = Wip::live(&store);
+        assert!(!w.agents.iter().any(|s| s.seat.as_str() == "w2:p1@mb2"), "the silence is real");
+        assert_eq!(w.since.get("w2:p1@mb2"), Some(&long_ago), "a silent machine is not a gone seat");
+        assert_eq!(w.since.get("w1:p1"), Some(&long_ago), "and this machine's seat never changed");
+        use crate::cmd_watch::Source;
+        crate::cmd_watch::Poll::new(&store, crate::cmd_watch::Scope::machine(), BTreeSet::new(), None).sample();
+
+        // mb2 is back, same seat, same turn.
+        let far = crate::fake::Fake::bind(store.machine_socket("mb2"), stage("w2:p1")).expect("mb2's socket again");
+        let w = Wip::live(&store);
+        assert_eq!(w.since.get("w2:p1@mb2"), Some(&long_ago), "the turn still reads two hours: {:?}", w.since);
+        let rows = wip_json(&w);
+        let row = rows["agents"].as_array().unwrap().iter().find(|a| a["pane"] == "w2:p1@mb2").unwrap().clone();
+        assert_eq!(row["since"], json!(long_ago));
+
+        // mb2 answers without it: now it is gone, and a seat that comes back
+        // under the same id later is a new reading.
+        far.restage(crate::fake::Stage::of(vec![]));
+        let w = Wip::live(&store);
+        assert_eq!(w.since.get("w2:p1@mb2"), None, "its own machine answered without it: {:?}", w.since);
+        assert_eq!(w.since.get("w1:p1"), Some(&long_ago));
+    }
+
     /// A compound seat directory whose pid is dead, last written `ago` seconds
     /// before now: the shape `wip` calls `gone`, dated by the only clock a dead
     /// agent leaves.
@@ -8641,9 +8714,13 @@ mod tests {
         let claimed = util::iso_at(util::epoch_secs() - 3 * 3600);
         w.claims.insert("t-001".into(), json!({ "claimed_at": claimed }));
         let t0 = util::epoch_secs() - 3600;
+        let herdr: BTreeSet<String> = ["herdr".to_string()].into();
+        let clocks = |w: &Wip, answered: &BTreeSet<String>, at: i64| {
+            seat_clocks(&store, w.agents.iter().map(|s| (s, Some("herdr".to_string()))), answered, at)
+        };
         let read_at = |w: &mut Wip, state: State, at: i64| {
             w.agents[0].state = state;
-            w.since = seat_clocks(&store, &w.agents, true, at);
+            w.since = clocks(w, &herdr, at);
             let v = wip_json(w);
             let row = v["agents"].as_array().unwrap().iter().find(|a| a["pane"] == "w1:p1").unwrap().clone();
             (row["since"].as_str().map(str::to_string), row["held"].clone())
@@ -8678,16 +8755,10 @@ mod tests {
         let (since, _) = read_at(&mut w, State::Gone, t0 + 3000);
         assert_eq!(since, Some(util::iso_at(t0 + 3000)));
 
-        // A seat missing from a partial census keeps its clock; from a whole
-        // one it is forgotten.
-        let held_on = store.note_seat_states(&[], t0 + 3300, false);
-        assert_eq!(held_on.get("w1:p1"), Some(&util::iso_at(t0 + 3000)), "a quiet machine is not a gone seat");
-        assert!(store.note_seat_states(&[], t0 + 3600, true).is_empty());
-
         // On the TUI: a seat on a prompt, stopped twelve minutes ago.
         let twelve = util::epoch_secs() - 12 * 60 - 5;
         w.agents[0].state = State::Blocked;
-        w.since = seat_clocks(&store, &w.agents, true, twelve);
+        w.since = clocks(&w, &herdr, twelve);
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         let line = text.lines().find(|l| l.contains("w1:p1")).unwrap_or_default();
         assert!(line.contains("waiting 12m · person"), "{text}");

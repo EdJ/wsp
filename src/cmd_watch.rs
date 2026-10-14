@@ -2466,8 +2466,16 @@ impl Source for Poll<'_> {
             lists: Vec::new(),
             // Read for state, never published — but this is the reading that
             // ticks, so it is the one that dates a seat's change when nobody
-            // runs `wsp wip` (`wsp-250`).
-            since: cmd_agent::seat_clocks(self.store, &seats, census.unheard().next().is_none(), crate::util::epoch_secs()),
+            // runs `wsp wip` (`wsp-250`). It forgets nothing: the probe folds
+            // every herdr machine into one answer and drops a far machine's
+            // silence, so it cannot say whose machine went without a seat.
+            // `wsp wip`, which asks each machine apart, does the forgetting.
+            since: cmd_agent::seat_clocks(
+                self.store,
+                seats.iter().map(|s| (s, None)),
+                &BTreeSet::new(),
+                crate::util::epoch_secs(),
+            ),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
