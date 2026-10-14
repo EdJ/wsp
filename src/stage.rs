@@ -504,20 +504,45 @@ pub(crate) fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> 
     out
 }
 
-/// Every stage `ls` and `show` give, for the tasks asked about: one read of
-/// each source for the whole set.
-pub(crate) fn of_tasks(store: &Store, asked: &[&Task]) -> BTreeMap<String, Told> {
-    read(store, asked, false).into_iter().map(|(id, (now, _))| (id, now)).collect()
+/// When the row entered the stage it is at now (`wsp-274`): the newest step
+/// of its [`history`] under the live word — the last one, wherever the two
+/// agree, so a list member's `since` is its last `member_stages` entry.
+///
+/// **Not the stage's `at`**, which is the time of the record the word was
+/// read off: a seat that has said three things while working has three `at`s
+/// and one `since`, its claim. Where the timeline has no step under the word
+/// — a status edited by hand, with no `→` line — the record's time is the
+/// best there is, and empty where neither dates it.
+pub(crate) fn since(now: &Told, steps: &[Step]) -> String {
+    steps
+        .iter()
+        .rev()
+        .find(|s| s.word == now.word && !s.at.is_empty())
+        .map(|s| s.at.clone())
+        .unwrap_or_else(|| now.at.clone())
 }
 
-/// [`of_tasks`] and each task's [`history`] beside it, off the same reads —
-/// for `show` and `worklist show --json`, and not `ls`, which carries a stage
-/// and no timeline.
+/// The stage as `ls`, `find`, `show` and `worklist show` give it: the
+/// caption's own fields and [`since`], absent on the same rule as `at`.
+pub(crate) fn json(now: &Told, steps: &[Step]) -> serde_json::Value {
+    let mut v = now.json();
+    let since = since(now, steps);
+    if !since.is_empty() {
+        v["since"] = serde_json::json!(since);
+    }
+    v
+}
+
+/// Every stage `ls`, `find`, `show` and `worklist show --json` give, for the
+/// tasks asked about, each with its [`history`] beside it: one read of each
+/// source for the whole set. `ls` carries no timeline, but its `since` is the
+/// timeline's, so it is replayed for every row there too — a parse of each
+/// row's `## Log` and the passes already read.
 pub(crate) fn with_history(store: &Store, asked: &[&Task]) -> BTreeMap<String, (Told, Vec<Step>)> {
-    read(store, asked, true)
+    read(store, asked)
 }
 
-fn read(store: &Store, asked: &[&Task], timed: bool) -> BTreeMap<String, (Told, Vec<Step>)> {
+fn read(store: &Store, asked: &[&Task]) -> BTreeMap<String, (Told, Vec<Step>)> {
     let all = store.tasks();
     let claims = store.claims();
     let said = sayings(store);
@@ -544,7 +569,7 @@ fn read(store: &Store, asked: &[&Task], timed: bool) -> BTreeMap<String, (Told, 
                 agent: agents.get(&t.id).copied().unwrap_or_default(),
             };
             let now = of_member(&m);
-            let steps = if timed { history(t, &passes, Some(&now)) } else { Vec::new() };
+            let steps = history(t, &passes, Some(&now));
             (t.id.clone(), (now, steps))
         })
         .collect()
@@ -1001,5 +1026,39 @@ mod tests {
         let working = [step("working", "2026-10-08T09:00:00Z")];
         let unsettled = [Some((Status::Review, &first[..])), Some((Status::Doing, &working[..]))];
         assert_eq!(times(None, None, &unsettled, None), Times::default(), "not reached, a member still out, and nothing decided");
+    }
+
+    /// `wsp-274`'s three: a row off any list that says three things while
+    /// working has three `at`s and one `since`, its claim; one that went
+    /// working, landed and to review entered review at its review line; and
+    /// a status nobody logged falls back to the record it was read off.
+    #[test]
+    fn since_is_when_the_row_entered_its_word_not_when_its_record_was_written() {
+        let mut t = task("doing", &["2026-10-08T08:00:00Z claimed by pane w1:p1"]);
+        let mut seen = Vec::new();
+        for (updated, said) in [("2026-10-08T08:10:00Z", "reading"), ("2026-10-08T08:40:00Z", "writing"), ("2026-10-08T09:20:00Z", "testing")] {
+            t.updated = updated.into();
+            let m = Member { said: Some(said), claimed: true, ..member(&t, &[]) };
+            let now = of_member(&m);
+            let v = json(&now, &history(&t, &[], Some(&now)));
+            seen.push((v["at"].as_str().unwrap().to_string(), v["since"].as_str().unwrap().to_string()));
+        }
+        assert_eq!(seen.iter().map(|(at, _)| at.as_str()).collect::<Vec<_>>(), ["2026-10-08T08:10:00Z", "2026-10-08T08:40:00Z", "2026-10-08T09:20:00Z"]);
+        assert!(seen.iter().all(|(_, since)| since == "2026-10-08T08:00:00Z"), "one since, the claim: {seen:?}");
+
+        let t = task(
+            "review",
+            &["2026-10-08T08:00:00Z claimed by pane w1:p1", "2026-10-08T09:00:00Z wsp: landed abc1234 · 2 files", "2026-10-08T09:05:00Z review: built it"],
+        );
+        let now = of_member(&member(&t, &[]));
+        let steps = history(&t, &[], Some(&now));
+        assert_eq!((now.word, since(&now, &steps).as_str()), ("at review", "2026-10-08T09:05:00Z"), "{steps:?}");
+        assert_eq!(steps.last().map(|s| s.at.as_str()), Some("2026-10-08T09:05:00Z"), "and it is the timeline's last step");
+
+        // Edited to `doing` by hand: no `→ doing`, so the timeline never left
+        // `not started` and the word's own record is all that dates it.
+        let t = task("doing", &[]);
+        let now = of_member(&member(&t, &[]));
+        assert_eq!((now.word, since(&now, &history(&t, &[], Some(&now))).as_str()), ("started", "2026-10-08T09:00:00Z"));
     }
 }

@@ -249,12 +249,13 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     let tasks = filtered(store, args, &index, scope.clone());
     if args.json() {
         // `wsp-242`: each row's stage, every source read once for all of them.
-        let stages = crate::stage::of_tasks(store, &tasks.iter().collect::<Vec<_>>());
+        let stages = crate::stage::with_history(store, &tasks.iter().collect::<Vec<_>>());
         let out: Vec<_> = tasks
             .iter()
             .map(|t| {
                 let mut v = t.json();
-                v["stage"] = json!(stages.get(&t.id).map(|s| s.json()));
+                // `wsp-274`: and since when, off the same timeline `show` gives.
+                v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
                 v
             })
             .collect();
@@ -366,7 +367,7 @@ pub fn find(store: &Store, args: &Args) -> i32 {
         // `wsp-242`: one read of each source the stages stand on, for every
         // row at once, rather than a walk of the store per row.
         let asked: Vec<&Task> = hits.iter().chain(archived.iter()).collect();
-        let stages = crate::stage::of_tasks(store, &asked);
+        let stages = crate::stage::with_history(store, &asked);
         let out: Vec<_> = hits
             .iter()
             .map(|t| (t, false))
@@ -374,7 +375,8 @@ pub fn find(store: &Store, args: &Args) -> i32 {
             .map(|(t, filed)| {
                 let mut v = t.json();
                 v["archived"] = json!(filed);
-                v["stage"] = json!(stages.get(&t.id).map(|s| s.json()));
+                // `wsp-274`: and since when, off the same timeline `show` gives.
+                v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
                 v
             })
             .collect();
@@ -729,7 +731,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         // `wsp-255`: and when it entered each stage it has been in.
         let staged = crate::stage::with_history(store, &[&t]);
         let staged = staged.get(&t.id);
-        v["stage"] = json!(staged.map(|(s, _)| s.json()));
+        v["stage"] = json!(staged.map(|(s, h)| crate::stage::json(s, h)));
         v["stages"] = json!(staged.map(|(_, h)| h.iter().map(|s| s.json()).collect::<Vec<_>>()));
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;

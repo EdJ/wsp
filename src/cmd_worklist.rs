@@ -1890,7 +1890,7 @@ fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::mode
             // member is, so a graph reads every node in one call. A member no
             // task answers to has no stage, and is the group's `gone` instead.
             "stage": stage.json(),
-            "stages": g.members.iter().zip(&of).filter_map(|(m, s)| Some((m.clone(), (*s)?.json()))).collect::<serde_json::Map<_, _>>(),
+            "stages": g.members.iter().filter_map(|m| stages.get(m).map(|(s, h, _)| (m.clone(), crate::stage::json(s, h)))).collect::<serde_json::Map<_, _>>(),
             // `wsp-255`: when each member entered each stage, and when the
             // group started, settled and was decided.
             "member_stages": g.members.iter().filter_map(|m| Some((m.clone(), json!(stages.get(m)?.1.iter().map(|s| s.json()).collect::<Vec<_>>())))).collect::<serde_json::Map<_, _>>(),
@@ -5081,7 +5081,8 @@ mod tests {
         assert_eq!(v[0]["stage"]["text"], "Standing — nobody has written", "{v}");
         assert_eq!(v[0]["stages"]["s-1"]["word"], "at review");
         assert_eq!(v[1]["stage"]["word"], "not reached");
-        assert_eq!(v[1]["stages"], json!({ "s-2": { "word": "not started", "text": "Not started", "from": "status", "at": store.task("s-2").unwrap().created } }));
+        let made = store.task("s-2").unwrap().created;
+        assert_eq!(v[1]["stages"], json!({ "s-2": { "word": "not started", "text": "Not started", "from": "status", "at": made, "since": made } }));
     }
 
     /// `wsp-255`: each member's timeline, and each group's three times, in
@@ -5133,6 +5134,12 @@ mod tests {
         );
         assert_eq!(v[1]["stages"]["s-2"]["word"], "started", "wsp-242's map is as it was: {v}");
         assert_eq!(v[1]["member_stages"]["s-2"][1], json!({ "word": "started", "at": "2026-10-08T09:01:00Z" }), "claimed, nothing said, and the timeline ends there too");
+        // `wsp-274`: each member's stage says since when, and it is the
+        // timeline's last entry.
+        for (g, m) in [(0, "s-1"), (1, "s-2")] {
+            let last = v[g]["member_stages"][m].as_array().and_then(|a| a.last()).map(|s| s["at"].clone());
+            assert_eq!(Some(v[g]["stages"][m]["since"].clone()), last, "{m}: {v}");
+        }
     }
 
     /// The list half of the refusals, through the verbs: a member may not be
