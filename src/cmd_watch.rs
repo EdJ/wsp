@@ -2459,8 +2459,6 @@ impl Source for Poll<'_> {
             // (c) asks every row whether it is waiting — the one reading the
             // reconciler and the barrier ask too.
             asks: crate::waiting::Asks::read(self.store),
-            // Nothing here draws a governor's count.
-            answered_by: Default::default(),
             // Nor a direction: rows here are read for state, never published.
             mandates: Default::default(),
             checking: Default::default(),
@@ -4566,6 +4564,8 @@ mod tests {
             said: None,
             waiting: None,
             members_waiting: 0,
+            answers_to: None,
+            answers_to_empty: None,
             held: None,
             direction: None,
             runs: Default::default(),
@@ -5623,6 +5623,8 @@ mod tests {
             said: None,
             waiting: None,
             members_waiting: 0,
+            answers_to: None,
+            answers_to_empty: None,
             held: None,
             direction: None,
             runs: Default::default(),

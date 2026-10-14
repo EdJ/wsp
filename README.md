@@ -2177,6 +2177,19 @@ that is two of these is named in the order `task` names it — governor, the
 work it holds, a pass, a check. A helper a governor spawned is not yet a role
 of its own; that waits on the spawn recording who spawned it (`wsp-249`).
 
+And it says whom each seat answers to, as `answers_to` (`wsp-247`): the scope
+of the governor the seat hangs under, walked the way the seat's own `wsp ask`
+would go, so a reader draws the tree from it and walks nothing itself. A member
+answers to its running list's seat, else the nearest seated project at or above
+its own; a verifier to whomever its member does; a barrier check to its list's
+seat, else its group's project's walk; a list's governor to its home project's
+(`wsp-263`); any other seat to its project's walk; a project's governor to
+nobody, `null`. When nobody on the walk is seated it is `null` too, and
+`answers_to_empty` names the scope the walk starts at — the list, the project,
+or a list's home — so "no governor seated" is said, not guessed; it is `null`
+wherever `answers_to` is not. A governor's `members_waiting` counts the waiting
+rows whose `answers_to` is its scope.
+
 ### Looking at a pane
 
 ```sh
@@ -2903,7 +2916,8 @@ three stands nowhere, and `worklist show` says so.
   draws a list's seat one step in from its project's. `wip --json` gives a
   list governor's row `answers_to` — the seat it answers to, or `null` with
   `answers_to_empty` naming the home when nobody there is seated — and a
-  project governor's `answers_to` is `null`.
+  project governor's `answers_to` is `null`; every other row carries it too
+  (`wsp-247`, under "What tier it starts at").
 - **Read:** `wsp worklist show --json` gives the list's home as
   `worklist.project` — `{id, from}`, where `id` is the project and `from` says
   which of the three answered: `stated`, `members` or `maker` (off `made_in:`)
