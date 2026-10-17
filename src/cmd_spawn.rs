@@ -2672,6 +2672,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 false => None,
             },
             resume: None,
+            // Only a brief that was written: a flag naming a file that is not
+            // there would be silence in pi, and `route` has already sent that
+            // spawn the old way.
+            brief: brief_at.as_deref().filter(|_| laid == Laid::Written),
         };
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
         // Two waits, and they are different questions: `start` comes back when
@@ -3426,6 +3430,7 @@ fn rotate_as(
             false => None,
         },
         resume: None,
+        brief: None,
     };
     let agent = Agent { kind: kind.clone(), name: subject.clone(), args: how.args(&spawn) };
 
@@ -5727,7 +5732,7 @@ mod tests {
         clock: &util::Dial,
     ) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, subagents: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None };
+            agent_commands::Spawn { full: false, subagents: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None, brief: None };
         // The retry fields come from `retrying` because this test is about a
         // single attempt: a literal here would have to be updated every time the
         // retry's numbers move, for a wait that never reads them.
@@ -5806,7 +5811,7 @@ mod tests {
 
     fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, subagents: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None };
+            agent_commands::Spawn { full: false, subagents: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None, brief: None };
         let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new() };
         start_agent(place, how, &spawn, &agent, "claude", wait)
     }
@@ -6103,6 +6108,7 @@ mod tests {
             effort: None,
             order: None,
             resume: None,
+            brief: None,
         };
         // The retry fields come from `retrying` because this test is about a
         // single attempt: a literal here would have to be updated every time the
@@ -6136,6 +6142,7 @@ mod tests {
             effort: None,
             order: None,
             resume: None,
+            brief: None,
         };
         let wait = Patience { ready: READY, taken: TAKEN, nudges: PRESSES, poll: STEP, gone: GRACE, clock: &dial, ..retrying(&dial) };
         let place = Composer { reads: Some(true), ..Composer::of(None, true) };

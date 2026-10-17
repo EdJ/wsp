@@ -723,6 +723,14 @@ pub struct Spawn<'a> {
     /// fresh, which is the same fallback an unknown kind gets for everything
     /// else here.
     pub resume: Option<&'a str>,
+    /// The file this seat's brief was written to, for a kind that takes the
+    /// path **in argv** because its runtime has a flag for it and no config
+    /// key — [`Kind::brief_file`] is the question, [`Kind::env`] the other
+    /// carrier. `None` for a spawn with nothing to brief about, for one whose
+    /// brief could not be written, and for every kind that reads it from its
+    /// environment or is not given one. A path and not the text, because a
+    /// brief is multi-line and herdr refuses control characters in an arg.
+    pub brief: Option<&'a Path>,
 }
 
 /// The handle wsp will address this agent by, decided before it exists.
@@ -1681,10 +1689,10 @@ fn opencode_rows(session: &str) -> Option<Vec<Value>> {
 /// [`Kind::efforts`] is a list again. Measured against pi 1.3.0 in tmux panes
 /// on the `local` provider, on 2026-10-17, rather than read off `--help`.
 ///
-/// This row is the tier and `--approve`. The brief, the work order, resume,
-/// clear and the attempt record are rows of their own (`pi-support-003` to
-/// `-005`), so every one of them is still [`Plain`]'s answer here: a kind
-/// claims only what has been measured for it.
+/// The tier and `--approve` are `pi-support-002`; the brief and the work order
+/// at launch are `pi-support-003`. Resume, clear and the attempt record are
+/// rows of their own (`-004`, `-005`), so each is still [`Plain`]'s answer
+/// here: a kind claims only what has been measured for it.
 pub struct Pi;
 
 /// pi's thinking levels, straight off `pi --help`, and the words `--effort`
@@ -1814,6 +1822,15 @@ impl Kind for Pi {
             argv.push("--thinking".into());
             argv.push(effort.to_string());
         }
+        if let Some(brief) = spawn.brief {
+            argv.push("--append-system-prompt".into());
+            argv.push(brief.display().to_string());
+        }
+        if let Some(order) = spawn.order {
+            // `--` so an order is never read as a flag; see [`Kind::order_in_args`].
+            argv.push("--".into());
+            argv.push(order.to_string());
+        }
         argv
     }
 
@@ -1895,8 +1912,30 @@ impl Kind for Pi {
         None
     }
 
-    /// Typed at, like [`Plain`]. How a work order reaches pi is
-    /// `pi-support-003`'s, not this row's.
+    /// Yes — `--append-system-prompt <file>`, which pi takes as a path when
+    /// one exists. Driven against pi 1.3.0 on `local/qwen3.8-27b` with a brief
+    /// holding a codeword found nowhere else: asked for it as the first
+    /// message, the pane answered with it, and `[Context]` listed the file at
+    /// startup. The flag is argv, so the path is the carrier and the text never
+    /// is (a brief is multi-line; see [`Spawn::brief`]). A path that does not
+    /// exist is taken as the *text* of the prompt, in silence, which is why
+    /// [`crate::cmd_spawn`] hands one over only when it was written.
+    fn brief_file(&self) -> bool {
+        true
+    }
+
+    /// Yes — pi's positional message, last, after a `--`. Driven in a tmux
+    /// pane: the order is the first user message, answered once, with no
+    /// second submit to double it. `--` is needed and sufficient for an order
+    /// starting `-` (`-dash …` is otherwise an unknown flag); `@name` is
+    /// pi's file-include and is read as one even after `--` when it is the
+    /// first character — wsp's orders open with prose, and a leading space
+    /// measured as prose.
+    fn order_in_args(&self) -> bool {
+        true
+    }
+
+    /// Typed at, like [`Plain`].
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
         crate::place::submit(place, seat, text, &crate::place::Pressing::default())
     }
@@ -3158,7 +3197,7 @@ mod tests {
     /// ~28K, and a trim that pushes work into Bash costs more than it saves.
     /// A spawn description, so the tests below argue about one thing each.
     fn spawn<'a>(full: bool, name: &'a str, seat: &'a Seat) -> Spawn<'a> {
-        Spawn { full, subagents: false, name, seat, model: None, effort: None, order: None, resume: None }
+        Spawn { full, subagents: false, name, seat, model: None, effort: None, order: None, resume: None, brief: None }
     }
 
     /// The same, at a stated tier.
@@ -3197,6 +3236,37 @@ mod tests {
         let argv = of("opencode").args(&sp);
         assert_eq!(argv.len(), 2, "one flag and one value, never a split sentence: {argv:?}");
         assert_eq!(argv[1], prose, "nothing quoted, escaped or eaten on the way");
+    }
+
+    #[test]
+    fn a_pi_is_started_with_its_brief_as_a_path_and_its_order_as_the_last_argument() {
+        let seat = Seat::new("w1:p1");
+        let brief = Path::new("/state/briefs/pi-support-003.md");
+        let sp = Spawn {
+            model: Some("local/qwen3.8-27b"),
+            effort: Some("off"),
+            brief: Some(brief),
+            order: Some("-You have been claimed onto pi-support-003."),
+            ..spawn(false, "pi-support-003", &seat)
+        };
+        assert_eq!(
+            of("pi").args(&sp),
+            vec![
+                "--approve",
+                "--model",
+                "local/qwen3.8-27b",
+                "--thinking",
+                "off",
+                "--append-system-prompt",
+                "/state/briefs/pi-support-003.md",
+                "--",
+                "-You have been claimed onto pi-support-003."
+            ],
+            "the brief by path, the order after `--` so a leading dash is not a flag"
+        );
+        assert!(of("pi").brief_file() && of("pi").order_in_args());
+        let bare = of("pi").args(&spawn(false, "pi-support-003", &seat));
+        assert_eq!(bare, vec!["--approve"], "nothing to brief or order sends neither flag");
     }
 
     #[test]
