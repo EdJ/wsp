@@ -779,7 +779,7 @@ fn judge(repo: &Path, onto: &str, task: &str, dir: &Path, closed: bool, passed: 
 /// check out. The other half is [`strays`], which finds that branch again on
 /// every `doctor` afterwards, because a name printed once is a name that has
 /// scrolled away by the time anybody wants it.
-fn remove(repo: &Path, dir: &Path) -> Removed {
+pub(crate) fn remove(repo: &Path, dir: &Path) -> Removed {
     let existed = dir.exists();
     // Before the removal: a tree that has gone cannot be asked what it was on.
     // `None` is a detached HEAD, where there is no branch to keep and nothing
@@ -821,13 +821,13 @@ fn foresee(repo: &Path, dir: &Path, onto: &str) -> Removed {
     Removed { existed: dir.exists(), kept }
 }
 
-struct Removed {
+pub(crate) struct Removed {
     existed: bool,
     /// The branch that outlived the tree, named rather than flagged: it is what
     /// a reader has to type to get the work back, and it is not always the
     /// task's id. `None` is a branch that went with the tree, having nothing
     /// the trunk had not got.
-    kept: Option<String>,
+    pub(crate) kept: Option<String>,
 }
 
 /// What one sweep did, and what it declined to do.

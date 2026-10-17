@@ -2000,6 +2000,9 @@ fn end_check_seat(store: &Store, list: &str, seat: &str) {
         log_line(store, &format!("{list}: the check in {seat} was not ended: {}", util::truncate(why, 200)));
     }
     crate::barrier::mark_ended(store, seat, ended.is_ok());
+    // And its tree, as the same step: `despawn` takes it, and this says what
+    // became of it — or of one an earlier ending left behind (`wsp-289`).
+    crate::check_tree::tidy(store, &[seat.to_string()]);
 }
 
 /// The lists that have a barrier check holding a claim right now.
@@ -2497,6 +2500,10 @@ pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
 
 /// `wsp despawn --pane <seat>`, as a process — a verifier holds no claim, so
 /// its seat is the only handle there is.
+///
+/// **From `/`**, not from wherever this process stands: the ending a check's
+/// `go` launches stands in the check's own tree, and `despawn` kept every one
+/// of them for "you are standing in it" (`wsp-289`).
 pub(crate) fn despawn_seat(seat: &str) -> Result<(), String> {
     if cfg!(test) {
         #[cfg(test)]
@@ -2506,7 +2513,12 @@ pub(crate) fn despawn_seat(seat: &str) -> Result<(), String> {
         });
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let out = Command::new(exe).args(["despawn", "--pane", seat]).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    let out = Command::new(exe)
+        .args(["despawn", "--pane", seat])
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
     match out.status.success() {
         true => Ok(()),
         false => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),

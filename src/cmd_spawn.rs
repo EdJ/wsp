@@ -4025,6 +4025,9 @@ fn swept_up(
     };
 
     let tree = match task.filter(|_| !keep) {
+        // A barrier check's tree is taken on its own rule (`wsp-289`): nothing
+        // in it beyond `target/`, and its check no longer anybody's.
+        Some(t) if crate::check_tree::named(store, t).is_some() => crate::check_tree::discard(store, t, &standing),
         Some(t) => cmd_checkout::discard(cmd_checkout::candidates(store, &cwd, t), t, &standing),
         // A seat holding nothing names no tree. There is no path from a seat to
         // a checkout except through the task, and guessing one from the pane's

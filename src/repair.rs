@@ -283,6 +283,10 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     if !ended.is_empty() {
         stamp(store, &format!("barrier check seat(s) with nothing left to do, ended: {}", ended.join(" ")));
     }
+    // And their trees, read off the disk rather than off the endings above, so
+    // a tree whose seat went some other way — or before this — goes too.
+    // `wsp-289`, after compound's disk filled with 56 of them.
+    crate::check_tree::tidy(store, &ended);
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);

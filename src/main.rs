@@ -12,6 +12,7 @@ mod after;
 mod agent_commands;
 mod barrier;
 mod caption;
+mod check_tree;
 mod arrange;
 mod attention;
 mod cmd_agent;
