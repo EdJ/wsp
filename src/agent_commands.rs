@@ -769,7 +769,7 @@ pub fn of(kind: &str) -> &'static dyn Kind {
 /// This is the kinds wsp has *measured*, not the kinds herdr can start: any
 /// other name `--kind` is given is still passed through to herdr, which owns
 /// that catalogue (see [`of`]).
-const KNOWN: &[(&str, &'static dyn Kind)] = &[("claude", &Claude), ("opencode", &OpenCode)];
+const KNOWN: &[(&str, &'static dyn Kind)] = &[("claude", &Claude), ("opencode", &OpenCode), ("pi", &Pi)];
 
 /// What a menu needs to know about one kind. Read off [`Kind`], never stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1670,6 +1670,245 @@ fn opencode_rows(session: &str) -> Option<Vec<Value>> {
         return None;
     }
     serde_json::from_slice(&out.stdout).ok()
+}
+
+/// pi.
+///
+/// The third kind wsp knows by name, and in what it is asked about here it is
+/// [`OpenCode`] again: a model named `provider/id` out of a per-machine
+/// catalogue, so [`Kind::models`] is empty and the check shells out. What it
+/// adds is an effort knob that opencode does not have — `--thinking` — and so
+/// [`Kind::efforts`] is a list again. Measured against pi 1.3.0 in tmux panes
+/// on the `local` provider, on 2026-10-17, rather than read off `--help`.
+///
+/// This row is the tier and `--approve`. The brief, the work order, resume,
+/// clear and the attempt record are rows of their own (`pi-support-003` to
+/// `-005`), so every one of them is still [`Plain`]'s answer here: a kind
+/// claims only what has been measured for it.
+pub struct Pi;
+
+/// pi's thinking levels, straight off `pi --help`, and the words `--effort`
+/// takes for this kind.
+///
+/// **wsp's five efforts are five of these seven, name for name** — `low`,
+/// `medium`, `high`, `xhigh` and `max` reach `--thinking` as they were typed,
+/// so an effort a governor's record carries for a claude means the same rung
+/// here. `off` and `minimal` are pi's own and have no claude word; they are
+/// taken because they are the cheap end of the ladder this kind is mostly for,
+/// a local model where thinking is the whole of what a turn costs.
+const PI_THINKING: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// One row of `pi --list-models`: the name `--model` takes, and whether the
+/// model thinks at all — the column the effort check reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PiModel {
+    id: String,
+    thinks: bool,
+}
+
+/// The catalogue, from the table `pi --list-models` prints.
+///
+/// The table is `provider  model  context  max-out  thinking  images`, padded
+/// with spaces, and the name `--model` takes is the first two columns joined by
+/// a `/`. A model id may carry a `/` or a `:` of its own —
+/// `openrouter/z-ai/glm-5.3:batch` is one row — and pi's resolver tries an exact
+/// `provider/id` before it looks for a `:<thinking>` suffix, so the joined name
+/// is the right key and `--thinking` beside it is never read as part of it.
+///
+/// A row is six fields with `yes` or `no` in the last two, and nothing else is
+/// one: the header has `thinking` and `images` there, and a machine with no
+/// provider configured prints a sentence instead of a table.
+fn read_pi_models(table: &str) -> Vec<PiModel> {
+    let yes_no = |s: &str| s == "yes" || s == "no";
+    table
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() == 6 && yes_no(f[4]) && yes_no(f[5]))
+                .then(|| PiModel { id: format!("{}/{}", f[0], f[1]), thinks: f[4] == "yes" })
+        })
+        .collect()
+}
+
+/// `pi --list-models`, read. It lists only the models whose provider has
+/// credentials, which is the question being asked: what this machine can
+/// serve, not what pi has heard of. 395 models on this machine and 0.2s, a tenth
+/// of what `opencode models` costs.
+///
+/// Through [`captured`], because it grows with what is configured. pi also
+/// writes a warning to stderr for every `enabledModels` pattern in its settings
+/// that matches nothing — eight here — and `captured` drops stderr, which is
+/// where those belong.
+fn pi_models() -> std::result::Result<Vec<PiModel>, String> {
+    Ok(read_pi_models(&String::from_utf8_lossy(&captured(pi_bin(), &["--list-models"])?)))
+}
+
+/// pi, wherever it is — [`opencode_bin`]'s reasoning, with one difference that
+/// a lookup cannot fix. pi is a node script (`#!/usr/bin/env node`), so a `PATH`
+/// without node on it fails whichever path the script is found at: measured
+/// with `env -i`, `env: node: No such file or directory`. Through [`captured`]
+/// that reads as `pi --list-models failed`, which is the true sentence.
+fn pi_bin() -> PathBuf {
+    if let Some(v) = std::env::var_os("PI_BIN") {
+        let p = PathBuf::from(v);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join("pi");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    PathBuf::from("/opt/homebrew/bin/pi")
+}
+
+/// The half of [`Pi::tier`] that needs the catalogue, given one, so the
+/// sentences can be tested without a pi on the machine.
+fn pi_tier_in(m: &str, effort: Option<&str>, models: &[PiModel]) -> std::result::Result<(), String> {
+    let Some(found) = models.iter().find(|k| k.id == m) else {
+        return Err(format!(
+            "no model `{m}` on this machine — `pi --list-models` lists {} of them. \
+             If this spawn is --on another machine, its providers are its own",
+            models.len()
+        ));
+    };
+    match effort {
+        Some(e) if e != "off" && !found.thinks => Err(format!(
+            "`{m}` does not think, so pi runs it at `off` whatever --effort says — \
+             drop --effort, or say --effort off"
+        )),
+        _ => Ok(()),
+    }
+}
+
+impl Kind for Pi {
+    /// `--approve`, then the model and the thinking level when they were asked
+    /// for.
+    ///
+    /// **`--approve` is always sent, and it is the one flag here nobody typed.**
+    /// It answers pi's project-trust prompt before it is asked — see
+    /// [`Pi::unattended`] for the measurement — which is the only thing that
+    /// stops a pi with nobody at the pane. Decided 2026-10-17 between it and
+    /// `--no-approve`: a seat's tree is one wsp made for the work, so what that
+    /// tree's `.pi/` carries is the project's own setup and is meant to load.
+    /// It trusts for this run only; driven in a scratch tree with an empty
+    /// `.pi/settings.json`, the pane came up at the composer and
+    /// `~/.pi/agent/trust.json` was unchanged afterwards.
+    ///
+    /// `--thinking` and not a `:<level>` suffix on the model, though pi takes
+    /// both. A suffix is parsed off the end of a string that may already carry
+    /// a colon of its own (see [`read_pi_models`]), and a flag with its own
+    /// argv element has nothing to be confused with. pi's docs say `--thinking`
+    /// wins over a suffix, so the two cannot disagree either.
+    fn args(&self, spawn: &Spawn) -> Vec<String> {
+        let mut argv: Vec<String> = vec!["--approve".into()];
+        if let Some(model) = spawn.model {
+            argv.push("--model".into());
+            argv.push(model.to_string());
+        }
+        if let Some(effort) = spawn.effort {
+            argv.push("--thinking".into());
+            argv.push(effort.to_string());
+        }
+        argv
+    }
+
+    /// A `provider/id` this machine can serve, and one of [`PI_THINKING`].
+    ///
+    /// [`OpenCode::tier`] carries the argument for the model half — no mapping
+    /// from wsp's aliases, the shape checked before the catalogue is paid for,
+    /// `--on` as the known gap — and it holds here unchanged. It is sharper for
+    /// pi: `pi --model opus` is not refused, it is **fuzzy-matched**, and on
+    /// this machine it resolved to an openrouter batch model and made a request
+    /// before failing. An id pi does not list under a provider it does know is
+    /// not refused either — `local/qwen3.8-27b:bogus` started with "Using
+    /// custom model id" and failed only at the server. Both are a pane that
+    /// starts at a tier nobody asked for, so the catalogue lookup is what
+    /// stands between a typo and a running agent.
+    ///
+    /// **The effort half is what pi adds, and pi does not refuse an effort a
+    /// model cannot take; it moves it.** Measured in the footer pi draws for
+    /// the level it is running at: `--thinking high` on
+    /// `openrouter/~unbiased/pareto-latest`, which lists `thinking no`, showed
+    /// no level at all; `xhigh` and `max` on `local/qwen3.8-27b` both showed
+    /// `high`; `max` on `~anthropic/claude-opus-latest` showed `max`. That is
+    /// Claude Code's ignored-effort warning without the warning, so the first
+    /// case is refused here: a model `--list-models` says does not think takes
+    /// only `off`. The second is **the known gap** — which models map `xhigh`
+    /// and `max` is in pi's model metadata and not in the listing, so a model
+    /// that tops out at `high` runs there and says nothing. Not refused,
+    /// because the alternative is a catalogue of pi's internals kept in wsp.
+    ///
+    /// An effort with no `--model` costs no subprocess and is checked against
+    /// the list alone: it lands on whatever pi's settings default to, which is
+    /// a model wsp has not been told about.
+    fn tier(&self, model: Option<&str>, effort: Option<&str>) -> std::result::Result<(), String> {
+        if let Some(e) = effort {
+            if !PI_THINKING.contains(&e) {
+                return Err(format!("no effort `{e}` — pi takes {}", PI_THINKING.join(", ")));
+            }
+        }
+        let Some(m) = model else { return Ok(()) };
+        if !m.contains('/') {
+            return Err(format!(
+                "no model `{m}` — pi names models `provider/id`, not by alias. \
+                 `pi --list-models` lists what this machine can serve"
+            ));
+        }
+        let models = pi_models().map_err(|e| format!("cannot check `{m}` — {e}. Is pi installed?"))?;
+        pi_tier_in(m, effort, &models)
+    }
+
+    /// Nothing, and it was measured rather than left unasked. Driven in a
+    /// tmux pane on `local/qwen3.8-27b`: told to run a shell command, edit a
+    /// file, write one **outside** its tree and list the parent directory, pi
+    /// did all four and asked nothing. Its own `docs/security.md` says as much —
+    /// it "does not ask for approval before every tool call" — and none of the
+    /// five extensions on this machine asks on a tool's path by default
+    /// (`pi-intercom` can, with `confirmSend`, which is off).
+    ///
+    /// **What does stop it is the tree, not the tier**, and so it is not this
+    /// method's to answer. pi asks *Trust project folder?* at startup in a tree
+    /// with `.pi/settings.json`, `.pi/extensions` or the other project
+    /// resources its docs list, unless `~/.pi/agent/trust.json` already decided
+    /// for that folder or one above it — driven in a scratch directory with an
+    /// empty `.pi/settings.json`, and the pane sat on the menu. A bare tree
+    /// under `~` did not ask (`~/.agents/skills` is read as the user's, not as a
+    /// project's). [`Pi::args`] sends `--approve`, which decides it before it
+    /// is asked, so a spawned pi never reaches that menu whatever its tree
+    /// holds.
+    fn unattended(&self, _model: Option<&str>) -> Option<String> {
+        None
+    }
+
+    fn efforts(&self) -> &'static [&'static str] {
+        PI_THINKING
+    }
+
+    /// Nothing yet. pi has `--session-id` and `--name`; neither is measured
+    /// here, and a handle wsp cannot address anything with is not one.
+    fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<Address> {
+        None
+    }
+
+    /// Typed at, like [`Plain`]. How a work order reaches pi is
+    /// `pi-support-003`'s, not this row's.
+    fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
+        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+    }
+
+    fn running(&self, _spawn: &Spawn) -> Option<bool> {
+        None
+    }
+
+    /// Nothing yet — `pi-support-005` reads pi's session record.
+    fn ran(&self, _session: &str, _cwd: &str, _since: i64) -> Option<Ran> {
+        None
+    }
 }
 
 /// How long a completed turn has to have been over before a screen still
@@ -3335,6 +3574,96 @@ mod tests {
         );
     }
 
+    /// Rows of `pi --list-models` from this machine on 2026-10-17, header and
+    /// padding as printed: an id with a `/` of its own, one with a `:` that is
+    /// not a thinking level, and a model that does not think.
+    const PI_LISTING: &str = "\
+provider    model                                               context  max-out  thinking  images
+local       qwen3.8-27b                                         262.1K   32.8K    yes       yes
+openrouter  ~unbiased/pareto-latest                             262.1K   131.1K   no        yes
+openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K   yes       yes
+";
+
+    #[test]
+    fn a_pi_is_started_with_the_model_and_the_thinking_it_was_given() {
+        let seat = Seat::new("w1:p1");
+        let argv = of("pi").args(&at("pi-support-002", &seat, Some("local/qwen3.8-27b"), Some("minimal")));
+        assert_eq!(argv, vec!["--approve", "--model", "local/qwen3.8-27b", "--thinking", "minimal"]);
+        assert_eq!(
+            of("pi").args(&spawn(false, "pi-support-002", &seat)),
+            vec!["--approve"],
+            "an unflagged spawn names no tier, so pi's own settings decide it — and still never \
+             stops at the trust prompt"
+        );
+    }
+
+    #[test]
+    fn a_pi_takes_its_seven_thinking_levels_and_wsps_five_are_five_of_them() {
+        assert_eq!(of("pi").efforts(), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+        for e in EFFORTS {
+            assert!(of("pi").efforts().contains(e), "`{e}` reaches --thinking as it was typed");
+            assert!(of("pi").tier(None, Some(e)).is_ok(), "and with no model it costs no subprocess");
+        }
+        let why = of("pi").tier(None, Some("ultra")).expect_err("pi would not refuse it, it would clamp");
+        assert!(why.contains("off, minimal"), "the refusal lists what pi takes — {why}");
+    }
+
+    #[test]
+    fn wsps_own_model_words_are_refused_by_pi_before_it_can_fuzzy_match_them() {
+        // Measured: `pi --model opus` resolves to *some* model and makes a
+        // request. The shape check is what catches it, and it is free.
+        let why = of("pi").tier(Some("opus"), Some("high")).expect_err("an alias is not a model here");
+        assert!(why.contains("provider/id"), "say the shape that would work — {why}");
+        assert!(why.contains("pi --list-models"), "and where the real names come from — {why}");
+        assert!(of("pi").tier(None, None).is_ok(), "no flags, no catalogue, no cost");
+    }
+
+    #[test]
+    fn the_name_pi_takes_is_the_first_two_columns_joined_and_nothing_else_is_a_row() {
+        let models = read_pi_models(PI_LISTING);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["local/qwen3.8-27b", "openrouter/~unbiased/pareto-latest", "openrouter/z-ai/glm-5.3:batch"],
+            "the header is not a model"
+        );
+        assert_eq!(models.iter().map(|m| m.thinks).collect::<Vec<_>>(), [true, false, true]);
+        assert!(
+            read_pi_models("No models available. Use /login or set an API key.\n").is_empty(),
+            "a sentence where the table would be is no catalogue, not a model called `No/models`"
+        );
+    }
+
+    #[test]
+    fn a_pi_model_this_machine_does_not_list_is_refused_with_the_count_it_does() {
+        let models = read_pi_models(PI_LISTING);
+        assert!(pi_tier_in("local/qwen3.8-27b", Some("high"), &models).is_ok());
+        assert!(pi_tier_in("openrouter/z-ai/glm-5.3:batch", None, &models).is_ok());
+        // pi itself would start this one "using custom model id" and fail at
+        // the server, in a pane nobody is looking at.
+        let why = pi_tier_in("local/qwen3.8-27b:bogus", None, &models).expect_err("not listed");
+        assert!(why.contains("lists 3 of them"), "{why}");
+    }
+
+    #[test]
+    fn an_effort_on_a_pi_model_that_does_not_think_is_refused_rather_than_run_at_off() {
+        let models = read_pi_models(PI_LISTING);
+        let m = "openrouter/~unbiased/pareto-latest";
+        let why = pi_tier_in(m, Some("high"), &models).expect_err("measured: pi ran it with no thinking");
+        assert!(why.contains("--effort off"), "the one effort it does take — {why}");
+        assert!(pi_tier_in(m, Some("off"), &models).is_ok(), "which is what it runs at anyway");
+        assert!(pi_tier_in(m, None, &models).is_ok());
+    }
+
+    #[test]
+    fn a_pi_at_any_tier_can_be_left_alone() {
+        // Measured, not unasked: no tool call asked. The trust prompt is the
+        // tree's, no model makes it more or less likely, and `--approve` on
+        // every launch answers it.
+        assert_eq!(of("pi").unattended(Some("local/qwen3.8-27b")), None);
+        assert_eq!(of("pi").unattended(None), None);
+    }
+
     #[test]
     fn a_spawned_claude_is_not_given_the_two_tools_it_is_told_not_to_use() {
         let seat = Seat::new("w2J:p1");
@@ -4164,20 +4493,26 @@ mod tests {
 
     /// The read a menu takes and `of` agree because they are one table: every
     /// kind `kinds` names is one `of` answers with something other than `Plain`
-    /// (a `Plain` has no resume flag, and these two both do), and exactly one is
-    /// the default.
+    /// (a `Plain` has no resume flag and no efforts, and each of these has one
+    /// or the other), and exactly one is the default.
     #[test]
     fn the_kinds_a_menu_reads_are_the_kinds_of_answers_to() {
         let all = kinds();
         let names: Vec<_> = all.iter().map(|k| k.name).collect();
-        assert_eq!(names, ["claude", "opencode"]);
+        assert_eq!(names, ["claude", "opencode", "pi"]);
         for k in &all {
-            assert!(of(k.name).resume_flag().is_some(), "{} fell through to Plain", k.name);
-            assert_eq!(k.resume, of(k.name).resume_flag().is_some());
+            let kind = of(k.name);
+            assert!(
+                kind.resume_flag().is_some() || !kind.efforts().is_empty(),
+                "{} fell through to Plain",
+                k.name
+            );
+            assert_eq!(k.resume, kind.resume_flag().is_some());
         }
         assert_eq!(all.iter().filter(|k| k.default).count(), 1);
         assert_eq!(all[0].models, MODELS);
         assert!(all[1].models.is_empty() && all[1].efforts.is_empty());
+        assert!(all[2].models.is_empty() && all[2].efforts == PI_THINKING && !all[2].resume);
     }
 
     /// A kind spells its clear once, and every caller reads the same answer —
