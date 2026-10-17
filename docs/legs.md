@@ -39,6 +39,11 @@ What the revision changed from the chain design (29779a8, decision d1 on
 - A leg that waits on several legs reads all their batons, under a total cap
   (*The baton*).
 - A rework leg waits on the last leg and becomes the new last leg (*The run*).
+- **A leg runs on Sonnet unless it says otherwise, and says why** (Ed, through
+  compound's custodian, 2026-10-18: "we should also primarily use sonnet for
+  such sub-rows"). The member's `agent` line no longer sets a leg's tier.
+  Any other tier is written on the leg with a reason, such as Opus for a
+  design leg that decides (*The record*).
 
 ## Why
 
@@ -56,21 +61,49 @@ legs address both:
   re-reads about T·(S₀ + gT/(2k) + R(k−1)/k). The saving is
   **T·(1 − 1/k)·(gT/2 − R)**. That is positive once a single session would grow
   by more than 2R.
-- **Opus doing the volume.** Opus input costs 2.5× Sonnet's (`cmd_burn::PRICES`,
-  $5 against $2 a million). A leg that reads or edits to a plan does not need
-  Opus. A leg that decides does, and it can do that from a baton and a few
-  targeted reads.
+- **Opus doing the volume.** A leg that reads or edits to a plan does not need
+  Opus. So **every leg runs on Sonnet unless the leg says why not**. A leg that
+  decides may be worth Opus, and it can decide from a baton and a few targeted
+  reads.
+
+**What the tiers cost.** wsp's price table (`cmd_burn::PRICES`, read
+2026-10-06) prices every Opus at $5 input with cache reads at a tenth, which
+is $0.50 a million read. It prices Sonnet 5 at $2, which is $0.20. The table's
+own comment says Opus 5.5, which is what the fleet runs (`ran opus-5-5/high`
+on the release lines), lists at $4/$20 with cache reads at 0.05×. That is
+**$0.20 a million, the same as Sonnet's**, and the table does not model it.
+So the figures below are given both ways. Every dollar the flight comparison
+and `wsp burn` printed for an Opus 5.5 row used the table's rate, which is 2.5×
+too high for cache reads. legs-measure fixes the rate (*Build rows*).
 
 The measured inputs: g ≈ 1.7k tokens a turn (compound-476 went from 43k to 481k
 over 254 calls, and 512 reached 491k). R ≈ 60–80k, which is what the flight
 builders read before their first edit. Break-even growth is therefore
-2R ≈ 120–160k, or **about 70–95 turns**. That fits the first guess of ~80. A
-row shaped like 476, run as four legs with one on Opus and three on Sonnet,
-comes out at about 38M cache-read tokens and ~$10, against 66M and ~$33. That
-figure is an estimate. The trial row exists to replace it with a measurement.
+2R ≈ 120–160k, or **about 70–95 turns**. That fits the first guess of ~80.
+Break-even does not depend on the tier: it compares a row with the same row
+split, both on the same model.
+
+A row shaped like 476 (T = 254, S₀ = 43k, k = 4, R = 70k), counting cache reads
+only:
+
+| run as | cache reads | at the table's rates | at Opus 5.5's listed rate |
+|---|---|---|---|
+| one Opus session (as 476 ran) | 66M | $33 | $13 |
+| one Sonnet session | 66M | $13 | $13 |
+| four legs, plan on Opus, three on Sonnet (d1) | 38M | $10 | $8 |
+| **four Sonnet legs** | 38M | **$8** | **$8** |
+
+Four Sonnet legs also pay four starts, ~43k written to the cache each, which
+is about $0.43 in all. So **~$8 against ~$33** at the prices wsp prints
+today. At Opus 5.5's listed rate the baseline is ~$13. There, the tier saves
+nothing on cache reads, and the split's own 28M fewer tokens (~$5.6, 42%)
+is the whole saving. Either way, the saving that does not depend on a
+price-table entry is the split's. These figures are estimates. The trial row
+exists to replace them with measurements, and Sonnet may take more turns than
+Opus for the same work, which would raise g and T.
 
 Below break-even, legs cost money. A leg's start writes ~43k to the cache
-($0.27 on Opus, $0.11 on Sonnet), and it pays its R again.
+($0.11 on Sonnet, $0.22–0.27 on Opus), and it pays its R again.
 
 Running legs side by side changes none of that arithmetic. It changes the
 time a row takes. *When to stage* says when that is worth having.
@@ -95,6 +128,7 @@ claim to another task (`cmd_agent::hand_off`). So:
   order: Read the three call sites of … and say which layer owns …
   baton: three layers: store (src/legs.rs new), spawn (cmd_spawn.rs:2274–2330), …
 - plan · claude opus high · done · pane cpd-34 · ended
+  why: decides which layer owns the leg record, from the scout's three options
 - build-store · claude sonnet medium · running · pane cpd-36 · tree wsp-287.build-store
   after: plan
 - build-spawn · claude sonnet medium · running · pane cpd-37 · tree wsp-287.build-spawn
@@ -121,8 +155,19 @@ claim to another task (`cmd_agent::hand_off`). So:
 - **No cost here.** A leg's spend goes on its end line in the row's log (see
   *Measured*). A second copy would be two records of one fact, which is how
   wsp-148 ended up with five rows.
-- A leg with no policy runs on the member's line (`agent <member>:`, or else
-  the group's line).
+- **The tier is Sonnet unless the leg says otherwise.** A leg with no policy
+  runs on `claude sonnet medium`, one constant in `legs.rs`, and `wsp show`
+  prints it so the record never hides a tier. The member's `agent <member>:`
+  line and the group's line do not reach a leg. They say how the row runs
+  unstaged, and staging it is the choice to run it on cheaper seats.
+- **Any other policy needs a `why:`**, indented under the entry and capped at
+  300 chars: `wsp leg add … --agent "claude opus high" --why "decides …"`.
+  It applies to another model, another effort or another kind alike. The
+  reason has to be about the leg's work, such as Opus for a design leg that
+  chooses between approaches. "The row is hard" is a reason to stage it, not
+  a reason to give a leg Opus. A policy other than the default with no
+  `why:` is refused, and so is a `why:` on a default leg, which would be a
+  reason for nothing.
 - Opening a leg (`running`) is written under the store lock **before** its seat
   is spawned, so it is the idempotence key, as a running pass is. As with
   verification bookkeeping, it does not move `updated`.
@@ -202,8 +247,11 @@ way, on its entry, whether it runs alone or beside a sibling. One rule for both.
   Pairing is by leg name, not "the last open attempt"
   (`attempts_of` pairs that way today), because two siblings' lines
   interleave.
-- **Tier.** The tier is the leg's policy, checked with `Kind::tier` before
-  anything is opened, as a member's is.
+- **Tier.** The tier is the leg's policy, or Sonnet when it has none,
+  checked with `Kind::tier` before anything is opened, as a member's is. The
+  start line says which: `spawned at sonnet/medium`, or `spawned at
+  opus/high · why decides …` for a leg with a reason, so `cmd_attempts` can
+  set each Opus leg beside the reason it was given.
 - **Fresh context.** Every leg gets a new seat and a new session. It is not a
   `/clear` in the same pane: a clear cannot change the kind or the model, and
   only some kinds have a measured `clear_command`.
@@ -402,11 +450,12 @@ anything.
 - **Send-back.** A blocking verdict appends one `rework` leg. **It waits on
   the last leg, and becomes the new last leg**, so nothing waits on it and
   the one-last-leg rule holds. It runs in the row's tree, which by then holds
-  every leg's merged work. Its policy is that of the leg the verdict names.
-  If the verdict names several, it gets the most expensive of their
-  policies. If it names none, it runs on the member's line, because a verdict
-  that does not say which part failed is a verdict on the row. Its order is
-  the verdict. It may add legs downstream of itself like any seated leg, so a
+  every leg's merged work. It runs on Sonnet, like any leg, unless the leg
+  the verdict names had another tier. Then it takes that tier and that leg's
+  `why:`, prefixed `rework of <leg>:`. If the verdict names several legs, it
+  takes the dearest of their tiers. A verdict that names no leg gives no
+  reason for anything but the default, so that rework runs on Sonnet. Its
+  order is the verdict. It may add legs downstream of itself like any seated leg, so a
   rework that splits into parallel fixes can. The member goes back to
   `doing` and the step starts it. A row that has hit the 8-leg cap goes to
   its governor.
@@ -467,18 +516,32 @@ the last open claim, and two siblings' lines would be crossed by it.
 This is the rule for the handbook, kept to what can be checked when the list
 is written:
 
-- **Stage a row** when it is expected to run past ~80 Opus turns, or when it
+- **Stage a row** when it is expected to run past ~80 turns, or when it
   crosses more than one layer (each layer becomes a build leg).
   Expected-past-80 in practice means it reads more than it edits (476 made
   ~5 edits in 254 calls), touches more than one module family, or has a
-  plan that names more than one step under *Order*.
-- **The default graph:** `scout` (Sonnet: reads, and writes a baton of
-  pointers), then `plan` (Opus: decides from the baton plus targeted reads,
-  and adds the build legs), then `build-<layer>` × N (Sonnet: edits, runs the
-  loop, commits), then `finish` (Sonnet: the full test, rebase, land,
+  plan that names more than one step under *Order*. The threshold is in
+  turns of the row as one session, whatever its tier. It is where a split
+  starts saving against the same row on the same model (*Why*).
+- **The legs are Sonnet.** Every leg of the default graph runs on Sonnet.
+  A leg gets another tier only for its own work, written as its `why:`. The
+  one leg the default graph expects might have one is a plan that has to
+  **choose**: between designs, between layers to own a record, or anything
+  the overview leaves open. Opus there, with that choice as the reason. A
+  plan that only divides work the overview has already designed stays on
+  Sonnet. Against a row that would have run on Opus, a Sonnet leg also gains
+  the tier difference (see the table in *Why*). That is a bonus. It is not
+  why a row is staged, and it is the whole difference only at the table's
+  Opus rate.
+- **The default graph:** `scout` (reads, and writes a baton of pointers),
+  then `plan` (decides from the baton plus targeted reads, and adds the
+  build legs; Opus only with a `why:`), then `build-<layer>` × N (edits,
+  runs the loop, commits), then `finish` (the full test, rebase, land,
   review). The plan leg decides whether the builds are a chain or siblings.
 - **Do not stage** a row under ~80 turns that sits in one layer. The extra
-  starts and re-reads cost more than they save.
+  starts and re-reads cost more than they save, against the same row
+  unstaged on the same tier. Which tier an unstaged row runs on is the list's
+  choice, as it is today.
 
 **When the builds run side by side.** Overlap does not change the token
 saving. Each leg's spend is the same whether its sibling runs at the same time
@@ -505,9 +568,10 @@ a cold build (on compound, several minutes a tree), and the row is the long
 pole of its group. Otherwise keep them a chain. A chain costs the same tokens
 and has nothing to merge.
 
-The threshold is a calculation from four rows, and the overlap rule is
-reasoning with no row behind it yet. The trial row is where both get measured
-and either confirmed or moved.
+The threshold is a calculation from four Opus rows. Sonnet's g and T on the
+same work are not measured yet, and the overlap rule is reasoning with no row
+behind it at all. The trial row is where all three get measured and either
+confirmed or moved.
 
 ## Not this
 
@@ -548,11 +612,18 @@ files the seventh.
    per-row and per-list cost table. Changed: `cmd_attempts` reads the leg
    start and end lines as attempts, **pairs them by leg name** rather than
    with the last open claim, and the table adds the row's wall time beside
-   the sum of its legs' times, with join legs marked. *Done when* `wsp
-   attempts compound-512 --cost` (or the chosen name) prints worker, rework
-   and verifier spend with tier, turns and peak, and a captured log of two
-   siblings' interleaved lines pairs each end with its own start. Tested on
-   captured log lines. *After:* nothing. It measures unstaged rows too.
+   the sum of its legs' times, with join legs marked. Each leg not on Sonnet
+   is shown with its `why:`. New: `cmd_burn::PRICES` gets an Opus 5.5 row at
+   its listed rate ($4/$20, cache reads at 0.05×), which its own comment
+   names and the table does not model. Otherwise every Opus 5.5 baseline the
+   trial compares against costs 2.5× its real cache-read price, and the
+   comparison would credit legs with money the tier never cost. That row
+   re-reads the price page first, as the table's comment asks. *Done when*
+   `wsp attempts compound-512 --cost` (or the chosen name) prints worker,
+   rework and verifier spend with tier, turns and peak; a captured log of two
+   siblings' interleaved lines pairs each end with its own start; and an
+   `opus-5-5` attempt is priced at the Opus 5.5 rate. Tested on captured log
+   lines. *After:* nothing. It measures unstaged rows too.
 2. **legs-record** (wsp-291, *changes*): `## Legs` on a row. As before: the
    parse and write module (`legs.rs`, modelled on `verification.rs`),
    `wsp leg add | skip | show`, the caps (8 legs, 3,000-char order and
@@ -560,16 +631,22 @@ files the seventh.
    (the entry above) and `after: -`; `--after` and `--before` on `add`;
    `wsp leg after`; the refusals (unknown leg, itself, a cycle named as
    `after::refuse` names one, more than one last leg); the downstream
-   authority rule; readiness (done or skipped); and the baton cap of
-   min(3,000, 6,000 / n). *Done when* every rule in *The record* and the
-   baton cap has a test that builds exactly the record it refuses or
-   accepts, including a d1 record with no `after:` reading as a chain.
+   authority rule; readiness (done or skipped); the baton cap of
+   min(3,000, 6,000 / n); and the tier: no policy reads as the Sonnet
+   constant, `--why` and the `why:` line, and both refusals (another tier
+   with no `why:`, and a `why:` on a default leg). *Done when* every rule in
+   *The record* and the baton cap has a test that builds exactly the record
+   it refuses or accepts, including a d1 record with no `after:` reading as a
+   chain, and a leg with no policy on a member whose `agent` line says Opus
+   reading as Sonnet.
    *After:* nothing.
 3. **legs-seat** (wsp-292, *changes*): a leg is a seat. As before: `spawn
    --leg`, the leg brief block, `wsp leg done` (clean tree, caps, caption,
    poke). Changed: **a leg claims nothing**. It is recorded on its entry as a
    verifier is on its pass, and the pane is bound to the row. It writes the
-   leg start and end lines in place of claim and release. The brief carries
+   leg start and end lines in place of claim and release. It spawns at the
+   leg's tier, which is Sonnet when the entry names none, and the start line
+   carries the `why` of any other tier. The brief carries
    every incoming baton and the join block. `review` is refused while a
    sibling is running, and from the last running leg it skips the rest.
    `block` blocks the row and lets running siblings finish. *Done when* a
@@ -596,7 +673,8 @@ files the seventh.
    `/`; the detached launch from `leg done` going through the gate; the
    `wedged` and `sent_back_unseated` exclusion by `## Legs`; the verifier's
    order line; and a blocking verdict appending one `rework` leg after the
-   last leg, on the policy rule in *The run*. *Done when* a `wsp sandbox
+   last leg, on the tier rule in *The run* (Sonnet, unless the named leg had
+   a `why:`, which it inherits). *Done when* a `wsp sandbox
    --fake --stage` list with one staged member whose plan leg fans out into
    two siblings runs every leg to verified with no hand step; with the seat
    capped at 2 and a second member ready, the siblings take places ahead of
@@ -607,17 +685,24 @@ files the seventh.
    Changed: `wip` reads running legs off `## Legs`, not claims; the label is
    `<task> · <leg>` with no `n/m`; `wip --json` carries `leg: {name, after,
    index, of}`; the row line counts running and done legs; and the handbook
-   rule includes *When the builds run side by side*. *Done when* `wsp wip`
+   rule is *When to stage* as revised: legs on Sonnet, another tier only
+   with a `why:` about that leg's own work, and *When the builds run side by
+   side*. *Done when* `wsp wip`
    and `wsp wip --json` show both running siblings of a sandboxed staged row,
    and the handbook carries the rule. *After:* 3.
 7. **legs-trial** (wsp-295, *changes*): the comparison, measured. As before:
    run two or three large rows (expected past 80 turns) staged on the default
    graph, and compare them with 1's table against unstaged Opus rows of
-   similar scope. Changed: at least one of them fans its builds out as
-   siblings, and the decision also covers the overlap rule, using the wall
-   time against the sum of leg times and the join's merge turns. *Done when*
-   a decision that confirms or moves the ~80-turn threshold and the
-   when-to-fan-out rule is recorded with the table behind it. *After:* 1, 5,
+   similar scope. Changed: the staged rows run on Sonnet legs, with Opus
+   only on a leg whose `why:` gives a reason. At least one is staged all
+   Sonnet, so the split's saving and the tier's can be told apart. At least
+   one fans its builds out as siblings. The Opus baselines are priced at
+   Opus 5.5's rate from 1. The decision also covers the overlap rule, using
+   the wall time against the sum of leg times and the join's merge turns,
+   and Sonnet's turns per row against Opus's on similar scope, which would
+   move g and T. *Done when* a decision that confirms or moves the ~80-turn
+   threshold, the Sonnet default, and the when-to-fan-out rule is recorded
+   with the table behind it. *After:* 1, 5,
    6.
 
 1 and 2 can share a group. 3 and 4 can share the next, since both rest only
