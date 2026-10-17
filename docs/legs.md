@@ -146,9 +146,15 @@ claim to another task (`cmd_agent::hand_off`). So:
   waits on the entry above it, and the first entry waits on nothing, so a
   chain needs no `after:` lines at all and every d1 record still means what
   it said. To make a leg wait on nothing, write `after: -`.
-- A leg is **ready** when every leg it waits on is `done` or `skipped`. A
-  skipped leg satisfies the wait. The legs that waited on it are told it was
-  skipped, and why, in their brief.
+- A leg is **ready** when every leg **upstream** of it, by any path and not
+  only the ones it names, is `done` or `skipped`. A skipped leg satisfies the
+  wait. The legs that waited on it are told it was skipped, and why, in their
+  brief. The wider rule is what a skip needs: with A → B → J, A running in the
+  row's tree and B skipped, J names only B, and J's join merges into a tree
+  nobody may be standing in. Readiness waits on A, so J opens when A is done.
+  The skip itself is accepted while A runs, because a governor skipping a
+  pending leg while the one before it works is ordinary. Refusing it would
+  leave the same J ready the moment A finished anyway.
 - The order and the baton are each capped at 3,000 chars. Above the cap the
   text is refused, never truncated. A baton's cap can be lower when several
   batons meet at one leg (*The baton*).
@@ -196,6 +202,14 @@ wsp leg add wsp-287 build-store --order store.md --after plan --before finish
 wsp leg add wsp-287 build-spawn --order spawn.md --after plan --before finish
 ```
 
+**`add` appends.** A new entry goes at the end of the section, never in the
+middle, because an entry with no `after:` waits on the entry above it and an
+insert would change what that entry waits on. Every other leg keeps its waits
+exactly. A new leg gets an `after:` line only when it differs from the entry
+above, so a chain stays a chain with no `after:` lines. `--before X` with no
+`--after` gives the new leg the legs X waits on now and adds the new leg to X,
+since "the current last leg" would be X itself and a cycle.
+
 Every record in between those two commands ends in one leg (`finish`), so no
 write sees two ends. `wsp leg after <task> <name> <leg>…` replaces a pending
 leg's `after:`, the way `wsp after` replaces a task's.
@@ -215,7 +229,8 @@ leg's `after:`, the way `wsp after` replaces a task's.
   each changing a leg downstream of themselves, which is allowed, and each
   write is checked whole under the lock, so the second one sees the first
   one's result.
-  A seated leg's `--before X` needs X downstream of it too.
+  A seated leg's `--before X` needs X downstream of it too. A re-point is
+  judged by the waits it adds: a sibling the leg already waited on may stay.
 - Nobody edits a `running` or `done` leg, and `--before` names a pending leg.
   A new leg may wait on a done one. It is ready at once.
 

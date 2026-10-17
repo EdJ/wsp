@@ -715,6 +715,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         v["raised"] = json!(raised_about(store, &t.id).iter().map(|m| m.to_json()).collect::<Vec<_>>());
         // `wsp-241`: the passes, which were only ever inside `body`.
         v["verification"] = crate::verification::json(&t);
+        v["legs"] = crate::legs::json(&t);
         // `wsp-242`: where it is, as a word wsp derives and the tail the step
         // that put it there was given.
         // `wsp-255`: and when it entered each stage it has been in.
@@ -870,6 +871,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // arrived at the same way.
     let mut rest = crate::model::localise_dates(&t.body);
     crate::model::set_section_in(&mut rest, "Decisions", "");
+    // The legs as a table, the tier and what each waits on printed in full — the
+    // entry on disk leaves both implicit (`docs/legs.md`, *The record*).
+    if let Some(table) = crate::legs::section_for_show(&t) {
+        crate::model::set_section_in(&mut rest, crate::legs::SECTION, &table);
+    }
     // Lifted out and printed below rather than with the body, because it is the
     // one section that is capped. It is last in a body whatever order the file
     // was in — `set_section_in` above has just re-sorted the sections — so

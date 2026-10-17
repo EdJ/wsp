@@ -33,6 +33,7 @@ mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;
 mod cmd_verify;
+mod legs;
 mod verification;
 mod cmd_watch;
 mod wake;
@@ -358,6 +359,10 @@ const VALUED_ON: &[(&str, &str)] = &[
     ("project", "status"),
     // `spawn --agent` stands alone; on a worklist it names who runs a group.
     ("worklist", "agent"),
+    // And on `leg add`, where it is the policy the leg runs on and `--why` the
+    // reason: `--agent "claude opus high"` is read as a value, not as a flag
+    // that leaves its policy behind as a positional.
+    ("leg", "agent"),
     // `verify --check` stands alone; on `spawn` it names the group a barrier
     // check reads (`wsp-230`).
     ("spawn", "check"),
@@ -1105,6 +1110,7 @@ fn main() {
         "review" => cmd_task::review(&store, &args),
         "reopen" => cmd_task::reopen(&store, &args),
         "verified" => verification::cmd_verified(&store, &args),
+        "leg" => legs::dispatch(&store, &args),
         "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
         "after" => after::run(&store, &args),
@@ -1577,6 +1583,14 @@ fn help_text() -> String {
                                 send work back: moves the row, tells
                                 its pane, and stops the run reading it as
                                 finished (`todo` sets the status and takes no prose)
+  wsp leg add <task> <name> --order FILE|- [--agent "claude opus high" --why "…"] [--after <leg>,…|-] [--before <leg>]
+                                    a leg of a row (docs/legs.md): appended under
+                                    ## Legs, waiting on the last leg unless
+                                    --after says otherwise. No --agent is claude
+                                    sonnet medium; another tier needs --why
+  wsp leg after <task> <name> <leg>…|-   replace a pending leg's waits
+  wsp leg skip <task> <name> "why"       a pending leg, never run
+  wsp leg show <task> [<name>]           the legs, the tier and waits in full
   wsp verified <member> --holds|--blocks --from FILE --caption "…"
                                     a verifier's verdict, recorded on the member
                                     under ## Verification. --blocks sends it back
@@ -2529,6 +2543,22 @@ mod tests {
         let a = parse(&["verify", "--check", "src/cycle.rs"]);
         assert!(a.has("check"));
         assert_eq!(a.rest, vec!["src/cycle.rs"]);
+    }
+
+    /// `wsp-291`. `agent` is a bare flag everywhere but `spawn --agent`-style
+    /// verbs that list it in [`VALUED_ON`]; on `leg add` it carries the policy,
+    /// and without its entry the policy was dropped and the words passed on as
+    /// positionals.
+    #[test]
+    fn leg_add_agent_takes_its_policy_and_why_its_reason() {
+        let parse = |line: &[&str]| crate::Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+        let a = parse(&["leg", "add", "m-1", "plan", "--order", "o.md", "--agent", "claude opus high", "--why", "chooses"]);
+        assert_eq!(a.get("agent").as_deref(), Some("claude opus high"));
+        assert_eq!(a.get("why").as_deref(), Some("chooses"));
+        assert_eq!(a.rest, vec!["add", "m-1", "plan"], "and the policy is not a positional");
+        // Elsewhere it is still a bare flag that leaves the next word alone.
+        let a = parse(&["spawn", "--agent", "m-1"]);
+        assert_eq!(a.rest, vec!["m-1"]);
     }
 
     /// A rule that names a command nobody dispatches is a rule that does
