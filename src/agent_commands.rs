@@ -1681,7 +1681,7 @@ fn opencode_rows(session: &str) -> Option<Vec<Value>> {
 /// [`Kind::efforts`] is a list again. Measured against pi 1.3.0 in tmux panes
 /// on the `local` provider, on 2026-10-17, rather than read off `--help`.
 ///
-/// This row is the tier and nothing else. The brief, the work order, resume,
+/// This row is the tier and `--approve`. The brief, the work order, resume,
 /// clear and the attempt record are rows of their own (`pi-support-003` to
 /// `-005`), so every one of them is still [`Plain`]'s answer here: a kind
 /// claims only what has been measured for it.
@@ -1786,8 +1786,18 @@ fn pi_tier_in(m: &str, effort: Option<&str>, models: &[PiModel]) -> std::result:
 }
 
 impl Kind for Pi {
-    /// The model and the thinking level, and nothing when neither was asked
-    /// for — the same compatibility rule every kind here keeps.
+    /// `--approve`, then the model and the thinking level when they were asked
+    /// for.
+    ///
+    /// **`--approve` is always sent, and it is the one flag here nobody typed.**
+    /// It answers pi's project-trust prompt before it is asked — see
+    /// [`Pi::unattended`] for the measurement — which is the only thing that
+    /// stops a pi with nobody at the pane. Decided 2026-10-17 between it and
+    /// `--no-approve`: a seat's tree is one wsp made for the work, so what that
+    /// tree's `.pi/` carries is the project's own setup and is meant to load.
+    /// It trusts for this run only; driven in a scratch tree with an empty
+    /// `.pi/settings.json`, the pane came up at the composer and
+    /// `~/.pi/agent/trust.json` was unchanged afterwards.
     ///
     /// `--thinking` and not a `:<level>` suffix on the model, though pi takes
     /// both. A suffix is parsed off the end of a string that may already carry
@@ -1795,7 +1805,7 @@ impl Kind for Pi {
     /// argv element has nothing to be confused with. pi's docs say `--thinking`
     /// wins over a suffix, so the two cannot disagree either.
     fn args(&self, spawn: &Spawn) -> Vec<String> {
-        let mut argv: Vec<String> = Vec::new();
+        let mut argv: Vec<String> = vec!["--approve".into()];
         if let Some(model) = spawn.model {
             argv.push("--model".into());
             argv.push(model.to_string());
@@ -1868,9 +1878,9 @@ impl Kind for Pi {
     /// for that folder or one above it — driven in a scratch directory with an
     /// empty `.pi/settings.json`, and the pane sat on the menu. A bare tree
     /// under `~` did not ask (`~/.agents/skills` is read as the user's, not as a
-    /// project's). No wsp tree carries a `.pi/` today; `--approve` and
-    /// `--no-approve` are pi's answer to the day one does, and choosing between
-    /// them is a launch decision for the rows that hand pi its brief.
+    /// project's). [`Pi::args`] sends `--approve`, which decides it before it
+    /// is asked, so a spawned pi never reaches that menu whatever its tree
+    /// holds.
     fn unattended(&self, _model: Option<&str>) -> Option<String> {
         None
     }
@@ -3578,10 +3588,12 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     fn a_pi_is_started_with_the_model_and_the_thinking_it_was_given() {
         let seat = Seat::new("w1:p1");
         let argv = of("pi").args(&at("pi-support-002", &seat, Some("local/qwen3.8-27b"), Some("minimal")));
-        assert_eq!(argv, vec!["--model", "local/qwen3.8-27b", "--thinking", "minimal"]);
-        assert!(
-            of("pi").args(&spawn(false, "pi-support-002", &seat)).is_empty(),
-            "an unflagged spawn says nothing, so pi's own settings decide"
+        assert_eq!(argv, vec!["--approve", "--model", "local/qwen3.8-27b", "--thinking", "minimal"]);
+        assert_eq!(
+            of("pi").args(&spawn(false, "pi-support-002", &seat)),
+            vec!["--approve"],
+            "an unflagged spawn names no tier, so pi's own settings decide it — and still never \
+             stops at the trust prompt"
         );
     }
 
@@ -3646,7 +3658,8 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     #[test]
     fn a_pi_at_any_tier_can_be_left_alone() {
         // Measured, not unasked: no tool call asked. The trust prompt is the
-        // tree's, and no model makes it more or less likely.
+        // tree's, no model makes it more or less likely, and `--approve` on
+        // every launch answers it.
         assert_eq!(of("pi").unattended(Some("local/qwen3.8-27b")), None);
         assert_eq!(of("pi").unattended(None), None);
     }
