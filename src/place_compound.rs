@@ -732,8 +732,8 @@ impl Compound<'_> {
     /// second-guess.
     ///
     /// `None` when there is nothing to ask at all: no socket minted yet, or
-    /// an agent kind the ported engine has no manifest for — only `claude`
-    /// and `opencode` are compiled (`compound-109`'s overview); anything else
+    /// an agent kind the ported engine has no manifest for — only `claude`,
+    /// `opencode` and `pi` are compiled (`compound-109`'s overview); anything else
     /// falls back to [`State::Unknown`] exactly as it did before this
     /// existed.
     fn detected_state(&self, seat: &Seat, rec: &Value) -> Option<State> {
@@ -835,6 +835,10 @@ impl Compound<'_> {
 /// one. wsp does not own the manifest this mirrors; a rule changing there is
 /// a `compound-113`-shaped row on the compound side, not a silent divergence
 /// here — this is two characters, not the engine.
+///
+/// pi's manifest carries no `osc_title` rule either (only `working_literal`
+/// on the screen), so it returns `None` for pi too: a pi seat whose renderer
+/// died reads `Unknown`, the honest answer.
 fn title_state(kind: &str, osc_title: &str) -> Option<State> {
     if kind != "claude" {
         return None;
@@ -1231,7 +1235,7 @@ impl Compound<'_> {
 /// `tokenhub-spec-sync` shape, a pane that never comes up paid for every
 /// twenty minutes. [`crate::repair`] asks this before it spends anything.
 pub(crate) fn reads_kind(kind: &str) -> bool {
-    matches!(kind, "claude" | "opencode")
+    matches!(kind, "claude" | "opencode" | "pi")
 }
 
 impl Place for Compound<'_> {
@@ -2047,6 +2051,16 @@ mod tests {
         assert!(until(|| !socket.exists()), "compound-sup left its socket behind");
         assert!(until(|| !label_path.exists()), "the label sidecar outlived its socket");
         assert!(place.record(&seat).is_err(), "the seat directory itself must go with stop");
+    }
+
+    #[test]
+    fn a_pi_seat_is_readable_but_has_no_title_to_fall_back_on() {
+        assert!(reads_kind("pi"));
+        assert!(!reads_kind("pie"));
+        // pi.toml has no osc_title rule: with no renderer, whatever the title
+        // says, there is no answer to give.
+        assert_eq!(title_state("pi", "\u{2733} pi"), None);
+        assert_eq!(title_state("pi", "\u{280B} pi"), None);
     }
 
     /// `compound-109`'s barrier: `idle` is not proof `detected_state`
