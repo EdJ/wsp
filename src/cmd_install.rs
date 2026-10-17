@@ -1111,13 +1111,14 @@ pub fn install(store: &Store, args: &Args) -> i32 {
             println!("{} {}", p.green("✓"), "already live — byte for byte what you built");
         }
         let agent = launcher(store, &dst, dry, json_out, &p);
+        let pi = pi_extension(&dst, &dst, dry, json_out, &p);
         if json_out {
             println!(
                 "{}",
                 json!({"ok": true, "installed": false, "reason": "already live",
                        "source": util::contract(&src), "dest": util::contract(&dst),
                        "commit": ours.commit, "commit_from": ours.commit_from(),
-                       "daemon": agent})
+                       "daemon": agent, "pi_extension": pi})
             );
         }
         // The daemon is loaded even when the copy was a no-op. `wsp install`
@@ -1158,6 +1159,8 @@ pub fn install(store: &Store, args: &Args) -> i32 {
 
     if dry {
         let agent = launcher(store, &dst, true, json_out, &p);
+        // Asked of the build that would be installed, since nothing has been.
+        let pi = pi_extension(&src, &dst, true, json_out, &p);
         if json_out {
             println!(
                 "{}",
@@ -1166,7 +1169,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                        "commit": ours.commit, "commit_from": ours.commit_from(),
                        "dirty": ours.dirty, "dirty_files": ours.dirty_files,
                        "stale": ours.left_behind(),
-                       "daemon": agent,
+                       "daemon": agent, "pi_extension": pi,
                        "lock": holder(&lock_path(&dst)).map(|h| h.line())})
             );
         } else {
@@ -1238,6 +1241,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
 
     if json_out {
         let agent = launcher(store, &dst, false, true, &p);
+        let pi = pi_extension(&dst, &dst, false, true, &p);
         println!(
             "{}",
             json!({
@@ -1253,6 +1257,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "who": rec.who,
                 "why": why,
                 "daemon": agent,
+                "pi_extension": pi,
                 // The same answer the printed line gives, for the reader that
                 // is a script. Absent from neither: a caller parsing this is
                 // exactly the caller that will not see a yellow line go past.
@@ -1281,7 +1286,90 @@ pub fn install(store: &Store, args: &Args) -> i32 {
     );
     keeps_the_old_one(store, &ours, &p);
     launcher(store, &dst, false, json_out, &p);
+    pi_extension(&dst, &dst, false, json_out, &p);
     0
+}
+
+/// Write the pi extension where pi loads it — the third thing `wsp install`
+/// means by *this machine is covered*, after the binary and the daemon.
+///
+/// pi has no hooks to merge a snippet into; its hooks are an extension file,
+/// and a file this verb can simply put there. The Claude Code snippet stays by
+/// hand because `settings.json` is somebody's whole configuration, and this is
+/// one file under a name of its own beside herdr's.
+///
+/// The copy written is the one `bin` carries, asked for with `wsp agent
+/// pi-extension` — the binary just installed, or under `-n` the one that would
+/// be — and never this process's, which is the old binary on exactly the
+/// install that changes the extension. The README's first-install caveat for
+/// the daemon is the same fault, and asking the artefact is what keeps it from
+/// applying here too.
+///
+/// The [`launcher`]'s guards, for its reasons: only the real destination, never
+/// a sandbox, never a failure of the install. And nothing at all where pi has
+/// never been set up.
+fn pi_extension(bin: &Path, dst: &Path, dry: bool, json_out: bool, p: &util::Paint) -> Value {
+    if dst != default_dest() || crate::launchd::sandboxed() {
+        return json!({"installed": false, "reason": "not this machine's pi"});
+    }
+    if !crate::place_super::pi_agent_dir().is_dir() {
+        return json!({"installed": false, "reason": "pi is not set up here"});
+    }
+    let path = crate::place_super::pi_extension_path();
+    let shown = util::contract(&path);
+    let carried = std::process::Command::new(bin)
+        .args(["agent", "pi-extension"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success() && !o.stdout.is_empty())
+        .map(|o| o.stdout);
+    let Some(bytes) = carried else {
+        let why = format!("{} did not hand over a pi extension", util::contract(bin));
+        if !json_out {
+            println!("{} {}", p.yellow("!"), p.dim(&format!("the pi extension is not installed — {why}")));
+        }
+        return json!({"installed": false, "path": shown, "error": why});
+    };
+    let unchanged = fs::read(&path).map(|cur| cur == bytes).unwrap_or(false);
+    if dry {
+        if !json_out {
+            println!(
+                "{} {} · {}",
+                p.dim("pi"),
+                p.dim(&shown),
+                p.dim(if unchanged { "unchanged" } else { "would write" })
+            );
+        }
+        return json!({"installed": false, "path": shown,
+                      "extension": if unchanged { "unchanged" } else { "would write" }});
+    }
+    if unchanged {
+        if !json_out {
+            println!("{} {}", p.green("✓"), p.dim(&format!("pi extension {shown}, unchanged")));
+        }
+        return json!({"installed": true, "path": shown, "extension": "unchanged"});
+    }
+    // [`place`], for its reason: pi reads its extensions at every launch, and
+    // one starting mid-write would load half a file. It leaves the file
+    // executable, which a script pi imports has no use for.
+    let placed = place(&bytes, &path).map(|()| {
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+    });
+    match placed {
+        Ok(()) => {
+            if !json_out {
+                println!("{} {}", p.green("✓"), format!("pi extension → {shown}"));
+            }
+            json!({"installed": true, "path": shown, "extension": "written"})
+        }
+        Err(why) => {
+            if !json_out {
+                println!("{} {}", p.yellow("!"), p.dim(&format!("the pi extension is not installed — {why}")));
+            }
+            json!({"installed": false, "path": shown, "error": why})
+        }
+    }
 }
 
 /// Write and load the launchd agent that keeps `wsp daemon` alive.

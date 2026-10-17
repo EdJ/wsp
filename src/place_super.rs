@@ -519,6 +519,65 @@ pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) 
     }
 }
 
+/// pi's half of the hook snippet: `pi/wsp-session.ts`, carried in the binary.
+///
+/// pi has no hooks, only extensions, and an extension is a file pi loads from
+/// its own directory rather than a line in a settings file a person merges in.
+/// So `wsp install` writes it, and writes *this* copy — asked of the binary it
+/// just installed by `wsp agent pi-extension` — because the process doing the
+/// installing is the old binary, and its copy is the one being replaced.
+pub const PI_EXTENSION: &str = include_str!("../pi/wsp-session.ts");
+
+/// Where pi keeps its agent directory on this machine — `$PI_CODING_AGENT_DIR`,
+/// or `~/.pi/agent`, which is pi's own rule for the same variable.
+pub fn pi_agent_dir() -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::expand("~/.pi/agent"))
+}
+
+/// Where [`PI_EXTENSION`] goes: beside herdr's `herdr-agent-state.ts`, under a
+/// name of its own, since pi loads every file in the directory.
+pub fn pi_extension_path() -> PathBuf {
+    pi_extension_in(&pi_agent_dir())
+}
+
+fn pi_extension_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions").join("wsp-session.ts")
+}
+
+/// [`hook_snippet_health`] for pi. Nothing at all on a machine pi has never run
+/// on — no agent directory is not a fault, and a note on every `doctor` there
+/// would be noise. The extension missing where pi is set up is a note, for the
+/// reason a missing Claude settings file is: a machine that never installed it
+/// is not lying about being configured. A copy that is not the one this wsp
+/// carries is the problem, because it looks installed: an older one names hooks
+/// a newer `said_by` reads differently, or misses one it learnt.
+pub fn pi_extension_health(problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    pi_extension_health_in(&pi_agent_dir(), problems, notes)
+}
+
+/// The same check against a directory handed in, so a test can ask it without
+/// setting `PI_CODING_AGENT_DIR` under every other test's feet.
+fn pi_extension_health_in(agent_dir: &Path, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    if !agent_dir.is_dir() {
+        return;
+    }
+    let path = pi_extension_in(agent_dir);
+    match fs::read_to_string(&path) {
+        Err(_) => notes.push(format!(
+            "pi is set up here and {} is not there — a pi seat never tells wsp its state, and reads Starting until it is gone; `wsp install` writes it",
+            util::contract(&path)
+        )),
+        Ok(text) if text != PI_EXTENSION => problems.push(format!(
+            "{} is not the pi extension this wsp carries — pi seats report through whatever that copy says; `wsp install` rewrites it",
+            util::contract(&path)
+        )),
+        Ok(_) => {}
+    }
+}
+
 /// `wsp report <hook>` — an agent saying what it has just done, from inside its
 /// own hook.
 ///
@@ -2329,5 +2388,64 @@ mod tests {
         hook_snippet_health(&mut problems, &mut notes);
         assert!(problems.is_empty());
         assert_eq!(notes.len(), 1);
+    }
+
+    /// pi never run here: no agent directory, and `doctor` says nothing about
+    /// pi at all.
+    #[test]
+    fn no_pi_agent_dir_is_silent() {
+        let dir = std::env::temp_dir().join(format!("wsp-pi-none-{}-{}", std::process::id(), util::epoch_nanos()));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        pi_extension_health_in(&dir, &mut problems, &mut notes);
+        assert!(problems.is_empty() && notes.is_empty());
+    }
+
+    /// The three readings of a directory pi has been set up in: the extension
+    /// absent is a note, a copy that is not this binary's is a problem, and
+    /// this binary's own copy is nothing to say.
+    #[test]
+    fn the_pi_extension_is_checked_against_the_copy_this_wsp_carries() {
+        let dir = std::env::temp_dir().join(format!("wsp-pi-agent-{}-{}", std::process::id(), util::epoch_nanos()));
+        fs::create_dir_all(&dir).unwrap();
+        let ext = pi_extension_in(&dir);
+
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        pi_extension_health_in(&dir, &mut problems, &mut notes);
+        assert!(problems.is_empty());
+        assert_eq!(notes.len(), 1, "set up and not installed is a note: {notes:?}");
+
+        fs::create_dir_all(ext.parent().unwrap()).unwrap();
+        fs::write(&ext, "// an older wsp's copy\n").unwrap();
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        pi_extension_health_in(&dir, &mut problems, &mut notes);
+        assert_eq!(problems.len(), 1, "a stale copy looks installed, which is the problem");
+        assert!(notes.is_empty());
+
+        fs::write(&ext, PI_EXTENSION).unwrap();
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        pi_extension_health_in(&dir, &mut problems, &mut notes);
+        assert!(problems.is_empty() && notes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What the extension says has to be what [`said_by`] reads. Asserted on
+    /// the text, because nothing compiles the TypeScript against this match:
+    /// a hook name the extension sends and `said_by` does not know would be
+    /// dropped by `wsp report` in silence.
+    #[test]
+    fn every_hook_the_pi_extension_sends_is_one_wsp_reads() {
+        let sent: Vec<&str> = PI_EXTENSION
+            .split("report(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        for hook in ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "SessionEnd"] {
+            assert!(sent.contains(&hook), "{hook} is not sent by pi/wsp-session.ts: {sent:?}");
+        }
+        for hook in &sent {
+            assert!(said_by(hook).is_some(), "pi/wsp-session.ts sends {hook}, which `wsp report` ignores");
+        }
+        // And the guard comes first: a seat-less pi is silent.
+        assert!(PI_EXTENSION.contains("process.env.WSP_SEAT_ID"));
     }
 }
