@@ -1690,9 +1690,8 @@ fn opencode_rows(session: &str) -> Option<Vec<Value>> {
 /// on the `local` provider, on 2026-10-17, rather than read off `--help`.
 ///
 /// The tier and `--approve` are `pi-support-002`; the brief and the work order
-/// at launch are `pi-support-003`. Resume, clear and the attempt record are
-/// rows of their own (`-004`, `-005`), so each is still [`Plain`]'s answer
-/// here: a kind claims only what has been measured for it.
+/// at launch are `pi-support-003`; resume, clear and the attempt record are
+/// `pi-support-005`. A kind claims only what has been measured for it.
 pub struct Pi;
 
 /// pi's thinking levels, straight off `pi --help`, and the words `--effort`
@@ -1793,6 +1792,129 @@ fn pi_tier_in(m: &str, effort: Option<&str>, models: &[PiModel]) -> std::result:
     }
 }
 
+/// The directory name pi derives from a cwd for its session store — the
+/// "mangling" pi's session-manager.js applies.
+///
+/// pi resolves the cwd, strips one leading `/` or `\`, and replaces every
+/// `/`, `\`, `:` with `-`, wrapped in `--...--`. This function is the pure
+/// half of that: given a canonical cwd, produce the directory name pi would
+/// store sessions under.
+fn pi_session_dir_name(cwd: &str) -> String {
+    let stripped = cwd.strip_prefix('/').or_else(|| cwd.strip_prefix('\\')).unwrap_or(cwd);
+    let mangled: String = stripped.chars().map(|c| match c {
+        '/' | '\\' | ':' => '-',
+        other => other,
+    }).collect();
+    format!("--{}--", mangled)
+}
+
+/// The session file for a pi session id under a cwd, or `None` if the id is
+/// invalid or no file is found.
+///
+/// The id is validated before it reaches a path — it arrives from herdr and
+/// must not be used to open arbitrary files. It must be non-empty and
+/// contain only alphanumerics, `-`, `_`, `.`.
+fn pi_session_file(session: &str, cwd: &str) -> Option<PathBuf> {
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return None;
+    }
+    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::home().join(".pi").join("agent"));
+    let dir_name = if let Ok(canonical) = std::fs::canonicalize(cwd) {
+        pi_session_dir_name(&canonical.to_string_lossy())
+    } else {
+        pi_session_dir_name(cwd)
+    };
+    let sessions = agent_dir.join("sessions").join(&dir_name);
+    let suffix = format!("_{session}.jsonl");
+    let mut best: Option<(String, PathBuf)> = None;
+    for entry in std::fs::read_dir(&sessions).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(&suffix) {
+            if best.as_ref().is_none_or(|(prev, _)| name.as_ref() > prev.as_str()) {
+                let ts = name.strip_suffix(&suffix).unwrap_or(&name).to_string();
+                best = Some((ts, entry.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// A pi session JSONL file, reduced to what served it and what it cost.
+///
+/// Parses line by line through serde_json — lines that fail to parse are
+/// skipped. Only `type == "message"` entries with `message.role ==
+/// "assistant"` are counted. System, user, and toolResult messages are
+/// ignored, as are top-level `usage`, `custom`, and `custom_message` entries.
+///
+/// The since window: nested `message.timestamp` is epoch ms — if
+/// `since > 0 && at_ms / 1000 < since` the entry is skipped. If the nested
+/// timestamp is missing, the entry is counted (fail-open, as read_ran does).
+/// `usage.reasoning` is NOT added to output — pi includes it in
+/// `usage.output` already (pi's own docs warn against double-counting).
+///
+/// `None` when no assistant turn was counted.
+fn read_pi_session(src: &[u8], since: i64) -> Option<Ran> {
+    let mut ran = Ran::default();
+    let mut micros: u64 = 0;
+    for line in src.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_slice(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let message = match v.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if since > 0 {
+            if let Some(ms) = message.get("timestamp").and_then(Value::as_i64) {
+                if ms / 1_000 < since {
+                    continue;
+                }
+            }
+        }
+        let provider = message.get("provider").and_then(Value::as_str).unwrap_or("");
+        let model = message.get("model").and_then(Value::as_str).unwrap_or("");
+        if model.is_empty() {
+            continue;
+        }
+        ran.turns += 1;
+        let label = if provider.is_empty() { model.to_string() } else { format!("{provider}/{model}") };
+        if !ran.models.contains(&label) {
+            ran.models.push(label);
+        }
+        let usage = message.get("usage");
+        let n = |p: &str| usage.and_then(|u| u.pointer(p)).and_then(Value::as_u64).unwrap_or(0);
+        ran.spend.cache += n("/cacheRead");
+        ran.spend.input += n("/input") + n("/cacheWrite");
+        ran.spend.output += n("/output");
+        if let Some(cost) = usage.and_then(|u| u.pointer("/cost/total")).and_then(Value::as_f64) {
+            micros += (cost * 1e6).round() as u64;
+        }
+        if let Some(effort) = message.get("thinkingLevel").and_then(Value::as_str) {
+            if !ran.efforts.iter().any(|e| e == effort) {
+                ran.efforts.push(effort.to_string());
+            }
+        }
+    }
+    if ran.models.is_empty() {
+        return None;
+    }
+    ran.spend.micros = Some(micros);
+    Some(ran)
+}
+
 impl Kind for Pi {
     /// `--approve`, then the model and the thinking level when they were asked
     /// for.
@@ -1825,6 +1947,10 @@ impl Kind for Pi {
         if let Some(brief) = spawn.brief {
             argv.push("--append-system-prompt".into());
             argv.push(brief.display().to_string());
+        }
+        if let (Some(flag), Some(session)) = (self.resume_flag(), spawn.resume) {
+            argv.push(flag.into());
+            argv.push(session.to_string());
         }
         if let Some(order) = spawn.order {
             // `--` so an order is never read as a flag; see [`Kind::order_in_args`].
@@ -1906,8 +2032,23 @@ impl Kind for Pi {
         PI_THINKING
     }
 
-    /// Nothing yet. pi has `--session-id` and `--name`; neither is measured
-    /// here, and a handle wsp cannot address anything with is not one.
+    /// `--session-id`. An existing session id resumes (appends to the
+    /// existing file); a missing one creates a new session with that id
+    /// (with a warning). Measured against pi 1.3.0 on 2026-10-17 — a live
+    /// session remembered the number 42 across two invocations — and
+    /// confirmed in pi's source (main.js:344-351).
+    fn resume_flag(&self) -> Option<&'static str> {
+        Some("--session-id")
+    }
+
+    /// `/new`. pi's `/new` starts a brand-new session with a new id —
+    /// `runtimeHost.newSession()` makes a fresh uuidv7 and a new file,
+    /// so the session id is replaced rather than carried forward.
+    /// Read from pi's source (session-manager.js) on 2026-10-17.
+    fn clear_command(&self) -> Option<&'static str> {
+        Some("/new")
+    }
+
     fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<Address> {
         None
     }
@@ -1944,9 +2085,10 @@ impl Kind for Pi {
         None
     }
 
-    /// Nothing yet — `pi-support-005` reads pi's session record.
-    fn ran(&self, _session: &str, _cwd: &str, _since: i64) -> Option<Ran> {
-        None
+    fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran> {
+        let file = pi_session_file(session, cwd)?;
+        let src = std::fs::read(&file).ok()?;
+        read_pi_session(&src, since)
     }
 }
 
@@ -4582,7 +4724,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
         assert_eq!(all.iter().filter(|k| k.default).count(), 1);
         assert_eq!(all[0].models, MODELS);
         assert!(all[1].models.is_empty() && all[1].efforts.is_empty());
-        assert!(all[2].models.is_empty() && all[2].efforts == PI_THINKING && !all[2].resume);
+        assert!(all[2].models.is_empty() && all[2].efforts == PI_THINKING && all[2].resume && all[2].clear == Some("/new"));
     }
 
     /// A kind spells its clear once, and every caller reads the same answer —
@@ -4606,6 +4748,109 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
 
         assert!(clear_of("codex").is_none(), "never measured");
         assert!(clear_of("").is_none(), "a shell is not a kind");
+    }
+
+    /// pi's cwd mangling: one leading `/` or `\` stripped, and every `/`,
+    /// `\`, `:` replaced by `-`, wrapped in `--...--`. Read from pi's
+    /// session-manager.js on 2026-10-17.
+    #[test]
+    fn pi_session_dir_name_mangles_the_cwd_as_pi_does() {
+        assert_eq!(
+            pi_session_dir_name("/Users/jesper/src/private/wsp"),
+            "--Users-jesper-src-private-wsp--"
+        );
+        assert_eq!(
+            pi_session_dir_name("/private/tmp/pi-005-resume"),
+            "--private-tmp-pi-005-resume--"
+        );
+    }
+
+    /// pi's resume flag and clear command, measured against pi 1.3.0.
+    #[test]
+    fn pi_spells_its_resume_and_clear() {
+        assert_eq!(of("pi").resume_flag(), Some("--session-id"));
+        assert_eq!(of("pi").clear_command(), Some("/new"));
+    }
+
+    /// A pi session read from the recorded fixture. Two assistant turns on
+    /// `local/qwen3.8-27b` at `off`, with a cost of zero — all cost fields
+    /// are zero because the local model costs nothing, and `micros` is
+    /// `Some(0)` to say the price is known rather than silent.
+    #[test]
+    fn a_pi_session_records_what_served_it() {
+        const FIXTURE: &str = include_str!("../fixtures/pi-session-wsp005resume.jsonl");
+        let ran = read_pi_session(FIXTURE.as_bytes(), 0).expect("two turns");
+        assert_eq!(ran.turns, 2);
+        assert_eq!(ran.models, vec!["local/qwen3.8-27b"]);
+        assert_eq!(ran.efforts, vec!["off"]);
+        assert_eq!(ran.spend.cache, 0);
+        assert_eq!(ran.spend.input, 4667 + 4697, "input includes cache write (zero here)");
+        assert_eq!(ran.spend.output, 2 + 3, "output does not add reasoning — pi includes it already");
+        assert_eq!(ran.spend.micros, Some(0), "a free model cost nothing, stated rather than silent");
+        assert_eq!(
+            ran.spend.clause().as_deref(),
+            Some("9.4k in 5 out $0"),
+            "and the clause that lands on the release line"
+        );
+    }
+
+    /// The since window for pi: a `since` between the two turns counts only
+    /// the second; after both, returns `None`.
+    #[test]
+    fn a_pi_session_is_read_from_the_claim_too() {
+        const FIXTURE: &str = include_str!("../fixtures/pi-session-wsp005resume.jsonl");
+        // First turn timestamp: 1792249467427 ms → 1792249467 s
+        // Second turn timestamp: 1792249473178 ms → 1792249473 s
+        let ran = read_pi_session(FIXTURE.as_bytes(), 1_792_249_470).expect("the second turn only");
+        assert_eq!(ran.turns, 1);
+        assert_eq!(ran.spend.output, 3);
+        // After both turns → None
+        assert!(
+            read_pi_session(FIXTURE.as_bytes(), 1_792_249_475).is_none(),
+            "both turns before the window"
+        );
+    }
+
+    /// A session file with no assistant turn returns `None` — it is not
+    /// evidence of a tier.
+    #[test]
+    fn a_pi_session_with_no_assistant_turn_is_no_tier() {
+        let src = concat!(
+            r#"{"type":"session","version":3,"id":"empty","timestamp":"2026-10-17T00:00:00.000Z","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"message","id":"1","parentId":null,"timestamp":"2026-10-17T00:00:00.001Z","message":{"role":"user","content":[]}}"#,
+            "\n",
+        );
+        assert!(read_pi_session(src.as_bytes(), 0).is_none());
+    }
+
+    /// A pi args with resume, brief, and order puts the
+    /// `--session-id` before the `--` — after `--` it would be read
+    /// as text.
+    #[test]
+    fn pi_args_puts_resume_before_the_dash_dash() {
+        let seat = Seat::new("w1:p1");
+        let brief = std::path::Path::new("/tmp/wsp-brief");
+        let sp = Spawn {
+            model: Some("local/qwen3.8-27b"),
+            effort: Some("off"),
+            brief: Some(brief),
+            order: Some("pi-support-005 test"),
+            resume: Some("my-session-id"),
+            ..spawn(false, "pi-support-005", &seat)
+        };
+        let argv = of("pi").args(&sp);
+        assert_eq!(
+            argv,
+            vec![
+                "--approve",
+                "--model", "local/qwen3.8-27b",
+                "--thinking", "off",
+                "--append-system-prompt", "/tmp/wsp-brief",
+                "--session-id", "my-session-id",
+                "--", "pi-support-005 test",
+            ],
+        );
     }
 }
 
