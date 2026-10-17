@@ -33,6 +33,7 @@ mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;
 mod cmd_verify;
+mod leg_seat;
 mod legs;
 mod verification;
 mod cmd_watch;
@@ -1591,6 +1592,8 @@ fn help_text() -> String {
   wsp leg after <task> <name> <leg>…|-   replace a pending leg's waits
   wsp leg skip <task> <name> "why"       a pending leg, never run
   wsp leg show <task> [<name>]           the legs, the tier and waits in full
+  wsp leg done <task> --from FILE|- --caption "…"   a leg's seat ends it, at a clean
+                                         commit: the baton, the caption, the run poked
   wsp verified <member> --holds|--blocks --from FILE --caption "…"
                                     a verifier's verdict, recorded on the member
                                     under ## Verification. --blocks sends it back
@@ -1735,6 +1738,11 @@ fn help_text() -> String {
                                     unless --focus says you will be at the pane
                                     --verify is a run's verifier on a member: no
                                     claim, the seat written on its open pass
+                                    --leg <name> is one leg of a row run as legs:
+                                    no claim either, the seat written on the
+                                    leg's entry and the pane bound to the row,
+                                    at the leg's own tier (sonnet unless it
+                                    says why)
   wsp spawn <list> --agent --check N  a run's barrier check on group N: no row
                                     and no claim, the seat written on the
                                     group's open check, the order the barrier's

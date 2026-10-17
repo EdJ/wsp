@@ -1365,6 +1365,15 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", account.len()));
+    // From a leg's seat the row is not finished while a sibling runs, and from
+    // the last running leg the rest are skipped (`docs/legs.md`, *A leg is a
+    // seat*). Refused before the row moves.
+    if let Some(needle) = args.rest.first() {
+        if let Err(why) = crate::leg_seat::on_review(store, needle, &account, crate::cmd_agent::my_pane().as_deref()) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    }
     let code = mutate_saying(store, args, "review", said.as_deref(), |t| {
         t.set_status(Status::Review);
         // `review: …`, the shape `blocked:` and `parked:` already have — the

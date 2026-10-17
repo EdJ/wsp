@@ -2188,7 +2188,7 @@ pub fn worked_line(w: &serde_json::Value) -> String {
 /// Empty for a spawn that stated neither, so the ordinary claim line is
 /// byte-for-byte what it was — the same compatibility rule `--model` itself
 /// keeps, and the reason nothing in the store needs migrating.
-fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
+pub(crate) fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
     match (model, effort) {
         (None, None) => String::new(),
         (m, e) => format!(
@@ -2252,13 +2252,30 @@ fn ran_at(store: &Store, task_id: &str, since: &str) -> String {
     let Some(thread) = crate::cmd_resume::thread_for_task(store, task_id) else {
         return String::new();
     };
+    ran_clause(&thread.kind, &thread.session, &thread.cwd, since)
+}
+
+/// [`ran_at`] for a leg's seat. A leg holds no claim and two siblings share one
+/// task, so the session is the seat's own binding's and not the task's.
+pub(crate) fn ran_in_seat(store: &Store, seat: &str, since: &str) -> String {
+    let bindings = store.bindings();
+    let Some(b) = bindings.get(seat) else { return String::new() };
+    let get = |k: &str| b.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let session = get("agent_session_id");
+    if session.is_empty() {
+        return String::new();
+    }
+    ran_clause(&crate::cmd_spawn::kind_or_default(&get("agent_kind")), &session, &get("cwd"), since)
+}
+
+fn ran_clause(kind: &str, session: &str, cwd: &str, since: &str) -> String {
     // From the claim, not from the start of the session. One session serves
     // several attempts whenever an agent is handed the next task from the same
     // seat, and without the window the second attempt reports the first one's
     // turns and its bill — see [`crate::agent_commands::Kind::ran`].
-    let ran = crate::agent_commands::of(&thread.kind).ran(
-        &thread.session,
-        &thread.cwd,
+    let ran = crate::agent_commands::of(kind).ran(
+        session,
+        cwd,
         util::epoch_of(since),
     );
     let Some(ran) = ran else { return String::new() };

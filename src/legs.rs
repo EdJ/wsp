@@ -137,6 +137,9 @@ pub(crate) struct Leg {
     pub caption: Option<String>,
     /// Why it was skipped.
     pub skipped: Option<String>,
+    /// When it was opened and when it finished, RFC 3339. Written by legs-seat.
+    pub started: Option<String>,
+    pub closed: Option<String>,
 }
 
 /// The tier a leg with no policy runs on.
@@ -176,6 +179,8 @@ impl Leg {
             baton: String::new(),
             caption: None,
             skipped: None,
+            started: None,
+            closed: None,
         }
     }
 
@@ -188,6 +193,8 @@ impl Leg {
         };
         clause("pane", &self.pane);
         clause("tree", &self.tree);
+        clause("started", &self.started);
+        clause("closed", &self.closed);
         match &self.ending {
             Ending::Standing => {}
             Ending::Ended => out.push_str(" · ended"),
@@ -245,6 +252,8 @@ impl Leg {
                 match k {
                     "pane" => leg.pane = v,
                     "tree" => leg.tree = v,
+                    "started" => leg.started = v,
+                    "closed" => leg.closed = v,
                     _ => {}
                 }
             }
@@ -636,6 +645,102 @@ pub(crate) fn set_after(old: &[Leg], name: &str, on: Vec<String>, actor: Option<
     Ok(legs)
 }
 
+// ---- a leg's seat (legs-seat) ----------------------------------------------------
+
+fn find<'a>(legs: &'a mut [Leg], name: &str) -> Result<&'a mut Leg, String> {
+    legs.iter_mut().find(|l| l.name == name).ok_or_else(|| format!("no leg called {name}"))
+}
+
+/// The record with `name` opened: `running`, stamped, no seat yet. Idempotent for
+/// a leg already running with no seat, which is the key a retried spawn finds.
+pub(crate) fn open(old: &[Leg], name: &str, at: &str) -> Result<Vec<Leg>, String> {
+    let mut legs = old.to_vec();
+    let leg = find(&mut legs, name)?;
+    match leg.state {
+        State::Running if leg.pane.is_none() => return Ok(legs),
+        State::Pending => {}
+        other => return Err(format!("{name} is {}, and only a pending leg can be opened", other.as_str())),
+    }
+    if !ready(old).iter().any(|r| r == name) {
+        let open: Vec<String> = upstream(old, name)
+            .into_iter()
+            .filter(|u| old.iter().any(|l| &l.name == u && !l.state.settled()))
+            .collect();
+        return Err(format!("{name} is not ready: still open upstream of it — {}", open.join(", ")));
+    }
+    let leg = find(&mut legs, name)?;
+    leg.state = State::Running;
+    leg.started = Some(at.to_string());
+    Ok(legs)
+}
+
+/// An opening taken back: a spawn that never got a seat leaves the leg pending.
+pub(crate) fn unopen(old: &[Leg], name: &str) -> Vec<Leg> {
+    let mut legs = old.to_vec();
+    if let Ok(l) = find(&mut legs, name) {
+        if l.state == State::Running && l.pane.is_none() {
+            l.state = State::Pending;
+            l.started = None;
+        }
+    }
+    legs
+}
+
+/// The seat written onto the entry, as a verifier's is onto its pass.
+pub(crate) fn attach(old: &[Leg], name: &str, seat: &str) -> Result<Vec<Leg>, String> {
+    let mut legs = old.to_vec();
+    let leg = find(&mut legs, name)?;
+    if leg.state != State::Running {
+        return Err(format!("{name} is {}, not running", leg.state.as_str()));
+    }
+    leg.pane = Some(seat.to_string());
+    Ok(legs)
+}
+
+/// The record with a running leg `done`, its baton and caption written. The baton
+/// is held to the cap the record sets for it.
+pub(crate) fn finish(old: &[Leg], name: &str, baton: &str, caption: &str, at: &str) -> Result<Vec<Leg>, String> {
+    let caption = caption.trim();
+    if caption.is_empty() {
+        return Err("a leg's end takes a caption: the line a glance reads, --caption \"…\"".into());
+    }
+    let mut legs = old.to_vec();
+    let leg = find(&mut legs, name)?;
+    if leg.state != State::Running {
+        return Err(format!("{name} is {}, and only a running leg can be ended", leg.state.as_str()));
+    }
+    leg.state = State::Done;
+    leg.baton = baton.trim().to_string();
+    leg.caption = Some(caption.to_string());
+    leg.closed = Some(at.to_string());
+    judged(old, &legs)?;
+    Ok(legs)
+}
+
+/// What `review` from a leg does to the record: refused while another leg is
+/// running, otherwise this leg is done and every pending leg is skipped.
+pub(crate) fn end_by_review(old: &[Leg], name: &str, account: &str, at: &str) -> Result<Vec<Leg>, String> {
+    if let Some(other) = old.iter().find(|l| l.name != name && l.state == State::Running) {
+        return Err(format!(
+            "{} is still running — the row is not finished while work on it is open. \
+             `wsp leg done` ends your leg; `review` is typed by the last leg, once nothing else runs",
+            other.name
+        ));
+    }
+    let mut legs = old.to_vec();
+    let leg = find(&mut legs, name)?;
+    if leg.state == State::Running {
+        leg.state = State::Done;
+        leg.closed = Some(at.to_string());
+        leg.caption.get_or_insert_with(|| util::truncate(&crate::cmd_task::fold(account), 100));
+    }
+    for l in legs.iter_mut().filter(|l| l.state == State::Pending) {
+        l.state = State::Skipped;
+        l.skipped = Some("ended by review".to_string());
+    }
+    Ok(legs)
+}
+
 // ---- the record, read ----------------------------------------------------------
 
 /// The legs as `wsp show --json` gives them.
@@ -658,6 +763,10 @@ pub(crate) fn json(t: &Task) -> serde_json::Value {
             "tree": l.tree,
             "caption": l.caption,
             "skipped": l.skipped,
+            "started": l.started,
+            "ended": l.closed,
+            "order": l.order,
+            "baton": l.baton,
         }))
         .collect::<Vec<_>>())
 }
@@ -695,7 +804,8 @@ const USAGE: &str = "usage:
   wsp leg add <task> <name> --order FILE|- [--agent \"claude opus high\" --why \"…\"] [--after <leg>,…|--after=-] [--before <leg>]
   wsp leg after <task> <name> <leg>…|-     replace a pending leg's waits
   wsp leg skip <task> <name> \"why\"         a pending leg, never run
-  wsp leg show <task> [<name>]             the table, or one leg whole";
+  wsp leg show <task> [<name>]             the table, or one leg whole
+  wsp leg done <task> --from FILE|- --caption \"…\"   a leg's seat ends it, at a commit";
 
 pub fn dispatch(store: &Store, args: &Args) -> i32 {
     let me = crate::cmd_agent::my_pane();
@@ -708,6 +818,7 @@ pub(crate) fn run(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Some("add") => cmd_add(store, args, pane),
         Some("after") => cmd_after(store, args, pane),
         Some("skip") => cmd_skip(store, args, pane),
+        Some("done") => crate::leg_seat::cmd_done(store, args, pane),
         Some("show") | Some("ls") | None => cmd_show(store, args),
         Some(other) => {
             eprintln!("wsp leg: unknown subcommand `{other}`\n{USAGE}");
@@ -902,6 +1013,8 @@ mod tests {
             baton: "three layers: store, spawn".into(),
             caption: Some("three layers · one owner".into()),
             skipped: None,
+            started: Some("2026-10-18T10:00:00Z".into()),
+            closed: Some("2026-10-18T10:30:00Z".into()),
         };
         let skipped = Leg { skipped: Some("the scout found nothing".into()), state: State::Skipped, ..with("probe", &[]) };
         write(&mut t, &[leg("scout"), skipped.clone(), full.clone()]);
@@ -1340,5 +1453,66 @@ mod tests {
         assert_eq!(ls[4].skipped.as_deref(), Some("the split was wrong"));
         assert_eq!(ls[3].after, Some(vec![]));
         assert_eq!(go(&["leg", "bogus"]), 2);
+    }
+
+    // ---- legs-seat (wsp-292) ----
+
+    /// A leg opens only when everything upstream is settled, a retried open of
+    /// an open leg with no seat is quiet, and an open one with a seat is not.
+    #[test]
+    fn a_leg_opens_when_ready_and_an_open_one_is_not_opened_twice() {
+        let ls = vec![leg("a"), leg("b")];
+        assert!(open(&ls, "b", "t").unwrap_err().contains("still open upstream of it — a"));
+        let one = open(&ls, "a", "2026-10-18T10:00:00Z").unwrap();
+        assert_eq!(one[0].state, State::Running);
+        assert_eq!(one[0].started.as_deref(), Some("2026-10-18T10:00:00Z"));
+        assert_eq!(open(&one, "a", "later").unwrap()[0].started.as_deref(), Some("2026-10-18T10:00:00Z"));
+        let seated = attach(&one, "a", "cpd-1").unwrap();
+        assert!(open(&seated, "a", "t").is_err(), "a seated leg is not opened again");
+        assert_eq!(unopen(&seated, "a")[0].state, State::Running, "and a seated one is not given back");
+        assert_eq!(unopen(&one, "a")[0].state, State::Pending);
+    }
+
+    /// The baton is held to the cap the record sets, a caption is required, and
+    /// `review` is refused with a sibling running.
+    #[test]
+    fn finishing_checks_the_caption_and_the_baton_and_review_checks_the_siblings() {
+        let ls = vec![
+            Leg { state: State::Done, ..leg("plan") },
+            Leg { state: State::Running, after: Some(vec!["plan".into()]), ..leg("a") },
+            Leg { state: State::Running, after: Some(vec!["plan".into()]), ..leg("b") },
+            Leg { after: Some(vec!["a".into(), "b".into()]), ..leg("finish") },
+        ];
+        assert!(finish(&ls, "a", "ok", "  ", "t").is_err(), "no caption");
+        let cap = baton_cap(&ls, "a").0;
+        assert_eq!(cap, 3_000, "two batons meeting fit 3,000 each");
+        assert!(finish(&ls, "a", &"x".repeat(cap + 1), "c", "t").unwrap_err().contains("its cap is 3000"));
+        let done = finish(&ls, "a", "pointers", "c", "t").unwrap();
+        assert_eq!((done[1].state, done[1].caption.as_deref()), (State::Done, Some("c")));
+        assert!(finish(&done, "a", "again", "c", "t").is_err(), "a done leg is not ended twice");
+        assert!(end_by_review(&ls, "a", "x", "t").unwrap_err().contains("b is still running"));
+        let ended = end_by_review(&done, "b", "all fine", "t").unwrap();
+        assert_eq!(ended[2].state, State::Done);
+        assert_eq!(ended[3].state, State::Skipped);
+    }
+
+    /// `show --json` carries the leg's times and whole order and baton.
+    #[test]
+    fn the_json_carries_started_ended_order_and_baton() {
+        let mut t = row("");
+        let l = Leg {
+            state: State::Done,
+            started: Some("2026-10-18T10:00:00Z".into()),
+            closed: Some("2026-10-18T10:30:00Z".into()),
+            baton: "pointers".into(),
+            ..leg("plan")
+        };
+        write(&mut t, &[l]);
+        let j = json(&t);
+        assert_eq!(j[0]["started"], "2026-10-18T10:00:00Z");
+        assert_eq!(j[0]["ended"], "2026-10-18T10:30:00Z");
+        assert_eq!((j[0]["order"].as_str(), j[0]["baton"].as_str()), (Some("do plan"), Some("pointers")));
+        write(&mut t, &[leg("fresh")]);
+        assert!(json(&t)[0]["started"].is_null() && json(&t)[0]["ended"].is_null(), "null until set");
     }
 }
