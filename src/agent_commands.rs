@@ -758,7 +758,47 @@ pub fn mint(name: &str, seat: &Seat) -> Option<String> {
 /// nothing for `codex` or `gemini`.
 pub fn of(kind: &str) -> &'static dyn Kind {
     let kind = kind.trim();
-    KNOWN.iter().find(|(n, _)| *n == kind).map_or(&Plain, |(_, k)| *k)
+    if let Some((_, k)) = KNOWN.iter().find(|(n, _)| *n == kind) {
+        return *k;
+    }
+    registry().kinds.iter().find(|k| k.name == kind).map_or(&Plain, |k| *k as &'static dyn Kind)
+}
+
+/// The kinds declared as data under `<store>/kinds/`, loaded once per process.
+/// Built-ins are never looked up here first: [`of`] asks [`KNOWN`] before this.
+struct Registry {
+    kinds: Vec<&'static crate::kind_data::DataKind>,
+    refused: Vec<(PathBuf, String)>,
+}
+
+fn registry() -> &'static Registry {
+    static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| load_registry(kinds_dir().as_deref()))
+}
+
+/// `<store root>/kinds`, resolving the root as [`crate::store::Store::open`]
+/// does. A test with no `WSP_HOME` reads nothing rather than the developer's
+/// own store.
+fn kinds_dir() -> Option<PathBuf> {
+    match std::env::var_os("WSP_HOME") {
+        Some(v) => Some(PathBuf::from(v).join("kinds")),
+        None if cfg!(test) => None,
+        None => Some(util::home().join("wsp").join("kinds")),
+    }
+}
+
+fn load_registry(dir: Option<&Path>) -> Registry {
+    let Some(dir) = dir else { return Registry { kinds: Vec::new(), refused: Vec::new() } };
+    let (kinds, refused) = crate::kind_data::load_dir(dir);
+    let mut kinds: Vec<&'static crate::kind_data::DataKind> =
+        kinds.into_iter().map(|k| &*Box::leak(Box::new(k))).collect();
+    kinds.sort_by_key(|k| k.name);
+    Registry { kinds, refused }
+}
+
+/// The kind files that were refused, and why. Empty when every file parsed.
+pub fn refusals() -> &'static [(PathBuf, String)] {
+    &registry().refused
 }
 
 /// The kinds wsp has behaviour for, in the order a menu should show them, and
@@ -785,13 +825,19 @@ pub struct Info {
     pub efforts: &'static [&'static str],
 }
 
-/// Every kind wsp has behaviour for. See [`KNOWN`].
+/// Every kind wsp has behaviour for: [`KNOWN`] in order, then data kinds by name.
 pub fn kinds() -> Vec<Info> {
-    KNOWN
-        .iter()
+    kinds_with(registry())
+}
+
+fn kinds_with(reg: &Registry) -> Vec<Info> {
+    let built_in = KNOWN.iter().map(|(name, k)| (*name, *k));
+    let declared = reg.kinds.iter().map(|k| (k.name, *k as &'static dyn Kind));
+    built_in
+        .chain(declared)
         .map(|(name, k)| Info {
             name,
-            default: *name == crate::cmd_spawn::DEFAULT_KIND,
+            default: name == crate::cmd_spawn::DEFAULT_KIND,
             resume: k.resume_flag().is_some(),
             clear: k.clear_command(),
             models: k.models(),
@@ -2857,6 +2903,24 @@ pub fn no_channel() -> Refusal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn data_kinds_follow_the_built_ins_by_name_and_refusals_are_kept() {
+        let dir = std::env::temp_dir().join(format!("wsp-kinds-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["zed", "amp"] {
+            std::fs::write(dir.join(format!("{n}.json")), format!(r#"{{"kind_version":1,"name":"{n}"}}"#)).unwrap();
+        }
+        std::fs::write(dir.join("claude.json"), r#"{"kind_version":1,"name":"claude"}"#).unwrap();
+        let reg = super::load_registry(Some(&dir));
+        let names: Vec<_> = super::kinds_with(&reg).iter().map(|i| i.name).collect();
+        assert_eq!(names, ["claude", "opencode", "pi", "amp", "zed"]);
+        assert_eq!(reg.refused.len(), 1, "a built-in's name is refused, not shadowed");
+        assert!(super::load_registry(None).kinds.is_empty());
+        assert!(super::load_registry(Some(&dir.join("absent"))).kinds.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::place::{Agent, Event, Order, Seated, State};
 
