@@ -673,10 +673,113 @@ a cold build (on compound, several minutes a tree), and the row is the long
 pole of its group. Otherwise keep them a chain. A chain costs the same tokens
 and has nothing to merge.
 
-The threshold is a calculation from four Opus rows. Sonnet's g and T on the
-same work are not measured yet, and the overlap rule is reasoning with no row
-behind it at all. The trial row is where all three get measured and either
-confirmed or moved.
+The threshold is a calculation from four Opus rows, and the trial (*The trial*)
+did not move it. The overlap rule has one row behind it, too short to test it.
+
+## The trial
+
+`wsp-295`, 2026-10-18, on master 4c5f537 installed. Three real rows, staged on
+the rows themselves (no list, so **no verifier ran on any of them**: what is
+measured is cost and shape, and quality is only what each row's own review
+note says). Priced with `wsp attempts <row> --cost` at report time.
+
+**The staged rows.** Every leg `claude sonnet medium` except where marked.
+
+| row | graph | turns | peak | cost | legs summed | wall |
+|---|---|---|---|---|---|---|
+| C `wsp-264` (worklist cost) | scout, **plan on Opus** (`why:` governor-seat attribution), ledger → cost → docs, finish | 104 | 104k | $2.47 | 31m | 46m |
+| A `wsp-113` (agent kinds as data), all Sonnet | scout, plan, data → registry → callers → docs, finish | 61 | 83k | $1.12 | 1h23m | 1h33m |
+| B `compound-396` (dead sockets swept), all Sonnet | build-sessions ‖ build-supervisor ‖ build-tests, finish (the join) | 36 | 61k | $0.55 | 15m | 14m |
+
+Legs, turns, cost: C scout 17 / $0.35, plan (Opus) 22 / $0.90, ledger 14 / $0.26,
+cost 24 / $0.54, docs 23 / $0.36, finish 4 / $0.06. A scout 8, plan 9, data 16,
+registry 6, callers 10, docs 5, finish 7. B build-sessions 8, build-supervisor 6,
+build-tests 13, finish 9. A's finish took 1h6m because `wsp land` was refused by
+the permission classifier (robustness-071) until told again; its 7 turns are the
+measure, and the wall time is not. Of C's cost, the one Opus leg is $0.90 (36%)
+for 22 of 104 turns (21%).
+
+**Overhead.** The legs that only aim the work (scout, plan, finish) were 43 of
+104 turns on C (41%) and 24 of 61 on A (39%). B had no scout or plan (the
+split was given) and its join was 9 of 36 (25%).
+
+**The unstaged baselines, and the rule that pairs them.** Unstaged worker
+attempts released since 2026-09-01 (the first date with recorded turns), in the
+row's own repo (`wsp` = every id but `compound-*`), on the named tier and
+effort, with turns inside a band around the staged row's total. Verifiers and
+rework left out of both sides. Priced by the same command, so Opus 5.5 is at
+its listed rate. n is attempts, not rows' scopes: scope is not matched, only
+repo, tier and turn band.
+
+| staged row | band | Opus/high median | Sonnet/high median | staged / Opus | staged / Sonnet |
+|---|---|---|---|---|---|
+| C, 104 turns | 90–135 | wsp n=15: 109 turns, $4.58 | compound n=27: 114 turns, $3.20 (wsp n=1: 126, $3.73) | 0.54 | 0.77 (0.66) |
+| A, 61 turns | 55–90 | wsp n=20: 77 turns, $3.18 | wsp n=6: 66 turns, $1.57 | 0.35 | 0.71 |
+| B, 36 turns | 25–50 | compound n=15: 32 turns, $1.51 | compound n=27: 39 turns, $0.72 | 0.36 | 0.76 |
+
+Per turn, same band, Sonnet over Opus: 0.57 (wsp 55–90), 0.46 (compound 25–50),
+0.49 (compound 90–135). Across all attempts at 80 turns or more, Sonnet 5.5
+medians 125 turns against Opus 5.5's 124, at $0.035 a turn against $0.069.
+
+**What the numbers say, and how far.**
+
+- **The tier is about half the price per turn and costs no turns.** Same band,
+  same repo, Sonnet takes the turns Opus takes (125 against 124 at 80 or more;
+  114 against 116 on compound 90–135). So g and T do not move with the tier. In
+  C itself the Opus leg ran $0.041 a turn and the Sonnet legs $0.019.
+- **Staged Sonnet cost 0.71–0.77 of unstaged Sonnet at the same total turns**,
+  on all three rows. But a staged row's turn total includes the overhead above.
+  Matched on turns less overhead, the unstaged row is shorter, and the staged
+  row comes out between roughly 1.0× (B) and 1.6× (C with its Opus plan; 1.3×
+  with a Sonnet plan) of it, by a rough extrapolation. So the split's saving is anywhere from a quarter
+  off to 60% more, depending on a matching this data cannot make. **The
+  trial has no twin: the same row run staged and unstaged.** That is the
+  measurement the threshold needs.
+- **The overlap rule got no test.** B's three builds ran 3m, 2m and 1m, shorter
+  than a cold compound build. build-sessions and build-supervisor overlapped; build-tests
+  waited for a place and started when build-sessions ended. Wall 14m against 15m
+  of leg time: nothing bought. The merge was clean (no conflict), and the join's
+  9 turns were wiring, the slow lane (87 run, 0 failed) and landing, not merging.
+  The machine was at its cap of 4 through most of the trial, and this seat, with a
+  monitor armed, held one of the four.
+
+**The decision (recorded on `wsp-295`).**
+
+1. **The ~80-turn threshold: not moved, not confirmed.** The three rows ran 36,
+   61 and 104 turns, and none had a twin. Keep ~80 as the rule for when to
+   stage. It is a calculation, now with a measured overhead beside it
+   (scout + plan + finish ≈ 40% of a 60–100 turn row), and still not a
+   measurement of break-even. The next measurement is a twin pair of rows of
+   one shape, one staged and one not.
+2. **The Sonnet default: confirmed.** All three rows' legs ran on Sonnet
+   medium and each reached its Done when by its own review note (C: full suite
+   1985 pass; A: 1986 pass; B: slow lane 87 run, 0 failed), at about half the
+   per-turn price of Opus and with no extra turns. The Opus plan leg is **not
+   supported**: C paid 36% of its cost for it, and A's all-Sonnet plan on a row
+   with an open design (what a kind file holds, how a bad one is refused)
+   produced a design the row landed. No row compared the two plans on the same
+   work. Keep "Opus only with a `why:`" as permitted, and stop calling an Opus
+   plan the expected case.
+3. **When to fan out: not moved.** The rule's clauses stand and the first two
+   remain unmeasured. What the trial adds: a leg of 1–3 minutes does not pay
+   for a sibling tree, and the cap, which was binding for most of the run, queued the
+   third sibling. Stand by "disjoint files, each long enough, and the row is
+   the long pole with places free", and read "long enough" as more than the
+   few minutes these builds took.
+
+**Found while running it.**
+
+- A staged row needs no hand step after its first leg: `leg done` and the repair
+  tick opened every following leg through the gate (A and C ran five to seven
+  legs each), and the held ones say so once in `cycle.log`.
+- `wsp spawn --leg` by hand starts past the cap with a warning; only the run
+  holds a leg at the cap.
+- A plan leg set out its own build legs with `--before finish` unaided, twice.
+- `wsp land` refused by the classifier stalled A's finish for an hour. A finish
+  leg is where the landing is, so robustness-071 costs a staged row more than
+  an unstaged one.
+- The cap counts a coordinating seat. While this seat watched the rows, one of
+  four places was spent on waiting.
 
 ## Not this
 
