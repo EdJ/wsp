@@ -373,6 +373,69 @@ pub(crate) fn ready(legs: &[Leg]) -> Vec<String> {
         .collect()
 }
 
+/// What `wip` reads of a leg standing in a seat (`docs/legs.md`, *Seen*).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Standing {
+    pub task: String,
+    pub leg: Leg,
+    /// What it waits on, as [`waits`] reads it.
+    pub after: Vec<String>,
+    /// Record order, counting from 1.
+    pub index: usize,
+    /// How many legs the row has.
+    pub of: usize,
+    pub running: usize,
+    pub done: usize,
+}
+
+/// The legs whose seat is still up, by seat: `running`, or `done` and not yet
+/// ended by the tick. A leg holds no claim, so this is where `wip` finds it, as
+/// [`crate::verification::seated`] finds a verifier.
+pub(crate) fn seated(tasks: &[Task]) -> BTreeMap<String, Standing> {
+    let mut out = BTreeMap::new();
+    for t in tasks.iter().filter(|t| t.body.contains(&format!("## {SECTION}"))) {
+        let ls = legs(t);
+        let w = waits(&ls);
+        let running = ls.iter().filter(|l| l.state == State::Running).count();
+        let done = ls.iter().filter(|l| l.state == State::Done).count();
+        for (i, (l, after)) in ls.iter().zip(w).enumerate() {
+            let up = matches!(l.state, State::Running | State::Done) && l.ending == Ending::Standing;
+            if let Some(pane) = l.pane.clone().filter(|_| up) {
+                out.insert(
+                    pane,
+                    Standing { task: t.id.clone(), leg: l.clone(), after, index: i + 1, of: ls.len(), running, done },
+                );
+            }
+        }
+    }
+    out
+}
+
+/// The seat's label and the `task` column's text: `wsp-287 · build-store`, with no
+/// position in the list — in a graph it does not say how far along the row is.
+pub(crate) fn seat_label(task: &str, leg: &str) -> String {
+    format!("{task} · {leg}")
+}
+
+/// `legs 2 running, 2 done of 5`: the row's own line.
+pub(crate) fn tally(s: &Standing) -> String {
+    format!("legs {} running, {} done of {}", s.running, s.done, s.of)
+}
+
+/// The newest leg caption written, as `scout: three layers, plan next`. Newest
+/// by when the leg closed; with siblings, whichever finished last. Nothing is
+/// derived: a leg with no caption says nothing.
+pub(crate) fn newest_caption(t: &Task) -> Option<String> {
+    let ls = legs(t);
+    let l = ls
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.closed.is_some() && l.caption.as_deref().is_some_and(|c| !c.trim().is_empty()))
+        .max_by_key(|(i, l)| (l.closed.clone(), *i))
+        .map(|(_, l)| l)?;
+    Some(format!("{}: {}", l.name, crate::cmd_task::fold(l.caption.as_deref()?)))
+}
+
 /// The path a cycle goes round, first leg repeated at the end, in the arrow form
 /// `wsp after` refuses with: `plan → build-store → plan`.
 fn cycle(legs: &[Leg]) -> Option<Vec<String>> {

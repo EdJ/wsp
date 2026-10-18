@@ -514,6 +514,13 @@ the last open claim, and two siblings' lines would be crossed by it.
   (`index` is record order, kept for sorting). The census is the backend's
   list of panes (`place::census`), so a leg's pane is in it already, under
   its label.
+  A leg's seat is `role: {is: leg, task, leg}` and its `task` is the label,
+  `wsp-287 · build-store`. `index` counts from 1. Its `kind`, `model` and
+  `effort` are the entry's policy, and `held` is since the leg opened: there is
+  no claim to read either from. A leg that is `done` and whose seat the tick has
+  not ended yet has `needs_you: false`, since it is finished and nobody is owed
+  anything from it. `wsp ls --json` gives a staged row the same `legs` objects
+  `wsp show --json` has, and an unstaged row none.
 - **Caption.** `stage.rs` keeps its word (`doing`). The tail is the newest
   leg caption written, so a row reads `doing · scout: three layers, plan
   next`. With siblings it is whichever finished last. No new word, and

@@ -2969,6 +2969,10 @@ fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
             let mut v = t.json();
             // `wsp-274`: and since when, off the same timeline `show` gives.
             v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
+            // The objects `show --json` has, and absent on an unstaged row.
+            if t.body.contains(&format!("## {}", crate::legs::SECTION)) && !crate::legs::legs(t).is_empty() {
+                v["legs"] = crate::legs::json(t);
+            }
             v
         })
         .collect()
@@ -3002,6 +3006,25 @@ mod tests {
         let stage = &rows[0]["stage"];
         assert_eq!((&stage["word"], &stage["since"]), (&json!("started"), &json!("2026-10-08T08:00:00Z")), "{rows:?}");
         assert_ne!(stage["at"], stage["since"], "at stays the record's time");
+    }
+
+    /// `ls --json` gives a staged row the `legs` objects `show --json` has, and an
+    /// unstaged row none at all.
+    #[test]
+    fn ls_json_carries_a_staged_rows_legs_and_an_unstaged_row_none() {
+        let store = scratch("ls-legs");
+        let mut staged = Task::new("A staged row", "s-1");
+        staged.status_raw = "doing".into();
+        crate::legs::write(&mut staged, &[crate::legs::Leg::pending("scout", "look"), crate::legs::Leg::pending("finish", "land")]);
+        store.save_task(&staged).unwrap();
+        let mut plain = Task::new("An unstaged row", "s-2");
+        plain.status_raw = "doing".into();
+        store.save_task(&plain).unwrap();
+        let rows = rows_json(&store, &store.tasks());
+        let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap().clone();
+        assert_eq!(row("s-1")["legs"], crate::legs::json(&store.find_task("s-1").unwrap()));
+        assert_eq!(row("s-1")["legs"][1]["after"], json!(["scout"]));
+        assert!(row("s-2").get("legs").is_none(), "absent, not empty: {}", row("s-2"));
     }
 
     /// The occurrence, and it is `render-014`'s exactly: `wsp review render-014`
