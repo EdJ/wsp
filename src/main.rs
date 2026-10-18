@@ -55,6 +55,7 @@ mod herdr;
 mod input;
 mod kanban;
 mod live;
+mod kind_data;
 mod launchd;
 mod message;
 mod model;
