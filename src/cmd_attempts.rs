@@ -607,6 +607,7 @@ fn attempts_json_with(
             };
             json!({
                 "task": a.task,
+                "role": "member",
                 "leg": a.leg,
                 "title": a.title,
                 "at": a.at,
@@ -659,7 +660,11 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
     }
 
     if args.json() {
-        println!("{}", json!({ "attempts": attempts_json(&rows) }));
+        let mut out = attempts_json(&rows);
+        for t in &tasks {
+            out.extend(crate::cmd_cost::verifier_rows(t));
+        }
+        println!("{}", json!({ "attempts": out }));
         return 0;
     }
 

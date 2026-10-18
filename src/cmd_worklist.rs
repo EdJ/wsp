@@ -109,6 +109,14 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "edit" => edit(store, args),
         "ls" | "list" => list(store, args),
         "show" | "get" => show(store, args),
+        // wsp-264: what the list spent, by group and member.
+        "cost" => match args.rest.get(1) {
+            Some(slug) => crate::cmd_cost::cost(store, args, slug),
+            None => {
+                eprintln!("wsp worklist cost: which list? `wsp worklist cost <slug> [--json]`");
+                2
+            }
+        },
         // Running it, which is the barrier. Everything above composes a plan.
         "next" => next(store, args),
         "go" | "start" => go(store, args),

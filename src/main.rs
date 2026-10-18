@@ -19,6 +19,7 @@ mod cmd_agent;
 mod cmd_attempts;
 mod cmd_brief;
 mod cmd_burn;
+mod cmd_cost;
 mod cmd_checkout;
 mod cmd_govern;
 mod cmd_install;
