@@ -748,8 +748,12 @@ pub fn mint(name: &str, seat: &Seat) -> Option<String> {
     }
 }
 
-/// The kind a `--kind` names, or [`Plain`] for one this file has nothing to say
-/// about.
+/// The kind a `--kind` names: a built-in in [`KNOWN`], else a kind declared as
+/// data under `<store>/kinds/` (`docs/kinds.md`), else [`Plain`].
+///
+/// Built-ins are asked first and always win; a kind file cannot shadow one. A
+/// name whose file was *refused* is not registered and falls to [`Plain`] here;
+/// [`refusal_of`] is how a caller tells that from a name with no file.
 ///
 /// Unknown kinds are not refused here. herdr owns the catalogue and refuses an
 /// unknown kind with the whole of it in the message, which is a better list than
@@ -815,9 +819,10 @@ pub fn refusal_of(kind: &str) -> Option<&'static str> {
 /// offers "New agent ▸" never keeps a second list that [`of`] could disagree
 /// with.
 ///
-/// This is the kinds wsp has *measured*, not the kinds herdr can start: any
+/// This is the kinds the code has *measured*, not the kinds herdr can start:
+/// a kind declared as a file is consulted after this table (see [`of`]), and any
 /// other name `--kind` is given is still passed through to herdr, which owns
-/// that catalogue (see [`of`]).
+/// that catalogue.
 const KNOWN: &[(&str, &'static dyn Kind)] = &[("claude", &Claude), ("opencode", &OpenCode), ("pi", &Pi)];
 
 /// What a menu needs to know about one kind. Read off [`Kind`], never stored.

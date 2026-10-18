@@ -261,6 +261,16 @@ mod tests {
         assert!(k.tier(None, None).is_ok());
     }
 
+    /// `docs/kinds.md`'s worked example is the first ```json block on the page.
+    #[test]
+    fn the_documented_example_parses() {
+        let page = include_str!("../docs/kinds.md");
+        let body = page.split("```json\n").nth(1).and_then(|r| r.split("\n```").next()).expect("a json block");
+        let k = parse("mytool", body).unwrap_or_else(|e| panic!("docs/kinds.md example refused: {e}"));
+        assert_eq!(k.name, "mytool");
+        assert_eq!(k.clear_command(), Some("/new"));
+    }
+
     #[test]
     fn refusals_say_why() {
         for (stem, text, why) in [

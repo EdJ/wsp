@@ -3615,6 +3615,9 @@ wsp spawn 033 --agent --kind codex # any agent kind herdr knows
 wsp spawn 033 --agent --focus      # …and go there, which it otherwise will not
 ```
 
+A kind wsp has no Rust arm for can still be described by a file under
+`~/wsp/kinds/`, no rebuild needed: `docs/kinds.md`.
+
 **A spawn does not move the screen.** The seat is created, the agent is started
 in it and told what it holds, and whatever you were reading stays in front of
 you; `--focus` is how you ask to be taken there. It read the other way round
