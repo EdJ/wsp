@@ -43,16 +43,12 @@
 //!   A closed row's leg trees go with the row's own, through `wsp checkout
 //!   --sweep` (`cmd_checkout::stale` reads `<task>.<leg>` as the row's).
 
-// Called by the leg's spawn and `leg done` (legs-seat, legs-run), which are not
-// built yet; the tick and `despawn` reach tidy and discard already.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::cmd_checkout::{self, Tree, WORKTREES};
-use crate::cmd_verify::{git, git_ok};
+use crate::cmd_verify::{self, git, git_ok};
 use crate::legs::{self, Leg, State};
 use crate::model::Task;
 use crate::store::Store;
@@ -105,10 +101,12 @@ pub(crate) struct Opened {
     /// The tree, as `~/…`; also the branch's name's directory. The entry's
     /// `tree` clause is [`Opened::name`].
     pub path: String,
+    #[cfg_attr(not(test), allow(dead_code))] // read by the tests
     pub dir: PathBuf,
     /// The branch, and the name the entry records.
     pub name: String,
     /// The commit it was cut at, short.
+    #[cfg_attr(not(test), allow(dead_code))] // read by the tests
     pub from: String,
 }
 
@@ -174,6 +172,12 @@ pub(crate) fn prepare(store: &Store, root: &str, row_cwd: &str, task: &str, name
         _ => return Ok(Prepared::default()),
     }
     let row_dir = util::expand(row_cwd);
+    // A merge or a sibling's tree both need the row's own tree. The spawn falls
+    // back to the trunk checkout when the row's tree could not be made, and a
+    // merge there would put the legs' work on master unlanded.
+    if has_siblings(&all, name) || !inbound(&all, name).is_empty() {
+        require_row_tree(root, row_cwd, task)?;
+    }
     let joined = join(&row_dir, &all, name);
     let mut lines: Vec<String> = joined.brief().into_iter().collect();
     // What the legs it waits on both touched, read from their branches.
@@ -196,6 +200,28 @@ pub(crate) fn prepare(store: &Store, root: &str, row_cwd: &str, task: &str, name
     }
     let o = open(root, task, name)?;
     Ok(Prepared { cwd: Some(o.path), tree: Some(o.name), join: join_text })
+}
+
+/// `row_cwd` must be the row's own tree under the trunk's `.worktrees/`, not the
+/// trunk checkout itself or any other directory.
+fn require_row_tree(root: &str, row_cwd: &str, task: &str) -> Result<(), String> {
+    let root = util::expand(root);
+    let own = cmd_verify::toplevel(&root)
+        .and_then(|repo| cmd_checkout::trunk(&repo))
+        .map(|trunk| cmd_checkout::checkout_dir(&trunk, task))
+        .filter(|dir| dir.join(".git").exists());
+    let here = util::expand(row_cwd);
+    let same = own.as_ref().is_some_and(|dir| match (dir.canonicalize(), here.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    });
+    if same {
+        return Ok(());
+    }
+    Err(format!(
+        "{task} has no tree of its own ({} is not it) — a leg's merge and a sibling's tree are cut from the row's tree; `wsp checkout {task}`",
+        util::contract(&here)
+    ))
 }
 
 /// A tree's path beside the row's: both are directories under `.worktrees/`.
@@ -264,6 +290,7 @@ pub(crate) struct Joined {
 
 impl Joined {
     /// Nothing for the join to do by hand.
+    #[cfg(test)]
     pub(crate) fn clean(&self) -> bool {
         self.conflict.is_none() && self.waiting.is_empty() && self.held.is_none()
     }
@@ -967,6 +994,35 @@ mod tests {
         legs::write(&mut t, &running);
         let lines = crate::leg_seat::brief_lines(&[t], "cpd-9").unwrap().join("\n");
         assert!(lines.contains("the join:") && lines.contains("CONFLICT merging b"), "{lines}");
+    }
+
+    /// The spawn falls back to the project root when the row has no tree. A
+    /// join must then be refused with nothing merged: master is where that
+    /// merge would land.
+    #[test]
+    fn a_join_is_refused_when_the_row_has_no_tree_and_master_does_not_move() {
+        let (_env, store, repo, _row) = scratch("no-row-tree");
+        let mut done = graph();
+        for n in ["a", "b"] {
+            let name = tree_name("p-001", n);
+            let dir = repo.join(WORKTREES).join(&name);
+            run(&repo, &["worktree", "add", "--quiet", "-b", &name, &dir.display().to_string(), "p-001"]);
+            commit(&dir, &format!("{n}.txt"), "work\n");
+            done.iter_mut().find(|l| l.name == n).unwrap().tree = Some(name);
+        }
+        record_legs(&store, &done);
+        let master = git(&repo, &["rev-parse", "master"]).unwrap();
+
+        let err = prepare(&store, &root(&repo), &root(&repo), "p-001", "fin").unwrap_err();
+        assert!(err.contains("no tree of its own"), "{err}");
+        assert_eq!(git(&repo, &["rev-parse", "master"]).unwrap(), master, "nothing merged into master");
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]).unwrap(), master);
+        assert_eq!(cmd_checkout::uncommitted(&repo), 0);
+
+        // The same call from the row's own tree goes through.
+        let row = repo.join(WORKTREES).join("p-001");
+        let ok = prepare(&store, &root(&repo), &util::contract(&row), "p-001", "fin").unwrap();
+        assert!(ok.join.unwrap().contains("merged a"));
     }
 
     fn record_legs(store: &Store, legs: &[Leg]) {
