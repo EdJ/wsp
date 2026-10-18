@@ -1550,11 +1550,25 @@ pub(crate) fn start_legs(store: &Store, row: &str, seats: &dyn Seats) -> Vec<Str
     }
     let gate = crate::room::Gate::new(store, seats);
     let started = run_legs(store, None, row, Rows::Started, None, &gate);
-    let held = gate.take_held();
-    if let Some(cap) = gate.cap {
-        for (what, room) in held {
-            log_line(store, &format!("{what} waits — the seat is at its cap of {cap}: {}", crate::room::names(&room)));
+    // Said once while it lasts, as a list's step does through `capped.json`
+    // (`say_capped`), keyed on the row since there is no list: the repair tick
+    // asks every minute and a held leg is the same sentence each time.
+    let before = store.capped().get(row).and_then(|v| v.as_object().cloned()).unwrap_or_default();
+    let mut now = serde_json::Map::new();
+    for (what, room) in gate.take_held() {
+        match before.get(&what) {
+            Some(since) => {
+                now.insert(what, since.clone());
+            }
+            None => {
+                let cap = gate.cap.unwrap_or_default();
+                log_line(store, &format!("{what} waits — the seat is at its cap of {cap}: {}", crate::room::names(&room)));
+                now.insert(what, serde_json::Value::String(util::now_iso()));
+            }
         }
+    }
+    if now != before {
+        store.set_capped(row, (!now.is_empty()).then_some(serde_json::Value::Object(now)));
     }
     started
 }
@@ -6130,6 +6144,8 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(start_legs(&store, "m-1", &Blind), ["m-1 · a".to_string()], "one place");
         assert_eq!(ids(spawned()), ["m-1 · a".to_string()]);
         assert!(start_legs(&store, "m-1", &Blind).is_empty(), "and once");
+        let held = |said: Vec<String>| said.iter().filter(|l| l.contains("m-1 · b waits")).count();
+        assert_eq!(held(drained(&SAID)), 1, "the held leg is said once while it lasts, not on every tick");
     }
 
     #[test]
