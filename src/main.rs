@@ -34,6 +34,7 @@ mod cmd_stamp;
 mod cmd_task;
 mod cmd_verify;
 mod leg_seat;
+mod leg_tree;
 mod legs;
 mod verification;
 mod cmd_watch;

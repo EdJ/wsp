@@ -4052,6 +4052,8 @@ struct Caller<'a> {
 /// What the ending took away after the seat itself.
 struct Leftovers {
     tree: Tree,
+    /// The trees of the row's finished legs, taken on `leg_tree`'s rule.
+    legs: Vec<Tree>,
     /// Build trees that were keyed on the workspace the seat took with it.
     builds: Vec<String>,
 }
@@ -4126,7 +4128,13 @@ fn swept_up(
         Some(ws) if gone(ws).unwrap_or(false) => crate::cmd_verify::clear_build_key(store, ws),
         _ => Vec::new(),
     };
-    Leftovers { tree, builds }
+    // And the row's finished legs' trees (wsp-297): the row's own is taken on
+    // its rule above, and these on theirs, which wants the leg's branch merged.
+    let legs = match task.filter(|_| !keep) {
+        Some(t) if crate::check_tree::named(store, t).is_none() => crate::leg_tree::discard(store, t, &standing),
+        _ => Vec::new(),
+    };
+    Leftovers { tree, legs, builds }
 }
 
 /// Which seat a despawn is about: the one named, or the one holding the task.
@@ -4355,7 +4363,7 @@ fn end_work(
     // Last, and only now: the tree is the one step a person can still do by
     // hand afterwards, so it must not be the step that stops the claim being
     // released. Everything before this line is what `despawn` has always done.
-    let Leftovers { tree, builds } = tidy(&seat, task.as_deref().or(check.as_deref()), workspace.as_deref());
+    let Leftovers { tree, legs, builds } = tidy(&seat, task.as_deref().or(check.as_deref()), workspace.as_deref());
 
     if args.json() {
         println!(
@@ -4372,6 +4380,11 @@ fn end_work(
                     Tree::Kept { path, why } =>
                         json!({ "removed": false, "path": path, "why": why }),
                 },
+                "legs": legs.iter().map(|t| match t {
+                    Tree::Absent => serde_json::Value::Null,
+                    Tree::Removed { path, kept } => json!({ "removed": true, "path": path, "branch": kept }),
+                    Tree::Kept { path, why } => json!({ "removed": false, "path": path, "why": why }),
+                }).collect::<Vec<_>>(),
                 "builds": builds,
             })
         );
@@ -4404,6 +4417,13 @@ fn end_work(
             // and the leak this verb exists to stop is exactly a cleanup step
             // that reported success it had not achieved.
             Tree::Kept { path, why } => println!("  {}", p.yellow(&format!("kept {path} — {why}"))),
+        }
+        for t in &legs {
+            match t {
+                Tree::Absent => {}
+                Tree::Removed { path, .. } => println!("  {}", p.dim(&format!("removed leg tree {path}"))),
+                Tree::Kept { path, why } => println!("  {}", p.yellow(&format!("kept leg tree {path} — {why}"))),
+            }
         }
         if !builds.is_empty() {
             println!("  {}", p.dim(&format!("removed {} build tree(s) keyed on the workspace", builds.len())));
@@ -6565,7 +6585,7 @@ mod tests {
         // And the ending takes it away. A brief left behind is a stale answer
         // waiting to be handed to whoever is spawned onto the task next.
         assert_eq!(end_work(&place, &store, &Args::synth("despawn", &["t-1"], &[]), Caller::default(), &|_, _, _| {
-            Leftovers { tree: Tree::Absent, builds: Vec::new() }
+            Leftovers { tree: Tree::Absent, legs: Vec::new(), builds: Vec::new() }
         }), 0);
         assert!(!std::path::Path::new(&named).exists(), "the brief outlived the seat: {named}");
     }
@@ -6974,7 +6994,7 @@ mod tests {
         fn f(&self) -> impl Fn(&Seat, Option<&str>, Option<&str>) -> Leftovers + '_ {
             |seat: &Seat, task: Option<&str>, _ws: Option<&str>| {
                 self.0.borrow_mut().push((seat.as_str().to_string(), task.map(String::from)));
-                Leftovers { tree: Tree::Absent, builds: Vec::new() }
+                Leftovers { tree: Tree::Absent, legs: Vec::new(), builds: Vec::new() }
             }
         }
     }

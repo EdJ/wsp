@@ -299,7 +299,7 @@ struct Orphan {
 /// Two answers rather than one because the second is a *finding* and not a
 /// result: the tree was made either way, and [`Orphan`] is what nobody was
 /// looking at.
-struct Made {
+pub(crate) struct Made {
     /// Whether the tree was new.
     fresh: bool,
     orphan: Option<Orphan>,
@@ -373,7 +373,7 @@ fn orphan(repo: &Path, onto: &str, task: &str) -> Option<Orphan> {
 /// adopting the old branch is the worse answer — but it no longer does it
 /// silently, and the finding rides out on [`Made`] rather than being printed
 /// from here, because two callers want it in two shapes.
-fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<Made, String> {
+pub(crate) fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<Made, String> {
     // Before the early return, because the guard is a property of the
     // repository rather than of this tree: a second agent arriving at a tree
     // that already exists is exactly who it is for. See `crate::guard` for why
@@ -1904,6 +1904,14 @@ pub(crate) fn stranded_line(s: &Stray) -> String {
             "{held} — it is {now} now, and `wsp checkout {now}` cuts a fresh branch rather than finding this one; `git switch {}` does",
             s.branch
         ),
+        // A leg's branch (`leg_tree`) is not a task `checkout` can name; the
+        // row's join merges it, and git can stand a tree on it again.
+        _ if s.branch.contains('.') => format!(
+            "{held} — a leg of {}; `git worktree add {WORKTREES}/{} {}` stands a tree on it again",
+            crate::leg_tree::row_of(&s.branch),
+            s.branch,
+            s.branch
+        ),
         _ => format!("{held} — `wsp checkout {}` builds it again", s.branch),
     }
 }
@@ -1924,6 +1932,8 @@ pub(crate) fn finished(store: &Store) -> impl Fn(&str) -> bool {
     let tasks = store.tasks();
     let archived = store.archived_ids();
     move |id: &str| {
+        // A leg's tree is named `<task>.<leg>` and is finished when its row is.
+        let id = crate::leg_tree::row_of(id);
         tasks
             .iter()
             .find(|t| t.id == id)
@@ -1949,6 +1959,8 @@ pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Who
         store.tasks().into_iter().map(|t| t.id).chain(store.archived_ids()).collect();
     let renamed = store.renamed_ids();
     move |branch: &str| {
+        // `<task>.<leg>` is a leg's branch (`leg_tree`), and the row's.
+        let branch = crate::leg_tree::row_of(branch);
         if known.contains(branch) {
             return Whose::Task;
         }

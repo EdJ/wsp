@@ -5849,7 +5849,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
                 // A seat still bound to the task changes the advice rather than
                 // the finding: the tree is litter either way, but a `--rm`
                 // there leaves the agent and the workspace behind it.
-                let seated = !store.panes_for_task(&s.task).is_empty();
+                let seated = !store.panes_for_task(crate::leg_tree::row_of(&s.task)).is_empty();
                 notes.push(format!(
                     "{}: the tree for {} is finished with — {} — {}",
                     util::contract(&root),

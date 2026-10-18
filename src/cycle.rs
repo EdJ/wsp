@@ -2003,6 +2003,7 @@ fn end_check_seat(store: &Store, list: &str, seat: &str) {
     // And its tree, as the same step: `despawn` takes it, and this says what
     // became of it — or of one an earlier ending left behind (`wsp-289`).
     crate::check_tree::tidy(store, &[seat.to_string()]);
+    crate::leg_tree::tidy(store, &[seat.to_string()]);
 }
 
 /// The lists that have a barrier check holding a claim right now.

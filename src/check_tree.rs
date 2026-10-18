@@ -66,7 +66,7 @@ fn in_use(store: &Store, list: &str, at: usize) -> bool {
 
 /// What is in a tree besides `target/`, by path — `None` when git cannot read
 /// it, which keeps it.
-fn litter(dir: &Path) -> Option<Vec<String>> {
+pub(crate) fn litter(dir: &Path) -> Option<Vec<String>> {
     let out = git(dir, &["status", "--porcelain", "--ignored", "--untracked-files=normal"])?;
     Some(
         out.lines()
@@ -99,7 +99,7 @@ fn take(repo: &Path, dir: &Path, standing: &dyn Fn(&Path) -> Option<String>) -> 
 /// up to the directory holding `.git` — on disk, with no git to run, because
 /// the tick asks this every twenty seconds and nearly always finds nothing.
 /// A root that is itself a linked tree is skipped; its trunk is a root too.
-fn repos(store: &Store) -> Vec<PathBuf> {
+pub(crate) fn repos(store: &Store) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for root in store.projects().iter().flat_map(|p| p.roots.iter()) {

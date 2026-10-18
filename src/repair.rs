@@ -287,6 +287,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // a tree whose seat went some other way — or before this — goes too.
     // `wsp-289`, after compound's disk filled with 56 of them.
     crate::check_tree::tidy(store, &ended);
+    // And a finished leg's (wsp-297): the same read off the disk.
+    crate::leg_tree::tidy(store, &ended);
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);
