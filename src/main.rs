@@ -177,6 +177,8 @@ const BOOL_FLAGS: &[&str] = &[
     "keep", "seed", "fake",
     // And `despawn`, whose positional is a task id.
     "keep-tree",
+    // And `reopen`, whose positionals are the id and the reason.
+    "no-seat",
     // And `govern`, whose positional is a project: `wsp spawn -p wsp --govern`
     // and `wsp govern wsp --remove` both put the flag last, where anything not
     // known here swallows the argument after it. `--rotate` is the same shape:
@@ -1585,10 +1587,13 @@ fn help_text() -> String {
                                     earlier ones it did not print; --log for
                                     all of them
   wsp start|review <id>           move through the workflow
-  wsp reopen|todo <id> "what is owed"
+  wsp reopen|todo <id> "what is owed" [--no-seat]
                                 send work back: moves the row, tells
                                 its pane, and stops the run reading it as
-                                finished (`todo` sets the status and takes no prose)
+                                finished (`todo` sets the status and takes no prose).
+                                A row whose agent is gone is seated again:
+                                by its run, or with the kind and tier it ran
+                                with; --no-seat leaves it to you
   wsp leg add <task> <name> --order FILE|- [--agent "claude opus high" --why "…"] [--after <leg>,…|-] [--before <leg>]
                                     a leg of a row (docs/legs.md): appended under
                                     ## Legs, waiting on the last leg unless
@@ -2150,6 +2155,16 @@ the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
 
 #[cfg(test)]
 mod tests {
+    /// `wsp reopen <id> --no-seat "reason"` with the flag first: valued, it
+    /// would eat the reason and the reopen would refuse for want of one.
+    #[test]
+    fn no_seat_on_reopen_takes_no_value() {
+        use crate::Args;
+        let args = Args::parse(["reopen", "m-1", "--no-seat", "what is owed"].iter().map(|s| (*s).to_string()).collect());
+        assert!(args.has("no-seat"));
+        assert_eq!(args.rest, ["m-1", "what is owed"], "the reason stays a positional");
+    }
+
     /// `status` is a mode word on `watch` and a filter value everywhere else
     /// it is read, and [`BOOL_FLAGS`] could only say the first half. So
     /// `wsp ls -p fork -s done` parsed as a bare flag plus a stray positional:

@@ -5639,11 +5639,40 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(crate::cmd_worklist::hold(&store, &hold), 0);
         set(&store, "m-1", Status::Review);
 
+        let mut t = store.find_task("m-1").unwrap();
+        t.log("claimed by pane cpd-1 · spawned at opus/high");
+        t.log("released after 5m");
+        store.save_task(&t).unwrap();
+
         let reopen = Args::synth("reopen", &["m-1", "one more thing"], &[]);
         assert_eq!(crate::cmd_task::reopen(&store, &reopen), 0);
         assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Held);
+        assert!(crate::cmd_task::tests::reseated().is_empty(), "nor does the reopen seat it past the hold");
         step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "{:?}", spawned());
+    }
+
+    /// `wsp-304`, beside `wsp-286`: the reopen of a lone row seats an agent
+    /// itself, and the reopen of a running group's member leaves it to the
+    /// step — one seat between them, never two.
+    #[test]
+    fn a_running_members_reopen_is_seated_by_the_run_and_not_by_the_reopen_too() {
+        let (_env, store) = scratch("reopenrunning");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Todo);
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        let mut t = store.find_task("m-1").unwrap();
+        t.log("claimed by pane cpd-1 · spawned at opus/high");
+        t.log("released after 5m");
+        store.save_task(&t).unwrap();
+
+        let reopen = Args::synth("reopen", &["m-1", "the regression"], &[]);
+        assert_eq!(crate::cmd_task::reopen(&store, &reopen), 0);
+        assert!(crate::cmd_task::tests::reseated().is_empty(), "the reopen leaves the member to its run");
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".into(), "claude".into())], "and the run seats it, once");
     }
 
     /// `wsp-188`. A verdict that holds leaves the member at `review` and tells
