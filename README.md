@@ -4790,6 +4790,15 @@ has uncommitted work in, `-n` to look first. That is the same shape as `wsp
 archive` for tasks and `wsp reconcile --reap` for claims, and it exists for the
 same reason both of those do.
 
+**Closing is finishing** (`wsp-305`), so `wsp done` takes the tree itself — and
+so does `wsp worklist done`, for each member it closes over that is done. Nobody
+remembered: compound held 18 trees on 2026-10-19, six of them done rows'. The
+rule is narrower than `--sweep`'s: the tree goes, with its branch and its legs'
+trees, only when there is nothing uncommitted in it, nothing on its branch the
+trunk has not got, nobody standing in it and no claim held. Anything else is
+kept and the line under the receipt says why. `--keep-tree` leaves it. `land`
+still takes nothing, for the reasons above.
+
 **And the trees whose group a worklist has passed** (`wsp-092` d3). Nothing here
 ever reaches `done` — everything sits at `review` by design — so "the task is
 closed" almost never arrives, and eighteen worktrees and nineteen orphaned

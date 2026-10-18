@@ -4921,6 +4921,16 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     // and ending a member's agent on a list somebody meant to come back to is
     // not something to do without saying.
     crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, how);
+    // And the trees of its members that are closed, where their work is on the
+    // trunk (`wsp-305`): no barrier will sweep them now. After the run's seats
+    // are ended, so a claim that just went does not keep one.
+    let closed: Vec<String> = groups
+        .iter()
+        .flat_map(|g| g.members.iter())
+        .filter(|m| store.task(m).is_some_and(|t| t.status() == crate::model::Status::Done))
+        .cloned()
+        .collect();
+    let swept = crate::cmd_checkout::closed_lines(&crate::cmd_checkout::sweep_closed(store, &closed, false));
     crate::cycle::tell_above(
         store,
         &w,
@@ -4933,7 +4943,7 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     if args.json() {
         println!(
             "{}",
-            json!({ "worklist": w.id, "status": "done", "at": pos.at, "open": left, "behind": behind, "unwritten": pos.unwritten })
+            json!({ "worklist": w.id, "status": "done", "at": pos.at, "open": left, "behind": behind, "unwritten": pos.unwritten, "trees": swept })
         );
         return 0;
     }
@@ -4962,6 +4972,9 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     }
     for line in unwritten_lines(&p, &pos.unwritten, &p.bold("unwritten"), 8) {
         println!("{line}");
+    }
+    for line in &swept {
+        println!("{}", p.dim(line));
     }
     0
 }

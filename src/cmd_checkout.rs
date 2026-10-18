@@ -1009,6 +1009,85 @@ pub(crate) fn sweep_passed(
     out
 }
 
+/// The trees a closed row may have under these trunks: its own, and its legs'
+/// (`<id>.<leg>`), each named so [`sweep_passed`] finds it.
+///
+/// The row's own goes in whether or not its directory is there — `sweep_passed`
+/// skips one that is not, and resolves a tree made under a former id through
+/// [`checkout_dir`] — and the legs are read off the directory, since nothing
+/// else names them once the row is closed.
+fn closed_members(trunks: &[(PathBuf, String)], id: &str) -> Vec<Passed> {
+    let mut out = Vec::new();
+    for (trunk, branch) in trunks {
+        let mut names = vec![id.to_string()];
+        let legs = std::fs::read_dir(trunk.join(WORKTREES))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != id && crate::leg_tree::row_of(n) == id);
+        names.extend(legs);
+        names.sort();
+        out.extend(names.into_iter().map(|task| Passed { task, trunk: trunk.clone(), trunk_branch: branch.clone() }));
+    }
+    out
+}
+
+/// Take the trees of rows that have just been closed, where their work is on
+/// the trunk. `wsp-305`.
+///
+/// **A closed row kept its tree and branch forever.** Only `despawn` and a
+/// hand `--sweep` removed one, so a row closed with `wsp done`, or by a run
+/// ending, left its tree under `.worktrees/` until somebody swept: compound
+/// held 18 trees on 2026-10-19, six of them done rows'. Closing is the moment
+/// the evidence arrives, so it is the moment the tree goes.
+///
+/// **Narrower than `--sweep`, which takes a closed row's tree whatever its
+/// branch holds.** Here the row being closed is not licence enough: the tree is
+/// taken only on [`sweep_passed`]'s rule with nothing closed — nothing
+/// uncommitted, nothing on the branch the trunk has not got, nobody standing in
+/// it (`compound-320`: a window launched from the tree is still running in it),
+/// no claim held. A row closed over unlanded work is a decision somebody may
+/// not have meant to make about that work, and `--sweep` is still there to
+/// make it on purpose.
+///
+/// Every root the row's project names, not where the caller stands: `done` is
+/// typed from anywhere, and most often by somebody who was never in the tree.
+pub(crate) fn sweep_closed(store: &Store, ids: &[String], dry: bool) -> Swept {
+    let index = crate::resolve::Index::new(store.projects());
+    let mut members = Vec::new();
+    for id in ids {
+        let Some(project) = store.task(id).and_then(|t| t.project) else { continue };
+        let mut trunks: Vec<(PathBuf, String)> = Vec::new();
+        for r in index.roots_of(&project).unwrap_or_default() {
+            let Some(t) = toplevel(&util::expand(&r)).and_then(|repo| trunk(&repo)) else { continue };
+            let Some(b) = trunk_branch(&t) else { continue };
+            let real = util::real(&t.display().to_string());
+            if !trunks.iter().any(|(x, _)| util::real(&x.display().to_string()) == real) {
+                trunks.push((t, b));
+            }
+        }
+        members.extend(closed_members(&trunks, id));
+    }
+    // Only the trees on disk, so a row that never took one asks no backend
+    // who is standing anywhere: most closes are that, and the census is not
+    // free.
+    members.retain(|m| checkout_dir(&m.trunk, &m.task).join(".git").exists());
+    if members.is_empty() {
+        return Swept::default();
+    }
+    let occupied = Occupied::now(store);
+    sweep_passed(&members, &|_| false, &|t, d| occupied.of(t, d), dry)
+}
+
+/// What [`sweep_closed`] did, in lines: nothing for a row that had no tree.
+pub(crate) fn closed_lines(out: &Swept) -> Vec<String> {
+    let mut lines: Vec<String> = out.removed.iter().map(|t| format!("removed {t}'s tree — its work is on the trunk")).collect();
+    lines.extend(out.branches.iter().map(|b| format!("branch {b} kept — it has commits the trunk has not")));
+    lines.extend(out.kept.iter().map(|(t, why)| format!("kept {t}'s tree — {why}")));
+    lines
+}
+
 /// Every backend wsp can spawn onto, asked who is standing where — the same
 /// merge `cmd_spawn::swept_up` builds for `despawn`'s tree check
 /// (`compound-111`), pulled out here because `Occupied` is now a second caller
@@ -3405,5 +3484,70 @@ mod tests {
         run(&dir, &["reset", "--quiet"]);
         git_ok(&dir, &["merge", "--ff-only", "--quiet", "t-5"]).expect("a bare reset was not the fix");
         assert_eq!(std::fs::read_to_string(dir.join("kept.txt")).unwrap(), "three\n");
+    }
+
+    /// `wsp-305`: closing a row takes its tree, and its legs', when the work is
+    /// on the trunk — and nothing else's.
+    #[test]
+    fn closing_a_row_takes_its_landed_tree_and_its_legs_and_leaves_its_neighbour() {
+        let env = util::isolated("co-closed");
+        let dir = lane(&env, "p", "p-001");
+        for t in ["p-001", "p-001.a", "p-002"] {
+            ensure(&dir, &checkout_dir(&dir, t), t, "master").unwrap();
+        }
+        let store = Store::open();
+
+        let out = sweep_closed(&store, &["p-001".to_string()], false);
+        assert_eq!(out.removed, ["p-001", "p-001.a"], "kept: {:?}", out.kept);
+        assert!(out.branches.is_empty() && out.kept.is_empty());
+        assert!(!checkout_dir(&dir, "p-001").exists() && !checkout_dir(&dir, "p-001.a").exists());
+        assert!(git(&dir, &["rev-parse", "--verify", "--quiet", "refs/heads/p-001"]).is_none(), "the branch outlived its tree");
+        assert!(checkout_dir(&dir, "p-002").join(".git").exists(), "a neighbour's tree went with it");
+        assert!(sweep_closed(&store, &["p-001".to_string()], false).removed.is_empty(), "a second close found something");
+    }
+
+    /// Narrower than `--sweep`: a closed row whose branch holds work the trunk
+    /// has not got, or whose tree holds uncommitted work, keeps its tree, and
+    /// the reason is said.
+    #[test]
+    fn closing_a_row_keeps_a_tree_holding_unlanded_or_uncommitted_work() {
+        let env = util::isolated("co-closed-kept");
+        let dir = lane(&env, "p", "p-001");
+        let store = Store::open();
+        let mut t = crate::model::Task::new("another", "p-002");
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+
+        let ahead = checkout_dir(&dir, "p-001");
+        ensure(&dir, &ahead, "p-001", "master").unwrap();
+        std::fs::write(ahead.join("mine.txt"), "mine\n").unwrap();
+        run(&ahead, &["add", "."]);
+        run(&ahead, &["commit", "--quiet", "-m", "unlanded"]);
+        let dirty = checkout_dir(&dir, "p-002");
+        ensure(&dir, &dirty, "p-002", "master").unwrap();
+        std::fs::write(dirty.join("loose.txt"), "loose\n").unwrap();
+
+        let out = sweep_closed(&store, &["p-001".to_string(), "p-002".to_string()], false);
+        assert!(out.removed.is_empty(), "removed {:?}", out.removed);
+        let why = |id: &str| out.kept.iter().find(|(t, _)| t == id).map(|(_, w)| w.clone()).unwrap_or_default();
+        assert!(why("p-001").contains("that master has not got"), "{:?}", out.kept);
+        assert!(why("p-002").contains("uncommitted"), "{:?}", out.kept);
+        assert!(ahead.join("mine.txt").exists() && dirty.join("loose.txt").exists());
+        assert_eq!(closed_lines(&out).len(), 2);
+    }
+
+    /// A claim still held keeps the tree, with the verb that ends it — the
+    /// same refusal the barrier's sweep makes.
+    #[test]
+    fn closing_a_row_keeps_a_tree_whose_claim_is_still_held() {
+        let env = util::isolated("co-closed-claimed");
+        let dir = lane(&env, "p", "p-001");
+        ensure(&dir, &checkout_dir(&dir, "p-001"), "p-001", "master").unwrap();
+        let store = Store::open();
+        store.set_claim("p-001", json!({"workspace": "w-1"}));
+
+        let out = sweep_closed(&store, &["p-001".to_string()], false);
+        assert!(out.removed.is_empty());
+        assert!(out.kept[0].1.contains("wsp despawn p-001"), "{:?}", out.kept);
     }
 }

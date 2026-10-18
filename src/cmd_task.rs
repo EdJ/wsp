@@ -1122,10 +1122,25 @@ pub fn done(store: &Store, args: &Args) -> i32 {
         }
         crate::cmd_agent::hand_off(store, &t.id, None, "done");
     }
-    mutate(store, args, "done", |t| {
+    let id = args.rest.first().and_then(|needle| store.find_task(needle)).map(|t| t.id);
+    let code = mutate(store, args, "done", |t| {
         t.set_status(Status::Done);
         t.log("→ done");
-    })
+    });
+    // And its tree, where the work is on the trunk (`wsp-305`). After the
+    // claim is let go, so a claim this verb has just ended does not keep it.
+    if let Some(id) = id.filter(|_| code == 0 && !args.has("keep-tree")) {
+        let out = crate::cmd_checkout::sweep_closed(store, &[id], false);
+        for line in crate::cmd_checkout::closed_lines(&out) {
+            // Beside the receipt, and off stdout under --json, which is one
+            // object a caller parses.
+            match args.json() {
+                true => eprintln!("wsp: {line}"),
+                false => println!("  {}", Paint::new().dim(&line)),
+            }
+        }
+    }
+    code
 }
 
 /// `wsp reopen <id> "what is owed"` — sending work back, as one act.
@@ -4034,6 +4049,54 @@ pub(crate) mod tests {
 
     fn parse(line: &[&str]) -> Args {
         Args::parse(line.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    /// `wsp-305`, at the verb: `done` takes the row's tree when its work is on
+    /// the trunk, and `--keep-tree` leaves it.
+    #[test]
+    fn done_takes_a_landed_rows_tree_and_keep_tree_leaves_it() {
+        let env = util::isolated("done-tree");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "--quiet", "-b", "master"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "--quiet", "-m", "first"]);
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut trees = Vec::new();
+        for id in ["p-001", "p-002"] {
+            let mut t = Task::new("a row", id);
+            t.project = Some("p".into());
+            t.set_status(Status::Review);
+            store.save_task(&t).unwrap();
+            let dir = crate::cmd_checkout::checkout_dir(&repo, id);
+            crate::cmd_checkout::ensure(&repo, &dir, id, "master").unwrap();
+            trees.push(dir);
+        }
+
+        assert_eq!(done(&store, &parse(&["done", "p-001"])), 0);
+        assert!(!trees[0].exists(), "a done row whose work is on the trunk kept its tree");
+        assert_eq!(done(&store, &parse(&["done", "p-002", "--keep-tree"])), 0);
+        assert!(trees[1].join(".git").exists(), "--keep-tree did not keep it");
+        assert_eq!(store.task("p-002").unwrap().status(), Status::Done);
     }
 
     fn scratch_file(name: &str, text: &str) -> String {

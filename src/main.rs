@@ -1612,7 +1612,10 @@ fn help_text() -> String {
                                     block by hand writes --holds in their name.
                                     --caption is required: the reason in under
                                     60, read after the holds/blocks wsp adds
-  wsp done <id> [--force]           complete; --force over open sub-tasks
+  wsp done <id> [--force]           complete; --force over open sub-tasks. Its
+                                    worktree and branch go too when the work is
+                                    on the trunk and nobody is in it; otherwise
+                                    kept and said why. --keep-tree leaves it
   wsp block <id> "reason"           stop it: somebody owes you an answer
   wsp park <id> "reason"            not yet, deliberately — say what brings
                                     it back. Open work, sorted last and drawn
