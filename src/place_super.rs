@@ -258,6 +258,45 @@ pub(crate) fn last_written(dir: &Path) -> Option<i64> {
     files.chain(secs(dir)).max()
 }
 
+/// The ledger of what stopped seats spent, one JSON line each, beside the seat
+/// roots (`<state>/spent.jsonl`). `stop()` deletes the seat's directory and
+/// its `burn.json` with it; this is the one copy that outlives it (wsp-264).
+pub(crate) const SPENT_FILE: &str = "spent.jsonl";
+
+/// Append the seat's burn record to the ledger before its directory goes.
+/// Best effort and silent: a stop that cannot write a receipt still stops.
+/// Same field names as `wsp burn --json`, so one reader serves both.
+pub(crate) fn bank_burn(dir: &Path) {
+    let rec = read_json(&dir.join(BURN_FILE));
+    if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
+        return;
+    }
+    let (Some(seat), Some(state)) = (
+        dir.file_name().map(|n| n.to_string_lossy().to_string()),
+        dir.parent().and_then(|r| r.parent()),
+    ) else {
+        return;
+    };
+    let n = |k: &str| rec.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let line = serde_json::json!({
+        "seat": seat,
+        "ended": util::now_iso(),
+        "session_id": str_of(&rec, "session_id"),
+        "model": str_of(&rec, "model"),
+        "turns": n("turns"),
+        "input": n("input"),
+        "output": n("output"),
+        "cache_read": n("cache_read"),
+        "cache_write": n("cache_write"),
+        "cost": crate::cmd_burn::cost_of(&rec),
+    });
+    if let Ok(mut f) =
+        fs::OpenOptions::new().create(true).append(true).open(state.join(SPENT_FILE))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Every seat's burn record under one root, seat id attached.
 ///
 /// The reading half of [`tally_burn`] (`core-049`): the ranking is a question
@@ -1294,6 +1333,7 @@ impl Place for Supervisor<'_> {
         // always going to be — the seat's directory holds a copy of the stream
         // and the orders it was given, and neither is the thing to keep a
         // directory per dead agent for.
+        bank_burn(&dir);
         fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
         Ok(())
     }
@@ -1763,6 +1803,31 @@ mod tests {
             ],
             "a seat that was already open was announced as news, or a change was missed"
         );
+    }
+
+    /// wsp-264: stop() deletes the seat's directory, burn.json with it; the
+    /// ledger beside the seat root keeps one line equal to that record.
+    #[test]
+    fn stop_leaves_the_seats_burn_in_the_ledger() {
+        let base = std::env::temp_dir()
+            .join(format!("wsp-ledger-{}-{}", std::process::id(), util::epoch_nanos()));
+        let place = Supervisor { poll: Duration::from_millis(10), ..Supervisor::at(base.join("seats")) };
+        fs::create_dir_all(base.join("seats")).unwrap();
+        let seat = place.open(&Order::default()).unwrap();
+        let burn = json!({ "session_id": "s-1", "model": "claude-sonnet-5-5", "turns": 7,
+            "input": 1_234_567, "output": 89_012, "cache_read": 345_678_901,
+            "cache_write": 2_345_678, "cost": 4_321_987 });
+        fs::write(base.join("seats").join(seat.as_str()).join(BURN_FILE), burn.to_string()).unwrap();
+        place.stop(&seat).expect("the seat was there");
+        assert!(!base.join("seats").join(seat.as_str()).exists());
+        let text = fs::read_to_string(base.join(SPENT_FILE)).expect("a ledger");
+        let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        for k in ["session_id", "model", "turns", "input", "output", "cache_read", "cache_write", "cost"] {
+            assert_eq!(line[k], burn[k], "{k}");
+        }
+        assert_eq!(line["seat"], seat.as_str());
+        assert_eq!(text.lines().count(), 1);
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// A hook that arrives after the seat has been ended does not bring it back.

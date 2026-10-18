@@ -570,6 +570,66 @@ fn live(store: &Store, a: &mut Attempt) {
     }
 }
 
+/// The `attempts --json` objects. The token and dollar keys are exact, from
+/// `cmd_burn::reading(pane)` (live burn, else the stop ledger), when the pane
+/// served only one attempt among `rows`: then `input_tokens` is fresh input
+/// alone, `cache_write_tokens` is kept apart, and `exact` is true. A pane that
+/// served two attempts, or has no reading, keeps the log clause's rounded
+/// figures (input there includes cache writes) and says `exact: false`.
+fn attempts_json(rows: &[Attempt]) -> Vec<serde_json::Value> {
+    attempts_json_with(rows, &|pane| crate::cmd_burn::reading(pane))
+}
+
+fn attempts_json_with(
+    rows: &[Attempt],
+    read: &dyn Fn(&str) -> Option<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|a| {
+            let alone = !a.pane.is_empty() && rows.iter().filter(|b| b.pane == a.pane).count() == 1;
+            let exact = if alone { read(&a.pane) } else { None };
+            let num = |k: &str| exact.as_ref().and_then(|r| r.get(k)).and_then(|v| v.as_u64());
+            let (input, output, cache, write, micros) = match &exact {
+                Some(_) => (
+                    json!(num("input")),
+                    json!(num("output")),
+                    json!(num("cache_read")),
+                    json!(num("cache_write")),
+                    json!(num("cost")),
+                ),
+                None => (
+                    json!(a.spend.input),
+                    json!(a.spend.output),
+                    json!(a.spend.cache),
+                    json!(null),
+                    json!(a.spend.micros),
+                ),
+            };
+            json!({
+                "task": a.task,
+                "leg": a.leg,
+                "title": a.title,
+                "at": a.at,
+                "pane": a.pane,
+                "spawned_at": a.spawned,
+                "ran_at": a.ran,
+                "turns": match num("turns") { Some(t) => t as usize, None => a.turns },
+                "peak_tokens": a.peak,
+                "cache_tokens": cache,
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_write_tokens": write,
+                "usd_micros": micros,
+                "exact": exact.is_some(),
+                "released_at": a.until,
+                "reviewed_at": a.reviewed,
+                "seconds": a.seconds(),
+                "outcome": a.outcome.as_str(),
+            })
+        })
+        .collect()
+}
+
 pub fn attempts(store: &Store, args: &Args) -> i32 {
     if args.has("cost") && args.get("list").is_some_and(|l| l != "true") {
         return cost_report(store, args, Vec::new());
@@ -599,30 +659,7 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
     }
 
     if args.json() {
-        println!(
-            "{}",
-            json!({
-                "attempts": rows.iter().map(|a| json!({
-                    "task": a.task,
-                    "leg": a.leg,
-                    "title": a.title,
-                    "at": a.at,
-                    "pane": a.pane,
-                    "spawned_at": a.spawned,
-                    "ran_at": a.ran,
-                    "turns": a.turns,
-                    "peak_tokens": a.peak,
-                    "cache_tokens": a.spend.cache,
-                    "input_tokens": a.spend.input,
-                    "output_tokens": a.spend.output,
-                    "usd_micros": a.spend.micros,
-                    "released_at": a.until,
-                    "reviewed_at": a.reviewed,
-                    "seconds": a.seconds(),
-                    "outcome": a.outcome.as_str(),
-                })).collect::<Vec<_>>(),
-            })
-        );
+        println!("{}", json!({ "attempts": attempts_json(&rows) }));
         return 0;
     }
 
@@ -1056,6 +1093,38 @@ mod tests {
         let mut t = Task::new("a task", "t-1");
         t.body = format!("## Log\n{}\n", log.join("\n"));
         t
+    }
+
+    /// wsp-264: a pane with a reading gives exact fields, cache write apart; a
+    /// pane two attempts shared, or with no reading, says `exact: false`.
+    #[test]
+    fn an_attempt_with_a_reading_is_exact_and_a_shared_pane_is_not() {
+        let t = task(&[
+            "- 2026-08-18T09:00:00Z claimed by pane cpd-1 · spawned at sonnet/high",
+            "- 2026-08-18T10:00:00Z released after 1h · ran sonnet-5-5/high · 9 turns · 5.00M cache 1.50M in 60k out",
+            "- 2026-08-18T11:00:00Z claimed by pane cpd-2",
+            "- 2026-08-18T12:00:00Z released after 1h · ran sonnet-5-5/high · 4 turns",
+            "- 2026-08-18T13:00:00Z claimed by pane cpd-2",
+            "- 2026-08-18T14:00:00Z released after 1h · ran sonnet-5-5/high · 4 turns",
+        ]);
+        let rows = attempts_of(&t);
+        let burn = json!({ "turns": 9, "input": 1_234_567, "output": 59_999, "cache_read": 4_999_999,
+            "cache_write": 265_433, "cost": 777_001 });
+        let out = attempts_json_with(&rows, &|pane| (pane == "cpd-1" || pane == "cpd-2").then(|| burn.clone()));
+        assert_eq!(out.len(), 3);
+        let a = &out[0];
+        assert_eq!(a["exact"], true);
+        assert_eq!(
+            (a["input_tokens"].as_u64(), a["output_tokens"].as_u64(), a["cache_tokens"].as_u64(),
+             a["cache_write_tokens"].as_u64(), a["usd_micros"].as_u64()),
+            (Some(1_234_567), Some(59_999), Some(4_999_999), Some(265_433), Some(777_001))
+        );
+        for shared in &out[1..] {
+            assert_eq!(shared["exact"], false, "two attempts, one pane");
+            assert!(shared["cache_write_tokens"].is_null());
+        }
+        let none = attempts_json_with(&rows[..1], &|_| None);
+        assert_eq!(none[0]["exact"], false);
     }
 
     /// The two clauses this task added, read back off the lines they were

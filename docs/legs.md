@@ -515,6 +515,20 @@ price table now carries the cache-read multiplier per row: Opus 5.5 and Sonnet
 5.5 at 0.05x, Fable 5.1 and Mythos 5.1 at 0.025x. Haiku 5.5's prompt-length
 tiers are not modelled.
 
+*Exact spend (wsp-264):* `attempts --json` keeps its keys and adds
+`cache_write_tokens` and `exact`. A seat's burn is deleted with its directory, so
+`stop()` first appends its `burn.json` to `<state>/spent.jsonl` (`seat`, `ended`,
+`session_id`, `model`, `turns`, `input`, `output`, `cache_read`, `cache_write`,
+`cost`, the names `wsp burn --json` uses). `cmd_burn::reading(seat)` is the live
+record if the directory has one, else the newest ledger line. An attempt whose pane
+served only that attempt in the output takes `input_tokens`, `output_tokens`,
+`cache_tokens` (cache read), `cache_write_tokens` and `usd_micros` (burn's `cost`)
+from it as exact integers, with `exact: true`; here `input_tokens` is fresh input
+alone. Otherwise the log clause's rounded figures stay (input there includes cache
+writes), `cache_write_tokens` is null, `usd_micros` is whatever the runtime
+published (null for Claude Code) and `exact` is false. Seats stopped before this
+leg have no ledger line.
+
 ## Seen
 
 - **wip and census.** A leg holds no claim, so `wip` reads running legs off

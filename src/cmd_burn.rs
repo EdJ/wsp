@@ -312,6 +312,37 @@ fn fleet() -> Vec<(String, serde_json::Value)> {
     seats
 }
 
+/// What a seat spent, exactly: its live `burn.json` if its directory still has
+/// one, else the newest line the ledger (`<state>/spent.jsonl`, written by
+/// `stop()`) holds for it. The record has `wsp burn --json`'s fields, so a
+/// figure read through here matches `burn` by construction (wsp-264).
+pub(crate) fn reading(seat: &str) -> Option<serde_json::Value> {
+    reading_in(&crate::store::Store::open().state, seat)
+}
+
+pub(crate) fn reading_in(state: &std::path::Path, seat: &str) -> Option<serde_json::Value> {
+    for root in ["seats", "compound-seats"] {
+        let rec = crate::place_super::read_json(&state.join(root).join(seat).join("burn.json"));
+        if n(&rec, "turns") > 0 {
+            return Some(json!({
+                "seat": seat,
+                "model": rec.get("model").cloned().unwrap_or(json!("")),
+                "turns": n(&rec, "turns"),
+                "input": n(&rec, "input"),
+                "output": n(&rec, "output"),
+                "cache_read": n(&rec, "cache_read"),
+                "cache_write": n(&rec, "cache_write"),
+                "cost": cost_of(&rec),
+            }));
+        }
+    }
+    let text = std::fs::read_to_string(state.join(crate::place_super::SPENT_FILE)).ok()?;
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("seat").and_then(|s| s.as_str()) == Some(seat))
+        .last()
+}
+
 fn str_or_dash(v: &serde_json::Value, key: &str) -> String {
     match v.get(key).and_then(|x| x.as_str()).unwrap_or("") {
         "" => "—".to_string(),
@@ -353,6 +384,29 @@ mod tests {
             json!({ "turns": turns, "output": output, "cost": output * 100 }).to_string(),
         )
         .unwrap();
+    }
+
+    /// wsp-264: a live burn.json is what `reading` returns; once the directory
+    /// is gone the newest ledger line for the seat is; a seat in neither is None.
+    #[test]
+    fn reading_prefers_the_live_record_over_the_ledger() {
+        let iso = crate::util::isolated("reading");
+        let state = iso.state();
+        let ledger = |seat: &str, cost: u64| {
+            json!({ "seat": seat, "turns": 3, "input": 1, "output": 2, "cache_read": 3,
+                "cache_write": 4, "cost": cost })
+                .to_string()
+        };
+        std::fs::write(
+            state.join("spent.jsonl"),
+            format!("{}\n{}\n{}\n", ledger("cpd-1", 10), ledger("cpd-2", 20), ledger("cpd-1", 30)),
+        )
+        .unwrap();
+        assert_eq!(reading_in(&state, "cpd-1").unwrap()["cost"], 30, "the newest line");
+        assert!(reading_in(&state, "cpd-9").is_none());
+        seat(&state, "compound-seats", "cpd-1", 5, 7);
+        let live = reading_in(&state, "cpd-1").unwrap();
+        assert_eq!((live["turns"].as_u64(), live["cost"].as_u64()), (Some(5), Some(700)));
     }
 
     /// `core-056`: Sonnet 5's $3/$15 step was cancelled, so $2/$10 is its

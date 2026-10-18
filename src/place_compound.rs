@@ -1388,6 +1388,7 @@ impl Place for Compound<'_> {
         // gone and nobody asked it to stop) is filed; this is the one seat
         // this call just ended.
         self.end_process(seat, &rec);
+        crate::place_super::bank_burn(&dir);
         fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
         Ok(())
     }
