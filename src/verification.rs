@@ -563,9 +563,11 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         serde_json::json!({ "id": member.id, "verdict": state.as_str(), "caption": caption, "read": pass.read, "pane": pass.pane }),
     );
     store.git_commit(&format!("wsp: verified {} {} — {}", member.id, state.as_str(), member.title));
-    // A row run as legs has no one agent to tell: the rework leg carries the verdict.
-    if state == State::Blocks && !crate::legs::staged(&member) {
-        crate::cmd_task::deliver_reason(store, &member.id, text.trim());
+    // A row run as legs has no one agent to tell while its rework leg carries the
+    // verdict. With no rework leg (the row is at the leg cap) nothing does, so the
+    // reason is delivered as for any member sent back.
+    if state == State::Blocks {
+        deliver_unless_reworked(store, &member.id, &text);
     }
     crate::cycle::poke_task(store, &member.id, "verified");
 
@@ -580,6 +582,15 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         println!("  {}", p.dim("sent back to doing with your verdict as what is owed; its governor is told"));
     }
     0
+}
+
+/// A blocking verdict's reason, told to the member's pane unless a rework leg
+/// carries it.
+pub(crate) fn deliver_unless_reworked(store: &Store, member: &str, text: &str) {
+    let reworked = store.find_task(member).is_some_and(|t| crate::legs::rework_open(&crate::legs::legs(&t)));
+    if !reworked {
+        crate::cmd_task::deliver_reason(store, member, text.trim());
+    }
 }
 
 /// The store half of [`verified`]: the pass written, and the member moved when

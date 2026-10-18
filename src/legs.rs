@@ -880,6 +880,12 @@ fn dearness(p: &Policy) -> (u8, u8) {
     (model, effort)
 }
 
+/// Whether the record ends in a rework leg that has not finished: a blocked row
+/// that has a leg to go back to. False at the leg cap, where none could be added.
+pub(crate) fn rework_open(legs: &[Leg]) -> bool {
+    legs.last().is_some_and(|l| l.rework.is_some() && matches!(l.state, State::Pending | State::Running))
+}
+
 /// The record a blocking verdict leaves: one `rework` leg appended, waiting on
 /// the last leg and becoming it, whose order is the verdict.
 ///
@@ -889,7 +895,7 @@ fn dearness(p: &Policy) -> (u8, u8) {
 /// but the default. `Ok(None)` when a rework is already outstanding at the end of
 /// the record — a verdict recorded twice is one send-back, not two.
 pub(crate) fn rework(old: &[Leg], verdict: &str) -> Result<Option<Vec<Leg>>, String> {
-    if old.last().is_some_and(|l| l.rework.is_some() && matches!(l.state, State::Pending | State::Running)) {
+    if rework_open(old) {
         return Ok(None);
     }
     if old.len() >= MAX_LEGS {

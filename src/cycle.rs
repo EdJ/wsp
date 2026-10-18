@@ -715,9 +715,15 @@ fn told_verdict(store: &Store, w: &Worklist, t: &Task) {
         util::truncate(&t.title, 60),
         p.read.as_deref().map(|r| format!(" — it read {r}")).unwrap_or_default(),
         t.id,
-        match crate::legs::staged(t) {
-            true => "It runs as legs: wsp appended a `rework` leg after the last, whose order is the verdict, and starts it.",
-            false => "The run waits for it to land again.",
+        match (crate::legs::staged(t), crate::legs::rework_open(&crate::legs::legs(t))) {
+            (_, true) => "It runs as legs: wsp appended a `rework` leg after the last, whose order is the verdict, and starts it.".to_string(),
+            (true, false) => format!(
+                "It runs as legs and is at the {}-leg cap, so NO rework leg was added and nothing will start: it is yours to decide. \
+                 The verdict: {}. Split the row into new rows, or record that the finding is wrong with `wsp verified --holds`.",
+                crate::legs::MAX_LEGS,
+                util::truncate(&p.text, 400)
+            ),
+            (false, _) => "The run waits for it to land again.".to_string(),
         },
         t.id
     ));
@@ -6116,9 +6122,11 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(embedded.last().unwrap().rework.as_deref().unwrap().is_empty());
     }
 
-    /// A row at the leg cap has no room for a rework leg, and says so on its row.
+    /// A row at the leg cap has no room for a rework leg: it says so on its row,
+    /// the verdict still reaches whoever is on the row, and the governor is told
+    /// there is no rework leg rather than that one was added.
     #[test]
-    fn a_row_at_the_leg_cap_gets_no_rework_leg_and_says_why() {
+    fn a_row_at_the_leg_cap_gets_no_rework_leg_and_its_governor_and_pane_are_told_the_truth() {
         let (_env, store) = scratch("legs-rework-cap");
         task(&store, "m-1", Status::Review);
         let mut all: Vec<crate::legs::Leg> = (0..crate::legs::MAX_LEGS)
@@ -6126,11 +6134,51 @@ fn only_a_working_screen_is_ever_overruled() {
             .collect();
         all[0].after = Some(Vec::new());
         edit_legs(&store, "m-1", |_| Ok(all.clone()));
-        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "no", None, None).unwrap();
+        store.set_binding("cpd-7", serde_json::json!({ "task_id": "m-1" }));
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let _ = drained(&TOLD);
+        let _ = drained(&MEMBER_TOLD);
+
+        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "the second caller is untested", None, None).unwrap();
         let t = store.find_task("m-1").unwrap();
         assert_eq!(crate::legs::legs(&t).len(), crate::legs::MAX_LEGS);
+        assert!(!crate::legs::rework_open(&crate::legs::legs(&t)));
         let log = t.section("Log").unwrap_or_default().to_string();
         assert!(log.contains("no rework leg was added") && log.contains("governor decides"), "{log}");
+
+        crate::verification::deliver_unless_reworked(&store, "m-1", "the second caller is untested");
+        assert_eq!(drained(&MEMBER_TOLD).len(), 1, "nothing carries the verdict, so the pane is told it");
+
+        told_verdict(&store, &w, &t);
+        let told = drained(&TOLD).join("\n");
+        assert!(told.contains("NO rework leg") && told.contains("the second caller is untested"), "{told}");
+        assert!(!told.contains("appended a `rework` leg"), "and it does not claim one: {told}");
+    }
+
+    /// And with a rework leg, the leg carries the verdict: the pane is not told twice
+    /// and the governor is told one was appended.
+    #[test]
+    fn with_a_rework_leg_the_verdict_is_not_also_delivered_to_the_pane() {
+        let (_env, store) = scratch("legs-rework-told");
+        staged(&store, "m-1", Status::Review);
+        leg_done_by_hand(&store);
+        store.set_binding("cpd-7", serde_json::json!({ "task_id": "m-1" }));
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let _ = drained(&TOLD);
+        let _ = drained(&MEMBER_TOLD);
+        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "it is thin", None, None).unwrap();
+        crate::verification::deliver_unless_reworked(&store, "m-1", "it is thin");
+        assert!(drained(&MEMBER_TOLD).is_empty());
+        told_verdict(&store, &w, &store.find_task("m-1").unwrap());
+        assert!(drained(&TOLD).join("\n").contains("appended a `rework` leg"));
+    }
+
+    fn leg_done_by_hand(store: &Store) {
+        edit_legs(store, "m-1", |old| {
+            let mut v = old.to_vec();
+            v[0].state = crate::legs::State::Done;
+            Ok(v)
+        });
     }
 
     /// A row staged and spawned by hand has no list to step it: the launch from
