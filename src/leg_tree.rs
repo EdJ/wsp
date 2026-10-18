@@ -134,6 +134,102 @@ pub(crate) fn open(root: &str, task: &str, leg: &str) -> Result<Opened, String> 
     Ok(Opened { path: util::contract(&dir), dir, name, from })
 }
 
+// ---- opening a leg, from the spawn -----------------------------------------------
+
+/// Where a leg's seat stands and what it was told on the way there.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Prepared {
+    /// The tree to open in, as `~/…`, when it is not the row's.
+    pub cwd: Option<String>,
+    /// The tree's name, for the entry's `tree` clause.
+    pub tree: Option<String>,
+    /// The join's account, for the entry and so the brief.
+    pub join: Option<String>,
+}
+
+/// The cap on the join's account, as an order's.
+const JOIN_TEXT: usize = legs::TEXT_CAP;
+
+/// What a leg's spawn does before its seat opens: merge what the leg waits on
+/// into the row's branch, and cut a tree of its own if it has siblings.
+///
+/// `row_cwd` is the row's tree, which the spawn has just made or found, and
+/// `root` the project root the trees are cut in. A leg that is not ready, or is
+/// already running, is left to `leg_seat::open` and to its own record: a leg that
+/// was opened before reopens in the tree its entry names, and nothing is merged
+/// twice. An `Err` is a tree that could not be made, and the leg must not open
+/// in the row's tree instead: that is the tree its sibling's merge goes into.
+pub(crate) fn prepare(store: &Store, root: &str, row_cwd: &str, task: &str, name: &str) -> Result<Prepared, String> {
+    let Some(t) = store.find_task(task) else { return Ok(Prepared::default()) };
+    let all = legs::legs(&t);
+    let Some(leg) = all.iter().find(|l| l.name == name) else { return Ok(Prepared::default()) };
+    match leg.state {
+        State::Running => {
+            return Ok(match &leg.tree {
+                Some(tree) => Prepared { cwd: Some(tree_path(row_cwd, tree)), ..Prepared::default() },
+                None => Prepared::default(),
+            });
+        }
+        State::Pending if legs::ready(&all).iter().any(|r| r == name) => {}
+        _ => return Ok(Prepared::default()),
+    }
+    let row_dir = util::expand(row_cwd);
+    let joined = join(&row_dir, &all, name);
+    let mut lines: Vec<String> = joined.brief().into_iter().collect();
+    // What the legs it waits on both touched, read from their branches.
+    let waits: Vec<(String, String)> = inbound(&all, name);
+    let mut told = BTreeSet::new();
+    for (from, _) in &waits {
+        if let Some(line) = overlap_line(from, &overlaps(&row_dir, &all, from)) {
+            if told.insert(line.clone()) {
+                lines.push(line);
+            }
+        }
+    }
+    let mut join_text = lines.join("\n");
+    if join_text.chars().count() > JOIN_TEXT {
+        join_text = join_text.chars().take(JOIN_TEXT - 1).collect::<String>() + "…";
+    }
+    let join_text = Some(join_text).filter(|j| !j.is_empty());
+    if !has_siblings(&all, name) {
+        return Ok(Prepared { cwd: None, tree: None, join: join_text });
+    }
+    let o = open(root, task, name)?;
+    Ok(Prepared { cwd: Some(o.path), tree: Some(o.name), join: join_text })
+}
+
+/// A tree's path beside the row's: both are directories under `.worktrees/`.
+fn tree_path(row_cwd: &str, tree: &str) -> String {
+    let row = util::expand(row_cwd);
+    let path = row.parent().map(|p| p.join(tree)).unwrap_or_else(|| PathBuf::from(tree));
+    util::contract(&path)
+}
+
+/// Put what [`prepare`] did onto the leg's entry, under the store lock.
+pub(crate) fn record(store: &Store, task: &str, name: &str, p: &Prepared) {
+    if p.tree.is_none() && p.join.is_none() {
+        return;
+    }
+    store.locked(|| {
+        let Some(mut t) = store.find_task(task) else { return };
+        let mut all = legs::legs(&t);
+        let Some(leg) = all.iter_mut().find(|l| l.name == name) else { return };
+        leg.tree = p.tree.clone().or(leg.tree.take());
+        leg.join = p.join.clone().or(leg.join.take());
+        legs::write(&mut t, &all);
+        let _ = store.save_task(&t);
+    });
+}
+
+/// `leg done`'s line for a sibling: the paths it changed that another sibling's
+/// branch has also changed. `dir` is any directory of the repository.
+pub(crate) fn overlap_for(dir: &Path, task: &str, all: &[Leg], leg: &str) -> Option<String> {
+    let trunk = cmd_checkout::trunk(dir)?;
+    let row_dir = cmd_checkout::checkout_dir(&trunk, task);
+    row_dir.join(".git").exists().then_some(())?;
+    overlap_line(leg, &overlaps(&row_dir, all, leg))
+}
+
 // ---- the merge back --------------------------------------------------------------
 
 /// One branch merged into the row's.
@@ -528,7 +624,7 @@ mod tests {
         ]
     }
 
-    fn record(store: &Store, legs: &[Leg]) {
+    fn record_legs_into(store: &Store, legs: &[Leg]) {
         let mut t = store.task("p-001").unwrap();
         legs::write(&mut t, legs);
         store.save_task(&t).unwrap();
@@ -552,7 +648,7 @@ mod tests {
             legs.iter_mut().find(|l| l.name == name).unwrap().tree = Some(o.name);
             dirs.push(o.dir);
         }
-        record(store, &legs);
+        record_legs_into(store, &legs);
         (legs, dirs.remove(0), dirs.remove(0))
     }
 
@@ -626,7 +722,7 @@ mod tests {
         for l in legs.iter_mut() {
             l.ending = crate::verification::Ending::Ended;
         }
-        record(&store, &legs);
+        record_legs_into(&store, &legs);
         let out = sweep(&store, &nobody);
         assert_eq!(out.len(), 2, "{}", out.len());
         assert!(out.iter().all(|t| matches!(t, Tree::Removed { kept: None, .. })));
@@ -670,7 +766,7 @@ mod tests {
         for l in over.iter_mut() {
             l.state = State::Done;
         }
-        record(&store, &over);
+        record_legs_into(&store, &over);
         let kept: Vec<_> = sweep(&store, &nobody);
         let blocked: Vec<&Tree> = kept.iter().filter(|t| matches!(t, Tree::Kept { .. })).collect();
         assert_eq!(blocked.len(), 2, "b and c are not merged");
@@ -742,13 +838,13 @@ mod tests {
         assert!(a.exists());
 
         legs.iter_mut().find(|l| l.name == "a").unwrap().state = State::Running;
-        record(&store, &legs);
+        record_legs_into(&store, &legs);
         sweep(&store, &nobody);
         assert!(a.exists(), "a running leg's tree was swept");
 
         // A closed row's trees are the row's to take, not this sweep's.
         legs.iter_mut().find(|l| l.name == "a").unwrap().state = State::Done;
-        record(&store, &legs);
+        record_legs_into(&store, &legs);
         let mut t = store.task("p-001").unwrap();
         t.set_status(crate::model::Status::Done);
         store.save_task(&t).unwrap();
@@ -763,7 +859,7 @@ mod tests {
         run(&repo, &["worktree", "add", "--quiet", "-b", "nolist.leg", &stranger.display().to_string(), "master"]);
         let unknown_leg = repo.join(WORKTREES).join("p-001.nothing");
         run(&repo, &["worktree", "add", "--quiet", "-b", "p-001.nothing", &unknown_leg.display().to_string(), "master"]);
-        record(&store, &graph());
+        record_legs_into(&store, &graph());
         assert!(sweep(&store, &nobody).is_empty());
         assert!(stranger.exists() && unknown_leg.exists() && row.exists());
     }
@@ -818,5 +914,62 @@ mod tests {
         let names: Vec<&str> = found.iter().map(|s| s.task.as_str()).collect();
         assert!(names.contains(&"p-001.b"), "{names:?}");
         assert!(b_dir.exists());
+    }
+
+    /// What the spawn does: a sibling is cut a tree off the row's tip, a join
+    /// merges first and carries the account on its entry, and a chain leg is
+    /// left in the row's tree.
+    #[test]
+    fn the_spawns_prepare_cuts_siblings_trees_and_merges_at_the_join() {
+        let (_env, store, repo, row) = scratch("prepare");
+        let row_cwd = util::contract(&row);
+        let mut legs = graph();
+        for n in ["a", "b"] {
+            legs.iter_mut().find(|l| l.name == n).unwrap().state = State::Pending;
+        }
+        record_legs(&store, &legs);
+
+        let a = prepare(&store, &root(&repo), &row_cwd, "p-001", "a").unwrap();
+        let b = prepare(&store, &root(&repo), &row_cwd, "p-001", "b").unwrap();
+        assert_eq!((a.tree.as_deref(), b.tree.as_deref()), (Some("p-001.a"), Some("p-001.b")));
+        assert!(a.cwd.as_deref().unwrap().ends_with(".worktrees/p-001.a"), "{:?}", a.cwd);
+        assert_eq!(a.join, None);
+        // The plan has no siblings and stands in the row's tree.
+        assert_eq!(prepare(&store, &root(&repo), &row_cwd, "p-001", "plan").unwrap(), Prepared::default());
+        // A leg that is not ready is left for `open` to refuse, with nothing made.
+        assert_eq!(prepare(&store, &root(&repo), &row_cwd, "p-001", "fin").unwrap(), Prepared::default());
+        assert!(!repo.join(WORKTREES).join("p-001.fin").exists());
+
+        // Both legs work and finish; their trees are on their entries.
+        let mut done = graph();
+        for (n, pr, file) in [("a", &a, "shared.txt"), ("b", &b, "shared.txt")] {
+            let dir = repo.join(WORKTREES).join(pr.tree.as_deref().unwrap());
+            commit(&dir, file, &format!("{n}\n"));
+            done.iter_mut().find(|l| l.name == n).unwrap().tree = pr.tree.clone();
+        }
+        record_legs(&store, &done);
+        let fin = prepare(&store, &root(&repo), &row_cwd, "p-001", "fin").unwrap();
+        assert_eq!(fin.cwd, None, "the last leg stands in the row's tree");
+        let text = fin.join.clone().unwrap();
+        assert!(text.contains("merged a") && text.contains("CONFLICT merging b") && text.contains("shared.txt"), "{text}");
+        assert_eq!(cmd_checkout::uncommitted(&row), 0);
+
+        // It rides on the entry, through the record's own text, into the brief.
+        record(&store, "p-001", "fin", &fin);
+        let t = store.task("p-001").unwrap();
+        let back = legs::legs(&t);
+        assert_eq!(back.iter().find(|l| l.name == "fin").unwrap().join.as_deref(), Some(text.as_str()));
+        let mut running = back.clone();
+        let f = running.iter_mut().find(|l| l.name == "fin").unwrap();
+        f.state = State::Running;
+        f.pane = Some("cpd-9".into());
+        let mut t = t;
+        legs::write(&mut t, &running);
+        let lines = crate::leg_seat::brief_lines(&[t], "cpd-9").unwrap().join("\n");
+        assert!(lines.contains("the join:") && lines.contains("CONFLICT merging b"), "{lines}");
+    }
+
+    fn record_legs(store: &Store, legs: &[Leg]) {
+        record_legs_into(store, legs);
     }
 }

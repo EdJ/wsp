@@ -2426,6 +2426,27 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
         _ => cwd,
     };
+    // A leg with siblings stands in a tree of its own, cut from the row's tip once
+    // what it waits on is merged there (`leg_tree`, wsp-297). Before the order is
+    // composed, because the tree is where the seat opens.
+    let mut prepared = crate::leg_tree::Prepared::default();
+    let cwd = match (&leg_rec, work.task.as_deref(), cwd.as_deref(), &leg_name) {
+        (Some(_), Some(task), Some(row_cwd), Some(name)) if !no_tree => {
+            let root = work.project.as_deref().and_then(|p| index.root_for(p, &refs)).unwrap_or_else(|| row_cwd.to_string());
+            match crate::leg_tree::prepare(store, &root, row_cwd, task, name) {
+                Ok(p) => {
+                    let here = p.cwd.clone().or(cwd.clone());
+                    prepared = p;
+                    here
+                }
+                Err(why) => {
+                    eprintln!("wsp: {why}");
+                    return 1;
+                }
+            }
+        }
+        _ => cwd,
+    };
     // A bare terminal may stand anywhere; an agent may not, see [`grounded`].
     if args.has("agent") || args.has("govern") {
         if let Err(e) = grounded(&index, cwd.as_deref()) {
@@ -2502,6 +2523,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: {why}");
             return 1;
         }
+        crate::leg_tree::record(store, task, name, &prepared);
     }
     let seat = match place.open(&order) {
         Ok(v) => v,

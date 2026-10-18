@@ -257,6 +257,14 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     crate::cycle::poke_task(store, &t.id, "leg-done");
     let p = Paint::new();
     println!("{} {}  leg {name} done · {caption}", p.green("✓"), t.id);
+    // A sibling hears early which paths another has also changed; the join's
+    // brief carries the same line, read again from the branches when it opens.
+    let tree_mine = new.iter().find(|l| l.name == name).is_some_and(|l| l.tree.is_some());
+    if let (true, Some(dir)) = (tree_mine, standing_dir(store, pane)) {
+        if let Some(line) = crate::leg_tree::overlap_for(std::path::Path::new(&dir), &t.id, &new, &name) {
+            println!("  {}", p.yellow(&line));
+        }
+    }
     let ready = legs::ready(&new);
     match (ready.is_empty(), legs::lasts(&new).first() == Some(&name)) {
         (_, true) => println!("  {}", p.dim(&format!("{name} is the last leg — `wsp review {} \"…\"` ends the row", t.id))),
@@ -316,6 +324,15 @@ pub(crate) fn brief_lines(tasks: &[Task], pane: &str) -> Option<Vec<String>> {
     )];
     out.extend(legs::table(&all).lines().map(str::to_string));
     out.push(format!("your order: {}", me.order));
+    if let Some(tree) = &me.tree {
+        out.push(format!(
+            "your tree: {tree} (a branch of that name, cut from the row's tip) — you have siblings, so you stand apart; \
+             the join that waits on you merges it"
+        ));
+    }
+    if let Some(join) = &me.join {
+        out.push(format!("the join:\n{join}"));
+    }
     for w in &waits[at] {
         let Some(from) = all.iter().find(|l| &l.name == w) else { continue };
         out.push(match (&from.state, from.baton.is_empty()) {

@@ -140,6 +140,10 @@ pub(crate) struct Leg {
     /// When it was opened and when it finished, RFC 3339. Written by legs-seat.
     pub started: Option<String>,
     pub closed: Option<String>,
+    /// What the spawn did to bring this leg's waits together: the branches it
+    /// merged, the conflict it aborted, the overlaps its siblings reported.
+    /// Written by legs-tree when the leg opens; the leg's brief carries it.
+    pub join: Option<String>,
 }
 
 /// The tier a leg with no policy runs on.
@@ -181,6 +185,7 @@ impl Leg {
             skipped: None,
             started: None,
             closed: None,
+            join: None,
         }
     }
 
@@ -229,6 +234,7 @@ impl Leg {
         field("caption", self.caption.as_deref().unwrap_or_default());
         field("baton", &self.baton);
         field("skipped", self.skipped.as_deref().unwrap_or_default());
+        field("join", self.join.as_deref().unwrap_or_default());
         out
     }
 
@@ -274,7 +280,7 @@ pub(crate) fn legs(t: &Task) -> Vec<Leg> {
             continue;
         }
         let Some((_, fields, key)) = out.last_mut() else { continue };
-        const KEYS: [&str; 6] = ["after", "why", "order", "caption", "baton", "skipped"];
+        const KEYS: [&str; 7] = ["after", "why", "order", "caption", "baton", "skipped", "join"];
         let two = line.strip_prefix("  ").filter(|r| !r.starts_with(' '));
         if let Some((k, v)) = two.and_then(|r| r.split_once(':')).filter(|(k, _)| KEYS.contains(k)) {
             fields.insert(k.to_string(), v.strip_prefix(' ').unwrap_or(v).to_string());
@@ -297,6 +303,7 @@ pub(crate) fn legs(t: &Task) -> Vec<Leg> {
             leg.caption = get("caption");
             leg.baton = get("baton").unwrap_or_default();
             leg.skipped = get("skipped");
+            leg.join = get("join");
             leg
         })
         .collect()
@@ -681,6 +688,9 @@ pub(crate) fn unopen(old: &[Leg], name: &str) -> Vec<Leg> {
         if l.state == State::Running && l.pane.is_none() {
             l.state = State::Pending;
             l.started = None;
+            // Made for this opening (`leg_tree::record`); the next one makes its own.
+            l.tree = None;
+            l.join = None;
         }
     }
     legs
@@ -1015,6 +1025,7 @@ mod tests {
             skipped: None,
             started: Some("2026-10-18T10:00:00Z".into()),
             closed: Some("2026-10-18T10:30:00Z".into()),
+            join: Some("merged a (m-1.a) into the row's branch; it is at abc123".into()),
         };
         let skipped = Leg { skipped: Some("the scout found nothing".into()), state: State::Skipped, ..with("probe", &[]) };
         write(&mut t, &[leg("scout"), skipped.clone(), full.clone()]);
