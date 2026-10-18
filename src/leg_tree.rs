@@ -162,12 +162,18 @@ pub(crate) fn prepare(store: &Store, root: &str, row_cwd: &str, task: &str, name
     let all = legs::legs(&t);
     let Some(leg) = all.iter().find(|l| l.name == name) else { return Ok(Prepared::default()) };
     match leg.state {
-        State::Running => {
+        State::Running if leg.pane.is_some() => {
             return Ok(match &leg.tree {
                 Some(tree) => Prepared { cwd: Some(tree_path(row_cwd, tree)), ..Prepared::default() },
                 None => Prepared::default(),
             });
         }
+        // Opened by the run (`cycle`, wsp-293), which writes `running` under the
+        // store lock before it spawns, so the cap is counted in the same section.
+        // No seat yet means nothing has been prepared for the seat, or a start
+        // that died is being retried; both are safe to do again, since a branch
+        // already merged is passed over and a tree already cut is reused.
+        State::Running => {}
         State::Pending if legs::ready(&all).iter().any(|r| r == name) => {}
         _ => return Ok(Prepared::default()),
     }
@@ -941,6 +947,37 @@ mod tests {
         let names: Vec<&str> = found.iter().map(|s| s.task.as_str()).collect();
         assert!(names.contains(&"p-001.b"), "{names:?}");
         assert!(b_dir.exists());
+    }
+
+    /// The run writes a leg `running` before it spawns it (wsp-293), so that the
+    /// seat's cap is counted with the opening. The spawn must still cut the
+    /// sibling's tree and merge at the join for a leg in that state, and only a
+    /// leg that has a seat is reopened where its entry says.
+    #[test]
+    fn a_leg_the_run_opened_with_no_seat_yet_is_still_prepared() {
+        let (_env, store, repo, row) = scratch("prepare-run");
+        let row_cwd = util::contract(&row);
+        let mut legs = graph();
+        for n in ["a", "b"] {
+            let l = legs.iter_mut().find(|l| l.name == n).unwrap();
+            l.state = State::Running;
+            l.pane = None;
+            l.started = Some(util::now_iso());
+        }
+        record_legs(&store, &legs);
+        let a = prepare(&store, &root(&repo), &row_cwd, "p-001", "a").unwrap();
+        assert_eq!(a.tree.as_deref(), Some("p-001.a"), "cut for a leg the run opened");
+        let again = prepare(&store, &root(&repo), &row_cwd, "p-001", "a").unwrap();
+        assert_eq!(again.tree, a.tree, "and a retried start finds the same tree");
+
+        // Seated, it is reopened in the tree its entry names, and nothing is made.
+        let mut seated = legs.clone();
+        let l = seated.iter_mut().find(|l| l.name == "a").unwrap();
+        l.pane = Some("cpd-2".into());
+        l.tree = a.tree.clone();
+        record_legs(&store, &seated);
+        let back = prepare(&store, &root(&repo), &row_cwd, "p-001", "a").unwrap();
+        assert!(back.cwd.as_deref().unwrap().ends_with(".worktrees/p-001.a") && back.tree.is_none(), "{back:?}");
     }
 
     /// What the spawn does: a sibling is cut a tree off the row's tip, a join

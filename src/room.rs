@@ -209,6 +209,22 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
         }
     }
 
+    // A leg, by the seat on its entry: its pane is bound to the row, so the
+    // binding below would count it too, once and as the row; read here first it
+    // is counted as the leg, and a seat counted is not counted twice. A leg
+    // that has finished is counted only while its seat is seen working.
+    for t in r.tasks.iter().filter(|t| t.body.contains("## Legs")) {
+        for l in crate::legs::legs(t) {
+            let what = crate::legs::label(&t.id, &l.name);
+            let running = l.state == crate::legs::State::Running;
+            match &l.pane {
+                Some(seat) => take(&mut out, Some(seat), what, !running || l.ending != crate::verification::Ending::Standing),
+                None if running && l.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false),
+                None => {}
+            }
+        }
+    }
+
     // A member or a helper: the seat its binding names, and the seat of the
     // agent its claim names — a binding is free to be lost and a claim is not.
     let status = |id: &str| r.tasks.iter().find(|t| t.id == id).map(|t| t.status());

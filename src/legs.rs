@@ -144,6 +144,9 @@ pub(crate) struct Leg {
     /// merged, the conflict it aborted, the overlaps its siblings reported.
     /// Written by legs-tree when the leg opens; the leg's brief carries it.
     pub join: Option<String>,
+    /// For the leg a blocking verdict appended: the legs the verdict named,
+    /// which may be none. `None` is a leg that is not a rework.
+    pub rework: Option<Vec<String>>,
 }
 
 /// The tier a leg with no policy runs on.
@@ -186,6 +189,7 @@ impl Leg {
             started: None,
             closed: None,
             join: None,
+            rework: None,
         }
     }
 
@@ -235,6 +239,9 @@ impl Leg {
         field("baton", &self.baton);
         field("skipped", self.skipped.as_deref().unwrap_or_default());
         field("join", self.join.as_deref().unwrap_or_default());
+        if let Some(of) = &self.rework {
+            field("rework", &if of.is_empty() { "-".to_string() } else { of.join(", ") });
+        }
         out
     }
 
@@ -280,7 +287,7 @@ pub(crate) fn legs(t: &Task) -> Vec<Leg> {
             continue;
         }
         let Some((_, fields, key)) = out.last_mut() else { continue };
-        const KEYS: [&str; 7] = ["after", "why", "order", "caption", "baton", "skipped", "join"];
+        const KEYS: [&str; 8] = ["after", "why", "order", "caption", "baton", "skipped", "join", "rework"];
         let two = line.strip_prefix("  ").filter(|r| !r.starts_with(' '));
         if let Some((k, v)) = two.and_then(|r| r.split_once(':')).filter(|(k, _)| KEYS.contains(k)) {
             fields.insert(k.to_string(), v.strip_prefix(' ').unwrap_or(v).to_string());
@@ -304,6 +311,9 @@ pub(crate) fn legs(t: &Task) -> Vec<Leg> {
             leg.baton = get("baton").unwrap_or_default();
             leg.skipped = get("skipped");
             leg.join = get("join");
+            leg.rework = get("rework").map(|a| {
+                a.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "-").collect()
+            });
             leg
         })
         .collect()
@@ -814,6 +824,102 @@ pub(crate) fn end_by_review(old: &[Leg], name: &str, account: &str, at: &str) ->
     Ok(legs)
 }
 
+// ---- the run ---------------------------------------------------------------------
+
+/// How a leg is named where an agent is counted or a start is held: `wsp-287 · build-store`,
+/// as its seat's label is.
+pub(crate) fn label(task: &str, leg: &str) -> String {
+    format!("{task} · {leg}")
+}
+
+/// Whether a row is run as legs: it has the section. The test the run's repairs
+/// leave a row alone by (`wedged`, `sent_back_unseated`), and not "has a running
+/// leg" — a staged row with no claim is the ordinary state of one.
+pub(crate) fn staged(t: &Task) -> bool {
+    t.section(SECTION).is_some_and(|s| s.lines().any(|l| l.starts_with("- ")))
+}
+
+/// The legs the run may start now, in record order: those ready, and those
+/// opened with no seat long enough ago that the start never arrived.
+pub(crate) fn startable(legs: &[Leg], lost: &dyn Fn(&str) -> bool) -> Vec<(String, bool)> {
+    let ready = ready(legs);
+    legs.iter()
+        .filter_map(|l| match l.state {
+            State::Pending if ready.contains(&l.name) => Some((l.name.clone(), false)),
+            State::Running if l.pane.is_none() && l.started.as_deref().is_some_and(lost) => Some((l.name.clone(), true)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a word of a verdict is the leg's name: the name with nothing that
+/// could continue it on either side.
+fn names(text: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices(name).any(|(i, m)| {
+        !text[..i].chars().next_back().is_some_and(word) && !text[i + m.len()..].chars().next().is_some_and(word)
+    })
+}
+
+/// How dear a policy is, to take the dearest of several: the model by name, then
+/// the effort. A model the table does not know is not cheap.
+fn dearness(p: &Policy) -> (u8, u8) {
+    let m = p.model.as_deref().unwrap_or_default();
+    let model = match () {
+        _ if m.contains("opus") => 3,
+        _ if m.contains("haiku") => 1,
+        _ => 2,
+    };
+    let effort = match p.effort.as_deref() {
+        Some("low") => 1,
+        Some("high") => 3,
+        Some("xhigh") => 4,
+        Some("max") => 5,
+        _ => 2,
+    };
+    (model, effort)
+}
+
+/// The record a blocking verdict leaves: one `rework` leg appended, waiting on
+/// the last leg and becoming it, whose order is the verdict.
+///
+/// It runs on the default tier, unless a leg the verdict names was on another:
+/// then it takes the dearest of those tiers, and that leg's `why:` prefixed
+/// `rework of <leg>:`. A verdict that names no leg gives no reason for anything
+/// but the default. `Ok(None)` when a rework is already outstanding at the end of
+/// the record — a verdict recorded twice is one send-back, not two.
+pub(crate) fn rework(old: &[Leg], verdict: &str) -> Result<Option<Vec<Leg>>, String> {
+    if old.last().is_some_and(|l| l.rework.is_some() && matches!(l.state, State::Pending | State::Running)) {
+        return Ok(None);
+    }
+    if old.len() >= MAX_LEGS {
+        return Err(format!(
+            "{} legs is the {MAX_LEGS} a row carries, rework included — no rework leg was added, and the row's governor decides",
+            old.len()
+        ));
+    }
+    let named: Vec<&Leg> = old.iter().filter(|l| names(verdict, &l.name)).collect();
+    let dearest = named.iter().filter(|l| !is_default(&l.policy)).max_by_key(|l| dearness(&l.policy));
+    let name = (1..).map(|n| if n == 1 { "rework".to_string() } else { format!("rework-{n}") })
+        .find(|n| !old.iter().any(|l| &l.name == n))
+        .unwrap_or_default();
+    let verdict = verdict.trim();
+    let head = "The verifier blocked this row. Its verdict, which is what is owed:\n\n";
+    let mut leg = Leg::pending(&name, &format!("{head}{}", util::truncate(verdict, TEXT_CAP - head.chars().count())));
+    if let Some(d) = dearest {
+        leg.policy = d.policy.clone();
+        leg.why = Some(format!("rework of {}: {}", d.name, d.why.as_deref().unwrap_or_default()));
+    }
+    leg.rework = Some(named.iter().map(|l| l.name.clone()).collect());
+    let after = lasts(old);
+    let implicit: Vec<String> = old.last().map(|l| vec![l.name.clone()]).unwrap_or_default();
+    leg.after = (after != implicit).then_some(after);
+    let mut legs = old.to_vec();
+    legs.push(leg);
+    judged(old, &legs)?;
+    Ok(Some(legs))
+}
+
 // ---- the record, read ----------------------------------------------------------
 
 /// The legs as `wsp show --json` gives them.
@@ -840,6 +946,7 @@ pub(crate) fn json(t: &Task) -> serde_json::Value {
             "ended": l.closed,
             "order": l.order,
             "baton": l.baton,
+            "rework_of": l.rework,
         }))
         .collect::<Vec<_>>())
 }
@@ -1089,10 +1196,12 @@ mod tests {
             started: Some("2026-10-18T10:00:00Z".into()),
             closed: Some("2026-10-18T10:30:00Z".into()),
             join: Some("merged a (m-1.a) into the row's branch; it is at abc123".into()),
+            rework: Some(vec!["scout".into(), "probe".into()]),
         };
+        let bare_rework = Leg { rework: Some(Vec::new()), ..with("redo", &["plan"]) };
         let skipped = Leg { skipped: Some("the scout found nothing".into()), state: State::Skipped, ..with("probe", &[]) };
-        write(&mut t, &[leg("scout"), skipped.clone(), full.clone()]);
-        assert_eq!(legs(&t), vec![leg("scout"), skipped, full], "{}", t.body);
+        write(&mut t, &[leg("scout"), skipped.clone(), full.clone(), bare_rework.clone()]);
+        assert_eq!(legs(&t), vec![leg("scout"), skipped, full, bare_rework], "{}", t.body);
         assert!(t.body.find("## Legs").unwrap() < t.body.find("## Log").unwrap(), "and the log stays last");
     }
 
@@ -1571,6 +1680,24 @@ mod tests {
     }
 
     /// `show --json` carries the leg's times and whole order and baton.
+    /// compound marks a leg `↺ rework` from `rework_of`: null on a leg that is
+    /// not one, a list of the legs the verdict named on the one that is, and an
+    /// empty list when it named none.
+    #[test]
+    fn the_json_gives_rework_of_as_null_a_list_or_an_empty_list() {
+        let old = vec![leg("build")];
+        let named = rework(&old, "build is thin").unwrap().unwrap();
+        let none = rework(&old, "it does not hold").unwrap().unwrap();
+        let mut t = row("");
+        write(&mut t, &named);
+        let j = json(&t);
+        assert_eq!(j[0]["rework_of"], serde_json::Value::Null);
+        assert_eq!(j[1]["rework_of"], serde_json::json!(["build"]));
+        write(&mut t, &none);
+        assert_eq!(json(&t)[1]["rework_of"], serde_json::json!([]));
+        assert_eq!(legs(&t)[1].rework, Some(Vec::new()), "and it survives the text");
+    }
+
     #[test]
     fn the_json_carries_started_ended_order_and_baton() {
         let mut t = row("");

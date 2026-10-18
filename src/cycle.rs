@@ -51,6 +51,34 @@
 //!    point that asks for a decision: a block, a hold, a pass. It never has to
 //!    act for the run to move.
 //!
+//! # Legs: a row that is a graph of agents (`wsp-293`)
+//!
+//! A member with a `## Legs` section is not started as one worker. The step
+//! opens every leg that is ready ([`take_legs`]), in record order, each through
+//! the seat's gate and written `running` with no seat under the store lock, so
+//! the cap is counted in the same section and a second advance finds the record.
+//! Order in a step: the verifiers and the barrier, then the legs of rows already
+//! begun, then new members, whose first legs count as one member against `xN`.
+//! `wedged` and `sent_back_unseated` leave a row with the section alone, so no
+//! whole-row worker is seated beside the legs. A blocking verdict appends one
+//! `rework` leg ([`crate::legs::rework`]) and the step starts it like any other.
+//!
+//! **The choices the doc left open (v1, Ed 2026-10-18: take the conventional
+//! one and keep going):**
+//!
+//! - **A leg's start is retaken like a member's**, ten minutes after it was
+//!   opened with no seat ([`WEDGED_AFTER`]). A leg whose seat *died* mid-run is
+//!   not repaired here: the row stalls with a leg `running`, which `wsp wip` and
+//!   `wsp leg show` show, and a person or `wsp leg skip` decides.
+//! - **A verdict names a leg by its name as a whole word** (`crate::legs::rework`).
+//!   Prose that happens to use a leg's name names it, and the cost is one wrong
+//!   tier on a rework, which is the default unless that leg had a `why:`.
+//! - **A row at the 8-leg cap gets no rework leg**; the row's log says so and the
+//!   governor is told by the verdict's own message. It is not reseated as a whole.
+//! - **Outside a list**, `leg done` pokes, the poke runs [`start_legs`], and the
+//!   repair tick runs [`legs_owed`] for rows that have begun. A row nothing has
+//!   begun is never started by a tick: staging it is not starting it.
+//!
 //! # Levels, so a lost trigger costs a delay and nothing else
 //!
 //! [`advance`] reads where the run is from the store and git alone and does
@@ -367,7 +395,8 @@ pub(crate) fn poke_task(store: &Store, id: &str, verb: &str) {
     let Some(t) = store.find_task(id) else { return };
     let ours = t.tags.iter().any(|g| g == VERIFY_TAG || g == BARRIER_TAG);
     let member = worklist::Running::read(store).list_of(&t.id).is_some();
-    if !ours && !member {
+    // A row run as legs has its next legs to start, in a list or not.
+    if !ours && !member && !crate::legs::staged(&t) {
         return;
     }
     launch(store, &["worklist", "advance", "--task", &t.id, "--verb", verb]);
@@ -501,6 +530,12 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
 
     if let (Some(id), Some(verb)) = (args.get("task"), args.get("verb")) {
         told_about_task(store, &id, &verb);
+        // A row staged and spawned by hand has no list to step it: the legs it
+        // is owed start here, through the gate (`start_legs` leaves a list's
+        // member to the list).
+        if store.find_task(&id).is_some_and(|t| crate::legs::staged(&t)) {
+            let _ = start_legs(store, &id, &Fleet);
+        }
     }
     if let (Some(list), Some(event)) = (named.as_deref(), args.get("event")) {
         let passed = args.get("passed").and_then(|n| n.parse::<usize>().ok());
@@ -673,13 +708,17 @@ fn told_verdict(store: &Store, w: &Worklist, t: &Task) {
     let Some(p) = crate::verification::blocked(&tasks, &t.id) else { return };
     tell(store, w, &format!(
         "A verifier found a problem in the {} run: {} ({}) was sent back to doing{}. \
-         `wsp show {}` has the verdict under ## Verification. The run waits for it to land again; \
-         if the finding is wrong, `wsp verified {} --holds --from FILE --caption \"…\"` records why, in your name.",
+         `wsp show {}` has the verdict under ## Verification. {} \
+         If the finding is wrong, `wsp verified {} --holds --from FILE --caption \"…\"` records why, in your name.",
         w.id,
         t.id,
         util::truncate(&t.title, 60),
         p.read.as_deref().map(|r| format!(" — it read {r}")).unwrap_or_default(),
         t.id,
+        match crate::legs::staged(t) {
+            true => "It runs as legs: wsp appended a `rework` leg after the last, whose order is the verdict, and starts it.",
+            false => "The run waits for it to land again.",
+        },
         t.id
     ));
 }
@@ -874,6 +913,14 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         }
     }
 
+    // 2b. The legs of a row already begun: every one that is ready, through the
+    // gate, in record order. After the verifiers and the barrier and before any
+    // new member, so a leg is unfinished work on a row the run has begun and
+    // finishing goes ahead of fanning out (`docs/legs.md`, *The run*).
+    for s in pos.members.iter().filter(|s| !s.finished()) {
+        started.extend(run_legs(store, Some((&w, at)), &s.id, Rows::Started, None, &gate));
+    }
+
     // 1. Members nobody has started, up to the group's cap — counted inside
     // the lock by `take_member`, because the two advances a pass can start
     // (the barrier agent's `go` and its own `review`) both read this list.
@@ -904,6 +951,12 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 continue;
             }
             let Some(t) = store.find_task(&s.id) else { continue };
+            // A staged member starts with its first legs, which count as one
+            // member against the group's `xN` however many it runs.
+            if crate::legs::staged(&t) {
+                started.extend(run_legs(store, Some((&w, at)), &s.id, Rows::New, Some((&g.members, cap)), &gate));
+                continue;
+            }
             if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap, &gate) {
                 log_line(store, &format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
                 if spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string())) {
@@ -1220,8 +1273,13 @@ const WEDGED_AFTER: i64 = 10 * 60;
 
 /// Unclaimed, and written long enough ago that a start in flight would have
 /// claimed it by now.
+///
+/// **Never a row run as legs** (`docs/legs.md`, *The run*): it holds no claim by
+/// design, so "unclaimed for ten minutes" is its ordinary state, and starting a
+/// whole-row worker on it would put one beside the legs. Excluded by having the
+/// section and not by a leg running, since between two legs none does.
 fn wedged(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
-    !claims.contains_key(&t.id) && util::epoch_secs() - util::epoch_of(&t.updated) > WEDGED_AFTER
+    !crate::legs::staged(t) && !claims.contains_key(&t.id) && util::epoch_secs() - util::epoch_of(&t.updated) > WEDGED_AFTER
 }
 
 /// The line `take_member` writes, and how it recognises its own record.
@@ -1256,6 +1314,9 @@ fn take_member(
     let id = t.id.clone();
     let took = store.locked(|| {
         let t = store.find_task(&id)?;
+        if crate::legs::staged(&t) {
+            return None;
+        }
         let claims = store.claims();
         let ours = t.section("Log").and_then(|l| l.lines().last().map(|x| x.contains(STARTED_BY))).unwrap_or(false);
         let why = match t.status() {
@@ -1264,13 +1325,7 @@ fn take_member(
             Status::Doing if sent_back_unseated(store, &t, &claims) => "again: it was sent back and nobody is on it",
             _ => return None,
         };
-        let going = members
-            .iter()
-            .filter(|m| **m != id)
-            .filter_map(|m| store.find_task(m))
-            .filter(|m| !Settlement::of(m).settled())
-            .filter(|m| m.status() == Status::Doing || claims.contains_key(&m.id))
-            .count();
+        let going = members_going(store, members, &id, &claims);
         if cap.is_some_and(|c| going >= c) {
             return None;
         }
@@ -1304,14 +1359,286 @@ fn take_member(
 /// in its seat is the ordinary case and that agent was just told what is owed:
 /// starting a second would be two agents in one tree. A claim whose seat went is
 /// [`crate::repair`]'s, which tells it, ends it and puts the row back at `todo`.
+///
+/// **A row run as legs is sent back to a leg**, the `rework` the verdict
+/// appended, and the step opens that; it is never reseated as a whole.
 fn sent_back_unseated(store: &Store, t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
-    if claims.contains_key(&t.id) || !store.panes_for_task(&t.id).is_empty() {
+    if crate::legs::staged(t) || claims.contains_key(&t.id) || !store.panes_for_task(&t.id).is_empty() {
         return false;
     }
     let log = t.section("Log").unwrap_or_default();
     let lines: Vec<&str> = log.lines().collect();
     let Some(back) = lines.iter().rposition(|l| l.contains(SENT_BACK)) else { return false };
     !lines[back + 1..].iter().any(|l| l.contains(STARTED_BY) || l.contains("claimed by pane "))
+}
+
+// ---- legs -----------------------------------------------------------------------
+
+/// Set in the environment of a leg the run starts outside any list, where there is
+/// no [`OWNED_LIST`] to say it is the run and not a person asking. `wsp spawn`
+/// reads either as "not by hand", so it does not say the seat is at its cap and
+/// start anyway: the gate has already decided.
+pub(crate) const RUN_STEP: &str = "WSP_RUN_STEP";
+
+/// Which rows [`take_legs`] opens legs on: a row the run has already begun
+/// (`doing`), or one it has not (`todo`, a new member, which also counts against
+/// its group's `xN`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    Started,
+    New,
+}
+
+/// A leg opened by [`take_legs`]: its name, and whether it is a start taken
+/// again because the last one never seated it.
+struct Opening {
+    name: String,
+    again: bool,
+}
+
+/// How many of `members`, other than `id`, are in flight: not settled, and at
+/// `doing` or holding a claim. What a group's `xN` is counted against.
+fn members_going(store: &Store, members: &[String], id: &str, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> usize {
+    members
+        .iter()
+        .filter(|m| *m != id)
+        .filter_map(|m| store.find_task(m))
+        .filter(|m| !Settlement::of(m).settled())
+        .filter(|m| m.status() == Status::Doing || claims.contains_key(&m.id))
+        .count()
+}
+
+/// Open every leg of `row` the run may start now, each through the seat's gate,
+/// and say which. `docs/legs.md`, *The run*.
+///
+/// **Written under the store lock, with the count taken in the same section**
+/// ([`crate::room`], `wsp-231`): each leg is `running` with no seat when the
+/// next is asked for, and a leg with no seat counts as an agent starting. So two
+/// advances racing find the record and start nothing twice, and a leg that does
+/// not fit stays `pending` and is said once in `cycle.log`.
+///
+/// A leg that is ready, or that was opened with no seat so long ago that the
+/// start never arrived ([`WEDGED_AFTER`]), in record order. A row at `doing`
+/// for [`Rows::Started`] and at `todo` and unclaimed for [`Rows::New`]; any
+/// other status, a blocked row among them, starts nothing.
+fn take_legs(
+    store: &Store,
+    row: &str,
+    rows: Rows,
+    within: Option<(&[String], Option<usize>)>,
+    gate: &crate::room::Gate,
+) -> Vec<Opening> {
+    let opened = store.locked(|| {
+        let mut opened = Vec::new();
+        let Some(t) = store.find_task(row) else { return opened };
+        if !crate::legs::staged(&t) {
+            return opened;
+        }
+        let claims = store.claims();
+        match (t.status(), rows) {
+            (Status::Doing, Rows::Started) => {}
+            (Status::Todo, Rows::New) if !claims.contains_key(row) => {
+                if let Some((members, Some(cap))) = within {
+                    if members_going(store, members, row, &claims) >= cap {
+                        return opened;
+                    }
+                }
+            }
+            _ => return opened,
+        }
+        let all = crate::legs::legs(&t);
+        let lost = |at: &str| util::epoch_secs() - util::epoch_of(at) > WEDGED_AFTER;
+        for (name, again) in crate::legs::startable(&all, &lost) {
+            if !gate.admits(&crate::legs::label(row, &name)) {
+                continue;
+            }
+            if again {
+                crate::leg_seat::unopen(store, row, &name);
+            }
+            if crate::leg_seat::open(store, row, &name).is_ok() {
+                opened.push(Opening { name, again });
+            }
+        }
+        opened
+    });
+    if !opened.is_empty() {
+        let names: Vec<&str> = opened.iter().map(|o| o.name.as_str()).collect();
+        store.git_commit(&format!("wsp: {row} opens leg {}", names.join(", ")));
+    }
+    opened
+}
+
+/// [`take_legs`], and a seat started on each leg it opened. `at` is the list and
+/// group these starts belong to, when there is one. Returns the labels started.
+fn run_legs(
+    store: &Store,
+    at: Option<(&Worklist, usize)>,
+    row: &str,
+    rows: Rows,
+    within: Option<(&[String], Option<usize>)>,
+    gate: &crate::room::Gate,
+) -> Vec<String> {
+    let mut started = Vec::new();
+    for o in take_legs(store, row, rows, within, gate) {
+        let label = crate::legs::label(row, &o.name);
+        let by = at.map(|(w, n)| format!("{} group {n}: ", w.id)).unwrap_or_default();
+        let again = if o.again { " again: the last start never seated it" } else { "" };
+        log_line(store, &format!("{by}starting leg {} of {row}{again}", o.name));
+        let owned = at.map(|(w, n)| (w.id.as_str(), n.to_string()));
+        match start_leg(store, row, &o.name, owned.as_ref().map(|(l, n)| (*l, n.as_str()))) {
+            None => started.push(label),
+            Some(why) => {
+                log_line(store, &format!("FAILED spawn leg {} of {row}: {why}", o.name));
+                crate::leg_seat::unopen(store, row, &o.name);
+                store.locked(|| {
+                    if let Some(mut t) = store.find_task(row) {
+                        t.log(&format!("wsp could not spawn leg {}: {}", o.name, util::truncate(&why, 300)));
+                        let _ = store.save_task(&t);
+                    }
+                });
+                if let Some((w, _)) = at {
+                    failed(store, w, row);
+                }
+            }
+        }
+    }
+    started
+}
+
+/// `wsp spawn <row> --agent --leg <name>`, and its refusal if it refused. The
+/// tier is the entry's, which the spawn reads for itself.
+fn start_leg(store: &Store, row: &str, leg: &str, owned: Option<(&str, &str)>) -> Option<String> {
+    if cfg!(test) {
+        #[cfg(test)]
+        return tests::SPAWNED.with(|s| {
+            let kind = store
+                .find_task(row)
+                .and_then(|t| crate::legs::legs(&t).into_iter().find(|l| l.name == leg))
+                .map(|l| l.policy.kind)
+                .unwrap_or_default();
+            s.borrow_mut().push((crate::legs::label(row, leg), kind));
+            tests::FAIL.with(|f| f.borrow().clone())
+        });
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return Some(e.to_string()),
+    };
+    let argv = ["spawn", row, "--agent", "--leg", leg];
+    log_line(store, &format!("spawn {}", argv[1..].join(" ")));
+    let mut cmd = Command::new(exe);
+    cmd.args(argv).stdin(Stdio::null());
+    match owned {
+        Some((list, group)) => cmd.env(OWNED_LIST, list).env(OWNED_GROUP, group),
+        None => cmd.env(RUN_STEP, "1"),
+    };
+    match cmd.output() {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Some(e.to_string()),
+    }
+}
+
+/// The ready legs of a row nobody's list runs, started through the gate: what
+/// `wsp leg done` launches, detached, when it ends a leg of a row staged and
+/// spawned by hand (`docs/legs.md`, *The run*, "Outside a list"). A launch is
+/// the run and not a person asking, so it waits for a place like any other start.
+/// A row in a running list is that list's step's, and is left to it.
+pub(crate) fn start_legs(store: &Store, row: &str, seats: &dyn Seats) -> Vec<String> {
+    if worklist::Running::read(store).list_of(row).is_some() {
+        return Vec::new();
+    }
+    let gate = crate::room::Gate::new(store, seats);
+    let started = run_legs(store, None, row, Rows::Started, None, &gate);
+    let held = gate.take_held();
+    if let Some(cap) = gate.cap {
+        for (what, room) in held {
+            log_line(store, &format!("{what} waits — the seat is at its cap of {cap}: {}", crate::room::names(&room)));
+        }
+    }
+    started
+}
+
+/// A row run as legs that is not in a running list, has started, and has legs
+/// ready that nothing is starting: the repair tick's catch for a launch that was
+/// lost, and for a leg that was held at the cap when its last neighbour ended.
+/// Rows nothing has begun are left alone: staging one is not starting it.
+pub(crate) fn legs_owed(store: &Store, seats: &dyn Seats) -> Vec<String> {
+    let running = worklist::Running::read(store);
+    let mut out = Vec::new();
+    for t in store.tasks().iter().filter(|t| t.status() == Status::Doing && crate::legs::staged(t)) {
+        let all = crate::legs::legs(t);
+        let begun = all.iter().any(|l| matches!(l.state, crate::legs::State::Done | crate::legs::State::Running));
+        if !begun || running.list_of(&t.id).is_some() {
+            continue;
+        }
+        out.extend(start_legs(store, &t.id, seats));
+    }
+    out
+}
+
+/// Every leg that is done and still seated, ended — once each, and never in a
+/// turn. The tick's half of ending a leg, as [`passes_finished`] is a verifier's:
+/// `wsp leg done` is the agent's own last act, and ending the seat inside that
+/// turn cuts it short. The outcome is written on the entry before anything can
+/// ask again, `ended` or `end failed: …`, and a failure is not retried.
+///
+/// **From `/`** ([`despawn_seat`]), so the tree a sibling stands in is not kept
+/// because the ending process is standing in it. Returns the seats it ended.
+pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
+    use crate::verification::Ending;
+    let mut ended = Vec::new();
+    for t in store.tasks().iter().filter(|t| crate::legs::staged(t)) {
+        for l in crate::legs::legs(t) {
+            let Some(seat) = l.pane.clone() else { continue };
+            if l.state != crate::legs::State::Done || l.ending != Ending::Standing {
+                continue;
+            }
+            if seats.state(&seat).is_some_and(|s| s.turn_in_flight()) {
+                continue;
+            }
+            let pids = match crate::ending::verifier_pids(seats, &seat) {
+                Ok(pids) => pids,
+                Err(why) => {
+                    crate::ending::say_leg_left(store, &t.id, &l.name, &seat, &why);
+                    continue;
+                }
+            };
+            let outcome = despawn_seat(&seat).and_then(|()| crate::ending::confirm_gone(seats, &pids));
+            let ending = match &outcome {
+                Ok(()) => Ending::Ended,
+                Err(why) => Ending::Failed(why.clone()),
+            };
+            let wrote = store.locked(|| {
+                let Some(mut row) = store.find_task(&t.id) else { return false };
+                let mut all = crate::legs::legs(&row);
+                let Some(q) = all.iter_mut().find(|q| q.name == l.name && q.pane.as_deref() == Some(seat.as_str())) else { return false };
+                q.ending = ending.clone();
+                crate::legs::write(&mut row, &all);
+                store.save_task(&row).is_ok()
+            });
+            if wrote {
+                store.git_commit(&format!("wsp: {}'s leg {} in {seat} {}", t.id, l.name, if outcome.is_ok() { "ended" } else { "would not end" }));
+            }
+            match outcome {
+                Ok(()) => {
+                    log_line(store, &format!("ended {seat}, which ran leg {} of {}", l.name, t.id));
+                    ended.push(seat);
+                }
+                Err(why) => {
+                    log_line(store, &format!("could not end {seat}, which ran leg {} of {}: {why} — not tried again", l.name, t.id));
+                    if let Some(w) = list_of(store, t) {
+                        tell(store, &w, &format!(
+                            "wsp could not end leg {} of {} in {seat}: {}. It is not tried again — \
+                             `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
+                            l.name, t.id, util::truncate(&why, 200)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    ended
 }
 
 /// The member's newest pass, when it stopped on a problem rather than holding.
@@ -1591,7 +1918,7 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
          code on the trunk rather than against the report: the commits it landed, whether they \
          do what the overview asked, and the tests that cover them — `cargo test <module>::` in \
-         debug for what it touched, never `wsp verify` or a release build.{stop}\n\n\
+         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}\n\n\
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
          - it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`;\n\
@@ -1603,6 +1930,24 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
         m = member.id,
         title = util::truncate(&member.title, 80),
         caption = CAPTION_ORDER,
+        legs = legs_line(member),
+    )
+}
+
+/// The line a verifier's order gains on a row that ran in legs: the table, and
+/// that a verdict which blocks names the leg whose work fails, since wsp sends
+/// the row back to a `rework` leg on that leg's tier. Empty for any other row.
+fn legs_line(member: &Task) -> String {
+    let all = crate::legs::legs(member);
+    if all.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n**This row ran in legs**, each a fresh agent handed the one before's baton:\n\n{}\n\n\
+         If it does not hold, **name the leg whose work fails** in your verdict, by its name from the table. \
+         wsp appends one `rework` leg after the last, with your verdict as its order, and runs it on that \
+         leg's tier. A verdict that names no leg sends it back on the default.",
+        crate::legs::table(&all)
     )
 }
 
@@ -5424,5 +5769,387 @@ fn only_a_working_screen_is_ever_overruled() {
             log.lines().any(|l| l.contains("run group 1: started m-1")),
             "the start is in cycle.log, not only on the daemon's stdout: {log:?}"
         );
+    }
+
+    // ---- legs (wsp-293) ---------------------------------------------------------
+
+    /// `legs::*` applied to the row's record, as the verb that does it would.
+    fn edit_legs(store: &Store, id: &str, f: impl FnOnce(&[crate::legs::Leg]) -> Result<Vec<crate::legs::Leg>, String>) {
+        let mut t = store.find_task(id).unwrap();
+        let new = f(&crate::legs::legs(&t)).unwrap();
+        crate::legs::write(&mut t, &new);
+        store.save_task(&t).unwrap();
+    }
+
+    /// A row staged with `plan` alone, as `wsp leg add` writes it.
+    fn staged(store: &Store, id: &str, status: Status) {
+        task(store, id, status);
+        edit_legs(store, id, |_| Ok(vec![crate::legs::Leg::pending("plan", "decide how it splits")]));
+    }
+
+    fn add_leg(store: &Store, id: &str, name: &str, after: &[&str], before: Option<&str>, actor: Option<&str>) {
+        edit_legs(store, id, |old| {
+            crate::legs::add(
+                old,
+                crate::legs::New {
+                    name: name.into(),
+                    order: format!("do {name}"),
+                    after: Some(after.iter().map(|a| a.to_string()).collect()),
+                    before: before.map(str::to_string),
+                    ..Default::default()
+                },
+                actor,
+            )
+        });
+    }
+
+    /// The seat a spawn gives a leg that opened, as `wsp spawn --leg` writes it.
+    fn seat_leg(store: &Store, id: &str, name: &str, seat: &str) {
+        let stand = crate::leg_seat::Standing { room: None, cwd: None, kind: "claude" };
+        assert!(crate::leg_seat::attach(store, id, name, seat, &stand), "{name} was not open to seat");
+    }
+
+    /// `wsp leg done` from the leg's seat.
+    fn leg_done(store: &Store, id: &str, name: &str) {
+        edit_legs(store, id, |old| crate::legs::finish(old, name, "handed on", "did it", "2026-10-18T10:00:00Z"));
+    }
+
+    fn leg_state(store: &Store, id: &str, name: &str) -> crate::legs::State {
+        crate::legs::legs(&store.find_task(id).unwrap()).into_iter().find(|l| l.name == name).unwrap().state
+    }
+
+    /// The row's legs, one staged member, run from the first start to a barrier
+    /// with no hand step: the plan fans out into two siblings and a join, every
+    /// leg is opened once however often the step runs, the row's own `review` is
+    /// the last leg's, and a verifier and the barrier follow.
+    #[test]
+    fn a_staged_member_runs_every_leg_to_verified_with_no_hand_step() {
+        let (_env, store) = scratch("legs-run");
+        staged(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · plan".to_string()], "the leg that waits on nothing, and no whole-row worker");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "the row is begun by its first leg");
+        assert!(store.claims().is_empty(), "a leg claims nothing");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "a second advance starts nothing twice");
+
+        // The plan seats, fans out into two siblings and the join, and ends.
+        seat_leg(&store, "m-1", "plan", "cpd-1");
+        add_leg(&store, "m-1", "finish", &["plan"], None, Some("plan"));
+        add_leg(&store, "m-1", "a", &["plan"], Some("finish"), Some("plan"));
+        add_leg(&store, "m-1", "b", &["plan"], Some("finish"), Some("plan"));
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "nothing is ready while the plan runs");
+        leg_done(&store, "m-1", "plan");
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · a".to_string(), "m-1 · b".to_string()], "both siblings, in record order");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "and once");
+
+        seat_leg(&store, "m-1", "a", "cpd-2");
+        seat_leg(&store, "m-1", "b", "cpd-3");
+        leg_done(&store, "m-1", "a");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "the join waits for both");
+        leg_done(&store, "m-1", "b");
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · finish".to_string()]);
+
+        // The last leg types `review`.
+        seat_leg(&store, "m-1", "finish", "cpd-4");
+        crate::leg_seat::on_review(&store, "m-1", "all of it done", Some("cpd-4")).unwrap();
+        set(&store, "m-1", Status::Review);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · verifying".to_string()], "the verifier runs once, on the row");
+        let order = verifier_order(&store, &store.find_task("m-1").unwrap());
+        assert!(order.contains("ran in legs") && order.contains("name the leg whose work fails") && order.contains("- finish"), "{order}");
+
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["run · barrier 1".to_string()], "and the barrier follows");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty());
+    }
+
+    /// The tick ends a done leg's seat once, from `/`, and records it on the entry.
+    #[test]
+    fn the_tick_ends_a_done_legs_seat_once_and_records_it_on_the_entry() {
+        let (_env, store) = scratch("legs-end");
+        staged(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        seat_leg(&store, "m-1", "plan", "cpd-1");
+        assert!(legs_finished(&store, &Exits).is_empty(), "a running leg's seat is not ended");
+        leg_done(&store, "m-1", "plan");
+        let _ = drained(&ENDED);
+        assert_eq!(legs_finished(&store, &Exits), ["cpd-1".to_string()]);
+        assert_eq!(drained(&ENDED), ["cpd-1".to_string()]);
+        let plan = crate::legs::legs(&store.find_task("m-1").unwrap()).remove(0);
+        assert_eq!(plan.ending, crate::verification::Ending::Ended);
+        assert!(legs_finished(&store, &Exits).is_empty(), "once");
+        assert!(drained(&ENDED).is_empty());
+    }
+
+    /// A row at `doing`: the plan done, two siblings and their join.
+    fn fanned_out(store: &Store, id: &str) {
+        staged(store, id, Status::Doing);
+        edit_legs(store, id, |old| {
+            let after = |on: &[&str], l: crate::legs::Leg| crate::legs::Leg { after: Some(on.iter().map(|s| s.to_string()).collect()), ..l };
+            let mut v = old.to_vec();
+            v.push(after(&["plan"], crate::legs::Leg::pending("a", "do a")));
+            v.push(after(&["plan"], crate::legs::Leg::pending("b", "do b")));
+            v.push(after(&["a", "b"], crate::legs::Leg::pending("finish", "join")));
+            Ok(v)
+        });
+        seat_leg_open(store, id, "plan", "cpd-1");
+        leg_done(store, id, "plan");
+    }
+
+    /// `plan` opened and seated by hand, which is how a row staged in a test
+    /// has its first leg run.
+    fn seat_leg_open(store: &Store, id: &str, name: &str, seat: &str) {
+        crate::leg_seat::open(store, id, name).unwrap();
+        seat_leg(store, id, name, seat);
+    }
+
+    /// With the seat capped at two and a second member ready, the siblings take
+    /// the places ahead of the new member, and the third agent waits.
+    #[test]
+    fn siblings_take_places_ahead_of_a_new_member_under_the_seats_cap() {
+        let (_env, store) = scratch("legs-cap");
+        store.set_seat_cap(Some(2)).unwrap();
+        fanned_out(&store, "m-1");
+        task(&store, "m-2", Status::Todo);
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        let _ = drained(&SAID);
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · a".to_string(), "m-1 · b".to_string()], "the row begun finishes before a new member fans out");
+        assert_eq!(store.find_task("m-2").unwrap().status(), Status::Todo, "the third agent waits");
+        let said = said_capped();
+        assert!(said.iter().any(|l| l.contains("m-2 waits")), "said once: {said:?}");
+
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "nothing starts twice, and the wait is not said again");
+        assert!(said_capped().is_empty(), "said once and not on every tick");
+
+        // A place frees when a sibling is done and its seat is not seen working.
+        seat_leg(&store, "m-1", "a", "cpd-2");
+        seat_leg(&store, "m-1", "b", "cpd-3");
+        leg_done(&store, "m-1", "a");
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-2".to_string()], "now the new member takes the place");
+    }
+
+    /// A leg that does not fit stays pending; the cap counts each running leg as
+    /// one agent, and a leg opened with no seat yet as one starting.
+    #[test]
+    fn each_running_leg_is_one_agent_and_a_leg_that_does_not_fit_waits_pending() {
+        let (_env, store) = scratch("legs-count");
+        store.set_seat_cap(Some(1)).unwrap();
+        fanned_out(&store, "m-1");
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · a".to_string()], "one place, one sibling");
+        assert_eq!(leg_state(&store, "m-1", "b"), crate::legs::State::Pending, "b waits, written as nothing");
+        let gate = crate::room::Gate::new(&store, &Blind);
+        let now = gate.working();
+        assert_eq!(now.iter().map(|c| c.what.clone()).collect::<Vec<_>>(), ["m-1 · a".to_string()], "{now:?}");
+
+        seat_leg(&store, "m-1", "a", "cpd-2");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "a seated, still running: the place is taken");
+        leg_done(&store, "m-1", "a");
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · b".to_string()], "a is done, so b has the place");
+    }
+
+    /// A start that never seated is taken again once it is old enough, and not
+    /// before.
+    #[test]
+    fn a_leg_opened_and_never_seated_is_started_again_once_it_is_wedged() {
+        let (_env, store) = scratch("legs-wedged");
+        staged(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · plan".to_string()]);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "a start in flight is left alone");
+
+        edit_legs(&store, "m-1", |old| {
+            let mut v = old.to_vec();
+            v[0].started = Some("2020-01-01T00:00:00Z".into());
+            Ok(v)
+        });
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · plan".to_string()], "ten minutes on with no seat: taken again");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "and the new opening is the key");
+    }
+
+    /// A failed start gives the leg back, and says so on the row.
+    #[test]
+    fn a_leg_whose_spawn_failed_goes_back_to_pending_with_the_reason_on_the_row() {
+        let (_env, store) = scratch("legs-fail");
+        staged(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        FAIL.with(|f| *f.borrow_mut() = Some("no room".into()));
+        step(&store, &w, &Blind);
+        FAIL.with(|f| *f.borrow_mut() = None);
+        let _ = spawned();
+        assert_eq!(leg_state(&store, "m-1", "plan"), crate::legs::State::Pending);
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default().to_string();
+        assert!(log.contains("could not spawn leg plan: no room"), "{log}");
+    }
+
+    /// A staged row is never given a whole-row worker beside its legs, by any of
+    /// the repairs that seat a row at `doing` with nobody on it.
+    #[test]
+    fn a_staged_row_with_no_claim_is_left_to_its_legs_by_the_whole_row_repairs() {
+        let (_env, store) = scratch("legs-exclusion");
+        fanned_out(&store, "m-1");
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{STARTED_BY} run group 1"));
+        t.log(&format!("{SENT_BACK} the verifier blocked: something"));
+        t.updated = "2026-10-18T08:00:00Z".into();
+        store.save_task(&t).unwrap();
+        let t = store.find_task("m-1").unwrap();
+        assert!(!wedged(&t, &store.claims()), "unclaimed for hours, and not wedged: it has no claim by design");
+        assert!(!sent_back_unseated(&store, &t, &store.claims()));
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · a".to_string(), "m-1 · b".to_string()], "its legs and not the row");
+    }
+
+    /// A blocking verdict appends exactly one `rework` leg after the last, which
+    /// the step starts; a verdict recorded twice is still one.
+    #[test]
+    fn a_blocking_verdict_appends_one_rework_leg_after_the_last_and_the_step_starts_it() {
+        let (_env, store) = scratch("legs-rework");
+        staged(&store, "m-1", Status::Todo);
+        add_leg(&store, "m-1", "build", &["plan"], None, None);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        seat_leg(&store, "m-1", "plan", "cpd-1");
+        leg_done(&store, "m-1", "plan");
+        step(&store, &w, &Blind);
+        seat_leg(&store, "m-1", "build", "cpd-2");
+        leg_done(&store, "m-1", "build");
+        set(&store, "m-1", Status::Review);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+
+        let verdict = "the wiring is untested; the build leg stopped before the second caller";
+        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, verdict, Some("cpd-9"), None).unwrap();
+        let all = crate::legs::legs(&store.find_task("m-1").unwrap());
+        assert_eq!(all.iter().filter(|l| l.rework.is_some()).count(), 1, "one rework leg: {all:?}");
+        let rework = all.last().unwrap();
+        assert_eq!(rework.name, "rework");
+        assert_eq!(crate::legs::waits(&all).last().unwrap(), &vec!["build".to_string()], "it waits on the last leg");
+        assert_eq!(crate::legs::lasts(&all), ["rework".to_string()], "and is the last leg now");
+        assert_eq!(rework.rework.as_deref(), Some(&["build".to_string()][..]), "naming the leg the verdict named");
+        assert!(rework.order.contains(verdict), "its order is the verdict");
+        assert!(crate::legs::is_default(&rework.policy) && rework.why.is_none(), "Sonnet: build had no why");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "the row is back at doing");
+
+        // A second recording of the same send-back appends nothing more.
+        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, verdict, None, None).unwrap();
+        assert_eq!(crate::legs::legs(&store.find_task("m-1").unwrap()).len(), 3, "plan, build, and the one rework");
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · rework".to_string()], "the rework leg, and no whole-row reseat");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty());
+    }
+
+    /// The tier rule: a named leg that had a `why` is inherited, `rework of …:`
+    /// prefixed; several named take the dearest; none named gives the default.
+    #[test]
+    fn a_rework_leg_inherits_the_dearest_named_tier_and_its_why() {
+        let opus = |name: &str, why: &str| crate::legs::Leg {
+            policy: crate::model::Policy::parse("claude opus high").unwrap(),
+            why: Some(why.into()),
+            after: Some(Vec::new()),
+            ..crate::legs::Leg::pending(name, "x")
+        };
+        let mid = crate::legs::Leg {
+            policy: crate::model::Policy::parse("claude sonnet high").unwrap(),
+            why: Some("hard to review".into()),
+            after: Some(vec!["design".into()]),
+            ..crate::legs::Leg::pending("mid", "x")
+        };
+        let plain = crate::legs::Leg { after: Some(vec!["mid".into()]), ..crate::legs::Leg::pending("build", "x") };
+        let old = vec![opus("design", "decides the layer"), mid, plain];
+
+        let both = crate::legs::rework(&old, "design is wrong and mid is thin").unwrap().unwrap();
+        let r = both.last().unwrap();
+        assert_eq!(r.policy, crate::model::Policy::parse("claude opus high").unwrap(), "the dearest of the two");
+        assert_eq!(r.why.as_deref(), Some("rework of design: decides the layer"));
+        assert_eq!(r.rework.as_deref(), Some(&["design".to_string(), "mid".to_string()][..]));
+
+        let default = crate::legs::rework(&old, "build left a path untested").unwrap().unwrap();
+        assert!(crate::legs::is_default(&default.last().unwrap().policy), "a default leg named gives no reason");
+
+        let none = crate::legs::rework(&old, "it does not hold").unwrap().unwrap();
+        let r = none.last().unwrap();
+        assert!(crate::legs::is_default(&r.policy) && r.why.is_none());
+        assert_eq!(r.rework.as_deref(), Some(&[][..]), "a list, empty, for a verdict that named none");
+
+        // And a name inside a longer word is not the leg.
+        let embedded = crate::legs::rework(&old, "the redesigned part").unwrap().unwrap();
+        assert!(embedded.last().unwrap().rework.as_deref().unwrap().is_empty());
+    }
+
+    /// A row at the leg cap has no room for a rework leg, and says so on its row.
+    #[test]
+    fn a_row_at_the_leg_cap_gets_no_rework_leg_and_says_why() {
+        let (_env, store) = scratch("legs-rework-cap");
+        task(&store, "m-1", Status::Review);
+        let mut all: Vec<crate::legs::Leg> = (0..crate::legs::MAX_LEGS)
+            .map(|n| crate::legs::Leg { state: crate::legs::State::Done, ..crate::legs::Leg::pending(&format!("l{n}"), "x") })
+            .collect();
+        all[0].after = Some(Vec::new());
+        edit_legs(&store, "m-1", |_| Ok(all.clone()));
+        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "no", None, None).unwrap();
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(crate::legs::legs(&t).len(), crate::legs::MAX_LEGS);
+        let log = t.section("Log").unwrap_or_default().to_string();
+        assert!(log.contains("no rework leg was added") && log.contains("governor decides"), "{log}");
+    }
+
+    /// A row staged and spawned by hand has no list to step it: the launch from
+    /// `leg done` starts what is ready through the same gate. A list's member is
+    /// left to its list.
+    #[test]
+    fn the_launch_from_leg_done_starts_a_hand_staged_rows_legs_through_the_gate() {
+        let (_env, store) = scratch("legs-hand");
+        store.set_seat_cap(Some(1)).unwrap();
+        fanned_out(&store, "m-1");
+        assert_eq!(start_legs(&store, "m-1", &Blind), ["m-1 · a".to_string()], "one place");
+        assert_eq!(ids(spawned()), ["m-1 · a".to_string()]);
+        assert!(start_legs(&store, "m-1", &Blind).is_empty(), "and once");
+    }
+
+    #[test]
+    fn a_member_of_a_running_list_is_left_to_the_list_by_the_launch_from_leg_done() {
+        let (_env, store) = scratch("legs-hand-listed");
+        fanned_out(&store, "m-1");
+        let _ = list(&store, &[(&["m-1"], "claude")]);
+        assert!(start_legs(&store, "m-1", &Blind).is_empty(), "a member of a running list is that list's step's");
+        assert!(spawned().is_empty());
+    }
+
+    /// The repair tick catches a launch that was lost: a begun row with legs ready
+    /// and nothing starting them. A row nothing has begun is not started by it.
+    #[test]
+    fn the_tick_starts_legs_owed_on_a_begun_hand_staged_row_and_not_an_unbegun_one() {
+        let (_env, store) = scratch("legs-owed");
+        fanned_out(&store, "begun");
+        staged(&store, "fresh", Status::Doing);
+        let owed = legs_owed(&store, &Blind);
+        assert_eq!(owed, ["begun · a".to_string(), "begun · b".to_string()]);
+        assert_eq!(ids(spawned()), ["begun · a".to_string(), "begun · b".to_string()]);
     }
 }

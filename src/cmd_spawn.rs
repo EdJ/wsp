@@ -2365,7 +2365,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // and the agent starts anyway. What the run starts carries its list in
     // the environment, or is a verifier or a check; a governor is not counted
     // at all; and an agent on another machine is that machine's to count.
-    let by_hand = std::env::var_os(crate::cycle::OWNED_LIST).is_none() && !verifying && checking.is_none();
+    let by_hand = std::env::var_os(crate::cycle::OWNED_LIST).is_none()
+        && std::env::var_os(crate::cycle::RUN_STEP).is_none()
+        && !verifying
+        && checking.is_none();
     if by_hand && args.has("agent") && !args.has("govern") && args.get("on").is_none() {
         if let Some((cap, now)) = crate::room::full(store, &crate::cycle::Fleet) {
             eprintln!(
@@ -4131,7 +4134,14 @@ fn swept_up(
             .map(|(id, _)| format!("{id} is standing in it"))
     };
 
-    let tree = match task.filter(|_| !keep) {
+    // A leg's seat is bound to the row it is a leg of, and the row's tree is
+    // the next leg's: ending one leg never takes it. The run ends a finished
+    // leg's seat on a tick while the legs after it have yet to start, and a
+    // scout that committed nothing would read as a tree with nothing to keep.
+    let a_leg = task.is_some_and(|t| {
+        store.find_task(t).is_some_and(|t| crate::legs::legs(&t).iter().any(|l| l.pane.as_deref() == Some(seat.as_str())))
+    });
+    let tree = match task.filter(|_| !keep && !a_leg) {
         // A barrier check's tree is taken on its own rule (`wsp-289`): nothing
         // in it beyond `target/`, and its check no longer anybody's.
         Some(t) if crate::check_tree::named(store, t).is_some() => crate::check_tree::discard(store, t, &standing),

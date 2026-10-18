@@ -563,7 +563,8 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         serde_json::json!({ "id": member.id, "verdict": state.as_str(), "caption": caption, "read": pass.read, "pane": pass.pane }),
     );
     store.git_commit(&format!("wsp: verified {} {} — {}", member.id, state.as_str(), member.title));
-    if state == State::Blocks {
+    // A row run as legs has no one agent to tell: the rework leg carries the verdict.
+    if state == State::Blocks && !crate::legs::staged(&member) {
         crate::cmd_task::deliver_reason(store, &member.id, text.trim());
     }
     crate::cycle::poke_task(store, &member.id, "verified");
@@ -630,6 +631,28 @@ pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: 
                 pass.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default(),
                 util::truncate(&crate::cmd_task::fold(text), 300)
             ));
+            // A row run as legs is sent back to a leg of its own: one `rework`
+            // leg after the last, whose order is the verdict (`docs/legs.md`,
+            // *The run*). The step starts it; nobody is told to go back to work.
+            let before = crate::legs::legs(&t);
+            if !before.is_empty() {
+                match crate::legs::rework(&before, text) {
+                    Ok(Some(after)) => {
+                        let leg = after.last().expect("a rework leg was appended");
+                        let of = leg.rework.as_deref().unwrap_or_default();
+                        t.log(&format!(
+                            "wsp: appended leg {} after {}{}{}",
+                            leg.name,
+                            crate::legs::waits(&after).last().map(|w| w.join(", ")).unwrap_or_default(),
+                            if of.is_empty() { String::new() } else { format!(" · the verdict names {}", of.join(", ")) },
+                            if crate::legs::is_default(&leg.policy) { String::new() } else { format!(" · on {}", leg.policy.label()) },
+                        ));
+                        crate::legs::write(&mut t, &after);
+                    }
+                    Ok(None) => {}
+                    Err(why) => t.log(&format!("wsp: {why}")),
+                }
+            }
         }
         store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
         Ok(pass)
