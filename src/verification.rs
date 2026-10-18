@@ -129,6 +129,27 @@ pub(crate) struct Pass {
     /// `holds` or `blocks` wsp puts in front. `None` on every pass written
     /// before captions, which reads as the word and its time.
     pub caption: Option<String>,
+    /// What the verifier's seat consumed, written when the seat is ended
+    /// (wsp-290). `None` on a pass still reading, on every pass written before
+    /// this, and on one whose seat had no session to read.
+    pub spent: Option<Spent>,
+}
+
+/// A pass's spend: the clauses a leg's end line carries, as clauses of the
+/// entry. `ran` is the tier that served it (`sonnet-5-5/high`), which `on`
+/// cannot say: that is what was asked for.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct Spent {
+    pub ran: String,
+    pub turns: usize,
+    pub peak: u64,
+    pub spend: crate::agent_commands::Spend,
+}
+
+impl Spent {
+    pub(crate) fn of(ran: &crate::agent_commands::Ran) -> Spent {
+        Spent { ran: ran.label(), turns: ran.turns, peak: ran.peak, spend: ran.spend }
+    }
 }
 
 impl Pass {
@@ -145,6 +166,7 @@ impl Pass {
             decided: None,
             text: String::new(),
             caption: None,
+            spent: None,
         }
     }
 
@@ -165,6 +187,12 @@ impl Pass {
         clause("on", &self.on);
         clause("was", &self.was);
         clause("decided", &self.decided);
+        if let Some(s) = &self.spent {
+            clause("ran", &Some(s.ran.clone()));
+            clause("turns", &Some(s.turns.to_string()));
+            clause("peak", &Some(util::count_human(s.peak)).filter(|_| s.peak > 0));
+            clause("spent", &s.spend.clause());
+        }
         match &self.ending {
             Ending::Standing => {}
             Ending::Ended => out.push_str(" · ended"),
@@ -205,6 +233,7 @@ impl Pass {
             decided: None,
             text: String::new(),
             caption,
+            spent: None,
         };
         for c in clauses {
             let c = c.trim();
@@ -220,6 +249,10 @@ impl Pass {
                     "on" => p.on = v,
                     "was" => p.was = v,
                     "decided" => p.decided = v,
+                    "ran" => p.spent.get_or_insert_with(Spent::default).ran = v.unwrap_or_default(),
+                    "turns" => p.spent.get_or_insert_with(Spent::default).turns = v.and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "peak" => p.spent.get_or_insert_with(Spent::default).peak = v.and_then(|v| util::count_of(&v)).unwrap_or(0),
+                    "spent" => p.spent.get_or_insert_with(Spent::default).spend = v.and_then(|v| crate::agent_commands::Spend::of_clause(&v)).unwrap_or_default(),
                     _ => {}
                 }
             }
@@ -339,6 +372,7 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         decided: (state != State::Running).then(|| row.updated.clone()),
         text: verdict_of(row),
         caption: None,
+        spent: None,
     }
 }
 
@@ -824,6 +858,12 @@ mod tests {
             text: "the second half does not hold\n1. spool first\n2. then deliver".into(),
             // A ` · ` of its own, which must not end the caption at it.
             caption: Some("spool first · then deliver".into()),
+            spent: Some(Spent {
+                ran: "sonnet-5-5/high".into(),
+                turns: 7,
+                peak: 70_000,
+                spend: crate::agent_commands::Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None },
+            }),
         };
         let bare = Pass { at: "2026-10-06T11:00:00Z".into(), ..Pass::opened(None, None) };
         write(&mut t, &[bare.clone(), full.clone()]);

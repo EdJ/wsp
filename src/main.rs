@@ -147,6 +147,8 @@ pub fn version() -> String {
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full",
+    // `attempts --cost <row>`, whose positional is a task id.
+    "cost",
     // `spawn --no-focus` is what focus not being asked for is now called, and it
     // is kept here rather than deleted so an invocation that still says it —
     // a script, a shell history, the README as it was — parses as a flag
@@ -1876,6 +1878,12 @@ fn help_text() -> String {
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,
                                     how long to review, and whether it came back
+  wsp attempts <task> --cost [--list <worklist>] [--json]
+                                    what a row cost: each attempt, leg and
+                                    verifier pass with tier, turns, peak context
+                                    and dollars, the row's wall time beside its
+                                    legs' summed, and a legs not on Sonnet with
+                                    their why
   wsp peek [panel|view|board|<task>] [--source recent] [--lines N]
                                     what is on that pane, or the frame the
                                     sidebar surface last drew; --source recent

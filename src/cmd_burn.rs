@@ -43,13 +43,17 @@ use crate::Args;
 struct Price {
     input: u64,
     output: u64,
+    /// What a cache read bills at, as a fraction of `input`. A tenth on most
+    /// tiers and not on all of them: the page lists Opus 5.5 and Sonnet 5.5 at
+    /// 0.05x and Fable 5.1 and Mythos 5.1 at 0.025x.
+    cache_read: (u64, u64),
 }
 
 /// When [`PRICES`] was last checked against the first-party price reference.
 /// Printed under the report, so the reader sees the age of the quote beside
 /// the money it produced. Move it only when the page has actually been
 /// re-read: the date is a claim about what the table was checked against.
-const PRICES_READ: &str = "2026-10-06";
+pub(crate) const PRICES_READ: &str = "2026-10-18";
 
 /// **List prices, first-party Anthropic API, read on [`PRICES_READ`].** This is
 /// the thing in wsp that goes stale without saying so, which is why it is a
@@ -67,9 +71,14 @@ const PRICES_READ: &str = "2026-10-06";
 /// So a row priced on a promotion carries its end date beside it, and the date
 /// is a prompt to re-read the page, not a number to apply.
 ///
-/// The page lists models whose cache-read multiplier differs from the tenth
-/// below (Opus 5.5 at $4/$20 with reads at 0.05x, Fable 5.1 and Mythos 5.1 at
-/// 0.025x); this table does not model them.
+/// **The cache-read multiplier is a column of this table, because the page's
+/// is not one number.** Opus 5.5 ($4/$20) and Sonnet 5.5 ($2/$10) read at 0.05x,
+/// Fable 5.1 and Mythos 5.1 at 0.025x, every other model at a tenth. A seat reads
+/// nearly all of its volume from cache, so a row priced at the wrong multiplier
+/// is wrong by up to the whole cache line: wsp-290 found Opus 5.5 priced at
+/// 2.5x its real read price and Sonnet 5.5, the tier legs run on, at 2x. Haiku
+/// 5.5 is priced by prompt length ($0.10/$0.50 up to 100k, $0.50/$2.50 over) and
+/// this table does not model that; it still reads as Haiku 4.5's $1/$5.
 ///
 /// Matched as a prefix, longest-specific first, because a model id carries a
 /// date or a variant wsp has no business parsing (`claude-opus-5`,
@@ -78,21 +87,38 @@ const PRICES_READ: &str = "2026-10-06";
 /// go* must never make an unrecognised spender look cheap, and the model column
 /// shows the name that was not recognised.
 const PRICES: &[(&str, Price)] = &[
-    ("claude-fable", Price { input: 10_000_000, output: 50_000_000 }),
-    ("claude-mythos", Price { input: 10_000_000, output: 50_000_000 }),
-    ("claude-opus", Price { input: 5_000_000, output: 25_000_000 }),
-    // Sonnet 4.x and Sonnet 5 are not the same price, and the fleet runs both:
-    // `d5f0956` starts work under a seat on sonnet while seats stay on the
-    // settings tier, so this is the row most likely to be read. Sonnet 5's
-    // $2/$10 was introductory through 2026-08-31; the step to $3/$15 that was
-    // to follow was cancelled and $2/$10 is now the standard price.
-    ("claude-sonnet-4", Price { input: 3_000_000, output: 15_000_000 }),
-    ("claude-sonnet", Price { input: 2_000_000, output: 10_000_000 }),
-    ("claude-haiku", Price { input: 1_000_000, output: 5_000_000 }),
+    ("claude-fable-5-1", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 40) }),
+    ("claude-mythos-5-1", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 40) }),
+    ("claude-fable", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 10) }),
+    ("claude-mythos", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 10) }),
+    ("claude-opus-5-5", Price { input: 4_000_000, output: 20_000_000, cache_read: (1, 20) }),
+    ("claude-opus", Price { input: 5_000_000, output: 25_000_000, cache_read: (1, 10) }),
+    // Sonnet 4.x, Sonnet 5 and Sonnet 5.5 are not the same price, and the fleet
+    // runs all three: `d5f0956` starts work under a seat on sonnet while seats
+    // stay on the settings tier, and a leg runs on Sonnet 5.5 unless its entry
+    // names another. Sonnet 5's $2/$10 was introductory through 2026-08-31; the
+    // step to $3/$15 that was to follow was cancelled and $2/$10 is now the
+    // standard price. Sonnet 5.5 is the same $2/$10 with reads at 0.05x.
+    ("claude-sonnet-4", Price { input: 3_000_000, output: 15_000_000, cache_read: (1, 10) }),
+    ("claude-sonnet-5-5", Price { input: 2_000_000, output: 10_000_000, cache_read: (1, 20) }),
+    ("claude-sonnet", Price { input: 2_000_000, output: 10_000_000, cache_read: (1, 10) }),
+    ("claude-haiku", Price { input: 1_000_000, output: 5_000_000, cache_read: (1, 10) }),
 ];
 
-/// Cache reads bill at a tenth of the input rate, cache writes at a quarter
-/// above it. Stated rather than hidden, exactly as `core-049` stated its
+/// What a model that matches nothing is priced at: the dearest row, at the
+/// ordinary multiplier. A report answering *where did the money go* must never
+/// make an unrecognised spender look cheap.
+const UNKNOWN: Price = Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 10) };
+
+/// Whether [`PRICES`] has a row for this model. A model id that is not Claude's
+/// (`opencode/x-free`) is priced by [`cost`] at [`UNKNOWN`], which is right for a
+/// seat's burn and wrong for a row that should say nothing instead.
+pub(crate) fn known(model: &str) -> bool {
+    PRICES.iter().any(|(prefix, _)| model.starts_with(prefix))
+}
+
+/// Cache reads bill at a tenth of the input rate unless the row says otherwise,
+/// cache writes at a quarter above it. Stated rather than hidden, exactly as `core-049` stated its
 /// tenth — the difference is that these are quoted rates rather than an
 /// estimate, so the column can say dollars.
 ///
@@ -103,7 +129,6 @@ const PRICES: &[(&str, Price)] = &[
 /// its cache hourly is undercounted on that one line item. Named here rather
 /// than guessed at; splitting the tally by TTL is worth doing the day cache
 /// writes are the answer to *where did the money go*, and they are not.
-const CACHE_READ: (u64, u64) = (1, 10);
 const CACHE_WRITE: (u64, u64) = (5, 4);
 
 /// What one request cost, in micro-dollars, on the model that served it.
@@ -117,11 +142,11 @@ pub(crate) fn cost(model: &str, input: u64, output: u64, cache_read: u64, cache_
         .iter()
         .find(|(prefix, _)| model.starts_with(prefix))
         .map(|(_, price)| price)
-        .unwrap_or(&PRICES[0].1);
+        .unwrap_or(&UNKNOWN);
     let at = |tokens: u64, per_mtok: u64| tokens.saturating_mul(per_mtok) / 1_000_000;
     at(input, p.input)
         + at(output, p.output)
-        + at(cache_read, p.input * CACHE_READ.0 / CACHE_READ.1)
+        + at(cache_read, p.input * p.cache_read.0 / p.cache_read.1)
         + at(cache_write, p.input * CACHE_WRITE.0 / CACHE_WRITE.1)
 }
 
@@ -341,6 +366,21 @@ mod tests {
         for model in ["claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-4-6"] {
             assert_eq!(cost(model, 1_000_000, 1_000_000, 0, 0), 18_000_000, "{model}");
         }
+    }
+
+    /// wsp-290: the page's Opus 5.5 row ($4/$20, reads at 0.05x), Sonnet 5.5's
+    /// 0.05x, and Fable 5.1's 0.025x, each against the model it is a variant of.
+    #[test]
+    fn a_cache_read_bills_at_the_multiplier_its_model_is_listed_at() {
+        let reads = |model: &str| cost(model, 0, 0, 1_000_000, 0);
+        assert_eq!(reads("claude-opus-5-5"), 200_000, "$0.20 a million, not the 0.1x $0.40");
+        assert_eq!(cost("claude-opus-5-5", 1_000_000, 1_000_000, 0, 0), 24_000_000, "$4 in, $20 out");
+        assert_eq!(reads("claude-opus-5"), 500_000, "Opus 5 keeps the tenth of $5");
+        assert_eq!(reads("claude-sonnet-5-5"), 100_000);
+        assert_eq!(reads("claude-sonnet-5"), 200_000);
+        assert_eq!(reads("claude-fable-5-1"), 250_000);
+        assert_eq!(reads("claude-fable-5"), 1_000_000);
+        assert_eq!(reads("gpt-something"), 1_000_000, "an unknown model is the dear row at a tenth");
     }
 
     /// **The bug, as a sentence.** A machine whose seats are all compound seats

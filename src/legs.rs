@@ -928,15 +928,32 @@ pub(crate) fn rework(old: &[Leg], verdict: &str) -> Result<Option<Vec<Leg>>, Str
 
 // ---- the record, read ----------------------------------------------------------
 
+/// What a done leg cost, from its end line: `{usd, turns, peak, seconds}`, or
+/// null for a leg that has not ended (compound-561 A5). `usd` is null where the
+/// record kept nothing to price, which is not the same as free.
+fn spent(ran: &[crate::cmd_attempts::Attempt], l: &Leg) -> serde_json::Value {
+    let Some(a) = ran.iter().find(|a| a.leg.as_deref() == Some(l.name.as_str()) && !a.until.is_empty()) else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "usd": crate::cmd_attempts::priced(&a.ran, &a.spend).map(|m| m as f64 / 1e6),
+        "turns": a.turns,
+        "peak": a.peak,
+        "seconds": a.seconds(),
+    })
+}
+
 /// The legs as `wsp show --json` gives them.
 pub(crate) fn json(t: &Task) -> serde_json::Value {
     let ls = legs(t);
     let w = waits(&ls);
     let ready = ready(&ls);
+    let ran = crate::cmd_attempts::attempts_of(t);
     serde_json::json!(ls
         .iter()
         .zip(w)
         .map(|(l, w)| serde_json::json!({
+            "spent": spent(&ran, l),
             "name": l.name,
             "agent": policy_line(&l.policy),
             "default": is_default(&l.policy),
@@ -1721,5 +1738,24 @@ mod tests {
         assert_eq!((j[0]["order"].as_str(), j[0]["baton"].as_str()), (Some("do plan"), Some("pointers")));
         write(&mut t, &[leg("fresh")]);
         assert!(json(&t)[0]["started"].is_null() && json(&t)[0]["ended"].is_null(), "null until set");
+    }
+
+    /// compound-561 A5: a done leg's cost from its end line, null for one that
+    /// has not ended or has no line.
+    #[test]
+    fn a_done_legs_json_carries_what_it_spent_and_an_open_one_carries_null() {
+        let mut t = Task::new("m", "m-1");
+        t.body = "## Log\n\
+- 2026-10-18T09:00:00Z leg a started by pane cpd-1\n\
+- 2026-10-18T09:10:00Z leg a ended after 10m · ran sonnet-5-5/high · 12 turns · peak 80k · 20M cache 1M in 50k out\n\
+- 2026-10-18T09:11:00Z leg b started by pane cpd-2\n".into();
+        write(&mut t, &[Leg::pending("a", ""), Leg::pending("b", "")]);
+        let j = json(&t);
+        assert_eq!(j[0]["spent"]["turns"], 12);
+        assert_eq!(j[0]["spent"]["peak"], 80_000);
+        assert_eq!(j[0]["spent"]["seconds"], 600);
+        // 20M at $0.10, 1M at $2, 50k at $10
+        assert_eq!(j[0]["spent"]["usd"], 4.5);
+        assert!(j[1]["spent"].is_null(), "b is still running");
     }
 }

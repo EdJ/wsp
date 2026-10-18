@@ -2258,14 +2258,24 @@ fn ran_at(store: &Store, task_id: &str, since: &str) -> String {
 /// [`ran_at`] for a leg's seat. A leg holds no claim and two siblings share one
 /// task, so the session is the seat's own binding's and not the task's.
 pub(crate) fn ran_in_seat(store: &Store, seat: &str, since: &str) -> String {
+    ran_of_seat(store, seat, since).map(|r| ran_text(&r)).unwrap_or_default()
+}
+
+/// What a seat's session served since `since`, from the seat's own binding. A
+/// verifier's seat is read the same way, and its pass keeps the reading.
+pub(crate) fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::agent_commands::Ran> {
     let bindings = store.bindings();
-    let Some(b) = bindings.get(seat) else { return String::new() };
+    let b = bindings.get(seat)?;
     let get = |k: &str| b.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let session = get("agent_session_id");
     if session.is_empty() {
-        return String::new();
+        return None;
     }
-    ran_clause(&crate::cmd_spawn::kind_or_default(&get("agent_kind")), &session, &get("cwd"), since)
+    crate::agent_commands::of(&crate::cmd_spawn::kind_or_default(&get("agent_kind"))).ran(
+        &session,
+        &get("cwd"),
+        util::epoch_of(since),
+    )
 }
 
 fn ran_clause(kind: &str, session: &str, cwd: &str, since: &str) -> String {
@@ -2278,12 +2288,22 @@ fn ran_clause(kind: &str, session: &str, cwd: &str, since: &str) -> String {
         cwd,
         util::epoch_of(since),
     );
-    let Some(ran) = ran else { return String::new() };
+    ran.map(|r| ran_text(&r)).unwrap_or_default()
+}
+
+/// The clauses a release line and a leg's end line carry: ` · ran opus-5/high ·
+/// 96 turns · peak 180k · 242M cache 4.7M in 875k out`. The peak is left out
+/// where the runtime read none, so a line written before it reads as it did.
+fn ran_text(ran: &crate::agent_commands::Ran) -> String {
+    let peak = match ran.peak {
+        0 => String::new(),
+        n => format!(" · peak {}", util::count_human(n)),
+    };
     let spent = match ran.spend.clause() {
         Some(c) => format!(" · {c}"),
         None => String::new(),
     };
-    format!(" · ran {} · {} turns{spent}", ran.label(), ran.turns)
+    format!(" · ran {} · {} turns{peak}{spent}", ran.label(), ran.turns)
 }
 
 /// End a claim and leave the trace behind.
@@ -10062,5 +10082,22 @@ mod tests {
         assert_eq!(release(&store, &args), 2);
         assert!(store.bindings().contains_key("w1:p1"), "a refusal costs nothing");
         assert!(store.claims().contains_key("batch-043"));
+    }
+
+    /// wsp-290: the clauses a release line and a leg's end line carry, with the
+    /// peak between the turns and the spend, and left out where none was read.
+    #[test]
+    fn the_ran_clauses_carry_the_peak_between_turns_and_spend() {
+        use crate::agent_commands::{Ran, Spend};
+        let mut ran = Ran {
+            models: vec!["sonnet-5-5".into()],
+            efforts: vec!["high".into()],
+            turns: 63,
+            peak: 180_000,
+            spend: Spend { cache: 4_100_000, input: 100_000, output: 5_000, micros: None },
+        };
+        assert_eq!(ran_text(&ran), " · ran sonnet-5-5/high · 63 turns · peak 180k · 4.1M cache 100k in 5.0k out");
+        ran.peak = 0;
+        assert_eq!(ran_text(&ran), " · ran sonnet-5-5/high · 63 turns · 4.1M cache 100k in 5.0k out");
     }
 }

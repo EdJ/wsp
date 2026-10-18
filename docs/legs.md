@@ -505,6 +505,16 @@ start building up before legs exist.
 Attempts are paired by leg name. Today's `attempts_of` pairs a release with
 the last open claim, and two siblings' lines would be crossed by it.
 
+*Built (wsp-290):* the name is `wsp attempts <row> --cost [--list <worklist>]
+[--json]`. The `peak` clause follows `turns` on a release or leg end line; a
+verification pass carries `ran`, `turns`, `peak` and `spent` clauses written when
+its seat is ended. Dollars are priced at report time from the recorded tokens,
+at the dearest tier a moved session named, and a cache write counts at the input
+rate (the record keeps `in` as input plus writes), so a total is a floor. The
+price table now carries the cache-read multiplier per row: Opus 5.5 and Sonnet
+5.5 at 0.05x, Fable 5.1 and Mythos 5.1 at 0.025x. Haiku 5.5's prompt-length
+tiers are not modelled.
+
 ## Seen
 
 - **wip and census.** A leg holds no claim, so `wip` reads running legs off

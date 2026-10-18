@@ -1543,6 +1543,7 @@ fn read_export(src: &[u8], since: i64) -> Option<Ran> {
         let n = |p: &str| info.pointer(p).and_then(Value::as_u64).unwrap_or(0);
         ran.spend.cache += n("/tokens/cache/read");
         ran.spend.input += n("/tokens/input") + n("/tokens/cache/write");
+        ran.peak = ran.peak.max(n("/tokens/input") + n("/tokens/cache/read") + n("/tokens/cache/write"));
         // Reasoning is counted *beside* output here and *inside* it by
         // Anthropic, whose `output_tokens` includes thinking. Adding them is
         // what makes the two kinds' out column the same unit — tokens the model
@@ -2296,6 +2297,11 @@ pub struct Ran {
     /// one turn is one call and one line of the bill. See [`read_ran`] for
     /// why counting the transcript's lines gave three times this.
     pub turns: usize,
+    /// The largest context any one turn read — cache reads, fresh input and
+    /// cache writes of a single request. It is the number staging is meant to
+    /// bring down (`docs/legs.md`, *Measured*), and a sum cannot say it: 63
+    /// turns of 40k and 63 turns growing to 400k read the same total.
+    pub peak: u64,
     pub spend: Spend,
 }
 
@@ -2554,6 +2560,11 @@ fn read_ran(src: &mut impl std::io::BufRead, since: i64) -> Option<Ran> {
         ran.spend.cache += n("/message/usage/cache_read_input_tokens");
         ran.spend.input +=
             n("/message/usage/input_tokens") + n("/message/usage/cache_creation_input_tokens");
+        ran.peak = ran.peak.max(
+            n("/message/usage/cache_read_input_tokens")
+                + n("/message/usage/input_tokens")
+                + n("/message/usage/cache_creation_input_tokens"),
+        );
         // Thinking is inside `output_tokens` here and beside it in opencode's
         // record; [`read_export`] adds the two so that this column means the
         // same thing on both sides. Claude Code publishes no price at all, so
@@ -4031,6 +4042,26 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
         assert_eq!(ran.efforts, ["high"]);
         assert_eq!(ran.turns, 2);
         assert_eq!(ran.label(), "opus-5/high");
+    }
+
+    /// wsp-290: the largest context any one turn read, which is cache reads plus
+    /// fresh input plus cache writes of a single request and not a sum over them.
+    #[test]
+    fn the_peak_is_the_largest_context_one_turn_read() {
+        let usage = |id: &str, read: u64, fresh: u64, write: u64| {
+            line(
+                id,
+                "claude-sonnet-5-5",
+                "high",
+                false,
+                "",
+                &format!(r#"{{"cache_read_input_tokens":{read},"input_tokens":{fresh},"cache_creation_input_tokens":{write},"output_tokens":10}}"#),
+            )
+        };
+        let ran = ran_of(&[usage("a", 40_000, 5, 1_000), usage("b", 120_000, 5, 30_000), usage("c", 90_000, 5, 0)])
+            .expect("three turns");
+        assert_eq!(ran.peak, 150_005, "the second turn read the most: 120k + 5 + 30k");
+        assert_eq!(ran.spend.cache, 250_000, "and the sum is still the sum");
     }
 
     /// The case the whole field exists for. A `/model` mid-session leaves both

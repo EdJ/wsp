@@ -2794,6 +2794,8 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
                 continue;
             }
         };
+        // Read before the despawn: it clears the binding the session is found by.
+        let spent = crate::cmd_agent::ran_of_seat(store, &seat, &p.at).map(|r| crate::verification::Spent::of(&r));
         let outcome = despawn_seat(&seat).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {
             Ok(()) => Ending::Ended,
@@ -2804,6 +2806,7 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
             let mut ps = passes(&t);
             let Some(q) = ps.iter_mut().find(|q| q.at == p.at && q.pane == p.pane) else { return false };
             q.ending = ending.clone();
+            q.spent = spent.clone();
             write(&mut t, &ps);
             store.save_task(&t).is_ok()
         });
