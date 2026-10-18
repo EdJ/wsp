@@ -529,6 +529,65 @@ writes), `cache_write_tokens` is null, `usd_micros` is whatever the runtime
 published (null for Claude Code) and `exact` is false. Seats stopped before this
 leg have no ledger line.
 
+*The list's cost (wsp-264):* `wsp worklist cost <slug> [--json]` counts every
+seat that worked for the list once, by precedence governor, barrier check,
+verifier, member attempt (a pane that served an earlier attempt too, or a
+verifier pass by the governor's own pane, is marked and not counted again).
+**A governor counts in full toward the group the run stood at when it was
+seated** (one plus the highest `passed` of the list's earlier `worklist-go`
+events). A pass short of the end rotates in a fresh seat, so each seat governs
+one group; burn is whole-session and cannot be split.
+
+Units: token fields are integer tokens; `usd_micros` is integer micro-dollars
+(1 000 000 = $1), priced as `wsp burn` prices; `seconds` is wall time of the seat
+or attempt; `turns` an integer. `input_tokens` is fresh input only when `exact` is
+true; on the rounded fallback it includes cache writes. Figures are kept apart and
+never added into one number across kinds.
+
+```
+{ "list": "<slug>",
+  "groups": [ { "group": 1,            // 1-based
+      "members": [ { "task": "wsp-12", "seats": [Seat…], "total": Total } ],
+      "barrier":  [Seat…],             // the group's barrier checker(s)
+      "governor": [Seat…],             // governor seats counted toward this group
+      "total": Total } ],
+  "total": Total }                     // every group, summed
+
+Seat  { "role": "worker"|"rework"|"leg"|"verifier"|"barrier"|"governor",
+        "member": "wsp-12"|null,       // null for barrier and governor
+        "leg": "scout"|null,           // the leg's name, else null
+        "seat": "cpd-1297",            // pane id; burn's key
+        "tier": "sonnet/medium",
+        "dropped": bool,               // the attempt was dropped
+        "by_governor": bool,           // verifier pass by the governor's pane; counted there, not summed here
+        "shared": bool,                // pane served an earlier attempt; counted at the first, not summed here
+        "through": int|null,           // governor only: the later group it sat through
+        "measured": bool, "exact": bool,
+        "input_tokens": int|null, "output_tokens": int|null,
+        "cache_tokens": int|null,      // cache read
+        "cache_write_tokens": int|null,
+        "usd_micros": int|null, "turns": int, "seconds": int }
+
+Total { "input_tokens", "output_tokens", "cache_tokens", "cache_write_tokens",
+        "usd_micros": int,             // sums of measured seats; 0 when none, so read `unmeasured`
+        "turns": int, "seconds": int,
+        "seats": int,                  // seats counted
+        "unmeasured": int,             // counted seats with no figures at all
+        "inexact": int }               // counted seats on rounded clause figures
+```
+
+`null` on a Seat's figures means *unmeasured or not recorded*, never zero:
+`measured: false` has every figure null (the seat ended before the ledger, or
+never read); `measured: true, exact: false` is the rounded clause fallback, with
+`cache_write_tokens` null and `usd_micros` null where the runtime published none.
+A Total of 0 with `unmeasured > 0` is a floor, not a fact.
+
+`attempts <task> --json` rows all carry `role: "member"` now, and each verifier
+pass is appended as a row `{task, role:"verifier", leg:null, at, pane, ran_at,
+turns, input_tokens, output_tokens, cache_tokens, cache_write_tokens,
+usd_micros, exact, seconds, outcome}` with the same null rules. Every attempt row
+has `cache_write_tokens`, `usd_micros` and `exact` as described above.
+
 ## Seen
 
 - **wip and census.** A leg holds no claim, so `wip` reads running legs off
