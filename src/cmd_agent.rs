@@ -3838,7 +3838,11 @@ fn kinds(args: &Args) -> i32 {
             })
             .collect();
         let default = all.iter().find(|k| k.default).map(|k| k.name);
-        println!("{}", json!({ "kinds": rows, "default": default, "passthrough": true }));
+        let refused: Vec<Value> = crate::agent_commands::refusals()
+            .iter()
+            .map(|(p, why)| json!({ "file": p.display().to_string(), "why": why }))
+            .collect();
+        println!("{}", json!({ "kinds": rows, "default": default, "passthrough": true, "refused": refused }));
         return 0;
     }
     let w = all.iter().map(|k| k.name.len()).max().unwrap_or(0);
@@ -3857,6 +3861,9 @@ fn kinds(args: &Args) -> i32 {
             facts.push(format!("efforts {}", k.efforts.join("|")));
         }
         println!("{:w$}  {}", k.name, facts.join(" · "));
+    }
+    for (p, why) in crate::agent_commands::refusals() {
+        println!("refused  {}: {why}", p.display());
     }
     println!("any other kind herdr can start is passed through by --kind");
     0

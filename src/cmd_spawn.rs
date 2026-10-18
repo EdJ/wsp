@@ -2288,6 +2288,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         Some(l) => leg_seat::tier_of(l).0,
         None => args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string()),
     };
+    // A kind file that did not parse is an error, not a fall to `Plain`: the
+    // spawn would start a program wsp was told to start differently.
+    if let Some(why) = agent_commands::refusal_of(&kind) {
+        eprintln!("wsp: kind `{kind}` is refused: {why}");
+        return 2;
+    }
     let tier_args;
     let tier_from = match &leg_rec {
         Some(l) => {

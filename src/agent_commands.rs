@@ -801,6 +801,15 @@ pub fn refusals() -> &'static [(PathBuf, String)] {
     &registry().refused
 }
 
+/// Why the kind file for `kind` was refused, if there is one and it was. A name
+/// with no file at all is `None`: that is a kind herdr may know, passed through.
+pub fn refusal_of(kind: &str) -> Option<&'static str> {
+    refusals()
+        .iter()
+        .find(|(p, _)| p.file_stem().and_then(|s| s.to_str()) == Some(kind.trim()))
+        .map(|(_, why)| why.as_str())
+}
+
 /// The kinds wsp has behaviour for, in the order a menu should show them, and
 /// the one place [`of`] looks. [`kinds`] reads this same table, so a chrome that
 /// offers "New agent ▸" never keeps a second list that [`of`] could disagree
@@ -2903,6 +2912,11 @@ pub fn no_channel() -> Refusal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unregistered_kind_has_no_refusal() {
+        assert_eq!(super::refusal_of("no-such-kind-anywhere"), None);
+    }
+
     #[test]
     fn data_kinds_follow_the_built_ins_by_name_and_refusals_are_kept() {
         let dir = std::env::temp_dir().join(format!("wsp-kinds-reg-{}", std::process::id()));

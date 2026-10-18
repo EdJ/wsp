@@ -553,6 +553,8 @@ impl Compound<'_> {
         // record older than the start is the last agent's, in a seat reused.
         let started = util::epoch_of(&str_of(rec, "started_at"));
         let kind = rec.get("agent").map(|a| str_of(a, "kind")).unwrap_or_default();
+        // Claude-only: the start window is a fact about Claude Code's hooks; a
+        // data kind has none and must not be taken for it.
         if kind == "claude" && started > 0 && at < started && util::epoch_secs() - started < STARTING_WINDOW {
             return State::Starting;
         }
@@ -836,6 +838,7 @@ impl Compound<'_> {
 /// a `compound-113`-shaped row on the compound side, not a silent divergence
 /// here — this is two characters, not the engine.
 fn title_state(kind: &str, osc_title: &str) -> Option<State> {
+    // Claude-only: the title glyph rule is Claude Code's; a data kind reads None.
     if kind != "claude" {
         return None;
     }
@@ -1231,6 +1234,8 @@ impl Compound<'_> {
 /// `tokenhub-spec-sync` shape, a pane that never comes up paid for every
 /// twenty minutes. [`crate::repair`] asks this before it spends anything.
 pub(crate) fn reads_kind(kind: &str) -> bool {
+    // Compound ships manifests for these two only; a data kind is unreadable
+    // there, so a governor on one is refused rather than left Unknown.
     matches!(kind, "claude" | "opencode")
 }
 
@@ -1371,6 +1376,7 @@ impl Place for Compound<'_> {
     /// as "do not press".
     fn typed(&self, seat: &Seat) -> Option<bool> {
         let rec = self.record(seat).ok()?;
+        // Claude-only: the composer is Claude Code's prompt shape.
         if rec.get("agent").map(|a| str_of(a, "kind")).as_deref() != Some("claude") {
             return None;
         }

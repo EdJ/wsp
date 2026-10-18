@@ -421,6 +421,8 @@ impl Recipe {
     /// without it. The stream on stdout is kept in the seat's `out.jsonl`, and
     /// is not what wsp reads state from: the hooks are.
     fn of(kind: &str) -> Recipe {
+        // Claude-only: print mode and stream-json are Claude Code's flags. A
+        // data kind is never this arm; it runs as `Recipe::plain`.
         match kind.trim() {
             "claude" => Recipe {
                 flags: &[
