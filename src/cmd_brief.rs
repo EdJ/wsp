@@ -1236,6 +1236,12 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             p.dim("your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk, and `git show master:<path>` reads it")
                 .to_string(),
         );
+        // Whose the land is and what review follows it (`wsp-306`), said to
+        // the agent holding a row and nobody else: a leg's work is landed by
+        // its row's finish, and a seat with nothing claimed has no row to end.
+        if r.mine.is_some() && r.leg.is_none() {
+            row("land", p.dim(crate::cmd_checkout::LANDING).to_string());
+        }
     }
 
     // Standing direction, before anything about the work itself. An agent
@@ -2318,6 +2324,14 @@ mod tests {
         assert_eq!(r.own_tree.as_deref(), Some("t-001"));
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("wsp land"), "an agent was not told how to get its work out:\n{text}");
+        assert!(text.contains(crate::cmd_checkout::LANDING), "the row's agent is told whose the land is:\n{text}");
+
+        // A tree with nothing claimed in it has no row to end.
+        b.world.bindings.clear();
+        let r = compose(&b);
+        assert!(r.own_tree.is_some() && r.mine.is_none());
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(!text.contains(crate::cmd_checkout::LANDING), "{text}");
 
         let r = compose(&briefing());
         assert!(r.own_tree.is_none(), "the trunk is not a tree of its own");

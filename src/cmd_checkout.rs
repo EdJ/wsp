@@ -184,6 +184,22 @@ use crate::Args;
 /// will ever exist here.
 pub(crate) const WORKTREES: &str = ".worktrees";
 
+/// What a land is and what follows it, said to the agent whose row it is.
+/// `wsp-306`.
+///
+/// **Facts, not authority.** Six of 1,035 `wsp land` calls in three weeks were
+/// refused by Claude Code's auto-mode classifier, read as a merge without
+/// review or a change nobody asked for. A sentence claiming the person's
+/// permission was tried first and refused in its turn: anything wsp prints is
+/// agent-written, so it cannot carry the person's word, and only their own
+/// settings or their own typing can. What wsp can say truly is whose act the
+/// land is, what it does, what review follows, and what to do when a land is
+/// refused — never a hand-rolled rebase and fast-forward (`robustness-071`).
+pub(crate) const LANDING: &str = "A row ends with its own agent's `wsp land`, which rebases the row's \
+     branch and fast-forwards the trunk; review follows it: wsp starts a read-only verifier on the land, and \
+     the person reads the row before `wsp done`. A land that is refused is asked about with `wsp ask`, never \
+     done by hand.";
+
 /// The working tree a path is in, when it is one of ours.
 ///
 /// A pure path rule on purpose: `overlap` calls it for every pane herdr reports,

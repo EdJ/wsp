@@ -755,7 +755,7 @@ fn told_unlanded(store: &Store, w: &Worklist, t: &Task) {
 fn unlanded(id: &str, note: &str) -> String {
     format!(
         "{id} is at review with {note}, so it has no verifier yet. \
-         `wsp land {id}` puts it there, and wsp starts the verifier on the land."
+         Its land is its own agent's act, `wsp land {id}`, and wsp starts the verifier on the land."
     )
 }
 

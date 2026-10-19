@@ -1074,7 +1074,8 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
         if told_once(store, &s.id, &said) {
             crate::cycle::tell(store, w, &format!(
                 "{} in the {} run is at {} with nothing started for it — {why}, so no verifier can run \
-                 on it. `wsp land {}` puts it on the trunk and its verifier starts on that.",
+                 on it. Its land is its own agent's act, `wsp land {}`, and wsp has told it so; its verifier \
+                 starts on the land.",
                 s.id,
                 w.id,
                 s.settlement.word(),
@@ -1087,7 +1088,10 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             // marker keys both, so it hears this as often as the seat does.
             tell_member(store, &s.id, &format!(
                 "wsp: {} is at {} but not on the trunk — {why} — so no verifier can start and the {} run \
-                 waits on you. Run `wsp land {}`: it puts your commits on the trunk, and the verifier starts on that.",
+                 waits on you. Run `wsp land {}`: the land is yours, as the end of your row, and it rebases your \
+                 branch and fast-forwards the trunk. Review follows it: wsp starts a read-only verifier on the land, \
+                 and the person reads the row before `wsp done`. If the land is refused, `wsp ask` about it; never \
+                 land by hand.",
                 s.id,
                 s.settlement.word(),
                 w.id,
