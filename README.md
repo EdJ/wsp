@@ -1630,6 +1630,23 @@ its label or an Other, and on anything wider are refused for want of a
 person's questions closed in the last ten minutes, each with `closed: {how:
 answered|abandoned, by: person|seat|pane|timeout, at, answer}`.
 
+**An agent with no hook asks inside its turn** (`wsp-300`). `wsp ask <id> --person
+--wait [--timeout S] [--choices F|-] ["…"]` raises the question and blocks until
+the person answers or it is abandoned; the agent's own tool call returns, and
+nothing is typed at its composer. Stdout is the answer and exit is 0: the label
+(a line each for a multi-select's picks, or the Other's words) for one question;
+`Header: label` lines for several; `talk: <sentence>` when the person declined to
+choose and spoke instead; `allow` / `deny: <sentence>` for a plan or permission;
+the words for a question with no choices. An abandon or a `--timeout` exits **3**
+with the reason on stderr. A timeout leaves the question open; `wsp ask <mid>`
+reads it (and its answer, once there is one), and `wsp ask <mid> --wait
+[--timeout S]` waits on it again. With a timeout and choices the question carries
+`choices.held: {at, timeout}`. While the wait stands the question carries
+`awaited: {pid, at}`, and the asker's `wsp wip --json` row says `needs_you: true`
+and `waiting: {why: "question", on: "person", id: <mid>}` whatever the runner
+word is. `wsp answer` types nothing at a seat whose waiter is alive; if the waiter
+has gone (the call was interrupted) it delivers as it always did.
+
 Something louder is a hook away, the same seam `review` uses:
 
 ```sh

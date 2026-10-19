@@ -58,6 +58,11 @@ pub(crate) enum Why {
     Answer(String),
     /// Shells of its own still running, and how many.
     Shell(usize),
+    /// Standing in its own `wsp ask --person --wait`, by the question's id
+    /// (`wsp-300`). It is inside a tool call, so the screen says `working`:
+    /// this is the only reading that counts it, and it counts whatever the
+    /// runner's word is.
+    Question(String),
 }
 
 /// Whom it is waiting on.
@@ -105,6 +110,7 @@ impl Wait {
         match &self.why {
             Why::Prompt => format!("stopped on a prompt only {whom} can answer"),
             Why::Answer(id) => format!("waiting on {whom} to answer its question {id}"),
+            Why::Question(id) => format!("blocked in `wsp ask --wait` for {whom} to answer {id}"),
             Why::Shell(n) => format!(
                 "waiting on {} of its own still running, which wakes it when {} ends",
                 if *n == 1 { "a shell".to_string() } else { format!("{n} shells") },
@@ -120,6 +126,7 @@ impl Wait {
         let (why, question, shells) = match &self.why {
             Why::Prompt => ("prompt", None, None),
             Why::Answer(id) => ("answer", Some(id.as_str()), None),
+            Why::Question(id) => ("question", Some(id.as_str()), None),
             Why::Shell(n) => ("shell", None, Some(*n)),
         };
         let on = match &self.on {
@@ -130,6 +137,10 @@ impl Wait {
         let mut v = serde_json::json!({ "why": why, "on": on, "question": question, "word": self.word() });
         if let Some(n) = shells {
             v["shells"] = n.into();
+        }
+        // §26.8 D9 names it `id`; `question` stays beside it as `answer`'s.
+        if let (Why::Question(id), Some(o)) = (&self.why, v.as_object_mut()) {
+            o.insert("id".into(), id.as_str().into());
         }
         v
     }
@@ -144,6 +155,10 @@ impl Wait {
 pub(crate) struct Asks {
     by_pane: BTreeMap<String, (String, On)>,
     by_task: BTreeMap<String, (String, On)>,
+    /// The person's questions a live `wsp ask --wait` is blocked on, by the
+    /// asker's pane and by its task.
+    awaited_pane: BTreeMap<String, String>,
+    awaited_task: BTreeMap<String, String>,
 }
 
 impl Asks {
@@ -188,6 +203,17 @@ impl Asks {
             if !w.task.is_empty() {
                 asks.by_task.insert(w.task.clone(), (m.id.clone(), on));
             }
+            // A wait stands only while its process does: a waiter killed with
+            // Esc leaves the mark behind, and the seat is then at its prompt
+            // like any asker.
+            if m.for_person && m.awaited.as_ref().is_some_and(|a| a.alive()) {
+                if !w.pane.is_empty() {
+                    asks.awaited_pane.insert(w.pane.clone(), m.id.clone());
+                }
+                if !w.task.is_empty() {
+                    asks.awaited_task.insert(w.task.clone(), m.id.clone());
+                }
+            }
         }
         asks
     }
@@ -201,6 +227,20 @@ impl Asks {
     pub(crate) fn of(&self, seat: &str, task: &str) -> Option<Wait> {
         let hit = self.by_pane.get(seat).or_else(|| (!task.is_empty()).then(|| self.by_task.get(task)).flatten())?;
         Some(Wait { why: Why::Answer(hit.0.clone()), on: hit.1.clone() })
+    }
+
+    /// The person's question this seat is blocked on in `wsp ask --wait`.
+    pub(crate) fn awaited(&self, seat: &str, task: &str) -> Option<Wait> {
+        let id = self.awaited_pane.get(seat).or_else(|| (!task.is_empty()).then(|| self.awaited_task.get(task)).flatten())?;
+        Some(Wait { why: Why::Question(id.clone()), on: On::Person })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiter(pane: &str, task: &str, id: &str) -> Asks {
+        let mut a = Asks::one(pane, task, id, On::Person);
+        a.awaited_pane.insert(pane.to_string(), id.to_string());
+        a.awaited_task.insert(task.to_string(), id.to_string());
+        a
     }
 
     #[cfg(test)]
@@ -379,7 +419,16 @@ fn elapsed(etime: &str) -> Option<i64> {
 /// started again; one nobody can read is not waiting on anybody as far as this
 /// can say.
 pub(crate) fn reading(state: Option<State>, asks: &Asks, shells: &Shells, seat: &str, task: &str) -> Option<Wait> {
-    match state? {
+    let state = state?;
+    // A seat blocked in `wsp ask --wait` is `Working` to the screen: its tool
+    // call is running. The prompt still wins (below), and a seat that is gone
+    // waits on nothing.
+    if !matches!(state, State::Blocked | State::Gone) {
+        if let Some(w) = asks.awaited(seat, task) {
+            return Some(w);
+        }
+    }
+    match state {
         State::Idle => asks.of(seat, task).or_else(|| shells.of_seat(seat)),
         other => on_screen(other),
     }
@@ -507,5 +556,34 @@ mod tests {
         assert_eq!(elapsed("13-01:13:00"), Some(13 * 86_400 + 3600 + 13 * 60));
         assert_eq!(elapsed("00:04"), Some(4));
         assert_eq!(elapsed("bad"), None);
+    }
+
+    /// `wsp-300`, §26.8 D9: a seat blocked in `wsp ask --wait` is in a tool
+    /// call, so the screen says `working`, and it still reads as waiting on a
+    /// person — whatever the runner's word, short of a prompt or a gone seat.
+    #[test]
+    fn a_seat_blocked_in_ask_wait_reads_waiting_on_the_person_whatever_the_screen_says() {
+        let asks = Asks::waiter("cpd-1", "wsp-1", "m-1");
+        for (state, want) in [
+            (State::Working, Some(Why::Question("m-1".into()))),
+            (State::Idle, Some(Why::Question("m-1".into()))),
+            (State::Starting, Some(Why::Question("m-1".into()))),
+            (State::Blocked, Some(Why::Prompt)),
+            (State::Gone, None),
+        ] {
+            let got = reading(Some(state), &asks, &Shells::default(), "cpd-1", "wsp-1");
+            assert_eq!(got.map(|w| w.why), want, "{state:?}");
+        }
+        // The pane is perishable and the task is not: a respawn is still it.
+        assert!(reading(Some(State::Working), &asks, &Shells::default(), "cpd-2", "wsp-1").is_some());
+        assert!(reading(Some(State::Working), &asks, &Shells::default(), "cpd-2", "wsp-9").is_none(), "another row's seat is not");
+        // A question with no waiter keeps the old rule: only an idle asker waits.
+        let plain = Asks::one("cpd-1", "wsp-1", "m-1", On::Person);
+        assert!(reading(Some(State::Working), &plain, &Shells::default(), "cpd-1", "wsp-1").is_none());
+
+        let w = reading(Some(State::Working), &asks, &Shells::default(), "cpd-1", "wsp-1").unwrap();
+        let j = w.json();
+        assert_eq!((j["why"].as_str(), j["on"].as_str(), j["id"].as_str()), (Some("question"), Some("person"), Some("m-1")));
+        assert!(w.owed() && w.word() == "waiting · person");
     }
 }

@@ -4441,11 +4441,17 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // A member waiting on its own shell is stopped on live work and needs
         // nobody (`wsp-214`): the shell wakes it. Every other wait still
         // needs somebody — a prompt a person, a question whoever it went to.
-        let needs_you = cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some())
-            && waiting.as_ref().is_none_or(|w| w.owed())
-            // A leg that has written its baton is finished: its seat stands
-            // until the tick ends it, and nobody is owed anything from it.
-            && legged.get(seat).is_none_or(|s| s.leg.state != crate::legs::State::Done);
+        //
+        // **Except a seat blocked in `wsp ask --wait`** (`wsp-300`, §26.8 D9):
+        // it is in a tool call, so it is `working` to the screen and `stopped`
+        // is false, and it is stopped on a person all the same.
+        let in_ask_wait = waiting.as_ref().is_some_and(|w| matches!(w.why, crate::waiting::Why::Question(_)));
+        let needs_you = in_ask_wait
+            || cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some())
+                && waiting.as_ref().is_none_or(|w| w.owed())
+                // A leg that has written its baton is finished: its seat stands
+                // until the tick ends it, and nobody is owed anything from it.
+                && legged.get(seat).is_none_or(|s| s.leg.state != crate::legs::State::Done);
         // The task whose claim started this seat: its binding's, or — once the
         // binding has gone with a reseat — the open one its agent claimed.
         let held = bound.or_else(|| {
@@ -9068,6 +9074,23 @@ mod tests {
         assert_eq!(row("w3:p1")["waiting"], serde_json::Value::Null, "a working seat is not waiting");
         assert_eq!(row("w3:p1")["members_waiting"], 2);
         assert_eq!(v["waiting"], 2);
+    }
+
+    /// `wsp-300`, §26.8 D9. A member inside `wsp ask --person --wait` is in a
+    /// tool call, so its screen says `working`; its row says it needs the
+    /// person and which question, and the governor counts it waiting.
+    #[test]
+    fn wip_counts_a_seat_blocked_in_ask_wait_as_needing_the_person_while_it_reads_working() {
+        let mut w = wip_world();
+        w.asks = crate::waiting::Asks::waiter("w1:p1", "t-001", "m-7");
+        let v = wip_json(&w);
+        let row = |pane: &str| v["agents"].as_array().unwrap().iter().find(|a| a["pane"] == pane).unwrap().clone();
+        assert_eq!(row("w1:p1")["state"], "working", "the screen's word is untouched: {v}");
+        assert_eq!(row("w1:p1")["needs_you"], true);
+        assert_eq!(row("w1:p1")["waiting"]["why"], "question");
+        assert_eq!(row("w1:p1")["waiting"]["on"], "person");
+        assert_eq!(row("w1:p1")["waiting"]["id"], "m-7");
+        assert_eq!(row("w3:p1")["needs_you"], false, "and a neighbour is not");
     }
 
     /// `wsp-214`. A member idle at `doing` on its own background shell is drawn

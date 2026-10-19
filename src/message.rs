@@ -790,6 +790,32 @@ pub struct Message {
     /// compound draw buttons, and what an answer is checked against. `None` is
     /// today's question, and a record from before this reads as one.
     pub choices: Option<Choices>,
+    /// **Somebody is standing in `wsp ask --wait` for this** (`wsp-300`): the
+    /// process that is blocked on it and will print the answer from its own
+    /// tool call. Written when the wait starts and when it is taken up again,
+    /// cleared when it times out; a waiter killed mid-wait leaves it set, and
+    /// [`Awaited::pid`] is how a reader tells that one from a live wait.
+    pub awaited: Option<Awaited>,
+}
+
+/// A `wsp ask --wait` in progress, as the question records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Awaited {
+    /// The waiting process. Its being alive is the whole of "the answer has
+    /// somewhere to go that is not the composer".
+    pub pid: u32,
+    pub at: String,
+}
+
+impl Awaited {
+    pub fn here() -> Awaited {
+        Awaited { pid: std::process::id(), at: util::now_iso() }
+    }
+
+    /// Whether the waiter is still there to be handed the answer.
+    pub fn alive(&self) -> bool {
+        crate::place_super::alive(&[self.pid]).contains(&self.pid)
+    }
 }
 
 impl Message {
@@ -815,6 +841,7 @@ impl Message {
             for_seat: None,
             caption: None,
             choices: None,
+            awaited: None,
         }
     }
 
@@ -1102,6 +1129,11 @@ impl Message {
                 Route::Unrouted => Value::Null,
             },
         });
+        // Written only while a wait stands or has stood, so a record nobody
+        // waited on is byte for byte what it was.
+        if let Some(a) = &self.awaited {
+            v["awaited"] = json!({ "pid": a.pid, "at": a.at });
+        }
         // Only a question owes a route — a hand with no `for` is the person's
         // and the seat's both, which is not a defect.
         if self.route() == Route::Unrouted && self.shape() == Some(Shape::Question) {
@@ -1162,6 +1194,10 @@ impl Message {
                 Some(Caption { text: text.to_string(), from })
             }),
             choices: Choices::stored(v.get("choices")),
+            awaited: v.get("awaited").and_then(|a| {
+                let pid = u32::try_from(a.get("pid").and_then(Value::as_u64)?).ok()?;
+                Some(Awaited { pid, at: a.get("at").and_then(Value::as_str).unwrap_or_default().to_string() })
+            }),
         }
     }
 
@@ -1439,6 +1475,39 @@ pub fn held(store: &Store, id: &str, pane: &str, why: &str) -> Result<Message, R
 /// first and [`Act::Noted`] for the second.
 pub fn unheld(store: &Store, id: &str, pane: &str, act: Act, note: &str) -> Result<Message, Refused> {
     hop(store, id, &Party::pane(pane, ""), act, note)
+}
+
+/// A `wsp ask --wait` takes up a question that is already open, as itself:
+/// the retry after a timeout, which reads the answer if it came meanwhile.
+/// Refused on a closed one, so the caller reads that answer instead.
+pub fn await_by(store: &Store, id: &str, waiter: Awaited) -> Result<Message, Refused> {
+    store.locked(|| {
+        let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        if !m.is_open() {
+            return Err(Refused::NotOpen(m.state_raw.clone()));
+        }
+        m.awaited = Some(waiter);
+        store.save_message(&m)?;
+        Ok(m)
+    })
+}
+
+/// The waiter lets go: a wait that timed out. Returns the record as it stands
+/// under the lock, so a caller that finds it **closed** has the answer that
+/// landed in the instant between its last look and now, and prints it.
+///
+/// Under the lock for the same reason [`close`] is: [`finish`]'s reply is
+/// delivered or not by whether `awaited` is set on the record it closes, and
+/// a release that read the question open and wrote after the close would be
+/// an answer nobody typed and nobody printed.
+pub fn release(store: &Store, id: &str) -> Result<Message, Refused> {
+    store.locked(|| {
+        let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        if m.is_open() && m.awaited.take().is_some() {
+            store.save_message(&m)?;
+        }
+        Ok(m)
+    })
 }
 
 /// *I have this and I am not passing it on.* A notification's disposition, and

@@ -156,6 +156,54 @@ impl Choices {
         }
     }
 
+    /// Mark the question as held for at most `timeout` seconds from `at`
+    /// (compound's §26.8 D3, on a `wsp ask --wait --timeout`). A `held` the
+    /// file already carried is overwritten: the hold that is true is this
+    /// verb's.
+    pub fn held(mut self, at: &str, timeout: u64) -> Choices {
+        if let Some(o) = self.0.as_object_mut() {
+            o.insert("held".into(), json!({ "at": at, "timeout": timeout }));
+        }
+        self
+    }
+
+    /// A stored answer, as the agent that waited for it reads it on stdout.
+    ///
+    /// One question: its picks, a line each (a label may hold a comma), or the
+    /// Other's words. Several: `<header or question>: <answer>` a line each,
+    /// a multi-select's picks joined by `", "` as the pane's own dialog joins
+    /// them. Declining an ask is `talk: <sentence>`, which an agent reads as
+    /// the person speaking instead of choosing; a plan or permission is
+    /// `allow` or `deny`, each with its sentence after a colon when it has one.
+    pub fn told(&self, stored: &Value) -> String {
+        if let Some(b) = stored.get("behavior").and_then(Value::as_str) {
+            let said = stored.get("message").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty());
+            return match (self.kind(), b, said) {
+                ("ask", _, said) => format!("talk: {}", said.unwrap_or_default()),
+                (_, b, Some(m)) => format!("{b}: {m}"),
+                (_, b, None) => b.to_string(),
+            };
+        }
+        let given = stored.get("answers").and_then(Value::as_object);
+        let qs = self.questions();
+        let line = |q: &Q<'_>| -> Vec<String> {
+            let Some(a) = given.and_then(|g| g.get(q.question)) else { return Vec::new() };
+            match (a.get("pick").and_then(Value::as_array), a.get("other").and_then(Value::as_str)) {
+                (Some(p), _) => p.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+                (None, Some(t)) => vec![t.to_string()],
+                _ => Vec::new(),
+            }
+        };
+        match qs.as_slice() {
+            [q] => line(q).join("\n"),
+            qs => qs
+                .iter()
+                .map(|q| format!("{}: {}", if q.header.is_empty() { q.question } else { q.header }, line(q).join(", ")))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
     /// What may be answered, in a sentence: the refusal's second half.
     pub fn options_line(&self) -> String {
         match self.kind() {

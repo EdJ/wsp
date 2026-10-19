@@ -131,6 +131,11 @@ use crate::Args;
 /// answer at all — that is what `wsp tell` and `wsp govern --tell` are still
 /// for. Prose with nothing owed back does not need a record.
 pub fn ask(store: &Store, args: &Args) -> i32 {
+    ask_with(store, args, &RealClock)
+}
+
+/// [`ask`] with the clock a `--wait` reads passed in, so a test can be time.
+fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         return open(store, args);
     };
@@ -139,8 +144,9 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     // they had to cut, so a seat never has to read the asker's screen or its
     // `--from` file to learn what it is being asked.
     if args.text(1).trim().is_empty() && args.get("from").is_none() && needle.starts_with("m-") {
-        return whole(store, &needle, args);
+        return whole(store, &needle, args, clock);
     }
+
     // A task, or — for a barrier check, which holds none (`wsp-230`) — the
     // worklist it is checking, whose log is then where the answer lives.
     let subject = match store.task_or_why(&needle) {
@@ -153,6 +159,15 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
                 return 1;
             }
         },
+    };
+    // `--wait` (`wsp-300`): block on the answer. Read and checked first too, so
+    // a bad `--timeout` is a sentence and not a question left open.
+    let wait = match Wait::read(args) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 2;
+        }
     };
     // The structured part, if any (`wsp-299`): read and checked before anything
     // is raised, so a malformed file is a sentence and not a half-asked question.
@@ -282,7 +297,22 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: --choices is for a question to the person — add --person");
             return 2;
         }
-        q.choices = Some(c);
+        // §26.8 D3: how long the question is held, and from when. Only with
+        // a timeout, and only where there are choices to carry it.
+        q.choices = Some(match wait.timeout {
+            Some(secs) => c.held(&q.at, secs),
+            None => c,
+        });
+    }
+    if wait.on {
+        // The answer comes back through this process, and only the person
+        // gives one: a seat's question is answered in words by a seat, to the
+        // composer, which is what `--wait` exists to avoid.
+        if !for_person {
+            eprintln!("wsp: --wait is for a question to the person — add --person");
+            return 2;
+        }
+        q.awaited = Some(message::Awaited::here());
     }
 
     // The guarantee this verb makes, checked before the record exists rather
@@ -326,6 +356,11 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     let report = seat.as_ref().filter(|s| !(q.for_person && me.scope() == Some(s.scope.as_str()))).map(|s| {
         crate::wake::say(store, &s.scope, &for_a_governor(&q), Some(&q.id))
     });
+
+    if wait.on {
+        eprintln!("? {}  asked of the person · waiting for the answer · the question stays open if this is stopped", q.id);
+        return wait_and_report(store, &q.id, wait.timeout, args, clock);
+    }
 
     let home = message::homes_to(store, &q).unwrap_or_default();
     if args.json() {
@@ -445,11 +480,36 @@ fn as_typed(q: &Message) -> String {
 }
 
 /// `wsp ask <message-id>` — one question, whole.
-fn whole(store: &Store, needle: &str, args: &Args) -> i32 {
+fn whole(store: &Store, needle: &str, args: &Args, clock: &dyn Clock) -> i32 {
     let q = match find(store, needle) {
         Ok(m) => m,
         Err(code) => return code,
     };
+    // `--wait` here is the retry after a timeout: wait on the question that
+    // stayed open, or read the answer that came meanwhile.
+    match Wait::read(args) {
+        Ok(Wait { on: true, timeout }) => {
+            if !q.for_person || q.is_reply() {
+                eprintln!("wsp: --wait is for a question to the person; {} is not one", q.id);
+                return 2;
+            }
+            // Taking it up again is the waiter's mark on the record; a closed
+            // question has nothing to mark and is read straight away.
+            if q.is_open() {
+                if let Err(e) = message::await_by(store, &q.id, message::Awaited::here()) {
+                    eprintln!("wsp: {e}");
+                    return 1;
+                }
+                eprintln!("? {}  waiting for the answer · the question stays open if this is stopped", q.id);
+            }
+            return wait_and_report(store, &q.id, timeout, args, clock);
+        }
+        Ok(_) => {}
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 2;
+        }
+    }
     if args.json() {
         println!("{}", q.to_json());
         return 0;
@@ -462,8 +522,179 @@ fn whole(store: &Store, needle: &str, args: &Args) -> i32 {
     if q.is_open() {
         println!();
         println!("{}", p.dim(&format!("wsp answer {} \"…\" closes it and reaches whoever asked", q.id)));
+    } else if let Some(h) = q.closing() {
+        // What a `--wait` that timed out comes back to read.
+        println!();
+        match h.act {
+            message::Act::Answered => println!("{}", p.dim(&format!("answered by {}:\n{}", h.by.byline(), told(&q)))),
+            _ => println!("{}", p.dim(&format!("abandoned by {}: {}", h.by.byline(), h.note.trim()))),
+        }
     }
     0
+}
+
+// ---- `wsp ask --wait`: the tool call that returns with the answer -----------
+
+/// `--wait` and `--timeout`, as given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Wait {
+    on: bool,
+    /// Seconds, when the wait is bounded.
+    timeout: Option<u64>,
+}
+
+impl Wait {
+    fn read(args: &Args) -> Result<Wait, String> {
+        let on = args.has("wait");
+        let timeout = match args.get("timeout") {
+            None => None,
+            Some(t) => match t.trim().parse::<u64>() {
+                Ok(0) | Err(_) => return Err(format!("--timeout is a number of seconds, more than none — not `{t}`")),
+                Ok(secs) if on => Some(secs),
+                Ok(_) => return Err("--timeout bounds a --wait; there is nothing here to time out".into()),
+            },
+        };
+        Ok(Wait { on, timeout })
+    }
+}
+
+/// What the wait ended with.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    Answered(Message),
+    Abandoned(Message),
+    /// The timeout passed with the question still open (and no longer
+    /// awaited: [`message::release`] took the mark off).
+    TimedOut,
+}
+
+/// Time, as the wait reads it: a seam so a test can be the clock.
+trait Clock {
+    fn now_ms(&self) -> u64;
+    fn sleep_ms(&self, ms: u64);
+}
+
+struct RealClock;
+
+impl Clock for RealClock {
+    fn now_ms(&self) -> u64 {
+        use std::sync::OnceLock;
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+    fn sleep_ms(&self, ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// How often the record is looked at. An answer is a person's act, so half a
+/// second is not felt, and the read is one small file.
+const POLL_MS: u64 = 500;
+
+/// Block until the question closes or `timeout` seconds pass.
+///
+/// **The last look is the release.** A timeout does not read the record and
+/// then give up: [`message::release`] takes the waiter's mark off under the
+/// lock and hands back the record as it stands, so an answer that landed
+/// between the last poll and the deadline is returned, not lost. The same lock
+/// is what [`deliver`] relies on in the other direction: an answer is typed
+/// at the composer only when no live waiter was marked on the question at the
+/// moment it closed.
+fn wait_for(store: &Store, id: &str, timeout: Option<u64>, clock: &dyn Clock) -> Result<Ended, String> {
+    let deadline = timeout.map(|s| clock.now_ms().saturating_add(s.saturating_mul(1000)));
+    loop {
+        let q = store.message(id).ok_or_else(|| format!("no message `{id}` any more"))?;
+        if !q.is_open() {
+            return Ok(ended(q));
+        }
+        let now = clock.now_ms();
+        if let Some(d) = deadline {
+            if now >= d {
+                let q = message::release(store, id).map_err(|e| e.to_string())?;
+                return Ok(match q.is_open() {
+                    true => Ended::TimedOut,
+                    false => ended(q),
+                });
+            }
+            clock.sleep_ms(POLL_MS.min(d - now));
+        } else {
+            clock.sleep_ms(POLL_MS);
+        }
+    }
+}
+
+fn ended(q: Message) -> Ended {
+    match q.closing().map(|h| h.act) {
+        Some(message::Act::Answered) => Ended::Answered(q),
+        _ => Ended::Abandoned(q),
+    }
+}
+
+/// An answered question, as the waiting agent reads it on stdout. See
+/// [`Choices::told`] for a structured one; a question with none is its words.
+fn told(q: &Message) -> String {
+    let Some(h) = q.closing().filter(|h| h.act == message::Act::Answered) else {
+        return String::new();
+    };
+    match (&q.choices, &h.choice) {
+        (Some(c), Some(v)) => c.told(v),
+        _ => h.note.trim().to_string(),
+    }
+}
+
+/// Wait, print, and say how it ended in the exit code: 0 with the answer on
+/// stdout, 3 with the reason on stderr for an abandon or a timeout.
+fn wait_and_report(store: &Store, id: &str, timeout: Option<u64>, args: &Args, clock: &dyn Clock) -> i32 {
+    let ended = match wait_for(store, id, timeout, clock) {
+        Ok(e) => e,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    };
+    report_wait(store, id, &ended, timeout, args)
+}
+
+fn report_wait(store: &Store, id: &str, ended: &Ended, timeout: Option<u64>, args: &Args) -> i32 {
+    // The answer has come back through the tool call; a copy typed at the
+    // composer later would be the second delivery. Only a reply held for an
+    // asker busy at the time is such a copy (a `wsp ask <mid> --wait` retry
+    // after a timeout), and it is ended here.
+    let settle = |q: &Message| {
+        for r in message::held_replies(store).into_iter().filter(|r| r.reply_to.as_deref() == Some(q.id.as_str())) {
+            let pane = route(store, r.waiting.as_ref());
+            let _ = message::unheld(store, &r.id, &pane, message::Act::Noted, "returned through `wsp ask --wait`; not typed");
+        }
+    };
+    match ended {
+        Ended::Answered(q) => {
+            settle(q);
+            let text = told(q);
+            if args.json() {
+                println!("{}", json!({ "id": q.id, "outcome": "answered", "answer": text, "closed": q.closed_json(), "choices": q.to_json()["choices"] }));
+            } else {
+                println!("{text}");
+            }
+            0
+        }
+        Ended::Abandoned(q) => {
+            settle(q);
+            let (by, why) = q.closing().map(|h| (h.by.byline(), h.note.trim().to_string())).unwrap_or_default();
+            eprintln!("wsp: {} was abandoned by {by}: {why}", q.id);
+            if args.json() {
+                println!("{}", json!({ "id": q.id, "outcome": "abandoned", "reason": why, "closed": q.closed_json() }));
+            }
+            3
+        }
+        Ended::TimedOut => {
+            let after = timeout.map(|s| format!(" in {s}s")).unwrap_or_default();
+            eprintln!("wsp: no answer to {id}{after} — it stays open: `wsp ask {id} --wait` waits again, `wsp ask {id}` reads it");
+            if args.json() {
+                println!("{}", json!({ "id": id, "outcome": "timeout" }));
+            }
+            3
+        }
+    }
 }
 
 /// `wsp answer <message-id> "the sentence"` — close a question, on the record
@@ -1191,6 +1422,17 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
         }
     };
 
+    // **A live `wsp ask --wait` is the delivery** (`wsp-300`). The asker is
+    // blocked in a tool call, and that call returns with the answer; typing it
+    // at the composer as well would be the second copy, and into a working
+    // agent, which `wsp-095` Part 5 refuses. Read off the question as it was
+    // closed, under the lock, against [`message::release`]. A waiter that has
+    // gone (Esc killed the call) is no delivery, and the asker is told the old
+    // way.
+    if let Some(w) = closed.question.awaited.as_ref().filter(|w| w.alive()) {
+        receipt(false, false, &format!("{} is blocked in `wsp ask --wait` (pid {}) — the answer returns through its tool call, and nothing is typed", asker(closed), w.pid));
+        return 0;
+    }
     if pane.is_empty() {
         receipt(false, false, "nobody to tell — the answer is on the record and in the log");
         return 0;
@@ -2403,5 +2645,299 @@ mod tests {
         let hops = store.message("m-old").unwrap().to_json()["via"].clone();
         assert!(hops[0].get("choice").is_none(), "{hops}");
         assert_eq!(store.message("m-old").unwrap().closed_json().unwrap()["answer"], serde_json::json!({ "text": "ok" }));
+    }
+
+    // ---- `wsp ask --wait` (wsp-300) -----------------------------------------
+
+    /// Time that moves only when the wait sleeps, and runs what is due **when
+    /// it is looked at** — so an event at the deadline lands after the wait's
+    /// last read and before its release, which is the race the release closes.
+    struct Fake<'a> {
+        now: std::cell::Cell<u64>,
+        due: std::cell::RefCell<Vec<(u64, Box<dyn FnOnce() + 'a>)>>,
+    }
+
+    impl<'a> Fake<'a> {
+        fn new() -> Fake<'a> {
+            Fake { now: std::cell::Cell::new(0), due: Default::default() }
+        }
+        fn at(&self, ms: u64, f: impl FnOnce() + 'a) {
+            self.due.borrow_mut().push((ms, Box::new(f)));
+        }
+    }
+
+    impl Clock for Fake<'_> {
+        fn now_ms(&self) -> u64 {
+            let now = self.now.get();
+            let ready: Vec<_> = {
+                let mut due = self.due.borrow_mut();
+                let (ready, later) = std::mem::take(&mut *due).into_iter().partition(|(t, _)| *t <= now);
+                *due = later;
+                ready
+            };
+            for (_, f) in ready {
+                f();
+            }
+            now
+        }
+        fn sleep_ms(&self, ms: u64) {
+            self.now.set(self.now.get() + ms);
+        }
+    }
+
+    /// A pid that has exited, for a waiter that was killed.
+    fn a_dead_pid() -> u32 {
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
+    fn one_question() -> serde_json::Value {
+        serde_json::json!({ "kind": "ask", "questions": [
+            { "question": "Land now?", "header": "Land", "options": [{ "label": "Land now" }, { "label": "Wait" }] }] })
+    }
+
+    /// A question for the person with a waiter on it, raised as the verb does.
+    fn waited_on(store: &Store, about: &str, choices: Option<&serde_json::Value>) -> Message {
+        let mut q = Message::question(Party::pane("cpd-893", ""), Kind::Note, "Land now?", Waiting::new("cpd-893", about))
+            .about(About::Task(about.into()))
+            .for_the_person();
+        q.choices = choices.map(|c| Choices::parse(c).unwrap());
+        q.awaited = Some(message::Awaited::here());
+        message::raise(store, &q).unwrap();
+        store.message(&q.id).unwrap()
+    }
+
+    /// The newest question in the store; the reply an answer mints is newer still.
+    fn last_question(store: &Store) -> Message {
+        message::all(store).into_iter().filter(|m| !m.is_reply()).last().expect("a question")
+    }
+
+    fn the_person_answers(store: &Store, mid: &str, how: &[(&str, &str)]) {
+        assert_eq!(answer(store, &answer_args(mid, how, &[])), 0);
+    }
+
+    #[test]
+    fn a_wait_ends_as_the_question_does_and_a_timeout_leaves_it_open() {
+        let _env = util::isolated("wait-ends");
+        let store = scratch("wait-ends");
+        task(&store, "lone-1");
+        // (what, timeout s, what the person does and when in ms, what the wait returns, when it returned)
+        enum Do {
+            Nothing,
+            Answer(u64),
+            Abandon(u64),
+        }
+        for (what, timeout, act, ends, at) in [
+            ("answered, no timeout", None, Do::Answer(3_000), "answered", 3_000),
+            ("answered inside its timeout", Some(10), Do::Answer(3_000), "answered", 3_000),
+            ("abandoned", Some(10), Do::Abandon(2_000), "abandoned", 2_000),
+            ("nobody answers", Some(5), Do::Nothing, "timeout", 5_000),
+            ("a timeout shorter than one poll", Some(1), Do::Nothing, "timeout", 1_000),
+            // The answer lands after the last read and before the release: the
+            // release returns it rather than reporting a timeout over it.
+            ("answered at the deadline", Some(5), Do::Answer(5_000), "answered", 5_000),
+            ("answered a moment after", Some(5), Do::Answer(5_001), "timeout", 5_000),
+        ] {
+            let q = waited_on(&store, "lone-1", Some(&one_question()));
+            let clock = Fake::new();
+            match act {
+                Do::Nothing => {}
+                Do::Answer(t) => clock.at(t, || the_person_answers(&store, &q.id, &[("choice", "Land=Wait")])),
+                Do::Abandon(t) => clock.at(t, || {
+                    message::abandon(&store, &q.id, &Party::Human, "not now").unwrap();
+                }),
+            }
+            let got = wait_for(&store, &q.id, timeout, &clock).unwrap();
+            let word = match &got {
+                Ended::Answered(_) => "answered",
+                Ended::Abandoned(_) => "abandoned",
+                Ended::TimedOut => "timeout",
+            };
+            assert_eq!(word, ends, "{what}");
+            // The clock stops where the wait did, to the poll: never later.
+            assert!((at..=at + POLL_MS).contains(&clock.now.get()), "{what}: returned at {}", clock.now.get());
+            let after = store.message(&q.id).unwrap();
+            match got {
+                Ended::TimedOut => {
+                    assert!(after.is_open(), "{what}: the question stays open");
+                    assert!(after.awaited.is_none(), "{what}: and nobody is waiting on it now");
+                }
+                _ => assert!(!after.is_open(), "{what}"),
+            }
+            // Leave nothing open for the next row to find.
+            let _ = message::abandon(&store, &q.id, &Party::Human, "next row");
+        }
+    }
+
+    #[test]
+    fn a_wait_prints_the_answer_as_the_agent_reads_it() {
+        let two = serde_json::json!({ "kind": "ask", "questions": [
+            { "question": "Which figure is the headline?", "header": "Headline", "options": [{ "label": "Output tokens" }, { "label": "USD" }] },
+            { "question": "Which views show the split?", "header": "Views", "multi": true,
+              "options": [{ "label": "Card" }, { "label": "Inspector" }, { "label": "Rail, wide" }] }] });
+        let plan = serde_json::json!({ "kind": "plan", "plan": "# steps" });
+        let perm = serde_json::json!({ "kind": "permission", "tool": "Bash", "command": "make", "suggestions": [] });
+        let store = scratch("wait-told");
+        task(&store, "lone-1");
+        // (what, the question's choices, the answer given, what the agent reads)
+        for (what, choices, given, read) in [
+            ("one pick, bare", Some(one_question()), serde_json::json!({ "answers": { "Land now?": "Wait" } }), "Wait"),
+            ("an Other, bare", Some(one_question()), serde_json::json!({ "answers": { "Land now?": "after lunch" } }), "after lunch"),
+            (
+                "two questions, a multi joined as the pane joins it",
+                Some(two.clone()),
+                serde_json::json!({ "answers": { "Which figure is the headline?": "USD", "Which views show the split?": { "pick": ["Card", "Rail, wide"] } } }),
+                "Headline: USD\nViews: Card, Rail, wide",
+            ),
+            (
+                "talking instead of choosing",
+                Some(one_question()),
+                serde_json::json!({ "behavior": "deny", "message": "ask me in person" }),
+                "talk: ask me in person",
+            ),
+            ("a plan allowed", Some(plan.clone()), serde_json::json!({ "behavior": "allow", "mode": "acceptEdits" }), "allow"),
+            ("a plan sent back", Some(plan), serde_json::json!({ "behavior": "deny", "message": "add a rollback" }), "deny: add a rollback"),
+            ("a permission denied", Some(perm), serde_json::json!({ "behavior": "deny" }), "deny"),
+        ] {
+            let q = waited_on(&store, "lone-1", choices.as_ref());
+            message::answer_choice(&store, &q.id, &Party::Human, "", &given).unwrap();
+            assert_eq!(told(&store.message(&q.id).unwrap()), read, "{what}");
+        }
+        // No choices: the words.
+        let q = waited_on(&store, "lone-1", None);
+        message::answer(&store, &q.id, &Party::Human, "yes, after the verify").unwrap();
+        assert_eq!(told(&store.message(&q.id).unwrap()), "yes, after the verify");
+    }
+
+    #[test]
+    fn a_wait_ends_with_the_exit_the_agent_branches_on() {
+        let _env = util::isolated("wait-exit");
+        let store = scratch("wait-exit");
+        task(&store, "lone-1");
+        let args = crate::Args::synth("ask", &[], &[]);
+        let q = waited_on(&store, "lone-1", None);
+        let answered = || {
+            message::answer(&store, &q.id, &Party::Human, "ok").unwrap();
+            store.message(&q.id).unwrap()
+        };
+        let a = answered();
+        assert_eq!(report_wait(&store, &q.id, &Ended::Answered(a), None, &args), 0);
+        let q = waited_on(&store, "lone-1", None);
+        message::abandon(&store, &q.id, &Party::Human, "dropped").unwrap();
+        assert_eq!(report_wait(&store, &q.id, &Ended::Abandoned(store.message(&q.id).unwrap()), None, &args), 3);
+        assert_eq!(report_wait(&store, &q.id, &Ended::TimedOut, Some(30), &args), 3);
+    }
+
+    /// The row's hardest requirement: the answer returns through the tool call
+    /// and is typed nowhere, and only when nobody is waiting is it typed.
+    #[test]
+    fn an_answer_to_a_live_wait_is_not_delivered_to_the_composer_and_to_a_dead_one_it_is() {
+        let _env = util::isolated("wait-once");
+        let store = scratch("wait-once");
+        task(&store, "lone-1");
+        let live = waited_on(&store, "lone-1", None);
+        let c = message::answer(&store, &live.id, &Party::Human, "ok").unwrap();
+        assert!(c.question.awaited.as_ref().is_some_and(|w| w.alive()), "the close carries the waiter it found");
+        // `deliver` returns on it before it looks for a pane to type at; with
+        // no backend here, the other road would have reported the pane gone.
+        assert_eq!(deliver(&store, &c, &answer_args(&live.id, &[("json", "")], &[])), 0);
+        assert!(message::held_replies(&store).is_empty(), "and nothing is held to be typed at the next idle");
+
+        // A waiter that was killed leaves its mark and no process.
+        let mut q = Message::question(Party::pane("cpd-893", ""), Kind::Note, "again?", Waiting::new("cpd-893", "lone-1"))
+            .about(About::Task("lone-1".into()))
+            .for_the_person();
+        q.awaited = Some(message::Awaited { pid: a_dead_pid(), at: util::now_iso() });
+        message::raise(&store, &q).unwrap();
+        let c = message::answer(&store, &q.id, &Party::Human, "ok").unwrap();
+        assert!(!c.question.awaited.as_ref().unwrap().alive());
+    }
+
+    #[test]
+    fn ask_wait_raises_marks_the_wait_and_returns_the_answer_without_typing_it() {
+        let env = util::isolated("ask-wait");
+        let store = scratch("ask-wait");
+        task(&store, "lone-1");
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-893");
+        let file = env.path("choices.json");
+        std::fs::write(&file, one_question().to_string()).unwrap();
+        let f = file.to_string_lossy().to_string();
+
+        // Refused before anything is raised.
+        let n = |store: &Store| message::all(store).len();
+        let before = n(&store);
+        for (what, flags) in [
+            ("--wait on a question a seat answers", vec![("wait", "")]),
+            ("--timeout with nothing to time out", vec![("person", ""), ("timeout", "30")]),
+            ("--timeout of nothing", vec![("person", ""), ("wait", ""), ("timeout", "0")]),
+            ("--timeout of words", vec![("person", ""), ("wait", ""), ("timeout", "soon")]),
+        ] {
+            let args = crate::Args::synth("ask", &["lone-1", "go?"], &flags);
+            assert_eq!(ask_with(&store, &args, &Fake::new()), 2, "{what}");
+            assert_eq!(n(&store), before, "{what}: nothing was raised");
+        }
+
+        // The wait: at +2s the question is marked and shows on the seat's
+        // row, at +4s the person answers, and the verb returns 0.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let clock = Fake::new();
+        clock.at(2_000, || {
+            let q = last_question(&store);
+            let wip = crate::waiting::Asks::read(&store).awaited("cpd-893", "lone-1").map(|w| w.json());
+            seen.borrow_mut().push((q.awaited.is_some(), q.to_json()["choices"]["held"].clone(), wip));
+        });
+        clock.at(4_000, || {
+            let q = last_question(&store);
+            the_person_answers(&store, &q.id, &[("choice", "Land=Land now")]);
+        });
+        let args = crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("wait", ""), ("timeout", "60"), ("choices", f.as_str())]);
+        assert_eq!(ask_with(&store, &args, &clock), 0);
+
+        let (marked, held, wip) = seen.borrow()[0].clone();
+        assert!(marked, "the question says a wait is standing on it");
+        assert_eq!(held["timeout"], 60, "D3: held carries the timeout");
+        assert!(held["at"].as_str().is_some_and(|a| !a.is_empty()));
+        let wip = wip.expect("D9: the seat reads as waiting");
+        assert_eq!((wip["why"].as_str(), wip["on"].as_str(), wip["id"].as_str().is_some()), (Some("question"), Some("person"), true));
+
+        let q = last_question(&store);
+        assert!(!q.is_open());
+        assert_eq!(told(&q), "Land now");
+        assert!(message::held_replies(&store).is_empty(), "the answer was not left to be typed");
+        assert!(crate::waiting::Asks::read(&store).awaited("cpd-893", "lone-1").is_none(), "and the seat waits no more");
+
+        // A timeout: exit 3, the question open and unmarked, and the retry is
+        // `wsp ask <mid> --wait`, which finds the answer that came meanwhile.
+        let clock = Fake::new();
+        let args = crate::Args::synth("ask", &["lone-1", "once more?"], &[("person", ""), ("wait", ""), ("timeout", "3")]);
+        assert_eq!(ask_with(&store, &args, &clock), 3);
+        assert_eq!(clock.now.get(), 3_000);
+        let q = last_question(&store);
+        assert!(q.is_open() && q.awaited.is_none());
+
+        message::answer(&store, &q.id, &Party::Human, "yes").unwrap();
+        // A reply held for the busy asker, as `deliver` held it before waiting
+        // existed: the retry returns the answer and ends the hold.
+        let reply = message::all(&store).into_iter().find(|m| m.reply_to.as_deref() == Some(q.id.as_str())).expect("the reply");
+        message::held(&store, &reply.id, "cpd-893", "working").unwrap();
+        assert_eq!(message::held_replies(&store).len(), 1);
+        let retry = crate::Args::synth("ask", &[q.id.as_str()], &[("wait", "")]);
+        assert_eq!(ask_with(&store, &retry, &Fake::new()), 0);
+        assert!(message::held_replies(&store).is_empty(), "returned once, through the call, and not typed after");
+        std::env::remove_var(crate::place::SEAT_ENV);
+    }
+
+    #[test]
+    fn a_question_with_a_waiter_round_trips_and_one_without_is_as_it_was() {
+        let store = scratch("wait-record");
+        task(&store, "lone-1");
+        let q = waited_on(&store, "lone-1", None);
+        let back = store.message(&q.id).unwrap();
+        assert_eq!(back.awaited, q.awaited);
+        assert_eq!(Message::from_json(&q.id, &back.to_json()), back);
+        let plain = a_question_for(&store, "lone-1");
+        assert!(plain.to_json().get("awaited").is_none(), "no key unless somebody waited");
     }
 }

@@ -215,6 +215,8 @@ const BOOL_FLAGS: &[&str] = &[
     // `wsp ask <id> --person "…"` and `wsp answer <id> --as-person "…"`
     // (`wsp-233`): each is followed by the sentence, which it must not eat.
     "person", "as-person",
+    // `wsp ask <id> --person --wait "…"` (`wsp-300`) blocks on the answer.
+    "wait",
 ];
 
 /// Flags whose value may be a lone `-`, the stream. A dash is otherwise read as
@@ -2127,6 +2129,13 @@ fn help_text() -> String {
                                     {{answers:{{Q: label|{{pick}}|{{other}}}}}} or
                                     {{behavior, message?, rule?, mode?}}
   wsp ack <mid>                     an answer read, or a notification taken on
+  wsp ask <id> --person --wait [--timeout S] [--choices F|-] ["…"]
+                                    ask inside the turn: blocks, prints the
+                                    answer (label, free text, `talk: …`,
+                                    `allow`/`deny: …`), exit 0; exit 3 with the
+                                    reason on stderr if abandoned or timed out
+                                    (the question stays open on a timeout)
+  wsp ask <mid> --wait [--timeout S]  wait again on one that stayed open
   wsp ask <id|list> --person "…"    a question only the person may answer: it is
                                     in `wsp yours`, holds the barrier of the
                                     group it names, and a seat or an agent may
@@ -2541,6 +2550,12 @@ mod tests {
         let a = parse(&["answer", "m-2", "--choice", "Views=Card", "--choice=Views=Rail, wide", "--other", "Q=free words"]);
         assert_eq!(a.each("choice"), vec!["Views=Card", "Views=Rail, wide"]);
         assert_eq!(a.each("other"), vec!["Q=free words"]);
+        // `wsp-300`: `--wait` is a switch (the sentence after it is the
+        // question), and `--timeout` takes its seconds.
+        let a = parse(&["ask", "wsp-300", "--person", "--wait", "--timeout", "90", "land now?"]);
+        assert!(a.has("wait") && a.get("timeout").as_deref() == Some("90") && a.text(1) == "land now?", "{:?}", a.rest);
+        let a = parse(&["ask", "m-1", "--wait"]);
+        assert!(a.has("wait") && a.rest.len() == 1);
         let a = parse(&["answer", "m-2", "--kind", "-"]);
         assert_eq!(a.get("kind").as_deref(), Some("true"), "any other flag still reads a dash as the next word");
 
