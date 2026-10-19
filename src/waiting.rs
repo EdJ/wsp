@@ -110,7 +110,9 @@ impl Wait {
         match &self.why {
             Why::Prompt => format!("stopped on a prompt only {whom} can answer"),
             Why::Answer(id) => format!("waiting on {whom} to answer its question {id}"),
-            Why::Question(id) => format!("blocked in `wsp ask --wait` for {whom} to answer {id}"),
+            // In a tool call that waits on a person: `wsp ask --wait`, or a
+            // dialog a hook holds for one (`wsp-301`).
+            Why::Question(id) => format!("held in a tool call for {whom} to answer {id}"),
             Why::Shell(n) => format!(
                 "waiting on {} of its own still running, which wakes it when {} ends",
                 if *n == 1 { "a shell".to_string() } else { format!("{n} shells") },
@@ -159,6 +161,9 @@ pub(crate) struct Asks {
     /// asker's pane and by its task.
     awaited_pane: BTreeMap<String, String>,
     awaited_task: BTreeMap<String, String>,
+    /// The ones a hook is holding a dialog for, by the same keys.
+    held_by_pane: BTreeMap<String, String>,
+    held_by_task: BTreeMap<String, String>,
 }
 
 impl Asks {
@@ -188,20 +193,30 @@ impl Asks {
         let governors = store.governors();
         for m in &open {
             let Some(w) = &m.waiting else { continue };
+            // A hook-held dialog is the person's whatever governs the row:
+            // only they can answer it, and a seat's guard refuses it.
+            let held = m.for_person && m.choices.as_ref().is_some_and(|c| c.json().get("via").and_then(|v| v.as_str()) == Some("hook"));
             let on = m
                 .about
                 .task()
                 .and_then(|id| store.find_task(id))
                 .and_then(|t| crate::cmd_govern::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref()))
                 .map(|s| On::Seat(s.scope))
+                .filter(|_| !held)
                 .unwrap_or(On::Person);
             // Oldest first and the later one wins, so the question a seat names
             // is its most recent — the one it is most likely sitting on.
             if !w.pane.is_empty() {
                 asks.by_pane.insert(w.pane.clone(), (m.id.clone(), on.clone()));
+                if held {
+                    asks.held_by_pane.insert(w.pane.clone(), m.id.clone());
+                }
             }
             if !w.task.is_empty() {
                 asks.by_task.insert(w.task.clone(), (m.id.clone(), on));
+                if held {
+                    asks.held_by_task.insert(w.task.clone(), m.id.clone());
+                }
             }
             // A wait stands only while its process does: a waiter killed with
             // Esc leaves the mark behind, and the seat is then at its prompt
@@ -225,6 +240,9 @@ impl Asks {
     /// and the question its predecessor asked is still the one the work is
     /// waiting on.
     pub(crate) fn of(&self, seat: &str, task: &str) -> Option<Wait> {
+        if let Some(w) = self.held(seat, task) {
+            return Some(w);
+        }
         let hit = self.by_pane.get(seat).or_else(|| (!task.is_empty()).then(|| self.by_task.get(task)).flatten())?;
         Some(Wait { why: Why::Answer(hit.0.clone()), on: hit.1.clone() })
     }
@@ -235,11 +253,26 @@ impl Asks {
         Some(Wait { why: Why::Question(id.clone()), on: On::Person })
     }
 
+    /// The dialog a hook is holding for this seat, if one is: a person's to
+    /// answer, and held whatever state the seat reads.
+    pub(crate) fn held(&self, seat: &str, task: &str) -> Option<Wait> {
+        let id = self.held_by_pane.get(seat).or_else(|| (!task.is_empty()).then(|| self.held_by_task.get(task)).flatten())?;
+        Some(Wait { why: Why::Question(id.clone()), on: On::Person })
+    }
+
     #[cfg(test)]
     pub(crate) fn waiter(pane: &str, task: &str, id: &str) -> Asks {
         let mut a = Asks::one(pane, task, id, On::Person);
         a.awaited_pane.insert(pane.to_string(), id.to_string());
         a.awaited_task.insert(task.to_string(), id.to_string());
+        a
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_one(pane: &str, task: &str, id: &str) -> Asks {
+        let mut a = Asks::one(pane, task, id, On::Person);
+        a.held_by_pane.insert(pane.to_string(), id.to_string());
+        a.held_by_task.insert(task.to_string(), id.to_string());
         a
     }
 
@@ -420,6 +453,15 @@ fn elapsed(etime: &str) -> Option<i64> {
 /// can say.
 pub(crate) fn reading(state: Option<State>, asks: &Asks, shells: &Shells, seat: &str, task: &str) -> Option<Wait> {
     let state = state?;
+    // A dialog a hook holds for the person is the seat's whole story whatever
+    // the screen says — `working` (a tool call is in flight) or `blocked` (the
+    // pane's own copy of the dialog is drawn) — and it wins over both. A seat
+    // that is gone has nobody left to wait.
+    if !matches!(state, State::Gone | State::Empty) {
+        if let Some(w) = asks.held(seat, task) {
+            return Some(w);
+        }
+    }
     // A seat blocked in `wsp ask --wait` is `Working` to the screen: its tool
     // call is running. The prompt still wins (below), and a seat that is gone
     // waits on nothing.
@@ -461,6 +503,27 @@ mod tests {
         let w = reading(Some(State::Idle), &asks, &Shells::default(), "cpd-1", "wsp-1").expect("idle at its prompt, and waiting");
         assert_eq!(w.word(), "waiting · wsp-process");
         assert!(w.sentence().contains("q-1"), "{}", w.sentence());
+    }
+
+    #[test]
+    fn a_dialog_a_hook_holds_is_a_question_on_the_person_whatever_the_seat_reads() {
+        let asks = Asks::held_one("cpd-1", "wsp-1", "q-1");
+        for state in [State::Working, State::Blocked, State::Idle] {
+            let w = reading(Some(state), &asks, &Shells::default(), "cpd-1", "wsp-1").unwrap_or_else(|| panic!("{state:?}"));
+            assert_eq!((w.why.clone(), w.on.clone()), (Why::Question("q-1".into()), On::Person), "{state:?}");
+        }
+        // A seat that is gone has nobody left to wait; another task's is not its.
+        for state in [State::Gone, State::Empty] {
+            assert!(reading(Some(state), &asks, &Shells::default(), "cpd-1", "wsp-1").is_none(), "{state:?}");
+        }
+        assert!(reading(Some(State::Working), &asks, &Shells::default(), "cpd-2", "wsp-2").is_none());
+        // The same seat for a plain ask is still only waiting when idle.
+        let plain = Asks::one("cpd-1", "wsp-1", "q-1", On::Person);
+        assert!(reading(Some(State::Working), &plain, &Shells::default(), "cpd-1", "wsp-1").is_none());
+        // The published shape is compound's: why, on, id.
+        let json = reading(Some(State::Working), &asks, &Shells::default(), "cpd-1", "wsp-1").unwrap().json();
+        assert_eq!((json["why"].as_str(), json["on"].as_str(), json["id"].as_str()), (Some("question"), Some("person"), Some("q-1")));
+        assert_eq!(json["question"], "q-1", "the key an older reader had is kept");
     }
 
     #[test]

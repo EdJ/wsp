@@ -4442,9 +4442,10 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // nobody (`wsp-214`): the shell wakes it. Every other wait still
         // needs somebody — a prompt a person, a question whoever it went to.
         //
-        // **Except a seat blocked in `wsp ask --wait`** (`wsp-300`, §26.8 D9):
-        // it is in a tool call, so it is `working` to the screen and `stopped`
-        // is false, and it is stopped on a person all the same.
+        // **Except a seat in a tool call that waits on a person** — blocked in
+        // `wsp ask --wait` (`wsp-300`) or held on a dialog by a hook
+        // (`wsp-301`), §26.8 D9: it is `working` to the screen and `stopped` is
+        // false, and it is stopped on a person all the same.
         let in_ask_wait = waiting.as_ref().is_some_and(|w| matches!(w.why, crate::waiting::Why::Question(_)));
         let needs_you = in_ask_wait
             || cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some())
@@ -9091,6 +9092,27 @@ mod tests {
         assert_eq!(row("w1:p1")["waiting"]["on"], "person");
         assert_eq!(row("w1:p1")["waiting"]["id"], "m-7");
         assert_eq!(row("w3:p1")["needs_you"], false, "and a neighbour is not");
+    }
+
+    /// `wsp-301`, compound's §26.8 D9. A seat a hook holds a dialog for reads
+    /// `working` — a tool call is in flight — and is stopped on a person all
+    /// the same: `needs_you`, and `waiting` names the question.
+    #[test]
+    fn a_seat_held_on_a_dialog_needs_the_person_though_it_reads_working() {
+        let mut w = wip_world();
+        let row = |w: &Wip, pane: &str| {
+            wip_json(w)["agents"].as_array().unwrap().iter().find(|a| a["pane"] == pane).unwrap().clone()
+        };
+        assert_eq!(row(&w, "w1:p1")["needs_you"], false, "working, and nobody is owed anything");
+        w.asks = crate::waiting::Asks::held_one("w1:p1", "t-001", "m-hold");
+        let held = row(&w, "w1:p1");
+        assert_eq!(held["state"], "working");
+        assert_eq!(held["needs_you"], true);
+        assert_eq!(held["waiting"]["why"], "question");
+        assert_eq!(held["waiting"]["on"], "person");
+        assert_eq!(held["waiting"]["id"], "m-hold");
+        assert_eq!(wip_json(&w)["needs_you"], 2, "it is counted beside the stopped member");
+        assert_eq!(row(&w, "w3:p1")["needs_you"], false, "and another seat is not");
     }
 
     /// `wsp-214`. A member idle at `doing` on its own background shell is drawn

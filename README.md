@@ -2643,7 +2643,26 @@ timeout`), no row held, a subagent, `wsp` missing. Never an `onFailure: block`.
 A second request from the same session for the same tool abandons the first.
 `wsp answer` on such a question types nothing at the pane; the hook carries it.
 The entry is one more to merge by hand, and `wsp doctor` notes it when it is
-missing. Answering when the *pane* answered first is `wsp-302`'s. In `auto` and
+missing. Compound's §26.8 fields are filled on the question it raises: `input` (the
+tool's input verbatim, a Write's content included), `cwd` and `tree` (the git
+root of `cwd`, else `cwd`), `held: {at, timeout}`, `suggestions`, `mode`, and for
+a permission a caption `<Tool>: <command or path>` under 60. **`risk`** is
+`[{rule, span: [start, end], says}]`, from `src/risk.rs`: nine named,
+deterministic token matchers (`deletes`, `rewrites-history`, `leaves-the-tree`,
+`as-root`, `publishes`, `runs-fetched-code`, `installs`, `writes-config`,
+`unreadable`) over the command split at `&&`, `||`, `;`, `|`, `&`, newlines,
+backticks and `$(…)`, with spans in bytes of the command (of the `file_path` for
+a Write or Edit, read for `leaves-the-tree` and `writes-config` alone). `[]`
+means no named rule matched, which is not a claim that nothing happens, and
+`unreadable` (`eval`, a shell's `-c`, a heredoc, a variable as the command,
+quotes that do not close) is a match that says *read it yourself*. A plan asked
+again carries `previous: {id, at, plan, answer}` (the session's last plan, and
+its structured answer, null if it never got one). A seat that holds no row (a
+governor, the chat) asks `about: {scope, seat}`. While a hold is open the
+asking seat reads `needs_you: true` and `waiting: {why: question, on: person,
+id}` in `wsp wip --json` whatever its state says, and the reply a close writes
+is read already, since the agent never asked. Answering when the *pane*
+answered first is `wsp-302`'s. In `auto` and
 `bypassPermissions` Claude Code fires nothing for a Bash call, so only the ask
 and the plan reach it there.
 

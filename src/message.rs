@@ -471,7 +471,10 @@ impl About {
         match self {
             About::Nothing => Value::Null,
             About::Task(t) => json!({ "task": t }),
-            About::Scope(s) => json!({ "scope": s }),
+            // `seat` as well (compound's §26.8 D8): a question about a seat with
+            // no row is keyed by the seat that asked, and a reader should not
+            // have to know that `scope` is the same word.
+            About::Scope(s) => json!({ "scope": s, "seat": s }),
             About::Group { scope, group } => json!({ "scope": scope, "group": group }),
         }
     }
@@ -1874,6 +1877,13 @@ fn finish(
     reply.reply_to = Some(question.id.clone());
     reply.waiting = Some(waiting);
     raise(store, &reply)?;
+    // A dialog a hook raised was never asked by the agent: the hook carries the
+    // answer into the tool call itself, so the reply that would otherwise sit
+    // in the agent's inbox waiting for an `ack` is read already (`wsp-301`).
+    // Here and not in the hook, which could look for the reply before it exists.
+    if question.choices.as_ref().is_some_and(|c| c.json().get("via").and_then(Value::as_str) == Some("hook")) {
+        let _ = acknowledge(store, &reply.id, &question.from);
+    }
 
     Ok(Closed { question, reply, landed })
 }

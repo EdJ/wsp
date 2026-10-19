@@ -74,11 +74,25 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).map(str::trim).unwrap_or_default()
 }
 
+/// What the hook knows that the payload does not say.
+pub struct Ctx<'a> {
+    /// The seat's tree root (D2 `tree`): where `leaves-the-tree` is measured from.
+    pub tree: &'a str,
+    /// The person's home, to place `~` for the same rules.
+    pub home: &'a str,
+    /// When the hold began (D3 `held.at`).
+    pub at: &'a str,
+    /// The last plan this session asked, if it asked one (D6).
+    pub previous: Option<Value>,
+}
+
 /// The `choices` a payload makes: the kind, what to show, and the fields
-/// compound's §26.8 names that this hook can fill (`via`, `held`, `cwd`, `mode`,
-/// `session_id`, `input`, `suggestions`). Not checked here — [`Choices::parse`]
-/// does that, and refuses what is not a question.
-pub fn choices_of(payload: &Value, secs: u64) -> Option<Value> {
+/// compound's §26.8 names that this hook fills (`wsp-301`): D1 `input` (the
+/// tool's input verbatim), D2 `cwd` and `tree`, D3 `held: {at, timeout}`, D4
+/// `suggestions`, D5 `risk`, D6 `previous`, D10 `mode`, with `via: hook` and the
+/// session and tool that key it. Not checked here — [`Choices::parse`] does
+/// that, and refuses what is not a question.
+pub fn choices_of(payload: &Value, secs: u64, ctx: &Ctx) -> Option<Value> {
     let tool = text(payload, "tool_name");
     if tool.is_empty() {
         return None;
@@ -87,11 +101,17 @@ pub fn choices_of(payload: &Value, secs: u64) -> Option<Value> {
     let mut c = Map::new();
     c.insert("via".into(), "hook".into());
     c.insert("tool".into(), tool.into());
-    c.insert("held".into(), json!({ "timeout": secs }));
+    c.insert("held".into(), json!({ "at": ctx.at, "timeout": secs }));
     for (from, to) in [("session_id", "session_id"), ("cwd", "cwd"), ("permission_mode", "mode")] {
         if !text(payload, from).is_empty() {
             c.insert(to.into(), text(payload, from).into());
         }
+    }
+    if !ctx.tree.is_empty() {
+        c.insert("tree".into(), ctx.tree.into());
+    }
+    if input.is_object() {
+        c.insert("input".into(), input.clone());
     }
     match tool {
         ASK => {
@@ -105,19 +125,86 @@ pub fn choices_of(payload: &Value, secs: u64) -> Option<Value> {
                 c.insert("planFilePath".into(), text(&input, "planFilePath").into());
             }
             c.insert("modes".into(), json!(MODES));
+            if let Some(p) = &ctx.previous {
+                c.insert("previous".into(), p.clone());
+            }
         }
         _ => {
             c.insert("kind".into(), "permission".into());
             if !text(&input, "command").is_empty() {
                 c.insert("command".into(), text(&input, "command").into());
             }
-            c.insert("input".into(), input);
+            // `[]` is *no named rule matched*, and is also what a tool the
+            // rules do not read says: the box draws it as that, never as safe.
+            let risk = crate::risk::of_tool(tool, &input, ctx.tree, ctx.home);
+            c.insert("risk".into(), if risk.is_null() { json!([]) } else { risk });
             if let Some(s) = payload.get("permission_suggestions").filter(|s| s.as_array().is_some_and(|a| !a.is_empty())) {
                 c.insert("suggestions".into(), s.clone());
             }
         }
     }
     Some(Value::Object(c))
+}
+
+/// A permission's one line, `<Tool>: <command or path>` under the caption limit.
+fn caption_of(payload: &Value, tree: &str) -> Option<String> {
+    let tool = text(payload, "tool_name");
+    if matches!(tool, "" | ASK | PLAN) {
+        return None;
+    }
+    let input = payload.get("tool_input").unwrap_or(&Value::Null);
+    let subject = match tool {
+        "Bash" => text(input, "command").lines().next().unwrap_or_default().to_string(),
+        "Write" | "Edit" | "MultiEdit" | "Read" => {
+            let p = text(input, "file_path");
+            p.strip_prefix(tree).map(|r| r.trim_start_matches('/')).filter(|_| !tree.is_empty()).unwrap_or(p).to_string()
+        }
+        "NotebookEdit" => text(input, "notebook_path").to_string(),
+        _ => String::new(),
+    };
+    let line = match subject.trim().is_empty() {
+        true => tool.to_string(),
+        false => format!("{tool}: {}", subject.trim()),
+    };
+    let limit = crate::caption::LIMIT;
+    Some(match line.chars().count() > limit {
+        true => format!("{}…", line.chars().take(limit - 1).collect::<String>().trim_end()),
+        false => line,
+    })
+}
+
+/// The root of the git tree `cwd` is in, else `cwd` itself: the seat's tree for
+/// `leaves-the-tree`. Empty when the payload names no directory.
+fn tree_of(cwd: &str) -> String {
+    if cwd.is_empty() {
+        return String::new();
+    }
+    std::process::Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| cwd.to_string())
+}
+
+/// D6: the last plan this session asked before this one, with how it ended.
+/// `answer` is the structured one (`{behavior, message}`), or null when it was
+/// never answered (abandoned, or still open).
+fn previous_plan(store: &Store, session: &str) -> Option<Value> {
+    if session.is_empty() {
+        return None;
+    }
+    let held = |m: &Message| -> Option<String> {
+        let c = m.choices.as_ref()?.json();
+        (c.get("kind")?.as_str()? == "plan" && c.get("via")?.as_str()? == "hook" && c.get("session_id")?.as_str()? == session)
+            .then(|| c.get("plan").and_then(Value::as_str).unwrap_or_default().to_string())
+    };
+    let mut asked: Vec<(Message, String)> = store.messages().into_values().filter(|m| !m.is_reply()).filter_map(|m| held(&m).map(|p| (m, p))).collect();
+    asked.sort_by(|a, b| a.0.at.cmp(&b.0.at).then_with(|| a.0.id.cmp(&b.0.id)));
+    let (m, plan) = asked.pop()?;
+    Some(json!({ "id": m.id, "at": m.at, "plan": plan, "answer": m.answer_choice().cloned() }))
 }
 
 /// A multi-select's labels as the pane hands them over (measured, `wsp-298`):
@@ -225,8 +312,8 @@ pub fn decision_of(payload: &Value, answer: &Value) -> Option<Value> {
 
 /// Hold the request in `payload` for the person, and print what they decide.
 /// Prints nothing, and returns 0, whenever it cannot or should not: not a
-/// seat holding a row, nothing that is a question, the wait running out, the
-/// question closed by something that is not an answer.
+/// seat that holds a row or answers for a scope, nothing that is a question,
+/// the wait running out, the question closed by something that is not an answer.
 pub fn hold(store: &Store, payload: &Value, secs: u64) -> i32 {
     // A subagent shares its parent's seat and has no business raising a
     // question under the parent's name. The shell wrapper turns these away
@@ -241,23 +328,46 @@ pub fn hold(store: &Store, payload: &Value, secs: u64) -> i32 {
         .get(&pane)
         .and_then(|b| b.get("task_id").and_then(Value::as_str).map(str::to_string))
         .filter(|id| store.task(id).is_some());
-    let Some(task) = held else { return 0 };
-    hold_at(store, me, &pane, &task, payload, secs, POLL)
+    // D8: a governor's, or the chat's, holds no row. It asks about its seat,
+    // which is a question the person answers like any other.
+    let about = match (held, &me) {
+        (Some(task), _) => About::Task(task),
+        (None, Party::Seat(scope)) => About::Scope(scope.clone()),
+        (None, _) => return 0,
+    };
+    let tree = tree_of(text(payload, "cwd"));
+    let home = std::env::var("HOME").unwrap_or_default();
+    hold_at(store, me, &pane, about, payload, secs, POLL, &tree, &home)
 }
 
-/// [`hold`] with the asker and the row it holds already known, and the poll
+/// [`hold`] with the asker and what it asks about already known, and the poll
 /// given, so a test can answer from the same process.
-pub(crate) fn hold_at(store: &Store, me: Party, pane: &str, task: &str, payload: &Value, secs: u64, poll: Duration) -> i32 {
-    let Some(choices) = choices_of(payload, secs).and_then(|v| Choices::parse(&v).ok()) else { return 0 };
-    let mut q = Message::question(me, Kind::Note, &choices.sentence(), Waiting::new(pane, task))
-        .about(About::Task(task.to_string()))
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hold_at(
+    store: &Store,
+    me: Party,
+    pane: &str,
+    about: About,
+    payload: &Value,
+    secs: u64,
+    poll: Duration,
+    tree: &str,
+    home: &str,
+) -> i32 {
+    let at = crate::util::now_iso();
+    let ctx = Ctx { tree, home, at: &at, previous: previous_plan(store, text(payload, "session_id")) };
+    let Some(choices) = choices_of(payload, secs, &ctx).and_then(|v| Choices::parse(&v).ok()) else { return 0 };
+    let subject = about.task().or(about.scope()).unwrap_or_default().to_string();
+    let mut q = Message::question(me, Kind::Note, &choices.sentence(), Waiting::new(pane, about.task().unwrap_or_default()))
+        .about(about)
         .for_the_person();
     q.choices = Some(choices);
+    q.caption = caption_of(payload, tree).map(|text| crate::caption::Caption { text, from: "authored" });
     supersede(store, &q);
     if message::raise(store, &q).is_err() {
         return 0;
     }
-    crate::cmd_message::asked_of_the_person(store, &q, task);
+    crate::cmd_message::asked_of_the_person(store, &q, &subject);
 
     let give_up = Instant::now() + Duration::from_secs(secs.saturating_sub(MARGIN).max(1));
     loop {
@@ -306,6 +416,10 @@ fn supersede(store: &Store, new: &Message) {
 mod tests {
     use super::*;
 
+    fn ctx() -> Ctx<'static> {
+        Ctx { tree: "/w/tree", home: "/Users/ed", at: "2026-10-20T10:00:00Z", previous: None }
+    }
+
     fn ask_payload() -> Value {
         json!({
             "hook_event_name": "PermissionRequest", "session_id": "s1", "tool_name": "AskUserQuestion", "permission_mode": "default",
@@ -339,23 +453,23 @@ mod tests {
     #[test]
     fn each_dialog_becomes_choices_wsp_accepts() {
         for (what, p, kind) in [("ask", ask_payload(), "ask"), ("plan", plan_payload(), "plan"), ("permission", bash_payload(), "permission")] {
-            let c = Choices::parse(&choices_of(&p, 600).unwrap()).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let c = Choices::parse(&choices_of(&p, 600, &ctx()).unwrap()).unwrap_or_else(|e| panic!("{what}: {e}"));
             assert_eq!(c.kind(), kind, "{what}");
             let v = c.json();
             assert_eq!((v["via"].as_str(), v["held"]["timeout"].as_u64(), v["session_id"].as_str()), (Some("hook"), Some(600), Some("s1")), "{what}");
         }
-        let plan = choices_of(&plan_payload(), 1).unwrap();
+        let plan = choices_of(&plan_payload(), 1, &ctx()).unwrap();
         assert_eq!((plan["plan"].as_str(), plan["planFilePath"].as_str(), plan["modes"].clone()), (Some("# steps"), Some("/p/plan.md"), json!(["auto", "acceptEdits"])));
-        let perm = choices_of(&bash_payload(), 1).unwrap();
+        let perm = choices_of(&bash_payload(), 1, &ctx()).unwrap();
         assert_eq!(perm["command"], "python3 -c \"print(11)\"");
         assert_eq!(perm["suggestions"][0]["ruleContent"], Value::Null, "suggestions are kept whole, rules inside");
         assert_eq!(perm["suggestions"][0]["rules"][0]["ruleContent"], "python3 -c \"print(11)\"");
         // Nothing to ask is nothing raised: no tool, no questions, no plan.
-        assert!(choices_of(&json!({}), 1).is_none());
+        assert!(choices_of(&json!({}), 1, &ctx()).is_none());
         for p in [json!({ "tool_name": "AskUserQuestion" }), json!({ "tool_name": "ExitPlanMode", "tool_input": {} })] {
-            assert!(Choices::parse(&choices_of(&p, 1).unwrap()).is_err(), "{p}");
+            assert!(Choices::parse(&choices_of(&p, 1, &ctx()).unwrap()).is_err(), "{p}");
         }
-        let none = choices_of(&json!({ "tool_name": "Write", "tool_input": {}, "permission_suggestions": [] }), 1).unwrap();
+        let none = choices_of(&json!({ "tool_name": "Write", "tool_input": {}, "permission_suggestions": [] }), 1, &ctx()).unwrap();
         assert!(none.get("suggestions").is_none(), "an empty list offers nothing");
     }
 
@@ -457,7 +571,7 @@ mod tests {
     }
 
     fn hold_in(root: &std::path::Path, payload: &Value, secs: u64) -> i32 {
-        hold_at(&at(root), Party::pane("cpd-1", ""), "cpd-1", "hold-1", payload, secs, Duration::from_millis(10))
+        hold_at(&at(root), Party::pane("cpd-1", ""), "cpd-1", About::Task("hold-1".into()), payload, secs, Duration::from_millis(10), "/w/tree", "/Users/ed")
     }
 
     /// The first question on the person's list, once it is raised.
@@ -541,5 +655,190 @@ mod tests {
         sub["agent_id"] = "a1".into();
         assert_eq!(hold(&store, &sub, 1), 0);
         assert!(store.messages().is_empty());
+    }
+
+    #[test]
+    fn the_choices_carry_what_the_design_reads() {
+        // D1 `input`, D2 `cwd` and `tree`, D3 `held`, D10 `mode`, on every kind.
+        let mut payload = bash_payload();
+        payload["cwd"] = "/w/tree/src".into();
+        payload["permission_mode"] = "acceptEdits".into();
+        payload["tool_input"]["command"] = "rm -rf build && ls ~/Documents".into();
+        let c = choices_of(&payload, 600, &ctx()).unwrap();
+        assert_eq!(c["input"], payload["tool_input"], "D1: the tool's input, verbatim");
+        assert_eq!((c["cwd"].as_str(), c["tree"].as_str(), c["mode"].as_str()), (Some("/w/tree/src"), Some("/w/tree"), Some("acceptEdits")));
+        assert_eq!(c["held"], json!({ "at": "2026-10-20T10:00:00Z", "timeout": 600 }), "D3");
+        assert_eq!(c["suggestions"], payload["permission_suggestions"], "D4, verbatim");
+        // D5: the named rules, with the span each matched.
+        let risk = c["risk"].as_array().unwrap();
+        assert_eq!((risk[0]["rule"].as_str(), risk[0]["span"].clone()), (Some("deletes"), json!([0, 12])));
+        assert_eq!((risk[1]["rule"].as_str(), risk[1]["span"].clone()), (Some("leaves-the-tree"), json!([19, 30])));
+        assert!(risk.iter().all(|r| r["says"].as_str().is_some_and(|s| !s.is_empty())));
+        // `[]` when none matched, and for a tool the rules do not read.
+        let quiet = choices_of(&json!({ "tool_name": "Bash", "tool_input": { "command": "cargo test" } }), 1, &ctx()).unwrap();
+        assert_eq!(quiet["risk"], json!([]));
+        let mcp = choices_of(&json!({ "tool_name": "mcp__x__navigate", "tool_input": { "url": "https://x" } }), 1, &ctx()).unwrap();
+        assert_eq!(mcp["risk"], json!([]));
+        let write = choices_of(&json!({ "tool_name": "Write", "tool_input": { "file_path": "/etc/hosts", "content": "x" } }), 1, &ctx()).unwrap();
+        assert_eq!(write["risk"][0]["rule"], "leaves-the-tree");
+        assert_eq!(write["input"]["content"], "x", "a Write's content is in `input`");
+        // An ask and a plan carry `input` and `tree` too, and no risk.
+        for p in [ask_payload(), plan_payload()] {
+            let c = choices_of(&p, 1, &ctx()).unwrap();
+            assert_eq!(c["input"], p["tool_input"]);
+            assert_eq!((c["tree"].as_str(), c.get("risk")), (Some("/w/tree"), None));
+            assert_eq!(c["held"]["at"], "2026-10-20T10:00:00Z");
+        }
+        // D6 rides on a plan only, as it was given.
+        let prev = json!({ "id": "m-1", "at": "2026-10-20T09:00:00Z", "plan": "# old", "answer": null });
+        let with = Ctx { previous: Some(prev.clone()), ..ctx() };
+        assert_eq!(choices_of(&plan_payload(), 1, &with).unwrap()["previous"], prev);
+        assert!(choices_of(&ask_payload(), 1, &with).unwrap().get("previous").is_none());
+        assert!(choices_of(&plan_payload(), 1, &ctx()).unwrap().get("previous").is_none(), "no earlier plan, no key");
+        // No directory named: no tree.
+        let none = Ctx { tree: "", ..ctx() };
+        assert!(choices_of(&plan_payload(), 1, &none).unwrap().get("tree").is_none());
+    }
+
+    #[test]
+    fn a_permissions_caption_is_its_tool_and_what_it_acts_on_under_the_limit() {
+        let cap = |p: Value| caption_of(&p, "/w/tree");
+        let bash = |c: &str| json!({ "tool_name": "Bash", "tool_input": { "command": c } });
+        assert_eq!(cap(bash("scripts/seed.sh save")).as_deref(), Some("Bash: scripts/seed.sh save"));
+        assert_eq!(cap(bash("make\nrm -rf x")).as_deref(), Some("Bash: make"), "the first line");
+        assert_eq!(
+            cap(json!({ "tool_name": "Write", "tool_input": { "file_path": "/w/tree/docs/plans/a.md" } })).as_deref(),
+            Some("Write: docs/plans/a.md"),
+            "a path in the tree is shown from the tree"
+        );
+        assert_eq!(cap(json!({ "tool_name": "Write", "tool_input": { "file_path": "/etc/hosts" } })).as_deref(), Some("Write: /etc/hosts"));
+        assert_eq!(cap(json!({ "tool_name": "mcp__x__navigate", "tool_input": { "url": "u" } })).as_deref(), Some("mcp__x__navigate"));
+        let long = cap(bash(&"x".repeat(200))).unwrap();
+        assert_eq!(long.chars().count(), crate::caption::LIMIT, "{long}");
+        assert!(long.ends_with('…'));
+        assert!(cap(ask_payload()).is_none() && cap(plan_payload()).is_none(), "an ask and a plan keep the derived one");
+    }
+
+    #[test]
+    fn the_seats_tree_is_its_git_root_else_where_it_stands() {
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let top = tree_of(src);
+        assert!(std::path::Path::new(&top).join("Cargo.toml").is_file() && src.starts_with(&top), "{top}");
+        let plain = std::env::temp_dir().join(format!("wsp-hold-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain = plain.to_string_lossy().to_string();
+        assert_eq!(tree_of(&plain), plain, "no repository: where it stands");
+        assert_eq!(tree_of(""), "");
+    }
+
+    /// Hold `payload` and answer it from the same process with `answer`.
+    fn held_and_answered(root: &std::path::Path, payload: &Value, answer: &Value) -> String {
+        std::thread::scope(|s| {
+            let held = s.spawn(|| hold_in(root, payload, 600));
+            let store = at(root);
+            let q = loop {
+                // The newest open one: an earlier question may still be listed closed.
+                if let Some(m) = message::for_the_person(&store).into_iter().last() {
+                    break m;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let (stored, _) = q.choices.as_ref().unwrap().accept(answer, "").unwrap();
+            message::answer_choice(&store, &q.id, &Party::Human, "", &stored).unwrap();
+            held.join().unwrap();
+            q.id
+        })
+    }
+
+    #[test]
+    fn a_plan_asked_again_carries_the_last_one_and_how_it_ended() {
+        let root = scratch("previous");
+        let mut first = plan_payload();
+        first["tool_input"]["plan"] = "# v1".into();
+        let id = held_and_answered(&root, &first, &json!({ "behavior": "deny", "message": "add a rollback step" }));
+        let store = at(&root);
+        // Another session's plan is nobody's `previous`.
+        assert!(previous_plan(&store, "s-other").is_none() && previous_plan(&store, "").is_none());
+        let prev = previous_plan(&store, "s1").unwrap();
+        assert_eq!((prev["id"].as_str(), prev["plan"].as_str()), (Some(id.as_str()), Some("# v1")));
+        assert_eq!(prev["answer"], json!({ "behavior": "deny", "message": "add a rollback step" }));
+        assert!(prev["at"].as_str().is_some_and(|a| a.starts_with("20")));
+
+        // The second time round, the question is raised with it.
+        let mut second = plan_payload();
+        second["tool_input"]["plan"] = "# v2".into();
+        let again = held_and_answered(&root, &second, &json!({ "behavior": "allow" }));
+        let q = store.message(&again).unwrap();
+        let c = q.choices.as_ref().unwrap().json();
+        assert_eq!(c["previous"]["id"], id.as_str());
+        assert_eq!(c["previous"]["plan"], "# v1");
+        assert_eq!(c["previous"]["answer"]["message"], "add a rollback step");
+        // And the first has no previous.
+        assert!(store.message(&id).unwrap().choices.unwrap().json().get("previous").is_none());
+
+        // A plan nobody answered has an answer of null, not a missing one.
+        let root = scratch("previous-open");
+        assert_eq!(hold_in(&root, &plan_payload(), 1), 0);
+        assert_eq!(previous_plan(&at(&root), "s1").unwrap()["answer"], Value::Null);
+    }
+
+    #[test]
+    fn a_seat_with_no_row_asks_about_itself_and_is_answered_like_any_question() {
+        let root = scratch("seat");
+        let payload = bash_payload();
+        std::thread::scope(|s| {
+            let held = s.spawn(|| {
+                hold_at(&at(&root), Party::seat("ux-next"), "cpd-9", About::Scope("ux-next".into()), &payload, 600, Duration::from_millis(10), "/w/tree", "/Users/ed")
+            });
+            let store = at(&root);
+            let q = raised(&store);
+            assert_eq!(q.about, About::Scope("ux-next".into()));
+            assert_eq!(q.waiting, Some(Waiting::new("cpd-9", "")), "the pane waits and no row does");
+            let about = q.to_json()["about"].clone();
+            assert_eq!(about["seat"], "ux-next", "D8: the question is keyed by its seat");
+            assert!(about.get("task").is_none_or(|t| t.is_null()));
+            let (stored, _) = q.choices.as_ref().unwrap().accept(&json!({ "behavior": "allow" }), "").unwrap();
+            message::answer_choice(&store, &q.id, &Party::Human, "", &stored).unwrap();
+            assert_eq!(held.join().unwrap(), 0);
+        });
+        let store = at(&root);
+        assert_eq!(only_message(&store).closed_json().unwrap()["how"], "answered");
+    }
+
+    /// D9 end to end: the question the hook raises is what the census reads.
+    #[test]
+    fn while_the_hold_is_open_the_seat_reads_as_waiting_on_the_person() {
+        use crate::place::State;
+        let root = scratch("census");
+        let payload = bash_payload();
+        std::thread::scope(|s| {
+            let held = s.spawn(|| hold_in(&root, &payload, 600));
+            let store = at(&root);
+            let q = raised(&store);
+            let asks = crate::waiting::Asks::read(&store);
+            let wait = |state| crate::waiting::reading(Some(state), &asks, &Default::default(), "cpd-1", "hold-1");
+            for state in [State::Working, State::Blocked] {
+                let w = wait(state).unwrap_or_else(|| panic!("{state:?}"));
+                assert_eq!((w.why, w.on), (crate::waiting::Why::Question(q.id.clone()), crate::waiting::On::Person));
+            }
+            let (stored, _) = q.choices.as_ref().unwrap().accept(&json!({ "behavior": "allow" }), "").unwrap();
+            message::answer_choice(&store, &q.id, &Party::Human, "", &stored).unwrap();
+            held.join().unwrap();
+            let after = crate::waiting::Asks::read(&store);
+            assert!(crate::waiting::reading(Some(State::Working), &after, &Default::default(), "cpd-1", "hold-1").is_none(), "answered, it is held no longer");
+        });
+    }
+
+    #[test]
+    fn the_reply_a_close_writes_is_read_already_whichever_way_it_closed() {
+        let unread = |root: &std::path::Path| -> usize {
+            at(root).messages().into_values().filter(|m| m.is_reply() && m.is_open()).count()
+        };
+        let root = scratch("ack-answered");
+        held_and_answered(&root, &bash_payload(), &json!({ "behavior": "deny", "message": "no" }));
+        assert_eq!((at(&root).messages().len(), unread(&root)), (2, 0), "answered: a reply, acknowledged");
+        let root = scratch("ack-timeout");
+        assert_eq!(hold_in(&root, &plan_payload(), 1), 0);
+        assert_eq!((at(&root).messages().len(), unread(&root)), (2, 0), "timed out: the same");
     }
 }

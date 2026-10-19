@@ -14,6 +14,7 @@ mod barrier;
 mod caption;
 mod choices;
 mod hold;
+mod risk;
 mod check_tree;
 mod arrange;
 mod attention;
