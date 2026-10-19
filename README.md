@@ -2661,10 +2661,33 @@ its structured answer, null if it never got one). A seat that holds no row (a
 governor, the chat) asks `about: {scope, seat}`. While a hold is open the
 asking seat reads `needs_you: true` and `waiting: {why: question, on: person,
 id}` in `wsp wip --json` whatever its state says, and the reply a close writes
-is read already, since the agent never asked. Answering when the *pane*
-answered first is `wsp-302`'s. In `auto` and
+is read already, since the agent never asked. In `auto` and
 `bypassPermissions` Claude Code fires nothing for a Bash call, so only the ask
 and the plan reach it there.
+
+**The pane answering first closes the question** (`wsp-302`). Claude Code does
+not signal a held hook when the pane's dialog is answered; it ran on to its own
+timeout in the spike. So the agent's other hooks close it, through `wsp report`
+(`src/hold_close.rs`), for the hook's own `session_id` and only for a question
+the hold raised: `PostToolUse` is an **answered** hop, `answered in pane`, with
+the pane's answers (the multi-select string matched against the question's
+labels, in order, and never split; what the labels do not account for is kept as
+the text it is; a plan or a permission is `{behavior: allow}`); `Stop`,
+`StopFailure` and `UserPromptSubmit` **abandon** it, `by: pane`, with the reason;
+`SessionEnd` abandons it `by: seat`. A `PostToolUse` closes a permission only
+when the tool *and its input* are the waiting call, since a turn can run several
+`Bash` calls at once and one a rule allowed must not close the one waiting on a
+person; an ask or a plan is matched by tool alone. The held hook sees its
+question closed by anyone but the person and exits with no output, within a poll
+(2 s). The wait running out is `abandoned`, `by: timeout`, `timed out after N s,
+left to the pane`; a seat that vanishes (its process gone, or its directory)
+with no `SessionEnd` is `abandoned`, `by: seat`, and the hold notices it on its
+own poll. Never a clear: every one of these is a hop with a sentence, and
+`closed: {how, by, at, answer}` says which. The snippet's `PostToolUse` entry
+fires after every tool call in a wsp seat, so it is one `sh` and one `wsp
+report` per call there; `wsp doctor` notes it when it is missing beside the
+hold. A deny in the pane produces no `PostToolUse`, so that question stays
+until the turn ends and reads `abandoned`, not `answered`.
 
 The **permissions** half matters as much as the hook. Create, claim, note,
 decide, flag and move through the workflow are pre-allowed, because a store an

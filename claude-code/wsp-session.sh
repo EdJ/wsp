@@ -108,6 +108,12 @@ case "$action" in
     # hook's own name, passed through. `wsp report` knows which of them mean
     # something and ignores the rest, so a hook wired here in error costs a
     # process and changes nothing.
+    #
+    # PostToolUse is here too and says nothing about the agent: it is what
+    # closes a question the held hook above raised, when the pane's dialog was
+    # answered first (wsp-302). Claude Code does not signal that hook, so the
+    # tool running afterwards is the only word there is. Stop, StopFailure,
+    # UserPromptSubmit and SessionEnd close it too, as abandoned.
     report "$action"
     ;;
 esac

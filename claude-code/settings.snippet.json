@@ -6,6 +6,8 @@
 
   "_comment_hold": "The second PermissionRequest entry, with the long timeout, is the held one (wsp-301): it raises an agent's dialog (AskUserQuestion, ExitPlanMode, a tool's permission) as a question for the person and prints their answer. It runs beside the 5-second reporter above it and beside the pane's own dialog, and whatever answers first wins. A timeout falls through to the pane, which is why it must not be set to block on failure. Keep the number after PermissionHold equal to its timeout, in seconds: wsp stops waiting 30 s before Claude Code would kill it. Merge it by hand with the rest, as ever.",
 
+  "_comment_close": "PostToolUse is the other half of the held entry (wsp-302): Claude Code does not signal a held hook when the pane's dialog is answered first, so the tool running afterwards is what closes the question as answered in the pane. Stop, StopFailure, UserPromptSubmit and SessionEnd above close it as abandoned. It fires after every tool call, and costs one sh in a session that is not in a wsp seat.",
+
   "hooks": {
     "SessionStart": [
       {
@@ -85,6 +87,18 @@
             "type": "command",
             "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' PermissionHold 86400",
             "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' PostToolUse",
+            "timeout": 5
           }
         ]
       }

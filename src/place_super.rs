@@ -572,6 +572,15 @@ pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) 
             util::contract(&path)
         ));
     }
+    // And the entry that closes what the held one raised (`wsp-302`): without
+    // it a question the pane answered stays on the person's list until the
+    // turn ends. Only worth saying where the held entry is.
+    if named("PermissionRequest", "PermissionHold") && !named("PostToolUse", "wsp-session.sh") {
+        notes.push(format!(
+            "{}: no PostToolUse entry — a question answered in the agent's pane stays on the list as open until its turn ends instead of closing as answered; merge the PostToolUse entry from claude-code/settings.snippet.json (wsp-302)",
+            util::contract(&path)
+        ));
+    }
     if !missing.is_empty() {
         problems.push(format!(
             "{}: wsp-session.sh is missing from {} of {} hooks — {} — those turns never reach `wsp report`, and state reads stale or Unknown for them; merge the missing entries in from claude-code/settings.snippet.json (compound-107)",
@@ -613,7 +622,13 @@ pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) 
 pub fn report(store: &crate::store::Store, args: &crate::Args) -> i32 {
     let hook = args.rest.first().cloned().unwrap_or_default();
     let Some(seat) = place::seat_from_env() else { return 0 };
-    let Some(state) = said_by(&hook) else { return 0 };
+    // `PostToolUse` says nothing about what the agent is doing, so it has no
+    // state; it is only ever here to close a question (`wsp-302`).
+    let state = said_by(&hook);
+    let closes = crate::hold_close::closes(&hook);
+    if state.is_none() && !closes {
+        return 0;
+    }
     let payload: Value = match args.has("payload") {
         // A test's way in, so that the mapping above can be argued about
         // without a hook and a pipe.
@@ -624,6 +639,14 @@ pub fn report(store: &crate::store::Store, args: &crate::Args) -> i32 {
             serde_json::from_str(&buf).unwrap_or(json!({}))
         }
     };
+    // The pane answered a dialog a held hook is waiting on, or the agent moved
+    // on from it, or the session is over: close the question and let the hold
+    // go (`wsp-302`). First, so a `SessionEnd` that the supervisor reads as
+    // `Gone` finds the question already closed.
+    if closes {
+        crate::hold_close::heard(store, &hook, &payload);
+    }
+    let Some(state) = state else { return 0 };
     // `--hold SECS` is the other thing this verb does for a hook: not saying
     // what happened but waiting on the person (`wsp-301`), and the only time
     // it prints anything. It is its own hook entry with its own long timeout,
@@ -963,7 +986,7 @@ impl Supervisor<'_> {
     /// read is whether it is a *file name*. Without it a seat called `../..` is
     /// a `stop` that removes somebody's home directory, which is not a
     /// hypothetical worth leaving to good manners.
-    fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
+    pub(crate) fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
         let id = seat.as_str();
         let plain = !id.is_empty()
             && !id.starts_with('.')
@@ -2422,6 +2445,7 @@ mod tests {
             .map(|h| (h.to_string(), hook_entry(&format!("sh '/x/wsp-session.sh' {h}"))))
             .collect();
         let mut entries = entries;
+        entries.insert("PostToolUse".into(), hook_entry("sh '/x/wsp-session.sh' PostToolUse"));
         entries.insert(
             "PermissionRequest".into(),
             json!([
@@ -2451,6 +2475,26 @@ mod tests {
         assert!(problems.is_empty());
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("PermissionHold"), "{}", notes[0]);
+    }
+
+    /// The held entry with nothing to close what it raises: a note, since the
+    /// question is closed at the turn's end instead (`wsp-302`).
+    #[test]
+    fn a_hold_entry_without_post_tool_use_is_a_note() {
+        let mut entries: serde_json::Map<String, Value> = HOOK_NAMES
+            .iter()
+            .map(|h| (h.to_string(), hook_entry(&format!("sh '/x/wsp-session.sh' {h}"))))
+            .collect();
+        entries.insert("PermissionRequest".into(), json!([
+            { "matcher": "*", "hooks": [{ "type": "command", "command": "sh '/x/wsp-session.sh' PermissionRequest" }] },
+            { "matcher": "*", "hooks": [{ "type": "command", "command": "sh '/x/wsp-session.sh' PermissionHold 86400" }] },
+        ]));
+        let _s = SettingsScratch::write(&Value::Object(entries));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        hook_snippet_health(&mut problems, &mut notes);
+        assert!(problems.is_empty());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("PostToolUse"), "{}", notes[0]);
     }
 
     /// No settings file at all is a smaller, different fact than a short one —

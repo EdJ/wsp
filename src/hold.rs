@@ -29,8 +29,14 @@
 //! keep that from being more than a sleeping process: a question closed by
 //! anyone else ends the wait, and a new request from the same session for the
 //! same tool abandons the old one — the question is keyed by `session_id` and
-//! tool, since `PermissionRequest` carries no `tool_use_id`. Closing on a pane
-//! answer is `wsp-302`'s.
+//! tool, since `PermissionRequest` carries no `tool_use_id`. Closing it when the
+//! pane answers, or the agent moves on, is [`crate::hold_close`] (`wsp-302`):
+//! the agent's own hooks close the question, and this loop sees it closed.
+//!
+//! **Only the person's answer is printed.** A question that closes any other
+//! way, whether by the pane, by a turn that ended, by a seat that went, or by
+//! the wait running out, ends the wait with no output, so that a decision built
+//! from the answer the pane gave is never sent back to a dialog that is gone.
 //!
 //! # What the answer has to say, measured
 //!
@@ -213,14 +219,15 @@ fn previous_plan(store: &Store, session: &str) -> Option<Value> {
 /// here reads it back. Whether the pane quotes a lone pick on a multi-select is
 /// not measured; it is quoted here as any other element is.
 fn joined(labels: &[&str]) -> String {
-    labels
-        .iter()
-        .map(|l| match l.contains(", ") {
-            true => format!("\"{}\"", l.replace('"', "\\\"")),
-            false => l.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    labels.iter().map(|l| rendered(l)).collect::<Vec<_>>().join(", ")
+}
+
+/// One label as the pane writes it inside a multi-select's string.
+pub(crate) fn rendered(label: &str) -> String {
+    match label.contains(", ") {
+        true => format!("\"{}\"", label.replace('"', "\\\"")),
+        false => label.to_string(),
+    }
 }
 
 /// The `updatedInput` of an ask: `tool_input` with `answers` — each question's
@@ -337,11 +344,12 @@ pub fn hold(store: &Store, payload: &Value, secs: u64) -> i32 {
     };
     let tree = tree_of(text(payload, "cwd"));
     let home = std::env::var("HOME").unwrap_or_default();
-    hold_at(store, me, &pane, about, payload, secs, POLL, &tree, &home)
+    hold_at(store, me, &pane, about, payload, secs, POLL, &tree, &home, &seat_watch())
 }
 
 /// [`hold`] with the asker and what it asks about already known, and the poll
-/// given, so a test can answer from the same process.
+/// and the seat's watch given, so a test can answer from the same process.
+/// `gone` says the seat that asked has gone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hold_at(
     store: &Store,
@@ -353,10 +361,33 @@ pub(crate) fn hold_at(
     poll: Duration,
     tree: &str,
     home: &str,
+    gone: &dyn Fn() -> bool,
 ) -> i32 {
+    if let Some(d) = held(store, me, pane, about, payload, secs, poll, tree, home, gone) {
+        println!("{d}");
+    }
+    0
+}
+
+/// The decision the person made, or `None` for every other end: nothing to ask,
+/// the question closed by anything but the person, the wait running out, the
+/// seat gone. Each of those leaves the dialog to the pane.
+#[allow(clippy::too_many_arguments)]
+fn held(
+    store: &Store,
+    me: Party,
+    pane: &str,
+    about: About,
+    payload: &Value,
+    secs: u64,
+    poll: Duration,
+    tree: &str,
+    home: &str,
+    gone: &dyn Fn() -> bool,
+) -> Option<Value> {
     let at = crate::util::now_iso();
     let ctx = Ctx { tree, home, at: &at, previous: previous_plan(store, text(payload, "session_id")) };
-    let Some(choices) = choices_of(payload, secs, &ctx).and_then(|v| Choices::parse(&v).ok()) else { return 0 };
+    let choices = choices_of(payload, secs, &ctx).and_then(|v| Choices::parse(&v).ok())?;
     let subject = about.task().or(about.scope()).unwrap_or_default().to_string();
     let mut q = Message::question(me, Kind::Note, &choices.sentence(), Waiting::new(pane, about.task().unwrap_or_default()))
         .about(about)
@@ -364,33 +395,56 @@ pub(crate) fn hold_at(
     q.choices = Some(choices);
     q.caption = caption_of(payload, tree).map(|text| crate::caption::Caption { text, from: "authored" });
     supersede(store, &q);
-    if message::raise(store, &q).is_err() {
-        return 0;
-    }
+    message::raise(store, &q).ok()?;
     crate::cmd_message::asked_of_the_person(store, &q, &subject);
 
     let give_up = Instant::now() + Duration::from_secs(secs.saturating_sub(MARGIN).max(1));
     loop {
-        match store.message(&q.id) {
-            None => return 0,
-            Some(m) if !m.is_open() => {
-                if let Some(d) = m.answer_choice().and_then(|a| decision_of(payload, a)) {
-                    println!("{d}");
-                }
-                return 0;
-            }
-            Some(_) => {}
+        let m = store.message(&q.id)?;
+        if !m.is_open() {
+            // The person's, and only the person's: a pane's answer is already
+            // what the dialog did, and a decision built from it would go back
+            // to a dialog that is gone.
+            return m.closing().filter(|h| h.by == Party::Human).and(m.answer_choice()).and_then(|a| decision_of(payload, a));
         }
-        if Instant::now() >= give_up {
-            let _ = message::abandon(
+        if gone() {
+            let _ = message::close_from_pane(
                 store,
                 &q.id,
-                &Party::wsp(),
-                &format!("no answer in {secs} s — the dialog in the pane is still the way to answer it"),
+                &Party::seat_gone(),
+                message::Act::Abandoned,
+                "the seat that asked has gone — there is no dialog left to answer",
+                None,
             );
-            return 0;
+            return None;
+        }
+        if Instant::now() >= give_up {
+            let _ = message::abandon(store, &q.id, &Party::wsp(), &format!("timed out after {secs} s, left to the pane"));
+            return None;
         }
         std::thread::sleep(poll);
+    }
+}
+
+/// The watch on the seat this hook runs in: true once the backend that held it
+/// at the start no longer does, or reads it `Gone`. A seat no backend held at
+/// the start is never gone, because there is nothing to compare with — a hook
+/// run by hand, or under a backend this cannot read.
+fn seat_watch() -> impl Fn() -> bool {
+    use crate::place::{Place, Refusal, State};
+    let seat = crate::place::seat_from_env();
+    let sup = crate::place_super::Supervisor::new();
+    let comp = crate::place_compound::Compound::new();
+    let in_sup = seat.as_ref().is_some_and(|s| sup.dir_of(s).map(|d| d.is_dir()).unwrap_or(false));
+    let in_comp = !in_sup && seat.as_ref().is_some_and(|s| comp.dir_of(s).map(|d| d.is_dir()).unwrap_or(false));
+    move || {
+        let Some(seat) = &seat else { return false };
+        let read = match (in_sup, in_comp) {
+            (true, _) => sup.state(seat),
+            (_, true) => comp.state(seat),
+            _ => return false,
+        };
+        matches!(read, Ok(State::Gone) | Err(Refusal::NoSeat(_)))
     }
 }
 
@@ -413,14 +467,14 @@ fn supersede(store: &Store, new: &Message) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn ctx() -> Ctx<'static> {
         Ctx { tree: "/w/tree", home: "/Users/ed", at: "2026-10-20T10:00:00Z", previous: None }
     }
 
-    fn ask_payload() -> Value {
+    pub(crate) fn ask_payload() -> Value {
         json!({
             "hook_event_name": "PermissionRequest", "session_id": "s1", "tool_name": "AskUserQuestion", "permission_mode": "default",
             "tool_input": { "questions": [
@@ -432,7 +486,7 @@ mod tests {
         })
     }
 
-    fn bash_payload() -> Value {
+    pub(crate) fn bash_payload() -> Value {
         json!({
             "hook_event_name": "PermissionRequest", "session_id": "s1", "tool_name": "Bash",
             "tool_input": { "command": "python3 -c \"print(11)\"", "description": "print" },
@@ -441,7 +495,7 @@ mod tests {
         })
     }
 
-    fn plan_payload() -> Value {
+    pub(crate) fn plan_payload() -> Value {
         json!({ "session_id": "s1", "tool_name": "ExitPlanMode", "tool_input": { "plan": "# steps", "planFilePath": "/p/plan.md" } })
     }
 
@@ -552,13 +606,13 @@ mod tests {
         assert!(decision_of(&bash, &json!({})).is_none());
     }
 
-    fn at(root: &std::path::Path) -> Store {
+    pub(crate) fn at(root: &std::path::Path) -> Store {
         Store::at(root.to_path_buf(), root.join("state"))
     }
 
     /// A store holding the one row the hook's seat holds. A `Store` caches in
     /// `RefCell`s and is not `Sync`, so each thread opens its own on the path.
-    fn scratch(tag: &str) -> std::path::PathBuf {
+    pub(crate) fn scratch(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("wsp-hold-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = at(&root);
@@ -571,11 +625,16 @@ mod tests {
     }
 
     fn hold_in(root: &std::path::Path, payload: &Value, secs: u64) -> i32 {
-        hold_at(&at(root), Party::pane("cpd-1", ""), "cpd-1", About::Task("hold-1".into()), payload, secs, Duration::from_millis(10), "/w/tree", "/Users/ed")
+        hold_at(&at(root), Party::pane("cpd-1", ""), "cpd-1", About::Task("hold-1".into()), payload, secs, Duration::from_millis(10), "/w/tree", "/Users/ed", &|| false)
+    }
+
+    /// [`held`] in the fixture's seat: what the hook would have printed, if anything.
+    pub(crate) fn held_in(root: &std::path::Path, payload: &Value, secs: u64, gone: &dyn Fn() -> bool) -> Option<Value> {
+        held(&at(root), Party::pane("cpd-1", ""), "cpd-1", About::Task("hold-1".into()), payload, secs, Duration::from_millis(10), "/w/tree", "/Users/ed", gone)
     }
 
     /// The first question on the person's list, once it is raised.
-    fn raised(store: &Store) -> Message {
+    pub(crate) fn raised(store: &Store) -> Message {
         for _ in 0..500 {
             if let Some(m) = message::for_the_person(store).into_iter().next() {
                 return m;
@@ -788,7 +847,7 @@ mod tests {
         let payload = bash_payload();
         std::thread::scope(|s| {
             let held = s.spawn(|| {
-                hold_at(&at(&root), Party::seat("ux-next"), "cpd-9", About::Scope("ux-next".into()), &payload, 600, Duration::from_millis(10), "/w/tree", "/Users/ed")
+                hold_at(&at(&root), Party::seat("ux-next"), "cpd-9", About::Scope("ux-next".into()), &payload, 600, Duration::from_millis(10), "/w/tree", "/Users/ed", &|| false)
             });
             let store = at(&root);
             let q = raised(&store);

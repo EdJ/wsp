@@ -553,6 +553,13 @@ impl Party {
     pub fn is_wsp(&self) -> bool {
         matches!(self, Party::Agent(h) if h == "wsp")
     }
+    /// wsp closing a question because the seat that asked it is gone (`wsp-302`):
+    /// the agent's process ended, its session ended, or its seat was despawned.
+    /// Its own handle, beside [`Party::wsp`]'s, so that [`Message::closed_json`]
+    /// can tell it from wsp giving up a wait (`timeout`) without reading prose.
+    pub fn seat_gone() -> Party {
+        Party::Agent(SEAT_GONE.into())
+    }
 
     /// One line, for a byline. `wsp-095` Part 4's whole point is that this
     /// exists at all: the seat had already adopted the rule by hand — *every
@@ -616,6 +623,9 @@ impl Party {
         Party::Human
     }
 }
+
+/// The handle of [`Party::seat_gone`].
+const SEAT_GONE: &str = "wsp (seat gone)";
 
 /// Who is sitting still while a question is open.
 ///
@@ -1217,9 +1227,10 @@ impl Message {
     /// How a closed question ended, as `wsp yours --json` says it
     /// (compound's §26.8 D7): `{how, by, at, answer}`.
     ///
-    /// `by` is read off the hop's party: the person, a seat, or a pane (an
-    /// agent's own, which is how an answer given in the dialog will be written
-    /// — `wsp-302` names that reason). `timeout` is wsp itself abandoning.
+    /// `by` is read off the hop's party: the person; a pane (the agent's own,
+    /// which is how an answer given in the dialog, or a dialog the agent moved
+    /// on from, is written — [`close_from_pane`]); a seat that is gone
+    /// ([`Party::seat_gone`]); or `timeout`, wsp itself giving up a wait.
     /// `answer` is the structured one, or `{text}` for a question that had no
     /// choices. `None` while the question is open.
     pub fn closed_json(&self) -> Option<Value> {
@@ -1231,6 +1242,7 @@ impl Message {
         let by = match (&h.by, h.act) {
             (Party::Human, _) => "person",
             (Party::Seat(_), _) => "seat",
+            (Party::Agent(h), _) if h == SEAT_GONE => "seat",
             (p, Act::Abandoned) if p.is_wsp() => "timeout",
             (p, _) if p.is_wsp() => "seat",
             _ => "pane",
@@ -1716,6 +1728,45 @@ pub fn answer_choice(store: &Store, id: &str, by: &Party, typed: &str, choice: &
 /// exists to prevent.
 pub fn abandon(store: &Store, id: &str, by: &Party, reason: &str) -> Result<Closed, Refused> {
     close(store, id, by, Act::Abandoned, reason, None)
+}
+
+/// Close a question a **hook** raised, on the word of the agent's own hooks
+/// (`wsp-302`): the pane's dialog answered first (`PostToolUse`), or the agent
+/// moved on from it (`Stop`, `UserPromptSubmit`), or the session ended.
+///
+/// The only road by which something that is not the person closes a question
+/// for the person, so it is narrow: the question must have been raised by the
+/// hold (`choices.via` is `hook`), and `by` is the asker's own pane or
+/// [`Party::seat_gone`], never a person. It writes no decision on the row: what
+/// the pane's dialog settled, the agent saw settled, and a permission asked a
+/// dozen times a turn would otherwise fill `## Decisions`. The hop and the
+/// acknowledged reply are the record. Never a clear (`worklist-004`): both
+/// acts take a sentence, and `choice` is the pane's answer in the shape
+/// [`crate::choices`] stores, written without being checked against the
+/// question's options because the pane's dialog is the one that checked it.
+pub fn close_from_pane(store: &Store, id: &str, by: &Party, act: Act, text: &str, choice: Option<Value>) -> Result<Closed, Refused> {
+    store.locked(|| {
+        if text.trim().is_empty() {
+            return Err(Refused::NeedsASentence);
+        }
+        let q = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        let held = q.choices.as_ref().is_some_and(|c| c.json().get("via").and_then(Value::as_str) == Some("hook"));
+        if !held {
+            return Err(Refused::BadChoice("only a question the hold raised is closed from the pane".into()));
+        }
+        if !matches!(act, Act::Answered | Act::Abandoned) || matches!(by, Party::Human | Party::Seat(_)) {
+            return Err(Refused::NotThePersons(by.byline()));
+        }
+        match q.shape() {
+            Some(s) if s.may(act) => {}
+            _ => return Err(Refused::WrongShape { shape: q.shape_raw.clone(), act }),
+        }
+        if !q.is_open() {
+            return Err(Refused::NotOpen(q.state_raw.clone()));
+        }
+        let waiting = q.waiting.clone().ok_or(Refused::NobodyWaiting)?;
+        finish(store, id, by, act, text, choice, waiting, Landed::RecordOnly("closed from the agent's own pane".into()))
+    })
 }
 
 fn close(store: &Store, id: &str, by: &Party, act: Act, text: &str, choice: Option<&Value>) -> Result<Closed, Refused> {
