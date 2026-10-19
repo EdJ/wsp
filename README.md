@@ -2602,6 +2602,34 @@ the first line of `wsp-session.sh`. If you already have the older
 than joining it — two entries print the brief twice, and a brief is ~3,300
 tokens on every request of the session.
 
+**A dialog can be answered from wsp** (`wsp-301`, from compound-562's spike). The
+snippet's second `PermissionRequest` entry, `wsp-session.sh PermissionHold
+86400` with `"timeout": 86400`, runs `wsp report PermissionRequest --hold SECS`
+beside the five-second reporter and beside the pane's own dialog. For
+`AskUserQuestion`, `ExitPlanMode` and a tool's permission prompt it raises a
+question for the person on the row the seat holds, with `choices` of `kind` `ask`,
+`plan` or `permission` and `via: hook` (the options, the plan and
+`planFilePath`, the command and the payload's `permission_suggestions`), and
+waits for `wsp answer`. The decision it prints is the answer mapped, and the pane
+and the person race: whichever answers first wins. An ask answers with
+`updatedInput` = `tool_input` + `answers` (a multi-select as the labels joined
+by `", "`, a label holding `", "` quoted; free text as typed; a single pick of an
+option with a `preview` sends it as `annotations`, as the pane does); a plan
+approves with `updatedInput` and, for `mode` `auto` or `acceptEdits`, a
+`setMode` for the session, or denies with the reason; a permission allows (with
+the suggestion offered, its destination forced to `session`) or denies. A bare
+`allow` would leave the plan's dialog up, which is measured in
+`docs/spikes/compound-562.md`. **Anything that is not an answer prints nothing**
+and so leaves the dialog to the pane: the wait ending (the hook gives up 30 s
+before Claude Code's `timeout` and abandons the question, which lists as `by:
+timeout`), no row held, a subagent, `wsp` missing. Never an `onFailure: block`.
+A second request from the same session for the same tool abandons the first.
+`wsp answer` on such a question types nothing at the pane; the hook carries it.
+The entry is one more to merge by hand, and `wsp doctor` notes it when it is
+missing. Answering when the *pane* answered first is `wsp-302`'s. In `auto` and
+`bypassPermissions` Claude Code fires nothing for a Bash call, so only the ask
+and the plan reach it there.
+
 The **permissions** half matters as much as the hook. Create, claim, note,
 decide, flag and move through the workflow are pre-allowed, because a store an
 agent has to ask permission to write is a store that stays empty — and `flag`

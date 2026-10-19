@@ -84,6 +84,25 @@ case "$action" in
     # a fact about the work and is `wsp despawn`'s to end.
     report SessionEnd
     ;;
+  PermissionHold)
+    # The one hook here that says something back. A PermissionRequest fires with
+    # the dialog already on the pane's screen and runs this beside it: `wsp
+    # report --hold` raises the dialog as a question for the person (an
+    # AskUserQuestion's options, a plan, a tool's permission), waits for `wsp
+    # answer`, and prints the decision for Claude Code to act on. Whoever
+    # answers first wins, the pane or the person, so the pane is never taken
+    # away.
+    #
+    # **Anything but an answer prints nothing and exits 0**, which is what
+    # Claude Code reads as "no opinion" and leaves the dialog to the pane: a
+    # wait that ran out, a store that is gone, no row to ask about, no `wsp`.
+    # Never a deny, and the settings entry must never say `onFailure: block`.
+    #
+    # `$2` is the `timeout` the settings entry gives this hook, in seconds, so
+    # that `wsp` stops waiting a little before Claude Code would kill it and
+    # can say so on the question. Keep the two equal.
+    printf '%s' "$payload" | wsp report PermissionRequest --hold "${2:-86400}" 2>/dev/null || true
+    ;;
   *)
     # UserPromptSubmit, Stop, StopFailure, PermissionRequest, Elicitation — the
     # hook's own name, passed through. `wsp report` knows which of them mean

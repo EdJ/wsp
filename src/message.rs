@@ -1672,7 +1672,11 @@ fn close_locked(
     if !q.is_open() {
         return Err(Refused::NotOpen(q.state_raw.clone()));
     }
-    if q.for_person && matches!(by, Party::Seat(_) | Party::Agent(_)) {
+    // wsp itself may *abandon* one, and only that: a held hook that gave up
+    // waiting (`wsp-301`) is how `closed_json` comes to say `timeout`. It cannot
+    // answer for the person, and no seat or agent can do either.
+    let wsp_giving_up = act == Act::Abandoned && by.is_wsp();
+    if q.for_person && matches!(by, Party::Seat(_) | Party::Agent(_)) && !wsp_giving_up {
         return Err(Refused::NotThePersons(by.byline()));
     }
     let waiting = q.waiting.clone().ok_or(Refused::NobodyWaiting)?;

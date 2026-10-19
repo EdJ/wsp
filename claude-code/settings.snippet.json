@@ -4,6 +4,8 @@
   "_comment_executor": "On an executor there is no checkout, so wsp-session.sh is copied to ~/.claude/hooks/ beside herdr's own and the command below points there instead. The permissions are not optional over there: nobody is sitting at that machine to answer a prompt, and an agent that stops at one stops until somebody notices in the panel.",
   "_hooks_comment": "SessionStart is the brief and is owed to every session. The other five are how a headless agent — one `wsp spawn --headless` is hosting, with no terminal at all — says what it is doing: UserPromptSubmit and Stop bracket a turn, PermissionRequest and Elicitation mean a person is needed, SessionEnd means it has gone. They cost one `sh` and exit in a session that is not in a wsp seat, which is every session in a herdr pane, so wiring them all is safe. See src/place_super.rs for what each one is read as.",
 
+  "_comment_hold": "The second PermissionRequest entry, with the long timeout, is the held one (wsp-301): it raises an agent's dialog (AskUserQuestion, ExitPlanMode, a tool's permission) as a question for the person and prints their answer. It runs beside the 5-second reporter above it and beside the pane's own dialog, and whatever answers first wins. A timeout falls through to the pane, which is why it must not be set to block on failure. Keep the number after PermissionHold equal to its timeout, in seconds: wsp stops waiting 30 s before Claude Code would kill it. Merge it by hand with the rest, as ever.",
+
   "hooks": {
     "SessionStart": [
       {
@@ -73,6 +75,16 @@
             "type": "command",
             "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' PermissionRequest",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' PermissionHold 86400",
+            "timeout": 86400
           }
         ]
       }

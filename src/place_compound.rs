@@ -482,6 +482,7 @@ impl Compound<'_> {
             &json!({
                 "state": state.as_str(),
                 "hook": hook,
+                "needs": crate::place_super::needs_of(hook, payload),
                 "at": util::now_iso(),
                 "session_id": keep("session_id"),
                 "transcript_path": keep("transcript_path"),

@@ -641,7 +641,7 @@ fn an_agent_process(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
 /// Raising one writes a line on its subject, so the committed record says it
 /// was asked even when the machine-local `messages.json` is gone, and an agent
 /// on that row reads it in its brief.
-fn asked_of_the_person(store: &Store, q: &Message, subject: &str) {
+pub(crate) fn asked_of_the_person(store: &Store, q: &Message, subject: &str) {
     let line = format!("asked of the person by {}: {} · {}", q.from.byline(), util::truncate(q.title(), 160), q.id);
     let saved = match store.task(subject) {
         Some(mut t) => {
@@ -1195,6 +1195,14 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
         receipt(false, false, "nobody to tell — the answer is on the record and in the log");
         return 0;
     }
+    // **A question a hook is holding is answered by the hook** (`wsp-301`): it
+    // polls the record and prints the decision into the tool call that asked.
+    // Typing the reply at the pane as well would put the answer into a dialog,
+    // or into the composer at the next idle, a second time.
+    if held_by_a_hook(&closed.question) {
+        receipt(false, false, "the hook holding the agent's dialog carries the answer — nothing is typed at the pane");
+        return 0;
+    }
     // Asked of every backend wsp can spawn onto (`compound-091`), not herdr
     // alone — the same fold `wsp tell` makes since `compound-077` and for the
     // same reason: a seat is a herdr pane, a compound seat, or nothing this
@@ -1256,6 +1264,12 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
             0
         }
     }
+}
+
+/// Whether a hook is waiting on this question to print the agent's decision
+/// (`choices.via` is `hook`), as against one raised from the CLI.
+fn held_by_a_hook(q: &Message) -> bool {
+    q.choices.as_ref().is_some_and(|c| c.json().get("via").and_then(|v| v.as_str()) == Some("hook"))
 }
 
 /// Hold the reply for `pane` and say so. The exit is 0: the answer is written,
@@ -1820,6 +1834,21 @@ mod tests {
         assert!(message::answer(&store, &q.id, &Party::Human, "accepted: +190 ms is the cost of gpui").is_ok());
     }
 
+    /// wsp itself is the one party besides the person that may end one, and
+    /// only by giving up: a held hook (`wsp-301`) that stopped waiting says so
+    /// on the question, and the list reads `timeout`. It answers for nobody.
+    #[test]
+    fn wsp_may_abandon_the_persons_question_and_never_answer_it() {
+        let store = scratch("yours-wsp");
+        task(&store, "wsp-095");
+        let q = for_the_person_about(&store, Party::pane("cpd-1", ""), About::Task("wsp-095".into()));
+        assert!(matches!(message::answer(&store, &q.id, &Party::wsp(), "yes"), Err(message::Refused::NotThePersons(_))));
+        assert!(store.message(&q.id).unwrap().is_open());
+        message::abandon(&store, &q.id, &Party::wsp(), "no answer in 600 s").unwrap();
+        let closed = store.message(&q.id).unwrap().closed_json().unwrap();
+        assert_eq!((closed["how"].as_str(), closed["by"].as_str()), (Some("abandoned"), Some("timeout")));
+    }
+
     /// The verb's half of the refusal, which only the caller's environment can
     /// tell: a seat and an agent's pane are refused, a person at a shell is
     /// not, and the person typing into an agent's pane says so in a word an
@@ -2279,6 +2308,17 @@ mod tests {
         store.save_message(&old).unwrap();
         assert!(recently_closed(&store).is_empty());
         drop(env);
+    }
+
+    #[test]
+    fn a_question_a_hook_holds_is_answered_by_the_hook_and_not_typed_at_the_pane() {
+        let _env = util::isolated("held-by-hook");
+        let store = scratch("held-by-hook");
+        task(&store, "lone-1");
+        let hooked = asked_with(&store, "lone-1", &a_permission());
+        let cli = asked_with(&store, "lone-1", &two_questions());
+        assert!(held_by_a_hook(&hooked) && !held_by_a_hook(&cli));
+        assert!(!held_by_a_hook(&a_question(&store, "lone-1")), "a question with no choices is nobody's hook");
     }
 
     #[test]

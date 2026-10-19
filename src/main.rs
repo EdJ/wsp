@@ -13,6 +13,7 @@ mod agent_commands;
 mod barrier;
 mod caption;
 mod choices;
+mod hold;
 mod check_tree;
 mod arrange;
 mod attention;
@@ -1183,7 +1184,7 @@ fn main() {
         // exited — and it ends in a full `sync` over the socket. This is an
         // agent saying what *it* is doing, from inside its own hook, several
         // times a turn, and it must touch nothing but its own seat's file.
-        "report" => place_super::report(&args),
+        "report" => place_super::report(&store, &args),
         "doctor" => cmd_agent::doctor(&store, &args),
         "adopt" => cmd_agent::adopt(&store, &args),
         "migrate" => cmd_migrate::run(&store, &args),

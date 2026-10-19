@@ -485,6 +485,19 @@ pub(crate) fn said_by(hook: &str) -> Option<State> {
     })
 }
 
+/// What a hook says the agent needs, written to `said.json` beside the state it
+/// is read as (`wsp-301`): `PermissionRequest` and `Elicitation` are `Working`
+/// to [`said_by`] because `State` has no word for *waiting on a person*, so the
+/// fact is kept here where a reader can ask for it. `null` for every other hook.
+pub(crate) fn needs_of(hook: &str, payload: &Value) -> Value {
+    match hook.trim() {
+        "PermissionRequest" | "Elicitation" => {
+            json!({ "who": "person", "hook": hook.trim(), "tool": str_of(payload, "tool_name") })
+        }
+        _ => Value::Null,
+    }
+}
+
 /// Every hook name [`said_by`] answers for. Kept as its own list rather than
 /// derived from that match, because nothing can enumerate a match's arms —
 /// and named here, beside [`hook_snippet_health`], for the reason
@@ -538,7 +551,7 @@ pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) 
         problems.push(format!("{}: not valid JSON — could not check which hooks are installed", util::contract(&path)));
         return;
     };
-    let installed = |event: &str| -> bool {
+    let named = |event: &str, what: &str| -> bool {
         settings["hooks"][event]
             .as_array()
             .into_iter()
@@ -546,9 +559,19 @@ pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) 
             .filter_map(|matcher| matcher["hooks"].as_array())
             .flatten()
             .filter_map(|h| h["command"].as_str())
-            .any(|c| c.contains("wsp-session.sh"))
+            .any(|c| c.contains(what))
     };
+    let installed = |event: &str| named(event, "wsp-session.sh");
     let missing: Vec<&str> = HOOK_NAMES.iter().copied().filter(|e| !installed(e)).collect();
+    // The held entry (`wsp-301`) is not one of the seven: nothing goes stale
+    // without it, it only leaves an agent's dialog to be answered in its pane.
+    // A note, and only where the reporter is there to sit beside it.
+    if installed("PermissionRequest") && !named("PermissionRequest", "PermissionHold") {
+        notes.push(format!(
+            "{}: no PermissionHold entry under PermissionRequest — an agent's question, plan or permission can only be answered in its pane, not from compound; merge the second PermissionRequest entry from claude-code/settings.snippet.json (wsp-301)",
+            util::contract(&path)
+        ));
+    }
     if !missing.is_empty() {
         problems.push(format!(
             "{}: wsp-session.sh is missing from {} of {} hooks — {} — those turns never reach `wsp report`, and state reads stale or Unknown for them; merge the missing entries in from claude-code/settings.snippet.json (compound-107)",
@@ -587,7 +610,7 @@ pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) 
 /// record is written into an existing directory or not at all, because a
 /// `SessionEnd` racing a [`Place::stop`] would otherwise recreate a seat that
 /// nothing would ever clear.
-pub fn report(args: &crate::Args) -> i32 {
+pub fn report(store: &crate::store::Store, args: &crate::Args) -> i32 {
     let hook = args.rest.first().cloned().unwrap_or_default();
     let Some(seat) = place::seat_from_env() else { return 0 };
     let Some(state) = said_by(&hook) else { return 0 };
@@ -601,6 +624,19 @@ pub fn report(args: &crate::Args) -> i32 {
             serde_json::from_str(&buf).unwrap_or(json!({}))
         }
     };
+    // `--hold SECS` is the other thing this verb does for a hook: not saying
+    // what happened but waiting on the person (`wsp-301`), and the only time
+    // it prints anything. It is its own hook entry with its own long timeout,
+    // so the five reporters stay at five seconds.
+    if args.has("hold") {
+        return match hook.as_str() {
+            "PermissionRequest" => {
+                let secs = args.get("hold").and_then(|s| s.parse().ok()).filter(|s| *s > 0).unwrap_or(crate::hold::SECS);
+                crate::hold::hold(store, &payload, secs)
+            }
+            _ => 0,
+        };
+    }
     let super_place = Supervisor::new();
     if super_place.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
         super_place.heard(&seat, &hook, state, &payload);
@@ -1035,6 +1071,10 @@ impl Supervisor<'_> {
                 // `working`, and this is the difference a seventh state would
                 // be read out of.
                 "hook": hook,
+                // Whether the agent is waiting on a person, which `state` has
+                // no word for. Rewritten whole by the next hook, so it ends
+                // with the turn or the next thing the agent says.
+                "needs": needs_of(hook, payload),
                 "at": util::now_iso(),
                 // Claude Code's session id and the transcript it is writing, both
                 // of which arrive in the payload and neither of which wsp could
@@ -1886,10 +1926,12 @@ mod tests {
         place.heard(&seat, "PermissionRequest", State::Working, &json!({ "session_id": "abc" }));
         let said = place.said(&seat);
         assert_eq!(str_of(&said, "hook"), "PermissionRequest", "the raised hand was lost");
+        assert_eq!(said["needs"], json!({ "who": "person", "hook": "PermissionRequest", "tool": "" }), "a person is needed");
         // And what the payload carries is kept when the next hook does not
         // repeat it, so a `Stop` does not forget which session it was.
         place.heard(&seat, "Stop", State::Idle, &json!({}));
         assert_eq!(str_of(&place.said(&seat), "session_id"), "abc");
+        assert_eq!(place.said(&seat)["needs"], Value::Null, "and not any longer once the agent has said something else");
     }
 
     /// A seat on another machine is refused rather than faked.
@@ -2379,11 +2421,36 @@ mod tests {
             .iter()
             .map(|h| (h.to_string(), hook_entry(&format!("sh '/x/wsp-session.sh' {h}"))))
             .collect();
+        let mut entries = entries;
+        entries.insert(
+            "PermissionRequest".into(),
+            json!([
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "sh '/x/wsp-session.sh' PermissionRequest" }] },
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "sh '/x/wsp-session.sh' PermissionHold 86400" }] },
+            ]),
+        );
         let _s = SettingsScratch::write(&Value::Object(entries));
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
         hook_snippet_health(&mut problems, &mut notes);
         assert!(problems.is_empty());
         assert!(notes.is_empty());
+    }
+
+    /// The held entry missing beside a reporter that is there is worth a
+    /// sentence and not a finding: the machine works, and a dialog is answered
+    /// in its pane as it always was.
+    #[test]
+    fn a_missing_hold_entry_is_a_note() {
+        let entries: serde_json::Map<String, Value> = HOOK_NAMES
+            .iter()
+            .map(|h| (h.to_string(), hook_entry(&format!("sh '/x/wsp-session.sh' {h}"))))
+            .collect();
+        let _s = SettingsScratch::write(&Value::Object(entries));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        hook_snippet_health(&mut problems, &mut notes);
+        assert!(problems.is_empty());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("PermissionHold"), "{}", notes[0]);
     }
 
     /// No settings file at all is a smaller, different fact than a short one —
