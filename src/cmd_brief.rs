@@ -1193,6 +1193,23 @@ const SEAT_JOB: &str = "yours to decide and direct; wsp runs the steps · wsp fl
 const PRIMARY_JOB: &str =
     "the person's side of the fleet; governs nothing · wsp wip, wsp yours, wsp govern · your asks wait on the person";
 
+/// What an agent holding `id` is told about asking the person (`wsp-303`).
+///
+/// Two lines, because the brief is re-read on every request. The example is the
+/// smallest `--choices` that `wsp ask` accepts, so an agent has the shape
+/// without a trip to the README. Claude is told its own tool still works
+/// (`wsp-301`'s hook catches it), so it is steered and not forbidden.
+fn asking(id: &str) -> [String; 2] {
+    [
+        format!(
+            "need the person to decide? `wsp ask {id} --person --wait --choices -` with \
+             {{\"kind\":\"ask\",\"questions\":[{{\"question\":\"…\",\"header\":\"…\",\"options\":[{{\"label\":\"…\",\"description\":\"…\"}}]}}]}} \
+             on stdin; the pick is printed to you"
+        ),
+        "use it rather than your own question tool or a question in your reply (AskUserQuestion still works)".into(),
+    ]
+}
+
 /// The brief as text, one line per element and nothing printed.
 fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     let terse = depth == Depth::Terse;
@@ -1430,6 +1447,15 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                         row(if i == 0 && j == 0 { "leg" } else { "" }, line.to_string());
                     }
                 }
+            }
+            // How a decision reaches the person (`wsp-303`). Said to an agent
+            // holding a row, whatever its kind: this brief is the one text every
+            // kind is handed — Claude's hook, opencode's `instructions` file,
+            // the others' `wsp brief --session` — so it is said here once
+            // rather than per kind. Without it an agent reaches for its own
+            // question tool, which only a person looking at that pane can answer.
+            for (i, l) in asking(&t.id).iter().enumerate() {
+                row(if i == 0 { "ask" } else { "" }, p.dim(l).to_string());
             }
         }
         // A verifier holds nothing either, and is not idle: its whole job is
@@ -2339,6 +2365,28 @@ mod tests {
             !brief_lines(&r, &plain(), Depth::Normal).join("\n").contains("wsp land"),
             "every brief in the shared tree pays for a line about a tree it is not in"
         );
+    }
+
+    /// An agent holding a row is told how a decision reaches the person, in the
+    /// one text every kind is handed, and a pane with nothing claimed is not
+    /// (`wsp-303`). The example is the shape `wsp ask --choices` parses, so a
+    /// change to either fails here rather than in an agent's first question.
+    #[test]
+    fn a_row_holder_is_told_to_ask_the_person_through_wsp() {
+        let mut b = briefing();
+        b.cwd = Some("/home/ed/claude/wsp/.worktrees/t-001/src".into());
+        let text = brief_lines(&compose(&b), &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("wsp ask t-001 --person --wait --choices -"), "{text}");
+        assert!(text.contains("AskUserQuestion still works"), "{text}");
+
+        let shown = &asking("t-001")[0];
+        let json = &shown[shown.find('{').unwrap()..shown.rfind('}').unwrap() + 1];
+        let v: serde_json::Value = serde_json::from_str(&json.replace('…', "x")).unwrap();
+        assert!(crate::choices::Choices::parse(&v).is_ok(), "the example in the brief must parse: {json}");
+
+        b.world.bindings.clear();
+        let text = brief_lines(&compose(&b), &plain(), Depth::Normal).join("\n");
+        assert!(!text.contains("--person --wait"), "nothing claimed, nothing to ask about:\n{text}");
     }
 
     /// Who can reach the files under your hands goes first and in the colour
