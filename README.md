@@ -1604,6 +1604,32 @@ answers or abandons one. The person typing in an agent's pane
 says so with `--as-person`. It is a guard against habit, not identity. The
 design, with what each of today's prose clauses becomes, is on `wsp-233`.
 
+**A question can carry choices** (`wsp-299`, from compound-562's spike). `wsp ask
+<id> --person --choices FILE|-` raises one with a structured `choices` field:
+`{kind: ask|plan|permission, questions: [{question, header, multi, options:
+[{label, description, preview?}]}], plan?, tool?, command?}`. Keys wsp does not
+know (`input`, `via`, `cwd`, `held`, `suggestions`, `risk`, …) are kept and
+printed as they came, and `via` is `ask` unless the file says `hook`. The
+message's `text` is still the sentence, and is derived from the questions when
+the verb is given none, so every surface that ignores `choices` reads the same
+question; `choices` is `null` on one with none, as it is in a record from before.
+The answer is checked against them: `wsp answer <mid> --choice 'Question=Label'`
+(repeat it for another question, or for a multi's other labels; `Question` is the
+question or its header, and may be left off when there is one), `--other
+'Question=words'` for a free-text Other, `--choice allow|deny "the reason"` on a
+plan or permission, or `--choice FILE|-` with `{answers: {<question>: <label> |
+{pick: [label…]} | {other: text}}}` or `{behavior: allow|deny, message?, rule?,
+mode?}` (`rule` one of the question's `suggestions`; `{behavior: deny, message}`
+on an ask is declining to choose). A pick that is not one of the labels is
+refused with the options named; plain words on a question with one question are
+its label or an Other, and on anything wider are refused for want of a
+`--choice`. The hop that closes it keeps the answer as `{answers: {<q>: {pick} |
+{other}}}` or `{behavior, …}`, the decision and the asker's reply read as
+`Headline: USD; Views: Card, Inspector`, and `wsp yours --json` and `wsp flag
+--json` print the `choices`; `wsp yours --json` also gives `closed`, the
+person's questions closed in the last ten minutes, each with `closed: {how:
+answered|abandoned, by: person|seat|pane|timeout, at, answer}`.
+
 Something louder is a hook away, the same seam `review` uses:
 
 ```sh

@@ -119,6 +119,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::{json, Value};
 
 use crate::caption::{self, Caption};
+use crate::choices::Choices;
 use crate::store::Store;
 use crate::util;
 
@@ -659,16 +660,24 @@ pub struct Hop {
     pub act: Act,
     /// What it wrote.
     pub note: String,
+    /// On the hop that answered a question with choices: the answer as it was
+    /// checked and stored — see [`crate::choices`]. `note` is its readable
+    /// form. Absent on every other hop, and on every hop an older build wrote.
+    pub choice: Option<Value>,
 }
 
 impl Hop {
     fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "at": self.at,
             "by": self.by.to_json(),
             "act": self.act.as_str(),
             "note": self.note,
-        })
+        });
+        if let Some(c) = &self.choice {
+            v["choice"] = c.clone();
+        }
+        v
     }
     fn from_json(v: &Value) -> Hop {
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
@@ -677,6 +686,7 @@ impl Hop {
             by: Party::from_json(v.get("by").filter(|b| !b.is_null())),
             act: Act::parse(&s("act")).unwrap_or(Act::Noted),
             note: s("note"),
+            choice: v.get("choice").filter(|c| !c.is_null()).cloned(),
         }
     }
 }
@@ -773,6 +783,13 @@ pub struct Message {
     /// is derived from [`Message::text`] at read time — see
     /// [`Message::caption`], which is what every surface asks.
     pub caption: Option<Caption>,
+    /// **What the question offers, when it offers something** (`wsp-299`): the
+    /// options of an `AskUserQuestion`, a plan to approve, a tool's permission
+    /// prompt. [`Message::text`] stays the sentence, so a surface that knows
+    /// nothing of this still reads the question; this is the extra that lets
+    /// compound draw buttons, and what an answer is checked against. `None` is
+    /// today's question, and a record from before this reads as one.
+    pub choices: Option<Choices>,
 }
 
 impl Message {
@@ -797,6 +814,7 @@ impl Message {
             for_person: false,
             for_seat: None,
             caption: None,
+            choices: None,
         }
     }
 
@@ -1075,6 +1093,9 @@ impl Message {
             // Derived ones too, for `source`'s reason; `from_json` keeps only
             // a written one, so a derived line is re-derived on every read.
             "caption": self.caption().json(),
+            // Null for a question with none, so a reader finds the key either
+            // way; compound's fixture holds it that way.
+            "choices": self.choices.as_ref().map(|c| c.json().clone()).unwrap_or(Value::Null),
             "for": match self.route() {
                 Route::Person => Value::from("person"),
                 Route::Seat(scope) => json!({ "seat": scope }),
@@ -1140,7 +1161,47 @@ impl Message {
                 };
                 Some(Caption { text: text.to_string(), from })
             }),
+            choices: Choices::stored(v.get("choices")),
         }
+    }
+
+    /// The hop that ended this question, if one has.
+    pub fn closing(&self) -> Option<&Hop> {
+        self.via.iter().rev().find(|h| h.act.closes().is_some())
+    }
+
+    /// The structured answer, when the question had choices and was answered.
+    pub fn answer_choice(&self) -> Option<&Value> {
+        self.closing().filter(|h| h.act == Act::Answered).and_then(|h| h.choice.as_ref())
+    }
+
+    /// How a closed question ended, as `wsp yours --json` says it
+    /// (compound's §26.8 D7): `{how, by, at, answer}`.
+    ///
+    /// `by` is read off the hop's party: the person, a seat, or a pane (an
+    /// agent's own, which is how an answer given in the dialog will be written
+    /// — `wsp-302` names that reason). `timeout` is wsp itself abandoning.
+    /// `answer` is the structured one, or `{text}` for a question that had no
+    /// choices. `None` while the question is open.
+    pub fn closed_json(&self) -> Option<Value> {
+        let h = self.closing()?;
+        let how = match h.act {
+            Act::Answered => "answered",
+            _ => "abandoned",
+        };
+        let by = match (&h.by, h.act) {
+            (Party::Human, _) => "person",
+            (Party::Seat(_), _) => "seat",
+            (p, Act::Abandoned) if p.is_wsp() => "timeout",
+            (p, _) if p.is_wsp() => "seat",
+            _ => "pane",
+        };
+        Some(json!({
+            "how": how,
+            "by": by,
+            "at": h.at,
+            "answer": h.choice.clone().unwrap_or_else(|| json!({ "text": h.note })),
+        }))
     }
 }
 
@@ -1211,6 +1272,9 @@ pub enum Refused {
     /// refused; the verb also refuses an agent's pane, which only the caller's
     /// environment can tell apart from a person's.
     NotThePersons(String),
+    /// An answer that is not one of the question's choices, or choices that
+    /// are not a question's. The sentence names the options.
+    BadChoice(String),
 }
 
 impl std::fmt::Display for Refused {
@@ -1237,6 +1301,7 @@ impl std::fmt::Display for Refused {
                 "that question is the person's to answer, and {who} is not the person — \
                  a seat or an agent may raise one and never close one"
             ),
+            Refused::BadChoice(why) => write!(f, "{why}"),
         }
     }
 }
@@ -1395,7 +1460,19 @@ pub fn acknowledge(store: &Store, id: &str, by: &Party) -> Result<Message, Refus
 /// saying one level looked at it when two did. The lock is reentrant, so the
 /// `save_message` inside takes it again without deadlocking.
 fn hop(store: &Store, id: &str, by: &Party, act: Act, note: &str) -> Result<Message, Refused> {
-    store.locked(|| hop_locked(store, id, by, act, note))
+    hop_with(store, id, by, act, note, None)
+}
+
+/// [`hop`], carrying the structured answer when there is one.
+fn hop_with(
+    store: &Store,
+    id: &str,
+    by: &Party,
+    act: Act,
+    note: &str,
+    choice: Option<Value>,
+) -> Result<Message, Refused> {
+    store.locked(|| hop_locked(store, id, by, act, note, choice))
 }
 
 fn hop_locked(
@@ -1404,6 +1481,7 @@ fn hop_locked(
     by: &Party,
     act: Act,
     note: &str,
+    choice: Option<Value>,
 ) -> Result<Message, Refused> {
     let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
     let Some(shape) = m.shape() else {
@@ -1423,21 +1501,23 @@ fn hop_locked(
         by: by.clone(),
         act,
         note: note.to_string(),
+        choice: choice.clone(),
     });
     if let Some(state) = act.closes() {
         m.state_raw = state.as_str().to_string();
     }
     store.save_message(&m)?;
-    store.log_event(
-        &format!("message-{}", act.as_str()),
-        json!({
-            "id": m.id,
-            "shape": m.shape_raw,
-            "by": by.to_json(),
-            "state": m.state_raw,
-            "note": note,
-        }),
-    );
+    let mut event = json!({
+        "id": m.id,
+        "shape": m.shape_raw,
+        "by": by.to_json(),
+        "state": m.state_raw,
+        "note": note,
+    });
+    if let Some(c) = choice {
+        event["choice"] = c;
+    }
+    store.log_event(&format!("message-{}", act.as_str()), event);
     Ok(m)
 }
 
@@ -1541,7 +1621,17 @@ pub struct Closed {
 /// asker is by definition sitting still: whatever it cost to ask, the answer is
 /// the thing that unblocks it. A caller with a reason may set it afterwards.
 pub fn answer(store: &Store, id: &str, by: &Party, text: &str) -> Result<Closed, Refused> {
-    close(store, id, by, Act::Answered, text)
+    close(store, id, by, Act::Answered, text, None)
+}
+
+/// Answer a question that has choices, with an answer in the shape
+/// [`crate::choices`] describes. `typed` is the sentence beside it, if any —
+/// the message of a deny that gave none. The answer is checked against the
+/// question's own choices and refused, naming them, when it is not one of them;
+/// what is logged and sent back is the readable form, and the hop keeps the
+/// structure for compound.
+pub fn answer_choice(store: &Store, id: &str, by: &Party, typed: &str, choice: &Value) -> Result<Closed, Refused> {
+    close(store, id, by, Act::Answered, typed, Some(choice))
 }
 
 /// Abandon a question, with a reason, and tell the asker.
@@ -1553,11 +1643,11 @@ pub fn answer(store: &Store, id: &str, by: &Party, text: &str) -> Result<Closed,
 /// the system, which is `worklist-004` and is the failure this whole shape
 /// exists to prevent.
 pub fn abandon(store: &Store, id: &str, by: &Party, reason: &str) -> Result<Closed, Refused> {
-    close(store, id, by, Act::Abandoned, reason)
+    close(store, id, by, Act::Abandoned, reason, None)
 }
 
-fn close(store: &Store, id: &str, by: &Party, act: Act, text: &str) -> Result<Closed, Refused> {
-    store.locked(|| close_locked(store, id, by, act, text))
+fn close(store: &Store, id: &str, by: &Party, act: Act, text: &str, choice: Option<&Value>) -> Result<Closed, Refused> {
+    store.locked(|| close_locked(store, id, by, act, text, choice))
 }
 
 fn close_locked(
@@ -1566,8 +1656,11 @@ fn close_locked(
     by: &Party,
     act: Act,
     text: &str,
+    choice: Option<&Value>,
 ) -> Result<Closed, Refused> {
-    if text.trim().is_empty() {
+    // A structured answer writes its own sentence, so only the words-only road
+    // owes one here; the rest is checked below, once the question is read.
+    if choice.is_none() && text.trim().is_empty() {
         return Err(Refused::NeedsASentence);
     }
     let q = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
@@ -1583,6 +1676,34 @@ fn close_locked(
         return Err(Refused::NotThePersons(by.byline()));
     }
     let waiting = q.waiting.clone().ok_or(Refused::NobodyWaiting)?;
+
+    // **An answer to a question that offers choices is one of them.** Checked
+    // here, under the lock and against the record, so no road to this function
+    // (the verb, a hook, a test) can close such a question with something it
+    // did not offer.
+    let (text, stored) = match (&q.choices, act, choice) {
+        (Some(c), Act::Answered, Some(input)) => {
+            let (v, readable) = c.accept(input, text).map_err(Refused::BadChoice)?;
+            (readable, Some(v))
+        }
+        (Some(c), Act::Answered, None) => {
+            let (v, readable) = c.accept_words(text).map_err(Refused::BadChoice)?;
+            (readable, Some(v))
+        }
+        (None, _, Some(_)) => {
+            return Err(Refused::BadChoice(
+                "that question has no choices — answer it in words".into(),
+            ))
+        }
+        (_, _, Some(_)) => {
+            return Err(Refused::BadChoice("abandoning takes a reason, not a choice".into()))
+        }
+        _ => (text.to_string(), None),
+    };
+    let text = text.as_str();
+    if text.trim().is_empty() {
+        return Err(Refused::NeedsASentence);
+    }
 
     // The task log FIRST. Everything after this point is best-effort delivery;
     // this is the part that is not.
@@ -1625,7 +1746,7 @@ fn close_locked(
                     let _ = store.save_task(&own);
                 }
             }
-            return finish(store, id, by, act, text, waiting, landed);
+            return finish(store, id, by, act, text, stored, waiting, landed);
         }
     }
     let home = homes_to(store, &q);
@@ -1659,7 +1780,7 @@ fn close_locked(
         }),
     };
 
-    finish(store, id, by, act, text, waiting, landed)
+    finish(store, id, by, act, text, stored, waiting, landed)
 }
 
 /// The hop that ends the question, and the reply addressed to whoever waited.
@@ -1669,10 +1790,11 @@ fn finish(
     by: &Party,
     act: Act,
     text: &str,
+    choice: Option<Value>,
     waiting: Waiting,
     landed: Landed,
 ) -> Result<Closed, Refused> {
-    let question = hop(store, id, by, act, text)?;
+    let question = hop_with(store, id, by, act, text, choice)?;
 
     let mut reply = Message::new(by.clone(), Kind::Direction, text);
     reply.about = question.about.clone();
@@ -2754,6 +2876,7 @@ mod tests {
             by: Party::seat("worklist"),
             act: Act::Escalated,
             note: "cannot answer this".into(),
+            choice: None,
         });
 
         let back = Message::from_json(&m.id, &m.to_json());

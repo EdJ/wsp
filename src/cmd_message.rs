@@ -101,6 +101,7 @@
 
 use serde_json::json;
 
+use crate::choices::Choices;
 use crate::herdr;
 use crate::message::{self, About, Kind, Landed, Message, Party, Shape, Waiting};
 use crate::store::Store;
@@ -153,9 +154,25 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
             }
         },
     };
-    let text = match crate::cmd_agent::prose(args, 1) {
-        Ok(t) => t,
-        Err(code) => return code,
+    // The structured part, if any (`wsp-299`): read and checked before anything
+    // is raised, so a malformed file is a sentence and not a half-asked question.
+    let choices = match args.get("choices") {
+        None => None,
+        Some(src) => match json_source(&src).and_then(|v| Choices::parse(&v)) {
+            Ok(c) => Some(c),
+            Err(why) => {
+                eprintln!("wsp: --choices: {why}");
+                return 2;
+            }
+        },
+    };
+    // With choices the sentence may be left out: the questions are it.
+    let text = match (&choices, args.text(1).trim().is_empty() && args.get("from").is_none()) {
+        (Some(c), true) => c.sentence(),
+        _ => match crate::cmd_agent::prose(args, 1) {
+            Ok(t) => t,
+            Err(code) => return code,
+        },
     };
     // The line the flight view names it by (`wsp-276`), checked as `add`'s is.
     // `--from` is the question's, so the caption has no file of its own.
@@ -257,6 +274,17 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         None => q = q.for_the_person(),
     }
 
+    if let Some(c) = choices {
+        // Choices are buttons for the person. A seat's question is answered in
+        // words by a seat, and an answer that had to be one of a list would
+        // be a rule nobody asked the seat to learn.
+        if !q.for_person {
+            eprintln!("wsp: --choices is for a question to the person — add --person");
+            return 2;
+        }
+        q.choices = Some(c);
+    }
+
     // The guarantee this verb makes, checked before the record exists rather
     // than reported after it does: there is no path here by which an answer can
     // be written and not routed.
@@ -305,7 +333,8 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
             "{}",
             json!({ "id": q.id, "about": subject_id, "waiting": held, "pane": pane, "lands_on": home,
                     "seat": seat.as_ref().map(|s| &s.scope), "for": q.to_json()["for"], "caption": q.caption().json(),
-                    "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why.clone()) })
+                    "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why.clone()),
+                    "choices": q.to_json()["choices"] })
         );
         return 0;
     }
@@ -322,6 +351,9 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
                 println!("  {}", p.dim(&why));
             }
             println!("  {}", p.dim("asked of the person · `wsp yours` lists it · only the person may answer it"));
+            if let Some(c) = &q.choices {
+                println!("  {}", p.dim(&format!("{} · answered with `wsp answer {} --choice …`: {}", c.kind(), q.id, c.options_line())));
+            }
             if let Some(holds) = unblocks(store, &q) {
                 println!("  {}", p.dim(&format!("holds {holds}")));
             }
@@ -465,11 +497,37 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
-    let text = match crate::cmd_agent::prose(args, 1) {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
     let giving_up = args.has("abandon");
+    // A structured answer (`wsp-299`) is `--choice` or `--other`; the sentence
+    // beside it, if any, is a deny's message, and otherwise there is none.
+    let chosen = args.has("choice") || args.has("other");
+    let (text, choice) = match chosen {
+        false => match crate::cmd_agent::prose(args, 1) {
+            Ok(t) => (t, None),
+            Err(code) => return code,
+        },
+        true => {
+            if giving_up {
+                eprintln!("wsp: abandoning takes a reason, not a choice");
+                return 2;
+            }
+            let typed = args.text(1);
+            let typed = match typed.trim().is_empty() {
+                true => String::new(),
+                false => match crate::cmd_agent::typed_message(&typed) {
+                    Ok(t) => t,
+                    Err(code) => return code,
+                },
+            };
+            match choice_given(args, &q) {
+                Ok(v) => (typed, Some(v)),
+                Err(why) => {
+                    eprintln!("wsp: {why}");
+                    return 2;
+                }
+            }
+        }
+    };
     let (me, pane) = whoami(store);
     // `wsp-233`: a governor can add to the person's list and never answer it.
     // Past this check the closer is the person, and is recorded as one.
@@ -491,9 +549,10 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         }
     };
 
-    let closed = match giving_up {
-        false => message::answer(store, &q.id, &me, &text),
-        true => message::abandon(store, &q.id, &me, &text),
+    let closed = match (giving_up, &choice) {
+        (false, Some(c)) => message::answer_choice(store, &q.id, &me, &text, c),
+        (false, None) => message::answer(store, &q.id, &me, &text),
+        (true, _) => message::abandon(store, &q.id, &me, &text),
     };
     let closed = match closed {
         Ok(c) => c,
@@ -519,6 +578,9 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
             (other, _) => landed_line(other),
         };
         println!("  {}", p.dim(&landed));
+        if choice.is_some() || closed.question.choices.is_some() {
+            println!("  {}", p.dim(&format!("→ {}", closed.reply.text.trim())));
+        }
     }
     if closed.question.for_person {
         tell_the_list(store, &closed, args);
@@ -642,20 +704,138 @@ fn item_json(store: &Store, q: &Message) -> serde_json::Value {
         "waiting": whole["waiting"],
         "for": whole["for"],
         "unrouted": whole["unrouted"],
+        // Null for a question with none, which is today's.
+        "choices": whole["choices"],
     })
+}
+
+/// A closed question of the person's, as `yours --json` lists it for ten
+/// minutes after (compound's §26.8 D7): the item, and how it ended.
+fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
+    let mut v = item_json(store, q);
+    v["closed"] = closed;
+    v
+}
+
+/// How long a closed question stays in `yours --json`'s `closed`.
+const CLOSED_FOR: i64 = 600;
+
+/// The person's questions closed in the last [`CLOSED_FOR`] seconds, newest
+/// first, each with `closed: {how, by, at, answer}`.
+pub(crate) fn recently_closed(store: &Store) -> Vec<(Message, serde_json::Value)> {
+    let mut out: Vec<(Message, serde_json::Value)> = store
+        .messages()
+        .into_values()
+        .filter(|m| m.shape() == Some(Shape::Question) && m.for_person && !m.is_open())
+        .filter_map(|m| {
+            let closed = m.closed_json()?;
+            let at = closed["at"].as_str().unwrap_or_default().to_string();
+            (util::epoch_of(&at) > 0 && util::since(&at) <= CLOSED_FOR).then(|| (m, closed))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1["at"].as_str().cmp(&a.1["at"].as_str()));
+    out
+}
+
+/// A JSON document from a file, or from the stream for `-` (or a bare flag).
+fn json_source(src: &str) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let raw = match src {
+        "-" | "true" => {
+            if util::stdin_is_tty() {
+                return Err("nothing is piped in — `-` reads it from a stream".into());
+            }
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).map_err(|e| format!("cannot read stdin: {e}"))?;
+            s
+        }
+        path => std::fs::read_to_string(util::expand(path)).map_err(|e| format!("cannot read {path}: {e}"))?,
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("not JSON: {e}"))
+}
+
+/// The answer `wsp answer` was given as `--choice`/`--other`, as a JSON value
+/// for [`message::answer_choice`] to check.
+///
+/// One `--choice` that is `-`, bare, or a file that exists is the JSON form
+/// (`{answers}` or `{behavior, message}`), which is what compound writes.
+/// Otherwise it is the shell's: `--choice 'Question=Label'`, repeated for
+/// another question or for a multi's other labels, `--other 'Question=words'`
+/// for a free-text Other, and on a plan or permission `--choice allow|deny`.
+/// A question is named by its text or its header; with a single question the
+/// `Question=` may be left off.
+fn choice_given(args: &Args, q: &Message) -> Result<serde_json::Value, String> {
+    let picks = args.each("choice");
+    let others = args.each("other");
+    if let [one] = picks.as_slice() {
+        if others.is_empty() && (matches!(one.as_str(), "-" | "true") || std::path::Path::new(&util::expand(one)).is_file()) {
+            return json_source(one);
+        }
+    }
+    let Some(c) = &q.choices else {
+        return Err("that question has no choices — answer it in words".into());
+    };
+    if c.kind() != "ask" {
+        return match (picks.as_slice(), others.is_empty()) {
+            ([one], true) if matches!(one.as_str(), "allow" | "deny") => Ok(serde_json::json!({ "behavior": one })),
+            _ => Err(format!("a {} is answered with `--choice allow` or `--choice deny`, or a JSON file", c.kind())),
+        };
+    }
+    let qs: Vec<(String, String)> = c.json()["questions"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|q| (q["question"].as_str().unwrap_or_default().to_string(), q["header"].as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let named = |k: &str| -> Option<String> {
+        let k = k.trim();
+        qs.iter().find(|(q, h)| q == k || (!h.is_empty() && h.eq_ignore_ascii_case(k))).map(|(q, _)| q.clone())
+    };
+    let which = |given: &str| -> Result<(String, String), String> {
+        if let Some((k, v)) = given.split_once('=') {
+            if let Some(q) = named(k) {
+                return Ok((q, v.trim().to_string()));
+            }
+        }
+        match qs.as_slice() {
+            [(only, _)] => Ok((only.clone(), given.trim().to_string())),
+            _ => Err(format!("`{given}` names no question — {}; write Question=Label", c.options_line())),
+        }
+    };
+    let mut answers = serde_json::Map::new();
+    for given in &picks {
+        let (question, label) = which(given)?;
+        let entry = answers.entry(question).or_insert_with(|| serde_json::json!({ "pick": [] }));
+        match entry.get_mut("pick").and_then(serde_json::Value::as_array_mut) {
+            Some(list) => list.push(label.into()),
+            None => return Err("a question is answered by a label or an Other, not both".into()),
+        }
+    }
+    for given in &others {
+        let (question, words) = which(given)?;
+        if answers.insert(question, serde_json::json!({ "other": words })).is_some() {
+            return Err("a question is answered by a label or an Other, not both".into());
+        }
+    }
+    Ok(serde_json::json!({ "answers": answers }))
 }
 
 /// The person's items in one project and every project under it, or in all.
 pub(crate) fn yours_in(store: &Store, project: Option<&str>) -> Vec<Message> {
     let index = crate::resolve::Index::new(store.projects());
-    message::for_the_person(store)
-        .into_iter()
-        .filter(|q| match project {
-            None => true,
-            Some(p) => project_of(store, &q.about)
-                .is_some_and(|mine| mine == p || index.ancestors(&mine).iter().any(|a| a == p)),
-        })
-        .collect()
+    message::for_the_person(store).into_iter().filter(|q| yours_scope(store, q, project, &index)).collect()
+}
+
+/// Is this item in the project, or any project under it? Everything is, with
+/// no project asked for.
+fn yours_scope(store: &Store, q: &Message, project: Option<&str>, index: &crate::resolve::Index) -> bool {
+    match project {
+        None => true,
+        Some(p) => project_of(store, &q.about)
+            .is_some_and(|mine| mine == p || index.ancestors(&mine).iter().any(|a| a == p)),
+    }
 }
 
 /// Every person item as `(project, headline)`, oldest first — what the brief
@@ -702,6 +882,13 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
                 "project": project,
                 "items": items.iter().map(|q| item_json(store, q)).collect::<Vec<_>>(),
                 "review": review,
+                // The person's questions closed in the last ten minutes, so a
+                // reader can tell *answered in the pane* from *gone*.
+                "closed": recently_closed(store)
+                    .into_iter()
+                    .filter(|(m, _)| project.is_none() || yours_scope(store, m, project.as_deref(), &index))
+                    .map(|(m, c)| closed_json(store, &m, c))
+                    .collect::<Vec<_>>(),
             }))
             .unwrap_or_default()
         );
@@ -716,6 +903,9 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
         for line in q.body().lines() {
             println!("  {line}");
         }
+        if let Some(c) = &q.choices {
+            println!("  {}", p.dim(&format!("{} · {}", c.kind(), c.options_line())));
+        }
         let mut parts = vec![format!("from {}", q.from.byline())];
         if let Some(u) = unblocks(store, q) {
             parts.push(format!("holds {u}"));
@@ -728,6 +918,9 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
     }
     if !items.is_empty() {
         println!("{}", p.dim("wsp answer <id> \"…\" — it lands as a decision on the row, and whoever waited is told"));
+        if items.iter().any(|q| q.choices.is_some()) {
+            println!("{}", p.dim("one with options takes `--choice 'Question=Label'` (or `--other 'Question=words'`)"));
+        }
     }
     if review > 0 {
         println!("{}", p.dim(&format!("{review} at review, waiting on `wsp done` — not items")));
@@ -987,6 +1180,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
                     "state": closed.question.state_raw,
                     "reply": closed.reply.id,
                     "landed": landed_line(&closed.landed),
+                    "choice": closed.question.answer_choice(),
                     "told": told,
                     "held": held,
                     "why": why,
@@ -1867,5 +2061,307 @@ mod tests {
         assert_eq!(v["project"], "worklist");
         assert_eq!(v["asked"], "accept +190 ms startup, or file rows?");
         assert_eq!(v["about"]["task"], "worklist-001");
+    }
+
+    // ---- choices (wsp-299) -------------------------------------------------
+
+    fn two_questions() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "ask",
+            "questions": [
+                { "question": "Which figure is the headline?", "header": "Headline",
+                  "options": [{ "label": "Output tokens", "description": "what it wrote" }, { "label": "USD" }] },
+                { "question": "Which views show the split?", "header": "Views", "multi": true,
+                  "options": [{ "label": "Card" }, { "label": "Inspector" }, { "label": "Rail, wide" }] },
+            ],
+        })
+    }
+
+    fn a_permission() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "permission", "tool": "Bash", "command": "scripts/seed.sh save", "via": "hook",
+            "input": { "command": "scripts/seed.sh save", "description": "save the seed" },
+            "suggestions": [{ "type": "setMode", "mode": "acceptEdits" }],
+        })
+    }
+
+    /// A question for the person carrying `choices`, raised the way the verb
+    /// raises it and read back from the store.
+    fn asked_with(store: &Store, about: &str, choices: &serde_json::Value) -> Message {
+        let mut q = Message::question(
+            Party::pane("w9:p1", "w9"),
+            Kind::Note,
+            "Which figure is the headline?",
+            Waiting::new("w9:p1", about),
+        )
+        .about(About::Task(about.into()))
+        .for_the_person();
+        q.choices = Some(Choices::parse(choices).unwrap());
+        message::raise(store, &q).unwrap();
+        store.message(&q.id).unwrap()
+    }
+
+    fn answer_args(mid: &str, flags: &[(&str, &str)], typed: &[&str]) -> crate::Args {
+        let mut rest = vec![mid];
+        rest.extend_from_slice(typed);
+        let mut f = flags.to_vec();
+        // The tests run under an agent, and this is the person typing in it.
+        f.push(("as-person", ""));
+        crate::Args::synth("answer", &rest, &f)
+    }
+
+    #[test]
+    fn ask_with_choices_raises_a_question_that_carries_them() {
+        let env = util::isolated("ask-choices");
+        let store = scratch("ask-choices");
+        task(&store, "lone-1");
+        // An asker has to be somewhere, and this agent's own seat is not it.
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-893");
+        let file = env.path("choices.json");
+        std::fs::write(&file, two_questions().to_string()).unwrap();
+        let f = file.to_string_lossy().to_string();
+
+        let bad = env.path("bad.json");
+        std::fs::write(&bad, r#"{"kind":"poll"}"#).unwrap();
+        let bad = bad.to_string_lossy().to_string();
+        let n = |store: &Store| message::all(store).len();
+        // (what, flags, the sentence typed, the exit)
+        for (what, flags, typed, code) in [
+            ("a file that is not there", vec![("person", ""), ("choices", "/nonexistent/c.json")], "", 2),
+            ("a file that is not JSON", vec![("person", ""), ("choices", "/dev/null")], "", 2),
+            ("a kind it does not know", vec![("person", ""), ("choices", bad.as_str())], "", 2),
+        ] {
+            let before = n(&store);
+            assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1", typed], &flags)), code, "{what}");
+            assert_eq!(n(&store), before, "{what}: nothing was raised");
+        }
+
+        // Without a sentence the questions are it, and the choices ride along.
+        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("choices", f.as_str())])), 0);
+        let q = message::all(&store).pop().expect("raised");
+        assert_eq!(q.text, "Which figure is the headline? Which views show the split?");
+        assert!(q.for_person);
+        let j = q.to_json();
+        assert_eq!(j["choices"]["kind"], "ask");
+        assert_eq!(j["choices"]["via"], "ask", "raised from the CLI");
+        assert_eq!(j["choices"]["questions"][1]["multi"], true);
+        assert_eq!(item_json(&store, &q)["choices"], j["choices"], "yours --json prints them");
+        assert_eq!(q.caption().text.chars().count() < 60, true, "the caption rule is unchanged: {:?}", q.caption());
+
+        // Choices are the person's: a question a seat answers takes none.
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["lone-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+        let before = n(&store);
+        let code = ask(&store, &crate::Args::synth("ask", &["lone-1", "pick"], &[("choices", f.as_str())]));
+        assert_eq!((code, n(&store)), (2, before), "a seat's question takes no choices");
+
+        // A sentence of its own stands, and a question without choices says null.
+        assert_eq!(
+            ask(&store, &crate::Args::synth("ask", &["lone-1", "pick one"], &[("person", ""), ("choices", f.as_str())])),
+            0
+        );
+        assert_eq!(message::all(&store).pop().unwrap().text, "pick one");
+        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1", "no options here"], &[("person", "")])), 0);
+        let plain = message::all(&store).pop().unwrap();
+        assert!(plain.choices.is_none() && plain.to_json()["choices"].is_null());
+        std::env::remove_var(crate::place::SEAT_ENV);
+    }
+
+    #[test]
+    fn a_shell_choice_is_read_against_the_question() {
+        let store = scratch("choice-given");
+        task(&store, "lone-1");
+        let q = asked_with(&store, "lone-1", &two_questions());
+        let perm = asked_with(&store, "lone-1", &a_permission());
+        let one = asked_with(
+            &store,
+            "lone-1",
+            &serde_json::json!({ "kind": "ask", "questions": [{ "question": "Land now?", "options": [{ "label": "Yes" }, { "label": "Wait" }] }] }),
+        );
+        let given = |m: &Message, flags: &[(&str, &str)]| choice_given(&answer_args(&m.id, flags, &[]), m);
+        let h = "Which figure is the headline?";
+        let v = "Which views show the split?";
+
+        // (what, the question, the flags, the answer handed on)
+        for (what, m, flags, want) in [
+            (
+                "a question by header, a multi by repeating it",
+                &q,
+                vec![("choice", "Headline=USD"), ("choice", "Views=Card"), ("choice", "Views=Rail, wide")],
+                serde_json::json!({ "answers": { h: { "pick": ["USD"] }, v: { "pick": ["Card", "Rail, wide"] } } }),
+            ),
+            (
+                "a question by its text, and an Other for the other",
+                &q,
+                vec![("choice", "Headline=Output tokens"), ("other", "Which views show the split?=none of them")],
+                serde_json::json!({ "answers": { h: { "pick": ["Output tokens"] }, v: { "other": "none of them" } } }),
+            ),
+            ("a single question needs no name", &one, vec![("choice", "Wait")], serde_json::json!({ "answers": { "Land now?": { "pick": ["Wait"] } } })),
+            ("a label with an equals sign in it", &one, vec![("choice", "a=b")], serde_json::json!({ "answers": { "Land now?": { "pick": ["a=b"] } } })),
+            ("allow on a permission", &perm, vec![("choice", "allow")], serde_json::json!({ "behavior": "allow" })),
+            ("deny on a permission", &perm, vec![("choice", "deny")], serde_json::json!({ "behavior": "deny" })),
+        ] {
+            assert_eq!(given(m, &flags).expect(what), want, "{what}");
+        }
+        for (what, m, flags, says) in [
+            ("two questions and no name", &q, vec![("choice", "USD")], "names no question"),
+            ("a label and an Other for one question", &one, vec![("choice", "Yes"), ("other", "Land now?=maybe")], "not both"),
+            ("an Other and a label for one question", &one, vec![("other", "Land now?=maybe"), ("choice", "Yes")], "not both"),
+            ("a word that is not allow or deny", &perm, vec![("choice", "maybe")], "allow` or `--choice deny"),
+            ("--other on a permission", &perm, vec![("other", "x")], "allow` or `--choice deny"),
+        ] {
+            let got = given(m, &flags).expect_err(what);
+            assert!(got.contains(says), "{what}: {got}");
+        }
+        // A question with none to choose from.
+        task(&store, "lone-2");
+        let plain = a_question_for(&store, "lone-2");
+        assert!(given(&plain, &[("choice", "x")]).unwrap_err().contains("no choices"));
+    }
+
+    fn a_question_for(store: &Store, about: &str) -> Message {
+        let q = Message::question(Party::pane("w9:p1", "w9"), Kind::Note, "plain?", Waiting::new("w9:p1", about))
+            .about(About::Task(about.into()))
+            .for_the_person();
+        message::raise(store, &q).unwrap();
+        q
+    }
+
+    #[test]
+    fn a_structured_answer_closes_the_question_and_is_read_by_yours() {
+        let env = util::isolated("answer-choice");
+        let store = scratch("answer-choice");
+        task(&store, "lone-1");
+        let q = asked_with(&store, "lone-1", &two_questions());
+        let h = "Which figure is the headline?";
+        let v = "Which views show the split?";
+
+        // Refused: still open, and the sentence names the options.
+        for flags in [
+            vec![("choice", "Headline=Euro"), ("choice", "Views=Card")],
+            vec![("choice", "Headline=USD")],
+            vec![("choice", "Headline=USD"), ("choice", "Headline=Output tokens"), ("choice", "Views=Card")],
+        ] {
+            assert_eq!(answer(&store, &answer_args(&q.id, &flags, &[])), 1, "{flags:?}");
+            assert!(store.message(&q.id).unwrap().is_open(), "{flags:?}: still the person's");
+        }
+        assert_eq!(answer(&store, &answer_args(&q.id, &[("choice", "Headline=USD"), ("choice", "Views=Card")], &["and a sentence"])), 1);
+        assert!(yours_in(&store, None).len() == 1 && recently_closed(&store).is_empty());
+
+        let flags = [("choice", "Headline=USD"), ("choice", "Views=Card"), ("choice", "Views=Inspector")];
+        assert_eq!(answer(&store, &answer_args(&q.id, &flags, &[])), 0);
+        let done = store.message(&q.id).unwrap();
+        assert!(!done.is_open());
+        let stored = serde_json::json!({ "answers": { h: { "pick": ["USD"] }, v: { "pick": ["Card", "Inspector"] } } });
+        assert_eq!(done.answer_choice(), Some(&stored), "the hop keeps the structure");
+        assert_eq!(done.closing().unwrap().note, "Headline: USD; Views: Card, Inspector", "…and the sentence");
+        let decided = crate::model::decisions(&store.task("lone-1").unwrap().body);
+        assert!(decided[0].1.contains("Headline: USD; Views: Card, Inspector"), "{decided:?}");
+        assert_eq!(message::all(&store).iter().find(|m| m.reply_to.as_deref() == Some(q.id.as_str())).unwrap().text, "Headline: USD; Views: Card, Inspector");
+
+        // The person's list is empty, and `closed` holds it for ten minutes.
+        assert!(yours_in(&store, None).is_empty());
+        let closed = recently_closed(&store);
+        assert_eq!(closed.len(), 1);
+        let item = closed_json(&store, &closed[0].0, closed[0].1.clone());
+        assert_eq!(item["id"], q.id.as_str());
+        assert_eq!(item["choices"]["kind"], "ask");
+        assert_eq!((item["closed"]["how"].as_str(), item["closed"]["by"].as_str()), (Some("answered"), Some("person")));
+        assert_eq!(item["closed"]["answer"], stored);
+        assert!(item["closed"]["at"].as_str().is_some_and(|a| a.starts_with("20")));
+
+        // Ten minutes on it is gone from the list, and an older close never was in it.
+        let mut old = store.message(&q.id).unwrap();
+        old.via.last_mut().unwrap().at = "2020-01-01T00:00:00Z".into();
+        store.save_message(&old).unwrap();
+        assert!(recently_closed(&store).is_empty());
+        drop(env);
+    }
+
+    #[test]
+    fn plan_and_permission_answers_are_decisions_and_an_abandon_takes_no_choice() {
+        let _env = util::isolated("answer-decision");
+        let store = scratch("answer-decision");
+        task(&store, "lone-1");
+        let plan = asked_with(&store, "lone-1", &serde_json::json!({ "kind": "plan", "plan": "# steps\n1. do it" }));
+        let perm = asked_with(&store, "lone-1", &a_permission());
+        let words = asked_with(&store, "lone-1", &two_questions());
+
+        // A plan's rejection takes its reason; plain words on a wider ask or
+        // on a permission are refused; abandoning takes no choice.
+        assert_eq!(answer(&store, &answer_args(&plan.id, &[("choice", "deny")], &[])), 1);
+        assert_eq!(answer(&store, &answer_args(&perm.id, &[], &["yes"])), 1);
+        assert_eq!(answer(&store, &answer_args(&words.id, &[], &["USD"])), 1);
+        assert_eq!(answer(&store, &answer_args(&perm.id, &[("choice", "allow"), ("abandon", "")], &["x"])), 2);
+        for m in [&plan, &perm, &words] {
+            assert!(store.message(&m.id).unwrap().is_open(), "{}", m.id);
+        }
+
+        assert_eq!(answer(&store, &answer_args(&plan.id, &[("choice", "deny")], &["add a rollback step"])), 0);
+        assert_eq!(
+            store.message(&plan.id).unwrap().answer_choice(),
+            Some(&serde_json::json!({ "behavior": "deny", "message": "add a rollback step" }))
+        );
+        assert_eq!(store.message(&plan.id).unwrap().closing().unwrap().note, "denied: add a rollback step");
+
+        // A rule that was offered rides in the JSON form; one that was not is refused.
+        let file = _env.path("allow.json");
+        std::fs::write(&file, r#"{"behavior":"allow","rule":{"type":"addRules"}}"#).unwrap();
+        assert_eq!(answer(&store, &answer_args(&perm.id, &[("choice", file.to_str().unwrap())], &[])), 1);
+        std::fs::write(&file, r#"{"behavior":"allow","rule":{"type":"setMode","mode":"acceptEdits"}}"#).unwrap();
+        assert_eq!(answer(&store, &answer_args(&perm.id, &[("choice", file.to_str().unwrap())], &[])), 0);
+        assert_eq!(
+            store.message(&perm.id).unwrap().answer_choice(),
+            Some(&serde_json::json!({ "behavior": "allow", "rule": { "type": "setMode", "mode": "acceptEdits" } }))
+        );
+
+        // Plain words on a single-question ask are its label, or an Other.
+        task(&store, "lone-2");
+        let one = asked_with(
+            &store,
+            "lone-2",
+            &serde_json::json!({ "kind": "ask", "questions": [{ "question": "Land now?", "options": [{ "label": "Yes" }, { "label": "Wait" }] }] }),
+        );
+        assert_eq!(answer(&store, &answer_args(&one.id, &[], &["not yet; the verifier is red"])), 0);
+        assert_eq!(
+            store.message(&one.id).unwrap().answer_choice(),
+            Some(&serde_json::json!({ "answers": { "Land now?": { "other": "not yet; the verifier is red" } } }))
+        );
+
+        // And a question with no choices refuses a choice.
+        task(&store, "lone-3");
+        let plain = a_question_for(&store, "lone-3");
+        assert_eq!(answer(&store, &answer_args(&plain.id, &[("choice", "allow")], &[])), 2);
+        assert!(store.message(&plain.id).unwrap().is_open());
+        assert_eq!(answer(&store, &answer_args(&plain.id, &[], &["words"])), 0);
+        let closed = recently_closed(&store);
+        let plain_closed = closed.iter().find(|(m, _)| m.id == plain.id).unwrap();
+        assert_eq!(plain_closed.1["answer"], serde_json::json!({ "text": "words" }), "a plain answer is its words");
+    }
+
+    #[test]
+    fn a_record_from_before_choices_reads_as_it_did_and_is_written_as_it_was() {
+        let store = scratch("choices-compat");
+        task(&store, "lone-1");
+        let old = serde_json::json!({
+            "id": "m-old", "shape": "question", "kind": "note", "state": "open", "at": "2026-10-01T00:00:00Z",
+            "text": "before choices", "from": { "pane": "w9:p1" }, "for": "person",
+            "waiting": { "pane": "w9:p1", "task": "lone-1" }, "about": { "task": "lone-1" },
+        });
+        let m = Message::from_json("m-old", &old);
+        assert!(m.choices.is_none() && m.via.is_empty());
+        let back = m.to_json();
+        assert!(back["choices"].is_null());
+        assert_eq!(Message::from_json("m-old", &back), m, "and it round-trips");
+        // A hop with no structure writes no `choice` key, so a previous build
+        // reading a newer file finds the hops it knew.
+        message::raise(&store, &m).unwrap();
+        message::answer(&store, "m-old", &Party::Human, "ok").unwrap();
+        let hops = store.message("m-old").unwrap().to_json()["via"].clone();
+        assert!(hops[0].get("choice").is_none(), "{hops}");
+        assert_eq!(store.message("m-old").unwrap().closed_json().unwrap()["answer"], serde_json::json!({ "text": "ok" }));
     }
 }

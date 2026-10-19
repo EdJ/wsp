@@ -12,6 +12,7 @@ mod after;
 mod agent_commands;
 mod barrier;
 mod caption;
+mod choices;
 mod check_tree;
 mod arrange;
 mod attention;
@@ -214,6 +215,12 @@ const BOOL_FLAGS: &[&str] = &[
     // (`wsp-233`): each is followed by the sentence, which it must not eat.
     "person", "as-person",
 ];
+
+/// Flags whose value may be a lone `-`, the stream. A dash is otherwise read as
+/// the next flag, so `--choices -` would have left `-` a positional and the flag
+/// a bare `true`. Only these two, because a valued flag followed by a payload
+/// `-` is how every other verb spells "nothing given, read the stream".
+const STREAM_VALUED: &[&str] = &["choices", "choice"];
 
 /// Flags that keep their meaning inside a command's payload.
 ///
@@ -497,7 +504,9 @@ impl Args {
                     valued.insert(name.clone());
                 } else if bool_flag(&name, valued_on) {
                     entry.push("true".into());
-                } else if i + 1 < argv.len() && !argv[i + 1].starts_with('-') {
+                } else if i + 1 < argv.len()
+                    && (!argv[i + 1].starts_with('-') || (argv[i + 1] == "-" && STREAM_VALUED.contains(&name.as_str())))
+                {
                     entry.push(argv[i + 1].clone());
                     valued.insert(name.clone());
                     i += 1;
@@ -578,6 +587,12 @@ impl Args {
     pub fn get(&self, name: &str) -> Option<String> {
         self.mark(name);
         self.flags.get(name).and_then(|v| v.first().cloned())
+    }
+    /// Every value the flag was given, as typed: not split at commas, which
+    /// [`Args::all`] does and which a label like `Rail, wide` would not survive.
+    pub fn each(&self, name: &str) -> Vec<String> {
+        self.mark(name);
+        self.flags.get(name).cloned().unwrap_or_default()
     }
     pub fn all(&self, name: &str) -> Vec<String> {
         self.mark(name);
@@ -2097,6 +2112,19 @@ fn help_text() -> String {
   wsp ask                           what is open, who is waiting, and how long
   wsp answer <mid> "…"|-|--from F   close one: the log first, then whoever asked
   wsp answer <mid> --abandon "…"    the other ending, and it also goes home
+  wsp ask <id> --person --choices F|-   a question with options (F: JSON {{kind:
+                                    ask|plan|permission, questions:[{{question,
+                                    header, multi, options:[{{label,
+                                    description, preview?}}]}}], plan?, tool?,
+                                    command?}}); the text may be left out, and a
+                                    surface that ignores choices still reads it
+  wsp answer <mid> --choice 'Q=Label' [--choice …] [--other 'Q=words']
+                                    answer one that has options: a label or an
+                                    Other, refused with the options named
+                                    otherwise; `--choice allow|deny "…"` on a
+                                    plan or permission; `--choice F|-` takes
+                                    {{answers:{{Q: label|{{pick}}|{{other}}}}}} or
+                                    {{behavior, message?, rule?, mode?}}
   wsp ack <mid>                     an answer read, or a notification taken on
   wsp ask <id|list> --person "…"    a question only the person may answer: it is
                                     in `wsp yours`, holds the barrier of the
@@ -2502,6 +2530,18 @@ mod tests {
         assert!(a.has("person") && a.text(1) == "keep the VERSION bump?");
         let a = parse(&["answer", "m-1", "--as-person", "keep it"]);
         assert!(a.has("as-person") && a.text(1) == "keep it");
+
+        // `wsp-299`: a lone `-` is the stream for `--choices` and `--choice`
+        // and for no other valued flag, and a label with a comma stays whole.
+        let a = parse(&["ask", "m-1", "--person", "--choices", "-"]);
+        assert_eq!((a.get("choices").as_deref(), a.rest.len()), (Some("-"), 1), "{:?}", a.rest);
+        let a = parse(&["answer", "m-2", "--choice", "-"]);
+        assert_eq!((a.get("choice").as_deref(), a.rest.len()), (Some("-"), 1));
+        let a = parse(&["answer", "m-2", "--choice", "Views=Card", "--choice=Views=Rail, wide", "--other", "Q=free words"]);
+        assert_eq!(a.each("choice"), vec!["Views=Card", "Views=Rail, wide"]);
+        assert_eq!(a.each("other"), vec!["Q=free words"]);
+        let a = parse(&["answer", "m-2", "--kind", "-"]);
+        assert_eq!(a.get("kind").as_deref(), Some("true"), "any other flag still reads a dash as the next word");
 
         // A value may hold spaces — it is the *name* that never does.
         assert_eq!(parse(&["project", "add", "verb", "--name=Reverb Lab"]).get("name").as_deref(), Some("Reverb Lab"));
