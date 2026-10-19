@@ -1647,6 +1647,14 @@ and `waiting: {why: "question", on: "person", id: <mid>}` whatever the runner
 word is. `wsp answer` types nothing at a seat whose waiter is alive; if the waiter
 has gone (the call was interrupted) it delivers as it always did.
 
+**The brief teaches it** (`wsp-303`). An agent holding a row is told in its
+session brief — the one text every kind is handed: Claude's `SessionStart` hook,
+opencode's `instructions` file, and `wsp brief --session` for the rest — on an
+`ask` row of two lines: when the person has to decide, `wsp ask <id> --person
+--wait --choices -` with the smallest `{kind: ask, questions: […]}` on stdin,
+rather than its own question tool or a question in its reply; `AskUserQuestion`
+still works (`wsp-301`'s hook catches it). The measurement is on the row.
+
 Something louder is a hook away, the same seam `review` uses:
 
 ```sh
