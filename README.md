@@ -2686,8 +2686,11 @@ own poll. Never a clear: every one of these is a hop with a sentence, and
 `closed: {how, by, at, answer}` says which. The snippet's `PostToolUse` entry
 fires after every tool call in a wsp seat, so it is one `sh` and one `wsp
 report` per call there; `wsp doctor` notes it when it is missing beside the
-hold. A deny in the pane produces no `PostToolUse`, so that question stays
-until the turn ends and reads `abandoned`, not `answered`.
+hold. **A refusal in the pane fires no hook at all**: Esc at a `Bash` dialog was
+followed by nothing (no `Stop`, `PostToolUse`, `PostToolUseFailure` or
+`PermissionDenied`; only the `Notification` that came before it), so that
+question stays open until the next prompt typed in the pane or the end of the
+session, and then reads `abandoned`, not `answered`.
 
 The **permissions** half matters as much as the hook. Create, claim, note,
 decide, flag and move through the workflow are pre-allowed, because a store an

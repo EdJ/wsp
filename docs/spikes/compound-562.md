@@ -163,3 +163,22 @@ with an account; the row that adds the Codex adapter should start by capturing o
   string above, kept opaque.
 - **compound rows**: `Wants::Choice` for `auto` / `bypassPermissions` sessions only ever has `ask` and `plan` kinds;
   a `permission` want exists in `default`, `acceptEdits` and `plan`.
+
+## Closing a held question, driven (wsp-302)
+
+Four real `claude` runs (2.1.303, `haiku`, `--setting-sources project`, `default` mode) in a pty, each with the
+wsp-301 hold and the wsp-302 closers wired from a project `settings.json`, a throwaway store (`WSP_HOME`,
+`WSP_STATE` and a dead herdr socket all set), `WSP_SEAT_ID=drv-1` holding one row, and `wsp` on `PATH` the
+debug build of this tree. A wrapper logged when each hook started and ended. Ed's settings were not read or written.
+
+| run | at the pane | hooks seen | the question after |
+|---|---|---|---|
+| multi-select `AskUserQuestion`, 3 options (two with commas), picked 1 and 3 | answered at +22 s | `PermissionRequest`, `PermissionHold`, then `PostToolUse` at +22 s; the hold ended the same second | `answered`, `by: pane`, `answers: {"Which tools?": {pick: ["Lint", "Test, and more, ok"]}}` (from `Lint, "Test, and more, ok"`) |
+| `Bash` `python3 -c "print(11)"` | Yes at +14 s | the same; `PostToolUse` carried a `tool_input` equal to the request's | `answered`, `by: pane`, `{behavior: allow}`, `allowed in pane`; the hold ended 2 s later (its poll) |
+| `Bash`, **Esc** at the dialog | Esc at +14 s | **nothing** after the dialog: no `Stop`, `PostToolUse`, `PostToolUseFailure` or `PermissionDenied`, only a `Notification` 6 s into the wait | open until the driver killed the session, then `SessionEnd` closed it `abandoned`, `by: seat` |
+| `AskUserQuestion`, left unanswered, session killed (`SIGTERM`) | none | `SessionEnd` within a second of the kill, once the driver stayed to see it | `abandoned`, `by: seat`, `the session ended with this still open`; `wsp yours --json` lists it under `closed` |
+
+So `Stop` closes a held question only when the turn ends on its own; a person refusing in the pane with Esc leaves it
+open until their next prompt (`UserPromptSubmit`) or the session's end. No hook says that a dialog was dismissed.
+A driver that exits at once after the `SIGTERM` loses the `SessionEnd`, as `place_super` already notes for a seat
+stopped too fast to announce itself.
