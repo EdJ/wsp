@@ -136,6 +136,9 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
 
 /// [`ask`] with the clock a `--wait` reads passed in, so a test can be time.
 fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
+    if args.has("cancel") {
+        return cancel(store, args);
+    }
     let Some(needle) = args.rest.first().cloned() else {
         return open(store, args);
     };
@@ -818,6 +821,93 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
     }
     deliver(store, &closed, args)
 }
+
+/// `wsp ask --cancel <mid> ["why"]` — the person dismisses an ask that no longer
+/// matters (`wsp-308`): any question, including one only the person may close,
+/// and a notification.
+///
+/// **The person's, always.** `wsp answer --abandon` is open to a seat or an
+/// agent on a question that is not the person's, which is right for an agent
+/// giving up its own question; this is the person *dismissing* one, so the
+/// caller is held to the same check a person's question gets
+/// ([`the_person`]) whatever the question is, and is recorded as the person.
+/// An agent says it no longer needs an answer with `wsp answer --abandon`, and
+/// a person's own question stays out of its hands.
+///
+/// **Told the way an answer tells.** A question goes home through the road
+/// `--abandon` takes — the log line first, the reply addressed to whoever
+/// waited, and [`deliver`] — so a `--wait` returns the cancellation (exit 3)
+/// and any other asker is typed it. A notification has nobody waiting and is
+/// closed on the record. The sentence is `cancelled by the person`, with the
+/// person's own words after it when they gave some.
+fn cancel(store: &Store, args: &Args) -> i32 {
+    let (me, pane) = whoami(store);
+    let caller = Caller {
+        seat: me.scope().is_some(),
+        agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)) || an_agent_process(|k| std::env::var_os(k)),
+        as_person: args.has("as-person"),
+    };
+    cancel_as(store, args, &caller)
+}
+
+/// [`cancel`] with the caller read already, which is the one thing about it
+/// that comes out of the environment — passed in for the reason [`the_person`]
+/// takes a [`Caller`], so a test reaches the refusal without exporting a
+/// process-wide variable every other test can see.
+fn cancel_as(store: &Store, args: &Args, caller: &Caller) -> i32 {
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp ask --cancel <message-id> [\"why\"]");
+        return 2;
+    };
+    let q = match find(store, &needle) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    if let Err(why) = the_person(caller) {
+        eprintln!("wsp: {}", why.replace("answer", "cancel"));
+        return 1;
+    }
+    let why = args.text(1);
+    let why = match why.trim().is_empty() {
+        true => CANCELLED.to_string(),
+        false => match crate::cmd_agent::typed_message(&why) {
+            Ok(t) => format!("{CANCELLED}: {}", t.trim()),
+            Err(code) => return code,
+        },
+    };
+    let p = Paint::new();
+    if q.shape() == Some(Shape::Question) {
+        let closed = match message::abandon(store, &q.id, &Party::Human, &why) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("wsp: {e}");
+                return 1;
+            }
+        };
+        if !args.json() {
+            println!("{} {}  {}", p.dim("·"), p.bold(&closed.question.id), p.dim("cancelled"));
+            println!("  {}", p.dim(&landed_line(&closed.landed)));
+        }
+        return deliver(store, &closed, args);
+    }
+    match message::lapse(store, &q.id, &Party::Human, &why) {
+        Ok(m) => {
+            if args.json() {
+                println!("{}", json!({ "id": m.id, "state": m.state_raw, "closed": m.closed_json() }));
+            } else {
+                println!("{} {}  {}", p.dim("·"), p.bold(&m.id), p.dim("cancelled"));
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            1
+        }
+    }
+}
+
+/// What the person's dismissal says, and what a `--wait` is released with.
+const CANCELLED: &str = "cancelled by the person";
 
 // ---- the person's list: `wsp-233` -----------------------------------------
 
@@ -2939,5 +3029,152 @@ mod tests {
         assert_eq!(Message::from_json(&q.id, &back.to_json()), back);
         let plain = a_question_for(&store, "lone-1");
         assert!(plain.to_json().get("awaited").is_none(), "no key unless somebody waited");
+    }
+
+    // ---- stale asks close, and the person can cancel (wsp-308) ---------------
+
+    /// Raised the way each kind is, about `lone-1`, for `cancel` to be driven on.
+    fn every_kind(store: &Store) -> Vec<(&'static str, Message)> {
+        let kinds: Vec<(&'static str, Message)> = vec![
+            ("person", waited_on(store, "lone-1", None)),
+            ("choices", waited_on(store, "lone-1", Some(&one_question()))),
+            ("governor", {
+                let mut q = Message::question(Party::pane("cpd-893", ""), Kind::Note, "keep it?", Waiting::new("cpd-893", "lone-1"))
+                    .about(About::Task("lone-1".into()));
+                q.for_seat = Some("worklist".into());
+                message::raise(store, &q).unwrap();
+                q
+            }),
+            ("barrier", {
+                let mut q = Message::question(Party::pane("cpd-894", ""), Kind::Note, "hold it?", Waiting::new("cpd-894", ""))
+                    .about(About::Group { scope: "the-run".into(), group: 1 });
+                q.for_seat = Some("worklist".into());
+                message::raise(store, &q).unwrap();
+                q
+            }),
+        ];
+        kinds
+    }
+
+    fn ask_cancel(mid: &str, why: &[&str], as_person: bool) -> crate::Args {
+        let mut flags = vec![("cancel", "")];
+        if as_person {
+            flags.push(("as-person", ""));
+        }
+        let mut rest = vec![mid];
+        rest.extend_from_slice(why);
+        crate::Args::synth("ask", &rest, &flags)
+    }
+
+    /// **The person's dismissal of any ask**, a person's own included: closed
+    /// as cancelled by the person, with their words after it when they gave
+    /// some, and the asker told the way an answer tells it — a reply addressed
+    /// to whoever waited.
+    #[test]
+    fn the_person_cancels_any_kind_of_ask_and_the_asker_is_told() {
+        let _env = util::isolated("cancel-kinds");
+        let store = scratch("cancel-kinds");
+        task(&store, "lone-1");
+        let person = Caller { seat: false, agent: false, as_person: false };
+        for (why, said) in [(&[][..], "cancelled by the person"), (&["no longer needed"][..], "cancelled by the person: no longer needed")] {
+            for (kind, q) in every_kind(&store) {
+                assert_eq!(cancel_as(&store, &ask_cancel(&q.id, why, false), &person), 0, "{kind}");
+                let after = store.message(&q.id).unwrap();
+                assert_eq!(after.state_raw, "abandoned", "{kind}");
+                let c = after.closed_json().unwrap();
+                assert_eq!(
+                    (c["how"].as_str(), c["by"].as_str(), c["kind"].as_str(), c["reason"].as_str()),
+                    (Some("abandoned"), Some("person"), Some("cancelled"), Some(said)),
+                    "{kind}"
+                );
+                let reply = message::replies_for(&store, "lone-1").into_iter().find(|r| r.reply_to.as_deref() == Some(q.id.as_str()));
+                let told = message::all(&store).into_iter().any(|m| m.reply_to.as_deref() == Some(q.id.as_str()) && m.text == said);
+                assert!(told || reply.is_some(), "{kind}: the asker was told with a reply that says `{said}`");
+            }
+        }
+    }
+
+    /// A notification is cancelled too, and there is nobody to tell.
+    #[test]
+    fn the_person_cancels_a_notification() {
+        let _env = util::isolated("cancel-note");
+        let store = scratch("cancel-note");
+        task(&store, "lone-1");
+        let n = Message::new(Party::pane("cpd-893", ""), Kind::Note, "heads up").about(About::Task("lone-1".into()));
+        message::raise(&store, &n).unwrap();
+        let person = Caller { seat: false, agent: false, as_person: false };
+        assert_eq!(cancel_as(&store, &ask_cancel(&n.id, &[], false), &person), 0);
+        let c = store.message(&n.id).unwrap().closed_json().unwrap();
+        assert_eq!((c["kind"].as_str(), c["by"].as_str(), c["reason"].as_str()), (Some("cancelled"), Some("person"), Some("cancelled by the person")));
+    }
+
+    /// An agent or a seat is refused — on a person's question, which they may
+    /// never close, and on the others, because cancelling is the person's act:
+    /// an agent that no longer needs an answer abandons its own question. The
+    /// refusal leaves everything open, and `--as-person` is the person typing in
+    /// an agent's pane.
+    #[test]
+    fn an_agent_is_refused_the_cancel_and_the_person_in_its_pane_may() {
+        let _env = util::isolated("cancel-refused");
+        let store = scratch("cancel-refused");
+        task(&store, "lone-1");
+        for (kind, q) in every_kind(&store) {
+            for caller in [Caller { seat: false, agent: true, as_person: false }, Caller { seat: true, agent: false, as_person: false }] {
+                assert_eq!(cancel_as(&store, &ask_cancel(&q.id, &["never mind"], false), &caller), 1, "{kind} {caller:?}");
+                assert!(store.message(&q.id).unwrap().is_open(), "{kind}: still open");
+            }
+            // The messages themselves refuse an agent's pane, a seat and a
+            // handle on a person's question, whichever verb reached them.
+            if q.for_person {
+                for by in [Party::pane("cpd-893", ""), Party::seat("worklist"), Party::Agent("a".into())] {
+                    assert!(matches!(message::abandon(&store, &q.id, &by, "x"), Err(message::Refused::NotThePersons(_))), "{kind} {by:?}");
+                }
+            }
+            let typing = Caller { seat: false, agent: true, as_person: true };
+            assert_eq!(cancel_as(&store, &ask_cancel(&q.id, &[], true), &typing), 0, "{kind}: the person in the pane");
+        }
+        assert_eq!(cancel_as(&store, &ask_cancel("m-nope", &[], false), &Caller::default()), 1, "no such message");
+    }
+
+    /// **A `--wait` is not left blocked** by any of the endings that are not an
+    /// answer: the row it was about going to review, the agent that asked being
+    /// let go, and the person cancelling. Each returns the abandonment with its
+    /// reason, and the verb's exit says why it was not an answer (3).
+    #[test]
+    fn a_wait_is_released_with_the_abandonment_when_the_ask_goes_stale_or_is_cancelled() {
+        let _env = util::isolated("wait-stale");
+        let store = scratch("wait-stale");
+        task(&store, "lone-1");
+        for (what, reason, kind) in [
+            ("row to review", "row went to review", "lapsed"),
+            ("agent closed", "agent closed", "seat-gone"),
+            ("cancelled", "cancelled by the person: not now", "cancelled"),
+        ] {
+            let q = waited_on(&store, "lone-1", None);
+            store.set_binding("cpd-893", serde_json::json!({ "task_id": "lone-1" }));
+            let clock = Fake::new();
+            clock.at(2_000, || match what {
+                "row to review" => {
+                    let mut t = store.task("lone-1").unwrap();
+                    t.set_status(crate::model::Status::Review);
+                    store.save_task(&t).unwrap();
+                }
+                "agent closed" => assert!(store.clear_binding("cpd-893")),
+                _ => assert_eq!(
+                    cancel_as(&store, &ask_cancel(&q.id, &["not now"], false), &Caller::default()),
+                    0
+                ),
+            });
+            let got = wait_for(&store, &q.id, Some(10), &clock).unwrap();
+            let Ended::Abandoned(closed) = &got else { panic!("{what}: {got:?}") };
+            assert!((2_000..=2_000 + POLL_MS).contains(&clock.now.get()), "{what}: released at {}", clock.now.get());
+            let c = closed.closed_json().unwrap();
+            assert_eq!((c["kind"].as_str(), c["reason"].as_str()), (Some(kind), Some(reason)), "{what}");
+            assert_eq!(report_wait(&store, &q.id, &got, Some(10), &answer_args(&q.id, &[("json", "")], &[])), 3, "{what}");
+            // Back to a clean row for the next case.
+            let mut t = store.task("lone-1").unwrap();
+            t.set_status(crate::model::Status::Doing);
+            store.save_task(&t).unwrap();
+        }
     }
 }

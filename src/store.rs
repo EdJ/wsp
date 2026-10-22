@@ -694,6 +694,9 @@ impl Store {
         let path = self.worklist_path(&w.id);
         write_atomic(&path, &w.render())?;
         self.wrote(path);
+        // A list going done or parked, or a verdict passing a barrier, is the
+        // moment what was asked about it stops mattering (`wsp-308`).
+        crate::lapse::list_moved(self, w);
         Ok(())
     }
 
@@ -904,8 +907,17 @@ impl Store {
     pub fn save_task(&self, t: &Task) -> std::io::Result<()> {
         fs::create_dir_all(self.tasks_dir())?;
         let path = self.task_path(&t.id);
+        // Read before the write, and only for a status that finishes the row:
+        // this is the write every `wsp note` makes too, and what stale asks
+        // close on is a row *entering* review, done or parked (`wsp-308`) —
+        // so a reopen, which writes no such status, closes and reopens nothing.
+        let entering = crate::lapse::finishes(t.status())
+            && self.task(&t.id).map(|was| was.status() != t.status()).unwrap_or(true);
         write_atomic(&path, &t.render())?;
         self.wrote(path);
+        if entering {
+            crate::lapse::row_moved(self, &t.id, &format!("row went to {}", t.status().as_str()));
+        }
         Ok(())
     }
 
@@ -1346,7 +1358,11 @@ impl Store {
     pub fn archive_task(&self, t: &Task) -> std::io::Result<String> {
         let month = if t.updated.len() >= 7 { &t.updated[0..7] } else { "unknown" };
         let dir = self.archive_dir().join(month);
-        self.file_away(&dir, &t.id, &t.render(), self.task_path(&t.id))
+        let filed = self.file_away(&dir, &t.id, &t.render(), self.task_path(&t.id))?;
+        // What was raised by or about a retired row has no row to be about
+        // (`wsp-308`).
+        crate::lapse::row_moved(self, &t.id, "row was archived");
+        Ok(filed)
     }
 
     /// Retire a project to `archive/projects/`, on the same terms as a task.
@@ -1667,6 +1683,12 @@ impl Store {
     pub fn clear_binding(&self, pane: &str) -> bool {
         let mut removed = false;
         self.update_json("bindings.json", |b| removed = b.remove(pane).is_some());
+        // The one place a seat's agent is let go of, whichever road led here:
+        // `release`, `despawn`, a pane that exited, a claim moved to another
+        // pane. What it asked from there has nobody to answer to (`wsp-308`).
+        if removed {
+            crate::lapse::seat_ended(self, pane);
+        }
         removed
     }
 
@@ -1862,7 +1884,14 @@ impl Store {
 
     pub fn clear_governor(&self, project: &str) -> bool {
         let mut removed = false;
-        self.update_json("governors.json", |g| removed = g.remove(project).is_some());
+        let mut pane = None;
+        self.update_json("governors.json", |g| {
+            pane = g.get(project).and_then(|r| r.get("pane")).and_then(|p| p.as_str()).map(String::from);
+            removed = g.remove(project).is_some();
+        });
+        if removed {
+            crate::lapse::governor_ended(self, project, pane.as_deref());
+        }
         removed
     }
 
@@ -2197,6 +2226,11 @@ impl Store {
     pub fn clear_claim(&self, task: &str) -> bool {
         let mut removed = false;
         self.update_json("claims.json", |c| removed = c.remove(task).is_some());
+        // Whoever held the claim is off the row, by release, handoff or a
+        // workspace that closed under it (`wsp-308`).
+        if removed {
+            crate::lapse::claim_ended(self, task);
+        }
         removed
     }
 

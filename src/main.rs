@@ -15,6 +15,7 @@ mod caption;
 mod choices;
 mod hold;
 mod hold_close;
+mod lapse;
 mod risk;
 mod check_tree;
 mod arrange;
@@ -219,6 +220,8 @@ const BOOL_FLAGS: &[&str] = &[
     "person", "as-person",
     // `wsp ask <id> --person --wait "…"` (`wsp-300`) blocks on the answer.
     "wait",
+    // `wsp ask --cancel <mid> "why"` (`wsp-308`): the id and the reason follow.
+    "cancel",
 ];
 
 /// Flags whose value may be a lone `-`, the stream. A dash is otherwise read as
@@ -2117,6 +2120,13 @@ fn help_text() -> String {
   wsp ask                           what is open, who is waiting, and how long
   wsp answer <mid> "…"|-|--from F   close one: the log first, then whoever asked
   wsp answer <mid> --abandon "…"    the other ending, and it also goes home
+  wsp ask --cancel <mid> ["why"]    the person's dismissal of any ask, one only
+                                    the person may close included: closed as
+                                    cancelled by the person, and the asker told
+                                    as an answer would tell it. A row going to
+                                    review, done, parked or the archive, an
+                                    agent closing, or a barrier passing closes
+                                    what it raised by itself, with the reason
   wsp ask <id> --person --choices F|-   a question with options (F: JSON {{kind:
                                     ask|plan|permission, questions:[{{question,
                                     header, multi, options:[{{label,
@@ -2556,6 +2566,10 @@ mod tests {
         // question), and `--timeout` takes its seconds.
         let a = parse(&["ask", "wsp-300", "--person", "--wait", "--timeout", "90", "land now?"]);
         assert!(a.has("wait") && a.get("timeout").as_deref() == Some("90") && a.text(1) == "land now?", "{:?}", a.rest);
+        // `--cancel` is a standing flag: the id and the reason after it are
+        // positionals, not its value (`wsp-308`).
+        let a = parse(&["ask", "--cancel", "m-1", "no longer needed"]);
+        assert!(a.has("cancel") && a.rest == ["m-1", "no longer needed"], "{:?}", a.rest);
         let a = parse(&["ask", "m-1", "--wait"]);
         assert!(a.has("wait") && a.rest.len() == 1);
         let a = parse(&["answer", "m-2", "--kind", "-"]);

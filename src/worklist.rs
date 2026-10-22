@@ -547,6 +547,12 @@ fn floor(groups: &[Group]) -> usize {
     groups.iter().rposition(|g| !g.verdict.trim().is_empty()).map_or(0, |i| i + 1)
 }
 
+/// How many barriers the run has passed — [`floor`], for the ask that was
+/// raised at one: it is over when its ordinal is at or below this.
+pub(crate) fn crossed(groups: &[Group]) -> usize {
+    floor(groups)
+}
+
 pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
     let groups = w.groups();
     let draft = w.status() == crate::model::WorklistStatus::Draft;

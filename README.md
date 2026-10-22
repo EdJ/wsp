@@ -2691,7 +2691,7 @@ question closed by anyone but the person and exits with no output, within a poll
 left to the pane`; a seat that vanishes (its process gone, or its directory)
 with no `SessionEnd` is `abandoned`, `by: seat`, and the hold notices it on its
 own poll. Never a clear: every one of these is a hop with a sentence, and
-`closed: {how, by, at, answer}` says which. The snippet's `PostToolUse` entry
+`closed: {how, by, kind, reason, at, answer}` says which. The snippet's `PostToolUse` entry
 fires after every tool call in a wsp seat, so it is one `sh` and one `wsp
 report` per call there; `wsp doctor` notes it when it is missing beside the
 hold. **A refusal in the pane fires no hook at all**: Esc at a `Bash` dialog was
@@ -2708,6 +2708,53 @@ doubly so: an agent that has to ask before it can ask is one that never does. `d
 are yours, and a deny rule states that better than a paragraph does — an agent
 that finishes to `review` because the rule says so is one prompt away from
 finishing to `done` when the rule is forgotten.
+
+### Stale asks close themselves, and the person can cancel
+
+A question or a notification is relevant while the thing it is about is going
+on. Every open `wsp ask` (to the person or a governor, with choices or without,
+a plan, a permission, a barrier's) and every notification **raised by or about**
+a row, a seat or a list is closed, as `abandoned` with the reason in its log, the
+moment that thing moves on. It is done once, in the store's own writes
+(`src/lapse.rs`), not in each verb:
+
+| what happened | the store write | the reason, and `closed.kind` |
+|---|---|---|
+| the row went to review, done or parked | `save_task`, **entering** the status | `row went to review` · `lapsed` |
+| the row was archived | `archive_task` | `row was archived` · `lapsed` |
+| the agent was let go: `despawn`, `release`, a pane that exited, a claim moved | `clear_binding` (and `despawn` for a seat with no binding) | `agent closed` · `seat-gone` |
+| a claim ended: release, handoff, a workspace closed under it | `clear_claim` | `agent closed` · `seat-gone` |
+| a governor stood down | `clear_governor` | `agent closed` · `seat-gone` |
+| a list went done or parked | `save_worklist` | `list is done`, `list was parked` · `lapsed` |
+| a barrier was passed (its group's verdict written) | `save_worklist` | `barrier 2 was passed` · `lapsed` |
+
+It is a **transition**, not a state: `save_task` is the write every `wsp note`
+makes, so it reads the status on disk and acts only on a row *entering* review,
+done or parked. A **reopen reopens nothing** — the old ones stay closed, and a
+question raised after is its own, closed by the next time the row finishes. A
+row that goes `blocked` or back to `doing` closes nothing. A **reply** is an
+answer on its way home, with its own delivery, and is not closed.
+
+Nothing is written to the asker's task log and no reply is minted: the hop is
+the record. A question held with `--wait` is released with the abandonment (exit
+3, the reason on stderr), because the waiter polls the record. wsp closes a
+person's question by its own handles (`wsp (moved on)`, `wsp (seat gone)`) and
+says why; the rule that **an agent never closes a `--person` question** is
+unchanged, and now the record itself refuses a pane as well as a seat.
+
+**`wsp ask --cancel <mid> ["why"]`** is the person's dismissal of any ask, one
+that only the person may close included, and of a notification. It is closed as
+`cancelled by the person` (with the words after it), recorded as the person, and
+a question's asker is told the way an answer tells it: the log first, the reply
+addressed to whoever waited, and a `--wait` returns it. An agent or a seat is
+refused (`--as-person` is the person typing in an agent's pane, as with `wsp
+answer`); an agent that no longer needs an answer uses `wsp answer --abandon`.
+
+`wsp yours --json` (`closed`, ten minutes) and `wsp ask <mid> --json` carry
+`closed: {how, by, kind, reason, at, answer}`. `kind` is `answered`,
+`cancelled`, `lapsed`, `seat-gone`, `timeout`, `moved-on` (the asker's pane moved
+past it) or `abandoned`; `reason` is the sentence for an abandonment and null for
+an answer; `by` gains `wsp` for a lapse.
 
 ### The standing rules
 
@@ -5053,6 +5100,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/caption.rs` | the line a glance reads for a task, a worklist and a group: authored and checked at the verb, or derived from the title or the members — one derivation, so `ls` and the chrome never disagree; and a verdict's, a word wsp derives and a tail the verb requires |
 | `src/stage.rs` | where a task or a group is, as a caption: a word from §17.5's closed list, derived from records wsp already keeps, and the tail the step that put it there was given — `stage` on `show`, `ls` and every group and member in `worklist show --json`; and when each was entered, off the log and the verification entries — `stages` on `show --json`, each group's `member_stages`, `started_at`, `settled_at` and `decided_at`; and `since` on every stage, when the row entered its current word, the timeline's last step under it — `at` is the record's time |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
+| `src/lapse.rs` | stale asks closing themselves: what a row, a seat or a list moving on takes with it, called from the store's own writes — and the table that holds every transition against every kind of ask |
 | `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back — and whose answer it waits on, `for` the person or a seat, written by `wsp ask` and read the same by `yours`, `flag --person` and the panel; and the `caption` each is named by, written at the verb or derived on read |
 | `src/after.rs` | member dependencies: `after:` on a task, `wsp after`, its five refusals, and the run's hold on a member until the member of its own group it rests on has landed |
 | `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, the sweep a passed group licenses, what a landed group touched, and — one storey up — which of all the lists there have ever been still want somebody |

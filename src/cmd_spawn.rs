@@ -4348,6 +4348,11 @@ fn end_work(
     // the `worked` record, the line in the task's log and the commit; a second
     // copy of that here would be a second contract.
     let (released, ended) = cmd_agent::release_pane(store, seat.as_str());
+    // A seat with no binding — a verifier, a leg, a barrier check, a governor —
+    // is let go of with nothing for `release_pane` to clear, so what it asked
+    // is closed here as well (`wsp-308`). For a bound seat this is a second
+    // look that finds nothing.
+    crate::lapse::seat_ended(store, seat.as_str());
     // What the binding said, unless the release found something else there —
     // which it will not, and if it ever does, the release is the later reading.
     let task = ended.or(task);

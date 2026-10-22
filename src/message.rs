@@ -560,6 +560,17 @@ impl Party {
     pub fn seat_gone() -> Party {
         Party::Agent(SEAT_GONE.into())
     }
+    /// wsp closing what no longer matters (`wsp-308`): the row it was about went
+    /// to review, done, parked or the archive, or the list it was a barrier of
+    /// moved on. Its own handle, so [`Message::closed_json`] says `lapsed` and
+    /// not `timeout`, and so [`close_locked`]'s refusal for a person's question
+    /// is never loosened for it: this party reaches [`lapse`] and nothing else.
+    pub fn lapsed() -> Party {
+        Party::Agent(LAPSED.into())
+    }
+    pub fn is_lapsed(&self) -> bool {
+        matches!(self, Party::Agent(h) if h == LAPSED)
+    }
 
     /// One line, for a byline. `wsp-095` Part 4's whole point is that this
     /// exists at all: the seat had already adopted the rule by hand — *every
@@ -626,6 +637,9 @@ impl Party {
 
 /// The handle of [`Party::seat_gone`].
 const SEAT_GONE: &str = "wsp (seat gone)";
+
+/// The handle of [`Party::lapsed`].
+const LAPSED: &str = "wsp (moved on)";
 
 /// Who is sitting still while a question is open.
 ///
@@ -1147,6 +1161,13 @@ impl Message {
         if let Some(a) = &self.awaited {
             v["awaited"] = json!({ "pid": a.pid, "at": a.at });
         }
+        // How it ended, once it has (`wsp-308`): the same `{how, by, kind,
+        // reason, at, answer}` `wsp yours --json` carries, so `wsp ask <id>
+        // --json` of a closed question says why without a reader walking `via`.
+        // Derived like `source`, and absent while open.
+        if let Some(c) = self.closed_json() {
+            v["closed"] = c;
+        }
         // Only a question owes a route — a hand with no `for` is the person's
         // and the seat's both, which is not a defect.
         if self.route() == Route::Unrouted && self.shape() == Some(Shape::Question) {
@@ -1243,6 +1264,7 @@ impl Message {
             (Party::Human, _) => "person",
             (Party::Seat(_), _) => "seat",
             (Party::Agent(h), _) if h == SEAT_GONE => "seat",
+            (p, _) if p.is_lapsed() => "wsp",
             (p, Act::Abandoned) if p.is_wsp() => "timeout",
             (p, _) if p.is_wsp() => "seat",
             _ => "pane",
@@ -1250,9 +1272,38 @@ impl Message {
         Some(json!({
             "how": how,
             "by": by,
+            "kind": self.closing_kind(h),
+            "reason": match h.act {
+                Act::Answered => Value::Null,
+                _ => Value::from(h.note.trim()),
+            },
             "at": h.at,
             "answer": h.choice.clone().unwrap_or_else(|| json!({ "text": h.note })),
         }))
+    }
+
+    /// Why it closed, as one word a surface can switch on (`wsp-308`), where
+    /// `how` and `by` say only the verb and the party:
+    ///
+    /// | kind | is |
+    /// |---|---|
+    /// | `answered` | somebody answered it |
+    /// | `cancelled` | the person dismissed it (`wsp ask --cancel`) |
+    /// | `lapsed` | wsp closed it: the row or list it was about moved on |
+    /// | `seat-gone` | wsp closed it: the agent that asked is gone |
+    /// | `timeout` | a held wait ran out |
+    /// | `moved-on` | the asker's own pane moved past it |
+    /// | `abandoned` | an agent or a seat gave it up, with a reason |
+    fn closing_kind(&self, h: &Hop) -> &'static str {
+        match (&h.by, h.act) {
+            (_, Act::Answered) => "answered",
+            (Party::Human, _) => "cancelled",
+            (p, _) if p.is_lapsed() => "lapsed",
+            (Party::Agent(a), _) if a == SEAT_GONE => "seat-gone",
+            (p, _) if p.is_wsp() => "timeout",
+            (Party::Pane { .. }, _) => "moved-on",
+            _ => "abandoned",
+        }
     }
 }
 
@@ -1730,6 +1781,51 @@ pub fn abandon(store: &Store, id: &str, by: &Party, reason: &str) -> Result<Clos
     close(store, id, by, Act::Abandoned, reason, None)
 }
 
+/// wsp closing a question or a notification nothing needs any more
+/// (`wsp-308`): the row it was about went to review, done, parked or the
+/// archive, the agent that raised it is gone, or the list it was a barrier of
+/// moved on. Closed as `abandoned`, with `why` in the hop — the reason is the
+/// record, and `wsp yours --json` says it.
+///
+/// **Not [`abandon`], and not through [`close`].** Three differences, each on
+/// purpose:
+///
+/// - **A notification may be lapsed**, which [`Shape::may`] does not allow
+///   anybody else: a notification is acknowledged by the person who read it, and
+///   here nobody read it and nobody will. The table that says a notification
+///   cannot be abandoned stays true of every verb; this is wsp's bookkeeping.
+/// - **A person's question may be lapsed.** What an agent may not do is close
+///   one; the row going to review is not an agent's decision about the question
+///   but the fact that took its subject away, and it is `by` [`Party::lapsed`],
+///   which no verb can be.
+/// - **Nothing is written to the asker's task log and no reply is minted.** The
+///   hop is the record; a `--wait` polls it and returns the abandonment, and a
+///   reply to an agent that has moved on is one more thing for it to `ack`.
+pub fn lapse(store: &Store, id: &str, by: &Party, why: &str) -> Result<Message, Refused> {
+    store.locked(|| {
+        if why.trim().is_empty() {
+            return Err(Refused::NeedsASentence);
+        }
+        let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        match m.shape() {
+            Some(Shape::Signal) => return Err(Refused::IsALevel),
+            Some(_) => {}
+            None => return Err(Refused::WrongShape { shape: m.shape_raw.clone(), act: Act::Abandoned }),
+        }
+        if !m.is_open() {
+            return Err(Refused::NotOpen(m.state_raw.clone()));
+        }
+        m.via.push(Hop { at: util::now_iso(), by: by.clone(), act: Act::Abandoned, note: why.to_string(), choice: None });
+        m.state_raw = State::Abandoned.as_str().to_string();
+        store.save_message(&m)?;
+        store.log_event(
+            "message-abandoned",
+            json!({ "id": m.id, "shape": m.shape_raw, "by": by.to_json(), "state": m.state_raw, "note": why }),
+        );
+        Ok(m)
+    })
+}
+
 /// Close a question a **hook** raised, on the word of the agent's own hooks
 /// (`wsp-302`): the pane's dialog answered first (`PostToolUse`), or the agent
 /// moved on from it (`Stop`, `UserPromptSubmit`), or the session ended.
@@ -1799,7 +1895,7 @@ fn close_locked(
     // waiting (`wsp-301`) is how `closed_json` comes to say `timeout`. It cannot
     // answer for the person, and no seat or agent can do either.
     let wsp_giving_up = act == Act::Abandoned && by.is_wsp();
-    if q.for_person && matches!(by, Party::Seat(_) | Party::Agent(_)) && !wsp_giving_up {
+    if q.for_person && matches!(by, Party::Seat(_) | Party::Agent(_) | Party::Pane { .. }) && !wsp_giving_up {
         return Err(Refused::NotThePersons(by.byline()));
     }
     let waiting = q.waiting.clone().ok_or(Refused::NobodyWaiting)?;
