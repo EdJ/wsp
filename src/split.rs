@@ -32,9 +32,13 @@ use crate::worklist::Running;
 /// What a member's seat does when its row turns out bigger than one seat. One
 /// sentence with no newline, because the brief draws it as a single row.
 pub(crate) fn route(id: &str) -> String {
+    format!("bigger than one seat (past ~80 turns, or more than one layer)? {}", steps(id))
+}
+
+/// The three steps of [`route`], for a sentence that has already said why.
+fn steps(id: &str) -> String {
     format!(
-        "bigger than one seat (past ~80 turns, or more than one layer)? commit, then \
-         `wsp leg add {id} <name> --order FILE` per piece ending in `finish`, then \
+        "commit, then `wsp leg add {id} <name> --order FILE` per piece ending in `finish`, then \
          `wsp release {id}` and stop: the run starts the legs in this tree (docs/legs.md)"
     )
 }
@@ -66,9 +70,9 @@ pub(crate) fn refusal(
         format!(
             "{id} is a member of the {list} list and this seat is working it: a sub-task filed under it is \
              not a member, so the run will never start it, verify it or bring it to a barrier. \
-             Stage what is left as legs instead: {route}",
+             Stage what is left as legs instead: {steps}",
             id = parent.id,
-            route = route(&parent.id),
+            steps = steps(&parent.id),
         )
     })
 }

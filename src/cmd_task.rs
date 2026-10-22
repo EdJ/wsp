@@ -12,7 +12,9 @@ use crate::util::{self, Paint};
 use crate::Args;
 
 pub fn add(store: &Store, args: &Args) -> i32 {
-    add_from(store, args, crate::cmd_agent::my_pane().as_deref())
+    // Asked only of a sub-task: the seat matters to nothing else `add` does.
+    let pane = args.get("parent").and_then(|_| crate::cmd_agent::my_pane());
+    add_from(store, args, pane.as_deref())
 }
 
 /// [`add`] from the seat `pane`, so a test says where it stands rather than
