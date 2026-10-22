@@ -4600,6 +4600,7 @@ mod tests {
             runs: Default::default(),
             role: Default::default(),
             spawned_by: None,
+            leg: None,
         }
     }
 
@@ -5661,6 +5662,7 @@ mod tests {
             runs: Default::default(),
             role: Default::default(),
             spawned_by: None,
+            leg: None,
         }
     }
 

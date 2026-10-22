@@ -537,6 +537,9 @@ pub(crate) struct Brief {
     /// holds no claim, so `mine` is empty, and without this the brief would
     /// tell it to go and claim something (`wsp-188`).
     pub verifying: Option<Task>,
+    /// The leg block, when this seat is a running leg's (`docs/legs.md`): which
+    /// leg, the table, its order and the batons it was handed.
+    pub leg: Option<Vec<String>>,
     /// The list and group this seat is checking — see [`Briefing::checking`].
     pub checking: Option<(String, usize)>,
     pub parent: Option<Task>,
@@ -860,6 +863,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     Brief {
         yours,
         verifying,
+        leg: b.pane.as_deref().and_then(|pane| crate::leg_seat::brief_lines(tasks, pane)),
         checking: b.checking.clone().filter(|_| mine.is_none()),
         handbook,
         parent_decided,
@@ -1412,6 +1416,14 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             // and nothing at all on the rows — most of them — that name none.
             for (i, at) in r.mine.iter().flat_map(|t| t.refs.iter()).enumerate() {
                 row(if i == 0 { "files" } else { "" }, p.dim(at).to_string());
+            }
+            // A leg's block: one line each, so it reads as the rest of the brief does.
+            if let Some(lines) = &r.leg {
+                for (i, block) in lines.iter().enumerate() {
+                    for (j, line) in block.lines().enumerate() {
+                        row(if i == 0 && j == 0 { "leg" } else { "" }, line.to_string());
+                    }
+                }
             }
         }
         // A verifier holds nothing either, and is not idle: its whole job is

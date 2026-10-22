@@ -277,12 +277,30 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     if !ended.is_empty() {
         stamp(store, &format!("verifier seat(s) with nothing left to do, ended: {}", ended.join(" ")));
     }
+    // And every leg that is done and still seated (wsp-293): the same, per leg,
+    // with the outcome on its entry. Its tree goes with the sweep below.
+    let ended_legs = crate::cycle::legs_finished(store, seats);
+    if !ended_legs.is_empty() {
+        stamp(store, &format!("leg seat(s) with nothing left to do, ended: {}", ended_legs.join(" ")));
+    }
+    // And a row run as legs, by hand, whose next legs nobody started: a launch
+    // that was lost, or a leg held at the cap until a place came free.
+    let owed = crate::cycle::legs_owed(store, seats);
+    if !owed.is_empty() {
+        stamp(store, &format!("legs owed on rows no list runs, started: {}", owed.join(" ")));
+    }
     // And every barrier check whose verdict is in (`wsp-230`): it holds no
     // claim either, so the claim-keyed ending above never sees one.
     let ended = crate::cycle::checks_finished(store, seats);
     if !ended.is_empty() {
         stamp(store, &format!("barrier check seat(s) with nothing left to do, ended: {}", ended.join(" ")));
     }
+    // And their trees, read off the disk rather than off the endings above, so
+    // a tree whose seat went some other way — or before this — goes too.
+    // `wsp-289`, after compound's disk filled with 56 of them.
+    crate::check_tree::tidy(store, &ended);
+    // And a finished leg's (wsp-297): the same read off the disk.
+    crate::leg_tree::tidy(store, &[ended.clone(), ended_legs].concat());
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);

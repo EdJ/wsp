@@ -12,12 +12,14 @@ mod after;
 mod agent_commands;
 mod barrier;
 mod caption;
+mod check_tree;
 mod arrange;
 mod attention;
 mod cmd_agent;
 mod cmd_attempts;
 mod cmd_brief;
 mod cmd_burn;
+mod cmd_cost;
 mod cmd_checkout;
 mod cmd_govern;
 mod cmd_install;
@@ -32,6 +34,9 @@ mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;
 mod cmd_verify;
+mod leg_seat;
+mod leg_tree;
+mod legs;
 mod verification;
 mod cmd_watch;
 mod wake;
@@ -50,6 +55,7 @@ mod herdr;
 mod input;
 mod kanban;
 mod live;
+mod kind_data;
 mod launchd;
 mod message;
 mod model;
@@ -143,6 +149,8 @@ pub fn version() -> String {
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full",
+    // `attempts --cost <row>`, whose positional is a task id.
+    "cost",
     // `spawn --no-focus` is what focus not being asked for is now called, and it
     // is kept here rather than deleted so an invocation that still says it —
     // a script, a shell history, the README as it was — parses as a flag
@@ -169,6 +177,8 @@ const BOOL_FLAGS: &[&str] = &[
     "keep", "seed", "fake",
     // And `despawn`, whose positional is a task id.
     "keep-tree",
+    // And `reopen`, whose positionals are the id and the reason.
+    "no-seat",
     // And `govern`, whose positional is a project: `wsp spawn -p wsp --govern`
     // and `wsp govern wsp --remove` both put the flag last, where anything not
     // known here swallows the argument after it. `--rotate` is the same shape:
@@ -357,6 +367,10 @@ const VALUED_ON: &[(&str, &str)] = &[
     ("project", "status"),
     // `spawn --agent` stands alone; on a worklist it names who runs a group.
     ("worklist", "agent"),
+    // And on `leg add`, where it is the policy the leg runs on and `--why` the
+    // reason: `--agent "claude opus high"` is read as a value, not as a flag
+    // that leaves its policy behind as a positional.
+    ("leg", "agent"),
     // `verify --check` stands alone; on `spawn` it names the group a barrier
     // check reads (`wsp-230`).
     ("spawn", "check"),
@@ -1033,7 +1047,7 @@ fn needs_store(args: &Args) -> bool {
     if matches!(args.cmd.as_str(), "init" | "doctor") {
         return false;
     }
-    if args.cmd == "agent" && args.rest.first().map(String::as_str) == Some("kinds") {
+    if args.cmd == "agent" && matches!(args.rest.first().map(String::as_str), Some("kinds" | "pi-extension")) {
         return false;
     }
     !(args.cmd == "panel" && args.rest.first().map(String::as_str) == Some("storyboard"))
@@ -1104,6 +1118,7 @@ fn main() {
         "review" => cmd_task::review(&store, &args),
         "reopen" => cmd_task::reopen(&store, &args),
         "verified" => verification::cmd_verified(&store, &args),
+        "leg" => legs::dispatch(&store, &args),
         "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
         "after" => after::run(&store, &args),
@@ -1572,10 +1587,23 @@ fn help_text() -> String {
                                     earlier ones it did not print; --log for
                                     all of them
   wsp start|review <id>           move through the workflow
-  wsp reopen|todo <id> "what is owed"
+  wsp reopen|todo <id> "what is owed" [--no-seat]
                                 send work back: moves the row, tells
                                 its pane, and stops the run reading it as
-                                finished (`todo` sets the status and takes no prose)
+                                finished (`todo` sets the status and takes no prose).
+                                A row whose agent is gone is seated again:
+                                by its run, or with the kind and tier it ran
+                                with; --no-seat leaves it to you
+  wsp leg add <task> <name> --order FILE|- [--agent "claude opus high" --why "…"] [--after <leg>,…|-] [--before <leg>]
+                                    a leg of a row (docs/legs.md): appended under
+                                    ## Legs, waiting on the last leg unless
+                                    --after says otherwise. No --agent is claude
+                                    sonnet medium; another tier needs --why
+  wsp leg after <task> <name> <leg>…|-   replace a pending leg's waits
+  wsp leg skip <task> <name> "why"       a pending leg, never run
+  wsp leg show <task> [<name>]           the legs, the tier and waits in full
+  wsp leg done <task> --from FILE|- --caption "…"   a leg's seat ends it, at a clean
+                                         commit: the baton, the caption, the run poked
   wsp verified <member> --holds|--blocks --from FILE --caption "…"
                                     a verifier's verdict, recorded on the member
                                     under ## Verification. --blocks sends it back
@@ -1584,7 +1612,10 @@ fn help_text() -> String {
                                     block by hand writes --holds in their name.
                                     --caption is required: the reason in under
                                     60, read after the holds/blocks wsp adds
-  wsp done <id> [--force]           complete; --force over open sub-tasks
+  wsp done <id> [--force]           complete; --force over open sub-tasks. Its
+                                    worktree and branch go too when the work is
+                                    on the trunk and nobody is in it; otherwise
+                                    kept and said why. --keep-tree leaves it
   wsp block <id> "reason"           stop it: somebody owes you an answer
   wsp park <id> "reason"            not yet, deliberately — say what brings
                                     it back. Open work, sorted last and drawn
@@ -1720,6 +1751,11 @@ fn help_text() -> String {
                                     unless --focus says you will be at the pane
                                     --verify is a run's verifier on a member: no
                                     claim, the seat written on its open pass
+                                    --leg <name> is one leg of a row run as legs:
+                                    no claim either, the seat written on the
+                                    leg's entry and the pane bound to the row,
+                                    at the leg's own tier (sonnet unless it
+                                    says why)
   wsp spawn <list> --agent --check N  a run's barrier check on group N: no row
                                     and no claim, the seat written on the
                                     group's open check, the order the barrier's
@@ -1792,6 +1828,8 @@ fn help_text() -> String {
                                     default, resume, models, efforts — for a menu
                                     that should not keep its own list. Any other
                                     kind herdr can start is passed by --kind
+  wsp agent pi-extension            the pi extension this binary carries, which
+                                    `wsp install` writes into pi's extensions
   wsp wip                           everything in flight, with agents
   wsp stamp [--headless] [--json]   has anything changed? Three opaque tokens
                                     for a separate process polling on an
@@ -1852,6 +1890,12 @@ fn help_text() -> String {
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,
                                     how long to review, and whether it came back
+  wsp attempts <task> --cost [--list <worklist>] [--json]
+                                    what a row cost: each attempt, leg and
+                                    verifier pass with tier, turns, peak context
+                                    and dollars, the row's wall time beside its
+                                    legs' summed, and a legs not on Sonnet with
+                                    their why
   wsp peek [panel|view|board|<task>] [--source recent] [--lines N]
                                     what is on that pane, or the frame the
                                     sidebar surface last drew; --source recent
@@ -2116,6 +2160,16 @@ the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
 
 #[cfg(test)]
 mod tests {
+    /// `wsp reopen <id> --no-seat "reason"` with the flag first: valued, it
+    /// would eat the reason and the reopen would refuse for want of one.
+    #[test]
+    fn no_seat_on_reopen_takes_no_value() {
+        use crate::Args;
+        let args = Args::parse(["reopen", "m-1", "--no-seat", "what is owed"].iter().map(|s| (*s).to_string()).collect());
+        assert!(args.has("no-seat"));
+        assert_eq!(args.rest, ["m-1", "what is owed"], "the reason stays a positional");
+    }
+
     /// `status` is a mode word on `watch` and a filter value everywhere else
     /// it is read, and [`BOOL_FLAGS`] could only say the first half. So
     /// `wsp ls -p fork -s done` parsed as a bare flag plus a stray positional:
@@ -2530,6 +2584,22 @@ mod tests {
         assert_eq!(a.rest, vec!["src/cycle.rs"]);
     }
 
+    /// `wsp-291`. `agent` is a bare flag everywhere but `spawn --agent`-style
+    /// verbs that list it in [`VALUED_ON`]; on `leg add` it carries the policy,
+    /// and without its entry the policy was dropped and the words passed on as
+    /// positionals.
+    #[test]
+    fn leg_add_agent_takes_its_policy_and_why_its_reason() {
+        let parse = |line: &[&str]| crate::Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+        let a = parse(&["leg", "add", "m-1", "plan", "--order", "o.md", "--agent", "claude opus high", "--why", "chooses"]);
+        assert_eq!(a.get("agent").as_deref(), Some("claude opus high"));
+        assert_eq!(a.get("why").as_deref(), Some("chooses"));
+        assert_eq!(a.rest, vec!["add", "m-1", "plan"], "and the policy is not a positional");
+        // Elsewhere it is still a bare flag that leaves the next word alone.
+        let a = parse(&["spawn", "--agent", "m-1"]);
+        assert_eq!(a.rest, vec!["m-1"]);
+    }
+
     /// A rule that names a command nobody dispatches is a rule that does
     /// nothing, and it would do nothing silently — the payload would go on
     /// being parsed as flags with the table looking correct. Same check the
@@ -2613,6 +2683,7 @@ mod tests {
         assert!(!needs_store(&Args::synth("panel", &["storyboard"], &[])));
         assert!(!needs_store(&Args::synth("init", &[], &[])));
         assert!(!needs_store(&Args::synth("doctor", &[], &[])));
+        assert!(!needs_store(&Args::synth("agent", &["pi-extension"], &[])));
 
         // The exemption is that one subcommand and no more of `panel`: the
         // live panel reads the store on its first frame, and letting it start

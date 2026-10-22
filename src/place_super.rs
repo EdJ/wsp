@@ -258,6 +258,45 @@ pub(crate) fn last_written(dir: &Path) -> Option<i64> {
     files.chain(secs(dir)).max()
 }
 
+/// The ledger of what stopped seats spent, one JSON line each, beside the seat
+/// roots (`<state>/spent.jsonl`). `stop()` deletes the seat's directory and
+/// its `burn.json` with it; this is the one copy that outlives it (wsp-264).
+pub(crate) const SPENT_FILE: &str = "spent.jsonl";
+
+/// Append the seat's burn record to the ledger before its directory goes.
+/// Best effort and silent: a stop that cannot write a receipt still stops.
+/// Same field names as `wsp burn --json`, so one reader serves both.
+pub(crate) fn bank_burn(dir: &Path) {
+    let rec = read_json(&dir.join(BURN_FILE));
+    if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
+        return;
+    }
+    let (Some(seat), Some(state)) = (
+        dir.file_name().map(|n| n.to_string_lossy().to_string()),
+        dir.parent().and_then(|r| r.parent()),
+    ) else {
+        return;
+    };
+    let n = |k: &str| rec.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let line = serde_json::json!({
+        "seat": seat,
+        "ended": util::now_iso(),
+        "session_id": str_of(&rec, "session_id"),
+        "model": str_of(&rec, "model"),
+        "turns": n("turns"),
+        "input": n("input"),
+        "output": n("output"),
+        "cache_read": n("cache_read"),
+        "cache_write": n("cache_write"),
+        "cost": crate::cmd_burn::cost_of(&rec),
+    });
+    if let Ok(mut f) =
+        fs::OpenOptions::new().create(true).append(true).open(state.join(SPENT_FILE))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Every seat's burn record under one root, seat id attached.
 ///
 /// The reading half of [`tally_burn`] (`core-049`): the ranking is a question
@@ -382,6 +421,8 @@ impl Recipe {
     /// without it. The stream on stdout is kept in the seat's `out.jsonl`, and
     /// is not what wsp reads state from: the hooks are.
     fn of(kind: &str) -> Recipe {
+        // Claude-only: print mode and stream-json are Claude Code's flags. A
+        // data kind is never this arm; it runs as `Recipe::plain`.
         match kind.trim() {
             "claude" => Recipe {
                 flags: &[
@@ -516,6 +557,65 @@ pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) 
             HOOK_NAMES.len(),
             missing.join(", ")
         ));
+    }
+}
+
+/// pi's half of the hook snippet: `pi/wsp-session.ts`, carried in the binary.
+///
+/// pi has no hooks, only extensions, and an extension is a file pi loads from
+/// its own directory rather than a line in a settings file a person merges in.
+/// So `wsp install` writes it, and writes *this* copy — asked of the binary it
+/// just installed by `wsp agent pi-extension` — because the process doing the
+/// installing is the old binary, and its copy is the one being replaced.
+pub const PI_EXTENSION: &str = include_str!("../pi/wsp-session.ts");
+
+/// Where pi keeps its agent directory on this machine — `$PI_CODING_AGENT_DIR`,
+/// or `~/.pi/agent`, which is pi's own rule for the same variable.
+pub fn pi_agent_dir() -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::expand("~/.pi/agent"))
+}
+
+/// Where [`PI_EXTENSION`] goes: beside herdr's `herdr-agent-state.ts`, under a
+/// name of its own, since pi loads every file in the directory.
+pub fn pi_extension_path() -> PathBuf {
+    pi_extension_in(&pi_agent_dir())
+}
+
+fn pi_extension_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions").join("wsp-session.ts")
+}
+
+/// [`hook_snippet_health`] for pi. Nothing at all on a machine pi has never run
+/// on — no agent directory is not a fault, and a note on every `doctor` there
+/// would be noise. The extension missing where pi is set up is a note, for the
+/// reason a missing Claude settings file is: a machine that never installed it
+/// is not lying about being configured. A copy that is not the one this wsp
+/// carries is the problem, because it looks installed: an older one names hooks
+/// a newer `said_by` reads differently, or misses one it learnt.
+pub fn pi_extension_health(problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    pi_extension_health_in(&pi_agent_dir(), problems, notes)
+}
+
+/// The same check against a directory handed in, so a test can ask it without
+/// setting `PI_CODING_AGENT_DIR` under every other test's feet.
+fn pi_extension_health_in(agent_dir: &Path, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    if !agent_dir.is_dir() {
+        return;
+    }
+    let path = pi_extension_in(agent_dir);
+    match fs::read_to_string(&path) {
+        Err(_) => notes.push(format!(
+            "pi is set up here and {} is not there — a pi seat never tells wsp its state, and reads Starting until it is gone; `wsp install` writes it",
+            util::contract(&path)
+        )),
+        Ok(text) if text != PI_EXTENSION => problems.push(format!(
+            "{} is not the pi extension this wsp carries — pi seats report through whatever that copy says; `wsp install` rewrites it",
+            util::contract(&path)
+        )),
+        Ok(_) => {}
     }
 }
 
@@ -1294,6 +1394,7 @@ impl Place for Supervisor<'_> {
         // always going to be — the seat's directory holds a copy of the stream
         // and the orders it was given, and neither is the thing to keep a
         // directory per dead agent for.
+        bank_burn(&dir);
         fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
         Ok(())
     }
@@ -1763,6 +1864,31 @@ mod tests {
             ],
             "a seat that was already open was announced as news, or a change was missed"
         );
+    }
+
+    /// wsp-264: stop() deletes the seat's directory, burn.json with it; the
+    /// ledger beside the seat root keeps one line equal to that record.
+    #[test]
+    fn stop_leaves_the_seats_burn_in_the_ledger() {
+        let base = std::env::temp_dir()
+            .join(format!("wsp-ledger-{}-{}", std::process::id(), util::epoch_nanos()));
+        let place = Supervisor { poll: Duration::from_millis(10), ..Supervisor::at(base.join("seats")) };
+        fs::create_dir_all(base.join("seats")).unwrap();
+        let seat = place.open(&Order::default()).unwrap();
+        let burn = json!({ "session_id": "s-1", "model": "claude-sonnet-5-5", "turns": 7,
+            "input": 1_234_567, "output": 89_012, "cache_read": 345_678_901,
+            "cache_write": 2_345_678, "cost": 4_321_987 });
+        fs::write(base.join("seats").join(seat.as_str()).join(BURN_FILE), burn.to_string()).unwrap();
+        place.stop(&seat).expect("the seat was there");
+        assert!(!base.join("seats").join(seat.as_str()).exists());
+        let text = fs::read_to_string(base.join(SPENT_FILE)).expect("a ledger");
+        let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        for k in ["session_id", "model", "turns", "input", "output", "cache_read", "cache_write", "cost"] {
+            assert_eq!(line[k], burn[k], "{k}");
+        }
+        assert_eq!(line["seat"], seat.as_str());
+        assert_eq!(text.lines().count(), 1);
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// A hook that arrives after the seat has been ended does not bring it back.
@@ -2329,5 +2455,64 @@ mod tests {
         hook_snippet_health(&mut problems, &mut notes);
         assert!(problems.is_empty());
         assert_eq!(notes.len(), 1);
+    }
+
+    /// pi never run here: no agent directory, and `doctor` says nothing about
+    /// pi at all.
+    #[test]
+    fn no_pi_agent_dir_is_silent() {
+        let dir = std::env::temp_dir().join(format!("wsp-pi-none-{}-{}", std::process::id(), util::epoch_nanos()));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        pi_extension_health_in(&dir, &mut problems, &mut notes);
+        assert!(problems.is_empty() && notes.is_empty());
+    }
+
+    /// The three readings of a directory pi has been set up in: the extension
+    /// absent is a note, a copy that is not this binary's is a problem, and
+    /// this binary's own copy is nothing to say.
+    #[test]
+    fn the_pi_extension_is_checked_against_the_copy_this_wsp_carries() {
+        let dir = std::env::temp_dir().join(format!("wsp-pi-agent-{}-{}", std::process::id(), util::epoch_nanos()));
+        fs::create_dir_all(&dir).unwrap();
+        let ext = pi_extension_in(&dir);
+
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        pi_extension_health_in(&dir, &mut problems, &mut notes);
+        assert!(problems.is_empty());
+        assert_eq!(notes.len(), 1, "set up and not installed is a note: {notes:?}");
+
+        fs::create_dir_all(ext.parent().unwrap()).unwrap();
+        fs::write(&ext, "// an older wsp's copy\n").unwrap();
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        pi_extension_health_in(&dir, &mut problems, &mut notes);
+        assert_eq!(problems.len(), 1, "a stale copy looks installed, which is the problem");
+        assert!(notes.is_empty());
+
+        fs::write(&ext, PI_EXTENSION).unwrap();
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        pi_extension_health_in(&dir, &mut problems, &mut notes);
+        assert!(problems.is_empty() && notes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What the extension says has to be what [`said_by`] reads. Asserted on
+    /// the text, because nothing compiles the TypeScript against this match:
+    /// a hook name the extension sends and `said_by` does not know would be
+    /// dropped by `wsp report` in silence.
+    #[test]
+    fn every_hook_the_pi_extension_sends_is_one_wsp_reads() {
+        let sent: Vec<&str> = PI_EXTENSION
+            .split("report(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        for hook in ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "SessionEnd"] {
+            assert!(sent.contains(&hook), "{hook} is not sent by pi/wsp-session.ts: {sent:?}");
+        }
+        for hook in &sent {
+            assert!(said_by(hook).is_some(), "pi/wsp-session.ts sends {hook}, which `wsp report` ignores");
+        }
+        // And the guard comes first: a seat-less pi is silent.
+        assert!(PI_EXTENSION.contains("process.env.WSP_SEAT_ID"));
     }
 }

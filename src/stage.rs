@@ -124,7 +124,13 @@ pub(crate) fn of_member(m: &Member) -> Told {
         let n = l.files.len();
         return told("landed", Some(format!("{n} file{}", if n == 1 { "" } else { "s" })), &t.updated, "stage");
     }
-    let said = m.said.map(|s| caption::say(s, Some(&t.id))).filter(|s| !s.is_empty());
+    // A staged row's tail is the newest leg caption written (`docs/legs.md`,
+    // *Seen*): `scout: three layers, plan next`. Written by the leg's seat at
+    // `leg done`, so it is never one wsp made up, and it comes before what the
+    // seat last said because it is the later and the plainer record of progress.
+    let said = crate::legs::newest_caption(t)
+        .or_else(|| m.said.map(|s| caption::say(s, Some(&t.id))))
+        .filter(|s| !s.is_empty());
     match (t.status(), m.agent) {
         (Status::Doing, Agent::WantsYou) => told("wants you", said, &t.updated, "say"),
         (Status::Doing, Agent::Working) => told("working", said, &t.updated, "say"),
@@ -1089,5 +1095,39 @@ mod tests {
         let m = Member { said: Some("picking it back up"), ..member(&t, &[]) };
         let now = of_member(&m);
         assert_eq!((now.word, since(&now, &history(&t, &[], Some(&now))).as_str()), ("working", "2026-10-08T09:40:00Z"), "a say left over from the attempt is no older a since");
+    }
+    /// `docs/legs.md`, *Seen*: the word is the one wsp chose, and the tail is the
+    /// newest leg caption written, the one that finished last among siblings.
+    #[test]
+    fn a_staged_rows_tail_is_the_newest_leg_caption() {
+        use crate::legs::{Leg, State};
+        let mut t = task("doing", &["2026-10-08T08:00:00Z claimed by pane w1:p1"]);
+        let done = |name: &str, at: &str, caption: &str| Leg {
+            state: State::Done,
+            closed: Some(at.into()),
+            caption: Some(caption.into()),
+            ..Leg::pending(name, "x")
+        };
+        crate::legs::write(
+            &mut t,
+            &[
+                done("scout", "2026-10-08T08:10:00Z", "three layers, plan next"),
+                Leg { after: Some(vec!["scout".into()]), ..done("build-a", "2026-10-08T09:00:00Z", "store done") },
+                Leg { after: Some(vec!["scout".into()]), ..done("build-b", "2026-10-08T08:50:00Z", "spawn done") },
+            ],
+        );
+        let m = Member { said: Some("reading"), agent: Agent::Working, claimed: true, ..member(&t, &[]) };
+        let now = of_member(&m);
+        assert_eq!((now.word, now.tail.as_deref()), ("working", Some("build-a: store done")), "the last to finish, not the last listed");
+
+        let mut one = task("doing", &[]);
+        crate::legs::write(&mut one, &[done("scout", "2026-10-08T08:10:00Z", "three layers, plan next")]);
+        let now = of_member(&Member { agent: Agent::Working, ..member(&one, &[]) });
+        assert_eq!(now.tail.as_deref(), Some("scout: three layers, plan next"));
+
+        let mut bare = task("doing", &[]);
+        crate::legs::write(&mut bare, &[Leg::pending("scout", "x")]);
+        let now = of_member(&Member { said: Some("reading"), agent: Agent::Working, ..member(&bare, &[]) });
+        assert_eq!(now.tail.as_deref(), Some("Reading"), "no caption written: the seat's own say stands");
     }
 }

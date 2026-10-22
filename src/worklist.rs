@@ -1512,6 +1512,11 @@ impl Running {
         self.at.get(task).is_some_and(|p| self.fronts.get(&p.list) == Some(&p.group))
     }
 
+    /// The group a running list stands at, and `None` past its last barrier.
+    pub fn front(&self, list: &str) -> Option<usize> {
+        self.fronts.get(list).copied()
+    }
+
     /// The list a task is in, which is the only half routing needs.
     pub fn list_of(&self, task: &str) -> Option<&str> {
         self.at.get(task).map(|p| p.list.as_str())

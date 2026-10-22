@@ -342,6 +342,18 @@ pub(crate) fn say_verifier_left(store: &Store, w: Option<&Worklist>, member: &st
     }
 }
 
+/// A finished leg's seat left running for a reason that will not pass: said once on
+/// the row and in `cycle.log`, as [`say_verifier_left`] says a verifier's.
+pub(crate) fn say_leg_left(store: &Store, row: &str, leg: &str, seat: &str, why: &Left) {
+    if why.passes() {
+        return;
+    }
+    let line = format!("wsp: leg {leg}'s seat {seat} is left running: {}", why.sentence());
+    if once(store, row, &line) {
+        crate::cycle::log_line(store, &format!("{row}: {}", line.trim_start_matches("wsp: ")));
+    }
+}
+
 /// The ending, on the member's row, once — re-read under the lock so two
 /// passes racing write it once.
 fn record_ended(store: &Store, id: &str, commit: &str) {

@@ -129,6 +129,27 @@ pub(crate) struct Pass {
     /// `holds` or `blocks` wsp puts in front. `None` on every pass written
     /// before captions, which reads as the word and its time.
     pub caption: Option<String>,
+    /// What the verifier's seat consumed, written when the seat is ended
+    /// (wsp-290). `None` on a pass still reading, on every pass written before
+    /// this, and on one whose seat had no session to read.
+    pub spent: Option<Spent>,
+}
+
+/// A pass's spend: the clauses a leg's end line carries, as clauses of the
+/// entry. `ran` is the tier that served it (`sonnet-5-5/high`), which `on`
+/// cannot say: that is what was asked for.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct Spent {
+    pub ran: String,
+    pub turns: usize,
+    pub peak: u64,
+    pub spend: crate::agent_commands::Spend,
+}
+
+impl Spent {
+    pub(crate) fn of(ran: &crate::agent_commands::Ran) -> Spent {
+        Spent { ran: ran.label(), turns: ran.turns, peak: ran.peak, spend: ran.spend }
+    }
 }
 
 impl Pass {
@@ -145,6 +166,7 @@ impl Pass {
             decided: None,
             text: String::new(),
             caption: None,
+            spent: None,
         }
     }
 
@@ -165,6 +187,12 @@ impl Pass {
         clause("on", &self.on);
         clause("was", &self.was);
         clause("decided", &self.decided);
+        if let Some(s) = &self.spent {
+            clause("ran", &Some(s.ran.clone()));
+            clause("turns", &Some(s.turns.to_string()));
+            clause("peak", &Some(util::count_human(s.peak)).filter(|_| s.peak > 0));
+            clause("spent", &s.spend.clause());
+        }
         match &self.ending {
             Ending::Standing => {}
             Ending::Ended => out.push_str(" · ended"),
@@ -205,6 +233,7 @@ impl Pass {
             decided: None,
             text: String::new(),
             caption,
+            spent: None,
         };
         for c in clauses {
             let c = c.trim();
@@ -220,6 +249,10 @@ impl Pass {
                     "on" => p.on = v,
                     "was" => p.was = v,
                     "decided" => p.decided = v,
+                    "ran" => p.spent.get_or_insert_with(Spent::default).ran = v.unwrap_or_default(),
+                    "turns" => p.spent.get_or_insert_with(Spent::default).turns = v.and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "peak" => p.spent.get_or_insert_with(Spent::default).peak = v.and_then(|v| util::count_of(&v)).unwrap_or(0),
+                    "spent" => p.spent.get_or_insert_with(Spent::default).spend = v.and_then(|v| crate::agent_commands::Spend::of_clause(&v)).unwrap_or_default(),
                     _ => {}
                 }
             }
@@ -339,6 +372,7 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         decided: (state != State::Running).then(|| row.updated.clone()),
         text: verdict_of(row),
         caption: None,
+        spent: None,
     }
 }
 
@@ -563,8 +597,11 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         serde_json::json!({ "id": member.id, "verdict": state.as_str(), "caption": caption, "read": pass.read, "pane": pass.pane }),
     );
     store.git_commit(&format!("wsp: verified {} {} — {}", member.id, state.as_str(), member.title));
+    // A row run as legs has no one agent to tell while its rework leg carries the
+    // verdict. With no rework leg (the row is at the leg cap) nothing does, so the
+    // reason is delivered as for any member sent back.
     if state == State::Blocks {
-        crate::cmd_task::deliver_reason(store, &member.id, text.trim());
+        deliver_unless_reworked(store, &member.id, &text);
     }
     crate::cycle::poke_task(store, &member.id, "verified");
 
@@ -579,6 +616,15 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         println!("  {}", p.dim("sent back to doing with your verdict as what is owed; its governor is told"));
     }
     0
+}
+
+/// A blocking verdict's reason, told to the member's pane unless a rework leg
+/// carries it.
+pub(crate) fn deliver_unless_reworked(store: &Store, member: &str, text: &str) {
+    let reworked = store.find_task(member).is_some_and(|t| crate::legs::rework_open(&crate::legs::legs(&t)));
+    if !reworked {
+        crate::cmd_task::deliver_reason(store, member, text.trim());
+    }
 }
 
 /// The store half of [`verified`]: the pass written, and the member moved when
@@ -630,6 +676,28 @@ pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: 
                 pass.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default(),
                 util::truncate(&crate::cmd_task::fold(text), 300)
             ));
+            // A row run as legs is sent back to a leg of its own: one `rework`
+            // leg after the last, whose order is the verdict (`docs/legs.md`,
+            // *The run*). The step starts it; nobody is told to go back to work.
+            let before = crate::legs::legs(&t);
+            if !before.is_empty() {
+                match crate::legs::rework(&before, text) {
+                    Ok(Some(after)) => {
+                        let leg = after.last().expect("a rework leg was appended");
+                        let of = leg.rework.as_deref().unwrap_or_default();
+                        t.log(&format!(
+                            "wsp: appended leg {} after {}{}{}",
+                            leg.name,
+                            crate::legs::waits(&after).last().map(|w| w.join(", ")).unwrap_or_default(),
+                            if of.is_empty() { String::new() } else { format!(" · the verdict names {}", of.join(", ")) },
+                            if crate::legs::is_default(&leg.policy) { String::new() } else { format!(" · on {}", leg.policy.label()) },
+                        ));
+                        crate::legs::write(&mut t, &after);
+                    }
+                    Ok(None) => {}
+                    Err(why) => t.log(&format!("wsp: {why}")),
+                }
+            }
         }
         store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
         Ok(pass)
@@ -790,6 +858,12 @@ mod tests {
             text: "the second half does not hold\n1. spool first\n2. then deliver".into(),
             // A ` · ` of its own, which must not end the caption at it.
             caption: Some("spool first · then deliver".into()),
+            spent: Some(Spent {
+                ran: "sonnet-5-5/high".into(),
+                turns: 7,
+                peak: 70_000,
+                spend: crate::agent_commands::Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None },
+            }),
         };
         let bare = Pass { at: "2026-10-06T11:00:00Z".into(), ..Pass::opened(None, None) };
         write(&mut t, &[bare.clone(), full.clone()]);

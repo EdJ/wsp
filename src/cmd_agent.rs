@@ -2188,7 +2188,7 @@ pub fn worked_line(w: &serde_json::Value) -> String {
 /// Empty for a spawn that stated neither, so the ordinary claim line is
 /// byte-for-byte what it was — the same compatibility rule `--model` itself
 /// keeps, and the reason nothing in the store needs migrating.
-fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
+pub(crate) fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
     match (model, effort) {
         (None, None) => String::new(),
         (m, e) => format!(
@@ -2252,21 +2252,58 @@ fn ran_at(store: &Store, task_id: &str, since: &str) -> String {
     let Some(thread) = crate::cmd_resume::thread_for_task(store, task_id) else {
         return String::new();
     };
+    ran_clause(&thread.kind, &thread.session, &thread.cwd, since)
+}
+
+/// [`ran_at`] for a leg's seat. A leg holds no claim and two siblings share one
+/// task, so the session is the seat's own binding's and not the task's.
+pub(crate) fn ran_in_seat(store: &Store, seat: &str, since: &str) -> String {
+    ran_of_seat(store, seat, since).map(|r| ran_text(&r)).unwrap_or_default()
+}
+
+/// What a seat's session served since `since`, from the seat's own binding. A
+/// verifier's seat is read the same way, and its pass keeps the reading.
+pub(crate) fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::agent_commands::Ran> {
+    let bindings = store.bindings();
+    let b = bindings.get(seat)?;
+    let get = |k: &str| b.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let session = get("agent_session_id");
+    if session.is_empty() {
+        return None;
+    }
+    crate::agent_commands::of(&crate::cmd_spawn::kind_or_default(&get("agent_kind"))).ran(
+        &session,
+        &get("cwd"),
+        util::epoch_of(since),
+    )
+}
+
+fn ran_clause(kind: &str, session: &str, cwd: &str, since: &str) -> String {
     // From the claim, not from the start of the session. One session serves
     // several attempts whenever an agent is handed the next task from the same
     // seat, and without the window the second attempt reports the first one's
     // turns and its bill — see [`crate::agent_commands::Kind::ran`].
-    let ran = crate::agent_commands::of(&thread.kind).ran(
-        &thread.session,
-        &thread.cwd,
+    let ran = crate::agent_commands::of(kind).ran(
+        session,
+        cwd,
         util::epoch_of(since),
     );
-    let Some(ran) = ran else { return String::new() };
+    ran.map(|r| ran_text(&r)).unwrap_or_default()
+}
+
+/// The clauses a release line and a leg's end line carry: ` · ran opus-5/high ·
+/// 96 turns · peak 180k · 242M cache 4.7M in 875k out`. The peak is left out
+/// where the runtime read none, so a line written before it reads as it did.
+fn ran_text(ran: &crate::agent_commands::Ran) -> String {
+    let peak = match ran.peak {
+        0 => String::new(),
+        n => format!(" · peak {}", util::count_human(n)),
+    };
     let spent = match ran.spend.clause() {
         Some(c) => format!(" · {c}"),
         None => String::new(),
     };
-    format!(" · ran {} · {} turns{spent}", ran.label(), ran.turns)
+    format!(" · ran {} · {} turns{peak}{spent}", ran.label(), ran.turns)
 }
 
 /// End a claim and leave the trace behind.
@@ -3778,10 +3815,17 @@ fn where_lines(at: &Located, p: &Paint) -> Vec<String> {
 pub fn agent(_store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(String::as_str) {
         Some("kinds") => kinds(args),
+        // The pi extension this binary carries, printed as is. `wsp install`
+        // asks the binary it has just installed for it, rather than writing
+        // its own copy, because the process doing the installing is the old one.
+        Some("pi-extension") => {
+            print!("{}", crate::place_super::PI_EXTENSION);
+            0
+        }
         other => {
             match other {
                 Some(w) => eprintln!("wsp agent: unknown subcommand `{w}`"),
-                None => eprintln!("wsp agent: usage: wsp agent kinds [--json]"),
+                None => eprintln!("wsp agent: usage: wsp agent kinds [--json] | wsp agent pi-extension"),
             }
             2
         }
@@ -3801,7 +3845,11 @@ fn kinds(args: &Args) -> i32 {
             })
             .collect();
         let default = all.iter().find(|k| k.default).map(|k| k.name);
-        println!("{}", json!({ "kinds": rows, "default": default, "passthrough": true }));
+        let refused: Vec<Value> = crate::agent_commands::refusals()
+            .iter()
+            .map(|(p, why)| json!({ "file": p.display().to_string(), "why": why }))
+            .collect();
+        println!("{}", json!({ "kinds": rows, "default": default, "passthrough": true, "refused": refused }));
         return 0;
     }
     let w = all.iter().map(|k| k.name.len()).max().unwrap_or(0);
@@ -3820,6 +3868,9 @@ fn kinds(args: &Args) -> i32 {
             facts.push(format!("efforts {}", k.efforts.join("|")));
         }
         println!("{:w$}  {}", k.name, facts.join(" · "));
+    }
+    for (p, why) in crate::agent_commands::refusals() {
+        println!("refused  {}: {why}", p.display());
     }
     println!("any other kind herdr can start is passed through by --kind");
     0
@@ -4189,6 +4240,9 @@ pub(crate) struct WipRow {
     /// recorded it (`wsp-249`). Published as `spawned_by`; `null` for a seat
     /// spawned from no seat.
     pub(crate) spawned_by: Option<Value>,
+    /// The leg standing in the seat, when it is one (`docs/legs.md`, *Seen*).
+    /// Published as `leg: {name, after, index, of}`; `null` for any other seat.
+    pub(crate) leg: Option<crate::legs::Standing>,
 }
 
 /// What a seat is, typed, for a reader that places it (`wsp-246`): compound's
@@ -4218,6 +4272,9 @@ pub(crate) enum Role {
     Verifier { member: String, pass: usize },
     /// It is checking `list`'s barrier `group`.
     Check { list: String, group: usize },
+    /// It is `leg` of the staged row `task` (`docs/legs.md`): it holds no
+    /// claim, and the row's `## Legs` is what names it.
+    Leg { task: String, leg: String },
     /// The governor of `scope` spawned it, and it holds `task` if it holds
     /// work — compound draws it at that row, or under that governor with none
     /// (`docs/ux-design.md` §18 rule 6).
@@ -4240,6 +4297,7 @@ impl Role {
             }
             Role::Verifier { member, pass } => json!({ "is": "verifier", "member": member, "pass": pass }),
             Role::Check { list, group } => json!({ "is": "check", "list": list, "group": group }),
+            Role::Leg { task, leg } => json!({ "is": "leg", "task": task, "leg": leg }),
             Role::Helper { scope, task: None } => json!({ "is": "helper", "scope": scope }),
             Role::Helper { scope, task: Some(t) } => json!({ "is": "helper", "scope": scope, "task": t }),
             Role::Agent => json!({ "is": "agent" }),
@@ -4306,6 +4364,11 @@ fn runs(w: &Wip, seat: &str, governs: Option<&str>, held: Option<&Task>) -> Runs
     if let Some(on) = crate::verification::ran_on(&w.tasks, seat).or_else(|| w.check_on.get(seat).cloned()) {
         return Runs::of_label(&on);
     }
+    // A leg holds no claim, so its entry's policy is the record that started it.
+    if let Some(s) = crate::legs::seated(&w.tasks).get(seat) {
+        let p = &s.leg.policy;
+        return Runs { kind: Some(p.kind.clone()), model: p.model.clone(), effort: p.effort.clone() };
+    }
     let Some(t) = held else { return Runs::default() };
     let kind = text(w.claims.get(&t.id), "agent_kind").or_else(|| text(w.bindings.get(seat), "agent_kind"));
     // The newest claim line, and only when it is this seat's: an older line,
@@ -4333,6 +4396,9 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     // A verifier holds no claim and no binding (`wsp-188`): its seat is named
     // on the member's open pass, and that is where this reads it from.
     let verifying = crate::verification::seated(&w.tasks);
+    // A leg holds none either (`docs/legs.md`, *Seen*): its entry on the row's
+    // `## Legs` names the seat, running or done and not yet ended.
+    let legged = crate::legs::seated(&w.tasks);
     let running = crate::worklist::Running::over(&w.lists);
     let homes = crate::worklist::homes(w.lists.iter().filter(|l| w.governors.contains_key(&l.id)), &w.tasks, &w.index);
     for a in &w.agents {
@@ -4383,13 +4449,17 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // nobody (`wsp-214`): the shell wakes it. Every other wait still
         // needs somebody — a prompt a person, a question whoever it went to.
         let needs_you = cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some())
-            && waiting.as_ref().is_none_or(|w| w.owed());
+            && waiting.as_ref().is_none_or(|w| w.owed())
+            // A leg that has written its baton is finished: its seat stands
+            // until the tick ends it, and nobody is owed anything from it.
+            && legged.get(seat).is_none_or(|s| s.leg.state != crate::legs::State::Done);
         // The task whose claim started this seat: its binding's, or — once the
         // binding has gone with a reseat — the open one its agent claimed.
         let held = bound.or_else(|| {
             holding(&w.tasks, &w.bindings, &w.claims, &w.agents_held, seat).and_then(|id| w.tasks.iter().find(|t| t.id == id))
         });
 
+        let leg = legged.get(seat);
         let role = match (&seat_of_project, held, verifying.get(seat), w.checking.get(seat)) {
             // A scope is a list when a worklist has its slug, whether or
             // not it has started — the order `cmd_govern::scope_of` reads
@@ -4404,6 +4474,12 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             (None, None, None, Some((list, at, _))) => Role::Check { list: list.clone(), group: *at },
             _ => Role::Agent,
         };
+        // A leg is bound to its row, which reads as the row's member above; the
+        // record that names the seat is the row's `## Legs`.
+        let role = match (role, leg) {
+            (Role::Member { .. } | Role::Agent, Some(s)) => Role::Leg { task: s.task.clone(), leg: s.leg.name.clone() },
+            (role, _) => role,
+        };
         let spawned_by = w.spawned.get(seat).filter(|v| v.is_object()).cloned();
         let role = match (role, spawned_by.as_ref().and_then(|b| b.get("scope")).and_then(Value::as_str)) {
             (Role::Agent, Some(scope)) => Role::Helper { scope: scope.to_string(), task: None },
@@ -4414,8 +4490,10 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
 
         rows.push(WipRow {
             project: r.project.unwrap_or_else(|| "—".into()),
-            task: bound
-                .map(|t| t.title.clone())
+            task: legged
+                .get(seat)
+                .map(|s| crate::legs::seat_label(&s.task, &s.leg.name))
+                .or_else(|| bound.map(|t| t.title.clone()))
                 .or_else(|| verifying.get(seat).map(|(m, _)| crate::verification::seat_label(m)))
                 .or_else(|| w.checking.get(seat).map(|(list, at, _)| crate::barrier::seat_label(list, *at)))
                 .unwrap_or_else(|| if a.label.is_empty() { "(unbound)".into() } else { format!("({})", a.label) }),
@@ -4430,10 +4508,14 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             said: sentence(&w.said, seat, bound.map(|t| t.id.as_str())),
             waiting,
             members_waiting: 0,
-            held: bound
-                .and_then(|t| w.claims.get(&t.id))
-                .and_then(|c| c.get("claimed_at"))
-                .and_then(|c| c.as_str())
+            // A leg's is when it opened: the row's claim, if any, is not its.
+            held: (match legged.get(seat) {
+                Some(s) => s.leg.started.as_deref(),
+                None => bound
+                    .and_then(|t| w.claims.get(&t.id))
+                    .and_then(|c| c.get("claimed_at"))
+                    .and_then(|c| c.as_str()),
+            })
                 .filter(|c| !c.is_empty())
                 .map(|c| util::since(c))
                 .filter(|&secs| secs > 0)
@@ -4448,6 +4530,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             answers_to_empty,
             role,
             spawned_by,
+            leg: leg.cloned(),
         });
     }
     // A governor's count, once every row has its own reading — off the same
@@ -4489,6 +4572,7 @@ fn wip_queues(w: &Wip) -> (Vec<&Task>, Vec<&Task>, usize) {
 /// - a **member**, [`cmd_govern::seat_for`] over the running list it is in and
 ///   its project's ancestors — what [`cmd_govern::answering_seat`] asks;
 /// - a **verifier**, its member's, since it hangs beside the member it reads;
+/// - a **leg**, its row's, since it works the row;
 /// - a **barrier check**, its list's, falling through to the project its
 ///   group's work is in;
 /// - a **list's governor**, the governor of the project the list stands in
@@ -4524,7 +4608,10 @@ fn answers_to(
                 None => (None, home.map(str::to_string)),
             };
         }
-        Role::Member { task, .. } | Role::Verifier { member: task, .. } | Role::Helper { task: Some(task), .. } => {
+        Role::Member { task, .. }
+        | Role::Verifier { member: task, .. }
+        | Role::Leg { task, .. }
+        | Role::Helper { task: Some(task), .. } => {
             task_walk(task)
         }
         Role::Check { list, .. } => (Some(list.as_str()), w.checking.get(seat).and_then(|(_, _, p)| p.as_deref()), None),
@@ -4564,6 +4651,9 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "role": r.role.json(),
             "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
             "spawned_by": r.spawned_by,
+            "leg": r.leg.as_ref().map(|s| json!({
+                "name": s.leg.name, "after": s.after, "index": s.index, "of": s.of,
+            })),
             })
         }).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
@@ -4677,6 +4767,9 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
                 ),
                 (Some(proj), _) => p.cyan(&format!("{} {}", glyph_seat(), cmd_govern::governor_of(proj))),
                 (None, true) => p.yellow("← needs you"),
+                // The row's own line (`docs/legs.md`, *Seen*): a leg holds no
+                // claim, so the count of its row's legs is said here.
+                (None, false) if r.leg.is_some() => r.leg.as_ref().map(|s| p.dim(&crate::legs::tally(s))).unwrap_or_default(),
                 // A gone seat that is still drawn is drawn because it holds
                 // something, and says what: the reconciler's to repair, not a
                 // row nobody swept (`wsp-169`).
@@ -5832,7 +5925,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
                 // A seat still bound to the task changes the advice rather than
                 // the finding: the tree is litter either way, but a `--rm`
                 // there leaves the agent and the workspace behind it.
-                let seated = !store.panes_for_task(&s.task).is_empty();
+                let seated = !store.panes_for_task(crate::leg_tree::row_of(&s.task)).is_empty();
                 notes.push(format!(
                     "{}: the tree for {} is finished with — {} — {}",
                     util::contract(&root),
@@ -6108,6 +6201,8 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // brief arrives — while every other turn boundary is silently invisible
     // (`compound-107`).
     crate::place_super::hook_snippet_health(&mut problems, &mut notes);
+    // And pi's half of the same thing: the extension that is its hooks.
+    crate::place_super::pi_extension_health(&mut problems, &mut notes);
     // And whether the compound wire agrees with itself: wsp's own hand-copied
     // WIRE_VERSION against what the installed compound-sup actually speaks,
     // and the host binary beside it against a build that only touched one of
@@ -8226,6 +8321,61 @@ mod tests {
         assert_eq!(answers(&j, "w10:p1"), empty("tonight"));
     }
 
+    /// `docs/legs.md`, *Seen* (wsp-294). A leg holds no claim, so `wip` reads
+    /// it off the row's `## Legs`: both running siblings are rows, each
+    /// typed as a leg with `leg: {name, after, index, of}`, the label is
+    /// `<task> · <leg>` with no `n/m`, and a leg that has written its baton
+    /// needs nobody while the tick has yet to end its seat.
+    #[test]
+    fn wip_shows_both_running_siblings_of_a_staged_row_and_a_done_leg_needs_nobody() {
+        use crate::legs::{Leg, State};
+        let mut w = wip_world();
+        let m = w.tasks.iter_mut().find(|t| t.id == "t-001").unwrap();
+        let mut plan = Leg::pending("plan", "decide");
+        plan.state = State::Done;
+        plan.pane = Some("cpd-40".into());
+        let mut store_leg = Leg { after: Some(vec!["plan".into()]), ..Leg::pending("build-store", "store") };
+        store_leg.state = State::Running;
+        store_leg.pane = Some("cpd-41".into());
+        let mut spawn_leg = Leg { after: Some(vec!["plan".into()]), ..Leg::pending("build-spawn", "spawn") };
+        spawn_leg.state = State::Running;
+        spawn_leg.pane = Some("cpd-42".into());
+        let finish = Leg { after: Some(vec!["build-store".into(), "build-spawn".into()]), ..Leg::pending("finish", "land") };
+        crate::legs::write(m, &[plan, store_leg, spawn_leg, finish]);
+        // The three bound to the row, as `leg_seat::attach` binds them, and none
+        // of them holding its claim.
+        for seat in ["cpd-40", "cpd-41", "cpd-42"] {
+            w.bindings.insert(seat.into(), json!({ "task_id": "t-001" }));
+            w.agents.push(seated_agent(seat, if seat == "cpd-40" { "idle" } else { "working" }, seat));
+        }
+
+        let j = wip_json(&w);
+        let row = |pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap().clone();
+        assert_eq!(row("cpd-41")["role"], json!({ "is": "leg", "task": "t-001", "leg": "build-store" }));
+        assert_eq!(row("cpd-42")["role"], json!({ "is": "leg", "task": "t-001", "leg": "build-spawn" }));
+        assert_eq!(row("cpd-41")["leg"], json!({ "name": "build-store", "after": ["plan"], "index": 2, "of": 4 }));
+        assert_eq!(
+            row("cpd-42")["leg"],
+            json!({ "name": "build-spawn", "after": ["plan"], "index": 3, "of": 4 }),
+            "the sibling is a row of its own"
+        );
+        assert_eq!(row("cpd-40")["leg"], json!({ "name": "plan", "after": [], "index": 1, "of": 4 }));
+        assert_eq!(row("cpd-41")["task"], "t-001 · build-store", "no n/m");
+        assert_eq!(row("cpd-41")["task_id"], "t-001", "still the row's");
+        assert_eq!(row("cpd-41")["model"], "sonnet", "the entry's policy, with no claim to read it from");
+        assert_eq!(row("cpd-41")["effort"], "medium");
+        // Idle on a `doing` row is `needs_you` for a member; for a leg that has
+        // written its baton it is the tick's to end.
+        assert_eq!(row("cpd-40")["needs_you"], false, "a done leg's seat waits on the tick");
+        assert_eq!(row("w2:p1")["needs_you"], true, "and a member still does");
+        assert_eq!(row("w1:p1")["leg"], json!(null), "a seat that is no leg says so");
+
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("t-001 · build-store"), "{text}");
+        assert!(text.contains("t-001 · build-spawn"), "{text}");
+        assert!(text.contains("legs 2 running, 1 done of 4"), "{text}");
+    }
+
     /// `wsp-246`. Every row says what its seat is, typed, so a reader placing
     /// it never parses `task` — one seat of each kind, each named off the
     /// record that makes it that: a project's and a list's governor off
@@ -8315,7 +8465,7 @@ mod tests {
         // t-003 is bound here, but its newest claim line is another pane's.
         w.bindings.insert("w7:p1".into(), json!({ "task_id": "t-003", "agent_kind": "claude" }));
         let groups = crate::model::parse_groups(
-            "- 1  m-1\n  checks: 2026-10-10T09:20:00Z running read:55c4839abcde pane:cpd-486\n          on:opencode+openrouter/some-model/high\n",
+            "- 1  m-1\n  checks: 2026-10-10T09:20:00Z running read:55c4839abcde pane:cpd-486\n          on:pi+openrouter/some-model/high\n",
         );
         let mut list = crate::model::Worklist::new("gpui-migration", "the list");
         list.set_groups(&groups);
@@ -8344,7 +8494,7 @@ mod tests {
         assert_eq!(runs("cpd-485"), (json!("claude"), json!("opus"), json!("high")), "a verifier, off its pass");
         assert_eq!(
             runs("cpd-486"),
-            (json!("opencode"), json!("openrouter/some-model"), json!("high")),
+            (json!("pi"), json!("openrouter/some-model"), json!("high")),
             "a check, off its entry, the model's own `/` kept"
         );
         assert_eq!(runs("w5:p1"), (json!("claude"), json!("opus"), json!("xhigh")), "a governor, off its record");
@@ -9948,5 +10098,22 @@ mod tests {
         assert_eq!(release(&store, &args), 2);
         assert!(store.bindings().contains_key("w1:p1"), "a refusal costs nothing");
         assert!(store.claims().contains_key("batch-043"));
+    }
+
+    /// wsp-290: the clauses a release line and a leg's end line carry, with the
+    /// peak between the turns and the spend, and left out where none was read.
+    #[test]
+    fn the_ran_clauses_carry_the_peak_between_turns_and_spend() {
+        use crate::agent_commands::{Ran, Spend};
+        let mut ran = Ran {
+            models: vec!["sonnet-5-5".into()],
+            efforts: vec!["high".into()],
+            turns: 63,
+            peak: 180_000,
+            spend: Spend { cache: 4_100_000, input: 100_000, output: 5_000, micros: None },
+        };
+        assert_eq!(ran_text(&ran), " · ran sonnet-5-5/high · 63 turns · peak 180k · 4.1M cache 100k in 5.0k out");
+        ran.peak = 0;
+        assert_eq!(ran_text(&ran), " · ran sonnet-5-5/high · 63 turns · 4.1M cache 100k in 5.0k out");
     }
 }

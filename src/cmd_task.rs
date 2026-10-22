@@ -715,6 +715,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         v["raised"] = json!(raised_about(store, &t.id).iter().map(|m| m.to_json()).collect::<Vec<_>>());
         // `wsp-241`: the passes, which were only ever inside `body`.
         v["verification"] = crate::verification::json(&t);
+        v["legs"] = crate::legs::json(&t);
         // `wsp-242`: where it is, as a word wsp derives and the tail the step
         // that put it there was given.
         // `wsp-255`: and when it entered each stage it has been in.
@@ -870,6 +871,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // arrived at the same way.
     let mut rest = crate::model::localise_dates(&t.body);
     crate::model::set_section_in(&mut rest, "Decisions", "");
+    // The legs as a table, the tier and what each waits on printed in full — the
+    // entry on disk leaves both implicit (`docs/legs.md`, *The record*).
+    if let Some(table) = crate::legs::section_for_show(&t) {
+        crate::model::set_section_in(&mut rest, crate::legs::SECTION, &table);
+    }
     // Lifted out and printed below rather than with the body, because it is the
     // one section that is capped. It is last in a body whatever order the file
     // was in — `set_section_in` above has just re-sorted the sections — so
@@ -1116,10 +1122,25 @@ pub fn done(store: &Store, args: &Args) -> i32 {
         }
         crate::cmd_agent::hand_off(store, &t.id, None, "done");
     }
-    mutate(store, args, "done", |t| {
+    let id = args.rest.first().and_then(|needle| store.find_task(needle)).map(|t| t.id);
+    let code = mutate(store, args, "done", |t| {
         t.set_status(Status::Done);
         t.log("→ done");
-    })
+    });
+    // And its tree, where the work is on the trunk (`wsp-305`). After the
+    // claim is let go, so a claim this verb has just ended does not keep it.
+    if let Some(id) = id.filter(|_| code == 0 && !args.has("keep-tree")) {
+        let out = crate::cmd_checkout::sweep_closed(store, &[id], false);
+        for line in crate::cmd_checkout::closed_lines(&out) {
+            // Beside the receipt, and off stdout under --json, which is one
+            // object a caller parses.
+            match args.json() {
+                true => eprintln!("wsp: {line}"),
+                false => println!("  {}", Paint::new().dim(&line)),
+            }
+        }
+    }
+    code
 }
 
 /// `wsp reopen <id> "what is owed"` — sending work back, as one act.
@@ -1160,18 +1181,169 @@ pub fn reopen(store: &Store, args: &Args) -> i32 {
     });
     if code == 0 {
         deliver_the_reason(store, args, reason.trim());
-        took_back_held_run(store, args, reason.trim());
+        let run = took_back_held_run(store, args, reason.trim());
+        reseat(store, args, run);
     }
     code
+}
+
+/// Who picks the work up, when nobody is holding the row. `wsp-304`.
+///
+/// **A reopen whose agent was gone left the row at `doing` with nobody on
+/// it.** compound-581 landed, was verified, its agent was released after 28m,
+/// and a regression sent it back: the row sat at `doing` and Ed had to ask
+/// for it to be forced open. The reason was on the row and nothing was going
+/// to read it.
+///
+/// **The run seats its own, and this seats the rest — never both.** A member
+/// of the group its run stands at ([`crate::worklist::Running::in_front`]) is
+/// the cycle's: its step reseats a member sent back with nobody on it
+/// (`sent_back_unseated`, `wsp-286`) under the group's policy and the seat's
+/// cap, so here it is only poked. So is a member of a group not yet reached,
+/// whose step comes when the run gets there, and a member of a held or parked
+/// list starts nothing, as `hold` and `park` promise. Any other row — on no
+/// list, or in a group already crossed — has no step to take it, so the reopen
+/// starts one itself: `wsp spawn <id> --agent` with the kind, model and effort
+/// it last ran with, the line its sender would otherwise have typed. Its work
+/// order is the brief, whose log ends in the `sent back:` line.
+///
+/// **Nobody holding it** is no binding and no claim, as for the run. A claim
+/// whose seat went is [`crate::repair`]'s. A row run as legs is sent back to a
+/// leg, which a reopen does not write, and a row no agent ever claimed was
+/// somebody's own work; both are said, with the verb that would seat one,
+/// rather than guessed at. `--no-seat` is the reopen that wants nobody yet.
+fn reseat(store: &Store, args: &Args, run: Option<String>) {
+    let Some(t) = args.rest.first().and_then(|n| store.task(n)) else { return };
+    let id = t.id.clone();
+    if t.status() != Status::Doing || !store.panes_for_task(&id).is_empty() || store.claims().contains_key(&id) {
+        return;
+    }
+    let p = Paint::new();
+    let say = |s: &str| {
+        if !args.json() {
+            println!("  {}", p.dim(s));
+        }
+    };
+    if crate::legs::staged(&t) {
+        say(&format!(
+            "no agent holds {id}, and it is run as legs: a reopen opens no leg — `wsp leg add {id} …` puts what is owed on one, and wsp starts it"
+        ));
+        return;
+    }
+    let running = crate::worklist::Running::read(store);
+    if let Some(p) = running.of(&id) {
+        if running.in_front(&id) {
+            // A held run taken back was poked by `reopened`, and said so.
+            if run.is_none() {
+                crate::cycle::poke_task(store, &id, "reopen");
+                say(&format!("no agent holds {id}: {} stands at its group, and the run seats it", p.list));
+            }
+            return;
+        }
+        if running.front(&p.list).is_some_and(|at| p.group > at) {
+            say(&format!(
+                "no agent holds {id}: it is in group {} of {}, which the run has not reached, and the run seats it there",
+                p.group, p.list
+            ));
+            return;
+        }
+    }
+    let stopped = store.worklists().into_iter().find(|w| {
+        matches!(w.status(), crate::model::WorklistStatus::Held | crate::model::WorklistStatus::Parked)
+            && w.groups().iter().any(|g| g.members.iter().any(|m| *m == id))
+    });
+    if let Some(w) = stopped {
+        say(&format!(
+            "no agent holds {id}, and {} is {}: nothing starts until it runs again — `wsp worklist show {}` says why",
+            w.id,
+            w.status().as_str(),
+            w.id
+        ));
+        return;
+    }
+    let ran = ran_with(store, &t);
+    if args.has("no-seat") {
+        let line = ran.map(|a| a.join(" ")).unwrap_or_else(|| format!("spawn {id} --agent"));
+        say(&format!("no agent holds {id} and nothing will pick it up — `wsp {line}` seats one"));
+        return;
+    }
+    let Some(argv) = ran else {
+        say(&format!(
+            "no agent holds {id}, and none ever claimed it — nothing will pick it up; `wsp spawn {id} --agent` seats one"
+        ));
+        return;
+    };
+    say(&format!("no agent holds {id} — seating one as it ran: wsp {}", argv.join(" ")));
+    let (said, code) = respawn(&argv, args.json());
+    if code != 0 {
+        eprintln!("wsp: {id} is at doing and nobody is on it — the spawn did not start ({said}); `wsp {}` retries", argv.join(" "));
+    }
+    let line = match code {
+        0 => format!("reseated after reopen: wsp {}", argv.join(" ")),
+        _ => format!("reseat after reopen failed: {said}"),
+    };
+    crate::cycle::log_line(store, &format!("{id}: {line}"));
+}
+
+/// `spawn <id> --agent` with the kind, model and effort the row last ran with,
+/// or `None` for a row no agent ever claimed.
+///
+/// **The tier is the claim line's `spawned at` clause** — what was asked for,
+/// in the words `--model` and `--effort` take — and not the release line's
+/// `ran`, which names what served (`sonnet-5-5`) and is not something to type.
+/// The effort is the last `/` segment, as [`crate::cmd_attempts`] reads it,
+/// because an opencode model has a `/` of its own. `default` is a half that
+/// was never stated, so it is left unstated again.
+///
+/// **The kind is the session wsp last learned for the row**
+/// ([`crate::cmd_resume::thread_for_task`], the record and then the event
+/// log), and the default kind where none was learned.
+fn ran_with(store: &Store, t: &Task) -> Option<Vec<String>> {
+    let log = t.section("Log").unwrap_or_default();
+    let claim = log.lines().filter(|l| l.contains("claimed by pane ")).last()?;
+    let kind = crate::cmd_resume::thread_for_task(store, &t.id).map(|th| th.kind).unwrap_or_default();
+    let mut argv = vec!["spawn".to_string(), t.id.clone(), "--agent".to_string()];
+    argv.extend(["--kind".to_string(), crate::cmd_spawn::kind_or_default(&kind)]);
+    let tier = claim.split(" · spawned at ").nth(1).and_then(|r| r.split(" · ").next()).map(str::trim);
+    if let Some((model, effort)) = tier.and_then(|s| s.rsplit_once('/')) {
+        for (flag, v) in [("--model", model), ("--effort", effort)] {
+            if !v.is_empty() && v != "default" {
+                argv.extend([flag.to_string(), v.to_string()]);
+            }
+        }
+    }
+    Some(argv)
+}
+
+/// Run `wsp <argv>` as the sender would have, in their environment, so the
+/// spawn records them as its spawner. Its own output is the receipt.
+fn respawn(argv: &[String], json: bool) -> (String, i32) {
+    if cfg!(test) {
+        #[cfg(test)]
+        tests::RESEATED.with(|r| r.borrow_mut().push(argv.to_vec()));
+        return (String::new(), 0);
+    }
+    let Ok(exe) = std::env::current_exe() else { return ("no wsp binary to run".to_string(), 1) };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(argv).stdin(std::process::Stdio::null());
+    if json {
+        cmd.stdout(std::process::Stdio::null());
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => (String::new(), 0),
+        Ok(s) => (format!("exit {}", s.code().unwrap_or(-1)), 1),
+        Err(e) => (e.to_string(), 1),
+    }
 }
 
 /// A member of a held run, sent back, takes the run back to its group —
 /// [`crate::cycle::reopened`] says when and why. Said here, after the row's own
 /// line, because the person who typed this is the one who should know their
-/// reopen also un-held a run.
-fn took_back_held_run(store: &Store, args: &Args, reason: &str) {
-    let Some(id) = args.rest.first().and_then(|n| store.task(n)).map(|t| t.id) else { return };
-    let Some((list, at)) = crate::cycle::reopened(store, &id, reason) else { return };
+/// reopen also un-held a run. Returns the list, so [`reseat`] does not say it
+/// twice.
+fn took_back_held_run(store: &Store, args: &Args, reason: &str) -> Option<String> {
+    let id = args.rest.first().and_then(|n| store.task(n)).map(|t| t.id)?;
+    let (list, at) = crate::cycle::reopened(store, &id, reason)?;
     if !args.json() {
         let p = Paint::new();
         println!(
@@ -1181,6 +1353,7 @@ fn took_back_held_run(store: &Store, args: &Args, reason: &str) {
             ))
         );
     }
+    Some(list)
 }
 
 /// Put the reason in the member's own pane, through the one delivery path.
@@ -1359,6 +1532,15 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", account.len()));
+    // From a leg's seat the row is not finished while a sibling runs, and from
+    // the last running leg the rest are skipped (`docs/legs.md`, *A leg is a
+    // seat*). Refused before the row moves.
+    if let Some(needle) = args.rest.first() {
+        if let Err(why) = crate::leg_seat::on_review(store, needle, &account, crate::cmd_agent::my_pane().as_deref()) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    }
     let code = mutate_saying(store, args, "review", said.as_deref(), |t| {
         t.set_status(Status::Review);
         // `review: …`, the shape `blocked:` and `parked:` already have — the
@@ -2954,14 +3136,36 @@ fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
             let mut v = t.json();
             // `wsp-274`: and since when, off the same timeline `show` gives.
             v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
+            // The objects `show --json` has, and absent on an unstaged row.
+            if t.body.contains(&format!("## {}", crate::legs::SECTION)) && !crate::legs::legs(t).is_empty() {
+                v["legs"] = crate::legs::json(t);
+            }
             v
         })
         .collect()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// What [`super::respawn`] would have run, instead of a real spawn.
+        pub(crate) static RESEATED: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn reseated() -> Vec<Vec<String>> {
+        RESEATED.with(|r| r.borrow_mut().drain(..).collect())
+    }
+
+    /// compound-581's shape: claimed at a tier, landed, reviewed, released.
+    fn released(store: &Store, id: &str, claim: &str) {
+        let mut t = Task::new(id, id);
+        t.set_status(Status::Review);
+        t.log(claim);
+        t.log("released after 28m · ran sonnet-5-5/high · 93 turns");
+        store.save_task(&t).unwrap();
+    }
 
     fn scratch(tag: &str) -> Store {
         let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
@@ -2987,6 +3191,25 @@ mod tests {
         let stage = &rows[0]["stage"];
         assert_eq!((&stage["word"], &stage["since"]), (&json!("started"), &json!("2026-10-08T08:00:00Z")), "{rows:?}");
         assert_ne!(stage["at"], stage["since"], "at stays the record's time");
+    }
+
+    /// `ls --json` gives a staged row the `legs` objects `show --json` has, and an
+    /// unstaged row none at all.
+    #[test]
+    fn ls_json_carries_a_staged_rows_legs_and_an_unstaged_row_none() {
+        let store = scratch("ls-legs");
+        let mut staged = Task::new("A staged row", "s-1");
+        staged.status_raw = "doing".into();
+        crate::legs::write(&mut staged, &[crate::legs::Leg::pending("scout", "look"), crate::legs::Leg::pending("finish", "land")]);
+        store.save_task(&staged).unwrap();
+        let mut plain = Task::new("An unstaged row", "s-2");
+        plain.status_raw = "doing".into();
+        store.save_task(&plain).unwrap();
+        let rows = rows_json(&store, &store.tasks());
+        let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap().clone();
+        assert_eq!(row("s-1")["legs"], crate::legs::json(&store.find_task("s-1").unwrap()));
+        assert_eq!(row("s-1")["legs"][1]["after"], json!(["scout"]));
+        assert!(row("s-2").get("legs").is_none(), "absent, not empty: {}", row("s-2"));
     }
 
     /// The occurrence, and it is `render-014`'s exactly: `wsp review render-014`
@@ -3828,6 +4051,54 @@ mod tests {
         Args::parse(line.iter().map(|s| (*s).to_string()).collect())
     }
 
+    /// `wsp-305`, at the verb: `done` takes the row's tree when its work is on
+    /// the trunk, and `--keep-tree` leaves it.
+    #[test]
+    fn done_takes_a_landed_rows_tree_and_keep_tree_leaves_it() {
+        let env = util::isolated("done-tree");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "--quiet", "-b", "master"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "--quiet", "-m", "first"]);
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut trees = Vec::new();
+        for id in ["p-001", "p-002"] {
+            let mut t = Task::new("a row", id);
+            t.project = Some("p".into());
+            t.set_status(Status::Review);
+            store.save_task(&t).unwrap();
+            let dir = crate::cmd_checkout::checkout_dir(&repo, id);
+            crate::cmd_checkout::ensure(&repo, &dir, id, "master").unwrap();
+            trees.push(dir);
+        }
+
+        assert_eq!(done(&store, &parse(&["done", "p-001"])), 0);
+        assert!(!trees[0].exists(), "a done row whose work is on the trunk kept its tree");
+        assert_eq!(done(&store, &parse(&["done", "p-002", "--keep-tree"])), 0);
+        assert!(trees[1].join(".git").exists(), "--keep-tree did not keep it");
+        assert_eq!(store.task("p-002").unwrap().status(), Status::Done);
+    }
+
     fn scratch_file(name: &str, text: &str) -> String {
         let p = std::env::temp_dir().join(format!("wsp-{name}-{}.md", std::process::id()));
         std::fs::write(&p, text).unwrap();
@@ -4169,5 +4440,54 @@ mod tests {
         assert_eq!(reopen(&store, &args), 0);
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
         assert!(crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow().is_empty()));
+        assert!(reseated().is_empty(), "no agent ever claimed it, so none is guessed at");
+    }
+
+    /// `wsp-304`. compound-581 was landed, verified and released, then sent
+    /// back for a regression: it sat at `doing` with nobody on it. A reopen
+    /// of a row whose agent has gone seats one, with the kind and tier it ran.
+    #[test]
+    fn a_reopen_after_the_agent_was_released_seats_one_as_it_ran() {
+        let store = scratch("reopenreseat");
+        released(&store, "m-1", "claimed by pane cpd-1306 · spawned at sonnet/high");
+        store.log_event("session-learned", serde_json::json!({ "id": "m-1", "kind": "opencode", "pane": "cpd-1306", "session": "s-1" }));
+
+        let args = Args::synth("reopen", &["m-1", "regression: the tab draws empty"], &[]);
+        assert_eq!(reopen(&store, &args), 0);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
+        assert_eq!(
+            reseated(),
+            [["spawn", "m-1", "--agent", "--kind", "opencode", "--model", "sonnet", "--effort", "high"]],
+            "one spawn, at what it ran with"
+        );
+    }
+
+    /// An opencode model has a `/` of its own, and an unstated half stays
+    /// unstated; with no session learned the kind is the default.
+    #[test]
+    fn the_tier_splits_at_the_last_slash_and_default_is_left_unsaid() {
+        let store = scratch("reopenreseattier");
+        released(&store, "m-1", "claimed by pane w2:p1 · spawned at opencode/x-free/default");
+
+        assert_eq!(reopen(&store, &Args::synth("reopen", &["m-1", "again"], &[])), 0);
+        let kind = crate::cmd_spawn::kind_or_default("");
+        assert_eq!(reseated(), [vec!["spawn", "m-1", "--agent", "--kind", kind.as_str(), "--model", "opencode/x-free"]]);
+    }
+
+    /// The agent still in its seat was just told what is owed: a second one
+    /// would be two agents in one tree. And `--no-seat` asks for nobody.
+    #[test]
+    fn a_reopen_seats_nobody_beside_a_bound_agent_or_when_told_not_to() {
+        let store = scratch("reopenreseatheld");
+        released(&store, "m-1", "claimed by pane cpd-1 · spawned at opus/high");
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        assert_eq!(reopen(&store, &Args::synth("reopen", &["m-1", "one more thing"], &[])), 0);
+        assert!(reseated().is_empty(), "its agent is there and was told");
+        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().clear());
+
+        released(&store, "m-2", "claimed by pane cpd-2 · spawned at opus/high");
+        assert_eq!(reopen(&store, &Args::synth("reopen", &["m-2", "later"], &[("no-seat", "true")])), 0);
+        assert!(reseated().is_empty(), "--no-seat leaves it to whoever sent it back");
+        assert_eq!(store.find_task("m-2").unwrap().status(), Status::Doing);
     }
 }
