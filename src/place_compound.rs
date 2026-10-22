@@ -734,8 +734,8 @@ impl Compound<'_> {
     /// second-guess.
     ///
     /// `None` when there is nothing to ask at all: no socket minted yet, or
-    /// an agent kind the ported engine has no manifest for — only `claude`
-    /// and `opencode` are compiled (`compound-109`'s overview); anything else
+    /// an agent kind the ported engine has no manifest for — only `claude`,
+    /// `opencode` and `pi` are compiled (`compound-109`'s overview); anything else
     /// falls back to [`State::Unknown`] exactly as it did before this
     /// existed.
     fn detected_state(&self, seat: &Seat, rec: &Value) -> Option<State> {
@@ -837,6 +837,10 @@ impl Compound<'_> {
 /// one. wsp does not own the manifest this mirrors; a rule changing there is
 /// a `compound-113`-shaped row on the compound side, not a silent divergence
 /// here — this is two characters, not the engine.
+///
+/// pi's manifest carries no `osc_title` rule either (only `working_literal`
+/// on the screen), so it returns `None` for pi too: a pi seat whose renderer
+/// died reads `Unknown`, the honest answer.
 fn title_state(kind: &str, osc_title: &str) -> Option<State> {
     // Claude-only: the title glyph rule is Claude Code's; a data kind reads None.
     if kind != "claude" {
@@ -1234,9 +1238,7 @@ impl Compound<'_> {
 /// `tokenhub-spec-sync` shape, a pane that never comes up paid for every
 /// twenty minutes. [`crate::repair`] asks this before it spends anything.
 pub(crate) fn reads_kind(kind: &str) -> bool {
-    // Compound ships manifests for these two only; a data kind is unreadable
-    // there, so a governor on one is refused rather than left Unknown.
-    matches!(kind, "claude" | "opencode")
+    matches!(kind, "claude" | "opencode" | "pi")
 }
 
 impl Place for Compound<'_> {
@@ -2054,6 +2056,65 @@ mod tests {
         assert!(until(|| !socket.exists()), "compound-sup left its socket behind");
         assert!(until(|| !label_path.exists()), "the label sidecar outlived its socket");
         assert!(place.record(&seat).is_err(), "the seat directory itself must go with stop");
+    }
+
+    #[test]
+    fn a_pi_seat_is_readable_but_has_no_title_to_fall_back_on() {
+        assert!(reads_kind("pi"));
+        assert!(!reads_kind("pie"));
+        // pi.toml has no osc_title rule: with no renderer, whatever the title
+        // says, there is no answer to give.
+        assert_eq!(title_state("pi", "\u{2733} pi"), None);
+        assert_eq!(title_state("pi", "\u{280B} pi"), None);
+    }
+
+    /// What `state()` says for a pi seat, pinned against screens captured from
+    /// pi 1.3.0 (the same ones `compound#1`'s `pi_captured_screens_are_detected_as_the_manifest_does`
+    /// pins). **A working or blocked pi reads `Idle` here**: the vendored
+    /// `pi.toml` only has a `Working...` literal, so pi's spinner line and its
+    /// select prompt match nothing. That is a gap in herdr's manifest, not in
+    /// this backend; when a manifest sync closes it this test fails and the
+    /// row moves.
+    ///
+    /// Skips without `compound-sup` and `compound-render` (not hermetic about
+    /// them, like the `#[ignore]`d smokes); a script named `pi` on the seat's
+    /// `PATH` stands in for the binary and prints one screen, so no model runs.
+    #[test]
+    fn detected_state_for_a_pi_seat_reads_the_manifest_not_the_truth() {
+        if compound_sup_binary().is_none() || compound_render_binary().is_none() {
+            eprintln!("skipped: needs compound-sup and compound-render (set COMPOUND_SUP / COMPOUND_RENDER or put them on PATH)");
+            return;
+        }
+        let rule = "\u{2500}".repeat(100);
+        let foot = format!("{rule}\n\n{rule}\n~/work\n0.0%/262k (auto)    (local) qwen3.8-27b \u{2022} medium\n");
+        let cases = [
+            ("idle editor", "\u{2580}\u{2580}\u{2588}  v1.3.0\nescape interrupt \u{b7} ctrl+c/ctrl+d clear/exit", State::Idle),
+            ("Working... literal", "Working...", State::Working),
+            // pi is working, the manifest says idle
+            ("spinner and Working", "122. One hundred and twenty-two\n\n\u{2500}\u{2500} \u{2826} Working \u{2500}\u{2500}", State::Idle),
+            // pi is blocked on a prompt, the manifest says idle
+            ("select prompt", " Allow this command?  rm -rf build/\n\n \u{2192} Yes\n   No\n\n \u{2191}\u{2193} navigate  enter select  escape/ctrl+c cancel", State::Idle),
+        ];
+        for (name, body, want) in cases {
+            let scratch = Scratch::new("pi-detect");
+            let bin = scratch.root.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            let screen = scratch.root.join("screen.txt");
+            fs::write(&screen, format!("{body}\n{foot}")).unwrap();
+            let script = bin.join("pi");
+            fs::write(&script, format!("#!/bin/sh\ncat '{}'\nexec sleep 600\n", screen.display())).unwrap();
+            fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+
+            let place = scratch.place();
+            let seat = place
+                .open(&Order { label: "pi-support-007".into(), env: BTreeMap::from([("PATH".into(), path)]), ..Order::default() })
+                .expect("a seat");
+            place.start(&seat, &Agent { kind: "pi".into(), name: "pi".into(), args: vec![] }).expect("started");
+            let drawn = until(|| place.read_screen(&seat).is_ok_and(|t| t.contains("0.0%/262k")));
+            assert!(drawn, "{name}: the screen never drew: {:?}", place.read_screen(&seat));
+            assert_eq!(place.state(&seat).unwrap(), want, "{name}");
+        }
     }
 
     /// `compound-109`'s barrier: `idle` is not proof `detected_state`
