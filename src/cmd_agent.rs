@@ -8456,7 +8456,7 @@ mod tests {
         // t-003 is bound here, but its newest claim line is another pane's.
         w.bindings.insert("w7:p1".into(), json!({ "task_id": "t-003", "agent_kind": "claude" }));
         let groups = crate::model::parse_groups(
-            "- 1  m-1\n  checks: 2026-10-10T09:20:00Z running read:55c4839abcde pane:cpd-486\n          on:opencode+openrouter/some-model/high\n",
+            "- 1  m-1\n  checks: 2026-10-10T09:20:00Z running read:55c4839abcde pane:cpd-486\n          on:pi+openrouter/some-model/high\n",
         );
         let mut list = crate::model::Worklist::new("gpui-migration", "the list");
         list.set_groups(&groups);
@@ -8485,7 +8485,7 @@ mod tests {
         assert_eq!(runs("cpd-485"), (json!("claude"), json!("opus"), json!("high")), "a verifier, off its pass");
         assert_eq!(
             runs("cpd-486"),
-            (json!("opencode"), json!("openrouter/some-model"), json!("high")),
+            (json!("pi"), json!("openrouter/some-model"), json!("high")),
             "a check, off its entry, the model's own `/` kept"
         );
         assert_eq!(runs("w5:p1"), (json!("claude"), json!("opus"), json!("xhigh")), "a governor, off its record");
