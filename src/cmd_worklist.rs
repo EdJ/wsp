@@ -6085,6 +6085,10 @@ mod tests {
     /// its barrier reads each row against that row's own done-when.
     #[test]
     fn a_non_blocking_follow_up_becomes_the_next_group_ahead_of_a_planned_one() {
+        // `--next` goes on to `go_with`, whose sweep asks herdr who is standing
+        // in each tree, so this one needs a herdr of its own — it passed only
+        // while another test's guard happened to be up in the same process.
+        let _env = util::isolated("followup-next");
         let store = scratch("followup-next");
         task(&store, "wl-001", "review");
         task(&store, "wl-003", "todo");
