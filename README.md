@@ -2585,6 +2585,34 @@ are yours, and a deny rule states that better than a paragraph does — an agent
 that finishes to `review` because the rule says so is one prompt away from
 finishing to `done` when the rule is forgotten.
 
+### Wiring it to pi
+
+Nothing to do by hand: `wsp install` writes `pi/wsp-session.ts` to
+`~/.pi/agent/extensions/` (or `$PI_CODING_AGENT_DIR/extensions/`) on a machine
+where pi is set up, and `wsp doctor` says when it is missing or is not the copy
+the live binary carries. The copy written is asked of the binary just installed
+(`wsp agent pi-extension` prints it), not of the one doing the installing.
+
+pi has no hooks, so the extension is them. It sends the same names
+`wsp-session.sh` does, so `wsp report` reads a pi exactly as it reads a Claude
+Code session:
+
+| pi | `wsp report` |
+|---|---|
+| `session_start` | `SessionStart` |
+| `agent_start` | `UserPromptSubmit` |
+| `agent_settled`, and idle | `Stop` |
+| `ui_prompt_start` — an extension's dialog, the only way pi waits on a person | `PermissionRequest` |
+| `ui_prompt_end` | `UserPromptSubmit` or `Stop`, whichever is underneath |
+| `session_shutdown` on quit — not on `/new`, `/resume`, `/fork` or reload | `SessionEnd` |
+
+It does nothing without `WSP_SEAT_ID`, and nothing in a pi started by another
+pi's bash tool — `PI_SESSION_ID` in its environment says so, which is why
+`place::shed` keeps that name off a seat wsp starts. It sits beside herdr's
+`herdr-agent-state.ts` and does not touch it; a pane can run both. It sends
+pi's session id and not its session file, which `wsp burn` would misread as a
+Claude Code transcript.
+
 ### The standing rules
 
 `~/wsp/agents.md`, if it exists, is printed at the end. The protocol an agent

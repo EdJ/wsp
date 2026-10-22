@@ -1047,7 +1047,7 @@ fn needs_store(args: &Args) -> bool {
     if matches!(args.cmd.as_str(), "init" | "doctor") {
         return false;
     }
-    if args.cmd == "agent" && args.rest.first().map(String::as_str) == Some("kinds") {
+    if args.cmd == "agent" && matches!(args.rest.first().map(String::as_str), Some("kinds" | "pi-extension")) {
         return false;
     }
     !(args.cmd == "panel" && args.rest.first().map(String::as_str) == Some("storyboard"))
@@ -1828,6 +1828,8 @@ fn help_text() -> String {
                                     default, resume, models, efforts — for a menu
                                     that should not keep its own list. Any other
                                     kind herdr can start is passed by --kind
+  wsp agent pi-extension            the pi extension this binary carries, which
+                                    `wsp install` writes into pi's extensions
   wsp wip                           everything in flight, with agents
   wsp stamp [--headless] [--json]   has anything changed? Three opaque tokens
                                     for a separate process polling on an
@@ -2681,6 +2683,7 @@ mod tests {
         assert!(!needs_store(&Args::synth("panel", &["storyboard"], &[])));
         assert!(!needs_store(&Args::synth("init", &[], &[])));
         assert!(!needs_store(&Args::synth("doctor", &[], &[])));
+        assert!(!needs_store(&Args::synth("agent", &["pi-extension"], &[])));
 
         // The exemption is that one subcommand and no more of `panel`: the
         // live panel reads the store on its first frame, and letting it start
