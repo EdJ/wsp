@@ -6992,6 +6992,23 @@ mod tests {
         assert!(crate::message::raised(&store).is_empty());
     }
 
+    /// Archive a row **as an older build did**, leaving what was raised about it
+    /// standing. This build closes those with the row (`wsp-308`), so an orphan
+    /// is no longer made by `wsp rm`; the records an older binary already left
+    /// are what `doctor` still has to name, and this puts one back as it was.
+    fn archive_leaving_hands_up(store: &Store, id: &str) {
+        let standing: Vec<_> = crate::message::raised(store);
+        store.archive_task(&store.task(id).unwrap()).unwrap();
+        for m in standing {
+            let mut m = store.message(&m.id).unwrap();
+            if !m.is_open() {
+                m.via.pop();
+                m.state_raw = "open".into();
+                store.save_message(&m).unwrap();
+            }
+        }
+    }
+
     /// `doctor` says what the panel draws, which for a while nothing else did.
     ///
     /// ui-006's second half. Clearing an orphaned hand was fixed by resolving
@@ -7015,7 +7032,7 @@ mod tests {
         crate::message::health(&store, &store.tasks(), &store.archived_ids(), &mut problems);
         assert!(problems.is_empty(), "{problems:?}");
 
-        store.archive_task(&store.task("wsp-001").unwrap()).unwrap();
+        archive_leaving_hands_up(&store, "wsp-001");
         assert!(store.task("wsp-001").is_none(), "the subject is gone");
 
         crate::message::health(&store, &store.tasks(), &store.archived_ids(), &mut problems);
@@ -7064,7 +7081,7 @@ mod tests {
             raise_one(&store, &["wsp-001", "take this?"], &[("ask", "claim"), ("pane", "w4:p2")]),
             0
         );
-        store.archive_task(&store.task("wsp-001").unwrap()).unwrap();
+        archive_leaving_hands_up(&store, "wsp-001");
 
         let mut problems = Vec::new();
         crate::message::health(&store, &store.tasks(), &store.archived_ids(), &mut problems);
