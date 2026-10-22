@@ -628,15 +628,18 @@ pub fn work_order(subject: &str, how: Handover) -> String {
     }
 }
 
-/// *When to stage* (`docs/legs.md`), for the two seats that file rows: an
-/// author stages a big row as it files it (`wsp-311`). compound-758 was filed
-/// "M-L. Split it if larger", which left the split to the seat that met it, and
-/// that seat reached for sub-tasks no run would start. One line, ASCII, for the
-/// reason the orders it goes into are.
+/// How the two seats that file rows split a big one: into sub-tasks, as it is
+/// planned, each made a member (`wsp-311`). Legs are the working seat's, for a
+/// row that turns out bigger once it is under way (Ed, 2026-10-22: "decompose
+/// using legs when working, but using add --parent when planning").
+/// compound-758 was filed "M-L. Split it if larger", which left the split to
+/// the seat that met it, and that seat reached for sub-tasks no run would
+/// start. One line, ASCII, for the reason the orders it goes into are.
 const STAGE_WHEN_FILED: &str = "A row you file or direct that will run past ~80 turns, or cross more than one \
-     layer, is staged when it is filed: `wsp leg add <id> <name> --order FILE` per leg (scout, plan, a build per \
-     layer, finish; Sonnet unless a leg says why; docs/legs.md, When to stage), or split into rows that are each a \
-     member with its own done-when. Never file one as \"split it if larger\": the seat that meets it splits alone.";
+     layer, is decomposed when it is planned: `wsp add \"...\" --parent <id>` per piece, each with its own overview \
+     and done-when, and on a list `wsp worklist add <list> <id> --sub` makes the pieces members, since a sub-task \
+     no list holds is never started or verified. Never file one as \"split it if larger\": the seat that meets it \
+     can only stage legs inside its one row.";
 
 /// What a task's work order adds when the tree it starts in already holds
 /// uncommitted work — empty otherwise. `wsp-171`'s second half.
@@ -8812,15 +8815,16 @@ mod tests {
     /// `wsp-311`: the two seats that file rows stage a big one as they file it,
     /// and a member's order leaves the split to its brief.
     #[test]
-    fn the_seats_that_file_rows_are_told_to_stage_a_big_one_when_filing_it() {
+    fn the_seats_that_file_rows_are_told_to_split_a_big_one_into_member_sub_tasks_when_planning_it() {
         let cases = [
             ("a custodian or list governor", work_order("core", Handover::Custodian), true),
             ("the primary interface", work_order(cmd_govern::PRIMARY, Handover::Primary), true),
             ("a member", work_order("m-1", Handover::Spawned), false),
         ];
         for (who, order, told) in cases {
-            assert_eq!(order.contains("`wsp leg add <id> <name> --order FILE`"), told, "{who}: {order}");
-            assert_eq!(order.contains("When to stage"), told, "{who}: {order}");
+            assert_eq!(order.contains("--parent <id>` per piece"), told, "{who}: {order}");
+            assert_eq!(order.contains("`wsp worklist add <list> <id> --sub`"), told, "{who}: {order}");
+            assert!(!order.contains("wsp leg add"), "{who}: legs are the working seat's, not the planner's: {order}");
             assert_eq!(order.contains("split it if larger"), told, "{who}: {order}");
             assert!(!order.contains('\n') && order.is_ascii(), "{who}: one ASCII line");
         }

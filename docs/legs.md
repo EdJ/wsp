@@ -4,9 +4,11 @@
 **Built**: the record (`wsp-291`), the seat (`wsp-292`), the trees and the merge
 (`wsp-297`), the run (`wsp-293`), wip and captions (`wsp-294`) and the cost
 table (`wsp-290`), then trialled on three real rows (`wsp-295`, *The trial*).
-A row too big for one seat is staged with `wsp leg add`, never split into
-sub-tasks: *When to stage*, and *Staging a row already running* for a seat
-that finds out mid-row (`wsp-311`). The build rows are at the end.
+A seat that finds the row it is working too big stages the rest with
+`wsp leg add`, never sub-tasks (*Staging a row already running*, `wsp-311`).
+A row split while it is planned is split into sub-tasks with `wsp add
+--parent`, each made a list member (Ed, 2026-10-22). The build rows are at
+the end.
 
 ## The decision
 
@@ -681,9 +683,12 @@ leg. Around the route:
   When a verifier opens on it, its governor is told once, and the verifier's
   order names the sub-tasks and asks for the done-when to be checked item by
   item.
-- The governor's and the primary interface's orders carry this rule, so an
-  author stages a big row when filing it and does not write "split it if
-  larger".
+- Planning is the other half. The governor's and the primary interface's
+  orders say to split a big row as it is filed, with `wsp add --parent` per
+  piece, each with a done-when, made members with `wsp worklist add <list>
+  <id> --sub`, and never to file one as "split it if larger" (Ed,
+  2026-10-22: "decompose using legs when working, but using add --parent
+  when planning").
 
 **When the builds run side by side.** Overlap does not change the token
 saving. Each leg's spend is the same whether its sibling runs at the same time
