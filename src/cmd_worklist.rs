@@ -2116,6 +2116,8 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                 // The newest hold's caption, whether or not the list is still
                 // held: it is the last thing said about why it stopped.
                 "hold_caption": hold_caption(&w).map(|c| c.json()),
+                // Members split into sub-tasks no run starts (`wsp-311`).
+                "unrun": crate::split::json(&crate::split::on_list(&tasks, &w, &worklist::Running::read(store))),
             }))
             .unwrap_or_default()
         );
@@ -2289,6 +2291,18 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // A member whose seat split it into sub-tasks the run will never start
+    // (`wsp-311`, compound-758). Said while the member is worked, which is
+    // while there is still time to stage the rest as legs, and while it waits
+    // on its verdict.
+    let unrun = unrun_lines(&p, &crate::split::on_list(&tasks, &w, &worklist::Running::read(store)));
+    if !unrun.is_empty() {
+        println!();
+        for line in unrun {
+            println!("{line}");
+        }
+    }
+
     // The prose, minus the two sections that are not prose: `Groups` is drawn
     // above and `Log` grows for ever, so it is named and counted rather than
     // printed into every reading of the plan.
@@ -2308,6 +2322,28 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         );
     }
     0
+}
+
+/// `show`'s block for members split into sub-tasks no run starts
+/// ([`crate::split`]): a line a member, and what to do about it. Empty when
+/// there are none.
+pub(crate) fn unrun_lines(p: &Paint, found: &[(&crate::model::Task, Vec<&crate::model::Task>)]) -> Vec<String> {
+    if found.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = found
+        .iter()
+        .enumerate()
+        .map(|(i, (m, subs))| {
+            format!("{}  {}", p.dim(&util::pad(if i == 0 { "unrun" } else { "" }, 8)), p.yellow(&crate::split::line(m, subs)))
+        })
+        .collect();
+    out.push(format!(
+        "{}  {}",
+        util::pad("", 8),
+        p.dim("not members, so nothing starts or verifies them · stage the rest as legs: docs/legs.md")
+    ));
+    out
 }
 
 // ---- running it: the barrier ------------------------------------------

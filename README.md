@@ -2955,6 +2955,15 @@ The rules are the few that keep the tree honest:
   ids. A cycle is worth refusing rather than reporting because it resolves at
   every step: nothing downstream notices, `nest` draws the loop flat, and the
   tree quietly hangs a row beneath itself.
+- **A list member's own seat does not split it into sub-tasks** (`wsp-311`).
+  A sub-task is not a member, so no run starts it, verifies it or brings it
+  to a barrier. `wsp add --parent <row>` from a seat bound to that row,
+  while it is a member at doing, is refused and names legs instead: commit,
+  `wsp leg add` the rest, `wsp release` (`docs/legs.md`, *Staging a row
+  already running*). `--anyway` files it regardless, and `wsp worklist
+  show` lists it as **unrun** under its member until it closes. A follow-up
+  under a member at review, and anything a person or a barrier check files,
+  is not refused.
 - **Filtering never drops a child.** A task whose parent is not in the list is
   drawn at the top level rather than hidden; a row indented under nothing is
   just a row that looks broken.

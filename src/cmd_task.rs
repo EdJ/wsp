@@ -12,6 +12,12 @@ use crate::util::{self, Paint};
 use crate::Args;
 
 pub fn add(store: &Store, args: &Args) -> i32 {
+    add_from(store, args, crate::cmd_agent::my_pane().as_deref())
+}
+
+/// [`add`] from the seat `pane`, so a test says where it stands rather than
+/// reading this process's environment.
+pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     let title = args.text(0);
     if title.trim().is_empty() {
         eprintln!("usage: wsp add \"title\" [-p project] [-t tag]… [--prio high] [--parent id] [--after id,…]");
@@ -55,6 +61,21 @@ pub fn add(store: &Store, args: &Args) -> i32 {
                 return 1;
             }
         },
+        None => None,
+    };
+    // A member's own seat splitting its row into sub-tasks no run will start
+    // (`wsp-311`, compound-758). Read whether or not it applies, so the flag is
+    // never refused as unknown on an ordinary add.
+    let anyway = args.has("anyway");
+    let unrun = match parent.as_ref().and_then(|p| {
+        crate::split::refusal(p, &store.bindings(), &crate::worklist::Running::read(store), pane)
+    }) {
+        Some(why) if !anyway => {
+            eprintln!("wsp: {why}");
+            eprintln!("     `--anyway` files it regardless, as a row nothing runs");
+            return 1;
+        }
+        Some(_) => parent.as_ref().map(|p| p.id.clone()),
         None => None,
     };
     // And what it rests on, for the same reason: resolved while there is no id
@@ -156,6 +177,9 @@ pub fn add(store: &Store, args: &Args) -> i32 {
                 t.status().as_str()
             ))
         );
+        if let Some(parent) = &unrun {
+            println!("  {}", p.yellow(&crate::split::filed_anyway(parent, &t.id)));
+        }
     }
     0
 }
@@ -4384,6 +4408,44 @@ pub(crate) mod tests {
     fn text_before_the_first_bullet_is_an_entry_of_its_own() {
         let log = "a line somebody wrote without a bullet\n- 2026-08-19 filed\n";
         assert_eq!(log_entries(log).len(), 2, "counted, so `--log` is what prints it");
+    }
+
+    /// `wsp-311`, compound-758's shape: the seat working a member at doing files
+    /// a sub-task under it. Refused, nothing filed, and the refusal names legs;
+    /// `--anyway` files it. The same from a seat not bound to the member, and
+    /// under the member once it is at review, files it with nothing said.
+    #[test]
+    fn add_parent_from_the_seat_working_a_member_is_refused_without_anyway() {
+        let store = scratch("add-parent-member");
+        let mut m = Task::new("Build the four pieces", "m-1");
+        m.set_status(Status::Doing);
+        crate::model::set_section_in(&mut m.body, "Overview", "Four pieces.\n\nDone when: all four land.");
+        store.save_task(&m).unwrap();
+        let mut w = crate::model::Worklist::new("tweaks-next", "tweaks-next");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        let children = |s: &Store| s.tasks().into_iter().filter(|t| t.parent.as_deref() == Some("m-1")).count();
+
+        let piece = |anyway: bool| {
+            let mut flags = vec![("parent", "m-1")];
+            if anyway {
+                flags.push(("anyway", "true"));
+            }
+            Args::synth("add", &["The Review tab"], &flags)
+        };
+        assert_eq!(add_from(&store, &piece(false), Some("cpd-1")), 1, "refused from the member's own seat");
+        assert_eq!(children(&store), 0, "and nothing was filed");
+        assert_eq!(add_from(&store, &piece(true), Some("cpd-1")), 0, "--anyway files it");
+        assert_eq!(children(&store), 1);
+        assert_eq!(add_from(&store, &piece(false), Some("cpd-9")), 0, "a seat not working the member is not refused");
+        assert_eq!(add_from(&store, &piece(false), None), 0, "nor a person");
+        let mut m = store.find_task("m-1").unwrap();
+        m.set_status(Status::Review);
+        store.save_task(&m).unwrap();
+        assert_eq!(add_from(&store, &piece(false), Some("cpd-1")), 0, "a follow-up under a member at review is not refused");
+        assert_eq!(children(&store), 4);
     }
 
     /// `wsp-163`, and the whole of it in one verb. Sending work back and moving

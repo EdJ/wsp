@@ -74,6 +74,7 @@ mod repair;
 mod resolve;
 mod room;
 mod sharing;
+mod split;
 mod stage;
 mod story;
 mod store;
@@ -1592,7 +1593,9 @@ fn help_text() -> String {
 
 {tasks}
   wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]
-  wsp add "title" --parent <id>     a sub-task, filed where its parent is
+  wsp add "title" --parent <id>     a sub-task, filed where its parent is; refused from
+                                    a seat working that member, which stages legs instead
+                                    (`--anyway` files it, unrun)
   wsp add "title" --caption "…"     …with the line a glance reads, under 60
   wsp add "title" --after <id>[,<id>…]   …that rests on those, as `wsp after`
   wsp ls [-p proj] [-t tag] [-s status] [--all]

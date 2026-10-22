@@ -578,7 +578,7 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              (the verdict is on the member under ## Verification), a barrier held, a \
              barrier passed. Your job is those decisions and the record: answer what somebody \
              is blocked on, write the direction an arriving agent needs and no more, and keep \
-             decisions and corrections on the rows rather than in this conversation. Do not \
+             decisions and corrections on the rows rather than in this conversation. {stage} Do not \
              review, rebase, test or land yourself, and never spawn, verify, nudge or relay a \
              step of the run: wsp verifies each member as it lands, and an agent you `wsp spawn` \
              is for work no row owns yet. Sending work back is `wsp reopen <id> \"what is owed\"`, which moves the row, \
@@ -595,7 +595,8 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              Work that is not {subject}'s (a row for another project, an agent spawned for the \
              person, the machine's load, a message for another seat) is the primary \
              interface's: say so, or with the person's yes pass it on with `wsp govern primary \
-             --tell -`, and go back to {subject}."
+             --tell -`, and go back to {subject}.",
+            stage = STAGE_WHEN_FILED,
         ),
         // `wsp-234`'s write-up, in the README under *The primary interface*,
         // is the argument for every clause: its job is the person's side of
@@ -603,7 +604,7 @@ pub fn work_order(subject: &str, how: Handover) -> String {
         // Ed's. The subject is not named because it is always the same seat.
         // One line, because some kinds take the order in argv, where a control
         // character is refused.
-        Handover::Primary => "You are the primary interface: the one standing seat that is no \
+        Handover::Primary => format!("You are the primary interface: the one standing seat that is no \
              project's, where the person talks to the fleet. You have not been claimed onto a \
              task and you should not claim one, and you govern nothing: no project, no list, no \
              step of a run. Your brief is already above. Your job is the person's side of the \
@@ -614,7 +615,7 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              \"...\"`, and only for words they typed this turn, never for an answer you worked out. \
              File work that no project's seat owns with `wsp add -p <project>`, naming the \
              project every time because you stand in none, and spawn or end an agent when the \
-             person asks. Carry a message to a seat with `wsp govern <scope> --tell -`; the \
+             person asks. {STAGE_WHEN_FILED} Carry a message to a seat with `wsp govern <scope> --tell -`; the \
              seat that receives it decides it, not you. A project's decisions are its \
              custodian's and a list's are its governor's: carry the person's sentence there \
              rather than making the change, unless the person says you should, and then note on \
@@ -623,9 +624,19 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              is about, and never only in this conversation: this seat is reset, not handed \
              over. When nothing is asked of you, stop; the person comes to this pane when they \
              want you."
-            .to_string(),
+        ),
     }
 }
+
+/// *When to stage* (`docs/legs.md`), for the two seats that file rows: an
+/// author stages a big row as it files it (`wsp-311`). compound-758 was filed
+/// "M-L. Split it if larger", which left the split to the seat that met it, and
+/// that seat reached for sub-tasks no run would start. One line, ASCII, for the
+/// reason the orders it goes into are.
+const STAGE_WHEN_FILED: &str = "A row you file or direct that will run past ~80 turns, or cross more than one \
+     layer, is staged when it is filed: `wsp leg add <id> <name> --order FILE` per leg (scout, plan, a build per \
+     layer, finish; Sonnet unless a leg says why; docs/legs.md, When to stage), or split into rows that are each a \
+     member with its own done-when. Never file one as \"split it if larger\": the seat that meets it splits alone.";
 
 /// What a task's work order adds when the tree it starts in already holds
 /// uncommitted work — empty otherwise. `wsp-171`'s second half.
@@ -8796,5 +8807,22 @@ mod tests {
         let primary = work_order(cmd_govern::PRIMARY, Handover::of_seat(cmd_govern::PRIMARY));
         assert!(primary.contains("--as-person") && primary.contains("govern nothing"), "{primary}");
         assert!(!primary.contains('\n'), "one line, for a kind that takes it in argv");
+    }
+
+    /// `wsp-311`: the two seats that file rows stage a big one as they file it,
+    /// and a member's order leaves the split to its brief.
+    #[test]
+    fn the_seats_that_file_rows_are_told_to_stage_a_big_one_when_filing_it() {
+        let cases = [
+            ("a custodian or list governor", work_order("core", Handover::Custodian), true),
+            ("the primary interface", work_order(cmd_govern::PRIMARY, Handover::Primary), true),
+            ("a member", work_order("m-1", Handover::Spawned), false),
+        ];
+        for (who, order, told) in cases {
+            assert_eq!(order.contains("`wsp leg add <id> <name> --order FILE`"), told, "{who}: {order}");
+            assert_eq!(order.contains("When to stage"), told, "{who}: {order}");
+            assert_eq!(order.contains("split it if larger"), told, "{who}: {order}");
+            assert!(!order.contains('\n') && order.is_ascii(), "{who}: one ASCII line");
+        }
     }
 }

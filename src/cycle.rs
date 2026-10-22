@@ -849,6 +849,15 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
         let label = crate::verification::seat_label(&member.id);
         if let Some(opened) = open_verifier(store, &member, &on, &gone, &|| gate.admits(&label)) {
+            // A member split into sub-tasks no run started (`wsp-311`): its
+            // governor hears it once for each landing, as the pass opens.
+            if !opened.again {
+                let tasks = store.tasks();
+                let unrun = crate::split::unrun(&tasks, &member.id, &worklist::Running::read(store));
+                if !unrun.is_empty() {
+                    tell(store, &w, &crate::split::told(&w.id, &member, &unrun));
+                }
+            }
             if let Some(seat) = &opened.lost {
                 log_line(store, &format!(
                     "{} group {at}: {}'s verifier in {seat} is gone with no verdict — starting another",
@@ -1442,7 +1451,10 @@ fn take_legs(
         }
         let claims = store.claims();
         match (t.status(), rows) {
-            (Status::Doing, Rows::Started) => {}
+            // A row somebody holds whole opens no leg (`wsp-311`): a seat that
+            // stages the rest of its own row adds the legs and then releases,
+            // and a leg opened before the release would stand in its tree.
+            (Status::Doing, Rows::Started) if !claims.contains_key(row) => {}
             (Status::Todo, Rows::New) if !claims.contains_key(row) => {
                 if let Some((members, Some(cap))) = within {
                     if members_going(store, members, row, &claims) >= cap {
@@ -1938,7 +1950,7 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
          code on the trunk rather than against the report: the commits it landed, whether they \
          do what the overview asked, and the tests that cover them — `cargo test <module>::` in \
-         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}\n\n\
+         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{split}\n\n\
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
          - it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`;\n\
@@ -1951,6 +1963,7 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
         title = util::truncate(&member.title, 80),
         caption = CAPTION_ORDER,
         legs = legs_line(member),
+        split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
     )
 }
 
@@ -6073,6 +6086,111 @@ fn only_a_working_screen_is_ever_overruled() {
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
         assert_eq!(ids(spawned()), ["m-1 · a".to_string(), "m-1 · b".to_string()], "its legs and not the row");
+    }
+
+    /// A member's seat that finds its row bigger than one seat stages the rest
+    /// and releases (`wsp-311`): no leg opens while it still holds the row,
+    /// because the first one would stand in its tree, and every ready leg opens
+    /// on the step after the release.
+    #[test]
+    fn a_seat_that_stages_the_rest_of_its_own_row_hands_it_to_the_legs_by_releasing() {
+        let (_env, store) = scratch("legs-handed-over");
+        task(&store, "m-1", Status::Doing);
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        // From the claim-holder's seat, which is no leg's and so is judged as a
+        // person's: two builds side by side and a finish that joins them.
+        edit_legs(&store, "m-1", |old| {
+            crate::legs::add(old, crate::legs::New { name: "build-a".into(), order: "do a".into(), ..Default::default() }, None)
+        });
+        add_leg(&store, "m-1", "finish", &["build-a"], None, None);
+        add_leg(&store, "m-1", "build-b", &[], Some("finish"), None);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "the seat still holds the row, so nothing opens beside it");
+        assert_eq!(leg_state(&store, "m-1", "build-a"), crate::legs::State::Pending);
+
+        assert!(store.clear_claim("m-1"), "`wsp release` ends the claim");
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · build-a".to_string(), "m-1 · build-b".to_string()], "the ready legs, and not the finish");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "and each once");
+    }
+
+    /// `wsp-311`, compound-758's shape: one member at doing, whose seat filed
+    /// four sub-tasks under it with titles only and built them all itself, then
+    /// landed about 4,000 lines in one commit. Surfaced on `worklist show` while
+    /// the member is worked; at its landing, to the governor once and in the
+    /// verifier's order; and the barrier's follow-up, which is a member, never.
+    #[test]
+    fn a_member_split_into_sub_tasks_nothing_ran_is_surfaced_on_show_to_the_governor_and_to_its_verifier() {
+        let (_env, store) = scratch("unrun-758");
+        let mut m = Task::new("The Review tab, the Board as a document, the N at review door and do view board", "c-758");
+        m.status_raw = "doing".into();
+        crate::model::set_section_in(
+            &mut m.body,
+            "Overview",
+            "Size M-L. Split it if larger.\n\nDone when: the Review tab lists rows at review; the Board renders as a document; \
+             the door counts rows at review; `do view board` opens it.",
+        );
+        store.save_task(&m).unwrap();
+        store.set_claim("c-758", serde_json::json!({ "workspace": "w" }));
+        for (id, title) in [("c-782", "The Review tab"), ("c-783", "The Board as a document"), ("c-784", "The N at review door"), ("c-785", "do view board")] {
+            let mut s = Task::new(title, id);
+            s.parent = Some("c-758".into());
+            store.save_task(&s).unwrap();
+        }
+        // A barrier's follow-up under the same member is a member of the list,
+        // so the run starts it and it is not counted.
+        let mut f = Task::new("a follow-up the barrier attached", "c-790");
+        f.parent = Some("c-758".into());
+        store.save_task(&f).unwrap();
+        let w = list(&store, &[(&["c-758"], "claude"), (&["c-790"], "claude")]);
+        let _ = drained(&TOLD);
+
+        // While it is worked: on `worklist show`, in text and in JSON.
+        let found = |store: &Store| {
+            let tasks = store.tasks();
+            let run = worklist::Running::read(store);
+            let w = store.worklist("run").unwrap();
+            let lines = crate::cmd_worklist::unrun_lines(&util::Paint::plain(), &crate::split::on_list(&tasks, &w, &run));
+            (lines.join("\n"), crate::split::json(&crate::split::on_list(&tasks, &w, &run)))
+        };
+        let (text, json) = found(&store);
+        assert!(text.contains("unrun") && text.contains("c-758 is at doing with 4 sub-task(s)"), "{text}");
+        assert!(text.contains("c-782 c-783 c-784 c-785") && !text.contains("c-790"), "{text}");
+        assert!(text.contains("stage the rest as legs"), "{text}");
+        assert_eq!(json[0]["member"], "c-758");
+        assert_eq!(json[0]["subtasks"].as_array().map(Vec::len), Some(4), "{json}");
+
+        // The landing: one commit of about 4,000 lines, and the member to review.
+        let mut m = store.find_task("c-758").unwrap();
+        m.log(&format!("{} 13488cc6 on master · 85 files changed, 3912 insertions(+), 88 deletions(-)", crate::repair::LANDED));
+        m.set_status(Status::Review);
+        store.save_task(&m).unwrap();
+        store.clear_claim("c-758");
+        step(&store, &w, &Blind);
+        assert_eq!(reading(&store), vec!["c-758".to_string()], "its verifier opened");
+        let told = drained(&TOLD);
+        let about: Vec<&String> = told.iter().filter(|t| t.contains("no run starts or verifies")).collect();
+        assert_eq!(about.len(), 1, "the governor is told once: {told:?}");
+        assert!(about[0].contains("c-758 is at review with 4 sub-task(s)") && about[0].contains("wsp leg add"), "{}", about[0]);
+
+        let order = verifier_order(&store, &store.find_task("c-758").unwrap());
+        assert!(order.contains("c-758 was split into sub-tasks that never ran"), "{order}");
+        for id in ["c-782", "c-783", "c-784", "c-785"] {
+            assert!(order.contains(&format!("- {id} (")), "{id} is named: {order}");
+        }
+        assert!(!order.contains("c-790"), "the follow-up is a member and is run: {order}");
+        assert!(order.contains("Done when** item by item"), "{order}");
+
+        step(&store, &w, &Blind);
+        assert!(drained(&TOLD).iter().all(|t| !t.contains("no run starts or verifies")), "and not again on the next tick");
+        let (text, _) = found(&store);
+        assert!(text.contains("c-758 is at review"), "still on show while it waits on its verdict: {text}");
+
+        // A member with no sub-tasks gains nothing in its order.
+        task(&store, "m-2", Status::Review);
+        assert!(!verifier_order(&store, &store.find_task("m-2").unwrap()).contains("sub-tasks"));
     }
 
     /// A blocking verdict appends exactly one `rework` leg after the last, which

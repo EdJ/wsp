@@ -1,7 +1,12 @@
 # Legs: a row run as a graph of agents
 
 `wsp-287`, 2026-10-17, revised for parallel legs by `wsp-296`, 2026-10-18.
-Nothing here is built yet. The build rows are at the end.
+**Built**: the record (`wsp-291`), the seat (`wsp-292`), the trees and the merge
+(`wsp-297`), the run (`wsp-293`), wip and captions (`wsp-294`) and the cost
+table (`wsp-290`), then trialled on three real rows (`wsp-295`, *The trial*).
+A row too big for one seat is staged with `wsp leg add`, never split into
+sub-tasks: *When to stage*, and *Staging a row already running* for a seat
+that finds out mid-row (`wsp-311`). The build rows are at the end.
 
 ## The decision
 
@@ -647,6 +652,38 @@ is written:
   starts and re-reads cost more than they save, against the same row
   unstaged on the same tier. Which tier an unstaged row runs on is the list's
   choice, as it is today.
+
+**Staging a row already running** (`wsp-311`). A seat that finds its row
+bigger than one seat partway through hands the rest to legs. It does not
+split the row into sub-tasks. compound-758's seat filed four sub-tasks with
+`wsp add --parent`, titles only, built all four itself, and landed about 4,000
+lines in one commit. None was a member, so none was started, verified or seen
+at a barrier. The route, which a member's brief carries:
+
+1. Commit what is done. This is the row's first leg boundary.
+2. `wsp leg add <row> <name> --order FILE` once for each piece left, ending in
+   `finish`. The seat has done the reading, so it writes the build orders
+   itself, and a `plan` leg is only for a split it has not decided.
+3. `wsp release <row>`, then stop. The run opens the ready legs on its next
+   step, in the same tree.
+
+**While a row has a claim, the run opens no leg on it** (`cycle::take_legs`),
+so no leg can start in the tree of a seat that has not yet left it. Outside a
+list nothing starts a row that has not begun, so its person spawns the first
+leg. Around the route:
+
+- `wsp add --parent <row>` from a seat bound to that row is refused while the
+  row is a list member at doing. The refusal names this route, and
+  `--anyway` files the sub-task regardless. A follow-up under a member at
+  review, a barrier's follow-ups and a person's rows are not refused.
+- A member at doing or review with sub-tasks at todo that no running list
+  holds is shown as **unrun** on `wsp worklist show` (and in `--json`).
+  When a verifier opens on it, its governor is told once, and the verifier's
+  order names the sub-tasks and asks for the done-when to be checked item by
+  item.
+- The governor's and the primary interface's orders carry this rule, so an
+  author stages a big row when filing it and does not write "split it if
+  larger".
 
 **When the builds run side by side.** Overlap does not change the token
 saving. Each leg's spend is the same whether its sibling runs at the same time

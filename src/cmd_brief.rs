@@ -1423,6 +1423,14 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                         p.dim(&format!("group {} of {}", l.group, l.of))
                     ),
                 );
+                // What a member does when its row turns out bigger than one seat
+                // (`wsp-311`). compound-758's seat had nothing that mentioned legs,
+                // and split into sub-tasks no run started. A leg is already a
+                // piece of a split, and is told so in its own block.
+                if r.leg.is_none() {
+                    row("split", p.dim(&crate::split::route(&t.id)).to_string());
+                    row("", p.dim(crate::split::NOT_A_SUBTASK).to_string());
+                }
             }
             // The files this row names outside its own tree, which is a
             // different `refs` from the `names` block below: those are tasks
@@ -1855,6 +1863,32 @@ mod tests {
         assert!(text.contains("list"), "{text}");
         assert!(text.contains("batch"), "{text}");
         assert!(text.contains("group 2 of 4"), "{text}");
+    }
+
+    /// `wsp-311`: a member's seat is told what to do when its row is bigger than
+    /// one seat (legs, then release), and that a sub-task is not the way. Only a
+    /// member is told: a leg is already a piece of a split, and a row on no list
+    /// has no run to start legs for it.
+    #[test]
+    fn a_members_brief_says_split_into_legs_and_never_into_sub_tasks() {
+        let leg = || Some(vec!["leg build on t-001 · after plan".to_string()]);
+        let placed = || Some(crate::worklist::Placing { list: "tweaks-next".into(), group: 1, of: 2 });
+        let cases: [(&str, Option<crate::worklist::Placing>, Option<Vec<String>>, bool); 3] = [
+            ("a member", placed(), None, true),
+            ("a leg of a member", placed(), leg(), false),
+            ("a row on no list", None, None, false),
+        ];
+        for (what, list, legs, told) in cases {
+            let mut r = compose(&briefing());
+            r.list = list;
+            r.leg = legs;
+            for depth in [Depth::Normal, Depth::Session] {
+                let text = brief_lines(&r, &plain(), depth).join("\n");
+                assert_eq!(text.contains("wsp leg add t-001 <name> --order FILE"), told, "{what}: {text}");
+                assert_eq!(text.contains("wsp release t-001"), told, "{what}: {text}");
+                assert_eq!(text.contains("never `wsp add --parent`"), told, "{what}: {text}");
+            }
+        }
     }
 
     /// A governor seated on a worklist is told where the run is, and that is
