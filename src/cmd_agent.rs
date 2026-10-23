@@ -3815,10 +3815,17 @@ fn where_lines(at: &Located, p: &Paint) -> Vec<String> {
 pub fn agent(_store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(String::as_str) {
         Some("kinds") => kinds(args),
+        // The pi extension this binary carries, printed as is. `wsp install`
+        // asks the binary it has just installed for it, rather than writing
+        // its own copy, because the process doing the installing is the old one.
+        Some("pi-extension") => {
+            print!("{}", crate::place_super::PI_EXTENSION);
+            0
+        }
         other => {
             match other {
                 Some(w) => eprintln!("wsp agent: unknown subcommand `{w}`"),
-                None => eprintln!("wsp agent: usage: wsp agent kinds [--json]"),
+                None => eprintln!("wsp agent: usage: wsp agent kinds [--json] | wsp agent pi-extension"),
             }
             2
         }
@@ -6201,6 +6208,8 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // brief arrives — while every other turn boundary is silently invisible
     // (`compound-107`).
     crate::place_super::hook_snippet_health(&mut problems, &mut notes);
+    // And pi's half of the same thing: the extension that is its hooks.
+    crate::place_super::pi_extension_health(&mut problems, &mut notes);
     // And whether the compound wire agrees with itself: wsp's own hand-copied
     // WIRE_VERSION against what the installed compound-sup actually speaks,
     // and the host binary beside it against a build that only touched one of
@@ -8480,7 +8489,7 @@ mod tests {
         // t-003 is bound here, but its newest claim line is another pane's.
         w.bindings.insert("w7:p1".into(), json!({ "task_id": "t-003", "agent_kind": "claude" }));
         let groups = crate::model::parse_groups(
-            "- 1  m-1\n  checks: 2026-10-10T09:20:00Z running read:55c4839abcde pane:cpd-486\n          on:opencode+openrouter/some-model/high\n",
+            "- 1  m-1\n  checks: 2026-10-10T09:20:00Z running read:55c4839abcde pane:cpd-486\n          on:pi+openrouter/some-model/high\n",
         );
         let mut list = crate::model::Worklist::new("gpui-migration", "the list");
         list.set_groups(&groups);
@@ -8509,7 +8518,7 @@ mod tests {
         assert_eq!(runs("cpd-485"), (json!("claude"), json!("opus"), json!("high")), "a verifier, off its pass");
         assert_eq!(
             runs("cpd-486"),
-            (json!("opencode"), json!("openrouter/some-model"), json!("high")),
+            (json!("pi"), json!("openrouter/some-model"), json!("high")),
             "a check, off its entry, the model's own `/` kept"
         );
         assert_eq!(runs("w5:p1"), (json!("claude"), json!("opus"), json!("xhigh")), "a governor, off its record");

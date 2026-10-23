@@ -226,7 +226,7 @@ mod tests {
     const GOOD: &str = r#"{"kind_version":1,"name":"zed","args":["--yes"],"resume_flag":"--continue","clear":{"cmd":"/new","replaces_session":false},"briefed":true}"#;
 
     fn spawn<'a>(seat: &'a Seat, order: Option<&'a str>, resume: Option<&'a str>) -> Spawn<'a> {
-        Spawn { full: false, subagents: false, name: "t-1", seat, model: None, effort: None, order, resume }
+        Spawn { full: false, subagents: false, name: "t-1", seat, model: None, effort: None, order, resume, brief: None }
     }
 
     #[test]

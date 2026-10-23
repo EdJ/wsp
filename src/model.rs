@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::agent_commands;
 use crate::fm::{self, Doc, Val};
 use crate::util;
 
@@ -1596,6 +1597,10 @@ pub struct Policy {
 
 /// Whether a word is one of the five efforts — the closed set a tier is
 /// read by, since model names are open-ended.
+///
+/// Kept public as the fixed-answer half; kind-aware callers use
+/// `agent_commands::of(kind).efforts()` instead.
+#[allow(dead_code)]
 pub fn is_effort(word: &str) -> bool {
     matches!(word, "low" | "medium" | "high" | "xhigh" | "max")
 }
@@ -1623,6 +1628,8 @@ impl Policy {
             return None;
         }
         let mut p = Policy { kind: kind.to_string(), model: None, effort: None };
+        let efforts = agent_commands::of(kind).efforts();
+        let is_effort = |t: &str| efforts.contains(&t);
         for t in toks {
             match is_effort(t) {
                 true => p.effort = Some(t.to_string()),
@@ -1661,6 +1668,8 @@ impl Policy {
     pub fn of_label(label: &str) -> Option<Policy> {
         let mut toks = label.split_whitespace();
         let mut p = Policy { kind: toks.next()?.to_string(), model: None, effort: None };
+        let efforts = agent_commands::of(&p.kind).efforts();
+        let is_effort = |t: &str| efforts.contains(&t);
         for t in toks {
             match t.rsplit_once('/') {
                 _ if is_effort(t) => p.effort = Some(t.to_string()),
@@ -2780,14 +2789,14 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
     /// line at all both mean a group wsp does not run.
     #[test]
     fn a_groups_agent_line_round_trips_and_reads_as_a_policy() {
-        let text = "- 1  a-1  a-2\n  agent: opencode some/model-free high\n  stop: look\n- 2  a-3\n  agent: manual\n- 3  a-4\n";
+        let text = "- 1  a-1  a-2\n  agent: claude opus high\n  stop: look\n- 2  a-3\n  agent: manual\n- 3  a-4\n";
         let groups = parse_groups(text);
-        assert_eq!(groups[0].agent, "opencode some/model-free high");
+        assert_eq!(groups[0].agent, "claude opus high");
         assert_eq!(groups[0].members, vec!["a-1", "a-2"], "the line is not a member");
         assert_eq!(parse_groups(&render_groups(&groups)), groups);
         let p = groups[0].policy().unwrap();
-        assert_eq!((p.kind.as_str(), p.model.as_deref(), p.effort.as_deref()), ("opencode", Some("some/model-free"), Some("high")));
-        assert_eq!(p.spawn_flags(), vec!["--kind", "opencode", "--model", "some/model-free", "--effort", "high"]);
+        assert_eq!((p.kind.as_str(), p.model.as_deref(), p.effort.as_deref()), ("claude", Some("opus"), Some("high")));
+        assert_eq!(p.spawn_flags(), vec!["--kind", "claude", "--model", "opus", "--effort", "high"]);
         assert!(groups[1].policy().is_none() && groups[2].policy().is_none());
     }
 
@@ -3089,11 +3098,44 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
             ("claude", Some("opus"), Some("high")),
             ("claude", None, Some("low")),
             ("opencode", Some("openrouter/some-model"), None),
-            ("opencode", Some("openrouter/some-model"), Some("max")),
+            ("pi", Some("openrouter/some-model"), Some("max")),
         ] {
             let p = Policy { kind: kind.into(), model: model.map(String::from), effort: effort.map(String::from) };
             assert_eq!(Policy::of_label(&p.label()), Some(p.clone()), "{}", p.label());
         }
         assert_eq!(Policy::of_label(""), None);
+    }
+
+    /// pi's efforts include `off` and `minimal`, which the old fixed list
+    /// did not know. A pi line with `minimal` must parse that as the
+    /// effort, not as the model; a pi label with `off` must split it off
+    /// the model rather than reading it as part of it.
+    #[test]
+    fn a_pi_policy_parses_its_own_efforts() {
+        let p = Policy::parse("pi local/qwen3.8-27b minimal").unwrap();
+        assert_eq!(p.model.as_deref(), Some("local/qwen3.8-27b"));
+        assert_eq!(p.effort.as_deref(), Some("minimal"));
+
+        let p = Policy::parse("pi local/qwen3.8-27b off").unwrap();
+        assert_eq!(p.model.as_deref(), Some("local/qwen3.8-27b"));
+        assert_eq!(p.effort.as_deref(), Some("off"));
+
+        let p = Policy::of_label("pi local/qwen3.8-27b/off").unwrap();
+        assert_eq!(p.model.as_deref(), Some("local/qwen3.8-27b"));
+        assert_eq!(p.effort.as_deref(), Some("off"));
+    }
+
+    /// Claude lines must parse exactly as before — `high` is still an
+    /// effort, and `opus` is still a model. The existing round-trip test
+    /// covers label→of_label→label for the closed set; this one asserts
+    /// that `parse` still reads claude's five words as efforts.
+    #[test]
+    fn a_claude_policy_still_reads_its_five_efforts() {
+        let p = Policy::parse("claude opus high").unwrap();
+        assert_eq!(p.model.as_deref(), Some("opus"));
+        assert_eq!(p.effort.as_deref(), Some("high"));
+        let p = Policy::parse("claude high").unwrap();
+        assert_eq!(p.model.as_deref(), None);
+        assert_eq!(p.effort.as_deref(), Some("high"));
     }
 }

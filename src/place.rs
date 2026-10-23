@@ -402,8 +402,20 @@ pub const CHILD_MARKER: &str = "CLAUDE_CODE_CHILD_SESSION";
 /// keeps its configuration and is *supposed* to be inherited; that is what the
 /// list is for. Preferences are kept by name; everything else is identity.
 pub fn shed(key: &str) -> bool {
-    (key == "CLAUDECODE" || key.starts_with("CLAUDE_")) && !KEPT.contains(&key)
+    let claude = (key == "CLAUDECODE" || key.starts_with("CLAUDE_")) && !KEPT.contains(&key);
+    claude || PI_SESSION.contains(&key)
 }
+
+/// What pi's bash tool hands every command it runs: the pi session that ran
+/// it. Shed for the reason the `CLAUDE_` names are — it describes the caller,
+/// not the seat — and for one more: `pi/wsp-session.ts` reads `PI_SESSION_ID`
+/// as *this pi was started by another pi's shell* and stays silent, so a pi
+/// governor's spawn that passed it on would start a member that never reports.
+/// By name rather than by prefix, because pi's other `PI_` names
+/// (`PI_CODING_AGENT_DIR`, `PI_OFFLINE`, …) are this machine's preferences and
+/// are meant to be inherited.
+pub const PI_SESSION: &[&str] =
+    &["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"];
 
 /// The `CLAUDE_` names a seat inherits: preferences about this machine, not
 /// facts about the session that spawned it. [`shed`] says why it is this way
@@ -1412,10 +1424,14 @@ mod tests {
             "CLAUDE_EFFORT",
             "CLAUDE_CODE_SOMETHING_ADDED_LATER",
             "CLAUDE_SOMETHING_ADDED_LATER",
+            // A pi governor's bash tool, spawning: what it hands the command it
+            // runs, and what pi/wsp-session.ts reads as being nested.
+            "PI_SESSION_ID",
+            "PI_SESSION_FILE",
         ] {
             assert!(shed(key), "{key} names the spawning session and would have reached the seat");
         }
-        for key in ["CLAUDE_CONFIG_DIR", "WSP_TASK", "HERDR_SOCKET_PATH", "PATH", SEAT_ENV] {
+        for key in ["CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "WSP_TASK", "HERDR_SOCKET_PATH", "PATH", SEAT_ENV] {
             assert!(!shed(key), "{key} is not an identity and the seat is poorer without it");
         }
     }
