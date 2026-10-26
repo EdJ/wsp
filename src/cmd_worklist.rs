@@ -1858,10 +1858,9 @@ fn held_caption(of: &history::Of, groups: usize) -> Option<crate::caption::Told>
 /// Every member's stage, by id, for `worklist show --json` — the live tasks
 /// and, for a member somebody has since archived, the archive, read once and
 /// only if a member is not live.
-fn member_stages(store: &Store, groups: &[Group], tasks: &[crate::model::Task]) -> BTreeMap<String, (crate::caption::Told, Vec<crate::stage::Step>, Status)> {
-    let archive = std::cell::OnceCell::new();
+fn member_stages<'a>(store: &Store, ids: impl IntoIterator<Item = &'a String>, tasks: &[crate::model::Task], archive: &std::cell::OnceCell<Vec<crate::model::Task>>) -> BTreeMap<String, (crate::caption::Told, Vec<crate::stage::Step>, Status)> {
     let mut found: Vec<crate::model::Task> = Vec::new();
-    for id in groups.iter().flat_map(|g| &g.members) {
+    for id in ids {
         let t = tasks.iter().find(|t| &t.id == id).cloned().or_else(|| {
             archive.get_or_init(|| store.archived_tasks()).iter().rev().find(|t: &&crate::model::Task| &t.id == id).cloned()
         });
@@ -1911,12 +1910,19 @@ fn hold_caption(w: &Worklist) -> Option<crate::caption::Told> {
 }
 
 /// `worklist show --json`'s groups.
+#[cfg(test)]
 fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::model::Task], h: &History) -> serde_json::Value {
+    let archive = std::cell::OnceCell::new();
+    let stages = member_stages(store, w.groups().iter().flat_map(|g| &g.members), tasks, &archive);
+    groups_json_with(store, w, pos, tasks, h, &archive, &stages)
+}
+
+/// [`groups_json`] with the archive in hand: `--all` reads it once for every list.
+fn groups_json_with(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::model::Task], h: &History, archive: &std::cell::OnceCell<Vec<crate::model::Task>>, stages: &BTreeMap<String, (crate::caption::Told, Vec<crate::stage::Step>, Status)>) -> serde_json::Value {
     let groups = w.groups();
-    let stages = member_stages(store, &groups, tasks);
     json!(groups
         .iter()
-        .zip(group_captions(store, &groups))
+        .zip(group_captions(store, &groups, archive))
         .enumerate()
         .map(|(i, (g, caption))| {
             let of: Vec<Option<&crate::caption::Told>> = g.members.iter().map(|m| stages.get(m).map(|(s, _, _)| s)).collect();
@@ -2062,37 +2068,21 @@ fn flagged_in(pos: &Position) -> BTreeSet<usize> {
 
 // ---- show -------------------------------------------------------------
 
-pub fn show(store: &Store, args: &Args) -> i32 {
-    let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp worklist show <slug> [--log]");
-        return 2;
-    };
-    let w = match worklist_or_why(store, &needle) {
-        Ok(w) => w,
-        Err(why) => {
-            eprintln!("{why}");
-            return 1;
-        }
-    };
-
-    // Settled, and only settled. This is a reading verb somebody runs while
-    // composing, and the landed reading is a git process per member; the two
-    // disagreeing is itself worth seeing, and the barrier is where that is
-    // paid for.
-    let pos = worklist::position(store, &w, Reading::Settled);
+/// The object `show --json` prints for one list, plus its `## Overview`.
+///
+/// One function so `show <slug>` and `show --all` cannot drift: the window
+/// reads every open list in one process, and each must equal what asking for
+/// it alone would have given.
+fn show_json(store: &Store, w: &Worklist, shared: &ShowShared, pos: &Position) -> serde_json::Value {
+    let tasks = &shared.tasks;
     let groups = w.groups();
-    let dangling = worklist::dangling(store, &w);
-    // `after:` edges, read off the members' tasks, and the run's holds.
-    let tasks = store.tasks();
-    let held = |ordinal: usize, g: &Group| holds(store, &w, &pos, ordinal, g);
-    let past = history::of(&w, &groups);
-
-    if args.json() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "worklist": worklist_json(store, &w),
-                "groups": groups_json(store, &w, &pos, &tasks, &past),
+    let dangling = worklist::dangling(store, w);
+    let past = history::of(w, &groups);
+    let mut head = worklist_json_at(w, pos);
+    head["project"] = home_json(shared.home(store, w).as_ref());
+    let mut v = json!({
+                "worklist": head,
+                "groups": groups_json_with(store, w, pos, tasks, &past, &shared.archive, &shared.stages),
                 // One per group dropped while the run stood at it, which the
                 // graph draws as a cut branch under the gate it left from.
                 "dropped": past.dropped.iter().map(history::dropped_json).collect::<Vec<_>>(),
@@ -2115,14 +2105,106 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                 "dangling": dangling,
                 // The newest hold's caption, whether or not the list is still
                 // held: it is the last thing said about why it stopped.
-                "hold_caption": hold_caption(&w).map(|c| c.json()),
+                "hold_caption": hold_caption(w).map(|c| c.json()),
                 // Members split into sub-tasks no run starts (`wsp-311`).
-                "unrun": crate::split::json(&crate::split::on_list(&tasks, &w, &worklist::Running::read(store))),
-            }))
-            .unwrap_or_default()
-        );
+                "unrun": crate::split::json(&crate::split::on_list(tasks, w, &shared.running)),
+    });
+    v["overview"] = json!(w.section("Overview").unwrap_or_default());
+    v
+}
+
+/// What `show --json` reads that is the same for every list, read once: `--all`
+/// asks for dozens of lists, and each of these costs a pass over the store.
+struct ShowShared {
+    tasks: Vec<crate::model::Task>,
+    running: worklist::Running,
+    index: crate::resolve::Index,
+    archive: std::cell::OnceCell<Vec<crate::model::Task>>,
+    store_tasks: BTreeMap<String, Option<String>>,
+    stages: BTreeMap<String, (crate::caption::Told, Vec<crate::stage::Step>, Status)>,
+}
+
+impl ShowShared {
+    fn read(store: &Store, lists: &[&Worklist]) -> ShowShared {
+        let tasks = store.tasks();
+        let archive = std::cell::OnceCell::new();
+        // One `stage::with_history` for every member of every list asked
+        // about: it re-reads the store's claims, sayings and lists on each call.
+        let groups: Vec<Vec<Group>> = lists.iter().map(|w| w.groups()).collect();
+        let stages = member_stages(store, groups.iter().flatten().flat_map(|g| &g.members), &tasks, &archive);
+        let store_tasks = tasks.iter().map(|t| (t.id.clone(), t.project.clone())).collect();
+        ShowShared {
+            tasks,
+            running: worklist::Running::read(store),
+            index: crate::resolve::Index::new(store.projects()),
+            archive,
+            store_tasks,
+            stages,
+        }
+    }
+
+    /// [`worklist::home`], off the reads already in hand: a member's live
+    /// task, else the archive, read once however many lists need it.
+    fn home(&self, store: &Store, w: &Worklist) -> Option<worklist::Home> {
+        worklist::home_with(w, &self.index, |id| {
+            if let Some(p) = self.store_tasks.get(id) {
+                return Some(p.clone());
+            }
+            let archived = self.archive.get_or_init(|| store.archived_tasks());
+            archived.iter().rev().find(|t| t.id == id).map(|t| t.project.clone())
+        })
+    }
+}
+
+/// `wsp worklist show --all --json` — every list not closed, each as `show
+/// <slug> --json` gives it, in one process (`--include-closed` for the rest).
+fn show_all(store: &Store, args: &Args) -> i32 {
+    if !args.json() {
+        eprintln!("usage: wsp worklist show --all --json [--include-closed]");
+        return 2;
+    }
+    // "Closed" is `ls`'s word: a done list with nothing left that is anybody's.
+    let listed: Vec<_> = worklist::listing(store, store.worklists())
+        .into_iter()
+        .filter(|l| args.has("include-closed") || l.segment != worklist::Segment::Closed)
+        .collect();
+    let shared = ShowShared::read(store, &listed.iter().map(|l| &l.list).collect::<Vec<_>>());
+    let out: Vec<_> = listed.iter().map(|l| show_json(store, &l.list, &shared, &l.at)).collect();
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    0
+}
+
+pub fn show(store: &Store, args: &Args) -> i32 {
+    if args.has("all") {
+        return show_all(store, args);
+    }
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp worklist show <slug> [--log]");
+        return 2;
+    };
+    let w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+
+    if args.json() {
+        println!("{}", serde_json::to_string_pretty(&show_json(store, &w, &ShowShared::read(store, &[&w]), &worklist::position(store, &w, Reading::Settled))).unwrap_or_default());
         return 0;
     }
+
+    // Settled, and only settled. This is a reading verb somebody runs while
+    // composing, and the landed reading is a git process per member; the two
+    // disagreeing is itself worth seeing, and the barrier is where that is
+    // paid for.
+    let pos = worklist::position(store, &w, Reading::Settled);
+    let groups = w.groups();
+    let dangling = worklist::dangling(store, &w);
+    // `after:` edges, read off the members' tasks, and the run's holds.
+    let tasks = store.tasks();
+    let held = |ordinal: usize, g: &Group| holds(store, &w, &pos, ordinal, g);
 
     let p = Paint::new();
     println!("{}  {}", p.bold(&w.id), p.dim(&w.title));
@@ -5119,8 +5201,7 @@ fn rehome(store: &Store, args: &Args, w: Worklist) -> i32 {
 /// By exact id, the file first: a member is an id already, and the fuzzy
 /// resolution a person's needle gets would read every task on each miss. The
 /// archive is read once, and only if a member is not live.
-fn group_captions(store: &Store, groups: &[Group]) -> Vec<crate::caption::Caption> {
-    let archive = std::cell::OnceCell::new();
+fn group_captions(store: &Store, groups: &[Group], archive: &std::cell::OnceCell<Vec<crate::model::Task>>) -> Vec<crate::caption::Caption> {
     groups
         .iter()
         .map(|g| {
@@ -5213,6 +5294,43 @@ mod tests {
     fn run(store: &Store, argv: &[&str]) -> i32 {
         let rest: Vec<&str> = argv.to_vec();
         dispatch(store, &Args::synth("worklist", &rest, &[]))
+    }
+
+    /// `wsp-315`: the window reads every open list in one process, and each
+    /// must be what `show <slug> --json` gives, plus its overview.
+    #[test]
+    fn show_all_is_each_open_lists_show_plus_its_overview() {
+        let store = scratch("show-all");
+        for id in ["a-1", "a-2"] {
+            task(&store, id, "todo");
+        }
+        assert_eq!(run(&store, &["new", "one", "One"]), 0);
+        assert_eq!(run(&store, &["add", "one", "a-1"]), 0);
+        assert_eq!(run(&store, &["new", "two", "Two"]), 0);
+        assert_eq!(run(&store, &["add", "two", "a-2"]), 0);
+        let mut w = store.worklist("one").unwrap();
+        crate::model::set_section_in(&mut w.body, "Overview", "Start when ready.");
+        store.save_worklist(&w).unwrap();
+
+        // The batch: every list read once over shared reads, as `--all` does.
+        let lists = store.worklists();
+        let shared = ShowShared::read(&store, &lists.iter().collect::<Vec<_>>());
+        for w in &lists {
+            let pos = worklist::position(&store, w, Reading::Settled);
+            let batched = show_json(&store, w, &shared, &pos);
+            // The same list asked for alone, which is what `show <slug> --json` prints.
+            let alone = show_json(&store, w, &ShowShared::read(&store, &[w]), &pos);
+            assert_eq!(batched, alone, "{}", w.id);
+            assert!(batched["overview"].is_string(), "{batched}");
+            assert!(batched["worklist"].get("project").is_some(), "{batched}");
+        }
+        let overview = |id: &str| {
+            let w = store.worklist(id).unwrap();
+            show_json(&store, &w, &ShowShared::read(&store, &[&w]), &worklist::position(&store, &w, Reading::Settled))["overview"].clone()
+        };
+        assert_eq!(overview("one"), json!("Start when ready."));
+        assert_eq!(overview("two"), json!(""));
+        assert_eq!(dispatch(&store, &Args::synth("worklist", &["show"], &[("all", "true"), ("json", "true")])), 0);
     }
 
     /// `wsp-134`, Ed: configured when the group is created, with a sensible
@@ -5440,7 +5558,7 @@ mod tests {
 
         let w = store.worklist("cj").unwrap();
         assert_eq!(worklist_json(&store, &w)["caption"], json!({ "text": "The chrome leaves imgui for gpui", "from": "title" }));
-        let got: Vec<_> = group_captions(&store, &w.groups()).iter().map(|c| c.json()).collect();
+        let got: Vec<_> = group_captions(&store, &w.groups(), &std::cell::OnceCell::new()).iter().map(|c| c.json()).collect();
         assert_eq!(
             got,
             vec![

@@ -155,6 +155,8 @@ pub fn version() -> String {
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full",
+    // `worklist show --all --json --include-closed`.
+    "include-closed",
     // `attempts --cost <row>`, whose positional is a task id.
     "cost",
     // `spawn --no-focus` is what focus not being asked for is now called, and it

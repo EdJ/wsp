@@ -264,7 +264,12 @@ the member's `## Verification`, and the group's `verdict:` and `checks:`.
 
 **For a client, `wsp worklist show --json` reads that history back as data**
 (`wsp-254`), so the graph's gate badges, `+` marks and tombstones never parse
-prose. Each group carries:
+prose. `--json` also carries the list's `overview` (its `## Overview`, `""`
+where there is none), and **`wsp worklist show --all --json`** is every list
+that is not closed in one process — an array of exactly these objects, in
+`wsp worklist ls`'s order, `--include-closed` for the rest (`wsp-315`). A
+client that wants all of them asks once instead of once per list. Each group
+carries:
 
 - `id`: given when the group is made and never given again. The ordinal is a
   position and changes when a group goes in ahead; the id does not. It is the
