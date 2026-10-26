@@ -1916,6 +1916,8 @@ fn help_text() -> String {
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,
                                     how long to review, and whether it came back
+  wsp attempts --task <id>[,<id>…] | --list <worklist> [--json]
+                                    only those rows' attempts, in one process
   wsp attempts <task> --cost [--list <worklist>] [--json]
                                     what a row cost: each attempt, leg and
                                     verifier pass with tier, turns, peak context

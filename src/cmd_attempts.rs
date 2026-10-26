@@ -426,6 +426,25 @@ fn dated(line: &str) -> Option<(&str, &str)> {
 /// oversight — a finished task is the only kind that has an outcome worth
 /// calibrating against. `--all` is the escape hatch for the whole store.
 fn wanted(store: &Store, args: &Args) -> Result<Vec<Task>, String> {
+    // `--task a,b,c` and `--list <worklist>` name rows outright, so they read
+    // those rows and not the store: `store.tasks()` is what `--all` costs.
+    if let Some(ids) = args.get("task").filter(|v| v != "true") {
+        let mut out = Vec::new();
+        for id in ids.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match store.find_task(id) {
+                Some(t) => out.push(t),
+                None => return Err(format!("no task matching `{id}`")),
+            }
+        }
+        return Ok(out);
+    }
+    if let Some(name) = args.get("list").filter(|v| v != "true") {
+        let Some(w) = store.worklist(&name) else {
+            return Err(format!("no worklist {name}"));
+        };
+        let ids: Vec<String> = w.groups().into_iter().flat_map(|g| g.members).collect();
+        return Ok(ids.iter().filter_map(|id| store.find_task(id)).collect());
+    }
     let tasks = store.tasks();
     if args.has("all") {
         return Ok(tasks);
@@ -631,20 +650,8 @@ fn attempts_json_with(
         .collect()
 }
 
-pub fn attempts(store: &Store, args: &Args) -> i32 {
-    if args.has("cost") && args.get("list").is_some_and(|l| l != "true") {
-        return cost_report(store, args, Vec::new());
-    }
-    let tasks = match wanted(store, args) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("wsp: {e}");
-            return 2;
-        }
-    };
-    if args.has("cost") {
-        return cost_report(store, args, tasks);
-    }
+/// Every attempt of `tasks`, oldest first, the unended ones read live.
+fn attempt_rows(store: &Store, tasks: &[Task]) -> Vec<Attempt> {
     let mut rows: Vec<Attempt> = tasks.iter().flat_map(|t| attempts_of(t)).collect();
     rows.sort_by(|a, b| a.at.cmp(&b.at).then(a.task.cmp(&b.task)));
     // Every attempt that has not *ended*, which is not the same set as the ones
@@ -658,13 +665,36 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
     for a in rows.iter_mut().filter(|a| a.until.is_empty() && a.leg.is_none()) {
         live(store, a);
     }
+    rows
+}
+
+/// The objects `--json` prints: the attempts, then each task's verifier passes.
+fn attempts_objects(rows: &[Attempt], tasks: &[Task]) -> Vec<serde_json::Value> {
+    let mut out = attempts_json(rows);
+    for t in tasks {
+        out.extend(crate::cmd_cost::verifier_rows(t));
+    }
+    out
+}
+
+pub fn attempts(store: &Store, args: &Args) -> i32 {
+    if args.has("cost") && args.get("list").is_some_and(|l| l != "true") && args.get("task").is_none() {
+        return cost_report(store, args, Vec::new());
+    }
+    let tasks = match wanted(store, args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    };
+    if args.has("cost") {
+        return cost_report(store, args, tasks);
+    }
+    let rows = attempt_rows(store, &tasks);
 
     if args.json() {
-        let mut out = attempts_json(&rows);
-        for t in &tasks {
-            out.extend(crate::cmd_cost::verifier_rows(t));
-        }
-        println!("{}", json!({ "attempts": out }));
+        println!("{}", json!({ "attempts": attempts_objects(&rows, &tasks) }));
         return 0;
     }
 
@@ -1098,6 +1128,34 @@ mod tests {
         let mut t = Task::new("a task", "t-1");
         t.body = format!("## Log\n{}\n", log.join("\n"));
         t
+    }
+
+    /// wsp-316: `--task` and `--list` name rows outright, and what they print
+    /// is what `--all --json` prints for those rows.
+    #[test]
+    fn attempts_for_named_rows_are_the_objects_all_gives_for_them() {
+        let root = std::env::temp_dir().join(format!("wsp-attempts-task-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        store.ensure_dirs().unwrap();
+        for id in ["t-1", "t-2", "t-3"] {
+            let mut t = Task::new(id, id);
+            t.project = Some("p".into());
+            t.body = "## Log\n- 2026-08-18T09:00:00Z claimed by pane cpd-1 · spawned at sonnet/high\n- 2026-08-18T10:00:00Z released after 1h · ran sonnet-5-5/high · 9 turns\n".into();
+            store.save_task(&t).unwrap();
+        }
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+        let objects = |args: &Args| {
+            let tasks = wanted(&store, args).unwrap();
+            attempts_objects(&attempt_rows(&store, &tasks), &tasks)
+        };
+        let all = objects(&parse(&["attempts", "--all", "--json"]));
+        let some = objects(&parse(&["attempts", "--task", "t-1,t-3", "--json"]));
+        let want: Vec<_> = all.iter().filter(|o| o["task"] == "t-1" || o["task"] == "t-3").cloned().collect();
+        assert_eq!(some.len(), 2);
+        assert_eq!(some, want);
+        assert!(wanted(&store, &parse(&["attempts", "--task", "t-1,nope", "--json"])).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// wsp-264: a pane with a reading gives exact fields, cache write apart; a
