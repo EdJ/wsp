@@ -911,13 +911,11 @@ fn listed(store: &Store, w: Worklist) -> Listed {
     let segment = match w.status() {
         WorklistStatus::Draft | WorklistStatus::Running | WorklistStatus::Held => Segment::Running,
         WorklistStatus::Parked => Segment::Parked,
-        // Every member done, every barrier answered, nothing dangling — and
-        // `at.finished()` is the second half of "every barrier answered": it
-        // says the walk found no barrier still shut, where `at.unwritten` says
-        // none of the ones behind it was crossed in silence.
-        WorklistStatus::Done
-            if open == 0 && gone.is_empty() && at.finished() && at.unwritten.is_empty() =>
-        {
+        // Every member done, nothing dangling, and no barrier behind the walk
+        // crossed in silence (`at.unwritten`). A list `done` short of its last
+        // barrier was closed by a person, so a barrier still shut does not
+        // keep it unjudged once its rows are done.
+        WorklistStatus::Done if open == 0 && gone.is_empty() && at.unwritten.is_empty() => {
             Segment::Closed
         }
         WorklistStatus::Done => Segment::Unjudged,
@@ -2970,7 +2968,7 @@ mod tests {
 
         let mut open = w.clone();
         let mut groups = open.groups();
-        groups[1].verdict = String::new();
+        groups[0].verdict = String::new();
         open.set_groups(&groups);
         store.save_worklist(&open).unwrap();
         assert_eq!(
@@ -2978,6 +2976,31 @@ mod tests {
             Segment::Unjudged,
             "a barrier nobody wrote at is as unfinished as a row nobody judged",
         );
+    }
+
+    /// A list `done` short of its last barrier was closed by a person, so the
+    /// shut barrier does not keep it unjudged: its rows decide, and a running
+    /// list is untouched.
+    #[test]
+    fn a_done_list_short_of_a_barrier_is_unjudged_while_a_row_is_at_review_and_closed_after() {
+        let (_env, store, _repo) = scratch("short");
+        task(&store, "wsp-1", "done");
+        task(&store, "wsp-2", "review");
+        let mut w = named(&store, "phase", WorklistStatus::Done, "- 1  wsp-1
+- 2  wsp-2
+");
+        passed(&mut w, 1, "clean");
+        store.save_worklist(&w).unwrap();
+        assert!(!position(&store, &w, Reading::Settled).finished(), "group 2's barrier is shut");
+        assert_eq!(segment_of(&store, &w), Segment::Unjudged, "a row is at review");
+
+        task(&store, "wsp-2", "done");
+        assert_eq!(segment_of(&store, &w), Segment::Closed, "every row done, barrier never passed");
+
+        let mut running = w.clone();
+        running.set_status(WorklistStatus::Running);
+        store.save_worklist(&running).unwrap();
+        assert_eq!(segment_of(&store, &running), Segment::Running, "a running list is unaffected");
     }
 
     /// The `gone` line is the last chance to put something back, and a list
