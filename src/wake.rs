@@ -194,11 +194,10 @@ pub(crate) fn key_for(scope: &str) -> String {
 pub(crate) fn scopes_owed(store: &Store) -> Vec<(String, usize)> {
     let prefix = "wake:";
     store
-        .watches()
-        .keys()
-        .filter(|k| k.starts_with(prefix))
+        .watch_keys(prefix)
+        .into_iter()
         .filter_map(|k| {
-            let owed = owed_to_a_seat(store, k);
+            let owed = owed_to_a_seat(store, &k);
             (owed > 0).then(|| (k[prefix.len()..].to_string(), owed))
         })
         .collect()
@@ -223,7 +222,7 @@ pub(crate) fn wake(store: &Store, emits: &[Emit], at: i64) {
     // at all on a quiet fleet — which is precisely the fleet escalation exists
     // for. The retry and the escalation are both properties of the record, so
     // the record is what decides who gets looked at.
-    for key in store.watches().keys() {
+    for key in store.watch_keys("wake:") {
         if let Some(scope) = key.strip_prefix("wake:") {
             mine.entry(scope.to_string()).or_default();
         }
@@ -303,13 +302,20 @@ fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at
     // on this path: the fact is durable before anything is attempted (see the
     // module docs), and a `wsp watch --drain` from a governor's own pane
     // between two ticks is not written over by this one.
-    let mut spool = store.update_watch(&key, |rec| {
-        let fresh: Vec<Spooled> =
-            emits.iter().map(|e| Spooled::of(at, Line::News((*e).clone()))).collect();
-        let s = Spool::append(rec, fresh);
-        stamp(rec, scope, delivered, NOT_YET, &s);
-        s
-    });
+    //
+    // Nothing to append is nothing to make durable, and no write (`wsp-320`):
+    // a seat owed a backlog and visited with no news is the idle pass's whole
+    // workload, so this is read and the one write below is the only one.
+    let mut spool = match emits.is_empty() {
+        true => load(store, &key),
+        false => store.update_watch(&key, |rec| {
+            let fresh: Vec<Spooled> =
+                emits.iter().map(|e| Spooled::of(at, Line::News((*e).clone()))).collect();
+            let s = Spool::append(rec, fresh);
+            stamp(rec, scope, delivered, NOT_YET, &s);
+            s
+        }),
+    };
 
     // **`wsp-166`: a governor is typed decisions and nothing else.** What is
     // withheld stays in the record, so `wsp watch --drain` still reads it and
@@ -679,7 +685,9 @@ fn unseated(store: &Store, scope: &str) -> String {
     let up = store
         .daemon_holder()
         .map(|(pid, _)| pid)
-        .is_some_and(|pid| crate::place_super::alive(&[pid]).contains(&pid));
+        // The daemon asking about itself needs no `ps` (`wsp-320`): this runs
+        // once per vacant seat on every pass, and that was a fork each.
+        .is_some_and(|pid| pid == std::process::id() || crate::place_super::alive(&[pid]).contains(&pid));
     // **Five readings and not two, and each is one a reader can act on
     // differently.** `reseating` and `daemon down` were the two `wsp-148` asked
     // for; the other three are states that arrived with it and that those two
@@ -968,9 +976,14 @@ impl Sink for Tell<'_> {
 // ---------------------------------------------------------------------------
 
 fn record(store: &Store, key: &str) -> (usize, Value) {
-    let rec = store.watches().get(key).cloned().unwrap_or(Value::Null);
+    let rec = store.watch(key).unwrap_or(Value::Null);
     let n = rec.get("delivered").and_then(Value::as_u64).unwrap_or(0) as usize;
     (n, rec)
+}
+
+/// What [`scopes_owed`] counts for one scope, without visiting the others.
+pub(crate) fn owed_to(store: &Store, scope: &str) -> usize {
+    owed_to_a_seat(store, &key_for(scope))
 }
 
 /// How many entries in this seat's spool it would be typed.
@@ -1015,7 +1028,7 @@ fn restate(store: &Store, seats: &dyn Seats, scope: &str, key: &str) {
 }
 
 fn load(store: &Store, key: &str) -> Spool {
-    Spool::of_json(store.watches().get(key).and_then(|v| v.get("spool")).unwrap_or(&Value::Null))
+    Spool::of_json(store.watch(key).as_ref().and_then(|v| v.get("spool")).unwrap_or(&Value::Null))
 }
 
 /// What `--status` and `doctor` read: what has been delivered to this seat, and
@@ -1027,6 +1040,7 @@ fn stamp(rec: &mut Value, scope: &str, delivered: usize, why: &str, spool: &Spoo
     if !rec.is_object() {
         *rec = json!({});
     }
+    let was = rec.clone();
     let Some(o) = rec.as_object_mut() else { return };
     o.insert("scope".into(), json!(scope));
     o.insert("host".into(), json!(util::hostname()));
@@ -1046,6 +1060,19 @@ fn stamp(rec: &mut Value, scope: &str, delivered: usize, why: &str, spool: &Spoo
             _ => why.to_string(),
         }),
     );
+    // **`tick` moves only with something else** (`wsp-320`). It is when this
+    // record last said something new: a wake record is not a reporter, so
+    // `doctor` reads no liveness off it (`cmd_watch::health` skips it). A stamp
+    // that only moved the clock made every pass rewrite every held seat's
+    // record, and `update_watch` writes nothing for a record that is unchanged.
+    if let (Some(old), Some(o)) = (was.as_object(), rec.as_object_mut()) {
+        if let Some(t) = old.get("tick") {
+            let same = o.iter().all(|(k, v)| k == "tick" || old.get(k) == Some(v)) && old.len() == o.len();
+            if same {
+                o.insert("tick".into(), t.clone());
+            }
+        }
+    }
 }
 
 
@@ -1423,6 +1450,37 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let said = unseated(&store, "core");
         assert!(said.ends_with("nothing owed, so nobody is coming"), "{said}");
     }
+
+    /// **`wsp-320`: a seat that is owed and that nobody is in costs no write on
+    /// a pass with no news.** Thirty such seats were the live store's idle
+    /// state, each rewritten twice a minute — a megabyte and an `fsync` each —
+    /// to move nothing but its `tick`.
+    #[test]
+    fn an_owed_vacant_seat_is_not_rewritten_by_a_pass_with_no_news() {
+        let env = util::isolated("wakes-owed-idle");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let key = key_for("core");
+        let e = Emit {
+            edge: Edge::Up,
+            signal: Signal::new(Kind::Review, "m-1", "a verdict nobody has read").to("core"),
+            held: 0,
+            to: "core".into(),
+        };
+        store.update_watch(&key, |rec| {
+            Spool::append(rec, vec![Spooled::of(0, Line::News(e))]);
+        });
+        assert!(owed_to_a_seat(&store, &key) > 0, "the fixture is the case: owed");
+        vacated(&store);
+
+        deliver_to(&store, &Gone, "core", &[], 0);
+        mark(&store, &key);
+        deliver_to(&store, &Gone, "core", &[], 0);
+        assert!(!written(&store, &key), "a pass that changed nothing wrote the record anyway");
+        assert_eq!(load(&store, &key).depth(), 1, "and what is owed is still held");
+        drop(env);
+    }
+
 
     /// **`wsp-179`'s third item: a whole spool withheld *and* an empty seat,
     /// asserting the sentence.** The at-rest gate returned before the only writer

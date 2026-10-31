@@ -645,13 +645,22 @@ pub fn hostname() -> String {
             return h;
         }
     }
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "localhost".into())
+    // Asked once per process (`wsp-320`): the wake walk stamps every record it
+    // writes with this, and a `hostname` child per stamp was a fork and an exec
+    // per seat per minute in the daemon, for an answer that does not change
+    // under a running process — the daemon `exec`s itself on every install.
+    static ASKED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ASKED
+        .get_or_init(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "localhost".into())
+        })
+        .clone()
 }
 
 pub fn home() -> PathBuf {

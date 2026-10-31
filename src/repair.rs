@@ -339,6 +339,19 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
 /// seat a running list governs is examined as that list's own and the backlog
 /// contributes nothing new for it.
 fn seat_scopes(store: &Store) -> Vec<(String, String)> {
+    seat_scopes_owing(store, crate::wake::scopes_owed(store))
+}
+
+/// [`seat_scopes`], with the backlog half asked only of the scopes in `owed`.
+///
+/// **One walk and two callers, and the narrower one is `wsp-320`.** [`will_seat`]
+/// asks about one scope, and it used to ask by building the whole list — a
+/// `scopes_owed` over every seat's spool — so the wake walk, which asks it once
+/// per vacant seat, was quadratic in seats: on 43 of them it was most of the
+/// daemon's CPU, every minute, at idle. Another scope's backlog can only add
+/// that scope to the list, never take this one out of it, so asking only this
+/// scope's backlog is the same answer for it.
+fn seat_scopes_owing(store: &Store, owed: Vec<(String, usize)>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let add = |scope: String, trigger: String, out: &mut Vec<(String, String)>| {
         // First one wins, so the seat a running list governs is reported as that
@@ -396,7 +409,7 @@ fn seat_scopes(store: &Store) -> Vec<(String, String)> {
     // it waits for the person, and a reconciler that seated it because a
     // `--tell` landed while it was empty would start an agent at 3am that
     // nobody talks to (README, *Does the daemon refill it unprompted?*).
-    for (scope, owed) in crate::wake::scopes_owed(store) {
+    for (scope, owed) in owed {
         if governors.contains_key(&scope) && !paused.contains(&scope) && !crate::cmd_govern::is_primary(&scope) {
             // The count in the sentence is the count this walk counted, so the
             // line cannot claim a scope owes an answer without a number behind it.
@@ -414,7 +427,9 @@ fn seat_scopes(store: &Store) -> Vec<(String, String)> {
 /// lines none of which is owed, read `unseated · 8 held · counting` on
 /// 2026-10-06 while this walk never counted it.
 pub(crate) fn will_seat(store: &Store, scope: &str) -> bool {
-    seat_scopes(store).iter().any(|(s, _)| s == scope)
+    let owed = crate::wake::owed_to(store, scope);
+    let owed = if owed > 0 { vec![(scope.to_string(), owed)] } else { Vec::new() };
+    seat_scopes_owing(store, owed).iter().any(|(s, _)| s == scope)
 }
 
 /// **Why this pass is looking at this seat — two words, not a new field.** The

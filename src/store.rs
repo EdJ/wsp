@@ -113,6 +113,16 @@ pub struct Store {
     /// See [`Store::cached_dir`] for what makes that sound.
     tasks_cache: RefCell<Cache<Task>>,
     projects_cache: RefCell<Cache<Project>>,
+    /// `worklists/`, on the same rule as `tasks/` — see [`Store::worklists`]
+    /// for why it stopped being the one record kind read cold every time.
+    worklists_cache: RefCell<Cache<Worklist>>,
+    /// Bumped whenever a reading of `worklists/` found a file new, changed or
+    /// gone — the key [`Store::running`] is remembered against.
+    worklists_gen: Cell<u64>,
+    running_memo: RefCell<Option<(u64, std::rc::Rc<crate::worklist::Running>)>>,
+    /// The last parse of each state JSON file, by name, and the stamp it was
+    /// parsed at. See [`Store::read_json`].
+    json_cache: RefCell<BTreeMap<String, (Stamp, std::rc::Rc<Value>)>>,
 }
 
 /// What a file looked like when we last parsed it: modified time in
@@ -225,6 +235,10 @@ impl Store {
             written: RefCell::new(BTreeSet::new()),
             tasks_cache: RefCell::new(Cache::new()),
             projects_cache: RefCell::new(Cache::new()),
+            worklists_cache: RefCell::new(Cache::new()),
+            worklists_gen: Cell::new(0),
+            running_memo: RefCell::new(None),
+            json_cache: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -470,8 +484,27 @@ impl Store {
         cache: &RefCell<Cache<T>>,
         build: impl Fn(&fm::Doc, &str) -> T,
     ) -> Vec<T> {
+        Store::cached_dir_noting(dir, cache, build, &Cell::new(0), true)
+    }
+
+    /// [`Store::cached_dir`], bumping `generation` when the reading was not
+    /// the last one's: a file parsed afresh, or one gone from the directory.
+    /// With `collect` false it only brings the cache up to date and hands
+    /// nothing back, for a caller that wants to know whether anything moved
+    /// without paying for a copy of every record.
+    fn cached_dir_noting<T: Clone>(
+        dir: &Path,
+        cache: &RefCell<Cache<T>>,
+        build: impl Fn(&fm::Doc, &str) -> T,
+        generation: &Cell<u64>,
+        collect: bool,
+    ) -> Vec<T> {
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(dir) else {
+            if !cache.borrow().is_empty() {
+                cache.borrow_mut().clear();
+                generation.set(generation.get() + 1);
+            }
             return out;
         };
         let mut cache = cache.borrow_mut();
@@ -487,15 +520,20 @@ impl Store {
             if let Some(stamp) = stamp {
                 if let Some((was, parsed)) = cache.get(&path) {
                     if *was == stamp {
-                        out.push(parsed.clone());
+                        if collect {
+                            out.push(parsed.clone());
+                        }
                         seen.insert(path);
                         continue;
                     }
                 }
             }
             let Ok(text) = fs::read_to_string(&path) else { continue };
+            generation.set(generation.get() + 1);
             let parsed = build(&fm::parse(&text), &stem);
-            out.push(parsed.clone());
+            if collect {
+                out.push(parsed.clone());
+            }
             match stamp {
                 Some(stamp) => {
                     cache.insert(path.clone(), (stamp, parsed));
@@ -508,7 +546,11 @@ impl Store {
         }
         // A task archived or a project removed is a file that will never be
         // asked for again; without this the map only ever grows.
+        let before = cache.len();
         cache.retain(|p, _| seen.contains(p));
+        if cache.len() != before {
+            generation.set(generation.get() + 1);
+        }
         out
     }
 
@@ -647,12 +689,11 @@ impl Store {
     // ---- worklists --------------------------------------------------------
     //
     // The fifth kind, on the `machines/` pattern and for the same reason: a
-    // plan is durable and committed, one file each. No `cached_dir` here,
-    // unlike `tasks/` and `projects/` — that cache exists because the panel
-    // re-reads 285 files four times a second, and a store holds a handful of
-    // worklists read once at a barrier. A cache is worth having where it saves
-    // a reading somebody is waiting on, and is otherwise a second copy of the
-    // truth.
+    // plan is durable and committed, one file each. Read through `cached_dir`
+    // like `tasks/` and `projects/`, since `wsp-320`: this said a store holds
+    // a handful of worklists read once at a barrier, and by 2026-10-31 it held
+    // sixty (3.2 MB), read in full several times per scope by every attention
+    // pass the daemon makes.
 
     pub fn worklists_dir(&self) -> PathBuf {
         self.root.join("worklists")
@@ -666,22 +707,43 @@ impl Store {
     /// reason a retired machine is still a row: a worklist is a plan, and the
     /// history of a plan is the thing worth keeping about it.
     pub fn worklists(&self) -> Vec<Worklist> {
-        let mut out = Vec::new();
-        let Ok(entries) = fs::read_dir(self.worklists_dir()) else {
-            return out;
-        };
-        for e in entries.flatten() {
-            let path = e.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("md") {
-                continue;
-            }
-            let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
-            if let Ok(text) = fs::read_to_string(&path) {
-                out.push(Worklist::from_doc(&fm::parse(&text), &stem));
-            }
-        }
+        let mut out = Store::cached_dir_noting(
+            &self.worklists_dir(),
+            &self.worklists_cache,
+            Worklist::from_doc,
+            &self.worklists_gen,
+            true,
+        );
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
+    }
+
+    /// [`crate::worklist::Running`] over this store's lists, derived again only
+    /// when a list file has moved since the last answer (`wsp-320`).
+    ///
+    /// The wake walk asks it once per seat, and each asking was every list
+    /// copied out and re-read for an answer that had not changed. The reading
+    /// of `worklists/` still happens — a `stat` per file, which is what notices
+    /// a hand edit — and only the copying and deriving are saved.
+    pub(crate) fn running(&self) -> std::rc::Rc<crate::worklist::Running> {
+        // Refresh the stamps first, without copying anything out, so the
+        // generation compared is the one the files have now.
+        Store::cached_dir_noting(
+            &self.worklists_dir(),
+            &self.worklists_cache,
+            Worklist::from_doc,
+            &self.worklists_gen,
+            false,
+        );
+        let generation = self.worklists_gen.get();
+        if let Some((g, r)) = &*self.running_memo.borrow() {
+            if *g == generation {
+                return r.clone();
+            }
+        }
+        let r = std::rc::Rc::new(crate::worklist::Running::over(&self.worklists()));
+        *self.running_memo.borrow_mut() = Some((self.worklists_gen.get(), r.clone()));
+        r
     }
 
     pub fn worklist(&self, id: &str) -> Option<Worklist> {
@@ -1604,10 +1666,45 @@ impl Store {
     }
 
     fn read_json(&self, name: &str) -> Value {
-        fs::read_to_string(self.state_file(name))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| json!({}))
+        (*self.read_json_shared(name)).clone()
+    }
+
+    /// One state file's parse, shared, and re-read only when its stamp moved.
+    ///
+    /// **`wsp-320`, and the reason this exists.** `watches.json` is about a
+    /// megabyte, and the attention pass's wake walk asked for it once per
+    /// scope per scope — 43 scopes, so roughly a thousand parses of the same
+    /// unchanged megabyte a minute, which was 90% of the daemon's CPU and the
+    /// fan Ed could hear. Every write to a state file is `write_atomic`'s
+    /// rename, from this process or any other, so a write always moves the
+    /// stamp and the next reading here is a fresh parse; the rule and its one
+    /// accepted miss are [`Stamp`]'s.
+    ///
+    /// A file that cannot be stat'd is read and not kept, as in
+    /// [`Store::cached_dir`]; a file that is not there reads as `{}`, and is
+    /// not kept either, so its appearance is noticed on the next call.
+    pub(crate) fn read_json_shared(&self, name: &str) -> std::rc::Rc<Value> {
+        let path = self.state_file(name);
+        let stamp = fs::metadata(&path).ok().as_ref().and_then(stamp_of);
+        if let Some(stamp) = stamp {
+            if let Some((was, v)) = self.json_cache.borrow().get(name) {
+                if *was == stamp {
+                    return v.clone();
+                }
+            }
+        }
+        let parsed = fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok());
+        let v = std::rc::Rc::new(parsed.clone().unwrap_or_else(|| json!({})));
+        let mut cache = self.json_cache.borrow_mut();
+        match (stamp, parsed) {
+            (Some(stamp), Some(_)) => {
+                cache.insert(name.to_string(), (stamp, v.clone()));
+            }
+            _ => {
+                cache.remove(name);
+            }
+        }
+        v
     }
 
     fn write_json(&self, name: &str, v: &Value) {
@@ -2170,6 +2267,19 @@ impl Store {
     // identifier it has.
 
     /// pane (or `pid:N`) -> watch record: scope, pid, and when it last ticked.
+    /// One watch record, without copying the rest of `watches.json` out.
+    pub(crate) fn watch(&self, key: &str) -> Option<Value> {
+        self.read_json_shared("watches.json").get(key).cloned()
+    }
+
+    /// The keys of `watches.json` that start with `prefix`.
+    pub(crate) fn watch_keys(&self, prefix: &str) -> Vec<String> {
+        match &*self.read_json_shared("watches.json") {
+            Value::Object(m) => m.keys().filter(|k| k.starts_with(prefix)).cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn watches(&self) -> BTreeMap<String, Value> {
         match self.read_json("watches.json") {
             Value::Object(m) => m.into_iter().collect(),
@@ -2193,12 +2303,21 @@ impl Store {
     /// and write without anybody else getting in between.
     pub fn update_watch<T>(&self, key: &str, f: impl FnOnce(&mut Value) -> T) -> T {
         self.locked(|| {
+            let was = self.read_json_shared("watches.json").get(key).cloned();
+            let mut rec = was.clone().unwrap_or(Value::Null);
+            let out = f(&mut rec);
+            // A change that changed nothing is not written (`wsp-320`). The
+            // daemon visits every seat's record each pass, and rewriting a
+            // megabyte with an `fsync` to say what it already said was most of
+            // what an idle pass cost once the reading was cached. Decided on
+            // the one record, before the rest of the file is copied out.
+            if was.as_ref() == Some(&rec) {
+                return out;
+            }
             let mut m = match self.read_json("watches.json") {
                 Value::Object(m) => m,
                 _ => serde_json::Map::new(),
             };
-            let mut rec = m.remove(key).unwrap_or(Value::Null);
-            let out = f(&mut rec);
             m.insert(key.to_string(), rec);
             self.write_json("watches.json", &Value::Object(m));
             out
@@ -4116,6 +4235,74 @@ mod tests {
             1,
             "the cache still holds the file, and would hold every task the store has ever had",
         );
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// **`wsp-320`: the state files are read through a cache now, and a write
+    /// from another process is the case it must not miss.** `wsp watch --drain`
+    /// from a governor's pane rewrites `watches.json` under a daemon that has it
+    /// cached; the daemon's next reading has to be the drained one.
+    #[test]
+    fn a_state_file_another_process_rewrote_is_read_again() {
+        let store = scratch("json-cache");
+        store.set_watch("wake:x", json!({ "n": 1 }));
+        assert_eq!(store.watch("wake:x"), Some(json!({ "n": 1 })));
+        assert_eq!(store.watch_keys("wake:"), vec!["wake:x".to_string()]);
+
+        // Somebody else's write: not through this `Store`, and a different size.
+        fs::write(store.state_file("watches.json"), r#"{"wake:x":{"n":22},"wake:y":{}}"#).unwrap();
+        assert_eq!(store.watch("wake:x"), Some(json!({ "n": 22 })), "the cached parse outlived the file");
+        assert_eq!(store.watch_keys("wake:").len(), 2);
+
+        // And gone is `{}`, as it always was, rather than the last thing seen.
+        fs::remove_file(store.state_file("watches.json")).unwrap();
+        assert_eq!(store.watch("wake:x"), None);
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// An `update_watch` that changes nothing does not rewrite the file: the
+    /// daemon visits every seat's record each pass, and each one was a megabyte
+    /// and an `fsync` to say what it already said (`wsp-320`).
+    #[test]
+    fn a_watch_update_that_changes_nothing_is_not_written() {
+        let store = scratch("watch-unchanged");
+        store.set_watch("wake:x", json!({ "n": 1 }));
+        let path = store.state_file("watches.json");
+        let long_ago = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options().write(true).open(&path).unwrap().set_times(fs::FileTimes::new().set_modified(long_ago)).unwrap();
+        let mtime = || fs::metadata(&path).unwrap().modified().unwrap();
+
+        store.update_watch("wake:x", |rec| rec["n"] = json!(1));
+        assert_eq!(mtime(), long_ago, "a record rewritten to itself was written");
+
+        store.update_watch("wake:x", |rec| rec["n"] = json!(2));
+        assert_ne!(mtime(), long_ago, "a real change was not written");
+        assert_eq!(store.watch("wake:x"), Some(json!({ "n": 2 })));
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// [`Store::running`] answers again from its memo while no list has moved,
+    /// and derives afresh the moment one has — including a list written by
+    /// hand, which nothing in this process was told about.
+    #[test]
+    fn running_is_remembered_until_a_list_moves() {
+        let store = scratch("running-memo");
+        store.save_worklist(&Worklist::new("l", "a list")).unwrap();
+        let first = store.running();
+        assert!(std::rc::Rc::ptr_eq(&first, &store.running()), "nothing moved and it was derived again");
+
+        let path = store.worklist_path("l");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.replace("a list", "a list, edited by hand")).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&first, &store.running()), "a hand edit was answered from the memo");
+
+        fs::remove_file(&path).unwrap();
+        let after = store.running();
+        assert!(!std::rc::Rc::ptr_eq(&first, &after));
+        assert!(std::rc::Rc::ptr_eq(&after, &store.running()));
 
         let _ = fs::remove_dir_all(&store.root);
     }

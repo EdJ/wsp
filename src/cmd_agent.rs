@@ -4354,18 +4354,25 @@ impl Runs {
 /// start a governor's agent (`cmd_govern::note_started`); a claim made from a
 /// governor's seat afterwards did not start anything. Where wsp-117 left a
 /// governor's tier unwritten the record says `""`, which is `None` here too.
-fn runs(w: &Wip, seat: &str, governs: Option<&str>, held: Option<&Task>) -> Runs {
+fn runs(
+    w: &Wip,
+    seat: &str,
+    governs: Option<&str>,
+    held: Option<&Task>,
+    ran_on: &BTreeMap<String, Option<String>>,
+    legged: &BTreeMap<String, crate::legs::Standing>,
+) -> Runs {
     let text = |v: Option<&Value>, k: &str| {
         v.and_then(|v| v.get(k)).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
     };
     if let Some(rec) = governs.and_then(|g| w.governors.get(g)) {
         return Runs { kind: text(Some(rec), "kind"), model: text(Some(rec), "model"), effort: text(Some(rec), "effort") };
     }
-    if let Some(on) = crate::verification::ran_on(&w.tasks, seat).or_else(|| w.check_on.get(seat).cloned()) {
+    if let Some(on) = ran_on.get(seat).cloned().flatten().or_else(|| w.check_on.get(seat).cloned()) {
         return Runs::of_label(&on);
     }
     // A leg holds no claim, so its entry's policy is the record that started it.
-    if let Some(s) = crate::legs::seated(&w.tasks).get(seat) {
+    if let Some(s) = legged.get(seat) {
         let p = &s.leg.policy;
         return Runs { kind: Some(p.kind.clone()), model: p.model.clone(), effort: p.effort.clone() };
     }
@@ -4399,6 +4406,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     // A leg holds none either (`docs/legs.md`, *Seen*): its entry on the row's
     // `## Legs` names the seat, running or done and not yet ended.
     let legged = crate::legs::seated(&w.tasks);
+    let ran_on = crate::verification::ran_on_by_seat(&w.tasks);
     let running = crate::worklist::Running::over(&w.lists);
     let homes = crate::worklist::homes(w.lists.iter().filter(|l| w.governors.contains_key(&l.id)), &w.tasks, &w.index);
     for a in &w.agents {
@@ -4532,7 +4540,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             // mandate on one that has since been removed points nowhere.
             direction: crate::cmd_mandate::from_map(&w.mandates, agent.as_deref(), Some(workspace_id))
                 .filter(|p| w.index.get(p).is_some()),
-            runs: runs(w, seat, seat_of_project.as_deref(), held),
+            runs: runs(w, seat, seat_of_project.as_deref(), held, &ran_on, &legged),
             answers_to,
             answers_to_empty,
             role,

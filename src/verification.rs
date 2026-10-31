@@ -442,17 +442,24 @@ pub(crate) fn seated(tasks: &[Task]) -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// What the pass standing in `seat` records it ran on — its `on` clause, a
+/// What the pass standing in each seat records it ran on — its `on` clause, a
 /// [`crate::model::Policy::label`] — for `wip`'s kind, model and effort
-/// (`wsp-248`). `None` when no pass stands there or it recorded nothing.
-pub(crate) fn ran_on(tasks: &[Task], seat: &str) -> Option<String> {
-    tasks
-        .iter()
-        .filter(|t| t.body.contains("## Verification"))
-        .flat_map(passes)
-        .filter(|p| p.standing() && p.pane.as_deref() == Some(seat))
-        .last()
-        .and_then(|p| p.on)
+/// (`wsp-248`), by seat. `None` for a seat whose pass recorded nothing.
+///
+/// Every seat from one walk of the passes, since `wsp-320`: asked one seat at
+/// a time, it was a parse of every task's `## Verification` per agent, on
+/// every attention pass the daemon makes.
+pub(crate) fn ran_on_by_seat(tasks: &[Task]) -> BTreeMap<String, Option<String>> {
+    let mut out = BTreeMap::new();
+    for p in tasks.iter().filter(|t| t.body.contains("## Verification")).flat_map(passes) {
+        if p.standing() {
+            if let Some(pane) = p.pane.clone() {
+                // The last standing pass in a seat is the one that answers.
+                out.insert(pane, p.on);
+            }
+        }
+    }
+    out
 }
 
 /// The member a seat has ever verified, and the pass it did it in: the newest

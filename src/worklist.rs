@@ -1447,7 +1447,7 @@ pub fn homes<'a>(lists: impl IntoIterator<Item = &'a Worklist>, tasks: &[Task], 
 /// [`Default`] is the ordinary state spelled out: nothing running, every
 /// answer `None`. It is what a caller composing against a fixture wants and
 /// what a store with no `worklists/` reads as.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Running {
     at: BTreeMap<String, Placing>,
     /// The slugs of the running lists, for a row that is spawned by a list
@@ -1460,8 +1460,8 @@ pub struct Running {
 }
 
 impl Running {
-    pub fn read(store: &Store) -> Running {
-        Running::over(&store.worklists())
+    pub fn read(store: &Store) -> std::rc::Rc<Running> {
+        store.running()
     }
 
     /// The same reading, of lists already in hand — `wsp wip` has read them

@@ -2135,7 +2135,7 @@ impl ShowShared {
         let store_tasks = tasks.iter().map(|t| (t.id.clone(), t.project.clone())).collect();
         ShowShared {
             tasks,
-            running: worklist::Running::read(store),
+            running: worklist::Running::read(store).as_ref().clone(),
             index: crate::resolve::Index::new(store.projects()),
             archive,
             store_tasks,

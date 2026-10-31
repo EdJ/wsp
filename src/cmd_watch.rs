@@ -947,7 +947,7 @@ impl Spool {
         // `review` in its spool, and a list read is a directory walk.
         let running = match self.held.iter().any(|h| matches!(&h.line, Some(Line::News(e)) if e.signal.kind == Kind::Review)) {
             true => crate::worklist::Running::read(store),
-            false => crate::worklist::Running::default(),
+            false => Default::default(),
         };
         let (typed, withheld): (Vec<Spooled>, Vec<Spooled>) =
             self.held.drain(..).partition(|h| h.is_a_decision(&running));
