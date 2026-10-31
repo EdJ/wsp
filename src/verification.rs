@@ -774,10 +774,10 @@ pub(crate) struct Plan {
 }
 
 pub(crate) fn plan(store: &Store) -> Plan {
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     let claims = store.claims();
     let mut plan = Plan { moves: BTreeMap::new(), running: Vec::new(), orphans: Vec::new(), by_hand: Vec::new() };
-    for t in &tasks {
+    for t in tasks.iter() {
         if !filed_by_wsp(t) {
             if made_by_hand(t) {
                 plan.by_hand.push(t.id.clone());

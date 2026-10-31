@@ -857,8 +857,13 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         let now = crate::util::epoch_secs();
         let mut attention_moved = false;
         if pass.due(now) {
-            let mut source = attention::machine_source(store);
-            let emits = attention::tick(store, &mut pass, &mut source, now);
+            // One walk of the store for the whole pass (`wsp-320`): it reads
+            // the tasks once per seat, and a `stat` of every task per reading
+            // was most of what an idle pass cost. See `Store::steady`.
+            let emits = store.steady(|| {
+                let mut source = attention::machine_source(store);
+                attention::tick(store, &mut pass, &mut source, now)
+            });
             // An edge is exactly the moment the sidebar's `needs` token
             // changes, and nothing else below would notice: `store.fingerprint`
             // walks the store's committed records, and a level going up moves
@@ -895,7 +900,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // daemon stderr line nobody has attached to would be a second place to
         // look for the same answer.
         if repair_pass.due(now) {
-            crate::repair::tick(store, &crate::cycle::Fleet, &mut repair_pass);
+            store.steady(|| crate::repair::tick(store, &crate::cycle::Fleet, &mut repair_pass));
         }
 
         let fingerprint = store.fingerprint();

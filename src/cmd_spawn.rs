@@ -8455,7 +8455,7 @@ mod tests {
     /// compound's Agents view takes.
     fn wip_row(store: &Store, seat: &str) -> cmd_agent::WipRow {
         let w = cmd_agent::Wip {
-            tasks: store.tasks(),
+            tasks: store.tasks_shared(),
             index: Index::new(store.projects()),
             bindings: store.bindings(),
             claims: store.claims(),

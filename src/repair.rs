@@ -352,7 +352,6 @@ fn seat_scopes(store: &Store) -> Vec<(String, String)> {
 /// that scope to the list, never take this one out of it, so asking only this
 /// scope's backlog is the same answer for it.
 fn seat_scopes_owing(store: &Store, owed: Vec<(String, usize)>) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
     let add = |scope: String, trigger: String, out: &mut Vec<(String, String)>| {
         // First one wins, so the seat a running list governs is reported as that
         // list's — the more specific of the two reasons.
@@ -360,44 +359,52 @@ fn seat_scopes_owing(store: &Store, owed: Vec<(String, usize)>) -> Vec<(String, 
             out.push((scope, trigger));
         }
     };
-    // **Running, and with a group still ahead of it.** `wsp-177`: a list whose
-    // every barrier is passed has no next step for a seat to take, whatever its
-    // status says for the moment before `done` is written. Read `Settled`,
-    // which is the store alone: `will_seat` asks this from `wsp watch --status`
-    // too, and a git process per member there would be paid on every read.
-    let lists = store.worklists();
-    for w in lists.iter().filter(|w| w.status().is_running()) {
-        if worklist::position(store, w, Reading::Settled).finished() {
-            continue;
+    // **The lists' half is remembered** (`wsp-320`): it is the store alone, and
+    // the wake walk asks it once per vacant seat, which was a `position` over
+    // every running list each time for an answer that had not moved.
+    let lists_half = store.remembered("repair::seat_scopes.lists", || {
+        let mut out: Vec<(String, String)> = Vec::new();
+        // **Running, and with a group still ahead of it.** `wsp-177`: a list whose
+        // every barrier is passed has no next step for a seat to take, whatever its
+        // status says for the moment before `done` is written. Read `Settled`,
+        // which is the store alone: `will_seat` asks this from `wsp watch --status`
+        // too, and a git process per member there would be paid on every read.
+        let lists = store.worklists();
+        for w in lists.iter().filter(|w| w.status().is_running()) {
+            if worklist::position(store, w, Reading::Settled).finished() {
+                continue;
+            }
+            add(
+                crate::cycle::governing_post(store, w).unwrap_or_else(|| w.id.clone()),
+                RUNNING.to_string(),
+                &mut out,
+            );
         }
-        add(
-            crate::cycle::governing_post(store, w).unwrap_or_else(|| w.id.clone()),
-            RUNNING.to_string(),
-            &mut out,
-        );
-    }
+        // **A parked list's post is not seated for what it owes either**, and this
+        // is the half of `wsp-173` the status alone does not reach. A parked list
+        // already contributes nothing above, because it is not running; but a seat
+        // with a backlog is seated by the loop below whatever the list under it is
+        // doing, so a person's pause would be undone by the first hand raised on a
+        // member still in flight. Read as the list's post, so a project seat that
+        // also governs a *running* list is already in `out` and keeps its reason.
+        let mut paused: Vec<String> = lists
+            .iter()
+            .filter(|w| w.status() == WorklistStatus::Parked)
+            .map(|w| crate::cycle::governing_post(store, w).unwrap_or_else(|| w.id.clone()))
+            .collect();
+        // **And a list's own post is not seated for what it owes unless the list is
+        // running** (`wsp-177`). `tokenhub-spec-sync` was `done` at 10:27 on
+        // 2026-10-05. At 15:11 it was reseated anyway, and the line said "this
+        // list is running" because the backlog trigger reused that sentence. A
+        // finished or unstarted list has no next step for a governor to take.
+        // Held lines stay held, and `--status` says nobody is coming. Only the
+        // list's own id, not its post: a project seat over a finished list still
+        // answers for the project, which is the other half of this trigger.
+        paused.extend(lists.iter().filter(|w| !w.status().is_running()).map(|w| w.id.clone()));
+        (out, paused)
+    });
+    let (mut out, paused) = (lists_half.0.clone(), &lists_half.1);
     let governors = store.governors();
-    // **A parked list's post is not seated for what it owes either**, and this
-    // is the half of `wsp-173` the status alone does not reach. A parked list
-    // already contributes nothing above, because it is not running; but a seat
-    // with a backlog is seated by the loop below whatever the list under it is
-    // doing, so a person's pause would be undone by the first hand raised on a
-    // member still in flight. Read as the list's post, so a project seat that
-    // also governs a *running* list is already in `out` and keeps its reason.
-    let mut paused: Vec<String> = lists
-        .iter()
-        .filter(|w| w.status() == WorklistStatus::Parked)
-        .map(|w| crate::cycle::governing_post(store, w).unwrap_or_else(|| w.id.clone()))
-        .collect();
-    // **And a list's own post is not seated for what it owes unless the list is
-    // running** (`wsp-177`). `tokenhub-spec-sync` was `done` at 10:27 on
-    // 2026-10-05. At 15:11 it was reseated anyway, and the line said "this
-    // list is running" because the backlog trigger reused that sentence. A
-    // finished or unstarted list has no next step for a governor to take.
-    // Held lines stay held, and `--status` says nobody is coming. Only the
-    // list's own id, not its post: a project seat over a finished list still
-    // answers for the project, which is the other half of this trigger.
-    paused.extend(lists.iter().filter(|w| !w.status().is_running()).map(|w| w.id.clone()));
     // **`scopes_owed`, which is `wsp-178`'s question** — held is not owed:
     // `wsp-166` withholds a governor's non-decisions from its seat, and a scope
     // whose whole spool is withheld owes nothing while `depth() > 0` says it is
@@ -475,8 +482,8 @@ fn stamp(store: &Store, line: &str) {
 /// bug worth seeing rather than a silent one.
 fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
     let compound = crate::place_compound::Compound::new();
-    let tasks = store.tasks();
-    for t in tasks {
+    let tasks = store.tasks_shared();
+    for t in tasks.iter() {
         if !matches!(t.status(), Status::Review | Status::Done) {
             continue;
         }
@@ -1073,7 +1080,7 @@ pub(crate) fn landed(t: &Task) -> Option<String> {
 /// reason, and a seat hears it when the reason changes, which is when the
 /// sentence has stopped being the same sentence.
 fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
         let note = s.note();
         let why = if note.is_empty() { "its branch is not on the trunk".to_string() } else { note };

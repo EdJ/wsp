@@ -704,7 +704,7 @@ fn told_about_task(store: &Store, id: &str, verb: &str) {
 /// Told here and nowhere else, so once — the verb triggers this one advance,
 /// and the tick that follows reads the block without saying it again.
 fn told_verdict(store: &Store, w: &Worklist, t: &Task) {
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     let Some(p) = crate::verification::blocked(&tasks, &t.id) else { return };
     tell(store, w, &format!(
         "A verifier found a problem in the {} run: {} ({}) was sent back to doing{}. \
@@ -852,7 +852,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
             // A member split into sub-tasks no run started (`wsp-311`): its
             // governor hears it once for each landing, as the pass opens.
             if !opened.again {
-                let tasks = store.tasks();
+                let tasks = store.tasks_shared();
                 let unrun = crate::split::unrun(&tasks, &member.id, &worklist::Running::read(store));
                 if !unrun.is_empty() {
                     tell(store, &w, &crate::split::told(&w.id, &member, &unrun));
@@ -888,7 +888,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
 
     // 3. The barrier, once every member is landed, every verdict is in, and
     // every member has stopped working. `wsp-164`.
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     if pos.at_barrier() && pos.members.iter().all(|s| verified(&tasks, &s.id)) {
         match holding_barrier(store, seats, &w, &pos) {
             // A Barrier row filed before `wsp-230` and still open is that
@@ -1055,7 +1055,7 @@ fn say_capped(store: &Store, list: &str, at: usize, cap: Option<usize>, held: Ve
 /// and reads the group then. And only a member at `doing` or worse: one at
 /// `review` or `done` is settled and holds nothing.
 fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     // A row from before `wsp-230`, or the seat of the group's open check: the
     // name `followup` logs it under, and what `wsp tell` reaches it by.
     let row = tasks
@@ -1598,7 +1598,7 @@ pub(crate) fn start_legs(store: &Store, row: &str, seats: &dyn Seats) -> Vec<Str
 pub(crate) fn legs_owed(store: &Store, seats: &dyn Seats) -> Vec<String> {
     let running = worklist::Running::read(store);
     let mut out = Vec::new();
-    for t in store.tasks().iter().filter(|t| t.status() == Status::Doing && crate::legs::staged(t)) {
+    for t in store.tasks_shared().iter().filter(|t| t.status() == Status::Doing && crate::legs::staged(t)) {
         let all = crate::legs::legs(t);
         let begun = all.iter().any(|l| matches!(l.state, crate::legs::State::Done | crate::legs::State::Running));
         if !begun || running.list_of(&t.id).is_some() {
@@ -1620,7 +1620,7 @@ pub(crate) fn legs_owed(store: &Store, seats: &dyn Seats) -> Vec<String> {
 pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     use crate::verification::Ending;
     let mut ended = Vec::new();
-    for t in store.tasks().iter().filter(|t| crate::legs::staged(t)) {
+    for t in store.tasks_shared().iter().filter(|t| crate::legs::staged(t)) {
         for l in crate::legs::legs(t) {
             let Some(seat) = l.pane.clone() else { continue };
             if l.state != crate::legs::State::Done || l.ending != Ending::Standing {
@@ -1747,7 +1747,7 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) 
         _ => false,
     };
     let made = store.locked(|| {
-        let tasks = store.tasks();
+        let tasks = store.tasks_shared();
         let mut m = store.find_task(&member.id)?;
         let mut own = v::passes(&m);
         let mut superseded = None;
@@ -2226,7 +2226,7 @@ fn end_behind(store: &Store, seats: &dyn Seats, w: &Worklist, passed: usize) {
 pub(crate) fn end_group(store: &Store, seats: &dyn Seats, w: &Worklist, passed: usize) {
     let groups = w.groups();
     let Some(g) = groups.get(passed - 1) else { return };
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     let mut ids: Vec<String> = g.members.clone();
     ids.extend(
         tasks
@@ -2447,7 +2447,7 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
     }
     let behind = pos.at.unwrap_or(usize::MAX);
     let settled = stopped && !over;
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     let claims = store.claims();
     let standing: Vec<String> = tasks
         .iter()
@@ -2535,7 +2535,7 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
     if !matches!(how, Closing::Held) {
         stand_down_own_seat(store, list);
     }
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     let mut ids: Vec<String> = Vec::new();
     match at {
         // Every barrier of the list, and every verifier under a member of it:
@@ -2737,7 +2737,7 @@ fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
 /// a draft's is not this run's, because a plan is not a run and its agents are
 /// a governor's to finish.
 pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     let claims = store.claims();
     let lists = store.worklists();
     let open = |id: &str| {
@@ -2767,7 +2767,7 @@ pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
 pub(crate) fn passes_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     use crate::verification::{passes, State};
     let mut out = Vec::new();
-    for t in store.tasks().iter().filter(|t| t.body.contains("## Verification")) {
+    for t in store.tasks_shared().iter().filter(|t| t.body.contains("## Verification")) {
         let done = passes(t).iter().any(|p| p.standing() && p.state != State::Running);
         if done {
             out.extend(end_passes(store, seats, &t.id, |p| p.state != State::Running));
@@ -6149,7 +6149,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
         // While it is worked: on `worklist show`, in text and in JSON.
         let found = |store: &Store| {
-            let tasks = store.tasks();
+            let tasks = store.tasks_shared();
             let run = worklist::Running::read(store);
             let w = store.worklist("run").unwrap();
             let lines = crate::cmd_worklist::unrun_lines(&util::Paint::plain(), &crate::split::on_list(&tasks, &w, &run));

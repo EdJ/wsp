@@ -102,6 +102,28 @@ impl Found {
     }
 }
 
+/// Where each kind of record stands, as a number that moves whenever any file
+/// of that kind is new, changed or gone since this `Store` last read it.
+///
+/// **The index's answer to "what changed"** (`wsp-320`, ## Details). Two of
+/// these compare equal exactly when nothing a derived reading could have read
+/// has moved, so a reading remembered against one is good until they differ —
+/// see [`Store::remembered`]. Each number is local to its `Store`: they are
+/// for comparing a store with itself a moment ago, not for writing down.
+///
+/// Every field is brought up to date by a `stat` of each file and nothing
+/// more — about 2 ms on an 1800-task store — so a hand edit, a `git checkout`
+/// or another process's write moves it as surely as this process's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Generations {
+    pub(crate) tasks: u64,
+    pub(crate) projects: u64,
+    pub(crate) worklists: u64,
+    /// Every state JSON file's stamp, folded: these are one file each, and
+    /// the stamp is the whole of what changed about one.
+    pub(crate) state: u64,
+}
+
 pub struct Store {
     pub root: PathBuf,
     pub state: PathBuf,
@@ -119,6 +141,18 @@ pub struct Store {
     /// Bumped whenever a reading of `worklists/` found a file new, changed or
     /// gone — the key [`Store::running`] is remembered against.
     worklists_gen: Cell<u64>,
+    /// The same for `tasks/`, and the shared list [`Store::tasks_shared`]
+    /// answers from while it has not moved.
+    tasks_gen: Cell<u64>,
+    tasks_memo: RefCell<Option<(u64, std::rc::Rc<Vec<Task>>)>>,
+    projects_gen: Cell<u64>,
+    /// How deep we are in [`Store::steady`], and the generations it pinned,
+    /// with the write count they were read at.
+    steady_depth: Cell<usize>,
+    pinned: Cell<Option<(u64, Generations)>>,
+    /// Derived readings, by name, and the [`Generations`] each was derived at.
+    /// See [`Store::remembered`].
+    memos: RefCell<BTreeMap<&'static str, (Generations, std::rc::Rc<dyn std::any::Any>)>>,
     running_memo: RefCell<Option<(u64, std::rc::Rc<crate::worklist::Running>)>>,
     /// The last parse of each state JSON file, by name, and the stamp it was
     /// parsed at. See [`Store::read_json`].
@@ -237,6 +271,12 @@ impl Store {
             projects_cache: RefCell::new(Cache::new()),
             worklists_cache: RefCell::new(Cache::new()),
             worklists_gen: Cell::new(0),
+            tasks_gen: Cell::new(0),
+            tasks_memo: RefCell::new(None),
+            projects_gen: Cell::new(0),
+            steady_depth: Cell::new(0),
+            pinned: Cell::new(None),
+            memos: RefCell::new(BTreeMap::new()),
             running_memo: RefCell::new(None),
             json_cache: RefCell::new(BTreeMap::new()),
         }
@@ -557,8 +597,13 @@ impl Store {
     // ---- projects -------------------------------------------------------
 
     pub fn projects(&self) -> Vec<Project> {
-        let mut out =
-            Store::cached_dir(&self.projects_dir(), &self.projects_cache, Project::from_doc);
+        let mut out = Store::cached_dir_noting(
+            &self.projects_dir(),
+            &self.projects_cache,
+            Project::from_doc,
+            &self.projects_gen,
+            true,
+        );
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
@@ -726,8 +771,67 @@ impl Store {
     /// of `worklists/` still happens — a `stat` per file, which is what notices
     /// a hand edit — and only the copying and deriving are saved.
     pub(crate) fn running(&self) -> std::rc::Rc<crate::worklist::Running> {
-        // Refresh the stamps first, without copying anything out, so the
-        // generation compared is the one the files have now.
+        let generation = self.generations().worklists;
+        if let Some((g, r)) = &*self.running_memo.borrow() {
+            if *g == generation {
+                return r.clone();
+            }
+        }
+        let r = std::rc::Rc::new(crate::worklist::Running::over(&self.worklists()));
+        *self.running_memo.borrow_mut() = Some((generation, r.clone()));
+        r
+    }
+
+    /// Where every kind stands now. See [`Generations`].
+    ///
+    /// Inside [`Store::steady`] this is read once and then trusted until this
+    /// process writes something, rather than walked again on every asking.
+    pub(crate) fn generations(&self) -> Generations {
+        if self.steady_depth.get() == 0 {
+            return self.walk_generations();
+        }
+        let now = writes();
+        if let Some((at, g)) = self.pinned.get() {
+            if at == now {
+                return g;
+            }
+        }
+        let g = self.walk_generations();
+        self.pinned.set(Some((now, g)));
+        g
+    }
+
+    /// Run `f` as one pass over a store held still: the store is walked once
+    /// for the whole of it, and again only after a write of this thread's
+    /// own, rather than once per reading (`wsp-320`).
+    ///
+    /// **What it gives up, and why that is the right trade for a pass.** A file
+    /// another process writes during `f` is seen by the next pass instead of
+    /// the rest of this one. A pass was never a transaction anyway — it reads
+    /// the store a piece at a time — and the daemon's attention pass asks for
+    /// the tasks once per seat: forty-three `stat` walks of 1800 files a minute
+    /// was most of what an idle daemon still cost once the parsing was cached.
+    /// This thread's own writes are noticed at once, because every one of
+    /// them goes through `replace` or [`Store::wrote`].
+    pub(crate) fn steady<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.steady_depth.set(self.steady_depth.get() + 1);
+        let out = f();
+        self.steady_depth.set(self.steady_depth.get() - 1);
+        if self.steady_depth.get() == 0 {
+            self.pinned.set(None);
+        }
+        out
+    }
+
+    fn walk_generations(&self) -> Generations {
+        Store::cached_dir_noting(&self.tasks_dir(), &self.tasks_cache, Task::from_doc, &self.tasks_gen, false);
+        Store::cached_dir_noting(
+            &self.projects_dir(),
+            &self.projects_cache,
+            Project::from_doc,
+            &self.projects_gen,
+            false,
+        );
         Store::cached_dir_noting(
             &self.worklists_dir(),
             &self.worklists_cache,
@@ -735,15 +839,70 @@ impl Store {
             &self.worklists_gen,
             false,
         );
-        let generation = self.worklists_gen.get();
-        if let Some((g, r)) = &*self.running_memo.borrow() {
-            if *g == generation {
-                return r.clone();
+        Generations {
+            tasks: self.tasks_gen.get(),
+            projects: self.projects_gen.get(),
+            worklists: self.worklists_gen.get(),
+            state: self.state_stamps(),
+        }
+    }
+
+    /// The JSON files of the state directory and of the store's root
+    /// (`ids.json`, which says what was renumbered into what), and the records
+    /// in `machines/`, by path and stamp, folded into one number. The logs and spools beside them are not
+    /// JSON and not in it: nothing derived reads them.
+    fn state_stamps(&self) -> u64 {
+        let machines = self.machines_dir();
+        let mut stamps: Vec<(PathBuf, Stamp)> = [&self.state, &self.root, &machines]
+            .into_iter()
+            .filter_map(|d| fs::read_dir(d).ok())
+            .flat_map(|entries| entries.flatten())
+            .filter(|e| match e.path().extension().and_then(|x| x.to_str()) {
+                Some("json") => true,
+                // `machines/` has no cache of its own to keep a generation, so
+                // its records are stamped here with the rest.
+                Some("md") => e.path().parent() == Some(machines.as_path()),
+                _ => false,
+            })
+            .filter_map(|e| Some((e.path(), e.metadata().ok().as_ref().and_then(stamp_of)?)))
+            .collect();
+        stamps.sort();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+        for (name, (mtime, len)) in stamps {
+            for b in name.as_os_str().as_encoded_bytes() {
+                mix(*b as u64);
+            }
+            mix(mtime as u64);
+            mix((mtime >> 64) as u64);
+            mix(len);
+        }
+        h
+    }
+
+    /// A derived reading, remembered under `name` until [`Generations`] moves.
+    ///
+    /// **For a reading that reads the store and its state and nothing else** —
+    /// no clock, no backend, no git, no environment. That is the caller's
+    /// promise, and the reason the key is every kind at once rather than the
+    /// kinds this reading happens to touch today: a memo keyed on its inputs
+    /// goes stale the day one more is read, and keyed on all of them it is only
+    /// ever recomputed too often. A write the reading itself makes moves the
+    /// generations too, so the next asking derives afresh.
+    pub(crate) fn remembered<T: 'static>(&self, name: &'static str, derive: impl FnOnce() -> T) -> std::rc::Rc<T> {
+        let now = self.generations();
+        if let Some((at, v)) = self.memos.borrow().get(name) {
+            if *at == now {
+                if let Ok(v) = v.clone().downcast::<T>() {
+                    return v;
+                }
             }
         }
-        let r = std::rc::Rc::new(crate::worklist::Running::over(&self.worklists()));
-        *self.running_memo.borrow_mut() = Some((self.worklists_gen.get(), r.clone()));
-        r
+        let v = std::rc::Rc::new(derive());
+        // Stamped with what was true *before* deriving, so a reading that
+        // raced a write is derived again rather than kept.
+        self.memos.borrow_mut().insert(name, (now, v.clone()));
+        v
     }
 
     pub fn worklist(&self, id: &str) -> Option<Worklist> {
@@ -808,9 +967,29 @@ impl Store {
     /// the last call — see [`Store::cached_dir`], which is where the whole
     /// argument for that lives.
     pub fn tasks(&self) -> Vec<Task> {
-        let mut out = Store::cached_dir(&self.tasks_dir(), &self.tasks_cache, Task::from_doc);
+        let mut out =
+            Store::cached_dir_noting(&self.tasks_dir(), &self.tasks_cache, Task::from_doc, &self.tasks_gen, true);
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
+    }
+
+    /// [`Store::tasks`], shared: the same list, by id, handed out again without
+    /// a copy for as long as no task file has moved (`wsp-320`).
+    ///
+    /// Every task is still `stat`ed on every call — that is what notices a hand
+    /// edit — but the 16 MB of parsed records is copied out once per change,
+    /// not once per reader. The daemon's passes ask for the tasks a dozen times
+    /// a minute each, and before this every asking was a full copy.
+    pub fn tasks_shared(&self) -> std::rc::Rc<Vec<Task>> {
+        let generation = self.generations().tasks;
+        if let Some((g, t)) = &*self.tasks_memo.borrow() {
+            if *g == generation {
+                return t.clone();
+            }
+        }
+        let t = std::rc::Rc::new(self.tasks());
+        *self.tasks_memo.borrow_mut() = Some((generation, t.clone()));
+        t
     }
 
     pub fn task(&self, id: &str) -> Option<Task> {
@@ -1660,8 +1839,14 @@ impl Store {
                 Value::Object(m) => m,
                 _ => serde_json::Map::new(),
             };
+            let was = m.clone();
             f(&mut m);
-            self.write_json(name, &Value::Object(m));
+            // Unchanged is not written, as in `update_watch` (`wsp-320`): the
+            // daemon's passes re-assert records every minute, and each of these
+            // files is rewritten whole with an `fsync`.
+            if m != was {
+                self.write_json(name, &Value::Object(m));
+            }
         })
     }
 
@@ -2931,6 +3116,7 @@ impl Store {
     /// save/archive methods — `init`'s README, `project rm`'s deletion, an
     /// editor let loose on a task — have to say so themselves.
     pub fn wrote(&self, path: impl Into<PathBuf>) {
+        noted_write();
         self.written.borrow_mut().insert(path.into());
     }
 
@@ -3103,6 +3289,25 @@ pub fn substitute_tokens(text: &str, map: &BTreeMap<String, String>) -> (String,
 }
 
 /// Write via temp file + rename so a reader never sees a half-written task.
+thread_local! {
+    /// Every write this thread has made through [`replace`] or announced with
+    /// [`Store::wrote`]: what tells a [`Store::steady`] pass that its own write
+    /// has moved the store under it, so the next reading looks again.
+    ///
+    /// Per thread because a `Store` is: it is not `Sync`, so the pass and the
+    /// writes it must notice are on one thread, and another thread's write is
+    /// another writer's, seen by the next pass like another process's.
+    static WRITES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn noted_write() {
+    WRITES.with(|w| w.set(w.get() + 1));
+}
+
+fn writes() -> u64 {
+    WRITES.with(Cell::get)
+}
+
 pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     replace(path, contents, true)
 }
@@ -3139,6 +3344,7 @@ fn replace(path: &Path, contents: &str, durable: bool) -> std::io::Result<()> {
         }
     }
     fs::rename(&tmp, path)?;
+    noted_write();
     Ok(())
 }
 
@@ -4303,6 +4509,101 @@ mod tests {
         let after = store.running();
         assert!(!std::rc::Rc::ptr_eq(&first, &after));
         assert!(std::rc::Rc::ptr_eq(&after, &store.running()));
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// [`Generations`] moves for every kind of change a derived reading could
+    /// have read — this process's own write, a hand edit, another process's
+    /// state write, a file gone — and stands still while nothing moved.
+    #[test]
+    fn generations_move_with_every_kind_of_change_and_only_then() {
+        let store = scratch("generations");
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        titled(&store, "wsp-001", "one", t);
+        let g0 = store.generations();
+        assert_eq!(g0, store.generations(), "nothing moved and the generations did");
+
+        titled(&store, "wsp-001", "one, retitled by hand", t);
+        let g1 = store.generations();
+        assert_ne!(g0.tasks, g1.tasks, "a hand edit to a task was not seen");
+
+        store.set_watch("wake:x", json!({}));
+        let g2 = store.generations();
+        assert_ne!(g1.state, g2.state, "a state write was not seen");
+        assert_eq!(g1.tasks, g2.tasks);
+
+        store.save_worklist(&Worklist::new("l", "a list")).unwrap();
+        assert_ne!(g2.worklists, store.generations().worklists);
+
+        fs::remove_file(store.tasks_dir().join("wsp-001.md")).unwrap();
+        assert_ne!(store.generations().tasks, g2.tasks, "a task gone was not seen");
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// [`Store::remembered`] derives once while nothing moves, and again the
+    /// moment anything does.
+    #[test]
+    fn a_remembered_reading_is_derived_again_only_when_the_store_moves() {
+        let store = scratch("remembered");
+        let derived = Cell::new(0);
+        let read = || {
+            store.remembered("test.count", || {
+                derived.set(derived.get() + 1);
+                store.tasks().len()
+            })
+        };
+        assert_eq!(*read(), 0);
+        assert_eq!(*read(), 0);
+        assert_eq!(derived.get(), 1, "derived twice with nothing moved");
+
+        titled(&store, "wsp-001", "one", UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        assert_eq!(*read(), 1, "a new task was answered from the memo");
+        assert_eq!(derived.get(), 2);
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// [`Store::tasks_shared`] is the same list as [`Store::tasks`], shared
+    /// until a task moves.
+    #[test]
+    fn shared_tasks_are_shared_until_a_task_moves() {
+        let store = scratch("tasks-shared");
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        titled(&store, "wsp-002", "two", t);
+        titled(&store, "wsp-001", "one", t);
+        let a = store.tasks_shared();
+        assert_eq!(a.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["wsp-001", "wsp-002"]);
+        assert!(std::rc::Rc::ptr_eq(&a, &store.tasks_shared()));
+
+        titled(&store, "wsp-002", "two, edited", t);
+        let b = store.tasks_shared();
+        assert!(!std::rc::Rc::ptr_eq(&a, &b), "an edited task was handed out stale");
+        assert_eq!(b[1].title, "two, edited");
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// Inside [`Store::steady`] the store is walked once: another process's
+    /// write waits for the next pass, while this process's own is seen at once
+    /// — and outside it, every reading looks again.
+    #[test]
+    fn a_steady_pass_sees_its_own_writes_and_leaves_others_for_the_next() {
+        let store = scratch("steady");
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        titled(&store, "wsp-001", "one", t);
+        store.steady(|| {
+            assert_eq!(store.tasks_shared().len(), 1);
+            // Somebody else's: not through this process's writers.
+            titled(&store, "wsp-002", "two", t);
+            assert_eq!(store.tasks_shared().len(), 1, "the pass walked the store again");
+            // Our own write, of anything, is the signal to look again.
+            store.set_watch("wake:x", json!({}));
+            assert_eq!(store.tasks_shared().len(), 2, "a pass did not see the store after its own write");
+        });
+        titled(&store, "wsp-003", "three", t);
+        assert_eq!(store.tasks_shared().len(), 3, "outside a pass, a reading must look again");
 
         let _ = fs::remove_dir_all(&store.root);
     }

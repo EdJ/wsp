@@ -3912,7 +3912,10 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
 /// agents in the states you wanted and a task in the right status underneath
 /// them. There was nowhere to put one.
 pub(crate) struct Wip {
-    pub tasks: Vec<Task>,
+    /// Shared with the store's own reading (`wsp-320`): the daemon builds one
+    /// of these on every attention pass, and a copy of every task each time
+    /// was most of what one cost.
+    pub tasks: std::rc::Rc<Vec<Task>>,
     pub index: Index,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub claims: std::collections::BTreeMap<String, serde_json::Value>,
@@ -4052,7 +4055,7 @@ impl Wip {
             &answered,
             util::epoch_secs(),
         );
-        let tasks = store.tasks();
+        let tasks = store.tasks_shared();
         let bindings = store.bindings();
         let claims = store.claims();
         let governors = store.governors();
@@ -8004,7 +8007,7 @@ mod tests {
         // And a person reading `wip` sees it, which on this seat is the only
         // place anybody can.
         let w = Wip {
-            tasks: vec![t],
+            tasks: vec![t].into(),
             index: Index::new(vec![crate::model::Project::new("wsp")]),
             bindings: store.bindings(),
             claims: std::collections::BTreeMap::new(),
@@ -8189,7 +8192,7 @@ mod tests {
                 wip_task("t-003", "waiting on a decision", Some("wsp"), "blocked"),
                 wip_task("t-004", "finished, waiting on you", Some("wsp"), "review"),
                 wip_task("t-005", "unfiled", None, "todo"),
-            ],
+            ].into(),
             index: Index::new(vec![crate::model::Project::new("wsp")]),
             bindings,
             claims: std::collections::BTreeMap::new(),
@@ -8222,7 +8225,7 @@ mod tests {
     #[test]
     fn wip_names_a_verifier_seat_against_the_member_it_is_verifying() {
         let mut w = wip_world();
-        let m = w.tasks.iter_mut().find(|t| t.id == "t-004").unwrap();
+        let m = std::rc::Rc::make_mut(&mut w.tasks).iter_mut().find(|t| t.id == "t-004").unwrap();
         let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
         p.pane = Some("w3:p1".into());
         crate::verification::write(m, &[p]);
@@ -8257,7 +8260,7 @@ mod tests {
     #[test]
     fn wip_json_says_a_list_governor_answers_to_its_projects_governor() {
         let mut w = wip_world();
-        w.tasks.push(wip_task("data-001", "first of the run", Some("data"), "doing"));
+        std::rc::Rc::make_mut(&mut w.tasks).push(wip_task("data-001", "first of the run", Some("data"), "doing"));
         let mut data = crate::model::Project::new("data");
         data.parent = Some("wsp".into());
         w.index = Index::new(vec![crate::model::Project::new("wsp"), data]);
@@ -8297,11 +8300,11 @@ mod tests {
         let mut data = crate::model::Project::new("data");
         data.parent = Some("wsp".into());
         w.index = Index::new(vec![crate::model::Project::new("wsp"), data]);
-        w.tasks.push(wip_task("data-001", "in tonight's run", Some("data"), "review"));
-        w.tasks.push(wip_task("data-002", "outside the run", Some("data"), "doing"));
+        std::rc::Rc::make_mut(&mut w.tasks).push(wip_task("data-001", "in tonight's run", Some("data"), "review"));
+        std::rc::Rc::make_mut(&mut w.tasks).push(wip_task("data-002", "outside the run", Some("data"), "doing"));
         let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
         p.pane = Some("w9:p1".into());
-        crate::verification::write(w.tasks.iter_mut().find(|t| t.id == "data-001").unwrap(), &[p]);
+        crate::verification::write(std::rc::Rc::make_mut(&mut w.tasks).iter_mut().find(|t| t.id == "data-001").unwrap(), &[p]);
         let mut list = crate::model::Worklist::new("tonight", "the list");
         list.set_groups(&crate::model::parse_groups("- 1  data-001\n"));
         list.set_status(crate::model::WorklistStatus::Running);
@@ -8362,7 +8365,7 @@ mod tests {
     fn wip_shows_both_running_siblings_of_a_staged_row_and_a_done_leg_needs_nobody() {
         use crate::legs::{Leg, State};
         let mut w = wip_world();
-        let m = w.tasks.iter_mut().find(|t| t.id == "t-001").unwrap();
+        let m = std::rc::Rc::make_mut(&mut w.tasks).iter_mut().find(|t| t.id == "t-001").unwrap();
         let mut plan = Leg::pending("plan", "decide");
         plan.state = State::Done;
         plan.pane = Some("cpd-40".into());
@@ -8417,7 +8420,7 @@ mod tests {
     #[test]
     fn wip_json_types_each_seats_role() {
         let mut w = wip_world();
-        let m = w.tasks.iter_mut().find(|t| t.id == "t-004").unwrap();
+        let m = std::rc::Rc::make_mut(&mut w.tasks).iter_mut().find(|t| t.id == "t-004").unwrap();
         let mut first = crate::verification::Pass::opened(Some("abc1234".into()), None);
         first.pane = Some("cpd-484".into());
         first.state = crate::verification::State::Blocks;
@@ -8428,7 +8431,7 @@ mod tests {
         // The list's first member lives in another project than the list's
         // other work: the list is what its governor governs, wherever the row
         // is drawn.
-        w.tasks.push(wip_task("data-001", "first of the run", Some("data"), "review"));
+        std::rc::Rc::make_mut(&mut w.tasks).push(wip_task("data-001", "first of the run", Some("data"), "review"));
         w.index = Index::new(vec![crate::model::Project::new("wsp"), crate::model::Project::new("data")]);
         let mut list = crate::model::Worklist::new("gpui-migration", "the list");
         list.set_groups(&crate::model::parse_groups(
@@ -8479,7 +8482,7 @@ mod tests {
     fn wip_json_says_what_runs_in_each_seat_from_the_record_that_started_it() {
         let mut w = wip_world();
         let log = |t: &mut Task, line: &str| t.body = format!("## Log\n- {line}\n");
-        for t in w.tasks.iter_mut() {
+        for t in std::rc::Rc::make_mut(&mut w.tasks).iter_mut() {
             match t.id.as_str() {
                 "t-001" => log(t, "2026-10-10T09:00:00Z claimed by pane w1:p1 · spawned at sonnet[1m]/high"),
                 "t-002" => log(t, "2026-10-10T09:00:00Z claimed by pane w2:p1 · spawned at opencode/x-preview-f-free/default"),

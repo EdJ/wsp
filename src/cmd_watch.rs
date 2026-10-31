@@ -2452,7 +2452,7 @@ impl Source for Poll<'_> {
         // reason wsp cannot see (`wsp-214`).
         let shells = cmd_agent::idle_members_shells(&seats, &bindings);
         let wip = Wip {
-            tasks: self.store.tasks(),
+            tasks: self.store.tasks_shared(),
             index: Index::new(self.store.projects()),
             bindings,
             claims: self.store.claims(),
@@ -3767,7 +3767,7 @@ fn spec(store: &Store, args: &Args) -> Result<Spec, String> {
 /// not out of agents, and ending the watch there would end it exactly when the
 /// review is about to be handed back.
 fn is_out(store: &Store, scope: &Scope, needle: &str) -> bool {
-    let tasks = store.tasks();
+    let tasks = store.tasks_shared();
     if let Some(t) = tasks.iter().find(|t| t.id == needle) {
         return !t.status().is_open();
     }
