@@ -943,6 +943,139 @@ pub struct Task {
     pub body: String,
 }
 
+/// A task without its prose: every front-matter field, and the names of the
+/// `##` sections its body has — what `wsp ls`, `next` and the like read, and
+/// what the store's persisted index holds (`wsp-320`, the design in that
+/// row's Details).
+///
+/// **A type of its own, not a [`Task`] with an empty body**, so that no reader
+/// can mistake "not read" for "empty": a function that needs the prose has to
+/// ask for the task, and the compiler says so. [`TaskHead::bodiless`] is the
+/// one crossing back, for readers that take `&[Task]` and read front matter
+/// alone, and its name says what it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskHead {
+    pub id: String,
+    pub title: String,
+    pub project: Option<String>,
+    pub tags: Vec<String>,
+    pub status_raw: String,
+    pub priority_raw: String,
+    pub parent: Option<String>,
+    pub after: Vec<String>,
+    pub created: String,
+    pub updated: String,
+    pub refs: Vec<String>,
+    pub caption: Option<String>,
+    /// The body's `## ` headings, in order, so a reader can tell which tasks
+    /// carry a `## Verification` or a `## Legs` without opening any of them.
+    pub sections: Vec<String>,
+}
+
+impl TaskHead {
+    pub fn of(t: &Task) -> TaskHead {
+        TaskHead {
+            id: t.id.clone(),
+            title: t.title.clone(),
+            project: t.project.clone(),
+            tags: t.tags.clone(),
+            status_raw: t.status_raw.clone(),
+            priority_raw: t.priority_raw.clone(),
+            parent: t.parent.clone(),
+            after: t.after.clone(),
+            created: t.created.clone(),
+            updated: t.updated.clone(),
+            refs: t.refs.clone(),
+            caption: t.caption.clone(),
+            sections: t
+                .body
+                .lines()
+                .filter_map(|l| l.strip_prefix("## "))
+                .map(|h| h.trim().to_string())
+                .collect(),
+        }
+    }
+
+    pub fn status(&self) -> Status {
+        Status::parse(&self.status_raw).unwrap_or(Status::Todo)
+    }
+
+    pub fn priority(&self) -> Priority {
+        Priority::parse(&self.priority_raw).unwrap_or(Priority::Normal)
+    }
+
+    /// Whether the body has a `## <name>` heading — matched as
+    /// [`section_of`] matches it, without regard to case.
+    pub fn has_section(&self, name: &str) -> bool {
+        self.sections.iter().any(|s| s.eq_ignore_ascii_case(name))
+    }
+
+    /// This head as a [`Task`] whose body is empty because it **was not read**.
+    ///
+    /// Only for a reader that takes `&[Task]` and reads front matter alone —
+    /// `ls`'s rows, `next`'s choosing, a parent's counts — and never for one
+    /// that reads a section, a log or a note: that reader must ask the store
+    /// for the task. The name is the warning, at every call.
+    pub fn bodiless(&self) -> Task {
+        Task {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            project: self.project.clone(),
+            tags: self.tags.clone(),
+            status_raw: self.status_raw.clone(),
+            priority_raw: self.priority_raw.clone(),
+            parent: self.parent.clone(),
+            after: self.after.clone(),
+            created: self.created.clone(),
+            updated: self.updated.clone(),
+            refs: self.refs.clone(),
+            caption: self.caption.clone(),
+            body: String::new(),
+        }
+    }
+
+    /// The form the persisted index keeps it in.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id, "title": self.title, "project": self.project, "tags": self.tags,
+            "status": self.status_raw, "priority": self.priority_raw, "parent": self.parent,
+            "after": self.after, "created": self.created, "updated": self.updated,
+            "refs": self.refs, "caption": self.caption, "sections": self.sections,
+        })
+    }
+
+    /// Read back from [`TaskHead::to_json`]; `None` for anything that is not
+    /// exactly that shape, which the index reads as an entry to rebuild.
+    pub fn from_json(v: &serde_json::Value) -> Option<TaskHead> {
+        let s = |k: &str| v.get(k)?.as_str().map(str::to_string);
+        let opt = |k: &str| -> Option<Option<String>> {
+            match v.get(k)? {
+                serde_json::Value::Null => Some(None),
+                serde_json::Value::String(x) => Some(Some(x.clone())),
+                _ => None,
+            }
+        };
+        let list = |k: &str| -> Option<Vec<String>> {
+            v.get(k)?.as_array()?.iter().map(|x| x.as_str().map(str::to_string)).collect()
+        };
+        Some(TaskHead {
+            id: s("id")?,
+            title: s("title")?,
+            project: opt("project")?,
+            tags: list("tags")?,
+            status_raw: s("status")?,
+            priority_raw: s("priority")?,
+            parent: opt("parent")?,
+            after: list("after")?,
+            created: s("created")?,
+            updated: s("updated")?,
+            refs: list("refs")?,
+            caption: opt("caption")?,
+            sections: list("sections")?,
+        })
+    }
+}
+
 impl Task {
     pub fn new(title: &str, id: &str) -> Task {
         let now = util::now_iso();

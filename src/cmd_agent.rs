@@ -87,7 +87,9 @@ impl Here {
             claims: store.claims(),
             mandates: store.mandates(),
             agent: pane.as_deref().and_then(|p| store.agent_in_seat(p)),
-            tasks: store.tasks(),
+            // Front matter, and `## Verification` for `verifying_project`:
+            // all a `Here` reads of a task (`wsp-320`).
+            tasks: store.tasks_with_sections(&[crate::verification::SECTION]),
             workspaces: match (&env.workspace_id, herdr::available()) {
                 (Some(_), true) => herdr::workspaces().unwrap_or_default(),
                 _ => Vec::new(),
@@ -4055,7 +4057,7 @@ impl Wip {
             &answered,
             util::epoch_secs(),
         );
-        let tasks = store.tasks_shared();
+        let tasks = std::rc::Rc::new(wip_tasks(store));
         let bindings = store.bindings();
         let claims = store.claims();
         let governors = store.governors();
@@ -4097,6 +4099,24 @@ impl Wip {
             spawned: store.spawned(),
         }
     }
+}
+
+/// The tasks `wip` reads, from the store's index where their bodies are not
+/// read (`wsp-320`).
+///
+/// **In full: everything open, and every row a seat can be read off** — a
+/// `## Verification` or `## Legs`, and the Verify and Barrier rows wsp filed
+/// before those sections existed, whose `## Overview` and `## Log` the
+/// verification and barrier readers still consult. What is left is finished
+/// work with none of those, which `wip` reads for its status, project and
+/// parent alone: three quarters of the store, and the files it no longer opens.
+fn wip_tasks(store: &Store) -> Vec<Task> {
+    store.tasks_read_where(|h| {
+        h.status().is_open()
+            || h.has_section(crate::verification::SECTION)
+            || h.has_section(crate::legs::SECTION)
+            || h.tags.iter().any(|t| t == crate::verification::VERIFY_TAG || t == crate::cycle::BARRIER_TAG)
+    })
 }
 
 /// How long a seat must have been gone, with nothing held, before `wip` stops

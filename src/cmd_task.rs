@@ -162,7 +162,9 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     store.git_commit(&format!("wsp: add {} — {}", t.id, t.title));
 
     if args.json() {
-        println!("{}", t.json());
+        // In full: `json` carries what the index does not.
+        let full = store.task(&t.id).unwrap_or_else(|| t.clone());
+        println!("{}", full.json());
     } else {
         let p = Paint::new();
         println!(
@@ -272,11 +274,17 @@ pub fn list(store: &Store, args: &Args) -> i32 {
         }
     };
 
-    let tasks = filtered(store, args, &index, scope.clone());
     if args.json() {
+        let tasks = filtered(store, args, &index, scope.clone());
         println!("{}", serde_json::to_string_pretty(&rows_json(store, &tasks)).unwrap_or_default());
         return 0;
     }
+    // **The rows are front matter, so they are read from the index**
+    // (`wsp-320`): status, priority, title, project and parent are all a row
+    // draws, and opening all 1800 task files to draw them was most of what a
+    // `wsp ls` cost. `--json` above still reads the tasks, for what it prints.
+    let all: Vec<Task> = store.task_heads().iter().map(|h| h.bodiless()).collect();
+    let tasks = keep(all.clone(), args, &index, scope.clone());
 
     let p = Paint::new();
     if tasks.is_empty() {
@@ -290,7 +298,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     if let Some(s) = &scope {
         println!("{}", p.dim(&scope_line(s, &tasks)));
     }
-    print_tasks(&tasks, &store.tasks(), &p, scope.is_none());
+    print_tasks(&tasks, &all, &p, scope.is_none());
     0
 }
 
@@ -2304,7 +2312,10 @@ pub(crate) struct Backlog {
 impl Backlog {
     pub(crate) fn live(store: &Store) -> Backlog {
         Backlog {
-            tasks: store.tasks(),
+            // Choosing reads front matter alone — status, project, who holds
+            // it — so it is read from the index (`wsp-320`); the one task
+            // chosen is read in full before it is printed.
+            tasks: store.task_heads().iter().map(|h| h.bodiless()).collect(),
             bindings: store.bindings(),
             panes: if herdr::available() { herdr::panes().unwrap_or_default() } else { Vec::new() },
             me: crate::herdr::Env::read().pane_id,

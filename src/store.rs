@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::fm;
 use crate::message::{self, Message, Refused};
-use crate::model::{Machine, Project, Task, Worklist};
+use crate::model::{Machine, Project, Task, TaskHead, Worklist};
 use crate::util;
 
 thread_local! {
@@ -146,6 +146,9 @@ pub struct Store {
     tasks_gen: Cell<u64>,
     tasks_memo: RefCell<Option<(u64, std::rc::Rc<Vec<Task>>)>>,
     projects_gen: Cell<u64>,
+    /// The persisted task index as last read or written by this `Store`, by
+    /// file name. See [`Store::task_heads`].
+    heads_index: RefCell<Option<BTreeMap<String, (Stamp, TaskHead)>>>,
     /// How deep we are in [`Store::steady`], and the generations it pinned,
     /// with the write count they were read at.
     steady_depth: Cell<usize>,
@@ -169,6 +172,10 @@ pub struct Store {
 /// window a second wide. Two facts that would both have to collide are cheap
 /// insurance against a panel painting a task whose text has moved on.
 type Stamp = (u128, u64);
+
+/// The persisted index's own format. Bumped by hand when its shape changes;
+/// what a head *means* is covered by the build stamp beside it.
+const INDEX_SCHEMA: u32 = 1;
 
 /// path -> what it was when we read it, and what it parsed to.
 type Cache<T> = BTreeMap<PathBuf, (Stamp, T)>;
@@ -274,6 +281,7 @@ impl Store {
             tasks_gen: Cell::new(0),
             tasks_memo: RefCell::new(None),
             projects_gen: Cell::new(0),
+            heads_index: RefCell::new(None),
             steady_depth: Cell::new(0),
             pinned: Cell::new(None),
             memos: RefCell::new(BTreeMap::new()),
@@ -990,6 +998,176 @@ impl Store {
         let t = std::rc::Rc::new(self.tasks());
         *self.tasks_memo.borrow_mut() = Some((generation, t.clone()));
         t
+    }
+
+    // ---- the persisted task index (`wsp-320`, leg 3) ----------------------
+    //
+    // What a one-shot command reads instead of opening every task: a file per
+    // machine, `$WSP_STATE/index/tasks.json`, holding each task file's stamp
+    // and its [`TaskHead`]. It is never the truth and never trusted unchecked:
+    // every reading `stat`s every task file, answers the ones whose stamp
+    // matches from the index, and opens only the rest — so a hand edit, a
+    // `git checkout` or another machine's sync is read exactly as it would be
+    // without an index, and a missing, partial or foreign index costs one
+    // cold reading and is written again. A `wsp` built from other code
+    // ignores an index it did not write (the build stamp is in it), because
+    // what a head holds is whatever *its* `Task::from_doc` made of the file.
+
+    fn heads_path(&self) -> PathBuf {
+        self.state.join("index").join("tasks.json")
+    }
+
+    fn heads_key() -> String {
+        format!("{INDEX_SCHEMA}:{}", crate::build_stamp())
+    }
+
+    fn load_heads(&self) -> BTreeMap<String, (Stamp, TaskHead)> {
+        let Ok(text) = fs::read_to_string(self.heads_path()) else { return BTreeMap::new() };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else { return BTreeMap::new() };
+        let ours = v.get("key").and_then(Value::as_str) == Some(Store::heads_key().as_str())
+            && v.get("dir").and_then(Value::as_str) == Some(self.tasks_dir().display().to_string().as_str());
+        if !ours {
+            return BTreeMap::new();
+        }
+        let Some(rows) = v.get("rows").and_then(Value::as_object) else { return BTreeMap::new() };
+        rows.iter()
+            .filter_map(|(name, row)| {
+                let mtime: u128 = row.get("mtime")?.as_str()?.parse().ok()?;
+                let len = row.get("len")?.as_u64()?;
+                Some((name.clone(), ((mtime, len), TaskHead::from_json(row.get("head")?)?)))
+            })
+            .collect()
+    }
+
+    fn save_heads(&self, index: &BTreeMap<String, (Stamp, TaskHead)>) {
+        let rows: serde_json::Map<String, Value> = index
+            .iter()
+            .map(|(name, ((mtime, len), head))| {
+                (name.clone(), json!({ "mtime": mtime.to_string(), "len": len, "head": head.to_json() }))
+            })
+            .collect();
+        let doc = json!({ "key": Store::heads_key(), "dir": self.tasks_dir().display().to_string(), "rows": rows });
+        // Unsynced: it is a cache, and one lost to a power cut is rebuilt by
+        // the next reading.
+        let _ = write_atomic_unsynced(&self.heads_path(), &serde_json::to_string(&doc).unwrap_or_default());
+    }
+
+    /// Every task's [`TaskHead`], by id, without opening a task file that has
+    /// not moved since the index last saw it. See the section above.
+    ///
+    /// A file that cannot be `stat`ed is read and not indexed, the rule
+    /// [`Store::cached_dir`] keeps. A file parsed here also lands in the
+    /// in-process cache, so a later [`Store::tasks`] does not read it twice.
+    pub fn task_heads(&self) -> Vec<TaskHead> {
+        self.heads_by_path().into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Every task, read from the index — except those whose body has one of
+    /// `sections`, which are read in full.
+    ///
+    /// **For a reader whose only use of a body is those sections** — `Here`
+    /// reads a verifier's seat off `## Verification` and nothing else. Every
+    /// other task comes back [`TaskHead::bodiless`], so this is only right for
+    /// a reader that has been checked to read nothing more; the list of names
+    /// at the call is that check, written down.
+    pub fn tasks_with_sections(&self, sections: &[&str]) -> Vec<Task> {
+        self.tasks_read_where(|h| sections.iter().any(|s| h.has_section(s)))
+    }
+
+    /// Every task: read in full where `full` says so of its head, and
+    /// [`TaskHead::bodiless`] everywhere else. The general form of
+    /// [`Store::tasks_with_sections`], under the same rule: the predicate is
+    /// the caller's written-down claim about which bodies it reads.
+    pub fn tasks_read_where(&self, full: impl Fn(&TaskHead) -> bool) -> Vec<Task> {
+        self.heads_by_path()
+            .into_iter()
+            .map(|(path, h)| match full(&h) {
+                true => self.task_at(&path).unwrap_or_else(|| h.bodiless()),
+                false => h.bodiless(),
+            })
+            .collect()
+    }
+
+    /// One task file, through the in-process cache.
+    fn task_at(&self, path: &Path) -> Option<Task> {
+        let stamp = fs::metadata(path).ok().as_ref().and_then(stamp_of);
+        if let Some(st) = stamp {
+            if let Some((was, t)) = self.tasks_cache.borrow().get(path) {
+                if *was == st {
+                    return Some(t.clone());
+                }
+            }
+        }
+        let text = fs::read_to_string(path).ok()?;
+        let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+        let t = Task::from_doc(&fm::parse(&text), &stem);
+        if let Some(st) = stamp {
+            self.tasks_cache.borrow_mut().insert(path.to_path_buf(), (st, t.clone()));
+            self.tasks_gen.set(self.tasks_gen.get() + 1);
+        }
+        Some(t)
+    }
+
+    /// [`Store::task_heads`], with the file each came from, by id.
+    fn heads_by_path(&self) -> Vec<(PathBuf, TaskHead)> {
+        let mut held = self.heads_index.borrow_mut();
+        let index = held.get_or_insert_with(|| self.load_heads());
+        let mut out = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut moved = false;
+        if let Ok(entries) = fs::read_dir(self.tasks_dir()) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                let stamp = e.metadata().ok().as_ref().and_then(stamp_of);
+                if let (Some(stamp), Some((was, head))) = (stamp, index.get(&name)) {
+                    if *was == stamp {
+                        out.push((path.clone(), head.clone()));
+                        seen.insert(name);
+                        continue;
+                    }
+                }
+                let cached = stamp.and_then(|st| {
+                    self.tasks_cache.borrow().get(&path).filter(|(was, _)| *was == st).map(|(_, t)| TaskHead::of(t))
+                });
+                let head = match cached {
+                    Some(h) => h,
+                    None => {
+                        let Ok(text) = fs::read_to_string(&path) else { continue };
+                        let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                        let task = Task::from_doc(&fm::parse(&text), &stem);
+                        let head = TaskHead::of(&task);
+                        if let Some(st) = stamp {
+                            self.tasks_cache.borrow_mut().insert(path.clone(), (st, task));
+                            self.tasks_gen.set(self.tasks_gen.get() + 1);
+                        }
+                        head
+                    }
+                };
+                match stamp {
+                    Some(st) => {
+                        index.insert(name.clone(), (st, head.clone()));
+                        moved = true;
+                    }
+                    None => {
+                        moved |= index.remove(&name).is_some();
+                    }
+                }
+                seen.insert(name);
+                out.push((path, head));
+            }
+        }
+        let before = index.len();
+        index.retain(|name, _| seen.contains(name));
+        moved |= index.len() != before;
+        if moved {
+            self.save_heads(index);
+        }
+        out.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+        out
     }
 
     pub fn task(&self, id: &str) -> Option<Task> {
@@ -4607,4 +4785,67 @@ mod tests {
 
         let _ = fs::remove_dir_all(&store.root);
     }
+
+    fn written(store: &Store, id: &str, body: &str) {
+        let mut t = Task::new(&format!("{id} title"), id);
+        t.project = Some("p".into());
+        t.body = body.into();
+        fs::write(store.task_path(id), t.render()).unwrap();
+    }
+
+    /// **The persisted index is a cache of the files, never a second truth**
+    /// (`wsp-320` leg 3): heads read through it are what the files say, a
+    /// fresh `Store` answers from it, and a hand edit, a removal, a foreign
+    /// index and a corrupt one all come out as the files say.
+    #[test]
+    fn the_task_index_answers_what_the_files_say() {
+        let store = scratch("heads");
+        written(&store, "wsp-001", "## Overview\nfirst\n\n## Verification\n- pass\n");
+        written(&store, "wsp-002", "## Overview\nsecond\n");
+        let full: Vec<TaskHead> = store.tasks().iter().map(TaskHead::of).collect();
+        assert_eq!(store.task_heads(), full, "the heads are not the tasks' front matter");
+        assert!(store.heads_path().exists(), "no index was written");
+        assert_eq!(full[0].sections, ["Overview", "Verification"]);
+
+        // A new process: answered from the index.
+        let again = Store::at(store.root.clone(), store.state.clone());
+        assert_eq!(again.task_heads(), full);
+        assert!(again.tasks_cache.borrow().is_empty(), "a task file was opened that had not moved");
+
+        // By hand, in place, behind the index's back.
+        let mut t = again.task("wsp-002").unwrap();
+        t.title = "renamed by hand, at some length".into();
+        fs::write(again.task_path("wsp-002"), t.render()).unwrap();
+        fs::remove_file(again.task_path("wsp-001")).unwrap();
+        let heads = Store::at(store.root.clone(), store.state.clone()).task_heads();
+        assert_eq!(heads.len(), 1, "a removed task outlived its file");
+        assert_eq!(heads[0].title, "renamed by hand, at some length");
+
+        // An index some other build wrote, and one that is not JSON at all.
+        let raw = fs::read_to_string(store.heads_path()).unwrap();
+        fs::write(store.heads_path(), raw.replace(&Store::heads_key(), "0:another-build")).unwrap();
+        assert_eq!(Store::at(store.root.clone(), store.state.clone()).task_heads().len(), 1);
+        fs::write(store.heads_path(), "{ not json").unwrap();
+        assert_eq!(Store::at(store.root.clone(), store.state.clone()).task_heads()[0].title, "renamed by hand, at some length");
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// [`Store::tasks_read_where`] reads in full exactly what it is asked to,
+    /// and hands back the rest with their front matter and no body.
+    #[test]
+    fn tasks_read_where_reads_the_bodies_it_was_asked_for() {
+        let store = scratch("read-where");
+        written(&store, "wsp-001", "## Verification\n- pass\n");
+        written(&store, "wsp-002", "## Overview\nplain\n");
+        let tasks = Store::at(store.root.clone(), store.state.clone())
+            .tasks_with_sections(&[crate::verification::SECTION]);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks[0].body.contains("## Verification"), "the body asked for was not read");
+        assert!(tasks[1].body.is_empty(), "a body not asked for was read");
+        assert_eq!(tasks[1].project.as_deref(), Some("p"), "and its front matter is all there");
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
 }
+
