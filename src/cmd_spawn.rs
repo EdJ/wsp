@@ -758,6 +758,9 @@ fn order(
 pub(crate) struct Occupant<'a> {
     pub kind: &'a str,
     pub brief: Option<&'a std::path::Path>,
+    /// The row is a packet row and the seat takes the kind's short start: its
+    /// environment half goes on with the rest.
+    pub packet: bool,
     /// Where this agent may reach outside its own tree, from [`reach`].
     ///
     /// A field the caller must fill in rather than something worked out here,
@@ -875,6 +878,9 @@ fn seat_env_over(
     // every seat that does not is byte-for-byte what it was.
     if let Some(a) = agent {
         env.extend(crate::agent_commands::of(a.kind).env(a.brief, a.reach));
+        if a.packet {
+            env.extend(crate::agent_commands::of(a.kind).short_start_env());
+        }
     }
     env
 }
@@ -2503,6 +2509,17 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // is no `--agent` flag to look at.
     let will_start = args.has("agent")
         || (args.has("govern") && (work.list.is_some() || work.project.is_some() || work.primary));
+    // A row with a packet starts short (`wsp packet`), unless it opted out, the
+    // caller asked for `--full`, or the seat is not a plain member's: a leg,
+    // a verifier and a check each carry their own order.
+    let packet_start = args.has("agent")
+        && crate::packet::short_start(
+            work.task.as_deref().and_then(|t| store.find_task(t)).as_ref(),
+            !verifying && leg_name.is_none() && checking.is_none(),
+            args.has("full"),
+            args.has("no-packet"),
+            agent_commands::of(&kind).short_start(),
+        );
     // What this seat is about, in one word: the task, or — under `--govern` —
     // the scope it answers for. Worked out here rather than where the agent is
     // named below, because the seat's environment is fixed when the seat opens
@@ -2532,7 +2549,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // and by then the tree and the task are both known.
     let outside = reach(store, work.task.as_deref(), work.project.as_deref(), cwd.as_deref());
     let occupant =
-        will_start.then(|| Occupant { kind: &kind, brief: brief_at.as_deref(), reach: &outside });
+        will_start.then(|| Occupant { kind: &kind, brief: brief_at.as_deref(), reach: &outside, packet: packet_start });
     // `--govern` is the custodial spelling and the only one: it refuses a task
     // outright, so the flag alone says everything `seat_env`'s `custodian` half
     // needs. Asked here rather than read again below, because the environment
@@ -2608,6 +2625,9 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             }
             if let Some(e) = &effort {
                 flags.push(("effort", e));
+            }
+            if packet_start {
+                flags.push(("packet", "true"));
             }
             if args.has("force") {
                 flags.push(("force", "true"));
@@ -2766,6 +2786,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             (Some(t), _) if verifying => {
                 store.find_task(t).map(|m| crate::cmd_task::fold(&crate::cycle::verifier_order(store, &m)))
             }
+            (Some(t), _) if packet_start => Some(crate::packet::order(t)),
             (Some(t), _) if leg_name.is_some() => Some(leg_seat::order_line(
                 t,
                 leg_name.as_deref().unwrap_or_default(),
@@ -2791,6 +2812,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         let spawn = agent_commands::Spawn {
             full: args.has("full"),
             subagents: args.has("subagents"),
+            packet: packet_start,
             name: &name,
             seat: &seat,
             model: model.as_deref(),
@@ -3456,7 +3478,7 @@ fn rotate_as(
     // An agent is the whole point of a rotation — a successor with no agent in
     // it is a seat that answers for raised hands and cannot read one — so there
     // is no bare-workspace case here to make this conditional.
-    let occupant = Occupant { kind: &kind, brief: brief_at.as_deref(), reach: &outside };
+    let occupant = Occupant { kind: &kind, brief: brief_at.as_deref(), reach: &outside, packet: false };
     let open_order = order(&work, cwd.as_deref(), on.as_deref(), false, Some(occupant), true);
 
     // Step 1. The seat exists before anything is recorded or started — its id
@@ -3548,7 +3570,7 @@ fn rotate_as(
     let in_args = how.order_in_args();
     let spawn = agent_commands::Spawn {
         full: false,
-        subagents: false,
+        subagents: false, packet: false,
         name: &subject,
         seat: &seat,
         model: model.as_deref(),
@@ -5240,7 +5262,7 @@ mod tests {
             None,
             None,
             false,
-            Some(Occupant { kind: "opencode", brief: Some(&brief), reach: &Reach::default() }),
+            Some(Occupant { kind: "opencode", brief: Some(&brief), reach: &Reach::default(), packet: false }),
             false,
         );
         let cfg = o.env.get("OPENCODE_CONFIG_CONTENT").expect("opencode was given no config");
@@ -5271,10 +5293,22 @@ mod tests {
         );
         // …and the seat it is composed into is an ordinary one, which is the
         // other half of `unchanged` and the half `seat_env` could break.
-        let seat = Some(Occupant { kind: "claude", brief: Some(&brief), reach: &Reach::default() });
+        let seat = Some(Occupant { kind: "claude", brief: Some(&brief), reach: &Reach::default(), packet: false });
         let claude = order(&work, None, None, false, seat, false);
         assert_eq!(claude.env.get("WSP_TASK").map(String::as_str), Some("oc-001"));
         assert!(claude.env.get("OPENCODE_CONFIG_CONTENT").is_none(), "one kind's spelling reached another's seat");
+    }
+
+    #[test]
+    fn only_a_packet_seat_has_the_instruction_files_switched_off() {
+        let work = Work { task: Some("t-1".into()), project: Some("p".into()), label: "l".into(), list: None, primary: false };
+        let seat = |packet| {
+            let occ = Some(Occupant { kind: "claude", brief: None, reach: &Reach::default(), packet });
+            order(&work, None, None, false, occ, false).env
+        };
+        assert_eq!(seat(true).get("CLAUDE_CODE_DISABLE_CLAUDE_MDS").map(String::as_str), Some("1"));
+        assert!(seat(false).get("CLAUDE_CODE_DISABLE_CLAUDE_MDS").is_none());
+        assert_eq!(seat(true).get("WSP_TASK").map(String::as_str), Some("t-1"), "added to the seat's own, not instead");
     }
 
     /// The other half of the same order: an agent spawned from inside an agent
@@ -5903,7 +5937,7 @@ mod tests {
         clock: &util::Dial,
     ) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, subagents: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None, brief: None };
+            agent_commands::Spawn { full: false, subagents: false, packet: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None, brief: None };
         // The retry fields come from `retrying` because this test is about a
         // single attempt: a literal here would have to be updated every time the
         // retry's numbers move, for a wait that never reads them.
@@ -5982,7 +6016,7 @@ mod tests {
 
     fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, subagents: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None, brief: None };
+            agent_commands::Spawn { full: false, subagents: false, packet: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None, brief: None };
         let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new() };
         start_agent(place, how, &spawn, &agent, "claude", wait)
     }
@@ -6272,7 +6306,7 @@ mod tests {
         let seat = Seat::new("w3M:p1");
         let spawn = agent_commands::Spawn {
             full: false,
-            subagents: false,
+            subagents: false, packet: false,
             name: "robustness-035",
             seat: &seat,
             model: None,
@@ -6306,7 +6340,7 @@ mod tests {
         let dial = util::Dial::new();
         let spawn = agent_commands::Spawn {
             full: false,
-            subagents: false,
+            subagents: false, packet: false,
             name: "robustness-035",
             seat: &seat,
             model: None,

@@ -814,6 +814,7 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
                     Some(cmd_spawn::Occupant {
                         kind: &kind,
                         brief: None,
+                        packet: false,
                         // The same world the spawn had. `core-042` is a
                         // permission policy like the rest of this env, and
                         // `core-038`'s finding was that resume took the `WSP_*`
@@ -902,7 +903,7 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
             // rebuilt yesterday is what it should rebuild today. An
             // exploration-heavy task wants `wsp spawn --subagents` at birth;
             // nothing here re-decides that on the way back in.
-            subagents: false,
+            subagents: false, packet: false,
             name: &name,
             seat: &seat,
             model: None,

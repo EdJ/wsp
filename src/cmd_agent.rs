@@ -2759,7 +2759,10 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     for other in &displaced {
         t.log(&format!("taken over from pane {other}"));
     }
-    let asked = spawned_at(args.get("model").as_deref(), args.get("effort").as_deref());
+    let mut asked = spawned_at(args.get("model").as_deref(), args.get("effort").as_deref());
+    if args.has("packet") {
+        asked.push_str(&format!(" · {}", crate::packet::CLAUSE));
+    }
     match left.first() {
         Some(prev) => t.log(&format!("claimed by pane {pane}, taken up from {prev}{asked}")),
         None => t.log(&format!("claimed by pane {pane}{asked}")),

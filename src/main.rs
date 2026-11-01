@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 mod after;
+mod packet;
 mod agent_commands;
 mod barrier;
 mod barrier_replay;
@@ -162,7 +163,7 @@ pub fn version() -> String {
 const BOOL_FLAGS: &[&str] = &[
     "for-run",
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
-    "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full",
+    "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full", "no-packet",
     // `worklist show --all --json --include-closed`.
     "include-closed",
     // `attempts --cost <row>`, whose positional is a task id.
@@ -1175,6 +1176,7 @@ fn main() {
         "brief" => cmd_brief::brief(&store, &args),
         "burn" => cmd_burn::burn(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
+        "packet" => packet::packet(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
         "check" => check::check(&store, &args),
         "checkout" => cmd_checkout::checkout(&store, &args),
@@ -1716,6 +1718,8 @@ fn help_text() -> String {
                                     SessionStart hook's call — paid once at the
                                     top of a session, not on every brief after
   wsp commit-help                   how to commit in a tree somebody else is in
+  wsp packet <id> [--from FILE|-]   print a row's ## Packet and the files it names, under a cap;
+                                    a row with one is spawned with the short start
   wsp checkout [<id>] [-n]          a working tree of your own for the task in
                                     hand, under .worktrees/, on its own branch —
                                     nobody else's edits are in it and yours are

@@ -162,6 +162,9 @@ pub struct Attempt {
     pub leg: Option<String>,
     /// The `why` a leg's start line carries for a tier other than the default.
     pub why: Option<String>,
+    /// Ran as a packet: the claim line carries the `packet` clause
+    /// (`wsp packet`), so cost by kind can tell a short start from the usual.
+    pub packet: bool,
 }
 
 impl Attempt {
@@ -341,8 +344,11 @@ pub fn attempts_of(t: &Task) -> Vec<Attempt> {
                 ..Attempt::default()
             };
             for clause in parts {
-                if let Some(tier) = clause.trim().strip_prefix("spawned at ") {
+                let clause = clause.trim();
+                if let Some(tier) = clause.strip_prefix("spawned at ") {
                     a.spawned = tier.trim().to_string();
+                } else if clause == crate::packet::CLAUSE {
+                    a.packet = true;
                 }
             }
             out.push(a);
@@ -633,6 +639,7 @@ fn attempts_json_with(
                 "pane": a.pane,
                 "spawned_at": a.spawned,
                 "ran_at": a.ran,
+                "packet": a.packet,
                 "turns": match num("turns") { Some(t) => t as usize, None => a.turns },
                 "peak_tokens": a.peak,
                 "cache_tokens": cache,
@@ -1128,6 +1135,23 @@ mod tests {
         let mut t = Task::new("a task", "t-1");
         t.body = format!("## Log\n{}\n", log.join("\n"));
         t
+    }
+
+    #[test]
+    fn an_attempt_that_ran_as_a_packet_says_so_and_the_other_does_not() {
+        let t = task(&[
+            "- 2026-11-01T09:00:00Z claimed by pane cpd-1 · spawned at sonnet/high · packet",
+            "- 2026-11-01T09:30:00Z released after 30m · ran sonnet-5-5/high · 9 turns",
+            "- 2026-11-01T10:00:00Z claimed by pane cpd-2 · packet",
+            "- 2026-11-01T10:30:00Z released after 30m · 4 turns",
+            "- 2026-11-01T11:00:00Z claimed by pane cpd-3 · spawned at sonnet/high",
+        ]);
+        let a = attempts_of(&t);
+        assert_eq!(a.iter().map(|a| a.packet).collect::<Vec<_>>(), [true, true, false]);
+        assert_eq!(a[0].spawned, "sonnet/high", "the packet clause is not part of the tier");
+        let json = attempts_json_with(&a, &|_| None);
+        assert_eq!(json[0]["packet"], true);
+        assert_eq!(json[2]["packet"], false);
     }
 
     /// wsp-316: `--task` and `--list` name rows outright, and what they print

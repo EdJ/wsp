@@ -443,6 +443,20 @@ pub trait Kind {
         BTreeMap::new()
     }
 
+    /// Whether this kind has a short start for a row that carries a packet
+    /// (`wsp packet`): fewer tools, a one-line system prompt, no instruction
+    /// files. Only Claude Code, whose flags those are; every other kind is
+    /// spawned as it always was, packet or not.
+    fn short_start(&self) -> bool {
+        false
+    }
+
+    /// The environment half of the short start, set on the seat beside
+    /// [`Kind::env`] when [`Kind::short_start`] is taken.
+    fn short_start_env(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+
     /// Whether this kind will read a brief out of a file wsp names in its
     /// configuration, rather than having to be handed one or sent for one.
     ///
@@ -695,6 +709,9 @@ pub struct Spawn<'a> {
     /// as many words, which is a rule about the work rather than about
     /// context — and so does every MCP server.
     pub subagents: bool,
+    /// The row carries a packet: start with [`SHORT_START`] instead of [`TRIM`].
+    /// Only a kind that answers [`Kind::short_start`] reads it.
+    pub packet: bool,
     pub name: &'a str,
     pub seat: &'a Seat,
     /// The tier this spawn was asked for: which model, and how hard it thinks.
@@ -2264,6 +2281,27 @@ pub struct Claude;
 /// else.
 const TRIM: &[&str] = &["--strict-mcp-config", "--disallowedTools", "Agent", "Workflow"];
 
+/// What a packet row starts with instead of [`TRIM`]: three tools, a one-line
+/// system prompt, no skills, no MCP. compounding-033 measured the starting
+/// context at about 43k tokens for the ordinary start and 4 to 6k for this
+/// one, with the same change landing. `Write` is left out with the rest: the
+/// packet names the files to edit, and `Edit` and `Bash` make any new one.
+///
+/// Claude Code's instruction files are switched off by
+/// [`SHORT_START_ENV`], which a flag cannot do.
+const SHORT_START: &[&str] = &[
+    "--strict-mcp-config",
+    "--disable-slash-commands",
+    "--tools",
+    "Bash,Read,Edit",
+    "--system-prompt",
+    "You make one code change from the packet you are given: run `wsp packet` on your row, \
+     do what it says, run its one command, fix what it reports, then finish as your brief says.",
+];
+
+/// Set on the seat of a short start; see [`SHORT_START`].
+const SHORT_START_ENV: (&str, &str) = ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1");
+
 /// The model aliases `wsp spawn --model` takes, and the whole of the list.
 ///
 /// Aliases and not full names, on purpose. `claude --help` says an alias names
@@ -2335,10 +2373,11 @@ impl Kind for Claude {
         // rebuilt rather than filtered at the call site, so the one name that
         // moves is visible right here beside its reason — see
         // [`Spawn::subagents`].
-        let denied: &[&str] = match (spawn.full, spawn.subagents) {
-            (true, _) => &[],
-            (false, true) => &["--strict-mcp-config", "--disallowedTools", "Workflow"],
-            (false, false) => TRIM,
+        let denied: &[&str] = match (spawn.full, spawn.subagents, spawn.packet) {
+            (true, _, _) => &[],
+            (false, _, true) => SHORT_START,
+            (false, true, false) => &["--strict-mcp-config", "--disallowedTools", "Workflow"],
+            (false, false, false) => TRIM,
         };
         let mut argv: Vec<String> = denied.iter().map(|s| (*s).to_string()).collect();
         if let Some(handle) = mint(spawn.name, spawn.seat) {
@@ -2372,6 +2411,14 @@ impl Kind for Claude {
     /// `--resume`.
     fn resume_flag(&self) -> Option<&'static str> {
         Some("--resume")
+    }
+
+    fn short_start(&self) -> bool {
+        true
+    }
+
+    fn short_start_env(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([(SHORT_START_ENV.0.to_string(), SHORT_START_ENV.1.to_string())])
     }
 
     fn models(&self) -> &'static [&'static str] {
@@ -3446,7 +3493,7 @@ mod tests {
     /// ~28K, and a trim that pushes work into Bash costs more than it saves.
     /// A spawn description, so the tests below argue about one thing each.
     fn spawn<'a>(full: bool, name: &'a str, seat: &'a Seat) -> Spawn<'a> {
-        Spawn { full, subagents: false, name, seat, model: None, effort: None, order: None, resume: None, brief: None }
+        Spawn { full, subagents: false, packet: false, name, seat, model: None, effort: None, order: None, resume: None, brief: None }
     }
 
     /// The same, at a stated tier.
@@ -4010,7 +4057,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     fn an_exploration_spawn_keeps_subagents_and_still_trims_the_rest() {
         let seat = Seat::new("w2J:p1");
         let argv = of("claude").args(&Spawn {
-            subagents: true,
+            subagents: true, packet: false,
             ..spawn(false, "t-1", &seat)
         });
         assert!(!argv.contains(&"Agent".to_string()), "the explorer is back: {argv:?}");
@@ -4028,7 +4075,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
         let seat = Seat::new("w2J:p1");
         let argv = of("claude").args(&Spawn {
             full: true,
-            subagents: true,
+            subagents: true, packet: false,
             ..spawn(true, "t-1", &seat)
         });
         // The name goes on regardless — a handle is not a capability — but
@@ -4128,6 +4175,30 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     /// backlog rather than a hypothesis. The kind is the machine's: these are
     /// Claude Code's flag spellings, and handing them to `codex` or `gemini`
     /// buys a workspace with a shell in it and no agent.
+    /// The packet row's short start replaces the trim and keeps the handle;
+    /// `--full` still wins; and a kind with no short start ignores the flag.
+    #[test]
+    fn a_packet_row_starts_short_and_an_ordinary_row_starts_as_it_did() {
+        let seat = Seat::new("w2J:p1");
+        let packet = Spawn { packet: true, ..spawn(false, "t-1", &seat) };
+        let argv = of("claude").args(&packet);
+        let at = |flag: &str| argv.iter().position(|a| a == flag).unwrap_or_else(|| panic!("no {flag} in {argv:?}"));
+        assert_eq!(argv[at("--tools") + 1], "Bash,Read,Edit");
+        assert!(!argv[at("--system-prompt") + 1].contains('\n'), "herdr refuses control characters in an arg");
+        assert!(argv.contains(&"--disable-slash-commands".to_string()) && argv.contains(&"--strict-mcp-config".to_string()));
+        assert!(!argv.contains(&"--disallowedTools".to_string()), "the allowlist replaces the trim");
+        assert_eq!(&argv[argv.len() - 2..], ["-n", "t-1-w2J:p1"], "still addressable");
+        assert_eq!(of("claude").args(&spawn(false, "t-1", &seat))[..4], TRIM[..], "an ordinary row keeps the trim");
+        assert_eq!(
+            of("claude").args(&Spawn { packet: true, ..spawn(true, "t-1", &seat) }),
+            vec!["-n", "t-1-w2J:p1"],
+            "--full is the way back from the short start too"
+        );
+        assert_eq!(of("claude").short_start_env()["CLAUDE_CODE_DISABLE_CLAUDE_MDS"], "1");
+        assert!(!of("codex").short_start() && of("codex").short_start_env().is_empty());
+        assert!(of("codex").args(&packet).is_empty());
+    }
+
     #[test]
     fn the_trim_is_claude_codes_alone_and_one_flag_undoes_it() {
         let seat = Seat::new("w2J:p1");

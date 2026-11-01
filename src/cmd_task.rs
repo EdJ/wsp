@@ -2694,7 +2694,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
 /// `-` is a positional rather than `--from`'s value because a lone dash is not
 /// a path — it is the conventional name for the stream, and taking it as an
 /// argument is what `cat -` and `git apply -` have always done.
-fn prose_source(args: &Args) -> Option<String> {
+pub(crate) fn prose_source(args: &Args) -> Option<String> {
     if args.rest.iter().any(|a| a == "-") {
         return Some("-".into());
     }

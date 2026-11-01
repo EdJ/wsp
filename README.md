@@ -3883,6 +3883,28 @@ redundant spelling of something already true. Disagreeing is refused, because
 that is the near miss worth naming: a task claimed in one project's root,
 briefed about another, and branched in neither.
 
+### A row with a packet starts short
+
+A row can carry a `## Packet` section: the change as expected results, the one
+command that builds and verifies it, and `file: <path>` lines naming the files
+to inline. `wsp packet <row>` prints it with those files (relative to the tree
+you stand in, `--root` to say otherwise) and refuses over 16,000 bytes, naming
+the largest part, because a packet cut short briefs the agent on code that is
+not there. `wsp packet <row> --from FILE` (or a bare `-` for stdin) writes the section.
+
+`wsp spawn <row> --agent` on a Claude Code row with a packet starts the agent
+with `--tools Bash,Read,Edit`, a one-line `--system-prompt`, no skills, no MCP
+and `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` on the seat, and its order is one line:
+run `wsp packet <row>`. compounding-033 measured the starting context at about
+43k tokens for the ordinary start and 4 to 6k for this one. Any of `--full`,
+`--no-packet` or a `packet: off` line in the section starts it the ordinary
+way, as does a leg, a verifier, a check and any kind but Claude Code. The
+SessionStart brief still runs, so the row's prose is read either way.
+
+The claim line carries a `packet` clause, so `wsp attempts --json` has
+`"packet": true|false` on each attempt and cost by kind can tell them apart.
+A resumed packet agent resumes the ordinary way.
+
 ### What "started" means, and what it does not
 
 `spawn` says `open`, `start`, then `tell`, and it says them to a *backend* —
@@ -5364,6 +5386,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/render.rs` | a task or a project, in full, and the column menu |
 | `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
+| `src/packet.rs` | `wsp packet`: a row's `## Packet` (prose, `file:` lines to inline, `packet: off` to opt out) printed with the files it names under a 16,000-byte cap that refuses rather than cuts; and the one decision that a plain member's `spawn --agent` takes Claude Code's short start (`SHORT_START` in `agent_commands`) with the packet as its order |
 | `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, what it consumed, the outcome |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else — and the same brief composed for a seat that does not exist yet |
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, the three reasons one is finished with, and the branches a removed tree leaves behind |
