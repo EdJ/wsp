@@ -22,9 +22,11 @@
 //!   idempotent because a removed tree is not there to find again.
 //!
 //! **The rule**: the check has settled and its seat is ended, no live pane
-//! stands in the tree, and the tree holds nothing beyond `target/` — no
-//! tracked change, nothing untracked, nothing ignored. A check reads; it has
-//! no business writing, and something written there is kept and named with
+//! stands in the tree, and the tree holds nothing beyond build output — no
+//! tracked change, nothing untracked, and nothing ignored but `target/` and the
+//! other residue ([`Residue`]: `__pycache__/`, `*.pyc`, a `Cargo.lock` below the
+//! root, and a project's own `## Residue` list; `wsp-327`). A check reads; it
+//! has no business writing, and something written there is kept and named with
 //! its path.
 //!
 //! **A verifier has no tree of its own.** `spawn <member> --verify` stands it
@@ -64,35 +66,102 @@ fn in_use(store: &Store, list: &str, at: usize) -> bool {
         .is_some_and(|g| g.checks.iter().any(|c| c.open() || c.standing().is_some()))
 }
 
-/// What is in a tree besides `target/`, by path — `None` when git cannot read
-/// it, which keeps it.
-pub(crate) fn litter(dir: &Path) -> Option<Vec<String>> {
-    let out = git(dir, &["status", "--porcelain", "--ignored", "--untracked-files=normal"])?;
+/// The heading a project lists extra residue globs under, one per bullet.
+pub(crate) const RESIDUE_SECTION: &str = "Residue";
+
+/// What a build leaves behind that git ignores and nobody wrote: dropping it
+/// costs a rebuild and nothing else. A glob without a `/` (after a trailing one
+/// is dropped) names a file or directory at any depth; one with a `/` is
+/// anchored at the tree's root.
+const RESIDUE: &[&str] = &["target/", "__pycache__/", "*.pyc"];
+
+/// The ignored paths a tree may hold and still count as having nothing in it.
+/// Only an ignored path is ever residue: an untracked one is somebody's.
+pub(crate) struct Residue {
+    extra: Vec<String>,
+}
+
+impl Residue {
+    /// The built-in list and every `## Residue` bullet of a project rooted in `repo`.
+    pub(crate) fn of(store: &Store, repo: &Path) -> Residue {
+        let here = util::real(&repo.display().to_string());
+        let extra = store
+            .projects()
+            .iter()
+            .filter(|p| p.roots.iter().any(|r| repo_of(r).is_some_and(|d| util::real(&d.display().to_string()) == here)))
+            .filter_map(|p| p.section(RESIDUE_SECTION))
+            .flat_map(|s| s.lines().filter_map(glob_of).collect::<Vec<_>>())
+            .collect();
+        Residue { extra }
+    }
+
+    /// Whether the ignored `path`, as `git status` reports it, is residue.
+    fn covers(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        let segments: Vec<&str> = path.split('/').collect();
+        if segments.len() > 1 && segments.last() == Some(&"Cargo.lock") {
+            return true;
+        }
+        RESIDUE.iter().copied().chain(self.extra.iter().map(String::as_str)).any(|glob| {
+            let glob = glob.trim_end_matches('/');
+            match glob.contains('/') {
+                false => segments.iter().any(|s| crate::check::captures(glob, s).is_some()),
+                true => (1..=segments.len()).any(|n| crate::check::captures(glob, &segments[..n].join("/")).is_some()),
+            }
+        })
+    }
+}
+
+fn glob_of(line: &str) -> Option<String> {
+    let bullet = line.trim().strip_prefix("- ").or_else(|| line.trim().strip_prefix("* "))?;
+    let glob = bullet.trim().trim_start_matches('`').split(['`', ' ']).next()?;
+    (!glob.is_empty()).then(|| glob.to_string())
+}
+
+/// What is in a tree besides build output, by path — `None` when git cannot
+/// read it, which keeps it. A top-level `target` is never counted; an ignored
+/// path is not counted when `residue` covers it.
+pub(crate) fn litter(dir: &Path, residue: &Residue) -> Option<Vec<String>> {
+    let out = git(dir, &["status", "--porcelain", "--ignored=matching", "--untracked-files=normal"])?;
     Some(
         out.lines()
-            .filter_map(|l| l.get(3..))
-            .map(|p| p.trim_matches('"').to_string())
-            .filter(|p| p != "target" && !p.starts_with("target/"))
+            .filter_map(|l| Some((l.get(..2)?, l.get(3..)?.trim_matches('"'))))
+            .filter(|(_, p)| *p != "target" && !p.starts_with("target/"))
+            .filter(|(code, p)| !(*code == "!!" && residue.covers(p)))
+            .map(|(_, p)| p.to_string())
             .collect(),
     )
 }
 
+/// Why a tree is kept for what [`litter`] found in it.
+pub(crate) fn holds_more(found: &[String]) -> String {
+    let shown = found.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let more = if found.len() > 3 { format!(" and {} more", found.len() - 3) } else { String::new() };
+    format!("it holds more than build output: {shown}{more}")
+}
+
 /// Take the tree at `dir`, of the repository at `repo`, unless somebody is in
 /// it or something is.
-fn take(repo: &Path, dir: &Path, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
+fn take(repo: &Path, dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
     let path = util::contract(dir);
     if let Some(why) = standing(dir) {
         return Tree::Kept { path, why };
     }
-    match litter(dir) {
+    match litter(dir, residue) {
         None => Tree::Kept { path, why: "git could not read it".into() },
-        Some(found) if !found.is_empty() => {
-            let shown = found.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-            let more = if found.len() > 3 { format!(" and {} more", found.len() - 3) } else { String::new() };
-            Tree::Kept { path, why: format!("it holds more than target/: {shown}{more}") }
-        }
+        Some(found) if !found.is_empty() => Tree::Kept { path, why: holds_more(&found) },
         Some(_) => Tree::Removed { path, kept: cmd_checkout::remove(repo, dir).kept },
     }
+}
+
+/// The repository a project root is in: walked up to the directory holding
+/// `.git`, on disk with no git to run.
+fn repo_of(root: &str) -> Option<PathBuf> {
+    let mut dir = util::expand(root);
+    while !dir.join(".git").exists() {
+        dir = dir.parent()?.to_path_buf();
+    }
+    dir.join(".git").is_dir().then_some(dir)
 }
 
 /// The repositories check trees can be in: every project's roots, each walked
@@ -102,17 +171,7 @@ fn take(repo: &Path, dir: &Path, standing: &dyn Fn(&Path) -> Option<String>) -> 
 pub(crate) fn repos(store: &Store) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    for root in store.projects().iter().flat_map(|p| p.roots.iter()) {
-        let mut dir = util::expand(root);
-        while !dir.join(".git").exists() {
-            match dir.parent() {
-                Some(up) => dir = up.to_path_buf(),
-                None => break,
-            }
-        }
-        if !dir.join(".git").is_dir() {
-            continue;
-        }
+    for dir in store.projects().iter().flat_map(|p| p.roots.iter()).filter_map(|r| repo_of(r)) {
         if seen.insert(util::real(&dir.display().to_string())) {
             out.push(dir);
         }
@@ -139,7 +198,7 @@ pub(crate) fn discard(store: &Store, name: &str, standing: &dyn Fn(&Path) -> Opt
             why: "its check is still open — the tick takes it once the check has settled".into(),
         };
     }
-    take(&repo, &dir, standing)
+    take(&repo, &dir, &Residue::of(store, &repo), standing)
 }
 
 /// Every check tree on disk whose check is nobody's, taken on the rule.
@@ -148,6 +207,7 @@ pub(crate) fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -
     let mut out = Vec::new();
     for repo in repos(store) {
         let Ok(entries) = std::fs::read_dir(repo.join(WORKTREES)) else { continue };
+        let residue = Residue::of(store, &repo);
         let mut names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         for name in names {
@@ -159,7 +219,7 @@ pub(crate) fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -
             if in_use(store, &list, at) {
                 continue;
             }
-            out.push(take(&repo, &dir, standing));
+            out.push(take(&repo, &dir, &residue, standing));
         }
     }
     out
@@ -312,6 +372,61 @@ mod tests {
         std::fs::create_dir_all(dir.join(".worktrees")).unwrap();
         std::fs::write(dir.join(".worktrees/x"), "ignored, not target\n").unwrap();
         assert!(matches!(sweep(&store, &nobody).as_slice(), [Tree::Kept { .. }]), "an ignored file was not kept");
+    }
+
+    /// Spike crates leave ignored files of their own: a standalone `Cargo.lock`
+    /// and `__pycache__/`. They are build residue, so the tree goes; what git
+    /// does not ignore still keeps it, and says what it is.
+    #[test]
+    fn ignored_residue_does_not_keep_a_tree_but_untracked_files_do() {
+        let (_env, store, repo) = scratch("residue", ENDED);
+        std::fs::write(repo.join(".gitignore"), "target/\n.worktrees/\nCargo.lock\n__pycache__/\n*.pyc\n").unwrap();
+        run(&repo, &["commit", "--quiet", "-am", "ignore what a spike generates"]);
+        let dir = tree(&repo, "run-check-1");
+        std::fs::create_dir_all(dir.join("spikes/a/target/debug")).unwrap();
+        std::fs::write(dir.join("spikes/a/Cargo.lock"), "# generated\n").unwrap();
+        std::fs::create_dir_all(dir.join("spikes/b/__pycache__")).unwrap();
+        std::fs::write(dir.join("spikes/b/__pycache__/x.pyc"), "x").unwrap();
+        std::fs::write(dir.join("loose.pyc"), "x").unwrap();
+        // Tracked source beside the residue, so the directories are not wholly ignored.
+        std::fs::write(dir.join("spikes/a/main.rs"), "fn main() {}\n").unwrap();
+        run(&dir, &["add", "spikes/a/main.rs"]);
+        run(&dir, &["commit", "--quiet", "-m", "a spike"]);
+
+        std::fs::write(dir.join("spikes/a/notes.txt"), "untracked, not ignored\n").unwrap();
+        match sweep(&store, &nobody).as_slice() {
+            [Tree::Kept { why, .. }] => assert!(why.contains("notes.txt") && !why.contains("Cargo.lock") && !why.contains("pycache"), "{why}"),
+            _ => panic!("an untracked file did not keep the tree"),
+        }
+        std::fs::remove_file(dir.join("spikes/a/notes.txt")).unwrap();
+        let out = sweep(&store, &nobody);
+        assert!(matches!(out.as_slice(), [Tree::Removed { .. }]), "residue kept the tree: {:?}", out.iter().map(|t| match t { Tree::Kept { why, .. } => why.clone(), _ => "x".into() }).collect::<Vec<_>>());
+        assert!(!dir.exists());
+    }
+
+    /// A root `Cargo.lock` is the workspace's own and keeps the tree; the list
+    /// is extended per project under `## Residue`.
+    #[test]
+    fn the_residue_list_is_extended_by_the_project() {
+        let (_env, store, repo) = scratch("extended", ENDED);
+        std::fs::write(repo.join(".gitignore"), "target/\n.worktrees/\nCargo.lock\n.cache/\n").unwrap();
+        run(&repo, &["commit", "--quiet", "-am", "ignores"]);
+        let dir = tree(&repo, "run-check-1");
+        std::fs::write(dir.join("Cargo.lock"), "# the workspace's own\n").unwrap();
+        match sweep(&store, &nobody).as_slice() {
+            [Tree::Kept { why, .. }] => assert!(why.contains("Cargo.lock"), "{why}"),
+            _ => panic!("a root Cargo.lock was read as residue"),
+        }
+        std::fs::remove_file(dir.join("Cargo.lock")).unwrap();
+
+        std::fs::create_dir_all(dir.join(".cache")).unwrap();
+        std::fs::write(dir.join(".cache/x"), "x").unwrap();
+        assert!(matches!(sweep(&store, &nobody).as_slice(), [Tree::Kept { .. }]), ".cache/ is not on the built-in list");
+
+        let mut p = store.project("p").unwrap();
+        p.body = "## Residue\n- `.cache/`\n".into();
+        store.save_project(&p).unwrap();
+        assert!(matches!(sweep(&store, &nobody).as_slice(), [Tree::Removed { .. }]), "the project's own list was not read");
     }
 
     /// A live pane standing in it keeps it, and so does a check still

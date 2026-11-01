@@ -2469,6 +2469,7 @@ impl Source for Poll<'_> {
             // cost a `ps -E` on every tick of every watch to fill a field
             // nobody in this function looks at.
             daemon: None,
+            disk: None,
             // (c) asks every row whether it is waiting — the one reading the
             // reconciler and the barrier ask too.
             asks: crate::waiting::Asks::read(self.store),
@@ -4339,6 +4340,12 @@ fn status(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     if let Some(d) = &loud {
         println!("{}", p.red(d));
+    }
+    for disk in crate::disk::read(store, crate::disk::LOW, false) {
+        match disk.low() {
+            true => println!("{}", p.red(&disk.line())),
+            false => println!("{}", p.dim(&disk.line())),
+        }
     }
     if watches.is_empty() {
         println!("{}", p.dim("nobody is watching · `wsp watch` starts one"));

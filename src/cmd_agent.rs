@@ -3959,6 +3959,9 @@ pub(crate) struct Wip {
     /// unattended pass is not running is the machine where the *wake* spools
     /// are all holding — six days of it, read as busy the whole time.
     pub daemon: Option<String>,
+    /// A volume holding project roots that is nearly full, and what to remove —
+    /// [`crate::disk::loud`]. Absent while there is room.
+    pub disk: Option<String>,
     /// The open questions, read once — the store half of [`crate::waiting`]'s
     /// reading, asked for every row.
     pub asks: crate::waiting::Asks,
@@ -4098,6 +4101,7 @@ impl Wip {
             agents_held,
             said: store.said(),
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
+            disk: crate::disk::loud(store),
             asks: crate::waiting::Asks::read(store),
             shells,
             mandates: store.mandates(),
@@ -4712,6 +4716,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         // said, and a caller that has to ask "no daemon, or a daemon whose `ps`
         // would not answer?" cannot tell those apart from a flag either.
         "daemon": w.daemon,
+        "disk": w.disk,
         "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "inbox": inbox,
@@ -4734,7 +4739,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
 
     if rows.is_empty() {
         out.push(p.dim("no agents running"));
-        if let Some(d) = &w.daemon {
+        for d in w.daemon.iter().chain(&w.disk) {
             out.push(p.red(d));
         }
     } else {
@@ -4775,7 +4780,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         // Its own line rather than another `·` clause on the heading: it is a
         // fault and the heading is a census, and a heading that goes yellow
         // every hour trains its reader past the yellow.
-        if let Some(d) = &w.daemon {
+        for d in w.daemon.iter().chain(&w.disk) {
             out.push(p.red(d));
         }
         out.push(String::new());
@@ -6242,6 +6247,9 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
+    // And whether the disk the trees are on is running out (`wsp-327`), naming
+    // the largest build output that could go.
+    crate::disk::health(store, &mut problems, &mut notes);
     // And whether anything that said it was reporting still is. The only check
     // here whose subject is a *reporter* rather than a piece of work, and the
     // only place in wsp that can tell a fleet with nothing to say from a
@@ -8054,6 +8062,7 @@ mod tests {
             agents_held: std::collections::BTreeMap::new(),
             said,
             daemon: None,
+            disk: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),
@@ -8245,6 +8254,7 @@ mod tests {
             agents_held: std::collections::BTreeMap::new(),
             said: std::collections::BTreeMap::new(),
             daemon: None,
+            disk: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),

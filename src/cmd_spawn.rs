@@ -8465,6 +8465,7 @@ mod tests {
             agents_held: store.agents_held(),
             said: store.said(),
             daemon: None,
+            disk: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),

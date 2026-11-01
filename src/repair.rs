@@ -301,6 +301,11 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     crate::check_tree::tidy(store, &ended);
     // And a finished leg's (wsp-297): the same read off the disk.
     crate::leg_tree::tidy(store, &[ended.clone(), ended_legs].concat());
+    // And the build output of a landed row nobody is working in any more
+    // (`wsp-327`): `wsp done` takes the tree, and rows wait at review for days.
+    crate::build_output::tidy(store);
+    // And whether the disk those trees are on is running out.
+    crate::disk::tidy(store);
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);

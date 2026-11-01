@@ -5154,6 +5154,29 @@ trunk has not got, nobody standing in it and no claim held. Anything else is
 kept and the line under the receipt says why. `--keep-tree` leaves it. `land`
 still takes nothing, for the reasons above.
 
+**But review is where rows wait, so the build output goes sooner** (`wsp-327`).
+`done` is the person's bookkeeping and about 126 rows sat at `review` on
+2026-11-01, each tree holding gigabytes of `target/` — the machine reached 3.4 GB
+free. The daemon's tick drops the `target/` of a row's tree and of its legs'
+trees once the row is at `review` or `done`, holds no claim, has nobody standing
+in its tree (a verifier stands in its member's) and has nothing on its branch
+the trunk lacks. The trees stay, with whatever is uncommitted in them; a
+reopened row pays one cold build. `cycle.log` says what went and what was kept
+and why. Check and leg trees are swept on the same rule with a wider idea of
+nothing: an *ignored* `__pycache__/`, `*.pyc` or `Cargo.lock` below the tree's
+root counts as build residue, and so does anything a project lists under a
+`## Residue` section of its brief, one glob per bullet (`.cache/`, `*.o`;
+without a `/` it names a file or directory at any depth). Untracked files that
+git does not ignore still keep a tree, and `cycle.log` names them.
+
+**A disk line** (`wsp-327`). `wsp watch --status` prints the free space on each
+volume holding a project root, `wsp doctor` lists it as a note, and under 30 GB
+it is a problem there, red in `wsp watch --status` and a line under the heading
+of `wsp wip`: it names the largest `target/` in a project's `.worktrees/` or in
+`state/warm/` — what the machine could lose and only rebuild. The daemon
+measures it in a thread (`du` over a hundred trees takes minutes) into
+`state/disk.json`, good for ten minutes, and says it once in `cycle.log`.
+
 **And the trees whose group a worklist has passed** (`wsp-092` d3). Nothing here
 ever reaches `done` — everything sits at `review` by design — so "the task is
 closed" almost never arrives, and eighteen worktrees and nineteen orphaned

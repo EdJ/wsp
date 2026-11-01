@@ -47,6 +47,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::check_tree::Residue;
 use crate::cmd_checkout::{self, Tree, WORKTREES};
 use crate::cmd_verify::{self, git, git_ok};
 use crate::legs::{self, Leg, State};
@@ -461,7 +462,7 @@ pub(crate) fn overlap_line(leg: &str, found: &[(String, Vec<String>)]) -> Option
 
 /// Take the tree of a finished leg, on `check_tree`'s rule and one more: its
 /// branch is in the row's.
-fn take(repo: &Path, dir: &Path, name: &str, row_dir: &Path, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
+fn take(repo: &Path, dir: &Path, name: &str, row_dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
     let path = util::contract(dir);
     if let Some(why) = standing(dir) {
         return Tree::Kept { path, why };
@@ -472,13 +473,9 @@ fn take(repo: &Path, dir: &Path, name: &str, row_dir: &Path, standing: &dyn Fn(&
     if !contained(repo, name, &row) {
         return Tree::Kept { path, why: format!("its branch has commits {row} has not got — merged at the join that waits on it") };
     }
-    match crate::check_tree::litter(dir) {
+    match crate::check_tree::litter(dir, residue) {
         None => Tree::Kept { path, why: "git could not read it".into() },
-        Some(found) if !found.is_empty() => {
-            let shown = found.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-            let more = if found.len() > 3 { format!(" and {} more", found.len() - 3) } else { String::new() };
-            Tree::Kept { path, why: format!("it holds more than target/: {shown}{more}") }
-        }
+        Some(found) if !found.is_empty() => Tree::Kept { path, why: crate::check_tree::holds_more(&found) },
         Some(_) => {
             let _ = git(repo, &["worktree", "remove", "--force", &dir.display().to_string()]);
             let _ = std::fs::remove_dir_all(dir);
@@ -511,9 +508,10 @@ pub(crate) fn discard(store: &Store, task: &str, standing: &dyn Fn(&Path) -> Opt
     let prefix = format!("{task}.");
     let mut out = Vec::new();
     for repo in crate::check_tree::repos(store) {
+        let residue = Residue::of(store, &repo);
         for name in leg_trees(&repo, Some(&prefix)) {
             if let Some((dir, row_dir)) = settled_tree(store, &repo, &name) {
-                out.push(take(&repo, &dir, &name, &row_dir, standing));
+                out.push(take(&repo, &dir, &name, &row_dir, &residue, standing));
             }
         }
     }
@@ -524,9 +522,10 @@ pub(crate) fn discard(store: &Store, task: &str, standing: &dyn Fn(&Path) -> Opt
 pub(crate) fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -> Vec<Tree> {
     let mut out = Vec::new();
     for repo in crate::check_tree::repos(store) {
+        let residue = Residue::of(store, &repo);
         for name in leg_trees(&repo, None) {
             if let Some((dir, row_dir)) = settled_tree(store, &repo, &name) {
-                out.push(take(&repo, &dir, &name, &row_dir, standing));
+                out.push(take(&repo, &dir, &name, &row_dir, &residue, standing));
             }
         }
     }
