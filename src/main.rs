@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 mod after;
 mod agent_commands;
 mod barrier;
+mod barrier_replay;
+mod barrier_run;
 mod caption;
 mod choices;
 mod hold;

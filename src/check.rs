@@ -24,8 +24,9 @@
 //!    with no `on` runs for every landing, which is for what is cheap.
 //! 3. **The full suite at the barrier**, once per group, not per row:
 //!    `- name (limit) at barrier: command`. [`barrier_steps`] names them and
-//!    `wsp check <project> --barrier` runs them at the trunk; the barrier row
-//!    is compounding's, and this is the hook it calls.
+//!    `wsp check <project> --barrier` runs them by hand at the trunk; the
+//!    barrier itself runs them with every member's checks and the stop's, in
+//!    [`crate::barrier_run`] (`wsp-326`).
 //!
 //! A step passes when its command exits 0, and the limit is `90s`, `20m` or
 //! `2h` (ten minutes without one). wsp knows nothing about any project: it runs
@@ -87,7 +88,7 @@ pub(crate) const SECTION: &str = "Checks";
 const DEFAULT_LIMIT: Duration = Duration::from_secs(600);
 
 /// How long a run waits for the tree before giving it up for the next trigger.
-const TREE_WAIT: Duration = Duration::from_secs(45 * 60);
+pub(crate) const TREE_WAIT: Duration = Duration::from_secs(45 * 60);
 
 /// The longest a tail of output is kept on the row, in lines and in characters.
 const TAIL_LINES: usize = 25;
@@ -138,7 +139,7 @@ struct Head {
     barrier: bool,
 }
 
-fn step_of(item: &str, of: Of) -> Option<Step> {
+pub(crate) fn step_of(item: &str, of: Of) -> Option<Step> {
     let item = item.trim();
     let (head, command) = match item.split_once(": ") {
         Some((h, c)) if head_of(h).is_some() => (head_of(h), c),
@@ -364,7 +365,7 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
 /// The paths the landing changed: since the commit `wsp land` wrote on the row,
 /// and for a row landed before it did, in the commits up to `sha` that name the
 /// row's id — in front, as wsp's own do now, or at the end, as they once did.
-fn changed_paths(tg: &Target, t: &Task, use_since: bool) -> Vec<String> {
+pub(crate) fn changed_paths(tg: &Target, t: &Task, use_since: bool) -> Vec<String> {
     let since = tg.since.clone().or_else(|| use_since.then(|| since_of(t)).flatten());
     let out = match since {
         Some(base) => git(&tg.repo, &["diff", "--name-only", &base, &tg.sha]),
@@ -388,7 +389,7 @@ fn since_of(t: &Task) -> Option<String> {
     (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
 }
 
-fn project_of(t: &Task) -> Option<String> {
+pub(crate) fn project_of(t: &Task) -> Option<String> {
     t.project.clone().filter(|p| !p.is_empty()).or_else(|| t.id.rsplit_once('-').map(|(p, _)| p.to_string()))
 }
 
@@ -433,13 +434,13 @@ pub(crate) fn target(store: &Store, t: &Task, at: Option<&str>) -> Result<Target
     Err(format!("{sha} is in none of {project}'s roots ({})", roots.join(", ")))
 }
 
-fn dir_of(store: &Store, tg: &Target) -> PathBuf {
+pub(crate) fn dir_of(store: &Store, tg: &Target) -> PathBuf {
     let repo = tg.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     store.state_file("checks").join(format!("{}-{repo}", tg.project))
 }
 
 /// Move the warm tree to `sha`, making it on the first use.
-fn checkout(repo: &Path, tree: &Path, sha: &str) -> Result<(), String> {
+pub(crate) fn checkout(repo: &Path, tree: &Path, sha: &str) -> Result<(), String> {
     if tree.join(".git").exists() {
         git_ok(tree, &["checkout", "--detach", "--quiet", "--force", sha])?;
         // What a build left that git would track is cleaned; what it ignores
@@ -456,10 +457,10 @@ fn checkout(repo: &Path, tree: &Path, sha: &str) -> Result<(), String> {
 }
 
 /// One check at a time in a tree: a file beside it holding the pid that has it.
-struct TreeLock(PathBuf);
+pub(crate) struct TreeLock(PathBuf);
 
 impl TreeLock {
-    fn take(path: PathBuf, wait: Duration) -> Result<TreeLock, String> {
+    pub(crate) fn take(path: PathBuf, wait: Duration) -> Result<TreeLock, String> {
         let start = Instant::now();
         loop {
             if let Some(dir) = path.parent() {
@@ -609,6 +610,20 @@ pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, mut each: impl FnM
     out
 }
 
+/// Run every step whatever the one before did. A barrier wants all of its
+/// answers — a red suite does not excuse a member's own check from being read —
+/// where a row's run stops at the first.
+pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
+    steps
+        .iter()
+        .map(|s| {
+            let ran = run_again(dir, s, log);
+            each(&ran);
+            ran
+        })
+        .collect()
+}
+
 /// A step, and once more if it failed on its own account: a suite that fails
 /// intermittently (the handbook counts five red-then-greens on unmodified trees)
 /// would otherwise send a row back for nothing it did. The second pass is what
@@ -628,11 +643,11 @@ pub(crate) fn passed(ran: &[Ran]) -> bool {
     ran.iter().all(|r| r.done == Done::Passed)
 }
 
-fn secs(d: Duration) -> u64 {
+pub(crate) fn secs(d: Duration) -> u64 {
     d.as_secs().max(u64::from(d > Duration::ZERO))
 }
 
-fn why_failed(r: &Ran) -> String {
+pub(crate) fn why_failed(r: &Ran) -> String {
     match &r.done {
         Done::Failed { timed_out: true, .. } => format!("timed out after {}s", r.step.limit.as_secs()),
         Done::Failed { exit: Some(n), .. } => format!("exit {n}"),
@@ -684,7 +699,7 @@ pub(crate) fn owed(ran: &[Ran], sha: &str) -> String {
 
 /// How long a `running` entry is believed: its steps' limits, the wait for the
 /// tree, and a margin.
-fn stale_after(steps: &[Step]) -> i64 {
+pub(crate) fn stale_after(steps: &[Step]) -> i64 {
     (steps.iter().map(|s| s.limit).sum::<Duration>() + TREE_WAIT + Duration::from_secs(300)).as_secs() as i64
 }
 
@@ -918,6 +933,9 @@ pub fn check(store: &Store, args: &Args) -> i32 {
 
 /// Which tier brought a step in, for a plan and for a row's account.
 fn why_in(s: &Step) -> String {
+    if s.barrier {
+        return "at the barrier".into();
+    }
     match s.of {
         Of::Task => "the member's".into(),
         Of::Rule => format!("rule on {}", s.on.join(", ")),
@@ -927,8 +945,8 @@ fn why_in(s: &Step) -> String {
 
 /// `wsp check <project> --barrier [--at <commit>]` — the project's `at barrier`
 /// steps, run at the trunk's tip (or the named commit), once for a group: the
-/// hook the barrier's own row calls. It writes nothing; the barrier's agent
-/// records what it ran.
+/// by-hand form of what [`crate::barrier_run`] does for a group. It writes
+/// nothing.
 fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
     let p = Paint::new();
     let Some(found) = store.project(project) else {

@@ -1713,6 +1713,16 @@ pub struct Group {
     /// Every check of the barrier after this group, oldest first: `wsp-230`'s
     /// record of a check that has no row. See [`crate::barrier`].
     pub checks: Vec<crate::barrier::Check>,
+    /// `stop-checks:` — the mechanical part of the stop condition: commands
+    /// whose exit code is the answer, one item each in the form of a project's
+    /// `## Checks` (`name (limit): command`). wsp runs them with the barrier's
+    /// suite, and a stop with no prose beside them needs no agent to read it
+    /// (`wsp-326`).
+    ///
+    /// **A wsp from before this reads the lines as more members**, the hazard
+    /// [`Self::member_agents`] documents: `wsp install` after the land, before
+    /// a list carrying one is run by an older binary.
+    pub stop_checks: Vec<String>,
 }
 
 /// Who a group runs on: the kind, and optionally the model and the effort,
@@ -1940,6 +1950,7 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         Verdict,
         Landed,
         Checks,
+        StopChecks,
     }
 
     let mut out: Vec<Group> = Vec::new();
@@ -1976,6 +1987,10 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
                 }
                 Cont::Checks => {
                     crate::barrier::push(&mut last.checks, trimmed);
+                    continue;
+                }
+                Cont::StopChecks => {
+                    stop_check_push(&mut last.stop_checks, trimmed);
                     continue;
                 }
                 Cont::Members => {}
@@ -2036,12 +2051,18 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
             crate::barrier::push(&mut last.checks, rest);
             cont = Cont::Checks;
             label_indent = indent;
+        } else if let Some(rest) = trimmed.strip_prefix("stop-checks:") {
+            last.stop_checks.clear();
+            stop_check_push(&mut last.stop_checks, rest);
+            cont = Cont::StopChecks;
+            label_indent = indent;
         } else {
             match cont {
                 Cont::Stop => join(&mut last.stop, trimmed),
                 Cont::Verdict => join(&mut last.verdict, trimmed),
                 Cont::Landed => landed_push(&mut last.landed, trimmed),
                 Cont::Checks => crate::barrier::push(&mut last.checks, trimmed),
+                Cont::StopChecks => stop_check_push(&mut last.stop_checks, trimmed),
                 Cont::Members => {
                     last.members.extend(trimmed.split_whitespace().map(|t| t.to_string()))
                 }
@@ -2111,6 +2132,31 @@ fn landed_text(landed: &[Landed]) -> String {
     out
 }
 
+/// The items of a stop-checks list written as text: `- item` to a line.
+pub fn parse_stop_checks(text: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    for line in text.lines() {
+        stop_check_push(&mut items, line);
+    }
+    items
+}
+
+/// One line of a `stop-checks:` block: `- item` starts an item, and anything
+/// else continues the one before it.
+fn stop_check_push(items: &mut Vec<String>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    match line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        Some(item) => items.push(item.trim().to_string()),
+        None => match items.last_mut() {
+            Some(last) => join(last, line),
+            None => items.push(line.to_string()),
+        },
+    }
+}
+
 /// A wrapped line, put back onto the paragraph it was broken out of.
 fn join(text: &mut String, line: &str) {
     if !text.is_empty() {
@@ -2152,6 +2198,14 @@ pub fn render_groups(groups: &[Group]) -> String {
             }
         }
         block(&mut out, "stop", &g.stop);
+        if !g.stop_checks.is_empty() {
+            // One item to a line, never re-wrapped: a command's spacing is
+            // part of it.
+            out.push_str("  stop-checks:\n");
+            for item in &g.stop_checks {
+                out.push_str(&format!("      - {}\n", item.trim()));
+            }
+        }
         block(&mut out, "verdict", &g.verdict);
         // Never wrapped: a caption is refused past sixty at the verb.
         if !g.verdict_caption.trim().is_empty() {
@@ -2890,6 +2944,37 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         // which is what makes the body safe to hold the structure in.
         assert_eq!(render_groups(&gs), written);
         assert_eq!(parse_groups(&render_groups(&gs)), gs);
+    }
+
+    /// `stop-checks:` is one item to a line, beside the stop and not in it, and
+    /// a command's own spacing and colons survive a round trip; a wrapped item
+    /// is the one item, and the next group is not made of its words.
+    #[test]
+    fn stop_checks_sit_beside_the_stop_and_round_trip_one_item_to_a_line() {
+        let written = "\
+- 1  a-1  a-2
+  id: 1
+  stop: the cost line stays under five dollars
+  stop-checks:
+      - suite (20m): cargo test --lib
+      - doc: grep -c 'pilot' docs/pilot.md   # two  spaces
+  verdict: passes
+- 2  a-3
+  id: 2
+";
+        let gs = parse_groups(written);
+        assert_eq!(gs.len(), 2);
+        assert_eq!(gs[0].stop, "the cost line stays under five dollars");
+        assert_eq!(gs[0].stop_checks, vec!["suite (20m): cargo test --lib", "doc: grep -c 'pilot' docs/pilot.md   # two  spaces"]);
+        assert_eq!(gs[0].verdict, "passes", "the block ends where the next label begins");
+        assert!(gs[1].stop_checks.is_empty());
+        assert_eq!(render_groups(&gs), written);
+
+        let wrapped = "- 1  a-1\n  stop-checks: - one: sh a.sh\n      - two: sh b.sh\n        --strict\n- 2  a-2\n";
+        let gs = parse_groups(wrapped);
+        assert_eq!(gs.len(), 2, "a continuation is not a group");
+        assert_eq!(gs[0].stop_checks, vec!["one: sh a.sh", "two: sh b.sh --strict"]);
+        assert_eq!(parse_stop_checks("- a: x\n- b: y\n"), vec!["a: x", "b: y"]);
     }
 
     /// The ordinal is a rendering of the position, not an id. So the queue is

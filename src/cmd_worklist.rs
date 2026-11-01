@@ -105,6 +105,9 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "rm" | "remove" => rm(store, args),
         "mv" | "move" => mv(store, args),
         "group" => group(store, args),
+        "stop-checks" => stop_checks(store, args),
+        // What an automatic pass would have done to the barriers on record.
+        "replay" => crate::barrier_replay::run(store, args),
         "member" => member(store, args),
         "edit" => edit(store, args),
         "ls" | "list" => list(store, args),
@@ -927,6 +930,79 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         println!("{id} → {} group {at} of {}{tail}", w.id, groups.len());
     }
     0
+}
+
+// ---- stop-checks ------------------------------------------------------
+
+/// `wsp worklist stop-checks <slug> N [--from FILE|-] [--drop]` — the
+/// mechanical half of a group's stop condition (`wsp-326`): one `name (limit):
+/// command` item to a line, run by wsp at the barrier beside the suite. The
+/// list given replaces the one there; `--drop` takes it away.
+///
+/// A verb of its own and not a flag on `group`, whose checks are about prose
+/// and a window these items need none of. They may be set until the barrier's
+/// check is open, as the stop may, because after that wsp has read them.
+pub fn stop_checks(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str = "usage: wsp worklist stop-checks <slug> N --from FILE|-   (one `- name (limit): command` per line) · --drop clears";
+    let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let mut w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let mut groups = w.groups();
+    let ordinal = match ordinal_of(&n, groups.len()) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    let items = if args.has("drop") {
+        Vec::new()
+    } else {
+        let Some(src) = args.get("from") else {
+            eprintln!("{USAGE}");
+            return 2;
+        };
+        let text = if matches!(src.as_str(), "-" | "true") {
+            std::io::read_to_string(std::io::stdin()).unwrap_or_default()
+        } else {
+            match std::fs::read_to_string(util::expand(&src)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("wsp: {src}: {e}");
+                    return 1;
+                }
+            }
+        };
+        // A bare command is a step in a project's list, so prose handed here
+        // would be run as one: the first line has to say it is an item.
+        if text.lines().map(str::trim).find(|l| !l.is_empty()).is_some_and(|l| !l.starts_with("- ") && !l.starts_with("* ")) {
+            eprintln!("wsp: the list starts with a line that is not an item — one `- name (limit): command` per line");
+            return 2;
+        }
+        let items = crate::model::parse_stop_checks(&text);
+        if let Some(bad) = items.iter().find(|i| crate::check::step_of(i, crate::check::Of::Project).is_none()) {
+            eprintln!("wsp: `{bad}` is not a check — one `- name (limit): command` per line");
+            return 2;
+        }
+        items
+    };
+    if let Some(open) = open_check(store, &w, ordinal) {
+        eprintln!("wsp: will not change group {ordinal}'s stop checks — its barrier is open on {open}, which was handed them as they stand");
+        return 1;
+    }
+    groups[ordinal - 1].stop_checks = items.clone();
+    let said = if items.is_empty() { "no stop checks".to_string() } else { format!("{} stop check(s)", items.len()) };
+    w.log(&format!("group {ordinal} — {said} · by {}", crate::cmd_message::caller(store)));
+    let code = save(store, &mut w, &groups, "stop-checks", &format!("group {ordinal} {said}"));
+    if code == 0 {
+        println!("{} group {ordinal}: {said}", w.id);
+    }
+    code
 }
 
 // ---- group ------------------------------------------------------------
@@ -3831,16 +3907,19 @@ fn go_with(
             "worklist-go",
             json!({ "id": w.id, "passed": crossed, "started": starting, "verdict": said }),
         );
+        // Before the poke: the step it starts closes a last list from the copy
+        // it read, and a settlement written after that read is lost with it
+        // (`wsp-326`'s first automatic pass left its check reading `running`).
+        if let Some(n) = crossed {
+            crate::barrier::settle(store, &w.id, n, said_as);
+        }
         crate::cycle::poke_list(store, &w.id, "go", crossed);
     }
     // The check whose verdict this is is recorded on the group, and has
     // nothing left once its turn ends — and nothing after this verb could end
     // it on time. See [`crate::cycle::end_checks_when_idle`].
     let ending = match (dry, crossed) {
-        (false, Some(n)) => {
-            crate::barrier::settle(store, &w.id, n, said_as);
-            crate::cycle::end_checks_when_idle(store, &w.id, n)
-        }
+        (false, Some(n)) => crate::cycle::end_checks_when_idle(store, &w.id, n),
         _ => Vec::new(),
     };
 

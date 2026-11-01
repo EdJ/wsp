@@ -138,6 +138,39 @@ pub(crate) struct Check {
     /// The tries ran out and the person was flagged. Set once, so a tick that
     /// sees the entry spent again says nothing again.
     pub gave_up: bool,
+    /// The mechanical part, run by wsp before any agent is asked (`wsp-326`).
+    /// `None` where nothing was declared to run.
+    pub suite: Option<Suite>,
+    /// Who settled it, when it was not an agent: `wsp`.
+    pub by: Option<String>,
+}
+
+/// Where the barrier's mechanical run is: the project's full suite, the
+/// members' recorded checks and the stop condition's `stop-checks`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Suite {
+    Running,
+    Green,
+    Red,
+}
+
+impl Suite {
+    fn as_str(self) -> &'static str {
+        match self {
+            Suite::Running => "running",
+            Suite::Green => "green",
+            Suite::Red => "red",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Suite> {
+        Some(match s {
+            "running" => Suite::Running,
+            "green" => Suite::Green,
+            "red" => Suite::Red,
+            _ => return None,
+        })
+    }
 }
 
 impl Check {
@@ -152,6 +185,8 @@ impl Check {
             was: None,
             tries: 1,
             gave_up: false,
+            suite: None,
+            by: None,
         }
     }
 
@@ -159,6 +194,9 @@ impl Check {
     /// again: after its first start and after its second, and after its last
     /// never.
     fn wait_before_next_try(&self) -> Option<i64> {
+        if self.suite == Some(Suite::Running) {
+            return Some(SUITE_WEDGED_AFTER);
+        }
         wait_after(self.tries)
     }
 
@@ -203,11 +241,15 @@ pub(crate) fn push(acc: &mut Vec<Check>, text: &str) {
                 was: None,
                 tries: 1,
                 gave_up: false,
+                suite: None,
+                by: None,
             });
             continue;
         }
         let Some(c) = acc.last_mut() else { continue };
         match tok.split_once(':') {
+            Some(("suite", v)) => c.suite = Suite::parse(v),
+            Some(("by", v)) => c.by = Some(v.to_string()),
             Some(("read", v)) => c.read = Some(v.to_string()),
             Some(("pane", v)) => c.pane = Some(v.to_string()),
             Some(("on", v)) => c.on = Some(v.replace('+', " ")),
@@ -250,6 +292,12 @@ pub(crate) fn text(checks: &[Check]) -> String {
         }
         if c.gave_up {
             e.push("gave-up".into());
+        }
+        if let Some(s) = c.suite {
+            e.push(format!("suite:{}", s.as_str()));
+        }
+        if let Some(b) = &c.by {
+            e.push(format!("by:{b}"));
         }
         match c.ending {
             Ending::Standing => {}
@@ -338,12 +386,29 @@ fn change(store: &Store, list: &str, at: usize, f: impl FnOnce(&mut Group) -> bo
     })
 }
 
+/// Whether opening a check on `g` would write anything now: there is none open,
+/// the open one's seat has gone, or it has no seat and has waited out its start.
+/// Asked before the plan is read, so a barrier that is only being waited on does
+/// not read the repositories every tick.
+pub(crate) fn would_open(g: &Group, gone: &dyn Fn(&str) -> bool) -> bool {
+    match running(g) {
+        None => true,
+        Some(c) => match c.pane.as_deref() {
+            Some(p) => gone(p),
+            None => c.wait_before_next_try().is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w),
+        },
+    }
+}
+
 /// A check opened on group `at`, or none owed.
 pub(crate) struct Opened {
     /// It took over an open entry nobody's agent ever reached.
     pub retaken: bool,
     /// Which start of the entry this is, the first being 1.
     pub tries: u32,
+    /// Where the mechanical run of the entry it took over had got to, so a
+    /// start that failed after the suite finished does not run the suite again.
+    pub suite: Option<Suite>,
 }
 
 /// How many times an entry's agent is started before the run stops trying and
@@ -372,6 +437,17 @@ pub(crate) fn wait_after(tries: u32) -> Option<i64> {
 /// that never even got to say so.
 pub(crate) const NOT_UP_AFTER: i64 = 5 * 60;
 
+/// And while its suite is running: the longest a barrier's run is believed,
+/// the steps' own limits being what end it sooner.
+const SUITE_WEDGED_AFTER: i64 = 3 * 60 * 60;
+
+/// Whether wsp is to run the mechanical part for a check it opens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mechanical {
+    No,
+    Yes,
+}
+
 /// Open a check on group `at`, if one is owed, under the lock. `gone` answers
 /// whether a seat has nobody in it any more.
 ///
@@ -383,7 +459,7 @@ pub(crate) const NOT_UP_AFTER: i64 = 5 * 60;
 /// backoff, [`TRIES`] times in all, and then not at all: [`give_up`] says so.
 #[cfg(test)]
 pub(crate) fn open(store: &Store, w: &Worklist, at: usize, read: Option<String>, on: Option<String>, gone: &dyn Fn(&str) -> bool) -> Option<Opened> {
-    open_within(store, w, at, read, on, gone, &|| true)
+    open_within(store, w, at, read, on, Mechanical::No, gone, &|| true)
 }
 
 /// [`open`], asking `admit` whether the machine has room for one more agent
@@ -395,6 +471,7 @@ pub(crate) fn open_within(
     at: usize,
     read: Option<String>,
     on: Option<String>,
+    mech: Mechanical,
     gone: &dyn Fn(&str) -> bool,
     admit: &dyn Fn() -> bool,
 ) -> Option<Opened> {
@@ -414,9 +491,17 @@ pub(crate) fn open_within(
                     if !admit() {
                         return false;
                     }
+                    let before = c.suite;
                     c.at = util::now_iso();
-                    c.tries += 1;
-                    opened = Some(Opened { retaken: true, tries: c.tries });
+                    // A suite that never finished, or one not asked for until
+                    // now, is a run and not another try of the agent's start;
+                    // a finished suite's start is what is retried.
+                    if before == Some(Suite::Running) || (before.is_none() && mech == Mechanical::Yes) {
+                        c.suite = (mech == Mechanical::Yes).then_some(Suite::Running);
+                    } else {
+                        c.tries += 1;
+                    }
+                    opened = Some(Opened { retaken: true, tries: c.tries, suite: before });
                     return true;
                 }
                 None => return false,
@@ -424,8 +509,12 @@ pub(crate) fn open_within(
         } else if !admit() {
             return false;
         }
-        g.checks.push(Check::opened(read, on));
-        opened = Some(Opened { retaken: false, tries: 1 });
+        let mut c = Check::opened(read, on);
+        if mech == Mechanical::Yes {
+            c.suite = Some(Suite::Running);
+        }
+        g.checks.push(c);
+        opened = Some(Opened { retaken: false, tries: 1, suite: None });
         true
     });
     changed.then_some(()).and(opened)
@@ -513,6 +602,30 @@ pub(crate) fn try_again(store: &Store, list: &str) -> bool {
     any
 }
 
+/// Record where the open check's mechanical run got to, and — with `by` — that
+/// wsp, and no agent, is settling it. Written before the verb that settles, so
+/// the entry reads whole. `Some("")` takes the claim back, for a pass that
+/// could not be recorded.
+pub(crate) fn note_run(store: &Store, list: &str, at: usize, suite: Suite, by: Option<&str>) -> bool {
+    change(store, list, at, |g| match g.checks.iter_mut().rev().find(|c| c.open()) {
+        Some(c) => {
+            c.suite = Some(suite);
+            if let Some(b) = by {
+                c.by = Some(b.to_string()).filter(|b| !b.is_empty());
+            }
+            true
+        }
+        None => false,
+    })
+}
+
+/// The open check's suite state on group `at`, if it has one.
+pub(crate) fn suite_of(store: &Store, list: &str, at: usize) -> Option<Suite> {
+    let w = store.worklist(list)?;
+    let groups = w.groups();
+    running(groups.get(at - 1)?)?.suite
+}
+
 /// Settle the open check on group `at`. Returns the seat it ran in, for the
 /// ending, when there was one to settle.
 ///
@@ -571,6 +684,12 @@ pub(crate) fn lines(p: &Paint, g: &Group) -> Vec<String> {
             if let Some(w) = &c.was {
                 parts.push(format!("was {w}"));
             }
+            if let Some(s) = c.suite {
+                parts.push(format!("suite {}", s.as_str()));
+            }
+            if let Some(b) = &c.by {
+                parts.push(format!("by {b}, no agent"));
+            }
             p.dim(&parts.join(" · "))
         })
         .collect()
@@ -625,7 +744,7 @@ fn legacy(row: &Task, w: &Worklist, g: &Group, later: bool) -> Check {
         .find_map(|l| l.split("spawned at ").nth(1))
         .and_then(|r| r.split_whitespace().next())
         .map(str::to_string);
-    Check { at: row.created.clone(), state, read: None, pane, on, ending: Ending::Ended, was: Some(row.id.clone()), tries: 1, gave_up: false }
+    Check { at: row.created.clone(), state, read: None, pane, on, ending: Ending::Ended, was: Some(row.id.clone()), tries: 1, gave_up: false, suite: None, by: None }
 }
 
 /// What [`migrate`] would do.
@@ -790,6 +909,8 @@ mod tests {
             was: Some("compound-369".into()),
             tries: 3,
             gave_up: true,
+            suite: Some(Suite::Red),
+            by: Some("wsp".into()),
         };
         let bare = Check::opened(None, None);
         let g = Group {
@@ -806,6 +927,61 @@ mod tests {
         assert_eq!(back[0].checks, vec![full.clone(), bare, full], "{text}");
         assert_eq!(back[0].checks[0].on.as_deref(), Some("opencode openrouter/some-model high"), "a model's own `/` survives");
         assert_eq!(back[1].members, vec!["m-3"]);
+    }
+
+    /// The mechanical run is on the entry and nowhere else: opened with a
+    /// suite running it is not retaken at the ten minutes a bare start is, a
+    /// finished one is retaken for its start alone, and one that never began
+    /// is run when it is retaken.
+    #[test]
+    fn an_entry_with_a_suite_running_waits_longer_and_a_finished_one_only_retries_its_start() {
+        let (_env, store) = scratch("suite");
+        let w = list(&store, &[&["m-1"]]);
+        let never = |_: &str| false;
+        let open_mech = |m| open_within(&store, &store.worklist("run").unwrap(), 1, None, None, m, &never, &|| true);
+
+        assert!(open_mech(Mechanical::Yes).is_some());
+        assert_eq!(suite_of(&store, "run", 1), Some(Suite::Running));
+        assert!(open_mech(Mechanical::Yes).is_none(), "one entry is the key");
+
+        let aged = |secs: i64, f: &dyn Fn(&mut Check)| {
+            change(&store, "run", 1, |g| {
+                let c = g.checks.last_mut().unwrap();
+                c.at = util::iso_at(util::epoch_secs() - secs);
+                f(c);
+                true
+            });
+        };
+        aged(30 * 60, &|_| {});
+        assert!(open_mech(Mechanical::Yes).is_none(), "a suite in flight is believed for hours, not minutes");
+        assert!(!would_open(&store.worklist("run").unwrap().groups()[0], &never));
+
+        aged(4 * 60 * 60, &|_| {});
+        assert!(would_open(&store.worklist("run").unwrap().groups()[0], &never));
+        let o = open_mech(Mechanical::Yes).expect("a suite that never finished is taken again");
+        assert!(o.retaken && o.suite == Some(Suite::Running));
+
+        assert!(note_run(&store, "run", 1, Suite::Green, None));
+        aged(20 * 60, &|_| {});
+        let o = open_mech(Mechanical::Yes).expect("a finished suite whose start never arrived");
+        assert!(o.retaken && o.suite == Some(Suite::Green), "so its start is retried and the suite is not");
+        assert_eq!(suite_of(&store, "run", 1), Some(Suite::Green));
+        drop(w);
+    }
+
+    #[test]
+    fn a_pass_by_wsp_is_on_the_entry_and_a_claim_can_be_taken_back() {
+        let (_env, store) = scratch("by");
+        let w = list(&store, &[&["m-1"]]);
+        assert!(open_within(&store, &w, 1, None, None, Mechanical::Yes, &|_: &str| false, &|| true).is_some());
+        assert!(note_run(&store, "run", 1, Suite::Green, Some("wsp")));
+        let c = &checks(&store, 1)[0];
+        assert_eq!((c.suite, c.by.as_deref()), (Some(Suite::Green), Some("wsp")));
+        assert!(note_run(&store, "run", 1, Suite::Green, Some("")));
+        assert_eq!(checks(&store, 1)[0].by, None);
+        assert_eq!(settle(&store, "run", 1, State::Passes), None, "no seat to end");
+        let text = text(&checks(&store, 1));
+        assert!(text.contains("passes") && text.contains("suite:green") && !text.contains("by:"), "{text}");
     }
 
     /// The lifecycle the run walks: an entry opens before any agent exists,

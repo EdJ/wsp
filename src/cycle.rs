@@ -527,6 +527,11 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
         end_check_seat(store, list, &seat);
         return 0;
     }
+    // The barrier's mechanical run (`wsp-326`): minutes long, so it is a
+    // process of its own and not a step of the tick.
+    if let (Some(list), Some(at)) = (named.as_deref(), args.get("barrier-run").and_then(|a| a.parse::<usize>().ok())) {
+        return crate::barrier_run::run(store, list, at);
+    }
 
     if let (Some(id), Some(verb)) = (args.get("task"), args.get("verb")) {
         told_about_task(store, &id, &verb);
@@ -923,18 +928,33 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 if let Some(tries) = crate::barrier::give_up(store, &w.id, at) {
                     check_gave_up(store, &w, at, tries, "no start reported back");
                 }
-                if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, &gone, &admit) {
+                // Only read when an entry would be written, so a barrier that
+                // is being waited on costs no git calls each tick.
+                let mech = if crate::barrier::would_open(g, &gone) && crate::barrier_run::owed(store, &w, at) {
+                    crate::barrier::Mechanical::Yes
+                } else {
+                    crate::barrier::Mechanical::No
+                };
+                if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, mech, &gone, &admit) {
                     if o.retaken {
                         log_line(store, &format!(
                             "{} group {at}: starting its check again — the last start never arrived (try {} of {})",
                             w.id, o.tries, crate::barrier::TRIES
                         ));
                     }
-                    match start_check(store, &w.id, at, &policy) {
-                        None => started.push(label),
-                        Some(why) => {
-                            log_line(store, &format!("FAILED spawn the check on {label}: {why}"));
-                            check_start_failed(store, &w, at, &why);
+                    // wsp's own run first, when there is one to make. A retaken
+                    // entry whose run had finished has only its start to retry.
+                    let ran_already = matches!(o.suite, Some(crate::barrier::Suite::Green | crate::barrier::Suite::Red));
+                    if mech == crate::barrier::Mechanical::Yes && !ran_already {
+                        launch(store, &["worklist", "advance", &w.id, "--barrier-run", &at.to_string()]);
+                        started.push(label);
+                    } else {
+                        match start_check(store, &w.id, at, &policy) {
+                            None => started.push(label),
+                            Some(why) => {
+                                log_line(store, &format!("FAILED spawn the check on {label}: {why}"));
+                                check_start_failed(store, &w, at, &why);
+                            }
                         }
                     }
                 }
@@ -2028,7 +2048,31 @@ const CHECKED_ORDER: &str = "**Say which done-when items you checked.** In the v
 pub(crate) fn check_order(store: &Store, list: &str, at: usize) -> Option<String> {
     let w = store.worklist(list)?;
     let g = w.groups().into_iter().nth(at - 1)?;
-    Some(barrier_order(&w, at, &g))
+    let packet = packet_text(store, &w, at, &g);
+    Some(barrier_order(&w, at, &g, &packet))
+}
+
+/// What the check is handed so it need not gather it (`wsp-326`): each member
+/// and its verdict, the stop's mechanical items, and — when wsp ran the
+/// barrier's checks — what they said and whose fault a failure reads as.
+fn packet_text(store: &Store, w: &Worklist, at: usize, g: &Group) -> String {
+    let tasks = store.tasks_shared();
+    let mut out = format!("**The packet.** The members and their verifiers' verdicts:\n\n{}", crate::barrier_run::head_text(&tasks, g));
+    if !g.stop_checks.is_empty() {
+        out.push_str("\nThe stop condition's mechanical items, which wsp runs with the suite:\n");
+        for i in &g.stop_checks {
+            out.push_str(&format!("- {i}\n"));
+        }
+    }
+    let read = crate::barrier::running(g).and_then(|c| c.read.clone());
+    match crate::barrier_run::packet_for(store, &w.id, at, read.as_deref()) {
+        Some(results) => out.push_str(&format!(
+            "\n**wsp has already run the barrier's checks at the trunk. Do not build or run them again** unless you doubt a \
+             result; they are:\n\n{results}"
+        )),
+        None => out.push_str("\nwsp ran no checks for this barrier; build and test the group yourself.\n"),
+    }
+    out
 }
 
 /// The barrier agent's work order.
@@ -2036,7 +2080,7 @@ pub(crate) fn check_order(store: &Store, list: &str, at: usize) -> Option<String
 /// The third answer, `wsp worklist followup` (`wsp-210`), is offered only while
 /// the group still has its one round. A group that has spent it is told so, so
 /// the check knows that whatever more it finds goes to the governor.
-fn barrier_order(w: &Worklist, at: usize, g: &Group) -> String {
+fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str) -> String {
     let stop = match g.stop.trim() {
         "" => "There is no stop condition written at this barrier.".to_string(),
         s => format!("The stop condition, which your verdict answers:\n\n> {s}"),
@@ -2063,6 +2107,7 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group) -> String {
         "Check the barrier after group {at} of the `{list}` worklist. Every member has landed \
          and each has a verifier's verdict, as a note on the member: {members}.\n\n\
          {stop}\n\n\
+         {packet}\n\
          **Do not edit, commit, land or rebase.** The per-member reviews are done; what is \
          left is what only the group as a whole can show. `wsp worklist next {list}` gives \
          what the group landed and which members touched one file. Read the verdicts, check \
@@ -2081,6 +2126,7 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group) -> String {
         list = w.id,
         members = g.members.join(" "),
         caption = CAPTION_ORDER,
+        packet = packet,
     )
 }
 
@@ -2169,7 +2215,7 @@ fn start(store: &Store, id: &str, policy: &Policy, owned: (&str, &str), verify: 
 /// <at>`, which names its seat on the entry [`crate::barrier::open`] wrote.
 /// `Some` is why it did not start; the entry is left open with no seat, and
 /// the next step takes it again once it is wedged.
-fn start_check(store: &Store, list: &str, at: usize, policy: &Policy) -> Option<String> {
+pub(crate) fn start_check(store: &Store, list: &str, at: usize, policy: &Policy) -> Option<String> {
     if cfg!(test) {
         #[cfg(test)]
         return tests::SPAWNED.with(|s| {
@@ -2204,7 +2250,7 @@ fn trunk_tip(store: &Store, list: &str) -> Option<String> {
 }
 
 /// Tell the seat a start failed, so a stopped run is somebody's to see.
-fn failed(store: &Store, w: &Worklist, id: &str) {
+pub(crate) fn failed(store: &Store, w: &Worklist, id: &str) {
     tell(store, w, &format!(
         "wsp could not start an agent on {id} in the {} run, so the run is waiting there. \
          `wsp show {id}` has the reason; `wsp worklist advance {}` tries again.",
@@ -3593,6 +3639,35 @@ pub(crate) mod tests {
         assert!(crate::barrier::open(&store, &stale, 1, None, None, &|_| false).is_some(), "a check opens");
         let order = check_order(&store, "run", 1).expect("an order");
         assert!(order.contains("sonnet stays at 2/10"), "the barrier was handed a stop already corrected: {order}");
+    }
+
+    /// `wsp-326`: the check is handed the members, their verdicts, the stop's
+    /// mechanical items and — when wsp ran the barrier — what it found, so it
+    /// spends its turns on what only it can say; and with no run, it is told to
+    /// build and test itself.
+    #[test]
+    fn the_checks_order_carries_the_packet_and_says_whether_wsp_already_ran_the_suite() {
+        let (_env, store) = scratch("packet-order");
+        task(&store, "m-1", Status::Review);
+        let stale = list(&store, &[(&["m-1"], "claude")]);
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        groups[0].stop_checks = vec!["gate (1m): sh gate.sh".into()];
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+        assert!(crate::barrier::open(&store, &stale, 1, None, None, &|_| false).is_some());
+
+        let bare = check_order(&store, "run", 1).expect("an order");
+        assert!(bare.contains("The packet") && bare.contains("m-1"), "{bare}");
+        assert!(bare.contains("gate (1m): sh gate.sh"), "the stop's mechanical items are shown: {bare}");
+        assert!(bare.contains("ran no checks for this barrier"), "{bare}");
+
+        let file = crate::barrier_run::packet_file(&store, "run", 1);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "read: abc123\n  ✗ full · cargo test\n`full` failed — attributed to m-1.\n").unwrap();
+        let ran = check_order(&store, "run", 1).expect("an order");
+        assert!(ran.contains("Do not build or run them again") && ran.contains("attributed to m-1"), "{ran}");
+        assert!(!ran.contains("ran no checks"), "{ran}");
     }
 
     /// The checks on group `at` of the `run` list.

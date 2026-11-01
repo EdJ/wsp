@@ -4579,6 +4579,34 @@ agent was spent. A failure is not run again for the same landing; `wsp check
 steps and runs none; `--at <commit>` runs another commit and writes nothing on
 the row, which is how a landed row is replayed.
 
+### The barrier, run by wsp where nothing needs judgment (`wsp-326`)
+
+Ed, 2026-11-01. Of 186 barrier-check transcripts the median is nine turns and
+0.54M tokens, and about a quarter of the calls build and test, a fifth inspect
+git, and a fifth read wsp state. The mechanical part of a barrier is wsp's now;
+the agent is for steering the run.
+
+When a group's last verdict is in, wsp runs, once, at the trunk: the project's
+`at barrier` steps, every member's recorded `## Checks`, and the group's
+**`stop-checks`** (`wsp worklist stop-checks <list> N --from FILE`, one `- name
+(limit): command` per line — the mechanical half of the stop condition). Every
+step runs, so a red suite does not hide a member's own check, and a failure is
+**attributed** to the member whose recorded check failed or who landed a file the
+output names. The entry on the group says `suite:running`, then `green` or `red`.
+
+wsp **passes the barrier itself** only when nothing needs judgment: every
+member's verdict holds, at least one check was declared and all passed, and the
+stop has no prose. The entry reads `passes … by:wsp`. Any other barrier starts its
+agent as before, handed a **packet** — members, verdicts, the stop's items and
+what wsp ran and whose fault each failure reads as — and told not to run it
+again. **The automatic pass is off until a project turns it on** with
+`auto-pass: on` under a `## Barrier` heading in its body; off, `cycle.log` says
+`would pass without an agent` for each barrier it would have taken.
+`wsp worklist replay` reads the recorded barriers and says what the rule would
+have done to them. The design, the replay's numbers and the decision are in
+`docs/barrier.md`. **`wsp install` is needed** before a list carrying
+`stop-checks:` runs under an older binary, which would read the lines as members.
+
 ### What a verifier did, on its verdict (`wsp-325`)
 
 A verdict used to say the outcome, the commit read and the cost, and nothing
