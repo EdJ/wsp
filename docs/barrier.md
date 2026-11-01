@@ -32,6 +32,13 @@ opened (so the retake rule waits hours, not the ten minutes a bare start does),
 then `suite:green` or `suite:red`. A start that failed after the suite finished
 retries the start and does not run the suite again.
 
+**The run is not a try.** `wsp-328`'s backoff (three starts of the agent, three
+then five minutes apart) counts the agent's starts only. An entry with
+`suite:running` is believed for three hours before it is taken again, and taking
+it again runs the suite again without spending a try; an entry whose suite
+finished and whose agent never came up is retried on the backoff, and does not run
+the suite twice.
+
 ### The stop condition's `checks:` part
 
 ```text
