@@ -280,19 +280,131 @@ pub(crate) fn same_commit(a: &str, b: &str) -> bool {
 
 /// The passes written on a member's own row, oldest first.
 pub(crate) fn passes(t: &Task) -> Vec<Pass> {
-    let Some(text) = t.section(SECTION) else { return Vec::new() };
-    let mut out: Vec<Pass> = Vec::new();
-    for line in text.lines() {
-        if let Some(p) = Pass::parse(line) {
-            out.push(p);
-        } else if let (Some(last), Some(more)) = (out.last_mut(), line.strip_prefix("  ")) {
-            if !last.text.is_empty() {
-                last.text.push('\n');
-            }
-            last.text.push_str(more);
+    entries(t).0
+}
+
+/// A mechanical check run, written beside the passes (`wsp-324`): what `wsp
+/// check` ran at a landing and how it went.
+///
+/// ```text
+/// - 2026-11-01T15:30:00Z checked failed · read 55c4839abcde · 141s
+///   ✓ build · cargo build --release · 41s
+///   ✗ tests · cargo test · 100s · exit 101
+///     | test result: FAILED. 1 passed; 1 failed
+/// ```
+///
+/// **Not a [`Pass`]**: no agent read anything, so it is not a verdict, holds no
+/// seat, and the barrier's gate and the verifier's keys never see it. It shares
+/// the section because a reader of the member wants one place to look, and the
+/// two kinds of entry are told apart by the word after the instant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Run {
+    pub at: String,
+    pub state: RunState,
+    /// The commit it ran at.
+    pub read: Option<String>,
+    /// Seconds from start to finish; `None` while it is still running.
+    pub took: Option<u64>,
+    /// The step lines, indented under the entry.
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunState {
+    Running,
+    Passed,
+    Failed,
+}
+
+impl RunState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RunState::Running => "running",
+            RunState::Passed => "passed",
+            RunState::Failed => "failed",
         }
     }
-    out
+}
+
+/// What follows the instant on a run's line, before its state.
+const CHECKED: &str = "checked ";
+
+impl Run {
+    fn line(&self) -> String {
+        let mut out = format!("- {} {CHECKED}{}", self.at, self.state.as_str());
+        if let Some(r) = self.read.as_deref().filter(|r| !r.is_empty()) {
+            out.push_str(&format!(" · read {r}"));
+        }
+        if let Some(n) = self.took {
+            out.push_str(&format!(" · {n}s"));
+        }
+        for l in self.text.trim_end().lines() {
+            out.push_str("\n  ");
+            out.push_str(l.trim_end());
+        }
+        out
+    }
+
+    fn parse(line: &str) -> Option<Run> {
+        let rest = line.strip_prefix("- ")?;
+        let (at, rest) = rest.split_once(' ')?;
+        let rest = rest.strip_prefix(CHECKED)?;
+        let mut clauses = rest.split(" · ");
+        let state = match clauses.next()?.trim() {
+            "running" => RunState::Running,
+            "passed" => RunState::Passed,
+            "failed" => RunState::Failed,
+            _ => return None,
+        };
+        let mut run = Run { at: at.to_string(), state, read: None, took: None, text: String::new() };
+        for c in clauses {
+            let c = c.trim();
+            if let Some(r) = c.strip_prefix("read ") {
+                run.read = Some(r.trim().to_string());
+            } else if let Some(n) = c.strip_suffix('s').and_then(|n| n.parse().ok()) {
+                run.took = Some(n);
+            }
+        }
+        Some(run)
+    }
+}
+
+/// The check runs written on a member's own row, oldest first.
+pub(crate) fn runs(t: &Task) -> Vec<Run> {
+    entries(t).1
+}
+
+/// Both kinds of entry in one walk: an indented line belongs to whichever kind
+/// of entry came last.
+fn entries(t: &Task) -> (Vec<Pass>, Vec<Run>) {
+    let Some(text) = t.section(SECTION) else { return (Vec::new(), Vec::new()) };
+    let mut passes: Vec<Pass> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
+    let mut in_run = false;
+    for line in text.lines() {
+        if let Some(r) = Run::parse(line) {
+            runs.push(r);
+            in_run = true;
+        } else if let Some(p) = Pass::parse(line) {
+            passes.push(p);
+            in_run = false;
+        } else if let Some(more) = line.strip_prefix("  ") {
+            if in_run {
+                if let Some(last) = runs.last_mut() {
+                    if !last.text.is_empty() {
+                        last.text.push('\n');
+                    }
+                    last.text.push_str(more);
+                }
+            } else if let Some(last) = passes.last_mut() {
+                if !last.text.is_empty() {
+                    last.text.push('\n');
+                }
+                last.text.push_str(more);
+            }
+        }
+    }
+    (passes, runs)
 }
 
 /// The passes as `wsp show --json` gives them (`wsp-241`), oldest first.
@@ -320,14 +432,27 @@ pub(crate) fn json(t: &Task) -> serde_json::Value {
         .collect::<Vec<_>>())
 }
 
-/// Write the passes back under the heading, in time order.
+/// Write the passes back under the heading, in time order, with the check runs
+/// that were already there.
 ///
 /// Does not touch the member — see the module docs for why bookkeeping must
 /// not move `updated`.
 pub(crate) fn write(t: &mut Task, passes: &[Pass]) {
-    let mut sorted = passes.to_vec();
-    sorted.sort_by(|a, b| a.at.cmp(&b.at));
-    let text = sorted.iter().map(Pass::line).collect::<Vec<_>>().join("\n");
+    let kept = runs(t);
+    write_entries(t, passes, &kept);
+}
+
+/// [`write`] for the check runs, keeping the passes.
+pub(crate) fn write_runs(t: &mut Task, runs: &[Run]) {
+    let kept = passes(t);
+    write_entries(t, &kept, runs);
+}
+
+fn write_entries(t: &mut Task, passes: &[Pass], runs: &[Run]) {
+    let mut all: Vec<(String, String)> = passes.iter().map(|p| (p.at.clone(), p.line())).collect();
+    all.extend(runs.iter().map(|r| (r.at.clone(), r.line())));
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    let text = all.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n");
     crate::model::set_section_in(&mut t.body, SECTION, &text);
 }
 
@@ -675,40 +800,52 @@ pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: 
         let pass = ps[at].clone();
         write(&mut t, &ps);
         if state == State::Blocks {
-            t.set_status(Status::Doing);
-            t.updated = now;
-            t.log(&format!(
-                "{} the verifier blocked{}: {} — the whole verdict is under ## Verification",
-                crate::cycle::SENT_BACK,
-                pass.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default(),
-                util::truncate(&crate::cmd_task::fold(text), 300)
-            ));
-            // A row run as legs is sent back to a leg of its own: one `rework`
-            // leg after the last, whose order is the verdict (`docs/legs.md`,
-            // *The run*). The step starts it; nobody is told to go back to work.
-            let before = crate::legs::legs(&t);
-            if !before.is_empty() {
-                match crate::legs::rework(&before, text) {
-                    Ok(Some(after)) => {
-                        let leg = after.last().expect("a rework leg was appended");
-                        let of = leg.rework.as_deref().unwrap_or_default();
-                        t.log(&format!(
-                            "wsp: appended leg {} after {}{}{}",
-                            leg.name,
-                            crate::legs::waits(&after).last().map(|w| w.join(", ")).unwrap_or_default(),
-                            if of.is_empty() { String::new() } else { format!(" · the verdict names {}", of.join(", ")) },
-                            if crate::legs::is_default(&leg.policy) { String::new() } else { format!(" · on {}", leg.policy.label()) },
-                        ));
-                        crate::legs::write(&mut t, &after);
-                    }
-                    Ok(None) => {}
-                    Err(why) => t.log(&format!("wsp: {why}")),
-                }
-            }
+            send_back(&mut t, now, "the verifier blocked", pass.read.as_deref(), text, None);
         }
         store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
         Ok(pass)
     })
+}
+
+/// A member sent back to `doing` with `text` as what is owed: the move, the
+/// `sent back:` line, and for a row run as legs the rework leg that carries it.
+/// `by` is who sent it ("the verifier blocked", "wsp check failed") and `now`
+/// the one instant the caller also wrote its entry with.
+pub(crate) fn send_back(t: &mut Task, now: String, by: &str, read: Option<&str>, text: &str, rework_head: Option<&str>) {
+    t.set_status(Status::Doing);
+    t.updated = now;
+    t.log(&format!(
+        "{} {by}{}: {} — the whole verdict is under ## Verification",
+        crate::cycle::SENT_BACK,
+        read.map(|r| format!(" at {r}")).unwrap_or_default(),
+        util::truncate(&crate::cmd_task::fold(text), 300)
+    ));
+    // A row run as legs is sent back to a leg of its own: one `rework`
+    // leg after the last, whose order is the verdict (`docs/legs.md`,
+    // *The run*). The step starts it; nobody is told to go back to work.
+    let before = crate::legs::legs(t);
+    if !before.is_empty() {
+        let reworked = match rework_head {
+            Some(head) => crate::legs::rework_by(&before, text, head),
+            None => crate::legs::rework(&before, text),
+        };
+        match reworked {
+            Ok(Some(after)) => {
+                let leg = after.last().expect("a rework leg was appended");
+                let of = leg.rework.as_deref().unwrap_or_default();
+                t.log(&format!(
+                    "wsp: appended leg {} after {}{}{}",
+                    leg.name,
+                    crate::legs::waits(&after).last().map(|w| w.join(", ")).unwrap_or_default(),
+                    if of.is_empty() { String::new() } else { format!(" · the verdict names {}", of.join(", ")) },
+                    if crate::legs::is_default(&leg.policy) { String::new() } else { format!(" · on {}", leg.policy.label()) },
+                ));
+                crate::legs::write(t, &after);
+            }
+            Ok(None) => {}
+            Err(why) => t.log(&format!("wsp: {why}")),
+        }
+    }
 }
 
 /// `wsp migrate --verify-rows [-n]` — every Verify row wsp filed, moved onto

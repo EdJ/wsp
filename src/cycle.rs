@@ -848,6 +848,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         // mixed group is the member's own line and not the group's.
         let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
         let label = crate::verification::seat_label(&member.id);
+        // Before any agent reads it: the mechanical checks, which need none.
+        if crate::check::gate(store, &member) == crate::check::Gate::Wait {
+            continue;
+        }
         if let Some(opened) = open_verifier(store, &member, &on, &gone, &|| gate.admits(&label)) {
             // A member split into sub-tasks no run started (`wsp-311`): its
             // governor hears it once for each landing, as the pass opens.
@@ -4692,6 +4696,54 @@ fn only_a_working_screen_is_ever_overruled() {
         set(&store, "b-1", Status::Review);
         crate::repair::tick(&store, &Blind, &mut Pass::new());
         assert!(drained(&ENDED).contains(&"b-1".to_string()), "reviewed, and nothing left for it to decide");
+    }
+
+    /// `wsp-324`. A landed member whose project declares checks gets no verifier
+    /// until a check run for that landing has passed: the step writes the run's
+    /// entry and waits, the same step again waits on it, and the pass opens the
+    /// way. A project with no checks — every other test here — is untouched.
+    #[test]
+    fn a_member_with_checks_gets_its_verifier_only_after_the_run_has_passed() {
+        let (_env, store) = scratch("checks-gate");
+        let repo = _env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&repo).args(args).env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "--quiet", "-b", "master"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        git(&["add", "f"]);
+        git(&["commit", "--quiet", "-m", "one"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        let mut p = crate::model::Project::new("m");
+        p.roots = vec![repo.display().to_string()];
+        p.body = "## Checks\n- exists: test -f f\n".into();
+        store.save_project(&p).unwrap();
+        task(&store, "m-1", Status::Review);
+        let mut m = store.find_task("m-1").unwrap();
+        m.project = Some("m".into());
+        m.log(&format!("{} {sha} on master", crate::repair::LANDED));
+        store.save_task(&m).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "no verifier while the check is owed");
+        let runs = crate::verification::runs(&store.find_task("m-1").unwrap());
+        assert_eq!(runs.len(), 1, "the step wrote the run that keeps a second trigger from starting another");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty() && crate::verification::runs(&store.find_task("m-1").unwrap()).len() == 1);
+
+        let mut t = store.find_task("m-1").unwrap();
+        let mut done = crate::verification::runs(&t);
+        done[0].state = crate::verification::RunState::Passed;
+        crate::verification::write_runs(&mut t, &done);
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1 · verifying".into(), "claude".into())], "the check passed, and now the verifier");
     }
 
     /// `wsp-136` item 1. A note on a member is somebody **saying** something

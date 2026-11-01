@@ -17,6 +17,7 @@ mod hold;
 mod hold_close;
 mod lapse;
 mod risk;
+mod check;
 mod check_tree;
 mod arrange;
 mod attention;
@@ -215,6 +216,9 @@ const BOOL_FLAGS: &[&str] = &[
     // and `wsp migrate --verify-rows -n`: none takes a value, and each is
     // followed by a positional or a stream it must not eat.
     "holds", "blocks", "verify", "verify-rows", "barrier-rows", "run-notices",
+    // `wsp check <task> --plan|--auto`: the task id is the positional, and
+    // `--auto` is what the run's own trigger types.
+    "plan", "auto",
     // `wsp worklist followup <slug> <task>… --blocking|--next`: the rows are
     // positionals, and a flag between them must not eat the one after it.
     "blocking", "next",
@@ -1164,6 +1168,7 @@ fn main() {
         "burn" => cmd_burn::burn(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
+        "check" => check::check(&store, &args),
         "checkout" => cmd_checkout::checkout(&store, &args),
         "land" => cmd_checkout::land(&store, &args),
         "install" => cmd_install::install(&store, &args),
@@ -1710,6 +1715,16 @@ fn help_text() -> String {
   wsp land [<id>]                   rebase it onto the trunk and fast-forward the
                                     trunk onto it; prints what actually moved.
                                     The tree stays — landing is not finishing
+  wsp check <id> [--plan] [--at <commit>]
+                                    run a task's mechanical checks — its
+                                    project's ## Checks, then the task's own —
+                                    at the commit it landed, in a warm tree of
+                                    wsp's, and record each step under ##
+                                    Verification. A failure on a row at review
+                                    sends it back with the step as what is owed;
+                                    wsp runs it by itself after a land, before
+                                    any verifier. --plan lists the steps, --at
+                                    runs another commit and writes nothing
   wsp verify [<path>…] [--check] [--release] [--rm [--all] [-n]]
                                     build and test your change at HEAD, in one
                                     of a few warm trees this machine shares —

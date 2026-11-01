@@ -895,6 +895,14 @@ pub(crate) fn rework_open(legs: &[Leg]) -> bool {
 /// but the default. `Ok(None)` when a rework is already outstanding at the end of
 /// the record — a verdict recorded twice is one send-back, not two.
 pub(crate) fn rework(old: &[Leg], verdict: &str) -> Result<Option<Vec<Leg>>, String> {
+    rework_by(old, verdict, VERIFIER_HEAD)
+}
+
+/// What opens a rework leg's order when a verifier sent the row back.
+const VERIFIER_HEAD: &str = "The verifier blocked this row. Its verdict, which is what is owed:\n\n";
+
+/// [`rework`], with the sentence the order opens on: who sent the row back.
+pub(crate) fn rework_by(old: &[Leg], verdict: &str, head: &str) -> Result<Option<Vec<Leg>>, String> {
     if rework_open(old) {
         return Ok(None);
     }
@@ -910,7 +918,6 @@ pub(crate) fn rework(old: &[Leg], verdict: &str) -> Result<Option<Vec<Leg>>, Str
         .find(|n| !old.iter().any(|l| &l.name == n))
         .unwrap_or_default();
     let verdict = verdict.trim();
-    let head = "The verifier blocked this row. Its verdict, which is what is owed:\n\n";
     let mut leg = Leg::pending(&name, &format!("{head}{}", util::truncate(verdict, TEXT_CAP - head.chars().count())));
     if let Some(d) = dearest {
         leg.policy = d.policy.clone();

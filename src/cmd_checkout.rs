@@ -2251,6 +2251,7 @@ pub fn land(store: &Store, args: &Args) -> i32 {
 
     // `wsp-134`: a member reviewed before it landed is verified once it has.
     crate::cycle::poke_task(store, &w.task, "land");
+    crate::check::after_land(store, &w.task);
 
     if args.json() {
         println!(
