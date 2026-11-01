@@ -5,19 +5,36 @@
 //! sessions that blocked saw a failing test or a compile error. Building and
 //! running what a project already knows how to build and run needs no agent.
 //!
-//! # wsp knows nothing about any project
+//! # Three tiers, because the whole suite on every small change costs too much
 //!
-//! It runs what is declared and nothing else. Two places declare:
+//! Ed, 2026-11-01: wsp's full verify is about nine minutes, and running a
+//! pre-declared suite on every row is the cost this exists to remove. So a row
+//! is checked by what its change needs, and the full suite is the barrier's.
 //!
-//! - **The project**, in a `## Checks` section of its own file: one list item
-//!   per step, `- name (limit): command`, the limit optional (`90s`, `20m`,
-//!   `2h`; ten minutes without one). A step passes when its command exits 0.
-//! - **The task**, in a `## Checks` section of its prose: the same grammar, and
-//!   a bare `- command` is a step too. These are the ones only the task knows:
-//!   "this script reproduces its numbers", "this file exists".
+//! 1. **The member's own checks** — a `## Checks` section on its row, written
+//!    at `wsp review`: the exact commands that verify its change, the targeted
+//!    tests and any script whose numbers it reported. `wsp check` replays them
+//!    at the landed commit, so "I ran it and it was green" is checked rather
+//!    than believed (compounding-025's stale test: no leg reran the suite).
+//!    `- command` is a step; `- name (limit): command` names it.
+//! 2. **A minimum from the changed paths** — the project's `## Checks` holds
+//!    rules, `- name (limit) on <glob>[, <glob>…]: command`, and a rule joins
+//!    the run when a path the landing changed matches. The member's list cannot
+//!    be too narrow, because the diff, not the member, says what is owed. A rule
+//!    with no `on` runs for every landing, which is for what is cheap.
+//! 3. **The full suite at the barrier**, once per group, not per row:
+//!    `- name (limit) at barrier: command`. [`barrier_steps`] names them and
+//!    `wsp check <project> --barrier` runs them at the trunk; the barrier row
+//!    is compounding's, and this is the hook it calls.
 //!
-//! There is no inheritance. compound's parent is wsp, and a compound row has no
-//! business running wsp's `cargo test`.
+//! A step passes when its command exits 0, and the limit is `90s`, `20m` or
+//! `2h` (ten minutes without one). wsp knows nothing about any project: it runs
+//! what is declared. There is no inheritance either — compound's parent is wsp,
+//! and a compound row has no business running wsp's `cargo test`.
+//!
+//! Which paths a landing changed is read from what `wsp land` wrote on the row
+//! (`since <commit>`), or, for a row landed before it did, from the commits on
+//! the trunk whose subject begins with the row's id.
 //!
 //! # Where it runs: a warm tree, at the commit that landed
 //!
@@ -76,11 +93,15 @@ const TREE_WAIT: Duration = Duration::from_secs(45 * 60);
 const TAIL_LINES: usize = 25;
 const TAIL_COLS: usize = 200;
 
-/// Where a step was declared.
+/// Where a step came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Of {
-    Project,
+    /// The member's own `## Checks`.
     Task,
+    /// A project rule a changed path matched.
+    Rule,
+    /// A project rule with no paths: every landing.
+    Project,
 }
 
 /// One declared check.
@@ -90,6 +111,10 @@ pub(crate) struct Step {
     pub command: String,
     pub limit: Duration,
     pub of: Of,
+    /// The globs of a project rule; none for a step that is not path-driven.
+    pub on: Vec<String>,
+    /// Run by the barrier, not per row.
+    pub barrier: bool,
 }
 
 // ---- declarations ----------------------------------------------------------
@@ -105,6 +130,14 @@ pub(crate) fn parse_steps(text: &str, of: Of) -> Vec<Step> {
         .collect()
 }
 
+/// What stands before the `: ` of a step.
+struct Head {
+    name: String,
+    limit: Option<Duration>,
+    on: Vec<String>,
+    barrier: bool,
+}
+
 fn step_of(item: &str, of: Of) -> Option<Step> {
     let item = item.trim();
     let (head, command) = match item.split_once(": ") {
@@ -115,21 +148,52 @@ fn step_of(item: &str, of: Of) -> Option<Step> {
     if command.is_empty() {
         return None;
     }
-    let (name, limit) = match head {
-        Some((n, l)) => (n, l),
-        None => (named_by(command), None),
+    let h = head.unwrap_or_else(|| Head { name: named_by(command), limit: None, on: Vec::new(), barrier: false });
+    let of = match of {
+        Of::Project if !h.on.is_empty() => Of::Rule,
+        o => o,
     };
-    Some(Step { name, command: command.to_string(), limit: limit.unwrap_or(DEFAULT_LIMIT), of })
+    Some(Step { name: h.name, command: command.to_string(), limit: h.limit.unwrap_or(DEFAULT_LIMIT), of, on: h.on, barrier: h.barrier })
 }
 
-/// `name` or `name (limit)`, when the text before a `: ` is one.
-fn head_of(h: &str) -> Option<(String, Option<Duration>)> {
-    let (name, limit) = match h.split_once(" (") {
-        Some((n, rest)) => (n, Some(limit_of(rest.strip_suffix(')')?)?)),
-        None => (h, None),
-    };
-    let ok = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'));
-    ok.then(|| (name.to_string(), limit))
+/// `name [(limit)] [on <globs>] [at barrier]`, when the text before a `: ` is one.
+fn head_of(h: &str) -> Option<Head> {
+    let mut words = h.split_whitespace().peekable();
+    let name = words.next()?;
+    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+        return None;
+    }
+    let mut head = Head { name: name.to_string(), limit: None, on: Vec::new(), barrier: false };
+    if let Some(w) = words.peek().copied() {
+        if let Some(inner) = w.strip_prefix('(').and_then(|w| w.strip_suffix(')')) {
+            head.limit = Some(limit_of(inner)?);
+            words.next();
+        }
+    }
+    if words.peek() == Some(&"on") {
+        words.next();
+        let mut globs = String::new();
+        while let Some(w) = words.peek().copied() {
+            if w == "at" {
+                break;
+            }
+            globs.push_str(w);
+            globs.push(' ');
+            words.next();
+        }
+        head.on = globs.split(',').map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
+        if head.on.is_empty() {
+            return None;
+        }
+    }
+    if words.peek() == Some(&"at") {
+        words.next();
+        if words.next() != Some("barrier") {
+            return None;
+        }
+        head.barrier = true;
+    }
+    words.next().is_none().then_some(head)
 }
 
 fn limit_of(s: &str) -> Option<Duration> {
@@ -152,17 +216,176 @@ fn named_by(command: &str) -> String {
     util::truncate(base, 30)
 }
 
-/// Everything declared for a task: its project's steps, then its own.
-pub(crate) fn declared(store: &Store, t: &Task) -> Vec<Step> {
-    let mut out = project_of(t)
+/// Whether `path` is one `glob` names. See [`captures`].
+pub(crate) fn matches(glob: &str, path: &str) -> bool {
+    captures(glob, path).is_some()
+}
+
+/// What each `*` of `glob` stood for in `path`, or `None` when it does not name
+/// it. `*` and `?` stay inside a path segment, `**` is any number of whole
+/// segments, and a glob ending in `/` is everything under that directory. A
+/// rule's command names the captures `{1}`, `{2}`: `crates/*/**` with `cargo
+/// test -p {1}` is one crate's tests.
+pub(crate) fn captures(glob: &str, path: &str) -> Option<Vec<String>> {
+    fn seg(p: &[char], s: &[char], caps: &mut Vec<String>) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                for n in 0..=s.len() {
+                    caps.push(s[..n].iter().collect());
+                    if seg(&p[1..], &s[n..], caps) {
+                        return true;
+                    }
+                    caps.pop();
+                }
+                false
+            }
+            (Some('?'), Some(_)) => seg(&p[1..], &s[1..], caps),
+            (Some(a), Some(b)) if a == b => seg(&p[1..], &s[1..], caps),
+            _ => false,
+        }
+    }
+    fn segs(p: &[&str], s: &[&str], caps: &mut Vec<String>) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some(&"**") => {
+                for k in 0..=s.len() {
+                    let kept = caps.len();
+                    if segs(&p[1..], &s[k..], caps) {
+                        return true;
+                    }
+                    caps.truncate(kept);
+                }
+                false
+            }
+            Some(g) => {
+                let kept = caps.len();
+                let ok = !s.is_empty()
+                    && seg(&g.chars().collect::<Vec<_>>(), &s[0].chars().collect::<Vec<_>>(), caps)
+                    && segs(&p[1..], &s[1..], caps);
+                if !ok {
+                    caps.truncate(kept);
+                }
+                ok
+            }
+        }
+    }
+    let glob = glob.trim_start_matches("./");
+    let glob = if glob.ends_with('/') { format!("{glob}**") } else { glob.to_string() };
+    let p: Vec<&str> = glob.split('/').collect();
+    let s: Vec<&str> = path.split('/').collect();
+    let mut caps = Vec::new();
+    segs(&p, &s, &mut caps).then_some(caps)
+}
+
+/// Whether a capture is safe to put in a shell command: a filename is
+/// somebody's text, and `$(…)` in one must not run.
+fn plain(c: &str) -> bool {
+    !c.is_empty() && c.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The steps a rule makes of the changed paths: itself when it names no
+/// capture, and one per distinct capture otherwise.
+fn expand(rule: &Step, changed: &[String]) -> Vec<Step> {
+    let named = (1..=9).any(|n| rule.command.contains(&format!("{{{n}}}")));
+    let mut seen: Vec<Vec<String>> = Vec::new();
+    for path in changed {
+        if let Some(caps) = rule.on.iter().find_map(|g| captures(g, path)) {
+            if caps.iter().all(|c| plain(c)) && !seen.contains(&caps) {
+                seen.push(caps);
+            }
+        }
+    }
+    if !named {
+        return if seen.is_empty() { Vec::new() } else { vec![rule.clone()] };
+    }
+    seen.sort();
+    seen.into_iter()
+        .map(|caps| {
+            let mut command = rule.command.clone();
+            for (i, c) in caps.iter().enumerate() {
+                command = command.replace(&format!("{{{}}}", i + 1), c);
+            }
+            Step { name: format!("{}:{}", rule.name, caps.join(":")), command, ..rule.clone() }
+        })
+        .collect()
+}
+
+fn project_steps(store: &Store, t: &Task) -> Vec<Step> {
+    project_of(t)
         .and_then(|p| store.project(&p))
         .and_then(|p| p.section(SECTION))
         .map(|s| parse_steps(&s, Of::Project))
-        .unwrap_or_default();
-    if let Some(s) = t.section(SECTION) {
-        out.extend(parse_steps(&s, Of::Task));
+        .unwrap_or_default()
+}
+
+/// The member's own steps.
+pub(crate) fn task_steps(t: &Task) -> Vec<Step> {
+    t.section(SECTION).map(|s| parse_steps(&s, Of::Task)).unwrap_or_default()
+}
+
+/// The steps a project holds back for its barrier, whatever the row.
+pub(crate) fn barrier_steps(store: &Store, project: &str) -> Vec<Step> {
+    store
+        .project(project)
+        .and_then(|p| p.section(SECTION))
+        .map(|s| parse_steps(&s, Of::Project).into_iter().filter(|s| s.barrier).collect())
+        .unwrap_or_default()
+}
+
+/// What a landing is run against: the steps, in order, and the paths that
+/// brought the rules in.
+pub(crate) struct Plan {
+    pub steps: Vec<Step>,
+    pub changed: Vec<String>,
+}
+
+/// The member's steps, then the project's rules the changed paths call for,
+/// then its every-landing steps; a command named twice runs once, and a barrier
+/// step is not a row's.
+pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Plan {
+    let mut steps = task_steps(t);
+    let rules = project_steps(store, t);
+    let changed = if rules.iter().any(|s| s.of == Of::Rule && !s.barrier) { changed_paths(tg, t, at.is_none()) } else { Vec::new() };
+    for r in rules.into_iter().filter(|r| !r.barrier) {
+        let made = match r.of {
+            Of::Rule => expand(&r, &changed),
+            _ => vec![r],
+        };
+        for m in made {
+            if !steps.iter().any(|s| s.command == m.command) {
+                steps.push(m);
+            }
+        }
     }
-    out
+    Plan { steps, changed }
+}
+
+/// The paths the landing changed: since the commit `wsp land` wrote on the row,
+/// and for a row landed before it did, in the commits up to `sha` whose subject
+/// starts with the row's id.
+fn changed_paths(tg: &Target, t: &Task, use_since: bool) -> Vec<String> {
+    let since = use_since.then(|| since_of(t)).flatten();
+    let out = match since {
+        Some(base) => git(&tg.repo, &["diff", "--name-only", &base, &tg.sha]),
+        None => git(
+            &tg.repo,
+            &["log", &tg.sha, "-E", &format!("--grep=^{}[: ]", t.id), "--name-only", "--format="],
+        ),
+    };
+    let mut paths: Vec<String> = out.unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The `since <commit>` clause on the row's newest landing line.
+fn since_of(t: &Task) -> Option<String> {
+    let log = t.section("Log")?;
+    let line = log.lines().filter(|l| l.contains(crate::repair::LANDED)).last()?;
+    let after = line.split(" since ").nth(1)?;
+    let sha = after.split_whitespace().next()?;
+    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
 }
 
 fn project_of(t: &Task) -> Option<String> {
@@ -406,8 +629,7 @@ pub(crate) fn account(ran: &[Ran]) -> String {
             Done::Failed { .. } => ("✗", format!("{}s · {}", secs(r.took), why_failed(r))),
             Done::Skipped => ("–", "skipped".to_string()),
         };
-        let of = if r.step.of == Of::Task { " · the task's" } else { "" };
-        out.push(format!("{mark} {} · {} · {rest}{of}", r.step.name, r.step.command.lines().next().unwrap_or_default()));
+        out.push(format!("{mark} {} · {} · {rest} · {}", r.step.name, r.step.command.lines().next().unwrap_or_default(), why_in(&r.step)));
         if matches!(r.done, Done::Failed { .. }) {
             out.extend(r.tail.lines().map(|l| format!("  | {l}")));
         }
@@ -530,12 +752,18 @@ const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed
 // ---- the verb -----------------------------------------------------------------
 
 pub fn check(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--json]";
+    const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--json]\n       wsp check <project> --barrier [--plan] [--at <commit>]\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
     let p = Paint::new();
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: {USAGE}");
         return 2;
     };
+    if args.has("set") {
+        return set(store, args, &needle, USAGE);
+    }
+    if args.has("barrier") {
+        return barrier(store, args, &needle);
+    }
     let auto = args.has("auto");
     let t = match store.task_or_why(&needle) {
         Ok(t) => t,
@@ -544,29 +772,36 @@ pub fn check(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    let steps = declared(store, &t);
+    let at = args.get("at");
+    let tg = match target(store, &t, at.as_deref()) {
+        Ok(tg) => tg,
+        Err(why) => {
+            if auto {
+                crate::cycle::log_line(store, &format!("check {}: not run — {why}", t.id));
+            } else {
+                eprintln!("wsp: {why}");
+            }
+            return if auto { 0 } else { 1 };
+        }
+    };
+    let Plan { steps, changed } = plan(store, &t, &tg, at.as_deref());
     if steps.is_empty() {
         if !auto {
             println!(
                 "{} {}",
                 p.dim("nothing to run —"),
-                p.dim(&format!("project {} declares no ## Checks and {} has none", project_of(&t).unwrap_or_default(), t.id))
+                p.dim(&format!("{} has no ## Checks, and no rule of {} matches what it changed", t.id, project_of(&t).unwrap_or_default()))
             );
         }
         return 0;
     }
-    let at = args.get("at");
-    let tg = match target(store, &t, at.as_deref()) {
-        Ok(tg) => tg,
-        Err(why) => {
-            eprintln!("wsp: {why}");
-            return 1;
-        }
-    };
     if args.has("plan") || args.has("dry-run") {
         println!("{} at {}", p.bold(&t.id), &tg.sha[..12]);
         for s in &steps {
-            println!("  {} · {} · up to {}s{}", s.name, s.command, s.limit.as_secs(), if s.of == Of::Task { " · the task's" } else { "" });
+            println!("  {} · {} · up to {}s · {}", s.name, s.command, s.limit.as_secs(), why_in(s));
+        }
+        if !changed.is_empty() {
+            println!("  {}", p.dim(&format!("{} changed path(s) read for the rules", changed.len())));
         }
         println!("  {}", p.dim(&format!("in {}", util::contract(&dir_of(store, &tg).join("tree")))));
         return 0;
@@ -654,6 +889,128 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     i32::from(!ok)
 }
 
+/// Which tier brought a step in, for a plan and for a row's account.
+fn why_in(s: &Step) -> String {
+    match s.of {
+        Of::Task => "the member's".into(),
+        Of::Rule => format!("rule on {}", s.on.join(", ")),
+        Of::Project => "every landing".into(),
+    }
+}
+
+/// `wsp check <project> --barrier [--at <commit>]` — the project's `at barrier`
+/// steps, run at the trunk's tip (or the named commit), once for a group: the
+/// hook the barrier's own row calls. It writes nothing; the barrier's agent
+/// records what it ran.
+fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
+    let p = Paint::new();
+    let Some(found) = store.project(project) else {
+        eprintln!("wsp: no project {project}");
+        return 1;
+    };
+    let steps = barrier_steps(store, &found.id);
+    if steps.is_empty() {
+        println!("{} {}", p.dim("nothing to run —"), p.dim(&format!("{} declares no `at barrier` check", found.id)));
+        return 0;
+    }
+    let mut repo = None;
+    for root in &found.roots {
+        repo = crate::cmd_verify::toplevel(&util::expand(root));
+        if repo.is_some() {
+            break;
+        }
+    }
+    let Some(repo) = repo else {
+        eprintln!("wsp: {} has no root to run in", found.id);
+        return 1;
+    };
+    let Some(sha) = args.get("at").map(|a| git(&repo, &["rev-parse", "--verify", "--quiet", &format!("{a}^{{commit}}")])).unwrap_or_else(|| {
+        let trunk = crate::cmd_checkout::trunk(&repo)?;
+        let branch = crate::cmd_checkout::trunk_branch(&trunk)?;
+        git(&trunk, &["rev-parse", &branch])
+    }) else {
+        eprintln!("wsp: cannot read the commit to run at");
+        return 1;
+    };
+    let tg = Target { sha: sha.trim().to_string(), repo, project: found.id.clone() };
+    if args.has("plan") || args.has("dry-run") {
+        println!("{} barrier at {}", p.bold(&found.id), &tg.sha[..12]);
+        for s in &steps {
+            println!("  {} · {} · up to {}s", s.name, s.command, s.limit.as_secs());
+        }
+        return 0;
+    }
+    let dir = dir_of(store, &tg);
+    let tree = dir.join("tree");
+    let started = Instant::now();
+    let lock = match TreeLock::take(dir.join("lock"), TREE_WAIT) {
+        Ok(l) => l,
+        Err(why) => return gave_up(store, &found.id, None, &why),
+    };
+    if let Err(why) = checkout(&tg.repo, &tree, &tg.sha) {
+        drop(lock);
+        return gave_up(store, &found.id, None, &format!("could not put {} in {}: {why}", &tg.sha[..12], util::contract(&tree)));
+    }
+    println!("{} {} barrier at {}", p.dim("checking"), p.bold(&found.id), &tg.sha[..12]);
+    let ran = run_all(&tree, &steps, &dir.join("last.log"), |r| {
+        let (mark, tail) = match &r.done {
+            Done::Passed => (p.green("✓"), String::new()),
+            Done::Failed { .. } => (p.red("✗"), format!(" · {}", why_failed(r))),
+            Done::Skipped => (p.dim("–"), " · skipped".to_string()),
+        };
+        println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
+    });
+    drop(lock);
+    let ok = passed(&ran);
+    if !ok {
+        for l in owed(&ran, &tg.sha).lines().skip(2) {
+            println!("    {}", p.dim(l));
+        }
+    }
+    println!("{} {} {}  {}s", if ok { p.green("✓") } else { p.red("✗") }, p.bold(&found.id), if ok { "passed" } else { "failed" }, started.elapsed().as_secs());
+    i32::from(!ok)
+}
+
+/// `wsp check <task|project> --set --from FILE` — write the `## Checks` section
+/// of a project (when the name is one) or of a task. The list is the whole
+/// section: it replaces what was there.
+fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
+    let text = match crate::cmd_task::prose_kept(args, usage) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let steps = parse_steps(&text, Of::Project);
+    if steps.is_empty() {
+        eprintln!("wsp: no list item in that text declares a check — `- name (limit): command`");
+        return 2;
+    }
+    let what = if let Some(mut proj) = store.project(needle) {
+        crate::model::set_section_in(&mut proj.body, SECTION, &text);
+        if let Err(e) = store.save_project(&proj) {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+        format!("project {}", proj.id)
+    } else {
+        let mut t = match store.task_or_why(needle) {
+            Ok(t) => t,
+            Err(why) => {
+                eprintln!("{why}");
+                return 1;
+            }
+        };
+        crate::model::set_section_in(&mut t.body, SECTION, &text);
+        if let Err(e) = store.save_task(&t) {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+        t.id
+    };
+    store.git_commit(&format!("wsp: {what} declares {} check(s)", steps.len()));
+    println!("{what}: {} check(s) — {}", steps.len(), steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
+    0
+}
+
 /// A run that could not start: its entry is taken back and the reason said
 /// where somebody looks.
 fn gave_up(store: &Store, id: &str, entry: Option<&str>, why: &str) -> i32 {
@@ -678,27 +1035,48 @@ pub(crate) enum Gate {
 /// The gate in front of a member's verifier, starting the run it is waiting on
 /// when none is.
 ///
-/// Clear for a member with nothing declared, no landing, or no root to run in —
+/// Clear for a member with nothing to run, no landing, or no root to run in —
 /// none of those is a reason to hold work — and for a landing whose run has
 /// finished, either way: a pass opens the way, and a failure has already sent
 /// the member back, so one at review again was answered by a person.
 pub(crate) fn gate(store: &Store, member: &Task) -> Gate {
-    let steps = declared(store, member);
     let Some(sha) = crate::repair::landed(member) else { return Gate::Clear };
-    if steps.is_empty() {
-        return Gate::Clear;
-    }
-    if target(store, member, None).is_err() {
-        return Gate::Clear;
-    }
-    let mine = v::runs(member).into_iter().rev().find(|r| r.read.as_deref().is_some_and(|x| v::same_commit(x, &sha)));
+    let same = |read: &Option<String>| read.as_deref().is_some_and(|x| v::same_commit(x, &sha));
+    let mine = v::runs(member).into_iter().rev().find(|r| same(&r.read));
     if mine.as_ref().is_some_and(|r| r.state != RunState::Running) {
+        return Gate::Clear;
+    }
+    // A verifier already reading this landing was opened with nothing to wait
+    // for, and nothing here is asked again on every tick.
+    if mine.is_none() && v::passes(member).last().is_some_and(|p| same(&p.read)) {
+        return Gate::Clear;
+    }
+    let Ok(tg) = target(store, member, None) else { return Gate::Clear };
+    let steps = plan(store, member, &tg, None).steps;
+    if steps.is_empty() {
         return Gate::Clear;
     }
     if let Some(at) = begin(store, &member.id, &sha, stale_after(&steps), false) {
         crate::cycle::launch_out(store, &["check", &member.id, "--auto", "--run", &at]);
     }
     Gate::Wait
+}
+
+/// What `wsp review` says to a member that has recorded no checks: tier 1 is the
+/// member's to write, and a warning rather than a refusal, because design work
+/// has nothing to run. Silent for a project with no repository to run in.
+pub(crate) fn review_hint(store: &Store, t: &Task) -> Option<String> {
+    if !task_steps(t).is_empty() {
+        return None;
+    }
+    let has_root = project_of(t).and_then(|p| store.project(&p)).is_some_and(|p| !p.roots.is_empty());
+    has_root.then(|| {
+        format!(
+            "nothing under ## Checks on {id} — if code changed, record the exact commands that verify it (the targeted tests, any \
+             script behind a number you reported) with `wsp check {id} --set -`; wsp replays them at the landing",
+            id = t.id
+        )
+    })
 }
 
 /// After `wsp land`: start the run for a row that no list will gate.
@@ -758,7 +1136,7 @@ mod tests {
     }
 
     fn sh(command: &str, limit: u64) -> Step {
-        Step { name: "s".into(), command: command.into(), limit: Duration::from_secs(limit), of: Of::Project }
+        Step { name: "s".into(), command: command.into(), limit: Duration::from_secs(limit), of: Of::Project, on: Vec::new(), barrier: false }
     }
 
     #[test]
@@ -832,7 +1210,7 @@ mod tests {
         git_run(&repo, &["init", "--quiet", "-b", "master"]);
         std::fs::write(repo.join("check.sh"), script).unwrap();
         git_run(&repo, &["add", "check.sh"]);
-        git_run(&repo, &["commit", "--quiet", "-m", "first"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "pj-001: first"]);
         let sha = git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let store = Store::open();
         let mut p = Project::new("pj");
@@ -902,7 +1280,7 @@ mod tests {
         let (_env, store, sha) = world("sendback", "- tests: sh check.sh", "echo boom >&2; exit 7\n");
         let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
         let ran = vec![Ran {
-            step: Step { name: "tests".into(), command: "sh check.sh".into(), limit: DEFAULT_LIMIT, of: Of::Project },
+            step: Step { name: "tests".into(), command: "sh check.sh".into(), limit: DEFAULT_LIMIT, of: Of::Project, on: Vec::new(), barrier: false },
             done: Done::Failed { exit: Some(7), timed_out: false },
             took: Duration::from_secs(2),
             tail: "boom".into(),
@@ -957,17 +1335,116 @@ mod tests {
         t.body = "## Checks\n- ok: true\n".into();
         store.save_task(&t).unwrap();
         let t = store.find_task("pj-001").unwrap();
-        assert_eq!(declared(&store, &t).len(), 1, "a task's own checks count on their own");
+        assert_eq!(task_steps(&t).len(), 1, "a task's own checks count on their own");
         assert_eq!(gate(&store, &t), Gate::Clear, "no landing recorded");
     }
 
     #[test]
-    fn a_task_adds_its_checks_after_its_projects() {
-        let (_env, store, _) = world("both", "- build: true", "exit 0\n");
+    fn the_members_steps_come_first_then_the_rules_its_paths_call_for_then_every_landing_ones() {
+        let rules = "- always: true\n- docs on docs/**: test -f docs/a\n- src on src/**,lib/*.rs: test -f src/b\n- full (30m) at barrier: false";
+        let (_env, store, _) = world("tiers", rules, "exit 0\n");
         let mut t = store.find_task("pj-001").unwrap();
-        t.body.push_str("\n## Checks\n- `test -f check.sh`\n");
-        let steps = declared(&store, &t);
-        assert_eq!(steps.iter().map(|s| (s.name.as_str(), s.of)).collect::<Vec<_>>(), [("build", Of::Project), ("test", Of::Task)]);
+        t.body.push_str("\n## Checks\n- `test -f check.sh`\n- always-too: true\n");
+        let tg = target(&store, &t, None).unwrap();
+        let got = plan(&store, &t, &tg, None);
+        let names: Vec<_> = got.steps.iter().map(|s| (s.name.as_str(), s.of)).collect();
+        // The commit is `pj-001: first` and changed only check.sh, so neither path rule matches,
+        // the barrier step is nobody's per row, and `true` named twice runs once.
+        assert_eq!(names, [("test", Of::Task), ("always-too", Of::Task)], "{names:?}");
+        assert_eq!(got.changed, Vec::<String>::new().into_iter().chain(["check.sh".to_string()]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_rule_joins_when_a_changed_path_matches_and_not_before() {
+        let rules = "- top on **/*.sh: test -f check.sh\n- other on docs/: test -d docs";
+        let (_env, store, _) = world("rule", rules, "exit 0\n");
+        let t = store.find_task("pj-001").unwrap();
+        let tg = target(&store, &t, None).unwrap();
+        let steps = plan(&store, &t, &tg, None).steps;
+        assert_eq!(steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["top"], "check.sh matches **/*.sh, and docs/ is not touched");
+        assert_eq!(steps[0].of, Of::Rule);
+    }
+
+    #[test]
+    fn the_since_clause_a_land_wrote_bounds_the_paths_to_that_landing() {
+        let (env, store, sha) = world("since", "- src on src/**: true", "exit 0\n");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "x").unwrap();
+        git_run(&repo, &["add", "src"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "someone else's work"]);
+        let tip = git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let mut t = store.find_task("pj-001").unwrap();
+        t.log(&format!("{} {tip} on master · since {sha}", crate::repair::LANDED));
+        store.save_task(&t).unwrap();
+        let t = store.find_task("pj-001").unwrap();
+        let tg = target(&store, &t, None).unwrap();
+        assert_eq!(since_of(&t).as_deref(), Some(sha.as_str()));
+        assert_eq!(plan(&store, &t, &tg, None).changed, ["src/a.rs"], "the diff since, whatever the subject said");
+        // Named at the older commit, the diff is the row's own commits up to it.
+        let tg = target(&store, &t, Some(&sha)).unwrap();
+        assert_eq!(plan(&store, &t, &tg, Some(&sha)).changed, ["check.sh"]);
+    }
+
+    #[test]
+    fn globs_stay_in_a_segment_unless_they_are_double_starred() {
+        assert!(matches("crates/host-ui/**", "crates/host-ui/src/lib.rs"));
+        assert!(matches("crates/host-ui/", "crates/host-ui/src/lib.rs"), "a trailing slash is the directory");
+        assert!(matches("**/*.rs", "src/a/b.rs") && matches("**/*.rs", "b.rs"));
+        assert!(matches("src/*.rs", "src/a.rs") && !matches("src/*.rs", "src/a/b.rs"));
+        assert!(matches("src/?.rs", "src/a.rs") && !matches("src/?.rs", "src/ab.rs"));
+        assert!(!matches("crates/host-ui/**", "crates/host-views/src/lib.rs"));
+        assert!(matches("Cargo.toml", "Cargo.toml") && !matches("Cargo.toml", "x/Cargo.toml"));
+    }
+
+    #[test]
+    fn a_rule_runs_once_for_each_thing_it_names_in_the_paths_that_changed() {
+        let rule = step("- crate on crates/*/**: cargo test -p {1}");
+        let changed: Vec<String> = ["crates/host-ui/src/a.rs", "crates/host-ui/src/b.rs", "crates/sup/x.rs", "docs/a.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let made = expand(&rule, &changed);
+        let cmds: Vec<_> = made.iter().map(|s| s.command.as_str()).collect();
+        assert_eq!(cmds, ["cargo test -p host-ui", "cargo test -p sup"]);
+        assert_eq!(made[0].name, "crate:host-ui");
+        assert_eq!(captures("src/*.rs", "src/cmd_task.rs"), Some(vec!["cmd_task".to_string()]));
+        assert_eq!(captures("crates/*/**", "crates/host-ui/src/a.rs"), Some(vec!["host-ui".to_string()]));
+        let plain_rule = step("- all on src/**: cargo build");
+        assert_eq!(expand(&plain_rule, &changed).len(), 0, "no path of src/ changed");
+        assert_eq!(expand(&plain_rule, &["src/x.rs".to_string(), "src/y.rs".to_string()]).len(), 1, "named nothing: once");
+    }
+
+    #[test]
+    fn a_capture_that_is_not_a_plain_name_makes_no_step() {
+        let rule = step("- m on src/*.rs: cargo test {1}");
+        let changed = vec!["src/$(touch pwned).rs".to_string(), "src/ok.rs".to_string()];
+        let cmds: Vec<_> = expand(&rule, &changed).into_iter().map(|s| s.command).collect();
+        assert_eq!(cmds, ["cargo test ok"], "a filename is text, and it does not reach a shell");
+    }
+
+    #[test]
+    fn a_rule_head_reads_paths_and_a_barrier_and_a_command_with_a_colon_is_still_a_command() {
+        let s = step("- ui (15m) on crates/host-ui/**, goldens/: cargo test -p host-ui");
+        assert_eq!((s.name.as_str(), s.of, s.limit.as_secs()), ("ui", Of::Rule, 900));
+        assert_eq!(s.on, ["crates/host-ui/**", "goldens/"]);
+        let s = step("- full (45m) at barrier: cargo test --workspace");
+        assert!(s.barrier && s.on.is_empty() && s.of == Of::Project);
+        let s = step("- ui on x/** at barrier: y");
+        assert!(s.barrier && s.on == ["x/**"]);
+        let s = step("- on x: y");
+        assert_eq!(s.command, "on x: y", "`on x` has no name before it");
+        let s = step("- ui on : y");
+        assert_eq!(s.command, "ui on : y", "an `on` with no paths is not a head");
+    }
+
+    #[test]
+    fn the_barriers_steps_are_a_projects_and_not_a_rows() {
+        let (_env, store, _) = world("barrier", "- a: true\n- full at barrier: true\n- full2 at barrier: true", "exit 0\n");
+        assert_eq!(barrier_steps(&store, "pj").len(), 2);
+        let code = check(&store, &Args::synth("check", &["pj"], &[("barrier", "true")]));
+        assert_eq!(code, 0);
+        assert!(v::runs(&store.find_task("pj-001").unwrap()).is_empty(), "the barrier hook writes nothing on a row");
     }
 
     #[test]
@@ -1004,6 +1481,24 @@ mod tests {
         let t = store.find_task("pj-001").unwrap();
         assert_eq!(t.status(), Status::Doing);
         assert!(v::runs(&t)[0].text.contains("| broken"), "{}", v::runs(&t)[0].text);
+    }
+
+    #[test]
+    fn set_writes_a_projects_checks_or_a_tasks_and_keeps_the_rest_of_the_body() {
+        let (env, store, _) = world("set", "- old: true", "exit 0\n");
+        let file = env.path("checks.md");
+        std::fs::write(&file, "- build (5m): cargo build\n- tests: cargo test\n").unwrap();
+        let args = Args::synth("check", &["pj", "--from", &file.display().to_string()], &[("set", "true")]);
+        assert_eq!(check(&store, &args), 0);
+        let p = store.project("pj").unwrap();
+        let names: Vec<_> = parse_steps(&p.section(SECTION).unwrap(), Of::Project).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["build", "tests"], "replaced, not appended");
+
+        let args = Args::synth("check", &["pj-001", "--from", &file.display().to_string()], &[("set", "true")]);
+        assert_eq!(check(&store, &args), 0);
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(task_steps(&t).len(), 2, "the task's two");
+        assert!(t.section("Log").unwrap().contains(crate::repair::LANDED), "the log is untouched");
     }
 
     #[test]

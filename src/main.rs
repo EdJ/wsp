@@ -218,7 +218,7 @@ const BOOL_FLAGS: &[&str] = &[
     "holds", "blocks", "verify", "verify-rows", "barrier-rows", "run-notices",
     // `wsp check <task> --plan|--auto`: the task id is the positional, and
     // `--auto` is what the run's own trigger types.
-    "plan", "auto",
+    "plan", "auto", "set", "barrier",
     // `wsp worklist followup <slug> <task>… --blocking|--next`: the rows are
     // positionals, and a flag between them must not eat the one after it.
     "blocking", "next",

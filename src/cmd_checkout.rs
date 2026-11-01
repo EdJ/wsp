@@ -2242,7 +2242,12 @@ pub fn land(store: &Store, args: &Args) -> i32 {
             let line =
                 format!("{} {sha} on {on}", crate::repair::LANDED);
             if !t.section("Log").is_some_and(|l| l.contains(&line)) {
-                t.log(&line);
+                // The commit before the ones that landed, so `wsp check` can read
+                // which paths this landing changed (`wsp-324`).
+                let since = git(&w.trunk, &["rev-parse", &format!("{}~{}", sha.trim(), landed.len())])
+                    .map(|b| format!(" · since {}", b.trim()))
+                    .unwrap_or_default();
+                t.log(&format!("{line}{since}"));
                 t.touch();
                 let _ = store.save_task(t);
             }

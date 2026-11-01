@@ -1596,6 +1596,9 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         for line in crate::cmd_checkout::outstanding(store, &t.id) {
             eprintln!("  {}", p.yellow(&line));
         }
+        if let Some(line) = crate::check::review_hint(store, &t) {
+            eprintln!("  {}", p.yellow(&line));
+        }
     }
     0
 }
