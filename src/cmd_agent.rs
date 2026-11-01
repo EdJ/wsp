@@ -3965,6 +3965,9 @@ pub(crate) struct Wip {
     /// A volume holding project roots that is nearly full, and what to remove —
     /// [`crate::disk::loud`]. Absent while there is room.
     pub disk: Option<String>,
+    /// The load warning, when the machine has been over 1.5x its cores for a
+    /// while: [`crate::throttle::loud`], whatever the throttle's mode.
+    pub load: Option<String>,
     /// The open questions, read once — the store half of [`crate::waiting`]'s
     /// reading, asked for every row.
     pub asks: crate::waiting::Asks,
@@ -4105,6 +4108,7 @@ impl Wip {
             said: store.said(),
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
             disk: crate::disk::loud(store),
+            load: crate::throttle::loud(store),
             asks: crate::waiting::Asks::read(store),
             shells,
             mandates: store.mandates(),
@@ -4720,6 +4724,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         // would not answer?" cannot tell those apart from a flag either.
         "daemon": w.daemon,
         "disk": w.disk,
+        "load": w.load,
         "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "inbox": inbox,
@@ -4742,7 +4747,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
 
     if rows.is_empty() {
         out.push(p.dim("no agents running"));
-        for d in w.daemon.iter().chain(&w.disk) {
+        for d in w.daemon.iter().chain(&w.disk).chain(&w.load) {
             out.push(p.red(d));
         }
     } else {
@@ -4783,7 +4788,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         // Its own line rather than another `·` clause on the heading: it is a
         // fault and the heading is a census, and a heading that goes yellow
         // every hour trains its reader past the yellow.
-        for d in w.daemon.iter().chain(&w.disk) {
+        for d in w.daemon.iter().chain(&w.disk).chain(&w.load) {
             out.push(p.red(d));
         }
         out.push(String::new());
@@ -6253,6 +6258,8 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // And whether the disk the trees are on is running out (`wsp-327`), naming
     // the largest build output that could go.
     crate::disk::health(store, &mut problems, &mut notes);
+    // And what the build throttle is doing, and whether the load warning is up.
+    crate::throttle::health(store, &mut notes);
     // And whether anything that said it was reporting still is. The only check
     // here whose subject is a *reporter* rather than a piece of work, and the
     // only place in wsp that can tell a fleet with nothing to say from a
@@ -8066,6 +8073,7 @@ mod tests {
             said,
             daemon: None,
             disk: None,
+            load: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),
@@ -8258,6 +8266,7 @@ mod tests {
             said: std::collections::BTreeMap::new(),
             daemon: None,
             disk: None,
+            load: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),

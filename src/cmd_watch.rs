@@ -2470,6 +2470,7 @@ impl Source for Poll<'_> {
             // nobody in this function looks at.
             daemon: None,
             disk: None,
+            load: None,
             // (c) asks every row whether it is waiting — the one reading the
             // reconciler and the barrier ask too.
             asks: crate::waiting::Asks::read(self.store),
@@ -4346,6 +4347,9 @@ fn status(store: &Store, args: &Args) -> i32 {
             true => println!("{}", p.red(&disk.line())),
             false => println!("{}", p.dim(&disk.line())),
         }
+    }
+    if let Some(load) = crate::throttle::loud(store) {
+        println!("{}", p.red(&load));
     }
     if watches.is_empty() {
         println!("{}", p.dim("nobody is watching · `wsp watch` starts one"));

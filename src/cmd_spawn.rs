@@ -874,6 +874,9 @@ fn seat_env_over(
     if custodian {
         env.insert("WSP_TERSE".into(), "1".into());
     }
+    // The build shims, first on the seat's PATH, so a build is throttled and
+    // held to one per tree whoever types it (`wsp-331`).
+    env.extend(crate::throttle::seat_env());
     // The kind's own, last, so a runtime that needs configuring gets it and
     // every seat that does not is byte-for-byte what it was.
     if let Some(a) = agent {
@@ -5389,6 +5392,21 @@ mod tests {
         }
     }
 
+    /// `wsp-331`: every seat is born with the build shims first on its PATH,
+    /// a custodian's as much as a member's, because the tree hold is correctness
+    /// and a governor can build too.
+    #[test]
+    fn a_seat_is_born_with_the_build_shims_first_on_its_path() {
+        let iso = crate::util::isolated("seat-shims");
+        for (custodian, task) in [(true, None), (false, Some("wsp-9"))] {
+            let env = seat_env_over(&[], None, Some("wsp"), task, custodian);
+            let path = env.get("PATH").expect("a PATH that finds cargo is wrapped");
+            let shims = iso.state().join("shims");
+            assert!(path.starts_with(&format!("{}:", shims.display())), "{path}");
+            assert!(shims.join("cargo").exists());
+        }
+    }
+
     /// A list's rows, as one group: enough for the spawn to read its members.
     fn list_of(store: &Store, id: &str, rows: &[(&str, &str)]) {
         use crate::model::{Group, Task, Worklist};
@@ -8504,6 +8522,7 @@ mod tests {
             said: store.said(),
             daemon: None,
             disk: None,
+            load: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),

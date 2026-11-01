@@ -87,6 +87,7 @@ mod stage;
 mod story;
 mod store;
 mod sync;
+mod throttle;
 mod tunnel;
 mod untaken;
 mod util;
@@ -1082,7 +1083,7 @@ fn signpost(verb: &str) -> &'static [&'static str] {
 /// with "no store — run wsp init first" on exactly the machine it was written
 /// for. A seam that a gate three files away can close is not a seam.
 fn needs_store(args: &Args) -> bool {
-    if matches!(args.cmd.as_str(), "init" | "doctor") {
+    if matches!(args.cmd.as_str(), "init" | "doctor" | "throttle") {
         return false;
     }
     if args.cmd == "agent" && matches!(args.rest.first().map(String::as_str), Some("kinds" | "pi-extension")) {
@@ -1095,6 +1096,13 @@ fn main() {
     die_on_broken_pipe();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Before parsing: what follows `run` is the build tool's own command line,
+    // flags and all, and `Args` would take `--release` for one of ours.
+    if let [verb, run, rest @ ..] = argv.as_slice() {
+        if verb == "throttle" && run == "run" {
+            std::process::exit(throttle::run_raw(rest));
+        }
+    }
     let args = Args::parse(argv);
 
     if args.has("version") || args.cmd == "version" {
@@ -1175,6 +1183,7 @@ fn main() {
         "stamp" => cmd_stamp::stamp(&store, &args),
         "brief" => cmd_brief::brief(&store, &args),
         "burn" => cmd_burn::burn(&store, &args),
+        "throttle" => throttle::throttle(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "packet" => packet::packet(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
@@ -2135,6 +2144,16 @@ fn help_text() -> String {
   wsp burn [--json]                 tokens by seat, dearest first — input,
                                     output and cache, tallied per hook from
                                     the transcript; where core-049's cuts land
+  wsp throttle [off|on|auto] [--json]
+                                    how builds are held back for the person at
+                                    the machine: niced, capped in jobs, and a
+                                    slot for each heavy one across the fleet.
+                                    `auto` (the default) holds it only while the
+                                    person is at the machine; bare, it shows the
+                                    mode, whether it is in force, the load and
+                                    who is building. One cargo per tree is held
+                                    in every mode
+  wsp throttle set slots=N jobs=N away=MINUTES   …the sizes (`auto` for the first two)
   wsp doctor                        integrity check
   wsp say "…" | - | --from FILE     say where you have got to, on your pane;
                                     `--clear` takes the label off again. Prose

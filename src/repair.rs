@@ -307,6 +307,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     crate::build_output::tidy(store);
     // And whether the disk those trees are on is running out.
     crate::disk::tidy(store);
+    // And the build holds of processes that died, and the load warning's edges
+    // (`wsp-331`).
+    crate::throttle::tidy(store);
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);

@@ -3815,6 +3815,53 @@ headless ones); a pane agent's hooks carry no seat identity today, which is a
 gap recorded on `core-049` rather than silently closed, since opening the gate
 would start reporting for every Claude Code on the machine.
 
+## Builds on a shared machine
+
+`wsp-331`. Load average 48 on 8 cores came from one agent running two cargo
+builds at once in a tree, each fanning out to every core, with the other agents
+and the person's own window competing. Two different things were wrong, and they
+are kept apart:
+
+- **The throttle** is a courtesy to the person at the machine: builds run niced
+  (+12), under a job cap (`CARGO_BUILD_JOBS`), and wait for one of a few
+  machine-wide slots. `wsp throttle off|on|auto` sets it; **`auto` is the
+  default** and holds it only while the person is there (macOS HID idle time
+  under five minutes, from `ioreg -c IOHIDSystem`), lifting it once they have
+  been away. An unreadable idle time counts as present. `wsp throttle set
+  slots=N jobs=N away=MINUTES` sizes it; the defaults are a quarter of the cores
+  in slots and the rest of the cores, less one, shared across them (2 slots of 3
+  jobs on 8 cores).
+- **One cargo build per tree** is correctness: two in one tree segfaulted the
+  linker and it read as a compile error. It is held **in every mode**, `off`
+  included. The second waits and says who it is waiting for.
+
+**It is decided at each build, not at spawn.** Every spawned seat gets
+`~/.local/state/wsp/shims` first on its `PATH`; `cargo` there execs `wsp
+throttle run cargo …`, which finds the real cargo past the shims, holds the tree,
+takes a slot, sets the cap and nices the build when the throttle is in force at
+that moment. A niceness can be raised and never lowered without root, so an agent
+niced at spawn would stay niced after `auto` lifted the throttle. `PATH` is only
+rewritten when the spawner's own `PATH` finds a cargo, so a daemon with a thin
+`PATH` does not take cargo away from a seat's shell.
+
+Only `build check test clippy bench doc install rustc fix nextest` hold the tree
+and a slot. `cargo run` is niced and capped but holds nothing, because it may stay
+up for hours; any other subcommand passes through. A build inside a held build
+(`WSP_BUILD_HELD`) passes straight through, or it would wait on its parent.
+`throttle.json` in the state directory can declare other tools (`"tools":
+{"make": "MAKEFLAGS"}`): each gets a shim and counts as heavy, and the variable
+is set to the job number.
+
+A hold is a file under `builds/` in the state directory naming the process that
+owns it, so a build killed any way at all frees it: the next waiter finds the pid
+gone and takes the file over.
+
+`wsp throttle` shows the mode, whether it is in force this minute, the load, and
+who is building where. **The load warning is separate from the mode** and shows
+in all three: both the 1- and 5-minute averages over 1.5 times the cores prints a
+line on `wsp wip` and `wsp watch --status`, a note on `wsp doctor`, and the
+daemon logs it to `cycle.log` when it starts and clears.
+
 ## Spawning
 
 Handing work to an agent that already exists is `c`. Getting one where there is
@@ -5405,6 +5452,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified`, and the one-off migration off Verify rows |
 | `src/history.rs` | a list's history as data, off its `## Log` and `checks:`: membership replayed by ordinal, events placed on the group the run stood at by time, each group's maker and joins, and the groups dropped while they ran |
 | `src/barrier.rs` | a barrier check, on the group it checks: the `checks:` entries, opened before its agent starts, settled by `go`/`hold`/`followup`, the seats `wip` and the brief name, a check whose agent never came up started again on a backoff (3 tries over about ten minutes, then a flag on the list), and the one-off migration off Barrier rows |
+| `src/throttle.rs` | `wsp throttle`: the three-mode build throttle (nice, job cap, machine-wide slots) decided at each build through the shims on a seat's `PATH`, the one-cargo-per-tree hold that is on in every mode, the holds as files owned by a pid, and the load warning |
 | `src/repair.rs` | the same steps on the daemon's tick, plus the states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, a member `advance` skipped, and a governor seat standing empty on a running list. Each is keyed on a record the member's own `## Log` or the seat's own governor entry, and each says why in `cycle.log` and to the seat; a member left at `review` with commits off the trunk, told to land and still unlanded after five minutes with its seat idle or gone, is landed by the run (`wsp land --for-run`, which aborts a rebase that does not apply) or, if that fails, flagged to the person |
 | `src/untaken.rs` | a work order the run typed at a seat and no turn came of: pressed once if it sits in the prompt, sent again once if it never reached it, and the seat replaced if neither starts a turn; a seat still empty or starting after five minutes is replaced at once — each step a `cycle.log` line the next one reads back |
 | `src/waiting.rs` | whether a seat is waiting on somebody and on whom — a prompt on its screen, its own open `wsp ask`, or a shell of its own still running, which is waiting on nobody — the one reading the reconciler, the barrier, the watch, `tell` and `wip` all ask, so nothing treats a waiting seat as idle |
