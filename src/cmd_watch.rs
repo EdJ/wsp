@@ -2524,7 +2524,7 @@ impl Source for Poll<'_> {
                 Status::Review => out.push(Signal::new(
                     Kind::Review,
                     &t.id,
-                    "finished and waiting on you — wsp done <id> · wsp reopen <id>",
+                    "finished and waiting on you — wsp done <id> is the person's · wsp reopen <id> sends it back",
                 )),
                 Status::Blocked => out.push(Signal::new(
                     Kind::Blocked,

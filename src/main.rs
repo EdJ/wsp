@@ -1640,7 +1640,8 @@ fn help_text() -> String {
                                     block by hand writes --holds in their name.
                                     --caption is required: the reason in under
                                     60, read after the holds/blocks wsp adds
-  wsp done <id> [--force]           complete; --force over open sub-tasks. Its
+  wsp done <id> [--force]           the person's verb (a member finishes with
+                                    `wsp review`); complete; --force over open sub-tasks. Its
                                     worktree and branch go too when the work is
                                     on the trunk and nobody is in it; otherwise
                                     kept and said why. --keep-tree leaves it

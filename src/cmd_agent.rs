@@ -4709,6 +4709,14 @@ fn wip_json(w: &Wip) -> serde_json::Value {
     })
 }
 
+/// What the `REVIEW` line says to do about a row at `review` (`wsp-323`).
+///
+/// This is printed to every seat, and a governor or custodian reading `wsp done
+/// <id>` here passed it on to a member as "finish with `wsp done`" — a verb
+/// agents are denied by the decision of 2026-08-19, so the member stopped and
+/// the row sat at `doing`. It says whose verb each is, and what a member does.
+const REVIEW_VERBS: &str = "the person's: wsp done <id> · wsp reopen <id> — a member finishes with wsp review";
+
 fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
     let rows = wip_rows(w);
     let (blocked, in_review, inbox) = wip_queues(w);
@@ -4867,7 +4875,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
     // the list of things waiting on you rather than on anybody working.
     if !in_review.is_empty() {
         out.push(String::new());
-        out.push(format!("{}  {}   {}", p.yellow(&util::pad("REVIEW", 8)), in_review.len(), p.dim("wsp done <id> · wsp reopen <id>")));
+        out.push(format!("{}  {}   {}", p.yellow(&util::pad("REVIEW", 8)), in_review.len(), p.dim(REVIEW_VERBS)));
         for t in &in_review {
             named(&mut out, t);
         }
@@ -9248,6 +9256,21 @@ mod tests {
         assert!(text.contains("REVIEW"), "{text}");
         assert!(text.contains("finished, waiting on you"), "{text}");
         assert!(text.contains("INBOX"), "unfiled work is still unfiled:\n{text}");
+    }
+
+    /// `wsp-323`: `wsp done` is the person's. The REVIEW line is printed to
+    /// every seat, a governor passed its verb to a member, and the member —
+    /// denied `done` — stopped with the row at `doing`. The line names the
+    /// owner of each verb and the one a member does use.
+    #[test]
+    fn the_review_line_says_done_is_the_persons_and_a_member_reviews() {
+        let mut w = wip_world();
+        w.agents.clear();
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        let line = text.lines().find(|l| l.contains("REVIEW")).expect("a REVIEW line");
+        assert!(line.contains("the person's"), "{line}");
+        assert!(line.contains("wsp done <id>"), "{line}");
+        assert!(line.contains("a member finishes with wsp review"), "{line}");
     }
 
     /// `--terse` cuts the blocked list to its count and nothing else. `wip` is
