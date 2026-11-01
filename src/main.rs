@@ -2909,7 +2909,7 @@ mod tests {
     /// refuses a flag that is real somewhere.
     #[test]
     fn an_alias_the_help_does_not_spell_is_still_spell_checked() {
-        let a = args(&["list", "--al"]);
+        let a = args(&["list", "--alll"]);
         let u = super::unknown_flags(&a);
         assert_eq!(u.len(), 1);
         assert!(u[0].verb.is_none(), "it claimed to know what `list` takes");
