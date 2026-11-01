@@ -4517,6 +4517,68 @@ actually do it. The short version: commit through your own index, read the file
 list before the hunks, prove it in a worktree, and verify the artefact rather
 than the intention.
 
+### `wsp check`: a row's mechanical verification, run by wsp
+
+405 verifier transcripts since 15 October spent 22% of their calls building and
+running tests, and only 23% of the sessions that blocked had seen a failing test
+or a compile error. That part needs no agent, and `wsp check <id>` is it. Ed,
+2026-11-01: the full suite on every small change costs too much (wsp's own is
+about nine minutes), so a row is checked in **three tiers**:
+
+1. **The member's own checks.** At `wsp review` a member writes the exact
+   commands that verify its change into the row's `## Checks` — the targeted
+   tests, any script behind a number it reported — with `wsp check <id> --set
+   -` (a list, one `- command` per item; `- name (limit): command` names one and
+   bounds it, `90s`, `20m` or `2h`, ten minutes without). `wsp review` says so
+   when the section is empty. `wsp check` replays them at the landed commit, so
+   "I ran it and it was green" is checked: compounding-025's stale test passed
+   because nothing reran that suite.
+2. **A minimum from the paths the landing changed.** The project's own
+   `## Checks` holds rules, `- name (limit) on <glob>[, <glob>…]: command`. A
+   rule joins the run when a changed path matches, so a member's list cannot be
+   too narrow. A `*` in the glob is a capture, `{1}`, `{2}` in the command, and
+   the rule runs once per distinct capture: `- crate on crates/*/**: cargo test
+   -p {1}` is the tests of each crate the landing touched. Captures are plain
+   names only — a filename never reaches a shell. A rule with no `on` runs on
+   every landing, which is for what is cheap. Set the project's with `wsp check
+   <project> --set --from FILE`.
+3. **The full suite at the barrier**, once per group and not per row:
+   `- name (limit) at barrier: command`. `wsp check <project> --barrier` runs
+   them at the trunk's tip and writes nothing; the barrier row is the one that
+   calls it and records what it ran.
+
+Which paths a landing changed is the diff from the `since <commit>` that `wsp
+land` now writes on the row's `landed` line, or, for a row landed before that,
+the trunk's commits that name the row's id (`--since <commit>` names the base
+by hand, for a row whose commits do not).
+
+It runs in a **warm tree of wsp's own** (`<state>/checks/<project>-<repo>/tree`),
+moved to the landed commit and left standing so the next build is incremental,
+one check at a time (a lock beside it); not under `.worktrees/`, where
+`checkout --sweep` and the check-tree sweeps would take it. The commands get the
+caller's environment less every `WSP_*` and herdr variable. Steps stop at the
+first failure.
+
+The result is one entry under `## Verification` beside the verifiers' — each
+step, its time, and the tail of the failing one:
+
+```text
+- 2026-11-01T15:30:00Z checked failed · read 55c4839abcde · 141s
+  ✓ wake · cargo test wake:: · 31s · the member's
+  ✗ build · cargo build · 100s · exit 101 · rule on src/*.rs
+    | error[E0308]: mismatched types
+```
+
+**By itself after a land.** `wsp land` starts the run, and a run's step in front
+of the verifier does too: a landed member with anything to run gets no verifier
+until a run for that landing has passed. A failure on a row at `review` sends it
+back to `doing` **in the same write that records it**, with the failing step as
+what is owed — told to its pane, or a rework leg for a row run as legs — and no
+agent was spent. A failure is not run again for the same landing; `wsp check
+<id>` by hand runs it again whenever asked. `wsp check <id> --plan` lists the
+steps and runs none; `--at <commit>` runs another commit and writes nothing on
+the row, which is how a landed row is replayed.
+
 ### `wsp verify`, because step 3 wants to be code
 
 A rule that catches two different agents on two consecutive days is not a rule
@@ -5183,6 +5245,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor — or, past the last barrier, the list closed and its own seat stood down and ended |
+| `src/check.rs` | `wsp check`: a row's mechanical checks as a script — the member's `## Checks`, the project's path rules, the barrier's steps — run at the landing in a warm tree, recorded under `## Verification`, and the gate in front of the verifier |
 | `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified`, and the one-off migration off Verify rows |
 | `src/history.rs` | a list's history as data, off its `## Log` and `checks:`: membership replayed by ordinal, events placed on the group the run stood at by time, each group's maker and joins, and the groups dropped while they ran |
 | `src/barrier.rs` | a barrier check, on the group it checks: the `checks:` entries, opened before its agent starts, settled by `go`/`hold`/`followup`, the seats `wip` and the brief name, and the one-off migration off Barrier rows |

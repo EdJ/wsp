@@ -34,7 +34,7 @@
 //!
 //! Which paths a landing changed is read from what `wsp land` wrote on the row
 //! (`since <commit>`), or, for a row landed before it did, from the commits on
-//! the trunk whose subject begins with the row's id.
+//! the trunk that name the row's id.
 //!
 //! # Where it runs: a warm tree, at the commit that landed
 //!
@@ -216,8 +216,8 @@ fn named_by(command: &str) -> String {
     util::truncate(base, 30)
 }
 
-/// Whether `path` is one `glob` names. See [`captures`].
-pub(crate) fn matches(glob: &str, path: &str) -> bool {
+#[cfg(test)]
+fn matches(glob: &str, path: &str) -> bool {
     captures(glob, path).is_some()
 }
 
@@ -362,15 +362,15 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
 }
 
 /// The paths the landing changed: since the commit `wsp land` wrote on the row,
-/// and for a row landed before it did, in the commits up to `sha` whose subject
-/// starts with the row's id.
+/// and for a row landed before it did, in the commits up to `sha` that name the
+/// row's id — in front, as wsp's own do now, or at the end, as they once did.
 fn changed_paths(tg: &Target, t: &Task, use_since: bool) -> Vec<String> {
-    let since = use_since.then(|| since_of(t)).flatten();
+    let since = tg.since.clone().or_else(|| use_since.then(|| since_of(t)).flatten());
     let out = match since {
         Some(base) => git(&tg.repo, &["diff", "--name-only", &base, &tg.sha]),
         None => git(
             &tg.repo,
-            &["log", &tg.sha, "-E", &format!("--grep=^{}[: ]", t.id), "--name-only", "--format="],
+            &["log", &tg.sha, "-E", &format!("--grep=(^|[^[:alnum:]-]){}([^0-9]|$)", t.id), "--name-only", "--format="],
         ),
     };
     let mut paths: Vec<String> = out.unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
@@ -396,6 +396,8 @@ fn project_of(t: &Task) -> Option<String> {
 
 /// The commit to run at, and the repository that holds it.
 pub(crate) struct Target {
+    /// A base named on the command line for reading which paths changed.
+    pub since: Option<String>,
     pub sha: String,
     pub repo: PathBuf,
     pub project: String,
@@ -425,7 +427,7 @@ pub(crate) fn target(store: &Store, t: &Task, at: Option<&str>) -> Result<Target
     for root in &roots {
         let Some(repo) = crate::cmd_verify::toplevel(&util::expand(root)) else { continue };
         if let Some(full) = git(&repo, &["rev-parse", "--verify", "--quiet", &format!("{sha}^{{commit}}")]) {
-            return Ok(Target { sha: full.trim().to_string(), repo, project });
+            return Ok(Target { sha: full.trim().to_string(), repo, project, since: None });
         }
     }
     Err(format!("{sha} is in none of {project}'s roots ({})", roots.join(", ")))
@@ -517,6 +519,9 @@ pub(crate) struct Ran {
     pub done: Done,
     pub took: Duration,
     pub tail: String,
+    /// Why the first run failed and its tail, when the step passed on a second:
+    /// a flake is passed and kept in view, not swallowed.
+    pub first: Option<(String, String)>,
 }
 
 /// The environment a check's commands get: the caller's, less wsp's own.
@@ -538,6 +543,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
         done: Done::Failed { exit: None, timed_out: false },
         took: start.elapsed(),
         tail: why,
+        first: None,
     };
     let Ok(out) = std::fs::File::create(log) else { return failed(format!("could not write {}", util::contract(log))) };
     let Ok(err) = out.try_clone() else { return failed("could not share the log".into()) };
@@ -567,7 +573,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
     } else {
         Done::Failed { exit: status.and_then(|s| s.code()), timed_out }
     };
-    Ran { step: step.clone(), done, took: start.elapsed(), tail: tail_of(log) }
+    Ran { step: step.clone(), done, took: start.elapsed(), tail: tail_of(log), first: None }
 }
 
 /// The last lines of a log, each cut to a width a row can hold.
@@ -593,14 +599,29 @@ pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, mut each: impl FnM
     for s in steps {
         let stop = out.last().is_some_and(|r| matches!(r.done, Done::Failed { .. }) || r.done == Done::Skipped);
         let ran = if stop {
-            Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new() }
+            Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None }
         } else {
-            run_step(dir, s, log)
+            run_again(dir, s, log)
         };
         each(&ran);
         out.push(ran);
     }
     out
+}
+
+/// A step, and once more if it failed on its own account: a suite that fails
+/// intermittently (the handbook counts five red-then-greens on unmodified trees)
+/// would otherwise send a row back for nothing it did. The second pass is what
+/// counts, and the first is kept on the entry — `wsp verify` makes the same
+/// rule for the same reason: a flake swallowed stops being observable.
+/// A step that timed out is not run twice.
+pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path) -> Ran {
+    let first = run_step(dir, step, log);
+    if !matches!(first.done, Done::Failed { timed_out: false, .. }) {
+        return first;
+    }
+    let second = run_step(dir, step, log);
+    Ran { took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
 }
 
 pub(crate) fn passed(ran: &[Ran]) -> bool {
@@ -624,14 +645,20 @@ fn why_failed(r: &Ran) -> String {
 pub(crate) fn account(ran: &[Ran]) -> String {
     let mut out = Vec::new();
     for r in ran {
-        let (mark, rest) = match &r.done {
-            Done::Passed => ("✓", format!("{}s", secs(r.took))),
-            Done::Failed { .. } => ("✗", format!("{}s · {}", secs(r.took), why_failed(r))),
-            Done::Skipped => ("–", "skipped".to_string()),
+        let (mark, rest) = match (&r.done, &r.first) {
+            (Done::Passed, None) => ("✓", format!("{}s", secs(r.took))),
+            (Done::Passed, Some((why, _))) => ("✓", format!("{}s · passed on a second run, the first was {why}", secs(r.took))),
+            (Done::Failed { .. }, first) => {
+                let twice = if first.is_some() { " both times" } else { "" };
+                ("✗", format!("{}s · {}{twice}", secs(r.took), why_failed(r)))
+            }
+            (Done::Skipped, _) => ("–", "skipped".to_string()),
         };
         out.push(format!("{mark} {} · {} · {rest} · {}", r.step.name, r.step.command.lines().next().unwrap_or_default(), why_in(&r.step)));
         if matches!(r.done, Done::Failed { .. }) {
             out.extend(r.tail.lines().map(|l| format!("  | {l}")));
+        } else if let Some((_, tail)) = &r.first {
+            out.extend(tail.lines().map(|l| format!("  ~ {l}")));
         }
     }
     out.join("\n")
@@ -752,7 +779,7 @@ const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed
 // ---- the verb -----------------------------------------------------------------
 
 pub fn check(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--json]\n       wsp check <project> --barrier [--plan] [--at <commit>]\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
+    const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check <project> --barrier [--plan] [--at <commit>]\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
     let p = Paint::new();
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: {USAGE}");
@@ -774,7 +801,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     };
     let at = args.get("at");
     let tg = match target(store, &t, at.as_deref()) {
-        Ok(tg) => tg,
+        Ok(tg) => Target { since: args.get("since"), ..tg },
         Err(why) => {
             if auto {
                 crate::cycle::log_line(store, &format!("check {}: not run — {why}", t.id));
@@ -932,7 +959,7 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
         eprintln!("wsp: cannot read the commit to run at");
         return 1;
     };
-    let tg = Target { sha: sha.trim().to_string(), repo, project: found.id.clone() };
+    let tg = Target { sha: sha.trim().to_string(), repo, project: found.id.clone(), since: None };
     if args.has("plan") || args.has("dry-run") {
         println!("{} barrier at {}", p.bold(&found.id), &tg.sha[..12]);
         for s in &steps {
@@ -975,10 +1002,32 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
 /// of a project (when the name is one) or of a task. The list is the whole
 /// section: it replaces what was there.
 fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
-    let text = match crate::cmd_task::prose_kept(args, usage) {
-        Ok(t) => t,
-        Err(code) => return code,
+    // `--from FILE`, or `-` for the stream: the list keeps its lines, which is
+    // the whole of it, so it is not folded the way a log entry is.
+    let src = args.get("from").or_else(|| args.rest.get(1).cloned().filter(|a| a == "-"));
+    let text = match src.as_deref() {
+        Some("-") if util::stdin_is_tty() => {
+            eprintln!("wsp: nothing is piped in — `-` reads the list from a stream");
+            return 2;
+        }
+        Some("-") => {
+            let mut buf = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
+            buf
+        }
+        Some(path) => match std::fs::read_to_string(util::expand(path)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("wsp: cannot read {path}: {e}");
+                return 1;
+            }
+        },
+        None => {
+            eprintln!("usage: {usage}");
+            return 2;
+        }
     };
+    let text = text.trim().to_string();
     let steps = parse_steps(&text, Of::Project);
     if steps.is_empty() {
         eprintln!("wsp: no list item in that text declares a check — `- name (limit): command`");
@@ -1160,6 +1209,20 @@ mod tests {
     }
 
     #[test]
+    fn a_step_that_fails_once_and_passes_is_passed_and_the_flake_is_kept_on_the_entry() {
+        let (dir, log) = scratch_log("flake");
+        let flaky = sh("test -f seen || { touch seen; echo first-time >&2; exit 1; }", 10);
+        let ran = run_all(&dir, &[flaky], &log, |_| {});
+        assert!(passed(&ran), "the second run counts");
+        let text = account(&ran);
+        assert!(text.contains("passed on a second run, the first was exit 1") && text.contains("~ first-time"), "{text}");
+        let broken = sh("echo no; exit 2", 10);
+        let ran = run_all(&dir, &[broken], &log, |_| {});
+        assert!(!passed(&ran));
+        assert!(account(&ran).contains("exit 2 both times"), "{}", account(&ran));
+    }
+
+    #[test]
     fn steps_stop_at_the_first_failure_and_say_which_were_not_run() {
         let (dir, log) = scratch_log("stop");
         let steps = vec![sh("true", 10), sh("exit 1", 10), sh("true", 10)];
@@ -1232,7 +1295,7 @@ mod tests {
         let t = store.find_task("pj-001").unwrap();
         let tg = target(&store, &t, None).unwrap();
         let at = begin(&store, "pj-001", &tg.sha, 3600, false).unwrap();
-        let ran = vec![Ran { step: sh("sh check.sh", 10), done: Done::Passed, took: Duration::from_secs(4), tail: String::new() }];
+        let ran = vec![Ran { step: sh("sh check.sh", 10), done: Done::Passed, took: Duration::from_secs(4), tail: String::new(), first: None }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(4)), Settled::Passed);
 
         let t = store.find_task("pj-001").unwrap();
@@ -1255,7 +1318,7 @@ mod tests {
         let (_env, store, sha) = world("once", "- ok: true", "exit 0\n");
         let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
         assert!(begin(&store, "pj-001", &sha, 3600, false).is_none(), "a second trigger found the first one running");
-        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new() }];
+        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None }];
         settle(&store, "pj-001", &at, &ran, Duration::ZERO);
         assert!(begin(&store, "pj-001", &sha, 3600, false).is_none(), "a landing already checked is not checked again");
         assert!(begin(&store, "pj-001", &sha, 3600, true).is_some(), "but a person can ask");
@@ -1284,6 +1347,7 @@ mod tests {
             done: Done::Failed { exit: Some(7), timed_out: false },
             took: Duration::from_secs(2),
             tail: "boom".into(),
+            first: None,
         }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(2)), Settled::SentBack);
         let t = store.find_task("pj-001").unwrap();
@@ -1302,7 +1366,7 @@ mod tests {
         t.set_status(Status::Doing);
         store.save_task(&t).unwrap();
         let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
-        let ran = vec![Ran { step: sh("false", 10), done: Done::Failed { exit: Some(1), timed_out: false }, took: Duration::ZERO, tail: String::new() }];
+        let ran = vec![Ran { step: sh("false", 10), done: Done::Failed { exit: Some(1), timed_out: false }, took: Duration::ZERO, tail: String::new(), first: None }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::ZERO), Settled::Failed);
         assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Doing);
     }
@@ -1319,7 +1383,7 @@ mod tests {
         assert_eq!(gate(&store, &t), Gate::Wait, "and it is still running");
         assert_eq!(v::runs(&store.find_task("pj-001").unwrap()).len(), 1);
 
-        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new() }];
+        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None }];
         settle(&store, "pj-001", &runs[0].at, &ran, Duration::ZERO);
         let t = store.find_task("pj-001").unwrap();
         assert_eq!(gate(&store, &t), Gate::Clear, "passed for {sha}");
@@ -1488,13 +1552,13 @@ mod tests {
         let (env, store, _) = world("set", "- old: true", "exit 0\n");
         let file = env.path("checks.md");
         std::fs::write(&file, "- build (5m): cargo build\n- tests: cargo test\n").unwrap();
-        let args = Args::synth("check", &["pj", "--from", &file.display().to_string()], &[("set", "true")]);
+        let args = Args::synth("check", &["pj"], &[("set", "true"), ("from", &file.display().to_string())]);
         assert_eq!(check(&store, &args), 0);
         let p = store.project("pj").unwrap();
         let names: Vec<_> = parse_steps(&p.section(SECTION).unwrap(), Of::Project).into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["build", "tests"], "replaced, not appended");
 
-        let args = Args::synth("check", &["pj-001", "--from", &file.display().to_string()], &[("set", "true")]);
+        let args = Args::synth("check", &["pj-001"], &[("set", "true"), ("from", &file.display().to_string())]);
         assert_eq!(check(&store, &args), 0);
         let t = store.find_task("pj-001").unwrap();
         assert_eq!(task_steps(&t).len(), 2, "the task's two");
