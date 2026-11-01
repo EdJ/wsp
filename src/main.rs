@@ -160,6 +160,7 @@ pub fn version() -> String {
 
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
+    "for-run",
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full",
     // `worklist show --all --json --include-closed`.

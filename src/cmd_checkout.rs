@@ -2115,6 +2115,18 @@ fn holding(w: &Where) -> Vec<String> {
     out
 }
 
+/// A rebase the run started for a seat that is idle or gone and that did not
+/// apply (`wsp-328`): put back, so the tree is as the member left it and not
+/// stopped mid-rebase for whoever opens it next. Nobody is in the tree to
+/// resolve it, so the refusal goes to the person.
+fn abort_rebase(dir: &Path, onto: &str, why: &str) -> String {
+    let _ = git_ok(dir, &["rebase", "--abort"]);
+    format!(
+        "the rebase onto {onto} does not apply cleanly: {why}\nwsp: the rebase was aborted and {} is as it was",
+        util::contract(dir)
+    )
+}
+
 pub fn land(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let w = match locate(store, args) {
@@ -2176,6 +2188,9 @@ pub fn land(store: &Store, args: &Args) -> i32 {
         // agents who edited one file meet, which is the arrangement working
         // rather than failing.
         if let Err(e) = git_ok(&w.dir, &["rebase", &w.branch]) {
+            if args.has("for-run") {
+                return Err(abort_rebase(&w.dir, &w.branch, &e));
+            }
             return Err(format!(
                 "the rebase onto {} stopped: {e}\n\
                  wsp: it is your tree and your conflict — resolve it in {}, `git rebase --continue`, then `wsp land` again",
@@ -2344,6 +2359,27 @@ mod tests {
         assert_eq!(trunk_tip(&dir.display().to_string()).as_deref(), Some(master.as_str()));
         assert_eq!(trunk_tip(&wt.display().to_string()).as_deref(), Some(master.as_str()), "not the tree's own commit");
         assert!(trunk_tip("/nonexistent/wsp-230").is_none());
+    }
+
+    /// `wsp-328`: the run landing for a gone seat puts a conflicting rebase
+    /// back rather than leaving the member's tree stopped halfway.
+    #[test]
+    fn a_rebase_the_run_could_not_finish_is_aborted_and_leaves_the_tree_as_it_was() {
+        let (_env, dir) = scratch("forrun");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-7");
+        ensure(&dir, &wt, "t-7", "master").unwrap();
+        std::fs::write(wt.join("kept.txt"), "mine\n").unwrap();
+        run(&wt, &["commit", "--quiet", "-am", "mine"]);
+        std::fs::write(dir.join("kept.txt"), "theirs\n").unwrap();
+        run(&dir, &["commit", "--quiet", "-am", "theirs"]);
+
+        let e = git_ok(&wt, &["rebase", "master"]).unwrap_err();
+        let said = abort_rebase(&wt, "master", &e);
+        assert!(said.contains("does not apply cleanly") && said.contains("is as it was"), "{said}");
+        assert!(!git(&wt, &["status"]).unwrap().contains("rebase in progress"), "left mid-rebase");
+        assert!(!dirty(&wt), "the tree is clean again");
+        assert_eq!(ahead(&dir, "master", "t-7").len(), 1, "and its commit is still its own");
     }
 
     /// The whole point, asserted end to end: work committed in one agent's tree

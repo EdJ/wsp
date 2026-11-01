@@ -223,6 +223,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         }
         gone_member(store, seats, &w, at, &pos);
         skipped(store, &w, at, &pos);
+        landed_for_an_idle_seat(store, seats, &w, at, &pos);
     }
     // **After** the loop, and for a different reason to every repair above: this
     // one is about a run that has *finished*, so there is no group at a
@@ -1118,11 +1119,13 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
                  waits on you. Run `wsp land {}`: the land is yours, as the end of your row, and it rebases your \
                  branch and fast-forwards the trunk. Review follows it: wsp starts a read-only verifier on the land, \
                  and the person reads the row before `wsp done`. If the land is refused, `wsp ask` about it; never \
-                 land by hand.",
+                 land by hand. If nothing has landed {} min from now and this seat is idle or gone, wsp lands \
+                 it for you when the rebase is clean, and flags the person when it is not.",
                 s.id,
                 s.settlement.word(),
                 w.id,
-                s.id
+                s.id,
+                LAND_GRACE / 60
             ));
         }
     }
@@ -1170,6 +1173,121 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
                 ));
             }
         }
+    }
+}
+
+/// How long after a member was told to land the run waits before it lands for
+/// the member, if the member's seat has done nothing in that time.
+const LAND_GRACE: i64 = 5 * 60;
+
+/// The marker on a member's log that the run has taken its land on itself,
+/// keyed on the instant of the notice it follows so it is made once per wait.
+const LAND_TAKEN: &str = "wsp: the run is landing this member itself, after the notice of";
+
+/// A member at `review` with commits the trunk has not got, told to land, whose
+/// seat has sat idle or gone since: the run lands it (`wsp-328`).
+///
+/// **The same shape as a check that never started** — the run waits, a seat
+/// holds a claim and does nothing, and the cycle logged the wait every minute —
+/// seen on `compounding-040`, whose agent moved itself to review without
+/// landing and sat at its prompt until the primary seat ran `wsp land` for it.
+///
+/// **A land is the member's own act, and this is the exception** with its
+/// conditions written down. Only after the notice above has been out for
+/// [`LAND_GRACE`]; only when the seat is gone, holds no agent, or reads idle
+/// and is not waiting on a question of the person's; never over a seat that is
+/// working, blocked, or that nothing can read. `wsp land --for-run` refuses
+/// uncommitted work as it always does and **aborts** a rebase that does not
+/// apply, so a conflict leaves the tree as the member left it and goes to the
+/// person as a flag rather than half-resolved.
+///
+/// **Once per notice**, by the marker, because a land that failed is not
+/// retried every minute against the same tree; a member that returns to review
+/// with a new notice is a new wait.
+fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &Position) {
+    let now = util::epoch_secs();
+    let mut asks = None;
+    for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
+        let Some(t) = store.find_task(&s.id) else { continue };
+        let log = t.section("Log").unwrap_or_default();
+        let Some(notice) = log.lines().filter(|l| l.contains(WHY_NOT) && l.contains("not on the trunk")).last() else { continue };
+        let Some(told_at) = stamp_of(notice) else { continue };
+        if now - told_at < LAND_GRACE {
+            continue;
+        }
+        let seat = store.panes_for_task(&s.id).into_iter().next();
+        let cause = match &seat {
+            None => "it has no seat".to_string(),
+            Some(seat) if seats.absent(seat) => format!("{seat} is gone"),
+            Some(seat) => match seats.state(seat) {
+                Some(State::Gone | State::Empty) => format!("{seat} holds no agent"),
+                Some(State::Idle) => {
+                    let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
+                    let shells = seats.shells(&[seat]);
+                    if crate::waiting::reading(Some(State::Idle), asks, &shells, seat, &s.id).is_some() {
+                        continue;
+                    }
+                    format!("{seat} has sat idle {} min since it was told", (now - told_at) / 60)
+                }
+                _ => continue,
+            },
+        };
+        let instant = notice.trim_start_matches("- ").split_whitespace().next().unwrap_or_default();
+        if !told_of_verdict(store, &s.id, &format!("{LAND_TAKEN} {instant}")) {
+            continue;
+        }
+        let id = &s.id;
+        match land_for_the_run(id) {
+            Ok(()) => {
+                stamp(store, &format!("{} group {at}: {id} was not landed {} min after it was told — {cause} — so the run landed it", w.id, (now - told_at) / 60));
+                crate::cycle::tell(store, w, &format!(
+                    "{id} sat at review without landing ({cause}), so wsp ran `wsp land {id}` for it: the commits are on the trunk \
+                     and its verifier starts on the land."
+                ));
+                if seat.is_some() {
+                    tell_member(store, id, &format!("wsp: {id} is landed — wsp ran `wsp land {id}` for you. Nothing is owed."));
+                }
+            }
+            Err(why) => {
+                let why = util::truncate(why.trim(), 400);
+                stamp(store, &format!("{} group {at}: {id} was not landed and the run could not land it ({cause}): {why}", w.id));
+                use crate::message::{self, About, Kind, Message, Party};
+                let text = format!(
+                    "{id}: the run could not land it, and the {} run waits on it\n\n\
+                     {id} is at review with commits not on the trunk, and {cause}. wsp tried `wsp land {id}`: {why}\n\n\
+                     Land it yourself from its tree once that is cleared, or `wsp reopen {id} \"what is owed\"`.",
+                    w.id
+                );
+                let m = Message::new(Party::wsp(), Kind::Note, &text).about(About::Task(id.clone()));
+                let _ = message::raise(store, &m);
+                crate::cycle::tell(store, w, &format!(
+                    "{id} sat at review without landing ({cause}) and `wsp land {id}` for it failed: {why}. The person is flagged."
+                ));
+            }
+        }
+    }
+}
+
+/// `wsp land <id> --for-run`, as a process, from nowhere in particular: the
+/// verb finds the tree from the task's project, and the daemon stands in none.
+fn land_for_the_run(id: &str) -> Result<(), String> {
+    if cfg!(test) {
+        #[cfg(test)]
+        return tests::LANDED_FOR.with(|l| {
+            l.borrow_mut().push(id.to_string());
+            tests::LAND_FAILS.with(|f| f.borrow().clone()).map_or(Ok(()), Err)
+        });
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let out = std::process::Command::new(exe)
+        .args(["land", id, "--for-run"])
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    match out.status.success() {
+        true => Ok(()),
+        false => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
     }
 }
 
@@ -1260,6 +1378,13 @@ pub(crate) mod tests {
     use crate::model::{Group, WorklistStatus};
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    thread_local! {
+        /// The members the run landed for itself on this thread (`wsp-328`).
+        pub(crate) static LANDED_FOR: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// Set, and every such land fails with it.
+        pub(crate) static LAND_FAILS: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
 
     /// The seats a fake answers for. `None` in the map is a seat nobody can say
     /// anything about, which is deliberately not the same as one reading `Gone`.
@@ -2889,6 +3014,98 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         );
         assert!(governed().is_empty(), "and the seat is not handed the same sentence twice");
         assert!(member_told().is_empty(), "nor the member: once per reason, like the seat");
+    }
+
+    /// A member told to land, its notice an hour old and its seat `cpd-1`.
+    fn told_an_hour_ago(tag: &str) -> (util::Isolated, Store) {
+        let (env, store) = scratch(tag);
+        landed_member(&env, &store, true);
+        claim(&store, "m-1", "cpd-1");
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let _ = (governed(), member_told(), stamped());
+        let mut t = store.find_task("m-1").unwrap();
+        let log = t.section("Log").unwrap_or_default();
+        let aged: Vec<String> = log
+            .lines()
+            .map(|l| if l.contains(WHY_NOT) { format!("- {}{}", util::iso_at(util::epoch_secs() - 3600), &l[22..]) } else { l.to_string() })
+            .collect();
+        crate::model::set_section_in(&mut t.body, "Log", &format!("## Log\n\n{}\n", aged.join("\n")));
+        store.save_task(&t).unwrap();
+        LANDED_FOR.with(|l| l.borrow_mut().clear());
+        LAND_FAILS.with(|f| *f.borrow_mut() = None);
+        (env, store)
+    }
+
+    fn landed_for() -> Vec<String> {
+        LANDED_FOR.with(|l| l.borrow_mut().drain(..).collect())
+    }
+
+    /// `wsp-328`, seen on `compounding-040`: the member moved itself to review
+    /// without landing, and its seat sat idle holding the claim until the
+    /// primary seat ran `wsp land` for it.
+    #[test]
+    fn a_member_unlanded_after_its_notice_with_an_idle_seat_is_landed_by_the_run_once() {
+        let (_env, store) = told_an_hour_ago("landidle");
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert_eq!(landed_for(), vec!["m-1".to_string()]);
+        let gov = governed();
+        assert!(gov.iter().any(|t| t.contains("wsp ran `wsp land m-1` for it") && t.contains("sat idle")), "{gov:?}");
+        assert!(member_told().iter().any(|(id, t)| id == "m-1" && t.contains("is landed")));
+        assert!(crate::message::raised(&store).is_empty(), "a clean land flags nobody");
+
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert!(landed_for().is_empty(), "once per notice, not once a minute");
+    }
+
+    #[test]
+    fn a_member_told_a_moment_ago_is_given_its_grace_whatever_its_seat_reads() {
+        let (env, store) = scratch("landgrace");
+        landed_member(&env, &store, true);
+        claim(&store, "m-1", "cpd-1");
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert!(landed_for().is_empty(), "inside the grace the agent has time to land");
+    }
+
+    #[test]
+    fn a_seat_that_is_working_blocked_starting_or_unreadable_is_not_landed_over() {
+        let (_env, store) = told_an_hour_ago("landworking");
+        for state in [State::Working, State::Blocked, State::Starting] {
+            tick(&store, &Fake::new(&[("cpd-1", Some(state))]), &mut Pass::new());
+            assert!(landed_for().is_empty(), "{state:?}: somebody is there");
+        }
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert!(landed_for().is_empty(), "a seat nothing can read is left alone");
+    }
+
+    #[test]
+    fn a_member_whose_seat_is_gone_is_landed() {
+        let (_env, store) = told_an_hour_ago("landgone");
+        tick(&store, &Absent(vec!["cpd-1".into()]), &mut Pass::new());
+        assert_eq!(landed_for(), vec!["m-1".to_string()]);
+    }
+
+    #[test]
+    fn a_member_with_no_seat_at_all_is_landed() {
+        let (_env, store) = told_an_hour_ago("landnoseat");
+        store.clear_binding("cpd-1");
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(landed_for(), vec!["m-1".to_string()]);
+    }
+
+    #[test]
+    fn a_land_the_run_could_not_make_flags_the_person_and_is_not_tried_again() {
+        let (_env, store) = told_an_hour_ago("landfails");
+        LAND_FAILS.with(|f| *f.borrow_mut() = Some("the rebase onto master does not apply cleanly: conflict in a.txt".into()));
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert_eq!(landed_for().len(), 1);
+        let flags = crate::message::raised(&store);
+        assert_eq!(flags.len(), 1, "{flags:?}");
+        assert_eq!(flags[0].about, crate::message::About::Task("m-1".into()));
+        assert!(flags[0].text.contains("conflict in a.txt") && flags[0].text.contains("could not land it"), "{}", flags[0].text);
+        assert!(governed().iter().any(|t| t.contains("The person is flagged")));
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert!(landed_for().is_empty() && crate::message::raised(&store).len() == 1, "told once, tried once");
     }
 
     /// The barrier's own silence, one level up: every member settled, the run
