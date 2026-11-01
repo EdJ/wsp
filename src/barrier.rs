@@ -131,11 +131,35 @@ pub(crate) struct Check {
     pub ending: Ending,
     /// The Barrier row this entry was migrated from.
     pub was: Option<String>,
+    /// Starts of this entry's agent so far, the first included. `wsp-328`: an
+    /// entry whose agent never came up is started again on a backoff, up to
+    /// [`TRIES`], and then left for a person.
+    pub tries: u32,
+    /// The tries ran out and the person was flagged. Set once, so a tick that
+    /// sees the entry spent again says nothing again.
+    pub gave_up: bool,
 }
 
 impl Check {
     pub(crate) fn opened(read: Option<String>, on: Option<String>) -> Check {
-        Check { at: util::now_iso(), state: State::Running, read, pane: None, on, ending: Ending::Standing, was: None }
+        Check {
+            at: util::now_iso(),
+            state: State::Running,
+            read,
+            pane: None,
+            on,
+            ending: Ending::Standing,
+            was: None,
+            tries: 1,
+            gave_up: false,
+        }
+    }
+
+    /// How long this entry waits with no seat before its agent is started
+    /// again: after its first start and after its second, and after its last
+    /// never.
+    fn wait_before_next_try(&self) -> Option<i64> {
+        wait_after(self.tries)
     }
 
     /// Still somebody's: opened and not yet settled.
@@ -146,6 +170,11 @@ impl Check {
     /// A seat that has not been ended.
     pub(crate) fn standing(&self) -> Option<&str> {
         self.pane.as_deref().filter(|_| self.ending == Ending::Standing)
+    }
+
+    /// An open entry with no agent in it and no more starts to give it.
+    fn spent(&self) -> bool {
+        self.open() && self.pane.is_none() && self.tries >= TRIES
     }
 }
 
@@ -172,6 +201,8 @@ pub(crate) fn push(acc: &mut Vec<Check>, text: &str) {
                 on: None,
                 ending: Ending::Standing,
                 was: None,
+                tries: 1,
+                gave_up: false,
             });
             continue;
         }
@@ -181,8 +212,10 @@ pub(crate) fn push(acc: &mut Vec<Check>, text: &str) {
             Some(("pane", v)) => c.pane = Some(v.to_string()),
             Some(("on", v)) => c.on = Some(v.replace('+', " ")),
             Some(("was", v)) => c.was = Some(v.to_string()),
+            Some(("tries", v)) => c.tries = v.parse().unwrap_or(1),
             Some(_) => {}
             None => match tok {
+                "gave-up" => c.gave_up = true,
                 "ended" => c.ending = Ending::Ended,
                 "end-failed" => c.ending = Ending::Failed,
                 w => {
@@ -211,6 +244,12 @@ pub(crate) fn text(checks: &[Check]) -> String {
         }
         if let Some(w) = &c.was {
             e.push(format!("was:{w}"));
+        }
+        if c.tries > 1 {
+            e.push(format!("tries:{}", c.tries));
+        }
+        if c.gave_up {
+            e.push("gave-up".into());
         }
         match c.ending {
             Ending::Standing => {}
@@ -303,11 +342,35 @@ fn change(store: &Store, list: &str, at: usize, f: impl FnOnce(&mut Group) -> bo
 pub(crate) struct Opened {
     /// It took over an open entry nobody's agent ever reached.
     pub retaken: bool,
+    /// Which start of the entry this is, the first being 1.
+    pub tries: u32,
 }
 
-/// How long an open entry with no seat is left before it is taken again: the
-/// start is assumed to have failed. The same ten minutes as a row's.
-const WEDGED_AFTER: i64 = 10 * 60;
+/// How many times an entry's agent is started before the run stops trying and
+/// flags the person (`wsp-328`).
+pub(crate) const TRIES: u32 = 3;
+
+/// How long an open entry waits with no seat after its first start, and after
+/// its second, before the agent is started again (`wsp-328`). Three minutes
+/// first because `wsp spawn` names its seat within seconds of being asked, so
+/// an entry still bare at three is a start that failed or never arrived, and
+/// five after that so a full disk or an overloaded API has room to recover:
+/// three starts over about ten minutes with the spawns' own time.
+const RETRY_BACKOFF: [i64; 2] = [3 * 60, 5 * 60];
+
+/// The wait after `tries` starts, in seconds, and `None` once they are spent.
+pub(crate) fn wait_after(tries: u32) -> Option<i64> {
+    match tries {
+        0 => RETRY_BACKOFF.first().copied(),
+        n => RETRY_BACKOFF.get(n as usize - 1).copied().filter(|_| n < TRIES),
+    }
+}
+
+/// How long a seat may read empty or still starting before it is not a check
+/// that is coming up but one that never will. `claude started but never became
+/// ready` is the spawn's own verdict after about a minute; this is for the one
+/// that never even got to say so.
+pub(crate) const NOT_UP_AFTER: i64 = 5 * 60;
 
 /// Open a check on group `at`, if one is owed, under the lock. `gone` answers
 /// whether a seat has nobody in it any more.
@@ -316,7 +379,8 @@ const WEDGED_AFTER: i64 = 10 * 60;
 /// with a seat is a check in flight and nothing is owed — unless that seat has
 /// gone, when it is marked abandoned and a fresh one opens, rather than the run
 /// waiting on an agent that will never answer. An open entry with no seat after
-/// [`WEDGED_AFTER`] is a start that never arrived, and is taken again.
+/// [`RETRY_BACKOFF`] is a start that never arrived, and is taken again — on the
+/// backoff, [`TRIES`] times in all, and then not at all: [`give_up`] says so.
 #[cfg(test)]
 pub(crate) fn open(store: &Store, w: &Worklist, at: usize, read: Option<String>, on: Option<String>, gone: &dyn Fn(&str) -> bool) -> Option<Opened> {
     open_within(store, w, at, read, on, gone, &|| true)
@@ -346,12 +410,13 @@ pub(crate) fn open_within(
                     c.ending = Ending::Ended;
                 }
                 Some(_) => return false,
-                None if util::epoch_secs() - util::epoch_of(&c.at) > WEDGED_AFTER => {
+                None if c.wait_before_next_try().is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w) => {
                     if !admit() {
                         return false;
                     }
                     c.at = util::now_iso();
-                    opened = Some(Opened { retaken: true });
+                    c.tries += 1;
+                    opened = Some(Opened { retaken: true, tries: c.tries });
                     return true;
                 }
                 None => return false,
@@ -360,7 +425,7 @@ pub(crate) fn open_within(
             return false;
         }
         g.checks.push(Check::opened(read, on));
-        opened = Some(Opened { retaken: false });
+        opened = Some(Opened { retaken: false, tries: 1 });
         true
     });
     changed.then_some(()).and(opened)
@@ -377,6 +442,75 @@ pub(crate) fn name_seat(store: &Store, list: &str, at: usize, seat: &str) -> boo
         }
         None => false,
     })
+}
+
+/// What [`unseat`] took from an entry.
+pub(crate) struct Unseated {
+    /// The seat that held no agent, for the caller to end: after this the
+    /// entry names nobody, so `despawn`'s own `mark_ended` finds nothing to mark.
+    pub seat: Option<String>,
+    pub tries: u32,
+    /// This was the last try and the person has to be told, once.
+    pub spent: bool,
+}
+
+/// A start that did not take: take the seat off the open entry on group `at`
+/// and start its backoff from now (`wsp-328`). The next [`open_within`] after
+/// the wait starts the agent again, until [`TRIES`] have been had; the caller
+/// ends the seat returned and, when `spent`, flags the person.
+///
+/// **The seat comes off the entry rather than being left on it**, because an
+/// entry naming a pane is read as a check in flight and nothing is owed. That
+/// is the shape this row found: `claude started but never became ready` in
+/// cpd-2511, the pane named on the entry and idle, and the run waiting on it
+/// until somebody ended it by hand.
+pub(crate) fn unseat(store: &Store, list: &str, at: usize) -> Option<Unseated> {
+    let mut out = None;
+    change(store, list, at, |g| {
+        let Some(c) = g.checks.iter_mut().rev().find(|c| c.open()) else { return false };
+        let seat = c.pane.take();
+        c.ending = Ending::Standing;
+        c.at = util::now_iso();
+        out = Some(Unseated { seat, tries: c.tries, spent: c.spent() && !std::mem::replace(&mut c.gave_up, true) });
+        true
+    });
+    out
+}
+
+/// The entry on group `at` has had its last try and nobody seated it, and the
+/// start never reported failing — a spawn killed before it could (`wsp-328`).
+/// Marks it given up and answers how many tries it had, once; [`unseat`] says
+/// the same for a start that did report.
+pub(crate) fn give_up(store: &Store, list: &str, at: usize) -> Option<u32> {
+    let mut tries = None;
+    change(store, list, at, |g| {
+        let Some(c) = g.checks.iter_mut().rev().find(|c| c.open()) else { return false };
+        let waited = util::epoch_secs() - util::epoch_of(&c.at) > RETRY_BACKOFF[0];
+        if !c.spent() || c.gave_up || !waited {
+            return false;
+        }
+        c.gave_up = true;
+        tries = Some(c.tries);
+        true
+    });
+    tries
+}
+
+/// Somebody asked for the start again (`wsp worklist advance <list>` by hand)
+/// after the tries ran out: the spent entry is abandoned, so the same step
+/// opens a fresh one with a fresh count. Whether there was one to abandon.
+pub(crate) fn try_again(store: &Store, list: &str) -> bool {
+    let mut any = false;
+    let n = store.worklist(list).map_or(0, |w| w.groups().len());
+    for at in 1..=n {
+        any |= change(store, list, at, |g| {
+            let Some(c) = g.checks.iter_mut().rev().find(|c| c.open() && c.gave_up) else { return false };
+            c.state = State::Abandoned;
+            c.ending = Ending::Ended;
+            true
+        });
+    }
+    any
 }
 
 /// Settle the open check on group `at`. Returns the seat it ran in, for the
@@ -491,7 +625,7 @@ fn legacy(row: &Task, w: &Worklist, g: &Group, later: bool) -> Check {
         .find_map(|l| l.split("spawned at ").nth(1))
         .and_then(|r| r.split_whitespace().next())
         .map(str::to_string);
-    Check { at: row.created.clone(), state, read: None, pane, on, ending: Ending::Ended, was: Some(row.id.clone()) }
+    Check { at: row.created.clone(), state, read: None, pane, on, ending: Ending::Ended, was: Some(row.id.clone()), tries: 1, gave_up: false }
 }
 
 /// What [`migrate`] would do.
@@ -654,6 +788,8 @@ mod tests {
             on: Some("opencode openrouter/some-model high".into()),
             ending: Ending::Failed,
             was: Some("compound-369".into()),
+            tries: 3,
+            gave_up: true,
         };
         let bare = Check::opened(None, None);
         let g = Group {

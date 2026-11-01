@@ -91,10 +91,27 @@ pub(crate) fn look(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, g:
     let now = util::epoch_secs();
     let mut log: Option<String> = None;
     for o in owed(store, w, at, g, pos) {
+        let state = seats.state(&o.seat);
+        let not_up = matches!(state, Some(State::Empty | State::Starting));
+        if now - o.since < if not_up { crate::barrier::NOT_UP_AFTER } else { AFTER } {
+            continue;
+        }
+        // A seat that is not up has no prompt to press at or resend to, and
+        // took no turn by being there: ended and replaced on sight, once. The
+        // turn read below is for a seat that can have taken one.
+        if not_up && seats.turn_began_since(&o.seat, o.since) != Some(true) {
+            let log = log.get_or_insert_with(|| std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default());
+            if newest(log, &replaced(&o.seat)).is_some() {
+                continue;
+            }
+            let head = format!("{} group {at}: {} in {} still reads {} after {} min", w.id, o.who, o.seat, state.map_or("", |s| s.as_str()), (now - o.since) / 60);
+            replace(store, seats, w, at, &o, &head, &format!("its agent never came up: the seat reads {}", state.map_or("", |s| s.as_str())));
+            continue;
+        }
         if now - o.since < AFTER || seats.turn_began_since(&o.seat, o.since) != Some(false) {
             continue;
         }
-        if seats.state(&o.seat) != Some(State::Idle) {
+        if state != Some(State::Idle) {
             continue;
         }
         let log = log.get_or_insert_with(|| std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default());
@@ -121,28 +138,39 @@ pub(crate) fn look(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, g:
                 };
                 cycle::log_line(store, &format!("{head}, and its prompt is empty — {}: {outcome}", self::resent(&o.seat)));
             }
-            Some(_) if pressed.is_some() || resent.is_some() => replace(store, seats, w, &o, &head),
+            Some(_) if pressed.is_some() || resent.is_some() => {
+                replace(store, seats, w, at, &o, &head, "its seat took no turn on its order after a press or a resend")
+            }
             _ => {}
         }
     }
 }
 
-/// End a seat that took neither the press nor the resend, so the run opens a
-/// fresh one. Said in `cycle.log` and to the governor, because a seat the run
-/// ended and replaced is a decision somebody may want to see.
-fn replace(store: &Store, seats: &dyn Seats, w: &Worklist, o: &Owed, head: &str) {
+/// End a seat that never took its order, so the run opens a fresh one. Said in
+/// `cycle.log` and to the governor, because a seat the run ended and replaced
+/// is a decision somebody may want to see.
+///
+/// **A check's seat comes off its entry** ([`cycle::check_start_failed`]) and
+/// the entry is started again on a backoff, a few times and then the person is
+/// flagged (`wsp-328`), where a pass is superseded and a fresh one opens with no
+/// count. The check is the one a run cannot go on without.
+fn replace(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, o: &Owed, head: &str, why: &str) {
     let ended = match &o.replace {
         Replace::Not => return,
         Replace::Pass(member) => {
             crate::verification::supersede(store, member, &o.seat);
             !cycle::end_passes(store, seats, member, |p| p.pane.as_deref() == Some(o.seat.as_str())).is_empty()
         }
-        Replace::Check => cycle::despawn_seat(&o.seat).is_ok(),
+        Replace::Check => {
+            cycle::log_line(store, &format!("{head} — {} the check is started again", replaced(&o.seat)));
+            cycle::check_start_failed(store, w, at, &format!("{} in {}: {why}", o.who, o.seat));
+            return;
+        }
     };
     let how = if ended { "ended" } else { "could not be ended" };
-    cycle::log_line(store, &format!("{head} after a press or a resend — {} {how}, and the run opens another", replaced(&o.seat)));
+    cycle::log_line(store, &format!("{head}: {why} — {} {how}, and the run opens another", replaced(&o.seat)));
     cycle::tell(store, w, &format!(
-        "{} in {} took no turn on its order, after wsp pressed submit or sent it again. wsp {how} {} and starts another.",
+        "{} in {} did not take its order: {why}. wsp {how} {} and starts another.",
         o.who, o.seat, o.seat
     ));
 }

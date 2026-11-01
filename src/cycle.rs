@@ -586,6 +586,13 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // The bare form is somebody's: the sentence a failed start tells a seat
+    // ends in it. A check whose tries ran out starts again from the top.
+    if let (Some(list), None, None) = (named.as_deref(), args.get("task"), args.get("event")) {
+        if crate::barrier::try_again(store, list) {
+            log_line(store, &format!("{list}: the check that gave up is abandoned, and a fresh one opens"));
+        }
+    }
     let lists: Vec<Worklist> = match &named {
         Some(n) => store.worklist(n).into_iter().collect(),
         None => store.worklists(),
@@ -911,15 +918,23 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 let on = Some(policy.label());
                 let label = crate::barrier::seat_label(&w.id, at);
                 let admit = || gate.admits(&label);
+                // A start that was cut off before it could say it failed, on
+                // its last try: nothing else will ever see it.
+                if let Some(tries) = crate::barrier::give_up(store, &w.id, at) {
+                    check_gave_up(store, &w, at, tries, "no start reported back");
+                }
                 if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, &gone, &admit) {
                     if o.retaken {
-                        log_line(store, &format!("{} group {at}: starting its check again — the last start never arrived", w.id));
+                        log_line(store, &format!(
+                            "{} group {at}: starting its check again — the last start never arrived (try {} of {})",
+                            w.id, o.tries, crate::barrier::TRIES
+                        ));
                     }
                     match start_check(store, &w.id, at, &policy) {
                         None => started.push(label),
                         Some(why) => {
                             log_line(store, &format!("FAILED spawn the check on {label}: {why}"));
-                            failed(store, &w, &label);
+                            check_start_failed(store, &w, at, &why);
                         }
                     }
                 }
@@ -2193,6 +2208,61 @@ fn failed(store: &Store, w: &Worklist, id: &str) {
     tell(store, w, &format!(
         "wsp could not start an agent on {id} in the {} run, so the run is waiting there. \
          `wsp show {id}` has the reason; `wsp worklist advance {}` tries again.",
+        w.id, w.id
+    ));
+}
+
+/// A barrier check's start failed: end the pane it left, take it off the entry
+/// so the run does not read it as a check in flight, and say when it is tried
+/// again — or, on the last try, flag the person (`wsp-328`).
+///
+/// **Not [`failed`], which tells a seat to run `wsp worklist advance`.** That
+/// was the whole of the recovery before this row: the pane `wsp spawn` named
+/// stayed on the entry, idle, and the run waited on it until a person ended it
+/// and spawned the check again by hand.
+pub(crate) fn check_start_failed(store: &Store, w: &Worklist, at: usize, why: &str) {
+    let Some(u) = crate::barrier::unseat(store, &w.id, at) else { return };
+    let ended = match &u.seat {
+        Some(seat) => match despawn_seat(seat) {
+            Ok(()) => format!("{seat} was ended"),
+            Err(e) => format!("{seat} could not be ended ({e}): `wsp despawn --pane {seat}`"),
+        },
+        None => "it had no seat to end".to_string(),
+    };
+    let why = util::truncate(why, 300);
+    if u.spent {
+        log_line(store, &format!("{} group {at}: its check did not start on try {} of {} — giving up; {ended}", w.id, u.tries, crate::barrier::TRIES));
+        check_gave_up(store, w, at, u.tries, &why);
+        return;
+    }
+    let wait = crate::barrier::wait_after(u.tries).unwrap_or_default() / 60;
+    log_line(store, &format!("{} group {at}: its check did not start on try {} of {} — {ended}; starting it again in {wait} min", w.id, u.tries, crate::barrier::TRIES));
+    tell(store, w, &format!(
+        "The {} run's barrier check on group {at} did not start (try {} of {}): {why}. \
+         wsp ended the pane it left and starts the check again in {wait} min.",
+        w.id, u.tries, crate::barrier::TRIES
+    ));
+}
+
+/// The check's tries ran out: the person is flagged, on the list's group, and
+/// the governor told. Said once, because [`crate::barrier::unseat`] and
+/// [`crate::barrier::give_up`] each answer it once.
+pub(crate) fn check_gave_up(store: &Store, w: &Worklist, at: usize, tries: u32, last: &str) {
+    use crate::message::{self, About, Kind, Message, Party};
+    let text = format!(
+        "{list} group {at}: the barrier check never started, after {tries} tries\n\n\
+         Last error: {last}\n\n\
+         Every member has landed and been verified, and the run is waiting at the barrier with no check. \
+         `wsp worklist advance {list}` starts the check again once the cause is cleared, \
+         and `wsp worklist go {list}` passes the barrier without one.",
+        list = w.id,
+    );
+    let m = Message::new(Party::wsp(), Kind::Note, &text).about(About::Group { scope: w.id.clone(), group: at });
+    let _ = message::raise(store, &m);
+    log_line(store, &format!("{} group {at}: flagged the person — the check never started in {tries} tries: {last}", w.id));
+    tell(store, w, &format!(
+        "The {} run's barrier check on group {at} did not start in {tries} tries, and the person is flagged. \
+         `wsp worklist advance {}` starts it again once the cause is cleared.",
         w.id, w.id
     ));
 }
@@ -4998,6 +5068,154 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(c[0].state, crate::barrier::State::Abandoned);
         assert!(c[1].open());
         assert_eq!(spawned(), vec![("run · barrier 1".to_string(), "claude".into())]);
+    }
+
+    /// The barrier of a one-member run, open and with its first start taken.
+    fn barrier_open(tag: &str) -> (util::Isolated, Store, Worklist) {
+        let (env, store) = scratch(tag);
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        assert!(spawned().iter().any(|(id, _)| id == "run · barrier 1"), "the check's first start");
+        (env, store, w)
+    }
+
+    /// Make the open check on group 1 as old as it would be `secs` after its
+    /// last start or failure.
+    fn age_check(store: &Store, secs: i64) {
+        let mut l = store.worklist("run").unwrap();
+        let mut g = l.groups();
+        g[0].checks.last_mut().unwrap().at = util::iso_at(util::epoch_secs() - secs);
+        l.set_groups(&g);
+        store.save_worklist(&l).unwrap();
+    }
+
+    /// `wsp-328`, seen on `verification` group 2: `claude started but never
+    /// became ready` left the pane named on the entry, idle, and the run waited
+    /// on it until a person ended it and spawned the check again.
+    #[test]
+    fn a_check_that_never_started_loses_its_pane_and_is_started_again_on_a_backoff() {
+        let (_env, store, w) = barrier_open("checkretry");
+        check_seated(&store, 1, "cpd-9");
+        let _ = drained(&TOLD);
+        check_start_failed(&store, &w, 1, "claude started but never became ready for input");
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "the pane the start left is ended");
+        let c = checks(&store, 1);
+        assert_eq!((c.len(), c[0].pane.clone(), c[0].tries), (1, None, 1), "off the entry, so it is not read as in flight");
+        let told = drained(&TOLD);
+        assert!(told.len() == 1 && told[0].contains("try 1 of 3") && told[0].contains("never became ready"), "{told:?}");
+
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "not again at once — the backoff");
+        age_check(&store, 4 * 60);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("run · barrier 1".to_string(), "claude".into())], "the same entry, started again");
+        let c = checks(&store, 1);
+        assert_eq!((c.len(), c[0].tries), (1, 2), "a second start and not a second check");
+
+        // It comes up this time and nothing more is owed.
+        check_seated(&store, 1, "cpd-10");
+        age_check(&store, 60 * 60);
+        step(&store, &w, &Fixed::new(&[("cpd-10", State::Working)]));
+        assert!(spawned().is_empty() && drained(&ENDED).is_empty(), "a check that is running is left alone");
+    }
+
+    #[test]
+    fn a_spawn_that_fails_in_the_step_is_retried_and_the_person_is_flagged_when_the_tries_run_out() {
+        let (_env, store, w) = barrier_open("checkspent");
+        let _ = drained(&TOLD);
+        let raised = || crate::message::raised(&store).into_iter().filter(|m| m.about.scope() == Some("run")).collect::<Vec<_>>();
+
+        // Tries 2 and 3 fail inside the step itself, as the live spawn did.
+        FAIL.with(|f| *f.borrow_mut() = Some("claude started but never became ready for input".into()));
+        check_start_failed(&store, &w, 1, "the first try's error");
+        assert!(raised().is_empty());
+        for (try_, wait) in [(2, 4 * 60), (3, 6 * 60)] {
+            age_check(&store, wait);
+            step(&store, &w, &Blind);
+            assert_eq!(spawned().len(), 1, "try {try_}");
+            assert_eq!(checks(&store, 1)[0].tries, try_);
+        }
+        FAIL.with(|f| *f.borrow_mut() = None);
+
+        let c = checks(&store, 1);
+        assert!(c[0].gave_up && c[0].pane.is_none() && c[0].open(), "{c:?}");
+        let flags = raised();
+        assert_eq!(flags.len(), 1, "one flag on the list");
+        assert_eq!(flags[0].about, crate::message::About::Group { scope: "run".into(), group: 1 });
+        assert!(flags[0].text.contains("after 3 tries") && flags[0].text.contains("never became ready"), "{}", flags[0].text);
+        assert!(drained(&TOLD).iter().any(|t| t.contains("person is flagged")), "the governor hears it too");
+
+        // Spent: no fourth start however long it waits, and no second flag.
+        age_check(&store, 60 * 60);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty());
+        assert_eq!(raised().len(), 1);
+
+        // A person's `advance` takes it from the top: the entry is abandoned and a fresh one starts.
+        assert!(crate::barrier::try_again(&store, "run"));
+        step(&store, &w, &Blind);
+        let c = checks(&store, 1);
+        assert_eq!((c.len(), c[0].state, c[1].tries), (2, crate::barrier::State::Abandoned, 1), "{c:?}");
+        assert_eq!(spawned().len(), 1);
+    }
+
+    /// The spawn killed before it could say it failed: no seat, no report, and
+    /// the last try. Nothing else would ever see it.
+    #[test]
+    fn a_last_try_that_never_reported_back_is_flagged_by_the_tick() {
+        let (_env, store, w) = barrier_open("checklost");
+        let mut l = store.worklist("run").unwrap();
+        let mut g = l.groups();
+        g[0].checks[0].tries = crate::barrier::TRIES;
+        l.set_groups(&g);
+        store.save_worklist(&l).unwrap();
+
+        age_check(&store, 60);
+        step(&store, &w, &Blind);
+        assert!(crate::message::raised(&store).is_empty(), "not yet: a start may be in flight");
+        age_check(&store, 4 * 60);
+        step(&store, &w, &Blind);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "no fourth start");
+        let flags: Vec<_> = crate::message::raised(&store).into_iter().filter(|m| m.about.scope() == Some("run")).collect();
+        assert_eq!(flags.len(), 1, "said once");
+        assert!(checks(&store, 1)[0].gave_up);
+    }
+
+    /// A check whose pane reads empty or still starting is not coming up, and
+    /// the tick says so without waiting for the spawn that left it to report.
+    #[test]
+    fn a_check_seat_that_is_not_up_after_five_minutes_is_ended_and_started_again_on_the_backoff() {
+        let (_env, store, w) = barrier_open("checknotup");
+        check_seated(&store, 1, "cpd-9");
+        let starting = Fixed::new(&[("cpd-9", State::Starting)]);
+        age_check(&store, 4 * 60);
+        step(&store, &w, &starting);
+        assert!(drained(&ENDED).is_empty(), "a slow start inside five minutes is left alone");
+        age_check(&store, 6 * 60);
+        step(&store, &w, &starting);
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()]);
+        let c = checks(&store, 1);
+        assert_eq!((c[0].pane.clone(), c[0].tries), (None, 1));
+        assert!(spawned().is_empty(), "its backoff has begun, and it is not the same pass's start");
+        age_check(&store, 4 * 60);
+        step(&store, &w, &starting);
+        assert_eq!(spawned().len(), 1);
+        assert_eq!(checks(&store, 1)[0].tries, 2);
+    }
+
+    #[test]
+    fn the_tries_and_the_give_up_survive_the_checks_block() {
+        let mut c = crate::barrier::Check::opened(Some("abc".into()), None);
+        c.tries = 3;
+        c.gave_up = true;
+        let text = crate::barrier::text(&[c.clone()]);
+        let mut back = Vec::new();
+        crate::barrier::push(&mut back, &text);
+        assert_eq!(back, vec![c]);
     }
 
     /// **A verifier whose seat has gone is superseded, and a fresh one starts**
