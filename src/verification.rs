@@ -133,6 +133,12 @@ pub(crate) struct Pass {
     /// (wsp-290). `None` on a pass still reading, on every pass written before
     /// this, and on one whose seat had no session to read.
     pub spent: Option<Spent>,
+    /// What the verifier did, read off its transcript when its seat was ended
+    /// (`wsp-325`). `None` on a pass still reading, on every pass written
+    /// before this, and on one whose transcript could not be read.
+    pub did: Option<crate::did::Did>,
+    /// The done-when items the verifier says it checked, each held or not.
+    pub checked: Vec<crate::did::Checked>,
 }
 
 /// A pass's spend: the clauses a leg's end line carries, as clauses of the
@@ -167,6 +173,8 @@ impl Pass {
             text: String::new(),
             caption: None,
             spent: None,
+            did: None,
+            checked: Vec::new(),
         }
     }
 
@@ -210,7 +218,52 @@ impl Pass {
             out.push_str("\n  ");
             out.push_str(l.trim_end());
         }
+        // The lines wsp wrote come last, and a reader takes them off the end:
+        // a verdict whose own last line looks like one is closed first.
+        let ours: Vec<String> = self
+            .did
+            .iter()
+            .flat_map(|d| d.lines())
+            .chain(self.checked.iter().map(|c| crate::did::line("checked", &c.text())))
+            .collect();
+        if !ours.is_empty() && crate::did::ends_like_ours(&self.text) {
+            out.push_str("\n  (end of verdict)");
+        }
+        for l in ours {
+            out.push_str("\n  ");
+            out.push_str(&l);
+        }
         out
+    }
+
+    /// Take the trailing lines wsp wrote off the verdict's text.
+    fn peel(&mut self) {
+        let lines: Vec<&str> = self.text.lines().collect();
+        let mut start = lines.len();
+        while start > 0 && crate::did::split_line(lines[start - 1]).is_some() {
+            start -= 1;
+        }
+        if start == lines.len() {
+            return;
+        }
+        let mut did = crate::did::Did::default();
+        let mut read = false;
+        for l in &lines[start..] {
+            let Some((key, body)) = crate::did::split_line(l) else { continue };
+            if key == "checked" {
+                self.checked.extend(crate::did::Checked::parse(body));
+            } else {
+                read = true;
+                did.absorb(key, body);
+            }
+        }
+        if read {
+            self.did = Some(did);
+        }
+        if start > 0 && lines[start - 1] == "(end of verdict)" {
+            start -= 1;
+        }
+        self.text = lines[..start].join("\n");
     }
 
     fn parse(line: &str) -> Option<Pass> {
@@ -234,6 +287,8 @@ impl Pass {
             text: String::new(),
             caption,
             spent: None,
+            did: None,
+            checked: Vec::new(),
         };
         for c in clauses {
             let c = c.trim();
@@ -404,6 +459,9 @@ fn entries(t: &Task) -> (Vec<Pass>, Vec<Run>) {
             }
         }
     }
+    for p in &mut passes {
+        p.peel();
+    }
     (passes, runs)
 }
 
@@ -427,9 +485,26 @@ pub(crate) fn json(t: &Task) -> serde_json::Value {
                 "decided": p.decided,
                 "read": p.read,
                 "pane": p.pane,
+                "did": p.did.as_ref().map(did_json),
+                "checked": p.checked.iter().map(|c| serde_json::json!({ "item": c.item, "held": c.held })).collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>())
+}
+
+/// What a verifier did, as `wsp show --json` gives it (`wsp-325`).
+fn did_json(d: &crate::did::Did) -> serde_json::Value {
+    serde_json::json!({
+        "ran": d.ran.iter().map(|c| serde_json::json!({ "command": c.text, "test": c.is_test(), "outcome": c.last().word() })).collect::<Vec<_>>(),
+        "ran_more": d.more_ran,
+        "drove": d.drove,
+        "read": {
+            "files": d.read.files.iter().map(|f| serde_json::json!({ "path": f.path, "lines": f.lines.iter().map(|(a, b)| serde_json::json!([a, b])).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+            "files_more": d.read.more_files,
+            "diffs": d.read.diffs,
+            "diffs_more": d.read.more_diffs,
+        },
+    })
 }
 
 /// Write the passes back under the heading, in time order, with the check runs
@@ -498,6 +573,8 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         text: verdict_of(row),
         caption: None,
         spent: None,
+        did: None,
+        checked: Vec::new(),
     }
 }
 
@@ -708,6 +785,15 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         Ok(t) => t,
         Err(code) => return code,
     };
+    // The `checked:` lines are the verifier's own record of the done-when items
+    // it looked at; they leave the prose and sit beside what wsp derived.
+    let (text, checked) = match crate::did::take_checked(&text) {
+        Ok(taken) => taken,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 2;
+        }
+    };
     let member = match store.task_or_why(&needle) {
         Ok(t) => t,
         Err(why) => {
@@ -716,7 +802,7 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         }
     };
     let me = crate::cmd_agent::my_pane();
-    let recorded = record(store, &member.id, state, &text, me.as_deref(), Some(&caption));
+    let recorded = record_checked(store, &member.id, state, &text, me.as_deref(), Some(&caption), checked);
     let pass = match recorded {
         Ok(p) => p,
         Err(why) => {
@@ -733,7 +819,7 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
     // verdict. With no rework leg (the row is at the leg cap) nothing does, so the
     // reason is delivered as for any member sent back.
     if state == State::Blocks {
-        deliver_unless_reworked(store, &member.id, &text);
+        deliver_unless_reworked(store, &member.id, &owed(&text, &pass.checked));
     }
     crate::cycle::poke_task(store, &member.id, "verified");
 
@@ -747,7 +833,20 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
     if state == State::Blocks {
         println!("  {}", p.dim("sent back to doing with your verdict as what is owed; its governor is told"));
     }
+    if pass.checked.is_empty() {
+        println!("  {}", p.dim("no `checked:` lines — one per done-when item you looked at, ending in held or not held, is what `wsp verifications` counts"));
+    }
     0
+}
+
+/// A blocking verdict as what is owed: its prose, and the items it says did not
+/// hold, which left the prose when they became `checked` lines.
+pub(crate) fn owed(text: &str, checked: &[crate::did::Checked]) -> String {
+    let not_held: Vec<String> = checked.iter().filter(|c| !c.held).map(|c| format!("- {}", c.item)).collect();
+    if not_held.is_empty() {
+        return text.trim().to_string();
+    }
+    format!("{}\n\nNot held:\n{}", text.trim(), not_held.join("\n"))
 }
 
 /// A blocking verdict's reason, told to the member's pane unless a rework leg
@@ -762,7 +861,21 @@ pub(crate) fn deliver_unless_reworked(store: &Store, member: &str, text: &str) {
 /// The store half of [`verified`]: the pass written, and the member moved when
 /// the verdict blocks. Separate so the choice of pass can be tested without a
 /// process environment to read a pane out of.
+#[cfg(test)]
 pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: Option<&str>, caption: Option<&str>) -> Result<Pass, String> {
+    record_checked(store, member, state, text, me, caption, Vec::new())
+}
+
+/// [`record`] with the done-when items the verifier checked (`wsp-325`).
+pub(crate) fn record_checked(
+    store: &Store,
+    member: &str,
+    state: State,
+    text: &str,
+    me: Option<&str>,
+    caption: Option<&str>,
+    checked: Vec<crate::did::Checked>,
+) -> Result<Pass, String> {
     store.locked(|| {
         let Some(mut t) = store.find_task(member) else { return Err(format!("no task {member}")) };
         let mut ps = passes(&t);
@@ -797,10 +910,11 @@ pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: 
         ps[at].decided = Some(now.clone());
         ps[at].text = text.trim().to_string();
         ps[at].caption = caption.map(str::to_string);
+        ps[at].checked = checked;
         let pass = ps[at].clone();
         write(&mut t, &ps);
         if state == State::Blocks {
-            send_back(&mut t, now, "the verifier blocked", pass.read.as_deref(), text, None);
+            send_back(&mut t, now, "the verifier blocked", pass.read.as_deref(), &owed(text, &pass.checked), None);
         }
         store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
         Ok(pass)
@@ -1008,12 +1122,58 @@ mod tests {
                 peak: 70_000,
                 spend: crate::agent_commands::Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None },
             }),
+            did: None,
+            checked: Vec::new(),
         };
         let bare = Pass { at: "2026-10-06T11:00:00Z".into(), ..Pass::opened(None, None) };
         write(&mut t, &[bare.clone(), full.clone()]);
         assert_eq!(passes(&t), vec![full, bare], "oldest first, whichever order they were handed in");
         assert!(t.body.find("## Verification").unwrap() < t.body.find("## Log").unwrap(), "and the log stays last");
         assert!(t.body.contains("- 2026-10-06T10:00:00Z blocks · read 55c4839abcde · pane cpd-12"), "{}", t.body);
+    }
+
+    /// The lines wsp wrote sit under the verdict and come back as fields: the
+    /// derived three and the verifier's own, and the verdict's prose is what it
+    /// was — including a verdict that ends in a line that looks like one of ours.
+    #[test]
+    fn the_lines_a_pass_carries_come_back_as_fields_and_the_prose_is_untouched() {
+        let mut t = Task::new("a member", "m-1");
+        t.body = "## Overview\nthe work\n\n## Log\n- 2026-10-06 claimed\n".into();
+        let mut d = crate::did::Did::default();
+        d.absorb("ran", "cargo test check:: · failed → passed");
+        d.absorb("ran", "wsp check m-1 · passed");
+        d.absorb("drove", "ctl · 3 commands");
+        d.absorb("read", "src/a.rs:1-40 90-, README.md · diff 9e1c..55c4");
+        let checked = vec![
+            crate::did::Checked { item: "the gate holds the verifier".into(), held: true },
+            crate::did::Checked { item: "compound has a declaration · yet".into(), held: false },
+        ];
+        for text in ["It holds.\n\nthe prose\nof two paragraphs", "It holds.\n- **ran:** cargo test, I wrote this myself"] {
+            let p = Pass {
+                at: "2026-10-06T10:00:00Z".into(),
+                state: State::Holds,
+                text: text.into(),
+                did: Some(d.clone()),
+                checked: checked.clone(),
+                ..Pass::opened(None, None)
+            };
+            write(&mut t, &[p.clone()]);
+            assert_eq!(passes(&t), vec![p], "{}", t.body);
+            assert!(t.body.contains("\n  - **ran:** cargo test check:: · failed → passed\n"), "{}", t.body);
+        }
+        let none = Pass { did: None, checked: checked.clone(), ..Pass::opened(None, None) };
+        write(&mut t, &[none.clone()]);
+        assert_eq!(passes(&t), vec![none], "an entry never read has no ran line and says nothing about it");
+    }
+
+    /// A blocking verdict sent back carries what did not hold, which left its
+    /// prose when it became a `checked` line.
+    #[test]
+    fn what_did_not_hold_is_still_what_is_owed() {
+        let held = crate::did::Checked { item: "a".into(), held: true };
+        let not = crate::did::Checked { item: "the replay covers 20 rows".into(), held: false };
+        assert_eq!(owed("Blocks.", &[held.clone()]), "Blocks.");
+        assert_eq!(owed("Blocks.\n", &[held, not]), "Blocks.\n\nNot held:\n- the replay covers 20 rows");
     }
 
     /// A landing records forty characters and an entry twelve: the same commit
@@ -1196,6 +1356,46 @@ mod tests {
         assert_eq!(parsed.get("caption").as_deref(), Some("the wiring is tested now"));
         // `--from` stays a positional on a stream verb, by design (`Literal::stream`).
         assert_eq!(parsed.rest, vec!["m-1", "--from", "v.md"], "and the caption did not become the verdict");
+    }
+
+    /// `wsp-325`: a verdict's `checked:` lines leave its prose and sit on the
+    /// entry as items; one that does not say held or not held is refused with
+    /// nothing written; and a block sends back what did not hold.
+    #[test]
+    fn a_verdicts_checked_lines_become_items_and_a_line_nobody_can_count_is_refused() {
+        let (_env, store) = scratch("checked");
+        let mut t = Task::new("a member", "m-1");
+        t.status_raw = "review".into();
+        store.save_task(&t).unwrap();
+        let from = store.root.join("verdict.md");
+        let verdict = |text: &str| {
+            std::fs::write(&from, text).unwrap();
+            let from = from.display().to_string();
+            Args::synth("verified", &["m-1", "--from", &from], &[("blocks", "true"), ("caption", "the replay is short")])
+        };
+
+        let refused = verdict("Blocks.\nchecked: the replay was run on 20 rows");
+        assert_eq!(cmd_verified(&store, &refused), 2);
+        assert!(passes(&store.find_task("m-1").unwrap()).is_empty(), "a refused verdict writes nothing");
+
+        let ok = verdict("Blocks, the replay is short.\n\nchecked: the gate holds the verifier — held\n- **checked:** the replay covers 20 rows — not held\n");
+        assert_eq!(cmd_verified(&store, &ok), 0);
+        let t = store.find_task("m-1").unwrap();
+        let p = passes(&t).pop().unwrap();
+        assert_eq!(p.text, "Blocks, the replay is short.");
+        assert_eq!(
+            p.checked,
+            vec![
+                crate::did::Checked { item: "the gate holds the verifier".into(), held: true },
+                crate::did::Checked { item: "the replay covers 20 rows".into(), held: false },
+            ]
+        );
+        assert!(t.body.contains("\n  - **checked:** the replay covers 20 rows · not held"), "{}", t.body);
+        let log = t.body.lines().find(|l| l.contains("sent back")).unwrap_or_default();
+        assert!(log.contains("Not held: - the replay covers 20 rows"), "what did not hold is what is owed: {log}");
+        let v = json(&t);
+        assert_eq!(v[0]["checked"][1], serde_json::json!({ "item": "the replay covers 20 rows", "held": false }));
+        assert!(v[0]["did"].is_null(), "and nothing derived until the seat ends");
     }
 
     /// The caption is on the entry's header line and back out of it, and

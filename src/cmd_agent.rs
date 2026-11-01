@@ -2266,6 +2266,19 @@ pub(crate) fn ran_in_seat(store: &Store, seat: &str, since: &str) -> String {
 /// What a seat's session served since `since`, from the seat's own binding. A
 /// verifier's seat is read the same way, and its pass keeps the reading.
 pub(crate) fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::agent_commands::Ran> {
+    let (kind, session, cwd) = session_of_seat(store, seat)?;
+    crate::agent_commands::of(&kind).ran(&session, &cwd, util::epoch_of(since))
+}
+
+/// What the seat's agent did since `since` (`wsp-325`): [`ran_of_seat`]'s
+/// reading of the same session, for the lines a verdict carries.
+pub(crate) fn did_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::did::Did> {
+    let (kind, session, cwd) = session_of_seat(store, seat)?;
+    crate::agent_commands::of(&kind).did(&session, &cwd, util::epoch_of(since))
+}
+
+/// The kind, session and cwd a seat's binding records, when it has a session.
+fn session_of_seat(store: &Store, seat: &str) -> Option<(String, String, String)> {
     let bindings = store.bindings();
     let b = bindings.get(seat)?;
     let get = |k: &str| b.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -2273,11 +2286,7 @@ pub(crate) fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crat
     if session.is_empty() {
         return None;
     }
-    crate::agent_commands::of(&crate::cmd_spawn::kind_or_default(&get("agent_kind"))).ran(
-        &session,
-        &get("cwd"),
-        util::epoch_of(since),
-    )
+    Some((crate::cmd_spawn::kind_or_default(&get("agent_kind")), session, get("cwd")))
 }
 
 fn ran_clause(kind: &str, session: &str, cwd: &str, since: &str) -> String {

@@ -4579,6 +4579,86 @@ agent was spent. A failure is not run again for the same landing; `wsp check
 steps and runs none; `--at <commit>` runs another commit and writes nothing on
 the row, which is how a landed row is replayed.
 
+### What a verifier did, on its verdict (`wsp-325`)
+
+A verdict used to say the outcome, the commit read and the cost, and nothing
+about the pass: whether it ran the tests, drove the app, read the diff. Finding
+out took a hand analysis of 405 transcripts. Ed, 2026-11-01: put it on the
+verdict, and add it up. Each entry under `## Verification` now ends in lines of
+four kinds, after the prose:
+
+```text
+  - **ran:** cargo test check:: · failed → passed
+  - **ran:** wsp check wsp-324 · passed
+  - **drove:** ctl · 14 commands
+  - **read:** src/check.rs:1-200 410-470, src/cycle.rs · diff 9e1c4a..55c4839
+  - **checked:** the gate holds the verifier until a run passed · held
+  - **checked:** compound has a declaration · not held
+```
+
+**`ran`, `drove` and `read` are derived, not asked for.** When wsp ends the
+verifier's seat it reads the seat's Claude Code transcript (`src/did.rs`) over
+the same window the pass's cost is read over, and writes them. A verifier that
+did nothing writes `ran: none`; an entry with **no `ran` line was never read**
+(it is older than this, or the kind's record is not one wsp reads — only Claude
+Code's is), and the report counts it apart rather than as a verifier that did
+nothing.
+
+- **ran** is each distinct command that was not just looking. Looking is a short
+  list of programs (`ls`, `grep`, `git log`, `sed -n`, `wsp show` …, `INSPECT`
+  in `did.rs`); everything else — a test runner, a build, a script, `wsp check`
+  — is a command that ran, so a project's own scripts count without being
+  named. The shell around it is not part of it: `cd`, `env`, `| tail`, a
+  heredoc that writes the verdict, a one-liner reading a pipe. The outcome is
+  `passed` or `failed` from the tool's result, and for a test run from its
+  output too, since `| grep` reports `grep`'s status. A command run again keeps
+  every outcome in order: `failed → passed`. A pipe-hidden `command not found` is
+  a failure. Past thirty the rest are counted, not listed.
+- **drove** is a running thing acted on: a browser or desktop MCP server's
+  tools, a screen capture, a `ctl` binary, `wsp sandbox`, a headless browser,
+  the built program itself (`target/debug/x`, `cargo run`, `--drive`, `--png`).
+  Running a test that drives the app headlessly is `ran`, not `drove`. The
+  tables to extend are `drove_by`, `driving_server` and `is_test` in `did.rs`.
+- **read** is the files with the lines taken (`file:40-90`, `file:~` for a part
+  a pattern chose, `file` for all of it), from `Read`, `sed -n`, `head`, `tail`,
+  `cat`, and `git show REV:PATH`; and the diffs and commits looked at (`git
+  show`, `git diff`, `git log -p`). Paths are the session's tree's, whichever
+  directory the shell was in; a session's own temp and scratch files are not
+  the work.
+
+**`checked` is the verifier's**, because which done-when item it looked at and
+whether it held is not in any transcript. The verifier's work order asks for one
+line per item in the verdict file — `checked: <the item> — held` or `— not
+held` — and `wsp verified` takes them out of the prose and onto the entry. A
+line that ends in neither is refused, naming it, with nothing written. A
+blocking verdict's `not held` items are added to what is sent back as owed.
+
+**`wsp verifications [<project>] [--since DATE|Nd] [--until DATE] [--by …]`**
+adds them up, over live and archived rows: by project (the default), `week`,
+`month`, or `project,week`. Of the verdicts whose transcript was read — the
+`recorded` column — the share that ran tests, the share that drove, the share
+that read a diff; the share of *all* verdicts with `checked` lines; how many
+done-when items held; and **blocks by cause**, each block given the first that
+applies from its own lines: a done-when item `not held`; a test run whose last
+word was `failed`; some other command whose last word was `failed`; none of
+those (`found by reading`); no lines at all (`unrecorded`). `--json` gives the
+counts. `wsp verifications --transcript FILE` prints the lines that session
+would give a verdict, which is how the derivation is checked against a hand
+reading.
+
+**Checked by hand, on 40 of the 309 verifier transcripts on this machine** — four
+samples of ten, each drawn at random from the ones not yet read, each `ran`,
+`drove` and `read` line compared with the commands and results in the
+transcript. Every sample found misreadings (six, four, three, two) and each
+is now a test in `did.rs` (`the_misreadings_a_hand_check_found`,
+`a_cd_names_where_the_path_after_it_is`, `a_cd_that_could_only_have_failed_…`);
+the number is still falling, not zero, so a fifth sample is the way to find the
+next. `wsp verifications --transcript FILE` makes that a minute's work. What it
+gets wrong and will go on getting wrong: a command run by a script is one `ran`
+line; `wsp say`, `note`, `ask` and `flag` are taken as looks even when that verb
+is the row under test; `cat f | head -n` reads as all of `f`; and whether an
+unfamiliar command only looks is a list, not a fact.
+
 ### `wsp verify`, because step 3 wants to be code
 
 A rule that catches two different agents on two consecutive days is not a rule
@@ -5246,6 +5326,8 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor — or, past the last barrier, the list closed and its own seat stood down and ended |
 | `src/check.rs` | `wsp check`: a row's mechanical checks as a script — the member's `## Checks`, the project's path rules, the barrier's steps — run at the landing in a warm tree, recorded under `## Verification`, and the gate in front of the verifier |
+| `src/did.rs` | what a verifier did, as lines on its verdict: the commands it ran, what it drove and what it read — derived from the seat's Claude Code transcript when wsp ends it — and the `checked:` lines the verifier writes itself |
+| `src/cmd_verifications.rs` | `wsp verifications`: those lines added up by project and period — the share that ran tests, drove the app and read the diff, the done-when items checked, blocks by cause |
 | `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified`, and the one-off migration off Verify rows |
 | `src/history.rs` | a list's history as data, off its `## Log` and `checks:`: membership replayed by ordinal, events placed on the group the run stood at by time, each group's maker and joins, and the groups dropped while they ran |
 | `src/barrier.rs` | a barrier check, on the group it checks: the `checks:` entries, opened before its agent starts, settled by `go`/`hold`/`followup`, the seats `wip` and the brief name, and the one-off migration off Barrier rows |

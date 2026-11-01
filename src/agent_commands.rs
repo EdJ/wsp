@@ -578,6 +578,14 @@ pub trait Kind {
     /// either way.
     fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran>;
 
+    /// What the session did — the commands it ran, what it drove, what it read
+    /// (`wsp-325`) — off the same record [`Kind::ran`] reads, over the same
+    /// window. `None` for a kind whose record this does not read, which is not
+    /// an agent that did nothing.
+    fn did(&self, _session: &str, _cwd: &str, _since: i64) -> Option<crate::did::Did> {
+        None
+    }
+
     /// How this kind's own command line says *pick that session back up* —
     /// `None` for one that cannot be told to.
     ///
@@ -2504,6 +2512,11 @@ impl Kind for Claude {
     fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran> {
         let file = std::fs::File::open(transcript(session, cwd)?).ok()?;
         read_ran(&mut std::io::BufReader::new(file), since)
+    }
+
+    fn did(&self, session: &str, cwd: &str, since: i64) -> Option<crate::did::Did> {
+        let file = std::fs::File::open(transcript(session, cwd)?).ok()?;
+        crate::did::of_transcript(&mut std::io::BufReader::new(file), since)
     }
 }
 

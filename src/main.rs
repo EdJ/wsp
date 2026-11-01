@@ -39,6 +39,7 @@ mod cmd_sandbox;
 mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;
+mod cmd_verifications;
 mod cmd_verify;
 mod leg_seat;
 mod leg_tree;
@@ -51,6 +52,7 @@ mod cycle;
 mod daemon;
 mod detail;
 mod detect_override;
+mod did;
 mod draw;
 mod ending;
 mod fake;
@@ -1148,6 +1150,7 @@ fn main() {
         "review" => cmd_task::review(&store, &args),
         "reopen" => cmd_task::reopen(&store, &args),
         "verified" => verification::cmd_verified(&store, &args),
+        "verifications" => cmd_verifications::verifications(&store, &args),
         "leg" => legs::dispatch(&store, &args),
         "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
@@ -1645,6 +1648,14 @@ fn help_text() -> String {
                                     block by hand writes --holds in their name.
                                     --caption is required: the reason in under
                                     60, read after the holds/blocks wsp adds
+  wsp verifications [<project>] [--since DATE|Nd] [--until DATE] [--by project|week|month|project,week] [--json]
+                                    what verifiers did, added up: of the passes
+                                    whose transcript was read, the share that ran
+                                    tests, drove the app and read the diff; the
+                                    done-when items checked; blocks by cause
+  wsp verifications --transcript FILE
+                                    the ran/drove/read lines that session's
+                                    transcript would give a verdict
   wsp done <id> [--force]           the person's verb (a member finishes with
                                     `wsp review`); complete; --force over open sub-tasks. Its
                                     worktree and branch go too when the work is

@@ -1961,11 +1961,13 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
          - it does not: `wsp verified {m} --blocks --from FILE --caption \"…\"`. {m} goes back to doing with \
          your verdict as what is owed, and its governor is told.\n\n\
          {caption}\n\n\
+         {checked}\n\n\
          There is no row of your own: the verdict is recorded on {m} under `## Verification`, \
          and wsp ends this seat once it is in.",
         m = member.id,
         title = util::truncate(&member.title, 80),
         caption = CAPTION_ORDER,
+        checked = CHECKED_ORDER,
         legs = legs_line(member),
         split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
     )
@@ -1996,6 +1998,14 @@ const CAPTION_ORDER: &str = "**The caption is required**, and it is what a perso
      (`holds`, `blocks`, `passed`, `held`). Plain words, no commit hashes, no ids. Like: \
      `the wiring between the two has no test`, `the wiring is tested now`, \
      `all six hold; Ed settled his two items`, `waiting on Ed's read of the design`.";
+
+/// What a verifier is asked to write about what it checked (`wsp-325`): the one
+/// part of what a verdict records that a transcript cannot say.
+const CHECKED_ORDER: &str = "**Say which done-when items you checked.** In the verdict file, one line for each item of \
+     the row's done-when you looked at, ending in `held` or `not held`: `checked: <the item, in a few words> — held`. \
+     wsp takes these lines out of your prose and records them beside what it reads off your session itself — \
+     the commands you ran, what you drove, what you read — so do not list those. A blocking verdict's `not held` \
+     items are sent back as what is owed. A line that does not end in `held` or `not held` is refused.";
 
 /// A check's work order, composed from the list as it stands when it is asked,
 /// since a check has no row to keep it on: what `wsp spawn --check` hands the
@@ -2813,6 +2823,7 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
         };
         // Read before the despawn: it clears the binding the session is found by.
         let spent = crate::cmd_agent::ran_of_seat(store, &seat, &p.at).map(|r| crate::verification::Spent::of(&r));
+        let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
         let outcome = despawn_seat(&seat).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {
             Ok(()) => Ending::Ended,
@@ -2824,6 +2835,7 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
             let Some(q) = ps.iter_mut().find(|q| q.at == p.at && q.pane == p.pane) else { return false };
             q.ending = ending.clone();
             q.spent = spent.clone();
+            q.did = did.clone();
             write(&mut t, &ps);
             store.save_task(&t).is_ok()
         });
@@ -3584,6 +3596,8 @@ pub(crate) mod tests {
         assert!(order.contains("read-only") && order.contains("wsp verified m-1 --holds --from FILE"), "{order}");
         // `wsp-241`: and how to write the caption the verb now requires.
         assert!(order.contains("--holds --from FILE --caption") && order.contains("under 60 characters") && order.contains("no commit hashes"), "{order}");
+        // `wsp-325`: and the one thing about the pass only the verifier can say.
+        assert!(order.contains("checked: <the item") && order.contains("held` or `not held"), "{order}");
         assert_eq!(spawned(), vec![("m-1 · verifying".into(), "opencode".into())], "on the same policy: the floor holds");
         step(&store, &w, &Blind);
         assert!(spawned().is_empty() && passes_on(&store, "m-1").len() == 1, "and only once");
@@ -4257,6 +4271,65 @@ fn only_a_working_screen_is_ever_overruled() {
         END_FAIL.with(|f| *f.borrow_mut() = None);
         assert!(drained(&ENDED).is_empty(), "a failed ending is not tried again every tick");
         assert!(!drained(&TOLD).iter().any(|t| t.contains("could not end")), "nor told again");
+    }
+
+    /// `wsp-325`: the seat's transcript is read when its pass is ended, and the
+    /// entry carries what the verifier ran, drove and read — beside the
+    /// `checked` lines the verifier wrote itself, which ending leaves alone.
+    #[test]
+    fn ending_a_verifier_writes_what_it_did_from_its_transcript_and_keeps_what_it_checked() {
+        use crate::repair::Pass;
+        use crate::verification::State as V;
+
+        let (env, store) = scratch("didending");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        crate::verification::name_seat(&store, "m-1", "cpd-9");
+        let checked = vec![crate::did::Checked { item: "the gate holds".into(), held: false }];
+        crate::verification::record_checked(&store, "m-1", V::Blocks, "it does not", Some("cpd-9"), None, checked.clone()).unwrap();
+
+        // The transcript Claude Code would have written, where it looks for it.
+        let home = env.path("home");
+        let cwd = "/w/m-1";
+        let dir = home.join(".claude/projects").join(cwd.replace('/', "-"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |v: serde_json::Value| format!("{v}\n");
+        let call = |id: &str, name: &str, input: serde_json::Value| {
+            line(serde_json::json!({"type": "assistant", "cwd": cwd, "timestamp": util::now_iso(), "message": {"id": id, "model": "claude-sonnet-5-5",
+                "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}}))
+        };
+        let said = |id: &str, text: &str| {
+            line(serde_json::json!({"type": "user", "cwd": cwd, "timestamp": util::now_iso(), "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}}))
+        };
+        std::fs::write(
+            dir.join("sess-1.jsonl"),
+            call("t1", "Bash", serde_json::json!({"command": "cargo test cycle:: 2>&1 | tail -3"}))
+                + &said("t1", "test result: FAILED. 1 passed; 1 failed")
+                + &call("t2", "Read", serde_json::json!({"file_path": "/w/m-1/src/cycle.rs", "offset": 10, "limit": 5})),
+        )
+        .unwrap();
+        store.set_binding("cpd-9", serde_json::json!({ "agent_session_id": "sess-1", "agent_kind": "claude", "cwd": cwd }));
+
+        let before = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
+        match before {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let p = &passes_on(&store, "m-1")[0];
+        assert_eq!(p.ending, crate::verification::Ending::Ended);
+        let did = p.did.as_ref().expect("the transcript was read");
+        assert_eq!(did.ran.len(), 1);
+        assert_eq!(did.ran[0].text, "cargo test cycle::");
+        assert_eq!(did.ran[0].last(), crate::did::Outcome::Failed, "a pipe hid the exit status; the output did not");
+        assert_eq!(did.read.files[0].text(), "src/cycle.rs:10-14");
+        assert_eq!(p.checked, checked);
+        let body = store.find_task("m-1").unwrap().body;
+        assert!(body.contains("\n  - **ran:** cargo test cycle:: · failed\n") && body.contains("\n  - **checked:** the gate holds · not held"), "{body}");
     }
 
     /// `wsp-158` item 2, and the one nothing could find. A governor spawns a
