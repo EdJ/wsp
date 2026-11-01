@@ -3860,7 +3860,9 @@ gone and takes the file over.
 who is building where. **The load warning is separate from the mode** and shows
 in all three: both the 1- and 5-minute averages over 1.5 times the cores prints a
 line on `wsp wip` and `wsp watch --status`, a note on `wsp doctor`, and the
-daemon logs it to `cycle.log` when it starts and clears.
+daemon logs it to `cycle.log` when it starts and clears. `wsp wip` (text and
+`--json`) and `wsp watch --status` also carry one line in every mode, load or
+not: the mode, whether it holds this minute, and who is building.
 
 ## Spawning
 

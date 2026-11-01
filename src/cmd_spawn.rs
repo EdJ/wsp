@@ -8523,6 +8523,7 @@ mod tests {
             daemon: None,
             disk: None,
             load: None,
+            throttle: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),

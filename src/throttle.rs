@@ -513,7 +513,7 @@ fn wait_for(ctx: &Ctx, what: &str, attempt: &mut dyn FnMut() -> Taken, lifted: O
                 v => who(&v),
             };
             (ctx.say)(&format!(
-                "wsp: waiting for {what} — held by {by}. Queued, not failed; this is wsp's build throttle (`wsp throttle` shows it, `wsp throttle off` lifts the slots)"
+                "wsp: waiting for {what} — held by {by}. Queued, not failed; this is wsp's build throttle (`wsp throttle` shows it, `wsp throttle off` lifts the slots, not the one-build-per-tree hold)"
             ));
             next_say = waited + Duration::from_secs(60);
         }
@@ -735,6 +735,19 @@ impl View {
         out.join("\n")
     }
 
+    /// The one line `wsp wip` and `wsp watch --status` carry in every mode: the
+    /// mode, whether it holds this minute, and who is building.
+    pub(crate) fn status_line(&self) -> String {
+        let building = match self.builds.is_empty() {
+            true => String::new(),
+            false => format!(
+                " · building: {}",
+                self.builds.iter().map(|b| who(&b.holder)).collect::<Vec<_>>().join("; ")
+            ),
+        };
+        format!("throttle: {}{building}", self.force_line())
+    }
+
     fn load_sentence(&self) -> String {
         let (one, five, _) = self.load.unwrap_or_default();
         let names: Vec<String> = self.builds.iter().map(|b| who(&b.holder)).collect();
@@ -780,6 +793,11 @@ fn builds(state: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<Build> {
 pub(crate) fn loud(store: &Store) -> Option<String> {
     let v = View::read(&store.state);
     v.load_warning().then(|| v.load_sentence())
+}
+
+/// [`View::status_line`], for the surfaces that are not `wsp throttle`.
+pub(crate) fn status_line(store: &Store) -> String {
+    View::read(&store.state).status_line()
 }
 
 pub(crate) fn health(store: &Store, notes: &mut Vec<String>) {
@@ -1365,6 +1383,42 @@ mod tests {
         assert!(out.contains("auto — in force, the person is here"), "{out}");
         assert!(out.contains("wsp-9 `cargo test`") && out.contains("[slot 1/2]"), "{out}");
         assert!(out.contains("⚠ load is 20.0 (1m) and 18.0 (5m) on 8 cores"), "{out}");
+    }
+
+    #[test]
+    fn the_status_line_names_the_mode_and_whether_it_holds_in_every_mode() {
+        for (m, idle, want) in [
+            (Mode::Off, Some(0), "throttle: off"),
+            (Mode::On, Some(9999), "throttle: on — in force"),
+            (Mode::Auto, Some(12), "throttle: auto — in force, the person is here"),
+            (Mode::Auto, Some(9999), "throttle: auto — not in force, away"),
+        ] {
+            let v = View {
+                settings: Settings { mode: m, ..Settings::default() },
+                idle,
+                in_force: in_force(m, idle, 5),
+                cores: 8,
+                load: Some((1.0, 1.0, 1.0)),
+                builds: vec![],
+                shims: PathBuf::from("/s"),
+            };
+            assert!(v.status_line().starts_with(want), "{m:?}: {}", v.status_line());
+            assert!(!v.load_warning(), "the line shows with no load warning up");
+        }
+    }
+
+    #[test]
+    fn the_status_line_names_who_is_building() {
+        let v = View {
+            settings: Settings::default(),
+            idle: Some(1),
+            in_force: true,
+            cores: 8,
+            load: None,
+            builds: vec![Build { holder: rec_for(1), slot: Some(0) }],
+            shims: PathBuf::from("/s"),
+        };
+        assert!(v.status_line().contains(" · building: wsp-9 `cargo test`"), "{}", v.status_line());
     }
 
     #[test]

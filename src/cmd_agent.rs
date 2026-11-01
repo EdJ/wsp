@@ -3968,6 +3968,9 @@ pub(crate) struct Wip {
     /// The load warning, when the machine has been over 1.5x its cores for a
     /// while: [`crate::throttle::loud`], whatever the throttle's mode.
     pub load: Option<String>,
+    /// [`crate::throttle::status_line`]: the build throttle's mode and whether it
+    /// holds now, every time and in every mode.
+    pub throttle: Option<String>,
     /// The open questions, read once — the store half of [`crate::waiting`]'s
     /// reading, asked for every row.
     pub asks: crate::waiting::Asks,
@@ -4109,6 +4112,7 @@ impl Wip {
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
             disk: crate::disk::loud(store),
             load: crate::throttle::loud(store),
+            throttle: Some(crate::throttle::status_line(store)),
             asks: crate::waiting::Asks::read(store),
             shells,
             mandates: store.mandates(),
@@ -4725,6 +4729,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         "daemon": w.daemon,
         "disk": w.disk,
         "load": w.load,
+        "throttle": w.throttle,
         "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "inbox": inbox,
@@ -4750,6 +4755,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         for d in w.daemon.iter().chain(&w.disk).chain(&w.load) {
             out.push(p.red(d));
         }
+        out.extend(w.throttle.iter().map(|t| p.dim(t)));
     } else {
         // Not `all busy`, which is what this said and was the same sentence
         // `doctor`'s `herdr up, 12 agents` was saying on the night seven of
@@ -4791,6 +4797,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         for d in w.daemon.iter().chain(&w.disk).chain(&w.load) {
             out.push(p.red(d));
         }
+        out.extend(w.throttle.iter().map(|t| p.dim(t)));
         out.push(String::new());
         let pw = rows.iter().map(|r| r.project.chars().count()).max().unwrap_or(7).max(7);
         let tw = 46;
@@ -8074,6 +8081,7 @@ mod tests {
             daemon: None,
             disk: None,
             load: None,
+            throttle: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),
@@ -8267,6 +8275,7 @@ mod tests {
             daemon: None,
             disk: None,
             load: None,
+            throttle: None,
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),
@@ -8643,6 +8652,29 @@ mod tests {
         // place this is said, and a script cannot ask whether *it* would have
         // seen a daemon.
         assert!(wip_json(&w)["daemon"].as_str().unwrap().contains("no wsp daemon"));
+    }
+
+    /// `wsp-331`. The throttle's mode and whether it holds now are on the
+    /// answer every time, with agents or without, whatever the mode and with no
+    /// load warning up: a line that appeared only under load would leave the
+    /// person unable to tell `off` from `auto` while the machine was fine.
+    #[test]
+    fn the_throttle_line_is_on_wip_in_every_mode_with_and_without_agents() {
+        for line in ["throttle: off — builds run", "throttle: on — in force", "throttle: auto — in force, the person is here"] {
+            let mut w = wip_world();
+            w.throttle = Some(line.to_string());
+            let text = wip_lines(&w, &Paint::new(), false).join("\n");
+            assert!(text.contains(line), "{text}");
+            assert!(
+                text.lines().position(|l| l.contains(line)) < text.lines().position(|l| l.contains("PROJECT")),
+                "drawn under the table: {text}"
+            );
+            assert_eq!(wip_json(&w)["throttle"].as_str(), Some(line));
+            let mut bare = wip_world();
+            bare.agents.clear();
+            bare.throttle = Some(line.to_string());
+            assert!(wip_lines(&bare, &Paint::new(), false).join("\n").contains(line));
+        }
     }
 
     /// An idle agent on a task that is still `doing` is a person being the
