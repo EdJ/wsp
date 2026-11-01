@@ -1084,6 +1084,11 @@ mod tests {
     fn rig(name: &str) -> Rig {
         use std::os::unix::fs::PermissionsExt;
         let iso = crate::util::isolated(name);
+        // `wsp verify` runs these tests under a shim of its own, so the process
+        // is born holding a tree and a job cap; the fake tool must see only
+        // what the run under test gave it.
+        std::env::remove_var(HELD);
+        std::env::remove_var("CARGO_BUILD_JOBS");
         let bin = iso.path("bin");
         fs::create_dir_all(&bin).unwrap();
         let out = iso.path("seen");
