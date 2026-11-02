@@ -1178,6 +1178,32 @@ mod tests {
         }
     }
 
+    /// The niceness the test process itself runs at: `nice -n 12 cargo test`
+    /// hands every fake cargo that base, throttled or not.
+    fn base_nice() -> i32 {
+        let out = Command::new("ps")
+            .args(["-o", "ni=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    fn nice_of(line: &str) -> i32 {
+        let rest = line.split("nice=").nth(1).unwrap_or_else(|| panic!("no nice in {line}"));
+        rest.split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    /// Niced by the throttle: setpriority sets NICE, and never lowers a runner
+    /// already above it.
+    fn niced(line: &str) -> bool {
+        nice_of(line) == base_nice().max(NICE)
+    }
+
+    /// Left at the niceness it was born with, whatever that is.
+    fn at_base_nice(line: &str) -> bool {
+        nice_of(line) == base_nice()
+    }
+
     fn seen(rig: &Rig) -> Vec<String> {
         fs::read_to_string(&rig.out).unwrap_or_default().lines().map(String::from).collect()
     }
@@ -1189,7 +1215,7 @@ mod tests {
         let (idle, say, env) = (|| Some(0), |_: &str| {}, |_: &str| None);
         assert_eq!(run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["test"])), 0);
         let line = &seen(&rig)[0];
-        assert!(line.contains("jobs=2") && line.contains("nice=12"), "{line}");
+        assert!(line.contains("jobs=2") && niced(line), "{line}");
     }
 
     #[test]
@@ -1209,7 +1235,7 @@ mod tests {
         let (idle, say, env) = (|| Some(3600), |_: &str| {}, |_: &str| None);
         run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["build"]));
         let line = &seen(&rig)[0];
-        assert!(line.contains("jobs=none") && !line.contains("nice=12"), "{line}");
+        assert!(line.contains("jobs=none") && at_base_nice(line), "{line}");
         assert!(
             !builds_dir(&rig.state).join("slot-0").exists(),
             "an away machine takes no slot, and the hold is gone after"
@@ -1222,7 +1248,7 @@ mod tests {
         mode(&rig, Mode::Auto, 2);
         let (idle, say, env) = (|| Some(10), |_: &str| {}, |_: &str| None);
         run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["check"]));
-        assert!(seen(&rig)[0].contains("nice=12"));
+        assert!(niced(&seen(&rig)[0]));
     }
 
     #[test]
@@ -1233,7 +1259,7 @@ mod tests {
         let (idle, say, env) = (|| Some(0), |_: &str| {}, |_: &str| None);
         run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["test"]));
         let line = &seen(&rig)[0];
-        assert!(line.contains("jobs=none") && !line.contains("nice=12"), "{line}");
+        assert!(line.contains("jobs=none") && at_base_nice(line), "{line}");
         // And the tree hold was taken and released: a second build is not stuck.
         assert!(!tree_path(&rig.state, &tree).exists());
     }
@@ -1324,7 +1350,7 @@ mod tests {
         let (say, env) = (|_: &str| {}, |_: &str| None);
         run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["test"]));
         let line = &seen(&rig)[0];
-        assert!(line.contains("jobs=none") && !line.contains("nice=12"), "{line}");
+        assert!(line.contains("jobs=none") && at_base_nice(line), "{line}");
     }
 
     #[test]
@@ -1349,7 +1375,7 @@ mod tests {
         let (idle, say, env) = (|| Some(0), |_: &str| {}, |_: &str| None);
         run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["run", "-p", "host"]));
         let line = &seen(&rig)[0];
-        assert!(line.contains("jobs=2") && line.contains("nice=12") && !line.contains("held=yes"), "{line}");
+        assert!(line.contains("jobs=2") && niced(line) && !line.contains("held=yes"), "{line}");
     }
 
     #[test]
