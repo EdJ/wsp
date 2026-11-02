@@ -313,6 +313,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);
+    // And a governor seat with nothing left to govern (`wsp-337`).
+    crate::stand_down::tick(store, seats);
     // **Collected first and then visited once each**, which is the whole of the
     // second trigger and the reason it is here rather than in the loop above.
     // A scope on a running list and a scope with a backlog are the same seat, and

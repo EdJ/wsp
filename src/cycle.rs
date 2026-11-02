@@ -2785,7 +2785,7 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
 /// stood down, and `wsp govern` went on saying a successor was being seated on
 /// a done list. One held from another machine is left alone, as the reconciler
 /// leaves it.
-fn stand_down_own_seat(store: &Store, list: &str) {
+pub(crate) fn stand_down_own_seat(store: &Store, list: &str) {
     let governors = store.governors();
     let Some(seat) = crate::cmd_govern::seat_of_scope(list, &governors) else {
         let empty = governors
@@ -2818,7 +2818,7 @@ fn stand_down_own_seat(store: &Store, list: &str) {
 /// The pane a seat's agent is in now, through the port, as
 /// [`rotate_on_behalf`](crate::cmd_spawn::rotate_on_behalf) finds the one it
 /// replaces; under test, the recorded one.
-fn occupied(store: &Store, seat: &crate::cmd_govern::Seat) -> Option<String> {
+pub(crate) fn occupied(store: &Store, seat: &crate::cmd_govern::Seat) -> Option<String> {
     if cfg!(test) {
         return (!seat.pane.is_empty()).then(|| seat.pane.clone());
     }
@@ -2827,7 +2827,7 @@ fn occupied(store: &Store, seat: &crate::cmd_govern::Seat) -> Option<String> {
 }
 
 /// [`crate::cmd_spawn::end_seat_when_idle`], recorded instead under test.
-fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
+pub(crate) fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
     if cfg!(test) {
         #[cfg(test)]
         tests::ENDED.with(|s| s.borrow_mut().push(seat.to_string()));
