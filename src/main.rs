@@ -69,6 +69,8 @@ mod input;
 mod kanban;
 mod live;
 mod kind_data;
+mod kind_attention;
+mod cmd_attend;
 mod launchd;
 mod message;
 mod model;
@@ -1186,6 +1188,7 @@ fn main() {
         "throttle" => throttle::throttle(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "packet" => packet::packet(&store, &args),
+        "attend" => cmd_attend::attend(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
         "check" => check::check(&store, &args),
         "checkout" => cmd_checkout::checkout(&store, &args),
@@ -1729,6 +1732,8 @@ fn help_text() -> String {
   wsp commit-help                   how to commit in a tree somebody else is in
   wsp packet <id> [--from FILE|-]   print a row's ## Packet and the files it names, under a cap;
                                     a row with one is spawned with the short start
+  wsp attend <id>                   one attention-harness attempt on a row, to its checks'
+                                    result: what `spawn --kind attention` runs; nobody types it
   wsp checkout [<id>] [-n]          a working tree of your own for the task in
                                     hand, under .worktrees/, on its own branch —
                                     nobody else's edits are in it and yours are

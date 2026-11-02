@@ -1307,7 +1307,8 @@ impl Place for Compound<'_> {
                 self.end_process(seat, &rec);
             }
         }
-        let mut rec = self.spawn_sup(seat, &rec, &agent.kind, &agent.args)?;
+        let (program, argv) = crate::agent_commands::command(&agent.kind, &agent.args);
+        let mut rec = self.spawn_sup(seat, &rec, &program, &argv)?;
         rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
         write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
             .map_err(|e| Refusal::Backend(e.to_string()))?;

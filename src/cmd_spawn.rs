@@ -1092,6 +1092,26 @@ fn tier(
     Ok((model, effort))
 }
 
+/// What `--kind attention` needs that no other kind does (wsp-330), refused
+/// before a seat is opened: a backend that can start it, a plain member's row
+/// that opted in with `attention:` in its `## Packet`, and a command to end at.
+fn attention_gate(store: &Store, args: &Args, kind: &str, task: Option<&str>) -> Result<(), String> {
+    let how = agent_commands::of(kind);
+    if how.program().is_none() {
+        return Ok(());
+    }
+    if args.has("herdr") && !args.has("compound") {
+        return Err(format!("--kind {kind} cannot run on herdr, whose agent catalogue is closed — drop `--herdr` (compound is the default) or use `--headless`"));
+    }
+    if args.has("verify") || args.has("govern") || args.has("leg") {
+        return Err(format!("--kind {kind} runs a plain member's row, not a verifier, a leg or a governor"));
+    }
+    let Some(t) = task.and_then(|t| store.find_task(t)) else {
+        return Err(format!("--kind {kind} runs a row: `wsp spawn <task> --agent --kind {kind}`"));
+    };
+    crate::cmd_attend::opt_in(&t).map(|_| ())
+}
+
 /// The tier a spawn onto governed work starts at, when nobody said otherwise.
 ///
 /// Sonnet because d5 *measured* it: `wsp-061` ran an unattended sonnet agent
@@ -2340,6 +2360,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             return 2;
         }
     };
+    if args.has("agent") {
+        if let Err(e) = attention_gate(store, args, &kind, work.task.as_deref()) {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    }
 
     // A verifier (`wsp-188`): an agent on a member that holds no claim and
     // has no row, recorded on the member's open pass instead. Never with

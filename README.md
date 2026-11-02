@@ -3954,6 +3954,39 @@ The claim line carries a `packet` clause, so `wsp attempts --json` has
 `"packet": true|false` on each attempt and cost by kind can tell them apart.
 A resumed packet agent resumes the ordinary way.
 
+### A packet row on the attention harness (`--kind attention`)
+
+`~/claude/ai/attention`'s `tiered-nudge` arm ran packets at about 0.4 of the
+tokens Claude Code spent (compounding-034). A row opts in, never a kind by
+itself: its `## Packet` carries an `attention:` line, `attention: 1.50` for the
+most one attempt may spend in dollars at list price (`on` is $2), and its
+`## Checks` carries the command the attempt ends at. Then
+`wsp spawn <row> --agent --kind attention` (add `--model api/haiku`, the
+harness's own names; there is no `--effort`) opens a seat running `wsp attend
+<row>`, which:
+
+1. gives the attempt a directory under `<state>/attention/` and teaches the
+   claim that name as the session, so release writes `ran <model> · N turns ·
+   tokens · $` as for any kind;
+2. runs `attention chat . --yes --max-cost <cap> --deny <list> -m <packet>` in
+   the tree, with the row's packet inlined as the one message (the harness stops
+   at the cap and exits 3);
+3. runs the row's `## Checks` in the tree — **that, not the harness's own
+   answer, is the outcome**;
+4. green: commits what is left, `wsp land`, `wsp review`; anything else
+   (red checks, the cap, a harness that would not start): `wsp block` with the
+   account. A respawn on `claude` is the person's call.
+
+It runs where a backend execs the kind's program — compound (the default) and
+`--headless`. herdr starts only its own catalogue, so `--herdr` is refused before
+a seat is opened. A row that has not opted in, or has no `## Checks`, is refused
+the same way. The harness denies itself `wsp done|land|review|block|release…`,
+`git push|stash` and `cargo fmt`; those are the wrapper's or the person's. The
+harness fires no hooks, so `wsp attend` reports `SessionStart`, `UserPromptSubmit`
+and `Stop` for it through `wsp report`, which is what lets `spawn` see a seat
+that is ready rather than one still starting. `attention` must be on the PATH
+(`bin/attention` in that repo) and its `.env` hold the key.
+
 ### What "started" means, and what it does not
 
 `spawn` says `open`, `start`, then `tell`, and it says them to a *backend* —
@@ -5435,7 +5468,9 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/render.rs` | a task or a project, in full, and the column menu |
 | `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
-| `src/packet.rs` | `wsp packet`: a row's `## Packet` (prose, `file:` lines to inline, `packet: off` to opt out) printed with the files it names under a 16,000-byte cap that refuses rather than cuts; and the one decision that a plain member's `spawn --agent` takes Claude Code's short start (`SHORT_START` in `agent_commands`) with the packet as its order |
+| `src/packet.rs` | `wsp packet`: a row's `## Packet` (prose, `file:` lines to inline, `packet: off` to opt out, `attention: <dollars>` to opt in to the attention harness) printed with the files it names under a 16,000-byte cap that refuses rather than cuts; and the one decision that a plain member's `spawn --agent` takes Claude Code's short start (`SHORT_START` in `agent_commands`) with the packet as its order |
+| `src/kind_attention.rs` | the attention harness as a kind (wsp-330): the program it runs (`wsp attend`), the model names it takes, no effort, nothing that can be told to it, and an attempt's turns, tokens and dollars read off the directory the harness logged into |
+| `src/cmd_attend.rs` | `wsp attend <row>`: one attempt from the packet to the row's `## Checks`, the harness run under a cost cap and a deny list, and the row committed, landed and reviewed on green or blocked with the account on anything else |
 | `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, what it consumed, the outcome |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else — and the same brief composed for a seat that does not exist yet |
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, the three reasons one is finished with, and the branches a removed tree leaves behind |

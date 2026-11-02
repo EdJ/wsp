@@ -13,6 +13,7 @@
 //! ```text
 //! file: src/lean.rs        inline this file, relative to the tree
 //! packet: off              keep the section, spawn the row the ordinary way
+//! attention: 1.50          opt in to the attention harness, capped at $1.50 an attempt
 //! ```
 //!
 //! Nothing else is read as structure: the cases, the change and the command are
@@ -41,12 +42,28 @@ pub const CAP: usize = 16_000;
 /// `cmd_attempts`, so cost by kind can tell the two apart.
 pub const CLAUSE: &str = "packet";
 
+/// What an `attention: on` row may spend an attempt when it names no figure.
+pub const ATTENTION_DEFAULT_CENTS: u64 = 200;
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Packet {
     /// The author's words, directive lines removed.
     pub text: String,
     pub files: Vec<String>,
     pub off: bool,
+    /// The row opted in to the attention harness (`wsp spawn --kind attention`):
+    /// the most one attempt may spend, in cents. Nothing else opts a row in.
+    pub attention_cents: Option<u64>,
+}
+
+/// `on`, `2`, `$1.50` — a cap in cents, or `None` for anything that is not one.
+fn cap_cents(word: &str) -> Option<u64> {
+    let word = word.trim().trim_start_matches('$');
+    if word.eq_ignore_ascii_case("on") {
+        return Some(ATTENTION_DEFAULT_CENTS);
+    }
+    let dollars: f64 = word.parse().ok()?;
+    (dollars.is_finite() && dollars > 0.0).then(|| (dollars * 100.0).round() as u64).filter(|c| *c > 0)
 }
 
 pub fn parse(section: &str) -> Packet {
@@ -64,6 +81,12 @@ pub fn parse(section: &str) -> Packet {
         if bare.eq_ignore_ascii_case("packet: off") {
             p.off = true;
             continue;
+        }
+        if let Some(cap) = bare.strip_prefix("attention:") {
+            if let Some(cents) = cap_cents(cap) {
+                p.attention_cents = Some(cents);
+                continue;
+            }
         }
         kept.push(line);
     }
@@ -219,6 +242,19 @@ mod tests {
         assert_eq!(p.files, ["src/a.rs", "src/b.rs"]);
         assert!(p.off);
         assert_eq!(p.text, "When save runs, it prints ok.\nRun: cargo test a::");
+    }
+
+    #[test]
+    fn the_attention_line_is_a_cap_in_cents_and_is_not_the_authors_words() {
+        for (line, cents) in [("attention: 2", 200), ("attention: $1.50", 150), ("attention: on", 200), ("- attention: 0.05", 5)] {
+            let p = parse(&format!("Do it.\n{line}"));
+            assert_eq!((p.attention_cents, p.text.as_str()), (Some(cents), "Do it."), "{line}");
+        }
+        for line in ["attention: 0", "attention: free", "attention: -2", "attention:"] {
+            let p = parse(&format!("Do it.\n{line}"));
+            assert_eq!(p.attention_cents, None, "{line}");
+            assert!(p.text.contains(line), "a line that is not a cap stays the author's words: {line}");
+        }
     }
 
     #[test]

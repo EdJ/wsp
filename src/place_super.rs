@@ -1349,9 +1349,10 @@ impl Place for Supervisor<'_> {
             return Err(Refusal::Backend("the feed had no pipe".into()));
         };
 
-        let mut cmd = Command::new(&agent.kind);
+        let (program, argv) = crate::agent_commands::command(&agent.kind, &agent.args);
+        let mut cmd = Command::new(&program);
         cmd.args(recipe.flags)
-            .args(&agent.args)
+            .args(&argv)
             .stdin(Stdio::from(feed))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))

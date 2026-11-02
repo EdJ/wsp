@@ -229,6 +229,14 @@ pub trait Kind {
     /// it is a function of the task and the seat.
     fn args(&self, spawn: &Spawn) -> Vec<String>;
 
+    /// The program a backend that execs this kind runs, when it is not the
+    /// kind's own name — `None` for every kind that is a binary of that name.
+    /// Such a kind cannot be started by herdr, whose agent catalogue is closed,
+    /// and `spawn` refuses `--herdr` for it before a seat is opened.
+    fn program(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this kind will accept the tier it has been asked for, and why
     /// not if it will not.
     ///
@@ -856,7 +864,23 @@ pub fn refusal_of(kind: &str) -> Option<&'static str> {
 /// a kind declared as a file is consulted after this table (see [`of`]), and any
 /// other name `--kind` is given is still passed through to herdr, which owns
 /// that catalogue.
-const KNOWN: &[(&str, &'static dyn Kind)] = &[("claude", &Claude), ("opencode", &OpenCode), ("pi", &Pi)];
+const KNOWN: &[(&str, &'static dyn Kind)] = &[
+    ("claude", &Claude),
+    ("opencode", &OpenCode),
+    ("pi", &Pi),
+    ("attention", &crate::kind_attention::Attention),
+];
+
+/// The program and argv a backend that execs a kind runs for it: the kind's
+/// name and `args` unless the kind runs under a program of its own
+/// ([`Kind::program`]). One copy, for the backends that fork or exec — herdr
+/// types the kind's name into a shell and cannot.
+pub fn command(kind: &str, args: &[String]) -> (String, Vec<String>) {
+    match of(kind).program() {
+        Some(program) => (program.to_string(), args.to_vec()),
+        None => (kind.to_string(), args.to_vec()),
+    }
+}
 
 /// What a menu needs to know about one kind. Read off [`Kind`], never stored.
 #[derive(Debug, Clone, PartialEq, Eq)]

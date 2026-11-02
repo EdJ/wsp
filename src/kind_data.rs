@@ -24,7 +24,7 @@ use crate::place::{Delivery, Place, Result, Seat};
 pub const KIND_VERSION: u64 = 1;
 
 /// Names the code owns. A file may not shadow one: built-ins win.
-const BUILT_IN: &[&str] = &["claude", "opencode", "pi"];
+const BUILT_IN: &[&str] = &["claude", "opencode", "pi", "attention"];
 
 const KEYS: &[&str] = &[
     "kind_version",

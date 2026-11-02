@@ -1,7 +1,7 @@
 # Agent kinds as files
 
-wsp has behaviour for three agent runtimes written in Rust (`claude`, `opencode`,
-`pi`; `agent_commands::KNOWN`). Any other runtime can be described by a file,
+wsp has behaviour for four agent runtimes written in Rust (`claude`, `opencode`,
+`pi`, `attention`; `agent_commands::KNOWN`). Any other runtime can be described by a file,
 with no rebuild and no reinstall. This page is what such a file may say, what it
 may not, and why.
 
@@ -92,6 +92,16 @@ than read, and a wrong belief here is delivered to a live agent.
 
 And one rule that holds for every kind, declared or built-in: nothing types where
 a person is. A pane someone is using is not typed into on a file's say-so.
+
+## `attention`: a built-in that runs under a program of its own
+
+The attention harness is not a data kind because it needs per-attempt facts a
+file cannot hold (a cap from the row, a log directory, the row's checks), and it
+is not like the others because it is not an interactive agent: it answers once
+and exits. `Kind::program` names `wsp attend` as what a backend runs for it, so
+only the backends that fork or exec a program can host it; herdr cannot, and
+`--herdr` is refused. The whole account, and the opt-in a row must make, is the
+README section *A packet row on the attention harness*.
 
 ## What is not built
 
