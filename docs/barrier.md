@@ -16,7 +16,7 @@ When a group's last member has landed and every verdict is in, the step that use
 to start the barrier's agent first starts a process of its own
 (`wsp worklist advance <list> --barrier-run <n>`), because the suite takes
 minutes and the tick does not wait. For each repository the group's members live
-in, at the trunk's tip, in the warm tree `wsp check` keeps:
+in, at the trunk's tip, in the barrier's own warm tree (`barrier/<project>-<repo>/tree`, moved in place, never cloned; `wsp-342`):
 
 1. the project's **`at barrier` steps**: the full suite, once for the group;
 2. every member's **recorded `## Checks`**, replayed on the integrated trunk;

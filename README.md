@@ -4726,6 +4726,46 @@ names each step's tier and whether the greens ledger already holds it at that
 commit (`green · reused, 101s`), which is what a run would skip. `--set` warns,
 and does not refuse, when a project declares `at end` without `at barrier`.
 
+### Test tiers (`wsp-342`)
+
+The tier table is above. Three things make the tiers skip each other.
+
+**The greens ledger** (`src/greens.rs`). One append-only file per repository,
+`greens/<project>-<repo>.tsv` in the state dir, a line per pass: full commit,
+environment, seconds, time, who, exact command. Two rules:
+
+- *Record only a pass at a clean HEAD.* A tree with changes proved the diff, not
+  the commit; a green on a rebased commit says nothing of the pre-rebase one, and
+  nothing is carried forward over a rebase (`affected` decides what reruns).
+- *A cold green satisfies a warm ask; a warm green never satisfies a cold one.*
+
+A step already green at the commit, with the same command, is reported
+`✓ reused` with when, how long it took and who proved it; it costs nothing and is
+not written again. `wsp check`, a landing's rerun and the barrier run all
+consult it. `wsp check <id>` by hand and `--again` ignore it. Lines older than 30
+days are dropped on the next append; unreadable lines are skipped.
+
+**The barrier tree.** The barrier run (`--barrier-run`, detached as the group's
+last member lands and is verified) works in `barrier/<project>-<repo>/tree`,
+kept and moved forward in place (`checkout --detach --force`, `clean -fdq`),
+never cloned. `wsp check --barrier-tree` says where it stands. A second look at
+the same tip reruns nothing: every step is in the ledger.
+
+**The cold build** (`src/cold.rs`). `wsp cold <list|project> [--plan] [--at
+COMMIT] [--keep]` runs the project's `at barrier` steps then its `at end` steps,
+for each repository the list's members landed in, at the trunk tip, in a fresh
+`git worktree add --detach` under `cold/<label>-<n>/` with no `target/`, `WSP_*`
+and `HERDR_*` removed. Every step runs whatever the one before did. The tree is
+removed after unless `--keep`; the log stays at `cold/<label>-<n>.log`. Greens
+are recorded as `cold`, a line goes in the list's `## Log`, and a red is flagged.
+It starts once, detached, as a list closes; a daemon-tick rule also starts it
+when the person is away (throttle in auto mode, idle past `away`), at most once
+per six hours. A step already green cold at the tip is not run again.
+
+**`at end`** declares a step for the cold build only, beside `at barrier`:
+`- launchd (limit): cargo test --test launchd  at end`-style rules in the
+project's `## Checks`, for goldens, perf and load-sensitive tests.
+
 ### The barrier, run by wsp where nothing needs judgment (`wsp-326`)
 
 Ed, 2026-11-01. Of 186 barrier-check transcripts the median is nine turns and
@@ -5526,6 +5566,8 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor — or, past the last barrier, the list closed and its own seat stood down and ended |
+| `src/greens.rs` | the greens ledger: a pass recorded per repository at its full commit and exact command, warm or cold, and the reuse that lets a later tier skip it |
+| `src/cold.rs` | `wsp cold`: a list's barrier and `at end` steps in a fresh tree with no `target/`, started once as a list closes and by the daemon when the person is away |
 | `src/check.rs` | `wsp check`: a row's mechanical checks as a script — the member's `## Checks`, the project's path rules, the barrier's steps — run in the member's own tree at its ready commit (a warm tree of wsp's for a landed row), only the steps a rebase can affect after a moved trunk, recorded under `## Verification`, and the gate in front of the verifier |
 | `src/did.rs` | what a verifier did, as lines on its verdict: the commands it ran, what it drove and what it read — derived from the seat's Claude Code transcript when wsp ends it — and the `checked:` lines the verifier writes itself |
 | `src/cmd_verifications.rs` | `wsp verifications`: those lines added up by project and period — the share that ran tests, drove the app and read the diff, the done-when items checked, blocks by cause |
