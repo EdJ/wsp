@@ -1,0 +1,31 @@
+#!/bin/sh
+# The compiler `rustc-wrap` hands sccache: the real rustc
+# ($COMPOUND_REAL_RUSTC), plus `--remap-path-prefix=<this tree>=/compound` on
+# a compile whose source is NOT in this tree and that is not incremental —
+# that is, a registry crate (`compound-366`, docs/host-build.md §9.9b).
+#
+# Why here and not on the command line: a crate whose source reads
+# `env!("OUT_DIR")` (serde_core, gpui, ...) carries `<tree>/target/...` in its
+# output, and every crate above it missed per tree. `--remap-path-prefix`
+# given to sccache goes into the KEY, which then differs per tree, and that
+# measured worse. Added by this shim, it is added after sccache has keyed the
+# compile, so the key is the same in every tree and the output carries
+# `/compound/...` instead of the tree. sccache keys the shim by the rustc it
+# reports, not by the shim's own path. A workspace crate is never remapped:
+# its paths are the tree's own, and a test may read them. A change to the flag
+# this adds bumps `WRAP` in `scripts/seed.sh`.
+tree="${COMPOUND_TREE:-}"; src=""; incr=""
+for a in "$@"; do
+    case "$a" in
+        incremental=*) incr=1 ;;
+        -*) ;;
+        *.rs) src="$a" ;;
+    esac
+done
+if [ -n "$tree" ] && [ -n "$src" ] && [ -z "$incr" ]; then
+    case "$src" in
+        "$tree"/*|[!/]*) ;;
+        *) set -- "$@" "--remap-path-prefix=$tree=/compound" ;;
+    esac
+fi
+exec "$COMPOUND_REAL_RUSTC" "$@"

@@ -1,0 +1,81 @@
+#!/bin/sh
+# The rustc wrapper `.cargo/config.toml` names: sccache when this machine has it, the bare compiler
+# when it does not. cargo calls it as `rustc-wrap <rustc> <args...>`. Copied from compound's
+# `.cargo/rustc-wrap` (compound-965) without its target seed and its vendored-crate step; what each
+# step does and measures is in ~/claude/compounding/docs/build-cache.md.
+#
+# - sccache keys a compile by content, so a crate any worktree built is a hit for the next. NOT a
+#   shared target/: cargo checks workspace crates by path and mtime, so worktrees sharing one take
+#   each other's builds as fresh.
+# - `-Wl,-S` and the install name keep the tree's path out of a proc-macro dylib; a registry
+#   proc-macro is served by `rustc-pm`; `OUT_DIR` (and env vars into it) become a content-named copy.
+# - `rustc-remap` adds `--remap-path-prefix` AFTER sccache has keyed the compile.
+# COMPOUND_NO_SCCACHE=1 bypasses sccache and the shim; an explicit RUSTC_WRAPPER overrides this file.
+rustc="$1"; shift
+here=$(dirname "$0")
+root=$(cd "$here/.." && pwd -P)
+
+crate=""; extra=""; pm=""; lib=""; prev=""; src=""
+for a in "$@"; do
+    case "$a" in -*) ;; *.rs) src="$a" ;; esac
+    case "$prev" in
+        --crate-name) crate="$a" ;;
+        --crate-type) [ "$a" = proc-macro ] && pm=1; [ "$a" = lib ] && lib=1 ;;
+    esac
+    case "$a" in extra-filename=*) extra="${a#extra-filename=}" ;; esac
+    prev="$a"
+done
+
+if [ -n "$pm" ] && [ -n "$crate" ]; then
+    set -- "$@" -C "link-arg=-Wl,-install_name,@rpath/lib${crate}${extra}.dylib" -C link-arg=-Wl,-S
+fi
+# A registry crate that reads env!("OUT_DIR") has the tree's path in sccache's key (the
+# value, and the generated files' paths in the dep-info). Its build-script output is
+# copied once to a directory NAMED BY ITS CONTENTS, and both sccache and rustc are given
+# that, so two trees with the same output share one path. compound-965.
+canon_out=""
+case "$src" in */.cargo/registry/src/*) canon_out=1 ;; esac
+if [ -n "$canon_out" ]; then
+    {
+        if [ -n "${OUT_DIR:-}" ] && [ -d "$OUT_DIR" ]; then
+            h=$(cd "$OUT_DIR" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 2>/dev/null \
+                | shasum -a 256 | cut -c1-32)
+            canon="${COMPOUND_OUT_CACHE:-$HOME/.cache/compound/out}/$h"
+            if [ -n "$h" ] && [ ! -d "$canon" ]; then
+                mkdir -p "$canon.tmp.$$" 2>/dev/null && cp -Rp "$OUT_DIR/." "$canon.tmp.$$/" \
+                    && { [ -d "$canon" ] || mv "$canon.tmp.$$" "$canon"; }
+                rm -rf "$canon.tmp.$$"
+            fi
+            if [ -n "$h" ] && [ -d "$canon" ]; then
+                # A build script's `cargo:rustc-env=X=<OUT_DIR>/f` (mime_guess) names the tree too.
+                real="$OUT_DIR"
+                for v in $(env | grep -F "=$real" | cut -d= -f1); do
+                    eval "val=\${$v}"; export "$v=$canon${val#"$real"}"
+                done
+            fi
+        fi
+    }
+fi
+# A registry proc-macro: sccache will not cache the crate type, `rustc-pm` does.
+if [ -n "$pm" ] && [ -n "$crate" ] && [ -z "${COMPOUND_NO_PM_CACHE:-}" ] && [ -z "${COMPOUND_NO_SCCACHE:-}" ]; then
+    case "$src" in
+        */.cargo/registry/src/*) exec "$here/rustc-pm" "$rustc" "$root" "$@" ;;
+    esac
+fi
+# The server must outlive a build and the cache must hold every profile the fleet
+# builds; a server started by this wrapper takes these (env wins over the config
+# file). The default 10G and 10-minute idle exit left 0 hits of 5 (compound-965).
+export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-20G}" SCCACHE_IDLE_TIMEOUT="${SCCACHE_IDLE_TIMEOUT:-0}"
+if [ -z "${COMPOUND_NO_SCCACHE:-}" ]; then
+    for candidate in \
+        "$(command -v sccache 2>/dev/null || true)" \
+        /usr/local/bin/sccache \
+        /opt/homebrew/bin/sccache
+    do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$root" \
+                exec "$candidate" "$here/rustc-remap" "$@"
+        fi
+    done
+fi
+exec "$rustc" "$@"

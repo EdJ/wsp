@@ -37,21 +37,30 @@
 //! today's behaviour when there is not, because a verify an agent has to queue
 //! for is a verify it stops running.
 //!
-//! # Why not a compiler cache, which was the obvious answer
+//! # The compiler cache, which sits beside the warm trees rather than replacing them
 //!
-//! `sccache` was the first candidate on `robustness-070`, and it was measured
-//! before being believed. It cannot do this. Two worktrees of the same commit,
-//! same compiler, same flags, built one after the other into one `SCCACHE_DIR`:
-//! **0 hits, 5 misses**. Give the *second* tree the *first* tree's target
-//! directory path and the same five compilations hit 5 out of 5.
+//! `sccache` was the first candidate on `robustness-070` and it measured badly:
+//! two worktrees of the same commit built into one `SCCACHE_DIR` gave **0 hits,
+//! 5 misses**, and the same five compilations hit 5 out of 5 once the second
+//! tree was given the first tree's target directory path. Its key turned on the
+//! tree, because cargo puts `-L dependency=<target>/…` and `OUT_DIR=<target>/…`
+//! on the rustc command line. `SCCACHE_BASEDIR` did not rescue it.
 //!
-//! What its key turns on is therefore the target directory, which is precisely
-//! what two isolated builds cannot share: cargo puts `-L dependency=<target>/…`
-//! and `OUT_DIR=<target>/…` on the rustc command line and they are in the hash.
-//! `SCCACHE_BASEDIR` does not rescue it — also measured, also 0 hits. On a full
-//! miss the wrapper costs about 8% (90–95s against 82–86s, four builds at
-//! once), so a cache that cannot be hit is worse than no cache, and there is
-//! none here.
+//! That is no longer true of a build here, because `.cargo/config.toml` routes
+//! every rustc through `.cargo/rustc-wrap` (compound-965, wsp-343), which
+//! removes the tree from the key: a proc-macro is linked with `-Wl,-S` and a
+//! fixed install name, a registry crate's `OUT_DIR` is copied to a directory
+//! named by its contents, a registry proc-macro is served by `rustc-pm`'s own
+//! content-addressed cache, and `rustc-remap` adds `--remap-path-prefix` after
+//! sccache has keyed the compile. A fresh tree's first build therefore hits the
+//! cache for registry dependencies. Why each step exists, and what it measured,
+//! is in compound's `docs/build-cache.md`.
+//!
+//! The cache holds *registry* crates, which is where a cold build's time goes;
+//! the workspace's own crate is compiled in every tree, since cargo builds it
+//! incrementally and sccache refuses that. So the warm trees above still matter
+//! for the part a compiler cache cannot serve, and they are what keeps cargo's
+//! fingerprints right for a patched tree.
 //!
 //! # The budget, which is the other half
 //!

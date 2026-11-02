@@ -1,0 +1,68 @@
+#!/bin/sh
+# A registry proc-macro, served from a content-addressed cache (compound-965).
+# sccache does not cache `--crate-type proc-macro`; `rustc-wrap` hands those here.
+#   rustc-pm <rustc> <tree> <rustc args...>
+#
+# The key is everything the dylib can depend on: the compiler and linker, every argument
+# except the output dir and `-L dependency=` (which name the tree), each `--extern` by the
+# CONTENT of its file, and the CARGO_* / OUT_DIR / SDK environment. The dylib is
+# byte-identical across trees (`-Wl,-S`, the install name), so a hit is the same file.
+# A restore must NOT keep the stored mtime (cargo calls a unit older than its dependencies stale).
+# The stored `.d` and stderr carry the output dir as @OUT@. Entries unused for 60 days go.
+rustc="$1"; tree="$2"; shift 2
+here=$(dirname "$0")
+cache="${COMPOUND_PM_CACHE:-$HOME/.cache/compound/proc-macro}"
+
+compile() { COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$tree" "$here/rustc-remap" "$@"; }
+sum() { shasum -a 256 | cut -c1-64; }
+
+out=""; crate=""; extra=""; prev=""
+keyf=$(mktemp "${TMPDIR:-/tmp}/rustc-pm.XXXXXX") || { compile "$@"; exit $?; }
+trap 'rm -f "$keyf"' EXIT
+{ "$rustc" -vV; ld -v 2>&1; uname -sr; echo "pm 1"; } >> "$keyf" 2>&1
+for a in "$@"; do
+    case "$prev" in
+        --out-dir) out="$a"; prev="$a"; continue ;;
+        --crate-name) crate="$a" ;;
+        --extern)
+            n="${a%%=*}"; p="${a#*=}"
+            if [ "$n" != "$a" ] && [ -f "$p" ]; then
+                printf 'extern %s %s %s\n' "$n" "$(basename "$p")" "$(sum < "$p")" >> "$keyf"
+            else printf 'extern %s\n' "$a" >> "$keyf"; fi
+            prev="$a"; continue ;;
+    esac
+    case "$a" in
+        extra-filename=*) extra="${a#extra-filename=}" ;;
+        dependency=*) prev="$a"; continue ;;
+    esac
+    printf 'arg %s\n' "$a" >> "$keyf"
+    prev="$a"
+done
+env | grep -E '^(CARGO|OUT_DIR=|SDKROOT=|MACOSX_DEPLOYMENT_TARGET=|RUSTFLAGS=)' \
+    | grep -vE '^(CARGO_MAKEFLAGS|CARGO_BUILD_JOBS|CARGO_TARGET_DIR|CARGO_BUILD_TARGET_DIR)=' | LC_ALL=C sort >> "$keyf"
+
+dylib="lib${crate}${extra}.dylib"; dep="${crate}${extra}.d"
+[ -n "$out" ] && [ -n "$crate" ] && [ -n "$extra" ] || { compile "$@"; exit $?; }
+key=$(sum < "$keyf"); d="$cache/$key"
+
+trace() { [ -n "${COMPOUND_PM_TRACE:-}" ] && echo "$1 $crate" >> "$COMPOUND_PM_TRACE"; return 0; }
+if [ -f "$d/ok" ]; then
+    trace hit
+    cp "$d/dylib" "$out/$dylib.tmp.$$" && mv "$out/$dylib.tmp.$$" "$out/$dylib" \
+        && sed "s|@OUT@|$out|g" "$d/dep" > "$out/$dep" && sed "s|@OUT@|$out|g" "$d/stderr" >&2 \
+        && { touch "$d/ok" 2>/dev/null; exit 0; }
+fi
+
+trace miss
+err=$(mktemp "${TMPDIR:-/tmp}/rustc-pm-err.XXXXXX"); trap 'rm -f "$keyf" "$err"' EXIT
+compile "$@" 2>"$err"; rc=$?
+cat "$err" >&2
+if [ "$rc" = 0 ] && [ -f "$out/$dylib" ] && [ -f "$out/$dep" ] && [ ! -d "$d" ]; then
+    mkdir -p "$cache" && t="$cache/.tmp.$$" && rm -rf "$t" && mkdir "$t" \
+        && cp -p "$out/$dylib" "$t/dylib" && sed "s|$out|@OUT@|g" "$out/$dep" > "$t/dep" \
+        && sed "s|$out|@OUT@|g" "$err" > "$t/stderr" && : > "$t/ok" \
+        && { mv "$t" "$d" 2>/dev/null || true; }
+    rm -rf "$t"
+    find "$cache" -maxdepth 2 -name ok -mtime +60 -exec sh -c 'rm -rf "$(dirname "$1")"' _ {} \; 2>/dev/null
+fi
+exit "$rc"

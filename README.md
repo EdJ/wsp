@@ -4901,16 +4901,14 @@ building in is never removed, and is free again the moment that build ends. `wsp
 pointer in the agent's own directory, because after this a build no longer lands
 anywhere the checkout can work out.
 
-What is **not** shared is a compiler cache, and that is a measurement rather
-than a preference. `sccache` was the obvious candidate. Two worktrees of the
-same commit, same compiler, same flags, built one after the other into one
-`SCCACHE_DIR`: **0 hits, 5 misses**. Give the second tree the first tree's
-target directory *path* and the same five compilations hit 5 out of 5 — so its
-key turns on the target directory, which is exactly what two isolated builds
-cannot share (cargo puts `-L dependency=<target>/…` and `OUT_DIR=<target>/…` on
-the rustc command line and they are in the hash). `SCCACHE_BASEDIR` does not
-rescue it: also measured, also 0 hits. On a full miss the wrapper costs about
-8%, so a cache that cannot be hit is worse than none.
+A compiler cache sits beside the warm trees. `sccache` measured badly here at
+first (two worktrees of the same commit, 0 hits of 5, because cargo puts the
+target directory on the rustc command line and it is in the key), but
+`.cargo/config.toml` now routes every rustc through `.cargo/rustc-wrap`, which
+keeps the tree out of the key (compound-965, wsp-343; the reasons are in
+compound's `docs/build-cache.md`). A fresh tree's first build hits the cache for
+registry dependencies. The workspace's own crate is still compiled in every tree,
+so the warm trees remain what makes a verify cheap.
 
 What the cold build is actually worth is the other measurement, 2026-08-18, one
 tree, `cargo test --no-run`: **23s** into an empty target directory, **3s** for
