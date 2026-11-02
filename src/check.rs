@@ -812,7 +812,12 @@ pub(crate) fn begin(store: &Store, id: &str, sha: &str, stale: i64, again: bool)
                 _ => {}
             }
         }
-        let at = util::now_iso();
+        // An entry is found again by its stamp, and a run answered wholly by the ledger ends within the second it began.
+        let mut secs = util::epoch_secs();
+        while runs.iter().any(|r| util::epoch_of(&r.at) >= secs) {
+            secs += 1;
+        }
+        let at = util::iso_at(secs);
         runs.push(Run { at: at.clone(), state: RunState::Running, read: Some(read), took: None, text: String::new() });
         v::write_runs(&mut t, &runs);
         store.save_task(&t).ok()?;
