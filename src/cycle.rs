@@ -597,6 +597,10 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
         if crate::barrier::try_again(store, list) {
             log_line(store, &format!("{list}: the check that gave up is abandoned, and a fresh one opens"));
         }
+        let spent = forgive_spent_starts(store, list);
+        if spent > 0 {
+            log_line(store, &format!("{list}: {spent} start(s) that gave up are tried from the top"));
+        }
     }
     let lists: Vec<Worklist> = match &named {
         Some(n) => store.worklist(n).into_iter().collect(),
@@ -1013,10 +1017,9 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
             }
             if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap, &gate) {
                 log_line(store, &format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
+                // A failed member start is told, retried and flagged by `spawn`.
                 if spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string())) {
                     started.push(s.id.clone());
-                } else {
-                    failed(store, &w, &s.id);
                 }
             }
         }
@@ -1372,10 +1375,20 @@ fn take_member(
             return None;
         }
         let claims = store.claims();
+        // After a start that did not take: its wait is not over, or its tries
+        // are spent and a person is to say (`wsp-335`).
+        if crate::starts::held(store, &id) {
+            return None;
+        }
         let ours = t.section("Log").and_then(|l| l.lines().last().map(|x| x.contains(STARTED_BY))).unwrap_or(false);
         let why = match t.status() {
             Status::Todo if !claims.contains_key(&id) => "new",
-            Status::Doing if ours && wedged(&t, &claims) => "again: the last start never claimed it",
+            Status::Doing if ours && wedged(&t, &claims) => {
+                if !retry_lost_start(store, &id, &id, &id, &format!("`wsp worklist advance {list}`")) {
+                    return None;
+                }
+                "again: the last start never claimed it"
+            }
             Status::Doing if sent_back_unseated(store, &t, &claims) => "again: it was sent back and nobody is on it",
             _ => return None,
         };
@@ -1506,7 +1519,21 @@ fn take_legs(
         let all = crate::legs::legs(&t);
         let lost = |at: &str| util::epoch_secs() - util::epoch_of(at) > WEDGED_AFTER;
         for (name, again) in crate::legs::startable(&all, &lost) {
-            if !gate.admits(&crate::legs::label(row, &name)) {
+            let label = crate::legs::label(row, &name);
+            // After a start that did not take: its wait is not over, or its
+            // tries are spent (`wsp-335`). A start written down and lost is
+            // given back too, or it would stand `running` with no seat.
+            if crate::starts::held(store, &label) {
+                if again {
+                    crate::leg_seat::unopen(store, row, &name);
+                }
+                continue;
+            }
+            if again && !retry_lost_start(store, row, &label, &format!("leg {name} of {row}"), &format!("`wsp leg reset {row} {name} \"why\"`")) {
+                crate::leg_seat::unopen(store, row, &name);
+                continue;
+            }
+            if !gate.admits(&label) {
                 continue;
             }
             if again {
@@ -1546,16 +1573,7 @@ fn run_legs(
             None => started.push(label),
             Some(why) => {
                 log_line(store, &format!("FAILED spawn leg {} of {row}: {why}", o.name));
-                crate::leg_seat::unopen(store, row, &o.name);
-                store.locked(|| {
-                    if let Some(mut t) = store.find_task(row) {
-                        t.log(&format!("wsp could not spawn leg {}: {}", o.name, util::truncate(&why, 300)));
-                        let _ = store.save_task(&t);
-                    }
-                });
-                if let Some((w, _)) = at {
-                    failed(store, w, row);
-                }
+                leg_start_failed(store, at.map(|(w, _)| w), row, &o.name, &why);
             }
         }
     }
@@ -2172,6 +2190,9 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
     if saved {
         store.git_commit(&format!("wsp: spawn failed on {id}"));
     }
+    if matches!(undo, Undo::Member) {
+        member_start_failed(store, owned.0, id, &why);
+    }
     false
 }
 
@@ -2311,6 +2332,127 @@ pub(crate) fn check_gave_up(store: &Store, w: &Worklist, at: usize, tries: u32, 
          `wsp worklist advance {}` starts it again once the cause is cleared.",
         w.id, w.id
     ));
+}
+
+/// The members of `list`, and the legs of those run as legs, whose starts ran
+/// out of tries: forgiven, so the step that follows starts them again.
+fn forgive_spent_starts(store: &Store, list: &str) -> usize {
+    let Some(w) = store.worklist(list) else { return 0 };
+    let mut labels = Vec::new();
+    for g in w.groups() {
+        for id in &g.members {
+            labels.push(id.clone());
+            if let Some(t) = store.find_task(id) {
+                labels.extend(crate::legs::legs(&t).iter().map(|l| crate::legs::label(id, &l.name)));
+            }
+        }
+    }
+    crate::starts::forgive_spent(store, &labels)
+}
+
+/// A member's start failed, in the step: its agent and claim are ended so the
+/// row is as it was before the start, the miss is counted, and the governor is
+/// told when it is tried again or that the person is flagged (`wsp-335`).
+///
+/// **Ended here and not left for [`crate::repair`]**: that reading is of a row at
+/// `doing` with a claim, and [`spawn`] has just put this one back at `todo` —
+/// a claim held by a pane whose agent never came up, which nothing else reads.
+fn member_start_failed(store: &Store, list: &str, id: &str, why: &str) {
+    despawn(store, id);
+    let m = crate::starts::missed(store, id);
+    let why = util::truncate(why, 300);
+    let w = store.worklist(list);
+    if m.last {
+        log_line(store, &format!("{list}: {id} did not start on try {} of {} — giving up", m.tries, crate::barrier::TRIES));
+        start_gave_up(store, w.as_ref(), id, id, m.tries, &why, &format!("`wsp worklist advance {list}`"));
+        return;
+    }
+    let wait = m.again_in.unwrap_or_default();
+    log_line(store, &format!("{list}: {id} did not start on try {} of {} — starting it again in {wait} min", m.tries, crate::barrier::TRIES));
+    if let Some(w) = &w {
+        tell(store, w, &format!(
+            "wsp could not start an agent on {id} in the {list} run (try {} of {}): {why}. \
+             wsp ended what the start left and starts it again in {wait} min.",
+            m.tries, crate::barrier::TRIES
+        ));
+    }
+}
+
+/// A leg's start failed, or its seat never came up: the seat is ended, the entry
+/// goes back to pending with no seat on it, and the leg is started again on the
+/// backoff — or the person is flagged, on the last try (`wsp-335`). `w` is the
+/// list that runs the row, when one does.
+///
+/// **The entry is reset with its seat named, which [`crate::legs::unopen`] will
+/// not do.** `wsp spawn` names the pane on the entry before the agent starts, so
+/// a start that then fails readiness left `running · pane cpd-2559` with the
+/// pane gone: `unopen` took that for a leg somebody is running, `spawn --leg`
+/// refused it as not pending, and the seat cap counted it until a person edited
+/// the store (`compound-956`).
+pub(crate) fn leg_start_failed(store: &Store, w: Option<&Worklist>, row: &str, name: &str, why: &str) {
+    let label = crate::legs::label(row, name);
+    let seat = store
+        .find_task(row)
+        .and_then(|t| crate::legs::legs(&t).into_iter().find(|l| l.name == name))
+        .and_then(|l| l.pane);
+    let ended = match &seat {
+        Some(seat) => match despawn_seat(seat) {
+            Ok(()) => format!("{seat} was ended"),
+            Err(e) => format!("{seat} could not be ended ({e}): `wsp despawn --pane {seat}`"),
+        },
+        None => "it had no seat to end".to_string(),
+    };
+    crate::leg_seat::reset(store, row, name);
+    let m = crate::starts::missed(store, &label);
+    let why = util::truncate(why, 300);
+    let wait = m.again_in.map_or_else(|| "it is not tried again".to_string(), |min| format!("it starts again in {min} min"));
+    store.locked(|| {
+        if let Some(mut t) = store.find_task(row) {
+            t.log(&format!("wsp could not spawn leg {name} (try {} of {}): {why}", m.tries, crate::barrier::TRIES));
+            let _ = store.save_task(&t);
+        }
+    });
+    log_line(store, &format!("{label}: its start did not take on try {} of {} — {ended}; {wait}", m.tries, crate::barrier::TRIES));
+    if m.last {
+        let remedy = format!("`wsp leg reset {row} {name} \"why\"` starts it again once the cause is cleared");
+        start_gave_up(store, w, row, &format!("leg {name} of {row}"), m.tries, &why, &remedy);
+    } else if let Some(w) = w {
+        tell(store, w, &format!(
+            "leg {name} of {row} did not start in the {} run (try {} of {}): {why}. \
+             wsp ended the seat it left and {wait}.",
+            w.id, m.tries, crate::barrier::TRIES
+        ));
+    }
+}
+
+/// A start written down that never arrived — an advance killed between its
+/// record and its spawn — is a miss of the same kind as one that failed. Counts
+/// it, and says whether the start may go ahead: not when this was the last try,
+/// when the person is flagged instead.
+fn retry_lost_start(store: &Store, row: &str, label: &str, what: &str, remedy: &str) -> bool {
+    let m = crate::starts::missed(store, label);
+    if !m.last {
+        return true;
+    }
+    log_line(store, &format!("{label}: the last start never arrived, on try {} of {} — giving up", m.tries, crate::barrier::TRIES));
+    start_gave_up(store, None, row, what, m.tries, "the start never arrived", remedy);
+    false
+}
+
+/// A member's or a leg's tries ran out: the person is flagged on the row, and
+/// the governor told. Said once, because [`crate::starts::missed`] answers it once.
+fn start_gave_up(store: &Store, w: Option<&Worklist>, row: &str, what: &str, tries: u32, last: &str, remedy: &str) {
+    use crate::message::{self, About, Kind, Message, Party};
+    let text = format!(
+        "{what} never started, after {tries} tries\n\nLast error: {last}\n\n\
+         The run has stopped trying and the row is waiting. {remedy}."
+    );
+    let m = Message::new(Party::wsp(), Kind::Note, &text).about(About::Task(row.to_string()));
+    let _ = message::raise(store, &m);
+    log_line(store, &format!("{row}: flagged the person — {what} never started in {tries} tries: {last}"));
+    if let Some(w) = w {
+        tell(store, w, &format!("{what} did not start in {tries} tries and the person is flagged. {remedy}."));
+    }
 }
 
 /// End the agents a passed group no longer needs: its members, their
@@ -5962,6 +6104,11 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(t.section("Log").unwrap().contains("no compound session"), "and the reason is on the row");
         assert_eq!(drained(&TOLD).len(), 1, "and the seat is told");
 
+        // Held for its backoff first (`wsp-335`), then started again.
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "not at once");
+        age_start(&store, "m-1", 4 * 60);
+
         // Lost: `doing`, unclaimed, wsp's own start its last word, long ago.
         step(&store, &w, &Blind);
         assert_eq!(spawned().len(), 1);
@@ -6449,6 +6596,189 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(ids(spawned()), ["m-1 · b".to_string()], "a is done, so b has the place");
     }
 
+    // ---- starts that did not take (wsp-335) --------------------------------------
+
+    /// Make the misses of `label` as old as they would be `secs` after the last.
+    fn age_start(store: &Store, label: &str, secs: i64) {
+        store.update_starts(|m| {
+            m.get_mut(label).unwrap()["at"] = serde_json::json!(util::epoch_secs() - secs);
+        });
+    }
+
+    fn flags_on(store: &Store, row: &str) -> Vec<crate::message::Message> {
+        crate::message::raised(store).into_iter().filter(|m| m.about.task() == Some(row)).collect()
+    }
+
+    fn leg_of(store: &Store, id: &str, name: &str) -> crate::legs::Leg {
+        crate::legs::legs(&store.find_task(id).unwrap()).into_iter().find(|l| l.name == name).unwrap()
+    }
+
+    /// `wsp-335`, seen on `compound-956`: `wsp spawn` named the pane on the leg,
+    /// the agent never came up, and the entry stayed `running` on a pane that
+    /// was gone, which nothing reset and `spawn --leg` refused to open again.
+    #[test]
+    fn a_leg_whose_agent_never_came_up_loses_its_seat_and_starts_again_on_the_backoff() {
+        let (_env, store) = scratch("legs-never-up");
+        staged(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        seat_leg_open(&store, "m-1", "plan", "cpd-9");
+        let _ = (drained(&TOLD), drained(&ENDED));
+
+        leg_start_failed(&store, Some(&w), "m-1", "plan", "claude started but never became ready for input");
+
+        let leg = leg_of(&store, "m-1", "plan");
+        assert_eq!((leg.state, leg.pane.clone(), leg.started.clone()), (crate::legs::State::Pending, None, None), "{leg:?}");
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "the pane the start left is ended");
+        assert!(store.bindings().get("cpd-9").is_none(), "and no longer says it is the row's");
+        let told = drained(&TOLD);
+        assert!(told.len() == 1 && told[0].contains("try 1 of 3") && told[0].contains("never became ready"), "{told:?}");
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default().to_string();
+        assert!(log.contains("could not spawn leg plan (try 1 of 3)"), "{log}");
+
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "not at once: the backoff");
+        age_start(&store, "m-1 · plan", 4 * 60);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · plan".to_string()], "started again, by the ordinary step");
+    }
+
+    /// The step's own start failing is the same road: no pane had to be named
+    /// for the leg to be put back and held.
+    #[test]
+    fn a_leg_start_that_fails_in_the_step_is_retried_and_the_person_is_flagged_when_the_tries_run_out() {
+        let (_env, store) = scratch("legs-spent");
+        staged(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        FAIL.with(|f| *f.borrow_mut() = Some("claude started but never became ready for input".into()));
+
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().len(), 1);
+        assert_eq!(leg_state(&store, "m-1", "plan"), crate::legs::State::Pending);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "held for its three minutes");
+        assert!(flags_on(&store, "m-1").is_empty());
+
+        for wait in [4 * 60, 6 * 60] {
+            age_start(&store, "m-1 · plan", wait);
+            step(&store, &w, &Blind);
+            assert_eq!(spawned().len(), 1);
+        }
+        FAIL.with(|f| *f.borrow_mut() = None);
+
+        let flags = flags_on(&store, "m-1");
+        assert_eq!(flags.len(), 1, "one flag, on the row");
+        assert!(flags[0].text.contains("after 3 tries") && flags[0].text.contains("never became ready"), "{}", flags[0].text);
+        assert!(flags[0].text.contains("wsp leg reset m-1 plan"), "it says how to go on: {}", flags[0].text);
+
+        age_start(&store, "m-1 · plan", 24 * 60 * 60);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "spent: no fourth start however long it waits");
+        assert_eq!(flags_on(&store, "m-1").len(), 1, "and no second flag");
+
+        // A person's `wsp worklist advance <list>` takes it from the top.
+        assert_eq!(forgive_spent_starts(&store, "run"), 1);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · plan".to_string()]);
+    }
+
+    /// The cap counted the dead leg and held the next one back. Reset, it holds
+    /// no place at all.
+    #[test]
+    fn a_leg_that_never_came_up_holds_no_place_under_the_seats_cap() {
+        let (_env, store) = scratch("legs-cap-dead");
+        store.set_seat_cap(Some(1)).unwrap();
+        staged(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        seat_leg_open(&store, "m-1", "plan", "cpd-9");
+        let starting = Fixed::new(&[("cpd-9", State::Starting)]);
+        let held = crate::room::Gate::new(&store, &starting).working();
+        assert_eq!(held.len(), 1, "a seat coming up counts: {held:?}");
+
+        leg_start_failed(&store, Some(&w), "m-1", "plan", "never ready");
+        assert!(crate::room::Gate::new(&store, &starting).working().is_empty(), "reset, it is nobody's place");
+    }
+
+    /// A member's failed start leaves a claim on a pane whose agent never came
+    /// up, with the row put back at `todo` where `repair` does not look.
+    #[test]
+    fn a_member_whose_agent_never_came_up_is_ended_and_started_again_and_the_person_is_flagged_at_the_end() {
+        let (_env, store) = scratch("member-never-up");
+        task(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        FAIL.with(|f| *f.borrow_mut() = Some("claude started but never became ready for input".into()));
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1".to_string()]);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo, "put back");
+        assert_eq!(drained(&ENDED), vec!["m-1".to_string()], "and what the start left is ended");
+        let told = drained(&TOLD);
+        assert!(told.iter().any(|t| t.contains("try 1 of 3") && t.contains("never became ready")), "{told:?}");
+
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "held for its wait");
+        for wait in [4 * 60, 6 * 60] {
+            age_start(&store, "m-1", wait);
+            step(&store, &w, &Blind);
+            assert_eq!(ids(spawned()), ["m-1".to_string()]);
+        }
+        FAIL.with(|f| *f.borrow_mut() = None);
+        assert_eq!(flags_on(&store, "m-1").len(), 1);
+        age_start(&store, "m-1", 24 * 60 * 60);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "spent");
+
+        assert_eq!(forgive_spent_starts(&store, "run"), 1);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1".to_string()]);
+    }
+
+    /// The spawn that was killed before it could say it failed: the pane reads
+    /// `starting` for good, and the tick says so.
+    #[test]
+    fn a_leg_seat_that_is_not_up_after_five_minutes_is_ended_and_the_leg_started_again() {
+        let (_env, store) = scratch("legs-not-up");
+        staged(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        seat_leg_open(&store, "m-1", "plan", "cpd-9");
+        let starting = Fixed::new(&[("cpd-9", State::Starting)]);
+        let opened_ago = |secs: i64| edit_legs(&store, "m-1", |old| {
+            let mut v = old.to_vec();
+            v[0].started = Some(util::iso_at(util::epoch_secs() - secs));
+            Ok(v)
+        });
+
+        opened_ago(4 * 60);
+        step(&store, &w, &starting);
+        assert!(drained(&ENDED).is_empty(), "a slow start inside five minutes is left alone");
+        assert_eq!(leg_state(&store, "m-1", "plan"), crate::legs::State::Running);
+
+        opened_ago(6 * 60);
+        step(&store, &w, &starting);
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()]);
+        assert_eq!(leg_state(&store, "m-1", "plan"), crate::legs::State::Pending);
+        assert!(drained(&TOLD).iter().any(|t| t.contains("try 1 of 3")));
+        step(&store, &w, &starting);
+        assert!(spawned().is_empty(), "and tried again on the backoff, not at once");
+    }
+
+    /// `wsp leg reset`'s half: the record goes back and the misses are forgiven,
+    /// so the leg is not held by a count it earned before.
+    #[test]
+    fn a_running_leg_reset_by_hand_is_pending_with_its_misses_forgiven() {
+        let (_env, store) = scratch("legs-reset");
+        staged(&store, "m-1", Status::Todo);
+        seat_leg_open(&store, "m-1", "plan", "cpd-9");
+        for _ in 0..3 {
+            crate::starts::missed(&store, "m-1 · plan");
+        }
+        assert_eq!(crate::leg_seat::reset(&store, "m-1", "plan"), Some(Some("cpd-9".to_string())));
+        assert!(crate::starts::forgive(&store, "m-1 · plan"));
+        assert!(!crate::starts::held(&store, "m-1 · plan"));
+        let leg = leg_of(&store, "m-1", "plan");
+        assert_eq!((leg.state, leg.pane), (crate::legs::State::Pending, None));
+        assert_eq!(crate::leg_seat::reset(&store, "m-1", "plan"), None, "a pending leg is not reset");
+    }
+
     /// A start that never seated is taken again once it is old enough, and not
     /// before.
     #[test]
@@ -6484,7 +6814,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
         assert_eq!(leg_state(&store, "m-1", "plan"), crate::legs::State::Pending);
         let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default().to_string();
-        assert!(log.contains("could not spawn leg plan: no room"), "{log}");
+        assert!(log.contains("could not spawn leg plan (try 1 of 3): no room"), "{log}");
     }
 
     /// A staged row is never given a whole-row worker beside its legs, by any of

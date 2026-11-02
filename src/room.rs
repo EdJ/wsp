@@ -60,7 +60,11 @@ pub(crate) enum Look {
     /// Positively not there, or there with nothing running in it.
     Gone,
     Working,
-    /// Idle, starting, on a prompt: there, and not seen working.
+    /// An agent still coming up in it. Counted while it has had time to, and
+    /// not after ([`crate::barrier::NOT_UP_AFTER`]): a seat reading this that
+    /// long is a start that never took, `wsp-335`.
+    Starting,
+    /// Idle, on a prompt: there, and not seen working.
     Quiet,
     /// Nobody can say.
     Unknown,
@@ -74,6 +78,7 @@ impl Look {
         match seats.state(seat) {
             Some(State::Gone | State::Empty) => Look::Gone,
             Some(State::Working) => Look::Working,
+            Some(State::Starting) => Look::Starting,
             Some(State::Unknown) | None => Look::Unknown,
             Some(_) => Look::Quiet,
         }
@@ -85,7 +90,7 @@ impl Look {
         match self {
             Look::Gone => false,
             Look::Working => true,
-            Look::Quiet | Look::Unknown => !finished,
+            Look::Starting | Look::Quiet | Look::Unknown => !finished,
         }
     }
 }
@@ -170,9 +175,15 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     let governor = |seat: &str| crate::cmd_agent::governs_seat(&r.governors, seat);
-    let mut take = |out: &mut Vec<Counted>, seat: Option<&str>, what: String, finished: bool| {
+    // `since` is when the record opened, where one says: a seat still reading
+    // `starting` that long after is not an agent that is coming up.
+    let mut take = |out: &mut Vec<Counted>, seat: Option<&str>, what: String, finished: bool, since: Option<&str>| {
         if let Some(s) = seat {
             if !here(s) || governor(s) || !seen.insert(s.to_string()) || !look(s).counts(finished) {
+                return;
+            }
+            let never_up = look(s) == Look::Starting && since.is_some_and(|at| now - util::epoch_of(at) > crate::barrier::NOT_UP_AFTER);
+            if never_up {
                 return;
             }
         }
@@ -186,9 +197,9 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             let running = p.state == crate::verification::State::Running;
             match &p.pane {
                 Some(_) if !p.standing() => {}
-                Some(seat) => take(&mut out, Some(seat), what, !running),
+                Some(seat) => take(&mut out, Some(seat), what, !running, Some(&p.at)),
                 None if running && p.ending == crate::verification::Ending::Standing && fresh(&p.at) => {
-                    take(&mut out, None, what, false)
+                    take(&mut out, None, what, false, None)
                 }
                 None => {}
             }
@@ -201,8 +212,8 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             for c in &g.checks {
                 let what = crate::barrier::seat_label(&w.id, i + 1);
                 match (c.standing(), &c.pane) {
-                    (Some(seat), _) => take(&mut out, Some(seat), what, !c.open()),
-                    (None, None) if c.open() && fresh(&c.at) => take(&mut out, None, what, false),
+                    (Some(seat), _) => take(&mut out, Some(seat), what, !c.open(), Some(&c.at)),
+                    (None, None) if c.open() && fresh(&c.at) => take(&mut out, None, what, false, None),
                     _ => {}
                 }
             }
@@ -218,8 +229,8 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             let what = crate::legs::label(&t.id, &l.name);
             let running = l.state == crate::legs::State::Running;
             match &l.pane {
-                Some(seat) => take(&mut out, Some(seat), what, !running || l.ending != crate::verification::Ending::Standing),
-                None if running && l.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false),
+                Some(seat) => take(&mut out, Some(seat), what, !running || l.ending != crate::verification::Ending::Standing, l.started.as_deref()),
+                None if running && l.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false, None),
                 None => {}
             }
         }
@@ -237,7 +248,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     held.extend(r.claimed());
     for (seat, id) in held {
         let Some(s) = status(&id) else { continue };
-        take(&mut out, Some(&seat), id, finished(s));
+        take(&mut out, Some(&seat), id, finished(s), None);
     }
 
     // A member the run moved to `doing` whose agent has not claimed it yet:
@@ -248,7 +259,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             .and_then(|l| l.lines().last().map(|x| x.contains(crate::cycle::STARTED_BY)))
             .unwrap_or(false);
         if t.status() == Status::Doing && ours && !r.claims.contains_key(&t.id) && fresh(&t.updated) {
-            take(&mut out, None, t.id.clone(), false);
+            take(&mut out, None, t.id.clone(), false, None);
         }
     }
     out
@@ -390,6 +401,27 @@ mod tests {
             ],
         );
         assert_eq!(got, ["working", "idle-doing", "unread", "busy-review"]);
+    }
+
+    /// `wsp-335`: a seat still reading `starting` long after its record opened
+    /// is an agent that never came up, and holds no place under the cap.
+    #[test]
+    fn a_leg_seat_still_starting_after_five_minutes_is_not_counted() {
+        use crate::legs::{Leg, State as LegState};
+        let leg_at = |name: &str, ago: i64| Leg {
+            state: LegState::Running,
+            pane: Some(format!("w1:{name}")),
+            started: Some(util::iso_at(util::epoch_secs() - ago)),
+            ..Leg::pending(name, "do it")
+        };
+        let mut t = task("m-1", Status::Doing);
+        crate::legs::write(&mut t, &[leg_at("fresh", 60), leg_at("stale", 6 * 60)]);
+        let r = records(vec![t], &[]);
+        let looks = [("w1:fresh", Look::Starting), ("w1:stale", Look::Starting)];
+        assert_eq!(counted(&r, &looks), ["m-1 · fresh"]);
+        // Working is working however old the record is.
+        let looks = [("w1:fresh", Look::Starting), ("w1:stale", Look::Working)];
+        assert_eq!(counted(&r, &looks), ["m-1 · fresh", "m-1 · stale"]);
     }
 
     /// A governor is not counted, by its pane, even holding a row.

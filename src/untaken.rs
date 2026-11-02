@@ -79,6 +79,9 @@ enum Replace {
     Pass(String),
     /// The check's seat is ended, and its entry is abandoned at the next open.
     Check,
+    /// The leg's seat is ended and the leg goes back to pending, to start
+    /// again on the backoff (`wsp-335`): a row's name and the leg's.
+    Leg(String, String),
     /// A member: not here.
     Not,
 }
@@ -166,6 +169,11 @@ fn replace(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, o: &Owed, 
             cycle::check_start_failed(store, w, at, &format!("{} in {}: {why}", o.who, o.seat));
             return;
         }
+        Replace::Leg(row, name) => {
+            cycle::log_line(store, &format!("{head} — {} the leg is started again", replaced(&o.seat)));
+            cycle::leg_start_failed(store, Some(w), row, name, &format!("{} in {}: {why}", o.who, o.seat));
+            return;
+        }
     };
     let how = if ended { "ended" } else { "could not be ended" };
     cycle::log_line(store, &format!("{head}: {why} — {} {how}, and the run opens another", replaced(&o.seat)));
@@ -194,6 +202,21 @@ fn owed(store: &Store, w: &Worklist, at: usize, g: &Group, pos: &Position) -> Ve
                 order: Some(crate::cmd_task::fold(&cycle::verifier_order(store, &t))),
                 replace: Replace::Pass(t.id.clone()),
             });
+        } else if crate::legs::staged(&t) {
+            // A leg claims nothing, so its entry is the record of its seat.
+            for l in crate::legs::legs(&t).into_iter().filter(|l| l.state == crate::legs::State::Running) {
+                let (Some(seat), Some(started)) = (l.pane.clone(), l.started.as_deref()) else { continue };
+                if l.ending != crate::verification::Ending::Standing {
+                    continue;
+                }
+                out.push(Owed {
+                    who: format!("leg {} of {}", l.name, t.id),
+                    seat,
+                    since: util::epoch_of(started),
+                    order: None,
+                    replace: Replace::Leg(t.id.clone(), l.name.clone()),
+                });
+            }
         } else if t.status() == Status::Doing && claims.contains_key(&t.id) {
             let (Some(seat), Some(since)) = (store.panes_for_task(&t.id).first().cloned(), crate::repair::started_at(&t))
             else {

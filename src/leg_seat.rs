@@ -76,6 +76,30 @@ pub(crate) fn unopen(store: &Store, id: &str, name: &str) {
     });
 }
 
+/// A running leg put back to pending whatever seat it names (`legs::reset`),
+/// and the seat's binding to the row dropped with it: a binding left would
+/// keep telling every command that asks which task the pane is on that it is
+/// still this leg's. Returns the seat the entry named, for the caller that
+/// ends it, or `None` when the leg was not running.
+pub(crate) fn reset(store: &Store, id: &str, name: &str) -> Option<Option<String>> {
+    let seat = store.locked(|| {
+        let mut t = store.find_task(id)?;
+        let old = legs::legs(&t);
+        let new = legs::reset(&old, name).ok()?;
+        let seat = old.iter().find(|l| l.name == name).and_then(|l| l.pane.clone());
+        legs::write(&mut t, &new);
+        store.save_task(&t).ok()?;
+        if let Some(s) = &seat {
+            store.clear_binding(s);
+        }
+        Some(seat)
+    });
+    if seat.is_some() {
+        store.git_commit(&format!("wsp: {id} leg {name} reset"));
+    }
+    seat
+}
+
 /// What a seat is bound with, besides the task: the room and tree it stands in
 /// and the kind that runs in it.
 pub(crate) struct Standing<'a> {

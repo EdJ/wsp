@@ -459,6 +459,24 @@ anything.
   does, through the same gate: a launch is the run, not a person asking, so it
   waits for a place. The daemon tick's repair catches a lost launch, and a
   leg held at the cap, in both cases.
+- **A start that does not take** (`wsp-335`). `wsp spawn --leg` writes the
+  leg `running` and names the pane on the entry before its agent starts, so a
+  start that then fails (`claude started but never became ready for input`,
+  seen at load 60 on 8 cores) leaves a seat on the entry. The step ends the
+  seat, puts the leg back to `pending` with no seat (`legs::reset`, which
+  unlike `unopen` resets a leg that names one), and starts it again on the
+  barrier check's backoff: three minutes after the first miss, five after
+  the second, and the third miss flags the person on the row and stops. The
+  count is `starts.json`, not the entry. A leg whose seat reads empty or
+  starting five minutes after it opened, with no turn since, is the same miss
+  found by the tick (`untaken`), and the cap stops counting a seat still
+  starting that long after its record opened. `wsp leg reset <task> <name>
+  "why"` is the hand: for a running leg whose seat is gone it puts the leg
+  back, forgives the misses and logs the reason on the row (`--force` ends a
+  seat that is still there first). `wsp worklist advance <list>` forgives
+  every spent start of the list's members and legs. A member's failed start
+  is the same rule: its claim and pane are ended and it is held for the
+  backoff.
 - **Must not double-start.** The existing "doing with no seat" repairs
   (`wedged`, `sent_back_unseated`) must leave a staged row to the leg path.
   If they did not, they would spawn a whole-row worker beside the legs. A row

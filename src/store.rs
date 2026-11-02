@@ -739,6 +739,19 @@ impl Store {
         });
     }
 
+    /// member id or `row · leg` -> how many of its starts did not take, and
+    /// when the last one failed: [`crate::starts`], `wsp-335`.
+    pub fn starts(&self) -> BTreeMap<String, Value> {
+        match self.read_json("starts.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn update_starts(&self, f: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+        self.update_json("starts.json", f);
+    }
+
     // ---- worklists --------------------------------------------------------
     //
     // The fifth kind, on the `machines/` pattern and for the same reason: a

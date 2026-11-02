@@ -769,6 +769,28 @@ pub(crate) fn unopen(old: &[Leg], name: &str) -> Vec<Leg> {
     legs
 }
 
+/// A running leg put back to pending, its seat taken off: the start did not
+/// take (`wsp-335`), or a person says its seat is gone and the leg is to run
+/// again. **Unlike [`unopen`], with a seat on the entry** — that was the
+/// `compound-956` shape, a pane named by a spawn that then failed to bring its
+/// agent up, which `unopen` leaves alone as a leg somebody is running. The
+/// caller has ended the seat, or knows it is gone.
+pub(crate) fn reset(old: &[Leg], name: &str) -> Result<Vec<Leg>, String> {
+    let mut legs = old.to_vec();
+    let leg = find(&mut legs, name)?;
+    if leg.state != State::Running {
+        return Err(format!("{name} is {}, and only a running leg can be reset", leg.state.as_str()));
+    }
+    leg.state = State::Pending;
+    leg.pane = None;
+    leg.ending = Ending::Standing;
+    leg.started = None;
+    // Made for this opening (`leg_tree::record`); the next one makes its own.
+    leg.tree = None;
+    leg.join = None;
+    Ok(legs)
+}
+
 /// The seat written onto the entry, as a verifier's is onto its pass.
 pub(crate) fn attach(old: &[Leg], name: &str, seat: &str) -> Result<Vec<Leg>, String> {
     let mut legs = old.to_vec();
@@ -1014,6 +1036,7 @@ const USAGE: &str = "usage:
   wsp leg add <task> <name> --order FILE|- [--agent \"claude opus high\" --why \"…\"] [--after <leg>,…|--after=-] [--before <leg>]
   wsp leg after <task> <name> <leg>…|-     replace a pending leg's waits
   wsp leg skip <task> <name> \"why\"         a pending leg, never run
+  wsp leg reset <task> <name> \"why\" [--force]   a running leg whose seat is gone, back to pending
   wsp leg show <task> [<name>]             the table, or one leg whole
   wsp leg done <task> --from FILE|- --caption \"…\"   a leg's seat ends it, at a commit";
 
@@ -1028,6 +1051,7 @@ pub(crate) fn run(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Some("add") => cmd_add(store, args, pane),
         Some("after") => cmd_after(store, args, pane),
         Some("skip") => cmd_skip(store, args, pane),
+        Some("reset") => cmd_reset(store, args),
         Some("done") => crate::leg_seat::cmd_done(store, args, pane),
         Some("show") | Some("ls") | None => cmd_show(store, args),
         Some(other) => {
@@ -1149,6 +1173,64 @@ fn cmd_skip(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     }
 }
 
+/// `wsp leg reset <task> <name> "why" [--force]`: a running leg whose seat is
+/// gone goes back to pending, its misses are forgiven, and the run starts it.
+///
+/// **Refused while the seat is there**, because a seat reading anything but
+/// gone or empty may be an agent at work in its own tree; `--force` ends it
+/// first. The `why` is on the row's log, so the reset is not a silent edit.
+fn cmd_reset(store: &Store, args: &Args) -> i32 {
+    let (Some(task), Some(name)) = (args.rest.get(1), args.rest.get(2)) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let why = args.text(3);
+    if why.trim().is_empty() {
+        return refuse("a reset takes the reason, which goes on the row's log".into());
+    }
+    let t = match store.task_or_why(task) {
+        Ok(t) => t,
+        Err(why) => return refuse(why),
+    };
+    let Some(leg) = legs(&t).into_iter().find(|l| &l.name == name) else {
+        return refuse(format!("{} has no leg called {name}", t.id));
+    };
+    if leg.state != State::Running {
+        return refuse(format!("{name} is {}, and only a running leg can be reset", leg.state.as_str()));
+    }
+    if let Some(seat) = &leg.pane {
+        use crate::cycle::Seats;
+        let fleet = crate::cycle::Fleet;
+        let there = !fleet.absent(seat) && !matches!(fleet.state(seat), Some(crate::place::State::Gone | crate::place::State::Empty));
+        if there && !args.has("force") {
+            return refuse(format!(
+                "{name}'s seat {seat} is still there — an agent in it may be at work. \
+                 `wsp leg reset {} {name} \"why\" --force` ends it first",
+                t.id
+            ));
+        }
+        if there {
+            if let Err(e) = crate::cycle::despawn_seat(seat) {
+                return refuse(format!("{seat} could not be ended: {e}"));
+            }
+        }
+    }
+    if crate::leg_seat::reset(store, &t.id, name).is_none() {
+        return refuse(format!("{name} could not be reset: it is no longer running"));
+    }
+    crate::starts::forgive(store, &label(&t.id, name));
+    store.locked(|| {
+        if let Some(mut row) = store.find_task(&t.id) {
+            row.log(&format!("leg {name} reset by hand: {}", crate::cmd_task::fold(&why)));
+            let _ = store.save_task(&row);
+        }
+    });
+    store.git_commit(&format!("wsp: {} leg {name} reset by hand", t.id));
+    crate::cycle::poke_task(store, &t.id, "leg-reset");
+    println!("{} {}  leg {name} is pending again", Paint::new().green("✓"), t.id);
+    0
+}
+
 fn cmd_show(store: &Store, args: &Args) -> i32 {
     let Some(task) = args.rest.get(1) else {
         eprintln!("{USAGE}");
@@ -1233,6 +1315,26 @@ mod tests {
         write(&mut t, &[leg("scout"), skipped.clone(), full.clone(), bare_rework.clone()]);
         assert_eq!(legs(&t), vec![leg("scout"), skipped, full, bare_rework], "{}", t.body);
         assert!(t.body.find("## Legs").unwrap() < t.body.find("## Log").unwrap(), "and the log stays last");
+    }
+
+    /// `wsp-335`: a running leg with a seat on it goes back to pending with no
+    /// seat — which `unopen` refuses, taking it for a leg somebody is running.
+    #[test]
+    fn a_running_leg_with_a_seat_is_reset_to_pending_and_only_a_running_one() {
+        let seated = Leg {
+            state: State::Running,
+            pane: Some("cpd-9".into()),
+            started: Some("2026-11-02T00:29:00Z".into()),
+            tree: Some("m-1.a".into()),
+            join: Some("merged".into()),
+            ..leg("a")
+        };
+        assert_eq!(unopen(&[seated.clone()], "a"), vec![seated.clone()], "unopen leaves a seated leg alone");
+        let back = reset(&[seated], "a").unwrap();
+        assert_eq!(back, vec![leg("a")], "{back:?}");
+        let err = reset(&back, "a").unwrap_err();
+        assert!(err.contains("only a running leg can be reset"), "{err}");
+        assert!(reset(&back, "zz").unwrap_err().contains("no leg called zz"));
     }
 
     /// And through the store, whose file parser has its own opinions about blank

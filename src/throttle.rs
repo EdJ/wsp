@@ -242,6 +242,25 @@ pub(crate) fn load_high(one: f64, five: f64, cores: usize) -> bool {
     one.min(five) > LOAD_FACTOR * cores as f64
 }
 
+/// How many times the readiness wait of a spawn is stretched at this load
+/// (`wsp-335`): once per core's worth of load queued, from 1 to 4. A
+/// `compound-956` agent never became ready inside sixty seconds at load about
+/// 60 on 8 cores; the same agent is up in twenty on a quiet machine, so the
+/// wait grows with the load rather than for everyone. The cap is four minutes:
+/// past that the start is better ended and tried again on the backoff.
+pub(crate) fn readiness_scale(one: f64, cores: usize) -> u32 {
+    ((one / cores.max(1) as f64).ceil() as u32).clamp(1, 4)
+}
+
+/// [`readiness_scale`] for the machine as it is now. 1 when the load cannot be
+/// read, and under test, where the clock is a dial and a load reading is noise.
+pub(crate) fn readiness_scale_now() -> u32 {
+    if cfg!(test) {
+        return 1;
+    }
+    load_average().map_or(1, |(one, _, _)| readiness_scale(one, cores()))
+}
+
 fn cores() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
@@ -957,6 +976,16 @@ mod tests {
         let out = "    | |   \"HIDIdleTime\" = 125000000000\n    | |   \"Other\" = 1\n";
         assert_eq!(parse_hid_idle(out), Some(125));
         assert_eq!(parse_hid_idle("nothing here"), None);
+    }
+
+    #[test]
+    fn the_readiness_wait_stretches_with_the_load_per_core_and_stops_at_four() {
+        assert_eq!(readiness_scale(0.5, 8), 1);
+        assert_eq!(readiness_scale(8.0, 8), 1, "a full machine is not a loaded one");
+        assert_eq!(readiness_scale(9.0, 8), 2);
+        assert_eq!(readiness_scale(20.0, 8), 3);
+        assert_eq!(readiness_scale(60.0, 8), 4, "capped: past it the start is ended and tried again");
+        assert_eq!(readiness_scale(5.0, 0), 4, "no core count is not a divide by zero");
     }
 
     #[test]

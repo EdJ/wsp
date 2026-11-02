@@ -1402,7 +1402,8 @@ struct Patience<'a> {
 impl Default for Patience<'static> {
     fn default() -> Patience<'static> {
         Patience {
-            ready: Duration::from_millis(60_000),
+            // Stretched with the load (`wsp-335`): see `throttle::readiness_scale`.
+            ready: Duration::from_millis(60_000) * crate::throttle::readiness_scale_now(),
             taken: Duration::from_millis(5_000),
             nudges: 2,
             poll: Duration::from_millis(150),

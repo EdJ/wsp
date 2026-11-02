@@ -87,6 +87,7 @@ mod room;
 mod sharing;
 mod split;
 mod stage;
+mod starts;
 mod stand_down;
 mod story;
 mod store;
