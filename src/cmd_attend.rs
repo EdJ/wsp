@@ -205,7 +205,7 @@ pub fn attend(store: &Store, args: &Args) -> i32 {
 
     let ran = agent_commands::of("attention").ran(&session, "", 0);
     let ran_clause = clause(ran.as_ref(), opted.cap_cents, &exit);
-    let checks = check::run_all(&here, &opted.steps, &dir.join("verify.log"), |_| {});
+    let checks = check::run_all(&here, &opted.steps, &dir.join("verify.log"), None, |_| {});
     let green = check::passed(&checks);
     say("Stop", &session);
     let account = format!(

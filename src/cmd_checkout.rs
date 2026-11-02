@@ -2526,7 +2526,12 @@ pub(crate) fn land_verdict(store: &Store, task: &str) -> Verdict {
             Ok(l) => l,
             Err(why) => return Verdict::Blocked(format!("wsp: the rerun after the trunk moved could not start: {why}")),
         };
-        let ran = crate::check::run_all(&w.dir, &steps, &dir.join("land.log"), |_| {});
+        let greens = store
+            .find_task(task)
+            .and_then(|t| crate::check::target(store, &t, Some(&new_head)).ok())
+            .map(|tg| crate::greens::Greens::open(store, &tg.project, &tg.repo));
+        let reuse = greens.as_ref().map(|g| crate::greens::Reuse { greens: g, sha: &new_head, env: crate::greens::Env::Warm, who: task });
+        let ran = crate::check::run_all(&w.dir, &steps, &dir.join("land.log"), reuse.as_ref(), |_| {});
         drop(lock);
         if !crate::check::passed(&ran) {
             return Verdict::Blocked(format!(

@@ -76,6 +76,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::cmd_verify::{git, git_ok};
+use crate::greens::{self, Green, Reuse};
 use crate::model::{Status, Task};
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -116,6 +117,8 @@ pub(crate) struct Step {
     pub on: Vec<String>,
     /// Run by the barrier, not per row.
     pub barrier: bool,
+    /// Run only in the cold build (`at end`), never per row or at the barrier.
+    pub end: bool,
 }
 
 // ---- declarations ----------------------------------------------------------
@@ -137,6 +140,7 @@ struct Head {
     limit: Option<Duration>,
     on: Vec<String>,
     barrier: bool,
+    end: bool,
 }
 
 pub(crate) fn step_of(item: &str, of: Of) -> Option<Step> {
@@ -149,22 +153,22 @@ pub(crate) fn step_of(item: &str, of: Of) -> Option<Step> {
     if command.is_empty() {
         return None;
     }
-    let h = head.unwrap_or_else(|| Head { name: named_by(command), limit: None, on: Vec::new(), barrier: false });
+    let h = head.unwrap_or_else(|| Head { name: named_by(command), limit: None, on: Vec::new(), barrier: false, end: false });
     let of = match of {
         Of::Project if !h.on.is_empty() => Of::Rule,
         o => o,
     };
-    Some(Step { name: h.name, command: command.to_string(), limit: h.limit.unwrap_or(DEFAULT_LIMIT), of, on: h.on, barrier: h.barrier })
+    Some(Step { name: h.name, command: command.to_string(), limit: h.limit.unwrap_or(DEFAULT_LIMIT), of, on: h.on, barrier: h.barrier, end: h.end })
 }
 
-/// `name [(limit)] [on <globs>] [at barrier]`, when the text before a `: ` is one.
+/// `name [(limit)] [on <globs>] [at barrier|end]`, when the text before a `: ` is one.
 fn head_of(h: &str) -> Option<Head> {
     let mut words = h.split_whitespace().peekable();
     let name = words.next()?;
     if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
         return None;
     }
-    let mut head = Head { name: name.to_string(), limit: None, on: Vec::new(), barrier: false };
+    let mut head = Head { name: name.to_string(), limit: None, on: Vec::new(), barrier: false, end: false };
     if let Some(w) = words.peek().copied() {
         if let Some(inner) = w.strip_prefix('(').and_then(|w| w.strip_suffix(')')) {
             head.limit = Some(limit_of(inner)?);
@@ -189,10 +193,11 @@ fn head_of(h: &str) -> Option<Head> {
     }
     if words.peek() == Some(&"at") {
         words.next();
-        if words.next() != Some("barrier") {
-            return None;
+        match words.next() {
+            Some("barrier") => head.barrier = true,
+            Some("end") => head.end = true,
+            _ => return None,
         }
-        head.barrier = true;
     }
     words.next().is_none().then_some(head)
 }
@@ -334,6 +339,15 @@ pub(crate) fn barrier_steps(store: &Store, project: &str) -> Vec<Step> {
         .unwrap_or_default()
 }
 
+/// The steps a project runs only in the cold build, at the end of a worklist.
+pub(crate) fn end_steps(store: &Store, project: &str) -> Vec<Step> {
+    store
+        .project(project)
+        .and_then(|p| p.section(SECTION))
+        .map(|s| parse_steps(&s, Of::Project).into_iter().filter(|s| s.end).collect())
+        .unwrap_or_default()
+}
+
 /// What a landing is run against: the steps, in order, and the paths that
 /// brought the rules in.
 pub(crate) struct Plan {
@@ -347,8 +361,8 @@ pub(crate) struct Plan {
 pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Plan {
     let mut steps = task_steps(t);
     let rules = project_steps(store, t);
-    let changed = if rules.iter().any(|s| s.of == Of::Rule && !s.barrier) { changed_paths(tg, t, at.is_none()) } else { Vec::new() };
-    for r in rules.into_iter().filter(|r| !r.barrier) {
+    let changed = if rules.iter().any(|s| s.of == Of::Rule && !s.barrier && !s.end) { changed_paths(tg, t, at.is_none()) } else { Vec::new() };
+    for r in rules.into_iter().filter(|r| !r.barrier && !r.end) {
         let made = match r.of {
             Of::Rule => expand(&r, &changed),
             _ => vec![r],
@@ -554,6 +568,8 @@ pub(crate) struct Ran {
     /// Why the first run failed and its tail, when the step passed on a second:
     /// a flake is passed and kept in view, not swallowed.
     pub first: Option<(String, String)>,
+    /// The green this step was answered by, when it did not run.
+    pub reused: Option<Green>,
 }
 
 /// The environment a check's commands get: the caller's, less wsp's own.
@@ -576,6 +592,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
         took: start.elapsed(),
         tail: why,
         first: None,
+        reused: None,
     };
     let Ok(out) = std::fs::File::create(log) else { return failed(format!("could not write {}", util::contract(log))) };
     let Ok(err) = out.try_clone() else { return failed("could not share the log".into()) };
@@ -605,7 +622,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
     } else {
         Done::Failed { exit: status.and_then(|s| s.code()), timed_out }
     };
-    Ran { step: step.clone(), done, took: start.elapsed(), tail: tail_of(log), first: None }
+    Ran { step: step.clone(), done, took: start.elapsed(), tail: tail_of(log), first: None, reused: None }
 }
 
 /// The last lines of a log, each cut to a width a row can hold.
@@ -626,14 +643,14 @@ fn tail_of(log: &Path) -> String {
 }
 
 /// Run `steps` in order, stopping at the first that fails.
-pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
+pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
     let mut out: Vec<Ran> = Vec::new();
     for s in steps {
         let stop = out.last().is_some_and(|r| matches!(r.done, Done::Failed { .. }) || r.done == Done::Skipped);
         let ran = if stop {
-            Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None }
+            Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None, reused: None }
         } else {
-            run_again(dir, s, log)
+            run_again(dir, s, log, reuse)
         };
         each(&ran);
         out.push(ran);
@@ -644,11 +661,11 @@ pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, mut each: impl FnM
 /// Run every step whatever the one before did. A barrier wants all of its
 /// answers — a red suite does not excuse a member's own check from being read —
 /// where a row's run stops at the first.
-pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
+pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
     steps
         .iter()
         .map(|s| {
-            let ran = run_again(dir, s, log);
+            let ran = run_again(dir, s, log, reuse);
             each(&ran);
             ran
         })
@@ -661,13 +678,28 @@ pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, mut each: impl F
 /// counts, and the first is kept on the entry — `wsp verify` makes the same
 /// rule for the same reason: a flake swallowed stops being observable.
 /// A step that timed out is not run twice.
-pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path) -> Ran {
-    let first = run_step(dir, step, log);
-    if !matches!(first.done, Done::Failed { timed_out: false, .. }) {
-        return first;
+///
+/// With a `reuse`, a step already green at that commit is not run (it costs 0s
+/// and is not written again), and a pass is recorded when the tree was clean at
+/// that commit before the step ran.
+pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>) -> Ran {
+    if let Some(r) = reuse {
+        if let Some(green) = r.greens.lookup(r.sha, &step.command, r.env) {
+            return Ran { step: step.clone(), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: Some(green) };
+        }
     }
-    let second = run_step(dir, step, log);
-    Ran { took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
+    let clean = reuse.is_some_and(|r| greens::clean_at(dir, r.sha));
+    let first = run_step(dir, step, log);
+    let ran = if matches!(first.done, Done::Failed { timed_out: false, .. }) {
+        let second = run_step(dir, step, log);
+        Ran { took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
+    } else {
+        first
+    };
+    if let (Some(r), true, Done::Passed) = (reuse, clean, &ran.done) {
+        r.greens.record(r.sha, &step.command, r.env, secs(ran.took), r.who, ran.first.is_some());
+    }
+    ran
 }
 
 pub(crate) fn passed(ran: &[Ran]) -> bool {
@@ -692,6 +724,14 @@ pub(crate) fn account(ran: &[Ran]) -> String {
     let mut out = Vec::new();
     for r in ran {
         let (mark, rest) = match (&r.done, &r.first) {
+            (Done::Passed, _) if r.reused.is_some() => {
+                let g = r.reused.as_ref().unwrap();
+                let flake = if g.flaky { ", a flake that passed on a second run" } else { "" };
+                (
+                    "✓",
+                    format!("reused (green at this commit, {}s, by {}, {}{flake})", g.took, g.who, g.when),
+                )
+            }
             (Done::Passed, None) => ("✓", format!("{}s", secs(r.took))),
             (Done::Passed, Some((why, _))) => ("✓", format!("{}s · passed on a second run, the first was {why}", secs(r.took))),
             (Done::Failed { .. }, first) => {
@@ -918,9 +958,13 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     if !auto && !args.json() {
         println!("{} {} at {} in {}", p.dim("checking"), p.bold(&t.id), &tg.sha[..12], util::contract(&tree));
     }
-    let ran = run_all(&tree, &steps, &dir.join("last.log"), |r| {
+    let greens = greens::Greens::open(store, &tg.project, &tg.repo);
+    let ledger = (at.is_none() && !args.has("again") && !args.has("force"))
+        .then(|| Reuse { greens: &greens, sha: &tg.sha, env: greens::Env::Warm, who: &t.id });
+    let ran = run_all(&tree, &steps, &dir.join("last.log"), ledger.as_ref(), |r| {
         if !auto && !args.json() {
             let (mark, tail) = match &r.done {
+                Done::Passed if r.reused.is_some() => (p.green("✓"), " · reused".to_string()),
                 Done::Passed => (p.green("✓"), String::new()),
                 Done::Failed { .. } => (p.red("✗"), format!(" · {}", why_failed(r))),
                 Done::Skipped => (p.dim("–"), " · skipped".to_string()),
@@ -975,6 +1019,9 @@ pub fn check(store: &Store, args: &Args) -> i32 {
 fn why_in(s: &Step) -> String {
     if s.barrier {
         return "at the barrier".into();
+    }
+    if s.end {
+        return "in the cold build".into();
     }
     match s.of {
         Of::Task => "the member's".into(),
@@ -1037,7 +1084,7 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
         return gave_up(store, &found.id, None, &format!("could not put {} in {}: {why}", &tg.sha[..12], util::contract(&tree)));
     }
     println!("{} {} barrier at {}", p.dim("checking"), p.bold(&found.id), &tg.sha[..12]);
-    let ran = run_all(&tree, &steps, &dir.join("last.log"), |r| {
+    let ran = run_all(&tree, &steps, &dir.join("last.log"), None, |r| {
         let (mark, tail) = match &r.done {
             Done::Passed => (p.green("✓"), String::new()),
             Done::Failed { .. } => (p.red("✗"), format!(" · {}", why_failed(r))),
@@ -1243,7 +1290,7 @@ mod tests {
     }
 
     fn sh(command: &str, limit: u64) -> Step {
-        Step { name: "s".into(), command: command.into(), limit: Duration::from_secs(limit), of: Of::Project, on: Vec::new(), barrier: false }
+        Step { name: "s".into(), command: command.into(), limit: Duration::from_secs(limit), of: Of::Project, on: Vec::new(), barrier: false, end: false }
     }
 
     #[test]
@@ -1270,12 +1317,12 @@ mod tests {
     fn a_step_that_fails_once_and_passes_is_passed_and_the_flake_is_kept_on_the_entry() {
         let (dir, log) = scratch_log("flake");
         let flaky = sh("test -f seen || { touch seen; echo first-time >&2; exit 1; }", 10);
-        let ran = run_all(&dir, &[flaky], &log, |_| {});
+        let ran = run_all(&dir, &[flaky], &log, None, |_| {});
         assert!(passed(&ran), "the second run counts");
         let text = account(&ran);
         assert!(text.contains("passed on a second run, the first was exit 1") && text.contains("~ first-time"), "{text}");
         let broken = sh("echo no; exit 2", 10);
-        let ran = run_all(&dir, &[broken], &log, |_| {});
+        let ran = run_all(&dir, &[broken], &log, None, |_| {});
         assert!(!passed(&ran));
         assert!(account(&ran).contains("exit 2 both times"), "{}", account(&ran));
     }
@@ -1284,7 +1331,7 @@ mod tests {
     fn steps_stop_at_the_first_failure_and_say_which_were_not_run() {
         let (dir, log) = scratch_log("stop");
         let steps = vec![sh("true", 10), sh("exit 1", 10), sh("true", 10)];
-        let ran = run_all(&dir, &steps, &log, |_| {});
+        let ran = run_all(&dir, &steps, &log, None, |_| {});
         let done: Vec<_> = ran.iter().map(|r| r.done.clone()).collect();
         assert_eq!(done[0], Done::Passed);
         assert!(matches!(done[1], Done::Failed { .. }));
@@ -1353,7 +1400,7 @@ mod tests {
         let t = store.find_task("pj-001").unwrap();
         let tg = target(&store, &t, None).unwrap();
         let at = begin(&store, "pj-001", &tg.sha, 3600, false).unwrap();
-        let ran = vec![Ran { step: sh("sh check.sh", 10), done: Done::Passed, took: Duration::from_secs(4), tail: String::new(), first: None }];
+        let ran = vec![Ran { step: sh("sh check.sh", 10), done: Done::Passed, took: Duration::from_secs(4), tail: String::new(), first: None, reused: None }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(4)), Settled::Passed);
 
         let t = store.find_task("pj-001").unwrap();
@@ -1376,7 +1423,7 @@ mod tests {
         let (_env, store, sha) = world("once", "- ok: true", "exit 0\n");
         let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
         assert!(begin(&store, "pj-001", &sha, 3600, false).is_none(), "a second trigger found the first one running");
-        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None }];
+        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None }];
         settle(&store, "pj-001", &at, &ran, Duration::ZERO);
         assert!(begin(&store, "pj-001", &sha, 3600, false).is_none(), "a landing already checked is not checked again");
         assert!(begin(&store, "pj-001", &sha, 3600, true).is_some(), "but a person can ask");
@@ -1401,11 +1448,12 @@ mod tests {
         let (_env, store, sha) = world("sendback", "- tests: sh check.sh", "echo boom >&2; exit 7\n");
         let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
         let ran = vec![Ran {
-            step: Step { name: "tests".into(), command: "sh check.sh".into(), limit: DEFAULT_LIMIT, of: Of::Project, on: Vec::new(), barrier: false },
+            step: Step { name: "tests".into(), command: "sh check.sh".into(), limit: DEFAULT_LIMIT, of: Of::Project, on: Vec::new(), barrier: false, end: false },
             done: Done::Failed { exit: Some(7), timed_out: false },
             took: Duration::from_secs(2),
             tail: "boom".into(),
             first: None,
+            reused: None,
         }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(2)), Settled::SentBack);
         let t = store.find_task("pj-001").unwrap();
@@ -1424,7 +1472,7 @@ mod tests {
         t.set_status(Status::Doing);
         store.save_task(&t).unwrap();
         let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
-        let ran = vec![Ran { step: sh("false", 10), done: Done::Failed { exit: Some(1), timed_out: false }, took: Duration::ZERO, tail: String::new(), first: None }];
+        let ran = vec![Ran { step: sh("false", 10), done: Done::Failed { exit: Some(1), timed_out: false }, took: Duration::ZERO, tail: String::new(), first: None, reused: None }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::ZERO), Settled::Failed);
         assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Doing);
     }
@@ -1441,7 +1489,7 @@ mod tests {
         assert_eq!(gate(&store, &t), Gate::Wait, "and it is still running");
         assert_eq!(v::runs(&store.find_task("pj-001").unwrap()).len(), 1);
 
-        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None }];
+        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None }];
         settle(&store, "pj-001", &runs[0].at, &ran, Duration::ZERO);
         let t = store.find_task("pj-001").unwrap();
         assert_eq!(gate(&store, &t), Gate::Clear, "passed for {sha}");
@@ -1558,6 +1606,141 @@ mod tests {
         assert_eq!(s.command, "on x: y", "`on x` has no name before it");
         let s = step("- ui on : y");
         assert_eq!(s.command, "ui on : y", "an `on` with no paths is not a head");
+    }
+
+    fn repo_at_head(name: &str) -> (PathBuf, PathBuf, String) {
+        let (dir, log) = scratch_log(name);
+        git_run(&dir, &["init", "--quiet", "-b", "master"]);
+        std::fs::write(dir.join("f"), "1").unwrap();
+        git_run(&dir, &["add", "f"]);
+        git_run(&dir, &["commit", "--quiet", "-m", "one"]);
+        let sha = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        (dir, log, sha)
+    }
+
+    fn counting(dir: &Path, file: &str) -> Step {
+        sh(&format!("echo x >> {}/{file}", dir.display()), 10)
+    }
+
+    fn runs_of(dir: &Path, file: &str) -> usize {
+        std::fs::read_to_string(dir.join(file)).map(|t| t.lines().count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_pass_is_recorded_at_the_commit_and_reused_by_the_next_run_of_the_same_command() {
+        let (_env, store, _) = world("reuse", "- x: true", "exit 0\n");
+        let (dir, log, sha) = repo_at_head("reuse");
+        let g = greens::Greens::open(&store, "pj", &dir);
+        let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "pj-001" };
+        let step = counting(&dir, "count");
+        let first = run_all(&dir, &[step.clone()], &log, Some(&reuse), |_| {});
+        assert!(passed(&first) && first[0].reused.is_none());
+        assert!(g.lookup(&sha, &step.command, greens::Env::Warm).is_some());
+        let second = run_all(&dir, &[step], &log, Some(&reuse), |_| {});
+        assert!(passed(&second));
+        assert_eq!(runs_of(&dir, "count"), 1, "the second run did not run the command");
+        assert_eq!(second[0].took, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_different_command_or_commit_is_not_reused() {
+        let (_env, store, _) = world("reuse-other", "- x: true", "exit 0\n");
+        let (dir, log, sha) = repo_at_head("reuse-other");
+        let g = greens::Greens::open(&store, "pj", &dir);
+        let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
+        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), |_| {});
+        run_all(&dir, &[counting(&dir, "two")], &log, Some(&reuse), |_| {});
+        assert_eq!((runs_of(&dir, "one"), runs_of(&dir, "two")), (1, 1));
+        std::fs::write(dir.join("f"), "2").unwrap();
+        git_run(&dir, &["commit", "--quiet", "-am", "two"]);
+        let sha2 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let reuse = Reuse { greens: &g, sha: &sha2, env: greens::Env::Warm, who: "a" };
+        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), |_| {});
+        assert_eq!(runs_of(&dir, "one"), 2, "a green at the old commit says nothing of the new one");
+    }
+
+    #[test]
+    fn a_dirty_tree_records_nothing_and_a_failing_step_is_never_recorded() {
+        let (_env, store, _) = world("reuse-dirty", "- x: true", "exit 0\n");
+        let (dir, log, sha) = repo_at_head("reuse-dirty");
+        let g = greens::Greens::open(&store, "pj", &dir);
+        let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
+        let bad = sh("exit 3", 10);
+        assert!(!passed(&run_all(&dir, &[bad.clone()], &log, Some(&reuse), |_| {})));
+        assert!(g.lookup(&sha, &bad.command, greens::Env::Warm).is_none());
+        std::fs::write(dir.join("untracked"), "x").unwrap();
+        let step = counting(&dir, "count");
+        run_all(&dir, &[step.clone()], &log, Some(&reuse), |_| {});
+        assert!(g.lookup(&sha, &step.command, greens::Env::Warm).is_none(), "a dirty tree proved the diff, not the commit");
+        std::fs::remove_file(dir.join("untracked")).unwrap();
+        std::fs::remove_file(dir.join("count")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "count\nlog\n").unwrap();
+        git_run(&dir, &["add", ".gitignore"]);
+        git_run(&dir, &["commit", "--quiet", "-m", "ignore"]);
+        let sha3 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let reuse = Reuse { greens: &g, sha: &sha3, env: greens::Env::Warm, who: "a" };
+        run_all(&dir, &[step.clone()], &log, Some(&reuse), |_| {});
+        assert!(g.lookup(&sha3, &step.command, greens::Env::Warm).is_some(), "ignored files do not make a tree dirty");
+    }
+
+    #[test]
+    fn a_cold_green_satisfies_a_warm_run_and_a_warm_green_does_not_satisfy_a_cold_one() {
+        let (_env, store, _) = world("reuse-env", "- x: true", "exit 0\n");
+        let (dir, log, sha) = repo_at_head("reuse-env");
+        let g = greens::Greens::open(&store, "pj", &dir);
+        let cold = Reuse { greens: &g, sha: &sha, env: greens::Env::Cold, who: "cold" };
+        let warm = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "warm" };
+        run_all(&dir, &[counting(&dir, "a")], &log, Some(&cold), |_| {});
+        run_all(&dir, &[counting(&dir, "a")], &log, Some(&warm), |_| {});
+        assert_eq!(runs_of(&dir, "a"), 1, "the cold green answered the warm ask");
+        run_all(&dir, &[counting(&dir, "b")], &log, Some(&warm), |_| {});
+        run_all(&dir, &[counting(&dir, "b")], &log, Some(&cold), |_| {});
+        assert_eq!(runs_of(&dir, "b"), 2, "the warm green did not answer the cold ask");
+    }
+
+    #[test]
+    fn a_reused_step_shows_reused_on_the_entry_with_who_and_how_long() {
+        let (_env, store, _) = world("reuse-account", "- x: true", "exit 0\n");
+        let (dir, log, sha) = repo_at_head("reuse-account");
+        let g = greens::Greens::open(&store, "pj", &dir);
+        g.record(&sha, "true", greens::Env::Warm, 101, "wsp-9", false);
+        let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "x" };
+        let ran = run_all(&dir, &[sh("true", 10)], &log, Some(&reuse), |_| {});
+        let text = account(&ran);
+        assert!(text.contains("reused (green at this commit, 101s, by wsp-9,"), "{text}");
+        assert!(passed(&ran));
+    }
+
+    #[test]
+    fn the_verb_reuses_a_green_at_the_landing_and_again_ignores_the_ledger() {
+        let (env, store, sha) = world("verb-reuse", "- n: true", "exit 0\n");
+        let counter = env.path("count");
+        let cmd = format!("echo x >> {}", counter.display());
+        let t = store.find_task("pj-001").unwrap();
+        let mut t = t;
+        t.body = format!("{}\n## Checks\n- n: {cmd}\n", t.body);
+        store.save_task(&t).unwrap();
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), 0);
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), 0);
+        let lines = |p: &Path| std::fs::read_to_string(p).map(|t| t.lines().count()).unwrap_or(0);
+        assert_eq!(lines(&counter), 1, "the second `wsp check` was answered by the ledger");
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[("again", "true")])), 0);
+        assert_eq!(lines(&counter), 2, "--again ignores it");
+        let _ = sha;
+    }
+
+    #[test]
+    fn an_end_step_parses_and_is_in_neither_a_rows_plan_nor_the_barriers_steps() {
+        let s = step("- perf (20m) at end: cargo bench");
+        assert!(s.end && !s.barrier && s.on.is_empty());
+        assert_eq!(why_in(&s), "in the cold build");
+        let (_env, store, _) = world("end", "- a: true\n- full at barrier: true\n- perf at end: true", "exit 0\n");
+        assert_eq!(barrier_steps(&store, "pj").len(), 1);
+        assert_eq!(end_steps(&store, "pj").len(), 1);
+        let t = store.find_task("pj-001").unwrap();
+        let tg = target(&store, &t, None).unwrap();
+        let names: Vec<_> = plan(&store, &t, &tg, None).steps.into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["a"]);
     }
 
     #[test]

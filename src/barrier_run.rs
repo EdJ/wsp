@@ -373,7 +373,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     let started = Instant::now();
     let mut ranged: Vec<Ranged> = Vec::new();
     for unit in &plan.units {
-        ranged.push(run_unit(store, unit));
+        ranged.push(run_unit(store, unit, &format!("barrier {list} {at}")));
     }
     let landed = crate::worklist::touched(store, &g.members).landed;
     let mut blames = Vec::new();
@@ -454,7 +454,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     0
 }
 
-fn run_unit(store: &Store, unit: &Unit) -> Ranged {
+fn run_unit(store: &Store, unit: &Unit, who: &str) -> Ranged {
     if unit.items.is_empty() {
         return Ranged::Ran(Vec::new());
     }
@@ -470,7 +470,9 @@ fn run_unit(store: &Store, unit: &Unit) -> Ranged {
         return Ranged::Could(format!("could not put {} in {}: {why}", &unit.sha[..12], util::contract(&tree)));
     }
     let steps: Vec<Step> = unit.items.iter().map(|i| i.step.clone()).collect();
-    let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), |_| {});
+    let greens = crate::greens::Greens::open(store, &unit.project, &unit.repo);
+    let reuse = crate::greens::Reuse { greens: &greens, sha: &unit.sha, env: crate::greens::Env::Warm, who };
+    let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), Some(&reuse), |_| {});
     drop(lock);
     Ranged::Ran(ran)
 }
@@ -516,7 +518,7 @@ mod tests {
     use super::*;
 
     fn step(name: &str, command: &str) -> Step {
-        Step { name: name.into(), command: command.into(), limit: std::time::Duration::from_secs(60), of: Of::Task, on: Vec::new(), barrier: false }
+        Step { name: name.into(), command: command.into(), limit: std::time::Duration::from_secs(60), of: Of::Task, on: Vec::new(), barrier: false, end: false }
     }
 
     fn failing(tail: &str) -> Ran {
@@ -526,6 +528,7 @@ mod tests {
             took: std::time::Duration::from_secs(1),
             tail: tail.into(),
             first: None,
+            reused: None,
         }
     }
 
@@ -714,7 +717,7 @@ mod tests {
         let (_env, store) = world("red", "echo 'store::tests::x FAILED'; exit 1\n", "");
         let w = store.worklist("run").unwrap();
         let plan = plan(&store, &w, 1);
-        let Ranged::Ran(ran) = run_unit(&store, &plan.units[0]) else { panic!("the tree was there") };
+        let Ranged::Ran(ran) = run_unit(&store, &plan.units[0], "barrier run 1") else { panic!("the tree was there") };
         let done: Vec<(&str, bool)> = ran.iter().map(|r| (r.step.name.as_str(), r.done == Done::Passed)).collect();
         assert_eq!(done, vec![("full", false), ("mine", true), ("stop:gate", true)], "a member's own check is still read");
 
