@@ -263,11 +263,18 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     }
     let started = old.iter().find(|l| l.name == name).cloned().unwrap_or_else(|| Leg::pending(&name, ""));
     let line = ended_line(store, &started, pane, "");
+    let ready_line = match ready_signal(store, &t.id, &old, &name, &baton, &caption) {
+        Ok(l) => l,
+        Err(why) => return refuse(why),
+    };
     let result = store.locked(|| {
         let mut t = store.find_task(&t.id).ok_or_else(|| format!("no task {}", t.id))?;
         let old = legs::legs(&t);
         let new = legs::finish(&old, &name, &baton, &caption, &util::now_iso())?;
         t.log(&line);
+        if let Some(l) = &ready_line {
+            t.log(l);
+        }
         legs::write(&mut t, &new);
         store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
         Ok::<_, String>((t, new))
@@ -296,6 +303,18 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         (false, false) => println!("  {}", p.dim(&format!("ready: {}", ready.join(", ")))),
     }
     0
+}
+
+/// The last leg's end is the row's ready signal, as `wsp review` is for a row
+/// without legs: the `wsp: ready <sha> on <branch>` line from the row's tree,
+/// for a member of a group wsp runs. `Err` when that tree holds uncommitted
+/// work, before anything is written; `None` for any other leg or row.
+fn ready_signal(store: &Store, task: &str, old: &[Leg], name: &str, baton: &str, caption: &str) -> Result<Option<String>, String> {
+    let Ok(after) = legs::finish(old, name, baton, caption, &util::now_iso()) else { return Ok(None) };
+    if legs::lasts(&after).first().map(String::as_str) != Some(name) || !crate::worklist::verified_by_a_run(store, task) {
+        return Ok(None);
+    }
+    Ok(crate::cmd_checkout::ready_at(store, task)?.map(|(sha, branch)| format!("{} {sha} on {branch}", crate::repair::READY)))
 }
 
 /// `review` typed in a leg's seat. Refused while another leg is running, naming
@@ -545,6 +564,54 @@ mod tests {
         assert_eq!(ls[1].state, State::Done);
         assert_eq!(ls[3].state, State::Skipped);
         assert_eq!(ls[3].skipped.as_deref(), Some("ended by review"));
+    }
+
+    /// `wsp-341`: the last leg's end is the ready signal for a member of a run.
+    #[test]
+    fn the_last_leg_done_records_ready() {
+        let env = util::isolated("leg-ready");
+        let (store, _) = staged(&env, vec![Leg::pending("only", "do it")]);
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-C", dir.to_str().unwrap()])
+                .args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&repo, &["init", "-q", "-b", "master"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        let tree = repo.join(".worktrees").join("m-1");
+        git(&repo, &["worktree", "add", "-q", "-b", "m-1", tree.to_str().unwrap(), "master"]);
+        std::fs::write(tree.join("w.txt"), "w\n").unwrap();
+        git(&tree, &["add", "."]);
+        git(&tree, &["commit", "-q", "-m", "work"]);
+        let tip = git(&tree, &["rev-parse", "HEAD"]);
+
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+
+        open(&store, "m-1", "only").unwrap();
+        let stand = Standing { room: None, cwd: tree.to_str(), kind: "claude" };
+        assert!(attach(&store, "m-1", "only", "cpd-31", &stand));
+        let done = || cmd_done(&store, &Args::synth("leg", &["done", "m-1"], &[("caption", "c")]), Some("cpd-31"));
+        assert_eq!(done(), 0);
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(crate::repair::ready(&t).as_deref(), Some(tip.as_str()), "{}", log_of(&store));
+        assert!(crate::repair::landed(&t).is_none());
     }
 
     /// A tree with uncommitted tracked changes cannot end a leg, and a baton over

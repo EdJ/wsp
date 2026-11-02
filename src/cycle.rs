@@ -784,7 +784,7 @@ fn told_unlanded(store: &Store, w: &Worklist, t: &Task) {
         return;
     }
     let Some(s) = pos.members.iter().find(|s| s.id == t.id) else { return };
-    if s.finished() || !s.settlement.settled() {
+    if s.owes_a_verifier() || !s.settlement.settled() {
         return;
     }
     tell(store, w, &format!("In the {} run, {}", w.id, unlanded(&s.id, &s.note())));
@@ -873,7 +873,8 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         crate::untaken::look(store, seats, &w, at, g, &pos);
     }
 
-    // 2. A verifier for each member that is finished — reviewed and landed.
+    // 2. A verifier for each member that is finished — reviewed and landed — or
+    // ready: reviewed at a commit that the verifier lands on a hold.
     // No row: the pass is written on the member, and the agent is started on
     // the member with `--verify` (`wsp-188`).
     //
@@ -882,7 +883,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // fans out. With no cap the order changes nothing — each start is keyed on
     // its own record.
     let gone = |seat: &str| seats.absent(seat) || seats.state(seat) == Some(State::Gone);
-    for s in pos.members.iter().filter(|s| s.finished()) {
+    for s in pos.members.iter().filter(|s| s.owes_a_verifier()) {
         let Some(member) = store.find_task(&s.id) else { continue };
         // On the kind the work ran on — `wsp-134` d1 (C) — which in a
         // mixed group is the member's own line and not the group's.
@@ -925,7 +926,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // its branch, this started nothing and wrote nothing, and its governor
     // went looking for the cause in the wrong record (`wsp-142`).
     if all {
-        for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
+        for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
             log_line(store, &format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
         }
     }
@@ -1822,7 +1823,7 @@ pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
 /// own bookkeeping never touches the member — see [`crate::verification`].
 fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
-    let now_landing = crate::repair::landed(member);
+    let now_landing = crate::repair::commit_of(member);
     let landed_again = |read: &Option<String>| match (&now_landing, read) {
         (Some(now), Some(then)) => !v::same_commit(now, then),
         _ => false,
@@ -5180,6 +5181,60 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_task(&t).unwrap();
         step(&store, &w, &Blind);
         assert_eq!(spawned(), vec![("m-1 · verifying".into(), "claude".into())], "the check passed, and now the verifier");
+    }
+
+    /// `wsp-341`: a member reviewed ready is owed a verifier whose pass reads
+    /// the ready commit, the step says nothing about it being unlanded, and the
+    /// barrier does not open on it. A hold on it does not re-verify it.
+    #[test]
+    fn a_ready_member_gets_a_verifier_reading_its_commit_and_no_unlanded_note() {
+        use crate::verification::State as V;
+        let (env, store) = scratch("ready");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C").arg(&repo).args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "master"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "first"]);
+        git(&["branch", "m-1"]);
+        git(&["checkout", "-q", "m-1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "work"]);
+        git(&["checkout", "-q", "master"]);
+        let tip = git(&["rev-parse", "m-1"]);
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        task(&store, "m-1", Status::Review);
+        let mut m = store.find_task("m-1").unwrap();
+        m.project = Some("p".into());
+        store.save_task(&m).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+
+        step(&store, &w, &Blind);
+        assert!(passes_on(&store, "m-1").is_empty(), "reviewed without a ready line: today's told-to-land path");
+
+        let mut m = store.find_task("m-1").unwrap();
+        m.log(&format!("{} {tip} on m-1", crate::repair::READY));
+        store.save_task(&m).unwrap();
+        step(&store, &w, &Blind);
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.len(), 1, "a ready member owes a verifier");
+        assert_eq!(ps[0].read.as_deref(), Some(&tip[..ps[0].read.as_deref().unwrap().len()]));
+        let pos = crate::worklist::position(&store, &w, crate::worklist::Reading::Landed);
+        assert!(!pos.at_barrier(), "ready is not landed, so the barrier waits");
+
+        verdict_all(&store, V::Holds);
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 1, "a hold on the same ready commit is not re-verified");
+        let _ = spawned();
     }
 
     /// `wsp-136` item 1. A note on a member is somebody **saying** something

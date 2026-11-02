@@ -1566,6 +1566,21 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", account.len()));
+    // A member of a group wsp runs is not landed by its agent: it is marked
+    // ready at its tree's commit, and the verifier that reads that tree lands
+    // it. Refused before the row moves when the tree holds uncommitted work.
+    let ready_line = match args.rest.first().and_then(|n| store.find_task(n)) {
+        Some(t) if crate::worklist::verified_by_a_run(store, &t.id) => {
+            match crate::cmd_checkout::ready_at(store, &t.id) {
+                Ok(at) => at.map(|(sha, branch)| format!("{} {sha} on {branch}", crate::repair::READY)),
+                Err(why) => {
+                    eprintln!("wsp: {why}");
+                    return 1;
+                }
+            }
+        }
+        _ => None,
+    };
     // From a leg's seat the row is not finished while a sibling runs, and from
     // the last running leg the rest are skipped (`docs/legs.md`, *A leg is a
     // seat*). Refused before the row moves.
@@ -1577,11 +1592,15 @@ pub fn review(store: &Store, args: &Args) -> i32 {
     }
     let code = mutate_saying(store, args, "review", said.as_deref(), |t| {
         t.set_status(Status::Review);
+
         // `review: …`, the shape `blocked:` and `parked:` already have — the
         // transition is implied by the prefix and the sentence is the entry.
         // `wsp attempts` reads both spellings; rows logged before this say
         // `→ review`.
         t.log(&format!("review: {account}"));
+        if let Some(line) = &ready_line {
+            t.log(line);
+        }
     });
     if code != 0 {
         return code;
@@ -3278,6 +3297,93 @@ pub(crate) mod tests {
 
         assert_eq!(review(&store, &parse(&["review", "wsp-101"])), 2);
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing", "and it did not move");
+    }
+
+    fn git_at(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A member `wsp-101` of a running group with an `agent:` line, in a real
+    /// repository, with a tree of its own holding one commit ahead of master.
+    fn a_member_with_a_commit(tag: &str) -> (crate::util::Isolated, Store, std::path::PathBuf) {
+        let env = crate::util::isolated(tag);
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_at(&repo, &["init", "--quiet", "-b", "master"]);
+        git_at(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        let tree = repo.join(".worktrees").join("wsp-101");
+        git_at(&repo, &["worktree", "add", "--quiet", "-b", "wsp-101", &tree.display().to_string(), "master"]);
+        std::fs::write(tree.join("work.txt"), "mine\n").unwrap();
+        git_at(&tree, &["add", "."]);
+        git_at(&tree, &["commit", "--quiet", "-m", "the work"]);
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut t = Task::new("a member", "wsp-101");
+        t.project = Some("p".into());
+        t.status_raw = "doing".into();
+        t.caption = Some("A member that did its work".into());
+        store.save_task(&t).unwrap();
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["wsp-101".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        (env, store, tree)
+    }
+
+    /// `wsp-341`: review is the ready signal for a member of a run, and it does
+    /// not land.
+    #[test]
+    fn a_member_reviewed_in_a_run_is_ready_and_not_landed() {
+        let (_env, store, tree) = a_member_with_a_commit("review-ready");
+        let tip = git_at(&tree, &["rev-parse", "HEAD"]);
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 0);
+        let t = store.task("wsp-101").unwrap();
+        assert_eq!(t.status_raw, "review");
+        assert_eq!(crate::repair::ready(&t).as_deref(), Some(tip.as_str()));
+        assert!(crate::repair::landed(&t).is_none(), "ready is not on the trunk");
+        let log = t.section("Log").unwrap();
+        assert!(log.contains(&format!("{} {tip} on wsp-101", crate::repair::READY)), "{log}");
+        let repo = tree.parent().unwrap().parent().unwrap();
+        assert_ne!(git_at(repo, &["rev-parse", "master"]), tip, "nothing reached the trunk");
+    }
+
+    /// A tree holding uncommitted work cannot be ready: refused, named, and the
+    /// row does not move.
+    #[test]
+    fn a_dirty_tree_refuses_review() {
+        let (_env, store, tree) = a_member_with_a_commit("review-dirty");
+        std::fs::write(tree.join("loose.txt"), "not committed\n").unwrap();
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done"])), 1);
+        let t = store.task("wsp-101").unwrap();
+        assert_eq!(t.status_raw, "doing", "and the row did not move");
+        assert!(crate::repair::ready(&t).is_none());
+    }
+
+    /// A row in no run is left as before: no ready line, no refusal.
+    #[test]
+    fn a_row_in_no_run_records_no_ready_line() {
+        let (_env, store, tree) = a_member_with_a_commit("review-no-run");
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(crate::model::WorklistStatus::Draft);
+        store.save_worklist(&w).unwrap();
+        std::fs::write(tree.join("loose.txt"), "not committed\n").unwrap();
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done"])), 0);
+        assert!(crate::repair::ready(&store.task("wsp-101").unwrap()).is_none());
     }
 
     /// Where the account goes, which on 2026-08-24 a governor and an agent

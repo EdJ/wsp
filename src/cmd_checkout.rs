@@ -200,6 +200,14 @@ pub(crate) const LANDING: &str = "A row ends with its own agent's `wsp land`, wh
      the person reads the row before `wsp done`. A land that is refused is asked about with `wsp ask`, never \
      done by hand.";
 
+/// What a member of a group wsp runs is told instead of [`LANDING`]: it does not
+/// land. `wsp review` is its whole last step, and the verifier that reads its
+/// tree lands it on a hold.
+pub(crate) const READY_FLOW: &str = "A row in a run wsp runs ends with `wsp review`, which records the commit it is \
+     ready at and does not land: a verifier reads your tree, and its `wsp verified --holds` lands the row \
+     (rebased on the trunk, checks rerun where the trunk moved). A block sends the row back with nothing on the \
+     trunk. Never `wsp land` it yourself, and never land by hand.";
+
 /// The working tree a path is in, when it is one of ours.
 ///
 /// A pure path rule on purpose: `overlap` calls it for every pane herdr reports,
@@ -2087,8 +2095,10 @@ pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Who
 /// be teaching its readers to stop reading it.
 pub(crate) fn outstanding(store: &Store, task: &str) -> Vec<String> {
     let Ok(cwd) = std::env::current_dir() else { return Vec::new() };
+    let by_a_run = crate::worklist::verified_by_a_run(store, task);
+    let ready = store.find_task(task).and_then(|t| crate::repair::ready(&t));
     match pick(candidates(store, &cwd, task), task) {
-        Ok(w) => holding(&w),
+        Ok(w) => holding(&w, by_a_run, ready.as_deref()),
         // Nothing to say and nothing wrong: a task whose project has no root
         // and whose caller is standing outside a repository is most of what
         // `wsp` is run against.
@@ -2098,7 +2108,7 @@ pub(crate) fn outstanding(store: &Store, task: &str) -> Vec<String> {
 
 /// The half of [`outstanding`] that is only git, so it can be asked of a real
 /// repository without a store or a working directory in the way.
-fn holding(w: &Where) -> Vec<String> {
+fn holding(w: &Where, by_a_run: bool, ready: Option<&str>) -> Vec<String> {
     if !w.dir.join(".git").exists() {
         return Vec::new();
     }
@@ -2109,10 +2119,37 @@ fn holding(w: &Where) -> Vec<String> {
     if let Some(branch) = w.on() {
         match ahead(&w.trunk, &w.branch, &branch).len() {
             0 => {}
-            n => out.push(format!("{} not on {} — `wsp land {}`?", n_commits(n), w.branch, w.task)),
+            n => out.push(match (by_a_run, ready) {
+                (true, Some(sha)) => format!("{} not on {} — ready at {}; a verifier lands it", n_commits(n), w.branch, &sha[..sha.len().min(10)]),
+                (true, None) => format!("{} not on {} — `wsp review` marks it ready; a verifier lands it", n_commits(n), w.branch),
+                _ => format!("{} not on {} — `wsp land {}`?", n_commits(n), w.branch, w.task),
+            }),
         }
     }
     out
+}
+
+/// What `wsp review` records for a member of a run: the commit its clean tree is
+/// at and the branch, when that branch is ahead of the trunk. `Ok(None)` for no
+/// repository or nothing ahead (design-only rows, rows that landed themselves);
+/// `Err` for a tree holding uncommitted work, naming it.
+pub(crate) fn ready_at(store: &Store, task: &str) -> Result<Option<(String, String)>, String> {
+    let Ok(cwd) = std::env::current_dir() else { return Ok(None) };
+    let Ok(w) = pick(candidates(store, &cwd, task), task) else { return Ok(None) };
+    if !w.dir.join(".git").exists() {
+        return Ok(None);
+    }
+    let Some(branch) = w.on() else { return Ok(None) };
+    if ahead(&w.trunk, &w.branch, &branch).is_empty() {
+        return Ok(None);
+    }
+    if dirty(&w.dir) {
+        return Err(format!(
+            "{} has uncommitted work — commit it (`wsp commit-help`), then `wsp review` again: a verifier reads the tree at the commit you are ready at",
+            util::contract(&w.dir)
+        ));
+    }
+    Ok(git(&w.dir, &["rev-parse", "HEAD"]).map(|sha| (sha.trim().to_string(), branch)))
 }
 
 /// A rebase the run started for a seat that is idle or gone and that did not
@@ -2427,7 +2464,7 @@ mod tests {
         repo(&dir);
         let wt = checkout_dir(&dir, "t-1");
         ensure(&dir, &wt, "t-1", "master").unwrap();
-        let asked = || holding(&pick(vec![dir.clone()], "t-1").unwrap());
+        let asked = || holding(&pick(vec![dir.clone()], "t-1").unwrap(), false, None);
 
         assert!(asked().is_empty(), "a tree just made holds nothing: {:?}", asked());
 

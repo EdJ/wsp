@@ -752,7 +752,7 @@ mod tests {
     fn standing(id: &str, status: &str) -> Standing {
         let mut t = Task::new(id, id);
         t.status_raw = status.into();
-        Standing { id: id.into(), settlement: Settlement::of(&t), landing: None }
+        Standing { id: id.into(), settlement: Settlement::of(&t), landing: None, ready: false }
     }
 
     fn pos(at: Option<usize>, members: Vec<Standing>) -> Position {

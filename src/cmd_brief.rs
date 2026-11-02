@@ -1247,17 +1247,23 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // worktrees). Every root of the project is an `external_directory` deny,
     // so the trunk and the trees beside this one are refused without anybody
     // being asked; the trunk is read from here, through git.
+    let in_a_run = r.list.as_ref().is_some_and(|l| l.run);
     if r.own_tree.is_some() {
         row(
             "tree",
-            p.dim("your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk, and `git show master:<path>` reads it")
-                .to_string(),
+            p.dim(if in_a_run {
+                "your own, and it is the whole project — commit freely; `wsp review` marks it ready and a verifier lands it, and `git show master:<path>` reads the trunk"
+            } else {
+                "your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk, and `git show master:<path>` reads it"
+            })
+            .to_string(),
         );
         // Whose the land is and what review follows it (`wsp-306`), said to
         // the agent holding a row and nobody else: a leg's work is landed by
         // its row's finish, and a seat with nothing claimed has no row to end.
         if r.mine.is_some() && r.leg.is_none() {
-            row("land", p.dim(crate::cmd_checkout::LANDING).to_string());
+            let said = if in_a_run { crate::cmd_checkout::READY_FLOW } else { crate::cmd_checkout::LANDING };
+            row("land", p.dim(said).to_string());
         }
     }
 
@@ -1858,7 +1864,7 @@ mod tests {
     #[test]
     fn a_task_in_a_running_list_is_told_which_group_it_is_in() {
         let mut r = compose(&briefing());
-        r.list = Some(crate::worklist::Placing { list: "batch".into(), group: 2, of: 4 });
+        r.list = Some(crate::worklist::Placing { list: "batch".into(), group: 2, of: 4, run: false });
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("list"), "{text}");
         assert!(text.contains("batch"), "{text}");
@@ -1872,7 +1878,7 @@ mod tests {
     #[test]
     fn a_members_brief_says_split_into_legs_and_never_into_sub_tasks() {
         let leg = || Some(vec!["leg build on t-001 · after plan".to_string()]);
-        let placed = || Some(crate::worklist::Placing { list: "tweaks-next".into(), group: 1, of: 2 });
+        let placed = || Some(crate::worklist::Placing { list: "tweaks-next".into(), group: 1, of: 2, run: false });
         let cases: [(&str, Option<crate::worklist::Placing>, Option<Vec<String>>, bool); 3] = [
             ("a member", placed(), None, true),
             ("a leg of a member", placed(), leg(), false),

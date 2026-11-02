@@ -225,6 +225,11 @@ pub struct Standing {
     /// `None` under [`Reading::Settled`], and for a member the store has never
     /// heard of — there is no branch to ask about and no project to ask it in.
     pub landing: Option<Landing>,
+    /// At `review`, ahead of the trunk, and the newest ready line is the
+    /// branch's tip: finished by its agent and owed a verifier, which lands it.
+    /// **Not [`Standing::finished`]** — the work is not on the trunk, so the
+    /// barrier still waits.
+    pub ready: bool,
 }
 
 impl Standing {
@@ -244,6 +249,11 @@ impl Standing {
                 self.settlement.settled()
             }
         }
+    }
+
+    /// Finished, or ready and owed a verifier: the members a pass may open on.
+    pub fn owes_a_verifier(&self) -> bool {
+        self.finished() || self.ready
     }
 
     /// Why it is not finished, in the words a reader can act on, and empty
@@ -627,13 +637,22 @@ pub fn member(store: &Store, repos: &mut Repos, id: &str, reading: Reading) -> S
         None => Settlement::Gone,
         Some(t) => Settlement::of(t),
     };
-    let landing = match (reading, &task) {
-        (Reading::Settled, _) => None,
-        (Reading::Landed, None) => None,
-        (Reading::Landed, Some(t)) => Some(landing(repos, t)),
+    let (landing, tip) = match (reading, &task) {
+        (Reading::Settled, _) => (None, None),
+        (Reading::Landed, None) => (None, None),
+        (Reading::Landed, Some(t)) => {
+            let (l, tip) = landing_and_tip(repos, t);
+            (Some(l), tip)
+        }
+    };
+    let ready = match (&settlement, &landing, &task, &tip) {
+        (Settlement::Review, Some(Landing::Ahead { .. }), Some(t), Some(tip)) => {
+            crate::repair::ready(t).is_some_and(|r| crate::verification::same_commit(&r, tip))
+        }
+        _ => false,
     };
     let id = task.map_or_else(|| id.to_string(), |t| t.id);
-    Standing { id, settlement, landing }
+    Standing { id, settlement, landing, ready }
 }
 
 /// The members no task answers to, across the whole list rather than only the
@@ -1220,10 +1239,16 @@ impl Repos {
 
 /// Whether a member's work is on the trunk.
 fn landing(repos: &mut Repos, t: &Task) -> Landing {
-    let Some(project) = t.project.as_deref() else { return Landing::NoRepo };
+    landing_and_tip(repos, t).0
+}
+
+/// [`landing`], and the branch's tip commit where the branch is ahead — what a
+/// ready line is compared with.
+fn landing_and_tip(repos: &mut Repos, t: &Task) -> (Landing, Option<String>) {
+    let Some(project) = t.project.as_deref() else { return (Landing::NoRepo, None) };
     let trunks = repos.of(project);
     if trunks.is_empty() {
-        return Landing::NoRepo;
+        return (Landing::NoRepo, None);
     }
 
     // Every trunk the project could mean, every name the task could be under
@@ -1243,7 +1268,7 @@ fn landing(repos: &mut Repos, t: &Task) -> Landing {
         Some((trunk.clone(), branch))
     });
     let Some((trunk, branch)) = hit else {
-        return Landing::NoBranch;
+        return (Landing::NoBranch, None);
     };
 
     // And this is the state `ahead()` alone does not have either: an empty
@@ -1252,9 +1277,19 @@ fn landing(repos: &mut Repos, t: &Task) -> Landing {
     // between `wsp spawn` and its first commit. Neither this nor `NoBranch` is
     // a verdict; `Standing::finished` settles both against the store.
     match cmd_checkout::ahead(&trunk.dir, &trunk.branch, &branch).len() {
-        0 => Landing::Nothing,
-        commits => Landing::Ahead { commits, trunk: trunk.branch },
+        0 => (Landing::Nothing, None),
+        commits => {
+            let tip = git(&trunk.dir, &["rev-parse", &format!("refs/heads/{branch}")]);
+            (Landing::Ahead { commits, trunk: trunk.branch }, tip)
+        }
     }
+}
+
+/// Whether a task is a member of a group wsp runs a verifier for — a running
+/// list's group with an `agent:` line. These are the rows `wsp review` marks
+/// ready rather than leaving to their own agent's `wsp land`.
+pub fn verified_by_a_run(store: &Store, task: &str) -> bool {
+    Running::read(store).of(task).is_some_and(|p| p.run)
 }
 
 /// The commit a member's work is on the trunk at, and the trunk it is on, for
@@ -1315,6 +1350,9 @@ pub struct Placing {
     /// 1-based, because it is the number printed and the number typed.
     pub group: usize,
     pub of: usize,
+    /// The group has an `agent:` line: wsp runs it, and starts a verifier that
+    /// lands each member.
+    pub run: bool,
 }
 
 /// Where a list stands: the project whose governor its own seat answers to,
@@ -1483,6 +1521,7 @@ impl Running {
                         list: w.id.clone(),
                         group: i + 1,
                         of: groups.len(),
+                        run: g.policy().is_some(),
                     });
                 }
             }
@@ -2249,6 +2288,41 @@ mod tests {
         assert_eq!(p.at, Some(1), "which is still a barrier, and still nobody has passed it");
     }
 
+    /// `wsp-341`: a member reviewed ready is owed a verifier, and it is not
+    /// landed — the barrier still waits for the verifier's land.
+    #[test]
+    fn a_ready_member_owes_a_verifier_and_holds_the_barrier() {
+        let (_env, store, repo) = scratch("ready");
+        task(&store, "wsp-1", "review");
+        let dir = committed(&repo, "wsp-1");
+        let w = list("- 1  wsp-1\n");
+
+        let p = position(&store, &w, Reading::Landed);
+        assert!(!p.members[0].ready && !p.members[0].owes_a_verifier(), "no ready line, no verifier yet");
+
+        let tip = git_out(&dir, &["rev-parse", "HEAD"]);
+        let mut t = store.find_task("wsp-1").unwrap();
+        t.log(&format!("{} {tip} on wsp-1", crate::repair::READY));
+        store.save_task(&t).unwrap();
+        let p = position(&store, &w, Reading::Landed);
+        assert!(p.members[0].ready && p.members[0].owes_a_verifier());
+        assert!(!p.members[0].finished(), "its work is not on the trunk");
+        assert!(!p.at_barrier(), "so the barrier waits");
+        assert!(crate::repair::landed(&store.find_task("wsp-1").unwrap()).is_none(), "and it never reads as landed");
+
+        // A commit after the ready line: the ready record is stale.
+        std::fs::write(dir.join("more.txt"), "more\n").unwrap();
+        git_run(&dir, &["add", "."]);
+        git_run(&dir, &["commit", "--quiet", "-m", "more"]);
+        let p = position(&store, &w, Reading::Landed);
+        assert!(!p.members[0].ready, "a ready line for an older commit is not the tip");
+
+        // Landed: finished, not ready.
+        land(&repo, "wsp-1");
+        let p = position(&store, &w, Reading::Landed);
+        assert!(p.members[0].finished() && !p.members[0].ready);
+    }
+
     /// The state `ahead()` alone does not have. A group nobody has spawned for
     /// has no branches, and every one of its members would otherwise read as
     /// having nothing outstanding — the barrier opening on work that has not
@@ -2795,7 +2869,7 @@ mod tests {
         let r = Running::read(&store);
         assert_eq!(
             r.of("wsp-2"),
-            Some(&Placing { list: "batch".into(), group: 2, of: 2 }),
+            Some(&Placing { list: "batch".into(), group: 2, of: 2, run: false }),
             "the group it is a member of, not the group the run is at"
         );
         assert_eq!(r.list_of("wsp-1").as_deref(), Some("batch"));

@@ -114,6 +114,18 @@ const WAITING: &str = "wsp: held while waiting —";
 /// on code nobody had touched.
 pub(crate) const LANDED: &str = "wsp: landed";
 
+/// The marker in a member's `## Log` saying its work is finished and waits for a
+/// verifier, and the commit it is finished at: `wsp: ready <sha> on <branch>`.
+///
+/// Written by `wsp review` (and the last leg's `wsp leg done`) when the member's
+/// tree is clean and its branch is ahead of the trunk. **It is not a landing**:
+/// [`landed`] does not read it, so ending, `after`, the barrier and
+/// `build_output` never take a ready row for work that is on the trunk. The
+/// verifier lands it, on a hold. Only a member of a group wsp runs a verifier
+/// for gets the new flow; a row in no such run is landed by its own agent's
+/// `wsp land`, as before.
+pub(crate) const READY: &str = "wsp: ready";
+
 /// The same marker on a **verifier's** row, naming the commit it was asked to
 /// read. A different word and the same shape, and the shape is what matters:
 /// [`landed`] reads both, because the question a reader is asking — "what is
@@ -1048,16 +1060,44 @@ fn unrecorded_landing(store: &Store, w: &Worklist, at: usize, pos: &Position) {
 /// agent, a whole read of the tree — on code that had not changed, every time
 /// somebody said anything about the row.
 pub(crate) fn landed(t: &Task) -> Option<String> {
+    newest_commit(t, &[LANDED, READING])
+}
+
+/// The commit the member's newest ready line names, unless a landed line for
+/// that same commit has since put it on the trunk. `None` for a row that was
+/// never reviewed ready, and for one that has landed.
+pub(crate) fn ready(t: &Task) -> Option<String> {
+    let sha = newest_commit(t, &[READY])?;
+    let on_trunk = commits_of(t, LANDED).into_iter().any(|l| crate::verification::same_commit(&l, &sha));
+    (!on_trunk).then_some(sha)
+}
+
+/// "The member's commit": the newest of its landed, ready and reading lines.
+/// What a verifier reads and what the checks run at, whichever route the row
+/// is on.
+pub(crate) fn commit_of(t: &Task) -> Option<String> {
+    newest_commit(t, &[LANDED, READY, READING])
+}
+
+fn commits_of(t: &Task, marker: &str) -> Vec<String> {
+    let Some(log) = t.section("Log") else { return Vec::new() };
+    log.lines().filter_map(|l| sha_after(l, marker)).collect()
+}
+
+fn newest_commit(t: &Task, markers: &[&str]) -> Option<String> {
     t.section("Log")?
         .lines()
-        .filter(|l| l.contains(LANDED) || l.contains(READING))
+        .filter_map(|l| markers.iter().find_map(|m| sha_after(l, m)))
         .last()
-        .and_then(|l| {
-            let marker = if l.contains(LANDED) { LANDED } else { READING };
-            let after = l.split(marker).nth(1)?.trim();
-            let sha = after.split_whitespace().next()?;
-            (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
-        })
+}
+
+fn sha_after(line: &str, marker: &str) -> Option<String> {
+    if !line.contains(marker) {
+        return None;
+    }
+    let after = line.split(marker).nth(1)?.trim();
+    let sha = after.split_whitespace().next()?;
+    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
 }
 
 // ---- a member `advance` skipped ------------------------------------------
@@ -1093,7 +1133,7 @@ pub(crate) fn landed(t: &Task) -> Option<String> {
 /// sentence has stopped being the same sentence.
 fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     let tasks = store.tasks_shared();
-    for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
+    for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
         let note = s.note();
         let why = if note.is_empty() { "its branch is not on the trunk".to_string() } else { note };
         stamp(store, &format!(
@@ -1213,7 +1253,7 @@ const LAND_TAKEN: &str = "wsp: the run is landing this member itself, after the 
 fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &Position) {
     let now = util::epoch_secs();
     let mut asks = None;
-    for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
+    for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
         let Some(t) = store.find_task(&s.id) else { continue };
         let log = t.section("Log").unwrap_or_default();
         let Some(notice) = log.lines().filter(|l| l.contains(WHY_NOT) && l.contains("not on the trunk")).last() else { continue };
@@ -3061,6 +3101,42 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
         assert!(landed_for().is_empty(), "once per notice, not once a minute");
+    }
+
+    /// `wsp-341`: a ready row is waiting on its verifier, whose hold lands it.
+    /// Landing it for an idle seat would merge work nobody has read.
+    #[test]
+    fn the_idle_seat_repair_does_not_land_a_ready_row() {
+        let (env, store) = told_an_hour_ago("landready");
+        let repo = env.path("repo");
+        let tip = git_in(&repo, &["rev-parse", "m-1"]);
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{READY} {} on m-1", tip.trim()));
+        store.save_task(&t).unwrap();
+        assert_eq!(ready(&t).as_deref(), Some(tip.trim()));
+        assert!(landed(&t).is_none(), "ready is not landed");
+        assert_eq!(commit_of(&t).as_deref(), Some(tip.trim()));
+
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert!(landed_for().is_empty(), "the run did not land work a verifier has not read");
+        assert!(crate::message::raised(&store).is_empty());
+    }
+
+    /// What each state of a row's log answers, in one place.
+    #[test]
+    fn ready_and_commit_of_read_the_log_newest_first_and_landed_supersedes_ready() {
+        let mut t = Task::new("m", "m-1");
+        assert_eq!((ready(&t), commit_of(&t), landed(&t)), (None, None, None));
+        t.log(&format!("{READY} aaaaaaa1111 on m-1"));
+        assert_eq!(ready(&t).as_deref(), Some("aaaaaaa1111"));
+        assert_eq!(commit_of(&t).as_deref(), Some("aaaaaaa1111"));
+        assert_eq!(landed(&t), None);
+        t.log(&format!("{READY} bbbbbbb2222 on m-1"));
+        assert_eq!(ready(&t).as_deref(), Some("bbbbbbb2222"), "the newest ready line");
+        t.log(&format!("{LANDED} bbbbbbb2222333 on master"));
+        assert_eq!(ready(&t), None, "a landing of that commit ends the wait");
+        assert_eq!(landed(&t).as_deref(), Some("bbbbbbb2222333"));
+        assert_eq!(commit_of(&t).as_deref(), Some("bbbbbbb2222333"));
     }
 
     #[test]

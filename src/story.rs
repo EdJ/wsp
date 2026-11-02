@@ -390,7 +390,7 @@ fn standing(id: &str, status: &str) -> crate::worklist::Standing {
             crate::model::Status::parse(other).expect("a status the fixture spelled right"),
         ),
     };
-    crate::worklist::Standing { id: id.to_string(), settlement, landing: None }
+    crate::worklist::Standing { id: id.to_string(), settlement, landing: None, ready: false }
 }
 
 /// A hand-built reading of one list: what [`crate::worklist::listing`] would
