@@ -58,6 +58,30 @@
 //! minute is a governor told once a minute about one pane.
 //!
 //! The row stays at `review`. Ending its agent is not `done`, which is Ed's.
+//!
+//! # Settled without a verdict, and the leg-run row's first seat (`wsp-336`)
+//!
+//! Ed, 2026-11-02: seventeen idle panes, sixteen of them members whose rows had
+//! been at `review` for days. `wsp-193` only looked at members of a list that
+//! was still open and only on a verdict, so a member of a **finished list**, of
+//! a group run by hand, or of no list at all was nobody's to end.
+//!
+//! A member is also settled **with no pass at all** when it is landed (the
+//! trunk has its commits), no verifier is owed — it is in no open list's group
+//! that wsp runs — and [`SETTLE_GRACE_SECS`] have gone by since it landed and
+//! reviewed, so a person reading the row has time to type to the agent first.
+//! A member with a pass that does not hold keeps its pane whatever the list
+//! says: a blocks verdict is answered from that context.
+//!
+//! The seat is the binding's, or — where a reaped binding left only the claim —
+//! the seat of the agent the claim names.
+//!
+//! **A row run as legs has no member seat to end.** It has the seat that staged
+//! it: the agent ran `wsp leg add`, `wsp release <row>` and stopped, and the
+//! pane stayed, unbound. `wsp release` writes [`HANDED`] on the row before it
+//! drops the binding, and [`original_seats`] ends that pane once every leg is
+//! `done` or `skipped` and the row is landed — by the same rules and the same
+//! confirmation as a member's.
 
 use crate::cycle::Seats;
 use crate::model::{Status, Task, Worklist, WorklistStatus};
@@ -78,6 +102,25 @@ const LEFT: &str = "wsp: verification holds and the agent is left running —";
 /// The line on a member's row saying its verifier's pane is left running.
 const VERIFIER_LEFT: &str = "wsp: the verifier is left running —";
 
+/// The line `wsp release` writes on a staged row for the seat that handed it to
+/// its legs, followed by the seat. Read by [`original_seats`].
+pub(crate) const HANDED: &str = "wsp: seat";
+const HANDED_TAIL: &str = "handed the row to its legs";
+
+/// The line saying that seat was ended once the last leg had ended and the row
+/// had landed.
+const ORIGINAL_ENDED: &str = "wsp: original seat";
+const ORIGINAL_ENDED_TAIL: &str = "ended — the last leg ended and the row is landed";
+const ORIGINAL_NOT_ENDED: &str = "wsp: could not end original seat";
+
+/// The line on a member's row saying its agent was ended with no verdict to
+/// wait for: it is landed and no verifier is owed.
+pub(crate) const SETTLED: &str = "ended: landed, no verifier owed, at";
+
+/// How long a landed member with no verifier owed is left before its agent is
+/// ended: the person's chance to type to it first.
+const SETTLE_GRACE_SECS: i64 = if cfg!(test) { 0 } else { 300 };
+
 /// How long a despawned agent's processes are given to exit before the ending
 /// is called failed. `compound`'s own `stop` already waits out `TERM` and sends
 /// `KILL`, so this is the margin after that, not the whole grace.
@@ -91,6 +134,27 @@ pub(crate) struct Holds {
     pub(crate) commit: String,
     /// When the verdict was recorded. A turn since then is somebody's.
     pub(crate) at: i64,
+    /// Whether a verdict stands behind this. `false` is a member that is landed
+    /// with no verifier owed, settled by the grace instead of by a verdict.
+    pub(crate) verdict: bool,
+}
+
+impl Holds {
+    /// The row's record that this was ended, and what [`ended`] looks for.
+    fn ended_line(&self) -> String {
+        match self.verdict {
+            true => format!("{ENDED} {}", self.commit),
+            false => format!("{SETTLED} {}", self.commit),
+        }
+    }
+
+    /// The reason, as a clause in a sentence.
+    fn because(&self) -> String {
+        match self.verdict {
+            true => format!("verification holds at {}", self.commit),
+            false => format!("it is landed at {} and no verifier is owed", self.commit),
+        }
+    }
 }
 
 /// The member's newest verification, if it holds and nothing has moved past it.
@@ -113,7 +177,31 @@ fn holds(tasks: &[Task], member: &Task) -> Option<Holds> {
         }
     }
     let commit = p.read.clone().or(now).unwrap_or_else(|| p.at.clone());
-    Some(Holds { commit, at: util::epoch_of(p.decided.as_deref().unwrap_or(&p.at)) })
+    Some(Holds { commit, at: util::epoch_of(p.decided.as_deref().unwrap_or(&p.at)), verdict: true })
+}
+
+/// The member as settled: a verdict that holds, or — with no pass at all, no
+/// verifier owed and the trunk holding its commits — the grace since it landed
+/// and reviewed. **A pass that is not a holds is never settled**, whatever the
+/// list says: a blocks verdict is answered from this agent's context.
+fn settled(tasks: &[Task], member: &Task, owed: bool) -> Option<Holds> {
+    if let Some(h) = holds(tasks, member) {
+        return Some(h);
+    }
+    if owed || crate::verification::latest(tasks, &member.id).is_some() {
+        return None;
+    }
+    let commit = crate::repair::landed(member)?;
+    let at = ["wsp: landed", "review:"].iter().filter_map(|n| last_stamp(member, n)).max()?;
+    (util::epoch_secs() - at >= SETTLE_GRACE_SECS).then_some(Holds { commit, at, verdict: false })
+}
+
+/// When the newest `## Log` line containing `needle` was written.
+fn last_stamp(t: &Task, needle: &str) -> Option<i64> {
+    let log = t.section("Log")?;
+    let line = log.lines().filter(|l| l.contains(needle)).last()?;
+    let stamp = line.trim_start_matches("- ").split_whitespace().next()?;
+    stamp.contains('T').then(|| util::epoch_of(stamp))
 }
 
 /// Why an agent is left running.
@@ -193,11 +281,14 @@ pub(crate) fn left(r: &Reading) -> Option<Left> {
     }
 }
 
-/// One pass over every member of every open list.
+/// One pass over every member at `review` that holds a seat, and then over the
+/// first seats of rows run as legs.
 ///
-/// **Open is running, held or parked**, the population
-/// [`crate::cycle::verdicts_recorded`] argues for: a hold stops nothing that
-/// has finished, and a held list's verified members were otherwise nobody's.
+/// **Every member, whatever its list is doing** (`wsp-336`): `wsp-193` read only
+/// the members of a list still running, held or parked, and the seventeen idle
+/// panes of 2026-11-02 were nobody's. Whether a verifier is still owed is read
+/// off the **open** lists alone — their groups that wsp runs — and the verdict
+/// off the member.
 pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
     let lists: Vec<Worklist> = store
         .worklists()
@@ -206,28 +297,61 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
         .collect();
     let mut tasks = None;
     let mut asks = None;
-    for w in &lists {
-        for id in w.groups().iter().flat_map(|g| g.members.clone()) {
-            let Some(m) = store.find_task(&id) else { continue };
-            if m.status() != Status::Review {
-                continue;
-            }
-            let tasks = tasks.get_or_insert_with(|| store.tasks());
-            let Some(h) = holds(tasks, &m) else { continue };
-            if ended(&m, &h.commit) || failed(&m, &h.commit) {
-                continue;
-            }
-            let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
-            if store.claims().contains_key(&m.id) && end_one(store, seats, w, &m.id, &h, asks) {
-                record_ended(store, &m.id, &h.commit);
-            }
+    for id in seated_rows(store) {
+        let Some(m) = store.find_task(&id) else { continue };
+        if m.status() != Status::Review || m.tags.iter().any(|g| g == crate::cycle::VERIFY_TAG || g == crate::cycle::BARRIER_TAG) {
+            continue;
+        }
+        if crate::legs::staged(&m) {
+            continue;
+        }
+        let w = lists.iter().find(|w| w.groups().iter().any(|g| g.members.contains(&m.id)));
+        let owed = w.is_some_and(|w| w.groups().iter().any(|g| g.members.contains(&m.id) && g.policy_for(&m.id).is_some()));
+        let tasks = tasks.get_or_insert_with(|| store.tasks());
+        let Some(h) = settled(tasks, &m, owed) else { continue };
+        if ended(&m, &h) || failed(&m, &h.commit) {
+            continue;
+        }
+        let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
+        if end_one(store, seats, w, &m.id, &h, asks) {
+            record_ended(store, &m.id, &h);
         }
     }
+    original_seats(store, seats);
 }
 
-/// Whether this verdict's ending is already recorded on the member.
-fn ended(m: &Task, commit: &str) -> bool {
-    let line = format!("{ENDED} {commit}");
+/// Every row a seat is held for: by a claim or by a binding that is not a leg's,
+/// each once.
+fn seated_rows(store: &Store) -> Vec<String> {
+    let mut ids: std::collections::BTreeSet<String> = store.claims().into_keys().collect();
+    ids.extend(
+        store
+            .bindings()
+            .values()
+            .filter(|b| b.get("leg").is_none())
+            .filter_map(|b| b.get("task_id").and_then(|t| t.as_str()).map(str::to_string)),
+    );
+    ids.into_iter().collect()
+}
+
+/// The member's seat: its binding, or — where a reaped binding left only the
+/// claim — the seat of the agent the claim names.
+fn seat_of(store: &Store, member: &str) -> Option<String> {
+    let bindings = store.bindings();
+    let bound = bindings
+        .iter()
+        .find(|(_, b)| b.get("task_id").and_then(|t| t.as_str()) == Some(member) && b.get("leg").is_none())
+        .map(|(pane, _)| pane.clone());
+    bound.or_else(|| {
+        let agent = store.claims().get(member)?.get("agent_id")?.as_str()?.to_string();
+        let seat = store.agents_held().get(&agent)?.get("seat")?.as_str()?.to_string();
+        (!seat.is_empty()).then_some(seat)
+    })
+}
+
+/// Whether this settlement's ending is already recorded on the member.
+fn ended(m: &Task, h: &Holds) -> bool {
+    let line = h.ended_line();
     m.section("Log").is_some_and(|l| l.lines().any(|x| x.ends_with(&line)))
 }
 
@@ -240,9 +364,9 @@ fn failed(m: &Task, commit: &str) -> bool {
 
 /// End the member's agent if nothing says leave it. `true` when it was ended
 /// and confirmed gone.
-fn end_one(store: &Store, seats: &dyn Seats, w: &Worklist, member: &str, h: &Holds, asks: &crate::waiting::Asks) -> bool {
-    let Some(seat) = store.panes_for_task(member).first().cloned() else {
-        // Held, and bound to no seat: nothing here can be asked or confirmed,
+fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str, h: &Holds, asks: &crate::waiting::Asks) -> bool {
+    let Some(seat) = seat_of(store, member) else {
+        // Settled, and bound to no seat: nothing here can be asked or confirmed,
         // and `repair`'s gone-member pass is the one that says so.
         return false;
     };
@@ -260,27 +384,119 @@ fn end_one(store: &Store, seats: &dyn Seats, w: &Worklist, member: &str, h: &Hol
         typed: seats.turn_began_since(&seat, h.at),
         pids: seats.pids(&seat),
     };
+    let by = w.map_or(member, |w| w.id.as_str());
     if let Some(why) = left(&reading) {
         if !why.passes() {
-            say_left(store, w, member, &seat, &why, &h.commit);
+            say_left(store, w, member, &seat, &why, h);
         }
         return false;
     }
     let pids = reading.pids.unwrap_or_default();
-    let outcome = crate::cycle::despawned(store, member).and_then(|()| confirm_gone(seats, &pids));
-    match outcome {
+    let claimed = store.claims().contains_key(member);
+    let ending = match claimed {
+        true => crate::cycle::despawned(store, member),
+        false => crate::cycle::despawn_seat(&seat),
+    };
+    match ending.and_then(|()| confirm_gone(seats, &pids)) {
         Ok(()) => {
-            crate::cycle::log_line(store, &format!(
-                "{} {member} ({seat}) ended — verification holds at {}, and no pid of it is running",
-                w.id, h.commit
-            ));
+            crate::cycle::log_line(store, &format!("{by} {member} ({seat}) ended — {}, and no pid of it is running", h.because()));
             true
         }
         Err(why) => {
-            not_ended(store, w, member, &seat, &h.commit, &why);
+            not_ended(store, w, member, &seat, h, &why);
             false
         }
     }
+}
+
+/// The first seat of every row run as legs, ended once the row has no leg left
+/// to run and has landed.
+///
+/// **Its own record, because the seat has no other.** `wsp release <row>` drops
+/// the binding and the claim, so the pane stays open with nothing naming it but
+/// the line [`handed_to_legs`] wrote. Ended by the member's own rules — never in
+/// a turn, behind a prompt or an ask, typed to since it handed the row over, or
+/// holding a governor post — and confirmed by pid, once, a failure not retried.
+fn original_seats(store: &Store, seats: &dyn Seats) {
+    let mut asks = None;
+    let bindings = store.bindings();
+    for row in store.tasks_shared().iter().filter(|t| crate::legs::staged(t)) {
+        if !matches!(row.status(), Status::Review | Status::Done) || crate::repair::landed(row).is_none() {
+            continue;
+        }
+        let legs = crate::legs::legs(row);
+        if legs.iter().any(|l| !matches!(l.state, crate::legs::State::Done | crate::legs::State::Skipped)) {
+            continue;
+        }
+        for (seat, at) in handed_seats(row) {
+            if original_recorded(row, &seat) || bindings.contains_key(&seat) {
+                continue;
+            }
+            let state = seats.state(&seat);
+            let shells = match state {
+                Some(State::Idle) => seats.shells(&[&seat]),
+                _ => Default::default(),
+            };
+            let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
+            let reading = Reading {
+                state,
+                wait: crate::waiting::reading(state, asks, &shells, &seat, &row.id),
+                governs: crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(seat.as_str())),
+                typed: seats.turn_began_since(&seat, at),
+                pids: seats.pids(&seat),
+            };
+            if let Some(why) = left(&reading) {
+                if !why.passes() {
+                    let line = format!("wsp: original seat {seat} is left running: {}", why.sentence());
+                    if once(store, &row.id, &line) {
+                        crate::cycle::log_line(store, &format!("{}: {}", row.id, line.trim_start_matches("wsp: ")));
+                    }
+                }
+                continue;
+            }
+            let pids = reading.pids.unwrap_or_default();
+            let outcome = crate::cycle::despawn_seat(&seat).and_then(|()| confirm_gone(seats, &pids));
+            let line = match &outcome {
+                Ok(()) => format!("{ORIGINAL_ENDED} {seat} {ORIGINAL_ENDED_TAIL}"),
+                Err(why) => format!("{ORIGINAL_NOT_ENDED} {seat} — {}", util::truncate(why, 160)),
+            };
+            if once(store, &row.id, &line) {
+                crate::cycle::log_line(store, &format!("{}: {}", row.id, line.trim_start_matches("wsp: ")));
+            }
+        }
+    }
+}
+
+/// Whether an ending of that original seat, successful or failed, is on the row.
+fn original_recorded(row: &Task, seat: &str) -> bool {
+    let (ended, failed) = (format!("{ORIGINAL_ENDED} {seat} "), format!("{ORIGINAL_NOT_ENDED} {seat} "));
+    row.section("Log").is_some_and(|l| l.lines().any(|x| x.contains(&ended) || x.contains(&failed)))
+}
+
+/// The seats that handed this row to its legs, each with when.
+fn handed_seats(row: &Task) -> Vec<(String, i64)> {
+    let Some(log) = row.section("Log") else { return Vec::new() };
+    log.lines()
+        .filter_map(|l| {
+            let rest = l.trim_start_matches("- ");
+            let (stamp, said) = rest.split_once(' ')?;
+            let seat = said.strip_prefix(HANDED)?.trim().strip_suffix(HANDED_TAIL)?.trim();
+            (!seat.is_empty()).then(|| (seat.to_string(), util::epoch_of(stamp)))
+        })
+        .collect()
+}
+
+/// Written by `wsp release` before it drops the binding of a seat that stages a
+/// row: the one record that names the seat afterwards.
+pub(crate) fn handed_to_legs(store: &Store, row: &str, seat: &str, binding: &serde_json::Value) {
+    if binding.get("leg").is_some() {
+        return;
+    }
+    let Some(t) = store.find_task(row) else { return };
+    if t.status() != Status::Doing || !crate::legs::staged(&t) {
+        return;
+    }
+    once(store, row, &format!("{HANDED} {seat} {HANDED_TAIL}"));
 }
 
 /// `Ok` once none of `pids` is running, waiting [`GONE_WITHIN_MS`] at most.
@@ -356,11 +572,11 @@ pub(crate) fn say_leg_left(store: &Store, row: &str, leg: &str, seat: &str, why:
 
 /// The ending, on the member's row, once — re-read under the lock so two
 /// passes racing write it once.
-fn record_ended(store: &Store, id: &str, commit: &str) {
-    let line = format!("{ENDED} {commit}");
+fn record_ended(store: &Store, id: &str, h: &Holds) {
+    let line = h.ended_line();
     store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return false };
-        if ended(&t, commit) {
+        if ended(&t, h) {
             return false;
         }
         t.log(&line);
@@ -371,31 +587,38 @@ fn record_ended(store: &Store, id: &str, commit: &str) {
 
 /// A failed ending: on the row, in `cycle.log`, and to the governor — once,
 /// because the row's line is what the next pass reads as "already tried".
-fn not_ended(store: &Store, w: &Worklist, member: &str, seat: &str, commit: &str, why: &str) {
+fn not_ended(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, h: &Holds, why: &str) {
+    let commit = &h.commit;
     let line = format!("{NOT_ENDED} {member} ({seat}) at {commit} — {}", util::truncate(why, 160));
     if !once(store, member, &line) {
         return;
     }
-    crate::cycle::log_line(store, &format!("{} {member}: {}", w.id, line.trim_start_matches("wsp: ")));
-    crate::cycle::tell(store, w, &format!(
-        "{member}'s verification holds at {commit}, and ending its agent ({seat}) failed: {}. \
-         It will not be tried again for this verdict; `wsp despawn {member}` is the hand version.",
-        util::truncate(why, 160)
-    ));
+    crate::cycle::log_line(store, &format!("{} {member}: {}", w.map_or(member, |w| w.id.as_str()), line.trim_start_matches("wsp: ")));
+    if let Some(w) = w {
+        crate::cycle::tell(store, w, &format!(
+            "{member}: {}, and ending its agent ({seat}) failed: {}. \
+             It will not be tried again for this verdict; `wsp despawn {member}` is the hand version.",
+            h.because(),
+            util::truncate(why, 160)
+        ));
+    }
 }
 
 /// An agent left running for a reason that will not pass: said once per
 /// reason per verdict.
-fn say_left(store: &Store, w: &Worklist, member: &str, seat: &str, why: &Left, commit: &str) {
-    let line = format!("{LEFT} {member} ({seat}) at {commit}: {}", why.sentence());
+fn say_left(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, why: &Left, h: &Holds) {
+    let line = format!("{LEFT} {member} ({seat}) at {}: {}", h.commit, why.sentence());
     if !once(store, member, &line) {
         return;
     }
-    crate::cycle::log_line(store, &format!("{} {member}: {}", w.id, line.trim_start_matches("wsp: ")));
-    crate::cycle::tell(store, w, &format!(
-        "{member}'s verification holds at {commit}, and its agent ({seat}) is left running: {}.",
-        why.sentence()
-    ));
+    crate::cycle::log_line(store, &format!("{} {member}: {}", w.map_or(member, |w| w.id.as_str()), line.trim_start_matches("wsp: ")));
+    if let Some(w) = w {
+        crate::cycle::tell(store, w, &format!(
+            "{member}: {}, and its agent ({seat}) is left running: {}.",
+            h.because(),
+            why.sentence()
+        ));
+    }
 }
 
 /// Write `line` on the row unless it is already there; whether it was written.
@@ -730,6 +953,204 @@ mod tests {
         tick(&store, &seats);
         assert!(drain(&DESPAWNED).contains(&"m-1".to_string()), "nobody is left in it to be using it");
         assert!(log_of(&store, "m-1").contains("ended: verification holds at abc1234"));
+    }
+
+    fn set_list(store: &Store, status: WorklistStatus, agent: &str) {
+        let mut w = Worklist::new("run", "run");
+        w.set_status(status);
+        w.set_groups(&[Group { members: vec!["m-1".into()], agent: agent.into(), ..Group::default() }]);
+        store.save_worklist(&w).unwrap();
+    }
+
+    /// `wsp-336`: the seventeen panes of 2026-11-02 were members of lists that
+    /// had finished, and `wsp-193` read only the lists still open.
+    #[test]
+    fn a_verified_member_of_a_finished_list_is_ended() {
+        let (_env, store) = verified("done-list");
+        set_list(&store, WorklistStatus::Done, "claude");
+        tick(&store, &Fake::at_rest());
+        assert!(member_ended());
+        assert!(log_of(&store, "m-1").contains("ended: verification holds at abc1234"));
+    }
+
+    #[test]
+    fn a_landed_member_in_no_list_with_no_pass_is_ended_once_and_says_why() {
+        let (_env, store) = verified("no-list");
+        let mut m = store.find_task("m-1").unwrap();
+        crate::verification::write(&mut m, &[]);
+        store.save_task(&m).unwrap();
+        store.save_worklist(&Worklist::new("run", "run")).unwrap();
+        let seats = Fake::at_rest();
+        tick(&store, &seats);
+        assert!(member_ended(), "landed, and nobody owes it a verifier");
+        let log = log_of(&store, "m-1");
+        assert_eq!(log.matches("ended: landed, no verifier owed, at abc1234").count(), 1, "{log}");
+        tick(&store, &seats);
+        assert!(!member_ended(), "once");
+    }
+
+    #[test]
+    fn a_member_of_a_group_wsp_verifies_keeps_its_pane_until_a_verdict() {
+        let (_env, store) = verified("owed");
+        let mut m = store.find_task("m-1").unwrap();
+        crate::verification::write(&mut m, &[]);
+        store.save_task(&m).unwrap();
+        set_list(&store, WorklistStatus::Running, "claude");
+        tick(&store, &Fake::at_rest());
+        assert!(!member_ended(), "its verifier has not started, and a blocks verdict is answered from this context");
+
+        set_list(&store, WorklistStatus::Running, "manual");
+        tick(&store, &Fake::at_rest());
+        assert!(member_ended(), "a group run by hand is owed no verifier");
+    }
+
+    #[test]
+    fn a_pass_that_does_not_hold_keeps_the_pane_whatever_the_list_says() {
+        let (_env, store) = verified("blocked-done");
+        set_pass(&store, crate::verification::State::Blocks);
+        set_list(&store, WorklistStatus::Done, "claude");
+        tick(&store, &Fake::at_rest());
+        assert!(!member_ended());
+    }
+
+    #[test]
+    fn an_unlanded_member_with_no_verifier_owed_is_left() {
+        let (_env, store) = verified("unlanded");
+        let mut m = Task::new("m-1", "m-1");
+        m.set_status(Status::Review);
+        store.save_task(&m).unwrap();
+        tick(&store, &Fake::at_rest());
+        assert!(!member_ended(), "nothing says the trunk has its commits");
+    }
+
+    #[test]
+    fn a_member_whose_binding_was_reaped_is_found_by_its_claims_agent() {
+        let (_env, store) = verified("reaped");
+        store.clear_binding("cpd-1");
+        store.set_claim("m-1", serde_json::json!({ "agent_id": "a-1" }));
+        store.set_agent("a-1", serde_json::json!({ "seat": "cpd-1" }));
+        tick(&store, &Fake::at_rest());
+        assert!(member_ended());
+    }
+
+    /// A staged row `s-1` at `review`, landed, every leg done, handed over by
+    /// `cpd-7`, which is bound to nothing now.
+    fn staged_row(tag: &str) -> (util::Isolated, Store) {
+        drain(&DESPAWNED);
+        drain(&SAID);
+        DESPAWN_FAILS.with(|f| *f.borrow_mut() = None);
+        let env = util::isolated(&format!("ending-{tag}"));
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("s-1", "s-1");
+        t.set_status(Status::Doing);
+        let mut leg = crate::legs::Leg::pending("finish", "land it");
+        leg.state = crate::legs::State::Running;
+        crate::legs::write(&mut t, &[leg]);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-7", serde_json::json!({ "task_id": "s-1" }));
+        handed_to_legs(&store, "s-1", "cpd-7", &store.bindings()["cpd-7"]);
+        store.clear_binding("cpd-7");
+        (env, store)
+    }
+
+    fn finish_row(store: &Store) {
+        let mut t = store.find_task("s-1").unwrap();
+        let mut legs = crate::legs::legs(&t);
+        legs[0].state = crate::legs::State::Done;
+        crate::legs::write(&mut t, &legs);
+        t.set_status(Status::Review);
+        t.log(&format!("{} abc1234", crate::repair::LANDED));
+        store.save_task(&t).unwrap();
+    }
+
+    fn seat_ended() -> bool {
+        drain(&DESPAWNED).contains(&"cpd-7".to_string())
+    }
+
+    fn lone() -> Fake {
+        let mut f = Fake::default();
+        f.state.insert("cpd-7".into(), State::Idle);
+        f.typed.insert("cpd-7".into(), false);
+        f.pids.insert("cpd-7".into(), vec![701, 702]);
+        f
+    }
+
+    #[test]
+    fn a_leg_run_rows_first_seat_is_ended_after_its_last_leg_and_the_landing() {
+        let (_env, store) = staged_row("orig");
+        assert!(log_of(&store, "s-1").contains("wsp: seat cpd-7 handed the row to its legs"));
+        tick(&store, &lone());
+        assert!(!seat_ended(), "a leg is still running");
+
+        finish_row(&store);
+        tick(&store, &lone());
+        assert!(seat_ended());
+        assert_eq!(log_of(&store, "s-1").matches("original seat cpd-7 ended").count(), 1);
+        tick(&store, &lone());
+        assert!(!seat_ended(), "once");
+    }
+
+    #[test]
+    fn a_leg_run_row_that_has_not_landed_keeps_its_first_seat() {
+        let (_env, store) = staged_row("orig-unlanded");
+        finish_row(&store);
+        let mut t = store.find_task("s-1").unwrap();
+        t.body = t.body.replace(crate::repair::LANDED, "wsp: nothing");
+        store.save_task(&t).unwrap();
+        tick(&store, &lone());
+        assert!(!seat_ended());
+    }
+
+    #[test]
+    fn a_first_seat_that_is_mid_turn_or_governs_is_left() {
+        let (_env, store) = staged_row("orig-left");
+        finish_row(&store);
+        let mut busy = lone();
+        busy.state.insert("cpd-7".into(), State::Working);
+        tick(&store, &busy);
+        assert!(!seat_ended(), "a turn passes by itself");
+
+        store.set_governor("run", serde_json::json!({ "workspace": "cpd-7", "pane": "cpd-7" }));
+        tick(&store, &lone());
+        assert!(!seat_ended(), "a governor seat is never ended");
+    }
+
+    #[test]
+    fn a_first_seat_a_person_typed_to_since_it_handed_over_is_left() {
+        let (_env, store) = staged_row("orig-typed");
+        finish_row(&store);
+        let mut typed = lone();
+        typed.typed.insert("cpd-7".into(), true);
+        tick(&store, &typed);
+        assert!(!seat_ended());
+        assert!(log_of(&store, "s-1").contains("original seat cpd-7 is left running"));
+    }
+
+    #[test]
+    fn a_first_seat_that_will_not_end_is_recorded_and_not_retried() {
+        let (_env, store) = staged_row("orig-fails");
+        finish_row(&store);
+        let mut seats = lone();
+        seats.survives = vec![702];
+        tick(&store, &seats);
+        tick(&store, &seats);
+        let log = log_of(&store, "s-1");
+        assert_eq!(log.matches("could not end original seat cpd-7").count(), 1, "{log}");
+        assert_eq!(drain(&DESPAWNED).iter().filter(|s| *s == "cpd-7").count(), 1, "tried once");
+    }
+
+    #[test]
+    fn release_records_the_seat_only_for_a_staged_row_at_doing() {
+        let (_env, store) = staged_row("handed");
+        let before = log_of(&store, "s-1");
+        handed_to_legs(&store, "s-1", "cpd-7", &serde_json::json!({ "leg": "finish" }));
+        assert_eq!(log_of(&store, "s-1"), before, "a leg's seat is not the row's first");
+        let mut plain = Task::new("p-1", "p-1");
+        plain.set_status(Status::Doing);
+        store.save_task(&plain).unwrap();
+        handed_to_legs(&store, "p-1", "cpd-8", &serde_json::json!({}));
+        assert!(!log_of(&store, "p-1").contains("handed the row"), "a row with no legs has no first seat to track");
     }
 
     #[test]

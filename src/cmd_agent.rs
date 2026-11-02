@@ -3491,6 +3491,9 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
     // looking held by a pane that no longer has a claim to stand on.
     let panes = store.panes_for_task(&t.id);
     for pane in &panes {
+        if let Some(binding) = store.bindings().get(pane) {
+            crate::ending::handed_to_legs(store, &t.id, pane, binding);
+        }
         if store.clear_binding(pane) {
             unname_after_task(store, pane, &t.id);
         }
@@ -3575,6 +3578,11 @@ fn end_claim(store: &Store, task_id: &str) {
 pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) {
     let had = store.bindings().get(pane).cloned();
     let mut released: Option<String> = None;
+    if let Some(binding) = &had {
+        if let Some(task_id) = binding.get("task_id").and_then(|t| t.as_str()) {
+            crate::ending::handed_to_legs(store, task_id, pane, binding);
+        }
+    }
     let removed = store.clear_binding(pane);
     if removed {
         if let Some(task_id) = had.as_ref().and_then(|b| b.get("task_id")).and_then(|t| t.as_str()) {
