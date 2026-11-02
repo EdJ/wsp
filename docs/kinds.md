@@ -100,7 +100,7 @@ file cannot hold (a cap from the row, a log directory, the row's checks), and it
 is not like the others because it is not an interactive agent: it answers once
 and exits. `Kind::program` names `wsp attend` as what a backend runs for it, so
 only the backends that fork or exec a program can host it; herdr cannot, and
-`--herdr` is refused. The whole account, and the opt-in a row must make, is the
+`--herdr` is refused. It is not in `wsp agent kinds` or the panel's menu, which list what a seat can be opened with by hand. The whole account, and the opt-in a row must make, is the
 README section *A packet row on the attention harness*.
 
 ## What is not built

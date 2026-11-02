@@ -896,13 +896,15 @@ pub struct Info {
     pub efforts: &'static [&'static str],
 }
 
-/// Every kind wsp has behaviour for: [`KNOWN`] in order, then data kinds by name.
+/// Every kind a seat can be opened with by hand: [`KNOWN`] in order, then data
+/// kinds by name. A kind that runs under a program of its own ([`Kind::program`])
+/// is a row's opt-in and not a menu entry, so it is not listed here.
 pub fn kinds() -> Vec<Info> {
     kinds_with(registry())
 }
 
 fn kinds_with(reg: &Registry) -> Vec<Info> {
-    let built_in = KNOWN.iter().map(|(name, k)| (*name, *k));
+    let built_in = KNOWN.iter().filter(|(_, k)| k.program().is_none()).map(|(name, k)| (*name, *k));
     let declared = reg.kinds.iter().map(|k| (k.name, *k as &'static dyn Kind));
     built_in
         .chain(declared)
