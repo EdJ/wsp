@@ -11,7 +11,13 @@
 //! however its agent went: the row is at `review` or `done`, holds no claim,
 //! nobody is standing in the tree (a verifier stands in its member's tree), and
 //! the tree's branch has nothing the trunk lacks — the work is landed. The row's
-//! own tree and its legs' trees (`<row>.<leg>`) are taken alike. A tree that
+//! own tree and its legs' trees (`<row>.<leg>`) are taken alike.
+//!
+//! **Until settled** (`wsp-341`): a member of a group wsp runs lands inside its
+//! verifier's `--holds`, in this very tree, so the warm `target/` is what the
+//! verifier and any re-verify after a block build on. For such a member the
+//! rule adds two conditions: its newest verification holds, and its group's
+//! barrier has passed. A row in no run keeps the rule above. A tree that
 //! fails any of it keeps its build output and `cycle.log` says why, once per
 //! daemon process.
 //!
@@ -24,7 +30,7 @@ use std::sync::Mutex;
 
 use crate::check_tree;
 use crate::cmd_checkout::{self, WORKTREES};
-use crate::model::Status;
+use crate::model::{Status, WorklistStatus};
 use crate::store::Store;
 use crate::util;
 
@@ -58,7 +64,7 @@ pub(crate) fn sweep(store: &Store, busy: &dyn Fn(&str, &Path) -> Option<String>)
                 out.push(Build::Kept { path, why });
                 continue;
             }
-            match unlanded(&repo, &dir) {
+            match unlanded(&repo, &dir).or_else(|| unsettled(store, row)) {
                 Some(why) => out.push(Build::Kept { path, why }),
                 None => match std::fs::remove_dir_all(&target) {
                     Ok(()) => out.push(Build::Dropped { path }),
@@ -78,6 +84,26 @@ fn unlanded(repo: &Path, dir: &Path) -> Option<String> {
     let Some(branch) = cmd_checkout::trunk_branch(dir) else { return Some("the tree is on a detached HEAD".into()) };
     let commits = cmd_checkout::ahead(&trunk, &onto, &branch);
     (!commits.is_empty()).then(|| format!("its branch {branch} has {} commit(s) {onto} has not — not landed", commits.len()))
+}
+
+/// Why a landed member of a group wsp runs is not settled, or `None` for a row
+/// in no such group. The barrier is read as `worklist::crossed` reads it: the
+/// group's ordinal is at or below the last verdict written on the list; a
+/// finished list has passed every barrier it had.
+fn unsettled(store: &Store, row: &str) -> Option<String> {
+    let tasks = store.tasks();
+    for w in store.worklists() {
+        let groups = w.groups();
+        let Some(i) = groups.iter().position(|g| g.members.iter().any(|m| m == row) && g.policy_for(row).is_some()) else {
+            continue;
+        };
+        if !crate::verification::verified(&tasks, row) {
+            return Some("its newest verification does not hold".into());
+        }
+        let passed = w.status() == WorklistStatus::Done || i + 1 <= crate::worklist::crossed(&groups);
+        return (!passed).then(|| "its group's barrier has not passed".into());
+    }
+    None
 }
 
 static SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -214,6 +240,43 @@ mod tests {
     fn a_done_row_loses_its_build_output_too() {
         let (_env, store, repo) = scratch("done", Status::Done);
         let row = tree_with_build(&repo, "p-001");
+        assert!(matches!(sweep(&store, &free).as_slice(), [Build::Dropped { .. }]));
+        assert!(!row.join("target").exists());
+    }
+
+    /// A landed member of a group wsp runs keeps its tree's `target/` until its
+    /// newest verification holds and its group's barrier has passed; a row in no
+    /// run keeps the old rule.
+    #[test]
+    fn a_landed_member_of_a_run_keeps_its_build_output_until_verified_and_its_barrier_passed() {
+        use crate::model::{Group, Worklist};
+        use crate::verification::{self, Pass, State};
+        let (_env, store, repo) = scratch("settled", Status::Review);
+        let row = tree_with_build(&repo, "p-001");
+        let mut w = Worklist::new("run", "r");
+        let group = Group { members: vec!["p-001".into()], agent: "claude sonnet medium".into(), ..Group::default() };
+        w.set_groups(&[group, Group { members: vec!["p-002".into()], ..Group::default() }]);
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+
+        let kept = |why: &str| match sweep(&store, &free).as_slice() {
+            [Build::Kept { why: got, .. }] => assert!(got.contains(why), "{got}"),
+            _ => panic!("expected the tree kept for {why}"),
+        };
+        kept("does not hold");
+
+        let mut t = store.task("p-001").unwrap();
+        let mut pass = Pass::opened(None, None);
+        pass.state = State::Holds;
+        verification::write(&mut t, &[pass]);
+        store.save_task(&t).unwrap();
+        kept("barrier has not passed");
+        assert!(row.join("target").exists());
+
+        let mut groups = w.groups();
+        groups[0].verdict = "holds".into();
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
         assert!(matches!(sweep(&store, &free).as_slice(), [Build::Dropped { .. }]));
         assert!(!row.join("target").exists());
     }
