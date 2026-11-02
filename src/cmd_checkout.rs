@@ -2505,11 +2505,19 @@ pub(crate) fn land_verdict(store: &Store, task: &str) -> Verdict {
         };
         let pulled_in = paths(&old_base, &new_base);
         let ours = paths(&old_base, &old_head);
-        let Some(t) = store.find_task(task) else { return Verdict::Nothing };
-        let Ok(tg) = crate::check::target(store, &t, Some(&new_head)) else { continue };
-        let tg = crate::check::Target { since: Some(old_base.clone()), ..tg };
-        let steps = crate::check::affected(&crate::check::plan(store, &t, &tg, Some(&new_head)).steps, &pulled_in, &ours);
+        let steps = match rerun_steps(store, task, &new_head, &old_base, &pulled_in, &ours) {
+            Ok(steps) => steps,
+            Err(why) => {
+                return Verdict::Blocked(format!(
+                    "wsp: {} moved and the rebase pulled in {} path(s), but the checks it can affect could not be planned: {why} — nothing was landed; \
+                     `wsp review` again once that is fixed",
+                    w.branch,
+                    pulled_in.len()
+                ))
+            }
+        };
         if steps.is_empty() {
+            // The one reason to run nothing: the plan was made and none of it is affected.
             continue;
         }
         let dir = store.state_file("checks").join(format!("{task}-tree"));
@@ -2530,6 +2538,24 @@ pub(crate) fn land_verdict(store: &Store, task: &str) -> Verdict {
         }
         reran.extend(steps.iter().map(|s| s.name.clone()));
     }
+}
+
+/// The checks a rebase onto a moved trunk can have affected. A rebase pulled the
+/// trunk in, so what it can have broken is owed a check: a check that cannot be
+/// planned is a land that checked nothing, and only an empty answer — planned,
+/// and none of it affected — may skip the run.
+pub(crate) fn rerun_steps(
+    store: &Store,
+    task: &str,
+    new_head: &str,
+    old_base: &str,
+    pulled_in: &[String],
+    ours: &[String],
+) -> Result<Vec<crate::check::Step>, String> {
+    let t = store.find_task(task).ok_or_else(|| format!("{task} is not in the store"))?;
+    let tg = crate::check::target(store, &t, Some(new_head))?;
+    let tg = crate::check::Target { since: Some(old_base.to_string()), ..tg };
+    Ok(crate::check::affected(&crate::check::plan(store, &t, &tg, Some(new_head)).steps, pulled_in, ours))
 }
 
 #[cfg(test)]

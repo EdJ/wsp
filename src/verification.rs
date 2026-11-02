@@ -1649,6 +1649,34 @@ mod tests {
         assert_eq!(git_t(&g.tree, &["rev-parse", "HEAD"]), g.ready, "and is as the member left it");
     }
 
+    /// `wsp-346`: a check target that cannot be resolved after the rebase is a
+    /// land that checked nothing, so it is an error with the reason named —
+    /// which `land_verdict` turns into a block — and only a plan with nothing
+    /// affected is an empty answer.
+    #[test]
+    fn checks_that_cannot_be_planned_after_the_trunk_moved_are_an_error_not_an_empty_plan() {
+        let g = ground("noplan", "- src on src/**: echo src >> RAN", &[("m.txt", "mine\n")], &[("src/a.txt", "theirs\n")]);
+        let base = git_t(&g.tree, &["merge-base", "master", "HEAD"]);
+        git_t(&g.tree, &["rebase", "master"]);
+        let head = git_t(&g.tree, &["rev-parse", "HEAD"]);
+        let pulled = vec!["src/a.txt".to_string()];
+        let ours = vec!["m.txt".to_string()];
+        let rerun = |id: &str| crate::cmd_checkout::rerun_steps(&g.store, id, &head, &base, &pulled, &ours);
+
+        let steps = rerun("m-1").expect("a plannable row");
+        assert_eq!(steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["src"]);
+        let none = crate::cmd_checkout::rerun_steps(&g.store, "m-1", &head, &base, &["other.txt".to_string()], &ours);
+        assert_eq!(none.expect("planned").len(), 0, "none affected is an empty answer");
+
+        let mut t = g.member();
+        t.project = Some("gone".into());
+        g.store.save_task(&t).unwrap();
+        let why = rerun("m-1").unwrap_err();
+        assert!(why.contains("no roots"), "the reason is named: {why}");
+        assert!(rerun("nobody-1").unwrap_err().contains("not in the store"));
+        assert_eq!(g.reran(), "", "and no check ran");
+    }
+
     #[test]
     fn a_trunk_that_keeps_moving_blocks_after_three_rounds() {
         let mover = "- always: n=$(ls REPO | wc -l | tr -d ' '); echo $n > REPO/g$n; git -C REPO add g$n; git -C REPO -c user.name=t -c user.email=t@t commit -qm g$n";
