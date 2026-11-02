@@ -290,34 +290,111 @@ pub(crate) fn left(r: &Reading) -> Option<Left> {
 /// off the **open** lists alone — their groups that wsp runs — and the verdict
 /// off the member.
 pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
-    let lists: Vec<Worklist> = store
-        .worklists()
-        .into_iter()
-        .filter(|w| matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked))
-        .collect();
+    let lists = open_lists(store);
     let mut tasks = None;
     let mut asks = None;
+    let mut seated = std::collections::BTreeSet::new();
     for id in seated_rows(store) {
+        seated.insert(id.clone());
         let Some(m) = store.find_task(&id) else { continue };
-        if m.status() != Status::Review || m.tags.iter().any(|g| g == crate::cycle::VERIFY_TAG || g == crate::cycle::BARRIER_TAG) {
+        let Some(h) = due(store, &lists, &mut tasks, &m) else { continue };
+        let Some(seat) = seat_of(store, &id) else {
+            // Settled, and bound to no seat: nothing here can be asked or confirmed,
+            // and `repair`'s gone-member pass is the one that says so.
             continue;
-        }
-        if crate::legs::staged(&m) {
-            continue;
-        }
-        let w = lists.iter().find(|w| w.groups().iter().any(|g| g.members.contains(&m.id)));
-        let owed = w.is_some_and(|w| w.groups().iter().any(|g| g.members.contains(&m.id) && g.policy_for(&m.id).is_some()));
-        let tasks = tasks.get_or_insert_with(|| store.tasks());
-        let Some(h) = settled(tasks, &m, owed) else { continue };
-        if ended(&m, &h) || failed(&m, &h.commit) {
-            continue;
-        }
+        };
+        let w = list_of_member(&lists, &m.id);
         let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
-        if end_one(store, seats, w, &m.id, &h, asks) {
+        if end_one(store, seats, w, &m.id, &seat, &h, asks) {
             record_ended(store, &m.id, &h);
         }
     }
+    released_seats(store, seats, &lists, &seated, &mut tasks, &mut asks);
     original_seats(store, seats);
+}
+
+fn open_lists(store: &Store) -> Vec<Worklist> {
+    store
+        .worklists()
+        .into_iter()
+        .filter(|w| matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked))
+        .collect()
+}
+
+fn list_of_member<'a>(lists: &'a [Worklist], member: &str) -> Option<&'a Worklist> {
+    lists.iter().find(|w| w.groups().iter().any(|g| g.members.contains(&member.to_string())))
+}
+
+/// The member's settlement when it is one to end an agent for, and not already
+/// ended or failed: at `review`, no verifier or barrier row, not a staged row.
+fn due(store: &Store, lists: &[Worklist], tasks: &mut Option<Vec<Task>>, m: &Task) -> Option<Holds> {
+    if m.status() != Status::Review || m.tags.iter().any(|g| g == crate::cycle::VERIFY_TAG || g == crate::cycle::BARRIER_TAG) {
+        return None;
+    }
+    if crate::legs::staged(m) {
+        return None;
+    }
+    let owed = list_of_member(lists, &m.id)
+        .is_some_and(|w| w.groups().iter().any(|g| g.members.contains(&m.id) && g.policy_for(&m.id).is_some()));
+    let tasks = tasks.get_or_insert_with(|| store.tasks());
+    let h = settled(tasks, m, owed)?;
+    (!ended(m, &h) && !failed(m, &h.commit)).then_some(h)
+}
+
+/// **The members whose seat nobody holds a record of.** A pane released at
+/// review has neither claim nor binding, so [`seated_rows`] cannot see it and
+/// it stood open, idle, for as long as the row waited for `wsp done` — five
+/// panes and 1.9 GB on 2026-11-02, `wsp-340`.
+///
+/// Found from the other side: each pane the backends hold whose label opens
+/// with a task's id, kept only where that task's last claim was made from this
+/// very pane and let go of. A pane another row has claimed or is bound to is
+/// that row's. Ended by [`end_one`], with all its rules.
+fn released_seats(
+    store: &Store,
+    seats: &dyn Seats,
+    lists: &[Worklist],
+    seated: &std::collections::BTreeSet<String>,
+    tasks: &mut Option<Vec<Task>>,
+    asks: &mut Option<crate::waiting::Asks>,
+) {
+    let Some(census) = seats.census() else { return };
+    let held = held_seats(store);
+    for (seat, label) in census {
+        let id = label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string();
+        if held.contains(&seat) || seated.contains(&id) {
+            continue;
+        }
+        let Some(m) = store.find_task(&id) else { continue };
+        if !released_from(&m, &seat) {
+            continue;
+        }
+        let Some(h) = due(store, lists, tasks, &m) else { continue };
+        let w = list_of_member(lists, &m.id);
+        let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
+        if end_one(store, seats, w, &m.id, &seat, &h, asks) {
+            record_ended(store, &m.id, &h);
+        }
+    }
+}
+
+/// Whether the member's last claim was made from `seat` and has been let go.
+fn released_from(m: &Task, seat: &str) -> bool {
+    crate::cmd_attempts::attempts_of(m)
+        .iter()
+        .rfind(|a| a.leg.is_none())
+        .is_some_and(|a| a.pane == seat && !a.until.is_empty())
+}
+
+/// Every seat a binding or a claim's agent holds.
+fn held_seats(store: &Store) -> std::collections::BTreeSet<String> {
+    let mut out: std::collections::BTreeSet<String> = store.bindings().into_keys().collect();
+    let agents = store.agents_held();
+    for claim in store.claims().values() {
+        let seat = claim.get("agent_id").and_then(|a| a.as_str()).and_then(|a| agents.get(a)).and_then(|a| a.get("seat")?.as_str());
+        out.extend(seat.map(str::to_string));
+    }
+    out
 }
 
 /// Every row a seat is held for: by a claim or by a binding that is not a leg's,
@@ -364,30 +441,25 @@ fn failed(m: &Task, commit: &str) -> bool {
 
 /// End the member's agent if nothing says leave it. `true` when it was ended
 /// and confirmed gone.
-fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str, h: &Holds, asks: &crate::waiting::Asks) -> bool {
-    let Some(seat) = seat_of(store, member) else {
-        // Settled, and bound to no seat: nothing here can be asked or confirmed,
-        // and `repair`'s gone-member pass is the one that says so.
-        return false;
-    };
-    let state = seats.state(&seat);
+fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str, seat: &str, h: &Holds, asks: &crate::waiting::Asks) -> bool {
+    let state = seats.state(seat);
     let shells = match state {
-        Some(State::Idle) => seats.shells(&[&seat]),
+        Some(State::Idle) => seats.shells(&[seat]),
         _ => Default::default(),
     };
     let reading = Reading {
         state,
         // An agent with a shell of its own still running is not ended under
         // it: ending is the group signalled, and that is the shell killed.
-        wait: crate::waiting::reading(state, asks, &shells, &seat, member),
-        governs: crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(seat.as_str())),
-        typed: seats.turn_began_since(&seat, h.at),
-        pids: seats.pids(&seat),
+        wait: crate::waiting::reading(state, asks, &shells, seat, member),
+        governs: crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(seat)),
+        typed: seats.turn_began_since(seat, h.at),
+        pids: seats.pids(seat),
     };
     let by = w.map_or(member, |w| w.id.as_str());
     if let Some(why) = left(&reading) {
         if !why.passes() {
-            say_left(store, w, member, &seat, &why, h);
+            say_left(store, w, member, seat, &why, h);
         }
         return false;
     }
@@ -395,7 +467,7 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     let claimed = store.claims().contains_key(member);
     let ending = match claimed {
         true => crate::cycle::despawned(store, member),
-        false => crate::cycle::despawn_seat(&seat),
+        false => crate::cycle::despawn_seat(seat),
     };
     match ending.and_then(|()| confirm_gone(seats, &pids)) {
         Ok(()) => {
@@ -403,7 +475,7 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
             true
         }
         Err(why) => {
-            not_ended(store, w, member, &seat, h, &why);
+            not_ended(store, w, member, seat, h, &why);
             false
         }
     }
@@ -650,6 +722,7 @@ mod tests {
         typed: BTreeMap<String, bool>,
         pids: BTreeMap<String, Vec<u32>>,
         survives: Vec<u32>,
+        census: Option<Vec<(String, String)>>,
     }
 
     impl Fake {
@@ -683,6 +756,9 @@ mod tests {
         }
         fn running(&self, pids: &[u32]) -> Vec<u32> {
             pids.iter().copied().filter(|p| self.survives.contains(p)).collect()
+        }
+        fn census(&self) -> Option<Vec<(String, String)>> {
+            self.census.clone()
         }
     }
 
@@ -893,6 +969,66 @@ mod tests {
         assert!(!log.contains("ended: verification holds"), "the seat closed and pid 102 did not: {log}");
         assert!(log.contains("pid 102 is still running"), "{log}");
         assert_eq!(drain(&TOLD).iter().filter(|t| t.contains("102")).count(), 1);
+    }
+
+    /// `m-1` as `wsp-340` found five: landed, at review, its verdict holding, and
+    /// its claim and binding let go — the pane still open at `cpd-1`.
+    fn released(tag: &str) -> (util::Isolated, Store, Fake) {
+        let (env, store) = verified(tag);
+        let mut m = store.find_task("m-1").unwrap();
+        m.log("claimed by pane cpd-1 · spawned at sonnet/high");
+        m.log("released after 1h · ran sonnet-5-5/high · 9 turns");
+        store.save_task(&m).unwrap();
+        store.clear_claim("m-1");
+        store.clear_binding("cpd-1");
+        let mut seats = Fake::at_rest();
+        seats.census = Some(vec![("cpd-1".into(), "m-1 · title".into())]);
+        (env, store, seats)
+    }
+
+    #[test]
+    fn a_pane_released_at_review_is_ended_once() {
+        let (_env, store, seats) = released("released");
+        tick(&store, &seats);
+        assert!(drain(&DESPAWNED).contains(&"cpd-1".to_string()), "no claim and no binding to find it by, and it is ended");
+        assert_eq!(log_of(&store, "m-1").matches("ended: verification holds at abc1234").count(), 1);
+        tick(&store, &seats);
+        assert!(drain(&DESPAWNED).is_empty(), "the row's record makes it once");
+    }
+
+    #[test]
+    fn a_released_pane_another_row_holds_is_not_the_members() {
+        let (_env, store, seats) = released("released-taken");
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-2" }));
+        tick(&store, &seats);
+        assert!(drain(&DESPAWNED).is_empty(), "the pane went on to another row");
+    }
+
+    #[test]
+    fn a_pane_that_was_never_the_members_claim_or_is_labelled_for_another_row_is_left() {
+        let (_env, store, mut seats) = released("released-other");
+        seats.census = Some(vec![("cpd-1".into(), "m-2 · title".into())]);
+        tick(&store, &seats);
+        assert!(drain(&DESPAWNED).is_empty(), "labelled for another row");
+        seats.census = Some(vec![("cpd-9".into(), "m-1 · title".into())]);
+        seats.state.insert("cpd-9".into(), State::Idle);
+        tick(&store, &seats);
+        assert!(drain(&DESPAWNED).is_empty(), "its claim was made from cpd-1, not cpd-9");
+    }
+
+    #[test]
+    fn a_released_pane_mid_turn_is_left() {
+        let (_env, store, seats) = released("released-turn");
+        tick(&store, &seats.with("cpd-1", State::Working));
+        assert!(drain(&DESPAWNED).is_empty());
+    }
+
+    #[test]
+    fn a_released_pane_with_no_census_is_left() {
+        let (_env, store, mut seats) = released("released-blind");
+        seats.census = None;
+        tick(&store, &seats);
+        assert!(drain(&DESPAWNED).is_empty(), "nobody answered, so there is nothing to sweep");
     }
 
     fn verifier_ending(store: &Store) -> Ending {

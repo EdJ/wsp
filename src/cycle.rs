@@ -230,6 +230,14 @@ pub(crate) trait Seats {
     fn running(&self, pids: &[u32]) -> Vec<u32> {
         crate::place_super::alive(pids).into_iter().collect()
     }
+
+    /// Every seat the backends here hold, with its label — for the sweeps that
+    /// look for a pane by what it is called because no record names it. `None`
+    /// where no backend answered, and the default, for [`Seats::absent`]'s
+    /// reason: a sweep over a census it never took ends nothing.
+    fn census(&self) -> Option<Vec<(String, String)>> {
+        None
+    }
 }
 
 /// The real reading, over the backends on this machine — with opencode's own
@@ -317,6 +325,22 @@ impl Seats for Fleet {
 
     fn resend(&self, seat: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
         crate::cmd_message::type_at(seat, text)
+    }
+
+    fn census(&self) -> Option<Vec<(String, String)>> {
+        let herdr_here = crate::herdr::available_now();
+        let mut heard = false;
+        let mut out = Vec::new();
+        for (backend, name) in crate::cmd_spawn::local_backends().into_iter().zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES) {
+            if name == "herdr" && !herdr_here {
+                continue;
+            }
+            if let Ok(census) = backend.census() {
+                heard = true;
+                out.extend(census.seats().map(|s| (s.seat.as_str().to_string(), s.label.clone())));
+            }
+        }
+        heard.then_some(out)
     }
 }
 
@@ -3154,6 +3178,58 @@ pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     out
 }
 
+/// Seats whose ending failed here, so a pane that will not close is tried once
+/// a daemon's lifetime and not once a minute.
+static ORPHAN_NOT_ENDED: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// **A check pane no entry names, ended once its group's barrier has settled.**
+/// `checks_finished` can only end the seat an entry records, and a start that
+/// was retried records only the retry's: on 2026-11-02 `stability · barrier 4`
+/// stood idle in the first try's pane after the second try's check passed the
+/// barrier (`wsp-340`).
+///
+/// Found by label ([`crate::barrier::seat_label`]) among the backends' panes.
+/// Not while the group has a check still open — the pane may be the one
+/// reading it — and not a pane mid-turn.
+pub(crate) fn checks_orphaned(store: &Store, seats: &dyn Seats) -> Vec<String> {
+    let Some(census) = seats.census() else { return Vec::new() };
+    let lists = store.worklists();
+    let named: std::collections::BTreeSet<String> = lists
+        .iter()
+        .flat_map(|w| w.groups())
+        .flat_map(|g| g.checks)
+        .filter(|c| c.standing().is_some() || c.ending == crate::barrier::Ending::Failed)
+        .filter_map(|c| c.pane)
+        .collect();
+    let mut out = Vec::new();
+    for (seat, label) in census {
+        let Some((list, at)) = crate::barrier::parse_label(&label) else { continue };
+        if named.contains(&seat) {
+            continue;
+        }
+        let Some(w) = lists.iter().find(|w| w.id == list) else { continue };
+        let Some(g) = w.groups().into_iter().nth(at - 1) else { continue };
+        let settled = w.status() == WorklistStatus::Done || (g.checks.iter().any(|c| !c.open()) && !g.checks.iter().any(|c| c.open()));
+        if !settled || seats.state(&seat) != Some(State::Idle) {
+            continue;
+        }
+        if ORPHAN_NOT_ENDED.lock().is_ok_and(|failed| failed.contains(&seat)) {
+            continue;
+        }
+        log_line(store, &format!("{list}: the check in {seat} outlived its barrier {at} — ending it"));
+        match despawn_seat(&seat) {
+            Ok(()) => out.push(seat),
+            Err(why) => {
+                log_line(store, &format!("{list}: the check in {seat} was not ended: {} — not tried again", util::truncate(&why, 200)));
+                if let Ok(mut failed) = ORPHAN_NOT_ENDED.lock() {
+                    failed.insert(seat);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `wsp despawn --pane <seat>`, as a process — a verifier holds no claim, so
 /// its seat is the only handle there is.
 ///
@@ -5662,6 +5738,64 @@ fn only_a_working_screen_is_ever_overruled() {
         l.set_status(WorklistStatus::Done);
         store.save_worklist(&l).unwrap();
         assert_eq!(checks_finished(&store, &Blind), vec!["cpd-open".to_string()]);
+    }
+
+    /// Panes the backends hold, all idle, each with its label.
+    struct Panes(Vec<(&'static str, &'static str)>);
+
+    impl Seats for Panes {
+        fn state(&self, seat: &str) -> Option<State> {
+            self.0.iter().any(|(s, _)| *s == seat).then_some(State::Idle)
+        }
+        fn census(&self) -> Option<Vec<(String, String)>> {
+            Some(self.0.iter().map(|(s, l)| (s.to_string(), l.to_string())).collect())
+        }
+    }
+
+    /// `wsp-340`: the first try's pane of a check whose retry passed the
+    /// barrier is named by no entry, and stood open for ever.
+    #[test]
+    fn a_check_pane_no_entry_names_is_ended_once_its_barrier_settled() {
+        let (_env, store) = scratch("orphancheck");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        check_seated(&store, 1, "cpd-retry");
+        let panes = Panes(vec![("cpd-first", "run · barrier 1"), ("cpd-retry", "run · barrier 1"), ("cpd-other", "run · barrier 2"), ("cpd-1", "m-1 · work")]);
+
+        assert!(checks_orphaned(&store, &panes).is_empty(), "the check is still open: the pane may be reading it");
+
+        crate::barrier::settle(&store, "run", 1, crate::barrier::State::Passes);
+        assert_eq!(checks_orphaned(&store, &panes), vec!["cpd-first".to_string()], "not the recorded seat, not another group's, not a member's");
+        assert_eq!(tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()), vec!["cpd-first".to_string()]);
+        assert!(checks_orphaned(&store, &Panes(vec![("cpd-retry", "run · barrier 1")])).is_empty(), "the recorded seat is checks_finished's");
+    }
+
+    #[test]
+    fn an_orphan_check_pane_mid_turn_or_unlisted_is_left() {
+        let (_env, store) = scratch("orphanturn");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        crate::barrier::settle(&store, "run", 1, crate::barrier::State::Passes);
+        assert!(checks_orphaned(&store, &Blind).is_empty(), "nobody answered the census");
+        let working = Fixed::new(&[("cpd-first", State::Working)]);
+        struct Mid(Fixed);
+        impl Seats for Mid {
+            fn state(&self, seat: &str) -> Option<State> {
+                self.0.state(seat)
+            }
+            fn census(&self) -> Option<Vec<(String, String)>> {
+                Some(vec![("cpd-first".into(), "run · barrier 1".into())])
+            }
+        }
+        assert!(checks_orphaned(&store, &Mid(working)).is_empty(), "a turn in flight is not ended");
     }
 
     /// Everything written before `wsp-134`, and a group somebody turned off,

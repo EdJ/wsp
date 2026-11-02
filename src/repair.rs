@@ -292,7 +292,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     }
     // And every barrier check whose verdict is in (`wsp-230`): it holds no
     // claim either, so the claim-keyed ending above never sees one.
-    let ended = crate::cycle::checks_finished(store, seats);
+    let mut ended = crate::cycle::checks_finished(store, seats);
+    ended.extend(crate::cycle::checks_orphaned(store, seats));
     if !ended.is_empty() {
         stamp(store, &format!("barrier check seat(s) with nothing left to do, ended: {}", ended.join(" ")));
     }

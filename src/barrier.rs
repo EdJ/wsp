@@ -315,6 +315,12 @@ pub(crate) fn seat_label(list: &str, at: usize) -> String {
     format!("{list} · barrier {at}")
 }
 
+/// The list and group a seat's label names, if it is a check's ([`seat_label`]).
+pub(crate) fn parse_label(label: &str) -> Option<(&str, usize)> {
+    let (list, at) = label.trim().split_once(" · barrier ")?;
+    Some((list, at.trim().parse().ok().filter(|at| *at >= 1)?))
+}
+
 /// The name a check's brief file and tree are kept under, as a verifier's is
 /// `<member>-verify`.
 pub(crate) fn subject(list: &str, at: usize) -> String {
