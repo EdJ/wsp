@@ -73,8 +73,14 @@ if [ -z "${COMPOUND_NO_SCCACHE:-}" ]; then
         /opt/homebrew/bin/sccache
     do
         if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            # Not `exec`: sccache exits 2 when it cannot reach or start its server ("failed to
+            # execute compile", "failed to fill whole buffer"), which rustc itself does not do, and
+            # a build must not depend on a cache server that died (wsp-343). Fall back to the compiler.
             COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$root" \
-                exec "$candidate" "$here/rustc-remap" "$@"
+                "$candidate" "$here/rustc-remap" "$@"
+            rc=$?
+            [ "$rc" = 2 ] || exit "$rc"
+            break
         fi
     done
 fi
