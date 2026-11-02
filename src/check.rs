@@ -409,7 +409,7 @@ pub(crate) struct Target {
 pub(crate) fn target(store: &Store, t: &Task, at: Option<&str>) -> Result<Target, String> {
     let sha = match at {
         Some(a) => a.to_string(),
-        None => crate::repair::landed(t).ok_or_else(|| format!("{} has no landing recorded — `wsp check {} --at <commit>` names one", t.id, t.id))?,
+        None => crate::repair::commit_of(t).ok_or_else(|| format!("{} has no landing recorded — `wsp check {} --at <commit>` names one", t.id, t.id))?,
     };
     let project = project_of(t).ok_or_else(|| format!("{} belongs to no project", t.id))?;
     let mut roots = Vec::new();
@@ -432,6 +432,18 @@ pub(crate) fn target(store: &Store, t: &Task, at: Option<&str>) -> Result<Target
         }
     }
     Err(format!("{sha} is in none of {project}'s roots ({})", roots.join(", ")))
+}
+
+/// The member's own tree, when the commit to check is the ready commit it
+/// stands at: the checks run there, in its warm `target/`, and not in a tree of
+/// wsp's own. A named commit (`--at`) is a look elsewhere and is never run here.
+fn member_tree_at(store: &Store, t: &Task, sha: &str, named: bool) -> Option<PathBuf> {
+    if named || !crate::repair::ready(t).is_some_and(|r| v::same_commit(&r, sha)) {
+        return None;
+    }
+    let tree = crate::cmd_checkout::member_tree(store, &t.id)?;
+    let head = git(&tree, &["rev-parse", "HEAD"])?;
+    v::same_commit(head.trim(), sha).then_some(tree)
 }
 
 pub(crate) fn dir_of(store: &Store, tg: &Target) -> PathBuf {
@@ -864,16 +876,25 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         (false, _) => None,
     };
 
-    let dir = dir_of(store, &tg);
-    let tree = dir.join("tree");
+    let own = member_tree_at(store, &t, &tg.sha, at.is_some());
+    let (dir, tree) = match &own {
+        Some(own) => (store.state_file("checks").join(format!("{}-tree", t.id)), own.clone()),
+        None => {
+            let dir = dir_of(store, &tg);
+            let tree = dir.join("tree");
+            (dir, tree)
+        }
+    };
     let started = Instant::now();
     let lock = match TreeLock::take(dir.join("lock"), TREE_WAIT) {
         Ok(l) => l,
         Err(why) => return gave_up(store, &t.id, entry.as_deref(), &why),
     };
-    if let Err(why) = checkout(&tg.repo, &tree, &tg.sha) {
-        drop(lock);
-        return gave_up(store, &t.id, entry.as_deref(), &format!("could not put {} in {}: {why}", &tg.sha[..12], util::contract(&tree)));
+    if own.is_none() {
+        if let Err(why) = checkout(&tg.repo, &tree, &tg.sha) {
+            drop(lock);
+            return gave_up(store, &t.id, entry.as_deref(), &format!("could not put {} in {}: {why}", &tg.sha[..12], util::contract(&tree)));
+        }
     }
     if !auto && !args.json() {
         println!("{} {} at {} in {}", p.dim("checking"), p.bold(&t.id), &tg.sha[..12], util::contract(&tree));
@@ -1107,7 +1128,7 @@ pub(crate) enum Gate {
 /// finished, either way: a pass opens the way, and a failure has already sent
 /// the member back, so one at review again was answered by a person.
 pub(crate) fn gate(store: &Store, member: &Task) -> Gate {
-    let Some(sha) = crate::repair::landed(member) else { return Gate::Clear };
+    let Some(sha) = crate::repair::commit_of(member) else { return Gate::Clear };
     let same = |read: &Option<String>| read.as_deref().is_some_and(|x| v::same_commit(x, &sha));
     let mine = v::runs(member).into_iter().rev().find(|r| same(&r.read));
     if mine.as_ref().is_some_and(|r| r.state != RunState::Running) {

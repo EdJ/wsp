@@ -889,6 +889,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         // mixed group is the member's own line and not the group's.
         let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
         let label = crate::verification::seat_label(&member.id);
+        if !prepare_ready(store, &w.id, at, &member) {
+            continue;
+        }
+        let member = store.find_task(&member.id).unwrap_or(member);
         // Before any agent reads it: the mechanical checks, which need none.
         if crate::check::gate(store, &member) == crate::check::Gate::Wait {
             continue;
@@ -1821,6 +1825,50 @@ pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
 /// deliberately: design-only work has no repository, and a member whose fix is
 /// prose has genuinely changed when it is touched. That is also why a pass's
 /// own bookkeeping never touches the member — see [`crate::verification`].
+/// Before a pass opens on a ready member (`wsp-341`): its branch rebased onto
+/// the trunk in its own tree, and the new head written as a fresh ready line so
+/// the checks and the verifier read the rebased commit. `false` when the member
+/// is not to have a pass this tick — a verifier is already standing in the tree,
+/// or the rebase did not apply and the member was sent back (once: it is at
+/// `doing` after, and owes nothing). No agent is spent.
+fn prepare_ready(store: &Store, list: &str, at: usize, member: &Task) -> bool {
+    use crate::cmd_checkout::Prepared;
+    if crate::repair::ready(member).is_none() {
+        return true;
+    }
+    let tasks = store.tasks_shared();
+    if crate::verification::all(&tasks, member).last().is_some_and(|p| p.state == crate::verification::State::Running) {
+        return true;
+    }
+    match crate::cmd_checkout::rebase_ready(store, &member.id) {
+        Prepared::Unchanged => true,
+        Prepared::Rebased { head, branch } => {
+            store.locked(|| {
+                if let Some(mut m) = store.find_task(&member.id) {
+                    m.log(&format!("{} {head} on {branch}", crate::repair::READY));
+                    let _ = store.save_task(&m);
+                }
+            });
+            log_line(store, &format!("{list} group {at}: {} rebased onto the trunk, ready at {}", member.id, &head[..head.len().min(12)]));
+            store.git_commit(&format!("wsp: {} rebased onto the trunk before its verifier", member.id));
+            true
+        }
+        Prepared::Refused(text) => {
+            let read = crate::repair::ready(member);
+            store.locked(|| {
+                if let Some(mut m) = store.find_task(&member.id) {
+                    crate::verification::send_back(&mut m, util::now_iso(), "wsp's rebase", read.as_deref(), &text, None);
+                    let _ = store.save_task(&m);
+                }
+            });
+            crate::verification::deliver_unless_reworked(store, &member.id, &text);
+            log_line(store, &format!("{list} group {at}: {} sent back — {}", member.id, crate::cmd_task::fold(&text)));
+            store.git_commit(&format!("wsp: {} sent back — the rebase onto the trunk does not apply", member.id));
+            false
+        }
+    }
+}
+
 fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::commit_of(member);
@@ -5235,6 +5283,84 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert_eq!(passes_on(&store, "m-1").len(), 1, "a hold on the same ready commit is not re-verified");
         let _ = spawned();
+    }
+
+    /// A project over a repository with member `m-1` in its own tree, one commit
+    /// ahead of a trunk that has since gained `trunk_file` (`wsp-341`).
+    fn ready_tree(tag: &str, member_file: &str, trunk_file: &str) -> (util::Isolated, Store, std::path::PathBuf, crate::model::Worklist) {
+        let (env, store) = scratch(tag);
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C").arg(dir).args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&repo, &["init", "-q", "-b", "master"]);
+        std::fs::write(repo.join("f"), "base\n").unwrap();
+        git(&repo, &["add", "f"]);
+        git(&repo, &["commit", "-q", "-m", "first"]);
+        let tree = repo.join(crate::cmd_checkout::WORKTREES).join("m-1");
+        git(&repo, &["worktree", "add", "-q", "-b", "m-1", &tree.display().to_string()]);
+        std::fs::write(tree.join(member_file), "member\n").unwrap();
+        git(&tree, &["add", "."]);
+        git(&tree, &["commit", "-q", "-m", "work"]);
+        std::fs::write(repo.join(trunk_file), "trunk\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "trunk moved"]);
+        let tip = git(&tree, &["rev-parse", "HEAD"]);
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        task(&store, "m-1", Status::Review);
+        let mut m = store.find_task("m-1").unwrap();
+        m.project = Some("p".into());
+        m.log(&format!("{} {tip} on m-1", crate::repair::READY));
+        store.save_task(&m).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        (env, store, tree, w)
+    }
+
+    /// `wsp-341`: the trunk moved after the member went ready. The step rebases
+    /// the member's tree onto it, writes a fresh ready line, and the pass reads
+    /// the rebased commit; a second tick changes nothing.
+    #[test]
+    fn a_pass_opens_on_the_rebased_commit() {
+        let (_env, store, tree, w) = ready_tree("rebase-clean", "g", "h");
+        let before = crate::repair::ready(&store.find_task("m-1").unwrap()).unwrap();
+        step(&store, &w, &Blind);
+        let head = String::from_utf8(std::process::Command::new("git").arg("-C").arg(&tree).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap();
+        let head = head.trim();
+        assert!(!crate::verification::same_commit(head, &before), "the branch moved");
+        let m = store.find_task("m-1").unwrap();
+        assert!(crate::verification::same_commit(&crate::repair::ready(&m).unwrap(), head), "a fresh ready line names the rebased head");
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.len(), 1);
+        assert!(crate::verification::same_commit(ps[0].read.as_deref().unwrap(), head), "the pass reads the rebased commit");
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 1, "an idempotent tick");
+        assert_eq!(store.find_task("m-1").unwrap().section("Log").unwrap().matches(crate::repair::READY).count(), 2, "one new ready line, no more");
+        let _ = spawned();
+    }
+
+    /// `wsp-341`: a rebase that does not apply is aborted, the member is sent
+    /// back with the reason, and no pass opens.
+    #[test]
+    fn a_rebase_that_does_not_apply_sends_the_member_back_and_spends_no_agent() {
+        let (_env, store, tree, w) = ready_tree("rebase-conflict", "f", "f");
+        step(&store, &w, &Blind);
+        let m = store.find_task("m-1").unwrap();
+        assert_eq!(m.status(), Status::Doing, "sent back");
+        assert!(m.section("Log").unwrap().contains("does not apply"), "{}", m.section("Log").unwrap());
+        assert!(passes_on(&store, "m-1").is_empty(), "no verifier pass");
+        assert!(spawned().iter().all(|(label, _)| !label.contains("verifying")), "no verifier agent");
+        let st = String::from_utf8(std::process::Command::new("git").arg("-C").arg(&tree).args(["status", "--porcelain"]).output().unwrap().stdout).unwrap();
+        assert!(st.trim().is_empty(), "the rebase was aborted: {st}");
     }
 
     /// `wsp-136` item 1. A note on a member is somebody **saying** something

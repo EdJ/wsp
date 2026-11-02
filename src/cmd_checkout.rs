@@ -2152,6 +2152,54 @@ pub(crate) fn ready_at(store: &Store, task: &str) -> Result<Option<(String, Stri
     Ok(git(&w.dir, &["rev-parse", "HEAD"]).map(|sha| (sha.trim().to_string(), branch)))
 }
 
+/// What preparing a ready member's tree for its verifier found.
+pub(crate) enum Prepared {
+    /// No tree for the task, or the branch already sits on the trunk's tip.
+    Unchanged,
+    /// The branch was rebased onto the trunk; the member is ready at this commit now.
+    Rebased { head: String, branch: String },
+    /// The tree cannot be rebased: what to send the member back with.
+    Refused(String),
+}
+
+/// The tree wsp made for `task`, when it is there.
+pub(crate) fn member_tree(store: &Store, task: &str) -> Option<PathBuf> {
+    let repos = candidates(store, Path::new("/"), task);
+    let w = pick(repos, task).ok()?;
+    w.dir.join(".git").exists().then_some(w.dir)
+}
+
+/// Before a pass opens on a ready member: its branch rebased onto the trunk in
+/// its own tree, which has the warm `target/`. Idempotent — a branch already on
+/// the trunk's tip is left alone and costs one `merge-base` call. A conflict is
+/// aborted so the tree is as the member left it.
+pub(crate) fn rebase_ready(store: &Store, task: &str) -> Prepared {
+    let repos = candidates(store, Path::new("/"), task);
+    let Ok(w) = pick(repos, task) else { return Prepared::Unchanged };
+    if !w.dir.join(".git").exists() {
+        return Prepared::Unchanged;
+    }
+    let Some(branch) = w.on() else { return Prepared::Unchanged };
+    let tree = util::contract(&w.dir);
+    if dirty(&w.dir) {
+        return Prepared::Refused(format!(
+            "wsp: {tree} has uncommitted work, so the rebase onto {} could not be made — commit it (`wsp commit-help`), then `wsp review` again",
+            w.branch
+        ));
+    }
+    if git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_ok() {
+        return Prepared::Unchanged;
+    }
+    if let Err(e) = git_ok(&w.dir, &["rebase", &w.branch]) {
+        let said = abort_rebase(&w.dir, &w.branch, &e);
+        return Prepared::Refused(format!("wsp: {said}\nresolve it in {tree}, then `wsp review` again"));
+    }
+    match git(&w.dir, &["rev-parse", "HEAD"]) {
+        Some(head) => Prepared::Rebased { head: head.trim().to_string(), branch },
+        None => Prepared::Unchanged,
+    }
+}
+
 /// A rebase the run started for a seat that is idle or gone and that did not
 /// apply (`wsp-328`): put back, so the tree is as the member left it and not
 /// stopped mid-rebase for whoever opens it next. Nobody is in the tree to
