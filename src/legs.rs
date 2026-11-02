@@ -515,6 +515,12 @@ fn name_ok(n: &str) -> bool {
         && n != "-"
 }
 
+/// The legs a row carries against [`MAX_LEGS`]: every one but a skipped leg,
+/// which never ran and carries no work (`wsp-359`).
+pub(crate) fn carried(legs: &[Leg]) -> usize {
+    legs.iter().filter(|l| l.state != State::Skipped).count()
+}
+
 /// What a record must satisfy, as the first thing that is wrong with it.
 pub(crate) fn check(legs: &[Leg]) -> Result<(), String> {
     let mut seen = BTreeSet::new();
@@ -529,8 +535,8 @@ pub(crate) fn check(legs: &[Leg]) -> Result<(), String> {
             return Err(format!("two legs are called {}", l.name));
         }
     }
-    if legs.len() > MAX_LEGS {
-        return Err(format!("{} legs is over the {MAX_LEGS} a row carries, rework included — split the row", legs.len()));
+    if carried(legs) > MAX_LEGS {
+        return Err(format!("{} legs is over the {MAX_LEGS} a row carries, rework included — split the row", carried(legs)));
     }
     for (l, w) in legs.iter().zip(waits(legs)) {
         for on in &w {
@@ -689,18 +695,45 @@ pub(crate) fn add(old: &[Leg], new: New, actor: Option<&str>) -> Result<Vec<Leg>
     Ok(legs)
 }
 
-/// The record with `name` skipped, for a reason.
+/// The record with `name` skipped, for a reason. A pending leg only; a running
+/// leg whose seat is gone goes through [`skip_seen`].
+#[cfg(test)]
 pub(crate) fn skip(old: &[Leg], name: &str, why: &str, actor: Option<&str>) -> Result<Vec<Leg>, String> {
+    skip_seen(old, name, why, actor, &|_| true)
+}
+
+/// [`skip`], which also takes a running leg **whose seat is gone**: no seat on
+/// the entry, or one `live` says is not there (`wsp-359`). A running leg with a
+/// live seat is refused, naming it. The skip takes the seat off the entry and
+/// leaves its tree alone.
+pub(crate) fn skip_seen(
+    old: &[Leg],
+    name: &str,
+    why: &str,
+    actor: Option<&str>,
+    live: &dyn Fn(&str) -> bool,
+) -> Result<Vec<Leg>, String> {
     let why = why.trim();
     if why.is_empty() {
         return Err("a skip says why".into());
     }
     let mut legs = old.to_vec();
-    pending(&mut legs, name)?;
+    let leg = find(&mut legs, name)?;
+    match (leg.state, leg.pane.as_deref()) {
+        (State::Pending, _) => {}
+        (State::Running, Some(seat)) if live(seat) => {
+            return Err(format!(
+                "{name} is running in seat {seat}, which is still there — `wsp despawn {seat}` ends it first"
+            ))
+        }
+        (State::Running, _) => {}
+        (other, _) => return Err(format!("{name} is {}, and only a pending leg, or a running one whose seat is gone, can be skipped", other.as_str())),
+    }
     authorize(old, actor, &[name], &[])?;
-    let leg = pending(&mut legs, name)?;
+    let leg = find(&mut legs, name)?;
     leg.state = State::Skipped;
     leg.skipped = Some(why.to_string());
+    leg.pane = None;
     judged(old, &legs)?;
     Ok(legs)
 }
@@ -928,10 +961,10 @@ pub(crate) fn rework_by(old: &[Leg], verdict: &str, head: &str) -> Result<Option
     if rework_open(old) {
         return Ok(None);
     }
-    if old.len() >= MAX_LEGS {
+    if carried(old) >= MAX_LEGS {
         return Err(format!(
             "{} legs is the {MAX_LEGS} a row carries, rework included — no rework leg was added, and the row's governor decides",
-            old.len()
+            carried(old)
         ));
     }
     let named: Vec<&Leg> = old.iter().filter(|l| names(verdict, &l.name)).collect();
@@ -1035,7 +1068,7 @@ pub(crate) fn section_for_show(t: &Task) -> Option<String> {
 const USAGE: &str = "usage:
   wsp leg add <task> <name> --order FILE|- [--packet FILE] [--agent \"claude opus high\" --why \"…\"] [--after <leg>,…|--after=-] [--before <leg>]
   wsp leg after <task> <name> <leg>…|-     replace a pending leg's waits
-  wsp leg skip <task> <name> \"why\"         a pending leg, never run
+  wsp leg skip <task> <name> \"why\"         a pending leg, or a running one whose seat is gone
   wsp leg reset <task> <name> \"why\" [--force]   a running leg whose seat is gone, back to pending
   wsp leg show <task> [<name>]             the table, or one leg whole
   wsp leg done <task> --from FILE|- --caption \"…\"   a leg's seat ends it, at a commit";
@@ -1149,7 +1182,7 @@ fn cmd_add(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Ok((t, legs)) => {
             store.log_event("leg-added", serde_json::json!({ "id": t.id, "leg": name }));
             store.git_commit(&format!("wsp: {} leg {name} added", t.id));
-            println!("{} {}  leg {receipt}  ({} of {MAX_LEGS})", Paint::new().green("✓"), t.id, legs.len());
+            println!("{} {}  leg {receipt}  ({} of {MAX_LEGS})", Paint::new().green("✓"), t.id, carried(&legs));
             0
         }
         Err(why) => refuse(why),
@@ -1185,7 +1218,20 @@ fn cmd_skip(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         return 2;
     };
     let why = args.text(3);
-    match edit(store, task, pane, |old, actor| skip(old, name, &why, actor)) {
+    let live = |seat: &str| {
+        use crate::cycle::Seats;
+        let fleet = crate::cycle::Fleet;
+        !fleet.absent(seat) && !matches!(fleet.state(seat), Some(crate::place::State::Gone | crate::place::State::Empty))
+    };
+    let mut seat = None;
+    let skipped = edit(store, task, pane, |old, actor| {
+        seat = old.iter().find(|l| &l.name == name && l.state == State::Running).and_then(|l| l.pane.clone());
+        skip_seen(old, name, &why, actor, &live)
+    });
+    if let (Ok(_), Some(s)) = (&skipped, &seat) {
+        store.clear_binding(s);
+    }
+    match skipped {
         Ok((t, _)) => {
             store.git_commit(&format!("wsp: {} leg {name} skipped", t.id));
             println!("{} {}  leg {name} skipped", Paint::new().green("✓"), t.id);
@@ -1664,6 +1710,51 @@ mod tests {
         // A seated leg adds legs after itself, before a leg downstream of itself.
         let ok = add(&ls, New { name: "decide".into(), order: "o".into(), agent: Some("claude opus high".into()), why: Some("chooses".into()), after: Some(vec!["plan".into()]), before: Some("finish".into()) }, Some("plan"));
         assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    /// The cap counts the work a row carries: a skipped leg never ran and is
+    /// not counted, so a row of 8 with 4 skipped takes 4 more (`wsp-359`).
+    #[test]
+    fn a_skipped_leg_does_not_count_toward_the_cap() {
+        let mut ls: Vec<Leg> = (1..=8).map(|n| leg(&format!("l{n}"))).collect();
+        for n in 1..=4 {
+            ls = skip(&ls, &format!("l{n}"), "re-staged", None).unwrap();
+        }
+        assert_eq!(carried(&ls), 4);
+        for n in 1..=4 {
+            ls = add(&ls, New { name: format!("n{n}"), order: "o".into(), ..Default::default() }, None)
+                .unwrap_or_else(|e| panic!("new leg {n}: {e}"));
+        }
+        assert_eq!((ls.len(), carried(&ls)), (12, 8));
+        let e = add(&ls, New { name: "n5".into(), order: "o".into(), ..Default::default() }, None).unwrap_err();
+        assert!(e.contains("9 legs is over the 8 a row carries"), "{e}");
+        assert!(rework(&ls, "fix it").is_err(), "the rework leg is held to the same count");
+    }
+
+    /// A running leg whose seat is gone can be skipped; one whose seat is still
+    /// there is refused, naming the seat. The skip leaves the tree alone.
+    #[test]
+    fn a_running_leg_skips_only_when_its_seat_is_gone() {
+        let mut ls = vec![leg("a"), leg("b")];
+        ls[0].state = State::Running;
+        ls[0].tree = Some("t.a".into());
+        let gone = |_: &str| false;
+        let live = |_: &str| true;
+        // No seat on the entry: skippable whatever the fleet says.
+        let out = skip_seen(&ls, "a", "started by mistake", None, &live).unwrap();
+        assert_eq!(out[0].state, State::Skipped);
+        assert_eq!(out[0].skipped.as_deref(), Some("started by mistake"));
+        assert_eq!(out[0].tree.as_deref(), Some("t.a"), "the tree is left alone");
+        // A seat that is gone: skippable, and the seat is off the entry.
+        ls[0].pane = Some("cpd-7".into());
+        let out = skip_seen(&ls, "a", "despawned", None, &gone).unwrap();
+        assert_eq!((out[0].state, out[0].pane.as_deref()), (State::Skipped, None));
+        // A live seat: refused, naming it.
+        let e = skip_seen(&ls, "a", "no", None, &live).unwrap_err();
+        assert!(e.contains("cpd-7") && e.contains("wsp despawn"), "{e}");
+        // A done leg is still refused.
+        ls[0].state = State::Done;
+        assert!(skip_seen(&ls, "a", "no", None, &gone).unwrap_err().contains("a is done"));
     }
 
     #[test]
