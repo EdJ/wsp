@@ -458,8 +458,7 @@ fn run_unit(store: &Store, unit: &Unit, who: &str) -> Ranged {
     if unit.items.is_empty() {
         return Ranged::Ran(Vec::new());
     }
-    let tg = check::Target { sha: unit.sha.clone(), repo: unit.repo.clone(), project: unit.project.clone(), since: None };
-    let dir = check::dir_of(store, &tg);
+    let dir = check::barrier_dir(store, &unit.project, &unit.repo);
     let tree = dir.join("tree");
     let lock = match check::TreeLock::take(dir.join("lock"), check::TREE_WAIT) {
         Ok(l) => l,
@@ -744,5 +743,74 @@ mod tests {
         assert!(packet_for(&store, "run", 1, Some(&sha[..12])).is_some(), "and one for this commit is, by its short name too");
         let head = head_text(&store.tasks_shared(), &store.worklist("run").unwrap().groups()[0]);
         assert!(head.contains("pj-001") && head.contains("no verdict"), "{head}");
+    }
+
+    fn ran_of(r: Ranged) -> Vec<Ran> {
+        match r {
+            Ranged::Ran(ran) => ran,
+            Ranged::Could(why) => panic!("could not run: {why}"),
+        }
+    }
+
+    fn commit_more(env: &util::Isolated, name: &str) {
+        let repo = env.path("repo");
+        std::fs::write(repo.join(name), "x\n").unwrap();
+        git_run(&repo, &["add", "."]);
+        git_run(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "pj-001: more"]);
+    }
+
+    #[test]
+    fn the_barrier_runs_in_its_own_tree_and_not_in_the_per_row_checks_tree() {
+        let (env, store) = world("own-tree", "exit 0\n", "");
+        let w = store.worklist("run").unwrap();
+        let plan = plan(&store, &w, 1);
+        assert!(ran_of(run_unit(&store, &plan.units[0], "barrier run 1")).iter().all(|r| r.done == Done::Passed));
+        let tree = check::barrier_dir(&store, "pj", &plan.units[0].repo).join("tree");
+        assert!(tree.join(".git").exists(), "the barrier tree is made under barrier/");
+        assert!(tree.starts_with(store.state_file("barrier")));
+        assert!(!store.state_file("checks").exists(), "nothing was put under checks/");
+        assert!(check::barrier_tree_line(&store, "pj", &plan.units[0].repo).contains(&plan.units[0].sha[..12]));
+        drop(env);
+    }
+
+    #[test]
+    fn a_second_look_at_the_same_tip_runs_nothing_and_the_packet_says_reused() {
+        let (_env, store) = world("twice", "exit 0\n", "");
+        let w = store.worklist("run").unwrap();
+        let plan = plan(&store, &w, 1);
+        let first = ran_of(run_unit(&store, &plan.units[0], "barrier run 1"));
+        assert!(first.iter().all(|r| r.reused.is_none()));
+        let second = run_unit(&store, &plan.units[0], "barrier run 1");
+        let reused = ran_of(run_unit(&store, &plan.units[0], "barrier run 1"));
+        assert!(reused.iter().all(|r| r.done == Done::Passed && r.reused.is_some()), "every step reused");
+        let text = results_text(&plan, &[second], &[], &Decision { pass: false, would_pass: true, needs: vec![] });
+        assert!(text.contains("reused"), "{text}");
+    }
+
+    #[test]
+    fn a_moved_trunk_runs_the_suite_again_in_the_same_tree_without_a_second_worktree() {
+        let (env, store) = world("moved", "exit 0\n", "");
+        let w = store.worklist("run").unwrap();
+        let before = plan(&store, &w, 1);
+        ran_of(run_unit(&store, &before.units[0], "barrier run 1"));
+        commit_more(&env, "more.txt");
+        let after = plan(&store, &w, 1);
+        assert_ne!(before.units[0].sha, after.units[0].sha);
+        let ran = ran_of(run_unit(&store, &after.units[0], "barrier run 1"));
+        assert!(ran.iter().all(|r| r.done == Done::Passed && r.reused.is_none()), "a new commit has no green");
+        let list = std::process::Command::new("git").arg("-C").arg(env.path("repo")).args(["worktree", "list"]).output().unwrap();
+        let list = String::from_utf8_lossy(&list.stdout).into_owned();
+        assert_eq!(list.lines().filter(|l| l.contains("/state/barrier/")).count(), 1, "{list}");
+        assert_eq!(list.lines().count(), 2, "the repository and the one barrier tree: {list}");
+    }
+
+    #[test]
+    fn the_barrier_tree_is_not_a_candidate_for_disk_removal() {
+        let (_env, store) = world("kept", "exit 0\n", "");
+        let w = store.worklist("run").unwrap();
+        let plan = plan(&store, &w, 1);
+        ran_of(run_unit(&store, &plan.units[0], "barrier run 1"));
+        let barrier_state = store.state_file("barrier");
+        assert!(crate::disk::candidates(&store).iter().all(|c| !c.starts_with(&barrier_state)));
     }
 }

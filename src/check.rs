@@ -484,6 +484,22 @@ pub(crate) fn dir_of(store: &Store, tg: &Target) -> PathBuf {
     store.state_file("checks").join(format!("{}-{repo}", tg.project))
 }
 
+/// The barrier's own warm tree and lock for a repository, apart from the
+/// per-row `checks/` trees so a row's check never moves the barrier's `target/`.
+pub(crate) fn barrier_dir(store: &Store, project: &str, repo: &Path) -> PathBuf {
+    let repo = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    store.state_file("barrier").join(format!("{project}-{repo}"))
+}
+
+/// Where the barrier tree stands: its path and the commit it is at, if it exists.
+pub(crate) fn barrier_tree_line(store: &Store, project: &str, repo: &Path) -> String {
+    let tree = barrier_dir(store, project, repo).join("tree");
+    match git(&tree, &["rev-parse", "HEAD"]) {
+        Some(head) if tree.join(".git").exists() => format!("barrier tree {} at {}", util::contract(&tree), &head.trim()[..head.trim().len().min(12)]),
+        _ => format!("barrier tree {} not made yet", util::contract(&tree)),
+    }
+}
+
 /// Move the warm tree to `sha`, making it on the first use.
 pub(crate) fn checkout(repo: &Path, tree: &Path, sha: &str) -> Result<(), String> {
     if tree.join(".git").exists() {
@@ -864,7 +880,7 @@ const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed
 
 // ---- the verb -----------------------------------------------------------------
 
-const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check --inner [<task>] [--run]   the steps this tree's changes call for\n       wsp check <project> --barrier [--plan] [--at <commit>]\n       wsp check <project> --tiers   its declared steps by tier\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
+const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check --inner [<task>] [--run]   the steps this tree's changes call for\n       wsp check <project> --barrier [--plan|--barrier-tree] [--at <commit>]\n       wsp check <project> --tiers   its declared steps by tier\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
 
 pub fn check(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
@@ -878,7 +894,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     if args.has("set") {
         return set(store, args, &needle, USAGE);
     }
-    if args.has("barrier") {
+    if args.has("barrier") || args.has("barrier-tree") {
         return barrier(store, args, &needle);
     }
     if args.has("tiers") {
@@ -1236,14 +1252,15 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
         return 1;
     };
     let tg = Target { sha: sha.trim().to_string(), repo, project: found.id.clone(), since: None };
-    if args.has("plan") || args.has("dry-run") {
+    if args.has("plan") || args.has("dry-run") || args.has("barrier-tree") {
         println!("{} barrier at {}", p.bold(&found.id), &tg.sha[..12]);
         for s in &steps {
             println!("  {} · {} · up to {}s", s.name, s.command, s.limit.as_secs());
         }
+        println!("  {}", p.dim(&barrier_tree_line(store, &tg.project, &tg.repo)));
         return 0;
     }
-    let dir = dir_of(store, &tg);
+    let dir = barrier_dir(store, &tg.project, &tg.repo);
     let tree = dir.join("tree");
     let started = Instant::now();
     let lock = match TreeLock::take(dir.join("lock"), TREE_WAIT) {
