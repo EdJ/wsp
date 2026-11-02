@@ -2544,7 +2544,29 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // a verifier and a check each carry their own order.
     // A small row with none gets one written first (`packet_gen`), so the
     // packet is the default; `packet_bytes` is what the agent will be handed.
-    let packet_bytes = if args.has("agent") {
+    // A leg starts short when its order names a packet of its own (`packet:
+    // FILE`, read from the tree the leg stands in): the row's overview and the
+    // ordinary preamble are what a 2k-character change otherwise re-reads on
+    // every turn (`wsp-357`).
+    let leg_last = match (&leg_rec, work.task.as_deref().and_then(|t| store.find_task(t))) {
+        (Some(l), Some(t)) => crate::legs::lasts(&crate::legs::legs(&t)).first() == Some(&l.name),
+        _ => false,
+    };
+    let packet_bytes = if !args.has("agent") {
+        None
+    } else if let (Some(l), Some(task)) = (&leg_rec, work.task.as_deref()) {
+        let root = cwd.as_deref().map(util::expand).unwrap_or_default();
+        crate::packet::at_leg_spawn(
+            task,
+            &l.name,
+            &l.order,
+            &root,
+            leg_last,
+            args.has("full"),
+            args.has("no-packet"),
+            agent_commands::of(&kind).short_start(),
+        )
+    } else if args.has("agent") {
         crate::packet::at_spawn(
             store,
             work.task.as_deref(),
@@ -2824,7 +2846,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             (Some(t), _) if verifying => {
                 store.find_task(t).map(|m| crate::cmd_task::fold(&crate::cycle::verifier_order(store, &m)))
             }
-            (Some(t), _) if packet_start => Some(crate::packet::order(t)),
+            (Some(t), _) if packet_start => Some(match leg_name.as_deref() {
+                Some(l) => crate::packet::leg_order(t, l, leg_last),
+                None => crate::packet::order(t),
+            }),
             (Some(t), _) if leg_name.is_some() => Some(leg_seat::order_line(
                 t,
                 leg_name.as_deref().unwrap_or_default(),
@@ -5345,7 +5370,9 @@ mod tests {
             order(&work, None, None, false, occ, false).env
         };
         assert_eq!(seat(true).get("CLAUDE_CODE_DISABLE_CLAUDE_MDS").map(String::as_str), Some("1"));
-        assert!(seat(false).get("CLAUDE_CODE_DISABLE_CLAUDE_MDS").is_none());
+        // Not `1`: run from a short-start seat the caller's own is shed, which
+        // is an empty override rather than an absence.
+        assert!(seat(false).get("CLAUDE_CODE_DISABLE_CLAUDE_MDS").is_none_or(|v| v.is_empty()));
         assert_eq!(seat(true).get("WSP_TASK").map(String::as_str), Some("t-1"), "added to the seat's own, not instead");
     }
 

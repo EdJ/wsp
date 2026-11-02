@@ -1742,7 +1742,10 @@ fn help_text() -> String {
                                     print a row's ## Packet and the files it names, under a cap;
                                     a row with none gets one generated (the overview, the context
                                     pack, the likely files) and written; a small row is spawned
-                                    with one and the short start unless `--no-packet`
+                                    with one and the short start unless `--no-packet`;
+                                    `--leg NAME` prints that leg's packet (an order line
+                                    `packet: FILE`, or `wsp leg add … --packet FILE`), which
+                                    also starts the leg short
   wsp attend <id>                   one attention-harness attempt on a row, to its checks'
                                     result: what `spawn --kind attention` runs; nobody types it
   wsp cold <list|project> [--plan] [--at COMMIT] [--keep]

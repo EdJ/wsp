@@ -193,6 +193,74 @@ pub fn order(task: &str) -> String {
     )
 }
 
+// ---- a leg's packet ---------------------------------------------------------------
+
+/// The order key a leg names its packet on: `packet: spikes/x/change-hint.md`,
+/// a line of its own, relative to the leg's tree (or absolute).
+/// `wsp leg add … --packet FILE` writes it.
+pub const LEG_KEY: &str = "packet:";
+
+/// The packet a leg's order names, when it names one. `packet: off` is not a
+/// path: a leg that says so is spawned the ordinary way.
+pub fn leg_path(order: &str) -> Option<String> {
+    order.lines().find_map(|l| {
+        let v = l.trim().trim_start_matches("- ").trim().strip_prefix(LEG_KEY)?.trim();
+        (!v.is_empty() && !v.eq_ignore_ascii_case("off")).then(|| v.to_string())
+    })
+}
+
+/// How a leg ends: `leg done`, or `review` for the leg nothing waits on.
+pub fn leg_finish(task: &str, last: bool) -> String {
+    match last {
+        true => format!("You are the last leg: commit, then `wsp review {task} \"...\"` ends the row."),
+        false => format!("Commit, then end with `wsp leg done {task} --from FILE --caption \"...\"` (FILE: your baton)."),
+    }
+}
+
+/// A leg's packet, printed: the file its order names, read as a `## Packet`
+/// section is (its `file:` lines inlined), then the leg's finish line.
+pub fn build_leg(task: &str, leg: &str, path: &str, root: &Path, last: bool) -> Result<String, String> {
+    let at = if Path::new(path).is_absolute() { PathBuf::from(path) } else { root.join(path) };
+    let text = std::fs::read_to_string(&at)
+        .map_err(|e| format!("leg {leg}'s `packet: {path}` cannot be read from {}: {e}", util::contract(root)))?;
+    let p = parse(&text);
+    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), &leg_finish(task, last))
+}
+
+/// A leg spawn's decision: the size of its packet when it starts short, `None`
+/// when it starts as ever. A packet that cannot be printed is said on stderr.
+pub fn at_leg_spawn(task: &str, leg: &str, order: &str, root: &Path, last: bool, full: bool, no_packet: bool, kind_short: bool) -> Option<u64> {
+    if full || no_packet || !kind_short {
+        return None;
+    }
+    let path = leg_path(order)?;
+    match build_leg(task, leg, &path, root, last) {
+        Ok(text) => Some(text.len() as u64),
+        Err(why) => {
+            eprintln!("wsp: {task} leg {leg} is not started short: {why}");
+            None
+        }
+    }
+}
+
+/// A short-started leg's work order: the packet, then the finish line.
+pub fn leg_order(task: &str, leg: &str, last: bool) -> String {
+    format!(
+        "You are leg {leg} of {task}. Your packet is the whole brief. Run `wsp packet {task} --leg {leg}` now, \
+         read what it prints, do the change it describes, run its one command. {} \
+         Read nothing the packet does not name.",
+        leg_finish(task, last)
+    )
+}
+
+/// The leg this seat is running on `t`, if any — so a bare `wsp packet <row>`
+/// in a leg's seat reads the leg's packet, as the short start's system prompt
+/// tells it to.
+fn my_leg(t: &Task) -> Option<String> {
+    let pane = crate::cmd_agent::my_pane()?;
+    crate::legs::actor_of(&crate::legs::legs(t), Some(&pane))
+}
+
 /// A path the packet may inline: relative, and staying inside the tree.
 fn inside(path: &str) -> bool {
     let p = Path::new(path);
@@ -201,6 +269,12 @@ fn inside(path: &str) -> bool {
 
 pub fn build(t: &Task, root: &Path) -> Result<String, String> {
     let Some(p) = of(t) else { return Err(format!("{} has no ## {SECTION} section", t.id)) };
+    render(&format!("# Packet · {} · {}\n", t.id, t.title), &p, root, &t.id, "")
+}
+
+/// The print: a heading, the author's words, each named file inline, and a tail
+/// (a leg's finish line), refused over [`CAP`].
+fn render(head: &str, p: &Packet, root: &Path, who: &str, tail: &str) -> Result<String, String> {
     let mut parts: Vec<(String, String)> = Vec::new();
     for f in &p.files {
         if !inside(f) {
@@ -210,12 +284,15 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
             .map_err(|e| format!("`file: {f}` cannot be read from {}: {e}", util::contract(root)))?;
         parts.push((f.clone(), body));
     }
-    let mut out = format!("# Packet · {} · {}\n", t.id, t.title);
+    let mut out = head.to_string();
     if !p.text.is_empty() {
         out.push_str(&format!("\n{}\n", p.text));
     }
     for (path, body) in &parts {
         out.push_str(&format!("\n## {path}\n```\n{}\n```\n", body.trim_end()));
+    }
+    if !tail.is_empty() {
+        out.push_str(&format!("\n{tail}\n"));
     }
     if out.len() > CAP {
         let mut sizes: Vec<(usize, &str)> = parts.iter().map(|(f, b)| (b.len(), f.as_str())).collect();
@@ -223,7 +300,7 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
         let largest: Vec<String> = sizes.iter().take(3).map(|(n, f)| format!("{f} {n}")).collect();
         return Err(format!(
             "the packet for {} is {} bytes and the cap is {CAP}; the prose is {} and the largest files are {}",
-            t.id,
+            who,
             out.len(),
             p.text.len(),
             if largest.is_empty() { "none".to_string() } else { largest.join(", ") }
@@ -290,9 +367,40 @@ pub fn packet(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     let root = root_for(store, &t, args);
+    if let Some(leg) = args.get("leg").filter(|l| l != "true").or_else(|| my_leg(&t)) {
+        let all = crate::legs::legs(&t);
+        let Some(l) = all.iter().find(|l| l.name == leg) else {
+            eprintln!("wsp: {} has no leg called {leg}", t.id);
+            return 1;
+        };
+        let Some(path) = leg_path(&l.order) else {
+            if args.get("leg").is_some() {
+                eprintln!("wsp: leg {leg} of {} names no packet (an order line `{LEG_KEY} FILE`)", t.id);
+                return 1;
+            }
+            // A leg with no packet of its own, asked bare: the row's, as ever.
+            return print_row(store, &mut t, &root, args);
+        };
+        let last = crate::legs::lasts(&all).first() == Some(&leg);
+        return match build_leg(&t.id, &leg, &path, &root, last) {
+            Ok(text) => {
+                print!("{text}");
+                0
+            }
+            Err(e) => {
+                eprintln!("wsp: {e}");
+                1
+            }
+        };
+    }
+    print_row(store, &mut t, &root, args)
+}
+
+/// The row's own packet, written first when it has none (or `--regen`).
+fn print_row(store: &Store, t: &mut Task, root: &Path, args: &Args) -> i32 {
     let has = t.section(SECTION).is_some_and(|s| !s.trim().is_empty());
     if !has || args.has("regen") {
-        if has && of(&t).is_some_and(|p| p.off) {
+        if has && of(t).is_some_and(|p| p.off) {
             eprintln!("wsp: {} declined a packet (`packet: off`); remove that line to have one made", t.id);
             return 1;
         }
@@ -300,18 +408,18 @@ pub fn packet(store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: {} has a packet written by hand; `wsp packet {} --regen --force` replaces it", t.id, t.id);
             return 1;
         }
-        let made = crate::packet_gen::generate(store, &t, &root);
+        let made = crate::packet_gen::generate(store, t, root);
         match &made.pack {
             Ok(n) => eprintln!("wsp: {} read as {} work; the pack expects {n} file(s) to change", t.id, made.kind.name()),
             Err(why) => eprintln!("wsp: no context pack ({why}); the packet is the overview and the files it names"),
         }
-        if let Err(why) = crate::packet_gen::write(store, &mut t, &made.section) {
+        if let Err(why) = crate::packet_gen::write(store, t, &made.section) {
             eprintln!("wsp: {why}");
             return 1;
         }
         eprintln!("wsp: wrote ## {SECTION} on {} — edit it, or `packet: off` to decline", t.id);
     }
-    match build(&t, &root) {
+    match build(t, root) {
         Ok(text) => {
             print!("{text}");
             0
@@ -414,6 +522,48 @@ mod tests {
         let err = build(&row("file: big.rs\nx"), &dir).unwrap_err();
         assert!(err.contains("cap is 16000") && err.contains("big.rs 16000"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_leg_names_its_packet_on_an_order_line_and_off_is_not_a_path() {
+        assert_eq!(leg_path("packet: spikes/p/change-hint.md\n\nDo the hint."), Some("spikes/p/change-hint.md".into()));
+        assert_eq!(leg_path("Do it.\n- packet: a.md"), Some("a.md".into()));
+        assert_eq!(leg_path("Read the call sites."), None);
+        assert_eq!(leg_path("packet: off"), None);
+        assert_eq!(leg_path("packet:"), None);
+    }
+
+    #[test]
+    fn a_legs_packet_is_its_file_inlined_then_its_finish_line_and_it_starts_short() {
+        let dir = std::env::temp_dir().join(format!("wsp-leg-packet-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("change.md"), "Make a return 1.\nfile: src/a.rs\n").unwrap();
+        let mid = build_leg("t-1", "hint", "change.md", &dir, false).unwrap();
+        assert!(mid.starts_with("# Packet · t-1 · leg hint\n"), "{mid}");
+        assert!(mid.contains("Make a return 1.") && mid.contains("## src/a.rs\n```\nfn a() {}\n```"), "{mid}");
+        assert!(mid.trim_end().ends_with(&leg_finish("t-1", false)) && mid.contains("wsp leg done t-1"), "{mid}");
+        let last = build_leg("t-1", "hint", "change.md", &dir, true).unwrap();
+        assert!(last.contains("wsp review t-1") && !last.contains("leg done"), "{last}");
+        assert!(build_leg("t-1", "hint", "gone.md", &dir, false).unwrap_err().contains("gone.md"));
+
+        let order = "packet: change.md\n\nthe hint";
+        let size = at_leg_spawn("t-1", "hint", order, &dir, false, false, false, true);
+        assert_eq!(size, Some(mid.len() as u64), "a leg with a packet starts short with its size");
+        assert_eq!(at_leg_spawn("t-1", "hint", "the hint", &dir, false, false, false, true), None, "no packet line");
+        assert_eq!(at_leg_spawn("t-1", "hint", order, &dir, false, true, false, true), None, "--full");
+        assert_eq!(at_leg_spawn("t-1", "hint", order, &dir, false, false, true, true), None, "--no-packet");
+        assert_eq!(at_leg_spawn("t-1", "hint", order, &dir, false, false, false, false), None, "a kind with no short start");
+        assert_eq!(at_leg_spawn("t-1", "hint", "packet: gone.md", &dir, false, false, false, true), None, "unprintable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legs_order_names_its_packet_verb_and_its_finish() {
+        let o = leg_order("t-1", "hint", false);
+        assert!(o.contains("`wsp packet t-1 --leg hint`") && o.contains("wsp leg done t-1") && !o.contains('\n'), "{o}");
+        assert!(leg_order("t-1", "hint", true).contains("wsp review t-1"));
+        assert!(o.is_ascii(), "a spawn once hung on one character");
     }
 
     #[test]

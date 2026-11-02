@@ -540,6 +540,9 @@ pub(crate) struct Brief {
     /// The leg block, when this seat is a running leg's (`docs/legs.md`): which
     /// leg, the table, its order and the batons it was handed.
     pub leg: Option<Vec<String>>,
+    /// That leg's order names a packet of its own (`packet: FILE`): the packet
+    /// is its brief, so the row's overview is not printed again (`wsp-357`).
+    pub leg_packet: bool,
     /// The list and group this seat is checking — see [`Briefing::checking`].
     pub checking: Option<(String, usize)>,
     pub parent: Option<Task>,
@@ -864,6 +867,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         yours,
         verifying,
         leg: b.pane.as_deref().and_then(|pane| crate::leg_seat::brief_lines(tasks, pane)),
+        leg_packet: b.pane.as_deref().is_some_and(|pane| crate::leg_seat::has_packet(tasks, pane)),
         checking: b.checking.clone().filter(|_| mine.is_none()),
         handbook,
         parent_decided,
@@ -1055,6 +1059,9 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
         // details at [`MAX_DETAILS_LINES`] — what it is, whole-ish; how else
         // to read it, pointed.
         for (sec, max) in [("Overview", MAX_TASK_LINES), ("Details", MAX_DETAILS_LINES)] {
+            if r.leg_packet {
+                break;
+            }
             if let Some(text) = crate::model::section_of(&t.body, sec) {
                 out.push(String::new());
                 block(&mut out, p, &sec.to_lowercase(), &text, max, &format!("wsp show {}", t.id));

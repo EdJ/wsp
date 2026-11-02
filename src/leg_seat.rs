@@ -347,6 +347,16 @@ pub(crate) fn on_review(store: &Store, needle: &str, account: &str, pane: Option
 /// The leg block of a brief: which leg this seat is, the table, its order, the
 /// batons it was handed in full, and the others by caption. `None` for a seat
 /// that is no running leg's.
+/// Whether the leg this seat runs names a packet of its own.
+pub(crate) fn has_packet(tasks: &[Task], pane: &str) -> bool {
+    tasks.iter().any(|t| {
+        let ls = legs::legs(t);
+        legs::actor_of(&ls, Some(pane))
+            .and_then(|n| ls.into_iter().find(|l| l.name == n))
+            .is_some_and(|l| crate::packet::leg_path(&l.order).is_some())
+    })
+}
+
 pub(crate) fn brief_lines(tasks: &[Task], pane: &str) -> Option<Vec<String>> {
     let (t, all, name) = tasks.iter().find_map(|t| {
         let ls = legs::legs(t);

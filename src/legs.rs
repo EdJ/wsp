@@ -1033,7 +1033,7 @@ pub(crate) fn section_for_show(t: &Task) -> Option<String> {
 // ---- the verbs ------------------------------------------------------------------
 
 const USAGE: &str = "usage:
-  wsp leg add <task> <name> --order FILE|- [--agent \"claude opus high\" --why \"…\"] [--after <leg>,…|--after=-] [--before <leg>]
+  wsp leg add <task> <name> --order FILE|- [--packet FILE] [--agent \"claude opus high\" --why \"…\"] [--after <leg>,…|--after=-] [--before <leg>]
   wsp leg after <task> <name> <leg>…|-     replace a pending leg's waits
   wsp leg skip <task> <name> \"why\"         a pending leg, never run
   wsp leg reset <task> <name> \"why\" [--force]   a running leg whose seat is gone, back to pending
@@ -1100,14 +1100,36 @@ fn order_text(args: &Args) -> Result<String, String> {
     crate::cmd_task::read_source(&src).map_err(|e| format!("cannot read {src}: {e}"))
 }
 
+/// `--packet FILE` as the order line a leg names its packet on: the path
+/// relative to the repository it is in, so the leg's own tree (a checkout of
+/// that repository) finds it, or absolute when it is in none.
+fn packet_line(file: &str) -> Result<String, String> {
+    let at = std::fs::canonicalize(util::expand(file)).map_err(|e| format!("--packet {file}: {e}"))?;
+    if !at.is_file() {
+        return Err(format!("--packet {file} is not a file"));
+    }
+    let dir = at.parent().unwrap_or(&at).to_path_buf();
+    let rel = crate::cmd_verify::toplevel(&dir)
+        .and_then(|top| std::fs::canonicalize(top).ok())
+        .and_then(|top| at.strip_prefix(&top).ok().map(|r| r.to_path_buf()))
+        .unwrap_or(at);
+    Ok(format!("{} {}", crate::packet::LEG_KEY, rel.display()))
+}
+
 fn cmd_add(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     let (Some(task), Some(name)) = (args.rest.get(1), args.rest.get(2)) else {
         eprintln!("{USAGE}");
         return 2;
     };
-    let order = match order_text(args) {
-        Ok(o) => o,
+    let packet = match args.get("packet").filter(|v| v != "true").map(|f| packet_line(&f)).transpose() {
+        Ok(p) => p,
         Err(why) => return refuse(why),
+    };
+    let order = match (order_text(args), &packet) {
+        (Ok(o), Some(line)) => format!("{line}\n\n{}", o.trim()),
+        (Ok(o), None) => o,
+        (Err(_), Some(line)) if args.get("order").is_none() => line.clone(),
+        (Err(why), _) => return refuse(why),
     };
     let after = args.get("after").map(|_| args.all("after").into_iter().filter(|a| a != "-").collect::<Vec<_>>());
     let new = New {
