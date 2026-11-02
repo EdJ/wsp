@@ -222,6 +222,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
             if w.groups().get(at - 1).is_some_and(|g| g.policy().is_some()) {
                 unrecorded_landing(store, &w, at, &before);
             }
+            landed_at_doing(store, &w, at, &before);
         }
         let _ = crate::cycle::step(store, &w, seats);
         let pos = worklist::position(store, &w, Reading::Landed);
@@ -237,6 +238,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         skipped(store, &w, at, &pos);
         landed_for_an_idle_seat(store, seats, &w, at, &pos);
     }
+    // A reason a send-back could not type to its pane, typed once the seat reads idle.
+    retry_undelivered_tells(store, seats);
     // **After** the loop, and for a different reason to every repair above: this
     // one is about a run that has *finished*, so there is no group at a
     // position to read it from. `wsp-136` item 3 — the last barrier's check was
@@ -989,6 +992,114 @@ fn tell_member(store: &Store, id: &str, text: &str) {
             util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)
         )),
         Err(e) => stamp(store, &format!("told {id}: not delivered — {e}")),
+    }
+}
+
+// ---- a landed row left at doing ------------------------------------------
+
+/// A member at `doing` whose work reached the trunk after the last time it was
+/// sent back, with nobody holding it: the verifier's hold landed it while a
+/// check's send-back stood (compounding-050, 2026-11-02), and `worklist next`
+/// waited on a row nothing was working on. It is at review, where the landing
+/// put it. The reverse of `wsp-328`'s review-but-not-landed.
+fn landed_at_doing(store: &Store, w: &Worklist, at: usize, pos: &Position) {
+    let held = store.claims();
+    for s in pos.members.iter().filter(|s| s.settlement == worklist::Settlement::Open(Status::Doing)) {
+        if held.contains_key(&s.id) || !store.panes_for_task(&s.id).is_empty() {
+            continue;
+        }
+        let id = s.id.clone();
+        let moved = store.locked(|| {
+            let mut t = store.find_task(&id)?;
+            if t.status() != Status::Doing {
+                return None;
+            }
+            let sha = landed_since_sent_back(&t)?;
+            t.set_status(Status::Review);
+            t.log(&format!(
+                "wsp: at review — the landing at {sha} came after the last send-back, and nobody holds the row at doing"
+            ));
+            store.save_task(&t).ok()?;
+            Some(sha)
+        });
+        let Some(sha) = moved else { continue };
+        store.git_commit(&format!("wsp: {id} landed at doing, moved to review"));
+        stamp(store, &format!(
+            "{} group {at}: {id} is landed at {sha} and was at doing with nothing holding it — moved to review",
+            w.id
+        ));
+        crate::cycle::tell(store, w, &format!(
+            "{id} in the {} run had landed at {sha} and was left at doing with no seat on it. wsp moved it to review; \
+             its verifier reads that commit.",
+            w.id
+        ));
+    }
+}
+
+/// The commit of a landing written below the newest send-back (or any landing,
+/// where there has been none): work that reached the trunk after the row was
+/// last told to go back to it.
+fn landed_since_sent_back(t: &Task) -> Option<String> {
+    let log = t.section("Log")?;
+    let lines: Vec<&str> = log.lines().collect();
+    let from = lines.iter().rposition(|l| l.contains(crate::cycle::SENT_BACK)).map_or(0, |i| i + 1);
+    lines[from..].iter().filter_map(|l| sha_after(l, LANDED)).last()
+}
+
+// ---- a reason that did not reach its pane ----------------------------------
+
+const TELL_PENDING: &str = "wsp: the sent-back reason did not reach its pane — typed when the seat reads idle";
+const TELL_DELIVERED: &str = "wsp: the sent-back reason reached its pane";
+
+/// Records that the newest send-back could not be typed to the member's pane.
+pub(crate) fn note_tell_pending(store: &Store, id: &str) {
+    store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return };
+        t.log(TELL_PENDING);
+        let _ = store.save_task(&t);
+    });
+}
+
+/// What the newest send-back said, when no delivery has been recorded since.
+fn undelivered_reason(t: &Task) -> Option<String> {
+    let log = t.section("Log")?;
+    let mut owed = None;
+    let mut pending = false;
+    for l in log.lines() {
+        if let Some(rest) = l.split(crate::cycle::SENT_BACK).nth(1).filter(|_| l.contains(crate::cycle::SENT_BACK)) {
+            owed = Some(rest.trim().to_string());
+            pending = false;
+        } else if l.contains(TELL_PENDING) {
+            pending = true;
+        } else if l.contains(TELL_DELIVERED) {
+            pending = false;
+        }
+    }
+    owed.filter(|_| pending)
+}
+
+/// Every row at `doing` whose send-back did not reach its pane, typed to the
+/// pane once its seat reads idle at a prompt nobody is answering.
+fn retry_undelivered_tells(store: &Store, seats: &dyn Seats) {
+    let mut asks = None;
+    for t in store.tasks_shared().iter().filter(|t| t.status() == Status::Doing) {
+        let Some(reason) = undelivered_reason(t) else { continue };
+        let Some(seat) = store.panes_for_task(&t.id).into_iter().next() else { continue };
+        if seats.state(&seat) != Some(State::Idle) {
+            continue;
+        }
+        let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
+        if crate::waiting::reading(Some(State::Idle), asks, &seats.shells(&[&seat]), &seat, &t.id).is_some() {
+            continue;
+        }
+        if crate::cmd_task::deliver(store, &t.id, &format!("wsp sent {} back: {reason}", t.id)) {
+            store.locked(|| {
+                let Some(mut t) = store.find_task(&t.id) else { return };
+                t.log(TELL_DELIVERED);
+                let _ = store.save_task(&t);
+            });
+            stamp(store, &format!("{}: the send-back that did not reach {seat} was typed to it, now it reads idle", t.id));
+        }
     }
 }
 
@@ -3125,6 +3236,71 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
         assert!(landed_for().is_empty(), "the run did not land work a verifier has not read");
         assert!(crate::message::raised(&store).is_empty());
+    }
+
+    /// compounding-050, 2026-11-02: a check sent the row back, the verifier's
+    /// hold landed it, and it stood at doing with nothing working on it.
+    #[test]
+    fn a_landed_row_left_at_doing_with_no_seat_is_moved_to_review_once() {
+        let (_env, store) = scratch("landeddoing");
+        member(&store, "m-1", Status::Doing);
+        let mut t = store.find_task("m-1").unwrap();
+        t.log("sent back: wsp check failed at abc1234: tests");
+        t.log(&format!("{LANDED} 94f8684aaaaa on master"));
+        store.save_task(&t).unwrap();
+        list(&store, &["m-1"], "claude");
+
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Review);
+        assert!(row_log(&store, "m-1").contains("nobody holds the row at doing"));
+        assert!(governed().iter().any(|g| g.contains("m-1") && g.contains("moved it to review")), "{:?}", governed());
+        let after = row_log(&store, "m-1");
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(row_log(&store, "m-1").matches("nobody holds the row").count(), after.matches("nobody holds the row").count());
+    }
+
+    #[test]
+    fn a_landed_row_held_by_a_seat_is_left_at_doing() {
+        let (_env, store) = in_flight("landedheld");
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{LANDED} 94f8684aaaaa on master"));
+        store.save_task(&t).unwrap();
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "a claimed row has a seat");
+    }
+
+    #[test]
+    fn a_landing_older_than_the_last_send_back_leaves_the_row_at_doing() {
+        let (_env, store) = scratch("landedback");
+        member(&store, "m-1", Status::Doing);
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{LANDED} 94f8684aaaaa on master"));
+        t.log("sent back: the verifier blocked: not held");
+        store.save_task(&t).unwrap();
+        list(&store, &["m-1"], "claude");
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "the landing is older than the send-back");
+    }
+
+    #[test]
+    fn a_send_back_that_did_not_reach_its_pane_is_typed_when_the_seat_reads_idle_and_once() {
+        let (_env, store) = in_flight("pendingtell");
+        let mut t = store.find_task("m-1").unwrap();
+        t.log("sent back: wsp check failed at abc1234: tests exit 7");
+        store.save_task(&t).unwrap();
+        note_tell_pending(&store, "m-1");
+        let _ = member_told();
+
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Working))]), &mut Pass::new());
+        assert!(member_told().iter().all(|(_, t)| !t.contains("sent m-1 back")), "a working seat is not typed over");
+
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        let told = member_told();
+        assert!(told.iter().any(|(id, t)| id == "m-1" && t.contains("sent m-1 back") && t.contains("tests exit 7")), "{told:?}");
+
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert!(member_told().iter().all(|(_, t)| !t.contains("sent m-1 back")), "delivered once, not every tick");
     }
 
     /// What each state of a row's log answers, in one place.

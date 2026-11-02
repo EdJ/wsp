@@ -1412,22 +1412,33 @@ fn deliver_the_reason(store: &Store, args: &Args, reason: &str) {
 /// The delivery itself, by id: `wsp verified --blocks` sends a member back the
 /// way `reopen` does and says it through the same one path.
 pub(crate) fn deliver_reason(store: &Store, id: &str, reason: &str) {
-    let id = id.to_string();
+    if !deliver(store, id, &format!("wsp sent {id} back: {reason}")) {
+        crate::repair::note_tell_pending(store, id);
+    }
+}
+
+/// A sentence for a member's pane that is not a send-back: a line to fix, say.
+/// Said once; not retried.
+pub(crate) fn deliver_notice(store: &Store, id: &str, text: &str) {
+    deliver(store, id, &format!("wsp: {text}"));
+}
+
+/// Types `line` to the member's pane. `false` only when there was a pane and it
+/// did not get it; no pane is nothing owed.
+pub(crate) fn deliver(store: &Store, id: &str, line: &str) -> bool {
     // Nothing to tell: a row nobody is holding has no pane, and saying so
     // would be noise on every reopen of finished work.
-    if store.panes_for_task(&id).is_empty() {
-        return;
+    if store.panes_for_task(id).is_empty() {
+        return true;
     }
     if cfg!(test) {
         #[cfg(test)]
-        crate::cycle::tests::MEMBER_TOLD.with(|t| {
-            t.borrow_mut().push((id.clone(), format!("sent back: {reason}")))
-        });
-        return;
+        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), line.to_string())));
+        return true;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else { return false };
     let mut child = match std::process::Command::new(exe)
-        .args(["tell", &id, "-"])
+        .args(["tell", id, "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1436,24 +1447,25 @@ pub(crate) fn deliver_reason(store: &Store, id: &str, reason: &str) {
         Ok(c) => c,
         Err(e) => {
             crate::cycle::log_line(store, &format!("tell {id}: could not run `wsp tell` ({e})"));
-            return;
+            return false;
         }
     };
     if let Some(mut to) = child.stdin.take() {
         use std::io::Write;
-        let _ = writeln!(to, "wsp sent {id} back: {reason}");
+        let _ = writeln!(to, "{line}");
     }
-    let said = match child.wait_with_output() {
-        Ok(o) if o.status.success() => "it has the sentence".to_string(),
-        Ok(o) => format!("not delivered — {}", util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)),
-        Err(e) => format!("not delivered — {e}"),
+    let (delivered, said) = match child.wait_with_output() {
+        Ok(o) if o.status.success() => (true, "it has the sentence".to_string()),
+        Ok(o) => (false, format!("not delivered — {}", util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120))),
+        Err(e) => (false, format!("not delivered — {e}")),
     };
     crate::cycle::log_line(store, &format!("tell {id}: {said}"));
-    if said.starts_with("not delivered") {
+    if !delivered {
         crate::cycle::log_line(store, &format!(
-            "{id} is at doing with the reason on its row, but its pane did not get it — `wsp tell {id} --anyway -` retries"
+            "{id} is at doing with the reason on its row, but its pane did not get it — wsp retries when its seat reads idle, or `wsp tell {id} --anyway -`"
         ));
     }
+    delivered
 }
 
 /// Reads its prose the same way `note` does — see [`payload_source`].
@@ -1581,6 +1593,19 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         }
         _ => None,
     };
+    // A `## Checks` line that cannot start would be replayed at the landing and
+    // fail there; it is refused here, where its author is.
+    if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+        let bad = crate::check::malformed_in(&crate::check::task_steps(&t));
+        if !bad.is_empty() {
+            eprintln!("wsp: {} not moved to review — its ## Checks has line(s) that cannot start under `sh`:", t.id);
+            for b in &bad {
+                eprintln!("  - {b}");
+            }
+            eprintln!("  fix them with `wsp check {} --set -` (a note after the command goes outside its backticks)", t.id);
+            return 2;
+        }
+    }
     // From a leg's seat the row is not finished while a sibling runs, and from
     // the last running leg the rest are skipped (`docs/legs.md`, *A leg is a
     // seat*). Refused before the row moves.

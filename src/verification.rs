@@ -811,6 +811,20 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         }
     };
     let me = crate::cmd_agent::my_pane();
+    // A row sent back while this verifier read it (a failed check, a person) is
+    // not landed by the hold: the send-back owns the row until it returns to
+    // review, where a fresh verifier reads what comes back.
+    if state == State::Holds && member.status() == Status::Doing && crate::repair::ready(&member).is_some() {
+        let said = format!("{}\n\n(not landed: {} was sent back to doing while this read it)", text.trim(), member.id);
+        let _ = record_checked(store, &member.id, State::Superseded, &said, me.as_deref(), Some(&caption), checked);
+        store.git_commit(&format!("wsp: verified {} superseded — sent back while read", member.id));
+        eprintln!(
+            "wsp: {} was sent back to doing while you read it, so your hold lands nothing and is recorded as superseded; \
+             a fresh verifier reads it when it returns to review",
+            member.id
+        );
+        return 1;
+    }
     // A hold on a member that is ready and unlanded lands it, here, so a land
     // that cannot happen turns the hold into a block in the same write.
     let mut state = state;
@@ -1588,6 +1602,21 @@ mod tests {
         assert_eq!(t.status_raw, "review");
         let again = Pass::parse(&p.line().lines().next().unwrap().to_string()).unwrap();
         assert_eq!(again.landed, p.landed, "the clause reads back");
+    }
+
+    #[test]
+    fn a_hold_on_a_row_sent_back_while_it_was_read_lands_nothing_and_is_superseded() {
+        let g = ground("sentback", "", &[("m.txt", "mine\n")], &[("t.txt", "theirs\n")]);
+        let before = g.trunk();
+        let mut t = g.member();
+        send_back(&mut t, util::now_iso(), "wsp check failed", Some(&g.ready), "a step failed", None);
+        g.store.save_task(&t).unwrap();
+        assert_eq!(g.verdict("holds"), 1);
+        assert_eq!(g.trunk(), before, "the hold landed nothing");
+        let t = g.member();
+        assert_eq!(t.status_raw, "doing", "and the send-back stands");
+        assert!(crate::repair::landed(&t).is_none());
+        assert_eq!(passes(&t).pop().unwrap().state, State::Superseded);
     }
 
     #[test]

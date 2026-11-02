@@ -149,7 +149,7 @@ pub(crate) fn step_of(item: &str, of: Of) -> Option<Step> {
         Some((h, c)) if head_of(h).is_some() => (head_of(h), c),
         _ => (None, item),
     };
-    let command = command.trim().trim_matches('`').trim();
+    let command = command_of(command);
     if command.is_empty() {
         return None;
     }
@@ -159,6 +159,39 @@ pub(crate) fn step_of(item: &str, of: Of) -> Option<Step> {
         o => o,
     };
     Some(Step { name: h.name, command: command.to_string(), limit: h.limit.unwrap_or(DEFAULT_LIMIT), of, on: h.on, barrier: h.barrier, end: h.end })
+}
+
+/// The command of a step's text: what stands inside its backticks when a note
+/// follows them (`` `npm test` (33 tests) ``), else the text with its backticks
+/// taken off.
+fn command_of(text: &str) -> &str {
+    let text = text.trim();
+    if text.starts_with('`') {
+        let closes = text.match_indices('`').map(|(i, _)| i).filter(|&i| i > 0);
+        for close in closes {
+            let rest = &text[close + 1..];
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return text[1..close].trim();
+            }
+        }
+    }
+    text.trim_matches('`').trim()
+}
+
+/// Why `sh` cannot take `command` as a script, or `None` when it parses.
+pub(crate) fn unparsable(command: &str) -> Option<String> {
+    let out = Command::new("sh").arg("-n").arg("-c").arg(command).stdin(Stdio::null()).output().ok()?;
+    if out.status.success() {
+        return None;
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    let said = said.lines().next().unwrap_or("it does not parse").trim();
+    Some(said.trim_start_matches("sh: ").trim_start_matches("-c: ").to_string())
+}
+
+/// Each step of `steps` that cannot start, with why: `name — reason`.
+pub(crate) fn malformed_in(steps: &[Step]) -> Vec<String> {
+    steps.iter().filter_map(|s| unparsable(&s.command).map(|why| format!("{} — {why}", s.name))).collect()
 }
 
 /// `name [(limit)] [on <globs>] [at barrier|end]`, when the text before a `: ` is one.
@@ -571,8 +604,18 @@ impl Drop for TreeLock {
 pub(crate) enum Done {
     Passed,
     Failed { exit: Option<i32>, timed_out: bool },
+    /// The command could not start — it does not parse, or names nothing to run.
+    /// The declaration is wrong; nothing the work did.
+    Malformed(String),
     /// An earlier step failed, so this one was not run.
     Skipped,
+}
+
+impl Done {
+    /// Anything that stops a run: a red step or one that could not start.
+    pub(crate) fn is_red(&self) -> bool {
+        matches!(self, Done::Failed { .. } | Done::Malformed(_))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -610,6 +653,9 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
         first: None,
         reused: None,
     };
+    if let Some(why) = unparsable(&step.command) {
+        return Ran { done: Done::Malformed(why.clone()), tail: why, ..failed(String::new()) };
+    }
     let Ok(out) = std::fs::File::create(log) else { return failed(format!("could not write {}", util::contract(log))) };
     let Ok(err) = out.try_clone() else { return failed("could not share the log".into()) };
     let mut cmd = Command::new("sh");
@@ -633,12 +679,26 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
         }
     };
     let ok = !timed_out && status.is_some_and(|s| s.success());
+    let tail = tail_of(log);
     let done = if ok {
         Done::Passed
+    } else if let Some(why) = failed_to_start(status.and_then(|s| s.code()), &tail) {
+        Done::Malformed(why)
     } else {
         Done::Failed { exit: status.and_then(|s| s.code()), timed_out }
     };
-    Ran { step: step.clone(), done, took: start.elapsed(), tail: tail_of(log), first: None, reused: None }
+    Ran { step: step.clone(), done, took: start.elapsed(), tail, first: None, reused: None }
+}
+
+/// Whether an exit says the command never ran: not found (127) or not
+/// executable (126), as `sh` words it on the last line of the output.
+fn failed_to_start(exit: Option<i32>, tail: &str) -> Option<String> {
+    let last = tail.lines().last().unwrap_or_default().trim();
+    match exit {
+        Some(127) if last.contains("not found") => Some(last.to_string()),
+        Some(126) if last.contains("Permission denied") || last.contains("cannot execute") => Some(last.to_string()),
+        _ => None,
+    }
 }
 
 /// The last lines of a log, each cut to a width a row can hold.
@@ -662,7 +722,7 @@ fn tail_of(log: &Path) -> String {
 pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
     let mut out: Vec<Ran> = Vec::new();
     for s in steps {
-        let stop = out.last().is_some_and(|r| matches!(r.done, Done::Failed { .. }) || r.done == Done::Skipped);
+        let stop = out.last().is_some_and(|r| r.done.is_red() || r.done == Done::Skipped);
         let ran = if stop {
             Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None, reused: None }
         } else {
@@ -731,6 +791,7 @@ pub(crate) fn why_failed(r: &Ran) -> String {
         Done::Failed { timed_out: true, .. } => format!("timed out after {}s", r.step.limit.as_secs()),
         Done::Failed { exit: Some(n), .. } => format!("exit {n}"),
         Done::Failed { exit: None, .. } => "no exit status".into(),
+        Done::Malformed(why) => format!("malformed: {why}"),
         _ => String::new(),
     }
 }
@@ -750,6 +811,7 @@ pub(crate) fn account(ran: &[Ran]) -> String {
             }
             (Done::Passed, None) => ("✓", format!("{}s", secs(r.took))),
             (Done::Passed, Some((why, _))) => ("✓", format!("{}s · passed on a second run, the first was {why}", secs(r.took))),
+            (Done::Malformed(why), _) => ("✗", format!("malformed — the line cannot start: {why}")),
             (Done::Failed { .. }, first) => {
                 let twice = if first.is_some() { " both times" } else { "" };
                 ("✗", format!("{}s · {}{twice}", secs(r.took), why_failed(r)))
@@ -757,7 +819,7 @@ pub(crate) fn account(ran: &[Ran]) -> String {
             (Done::Skipped, _) => ("–", "skipped".to_string()),
         };
         out.push(format!("{mark} {} · {} · {rest} · {}", r.step.name, r.step.command.lines().next().unwrap_or_default(), why_in(&r.step)));
-        if matches!(r.done, Done::Failed { .. }) {
+        if r.done.is_red() {
             out.extend(r.tail.lines().map(|l| format!("  | {l}")));
         } else if let Some((_, tail)) = &r.first {
             out.extend(tail.lines().map(|l| format!("  ~ {l}")));
@@ -769,7 +831,15 @@ pub(crate) fn account(ran: &[Ran]) -> String {
 /// What a failed run owes, for the row's log and the pane: the first failing
 /// step, its command and the end of its output.
 pub(crate) fn owed(ran: &[Ran], sha: &str) -> String {
-    let Some(r) = ran.iter().find(|r| matches!(r.done, Done::Failed { .. })) else { return String::new() };
+    let Some(r) = ran.iter().find(|r| r.done.is_red()) else { return String::new() };
+    if let Done::Malformed(why) = &r.done {
+        return format!(
+            "wsp check could not start `{}` at {}: {why}. The line is malformed, not the work — nothing was sent back. \
+             Fix it with `wsp check <id> --set -` (one `- name: command` item per check, the command alone in backticks if a note follows).",
+            r.step.name,
+            &sha[..sha.len().min(12)],
+        );
+    }
     let tail: Vec<&str> = r.tail.lines().collect();
     let tail = tail[tail.len().saturating_sub(12)..].join("\n");
     format!(
@@ -846,6 +916,9 @@ pub(crate) enum Settled {
     SentBack,
     /// Failed, and the row was not at review: recorded, nobody moved.
     Failed,
+    /// A step could not start: the line is wrong, not the work, so the row is
+    /// recorded and left where it is, and its owner is asked to fix the line.
+    Malformed,
     /// The row or its entry is gone.
     Lost,
 }
@@ -865,7 +938,9 @@ pub(crate) fn settle(store: &Store, id: &str, at: &str, ran: &[Ran], took: Durat
         let read = run.read.clone();
         v::write_runs(&mut t, &runs);
         let mut out = if state == RunState::Passed { Settled::Passed } else { Settled::Failed };
-        if state == RunState::Failed && t.status() == Status::Review {
+        if ran.iter().any(|r| matches!(r.done, Done::Malformed(_))) {
+            out = Settled::Malformed;
+        } else if state == RunState::Failed && t.status() == Status::Review {
             let owes = owed(ran, read.as_deref().unwrap_or_default());
             v::send_back(&mut t, util::now_iso(), "wsp check failed", read.as_deref(), &owes, Some(CHECK_HEAD));
             out = Settled::SentBack;
@@ -1009,7 +1084,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
             let (mark, tail) = match &r.done {
                 Done::Passed if r.reused.is_some() => (p.green("✓"), " · reused".to_string()),
                 Done::Passed => (p.green("✓"), String::new()),
-                Done::Failed { .. } => (p.red("✗"), format!(" · {}", why_failed(r))),
+                Done::Failed { .. } | Done::Malformed(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
                 Done::Skipped => (p.dim("–"), " · skipped".to_string()),
             };
             println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
@@ -1030,7 +1105,8 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         );
     } else if !auto {
         if !ok {
-            for l in owed(&ran, &tg.sha).lines().skip(2) {
+            let skip = if settled == Settled::Malformed { 0 } else { 2 };
+            for l in owed(&ran, &tg.sha).lines().skip(skip) {
                 println!("    {}", p.dim(l));
             }
         }
@@ -1051,6 +1127,11 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         if let Some(t) = store.find_task(&t.id) {
             crate::cmd_task::deliver_reason(store, &t.id, &owed(&ran, &tg.sha));
         }
+    }
+    if settled == Settled::Malformed {
+        let ask = owed(&ran, &tg.sha).replace("<id>", &t.id);
+        crate::cycle::log_line(store, &format!("check {}: malformed — {ask}", t.id));
+        crate::cmd_task::deliver_notice(store, &t.id, &ask);
     }
     if record {
         crate::cycle::poke_task(store, &t.id, "checked");
@@ -1280,7 +1361,7 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
     let ran = run_all(&tree, &steps, &dir.join("last.log"), None, |r| {
         let (mark, tail) = match &r.done {
             Done::Passed => (p.green("✓"), String::new()),
-            Done::Failed { .. } => (p.red("✗"), format!(" · {}", why_failed(r))),
+            Done::Failed { .. } | Done::Malformed(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
             Done::Skipped => (p.dim("–"), " · skipped".to_string()),
         };
         println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
@@ -1329,6 +1410,15 @@ fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
     let steps = parse_steps(&text, Of::Project);
     if steps.is_empty() {
         eprintln!("wsp: no list item in that text declares a check — `- name (limit): command`");
+        return 2;
+    }
+    let bad = malformed_in(&steps);
+    if !bad.is_empty() {
+        eprintln!("wsp: not written — {} check line(s) cannot start under `sh`:", bad.len());
+        for b in &bad {
+            eprintln!("  - {b}");
+        }
+        eprintln!("  one item per check, `- name: command`; a note after the command goes outside its backticks");
         return 2;
     }
     let what = if let Some(mut proj) = store.project(needle) {
@@ -1659,6 +1749,63 @@ mod tests {
         let run = &v::runs(&t)[0];
         assert_eq!(run.state, RunState::Failed);
         assert!(run.text.contains("✗ tests · sh check.sh · 2s · exit 7") && run.text.contains("  | boom"), "{}", run.text);
+    }
+
+    #[test]
+    fn a_note_after_the_backticked_command_is_not_part_of_it() {
+        let s = step("- `cd spikes/web-chrome && npm run check` (tsc, 33 Vitest, 11 Playwright on WebKit)");
+        assert_eq!(s.command, "cd spikes/web-chrome && npm run check");
+        assert!(unparsable(&s.command).is_none());
+        assert_eq!(step("- web: `npm test` — 33 tests").command, "npm test");
+        assert_eq!(step("- `echo `date``").command, "echo `date`");
+        assert_eq!(step("- `make test`").command, "make test");
+    }
+
+    #[test]
+    fn set_refuses_a_line_that_does_not_parse_and_writes_nothing() {
+        let (env, store, _) = world("setbad", "- old: true", "exit 0\n");
+        let file = env.path("bad.md");
+        std::fs::write(&file, "- ok: true\n- broken: cd x &&\n").unwrap();
+        let args = Args::synth("check", &["pj-001"], &[("set", "true"), ("from", &file.display().to_string())]);
+        assert_eq!(check(&store, &args), 2);
+        assert!(store.find_task("pj-001").unwrap().section("Checks").is_none(), "refused before it was written");
+        std::fs::write(&file, "- ok: true\n").unwrap();
+        assert_eq!(check(&store, &args), 0);
+    }
+
+    #[test]
+    fn a_step_that_cannot_start_is_malformed_and_never_run() {
+        let dir = std::env::temp_dir();
+        let log = dir.join(format!("wsp-malformed-{}.log", std::process::id()));
+        let broken = Ran { ..run_step(&dir, &sh("cd x &&", 30), &log) };
+        assert!(matches!(broken.done, Done::Malformed(_)), "{:?}", broken.done);
+        let missing = run_step(&dir, &sh("wsp-no-such-command-anywhere", 30), &log);
+        assert!(matches!(missing.done, Done::Malformed(_)), "a command that is not found is not a red test: {:?}", missing.done);
+        let red = run_step(&dir, &sh("exit 3", 30), &log);
+        assert!(matches!(red.done, Done::Failed { exit: Some(3), .. }), "and a real failure still is one");
+    }
+
+    #[test]
+    fn a_malformed_step_on_a_row_at_review_records_the_run_and_does_not_send_the_row_back() {
+        let (_env, store, sha) = world("malformed", "- t: true", "exit 0\n");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        let ran = vec![Ran {
+            step: Step { name: "t".into(), command: "cd x &&".into(), limit: DEFAULT_LIMIT, of: Of::Project, on: Vec::new(), barrier: false, end: false },
+            done: Done::Malformed("syntax error: unexpected end of file".into()),
+            took: Duration::from_secs(1),
+            tail: "syntax error: unexpected end of file".into(),
+            first: None,
+            reused: None,
+        }];
+        assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(1)), Settled::Malformed);
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(t.status(), Status::Review, "the row stays where it was");
+        assert!(!t.section("Log").unwrap().contains("sent back"));
+        let run = &v::runs(&t)[0];
+        assert_eq!(run.state, RunState::Failed);
+        assert!(run.text.contains("malformed"), "{}", run.text);
+        assert!(owed(&ran, &sha).contains("--set"), "and what it asks is for the line to be fixed");
+        assert_eq!(gate(&store, &t), Gate::Clear, "the verifier is not held for a declaration");
     }
 
     #[test]

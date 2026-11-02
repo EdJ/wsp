@@ -386,7 +386,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
             Ranged::Ran(ran) => {
                 count += ran.len();
                 for (item, ran) in u.items.iter().zip(ran) {
-                    if matches!(ran.done, Done::Failed { .. }) {
+                    if matches!(ran.done, Done::Failed { .. } | Done::Malformed(_)) {
                         failed.push(item.step.name.clone());
                         blames.push(blame(item, ran, &landed));
                     }
