@@ -3864,6 +3864,17 @@ daemon logs it to `cycle.log` when it starts and clears. `wsp wip` (text and
 `--json`) and `wsp watch --status` also carry one line in every mode, load or
 not: the mode, whether it holds this minute, and who is building.
 
+**Idle panes' memory** (`wsp-338`) is on the same two views. Idle `claude` panes
+held 150 to 300 MB each, and seventeen of them starved the machine, so `wsp wip`
+(text and `--json`'s `idle_memory`) and `wsp watch --status` carry one line,
+`idle panes: 5 holding 1.1 GB`: the resident memory of every process in each
+idle pane, found by the backend's root pid or, for herdr, by the `HERDR_PANE_ID`
+in the process's environment. Past 2 GB it adds a red line naming the total and
+the three largest panes. The threshold is `{"warn_mb": 4096}` in
+`idle-memory.json` under the state directory, or `WSP_IDLE_MEMORY_MB`, which
+wins. A pane on another machine, whose processes are not here, is counted as
+not readable and not as zero.
+
 ## Spawning
 
 Handing work to an agent that already exists is `c`. Getting one where there is

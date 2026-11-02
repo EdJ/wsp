@@ -8550,6 +8550,7 @@ mod tests {
             disk: None,
             load: None,
             throttle: None,
+            idle_memory: Default::default(),
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),

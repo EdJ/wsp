@@ -2472,6 +2472,7 @@ impl Source for Poll<'_> {
             disk: None,
             load: None,
             throttle: None,
+            idle_memory: Default::default(),
             // (c) asks every row whether it is waiting — the one reading the
             // reconciler and the barrier ask too.
             asks: crate::waiting::Asks::read(self.store),
@@ -4305,6 +4306,16 @@ fn held(w: &Registered) -> String {
     }
 }
 
+/// `wsp-338`: the idle panes' memory, off every local backend's census.
+fn idle_memory(store: &Store) -> crate::memory::IdleMemory {
+    let agents: Vec<crate::place::Seated> = crate::cmd_spawn::local_backends()
+        .iter()
+        .filter_map(|b| b.census().ok())
+        .flat_map(|c| c.seats().cloned().collect::<Vec<_>>())
+        .collect();
+    crate::memory::read(&store.state, &agents, &store.bindings())
+}
+
 fn status(store: &Store, args: &Args) -> i32 {
     let watches = registered(store);
     // The machine's daemon, and what its absence costs — read once here rather
@@ -4352,7 +4363,12 @@ fn status(store: &Store, args: &Args) -> i32 {
     if let Some(load) = crate::throttle::loud(store) {
         println!("{}", p.red(&load));
     }
+    let idle_memory = idle_memory(store);
+    if let Some(warning) = idle_memory.warning() {
+        println!("{}", p.red(&warning));
+    }
     println!("{}", p.dim(&crate::throttle::status_line(store)));
+    println!("{}", p.dim(&idle_memory.line()));
     if watches.is_empty() {
         println!("{}", p.dim("nobody is watching · `wsp watch` starts one"));
         return 0;

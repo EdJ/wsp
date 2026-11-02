@@ -72,6 +72,7 @@ mod kind_data;
 mod kind_attention;
 mod cmd_attend;
 mod launchd;
+mod memory;
 mod message;
 mod model;
 mod overlap;

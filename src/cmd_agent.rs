@@ -3979,6 +3979,9 @@ pub(crate) struct Wip {
     /// [`crate::throttle::status_line`]: the build throttle's mode and whether it
     /// holds now, every time and in every mode.
     pub throttle: Option<String>,
+    /// What the idle panes' processes hold in resident memory, and the
+    /// threshold it warns past (`wsp-338`).
+    pub idle_memory: crate::memory::IdleMemory,
     /// The open questions, read once — the store half of [`crate::waiting`]'s
     /// reading, asked for every row.
     pub asks: crate::waiting::Asks,
@@ -4107,6 +4110,7 @@ impl Wip {
             .map(|(s, _)| s)
             .collect::<Vec<_>>();
         let shells = idle_members_shells(&agents, &bindings);
+        let idle_memory = crate::memory::read(&store.state, &agents, &bindings);
         Wip {
             tasks,
             index: Index::new(store.projects()),
@@ -4121,6 +4125,7 @@ impl Wip {
             disk: crate::disk::loud(store),
             load: crate::throttle::loud(store),
             throttle: Some(crate::throttle::status_line(store)),
+            idle_memory,
             asks: crate::waiting::Asks::read(store),
             shells,
             mandates: store.mandates(),
@@ -4738,6 +4743,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         "disk": w.disk,
         "load": w.load,
         "throttle": w.throttle,
+        "idle_memory": w.idle_memory.json(),
         "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "inbox": inbox,
@@ -4760,10 +4766,11 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
 
     if rows.is_empty() {
         out.push(p.dim("no agents running"));
-        for d in w.daemon.iter().chain(&w.disk).chain(&w.load) {
+        for d in w.daemon.iter().chain(&w.disk).chain(&w.load).chain(&w.idle_memory.warning()) {
             out.push(p.red(d));
         }
         out.extend(w.throttle.iter().map(|t| p.dim(t)));
+        out.push(p.dim(&w.idle_memory.line()));
     } else {
         // Not `all busy`, which is what this said and was the same sentence
         // `doctor`'s `herdr up, 12 agents` was saying on the night seven of
@@ -4802,10 +4809,11 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         // Its own line rather than another `·` clause on the heading: it is a
         // fault and the heading is a census, and a heading that goes yellow
         // every hour trains its reader past the yellow.
-        for d in w.daemon.iter().chain(&w.disk).chain(&w.load) {
+        for d in w.daemon.iter().chain(&w.disk).chain(&w.load).chain(&w.idle_memory.warning()) {
             out.push(p.red(d));
         }
         out.extend(w.throttle.iter().map(|t| p.dim(t)));
+        out.push(p.dim(&w.idle_memory.line()));
         out.push(String::new());
         let pw = rows.iter().map(|r| r.project.chars().count()).max().unwrap_or(7).max(7);
         let tw = 46;
@@ -8090,6 +8098,7 @@ mod tests {
             disk: None,
             load: None,
             throttle: None,
+            idle_memory: Default::default(),
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),
@@ -8284,6 +8293,7 @@ mod tests {
             disk: None,
             load: None,
             throttle: None,
+            idle_memory: Default::default(),
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),
@@ -8683,6 +8693,36 @@ mod tests {
             bare.throttle = Some(line.to_string());
             assert!(wip_lines(&bare, &Paint::new(), false).join("\n").contains(line));
         }
+    }
+
+    /// `wsp-338`. The idle panes' total is on the answer with agents or
+    /// without, and the warning is there past the threshold and absent under it.
+    #[test]
+    fn idle_pane_memory_shows_its_total_and_warns_only_past_the_threshold() {
+        use crate::memory::{IdleMemory, Pane};
+        let held = |mb: &[u64], warn_mb: u64| IdleMemory {
+            panes: mb.iter().enumerate().map(|(i, m)| Pane { seat: format!("w{i}:p1"), name: format!("wsp-{i}"), kb: m * 1024 }).collect(),
+            unread: 0,
+            warn_kb: warn_mb * 1024,
+        };
+        for terse in [false, true] {
+            let mut w = wip_world();
+            w.idle_memory = held(&[300, 200], 1000);
+            let text = wip_lines(&w, &Paint::new(), terse).join("\n");
+            assert!(text.contains("idle panes: 2 holding 500 MB"), "{text}");
+            assert!(!text.contains("warning"), "under the threshold: {text}");
+            assert_eq!(wip_json(&w)["idle_memory"]["over"], false);
+
+            w.idle_memory = held(&[900, 800], 1000);
+            let text = wip_lines(&w, &Paint::new(), terse).join("\n");
+            assert!(text.contains("idle panes: 2 holding 1.7 GB"), "{text}");
+            assert!(text.contains("idle panes hold 1.7 GB, over the 1000 MB warning — largest: wsp-0 (900 MB), wsp-1 (800 MB)"), "{text}");
+            assert_eq!(wip_json(&w)["idle_memory"]["total_kb"], 1700 * 1024);
+            assert_eq!(wip_json(&w)["idle_memory"]["over"], true);
+        }
+        let mut bare = wip_world();
+        bare.agents.clear();
+        assert!(wip_lines(&bare, &Paint::new(), false).join("\n").contains("idle panes: none"));
     }
 
     /// An idle agent on a task that is still `doing` is a person being the
