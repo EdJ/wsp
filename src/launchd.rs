@@ -551,14 +551,24 @@ mod tests {
         assert!(loaded(&format!("{domain}/{label}")), "the job did not survive being written");
 
         // `RunAtLoad`, and the `daemon` argument, actually reaching the program.
-        for _ in 0..100 {
+        // Twenty seconds because launchd's first exec of a script written a
+        // moment ago has been seen to miss five on a loaded machine (wsp-339:
+        // one failure in a full-suite run, not reproduced in 25 isolated runs
+        // under 8 busy loops or in three later suite runs); a pass breaks out
+        // on the first sight of the log, so the longer wait costs nothing.
+        for _ in 0..400 {
             if ran.exists() { break }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(
-            std::fs::read_to_string(&ran).unwrap_or_default().contains("daemon"),
-            "the job ran something other than `wsp daemon`"
-        );
+        let ran_text = std::fs::read_to_string(&ran);
+        if !ran_text.as_deref().unwrap_or_default().contains("daemon") {
+            let said = Command::new("launchctl").args(["print", &format!("{domain}/{label}")]).output().unwrap();
+            panic!(
+                "the job ran something other than `wsp daemon`: log {ran_text:?}, script exists {}, launchctl says:\n{}",
+                bin.exists(),
+                String::from_utf8_lossy(&said.stdout)
+            );
+        }
 
         // The ordinary install: same text, same job. Nothing, because
         // `kickstart -k` on a running job waits out `ThrottleInterval` first —
