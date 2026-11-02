@@ -2212,20 +2212,52 @@ fn abort_rebase(dir: &Path, onto: &str, why: &str) -> String {
     )
 }
 
-pub fn land(store: &Store, args: &Args) -> i32 {
-    let p = util::Paint::new();
-    let w = match locate(store, args) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("wsp: {e}");
-            return 2;
-        }
-    };
+/// What reached the trunk.
+pub(crate) struct Landed {
+    /// The commits that landed, newest first.
+    pub commits: Vec<String>,
+    /// The stat lines of what they changed.
+    pub files: Vec<String>,
+    /// The trunk commit they landed on top of.
+    pub base: Option<String>,
+    /// The trunk's tip now, which is the branch's.
+    pub sha: String,
+}
 
-    if !w.dir.join(".git").exists() {
-        eprintln!("wsp: no tree for {} under {} — nothing to land", w.task, w.searched());
-        return 2;
+/// Why a land did not happen. Each carries what to print.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    Dirty(String),
+    Detached(String),
+    RebaseConflict(String),
+    NotFastForward(String),
+    /// The branch is already in the trunk: not a failure.
+    Nothing(String),
+}
+
+impl Refusal {
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Refusal::Dirty(s) | Refusal::Detached(s) | Refusal::RebaseConflict(s) | Refusal::NotFastForward(s) | Refusal::Nothing(s) => s,
+        }
     }
+}
+
+/// How a land gets the branch onto the trunk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Rebase first; a conflict is the author's to resolve.
+    Rebase,
+    /// Rebase first; a conflict is aborted (the run's land for an idle seat).
+    ForRun,
+    /// No rebase: the trunk has not moved since the work was checked, and if it
+    /// has, nothing is landed unchecked.
+    FastForward,
+}
+
+/// The land, on a task's tree: the part of `wsp land` that is not printing.
+/// Writes the `wsp: landed` line and nothing else on the row.
+fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
     // Committing is the agent's act and stays the agent's act: what is
     // uncommitted here is a decision nobody else can make, and landing around
     // it would be this command doing the one thing the whole arrangement exists
@@ -2239,14 +2271,12 @@ pub fn land(store: &Store, args: &Args) -> i32 {
         // then there genuinely is something here to commit.
         if index_only(&w.dir) && !untracked(&w.dir) {
             let d = util::contract(&w.dir);
-            eprintln!("wsp: {d} has nothing uncommitted — its files match HEAD exactly");
-            eprintln!(
-                "wsp: what `git status` shows is the index, a commit behind after a commit made through a private GIT_INDEX_FILE — `git -C {d} reset` clears it and touches no file"
-            );
-            return 2;
+            return Err(Refusal::Dirty(format!(
+                "{d} has nothing uncommitted — its files match HEAD exactly\n\
+                 wsp: what `git status` shows is the index, a commit behind after a commit made through a private GIT_INDEX_FILE — `git -C {d} reset` clears it and touches no file"
+            )));
         }
-        eprintln!("wsp: {} has uncommitted work — commit it first", util::contract(&w.dir));
-        return 2;
+        return Err(Refusal::Dirty(format!("{} has uncommitted work — commit it first", util::contract(&w.dir))));
     }
     // The branch is read off the tree, which is the whole of `worklist-025`:
     // `w.task` is the *current* id and the tree may be on a branch of the id it
@@ -2256,15 +2286,13 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     // tree is refused rather than guessed at, [`judge`]'s rule for the same
     // reason: there is no branch here to compare with the trunk.
     let Some(on) = w.on() else {
-        eprintln!(
-            "wsp: {} is on a detached HEAD — nothing here names a branch to land",
+        return Err(Refusal::Detached(format!(
+            "{} is on a detached HEAD — nothing here names a branch to land",
             util::contract(&w.dir)
-        );
-        return 2;
+        )));
     };
     if ahead(&w.repo, &w.branch, &on).is_empty() {
-        println!("{} {}", p.dim("nothing to land —"), p.dim(&format!("{on} is already in {}", w.branch)));
-        return 0;
+        return Err(Refusal::Nothing(format!("{on} is already in {}", w.branch)));
     }
 
     let result = landing(store, || {
@@ -2272,22 +2300,26 @@ pub fn land(store: &Store, args: &Args) -> i32 {
         // trunk can never gain a merge commit from here. This is also where two
         // agents who edited one file meet, which is the arrangement working
         // rather than failing.
-        if let Err(e) = git_ok(&w.dir, &["rebase", &w.branch]) {
-            if args.has("for-run") {
-                return Err(abort_rebase(&w.dir, &w.branch, &e));
+        if mode != Mode::FastForward {
+            if let Err(e) = git_ok(&w.dir, &["rebase", &w.branch]) {
+                let said = if mode == Mode::ForRun {
+                    abort_rebase(&w.dir, &w.branch, &e)
+                } else {
+                    format!(
+                        "the rebase onto {} stopped: {e}\n\
+                         wsp: it is your tree and your conflict — resolve it in {}, `git rebase --continue`, then `wsp land` again",
+                        w.branch,
+                        util::contract(&w.dir)
+                    )
+                };
+                return Ok(Err(Refusal::RebaseConflict(said)));
             }
-            return Err(format!(
-                "the rebase onto {} stopped: {e}\n\
-                 wsp: it is your tree and your conflict — resolve it in {}, `git rebase --continue`, then `wsp land` again",
-                w.branch,
-                util::contract(&w.dir)
-            ));
         }
         let landed = ahead(&w.repo, &w.branch, &on);
         // `--ff-only` in the trunk rather than a push: the trunk is a checked-out
         // working tree, and this is the one form of update that refuses rather
         // than silently overwriting a file somebody has open there.
-        git_ok(&w.trunk, &["merge", "--ff-only", "--quiet", &on]).map_err(|e| {
+        if let Err(e) = git_ok(&w.trunk, &["merge", "--ff-only", "--quiet", &on]) {
             let t = util::contract(&w.trunk);
             let mut msg = format!("{t} would not fast-forward: {e}");
             // git's refusal names *local changes*, and the commonest reason
@@ -2302,17 +2334,14 @@ pub fn land(store: &Store, args: &Args) -> i32 {
                      wsp: `git -C {t} reset` clears it and touches no file, then `wsp land` again"
                 ));
             }
-            msg
-        })?;
-        Ok(landed)
-    });
-
-    let landed = match result {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("wsp: {e}");
-            return 1;
+            return Ok(Err(Refusal::NotFastForward(msg)));
         }
+        Ok(Ok(landed))
+    });
+    let landed = match result {
+        Ok(Ok(l)) => l,
+        Ok(Err(refusal)) => return Err(refusal),
+        Err(e) => return Err(Refusal::NotFastForward(e)),
     };
 
     // The file list, printed after the fact against the trunk. This is step 4
@@ -2336,23 +2365,54 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     // are the same commit here by construction, since the merge above was
     // `--ff-only`, and naming the trunk is what a reader checking the claim
     // will compare against.
-    if let Some(sha) = git(&w.trunk, &["rev-parse", &on]) {
-        let mut t = store.find_task(&w.task);
-        if let Some(t) = t.as_mut() {
-            let line =
-                format!("{} {sha} on {on}", crate::repair::LANDED);
+    let sha = git(&w.trunk, &["rev-parse", &on]).map(|s| s.trim().to_string()).unwrap_or_default();
+    // The commit before the ones that landed, so `wsp check` can read which
+    // paths this landing changed (`wsp-324`).
+    let base = git(&w.trunk, &["rev-parse", &format!("{sha}~{}", landed.len())]).map(|b| b.trim().to_string());
+    if !sha.is_empty() {
+        if let Some(mut t) = store.find_task(&w.task) {
+            let line = format!("{} {sha} on {on}", crate::repair::LANDED);
             if !t.section("Log").is_some_and(|l| l.contains(&line)) {
-                // The commit before the ones that landed, so `wsp check` can read
-                // which paths this landing changed (`wsp-324`).
-                let since = git(&w.trunk, &["rev-parse", &format!("{}~{}", sha.trim(), landed.len())])
-                    .map(|b| format!(" · since {}", b.trim()))
-                    .unwrap_or_default();
+                let since = base.as_ref().map(|b| format!(" · since {b}")).unwrap_or_default();
                 t.log(&format!("{line}{since}"));
                 t.touch();
-                let _ = store.save_task(t);
+                let _ = store.save_task(&t);
             }
         }
     }
+    Ok(Landed { commits: landed, files, base, sha })
+}
+
+pub fn land(store: &Store, args: &Args) -> i32 {
+    let p = util::Paint::new();
+    let w = match locate(store, args) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    };
+
+    if !w.dir.join(".git").exists() {
+        eprintln!("wsp: no tree for {} under {} — nothing to land", w.task, w.searched());
+        return 2;
+    }
+    let mode = if args.has("for-run") { Mode::ForRun } else { Mode::Rebase };
+    let landed = match land_task(store, &w, mode) {
+        Ok(l) => l,
+        Err(Refusal::Nothing(said)) => {
+            println!("{} {}", p.dim("nothing to land —"), p.dim(&said));
+            return 0;
+        }
+        Err(r @ (Refusal::Dirty(_) | Refusal::Detached(_))) => {
+            eprintln!("wsp: {}", r.text());
+            return 2;
+        }
+        Err(r) => {
+            eprintln!("wsp: {}", r.text());
+            return 1;
+        }
+    };
 
     // `wsp-134`: a member reviewed before it landed is verified once it has.
     crate::cycle::poke_task(store, &w.task, "land");
@@ -2364,21 +2424,112 @@ pub fn land(store: &Store, args: &Args) -> i32 {
             json!({
                 "task": w.task,
                 "into": w.branch,
-                "commits": landed,
-                "files": files,
+                "commits": landed.commits,
+                "files": landed.files,
             })
         );
         return 0;
     }
 
-    println!("{} {} into {}", p.green("✓"), p.bold(&format!("{} commit(s)", landed.len())), w.branch);
-    for c in landed.iter().rev() {
+    println!("{} {} into {}", p.green("✓"), p.bold(&format!("{} commit(s)", landed.commits.len())), w.branch);
+    for c in landed.commits.iter().rev() {
         println!("  {c}");
     }
-    for f in &files {
+    for f in &landed.files {
         println!("  {}", p.dim(f));
     }
     0
+}
+
+/// What the verifier's hold did to the trunk.
+pub(crate) enum Verdict {
+    /// Nothing to land: no tree, nothing ahead, a row that landed itself.
+    Nothing,
+    Landed {
+        landed: Landed,
+        /// The steps rerun after the trunk moved, all green.
+        reran: Vec<String>,
+    },
+    /// The trunk is untouched; this is what is owed.
+    Blocked(String),
+}
+
+const ROUNDS: usize = 3;
+
+/// The land a hold performs, in the member's own tree. The trunk is landed
+/// on only by a fast-forward of exactly what was checked: when it moved since,
+/// the branch is rebased onto it and only the checks the rebase can have
+/// affected are rerun ([`crate::check::affected`]), up to [`ROUNDS`] times.
+pub(crate) fn land_verdict(store: &Store, task: &str) -> Verdict {
+    let Ok(w) = pick(candidates(store, Path::new("/"), task), task) else { return Verdict::Nothing };
+    if !w.dir.join(".git").exists() {
+        return Verdict::Nothing;
+    }
+    let tree = util::contract(&w.dir);
+    let moved = |w: &Where| git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_err();
+    let mut reran: Vec<String> = Vec::new();
+    let mut rebases = 0;
+    loop {
+        if !moved(&w) {
+            return match land_task(store, &w, Mode::FastForward) {
+                Ok(landed) => Verdict::Landed { landed, reran },
+                Err(Refusal::Nothing(_)) => Verdict::Nothing,
+                Err(Refusal::NotFastForward(_)) if moved(&w) => continue,
+                Err(r) => Verdict::Blocked(format!("wsp: the hold could not land {task}: {}", r.text())),
+            };
+        }
+        if rebases == ROUNDS {
+            return Verdict::Blocked(format!(
+                "wsp: {} moved {ROUNDS} times while its checks ran — the trunk is moving faster than they finish, so nothing was landed; \
+                 `wsp review` again when it settles",
+                w.branch
+            ));
+        }
+        rebases += 1;
+        if dirty(&w.dir) {
+            return Verdict::Blocked(format!("wsp: {tree} has uncommitted work — commit it (`wsp commit-help`), then `wsp review` again"));
+        }
+        let old_head = git(&w.dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
+        let old_base = git(&w.dir, &["merge-base", &w.branch, "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
+        if let Err(e) = git_ok(&w.dir, &["rebase", &w.branch]) {
+            let said = abort_rebase(&w.dir, &w.branch, &e);
+            return Verdict::Blocked(format!(
+                "wsp: {} moved since the rebase and the rebase does not apply: {said}\nresolve it in {tree}, then `wsp review` again",
+                w.branch
+            ));
+        }
+        let new_head = git(&w.dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
+        let new_base = git(&w.dir, &["rev-parse", &w.branch]).map(|s| s.trim().to_string()).unwrap_or_default();
+        let paths = |a: &str, b: &str| -> Vec<String> {
+            git(&w.dir, &["diff", "--name-only", a, b]).unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+        };
+        let pulled_in = paths(&old_base, &new_base);
+        let ours = paths(&old_base, &old_head);
+        let Some(t) = store.find_task(task) else { return Verdict::Nothing };
+        let Ok(tg) = crate::check::target(store, &t, Some(&new_head)) else { continue };
+        let tg = crate::check::Target { since: Some(old_base.clone()), ..tg };
+        let steps = crate::check::affected(&crate::check::plan(store, &t, &tg, Some(&new_head)).steps, &pulled_in, &ours);
+        if steps.is_empty() {
+            continue;
+        }
+        let dir = store.state_file("checks").join(format!("{task}-tree"));
+        let _ = std::fs::create_dir_all(&dir);
+        let lock = match crate::check::TreeLock::take(dir.join("lock"), crate::check::TREE_WAIT) {
+            Ok(l) => l,
+            Err(why) => return Verdict::Blocked(format!("wsp: the rerun after the trunk moved could not start: {why}")),
+        };
+        let ran = crate::check::run_all(&w.dir, &steps, &dir.join("land.log"), |_| {});
+        drop(lock);
+        if !crate::check::passed(&ran) {
+            return Verdict::Blocked(format!(
+                "wsp: {} moved while you waited and the rebase pulled in {} path(s); rerunning the checks it can affect failed.\n{}",
+                w.branch,
+                pulled_in.len(),
+                crate::check::owed(&ran, &new_head)
+            ));
+        }
+        reran.extend(steps.iter().map(|s| s.name.clone()));
+    }
 }
 
 #[cfg(test)]

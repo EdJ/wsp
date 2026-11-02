@@ -1746,9 +1746,16 @@ wsp verified wsp-148 --blocks --from verdict.md   # back to doing, verdict owed,
 
 ```
 ## Verification
-- 2026-10-06T10:00:00Z holds · read 55c4839abcde · pane cpd-12 · on claude opus/high · ended
+- 2026-10-06T10:00:00Z holds · read 55c4839abcde · landed 9f3a1c07d2e4 · pane cpd-12 · on claude opus/high · ended
   what was checked, what held, what did not
 ```
+
+`--holds` on a member that is ready and unlanded lands it, in the member's own
+tree: a fast-forward when the trunk has not moved since the checks ran, else a
+rebase and a rerun of only the checks the rebase can have affected, up to three
+rounds. A conflict, a red rerun or a trunk that keeps moving records `blocks`
+instead, and nothing reaches the trunk. `landed` is the commit that reached the
+trunk when it is not the one `read`; a re-verify treats it as the same work.
 
 The barrier, `wsp worklist show --verdicts` and `wsp wip` (`wsp-148 ·
 verifying`) all read the newest entry. A new landing supersedes a pass that is

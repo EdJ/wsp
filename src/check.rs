@@ -362,6 +362,25 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
     Plan { steps, changed }
 }
 
+/// The steps of a re-plan after the trunk moved that the rebase can have
+/// affected, given `pulled_in` (what the rebase brought from the trunk) and
+/// `ours` (what the branch changes): a project rule whose glob matches a pulled-in
+/// path; a member's own step when the two sets overlap; an every-landing step
+/// when anything was pulled in. A rule expanded from a capture is kept by its
+/// glob, so a sibling capture may be rerun too — more checks, never fewer.
+pub(crate) fn affected(steps: &[Step], pulled_in: &[String], ours: &[String]) -> Vec<Step> {
+    let overlap = pulled_in.iter().any(|d| ours.contains(d));
+    steps
+        .iter()
+        .filter(|s| match s.of {
+            Of::Rule => s.on.iter().any(|g| pulled_in.iter().any(|d| captures(g, d).is_some())),
+            Of::Task => overlap,
+            Of::Project => !pulled_in.is_empty(),
+        })
+        .cloned()
+        .collect()
+}
+
 /// The paths the landing changed: since the commit `wsp land` wrote on the row,
 /// and for a row landed before it did, in the commits up to `sha` that name the
 /// row's id — in front, as wsp's own do now, or at the end, as they once did.
@@ -1610,5 +1629,27 @@ mod tests {
         assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[("plan", "true")])), 0);
         assert!(v::runs(&store.find_task("pj-001").unwrap()).is_empty());
         assert!(!env.state().join("checks").exists(), "no tree was made");
+    }
+
+    #[test]
+    fn a_moved_trunk_keeps_only_the_steps_its_paths_can_affect() {
+        let rule = |glob: &str| Step { of: Of::Rule, on: vec![glob.into()], ..sh("true", 1) };
+        let member = Step { of: Of::Task, ..sh("true", 1) };
+        let always = Step { of: Of::Project, ..sh("true", 1) };
+        let steps = vec![rule("src/**"), rule("docs/**"), member.clone(), always.clone()];
+        let paths = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let table: [(&[&str], &[&str], usize); 5] = [
+            // pulled in, ours, which of the four survive (as a bitmask over the list)
+            (&["src/a.rs"], &["m.txt"], 0b1001),
+            (&["docs/x.md"], &["m.txt"], 0b0101),
+            (&["src/a.rs"], &["src/a.rs"], 0b1011),
+            (&["other"], &["m.txt"], 0b0001),
+            (&[], &["m.txt"], 0b0000),
+        ];
+        for (pulled, ours, want) in table {
+            let got = affected(&steps, &paths(pulled), &paths(ours));
+            let mask = steps.iter().enumerate().filter(|(_, s)| got.contains(s)).fold(0, |m, (i, _)| m | (1 << (3 - i)));
+            assert_eq!(mask, want, "pulled {pulled:?}, ours {ours:?}");
+        }
     }
 }

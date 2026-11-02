@@ -1068,8 +1068,11 @@ pub(crate) fn landed(t: &Task) -> Option<String> {
 /// never reviewed ready, and for one that has landed.
 pub(crate) fn ready(t: &Task) -> Option<String> {
     let sha = newest_commit(t, &[READY])?;
+    // A landing of the same commit puts it on the trunk; a landing of any other
+    // one, written after the ready line, is a rebased land of the same work.
     let on_trunk = commits_of(t, LANDED).into_iter().any(|l| crate::verification::same_commit(&l, &sha));
-    (!on_trunk).then_some(sha)
+    let newest = newest_commit(t, &[LANDED, READY])?;
+    (!on_trunk && crate::verification::same_commit(&newest, &sha)).then_some(sha)
 }
 
 /// "The member's commit": the newest of its landed, ready and reading lines.

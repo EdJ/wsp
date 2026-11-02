@@ -1872,8 +1872,8 @@ fn prepare_ready(store: &Store, list: &str, at: usize, member: &Task) -> bool {
 fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::commit_of(member);
-    let landed_again = |read: &Option<String>| match (&now_landing, read) {
-        (Some(now), Some(then)) => !v::same_commit(now, then),
+    let landed_again = |p: &v::Pass| match (&now_landing, &p.read) {
+        (Some(now), Some(then)) => !v::same_commit(now, then) && !p.landed.as_deref().is_some_and(|l| v::same_commit(now, l)),
         _ => false,
     };
     let made = store.locked(|| {
@@ -1899,7 +1899,7 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) 
                     return Some(Opened { superseded: None, again: true, lost: None });
                 }
                 let dead = !ended && own[i].pane.as_deref().is_some_and(gone);
-                if !ended && !dead && !landed_again(&p.read) {
+                if !ended && !dead && !landed_again(p) {
                     return None;
                 }
                 own[i].state = State::Superseded;
@@ -1911,7 +1911,7 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) 
                 superseded = own[i].pane.clone().filter(|_| !ended && !dead);
             }
             Some(p) if p.state == State::Holds => {
-                if !landed_again(&p.read) {
+                if !landed_again(p) {
                     return None;
                 }
             }
@@ -1968,7 +1968,10 @@ struct Opened {
 /// not itself buy a verifier for code that was never re-read.
 fn moved_since(now_landing: &Option<String>, member_updated: &str, pass: &crate::verification::Pass) -> bool {
     match (now_landing, &pass.read) {
-        (Some(now), Some(then)) => !crate::verification::same_commit(now, then),
+        // The commit a hold landed is the work it read, rebased.
+        (Some(now), Some(then)) => {
+            !crate::verification::same_commit(now, then) && !pass.landed.as_deref().is_some_and(|l| crate::verification::same_commit(now, l))
+        }
         // Against the verdict and not the opening: the block itself moves the
         // member to `doing`, and that is not the member moving. `decided` is
         // the instant the verdict was recorded (`wsp-193`), and the block's
@@ -5324,6 +5327,38 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_task(&m).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
         (env, store, tree, w)
+    }
+
+    /// `wsp-341`: a hold lands the branch rebased onto a trunk that moved again,
+    /// so the commit that reached the trunk is not the one the pass read. The
+    /// pass says so, and the next tick reads it as the same work.
+    #[test]
+    fn a_rebased_land_is_not_verified_again() {
+        let (_env, store, tree, w) = ready_tree("rebased-land", "g", "h");
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 1);
+        let repo = tree.parent().unwrap().parent().unwrap().to_path_buf();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::fs::write(repo.join("later"), "later\n").unwrap();
+        git(&repo, &["add", "later"]);
+        git(&repo, &["commit", "-q", "-m", "the trunk moved again"]);
+        let from = store.root.join("verdict.md");
+        std::fs::write(&from, "holds").unwrap();
+        let from = from.display().to_string();
+        let args = crate::Args::synth("verified", &["m-1", "--from", &from], &[("holds", "true"), ("caption", "it holds")]);
+        assert_eq!(crate::verification::cmd_verified(&store, &args), 0);
+        let m = store.find_task("m-1").unwrap();
+        let p = crate::verification::passes(&m).pop().unwrap();
+        assert!(p.landed.is_some(), "read and landed differ: {:?}", p);
+        step(&store, &w, &Blind);
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 1, "the landing is the work the pass read, rebased");
+        let _ = spawned();
     }
 
     /// `wsp-341`: the trunk moved after the member went ready. The step rebases

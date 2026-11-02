@@ -112,6 +112,9 @@ pub(crate) struct Pass {
     /// The commit it was asked to read: the member's landing when the pass was
     /// opened. `None` for work with no repository behind it.
     pub read: Option<String>,
+    /// The commit that reached the trunk when it is not the one read: a hold
+    /// lands the branch rebased onto a trunk that moved.
+    pub landed: Option<String>,
     /// The seat its agent was started in.
     pub pane: Option<String>,
     /// What it ran on: the kind, or the kind and its tier.
@@ -165,6 +168,7 @@ impl Pass {
             at: util::now_iso(),
             state: State::Running,
             read: read.map(|s| short(&s)),
+            landed: None,
             pane: None,
             on,
             was: None,
@@ -191,6 +195,7 @@ impl Pass {
             }
         };
         clause("read", &self.read);
+        clause("landed", &self.landed);
         clause("pane", &self.pane);
         clause("on", &self.on);
         clause("was", &self.was);
@@ -279,6 +284,7 @@ impl Pass {
             at: at.to_string(),
             state,
             read: None,
+            landed: None,
             pane: None,
             on: None,
             was: None,
@@ -300,6 +306,7 @@ impl Pass {
                 let v = Some(v.trim().to_string());
                 match k {
                     "read" => p.read = v,
+                    "landed" => p.landed = v,
                     "pane" => p.pane = v,
                     "on" => p.on = v,
                     "was" => p.was = v,
@@ -484,6 +491,7 @@ pub(crate) fn json(t: &Task) -> serde_json::Value {
                 "at": p.at,
                 "decided": p.decided,
                 "read": p.read,
+                "landed": p.landed,
                 "pane": p.pane,
                 "did": p.did.as_ref().map(did_json),
                 "checked": p.checked.iter().map(|c| serde_json::json!({ "item": c.item, "held": c.held })).collect::<Vec<_>>(),
@@ -564,6 +572,7 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         at: row.created.clone(),
         state,
         read: crate::repair::landed(row).map(|s| short(&s)),
+        landed: None,
         pane: attempt.map(|a| a.pane).filter(|p| !p.is_empty()),
         on,
         was: Some(row.id.clone()),
@@ -802,6 +811,28 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         }
     };
     let me = crate::cmd_agent::my_pane();
+    // A hold on a member that is ready and unlanded lands it, here, so a land
+    // that cannot happen turns the hold into a block in the same write.
+    let mut state = state;
+    let mut text = text;
+    let mut caption = caption;
+    let mut landing = None;
+    let mut reran = Vec::new();
+    if state == State::Holds && crate::repair::ready(&member).is_some() {
+        match crate::cmd_checkout::land_verdict(store, &member.id) {
+            crate::cmd_checkout::Verdict::Nothing => {}
+            crate::cmd_checkout::Verdict::Landed { landed, reran: r } => {
+                landing = Some(landed);
+                reran = r;
+            }
+            crate::cmd_checkout::Verdict::Blocked(why) => {
+                state = State::Blocks;
+                caption = "the hold could not land the row".to_string();
+                text = format!("{}\n\n{why}", text.trim());
+                println!("{}", Paint::new().red("■ the hold could not land the row, so it is recorded as a block"));
+            }
+        }
+    }
     let recorded = record_checked(store, &member.id, state, &text, me.as_deref(), Some(&caption), checked);
     let pass = match recorded {
         Ok(p) => p,
@@ -810,9 +841,16 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    let pass = match &landing {
+        Some(l) => note_landing(store, &member.id, l, &reran).unwrap_or(pass),
+        None => pass,
+    };
     store.log_event(
         "task-verified",
-        serde_json::json!({ "id": member.id, "verdict": state.as_str(), "caption": caption, "read": pass.read, "pane": pass.pane }),
+        serde_json::json!({
+            "id": member.id, "verdict": state.as_str(), "caption": caption, "read": pass.read, "pane": pass.pane,
+            "landed": landing.as_ref().map(|l| l.sha.clone()),
+        }),
     );
     store.git_commit(&format!("wsp: verified {} {} — {}", member.id, state.as_str(), member.title));
     // A row run as legs has no one agent to tell while its rework leg carries the
@@ -837,6 +875,26 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
         println!("  {}", p.dim("no `checked:` lines — one per done-when item you looked at, ending in held or not held, is what `wsp verifications` counts"));
     }
     0
+}
+
+/// After a hold landed the row: the newest pass gets the `landed` clause when
+/// the commit that reached the trunk is not the one it read, and the row's log
+/// says what reached the trunk and what was rerun for it.
+fn note_landing(store: &Store, member: &str, l: &crate::cmd_checkout::Landed, reran: &[String]) -> Option<Pass> {
+    store.locked(|| {
+        let mut t = store.find_task(member)?;
+        let mut ps = passes(&t);
+        let last = ps.last_mut()?;
+        if last.read.as_deref().is_none_or(|r| !same_commit(r, &l.sha)) {
+            last.landed = Some(short(&l.sha));
+        }
+        let pass = last.clone();
+        write(&mut t, &ps);
+        let again = if reran.is_empty() { String::new() } else { format!(" · reran {} after the trunk moved, green", reran.join(", ")) };
+        t.log(&format!("wsp: the verifier's hold landed {} commit(s) at {}{again}", l.commits.len(), short(&l.sha)));
+        store.save_task(&t).ok()?;
+        Some(pass)
+    })
 }
 
 /// A blocking verdict as what is owed: its prose, and the items it says did not
@@ -892,7 +950,7 @@ pub(crate) fn record_checked(
         let at = match at {
             Some(i) => i,
             None => {
-                let mut p = Pass::opened(crate::repair::landed(&t), None);
+                let mut p = Pass::opened(crate::repair::commit_of(&t), None);
                 p.pane = me.map(str::to_string);
                 // Nothing to end: this pass was written by somebody already
                 // standing somewhere, not by an agent wsp started for it.
@@ -1108,6 +1166,7 @@ mod tests {
             at: "2026-10-06T10:00:00Z".into(),
             state: State::Blocks,
             read: Some("55c4839abcde".into()),
+            landed: Some("77aa0000bbbb".into()),
             pane: Some("cpd-12".into()),
             on: Some("claude opus/high".into()),
             was: Some("wsp-174".into()),
@@ -1129,7 +1188,7 @@ mod tests {
         write(&mut t, &[bare.clone(), full.clone()]);
         assert_eq!(passes(&t), vec![full, bare], "oldest first, whichever order they were handed in");
         assert!(t.body.find("## Verification").unwrap() < t.body.find("## Log").unwrap(), "and the log stays last");
-        assert!(t.body.contains("- 2026-10-06T10:00:00Z blocks · read 55c4839abcde · pane cpd-12"), "{}", t.body);
+        assert!(t.body.contains("- 2026-10-06T10:00:00Z blocks · read 55c4839abcde · landed 77aa0000bbbb · pane cpd-12"), "{}", t.body);
     }
 
     /// The lines wsp wrote sit under the verdict and come back as fields: the
@@ -1426,5 +1485,182 @@ mod tests {
         assert_eq!(newest["caption"]["word"], "blocks");
         assert_eq!(newest["caption"]["tail"], "the wiring between the two has no test");
         assert_eq!(newest["caption"]["at"], newest["decided"], "a verdict's caption is dated by the verdict");
+    }
+
+    // ---- `wsp-341`: the hold lands the row ------------------------------------
+
+    fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(dir).args(args)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A member `m-1` ready in a tree of its own, with a pass reading it, and a
+    /// project whose `## Checks` are `checks` (`RAN` in a command is a file the
+    /// test reads back). `trunk` is committed to master after the pass opened.
+    struct Ground {
+        _env: util::Isolated,
+        store: Store,
+        repo: std::path::PathBuf,
+        tree: std::path::PathBuf,
+        ran: std::path::PathBuf,
+        ready: String,
+    }
+
+    fn ground(tag: &str, checks: &str, member: &[(&str, &str)], trunk: &[(&str, &str)]) -> Ground {
+        let env = util::isolated(&format!("hold-{tag}"));
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_t(&repo, &["init", "-q", "-b", "master"]);
+        std::fs::write(repo.join("f"), "base\n").unwrap();
+        git_t(&repo, &["add", "f"]);
+        git_t(&repo, &["commit", "-q", "-m", "first"]);
+        let tree = repo.join(".worktrees").join("m-1");
+        git_t(&repo, &["worktree", "add", "-q", "-b", "m-1", &tree.display().to_string()]);
+        let put = |dir: &std::path::Path, files: &[(&str, &str)], msg: &str| {
+            for (path, text) in files {
+                let at = dir.join(path);
+                std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                std::fs::write(&at, text).unwrap();
+                git_t(dir, &["add", path]);
+            }
+            git_t(dir, &["commit", "-q", "-m", msg]);
+        };
+        put(&tree, member, "the work");
+        let ready = git_t(&tree, &["rev-parse", "HEAD"]);
+        let ran = env.path("ran.log");
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        p.body = format!("## Checks\n{}\n", checks.replace("RAN", &ran.display().to_string()).replace("REPO", &repo.display().to_string()));
+        store.save_project(&p).unwrap();
+        let mut t = Task::new("a member", "m-1");
+        t.project = Some("p".into());
+        t.status_raw = "review".into();
+        t.log(&format!("{} {ready} on m-1", crate::repair::READY));
+        write(&mut t, &[Pass::opened(Some(ready.clone()), None)]);
+        store.save_task(&t).unwrap();
+        if !trunk.is_empty() {
+            put(&repo, trunk, "the trunk moved");
+        }
+        Ground { _env: env, store, repo, tree, ran, ready }
+    }
+
+    impl Ground {
+        fn verdict(&self, flag: &str) -> i32 {
+            let from = self.store.root.join("verdict.md");
+            std::fs::write(&from, "read it in the tree; that is the verdict").unwrap();
+            let from = from.display().to_string();
+            let args = Args::synth("verified", &["m-1", "--from", &from], &[(flag, "true"), ("caption", "it was read in the tree")]);
+            cmd_verified(&self.store, &args)
+        }
+        fn trunk(&self) -> String {
+            git_t(&self.repo, &["rev-parse", "master"])
+        }
+        fn member(&self) -> Task {
+            self.store.find_task("m-1").unwrap()
+        }
+        fn reran(&self) -> String {
+            std::fs::read_to_string(&self.ran).unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn a_hold_lands_the_row_and_records_both_commits() {
+        let g = ground("lands", "", &[("m.txt", "mine\n")], &[("t.txt", "theirs\n")]);
+        assert_eq!(g.verdict("holds"), 0);
+        let t = g.member();
+        let landed = crate::repair::landed(&t).expect("a landed line");
+        assert_eq!(landed, g.trunk(), "the trunk is at the landed commit");
+        assert_ne!(landed, g.ready, "the rebase made a new commit");
+        assert!(t.section("Log").unwrap().contains(&format!("{} {landed} on m-1 · since", crate::repair::LANDED)));
+        let p = passes(&t).pop().unwrap();
+        assert_eq!(p.state, State::Holds);
+        assert!(same_commit(p.read.as_deref().unwrap(), &g.ready), "the pass keeps the commit it read");
+        assert!(same_commit(p.landed.as_deref().unwrap(), &landed), "and names the one that reached the trunk");
+        assert!(crate::repair::ready(&t).is_none(), "landed is not ready");
+        assert_eq!(t.status_raw, "review");
+        let again = Pass::parse(&p.line().lines().next().unwrap().to_string()).unwrap();
+        assert_eq!(again.landed, p.landed, "the clause reads back");
+    }
+
+    #[test]
+    fn a_hold_on_a_trunk_that_did_not_move_lands_with_no_landed_clause() {
+        let g = ground("unmoved", "", &[("m.txt", "mine\n")], &[]);
+        assert_eq!(g.verdict("holds"), 0);
+        let t = g.member();
+        assert_eq!(g.trunk(), g.ready);
+        assert!(passes(&t).pop().unwrap().landed.is_none(), "read and landed are the same commit");
+        assert_eq!(crate::repair::landed(&t).as_deref(), Some(g.ready.as_str()));
+    }
+
+    #[test]
+    fn a_block_leaves_the_trunk_alone() {
+        let g = ground("blocks", "", &[("m.txt", "mine\n")], &[("t.txt", "theirs\n")]);
+        let before = g.trunk();
+        assert_eq!(g.verdict("blocks"), 0);
+        assert_eq!(g.trunk(), before, "nothing reached the trunk");
+        let t = g.member();
+        assert_eq!(t.status_raw, "doing");
+        assert!(crate::repair::landed(&t).is_none());
+        assert_eq!(passes(&t).pop().unwrap().state, State::Blocks);
+    }
+
+    #[test]
+    fn a_moved_trunk_reruns_only_the_affected_checks() {
+        let checks = "- src on src/**: echo src >> RAN\n- docs on docs/**: echo docs >> RAN\n- mine on m.txt: echo mine >> RAN\n- always: echo always >> RAN";
+        let g = ground("affected", checks, &[("m.txt", "mine\n")], &[("src/a.txt", "theirs\n")]);
+        assert_eq!(g.verdict("holds"), 0);
+        assert_eq!(g.reran(), "src\nalways\n", "the rule the rebase touched and the every-landing step, not the rule only the member touched");
+        assert!(g.member().section("Log").unwrap().contains("reran src, always after the trunk moved, green"));
+        assert_eq!(g.trunk(), crate::repair::landed(&g.member()).unwrap());
+    }
+
+    #[test]
+    fn a_red_rerun_after_the_rebase_blocks_the_hold() {
+        let g = ground("red", "- src on src/**: test ! -f src/a.txt", &[("m.txt", "mine\n")], &[("src/a.txt", "theirs\n")]);
+        let before = g.trunk();
+        assert_eq!(g.verdict("holds"), 0);
+        assert_eq!(g.trunk(), before, "the red rerun kept it off the trunk");
+        let t = g.member();
+        assert_eq!(t.status_raw, "doing");
+        let p = passes(&t).pop().unwrap();
+        assert_eq!(p.state, State::Blocks);
+        assert!(p.text.contains("read it in the tree") && p.text.contains("`src`"), "the verifier's prose, then the step that failed: {}", p.text);
+        assert!(t.section("Log").unwrap().contains(crate::cycle::SENT_BACK));
+    }
+
+    #[test]
+    fn a_conflict_after_the_trunk_moved_blocks_the_hold() {
+        let g = ground("conflict", "", &[("f", "member's line\n")], &[("f", "trunk's line\n")]);
+        let before = g.trunk();
+        assert_eq!(g.verdict("holds"), 0);
+        assert_eq!(g.trunk(), before);
+        let t = g.member();
+        assert_eq!(passes(&t).pop().unwrap().state, State::Blocks);
+        assert!(passes(&t).pop().unwrap().text.contains("does not apply"));
+        assert!(!g.tree.join(".git").is_dir() && git_t(&g.tree, &["status", "--porcelain"]).is_empty(), "the tree is not left mid-rebase");
+        assert_eq!(git_t(&g.tree, &["rev-parse", "HEAD"]), g.ready, "and is as the member left it");
+    }
+
+    #[test]
+    fn a_trunk_that_keeps_moving_blocks_after_three_rounds() {
+        let mover = "- always: n=$(ls REPO | wc -l | tr -d ' '); echo $n > REPO/g$n; git -C REPO add g$n; git -C REPO -c user.name=t -c user.email=t@t commit -qm g$n";
+        let g = ground("racing", mover, &[("m.txt", "mine\n")], &[("t.txt", "theirs\n")]);
+        let before = g.trunk();
+        assert_eq!(g.verdict("holds"), 0);
+        let t = g.member();
+        let p = passes(&t).pop().unwrap();
+        assert_eq!(p.state, State::Blocks);
+        assert!(p.text.contains("moved 3 times"), "{}", p.text);
+        assert!(crate::repair::landed(&t).is_none(), "nothing landed");
+        assert_ne!(g.trunk(), before, "the racing step really moved it");
+        let _ = &g.repo;
     }
 }
