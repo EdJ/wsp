@@ -1650,9 +1650,18 @@ fn start_leg(store: &Store, row: &str, leg: &str, owned: Option<(&str, &str)>) -
 /// `wsp leg done` launches, detached, when it ends a leg of a row staged and
 /// spawned by hand (`docs/legs.md`, *The run*, "Outside a list"). A launch is
 /// the run and not a person asking, so it waits for a place like any other start.
-/// A row in a running list is that list's step's, and is left to it.
+/// A row in a list that has not ended is that list's, and is left to it: a
+/// running list's step starts it, and a held or parked one starts nothing until
+/// it is resumed (`wsp-356`), which is said once here.
 pub(crate) fn start_legs(store: &Store, row: &str, seats: &dyn Seats) -> Vec<String> {
-    if worklist::Running::read(store).list_of(row).is_some() {
+    if let Some(w) = worklist::open_list_of(&store.worklists(), row) {
+        if !w.status().is_running() {
+            log_line(store, &format!(
+                "{row}'s legs wait — its list {} is {}; they start when it is resumed",
+                w.id,
+                w.status().as_str()
+            ));
+        }
         return Vec::new();
     }
     let gate = crate::room::Gate::new(store, seats);
@@ -1680,17 +1689,17 @@ pub(crate) fn start_legs(store: &Store, row: &str, seats: &dyn Seats) -> Vec<Str
     started
 }
 
-/// A row run as legs that is not in a running list, has started, and has legs
+/// A row run as legs that is in no list that has not ended, has started, and has legs
 /// ready that nothing is starting: the repair tick's catch for a launch that was
 /// lost, and for a leg that was held at the cap when its last neighbour ended.
 /// Rows nothing has begun are left alone: staging one is not starting it.
 pub(crate) fn legs_owed(store: &Store, seats: &dyn Seats) -> Vec<String> {
-    let running = worklist::Running::read(store);
+    let lists = store.worklists();
     let mut out = Vec::new();
     for t in store.tasks_shared().iter().filter(|t| t.status() == Status::Doing && crate::legs::staged(t)) {
         let all = crate::legs::legs(t);
         let begun = all.iter().any(|l| matches!(l.state, crate::legs::State::Done | crate::legs::State::Running));
-        if !begun || running.list_of(&t.id).is_some() {
+        if !begun || worklist::open_list_of(&lists, &t.id).is_some() {
             continue;
         }
         out.extend(start_legs(store, &t.id, seats));
@@ -7627,6 +7636,41 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = list(&store, &[(&["m-1"], "claude")]);
         assert!(start_legs(&store, "m-1", &Blind).is_empty(), "a member of a running list is that list's step's");
         assert!(spawned().is_empty());
+    }
+
+    /// `wsp-356`: a parked or held list starts nothing, its members' legs
+    /// included. `leg done` on the first of two chained legs starts nothing and
+    /// says why in one line, the repair tick leaves the row alone, and resuming
+    /// the list starts the next leg through its step.
+    #[test]
+    fn a_parked_or_held_lists_member_starts_no_legs_until_the_list_is_resumed() {
+        for stopped in [WorklistStatus::Parked, WorklistStatus::Held] {
+            let (_env, store) = scratch(&format!("legs-stopped-{}", stopped.as_str()));
+            staged(&store, "m-1", Status::Doing);
+            add_leg(&store, "m-1", "build", &["plan"], None, None);
+            let mut w = list(&store, &[(&["m-1"], "claude")]);
+            w.set_status(stopped);
+            store.save_worklist(&w).unwrap();
+            seat_leg_open(&store, "m-1", "plan", "cpd-1");
+            leg_done(&store, "m-1", "plan");
+            let _ = drained(&SAID);
+            let _ = spawned();
+
+            assert!(start_legs(&store, "m-1", &Blind).is_empty(), "{stopped:?}: the launch from leg done starts nothing");
+            assert!(spawned().is_empty());
+            let said = drained(&SAID);
+            let why: Vec<_> = said.iter().filter(|l| l.contains("m-1's legs wait")).collect();
+            assert_eq!(why.len(), 1, "{said:?}");
+            assert!(why[0].contains(&format!("its list run is {}", stopped.as_str())), "{}", why[0]);
+            assert!(legs_owed(&store, &Blind).is_empty(), "{stopped:?}: nor does the repair tick");
+            assert!(spawned().is_empty());
+            assert_eq!(leg_state(&store, "m-1", "build"), crate::legs::State::Pending);
+
+            w.set_status(WorklistStatus::Running);
+            store.save_worklist(&w).unwrap();
+            step(&store, &w, &Blind);
+            assert_eq!(ids(spawned()), ["m-1 · build".to_string()], "{stopped:?}: resumed, the list starts it");
+        }
     }
 
     /// The repair tick catches a launch that was lost: a begun row with legs ready

@@ -1122,6 +1122,18 @@ pub struct Sweep {
     pub earlier: Vec<String>,
 }
 
+/// The list that has `task` as a member and has not ended — running, held or
+/// parked — first in slug order. A row in one is that list's to start: a held
+/// or parked list starts nothing, its members' legs included (`wsp-356`), so a
+/// row's own launch asks this and not [`Running::list_of`], which knows only
+/// running lists. A draft is a plan and holds nobody.
+pub fn open_list_of<'a>(lists: &'a [Worklist], task: &str) -> Option<&'a Worklist> {
+    lists.iter().find(|w| {
+        matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked)
+            && w.groups().iter().any(|g| g.members.iter().any(|m| m == task))
+    })
+}
+
 /// Every task a *running* worklist has passed, and the ids those tasks used to
 /// have.
 ///
