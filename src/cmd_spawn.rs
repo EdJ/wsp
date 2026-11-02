@@ -2542,14 +2542,21 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // A row with a packet starts short (`wsp packet`), unless it opted out, the
     // caller asked for `--full`, or the seat is not a plain member's: a leg,
     // a verifier and a check each carry their own order.
-    let packet_start = args.has("agent")
-        && crate::packet::short_start(
-            work.task.as_deref().and_then(|t| store.find_task(t)).as_ref(),
+    // A small row with none gets one written first (`packet_gen`), so the
+    // packet is the default; `packet_bytes` is what the agent will be handed.
+    let packet_bytes = if args.has("agent") {
+        crate::packet::at_spawn(
+            store,
+            work.task.as_deref(),
             !verifying && leg_name.is_none() && checking.is_none(),
             args.has("full"),
             args.has("no-packet"),
             agent_commands::of(&kind).short_start(),
-        );
+        )
+    } else {
+        None
+    };
+    let packet_start = packet_bytes.is_some();
     // What this seat is about, in one word: the task, or — under `--govern` —
     // the scope it answers for. Worked out here rather than where the agent is
     // named below, because the seat's environment is fixed when the seat opens
@@ -2656,8 +2663,9 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             if let Some(e) = &effort {
                 flags.push(("effort", e));
             }
-            if packet_start {
-                flags.push(("packet", "true"));
+            let packet_flag = packet_bytes.map(|b| b.to_string());
+            if let Some(bytes) = &packet_flag {
+                flags.push(("packet", bytes));
             }
             if args.has("force") {
                 flags.push(("force", "true"));

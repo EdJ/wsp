@@ -2761,7 +2761,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     }
     let mut asked = spawned_at(args.get("model").as_deref(), args.get("effort").as_deref());
     if args.has("packet") {
-        asked.push_str(&format!(" · {}", crate::packet::CLAUSE));
+        asked.push_str(&format!(" · {}", crate::packet::clause(args.get("packet").and_then(|b| b.parse().ok()))));
     }
     match left.first() {
         Some(prev) => t.log(&format!("claimed by pane {pane}, taken up from {prev}{asked}")),

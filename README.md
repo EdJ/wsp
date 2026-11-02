@@ -3961,18 +3961,48 @@ you stand in, `--root` to say otherwise) and refuses over 16,000 bytes, naming
 the largest part, because a packet cut short briefs the agent on code that is
 not there. `wsp packet <row> --from FILE` (or a bare `-` for stdin) writes the section.
 
+**A row with none is given one (wsp-344).** `wsp packet <row>` on a row without a
+`## Packet` generates it and writes it into the row, where a person can read and
+edit it before the row is spawned; `--regen` replaces a generated one. It is the
+row's overview, then the context pack compounding-015 built
+(`~/claude/compounding/spikes/indexing-v2`, the `ixv2` binary): the closest
+finished row's diff trimmed to the files this one will likely touch, the
+signatures of what it touches, the test that verifies it with its command, a
+matching recipe. Then `file:` lines for the likely files that fit whole (7,000
+bytes each, 16,000 together). The builder is found at `WSP_PACK_BIN` or in
+compounding's `target/release`; without it `wsp packet` writes the overview and
+the files it names and says the pack is missing. It reads the project's trunk
+and a table of its finished rows that wsp writes under `<state>/packet/<project>/`
+and refreshes when the trunk moves; it reads Rust, so a project with none gets no
+pack.
+
+`wsp spawn <row> --agent` does the same for a plain member **by default** when the
+row reads as small work: routine or extension by compounding's
+`scripts/baseline/classify.py` rules as `gate.py` applies them to a brief, ported
+into `packet_gen::kind_of` (it agrees with the Python on every row in the store
+but the design rows, which it files as discovery because the Python does not read
+"design: " followed by a space). Novel, discovery and design rows spawn as
+before. A row opts in by having a packet (`wsp packet <row>` on any row) and out
+with `--no-packet`, `--full`, or a `## Packet` that says only `packet: off`. If no
+pack can be built, or it finds no file this row will touch, nothing is written and
+the row spawns the ordinary way, with the reason on stderr. The attention harness
+stays opt-in (`attention:`, below).
+
 `wsp spawn <row> --agent` on a Claude Code row with a packet starts the agent
 with `--tools Bash,Read,Edit`, a one-line `--system-prompt`, no skills, no MCP
 and `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` on the seat, and its order is one line:
 run `wsp packet <row>`. compounding-033 measured the starting context at about
 43k tokens for the ordinary start and 4 to 6k for this one. Any of `--full`,
 `--no-packet` or a `packet: off` line in the section starts it the ordinary
-way, as does a leg, a verifier, a check and any kind but Claude Code. The
+way, as does a leg, a verifier, a check and any kind but Claude Code, and so
+does a packet that cannot be printed (a named file gone, over the cap). The
 SessionStart brief still runs, so the row's prose is read either way.
 
-The claim line carries a `packet` clause, so `wsp attempts --json` has
-`"packet": true|false` on each attempt and cost by kind can tell them apart.
-A resumed packet agent resumes the ordinary way.
+The claim line carries a `packet N` clause with the bytes the agent was handed, so
+`wsp attempts --json` has `"packet": true|false` and `"packet_bytes": N|null` on
+each attempt and a batch can be compared with `lean-polish`, whose attempts
+carry neither. A resumed packet agent resumes the ordinary way. **`wsp install`
+is needed** for a spawn to write the size; an older binary writes `packet` alone.
 
 ### A packet row on the attention harness (`--kind attention`)
 
@@ -5552,6 +5582,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
 | `src/packet.rs` | `wsp packet`: a row's `## Packet` (prose, `file:` lines to inline, `packet: off` to opt out, `attention: <dollars>` to opt in to the attention harness) printed with the files it names under a 16,000-byte cap that refuses rather than cuts; and the one decision that a plain member's `spawn --agent` takes Claude Code's short start (`SHORT_START` in `agent_commands`) with the packet as its order |
+| `src/packet_gen.rs` | a packet for a row with none (wsp-344): the brief classified routine / extension / novel / discovery (compounding's classify rules, ported), the context pack builder run on the project's trunk with a table of its finished rows, and the section composed under the cap; `packet::at_spawn` writes it and takes the short start for a small row |
 | `src/kind_attention.rs` | the attention harness as a kind (wsp-330): the program it runs (`wsp attend`), the model names it takes, no effort, nothing that can be told to it, and an attempt's turns, tokens and dollars read off the directory the harness logged into |
 | `src/cmd_attend.rs` | `wsp attend <row>`: one attempt from the packet to the row's `## Checks`, the harness run under a cost cap and a deny list, and the row committed and reviewed (landed first when no run verifies it) on green or blocked with the account on anything else |
 | `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, what it consumed, the outcome |

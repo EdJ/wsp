@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 mod after;
 mod packet;
+mod packet_gen;
 mod agent_commands;
 mod barrier;
 mod barrier_replay;
@@ -171,7 +172,7 @@ pub fn version() -> String {
 const BOOL_FLAGS: &[&str] = &[
     "for-run",
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
-    "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full", "no-packet",
+    "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full", "no-packet", "regen",
     // `worklist show --all --json --include-closed`.
     "include-closed",
     // `attempts --cost <row>`, whose positional is a task id.
@@ -1736,8 +1737,11 @@ fn help_text() -> String {
                                     SessionStart hook's call — paid once at the
                                     top of a session, not on every brief after
   wsp commit-help                   how to commit in a tree somebody else is in
-  wsp packet <id> [--from FILE|-]   print a row's ## Packet and the files it names, under a cap;
-                                    a row with one is spawned with the short start
+  wsp packet <id> [--regen|--from FILE|-]
+                                    print a row's ## Packet and the files it names, under a cap;
+                                    a row with none gets one generated (the overview, the context
+                                    pack, the likely files) and written; a small row is spawned
+                                    with one and the short start unless `--no-packet`
   wsp attend <id>                   one attention-harness attempt on a row, to its checks'
                                     result: what `spawn --kind attention` runs; nobody types it
   wsp cold <list|project> [--plan] [--at COMMIT] [--keep]

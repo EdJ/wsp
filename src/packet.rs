@@ -5,8 +5,9 @@
 //! one command that builds and verifies — and the agent spent about a quarter
 //! of the tokens it spent finding its own way. A row that carries a `## Packet`
 //! section is spawned with the short start (`agent_commands::SHORT_START`) and
-//! is told to run this verb as its first act; a row without one spawns as it
-//! always did.
+//! is told to run this verb as its first act. A row without one that reads as
+//! small work is given one at spawn (`packet_gen`); the rest spawn as they always
+//! did.
 //!
 //! The section is prose, plus two directives, each on a line of its own:
 //!
@@ -41,6 +42,25 @@ pub const CAP: usize = 16_000;
 /// The claim line's clause for an attempt that ran as a packet — read back by
 /// `cmd_attempts`, so cost by kind can tell the two apart.
 pub const CLAUSE: &str = "packet";
+
+/// The claim line's clause for a packet of `bytes`: `packet 4210`, or `packet`
+/// when the size is not known.
+pub fn clause(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(b) => format!("{CLAUSE} {b}"),
+        None => CLAUSE.to_string(),
+    }
+}
+
+/// `Some(size)` for a packet clause, `Some(None)` for one without a size (a claim
+/// from before sizes were written), `None` for any other clause.
+pub fn clause_bytes(c: &str) -> Option<Option<u64>> {
+    let rest = c.trim().strip_prefix(CLAUSE)?;
+    if rest.is_empty() {
+        return Some(None);
+    }
+    rest.strip_prefix(' ').and_then(|n| n.trim().parse().ok()).map(Some)
+}
 
 /// What an `attention: on` row may spend an attempt when it names no figure.
 pub const ATTENTION_DEFAULT_CENTS: u64 = 200;
@@ -94,10 +114,11 @@ pub fn parse(section: &str) -> Packet {
     p
 }
 
-/// The row's packet, when it has one with anything in it.
+/// The row's packet, when it has one with anything in it — or one that says
+/// `packet: off`, which is a section too: a row that declined is not given one.
 pub fn of(t: &Task) -> Option<Packet> {
     let p = parse(&t.section(SECTION)?);
-    (!p.text.is_empty() || !p.files.is_empty()).then_some(p)
+    (!p.text.is_empty() || !p.files.is_empty() || p.off).then_some(p)
 }
 
 /// Whether a spawn of this row takes the short start: it has a packet and has
@@ -113,6 +134,45 @@ pub fn spawns_short(t: &Task) -> bool {
 /// is spawned as ever.
 pub fn short_start(t: Option<&Task>, member: bool, full: bool, no_packet: bool, kind_short: bool) -> bool {
     member && !full && !no_packet && kind_short && t.is_some_and(spawns_short)
+}
+
+/// Whether a spawn of this row starts short, and with how many bytes of packet.
+///
+/// A row with a `## Packet` (and no `packet: off`) starts short. A row without
+/// one that reads as routine or extension work is given one first — generated
+/// from its overview and the project's context pack and written into the row,
+/// where a person can see it. A packet that cannot be printed (a file gone, over
+/// the cap) is not started short, since the order would point at a verb that
+/// refuses; the reason goes to stderr and the row is spawned as ever.
+pub fn at_spawn(store: &Store, task: Option<&str>, member: bool, full: bool, no_packet: bool, kind_short: bool) -> Option<u64> {
+    if !member || full || no_packet || !kind_short {
+        return None;
+    }
+    let mut t = store.find_task(task?)?;
+    if t.section(SECTION).is_none_or(|s| s.trim().is_empty()) && crate::packet_gen::eligible(&t).is_ok() {
+        let root = tree_root(store, &t);
+        let made = crate::packet_gen::generate(store, &t, &root);
+        match &made.pack {
+            Ok(0) => eprintln!("wsp: {} is not given a packet: the pack found no file this row will touch", t.id),
+            Ok(_) => {
+                if let Err(why) = crate::packet_gen::write(store, &mut t, &made.section) {
+                    eprintln!("wsp: {} is not given a packet: {why}", t.id);
+                }
+            }
+            Err(why) => eprintln!("wsp: {} is not given a packet: {why}", t.id),
+        }
+        t = store.find_task(&t.id)?;
+    }
+    if !short_start(Some(&t), member, full, no_packet, kind_short) {
+        return None;
+    }
+    match build(&t, &tree_root(store, &t)) {
+        Ok(text) => Some(text.len() as u64),
+        Err(why) => {
+            eprintln!("wsp: {} is not started short: {why}", t.id);
+            None
+        }
+    }
 }
 
 /// The work order a packet row is told, one line because that is what an order
@@ -165,6 +225,16 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
     Ok(out)
 }
 
+/// The project's own checkout, where a spawn reads the packet's files before the
+/// agent has a tree.
+fn tree_root(store: &Store, t: &Task) -> PathBuf {
+    t.project
+        .as_deref()
+        .and_then(|p| crate::resolve::Index::new(store.projects()).root_of(p))
+        .map(|r| util::expand(&r))
+        .unwrap_or_default()
+}
+
 /// Where the named files are read from: `--root`, else the repository the
 /// caller stands in (the agent's own tree), else the project's root.
 fn root_for(store: &Store, t: &Task, args: &Args) -> PathBuf {
@@ -172,16 +242,16 @@ fn root_for(store: &Store, t: &Task, args: &Args) -> PathBuf {
         return util::expand(&r);
     }
     let here = std::env::current_dir().unwrap_or_default();
-    crate::cmd_verify::toplevel(&here)
-        .or_else(|| {
-            let project = t.project.as_deref()?;
-            crate::resolve::Index::new(store.projects()).root_of(project).map(|r| util::expand(&r))
-        })
-        .unwrap_or(here)
+    crate::cmd_verify::toplevel(&here).unwrap_or_else(|| {
+        let root = tree_root(store, t);
+        if root.as_os_str().is_empty() { here } else { root }
+    })
 }
 
-/// `wsp packet <task> [--root DIR]` prints it; `--from FILE` or a bare `-` writes
-/// the section from a file or stdin, so prose never passes through a shell string.
+/// `wsp packet <task> [--root DIR]` prints it, writing one first for a row that
+/// has none (`--regen` replaces a generated one); `--from FILE` or a bare `-`
+/// writes the section from a file or stdin, so prose never passes through a
+/// shell string.
 pub fn packet(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.iter().find(|a| *a != "-").cloned().or_else(|| std::env::var("WSP_TASK").ok().filter(|t| !t.is_empty())) else {
         eprintln!("usage: wsp packet <task> [--root DIR] | wsp packet <task> --from FILE | wsp packet <task> -");
@@ -212,7 +282,25 @@ pub fn packet(store: &Store, args: &Args) -> i32 {
         println!("{} packet set", t.id);
         return 0;
     }
-    match build(&t, &root_for(store, &t, args)) {
+    let root = root_for(store, &t, args);
+    let has = t.section(SECTION).is_some_and(|s| !s.trim().is_empty());
+    if !has || args.has("regen") {
+        if has && of(&t).is_some_and(|p| p.off) {
+            eprintln!("wsp: {} declined a packet (`packet: off`); remove that line to have one made", t.id);
+            return 1;
+        }
+        let made = crate::packet_gen::generate(store, &t, &root);
+        match &made.pack {
+            Ok(n) => eprintln!("wsp: {} read as {} work; the pack expects {n} file(s) to change", t.id, made.kind.name()),
+            Err(why) => eprintln!("wsp: no context pack ({why}); the packet is the overview and the files it names"),
+        }
+        if let Err(why) = crate::packet_gen::write(store, &mut t, &made.section) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+        eprintln!("wsp: wrote ## {SECTION} on {} — edit it, or `packet: off` to decline", t.id);
+    }
+    match build(&t, &root) {
         Ok(text) => {
             print!("{text}");
             0
@@ -321,5 +409,142 @@ mod tests {
     fn the_order_is_one_line_naming_the_verb_and_the_row() {
         let o = order("wsp-9");
         assert!(!o.contains('\n') && o.contains("`wsp packet wsp-9`"));
+    }
+
+    // ---- a row with no packet, at spawn ------------------------------------
+
+    /// A stand-in for the context pack builder: the same arguments, canned output.
+    struct FakePack(PathBuf);
+
+    impl FakePack {
+        fn with(dir: &Path, likely: &str) -> FakePack {
+            let script = dir.join("ixv2");
+            let body = format!(
+                "#!/bin/sh\ncat >/dev/null\ncase \"$*\" in\n*\"--depth meta\"*) echo '{{\"est_code_lines\":10,\"precedents\":[],\"likely\":[{likely}],\"recipe\":null}}';;\n*) printf 'CONTEXT PACK  compound@abc  built from 1 finished tasks  kind: x\\nlikely files  src/a.rs (identifier)\\n';;\nesac\n"
+            );
+            std::fs::write(&script, body).unwrap();
+            let _ = std::process::Command::new("chmod").arg("+x").arg(&script).status();
+            std::env::set_var("WSP_PACK_BIN", &script);
+            FakePack(script)
+        }
+    }
+
+    impl Drop for FakePack {
+        fn drop(&mut self) {
+            std::env::remove_var("WSP_PACK_BIN");
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A project `pj` whose repository has `src/a.rs`, and one row with `title`
+    /// and `section` (when given) as its `## Packet`.
+    fn world(name: &str, title: &str, section: Option<&str>) -> (crate::util::Isolated, Store, PathBuf) {
+        let env = crate::util::isolated(&format!("packet-gen-{name}"));
+        let repo = env.path("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"pj\"\n").unwrap();
+        git(&repo, &["init", "--quiet", "-b", "master"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "pj-001: first"]);
+        let store = Store::open();
+        let mut p = crate::model::Project::new("pj");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut t = Task::new(title, "pj-001");
+        t.project = Some("pj".into());
+        t.body = format!("## Overview\nShow the size in `src/a.rs`.\n{}", section.map(|s| format!("\n## {SECTION}\n{s}\n")).unwrap_or_default());
+        store.save_task(&t).unwrap();
+        (env, store, repo)
+    }
+
+    fn spawn(store: &Store, full: bool, no_packet: bool) -> Option<u64> {
+        at_spawn(store, Some("pj-001"), true, full, no_packet, true)
+    }
+
+    #[test]
+    fn a_small_row_with_no_packet_is_given_one_and_starts_short_with_its_size() {
+        let (env, store, _) = world("small", "Show the packet size", None);
+        let _builder = FakePack::with(&env.path(""), "\"src/a.rs\"");
+        let bytes = spawn(&store, false, false).expect("a packet row");
+        let t = store.find_task("pj-001").unwrap();
+        let written = t.section(SECTION).expect("written into the row, where a person can edit it");
+        assert!(written.contains("file: src/a.rs") && written.contains("CONTEXT PACK  pj@abc"), "{written}");
+        assert!(written.contains("verify  cargo test a::"), "the pack named no test, so the first file's tests are: {written}");
+        let printed = build(&t, &tree_root(&store, &t)).unwrap();
+        assert_eq!(bytes as usize, printed.len(), "the size recorded is the size the agent is handed");
+        assert!(printed.contains("pub fn a() {}") && printed.len() <= CAP);
+    }
+
+    #[test]
+    fn a_row_that_asked_for_the_ordinary_start_is_left_alone() {
+        let (env, store, _) = world("left", "Show the packet size", None);
+        let _builder = FakePack::with(&env.path(""), "\"src/a.rs\"");
+        assert!(spawn(&store, true, false).is_none() && spawn(&store, false, true).is_none(), "--full and --no-packet");
+        assert!(at_spawn(&store, Some("pj-001"), false, false, false, true).is_none(), "a leg, a verifier or a check");
+        assert!(at_spawn(&store, Some("pj-001"), true, false, false, false).is_none(), "a kind with no short start");
+        assert!(store.find_task("pj-001").unwrap().section(SECTION).is_none(), "and none of them wrote a section");
+    }
+
+    #[test]
+    fn a_row_that_declined_a_packet_is_left_alone() {
+        let (env, store, _) = world("declined", "Show the packet size", Some("packet: off"));
+        let _builder = FakePack::with(&env.path(""), "\"src/a.rs\"");
+        assert!(spawn(&store, false, false).is_none());
+        assert_eq!(store.find_task("pj-001").unwrap().section(SECTION).unwrap().trim(), "packet: off");
+    }
+
+    #[test]
+    fn a_novel_row_is_not_given_one() {
+        let (env, store, _) = world("novel", "Measure why the daemon is slow", None);
+        let _builder = FakePack::with(&env.path(""), "\"src/a.rs\"");
+        assert!(spawn(&store, false, false).is_none());
+        assert!(store.find_task("pj-001").unwrap().section(SECTION).is_none(), "novel work is spawned as today");
+    }
+
+    #[test]
+    fn a_row_a_person_wrote_a_packet_for_keeps_it_whatever_kind_it_is() {
+        let (_env, store, _) = world("authored", "Measure why the daemon is slow", Some("Do it.\nfile: src/a.rs"));
+        let bytes = spawn(&store, false, false).expect("an authored packet starts short");
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(t.section(SECTION).unwrap().trim(), "Do it.\nfile: src/a.rs");
+        assert_eq!(bytes as usize, build(&t, &tree_root(&store, &t)).unwrap().len());
+    }
+
+    #[test]
+    fn no_builder_leaves_the_row_to_the_ordinary_start() {
+        let (_env, store, _) = world("nobuilder", "Show the packet size", None);
+        std::env::set_var("WSP_PACK_BIN", "/nonexistent/ixv2");
+        assert!(spawn(&store, false, false).is_none());
+        std::env::remove_var("WSP_PACK_BIN");
+        assert!(store.find_task("pj-001").unwrap().section(SECTION).is_none());
+    }
+
+    #[test]
+    fn a_pack_that_names_no_file_leaves_the_row_to_the_ordinary_start() {
+        let (env, store, _) = world("nofiles", "Show the packet size", None);
+        let _builder = FakePack::with(&env.path(""), "");
+        assert!(spawn(&store, false, false).is_none());
+        assert!(store.find_task("pj-001").unwrap().section(SECTION).is_none());
+    }
+
+    #[test]
+    fn a_packet_that_cannot_be_printed_is_not_started_short() {
+        let (_env, store, _) = world("missing", "Show the packet size", Some("file: src/gone.rs\nDo it."));
+        assert!(spawn(&store, false, false).is_none(), "the order would point at a verb that refuses");
+    }
+
+    #[test]
+    fn the_claim_clause_carries_the_size_and_reads_back_old_claims_too() {
+        assert_eq!(clause(Some(4210)), "packet 4210");
+        assert_eq!(clause(None), "packet");
+        assert_eq!(clause_bytes("packet 4210"), Some(Some(4210)));
+        assert_eq!(clause_bytes("packet"), Some(None));
+        assert_eq!(clause_bytes("packets"), None);
+        assert_eq!(clause_bytes("spawned at sonnet/high"), None);
     }
 }
