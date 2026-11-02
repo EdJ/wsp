@@ -188,8 +188,9 @@ pub fn at_spawn(store: &Store, task: Option<&str>, member: bool, full: bool, no_
 pub fn order(task: &str) -> String {
     format!(
         "Your packet is the whole brief. Run `wsp packet {task}` now, read what it prints, \
-         do the change it describes, run its one command, then land and review the row as \
-         your brief says. Read nothing the packet does not name."
+         do the change it describes, run its one command. Then commit, run `wsp land {task}`, \
+         and end with `wsp review {task} \"...\"` (or `-` and the summary on stdin): the land \
+         alone leaves the row waiting. Read nothing the packet does not name."
     )
 }
 
@@ -570,6 +571,9 @@ mod tests {
     fn the_order_is_one_line_naming_the_verb_and_the_row() {
         let o = order("wsp-9");
         assert!(!o.contains('\n') && o.contains("`wsp packet wsp-9`"));
+        assert!(o.contains("`wsp land wsp-9`") && o.contains("`wsp review wsp-9 "), "{o}");
+        assert!(!o.contains("as your brief says"), "a short start carries almost no brief: {o}");
+        assert!(o.is_ascii(), "a spawn once hung on one character");
     }
 
     // ---- a row with no packet, at spawn ------------------------------------

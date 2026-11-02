@@ -2451,7 +2451,22 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     for f in &landed.files {
         println!("  {}", p.dim(f));
     }
+    if let Some(next) = still_wants_review(store.find_task(&w.task).map(|t| t.status()), &w.task) {
+        println!("{}", p.dim(&next));
+    }
     0
+}
+
+/// The land's last line while the row is still being worked: a land is not the
+/// end of a row, `wsp review` is, and every seat is told so — `wsp-358`.
+fn still_wants_review(status: Option<crate::model::Status>, task: &str) -> Option<String> {
+    use crate::model::Status::*;
+    match status? {
+        Inbox | Todo | Doing | Blocked | Parked => {
+            Some(format!("landed, not finished: end the row with `wsp review {task} \"...\"`"))
+        }
+        Review | Done => None,
+    }
 }
 
 /// What the verifier's hold did to the trunk.
@@ -2580,6 +2595,16 @@ pub(crate) fn rerun_steps(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn a_land_on_a_row_still_being_worked_names_wsp_review_last() {
+        use crate::model::Status;
+        let line = still_wants_review(Some(Status::Doing), "wsp-9").unwrap();
+        assert!(line.contains("`wsp review wsp-9 ") && line.is_ascii(), "{line}");
+        assert_eq!(still_wants_review(Some(Status::Review), "wsp-9"), None, "already reviewed");
+        assert_eq!(still_wants_review(Some(Status::Done), "wsp-9"), None);
+        assert_eq!(still_wants_review(None, "wsp-9"), None, "not in the store");
+    }
 
     /// A directory to stand a repository in, and an empty store beside it:
     /// [`checkout_dir`] resolves a task's former ids out of the *ambient*

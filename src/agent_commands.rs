@@ -2322,7 +2322,7 @@ const SHORT_START: &[&str] = &[
     "Bash,Read,Edit",
     "--system-prompt",
     "You make one code change from the packet you are given: run `wsp packet` on your row, \
-     do what it says, run its one command, fix what it reports, then finish as your brief says.",
+     do what it says, run its one command, fix what it reports, then finish as your order says.",
 ];
 
 /// Set on the seat of a short start; see [`SHORT_START`].
