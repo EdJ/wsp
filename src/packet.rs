@@ -86,10 +86,17 @@ fn cap_cents(word: &str) -> Option<u64> {
     (dollars.is_finite() && dollars > 0.0).then(|| (dollars * 100.0).round() as u64).filter(|c| *c > 0)
 }
 
+/// The first line of a section `wsp packet` wrote, so `--regen` can tell it from
+/// one a person wrote by hand. A comment: it is never part of the brief.
+pub const GENERATED: &str = "<!-- wsp: generated packet -->";
+
 pub fn parse(section: &str) -> Packet {
     let mut p = Packet::default();
     let mut kept: Vec<&str> = Vec::new();
     for line in section.lines() {
+        if line.trim() == GENERATED {
+            continue;
+        }
         let bare = line.trim().trim_start_matches("- ").trim();
         if let Some(path) = bare.strip_prefix("file:") {
             let path = path.trim();
@@ -249,7 +256,7 @@ fn root_for(store: &Store, t: &Task, args: &Args) -> PathBuf {
 }
 
 /// `wsp packet <task> [--root DIR]` prints it, writing one first for a row that
-/// has none (`--regen` replaces a generated one); `--from FILE` or a bare `-`
+/// has none (`--regen` replaces a generated one, `--regen --force` a hand-written one); `--from FILE` or a bare `-`
 /// writes the section from a file or stdin, so prose never passes through a
 /// shell string.
 pub fn packet(store: &Store, args: &Args) -> i32 {
@@ -287,6 +294,10 @@ pub fn packet(store: &Store, args: &Args) -> i32 {
     if !has || args.has("regen") {
         if has && of(&t).is_some_and(|p| p.off) {
             eprintln!("wsp: {} declined a packet (`packet: off`); remove that line to have one made", t.id);
+            return 1;
+        }
+        if has && !t.section(SECTION).is_some_and(|s| s.lines().any(|l| l.trim() == GENERATED)) && !args.has("force") {
+            eprintln!("wsp: {} has a packet written by hand; `wsp packet {} --regen --force` replaces it", t.id, t.id);
             return 1;
         }
         let made = crate::packet_gen::generate(store, &t, &root);
@@ -546,5 +557,32 @@ mod tests {
         assert_eq!(clause_bytes("packet"), Some(None));
         assert_eq!(clause_bytes("packets"), None);
         assert_eq!(clause_bytes("spawned at sonnet/high"), None);
+    }
+
+    #[test]
+    fn regen_refuses_a_hand_written_packet_unless_forced_and_the_marker_is_not_the_brief() {
+        let env = crate::util::isolated("packet-regen-guard");
+        let store = Store::open();
+        let mut t = Task::new("Fix a flag", "pk-001");
+        t.body = "## Overview\nFix the flag in src/a.rs.\n\n## Packet\nMy own words.\n".into();
+        store.save_task(&t).unwrap();
+        let run = |extra: &[&str]| {
+            let mut argv: Vec<String> = ["packet", "pk-001", "--root"].iter().map(|s| s.to_string()).collect();
+            argv.push(env.path("tree").display().to_string());
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            packet(&store, &Args::parse(argv))
+        };
+        std::fs::create_dir_all(env.path("tree")).unwrap();
+        let body = || match store.resolve_task("pk-001") {
+            Found::One(t) => t.section(SECTION).unwrap_or_default(),
+            _ => panic!("gone"),
+        };
+        assert_eq!(run(&["--regen"]), 1, "a hand-written packet is not replaced");
+        assert_eq!(body().trim(), "My own words.");
+        assert_eq!(run(&["--regen", "--force"]), 0);
+        assert!(body().contains(GENERATED) && !body().contains("My own words."), "{}", body());
+        assert_eq!(run(&["--regen"]), 0, "a generated packet is regenerated without the flag");
+        let p = parse(&body());
+        assert!(!p.text.contains("generated packet"), "the marker is not the brief: {}", p.text);
     }
 }

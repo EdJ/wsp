@@ -3963,7 +3963,7 @@ not there. `wsp packet <row> --from FILE` (or a bare `-` for stdin) writes the s
 
 **A row with none is given one (wsp-344).** `wsp packet <row>` on a row without a
 `## Packet` generates it and writes it into the row, where a person can read and
-edit it before the row is spawned; `--regen` replaces a generated one. It is the
+edit it before the row is spawned; `--regen` replaces a generated one (marked `<!-- wsp: generated packet -->`) and refuses a hand-written one unless `--force` is added. It is the
 row's overview, then the context pack compounding-015 built
 (`~/claude/compounding/spikes/indexing-v2`, the `ixv2` binary): the closest
 finished row's diff trimmed to the files this one will likely touch, the

@@ -522,7 +522,7 @@ pub fn eligible(t: &Task) -> Result<Kind, String> {
 
 /// Write a generated packet into the row. Returns what was written.
 pub fn write(store: &Store, t: &mut Task, section: &str) -> Result<(), String> {
-    crate::model::set_section_in(&mut t.body, SECTION, section);
+    crate::model::set_section_in(&mut t.body, SECTION, &format!("{}\n{section}", crate::packet::GENERATED));
     store.save_task(t).map_err(|e| e.to_string())?;
     store.git_commit(&format!("wsp: packet {} — generated", t.id));
     Ok(())

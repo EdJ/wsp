@@ -1737,16 +1737,13 @@ fn help_text() -> String {
                                     SessionStart hook's call — paid once at the
                                     top of a session, not on every brief after
   wsp commit-help                   how to commit in a tree somebody else is in
-  wsp packet <id> [--regen|--from FILE|-]
+  wsp packet <id> [--regen [--force]|--from FILE|-]
                                     print a row's ## Packet and the files it names, under a cap;
                                     a row with none gets one generated (the overview, the context
                                     pack, the likely files) and written; a small row is spawned
                                     with one and the short start unless `--no-packet`
   wsp attend <id>                   one attention-harness attempt on a row, to its checks'
                                     result: what `spawn --kind attention` runs; nobody types it
-  wsp cold <list|project> [--plan] [--at COMMIT] [--keep]
-                                    one cold build in a fresh checkout: the project's `at barrier`
-                                    then `at end` steps; started once as a list closes
   wsp cold <list|project> [--plan] [--at COMMIT] [--keep]
                                     one cold build in a fresh checkout: the project's `at barrier`
                                     then `at end` steps; started once as a list closes
