@@ -24,7 +24,7 @@ pub(crate) enum Env {
 }
 
 impl Env {
-    fn word(self) -> &'static str {
+    pub(crate) fn word(self) -> &'static str {
         match self {
             Env::Warm => "warm",
             Env::Cold => "cold",

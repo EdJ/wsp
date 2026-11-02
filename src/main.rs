@@ -233,7 +233,7 @@ const BOOL_FLAGS: &[&str] = &[
     "holds", "blocks", "verify", "verify-rows", "barrier-rows", "run-notices",
     // `wsp check <task> --plan|--auto`: the task id is the positional, and
     // `--auto` is what the run's own trigger types.
-    "plan", "auto", "set", "barrier",
+    "plan", "auto", "set", "barrier", "inner", "tiers",
     // `wsp worklist followup <slug> <task>… --blocking|--next`: the rows are
     // positionals, and a flag between them must not eat the one after it.
     "blocking", "next",
@@ -1756,6 +1756,11 @@ fn help_text() -> String {
                                     A member of a run does not type it: `wsp
                                     review` marks it ready and the verifier's
                                     `wsp verified --holds` lands it
+  wsp check --inner [<id>] [--run]  the steps this tree's changes call for,
+                                    narrowest first; --run runs them here and
+                                    records nothing
+  wsp check <project> --tiers       its declared steps by tier (inner, row,
+                                    barrier, end) and what it leaves out
   wsp check <id> [--plan] [--at <commit>]
                                     run a task's mechanical checks — its
                                     project's ## Checks, then the task's own —
@@ -1764,7 +1769,8 @@ fn help_text() -> String {
                                     Verification. A failure on a row at review
                                     sends it back with the step as what is owed;
                                     wsp runs it by itself on a ready or landed
-                                    row, before any verifier. --plan lists the steps, --at
+                                    row, before any verifier. --plan lists the steps with
+                                    their tier and any green already held, --at
                                     runs another commit and writes nothing
   wsp verify [<path>…] [--check] [--release] [--rm [--all] [-n]]
                                     build and test your change at HEAD, in one

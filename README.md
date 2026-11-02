@@ -4706,6 +4706,26 @@ agent was spent. A failure is not run again for the same landing; `wsp check
 steps and runs none; `--at <commit>` runs another commit and writes nothing on
 the row, which is how a landed row is replayed.
 
+**The tiers, as the declaration spells them** (`wsp-342`):
+
+| tier | declared as | runs |
+|---|---|---|
+| inner | a rule with `{1}` captures | by the agent: `wsp check --inner` |
+| row | `on <globs>` rules, every-landing steps, the member's `## Checks` | in the member's tree at its ready commit; after a moved trunk only the steps the rebase touched |
+| barrier | `at barrier` | once per group, in the barrier tree |
+| end | `at end` | only in a worklist's cold build, with the `at barrier` steps: goldens, perf, load-sensitive tests |
+
+`wsp check --inner [<id>] [--run]` lists the steps the working tree's own
+changes call for (`git diff` against the trunk base plus untracked files; the
+task is the tree's, or named), narrowest first. `--run` runs them in the tree and
+stops at the first failure; it records nothing, because a tree with changes
+proves no commit. `wsp check <project> --tiers` tables the project's own
+declared steps by tier and says what it leaves out (no `at end` step: the cold
+build runs only the barrier steps). `wsp check <id> --plan` (and `--json`) now
+names each step's tier and whether the greens ledger already holds it at that
+commit (`green · reused, 101s`), which is what a run would skip. `--set` warns,
+and does not refuse, when a project declares `at end` without `at barrier`.
+
 ### The barrier, run by wsp where nothing needs judgment (`wsp-326`)
 
 Ed, 2026-11-01. Of 186 barrier-check transcripts the median is nine turns and

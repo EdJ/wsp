@@ -864,9 +864,13 @@ const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed
 
 // ---- the verb -----------------------------------------------------------------
 
+const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check --inner [<task>] [--run]   the steps this tree's changes call for\n       wsp check <project> --barrier [--plan] [--at <commit>]\n       wsp check <project> --tiers   its declared steps by tier\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
+
 pub fn check(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check <project> --barrier [--plan] [--at <commit>]\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
     let p = Paint::new();
+    if args.has("inner") {
+        return inner(store, args);
+    }
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: {USAGE}");
         return 2;
@@ -876,6 +880,9 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     }
     if args.has("barrier") {
         return barrier(store, args, &needle);
+    }
+    if args.has("tiers") {
+        return tiers(store, &needle);
     }
     let auto = args.has("auto");
     let t = match store.task_or_why(&needle) {
@@ -909,9 +916,24 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     if args.has("plan") || args.has("dry-run") {
+        let ledger = greens::Greens::open(store, &tg.project, &tg.repo);
+        let green = |s: &Step| ledger.lookup(&tg.sha, &s.command, greens::Env::Warm);
+        if args.json() {
+            let rows: Vec<_> = steps
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name, "command": s.command, "limit": s.limit.as_secs(), "tier": tier(s), "why": why_in(s),
+                        "green": green(s).map(|g| serde_json::json!({ "env": g.env.word(), "took": g.took, "who": g.who, "when": g.when })),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::json!({ "task": t.id, "commit": tg.sha, "steps": rows }));
+            return 0;
+        }
         println!("{} at {}", p.bold(&t.id), &tg.sha[..12]);
         for s in &steps {
-            println!("  {} · {} · up to {}s · {}", s.name, s.command, s.limit.as_secs(), why_in(s));
+            println!("  {}", plan_line(s, green(s).as_ref()));
         }
         if !changed.is_empty() {
             println!("  {}", p.dim(&format!("{} changed path(s) read for the rules", changed.len())));
@@ -1013,6 +1035,155 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         crate::cycle::poke_task(store, &t.id, "checked");
     }
     i32::from(!ok)
+}
+
+/// The tier a step belongs to: `inner` (a rule that names a capture, so it is
+/// one module's tests), `row` (before review, verify and land), `barrier`, `end`.
+pub(crate) fn tier(s: &Step) -> &'static str {
+    if s.end {
+        "end"
+    } else if s.barrier {
+        "barrier"
+    } else if s.of == Of::Rule && (s.name.contains(':') || (1..=9).any(|n| s.command.contains(&format!("{{{n}}}")))) {
+        "inner"
+    } else {
+        "row"
+    }
+}
+
+fn plan_line(s: &Step, green: Option<&Green>) -> String {
+    let reused = green.map(|g| format!(" · green · reused, {}s", g.took)).unwrap_or_default();
+    format!("{} · {} · up to {}s · {} · {}{reused}", s.name, s.command, s.limit.as_secs(), tier(s), why_in(s))
+}
+
+/// The steps the paths a tree changed call for, narrowest first: the project's
+/// rules with captures, its other rules, the member's own, then every-landing
+/// steps. Barrier and end steps are never an inner loop's.
+pub(crate) fn inner_steps(store: &Store, t: &Task, changed: &[String]) -> Vec<Step> {
+    let mut steps = task_steps(t);
+    for r in project_steps(store, t).into_iter().filter(|r| !r.barrier && !r.end) {
+        steps.extend(match r.of {
+            Of::Rule => expand(&r, changed),
+            _ => vec![r],
+        });
+    }
+    steps.retain(|s| !s.barrier && !s.end);
+    let rank = |s: &Step| match (tier(s), s.of) {
+        ("inner", _) => 0,
+        (_, Of::Rule) => 1,
+        (_, Of::Task) => 2,
+        _ => 3,
+    };
+    steps.sort_by_key(rank);
+    let mut seen = Vec::new();
+    steps.retain(|s| {
+        let fresh = !seen.contains(&s.command);
+        seen.push(s.command.clone());
+        fresh
+    });
+    steps
+}
+
+/// What a tree changed against where it left the trunk: tracked changes,
+/// committed or not, and files git has not seen.
+fn changed_in_tree(tree: &Path) -> Option<Vec<String>> {
+    let trunk = crate::cmd_checkout::trunk(tree)?;
+    let branch = crate::cmd_checkout::trunk_branch(&trunk)?;
+    let base = git(tree, &["merge-base", "HEAD", &branch])?;
+    let mut paths: Vec<String> = git(tree, &["diff", "--name-only", base.trim()])?.lines().map(str::to_string).collect();
+    paths.extend(git(tree, &["ls-files", "--others", "--exclude-standard"])?.lines().map(str::to_string));
+    paths.retain(|l| !l.trim().is_empty());
+    paths.sort();
+    paths.dedup();
+    Some(paths)
+}
+
+/// `wsp check --inner [<task>] [--run]` — the steps this tree's changes call
+/// for. Run in the tree, it records nothing: a dirty tree proves no commit.
+fn inner(store: &Store, args: &Args) -> i32 {
+    let p = Paint::new();
+    let run = args.has("run");
+    // `--run` is valued elsewhere, so a task id typed after it arrives as its value.
+    let named = args.rest.first().cloned().or_else(|| args.get("run").filter(|v| v != "true"));
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(tree) = crate::cmd_verify::toplevel(&cwd) else {
+        eprintln!("wsp: {} is in no git tree", util::contract(&cwd));
+        return 1;
+    };
+    let dir_name = tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let found = match named {
+        Some(id) => store.task_or_why(&id),
+        None => store.task_or_why(&dir_name),
+    };
+    let t = match found {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let Some(changed) = changed_in_tree(&tree) else {
+        eprintln!("wsp: cannot read what {} changed against the trunk", util::contract(&tree));
+        return 1;
+    };
+    let steps = inner_steps(store, &t, &changed);
+    if steps.is_empty() {
+        println!("{} {}", p.dim("nothing to run —"), p.dim(&format!("{} changed path(s) call for no check of {}", changed.len(), t.id)));
+        return 0;
+    }
+    if !run {
+        println!("{} · {} changed path(s)", p.bold(&t.id), changed.len());
+        for s in &steps {
+            println!("  {} · {} · up to {}s · {}", s.name, s.command, s.limit.as_secs(), why_in(s));
+        }
+        return 0;
+    }
+    let log = store.state_file("checks").join(format!("{}-inner.log", t.id));
+    let _ = std::fs::create_dir_all(store.state_file("checks"));
+    for s in &steps {
+        let r = run_step(&tree, s, &log);
+        if r.done == Done::Passed {
+            println!("  {} {} · {}s", p.green("✓"), s.name, secs(r.took));
+            continue;
+        }
+        println!("  {} {} · {}s · {}", p.red("✗"), s.name, secs(r.took), why_failed(&r));
+        for l in r.tail.lines() {
+            println!("    {}", p.dim(l));
+        }
+        println!("{}", p.dim("nothing recorded: a tree with changes proves no commit"));
+        return 1;
+    }
+    println!("{}", p.dim("nothing recorded: a tree with changes proves no commit"));
+    0
+}
+
+/// `wsp check <project> --tiers` — the project's own declared steps by tier,
+/// and what it leaves undeclared.
+fn tiers(store: &Store, project: &str) -> i32 {
+    let p = Paint::new();
+    let Some(found) = store.project(project) else {
+        eprintln!("wsp: no project {project}");
+        return 1;
+    };
+    let steps: Vec<Step> = found.section(SECTION).map(|s| parse_steps(&s, Of::Project)).unwrap_or_default();
+    if steps.is_empty() {
+        println!("{} {}", p.dim("nothing declared —"), p.dim(&format!("{} has no ## Checks", found.id)));
+        return 0;
+    }
+    println!("{} declares {} step(s)", p.bold(&found.id), steps.len());
+    for word in ["inner", "row", "barrier", "end"] {
+        for s in steps.iter().filter(|s| tier(s) == word) {
+            let on = if s.on.is_empty() { String::new() } else { format!(" on {}", s.on.join(", ")) };
+            println!("  {word:<7} {} (up to {}s){on}: {}", s.name, s.limit.as_secs(), s.command);
+        }
+    }
+    if !steps.iter().any(|s| s.barrier) {
+        println!("  {}", p.dim("no `at barrier` step: no full suite runs when a group ends"));
+    }
+    if !steps.iter().any(|s| s.end) {
+        println!("  {}", p.dim("no `at end` step: a worklist's cold build runs only the barrier steps"));
+    }
+    0
 }
 
 /// Which tier brought a step in, for a plan and for a row's account.
@@ -1139,6 +1310,9 @@ fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
         return 2;
     }
     let what = if let Some(mut proj) = store.project(needle) {
+        if steps.iter().any(|s| s.end) && !steps.iter().any(|s| s.barrier) {
+            eprintln!("wsp: warning: an `at end` step but no `at barrier` step — the cold build runs the barrier steps with it, and a group's end runs none");
+        }
         crate::model::set_section_in(&mut proj.body, SECTION, &text);
         if let Err(e) = store.save_project(&proj) {
             eprintln!("wsp: {e}");
@@ -1834,5 +2008,75 @@ mod tests {
             let mask = steps.iter().enumerate().filter(|(_, s)| got.contains(s)).fold(0, |m, (i, _)| m | (1 << (3 - i)));
             assert_eq!(mask, want, "pulled {pulled:?}, ours {ours:?}");
         }
+    }
+
+    #[test]
+    fn a_plan_names_each_steps_tier_and_marks_the_one_already_green_at_the_commit() {
+        let (_env, store, sha) = world(
+            "plan-green",
+            "- mod on src/*.rs: cargo test {1}::\n- fast on src/*.rs: true\n- all at barrier: cargo test\n- gold at end: gold.sh",
+            "exit 0\n",
+        );
+        let steps = parse_steps("- mod on src/*.rs: cargo test {1}::\n- fast on src/*.rs: true\n- all at barrier: cargo test\n- gold at end: gold.sh", Of::Project);
+        let tiers: Vec<_> = steps.iter().map(tier).collect();
+        assert_eq!(tiers, ["inner", "row", "barrier", "end"]);
+        let t = store.find_task("pj-001").unwrap();
+        let tg = target(&store, &t, None).unwrap();
+        let ledger = greens::Greens::open(&store, &tg.project, &tg.repo);
+        assert!(!plan_line(&steps[1], ledger.lookup(&sha, "true", greens::Env::Warm).as_ref()).contains("reused"));
+        ledger.record(&sha, "true", greens::Env::Warm, 101, "pj-001", false);
+        let line = plan_line(&steps[1], ledger.lookup(&sha, "true", greens::Env::Warm).as_ref());
+        assert!(line.contains("row") && line.ends_with("green · reused, 101s"), "{line}");
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[("plan", "true"), ("json", "true")])), 0);
+    }
+
+    #[test]
+    fn inner_steps_follow_the_changed_paths_narrowest_first_and_never_include_barrier_or_end() {
+        let (_env, store, _sha) = world(
+            "inner",
+            "- always: true\n- mod on src/*.rs: cargo test {1}::\n- docs on docs/*: echo docs\n- all at barrier: cargo test\n- gold at end: gold.sh",
+            "exit 0\n",
+        );
+        let mut t = store.find_task("pj-001").unwrap();
+        crate::model::set_section_in(&mut t.body, SECTION, "- mine: sh check.sh");
+        let names = |changed: &[&str]| {
+            let c: Vec<String> = changed.iter().map(|s| s.to_string()).collect();
+            inner_steps(&store, &t, &c).into_iter().map(|s| s.name).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&["src/greens.rs"]), ["mod:greens", "mine", "always"]);
+        assert_eq!(names(&["docs/a.md", "src/a.rs"]), ["mod:a", "docs", "mine", "always"]);
+        assert_eq!(names(&[]), ["mine", "always"]);
+    }
+
+    #[test]
+    fn inner_run_reads_the_trees_changes_and_records_nothing() {
+        let (env, store, _sha) = world("inner-run", "- mark on src/*.rs: touch ran-{1}", "exit 0\n");
+        let tree = env.path("repo");
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::write(tree.join("src/new.rs"), "x").unwrap();
+        let before = store.find_task("pj-001").unwrap().body;
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tree).unwrap();
+        let code = check(&store, &Args::synth("check", &["pj-001"], &[("inner", "true"), ("run", "true")]));
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(code, 0);
+        assert!(tree.join("ran-new").exists(), "an untracked path selected its rule");
+        assert_eq!(store.find_task("pj-001").unwrap().body, before, "nothing on the row");
+        assert!(!greens::Greens::open(&store, "pj", &tree).lookup(&"0".repeat(40), "touch ran-new", greens::Env::Warm).is_some());
+    }
+
+    #[test]
+    fn tiers_lists_each_tier_and_set_warns_on_end_without_barrier() {
+        let (env, store, _sha) = world("tiers", "- mod on src/*.rs: cargo test {1}::\n- all at barrier: cargo test\n- gold at end: gold.sh", "exit 0\n");
+        assert_eq!(check(&store, &Args::synth("check", &["pj"], &[("tiers", "true")])), 0);
+        assert_eq!(check(&store, &Args::synth("check", &["nope"], &[("tiers", "true")])), 1);
+        let file = env.path("end-only.md");
+        std::fs::write(&file, "- gold at end: gold.sh\n").unwrap();
+        assert_eq!(check(&store, &Args::synth("check", &["pj"], &[("set", "true"), ("from", &file.display().to_string())])), 0);
+    }
+
+    #[test]
+    fn the_usage_line_names_inner_and_tiers() {
+        assert!(USAGE.contains("--inner [<task>] [--run]") && USAGE.contains("--tiers"));
     }
 }
