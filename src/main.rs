@@ -1751,7 +1751,10 @@ fn help_text() -> String {
                                     standing in or has work in, -n to look first
   wsp land [<id>]                   rebase it onto the trunk and fast-forward the
                                     trunk onto it; prints what actually moved.
-                                    The tree stays — landing is not finishing
+                                    The tree stays — landing is not finishing.
+                                    A member of a run does not type it: `wsp
+                                    review` marks it ready and the verifier's
+                                    `wsp verified --holds` lands it
   wsp check <id> [--plan] [--at <commit>]
                                     run a task's mechanical checks — its
                                     project's ## Checks, then the task's own —
@@ -1759,8 +1762,8 @@ fn help_text() -> String {
                                     wsp's, and record each step under ##
                                     Verification. A failure on a row at review
                                     sends it back with the step as what is owed;
-                                    wsp runs it by itself after a land, before
-                                    any verifier. --plan lists the steps, --at
+                                    wsp runs it by itself on a ready or landed
+                                    row, before any verifier. --plan lists the steps, --at
                                     runs another commit and writes nothing
   wsp verify [<path>…] [--check] [--release] [--rm [--all] [-n]]
                                     build and test your change at HEAD, in one

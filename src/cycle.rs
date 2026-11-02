@@ -2076,17 +2076,31 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
         .and_then(|p| p.read)
         .map(|r| format!(" at {r}"))
         .unwrap_or_default();
+    let ready = crate::repair::ready(member).is_some();
+    let (started, stand, readonly, holds) = match ready {
+        true => (
+            format!("wsp started you when {m} reached review, ready{read} and rebased on the trunk; it is not on the trunk yet and nobody else is going to read this work before it is", m = member.id),
+            format!("**You stand in {m}'s own tree**, at the commit it is ready at, with its build output: verify there, with `cargo test <module>::` or the project's equivalent incrementally, and read the trunk with `git show master:<path>` where you need it. ", m = member.id),
+            format!("**You are read-only.** Do not edit, commit, rebase, land, or change {m}'s status; never type `wsp land`. ", m = member.id),
+            format!("it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`, which lands {m} itself: it rebases the branch on the trunk if the trunk moved, reruns only the recorded checks the rebase can affect, and puts the commits on the trunk. A land that cannot happen (a conflict, a red rerun) is recorded as a block with the reason, and nothing reaches the trunk", m = member.id),
+        ),
+        false => (
+            format!("wsp started you when {m} reached review and landed{read}; nobody else is going to read this work before the barrier", m = member.id),
+            String::new(),
+            format!("**You are read-only.** Do not edit, commit, land, rebase, or change {m}'s status. ", m = member.id),
+            format!("it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`", m = member.id),
+        ),
+    };
     format!(
-        "Verify **{m}** ({title}){whose}. wsp started you when {m} reached review and landed{read}; \
-         nobody else is going to read this work before the barrier.\n\n\
-         **You are read-only.** Do not edit, commit, land, rebase, or change {m}'s status. \
+        "Verify **{m}** ({title}){whose}. {started}.\n\n\
+         {readonly}{stand}\
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
-         code on the trunk rather than against the report: the commits it landed, whether they \
+         code rather than against the report: the commits, whether they \
          do what the overview asked, and the tests that cover them — `cargo test <module>::` in \
          debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{split}\n\n\
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
-         - it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`;\n\
+         - {holds};\n\
          - it does not: `wsp verified {m} --blocks --from FILE --caption \"…\"`. {m} goes back to doing with \
          your verdict as what is owed, and its governor is told.\n\n\
          {caption}\n\n\
@@ -5380,6 +5394,165 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert_eq!(passes_on(&store, "m-1").len(), 1, "an idempotent tick");
         assert_eq!(store.find_task("m-1").unwrap().section("Log").unwrap().matches(crate::repair::READY).count(), 2, "one new ready line, no more");
+        let _ = spawned();
+    }
+
+    /// `wsp-341`, end to end: a project whose `## Checks` are `checks` (`RAN` is a
+    /// file the test reads back), a member ready in its own tree, the step that
+    /// rebases it and opens the pass, then `wsp verified`.
+    struct Run {
+        _env: util::Isolated,
+        store: Store,
+        repo: std::path::PathBuf,
+        tree: std::path::PathBuf,
+        w: crate::model::Worklist,
+        ran: std::path::PathBuf,
+    }
+
+    fn run_ready(tag: &str, checks: &str, member_file: &str, trunk_file: &str) -> Run {
+        let (env, store, tree, w) = ready_tree(tag, member_file, trunk_file);
+        let ran = env.path("ran.log");
+        let mut p = store.project("p").unwrap();
+        p.body = format!("## Checks\n{}\n", checks.replace("RAN", &ran.display().to_string()));
+        store.save_project(&p).unwrap();
+        let repo = tree.parent().unwrap().parent().unwrap().to_path_buf();
+        Run { _env: env, store, repo, tree, w, ran }
+    }
+
+    impl Run {
+        fn commit_on_trunk(&self, file: &str, text: &str) {
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git").arg("-C").arg(&self.repo).args(args).env_remove("GIT_INDEX_FILE")
+                    .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                    .output().unwrap();
+                assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap().trim().to_string()
+            };
+            let at = self.repo.join(file);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(&at, text).unwrap();
+            git(&["add", file]);
+            git(&["commit", "-q", "-m", "the trunk moved again"]);
+        }
+        fn trunk(&self) -> String {
+            let out = std::process::Command::new("git").arg("-C").arg(&self.repo).args(["rev-parse", "master"]).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+        fn verdict(&self, flag: &str) {
+            let from = self.store.root.join("verdict.md");
+            std::fs::write(&from, "read in the member's tree").unwrap();
+            let from = from.display().to_string();
+            let args = crate::Args::synth("verified", &["m-1", "--from", &from], &[(flag, "true"), ("caption", "read in its tree")]);
+            assert_eq!(crate::verification::cmd_verified(&self.store, &args), 0);
+        }
+        fn reran(&self) -> String {
+            std::fs::read_to_string(&self.ran).unwrap_or_default()
+        }
+        /// The step, the gate's run (a process of its own in the daemon, here in
+        /// line), and the step again that opens the pass behind it.
+        fn open_the_pass(&self) {
+            step(&self.store, &self.w, &Blind);
+            if let Some(run) = crate::verification::runs(&self.store.find_task("m-1").unwrap()).pop() {
+                assert_eq!(crate::check::check(&self.store, &crate::Args::synth("check", &["m-1"], &[("auto", "true"), ("run", &run.at)])), 0);
+            }
+            step(&self.store, &self.w, &Blind);
+        }
+        fn latest(&self) -> crate::verification::Pass {
+            passes_on(&self.store, "m-1").pop().unwrap()
+        }
+    }
+
+    /// Holds: ready → rebased and checked in the tree → pass → `--holds` lands
+    /// the row with nothing rerun (the trunk did not move since), and the next
+    /// tick neither verifies nor checks it again.
+    #[test]
+    fn a_ready_member_is_verified_in_its_tree_and_a_hold_lands_it() {
+        let r = run_ready("e2e-holds", "- always: echo always >> RAN", "g", "h");
+        r.open_the_pass();
+        assert_eq!(r.latest().state, crate::verification::State::Running);
+        assert_eq!(r.reran(), "always\n", "the gate ran once, in the member's tree");
+        assert!(crate::repair::landed(&r.store.find_task("m-1").unwrap()).is_none(), "nothing on the trunk before the verdict");
+        r.verdict("holds");
+        let m = r.store.find_task("m-1").unwrap();
+        assert_eq!(r.trunk(), crate::repair::landed(&m).unwrap());
+        assert!(r.repo.join("g").exists() && r.repo.join("h").exists(), "the member's work and the trunk's, together");
+        assert_eq!(r.reran(), "always\n", "an unmoved trunk reruns nothing");
+        assert!(r.latest().landed.is_none());
+        step(&r.store, &r.w, &Blind);
+        step(&r.store, &r.w, &Blind);
+        assert_eq!(passes_on(&r.store, "m-1").len(), 1);
+        assert_eq!(r.reran(), "always\n");
+        let _ = spawned();
+    }
+
+    /// Blocks: the verdict sends the row back and nothing reaches the trunk.
+    #[test]
+    fn a_block_on_a_ready_member_leaves_the_trunk_as_it_was() {
+        let r = run_ready("e2e-blocks", "", "g", "h");
+        r.open_the_pass();
+        let before = r.trunk();
+        r.verdict("blocks");
+        assert_eq!(r.trunk(), before);
+        assert!(!r.repo.join("g").exists());
+        let m = r.store.find_task("m-1").unwrap();
+        assert_eq!(m.status(), Status::Doing);
+        assert!(crate::repair::landed(&m).is_none());
+        assert_eq!(r.latest().state, crate::verification::State::Blocks);
+        let _ = spawned();
+    }
+
+    /// Moved trunk: between the pass opening and the hold the trunk gains a
+    /// commit; land rebases again and reruns the check that commit can affect
+    /// and not the one it cannot.
+    #[test]
+    fn a_trunk_that_moves_during_the_pass_reruns_only_the_affected_checks() {
+        let checks = "- src on src/**: echo src >> RAN\n- docs on docs/**: echo docs >> RAN\n- always: echo always >> RAN";
+        let r = run_ready("e2e-moved", checks, "g", "h");
+        r.open_the_pass();
+        assert_eq!(r.reran(), "always\n", "the gate ran the every-landing step: the member changed no path a rule names");
+        r.commit_on_trunk("src/a.txt", "theirs\n");
+        r.verdict("holds");
+        assert_eq!(r.reran(), "always\nsrc\nalways\n", "src reran for the path the rebase pulled in, and the every-landing step; docs did not");
+        let m = r.store.find_task("m-1").unwrap();
+        assert_eq!(r.trunk(), crate::repair::landed(&m).unwrap());
+        let p = r.latest();
+        assert!(p.landed.is_some(), "the commit that reached the trunk is not the one read");
+        step(&r.store, &r.w, &Blind);
+        assert_eq!(passes_on(&r.store, "m-1").len(), 1, "and it is not verified again");
+        let _ = spawned();
+    }
+
+    /// Moved trunk, red rerun: the affected check fails after the second
+    /// rebase, so the hold is a block and nothing lands.
+    #[test]
+    fn a_red_rerun_after_the_trunk_moved_blocks_a_ready_member() {
+        let r = run_ready("e2e-red", "- src on src/**: test ! -f src/a.txt", "g", "h");
+        r.open_the_pass();
+        let before = r.trunk();
+        r.commit_on_trunk("src/a.txt", "theirs\n");
+        let moved = r.trunk();
+        r.verdict("holds");
+        assert_eq!(r.trunk(), moved, "nothing of the member's reached the trunk");
+        assert!(!r.repo.join("g").exists() && before != moved);
+        assert_eq!(r.latest().state, crate::verification::State::Blocks);
+        assert_eq!(r.store.find_task("m-1").unwrap().status(), Status::Doing);
+        let _ = spawned();
+    }
+
+    /// Moved trunk, conflict: the second rebase does not apply, so the hold is a
+    /// block, the tree is left as the member had it, and nothing lands.
+    #[test]
+    fn a_conflict_after_the_trunk_moved_blocks_a_ready_member() {
+        let r = run_ready("e2e-conflict", "", "g", "h");
+        r.open_the_pass();
+        r.commit_on_trunk("g", "the trunk wrote g too\n");
+        let moved = r.trunk();
+        r.verdict("holds");
+        assert_eq!(r.trunk(), moved);
+        assert_eq!(r.latest().state, crate::verification::State::Blocks);
+        assert!(r.latest().text.contains("does not apply"), "{}", r.latest().text);
+        let status = std::process::Command::new("git").arg("-C").arg(&r.tree).args(["status", "--porcelain"]).output().unwrap();
+        assert!(status.stdout.is_empty(), "the tree is not left mid-rebase");
         let _ = spawned();
     }
 

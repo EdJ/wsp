@@ -13,8 +13,9 @@
 //! 3. **Run the row's `## Checks`** in this tree ([`crate::check::run_all`]).
 //!    Whatever the harness said about itself, this is the outcome: a model that
 //!    reports success and fails its checks has failed.
-//! 4. **Settle the row.** Green: commit what is uncommitted, `wsp land`, `wsp
-//!    review`. Anything else: `wsp block` with the account. A block is the row's
+//! 4. **Settle the row.** Green: commit what is uncommitted, `wsp review` — which
+//!    marks a row of a run ready for its verifier to land (`wsp-341`); a row in
+//!    no run is landed first, as before. Anything else: `wsp block` with the account. A block is the row's
 //!    honest state, a person's to read, and a respawn on `claude` is theirs to
 //!    choose; the wrapper never retries on a dearer kind.
 //!
@@ -88,7 +89,7 @@ fn message(packet: &str, id: &str, steps: &[check::Step]) -> String {
         "{packet}\n---\nYou are running unattended in your own git tree. Do the change above, run `{}` until it \
          passes, and commit your work with git (`git add <files>`, `git commit -m \"{id}: <what changed>\"`). \
          Do not run `wsp` verbs, `git push` or `git stash`: the run checks your work with that command, then \
-         lands and reviews the row, or blocks it. Finish with one line saying what you did.",
+         reviews the row (landing it first when no run verifies it), or blocks it. Finish with one line saying what you did.",
         commands.join("` and `")
     )
 }
@@ -220,11 +221,12 @@ pub fn attend(store: &Store, args: &Args) -> i32 {
             let _ = git(&here, &["add", "-A"]);
             let _ = git(&here, &["commit", "-q", "-m", &format!("{}: {} (attention)", t.id, t.title)]);
         }
-        let landed = Command::new(std::env::current_exe().unwrap_or_default())
-            .args(["land", &t.id])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let landed = crate::worklist::verified_by_a_run(store, &t.id)
+            || Command::new(std::env::current_exe().unwrap_or_default())
+                .args(["land", &t.id])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
         // Review asks for the line a glance reads; a row filed without one gets
         // the one its title gives, as review's own refusal suggests.
         if t.caption.is_none() {

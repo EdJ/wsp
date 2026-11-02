@@ -182,8 +182,8 @@ for anything no verb announces (`src/cycle.rs`, `src/repair.rs`):
 
 | when | wsp | the agent |
 |---|---|---|
-| the list starts, or a barrier passes | spawns the group's members, each on its own `agent` line or the group's | a member works, lands, and ends with `wsp review` |
-| a member is at `review` and landed | starts a read-only verifier on the member's line | the verifier ends with `wsp verified <m> --holds` or `--blocks` |
+| the list starts, or a barrier passes | spawns the group's members, each on its own `agent` line or the group's | a member works and ends with `wsp review`, which marks it ready at its tree's commit and does not land |
+| a member is at `review` and ready (or landed) | rebases a ready member onto the trunk in its own tree, runs its checks there, then starts a read-only verifier in that tree | the verifier ends with `wsp verified <m> --holds`, which lands the row, or `--blocks` |
 | a verdict blocks | puts the member back at `doing`, with the verdict as what is owed, and tells the governor | the member's agent carries on |
 | every member landed and holding | opens a check on the group (no row) and spawns `wsp spawn <list> --agent --check N` to read it | the check ends with `go`, `hold` or `followup` |
 | `go` | records the pass on the group's check, ends the check once its turn is over, sweeps the group's trees, ends what the group opened, starts the next group, rotates the governor | — |
@@ -1749,6 +1749,8 @@ wsp verified wsp-148 --blocks --from verdict.md   # back to doing, verdict owed,
 - 2026-10-06T10:00:00Z holds · read 55c4839abcde · landed 9f3a1c07d2e4 · pane cpd-12 · on claude opus/high · ended
   what was checked, what held, what did not
 ```
+
+**Verify before merge** (Ed, 2026-11-02). A member used to `wsp land` and a verifier then read the trunk, often in a tree whose `target/` was already gone, so verifying was a cold build and master carried unverified work for a while. Now `wsp review` only marks the member ready, the verifier stands in the member's own warm tree at the commit it is ready at, and the verdict lands the row.
 
 `--holds` on a member that is ready and unlanded lands it, in the member's own
 tree: a fast-forward when the trunk has not moved since the checks ran, else a
@@ -3991,7 +3993,7 @@ harness's own names; there is no `--effort`) opens a seat running `wsp attend
    at the cap and exits 3);
 3. runs the row's `## Checks` in the tree — **that, not the harness's own
    answer, is the outcome**;
-4. green: commits what is left, `wsp land`, `wsp review`; anything else
+4. green: commits what is left, `wsp review` (`wsp land` first only for a row no run verifies); anything else
    (red checks, the cap, a harness that would not start): `wsp block` with the
    account. A respawn on `claude` is the person's call.
 
@@ -4674,7 +4676,10 @@ land` now writes on the row's `landed` line, or, for a row landed before that,
 the trunk's commits that name the row's id (`--since <commit>` names the base
 by hand, for a row whose commits do not).
 
-It runs in a **warm tree of wsp's own** (`<state>/checks/<project>-<repo>/tree`),
+A ready member's checks run in **its own tree** at the commit it is ready at
+(`wsp-341`), after wsp has rebased the branch onto the trunk there; when the trunk
+moves again before the hold lands the row, only the steps whose paths the rebase
+touched run again. Otherwise it runs in a **warm tree of wsp's own** (`<state>/checks/<project>-<repo>/tree`),
 moved to the landed commit and left standing so the next build is incremental,
 one check at a time (a lock beside it); not under `.worktrees/`, where
 `checkout --sweep` and the check-tree sweeps would take it. The commands get the
@@ -4691,8 +4696,8 @@ step, its time, and the tail of the failing one:
     | error[E0308]: mismatched types
 ```
 
-**By itself after a land.** `wsp land` starts the run, and a run's step in front
-of the verifier does too: a landed member with anything to run gets no verifier
+**By itself, before the verifier.** A run's step in front of the verifier starts
+it (and `wsp land` does for a row landed by hand): a ready or landed member with anything to run gets no verifier
 until a run for that landing has passed. A failure on a row at `review` sends it
 back to `doing` **in the same write that records it**, with the failing step as
 what is owed — told to its pane, or a rework leg for a row run as legs — and no
@@ -5283,7 +5288,7 @@ It also prints the diffstat of what actually reached the trunk, which is step 4
 of the procedure above and the check that caught a wrong commit on two
 consecutive days.
 
-**Landing is not finishing** (Ed, 2026-08-17). `land` used to remove the tree it
+**Landing is not finishing** (Ed, 2026-08-17). A member of a run no longer lands before review: `wsp review` marks it ready and the verifier's `--holds` lands it, in this same tree. `land` used to remove the tree it
 had landed, which read as tidiness and was not: a task can be reopened, and a
 tree destroyed on every land has to be rebuilt — a second checkout and a cold
 `target/` — every time work resumes. It also deleted its own caller's cwd the
@@ -5310,7 +5315,9 @@ still takes nothing, for the reasons above.
 free. The daemon's tick drops the `target/` of a row's tree and of its legs'
 trees once the row is at `review` or `done`, holds no claim, has nobody standing
 in its tree (a verifier stands in its member's) and has nothing on its branch
-the trunk lacks. The trees stay, with whatever is uncommitted in them; a
+the trunk lacks. A member of a group wsp runs also needs its newest verification
+to hold and its group's barrier to have passed (`wsp-341`), since the verifier
+lands it in this tree and a block sends it back to a warm build. The trees stay, with whatever is uncommitted in them; a
 reopened row pays one cold build. `cycle.log` says what went and what was kept
 and why. Check and leg trees are swept on the same rule with a wider idea of
 nothing: an *ignored* `__pycache__/`, `*.pyc` or `Cargo.lock` below the tree's
@@ -5488,7 +5495,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/run.rs` | the detail pane itself |
 | `src/packet.rs` | `wsp packet`: a row's `## Packet` (prose, `file:` lines to inline, `packet: off` to opt out, `attention: <dollars>` to opt in to the attention harness) printed with the files it names under a 16,000-byte cap that refuses rather than cuts; and the one decision that a plain member's `spawn --agent` takes Claude Code's short start (`SHORT_START` in `agent_commands`) with the packet as its order |
 | `src/kind_attention.rs` | the attention harness as a kind (wsp-330): the program it runs (`wsp attend`), the model names it takes, no effort, nothing that can be told to it, and an attempt's turns, tokens and dollars read off the directory the harness logged into |
-| `src/cmd_attend.rs` | `wsp attend <row>`: one attempt from the packet to the row's `## Checks`, the harness run under a cost cap and a deny list, and the row committed, landed and reviewed on green or blocked with the account on anything else |
+| `src/cmd_attend.rs` | `wsp attend <row>`: one attempt from the packet to the row's `## Checks`, the harness run under a cost cap and a deny list, and the row committed and reviewed (landed first when no run verifies it) on green or blocked with the account on anything else |
 | `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, what it consumed, the outcome |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else — and the same brief composed for a seat that does not exist yet |
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, the three reasons one is finished with, and the branches a removed tree leaves behind |
@@ -5501,10 +5508,10 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor — or, past the last barrier, the list closed and its own seat stood down and ended |
-| `src/check.rs` | `wsp check`: a row's mechanical checks as a script — the member's `## Checks`, the project's path rules, the barrier's steps — run at the landing in a warm tree, recorded under `## Verification`, and the gate in front of the verifier |
+| `src/check.rs` | `wsp check`: a row's mechanical checks as a script — the member's `## Checks`, the project's path rules, the barrier's steps — run in the member's own tree at its ready commit (a warm tree of wsp's for a landed row), only the steps a rebase can affect after a moved trunk, recorded under `## Verification`, and the gate in front of the verifier |
 | `src/did.rs` | what a verifier did, as lines on its verdict: the commands it ran, what it drove and what it read — derived from the seat's Claude Code transcript when wsp ends it — and the `checked:` lines the verifier writes itself |
 | `src/cmd_verifications.rs` | `wsp verifications`: those lines added up by project and period — the share that ran tests, drove the app and read the diff, the done-when items checked, blocks by cause |
-| `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified`, and the one-off migration off Verify rows |
+| `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified` (whose `--holds` lands a ready member), and the one-off migration off Verify rows |
 | `src/history.rs` | a list's history as data, off its `## Log` and `checks:`: membership replayed by ordinal, events placed on the group the run stood at by time, each group's maker and joins, and the groups dropped while they ran |
 | `src/barrier.rs` | a barrier check, on the group it checks: the `checks:` entries, opened before its agent starts, settled by `go`/`hold`/`followup`, the seats `wip` and the brief name, a check whose agent never came up started again on a backoff (3 tries over about ten minutes, then a flag on the list), and the one-off migration off Barrier rows |
 | `src/throttle.rs` | `wsp throttle`: the three-mode build throttle (nice, job cap, machine-wide slots) decided at each build through the shims on a seat's `PATH`, the one-cargo-per-tree hold that is on in every mode, the holds as files owned by a pid, and the load warning |
@@ -5512,6 +5519,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/starts.rs` | a member's or a leg's start that did not take: how many misses, when the last was, and whether it is held (its backoff — the barrier check's, 3 minutes then 5 — or its tries spent), in `starts.json`; forgiven by `wsp worklist advance <list>` or `wsp leg reset` |
 | `src/untaken.rs` | a work order the run typed at a seat and no turn came of: pressed once if it sits in the prompt, sent again once if it never reached it, and the seat replaced if neither starts a turn; a seat still empty or starting after five minutes is replaced at once, a leg's included (the leg goes back to pending and starts again on the backoff) — each step a `cycle.log` line the next one reads back |
 | `src/waiting.rs` | whether a seat is waiting on somebody and on whom — a prompt on its screen, its own open `wsp ask`, or a shell of its own still running, which is waiting on nobody — the one reading the reconciler, the barrier, the watch, `tell` and `wip` all ask, so nothing treats a waiting seat as idle |
+| `src/build_output.rs` | the daemon's tick drops a row's `target/` once its tree is landed and released, and for a member of a run only once its verification holds and its group's barrier has passed |
 | `src/ending.rs` | a settled member has its agent ended, after `verification`'s tick has ended the verifier — settled is a newest pass that holds, or, with no pass, landed with no verifier owed (in no open list's group wsp runs) and five minutes gone, whatever its list is doing, a finished one included; and a leg-run row's first seat (the one `wsp release` wrote a `handed the row to its legs` line for) once every leg is done or skipped and the row is landed: never one in a turn, waiting, typed to since, or holding a governor seat; confirmed gone by pid, recorded once, and a failure told once; and the pid reading and check `cycle::end_passes` confirms every verifier's ending by |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |

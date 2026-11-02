@@ -666,8 +666,9 @@ is written:
 - **The default graph:** `scout` (reads, and writes a baton of pointers),
   then `plan` (decides from the baton plus targeted reads, and adds the
   build legs; Opus only with a `why:`), then `build-<layer>` × N (edits,
-  runs the loop, commits), then `finish` (the full test, rebase, land,
-  review). The plan leg decides whether the builds are a chain or siblings.
+  runs the loop, commits), then `finish` (the full test, rebase, review —
+  `wsp leg done` from the last leg marks the row ready and a verifier lands it;
+  a row in no run still lands). The plan leg decides whether the builds are a chain or siblings.
 - **Do not stage** a row under ~80 turns that sits in one layer. The extra
   starts and re-reads cost more than they save, against the same row
   unstaged on the same tier. Which tier an unstaged row runs on is the list's
