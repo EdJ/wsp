@@ -660,6 +660,9 @@ fn after_pass(store: &Store, seats: &dyn Seats, w: &Worklist, n: usize) {
     }
     let Some(now) = store.worklist(&w.id) else { return };
     let _ = crate::cmd_worklist::close(store, &Args::synth("worklist", &["done", &w.id], &[]), now, Closing::Passed);
+    // The one cold build of the list's tips (`wsp-342`), after the close is
+    // recorded and detached, so closing never waits on it.
+    crate::cold::at_close(store, &w.id);
 }
 
 /// Whether passing barrier `n` closes the list: it is the last, and wsp ran its

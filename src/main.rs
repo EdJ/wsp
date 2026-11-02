@@ -14,6 +14,7 @@ mod agent_commands;
 mod barrier;
 mod barrier_replay;
 mod barrier_run;
+mod cold;
 mod caption;
 mod choices;
 mod hold;
@@ -1195,6 +1196,7 @@ fn main() {
         "attend" => cmd_attend::attend(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
         "check" => check::check(&store, &args),
+        "cold" => cold::cold(&store, &args),
         "checkout" => cmd_checkout::checkout(&store, &args),
         "land" => cmd_checkout::land(&store, &args),
         "install" => cmd_install::install(&store, &args),
@@ -1738,6 +1740,12 @@ fn help_text() -> String {
                                     a row with one is spawned with the short start
   wsp attend <id>                   one attention-harness attempt on a row, to its checks'
                                     result: what `spawn --kind attention` runs; nobody types it
+  wsp cold <list|project> [--plan] [--at COMMIT] [--keep]
+                                    one cold build in a fresh checkout: the project's `at barrier`
+                                    then `at end` steps; started once as a list closes
+  wsp cold <list|project> [--plan] [--at COMMIT] [--keep]
+                                    one cold build in a fresh checkout: the project's `at barrier`
+                                    then `at end` steps; started once as a list closes
   wsp checkout [<id>] [-n]          a working tree of your own for the task in
                                     hand, under .worktrees/, on its own branch —
                                     nobody else's edits are in it and yours are

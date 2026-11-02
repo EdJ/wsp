@@ -323,6 +323,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // And the build holds of processes that died, and the load warning's edges
     // (`wsp-331`).
     crate::throttle::tidy(store);
+    // And a cold build for a tip that has none, while the person is away (`wsp-342`).
+    crate::cold::when_away(store);
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);

@@ -96,7 +96,7 @@ impl Plan {
     }
 }
 
-fn repo_of(store: &Store, project: &str) -> Option<PathBuf> {
+pub(crate) fn repo_of(store: &Store, project: &str) -> Option<PathBuf> {
     let mut at = Some(project.to_string());
     while let Some(p) = at.take() {
         let found = store.project(&p)?;
@@ -108,7 +108,7 @@ fn repo_of(store: &Store, project: &str) -> Option<PathBuf> {
     None
 }
 
-fn tip_of(repo: &std::path::Path) -> Option<String> {
+pub(crate) fn tip_of(repo: &std::path::Path) -> Option<String> {
     let trunk = crate::cmd_checkout::trunk(repo)?;
     let branch = crate::cmd_checkout::trunk_branch(&trunk)?;
     git(&trunk, &["rev-parse", &branch]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
