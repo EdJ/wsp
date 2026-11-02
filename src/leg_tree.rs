@@ -128,7 +128,14 @@ pub(crate) fn open(root: &str, task: &str, leg: &str) -> Result<Opened, String> 
     let row_branch = cmd_checkout::trunk_branch(&row_dir).ok_or_else(|| format!("{task}'s tree is on a detached HEAD"))?;
     let name = tree_name(task, leg);
     let dir = trunk.join(WORKTREES).join(&name);
-    cmd_checkout::ensure(&repo, &dir, &name, &row_branch)?;
+    let made = cmd_checkout::ensure(&repo, &dir, &name, &row_branch)?;
+    // The leg starts warm from the row's tree: one install there serves every
+    // leg after it (wsp-355).
+    if made.fresh {
+        for line in crate::warm::clone_from(&row_dir, &dir) {
+            eprintln!("wsp: {name}: {line}");
+        }
+    }
     let from = git(&dir, &["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
     Ok(Opened { path: util::contract(&dir), dir, name, from })
 }

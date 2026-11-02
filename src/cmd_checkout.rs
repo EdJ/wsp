@@ -325,7 +325,7 @@ struct Orphan {
 /// looking at.
 pub(crate) struct Made {
     /// Whether the tree was new.
-    fresh: bool,
+    pub(crate) fresh: bool,
     orphan: Option<Orphan>,
 }
 
@@ -466,6 +466,11 @@ pub(crate) fn tree_for(root: &str, task: &str) -> Option<String> {
     // guard declines a moment later, and a good reason to fall back to the root
     // rather than to fail the spawn.
     let made = ensure(&repo, &dir, task, &branch).ok()?;
+    if made.fresh {
+        for line in crate::warm::clone_from(&trunk, &dir) {
+            eprintln!("wsp: {line}");
+        }
+    }
     if let Some(o) = &made.orphan {
         eprintln!(
             "wsp: {task} was renumbered — branch {} still holds {} that {branch} has not, and this tree is not on it",
@@ -1839,6 +1844,14 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
         }
     };
     let fresh = made.fresh;
+    // Cut from the trunk, so warmed from the trunk checkout (wsp-355).
+    if fresh {
+        if let Some(trunk) = trunk(&w.repo) {
+            for line in crate::warm::clone_from(&trunk, &w.dir) {
+                eprintln!("wsp: {line}");
+            }
+        }
+    }
     // After [`ensure`], so a tree it has just made names its own new branch.
     let on = w.on();
     let commits = on.as_deref().map(|b| ahead(&w.repo, &w.branch, b)).unwrap_or_default();
