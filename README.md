@@ -4763,7 +4763,7 @@ when the person is away (throttle in auto mode, idle past `away`), at most once
 per six hours. A step already green cold at the tip is not run again.
 
 **`at end`** declares a step for the cold build only, beside `at barrier`:
-`- launchd (limit): cargo test --test launchd  at end`-style rules in the
+rules such as `- perf (20m) at end: cargo bench` in the
 project's `## Checks`, for goldens, perf and load-sensitive tests.
 
 ### The barrier, run by wsp where nothing needs judgment (`wsp-326`)
