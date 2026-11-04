@@ -972,7 +972,12 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                     crate::barrier::Mechanical::No
                 };
                 if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, mech, &gone, &admit) {
-                    if o.retaken {
+                    if let Some(pid) = o.died {
+                        log_line(store, &format!(
+                            "{} group {at}: its barrier run ended without a result (pid {pid}), starting it again (try {} of {})",
+                            w.id, o.tries, crate::barrier::TRIES
+                        ));
+                    } else if o.retaken {
                         log_line(store, &format!(
                             "{} group {at}: starting its check again — the last start never arrived (try {} of {})",
                             w.id, o.tries, crate::barrier::TRIES

@@ -141,8 +141,54 @@ pub(crate) struct Check {
     /// The mechanical part, run by wsp before any agent is asked (`wsp-326`).
     /// `None` where nothing was declared to run.
     pub suite: Option<Suite>,
+    /// The process making the mechanical run, while `suite` is running, and when
+    /// it started, so a pid that has been reused is not taken for it. A run that
+    /// is killed leaves its entry at `suite:running`; this is how that is seen.
+    pub run: Option<Run>,
     /// Who settled it, when it was not an agent: `wsp`.
     pub by: Option<String>,
+}
+
+/// The process of a barrier's mechanical run: `pid:25037@Tue_Nov_4_11:19:05_2026`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Run {
+    pub pid: u32,
+    /// `ps -o lstart=` for the pid, its spaces written as `_`.
+    pub started: String,
+}
+
+impl Run {
+    /// The running process's own.
+    pub(crate) fn this() -> Option<Run> {
+        let pid = std::process::id();
+        Some(Run { pid, started: start_of(pid).ok()?? })
+    }
+
+    fn parse(v: &str) -> Option<Run> {
+        let (pid, started) = v.split_once('@')?;
+        Some(Run { pid: pid.parse().ok()?, started: started.to_string() })
+    }
+
+    fn text(&self) -> String {
+        format!("{}@{}", self.pid, self.started)
+    }
+
+    /// Whether the process is gone: no such pid, or one that started at another
+    /// time. A `ps` that cannot be run says nothing, and the run is believed.
+    pub(crate) fn gone(&self) -> bool {
+        match start_of(self.pid) {
+            Ok(now) => now.as_deref() != Some(self.started.as_str()),
+            Err(()) => false,
+        }
+    }
+}
+
+/// When process `pid` started, as `ps` says it, or `None` where there is none.
+fn start_of(pid: u32) -> Result<Option<String>, ()> {
+    let out = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.split_whitespace().collect::<Vec<_>>().join("_");
+    Ok((!s.is_empty()).then_some(s))
 }
 
 /// Where the barrier's mechanical run is: the project's full suite, the
@@ -186,14 +232,26 @@ impl Check {
             tries: 1,
             gave_up: false,
             suite: None,
+            run: None,
             by: None,
         }
     }
 
+    /// Its mechanical run was started by a process that is no longer there, and
+    /// left no result.
+    pub(crate) fn run_died(&self) -> bool {
+        self.suite == Some(Suite::Running) && self.pane.is_none() && self.run.as_ref().is_some_and(Run::gone)
+    }
+
     /// How long this entry waits with no seat before its agent is started
     /// again: after its first start and after its second, and after its last
-    /// never.
+    /// never. A run known to be dead waits for nothing (while it has tries
+    /// left, each retake being one); one whose process is alive, or unknown, is
+    /// believed for [`SUITE_WEDGED_AFTER`] at most.
     fn wait_before_next_try(&self) -> Option<i64> {
+        if self.run_died() {
+            return (self.tries < TRIES).then_some(-1);
+        }
         if self.suite == Some(Suite::Running) {
             return Some(SUITE_WEDGED_AFTER);
         }
@@ -242,6 +300,7 @@ pub(crate) fn push(acc: &mut Vec<Check>, text: &str) {
                 tries: 1,
                 gave_up: false,
                 suite: None,
+                run: None,
                 by: None,
             });
             continue;
@@ -249,6 +308,7 @@ pub(crate) fn push(acc: &mut Vec<Check>, text: &str) {
         let Some(c) = acc.last_mut() else { continue };
         match tok.split_once(':') {
             Some(("suite", v)) => c.suite = Suite::parse(v),
+            Some(("pid", v)) => c.run = Run::parse(v),
             Some(("by", v)) => c.by = Some(v.to_string()),
             Some(("read", v)) => c.read = Some(v.to_string()),
             Some(("pane", v)) => c.pane = Some(v.to_string()),
@@ -295,6 +355,9 @@ pub(crate) fn text(checks: &[Check]) -> String {
         }
         if let Some(s) = c.suite {
             e.push(format!("suite:{}", s.as_str()));
+        }
+        if let Some(r) = &c.run {
+            e.push(format!("pid:{}", r.text()));
         }
         if let Some(b) = &c.by {
             e.push(format!("by:{b}"));
@@ -415,6 +478,8 @@ pub(crate) struct Opened {
     /// Where the mechanical run of the entry it took over had got to, so a
     /// start that failed after the suite finished does not run the suite again.
     pub suite: Option<Suite>,
+    /// The pid of the run it took over, when that run had died without a result.
+    pub died: Option<u32>,
 }
 
 /// How many times an entry's agent is started before the run stops trying and
@@ -498,16 +563,23 @@ pub(crate) fn open_within(
                         return false;
                     }
                     let before = c.suite;
+                    let died = c.run.as_ref().filter(|_| c.run_died()).map(|r| r.pid);
                     c.at = util::now_iso();
+                    c.run = None;
                     // A suite that never finished, or one not asked for until
                     // now, is a run and not another try of the agent's start;
-                    // a finished suite's start is what is retried.
+                    // a finished suite's start is what is retried. A run that
+                    // died is a try as well, so one that dies every time ends
+                    // in `give_up` and not in a loop.
                     if before == Some(Suite::Running) || (before.is_none() && mech == Mechanical::Yes) {
                         c.suite = (mech == Mechanical::Yes).then_some(Suite::Running);
+                        if died.is_some() {
+                            c.tries += 1;
+                        }
                     } else {
                         c.tries += 1;
                     }
-                    opened = Some(Opened { retaken: true, tries: c.tries, suite: before });
+                    opened = Some(Opened { retaken: true, tries: c.tries, suite: before, died });
                     return true;
                 }
                 None => return false,
@@ -520,7 +592,7 @@ pub(crate) fn open_within(
             c.suite = Some(Suite::Running);
         }
         g.checks.push(c);
-        opened = Some(Opened { retaken: false, tries: 1, suite: None });
+        opened = Some(Opened { retaken: false, tries: 1, suite: None, died: None });
         true
     });
     changed.then_some(()).and(opened)
@@ -616,6 +688,9 @@ pub(crate) fn note_run(store: &Store, list: &str, at: usize, suite: Suite, by: O
     change(store, list, at, |g| match g.checks.iter_mut().rev().find(|c| c.open()) {
         Some(c) => {
             c.suite = Some(suite);
+            if suite != Suite::Running {
+                c.run = None;
+            }
             if let Some(b) = by {
                 c.by = Some(b.to_string()).filter(|b| !b.is_empty());
             }
@@ -623,6 +698,25 @@ pub(crate) fn note_run(store: &Store, list: &str, at: usize, suite: Suite, by: O
         }
         None => false,
     })
+}
+
+/// Record that this process is making the open check's mechanical run, so a
+/// run that is killed is seen to be dead and not believed for hours. Only while
+/// the entry reads `suite:running`.
+pub(crate) fn note_pid(store: &Store, list: &str, at: usize) -> bool {
+    let Some(run) = Run::this() else { return false };
+    change(store, list, at, |g| match g.checks.iter_mut().rev().find(|c| c.open() && c.suite == Some(Suite::Running)) {
+        Some(c) => {
+            c.run = Some(run);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Whether the open check on `g` is a mechanical run whose process has died.
+pub(crate) fn run_died(g: &Group) -> bool {
+    running(g).is_some_and(Check::run_died)
 }
 
 /// The open check's suite state on group `at`, if it has one.
@@ -693,6 +787,9 @@ pub(crate) fn lines(p: &Paint, g: &Group) -> Vec<String> {
             if let Some(s) = c.suite {
                 parts.push(format!("suite {}", s.as_str()));
             }
+            if c.run_died() {
+                parts.push("barrier run died".into());
+            }
             if let Some(b) = &c.by {
                 parts.push(format!("by {b}, no agent"));
             }
@@ -750,7 +847,7 @@ fn legacy(row: &Task, w: &Worklist, g: &Group, later: bool) -> Check {
         .find_map(|l| l.split("spawned at ").nth(1))
         .and_then(|r| r.split_whitespace().next())
         .map(str::to_string);
-    Check { at: row.created.clone(), state, read: None, pane, on, ending: Ending::Ended, was: Some(row.id.clone()), tries: 1, gave_up: false, suite: None, by: None }
+    Check { at: row.created.clone(), state, read: None, pane, on, ending: Ending::Ended, was: Some(row.id.clone()), tries: 1, gave_up: false, suite: None, run: None, by: None }
 }
 
 /// What [`migrate`] would do.
@@ -916,6 +1013,7 @@ mod tests {
             tries: 3,
             gave_up: true,
             suite: Some(Suite::Red),
+            run: Some(Run { pid: 25037, started: "Tue_Nov_4_11:19:05_2026".into() }),
             by: Some("wsp".into()),
         };
         let bare = Check::opened(None, None);
@@ -973,6 +1071,86 @@ mod tests {
         assert!(o.retaken && o.suite == Some(Suite::Green), "so its start is retried and the suite is not");
         assert_eq!(suite_of(&store, "run", 1), Some(Suite::Green));
         drop(w);
+    }
+
+    /// `wsp-369`: a barrier run killed by hand leaves `suite:running`; the entry
+    /// names the run's process, and a gone one is retaken at once.
+    fn running_with(store: &Store, run: Run) -> (Option<Opened>, impl Fn() -> Option<Opened> + '_) {
+        let never = |_: &str| false;
+        assert!(open_within(store, &store.worklist("run").unwrap(), 1, None, None, Mechanical::Yes, &never, &|| true).is_some());
+        change(store, "run", 1, |g| {
+            g.checks.last_mut().unwrap().run = Some(run);
+            true
+        });
+        (None, move || open_within(store, &store.worklist("run").unwrap(), 1, None, None, Mechanical::Yes, &|_: &str| false, &|| true))
+    }
+
+    #[test]
+    fn a_run_whose_process_is_gone_is_retaken_at_once_and_counts_a_try() {
+        let (_env, store) = scratch("dead-run");
+        let _w = list(&store, &[&["m-1"]]);
+        let (_, retake) = running_with(&store, Run { pid: 2_000_000_000, started: "Tue_Nov_4_11:19:05_2026".into() });
+        let g = store.worklist("run").unwrap().groups()[0].clone();
+        assert!(run_died(&g) && would_open(&g, &|_| false));
+        let o = retake().expect("a dead run is not waited out");
+        assert!(o.retaken && o.died == Some(2_000_000_000) && o.suite == Some(Suite::Running));
+        assert_eq!(o.tries, 2);
+        assert_eq!(suite_of(&store, "run", 1), Some(Suite::Running));
+        assert!(retake().is_none(), "the new entry names no process yet and is believed");
+    }
+
+    #[test]
+    fn a_run_that_dies_every_time_stops_at_the_tries() {
+        let (_env, store) = scratch("dead-run-tries");
+        let _w = list(&store, &[&["m-1"]]);
+        let dead = Run { pid: 2_000_000_000, started: "x".into() };
+        let (_, retake) = running_with(&store, dead.clone());
+        let mut n = 1;
+        while let Some(o) = retake() {
+            n = o.tries;
+            change(&store, "run", 1, |g| {
+                g.checks.last_mut().unwrap().run = Some(dead.clone());
+                true
+            });
+            assert!(n <= TRIES);
+        }
+        assert_eq!(n, TRIES, "a loop would have gone on");
+    }
+
+    #[test]
+    fn a_run_whose_process_is_alive_is_left_alone() {
+        let (_env, store) = scratch("live-run");
+        let _w = list(&store, &[&["m-1"]]);
+        let (_, retake) = running_with(&store, Run::this().expect("ps reads this process"));
+        let g = store.worklist("run").unwrap().groups()[0].clone();
+        assert!(!run_died(&g) && !would_open(&g, &|_| false));
+        assert!(retake().is_none());
+    }
+
+    #[test]
+    fn a_pid_that_has_been_reused_is_a_dead_run() {
+        let (_env, store) = scratch("reused-run");
+        let _w = list(&store, &[&["m-1"]]);
+        let mut other = Run::this().expect("ps reads this process");
+        other.started = "Mon_Jan_1_00:00:00_2001".into();
+        let (_, retake) = running_with(&store, other);
+        assert!(run_died(&store.worklist("run").unwrap().groups()[0]));
+        assert!(retake().is_some_and(|o| o.died == Some(std::process::id())));
+    }
+
+    #[test]
+    fn the_pid_is_written_and_read_back_and_dropped_when_the_run_has_a_result() {
+        let (_env, store) = scratch("pid-text");
+        let _w = list(&store, &[&["m-1"]]);
+        let (_, _retake) = running_with(&store, Run { pid: 25037, started: "Tue_Nov_4_11:19:05_2026".into() });
+        let g = store.worklist("run").unwrap().groups()[0].clone();
+        let t = text(&g.checks);
+        assert!(t.contains("suite:running pid:25037@Tue_Nov_4_11:19:05_2026"), "{t}");
+        let mut back = Vec::new();
+        push(&mut back, &t);
+        assert_eq!(back, g.checks);
+        assert!(note_run(&store, "run", 1, Suite::Green, None));
+        assert!(!text(&store.worklist("run").unwrap().groups()[0].checks).contains("pid:"));
     }
 
     #[test]

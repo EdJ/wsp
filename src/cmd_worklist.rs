@@ -2007,6 +2007,7 @@ fn groups_json_with(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate:
                 pos,
                 draft: w.status() == WorklistStatus::Draft,
                 checking: crate::barrier::running(g).is_some(),
+                died: crate::barrier::run_died(g),
                 held: h.groups.get(i).and_then(|of| held_caption(of, groups.len())),
                 verdict: verdict_caption(g, groups.len()),
                 members: of.iter().map(|s| s.map(|s| s.word)).collect(),

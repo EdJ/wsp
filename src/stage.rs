@@ -151,6 +151,8 @@ pub(crate) struct Group<'a> {
     pub draft: bool,
     /// [`crate::barrier::running`]: a check's seat is open on this barrier.
     pub checking: bool,
+    /// The check is wsp's own mechanical run, and its process is gone.
+    pub died: bool,
     /// The hold, when the newest barrier event on this group is one.
     pub held: Option<Told>,
     /// The verdict's own caption, `Passed — …` or `Passed · <date> · N lines`.
@@ -198,6 +200,9 @@ pub(crate) fn of_group(g: &Group) -> Told {
         return bare("not reached", "", "stage");
     }
     if g.checking {
+        if g.died {
+            return told("being checked", Some("barrier run died".into()), "", "stage");
+        }
         return bare("being checked", "", "stage");
     }
     if let Some(h) = &g.held {
@@ -760,7 +765,7 @@ mod tests {
     }
 
     fn group<'a>(ordinal: usize, p: &'a Position) -> Group<'a> {
-        Group { ordinal, pos: p, draft: false, checking: false, held: None, verdict: None, members: vec![Some("working")] }
+        Group { ordinal, pos: p, draft: false, checking: false, died: false, held: None, verdict: None, members: vec![Some("working")] }
     }
 
     #[test]

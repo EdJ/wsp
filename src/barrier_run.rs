@@ -368,6 +368,8 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
         log_line(store, &format!("{list} group {at}: the barrier's run was asked for and nothing is waiting on it"));
         return 0;
     }
+    // Who is making the run, so that being killed is seen and not waited out.
+    barrier::note_pid(store, list, at);
     let groups = w.groups();
     let Some(g) = groups.get(at - 1).cloned() else { return 1 };
     let plan = plan(store, &w, at);
