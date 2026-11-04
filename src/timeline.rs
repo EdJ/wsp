@@ -234,7 +234,7 @@ fn render(i: &Inputs, phases: &[Phase], p: &Paint) -> String {
     let (Some(a), Some(b)) = (phases.iter().map(|x| x.start).min(), phases.iter().map(|x| x.end).max()) else {
         return format!("{}: nothing recorded to time\n", i.id);
     };
-    s.push_str(&format!("{} · {} start to end\n", p.bold(&i.id), util::duration_human(b - a)));
+    s.push_str(&format!("{} · {} start to end · times UTC\n", p.bold(&i.id), util::duration_human(b - a)));
     for x in phases {
         let line = format!("{}  {}  {:>6}  {}", clock(x.start), clock(x.end), format!("{}s", x.seconds()), x.label);
         if x.gap {
@@ -279,21 +279,28 @@ fn names(line: &str, id: &str) -> bool {
     false
 }
 
-/// The first prompt a session was given, from its Claude Code transcript.
-fn first_request(session: &str) -> Option<i64> {
+/// A session's Claude Code transcript, whole.
+fn transcript(session: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let root = std::path::Path::new(&home).join(".claude/projects");
     for dir in std::fs::read_dir(root).ok()?.flatten() {
-        let file = dir.path().join(format!("{session}.jsonl"));
-        let Ok(text) = std::fs::read_to_string(&file) else { continue };
-        for line in text.lines() {
-            if !line.contains("\"type\":\"user\"") {
-                continue;
-            }
-            let v: Value = serde_json::from_str(line).ok()?;
-            if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
-                return Some(util::epoch_of(ts)).filter(|t| *t > 0);
-            }
+        if let Ok(text) = std::fs::read_to_string(dir.path().join(format!("{session}.jsonl"))) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// The first prompt a session was given, from its Claude Code transcript.
+fn first_request(session: &str) -> Option<i64> {
+    let text = transcript(session)?;
+    for line in text.lines() {
+        if !line.contains("\"type\":\"user\"") {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).ok()?;
+        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
+            return Some(util::epoch_of(ts)).filter(|t| *t > 0);
         }
     }
     None
@@ -347,6 +354,244 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
     i
 }
 
+// ---- the seat's own model time and tokens ------------------------------------
+
+/// What the seat spent in one phase of the row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SeatPhase {
+    pub label: String,
+    pub start: i64,
+    pub end: i64,
+    pub calls: u64,
+    pub model_secs: i64,
+    /// Fresh input plus cache writes.
+    pub tokens_in: u64,
+    pub cache_read: u64,
+    pub tokens_out: u64,
+    /// Seconds from a tool call to its result, by tool.
+    pub tools: std::collections::BTreeMap<String, i64>,
+}
+
+impl SeatPhase {
+    fn holds(&self, t: i64, last: bool) -> bool {
+        t >= self.start && (t < self.end || (last && t == self.end))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SeatReport {
+    pub sessions: Vec<String>,
+    /// Sessions whose transcript could not be found.
+    pub missing: Vec<String>,
+    pub phases: Vec<SeatPhase>,
+}
+
+/// One model call, once per requestId.
+#[derive(Debug, Default)]
+struct Call {
+    at: i64,
+    start: i64,
+    end: i64,
+    tin: u64,
+    cache_read: u64,
+    out: u64,
+}
+
+const TOOL_KINDS: [&str; 4] = ["Bash", "Read", "Edit", "Write"];
+
+/// The model calls and tool times in one transcript. A call is a requestId:
+/// one transcript line per content block repeats its usage, so the figures are
+/// kept once (the largest seen). A call's model seconds run from the line
+/// before it to its last line; a tool's from its call to its result.
+fn read_transcript(text: &str) -> (Vec<Call>, Vec<(i64, String, i64)>) {
+    let mut calls: Vec<Call> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = Default::default();
+    let mut pending: std::collections::HashMap<String, (i64, String)> = Default::default();
+    let mut tools: Vec<(i64, String, i64)> = Vec::new();
+    let mut prev: Option<i64> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(t) = v["timestamp"].as_str().map(util::epoch_of).filter(|t| *t > 0) else { continue };
+        match v["type"].as_str() {
+            Some("assistant") => {
+                let m = &v["message"];
+                let key = v["requestId"].as_str().or_else(|| m["id"].as_str()).map(String::from);
+                let n = match key.as_ref().and_then(|k| index.get(k)) {
+                    Some(n) => *n,
+                    None => {
+                        calls.push(Call { at: t, start: prev.unwrap_or(t), end: t, ..Default::default() });
+                        if let Some(k) = key {
+                            index.insert(k, calls.len() - 1);
+                        }
+                        calls.len() - 1
+                    }
+                };
+                let c = &mut calls[n];
+                c.end = c.end.max(t);
+                let u = &m["usage"];
+                let num = |k: &str| u[k].as_u64().unwrap_or(0);
+                c.tin = c.tin.max(num("input_tokens") + num("cache_creation_input_tokens"));
+                c.cache_read = c.cache_read.max(num("cache_read_input_tokens"));
+                c.out = c.out.max(num("output_tokens"));
+                for b in m["content"].as_array().into_iter().flatten() {
+                    if b["type"] == "tool_use" {
+                        if let (Some(id), Some(name)) = (b["id"].as_str(), b["name"].as_str()) {
+                            pending.entry(id.to_string()).or_insert((t, name.to_string()));
+                        }
+                    }
+                }
+            }
+            Some("user") => {
+                for b in v["message"]["content"].as_array().into_iter().flatten() {
+                    if b["type"] == "tool_result" {
+                        if let Some((at, name)) = b["tool_use_id"].as_str().and_then(|id| pending.remove(id)) {
+                            tools.push((at, name, (t - at).max(0)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        prev = Some(t);
+    }
+    (calls, tools)
+}
+
+/// The seat's own sessions: those learned for the row outside its legs' windows
+/// and before it was first reviewed (a leg's seat and the verifier's are not it).
+fn seat_sessions(i: &Inputs, windows: &[(i64, i64)]) -> Vec<String> {
+    let review = i.kind("task-review", &i.id).first().map(|(t, _)| *t);
+    let mut out: Vec<String> = Vec::new();
+    for (t, d) in i.kind("session-learned", &i.id) {
+        let Some(s) = d["session"].as_str() else { continue };
+        if windows.iter().any(|(a, b)| t >= *a && t <= *b) || review.is_some_and(|r| t > r) || d.get("leg").is_some() {
+            continue;
+        }
+        if !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
+/// The seat's phases: before the first leg, between each pair, after the last
+/// up to review typed; one phase for a row with no legs. Boundaries are the
+/// leg phases `build` found from wsp's leg entries.
+fn seat_bounds(phases: &[Phase], windows: &mut Vec<(i64, i64)>) -> Vec<(String, i64, i64)> {
+    let legs: Vec<(String, i64, i64)> = phases
+        .iter()
+        .filter(|p| !p.gap && p.label.starts_with("leg "))
+        .map(|p| (p.label["leg ".len()..].split(" (").next().unwrap_or("").to_string(), p.start, p.end))
+        .collect();
+    *windows = legs.iter().map(|(_, a, b)| (*a, *b)).collect();
+    let (Some(begin), Some(end)) = (phases.iter().map(|p| p.start).min(), phases.iter().map(|p| p.end).max()) else { return Vec::new() };
+    if legs.is_empty() {
+        return vec![("the seat, spawn to review".into(), begin, end)];
+    }
+    let mut out = vec![(format!("before leg {}", legs[0].0), begin, legs[0].1)];
+    for w in legs.windows(2) {
+        out.push((format!("between leg {} and leg {}", w[0].0, w[1].0), w[0].2, w[1].1));
+    }
+    let l = &legs[legs.len() - 1];
+    out.push((format!("after leg {} → review typed", l.0), l.2, end.max(l.2)));
+    out
+}
+
+/// The seat's tokens and model time per phase. `load` reads a session's
+/// transcript; `None` is a transcript that cannot be found.
+pub(crate) fn seat_report(i: &Inputs, phases: &[Phase], load: &dyn Fn(&str) -> Option<String>) -> SeatReport {
+    let mut windows = Vec::new();
+    let bounds = seat_bounds(phases, &mut windows);
+    let mut r = SeatReport { sessions: seat_sessions(i, &windows), ..Default::default() };
+    r.phases = bounds.into_iter().map(|(label, start, end)| SeatPhase { label, start, end, ..Default::default() }).collect();
+    let last = r.phases.len().saturating_sub(1);
+    for s in r.sessions.clone() {
+        let Some(text) = load(&s) else {
+            r.missing.push(s);
+            continue;
+        };
+        let (calls, tools) = read_transcript(&text);
+        for c in calls {
+            if let Some(p) = r.phases.iter_mut().enumerate().find(|(n, p)| p.holds(c.at, *n == last)).map(|(_, p)| p) {
+                p.calls += 1;
+                p.model_secs += (c.end - c.start).max(0);
+                p.tokens_in += c.tin;
+                p.cache_read += c.cache_read;
+                p.tokens_out += c.out;
+            }
+        }
+        for (at, name, secs) in tools {
+            if let Some(p) = r.phases.iter_mut().enumerate().find(|(n, p)| p.holds(at, *n == last)).map(|(_, p)| p) {
+                let kind = if TOOL_KINDS.contains(&name.as_str()) { name } else { "other".to_string() };
+                *p.tools.entry(kind).or_insert(0) += secs;
+            }
+        }
+    }
+    r
+}
+
+const SEAT_SOURCE: &str = "phase boundaries from wsp's leg entries (cycle.log 'starting leg', leg-done events, the review)";
+
+fn render_seat(r: &SeatReport) -> String {
+    let mut s = String::new();
+    if r.sessions.is_empty() {
+        return "the seat's own work: no session recorded for this row\n".into();
+    }
+    if r.missing.len() == r.sessions.len() {
+        return format!("the seat's own work: transcript not found for session {}\n", r.missing.join(", "));
+    }
+    s.push_str(&format!("the seat's own work (times UTC; {SEAT_SOURCE}); tokens: in = fresh + cache write\n"));
+    for p in &r.phases {
+        let tools: Vec<String> = p.tools.iter().map(|(k, v)| format!("{k} {v}s")).collect();
+        s.push_str(&format!(
+            "{}  {}  {:>6}  {}  {} calls · model {}s · in {} (cache read {}) out {} · tools {}\n",
+            clock(p.start),
+            clock(p.end),
+            format!("{}s", p.end - p.start),
+            p.label,
+            p.calls,
+            p.model_secs,
+            p.tokens_in,
+            p.cache_read,
+            p.tokens_out,
+            if tools.is_empty() { "none".to_string() } else { tools.join(", ") }
+        ));
+    }
+    for m in &r.missing {
+        s.push_str(&format!("transcript not found for session {m}; its calls are not counted\n"));
+    }
+    s
+}
+
+fn seat_json(r: &SeatReport) -> Value {
+    let all_missing = r.sessions.is_empty() || r.missing.len() == r.sessions.len();
+    json!({
+        "source": SEAT_SOURCE,
+        "utc": true,
+        "sessions": r.sessions,
+        "missing": r.missing,
+        "note": if r.sessions.is_empty() { json!("no session recorded for this row") } else if all_missing { json!(format!("transcript not found for session {}", r.missing.join(", "))) } else { Value::Null },
+        "phases": if all_missing { Vec::new() } else { r.phases.iter().map(|p| {
+            let mut tools = serde_json::Map::new();
+            for k in TOOL_KINDS.iter().chain(["other"].iter()) {
+                tools.insert((*k).to_string(), json!(p.tools.get(*k).copied().unwrap_or(0)));
+            }
+            json!({
+                "label": p.label,
+                "start": util::iso_at(p.start),
+                "end": util::iso_at(p.end),
+                "wall_seconds": p.end - p.start,
+                "calls": p.calls,
+                "model_seconds": p.model_secs,
+                "tokens_in": p.tokens_in,
+                "tokens_cache_read": p.cache_read,
+                "tokens_out": p.tokens_out,
+                "tool_seconds": tools,
+            })
+        }).collect::<Vec<_>>() },
+    })
+}
+
 const USAGE: &str = "wsp timeline <row> [--json]";
 
 pub fn timeline(store: &Store, args: &Args) -> i32 {
@@ -363,10 +608,15 @@ pub fn timeline(store: &Store, args: &Args) -> i32 {
     };
     let i = gather(store, &t.id);
     let phases = build(&i);
+    let seat = seat_report(&i, &phases, &transcript);
     if args.json() {
-        println!("{}", to_json(&i, &phases));
+        let mut v = to_json(&i, &phases);
+        v["utc"] = json!(true);
+        v["seat"] = seat_json(&seat);
+        println!("{v}");
     } else {
         print!("{}", render(&i, &phases, &Paint::new()));
+        print!("{}", render_seat(&seat));
     }
     0
 }
@@ -432,5 +682,105 @@ mod tests {
         assert!(names("starting wsp-366 on x", "wsp-366"));
         assert!(!names("starting wsp-3660 on x", "wsp-366"));
         assert!(!names("starting xwsp-366", "wsp-366"));
+    }
+
+    fn line(t: i64, v: Value) -> String {
+        let mut v = v;
+        v["timestamp"] = json!(util::iso_at(t));
+        v.to_string()
+    }
+    fn asst(t: i64, rid: &str, usage: (u64, u64, u64), tool: Option<(&str, &str)>) -> String {
+        let content = match tool {
+            Some((id, name)) => json!([{"type": "tool_use", "id": id, "name": name}]),
+            None => json!([{"type": "text", "text": "x"}]),
+        };
+        line(t, json!({"type": "assistant", "requestId": rid, "message": {"content": content,
+            "usage": {"input_tokens": usage.0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": usage.1, "output_tokens": usage.2}}}))
+    }
+    fn result(t: i64, id: &str) -> String {
+        line(t, json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": id}]}}))
+    }
+
+    fn two_legs() -> Inputs {
+        let id = "r-1";
+        Inputs {
+            id: id.into(),
+            events: vec![
+                ev(110, "task-claimed", json!({"id": id})),
+                ev(112, "session-learned", json!({"id": id, "session": "s"})),
+                ev(200, "session-learned", json!({"id": id, "session": "l1"})),
+                ev(300, "leg-done", json!({"id": id, "leg": "a"})),
+                ev(410, "session-learned", json!({"id": id, "session": "l2"})),
+                ev(450, "leg-done", json!({"id": id, "leg": "b"})),
+                ev(460, "task-review", json!({"id": id})),
+                ev(470, "session-learned", json!({"id": id, "session": "v"})),
+            ],
+            cycle: vec![
+                (100, "starting r-1 on claude (new)".into()),
+                (190, "list group 1: starting leg a of r-1".into()),
+                (400, "list group 1: starting leg b of r-1".into()),
+            ],
+            legs: vec![LegIn { name: "a".into(), ..Default::default() }, LegIn { name: "b".into(), ..Default::default() }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_seats_tokens_are_summed_once_per_request_and_split_at_the_legs() {
+        let i = two_legs();
+        let ph = build(&i);
+        let text = [
+            line(118, json!({"type": "user", "message": {"content": "go"}})),
+            asst(120, "q1", (10, 100, 5), None),
+            asst(121, "q1", (10, 100, 5), Some(("t1", "Bash"))),
+            result(126, "t1"),
+            asst(133, "q2", (20, 200, 7), Some(("t2", "Read"))),
+            result(134, "t2"),
+            asst(250, "q4", (99, 99, 99), None),
+            line(305, json!({"type": "user", "message": {"content": "next"}})),
+            asst(310, "q3", (1, 2, 3), Some(("t3", "Edit"))),
+            result(315, "t3"),
+            asst(455, "q5", (4, 0, 8), Some(("t5", "Write"))),
+            result(459, "t5"),
+        ]
+        .join("\n");
+        let r = seat_report(&i, &ph, &|s| (s == "s").then(|| text.clone()));
+        assert_eq!(r.sessions, vec!["s".to_string()], "a leg's and the verifier's sessions are not the seat's");
+        assert!(r.missing.is_empty());
+        let labels: Vec<&str> = r.phases.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["before leg a", "between leg a and leg b", "after leg b → review typed"]);
+        let p = &r.phases[0];
+        assert_eq!((p.calls, p.model_secs, p.tokens_in, p.cache_read, p.tokens_out), (2, 3 + 7, 30, 300, 12));
+        assert_eq!((p.tools["Bash"], p.tools["Read"]), (5, 1));
+        let p = &r.phases[1];
+        assert_eq!((p.calls, p.model_secs, p.tokens_in, p.cache_read, p.tokens_out), (1, 5, 1, 2, 3));
+        assert_eq!(p.tools["Edit"], 5);
+        let p = &r.phases[2];
+        assert_eq!((p.calls, p.tokens_in, p.tokens_out, p.tools["Write"]), (1, 4, 8, 4));
+    }
+
+    #[test]
+    fn a_missing_transcript_is_named_not_zero() {
+        let i = two_legs();
+        let ph = build(&i);
+        let r = seat_report(&i, &ph, &|_| None);
+        assert_eq!(r.missing, vec!["s".to_string()]);
+        let out = render_seat(&r);
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("transcript not found for session s"), "{out}");
+        let j = seat_json(&r);
+        assert!(j["phases"].as_array().unwrap().is_empty());
+        assert!(j["note"].as_str().unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn a_row_with_no_legs_has_one_seat_phase() {
+        let i = row();
+        let ph = build(&i);
+        let r = seat_report(&i, &ph, &|_| Some(String::new()));
+        let legless = Inputs { legs: vec![], ..row() };
+        let r2 = seat_report(&legless, &build(&legless), &|_| Some(String::new()));
+        assert_eq!(r.phases.len(), 2);
+        assert_eq!(r2.phases.len(), 1);
     }
 }
