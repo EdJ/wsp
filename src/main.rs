@@ -97,6 +97,7 @@ mod story;
 mod store;
 mod sync;
 mod throttle;
+mod timeline;
 mod tunnel;
 mod untaken;
 mod util;
@@ -1194,6 +1195,7 @@ fn main() {
         "brief" => cmd_brief::brief(&store, &args),
         "burn" => cmd_burn::burn(&store, &args),
         "throttle" => throttle::throttle(&store, &args),
+        "timeline" => timeline::timeline(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "packet" => packet::packet(&store, &args),
         "attend" => cmd_attend::attend(&store, &args),
@@ -1998,6 +2000,9 @@ fn help_text() -> String {
                                     are; a watch whose process died is a line
                                     in `wsp doctor` rather than a silence
   wsp overlap                       who else is standing in this tree
+  wsp timeline <row> [--json]      where a row's wall time goes, spawn to barrier:
+                                    one line per phase, and the gaps where nothing
+                                    ran named for what they waited on
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,
                                     how long to review, and whether it came back

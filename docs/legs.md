@@ -976,3 +976,9 @@ files the seventh.
 
 1 and 2 can share a group. 3 and 4 can share the next, since both rest only
 on 2. 5 and 6 come after them, and 7 comes last.
+
+## Where a row's time goes: `wsp timeline <row>`
+
+`wsp timeline <row> [--json]` reads `events.jsonl`, `cycle.log`, the row's legs and the first prompt in its seat's transcript, and prints one line per phase from the spawn that was asked for to the barrier that passed it: seat start, warm-up, each leg with the gap before it, review, verifier spawn, verdict, barrier. A **gap** is a phase where nothing was running, named for what it waited on — a hand-off (a few seconds: a poke and a spawn), the daemon's tick, the seat's cap, or nothing the logs name.
+
+The hand-offs that are poked, not ticked: `leg done`, `review`, `verified` and `release` each start the next step as they return. A seat that ends frees a place under the cap, so the repair tick steps the running lists again after any ending it makes, rather than leaving a held start to the next tick (wsp-366).

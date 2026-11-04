@@ -3448,7 +3448,10 @@ fn release_here(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no pane — pass --pane or run inside herdr");
         return 2;
     };
-    let (removed, _task) = release_pane(store, &pane);
+    let (removed, task) = release_pane(store, &pane);
+    if let Some(id) = task {
+        crate::cycle::poke_task(store, &id, "release");
+    }
     if args.json() {
         println!("{}", json!({ "pane": pane, "released": removed }));
     } else if removed {
@@ -3509,6 +3512,11 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
     if !panes.is_empty() || where_held.is_some() {
         let mut cache = sync::Cache::default();
         let _ = sync::sync(store, &mut cache, true);
+        // The legs a row staged start now, as `leg done` and `review` start
+        // what they owe — not on the daemon's next tick, which after a release
+        // was 24s on a quiet machine and 291s on a loaded one (`wsp timeline
+        // compounding-048`). A row no run and no legs own is not touched.
+        crate::cycle::poke_task(store, &t.id, "release");
     }
 
     if args.json() {

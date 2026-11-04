@@ -285,17 +285,20 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
             verdicts.join(" ")
         ));
     }
+    let ended_verdicts = !verdicts.is_empty();
     crate::cycle::end_all(store, verdicts);
     // And every pass on a member whose verdict is in, or that a newer landing
     // superseded — `wsp-188`'s verifiers hold no claim, so the line above
     // never sees them. Each is ended once, with the outcome on the pass.
     let ended = crate::cycle::passes_finished(store, seats);
+    let ended_passes_any = !ended.is_empty();
     if !ended.is_empty() {
         stamp(store, &format!("verifier seat(s) with nothing left to do, ended: {}", ended.join(" ")));
     }
     // And every leg that is done and still seated (wsp-293): the same, per leg,
     // with the outcome on its entry. Its tree goes with the sweep below.
     let ended_legs = crate::cycle::legs_finished(store, seats);
+    let ended_legs_any = !ended_legs.is_empty();
     if !ended_legs.is_empty() {
         stamp(store, &format!("leg seat(s) with nothing left to do, ended: {}", ended_legs.join(" ")));
     }
@@ -311,6 +314,14 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     ended.extend(crate::cycle::checks_orphaned(store, seats));
     if !ended.is_empty() {
         stamp(store, &format!("barrier check seat(s) with nothing left to do, ended: {}", ended.join(" ")));
+    }
+    // **A seat that ended has freed a place under the seat's cap**, and the
+    // step above ran before it did: a start the cap held back (`compounding-051`
+    // at `wsp timeline compounding-048`, 10 minutes) waited for the next tick to
+    // be tried again. So when any ending above ended a seat, the running lists
+    // are stepped once more, now. `wsp-366`.
+    if ended_verdicts || ended_passes_any || ended_legs_any || !ended.is_empty() {
+        step_running(store, seats);
     }
     // And their trees, read off the disk rather than off the endings above, so
     // a tree whose seat went some other way — or before this — goes too.
@@ -342,6 +353,14 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // two log lines carried the same second on them.
     for (scope, trigger) in seat_scopes(store) {
         seat_vacant(store, seats, &scope, &trigger);
+    }
+}
+
+/// The step on every running list: what the tick does first, and again once an
+/// ending has freed a place. Idempotent, so twice in a pass starts nothing twice.
+fn step_running(store: &Store, seats: &dyn Seats) {
+    for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
+        let _ = crate::cycle::step(store, &w, seats);
     }
 }
 
