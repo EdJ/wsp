@@ -43,6 +43,16 @@ fi
 
 command -v wsp >/dev/null 2>&1 || exit 0
 
+# A `claude -p` started from inside a seat — by the agent, or by a script it
+# ran — inherits WSP_SEAT_ID and so reports here under its parent's seat. This
+# hook does not try to tell: `wsp report` judges every hook by its session_id
+# and ignores one from a session other than the seat's (wsp-364). A skip on
+# CLAUDE_CODE_CHILD_SESSION would not be enough alone — nothing sets it for a
+# script that calls `claude` directly — and under herdr it can be ambient in
+# every pane. A script starting an agent from a seat should still unset
+# WSP_SEAT_ID and HERDR_PANE_ID for it.
+
+
 # What the agent is doing, in its own words, recorded against the seat it is
 # standing in. Silent, and silent by construction rather than by redirection —
 # `wsp report` prints nothing and exits 0 outside a seat — but stdout from a

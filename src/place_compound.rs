@@ -471,6 +471,12 @@ impl Compound<'_> {
             return;
         }
         let was = read_json(&dir.join(SAID_FILE));
+        // A nested session's hook, not the seat's (`wsp-364`): logged as a
+        // child's, so the trail shows it arrived, and kept out of `said.json`.
+        if crate::place_super::a_childs(&was, payload) {
+            self.append_hooks_log_as(&dir, hook, state, Some(&str_of(payload, "session_id")));
+            return;
+        }
         let keep = |key: &str| -> String {
             match str_of(payload, key).is_empty() {
                 true => str_of(&was, key),
@@ -498,8 +504,18 @@ impl Compound<'_> {
     /// fails the hook, and a reader missing one line is a smaller loss than a
     /// session that stalls on it.
     fn append_hooks_log(&self, dir: &std::path::Path, hook: &str, state: State) {
+        self.append_hooks_log_as(dir, hook, state, None)
+    }
+
+    /// The same line, marked as a nested session's when `child` names one
+    /// (`wsp-364`). Readers of the trail that look at `hook` and `state` alone
+    /// must skip a line with `child` set: it is not the seat's.
+    fn append_hooks_log_as(&self, dir: &std::path::Path, hook: &str, state: State, child: Option<&str>) {
         use std::io::Write;
-        let line = json!({ "at": util::now_iso(), "hook": hook, "state": state.as_str() });
+        let mut line = json!({ "at": util::now_iso(), "hook": hook, "state": state.as_str() });
+        if let Some(session) = child {
+            line["child"] = json!(session);
+        }
         if let Ok(mut f) =
             fs::OpenOptions::new().create(true).append(true).open(dir.join(HOOKS_FILE))
         {
@@ -1434,7 +1450,8 @@ impl Place for Compound<'_> {
             if util::epoch_of(&str_of(&h, "at")) < since {
                 return Some(false);
             }
-            if str_of(&h, "hook") == "UserPromptSubmit" {
+            // A nested session's prompt is not the seat's turn (`wsp-364`).
+            if str_of(&h, "hook") == "UserPromptSubmit" && h.get("child").is_none() {
                 return Some(true);
             }
         }

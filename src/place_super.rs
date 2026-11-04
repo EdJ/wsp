@@ -485,6 +485,37 @@ pub(crate) fn said_by(hook: &str) -> Option<State> {
     })
 }
 
+/// Whether a hook came from a session other than the one standing in the seat
+/// (`wsp-364`): a `claude -p` that the agent, or a script it ran, started from
+/// inside the seat. The child inherits `WSP_SEAT_ID`, so its hooks arrive here
+/// naming the parent's seat, and its `SessionEnd` used to make the seat read
+/// gone two minutes into a ten-minute turn.
+///
+/// The seat's session is whichever one reported first — `said.json`'s
+/// `session_id`, written by the first hook on a fresh seat and kept by every
+/// one after. A hook naming another session is a child's and says nothing
+/// about the seat: not its state, not its end.
+///
+/// | `said.json` | the hook | a child's? |
+/// |---|---|---|
+/// | no session yet | any | no — the first to report takes the seat |
+/// | the seat's session said `SessionEnd` | any | no — `/clear` ends one session and starts the next in the same agent |
+/// | session A | `source: "clear"` | no — the same `/clear`, its start seen first |
+/// | session A | no `session_id` | no — nothing to judge it by, so it is believed, as before |
+/// | session A | session A | no |
+/// | session A | session B | **yes** |
+pub(crate) fn a_childs(was: &Value, payload: &Value) -> bool {
+    let theirs = str_of(payload, "session_id");
+    let seats = str_of(was, "session_id");
+    // `/clear` starts its new session with `source: "clear"`; a `claude -p`
+    // child starts with `startup`. Either order of `/clear`'s two hooks lands.
+    let cleared = str_of(payload, "source") == "clear";
+    if theirs.is_empty() || seats.is_empty() || cleared || str_of(was, "state") == "gone" {
+        return false;
+    }
+    theirs != seats
+}
+
 /// What a hook says the agent needs, written to `said.json` beside the state it
 /// is read as (`wsp-301`): `PermissionRequest` and `Elicitation` are `Working`
 /// to [`said_by`] because `State` has no word for *waiting on a person*, so the
@@ -1138,6 +1169,10 @@ impl Supervisor<'_> {
             return;
         }
         let was = read_json(&dir.join(SAID_FILE));
+        // A nested session's hook, not the seat's (`wsp-364`).
+        if a_childs(&was, payload) {
+            return;
+        }
         let keep = |key: &str| -> String {
             match str_of(payload, key).is_empty() {
                 true => str_of(&was, key),
@@ -2017,6 +2052,35 @@ mod tests {
         assert_eq!(place.said(&seat)["needs"], Value::Null, "and not any longer once the agent has said something else");
     }
 
+    /// A `claude -p` started from inside a seat inherits `WSP_SEAT_ID` and
+    /// reports under it; its hooks are a child's and its end is not the seat's
+    /// (`wsp-364`). The seat belongs to the first session that reported on it.
+    #[test]
+    fn a_nested_sessions_end_leaves_the_seat_working_and_the_seats_own_ends_it() {
+        let scratch = Scratch::new("nested");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        place.start(&seat, &a_process()).expect("a process");
+        let a = json!({ "session_id": "A" });
+        let b = json!({ "session_id": "B" });
+        place.heard(&seat, "SessionStart", State::Idle, &a);
+        place.heard(&seat, "UserPromptSubmit", State::Working, &a);
+        // The child starts, works and ends: none of it is the seat's.
+        place.heard(&seat, "SessionStart", State::Idle, &b);
+        place.heard(&seat, "Stop", State::Idle, &b);
+        place.heard(&seat, "SessionEnd", State::Gone, &b);
+        assert_eq!(place.state(&seat).unwrap(), State::Working, "a child's end ended the seat");
+        assert_eq!(str_of(&place.said(&seat), "session_id"), "A", "the child took the seat");
+        // The seat's own session ending does end it.
+        place.heard(&seat, "SessionEnd", State::Gone, &a);
+        assert_eq!(place.state(&seat).unwrap(), State::Gone);
+        // And after it, `/clear`'s next session is the seat's.
+        place.heard(&seat, "SessionStart", State::Idle, &b);
+        assert_eq!(place.state(&seat).unwrap(), State::Idle);
+        assert_eq!(str_of(&place.said(&seat), "session_id"), "B");
+        place.stop(&seat).ok();
+    }
+
     /// A seat on another machine is refused rather than faked.
     ///
     /// Ed's limit, and the one place this backend says no on purpose: a hook
@@ -2135,7 +2199,7 @@ mod tests {
         // this points at one.
         let other = scratch.root.join("transcript-2.jsonl");
         fs::write(&other, format!("{}\n", usage_line(7, 0, 0, 0, "m"))).unwrap();
-        let fresh = json!({ "session_id": "s2", "transcript_path": other.to_string_lossy() });
+        let fresh = json!({ "session_id": "s2", "source": "clear", "transcript_path": other.to_string_lossy() });
         place.heard(&seat, "SessionStart", State::Idle, &fresh);
         let b = burn();
         assert_eq!(str_of(&b, "session_id"), "s2");
@@ -2149,15 +2213,12 @@ mod tests {
         );
         assert_eq!(u_at(&b, "turns"), 1);
 
-        // The synthetic corner a live run never produces — the old path handed
-        // in under the new id — still must not *add* to anything: the file is
-        // counted once, under whichever session owns it now.
+        // A hook from the old session after the new one took the seat is not
+        // the seat's any more (`wsp-364`): it neither adds to the tally nor
+        // takes the seat back.
         place.heard(&seat, "Stop", State::Idle, &payload);
-        assert_eq!(
-            u_at(&burn(), "input"),
-            300,
-            "re-attributed whole, never summed across sessions"
-        );
+        assert_eq!(u_at(&burn(), "input"), 7, "a stray session's hook was counted");
+        assert_eq!(str_of(&burn(), "session_id"), "s2");
     }
 
     /// The reader is over a *root*, not over this backend — which is the whole

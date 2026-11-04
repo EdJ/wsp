@@ -2641,6 +2641,25 @@ the first line of `wsp-session.sh`. If you already have the older
 than joining it — two entries print the brief twice, and a brief is ~3,300
 tokens on every request of the session.
 
+**A `claude` started from inside a seat is not the seat** (`wsp-364`). An agent
+that runs `claude -p`, or a script it runs that does, hands the child its
+environment, `WSP_SEAT_ID` included, so the child's hooks report under the
+parent's seat — and its `SessionEnd` used to make the seat read gone minutes
+into the parent's turn. `wsp report` now judges every hook by the `session_id`
+it carries: the first session to report on a fresh seat is the seat's (kept in
+the seat's `said.json`), a hook from any other session is a child's and changes
+nothing about the seat (a compound seat logs it to `hooks.jsonl` with `child`
+set), and once the seat's own session has said `SessionEnd` the next one to
+report takes the seat, as does a `SessionStart` whose `source` is `clear`: both
+are what `/clear` looks like. The hook does not also
+skip on `CLAUDE_CODE_CHILD_SESSION`: that marker is only there when something
+set it, so a script calling `claude` directly would pass it by, and under herdr
+it can be ambient in every pane, which would silence real seats. As a
+belt-and-braces rule, **a script that starts an agent from inside a seat
+unsets `WSP_SEAT_ID` and `HERDR_PANE_ID`** for it (`env -u WSP_SEAT_ID -u
+HERDR_PANE_ID claude -p …`), and the `CLAUDE_` names `place::shed` lists if the
+child is meant to be a session of its own.
+
 **A dialog can be answered from wsp** (`wsp-301`, from compound-562's spike). The
 snippet's second `PermissionRequest` entry, `wsp-session.sh PermissionHold
 86400` with `"timeout": 86400`, runs `wsp report PermissionRequest --hold SECS`
