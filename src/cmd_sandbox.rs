@@ -399,20 +399,22 @@ fn ps_line(line: &str) -> Option<(u32, u32, String)> {
     Some((pid.parse().ok()?, ppid.parse().ok()?, rest.trim_start().to_string()))
 }
 
-/// What the session started and still has running.
+/// What the sandbox started and still has running.
 ///
-/// A herdr session server starts the `[[startup]]` command of every enabled
-/// plugin — globally configured, not per session — and puts `HERDR_SESSION` in
-/// their environment. That name is the only thing that distinguishes a
-/// sandbox's daemon from the live one, so it is what this matches on, with a
-/// boundary so `wsp-w1` does not reap `wsp-w12`.
+/// A herdr session server hands `HERDR_SESSION` to the plugins it starts, but a
+/// seat placed through the compound backend (`compound-sup`, `compound-render`,
+/// and the agent they start) carries no such variable and outlives the session.
+/// What every process of a sandbox does carry is `WSP_HOME` and `WSP_STATE`
+/// under `<root>/<name>/`, so that is the main handle; `HERDR_SESSION=<name>`
+/// stays as the second. Both match with a boundary, so `wsp-w1` does not reap
+/// `wsp-w12`.
 ///
 /// This process and its ancestors are never in the answer. The shell that typed
 /// `wsp sandbox rm` can have the session name on its own command line, and `ps
 /// -E` puts the command and the environment in one field.
-fn session_children(name: &str) -> Vec<u32> {
+fn session_children(root: &Path, name: &str) -> Vec<u32> {
     let all = processes();
-    children_of(&all, name)
+    children_of(&all, root, name)
 }
 
 /// This process and everything above it, so nothing we are standing on can end
@@ -441,13 +443,59 @@ fn holds_session(rest: &str, name: &str) -> bool {
         .any(|(i, _)| matches!(rest.as_bytes().get(i + needle.len()), None | Some(b' ') | Some(b'\t')))
 }
 
-fn children_of(all: &[(u32, u32, String)], name: &str) -> Vec<u32> {
+/// `WSP_HOME` or `WSP_STATE` at or below `<root>/<name>`, with a path boundary
+/// after the name so `wsp-tla` does not match `wsp-tla2`.
+fn holds_dir(rest: &str, root: &Path, name: &str) -> bool {
+    let base = root.join(name).display().to_string();
+    ["WSP_HOME=", "WSP_STATE="].iter().any(|key| {
+        let needle = format!("{key}{base}");
+        rest.match_indices(&needle).any(|(i, _)| {
+            let before = if i == 0 { None } else { rest.as_bytes().get(i - 1) };
+            matches!(before, None | Some(b' ') | Some(b'\t'))
+                && matches!(
+                    rest.as_bytes().get(i + needle.len()),
+                    None | Some(b' ') | Some(b'\t') | Some(b'/')
+                )
+        })
+    })
+}
+
+/// Whether a process's command-and-environment says it belongs to the sandbox.
+fn belongs(rest: &str, root: &Path, name: &str) -> bool {
+    holds_session(rest, name) || holds_dir(rest, root, name)
+}
+
+fn children_of(all: &[(u32, u32, String)], root: &Path, name: &str) -> Vec<u32> {
     let mine = ancestors(all);
     all.iter()
         .filter(|(pid, _, _)| !mine.contains(pid))
-        .filter(|(_, _, rest)| holds_session(rest, name))
+        .filter(|(_, _, rest)| belongs(rest, root, name))
         .map(|(pid, _, _)| *pid)
         .collect()
+}
+
+/// The names of the sandboxes a process says it belongs to, by either handle.
+fn sandboxes_named_in(rest: &str, root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |name: String| {
+        if name.starts_with(PREFIX) && !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    for (i, _) in rest.match_indices("HERDR_SESSION=") {
+        add(rest[i + "HERDR_SESSION=".len()..].chars().take_while(|c| !c.is_whitespace()).collect());
+    }
+    let base = format!("{}/", root.display());
+    for key in ["WSP_HOME=", "WSP_STATE="] {
+        let needle = format!("{key}{base}");
+        for (i, _) in rest.match_indices(&needle) {
+            if i > 0 && !matches!(rest.as_bytes()[i - 1], b' ' | b'\t') {
+                continue;
+            }
+            add(rest[i + needle.len()..].chars().take_while(|c| !c.is_whitespace() && *c != '/').collect());
+        }
+    }
+    out
 }
 
 /// Every sandbox some process still says it belongs to.
@@ -456,7 +504,7 @@ fn children_of(all: &[(u32, u32, String)], name: &str) -> Vec<u32> {
 /// directory — and the one `ls` was blind to. It said "no sandboxes" with a
 /// stray daemon up, because it asked herdr what sessions existed and a session
 /// is not the only thing a sandbox creates.
-fn sessions_with_processes() -> Vec<(String, usize)> {
+fn sessions_with_processes(root: &Path) -> Vec<(String, usize)> {
     let all = processes();
     let mine = ancestors(&all);
     let mut out: Vec<(String, usize)> = Vec::new();
@@ -464,14 +512,7 @@ fn sessions_with_processes() -> Vec<(String, usize)> {
         if mine.contains(pid) {
             continue;
         }
-        for (i, _) in rest.match_indices("HERDR_SESSION=") {
-            let name: String = rest[i + "HERDR_SESSION=".len()..]
-                .chars()
-                .take_while(|c| !c.is_whitespace())
-                .collect();
-            if !name.starts_with(PREFIX) {
-                continue;
-            }
+        for name in sandboxes_named_in(rest, root) {
             match out.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, n)) => *n += 1,
                 None => out.push((name, 1)),
@@ -518,23 +559,40 @@ fn kill(pids: &[u32], signal: &str) {
 /// us.
 ///
 /// Returns whether there was a session, and how many processes it left.
-fn stop_session(name: &str) -> (bool, usize) {
+fn stop_session(root: &Path, name: &str) -> (bool, usize) {
     let existed = session(name).is_some();
     let _ = herdr(&["session", "stop", name]);
 
-    let children = session_children(name);
-    kill(&children, "-TERM");
+    // Freeze the whole set before ending any of it: the daemon places seats, and
+    // a daemon that is still running while its seats are killed places new ones.
+    // A stopped process cannot, and what it started between two looks is caught
+    // by looking again until the set stops growing.
+    let mut children: Vec<u32> = Vec::new();
+    for _ in 0..10 {
+        let now = session_children(root, name);
+        let fresh: Vec<u32> = now.iter().copied().filter(|p| !children.contains(p)).collect();
+        if fresh.is_empty() {
+            break;
+        }
+        kill(&fresh, "-STOP");
+        children.extend(fresh);
+    }
     if !children.is_empty() {
+        kill(&children, "-TERM");
+        // TERM stays pending on a stopped process until it runs again.
+        kill(&children, "-CONT");
         // A daemon in the middle of a sync has a store lock and a socket read
         // to finish. Long enough to let it, short enough that a teardown is
         // still something you wait for.
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(50));
-            if session_children(name).is_empty() {
+            if session_children(root, name).is_empty() {
                 break;
             }
         }
-        kill(&session_children(name), "-KILL");
+        let left = session_children(root, name);
+        kill(&left, "-STOP");
+        kill(&left, "-KILL");
     }
 
     let _ = herdr(&["session", "delete", name]);
@@ -733,7 +791,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     // asking for one is a clean one. Whatever is there under this name — a
     // session left running, a directory left behind by a torn-down session —
     // goes first, and says so rather than being quietly reused.
-    let (had_session, reaped) = stop_session(&name);
+    let (had_session, reaped) = stop_session(&store.state.join("sandbox"), &name);
     let replaced = had_session || reaped > 0 || sb.dir.exists();
     let _ = std::fs::remove_dir_all(&sb.dir);
 
@@ -775,7 +833,7 @@ fn up(store: &Store, args: &Args) -> i32 {
             // coming up, and a half-started one nobody knows about is the leak
             // this command exists not to leave — including whatever its plugins
             // got as far as starting.
-            stop_session(&name);
+            stop_session(&store.state.join("sandbox"), &name);
             let _ = std::fs::remove_dir_all(&sb.dir);
             return 1;
         }
@@ -786,7 +844,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     if let Some(cmd) = args.get("run") {
         let code = run_in(&sb, &cmd, args, up_secs);
         if !args.has("keep") {
-            let (_, reaped) = stop_session(&sb.name);
+            let (_, reaped) = stop_session(&store.state.join("sandbox"), &sb.name);
             let _ = std::fs::remove_dir_all(&sb.dir);
             if !json_out {
                 println!("{}", p.dim(&format!("sandbox {} torn down{}", sb.name, reaped_note(reaped, false))));
@@ -972,7 +1030,7 @@ fn ls(store: &Store, args: &Args) -> i32 {
         })
         .unwrap_or_default();
     let live = sessions();
-    let running = sessions_with_processes();
+    let running = sessions_with_processes(&root);
     for name in live
         .iter()
         .map(|(n, _, _)| n)
@@ -1028,7 +1086,12 @@ fn ls(store: &Store, args: &Args) -> i32 {
         } else if fake {
             p.green("up (fake)")
         } else {
-            p.dim("herdr stopped")
+            let n = r["processes"].as_u64().unwrap_or(0);
+            match n {
+                0 => p.dim("herdr stopped"),
+                1 => p.red("herdr stopped · 1 process"),
+                n => p.red(&format!("herdr stopped · {n} processes")),
+            }
         };
         // The process count is loud when the session is gone, because that is
         // the state nothing else on this line would tell you about — and a fake
@@ -1036,6 +1099,8 @@ fn ls(store: &Store, args: &Args) -> i32 {
         let procs = match (r["processes"].as_u64().unwrap_or(0), r["running"].as_bool(), fake) {
             (0, _, _) => String::new(),
             (n, Some(true), _) | (n, _, true) => p.dim(&format!("{n} process(es)")),
+            // Said in the state column already, as "herdr stopped · N processes".
+            (_, _, _) if r["orphan"].as_bool() != Some(true) => String::new(),
             (n, _, _) => p.red(&format!("{n} process(es), no session")),
         };
         println!("{:<24} {:<16} {:<22} {}", name, state, procs, p.dim(r["dir"].as_str().unwrap_or("")));
@@ -1078,7 +1143,7 @@ fn rm(store: &Store, args: &Args) -> i32 {
         for n in sessions()
             .into_iter()
             .map(|(n, _, _)| n)
-            .chain(sessions_with_processes().into_iter().map(|(n, _)| n))
+            .chain(sessions_with_processes(&root).into_iter().map(|(n, _)| n))
             .filter(|n| n.starts_with(PREFIX))
         {
             if !names.contains(&n) {
@@ -1099,8 +1164,8 @@ fn rm(store: &Store, args: &Args) -> i32 {
         // turns on, and the real run destroys it.
         let had_dir = dir.exists();
         let (had_session, reaped) = match dry {
-            true => (session(name).is_some(), session_children(name).len()),
-            false => stop_session(name),
+            true => (session(name).is_some(), session_children(&root, name).len()),
+            false => stop_session(&root, name),
         };
         if !dry {
             let _ = std::fs::remove_dir_all(&dir);
@@ -1366,11 +1431,47 @@ mod tests {
             (900, 1, "zsh -c HERDR_SESSION=wsp-w1 wsp sandbox rm".to_string()),
             (901, 1, "wsp daemon HERDR_SESSION=wsp-w1".to_string()),
         ];
+        let root = Path::new("/state/sandbox");
         assert_eq!(
-            children_of(&all, "wsp-w1"),
+            children_of(&all, root, "wsp-w1"),
             vec![901],
             "the teardown was about to kill itself or the shell that asked for it"
         );
+    }
+
+    /// The leak behind wsp-368: a seat placed through the compound backend has
+    /// `WSP_HOME`/`WSP_STATE` under the sandbox and no `HERDR_SESSION`, and it
+    /// outlived `rm`.
+    #[test]
+    fn a_compound_placed_seat_is_reaped_by_its_store_and_a_sibling_prefix_is_not() {
+        let root = Path::new("/state/sandbox");
+        let me = std::process::id();
+        let all = vec![
+            (1u32, 0u32, "launchd".to_string()),
+            (me, 900, "wsp sandbox rm wsp-tla".to_string()),
+            (900, 1, "zsh".to_string()),
+            (
+                910,
+                1,
+                "compound-sup spawn PATH=/usr/bin WSP_HOME=/state/sandbox/wsp-tla/wsp WSP_STATE=/state/sandbox/wsp-tla/state"
+                    .to_string(),
+            ),
+            (911, 910, "claude -p WSP_STATE=/state/sandbox/wsp-tla/state HERDR_SOCKET_PATH=/state/sandbox/wsp-tla/herdr.sock".to_string()),
+            (912, 1, "wsp daemon WSP_HOME=/state/sandbox/wsp-tla".to_string()),
+            (920, 1, "compound-sup spawn WSP_HOME=/state/sandbox/wsp-tla2/wsp WSP_STATE=/state/sandbox/wsp-tla2/state".to_string()),
+            (921, 1, "claude XWSP_HOME=/state/sandbox/wsp-tla/wsp".to_string()),
+            (930, 1, "claude WSP_HOME=/elsewhere/state/sandbox/wsp-tla/wsp".to_string()),
+        ];
+        assert_eq!(children_of(&all, root, "wsp-tla"), vec![910, 911, 912]);
+        assert_eq!(children_of(&all, root, "wsp-tla2"), vec![920]);
+
+        let mut found = Vec::new();
+        for (_, _, rest) in &all {
+            found.extend(sandboxes_named_in(rest, root));
+        }
+        found.sort();
+        found.dedup();
+        assert_eq!(found, vec!["wsp-tla".to_string(), "wsp-tla2".to_string()]);
     }
 
     /// A fake is a *process this sandbox started*, and everything that has ever
