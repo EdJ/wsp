@@ -384,6 +384,8 @@ pub(crate) struct SeatReport {
     /// Sessions whose transcript could not be found.
     pub missing: Vec<String>,
     pub phases: Vec<SeatPhase>,
+    /// Where the leg boundaries came from.
+    pub source: String,
 }
 
 /// One model call, once per requestId.
@@ -474,37 +476,115 @@ fn seat_sessions(i: &Inputs, windows: &[(i64, i64)]) -> Vec<String> {
     out
 }
 
+/// One leg's span: `(name, start, end)`.
+pub(crate) type Span = (String, i64, i64);
+
+/// The legs `run-leg.sh` timed: every `legs/*/timeline.json` under `dirs`,
+/// whose `start` and `end` events fall inside `[from, to]` (the row's own
+/// time, so another row's legs in the same directory are left out).
+pub(crate) fn run_legs(dirs: &[std::path::PathBuf], from: i64, to: i64) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let Ok(text) = std::fs::read_to_string(e.path().join("timeline.json")) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+            let at = |ev: &str| v["events"].as_array().into_iter().flatten().find(|x| x["ev"] == ev).and_then(|x| x["at"].as_f64());
+            let (Some(a), Some(b)) = (at("start"), at("end")) else { continue };
+            let (a, b) = (a.floor() as i64, b.ceil() as i64);
+            if a < from.saturating_sub(1) || b > to + 1 {
+                continue;
+            }
+            let name = match (v["component"].as_str(), v["leg"].as_str()) {
+                (Some(c), Some(l)) => format!("{c}-{l}"),
+                _ => e.file_name().to_string_lossy().to_string(),
+            };
+            out.push((name, a, b));
+        }
+    }
+    out.sort_by_key(|(_, a, _)| *a);
+    out
+}
+
+/// Where run-leg timelines may be: `legs` directories one to three levels under
+/// the row's tree (`spikes/react-ports/legs`), never inside a dependency or
+/// another worktree.
+pub(crate) fn legs_dirs(tree: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let skip = |n: &str| n.starts_with('.') || n == "node_modules" || n == "target";
+    let mut out = Vec::new();
+    let mut level = vec![tree.to_path_buf()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for d in &level {
+            if d.join("legs").is_dir() {
+                out.push(d.join("legs"));
+            }
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                if e.path().is_dir() && !skip(&e.file_name().to_string_lossy()) && e.file_name() != "legs" {
+                    next.push(e.path());
+                }
+            }
+        }
+        level = next;
+    }
+    out
+}
+
+/// The `cwd` the first line of a transcript records: the tree the seat worked in.
+fn cwd_of(text: &str) -> Option<std::path::PathBuf> {
+    text.lines().take(50).find_map(|l| serde_json::from_str::<Value>(l).ok()?["cwd"].as_str().map(std::path::PathBuf::from))
+}
+
 /// The seat's phases: before the first leg, between each pair, after the last
 /// up to review typed; one phase for a row with no legs. Boundaries are the
-/// leg phases `build` found from wsp's leg entries.
-fn seat_bounds(phases: &[Phase], windows: &mut Vec<(i64, i64)>) -> Vec<(String, i64, i64)> {
-    let legs: Vec<(String, i64, i64)> = phases
-        .iter()
-        .filter(|p| !p.gap && p.label.starts_with("leg "))
-        .map(|p| (p.label["leg ".len()..].split(" (").next().unwrap_or("").to_string(), p.start, p.end))
-        .collect();
-    *windows = legs.iter().map(|(_, a, b)| (*a, *b)).collect();
-    let (Some(begin), Some(end)) = (phases.iter().map(|p| p.start).min(), phases.iter().map(|p| p.end).max()) else { return Vec::new() };
+/// given legs, which run-leg's timelines or wsp's own leg entries supply.
+fn seat_bounds(i: &Inputs, phases: &[Phase], legs: &[Span]) -> Vec<(String, i64, i64)> {
+    let first_review = |from: i64| {
+        let r: Vec<i64> = i.kind("task-review", &i.id).into_iter().map(|(t, _)| t).collect();
+        r.iter().copied().find(|t| *t >= from).or_else(|| r.first().copied())
+    };
+    let last_leg = legs.iter().map(|l| l.2).max();
+    let begin = phases.iter().map(|p| p.start).chain(legs.iter().map(|l| l.1)).min();
+    let all_end = phases.iter().map(|p| p.end).chain(legs.iter().map(|l| l.2)).max();
+    let end = first_review(last_leg.unwrap_or(0)).or(all_end);
+    let (Some(begin), Some(end)) = (begin, end) else { return Vec::new() };
+    let end = end.max(last_leg.unwrap_or(0));
     if legs.is_empty() {
         return vec![("the seat, spawn to review".into(), begin, end)];
     }
-    let mut out = vec![(format!("before leg {}", legs[0].0), begin, legs[0].1)];
+    let mut out = vec![(format!("before leg {}", legs[0].0), begin.min(legs[0].1), legs[0].1)];
     for w in legs.windows(2) {
-        out.push((format!("between leg {} and leg {}", w[0].0, w[1].0), w[0].2, w[1].1));
+        out.push((format!("between leg {} and leg {}", w[0].0, w[1].0), w[0].2, w[1].1.max(w[0].2)));
     }
     let l = &legs[legs.len() - 1];
-    out.push((format!("after leg {} → review typed", l.0), l.2, end.max(l.2)));
+    out.push((format!("after leg {} → review typed", l.0), l.2, end));
     out
 }
 
 /// The seat's tokens and model time per phase. `load` reads a session's
-/// transcript; `None` is a transcript that cannot be found.
-pub(crate) fn seat_report(i: &Inputs, phases: &[Phase], load: &dyn Fn(&str) -> Option<String>) -> SeatReport {
-    let mut windows = Vec::new();
-    let bounds = seat_bounds(phases, &mut windows);
-    let mut r = SeatReport { sessions: seat_sessions(i, &windows), ..Default::default() };
-    r.phases = bounds.into_iter().map(|(label, start, end)| SeatPhase { label, start, end, ..Default::default() }).collect();
+/// transcript; `None` is a transcript that cannot be found. `run_legs` are the
+/// legs `run-leg.sh` timed; with none, the legs are wsp's own.
+pub(crate) fn seat_report(i: &Inputs, phases: &[Phase], run_legs: &[Span], load: &dyn Fn(&str) -> Option<String>) -> SeatReport {
+    let (legs, source): (Vec<Span>, &str) = if run_legs.is_empty() {
+        let l = phases
+            .iter()
+            .filter(|p| !p.gap && p.label.starts_with("leg "))
+            .map(|p| (p.label["leg ".len()..].split(" (").next().unwrap_or("").to_string(), p.start, p.end))
+            .collect();
+        (l, SEAT_SOURCE_WSP)
+    } else {
+        (run_legs.to_vec(), SEAT_SOURCE_RUN)
+    };
+    let windows: Vec<(i64, i64)> = legs.iter().map(|(_, a, b)| (*a, *b)).collect();
+    let mut r = SeatReport { sessions: seat_sessions(i, &windows), source: source.to_string(), ..Default::default() };
+    r.phases = seat_bounds(i, phases, &legs).into_iter().map(|(label, start, end)| SeatPhase { label, start, end, ..Default::default() }).collect();
     let last = r.phases.len().saturating_sub(1);
+    let mut during = SeatPhase {
+        label: "while a leg ran (the seat's own calls inside a leg; its wait on the leg is not counted)".into(),
+        start: windows.iter().map(|w| w.0).min().unwrap_or(0),
+        end: windows.iter().map(|w| w.1).max().unwrap_or(0),
+        ..Default::default()
+    };
     for s in r.sessions.clone() {
         let Some(text) = load(&s) else {
             r.missing.push(s);
@@ -512,7 +592,9 @@ pub(crate) fn seat_report(i: &Inputs, phases: &[Phase], load: &dyn Fn(&str) -> O
         };
         let (calls, tools) = read_transcript(&text);
         for c in calls {
-            if let Some(p) = r.phases.iter_mut().enumerate().find(|(n, p)| p.holds(c.at, *n == last)).map(|(_, p)| p) {
+            let inside = windows.iter().any(|(a, b)| c.at >= *a && c.at < *b);
+            let found = r.phases.iter_mut().enumerate().find(|(n, p)| p.holds(c.at, *n == last)).map(|(_, p)| p);
+            if let Some(p) = found.or(if inside { Some(&mut during) } else { None }) {
                 p.calls += 1;
                 p.model_secs += (c.end - c.start).max(0);
                 p.tokens_in += c.tin;
@@ -520,17 +602,26 @@ pub(crate) fn seat_report(i: &Inputs, phases: &[Phase], load: &dyn Fn(&str) -> O
                 p.tokens_out += c.out;
             }
         }
+        // A tool's time is the part of its call-to-result span inside a phase:
+        // the call that starts a leg and waits for it counts nothing of the leg.
         for (at, name, secs) in tools {
-            if let Some(p) = r.phases.iter_mut().enumerate().find(|(n, p)| p.holds(at, *n == last)).map(|(_, p)| p) {
-                let kind = if TOOL_KINDS.contains(&name.as_str()) { name } else { "other".to_string() };
-                *p.tools.entry(kind).or_insert(0) += secs;
+            let kind = if TOOL_KINDS.contains(&name.as_str()) { name } else { "other".to_string() };
+            for p in r.phases.iter_mut() {
+                let o = (at + secs).min(p.end) - at.max(p.start);
+                if o > 0 {
+                    *p.tools.entry(kind.clone()).or_insert(0) += o;
+                }
             }
         }
+    }
+    if during.calls > 0 {
+        r.phases.push(during);
     }
     r
 }
 
-const SEAT_SOURCE: &str = "phase boundaries from wsp's leg entries (cycle.log 'starting leg', leg-done events, the review)";
+const SEAT_SOURCE_WSP: &str = "phase boundaries from wsp's leg entries (cycle.log 'starting leg', leg-done events, the review)";
+const SEAT_SOURCE_RUN: &str = "phase boundaries from run-leg.sh's timeline.json (start and end per leg), the end at the review";
 
 fn render_seat(r: &SeatReport) -> String {
     let mut s = String::new();
@@ -540,7 +631,7 @@ fn render_seat(r: &SeatReport) -> String {
     if r.missing.len() == r.sessions.len() {
         return format!("the seat's own work: transcript not found for session {}\n", r.missing.join(", "));
     }
-    s.push_str(&format!("the seat's own work (times UTC; {SEAT_SOURCE}); tokens: in = fresh + cache write\n"));
+    s.push_str(&format!("the seat's own work (times UTC; {}); tokens: in = fresh + cache write\n", r.source));
     for p in &r.phases {
         let tools: Vec<String> = p.tools.iter().map(|(k, v)| format!("{k} {v}s")).collect();
         s.push_str(&format!(
@@ -566,7 +657,7 @@ fn render_seat(r: &SeatReport) -> String {
 fn seat_json(r: &SeatReport) -> Value {
     let all_missing = r.sessions.is_empty() || r.missing.len() == r.sessions.len();
     json!({
-        "source": SEAT_SOURCE,
+        "source": r.source,
         "utc": true,
         "sessions": r.sessions,
         "missing": r.missing,
@@ -592,7 +683,22 @@ fn seat_json(r: &SeatReport) -> Value {
     })
 }
 
-const USAGE: &str = "wsp timeline <row> [--json]";
+/// The legs `run-leg.sh` timed for this row: in `--legs DIR`, or else in the
+/// `legs` directories of the tree the seat's transcript says it worked in.
+fn run_legs_for(i: &Inputs, phases: &[Phase], flag: Option<String>) -> Vec<Span> {
+    let from = phases.iter().map(|p| p.start).min().or_else(|| i.kind("task-claimed", &i.id).first().map(|(t, _)| *t)).unwrap_or(0);
+    let to = i.kind("task-review", &i.id).last().map(|(t, _)| *t).or_else(|| phases.iter().map(|p| p.end).max()).unwrap_or(i64::MAX - 2);
+    let dirs = match flag {
+        Some(d) => vec![util::expand(&d)],
+        None => {
+            let tree = i.kind("session-learned", &i.id).into_iter().find_map(|(_, d)| d["session"].as_str().and_then(transcript)).as_deref().and_then(cwd_of);
+            tree.map(|t| legs_dirs(&t)).unwrap_or_default()
+        }
+    };
+    run_legs(&dirs, from, to)
+}
+
+const USAGE: &str = "wsp timeline <row> [--json] [--legs DIR]";
 
 pub fn timeline(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first() else {
@@ -608,7 +714,8 @@ pub fn timeline(store: &Store, args: &Args) -> i32 {
     };
     let i = gather(store, &t.id);
     let phases = build(&i);
-    let seat = seat_report(&i, &phases, &transcript);
+    let seat_run_legs = run_legs_for(&i, &phases, args.get("legs"));
+    let seat = seat_report(&i, &phases, &seat_run_legs, &transcript);
     if args.json() {
         let mut v = to_json(&i, &phases);
         v["utc"] = json!(true);
@@ -744,11 +851,13 @@ mod tests {
             result(459, "t5"),
         ]
         .join("\n");
-        let r = seat_report(&i, &ph, &|s| (s == "s").then(|| text.clone()));
+        let r = seat_report(&i, &ph, &[], &|s| (s == "s").then(|| text.clone()));
         assert_eq!(r.sessions, vec!["s".to_string()], "a leg's and the verifier's sessions are not the seat's");
         assert!(r.missing.is_empty());
         let labels: Vec<&str> = r.phases.iter().map(|p| p.label.as_str()).collect();
-        assert_eq!(labels, ["before leg a", "between leg a and leg b", "after leg b → review typed"]);
+        assert_eq!(labels[..3], ["before leg a", "between leg a and leg b", "after leg b → review typed"]);
+        assert!(labels[3].starts_with("while a leg ran"), "the seat's call inside a leg is kept: {labels:?}");
+        assert_eq!((r.phases[3].calls, r.phases[3].tokens_out), (1, 99));
         let p = &r.phases[0];
         assert_eq!((p.calls, p.model_secs, p.tokens_in, p.cache_read, p.tokens_out), (2, 3 + 7, 30, 300, 12));
         assert_eq!((p.tools["Bash"], p.tools["Read"]), (5, 1));
@@ -763,7 +872,7 @@ mod tests {
     fn a_missing_transcript_is_named_not_zero() {
         let i = two_legs();
         let ph = build(&i);
-        let r = seat_report(&i, &ph, &|_| None);
+        let r = seat_report(&i, &ph, &[], &|_| None);
         assert_eq!(r.missing, vec!["s".to_string()]);
         let out = render_seat(&r);
         assert_eq!(out.lines().count(), 1);
@@ -777,10 +886,71 @@ mod tests {
     fn a_row_with_no_legs_has_one_seat_phase() {
         let i = row();
         let ph = build(&i);
-        let r = seat_report(&i, &ph, &|_| Some(String::new()));
+        let r = seat_report(&i, &ph, &[], &|_| Some(String::new()));
         let legless = Inputs { legs: vec![], ..row() };
-        let r2 = seat_report(&legless, &build(&legless), &|_| Some(String::new()));
+        let r2 = seat_report(&legless, &build(&legless), &[], &|_| Some(String::new()));
         assert_eq!(r.phases.len(), 2);
         assert_eq!(r2.phases.len(), 1);
+    }
+
+    #[test]
+    fn the_last_phase_ends_at_review_typed_not_at_the_verifier_or_the_barrier() {
+        let mut i = two_legs();
+        i.events.push(ev(520, "task-verified", json!({"id": "r-1"})));
+        i.cycle.push((461, "spawn r-1 --agent --verify --kind claude".into()));
+        i.cycle.push((470, "list group 1: started r-1 · verifying".into()));
+        i.cycle.push((540, "list group 1: barrier-run 1".into()));
+        i.cycle.push((600, "tell list: Barrier 1 of list passed".into()));
+        i.group = Some(("list".into(), 1, vec!["r-1".into()]));
+        let ph = build(&i);
+        assert!(ph.iter().any(|p| p.end >= 600), "the timeline runs to the barrier: {ph:?}");
+        let text = [
+            line(118, json!({"type": "user", "message": {"content": "go"}})),
+            asst(455, "q5", (4, 0, 8), None),
+            asst(480, "q6", (50, 50, 50), None),
+        ]
+        .join("\n");
+        let r = seat_report(&i, &ph, &[], &|s| (s == "s").then(|| text.clone()));
+        let last = r.phases.last().unwrap();
+        assert_eq!((last.start, last.end), (450, 460), "{last:?}");
+        assert_eq!((last.calls, last.tokens_out), (1, 8), "a call after review typed is not the seat's work");
+    }
+
+    #[test]
+    fn legs_run_leg_timed_split_the_seat_and_another_rows_legs_are_left_out() {
+        let dir = std::env::temp_dir().join(format!("wsp-371-legs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let put = |name: &str, a: f64, b: f64| {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            let v = json!({"component": "board", "leg": name, "events": [{"ev": "start", "at": a}, {"ev": "end", "at": b}]});
+            std::fs::write(dir.join(name).join("timeline.json"), v.to_string()).unwrap();
+        };
+        put("a", 150.4, 280.2);
+        put("b", 300.0, 400.0);
+        put("other", 9000.0, 9100.0);
+        let legs = run_legs(&[dir.clone()], 100, 460);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(legs, vec![("board-a".to_string(), 150, 281), ("board-b".to_string(), 300, 400)]);
+        let mut i = two_legs();
+        i.cycle.clear();
+        i.events.retain(|(_, k, _)| k != "leg-done");
+        let text = [
+            line(118, json!({"type": "user", "message": {"content": "go"}})),
+            asst(149, "q1", (1, 1, 1), Some(("t1", "Bash"))),
+            result(281, "t1"),
+            asst(283, "q2", (2, 2, 2), None),
+            asst(420, "q3", (3, 3, 3), None),
+        ]
+        .join("\n");
+        let ph = build(&i);
+        let r = seat_report(&i, &ph, &legs, &|s| (s == "s").then(|| text.clone()));
+        assert!(r.source.contains("run-leg.sh"), "{}", r.source);
+        let labels: Vec<&str> = r.phases.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["before leg board-a", "between leg board-a and leg board-b", "after leg board-b → review typed"]);
+        assert_eq!((r.phases[0].start, r.phases[0].end), (110, 150));
+        assert_eq!(r.phases[0].tools["Bash"], 1, "only the second before the leg; the wait inside it is the leg's");
+        assert_eq!(r.phases[1].tools.get("Bash"), None, "the leg's wait is in no phase");
+        assert_eq!(r.phases[1].calls, 1);
+        assert_eq!((r.phases[2].start, r.phases[2].end, r.phases[2].calls), (400, 460, 1));
     }
 }

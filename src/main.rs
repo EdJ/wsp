@@ -2000,11 +2000,14 @@ fn help_text() -> String {
                                     are; a watch whose process died is a line
                                     in `wsp doctor` rather than a silence
   wsp overlap                       who else is standing in this tree
-  wsp timeline <row> [--json]      where a row's wall time goes, spawn to barrier:
+  wsp timeline <row> [--json] [--legs DIR]
+                                    where a row's wall time goes, spawn to barrier:
                                     one line per phase, and the gaps where nothing
                                     ran named for what they waited on
                                     then the seat's own model time and tokens per
-                                    phase, split at the row's legs (times UTC)
+                                    phase, split at the row's legs (times UTC);
+                                    legs from run-leg.sh's timeline.json under the
+                                    row's tree, or --legs DIR, else wsp's own
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,
                                     how long to review, and whether it came back
