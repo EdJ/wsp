@@ -2307,11 +2307,22 @@ pub struct Claude;
 /// else.
 const TRIM: &[&str] = &["--strict-mcp-config", "--disallowedTools", "Agent", "Workflow"];
 
-/// What a packet row starts with instead of [`TRIM`]: three tools, a one-line
+/// What a packet row starts with instead of [`TRIM`]: four tools, a one-line
 /// system prompt, no skills, no MCP. compounding-033 measured the starting
 /// context at about 43k tokens for the ordinary start and 4 to 6k for this
-/// one, with the same change landing. `Write` is left out with the rest: the
-/// packet names the files to edit, and `Edit` and `Bash` make any new one.
+/// one, with the same change landing.
+///
+/// `Write` is in it (wsp-365): without it a new file can only be made by a
+/// shell heredoc (`cat > f <<EOF`), which permission rules and allow-lists
+/// commonly refuse — compounding's harness trial lost turns to three refused
+/// `cat > tagStore.ts` in one run of a change that adds a component and a
+/// store. It costs 236 tokens of starting context: 4,385 with
+/// `Bash,Read,Edit` and 4,621 with `Bash,Read,Edit,Write`, these flags and
+/// [`SHORT_START_ENV`], `claude -p` on sonnet, 2026-11-04.
+///
+/// Deleting and moving a file stay with `Bash` — `rm` and `git mv` — so an
+/// allow-list for packet rows has to permit those inside the row's tree, or
+/// a change that removes or renames a file cannot be made.
 ///
 /// Claude Code's instruction files are switched off by
 /// [`SHORT_START_ENV`], which a flag cannot do.
@@ -2319,7 +2330,7 @@ const SHORT_START: &[&str] = &[
     "--strict-mcp-config",
     "--disable-slash-commands",
     "--tools",
-    "Bash,Read,Edit",
+    "Bash,Read,Edit,Write",
     "--system-prompt",
     "You make one code change from the packet you are given: run `wsp packet` on your row, \
      do what it says, run its one command, fix what it reports, then finish as your order says.",
@@ -4209,7 +4220,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
         let packet = Spawn { packet: true, ..spawn(false, "t-1", &seat) };
         let argv = of("claude").args(&packet);
         let at = |flag: &str| argv.iter().position(|a| a == flag).unwrap_or_else(|| panic!("no {flag} in {argv:?}"));
-        assert_eq!(argv[at("--tools") + 1], "Bash,Read,Edit");
+        assert_eq!(argv[at("--tools") + 1], "Bash,Read,Edit,Write", "Write, so a new file is not a heredoc");
         assert!(!argv[at("--system-prompt") + 1].contains('\n'), "herdr refuses control characters in an arg");
         assert!(argv.contains(&"--disable-slash-commands".to_string()) && argv.contains(&"--strict-mcp-config".to_string()));
         assert!(!argv.contains(&"--disallowedTools".to_string()), "the allowlist replaces the trim");
