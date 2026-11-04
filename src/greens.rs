@@ -2,11 +2,14 @@
 //! tier does not run again what an earlier one proved.
 //!
 //! One append-only file per repository, `greens/<project>-<repo>.tsv`, a line
-//! per pass: `sha  environment  took-secs  iso-time  who  flaky  command`. The
-//! key is the full commit and the exact command; nothing is inferred (a release
-//! green is not a debug green, and no green is carried over a rebase — `affected`
-//! decides what reruns there). A cold green satisfies a warm ask, never the
-//! reverse. Lines older than [`KEEP_DAYS`] are dropped when the file is next
+//! per pass: `sha  environment  took-secs  iso-time  who  flaky  inputs=<hash>
+//! command` (a line from before `wsp-361` has no `inputs=` field and reads).
+//! A green is found by the exact command at the same commit, or — `wsp-361` —
+//! at any commit where the command's input hash ([`crate::affected::key`]: the
+//! command and git's ids for what it reads) is the same, so a trunk move that
+//! touched nothing a target reads reruns nothing. A release green is still not
+//! a debug green: the command is in the hash. A cold green satisfies a warm ask,
+//! never the reverse. Lines older than [`KEEP_DAYS`] are dropped when the file is next
 //! appended to, and a line that does not read is skipped.
 
 use std::path::{Path, PathBuf};
@@ -40,6 +43,10 @@ pub(crate) struct Green {
     pub when: String,
     pub who: String,
     pub flaky: bool,
+    /// The commit it passed at.
+    pub sha: String,
+    /// Found at another commit by its input hash.
+    pub carried: bool,
 }
 
 pub(crate) struct Greens {
@@ -69,9 +76,9 @@ impl Greens {
         std::fs::read_to_string(&self.file).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default()
     }
 
-    /// `(sha, command, green)` for a line that reads.
-    fn parse(line: &str) -> Option<(&str, String, Green)> {
-        let mut f = line.splitn(7, '\t');
+    /// `(inputs, command, green)` for a line that reads.
+    fn parse(line: &str) -> Option<(Option<String>, String, Green)> {
+        let mut f = line.splitn(8, '\t');
         let sha = f.next().filter(|s| s.len() == 40)?;
         let env = match f.next()? {
             "warm" => Env::Warm,
@@ -82,23 +89,46 @@ impl Greens {
         let when = f.next().filter(|w| util::epoch_of(w) > 0)?.to_string();
         let who = f.next()?.to_string();
         let flaky = f.next()? == "flaky";
-        let command = f.next()?.to_string();
-        Some((sha, command, Green { env, took, when, who, flaky }))
+        let seventh = f.next()?;
+        let (inputs, command) = match (seventh.strip_prefix("inputs="), f.next()) {
+            (Some(k), Some(c)) => ((k != "-" && !k.is_empty()).then(|| k.to_string()), c.to_string()),
+            _ => (None, seventh.to_string()),
+        };
+        Some((inputs, command, Green { env, took, when, who, flaky, sha: sha.to_string(), carried: false }))
     }
 
     /// The newest green of exactly this command at exactly this commit that
     /// satisfies `env`: a cold green satisfies either, a warm one only a warm ask.
     pub(crate) fn lookup(&self, sha: &str, command: &str, env: Env) -> Option<Green> {
-        let want = escape(command);
-        self.lines()
-            .iter()
-            .rev()
-            .filter_map(|l| Self::parse(l).map(|(s, c, g)| (s.to_string(), c, g)))
-            .find(|(s, c, g)| s == sha && *c == want && (env == Env::Warm || g.env == Env::Cold))
-            .map(|(_, _, g)| g)
+        self.lookup_by(sha, None, command, env)
     }
 
+    /// The same, or a green of the command at another commit whose input hash
+    /// is `inputs`. One at this very commit is preferred.
+    pub(crate) fn lookup_by(&self, sha: &str, inputs: Option<&str>, command: &str, env: Env) -> Option<Green> {
+        let want = escape(command);
+        let lines = self.lines();
+        let fits: Vec<(Option<String>, Green)> = lines
+            .iter()
+            .rev()
+            .filter_map(|l| Self::parse(l))
+            .filter(|(_, c, g)| *c == want && (env == Env::Warm || g.env == Env::Cold))
+            .map(|(k, _, g)| (k, g))
+            .collect();
+        if let Some((_, g)) = fits.iter().find(|(_, g)| g.sha == sha) {
+            return Some(g.clone());
+        }
+        let want = inputs?;
+        fits.into_iter().find(|(k, _)| k.as_deref() == Some(want)).map(|(_, g)| Green { carried: true, ..g })
+    }
+
+    #[cfg(test)]
     pub(crate) fn record(&self, sha: &str, command: &str, env: Env, took: u64, who: &str, flaky: bool) {
+        self.record_by(sha, None, command, env, took, who, flaky);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_by(&self, sha: &str, inputs: Option<&str>, command: &str, env: Env, took: u64, who: &str, flaky: bool) {
         let Some(dir) = self.file.parent() else { return };
         let _ = std::fs::create_dir_all(dir);
         let keep: Vec<String> =
@@ -109,10 +139,11 @@ impl Greens {
         }
         let who = escape(who).replace(' ', "_");
         text.push_str(&format!(
-            "{sha}\t{}\t{took}\t{}\t{who}\t{}\t{}\n",
+            "{sha}\t{}\t{took}\t{}\t{who}\t{}\tinputs={}\t{}\n",
             env.word(),
             util::now_iso(),
             if flaky { "flaky" } else { "-" },
+            inputs.filter(|k| k.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("-"),
             escape(command)
         ));
         let tmp = self.file.with_extension("tsv.tmp");
@@ -170,6 +201,30 @@ mod tests {
         assert!(found.flaky);
         assert_eq!(found.who, "barrier_l_1");
         assert_eq!(g.lines().len(), 1, "the garbage line is dropped when the file is appended to");
+    }
+
+    #[test]
+    fn a_green_is_reused_at_another_commit_only_where_the_input_hash_is_the_same() {
+        let (_s, g) = ledger("greens-inputs");
+        let other = SHA.replace('0', "a");
+        g.record_by(SHA, Some("k1"), "cargo test", Env::Warm, 60, "wsp-1", false);
+        let found = g.lookup_by(&other, Some("k1"), "cargo test", Env::Warm).unwrap();
+        assert_eq!((found.sha.as_str(), found.took, found.carried), (SHA, 60, true));
+        assert!(!g.lookup_by(SHA, Some("k1"), "cargo test", Env::Warm).unwrap().carried);
+        assert!(g.lookup_by(&other, Some("k2"), "cargo test", Env::Warm).is_none(), "what it reads changed");
+        assert!(g.lookup_by(&other, None, "cargo test", Env::Warm).is_none(), "no hash, no carry");
+        assert!(g.lookup_by(&other, Some("k1"), "cargo test -p x", Env::Warm).is_none());
+        g.record_by(SHA, Some("w"), "warm", Env::Warm, 1, "a", false);
+        assert!(g.lookup_by(&other, Some("w"), "warm", Env::Cold).is_none(), "a warm green never satisfies a cold ask");
+    }
+
+    #[test]
+    fn a_line_from_before_input_hashes_still_reads_and_is_found_only_at_its_commit() {
+        let (_s, g) = ledger("greens-legacy");
+        std::fs::create_dir_all(g.file.parent().unwrap()).unwrap();
+        std::fs::write(&g.file, format!("{SHA}\twarm\t5\t{}\tx\t-\tcargo test\n", util::now_iso())).unwrap();
+        assert!(g.lookup_by(SHA, Some("k"), "cargo test", Env::Warm).is_some());
+        assert!(g.lookup_by(&SHA.replace('0', "b"), Some("k"), "cargo test", Env::Warm).is_none());
     }
 
     #[test]

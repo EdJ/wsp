@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+mod affected;
 mod after;
 mod packet;
 mod packet_gen;
@@ -236,7 +237,7 @@ const BOOL_FLAGS: &[&str] = &[
     "holds", "blocks", "verify", "verify-rows", "barrier-rows", "run-notices",
     // `wsp check <task> --plan|--auto`: the task id is the positional, and
     // `--auto` is what the run's own trigger types.
-    "plan", "auto", "set", "barrier", "inner", "tiers", "barrier-tree",
+    "plan", "auto", "set", "barrier", "inner", "affected", "tiers", "barrier-tree",
     // `wsp worklist followup <slug> <task>… --blocking|--next`: the rows are
     // positionals, and a flag between them must not eat the one after it.
     "blocking", "next",
@@ -1772,6 +1773,12 @@ fn help_text() -> String {
   wsp check --inner [<id>] [--run]  the steps this tree's changes call for,
                                     narrowest first; --run runs them here and
                                     records nothing
+  wsp check --affected [<id>] [--run]
+                                    those, with the tests the crate graph
+                                    (cargo metadata) and Vitest's module graph
+                                    reach, narrowest first; --run in a tree
+                                    clean at HEAD reuses and records greens by
+                                    input hash, and says how many were reused
   wsp check <project> --tiers       its declared steps by tier (inner, row,
                                     barrier, end) and what it leaves out
   wsp check <id> [--plan] [--at <commit>]

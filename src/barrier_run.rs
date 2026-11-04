@@ -305,6 +305,7 @@ pub(crate) fn results_text(plan: &Plan, ranged: &[Ranged], blames: &[Blame], dec
                     out.push_str(line);
                     out.push('\n');
                 }
+                out.push_str(&format!("  {}\n", check::tally_line(ran)));
             }
         }
     }
@@ -380,11 +381,15 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     let mut failed = Vec::new();
     let mut could_not = Vec::new();
     let mut count = 0;
+    let (mut reused, mut ran_n) = (0, 0);
     for (u, r) in plan.units.iter().zip(&ranged) {
         match r {
             Ranged::Could(why) => could_not.push(format!("{} — {why}", u.project)),
             Ranged::Ran(ran) => {
                 count += ran.len();
+                let (a, b) = check::tally(ran);
+                reused += a;
+                ran_n += b;
                 for (item, ran) in u.items.iter().zip(ran) {
                     if matches!(ran.done, Done::Failed { .. } | Done::Malformed(_)) {
                         failed.push(item.step.name.clone());
@@ -425,7 +430,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     log_line(
         store,
         &format!(
-            "{list} group {at}: barrier run — {count} step(s), {} failed, {}s{}",
+            "{list} group {at}: barrier run — {count} step(s), {reused} reused, {ran_n} ran, {} failed, {}s{}",
             failed.len(),
             started.elapsed().as_secs(),
             if decision.would_pass && !on { " · would pass without an agent (auto-pass is off)" } else { "" }

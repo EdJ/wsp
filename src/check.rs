@@ -759,8 +759,9 @@ pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&R
 /// and is not written again), and a pass is recorded when the tree was clean at
 /// that commit before the step ran.
 pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>) -> Ran {
+    let inputs = reuse.and_then(|r| crate::affected::key(dir, r.sha, &step.command));
     if let Some(r) = reuse {
-        if let Some(green) = r.greens.lookup(r.sha, &step.command, r.env) {
+        if let Some(green) = r.greens.lookup_by(r.sha, inputs.as_deref(), &step.command, r.env) {
             return Ran { step: step.clone(), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: Some(green) };
         }
     }
@@ -773,9 +774,22 @@ pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reus
         first
     };
     if let (Some(r), true, Done::Passed) = (reuse, clean, &ran.done) {
-        r.greens.record(r.sha, &step.command, r.env, secs(ran.took), r.who, ran.first.is_some());
+        r.greens.record_by(r.sha, inputs.as_deref(), &step.command, r.env, secs(ran.took), r.who, ran.first.is_some());
     }
     ran
+}
+
+/// How many steps of a run were reused from the ledger and how many ran.
+pub(crate) fn tally(ran: &[Ran]) -> (usize, usize) {
+    let reused = ran.iter().filter(|r| r.reused.is_some()).count();
+    let skipped = ran.iter().filter(|r| r.done == Done::Skipped).count();
+    (reused, ran.len() - reused - skipped)
+}
+
+/// `N reused, M ran`, said on every run.
+pub(crate) fn tally_line(ran: &[Ran]) -> String {
+    let (reused, ran) = tally(ran);
+    format!("{reused} reused, {ran} ran")
 }
 
 pub(crate) fn passed(ran: &[Ran]) -> bool {
@@ -804,10 +818,8 @@ pub(crate) fn account(ran: &[Ran]) -> String {
             (Done::Passed, _) if r.reused.is_some() => {
                 let g = r.reused.as_ref().unwrap();
                 let flake = if g.flaky { ", a flake that passed on a second run" } else { "" };
-                (
-                    "✓",
-                    format!("reused (green at this commit, {}s, by {}, {}{flake})", g.took, g.who, g.when),
-                )
+                let at = if !g.carried { "this commit".to_string() } else { format!("{} with the same inputs", &g.sha[..12]) };
+                ("✓", format!("reused (green at {at}, {}s, by {}, {}{flake})", g.took, g.who, g.when))
             }
             (Done::Passed, None) => ("✓", format!("{}s", secs(r.took))),
             (Done::Passed, Some((why, _))) => ("✓", format!("{}s · passed on a second run, the first was {why}", secs(r.took))),
@@ -960,11 +972,11 @@ const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed
 
 // ---- the verb -----------------------------------------------------------------
 
-const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check --inner [<task>] [--run]   the steps this tree's changes call for\n       wsp check <project> --barrier [--plan|--barrier-tree] [--at <commit>]\n       wsp check <project> --tiers   its declared steps by tier\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
+const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check --inner [<task>] [--run]   the steps this tree's changes call for\n       wsp check --affected [<task>] [--run]   those and the targets the crate and module graphs reach\n       wsp check <project> --barrier [--plan|--barrier-tree] [--at <commit>]\n       wsp check <project> --tiers   its declared steps by tier\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
 
 pub fn check(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
-    if args.has("inner") {
+    if args.has("inner") || args.has("affected") {
         return inner(store, args);
     }
     let Some(needle) = args.rest.first().cloned() else {
@@ -1101,7 +1113,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     if args.json() {
         println!(
             "{}",
-            serde_json::json!({ "task": t.id, "commit": tg.sha, "passed": ok, "took": took.as_secs(), "steps": account(&ran) })
+            serde_json::json!({ "task": t.id, "commit": tg.sha, "passed": ok, "took": took.as_secs(), "reused": tally(&ran).0, "ran": tally(&ran).1, "steps": account(&ran) })
         );
     } else if !auto {
         if !ok {
@@ -1116,11 +1128,12 @@ pub fn check(store: &Store, args: &Args) -> i32 {
             _ => String::new(),
         };
         println!(
-            "{} {} {}  {}s{tail}",
+            "{} {} {}  {}s · {}{tail}",
             if ok { p.green("✓") } else { p.red("✗") },
             p.bold(&t.id),
             if ok { "passed" } else { "failed" },
-            took.as_secs()
+            took.as_secs(),
+            tally_line(&ran)
         );
     }
     if settled == Settled::SentBack {
@@ -1200,21 +1213,58 @@ fn changed_in_tree(tree: &Path) -> Option<Vec<String>> {
     Some(paths)
 }
 
-/// `wsp check --inner [<task>] [--run]` — the steps this tree's changes call
-/// for. Run in the tree, it records nothing: a dirty tree proves no commit.
+/// The steps a tree's changes reach, narrowest first (`wsp-361`): the rules'
+/// captures, the crates the paths changed in and Vitest's related tests, the
+/// project's other rules, the crates that depend on a changed one by distance,
+/// then the member's own and every-landing steps. A derived target a declared
+/// step already runs is not added again.
+pub(crate) fn affected_steps(store: &Store, t: &Task, tree: &Path, changed: &[String]) -> Vec<Step> {
+    let mut ranked: Vec<(usize, Step)> = inner_steps(store, t, changed)
+        .into_iter()
+        .map(|s| {
+            let r = match (tier(&s), s.of) {
+                ("inner", _) => 0,
+                (_, Of::Rule) => 2,
+                (_, Of::Task) => 100,
+                _ => 101,
+            };
+            (r, s)
+        })
+        .collect();
+    for (s, d) in crate::affected::derived(tree, changed) {
+        if !ranked.iter().any(|(_, r)| r.command == s.command) {
+            ranked.push((if d == 0 { 1 } else { 2 + d }, s));
+        }
+    }
+    ranked.sort_by_key(|(r, _)| *r);
+    ranked.into_iter().map(|(_, s)| s).collect()
+}
+
+/// `wsp check --inner|--affected [<task>] [--run]` — the steps this tree's
+/// changes call for. `--inner` reads the declared rules; `--affected` adds the
+/// targets the crate graph and Vitest's module graph reach. Named, it reads the
+/// member's own tree. A run in a tree with changes records nothing: a dirty
+/// tree proves no commit; `--affected --run` in a tree clean at its ready
+/// commit reuses and records greens by input hash.
 fn inner(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let run = args.has("run");
+    let wide = args.has("affected");
     // `--run` is valued elsewhere, so a task id typed after it arrives as its value.
-    let named = args.rest.first().cloned().or_else(|| args.get("run").filter(|v| v != "true"));
+    let named = args
+        .rest
+        .first()
+        .cloned()
+        .or_else(|| args.get("run").filter(|v| v != "true"))
+        .or_else(|| args.get("affected").filter(|v| v != "true"));
     let cwd = std::env::current_dir().unwrap_or_default();
-    let Some(tree) = crate::cmd_verify::toplevel(&cwd) else {
+    let Some(here) = crate::cmd_verify::toplevel(&cwd) else {
         eprintln!("wsp: {} is in no git tree", util::contract(&cwd));
         return 1;
     };
-    let dir_name = tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let found = match named {
-        Some(id) => store.task_or_why(&id),
+    let dir_name = here.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let found = match &named {
+        Some(id) => store.task_or_why(id),
         None => store.task_or_why(&dir_name),
     };
     let t = match found {
@@ -1224,11 +1274,16 @@ fn inner(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    // Named from elsewhere, the member's own tree is read when it has one.
+    let tree = match named.is_some() && dir_name != t.id {
+        true => crate::cmd_checkout::member_tree(store, &t.id).unwrap_or(here),
+        false => here,
+    };
     let Some(changed) = changed_in_tree(&tree) else {
         eprintln!("wsp: cannot read what {} changed against the trunk", util::contract(&tree));
         return 1;
     };
-    let steps = inner_steps(store, &t, &changed);
+    let steps = if wide { affected_steps(store, &t, &tree, &changed) } else { inner_steps(store, &t, &changed) };
     if steps.is_empty() {
         println!("{} {}", p.dim("nothing to run —"), p.dim(&format!("{} changed path(s) call for no check of {}", changed.len(), t.id)));
         return 0;
@@ -1242,21 +1297,30 @@ fn inner(store: &Store, args: &Args) -> i32 {
     }
     let log = store.state_file("checks").join(format!("{}-inner.log", t.id));
     let _ = std::fs::create_dir_all(store.state_file("checks"));
-    for s in &steps {
-        let r = run_step(&tree, s, &log);
-        if r.done == Done::Passed {
-            println!("  {} {} · {}s", p.green("✓"), s.name, secs(r.took));
-            continue;
+    let head = git(&tree, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()).unwrap_or_default();
+    let clean = wide && greens::clean_at(&tree, &head);
+    let ledger = clean
+        .then(|| {
+            let project = project_of(&t)?;
+            let trunk = crate::cmd_checkout::trunk(&tree)?;
+            Some(greens::Greens::open(store, &project, &trunk))
+        })
+        .flatten();
+    let reuse = ledger.as_ref().map(|g| Reuse { greens: g, sha: &head, env: greens::Env::Warm, who: &t.id });
+    let ran = run_all(&tree, &steps, &log, reuse.as_ref(), |r| match &r.done {
+        Done::Passed if r.reused.is_some() => println!("  {} {} · reused", p.green("✓"), r.step.name),
+        Done::Passed => println!("  {} {} · {}s", p.green("✓"), r.step.name, secs(r.took)),
+        Done::Skipped => println!("  {} {} · skipped", p.dim("–"), r.step.name),
+        _ => {
+            println!("  {} {} · {}s · {}", p.red("✗"), r.step.name, secs(r.took), why_failed(r));
+            for l in r.tail.lines() {
+                println!("    {}", p.dim(l));
+            }
         }
-        println!("  {} {} · {}s · {}", p.red("✗"), s.name, secs(r.took), why_failed(&r));
-        for l in r.tail.lines() {
-            println!("    {}", p.dim(l));
-        }
-        println!("{}", p.dim("nothing recorded: a tree with changes proves no commit"));
-        return 1;
-    }
-    println!("{}", p.dim("nothing recorded: a tree with changes proves no commit"));
-    0
+    });
+    let said = if reuse.is_some() { "greens recorded at the commit" } else { "nothing recorded: a tree with changes proves no commit" };
+    println!("{}", p.dim(&format!("{} · {said}", tally_line(&ran))));
+    i32::from(!passed(&ran))
 }
 
 /// `wsp check <project> --tiers` — the project's own declared steps by tier,
@@ -1298,6 +1362,7 @@ fn why_in(s: &Step) -> String {
     }
     match s.of {
         Of::Task => "the member's".into(),
+        Of::Rule if s.on.is_empty() => "reached by the changed paths (crate or module graph)".into(),
         Of::Rule => format!("rule on {}", s.on.join(", ")),
         Of::Project => "every landing".into(),
     }
@@ -1986,6 +2051,23 @@ mod tests {
     }
 
     #[test]
+    fn a_green_is_reused_at_a_new_commit_whose_inputs_are_unchanged_and_the_run_says_so() {
+        let (_env, store, _) = world("reuse-inputs", "- x: true", "exit 0\n");
+        let (dir, log, sha) = repo_at_head("reuse-inputs");
+        let g = greens::Greens::open(&store, "pj", &dir);
+        let step = counting(&dir, "count");
+        let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
+        assert_eq!(tally_line(&run_all(&dir, &[step.clone()], &log, Some(&reuse), |_| {})), "0 reused, 1 ran");
+        git_run(&dir, &["commit", "--quiet", "--allow-empty", "-m", "a rebase that changed nothing"]);
+        let sha2 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let reuse = Reuse { greens: &g, sha: &sha2, env: greens::Env::Warm, who: "a" };
+        let again = run_all(&dir, &[step], &log, Some(&reuse), |_| {});
+        assert_eq!(runs_of(&dir, "count"), 1, "the same inputs at another commit are not run again");
+        assert_eq!(tally_line(&again), "1 reused, 0 ran");
+        assert!(account(&again).contains("with the same inputs"));
+    }
+
+    #[test]
     fn a_different_command_or_commit_is_not_reused() {
         let (_env, store, _) = world("reuse-other", "- x: true", "exit 0\n");
         let (dir, log, sha) = repo_at_head("reuse-other");
@@ -2246,6 +2328,6 @@ mod tests {
 
     #[test]
     fn the_usage_line_names_inner_and_tiers() {
-        assert!(USAGE.contains("--inner [<task>] [--run]") && USAGE.contains("--tiers"));
+        assert!(USAGE.contains("--inner [<task>] [--run]") && USAGE.contains("--affected [<task>] [--run]") && USAGE.contains("--tiers"));
     }
 }
