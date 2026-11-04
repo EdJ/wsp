@@ -446,13 +446,27 @@ fn shim_dir(state: &Path) -> PathBuf {
     state.join("shims")
 }
 
+/// The line every shim carries; a file that has it is wsp's, whichever state
+/// directory it lives in.
+const SHIM_MARK: &str = "# wsp's build throttle (wsp-331)";
+
+/// Is `p` a shim wsp wrote? A temp `WSP_STATE` has its own shims dir, but the
+/// `PATH` it inherits can still carry the real seat's; resolving to that one
+/// runs `wsp throttle run` again, forever (wsp-367).
+fn is_shim(p: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 160];
+    let n = fs::File::open(p).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+    String::from_utf8_lossy(&head[..n]).starts_with("#!/bin/sh\n") && String::from_utf8_lossy(&head[..n]).contains(SHIM_MARK)
+}
+
 /// The first `tool` on `path` that is not one of ours.
 pub(crate) fn real_tool(tool: &str, path: &str, shims: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     path.split(':')
         .filter(|d| !d.is_empty() && Path::new(d) != shims)
         .map(|d| Path::new(d).join(tool))
-        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) && !is_shim(p))
 }
 
 pub(crate) fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
@@ -1402,6 +1416,18 @@ mod tests {
         assert!(got.ends_with(&path), "the rest of the PATH is kept whole: {got}");
         assert!(shims.join("cargo").exists());
         assert_eq!(real_tool("cargo", got, &shims), Some(rig.bin.join("cargo")), "the shim does not find itself");
+    }
+
+    #[test]
+    fn a_shim_from_another_state_dir_is_not_the_real_tool() {
+        let rig = rig("throttle-foreign-shim");
+        let other = rig.state.join("other-state");
+        let foreign = ensure_shims(&other, &Settings::load(&other));
+        let path = format!("{}:{}:/usr/bin", foreign.display(), rig.bin.display());
+        let mine = shim_dir(&rig.state);
+        assert_eq!(real_tool("cargo", &path, &mine), Some(rig.bin.join("cargo")));
+        let only = format!("{}:/usr/bin", foreign.display());
+        assert_eq!(real_tool("cargo", &only, &mine).filter(|p| p.starts_with(&foreign)), None);
     }
 
     #[test]
