@@ -713,6 +713,60 @@ fn run_legs_for(i: &Inputs, phases: &[Phase], flag: Option<String>) -> Vec<Span>
     run_legs(&dirs, from, to)
 }
 
+/// One row's timeline figures, read by the same functions `wsp timeline` prints
+/// from, for the effort report (`wsp-375`): nothing here is computed a second way.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct RowFigures {
+    /// First phase start to last phase end, seconds.
+    pub wall: i64,
+    pub start: i64,
+    pub end: i64,
+    /// Sum of the gap phases.
+    pub gap: i64,
+    /// Gap seconds by what was being waited for.
+    pub waits: std::collections::BTreeMap<String, i64>,
+    /// The seat's own calls, model seconds, tokens, and tool seconds by kind.
+    pub calls: u64,
+    pub model_secs: i64,
+    pub tokens_in: u64,
+    pub cache_read: u64,
+    pub tokens_out: u64,
+    pub tools: std::collections::BTreeMap<String, i64>,
+    /// Sessions whose transcript was not found: their calls are not counted.
+    pub missing: usize,
+    pub sessions: usize,
+}
+
+pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
+    let i = gather(store, id);
+    let phases = build(&i);
+    let run = run_legs_for(&i, &phases, None);
+    let seat = seat_report(&i, &phases, &run, &transcript);
+    let mut f = RowFigures::default();
+    let a = phases.iter().map(|p| p.start).min().unwrap_or(0);
+    let b = phases.iter().map(|p| p.end).max().unwrap_or(0);
+    f.wall = (b - a).max(0);
+    f.start = a;
+    f.end = b;
+    for p in phases.iter().filter(|p| p.gap) {
+        f.gap += p.seconds();
+        *f.waits.entry(p.waiting_for.clone().unwrap_or_else(|| "unnamed".into())).or_insert(0) += p.seconds();
+    }
+    f.sessions = seat.sessions.len();
+    f.missing = seat.missing.len();
+    for p in &seat.phases {
+        f.calls += p.calls;
+        f.model_secs += p.model_secs;
+        f.tokens_in += p.tokens_in;
+        f.cache_read += p.cache_read;
+        f.tokens_out += p.tokens_out;
+        for (k, v) in &p.tools {
+            *f.tools.entry(k.clone()).or_insert(0) += v;
+        }
+    }
+    f
+}
+
 const USAGE: &str = "wsp timeline <row> [--json] [--legs DIR]";
 
 pub fn timeline(store: &Store, args: &Args) -> i32 {

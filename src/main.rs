@@ -38,6 +38,7 @@ mod cmd_attempts;
 mod cmd_brief;
 mod cmd_burn;
 mod cmd_cost;
+mod cmd_report;
 mod cmd_checkout;
 mod cmd_govern;
 mod cmd_install;
@@ -205,6 +206,8 @@ const BOOL_FLAGS: &[&str] = &[
     "sweep",
     // And for `install`, whose positional is the binary to install.
     "dry-run",
+    // `worklist output <slug> --none`, and the source of one it adds.
+    "none", "wsp",
     // Same for `sandbox`, whose positional is a sandbox name.
     "keep", "seed", "fake",
     // And `despawn`, whose positional is a task id.
@@ -2173,7 +2176,17 @@ fn help_text() -> String {
   wsp worklist resume [<slug>] ["…"]  back to where it was parked, at the same
                                     group or barrier and with the same check
                                     owed. Records no verdict and passes nothing
-  wsp worklist done <slug>          nothing left to want from it
+  wsp worklist done <slug> [--force why…]
+                                    nothing left to want from it. Refused while
+                                    a declared output is missing; --force and
+                                    a why goes past it, logged
+  wsp worklist output <slug> [add <name> [--from <member>|--barrier|--wsp] [--kind html|md|json|png]|rm <name>|--none]
+                                    what the list hands back, in ~/.compound/
+                                    artefacts/<slug>/: work and effort unless
+                                    --none takes them off
+  wsp worklist report <slug> [--baseline <slug>]
+                                    (re)write effort.html and effort.json from
+                                    cost, timeline and attempts, any time
   wsp worklist advance [<slug>]     take the steps a run owes now: spawn its
                                     members, a read-only verifier on each that
                                     has landed, and an agent to check the

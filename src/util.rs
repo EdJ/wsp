@@ -143,6 +143,8 @@ pub fn isolated(name: &str) -> Isolated {
     std::fs::create_dir_all(dir.join("state/sock")).unwrap();
     std::env::set_var("WSP_HOME", dir.join("wsp"));
     std::env::set_var("WSP_STATE", dir.join("state"));
+    // wsp-375: a list's reports go under here and never into the real folder.
+    std::env::set_var("WSP_ARTEFACTS", dir.join("artefacts"));
     std::env::set_var("HERDR_SOCKET_PATH", dir.join("no-backend.sock"));
     // `my_pane()` reads the seat variable ahead of herdr's, so a `cargo test`
     // run from inside an agent's seat (as `wsp verify` is) would answer every

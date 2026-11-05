@@ -2338,6 +2338,11 @@ pub struct Worklist {
     /// list stand", after the stated one and the members' own, because at
     /// `new` there are no members to ask and later there may be.
     pub made_in: Option<String>,
+    /// `outputs:` — what the list hands back (`wsp-375`): comma-separated
+    /// `name:kind:source` entries, `-name` for a default taken off, and `off`
+    /// for a list with no outputs at all. Absent is the two defaults, `work`
+    /// and `effort`. Read by [`crate::cmd_report`].
+    pub outputs: Option<String>,
     pub body: String,
 }
 
@@ -2352,6 +2357,7 @@ impl Worklist {
             groups_made: 0,
             project: None,
             made_in: None,
+            outputs: None,
             body: String::new(),
         }
     }
@@ -2383,6 +2389,7 @@ impl Worklist {
             groups_made: doc.opt("groups_made").and_then(|n| n.trim().parse().ok()).unwrap_or(0),
             project: doc.opt("project").filter(|p| !p.trim().is_empty()),
             made_in: doc.opt("made_in").filter(|p| !p.trim().is_empty()),
+            outputs: doc.opt("outputs").filter(|p| !p.trim().is_empty()),
             body: doc.body.clone(),
         }
     }
@@ -2404,6 +2411,9 @@ impl Worklist {
         }
         if let Some(p) = &self.made_in {
             d.set_str("made_in", p);
+        }
+        if let Some(o) = &self.outputs {
+            d.set_str("outputs", o);
         }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();

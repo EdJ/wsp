@@ -120,6 +120,9 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
                 2
             }
         },
+        // wsp-375: what the list hands back, and the effort report wsp writes.
+        "output" | "outputs" => crate::cmd_report::output(store, args),
+        "report" => crate::cmd_report::report(store, args),
         // Running it, which is the barrier. Everything above composes a plan.
         "next" => next(store, args),
         "go" | "start" => go(store, args),
@@ -2292,6 +2295,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // moves when they do, and the reader deciding whether to state one wants to
     // know it was never stated.
     println!("{}  {}", p.dim(&util::pad("under", 8)), home_line(&p, &w.id, worklist::home(store, &w).as_ref()));
+    println!("{}  {}", p.dim(&util::pad("outputs", 8)), crate::cmd_report::line(&w));
     // Where it is up to, and — on a list nobody has started — the fact that
     // this is where it *would* start. A plan has no barriers behind its groups
     // and its position says where the run would begin, which is a different
@@ -3799,6 +3803,19 @@ fn go_with(
     let mut groups = w.groups();
     let resuming = matches!(shut, Some((Gate::Held, _)));
 
+    // wsp-375: **the last barrier is where the list's outputs are due.** wsp
+    // writes the effort report, the work report is composed if the check did
+    // not put its own, and a declared output still missing holds the barrier.
+    if let Some((Gate::After(at), _)) = &shut {
+        if *at == groups.len() && !groups.is_empty() {
+            if let Err(miss) = crate::cmd_report::at_last_barrier(store, &w, &said, args.has("dry-run")) {
+                eprintln!("wsp: the last barrier of `{}` holds — declared output(s) missing: {}", w.id, miss.join(", "));
+                eprintln!("     in {} · a member-sourced output is written by that member; `wsp worklist output {} rm <name>` takes one off", crate::cmd_report::dir(&w.id).display(), w.id);
+                return 1;
+            }
+        }
+    }
+
     // Which barrier was crossed, taken from the gate rather than from the
     // ordinal. Starting a list crosses none: the groups a freshly-started list
     // has already "passed" are work that was finished before it existed, and
@@ -5093,6 +5110,25 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
         println!("{} {}", w.id, Paint::new().dim("is already done"));
         return 0;
     }
+    // wsp-375: the outputs the list declared are part of it being done. A run
+    // wsp closes after the last barrier has been through that gate already.
+    let forced = if matches!(how, crate::cycle::Closing::Passed) {
+        None
+    } else {
+        let why = args.has("force").then(|| args.rest.iter().skip(2).cloned().collect::<Vec<_>>().join(" "));
+        match crate::cmd_report::gate_done(&w, why.as_deref()) {
+            Ok(f) => f,
+            Err(miss) => {
+                eprintln!("wsp: {} cannot be done — its declared output(s) are missing: {}", w.id, miss.join(", "));
+                eprintln!("     in {} · `wsp worklist report {}` writes the effort report", crate::cmd_report::dir(&w.id).display(), w.id);
+                eprintln!("     `wsp worklist output {} rm <name>` or `--none` takes one off; `done {} --force <why>` goes past, logged", w.id, w.id);
+                return 1;
+            }
+        }
+    };
+    if let Some(f) = &forced {
+        w.log(f);
+    }
     let pos = worklist::position(store, &w, Reading::Settled);
     let left: Vec<String> = pos.holding().iter().map(|s| s.id.clone()).collect();
     // The other half of what is being closed over, and the half that is easy to
@@ -5367,6 +5403,8 @@ fn worklist_json_at(w: &Worklist, at: &Position) -> serde_json::Value {
         "created": w.created,
         "groups": at.of,
         "at": at.at,
+        "outputs": crate::cmd_report::declared(w).iter().map(|o| json!({ "name": o.name, "kind": o.kind, "file": o.file(), "present": crate::cmd_report::dir(&w.id).join(o.file()).is_file() })).collect::<Vec<_>>(),
+        "outputs_dir": crate::cmd_report::dir(&w.id),
     })
 }
 
@@ -5396,6 +5434,12 @@ mod tests {
     fn run(store: &Store, argv: &[&str]) -> i32 {
         let rest: Vec<&str> = argv.to_vec();
         dispatch(store, &Args::synth("worklist", &rest, &[]))
+    }
+
+    /// `wsp-375`: a list that is not testing its outputs declares none, or
+    /// `done` waits on the reports every list now hands back.
+    fn no_outputs(store: &Store, slug: &str) {
+        assert_eq!(dispatch(store, &Args::synth("worklist", &["output", slug], &[("none", "true")])), 0);
     }
 
     /// `wsp-315`: the window reads every open list in one process, and each
@@ -7734,6 +7778,7 @@ mod tests {
         run(&store, &["add", "batch", "wl-001"]);
         assert_eq!(run(&store, &["park", "batch", "not", "yet"]), 1, "a draft starts nothing until go");
         assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Draft);
+        no_outputs(&store, "batch");
         assert_eq!(run(&store, &["done", "batch"]), 0);
         assert_eq!(run(&store, &["park", "batch", "too", "late"]), 1);
         assert_eq!(run(&store, &["resume", "batch"]), 1);
@@ -8061,6 +8106,7 @@ mod tests {
         );
 
         // Closing over it says so, once, where the decision is written down.
+        no_outputs(&store, "batch");
         assert_eq!(run(&store, &["done", "batch"]), 0);
         let log = store.worklist("batch").unwrap().section("Log").unwrap_or_default();
         assert!(
@@ -8086,6 +8132,7 @@ mod tests {
         run(&store, &["go", "batch"]);
         task(&store, "wl-001", "doing");
 
+        no_outputs(&store, "batch");
         assert_eq!(run(&store, &["done", "batch"]), 0);
         let log = store.worklist("batch").unwrap().section("Log").unwrap_or_default();
         assert!(
@@ -8181,6 +8228,7 @@ mod tests {
         run(&store, &["go", "batch"]);
 
         assert_eq!(run(&store, &["done"]), 2, "and it is named rather than taken from the seat");
+        no_outputs(&store, "batch");
         assert_eq!(run(&store, &["done", "batch"]), 0);
         let w = store.worklist("batch").unwrap();
         assert_eq!(w.status(), WorklistStatus::Done);
@@ -8435,6 +8483,7 @@ mod tests {
         let h = heard();
         assert_eq!(h.len(), 1, "{h:?}");
         assert!(h[0].contains("run list passed barrier 1 of 2") && h[0].contains("it holds"), "{h:?}");
+        no_outputs(&store, "run");
         assert_eq!(run(&store, &["done", "run"]), 0);
         let h = heard();
         assert_eq!(h.len(), 1, "{h:?}");
