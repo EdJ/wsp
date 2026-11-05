@@ -861,7 +861,7 @@ mod tests {
         let me = format!("pid {}", std::process::id());
         assert!(said.iter().any(|l| l.contains("waits for the tree lock") && l.contains(&me)), "{said:?}");
         let line = said.iter().find(|l| l.contains("barrier run —")).unwrap_or_else(|| panic!("{said:?}"));
-        let secs: u64 = line.split(", ").last().unwrap().split('s').next().unwrap().parse().unwrap_or_else(|_| panic!("{line}"));
+        let secs: u64 = line.split(" failed, ").nth(1).unwrap().split('s').next().unwrap().parse().unwrap_or_else(|_| panic!("{line}"));
         assert!(secs < 10, "the 12 s wait is not in the line: {line}");
     }
 
