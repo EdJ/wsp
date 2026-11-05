@@ -235,7 +235,7 @@ commits on top as the handbook tells it to.
 second row of the same project starts with a warm cache and `rsync --delete` never
 touches it. The far build is the agent's own iteration loop and **never** the
 verdict: the verdict is the seat's `verify` on the copied-back tree. This costs a
-cold build on the far side the first time per project, measured by the proof.
+cold build on the far side the first time per project, measured by the hand proof.
 
 **How it comes back.** Into the seat's worktree for that row: only files whose far
 hash differs from the base, plus deletions, never the excluded set. The agent's
@@ -313,7 +313,7 @@ Claude settings. *Unverified.*
 Which machine: a laptop that sleeps or locks is the wrong shape regardless of
 auth, because a sleeping machine is an unreachable one. The manual setup row asks
 Ed to name the machine; a machine that stays up is the better choice, and
-eds-macbook-i5 with the token is acceptable *if the proof passes on it*.
+eds-macbook-i5 with the token is acceptable *if the hand proof passes on it*.
 
 ## 9. The build, as groups on the `remote-agents` list
 
