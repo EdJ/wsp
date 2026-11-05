@@ -760,6 +760,16 @@ pub(crate) fn mark_ended(store: &Store, seat: &str, ok: bool) -> bool {
     })
 }
 
+/// Whether group `i` (0-based) has nothing left for a check to decide: its list
+/// is done, or its barrier — or one past it — has a verdict written. A check
+/// still open on such a group is a second one, seated while the first settled
+/// the barrier (`pre-prep` barrier 2, 2026-11-05: cpd-2999 stood 100 minutes
+/// holding one of the four places, and was told to close, and wsp then wrote a
+/// `go` for it on a barrier long passed). `wsp-385`.
+pub(crate) fn moot(w: &Worklist, groups: &[Group], i: usize) -> bool {
+    w.status() == crate::model::WorklistStatus::Done || i < crate::worklist::crossed(groups)
+}
+
 /// Group `at`'s standing check seats, settled or not.
 pub(crate) fn standing_on(g: &Group) -> Vec<String> {
     g.checks.iter().filter_map(|c| c.standing().map(str::to_string)).collect()

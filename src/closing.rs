@@ -338,9 +338,16 @@ pub(crate) fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
     }
     // A barrier check still open: its verdict, `go` or `hold`, is the close.
     for w in store.worklists().into_iter().filter(|w| matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held)) {
-        for (i, g) in w.groups().iter().enumerate() {
+        let groups = w.groups();
+        for (i, g) in groups.iter().enumerate() {
             let Some(c) = crate::barrier::running(g) else { continue };
             let Some(seat) = c.standing().map(str::to_string) else { continue };
+            // A barrier already passed has nothing for this check to decide:
+            // the tick ends its seat, and it is not told to close or closed
+            // with a `go` (`wsp-385`).
+            if crate::barrier::moot(&w, &groups, i) {
+                continue;
+            }
             let at = i + 1;
             let key = crate::barrier::subject(&w.id, at);
             let start = Some(util::epoch_of(&c.at));

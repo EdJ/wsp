@@ -25,6 +25,11 @@
 //! nobody can read is not, because a record the run has not yet ended would
 //! otherwise hold the cap for as long as it stood.
 //!
+//! **A seat whose verdict is recorded is not counted at all** (`wsp-385`), seen
+//! working or not: a verifier with its verdict, a check that has settled, and a
+//! check still open on a barrier that was passed without it (a second one, seated
+//! while the first settled). It is closing, and the tick ends it by its pane.
+//!
 //! **A seat that holds nothing is not counted unless it is seen working**
 //! (`wsp-353`): the seat of a row run as legs, which handed the row to them
 //! (the legs' own seats are counted as legs), and any seat of a member of a
@@ -193,9 +198,12 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     let governor = |seat: &str| crate::cmd_agent::governs_seat(&r.governors, seat);
     // `since` is when the record opened, where one says: a seat still reading
     // `starting` that long after is not an agent that is coming up.
-    let mut take = |out: &mut Vec<Counted>, seat: Option<&str>, what: String, finished: bool, since: Option<&str>| {
+    // **`settled`: a verdict is recorded** (`wsp-385`) — a verifier's, or a check's
+    // (its own, or its barrier's having passed). Such a seat is closing and holds
+    // no place whatever its screen shows; the tick ends it by its pane.
+    let mut take = |out: &mut Vec<Counted>, seat: Option<&str>, what: String, finished: bool, settled: bool, since: Option<&str>| {
         if let Some(s) = seat {
-            if !here(s) || governor(s) || !seen.insert(s.to_string()) || !look(s).counts(finished) {
+            if !here(s) || governor(s) || !seen.insert(s.to_string()) || settled || !look(s).counts(finished) {
                 return;
             }
             let never_up = look(s) == Look::Starting && since.is_some_and(|at| now - util::epoch_of(at) > crate::barrier::NOT_UP_AFTER);
@@ -213,9 +221,9 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             let running = p.state == crate::verification::State::Running;
             match &p.pane {
                 Some(_) if !p.standing() => {}
-                Some(seat) => take(&mut out, Some(seat), what, !running, Some(&p.at)),
+                Some(seat) => take(&mut out, Some(seat), what, !running, !running, Some(&p.at)),
                 None if running && p.ending == crate::verification::Ending::Standing && fresh(&p.at) => {
-                    take(&mut out, None, what, false, None)
+                    take(&mut out, None, what, false, false, None)
                 }
                 None => {}
             }
@@ -224,12 +232,14 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
 
     // A barrier check, by its entry on the group.
     for w in &r.lists {
-        for (i, g) in w.groups().iter().enumerate() {
+        let groups = w.groups();
+        for (i, g) in groups.iter().enumerate() {
+            let moot = crate::barrier::moot(w, &groups, i);
             for c in &g.checks {
                 let what = crate::barrier::seat_label(&w.id, i + 1);
                 match (c.standing(), &c.pane) {
-                    (Some(seat), _) => take(&mut out, Some(seat), what, !c.open(), Some(&c.at)),
-                    (None, None) if c.open() && fresh(&c.at) => take(&mut out, None, what, false, None),
+                    (Some(seat), _) => take(&mut out, Some(seat), what, !c.open() || moot, !c.open() || moot, Some(&c.at)),
+                    (None, None) if c.open() && fresh(&c.at) => take(&mut out, None, what, false, false, None),
                     _ => {}
                 }
             }
@@ -246,8 +256,8 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             let what = crate::legs::label(&t.id, &l.name);
             let running = l.state == crate::legs::State::Running;
             match &l.pane {
-                Some(seat) => take(&mut out, Some(seat), what, parked || !running || l.ending != crate::verification::Ending::Standing, l.started.as_deref()),
-                None if running && l.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false, None),
+                Some(seat) => take(&mut out, Some(seat), what, parked || !running || l.ending != crate::verification::Ending::Standing, false, l.started.as_deref()),
+                None if running && l.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false, false, None),
                 None => {}
             }
         }
@@ -266,7 +276,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     for (seat, id) in held {
         let Some(s) = status(&id) else { continue };
         let holds_nothing = in_parked_list(r, &id) || r.tasks.iter().any(|t| t.id == id && crate::legs::staged(t));
-        take(&mut out, Some(&seat), id, finished(s) || holds_nothing, None);
+        take(&mut out, Some(&seat), id, finished(s) || holds_nothing, false, None);
     }
 
     // A member the run moved to `doing` whose agent has not claimed it yet:
@@ -277,7 +287,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             .and_then(|l| l.lines().last().map(|x| x.contains(crate::cycle::STARTED_BY)))
             .unwrap_or(false);
         if t.status() == Status::Doing && ours && !r.claims.contains_key(&t.id) && fresh(&t.updated) {
-            take(&mut out, None, t.id.clone(), false, None);
+            take(&mut out, None, t.id.clone(), false, false, None);
         }
     }
     out
@@ -526,7 +536,26 @@ mod tests {
             counted(&r, &[("w3:p1", Look::Quiet), ("w3:p3", Look::Quiet)]),
             ["m-1 · verifying", "m-2 · verifying"]
         );
-        assert_eq!(counted(&r, &[("w3:p1", Look::Gone), ("w3:p3", Look::Working)]), ["m-2 · verifying", "m-3 · verifying"]);
+        // A decided verifier is closing: not counted even if its screen shows work (`wsp-385`).
+        assert_eq!(counted(&r, &[("w3:p1", Look::Gone), ("w3:p3", Look::Working)]), ["m-2 · verifying"]);
+    }
+
+    /// `wsp-385`: a check whose verdict is recorded, or whose barrier was passed
+    /// without it, holds no place however its screen reads; an undecided one does.
+    #[test]
+    fn a_check_with_its_verdict_recorded_is_not_counted_even_working() {
+        use crate::barrier::{Check, State as CheckState};
+        let mut w = Worklist::new("run", "A run");
+        let group = |checks: Vec<Check>, verdict: &str| crate::model::Group { checks, verdict: verdict.into(), ..Default::default() };
+        let seated = |seat: &str, state| Check { pane: Some(seat.into()), state, ..Check::opened(None, None) };
+        w.set_groups(&[
+            group(vec![seated("w1:p1", CheckState::Passes), seated("w1:p2", CheckState::Running)], "2026-11-05T15:49:26Z go"),
+            group(vec![seated("w1:p3", CheckState::Running)], ""),
+        ]);
+        let mut r = records(Vec::new(), &[]);
+        r.lists.push(w);
+        let looks = [("w1:p1", Look::Working), ("w1:p2", Look::Working), ("w1:p3", Look::Working)];
+        assert_eq!(counted(&r, &looks), ["run · barrier 2"]);
     }
 
     struct AllWorking;

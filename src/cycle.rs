@@ -3252,8 +3252,11 @@ pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     for w in store.worklists() {
         // A list closed by `done` while a check was still reading has nothing
         // left for that check to decide, settled or not.
-        let over = w.status() == WorklistStatus::Done;
-        for (i, g) in w.groups().iter().enumerate() {
+        let groups = w.groups();
+        for (i, g) in groups.iter().enumerate() {
+            // **Or a barrier already passed** (`wsp-385`): a second check seated
+            // while the first settled it has nothing to decide either.
+            let over = crate::barrier::moot(&w, &groups, i);
             for c in g.checks.iter().filter(|c| !c.open() || over) {
                 let Some(seat) = c.standing() else { continue };
                 if seats.state(seat).is_some_and(|s| s.turn_in_flight()) {
@@ -3269,6 +3272,10 @@ pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
                     ));
                 }
                 crate::barrier::mark_ended(store, seat, ended.is_ok());
+                if c.open() && ended.is_ok() {
+                    // Said on the entry too, so nothing reads it as still deciding.
+                    crate::barrier::settle(store, &w.id, i + 1, crate::barrier::State::Abandoned);
+                }
                 out.push(seat.to_string());
             }
         }
@@ -6196,6 +6203,36 @@ fn only_a_working_screen_is_ever_overruled() {
         l.set_status(WorklistStatus::Done);
         store.save_worklist(&l).unwrap();
         assert_eq!(checks_finished(&store, &Blind), vec!["cpd-open".to_string()]);
+    }
+
+    /// `wsp-385`: a second check seated while the first settled the barrier
+    /// stands open on a group that has passed. Nothing is left for it to decide,
+    /// so the tick ends its seat by its pane and writes the entry off — and the
+    /// closing tick neither tells it to close nor writes it a `go`.
+    #[test]
+    fn a_check_open_on_a_barrier_already_passed_is_ended_and_not_told_to_close() {
+        let (_env, store) = scratch("passedcheck");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        check_seated(&store, 1, "cpd-second");
+        assert!(checks_finished(&store, &Blind).is_empty(), "an open check on an open barrier is deciding");
+        let mut l = store.worklist("run").unwrap();
+        let mut g = l.groups();
+        g[0].verdict = "2026-11-05T15:49:26Z go".into();
+        l.set_groups(&g);
+        store.save_worklist(&l).unwrap();
+        tests::TOLD.with(|t| t.borrow_mut().clear());
+        crate::closing::tick_at(&store, &Blind, util::epoch_secs() + 3600);
+        assert!(tests::TOLD.with(|t| t.borrow().is_empty()), "a passed barrier's check is not told to close");
+        assert_eq!(checks_finished(&store, &Blind), vec!["cpd-second".to_string()]);
+        let c = &checks(&store, 1)[0];
+        assert_eq!(c.ending, crate::barrier::Ending::Ended);
+        assert_eq!(c.state, crate::barrier::State::Abandoned);
+        assert!(checks_finished(&store, &Blind).is_empty(), "ended once");
     }
 
     /// Panes the backends hold, all idle, each with its label.
