@@ -435,6 +435,43 @@ pub(crate) fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
     out
 }
 
+/// The worktrees the sandbox at `dir` made in real repositories, as `(repo,
+/// tree)` (`wsp-373`). A sandbox's store is seeded with the real projects, so a
+/// task started in it gets its tree under the project's real root —
+/// `~/claude/wsp/.worktrees/demo-001` — and `rm` removed the sandbox directory
+/// and left three of them, 25 GB each by `du`. A tree is a sandbox's when its
+/// row is a task of the sandbox's store and is not one of the real store's.
+fn strays_of(real: &Store, dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let home = dir.join("wsp");
+    if !home.is_dir() {
+        return Vec::new();
+    }
+    let sb = Store::at(home, dir.join("state"));
+    let rows: std::collections::BTreeSet<String> = sb.tasks().into_iter().map(|t| t.id).collect();
+    let mut out = Vec::new();
+    for repo in crate::check_tree::repos(&sb) {
+        let Ok(entries) = std::fs::read_dir(repo.join(crate::cmd_checkout::WORKTREES)) else { continue };
+        let mut trees: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.join(".git").exists()).collect();
+        trees.sort();
+        for tree in trees {
+            let name = tree.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let row = crate::leg_tree::row_of(name);
+            if rows.contains(row) && real.task(row).is_none() {
+                out.push((repo.clone(), tree));
+            }
+        }
+    }
+    out
+}
+
+/// Every sandbox's [`strays_of`], as paths, for the disk reading.
+pub(crate) fn strays(real: &Store) -> Vec<PathBuf> {
+    let root = real.state.join("sandbox");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    dirs.iter().flat_map(|d| strays_of(real, d)).map(|(_, t)| t).collect()
+}
+
 /// `HERDR_SESSION=<name>` in a process's environment, with a boundary after it
 /// so `wsp-w1` does not match `wsp-w12`.
 fn holds_session(rest: &str, name: &str) -> bool {
@@ -1163,15 +1200,22 @@ fn rm(store: &Store, args: &Args) -> i32 {
         // reason it is read before the removal below: it is the fact the answer
         // turns on, and the real run destroys it.
         let had_dir = dir.exists();
+        // Read before the directory goes: the sandbox's store says which trees
+        // in the real repositories are its own.
+        let trees = strays_of(store, &dir);
         let (had_session, reaped) = match dry {
             true => (session(name).is_some(), session_children(&root, name).len()),
             false => stop_session(&root, name),
         };
         if !dry {
+            for (repo, tree) in &trees {
+                crate::cmd_checkout::remove(repo, tree);
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
-        if had_session || had_dir || reaped > 0 {
-            removed.push(json!({ "name": name, "processes": reaped }));
+        if had_session || had_dir || reaped > 0 || !trees.is_empty() {
+            let shown: Vec<String> = trees.iter().map(|(_, t)| util::contract(t)).collect();
+            removed.push(json!({ "name": name, "processes": reaped, "trees": shown }));
         }
     }
 
@@ -1193,6 +1237,9 @@ fn rm(store: &Store, args: &Args) -> i32 {
             let n = r["processes"].as_u64().unwrap_or(0) as usize;
             let verb = if dry { "would remove" } else { "removed" };
             println!("{verb} {}{}", r["name"].as_str().unwrap_or(""), reaped_note(n, dry));
+            for t in r["trees"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                println!("  {verb} its worktree {t}");
+            }
         }
     }
     0
@@ -1617,5 +1664,34 @@ mod tests {
                 dir.display()
             );
         }
+    }
+
+    /// A sandbox's store seeded with a real project: a tree for a task only the
+    /// sandbox has is its stray, and a tree for a task the real store has is not.
+    #[test]
+    fn a_tree_a_sandbox_made_in_a_real_repo_is_its_stray_and_a_real_ones_is_not() {
+        let env = util::isolated("sandbox-strays");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for t in ["demo-001", "real-001", "other"] {
+            std::fs::create_dir_all(repo.join(".worktrees").join(t)).unwrap();
+            std::fs::write(repo.join(".worktrees").join(t).join(".git"), "gitdir: x\n").unwrap();
+        }
+        let real = Store::open();
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        real.save_project(&p).unwrap();
+        real.save_task(&crate::model::Task::new("real", "real-001")).unwrap();
+
+        let dir = real.state.join("sandbox").join("wsp-tl");
+        let sb = Store::at(dir.join("wsp"), dir.join("state"));
+        sb.save_project(&p).unwrap();
+        sb.save_task(&crate::model::Task::new("demo", "demo-001")).unwrap();
+        sb.save_task(&crate::model::Task::new("real", "real-001")).unwrap();
+
+        let found: Vec<String> = strays_of(&real, &dir).iter().map(|(_, t)| t.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(found, vec!["demo-001".to_string()]);
+        assert_eq!(strays(&real).len(), 1);
+        assert!(strays_of(&real, &real.state.join("sandbox").join("wsp-none")).is_empty());
     }
 }

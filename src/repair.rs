@@ -336,6 +336,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // (`wsp-327`): `wsp done` takes the tree, and rows wait at review for days.
     crate::build_output::tidy(store);
     // And whether the disk those trees are on is running out.
+    // And the scratch of rows that have closed (`wsp-373`).
+    crate::scratch::tidy(store);
     crate::disk::tidy(store);
     // And the build holds of processes that died, and the load warning's edges
     // (`wsp-331`).

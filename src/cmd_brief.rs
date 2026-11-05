@@ -1265,6 +1265,19 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             })
             .to_string(),
         );
+        // Where build dirs and copies outside the tree go (`wsp-373`): wsp
+        // removes it when the row closes; anything under `~/.cache` it does not
+        // know of.
+        if let Some(scratch) = std::env::var_os("WSP_SCRATCH") {
+            row(
+                "scratch",
+                p.dim(&format!(
+                    "{} ($WSP_SCRATCH) — put build dirs and copies that live outside your tree there, never under ~/.cache; wsp removes it when the row closes, keeping what you list in .keep or cite",
+                    util::contract(std::path::Path::new(&scratch))
+                ))
+                .to_string(),
+            );
+        }
         // Whose the land is and what review follows it (`wsp-306`), said to
         // the agent holding a row and nobody else: a leg's work is landed by
         // its row's finish, and a seat with nothing claimed has no row to end.

@@ -59,7 +59,7 @@ pub(crate) fn named(store: &Store, name: &str) -> Option<(String, usize)> {
 /// Whether group `at` of `list` still has a check that is somebody's: one
 /// still reading, or a seat not yet ended. A fresh check on the same group is
 /// started in the same tree, and its entry is written before its seat exists.
-fn in_use(store: &Store, list: &str, at: usize) -> bool {
+pub(crate) fn in_use(store: &Store, list: &str, at: usize) -> bool {
     store
         .worklist(list)
         .and_then(|w| w.groups().into_iter().nth(at.saturating_sub(1)))
@@ -73,7 +73,26 @@ pub(crate) const RESIDUE_SECTION: &str = "Residue";
 /// costs a rebuild and nothing else. A glob without a `/` (after a trailing one
 /// is dropped) names a file or directory at any depth; one with a `/` is
 /// anchored at the tree's root.
-const RESIDUE: &[&str] = &["target/", "__pycache__/", "*.pyc"];
+///
+/// **Web trees too** (`wsp-373`): `node_modules/`, `dist/`, `test-results/`
+/// and a dev server's `.dev-port`, `.dev.log`, `.dev/` and `.watch/`. A check
+/// of a web project ran `npm ci` and a dev server in its tree; each of those
+/// trees was kept as "more than build output" for a day, 5 GB apiece, because
+/// none of this was on the list and only a project's own `## Residue` could
+/// add it. Everything here is ignored by the project's own `.gitignore` or
+/// would be named by it, and is rebuilt by the same command that made it.
+const RESIDUE: &[&str] = &[
+    "target/",
+    "__pycache__/",
+    "*.pyc",
+    "node_modules/",
+    "dist/",
+    "test-results/",
+    ".dev-port",
+    ".dev.log",
+    ".dev/",
+    ".watch/",
+];
 
 /// The ignored paths a tree may hold and still count as having nothing in it.
 /// Only an ignored path is ever residue: an untracked one is somebody's.
@@ -140,13 +159,74 @@ pub(crate) fn holds_more(found: &[String]) -> String {
     format!("it holds more than build output: {shown}{more}")
 }
 
+/// The pids in `lsof -d cwd -Fpn` output whose working directory is `dir` or
+/// below it — the one fact that proves a process belongs to a tree.
+pub(crate) fn pids_in(lsof: &str, dir: &Path) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut pid = None;
+    for line in lsof.lines() {
+        match line.split_at_checked(1) {
+            Some(("p", rest)) => pid = rest.trim().parse::<u32>().ok(),
+            Some(("n", rest)) => {
+                if let (Some(p), true) = (pid, Path::new(rest).starts_with(dir)) {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What is running with `dir` as its working directory, other than this process
+/// and its parents.
+fn running_in(dir: &Path) -> Vec<u32> {
+    let Ok(out) = std::process::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output() else { return Vec::new() };
+    let dir = util::real(&dir.display().to_string());
+    let skip = crate::cmd_sandbox::ancestors(&crate::cmd_sandbox::processes());
+    pids_in(&String::from_utf8_lossy(&out.stdout), &dir).into_iter().filter(|p| !skip.contains(p)).collect()
+}
+
+/// Stop the dev servers and watchers a check left running in its tree (a Vite
+/// server, `tsgo` and Vitest watchers were still up 21 hours after their
+/// check, `wsp-373`): `TERM`, a moment, then `KILL` for what is left. Proved by
+/// cwd alone — a process whose working directory is in the tree is the tree's.
+/// Returns how many were stopped. Not under test: it would signal the machine's
+/// own processes; [`pids_in`] is what the tests drive.
+fn stop_running(dir: &Path) -> usize {
+    if cfg!(test) {
+        return 0;
+    }
+    let signal = |sig: &str, pids: &[u32]| {
+        if !pids.is_empty() {
+            let _ = std::process::Command::new("kill")
+                .arg(sig)
+                .args(pids.iter().map(|p| p.to_string()))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    };
+    let found = running_in(dir);
+    signal("-TERM", &found);
+    if !found.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        signal("-KILL", &running_in(dir));
+    }
+    found.len()
+}
+
 /// Take the tree at `dir`, of the repository at `repo`, unless somebody is in
-/// it or something is.
+/// it or something is. What its check left running is stopped first, once no
+/// seat is in it: a watcher rewrites `.dev.log` and holds the tree open.
 fn take(repo: &Path, dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
     let path = util::contract(dir);
     if let Some(why) = standing(dir) {
         return Tree::Kept { path, why };
     }
+    stop_running(dir);
     match litter(dir, residue) {
         None => Tree::Kept { path, why: "git could not read it".into() },
         Some(found) if !found.is_empty() => Tree::Kept { path, why: holds_more(&found) },
@@ -480,6 +560,35 @@ mod tests {
         assert!(matches!(discard(&store, "run-check-1", &nobody), Tree::Absent));
         let dir = tree(&repo, "run-check-1");
         assert!(matches!(discard(&store, "run-check-1", &nobody), Tree::Removed { .. }));
+        assert!(!dir.exists());
+    }
+
+    /// What `lsof -d cwd -Fpn` prints, narrowed to the tree: the processes
+    /// whose working directory is in it, below it too, and a sibling whose name
+    /// merely begins the same is not.
+    #[test]
+    fn a_process_is_the_trees_by_its_working_directory() {
+        let lsof = "p10\nn/r/.worktrees/web-check-3\np11\nn/r/.worktrees/web-check-3/spikes/web-chrome\np12\nn/r/.worktrees/web-check-30\np13\nn/\np11\nn/r/.worktrees/web-check-3/x\n";
+        assert_eq!(pids_in(lsof, Path::new("/r/.worktrees/web-check-3")), vec![10, 11]);
+    }
+
+    /// The trees of 2026-11-05: `npm ci` and a dev server left `node_modules/`,
+    /// `dist/`, `test-results/` and the server's own files, all ignored. They
+    /// are build output; a changed or untracked file beside them is not.
+    #[test]
+    fn a_web_checks_node_modules_and_dev_server_files_are_residue() {
+        let (_env, store, repo) = scratch("web", ENDED);
+        std::fs::write(repo.join(".gitignore"), "target/\n.worktrees/\nnode_modules/\ndist/\ntest-results/\n.dev-port\n.dev.log\n.watch/\n").unwrap();
+        run(&repo, &["add", ".gitignore"]);
+        run(&repo, &["commit", "--quiet", "-m", "ignore"]);
+        let dir = tree(&repo, "run-check-1");
+        for f in ["node_modules/a/x.js", "dist/i.js", "test-results/r.json", ".dev-port", ".dev.log", ".watch/w"] {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+        let found = sweep(&store, &nobody);
+        assert!(matches!(found.as_slice(), [Tree::Removed { .. }]), "the web residue kept the tree: {}", found.len());
         assert!(!dir.exists());
     }
 }

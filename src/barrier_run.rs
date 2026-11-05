@@ -370,6 +370,18 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     }
     // Who is making the run, so that being killed is seen and not waited out.
     barrier::note_pid(store, list, at);
+    // A run that builds waits while the disk is nearly full (`wsp-373`) rather
+    // than failing partway; it says so once and goes on when room appears.
+    if let Some(repo) = repo_of(store, &w.project.clone().unwrap_or_default()) {
+        let mut said = false;
+        while let Some(why) = crate::disk::hold(store, &repo) {
+            if !said {
+                log_line(store, &format!("{list} group {at}: the barrier's run waits: {why}"));
+                said = true;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
     let groups = w.groups();
     let Some(g) = groups.get(at - 1).cloned() else { return 1 };
     let plan = plan(store, &w, at);

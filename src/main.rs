@@ -29,6 +29,7 @@ mod check;
 mod greens;
 mod build_output;
 mod check_tree;
+mod scratch;
 mod disk;
 mod arrange;
 mod attention;
@@ -797,7 +798,7 @@ fn die_on_broken_pipe() {
 /// need. It is short because the property it describes is rare, and it going
 /// stale is the one failure here that costs nothing but a wrong signpost.
 const LOOKS_FIRST: &str =
-    "archive, checkout, install, migrate, project rm, sandbox rm, verify --rm, worklist go, worklist group --drop, worklist rm";
+    "archive, checkout, install, migrate, project rm, sandbox rm, scratch, verify --rm, worklist go, worklist group --drop, worklist rm";
 
 /// Whether this invocation reads `-n`, and what to call it if it does not.
 ///
@@ -887,6 +888,7 @@ fn dry_run(args: &Args) -> (bool, String) {
         "migrate" | "install" | "archive" | "checkout" => (true, args.cmd.clone()),
         "project" | "proj" | "p" => named(matches!(sub, "rm" | "remove" | "delete")),
         "sandbox" => named(matches!(sub, "rm" | "remove" | "stop")),
+        "scratch" => (true, args.cmd.clone()),
         // `group` the way `verify` is: only its removing branch, `--drop`,
         // has anything to look at first.
         "worklist" | "wl" => {
@@ -1210,6 +1212,7 @@ fn main() {
         "land" => cmd_checkout::land(&store, &args),
         "install" => cmd_install::install(&store, &args),
         "sandbox" => cmd_sandbox::sandbox(&store, &args),
+        "scratch" => scratch::scratch(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "spawn" => cmd_spawn::spawn(&store, &args),
         "resume" => cmd_resume::resume(&store, &args),
@@ -1838,6 +1841,9 @@ fn help_text() -> String {
                                     answers the socket out of a state you write
                                     down, so wsp can be driven through the ones
                                     a real herdr cannot be put in
+  wsp scratch [-n]                  the scratch of closed rows ($WSP_SCRATCH and
+                                    ~/.cache/<row-id>): list with sizes, then
+                                    remove what the row did not keep
   wsp sandbox ls|rm [<name>] [--all] [-n]  what is up, and how to drop it —
                                     --all drops every one, so -n names them
                                     first

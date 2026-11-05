@@ -2473,6 +2473,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // never reaches this arm, so asking down one branch only would refuse the
     // word on the other.
     let no_tree = args.has("no-tree");
+    // Work that builds waits while the disk is nearly full (`wsp-373`): a
+    // build that fails halfway costs more than the wait. A governor, a bare
+    // terminal and the primary seat build nothing.
+    if (work.task.is_some() || checking.is_some()) && args.has("agent") && !args.has("govern") {
+        if let Some(why) = cwd.as_deref().and_then(|c| crate::disk::hold(store, &util::expand(c))) {
+            eprintln!("wsp: not starting it: {why}");
+            return 1;
+        }
+    }
     // A check has no task, and reads the trunk: a tree of its own, named for
     // the check, so its builds are nobody else's and `despawn` can take it away.
     let tree_name = work.task.clone().or_else(|| checking.as_ref().map(|(l, at)| crate::barrier::subject(l, *at)));
@@ -2619,6 +2628,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // when `--from` is not given, and the orders say to write it there.
     if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {
         order.env.insert("WSP_BATON".into(), crate::closing::baton_path(store, task, name).display().to_string());
+    }
+    // A row's scratch has an owner (`wsp-373`): build dirs and copies outside
+    // its tree go here, and wsp removes them when the row closes.
+    if will_start {
+        if let Some(task) = work.task.as_deref() {
+            let scratch = crate::scratch::path(store, task);
+            let _ = std::fs::create_dir_all(&scratch);
+            order.env.insert("WSP_SCRATCH".into(), scratch.display().to_string());
+        }
     }
     // And so is the verdict of a member, a verifier and a check (`wsp-374`): the
     // closing verb reads it when it is given no `--from`, and a file left by an
