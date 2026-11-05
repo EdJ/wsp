@@ -8677,6 +8677,7 @@ mod tests {
             since: Default::default(),
             spawned: store.spawned(),
             unsent: Default::default(),
+            full_suite: Default::default(),
         };
         cmd_agent::wip_rows(&w).into_iter().find(|r| r.pane == seat).expect("the seat is drawn")
     }

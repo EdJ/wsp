@@ -4035,6 +4035,10 @@ pub(crate) struct Wip {
     /// tick (`wsp-386`) — [`crate::repair::unsent_seats`]. Drawn as `typed, not
     /// sent` in place of `idle`.
     pub unsent: std::collections::BTreeSet<String>,
+    /// Rows that started a full-suite `cargo test` in their seat (`wsp-389`):
+    /// [`crate::throttle::full_suite_tasks`]. Drawn as `full suite in a member
+    /// seat`; published as `full_suite`.
+    pub full_suite: std::collections::BTreeSet<String>,
 }
 
 /// Note this census's seats against `seat-since.json` and say since when each
@@ -4160,6 +4164,7 @@ impl Wip {
             since,
             spawned: store.spawned(),
             unsent: crate::repair::unsent_seats(store),
+            full_suite: crate::throttle::full_suite_tasks(&store.state),
         }
     }
 }
@@ -4332,6 +4337,10 @@ pub(crate) struct WipRow {
     /// The prompt holds text that was typed and never submitted, for more than
     /// a tick (`wsp-386`). Drawn as `typed, not sent`; published as `unsent`.
     pub(crate) unsent: bool,
+    /// The row this seat holds, or verifies, has started a full-suite `cargo
+    /// test` in its seat (`wsp-389`). Drawn as `full suite in a member seat`;
+    /// published as `full_suite`.
+    pub(crate) full_suite: bool,
     /// The scope this pane was the governor of, when it is gone. **A gone pane
     /// is not a governor** (`wsp-386`): `seat` and the governor role are left
     /// off it, so a list's seat that vanished does not read as seated; the
@@ -4646,6 +4655,10 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             spawned_by,
             leg: leg.cloned(),
             unsent: !a.state.turn_in_flight() && w.unsent.contains(seat),
+            full_suite: bound
+                .map(|t| t.id.as_str())
+                .or_else(|| verifying.get(seat).map(|(m, _)| m.as_str()))
+                .is_some_and(|id| w.full_suite.contains(id)),
             was_governor,
         });
     }
@@ -4767,7 +4780,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "role": r.role.json(),
             "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
             "spawned_by": r.spawned_by,
-            "unsent": r.unsent, "was_governor": r.was_governor,
+            "unsent": r.unsent, "full_suite": r.full_suite, "was_governor": r.was_governor,
             "leg": r.leg.as_ref().map(|s| json!({
                 "name": s.leg.name, "after": s.after, "index": s.index, "of": s.of,
             })),
@@ -4802,6 +4815,9 @@ const REVIEW_VERBS: &str = "the person's: wsp done <id> · wsp reopen <id> — a
 
 /// What the STATE column says of a seat whose prompt holds text nobody sent.
 const UNSENT_WORD: &str = "typed, not sent";
+
+/// The note on a row whose seat ran the whole suite (`wsp-389`).
+const FULL_SUITE_WORD: &str = "full suite in a member seat";
 
 fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
     let rows = wip_rows(w);
@@ -4923,6 +4939,10 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             // herdr label has always made, and on a seat herdr does not draw
             // this is the only place a person reading `wip` sees it.
             let doing = r.said.as_deref().unwrap_or(&r.task);
+            let flag = match r.full_suite {
+                true => format!("{flag} {}", p.yellow(&format!("· {FULL_SUITE_WORD}"))).trim_start().to_string(),
+                false => flag,
+            };
             out.push(format!(
                 "{}  {}  {}  {} {}",
                 util::pad(&r.project, pw),
@@ -8159,6 +8179,7 @@ mod tests {
             since: Default::default(),
             spawned: Default::default(),
             unsent: Default::default(),
+            full_suite: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -8355,6 +8376,7 @@ mod tests {
             since: Default::default(),
             spawned: Default::default(),
             unsent: Default::default(),
+            full_suite: Default::default(),
         }
     }
 
@@ -8413,6 +8435,18 @@ mod tests {
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         assert!(text.contains("typed, not sent"), "{text}");
         assert!(text.contains("was governor · tonight") || text.contains("was "), "{text}");
+    }
+
+    #[test]
+    fn a_seat_whose_row_ran_the_full_suite_says_so_and_the_others_do_not() {
+        let mut w = wip_world();
+        w.full_suite.insert("t-001".into());
+        let j = wip_json(&w);
+        let row = |pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap().clone();
+        assert_eq!(row("w1:p1")["full_suite"], true);
+        assert_eq!(row("w2:p1")["full_suite"], false);
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert_eq!(text.matches("full suite in a member seat").count(), 1, "{text}");
     }
 
     #[test]

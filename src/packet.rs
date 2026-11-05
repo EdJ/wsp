@@ -275,6 +275,10 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
     render(&format!("# Packet · {} · {}\n", t.id, t.title), &p, root, &t.id, "")
 }
 
+/// What a packet that names a `cargo test` says of how much to run (`wsp-389`):
+/// the narrow filter is the member's, the full suite the barrier's.
+pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrower filter of it, for what you changed — never the full `cargo test`. The full suite runs once per group, at the barrier and (where the project declares it) in the verifier's tier; a full-suite run in your seat is noted in `wsp wip`. If the full suite matters for your change, name it in your review summary and leave it to the barrier.";
+
 /// The print: a heading, the author's words, each named file inline, and a tail
 /// (a leg's finish line), refused over [`CAP`].
 fn render(head: &str, p: &Packet, root: &Path, who: &str, tail: &str) -> Result<String, String> {
@@ -290,6 +294,9 @@ fn render(head: &str, p: &Packet, root: &Path, who: &str, tail: &str) -> Result<
     let mut out = head.to_string();
     if !p.text.is_empty() {
         out.push_str(&format!("\n{}\n", p.text));
+    }
+    if p.text.contains("cargo test") {
+        out.push_str(&format!("\n{TEST_SCOPE}\n"));
     }
     for (path, body) in &parts {
         out.push_str(&format!("\n## {path}\n```\n{}\n```\n", body.trim_end()));
@@ -495,6 +502,18 @@ mod tests {
         assert!(!short_start(Some(&t), true, false, false, false), "a kind with no short start");
         assert!(!short_start(Some(&row("packet: off\nx")), true, false, false, true), "the row opted out");
         assert!(!short_start(Some(&row("")), true, false, false, true), "no packet");
+    }
+
+    #[test]
+    fn a_packet_naming_a_cargo_test_says_the_full_suite_is_the_barriers() {
+        let dir = std::env::temp_dir().join(format!("wsp-packet-scope-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let with = build(&row("file: src/a.rs\nverify  cargo test a::"), &dir).unwrap();
+        assert!(with.contains(TEST_SCOPE), "{with}");
+        let without = build(&row("file: src/a.rs\nSave prints ok."), &dir).unwrap();
+        assert!(!without.contains(TEST_SCOPE), "{without}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

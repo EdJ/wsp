@@ -469,6 +469,51 @@ pub(crate) fn real_tool(tool: &str, path: &str, shims: &Path) -> Option<PathBuf>
         .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) && !is_shim(p))
 }
 
+/// Whether `cargo test` is the whole suite: no filter, no target or package
+/// narrowing it. Any bare word after the subcommand is a filter (or a flag's
+/// value, which errs toward calling the run narrow, never the other way).
+pub(crate) fn is_full_suite(tool: &str, args: &[String]) -> bool {
+    if tool != "cargo" || !matches!(subcommand(args), Some("test" | "t")) {
+        return false;
+    }
+    const NARROW: &[&str] = &["--lib", "--bins", "--bin", "--test", "--tests", "--doc", "--example", "--examples", "--bench", "--benches", "-p", "--package"];
+    let at = args.iter().position(|a| !a.starts_with('+') && !a.starts_with('-')).unwrap_or(0);
+    let rest = &args[at + 1..];
+    !rest.iter().any(|a| !a.starts_with('-') || NARROW.contains(&a.split('=').next().unwrap_or("")))
+}
+
+fn full_suite_dir(state: &Path) -> PathBuf {
+    state.join("full-suite")
+}
+
+/// Note a full-suite `cargo test` started in a row's seat (`wsp-389`): the
+/// suite is the barrier's, once per group. A check or the barrier's own run has
+/// `WSP_*` stripped from its environment, so a task here is a member's or a
+/// verifier's seat. One file per row, with a count; `wsp wip` reads it.
+fn note_full_suite(ctx: &Ctx) {
+    let path = full_suite_dir(ctx.state).join(format!("{}.json", ctx.task));
+    let runs = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("runs").and_then(Value::as_u64))
+        .unwrap_or(0)
+        + 1;
+    let _ = fs::create_dir_all(full_suite_dir(ctx.state));
+    let rec = json!({"task": ctx.task, "runs": runs, "since": util::epoch_secs(), "tree": tree_of(&ctx.cwd).display().to_string()});
+    let _ = crate::store::write_atomic(&path, &rec.to_string());
+    (ctx.say)(&format!(
+        "wsp: that is the full suite, and in a member's or verifier's seat it is noted (`wsp wip` says so). Run the tests for what you changed (`cargo test <module>::`); the full suite runs once per group, at the barrier."
+    ));
+}
+
+/// The rows that have started a full suite in their seat.
+pub(crate) fn full_suite_tasks(state: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(rd) = fs::read_dir(full_suite_dir(state)) else { return Default::default() };
+    rd.flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".json")).map(str::to_string))
+        .collect()
+}
+
 pub(crate) fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
     let settings = Settings::load(ctx.state);
     let shims = shim_dir(ctx.state);
@@ -476,6 +521,9 @@ pub(crate) fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
         eprintln!("wsp: no `{tool}` on PATH past wsp's own shim");
         return 127;
     };
+    if !ctx.held && !ctx.task.is_empty() && is_full_suite(tool, args) {
+        note_full_suite(ctx);
+    }
     let mut cmd = Command::new(&real);
     cmd.args(args);
     let weight = weight(tool, args);
@@ -1342,7 +1390,7 @@ mod tests {
             })
         };
         let started = std::time::Instant::now();
-        run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["test"]));
+        run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["test", "x::"]));
         freer.join().unwrap();
         assert!(started.elapsed() >= Duration::from_millis(250));
         assert!(said.borrow()[0].contains("a build slot") && said.borrow()[0].contains("Queued, not failed"));
@@ -1390,6 +1438,44 @@ mod tests {
         run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["run", "-p", "host"]));
         let line = &seen(&rig)[0];
         assert!(line.contains("jobs=2") && niced(line) && !line.contains("held=yes"), "{line}");
+    }
+
+    #[test]
+    fn a_cargo_test_with_no_filter_is_the_full_suite_and_a_filtered_one_is_not() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_full_suite("cargo", &a(&["test"])));
+        assert!(is_full_suite("cargo", &a(&["+nightly", "test", "--release"])));
+        assert!(is_full_suite("cargo", &a(&["test", "--", "--nocapture"])));
+        assert!(!is_full_suite("cargo", &a(&["test", "cmd_spawn::"])));
+        assert!(!is_full_suite("cargo", &a(&["test", "--lib"])));
+        assert!(!is_full_suite("cargo", &a(&["test", "-p", "x"])));
+        assert!(!is_full_suite("cargo", &a(&["test", "--", "name"])));
+        assert!(!is_full_suite("cargo", &a(&["build"])));
+        assert!(!is_full_suite("npm", &a(&["test"])));
+    }
+
+    #[test]
+    fn a_full_suite_in_a_rows_seat_is_noted_and_counted_and_a_filtered_one_is_not() {
+        let rig = rig("throttle-full-suite");
+        mode(&rig, Mode::Off, 1);
+        let idle = || None;
+        let said = std::cell::RefCell::new(Vec::<String>::new());
+        let say = |m: &str| said.borrow_mut().push(m.to_string());
+        let env = |_: &str| None;
+        let c = ctx(&rig, &idle, &say, &env);
+        run_in(&c, "cargo", &["test".into(), "cmd_spawn::".into()]);
+        assert!(full_suite_tasks(&rig.state).is_empty(), "a filtered run is the member's own");
+        run_in(&c, "cargo", &["test".into()]);
+        run_in(&c, "cargo", &["test".into()]);
+        assert_eq!(full_suite_tasks(&rig.state), std::collections::BTreeSet::from(["wsp-9".to_string()]));
+        let rec: Value = serde_json::from_str(&fs::read_to_string(full_suite_dir(&rig.state).join("wsp-9.json")).unwrap()).unwrap();
+        assert_eq!(rec["runs"], 2);
+        assert!(said.borrow().iter().any(|m| m.contains("full suite") && m.contains("barrier")), "{:?}", said.borrow());
+        let mut seatless = ctx(&rig, &idle, &say, &env);
+        seatless.task = String::new();
+        let before = full_suite_tasks(&rig.state);
+        run_in(&seatless, "cargo", &["test".into()]);
+        assert_eq!(full_suite_tasks(&rig.state), before, "no row, no note");
     }
 
     #[test]

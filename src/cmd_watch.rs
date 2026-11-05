@@ -2497,6 +2497,7 @@ impl Source for Poll<'_> {
             // Read for state, never published, for `mandates`' reason.
             spawned: Default::default(),
             unsent: Default::default(),
+            full_suite: Default::default(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -4632,6 +4633,7 @@ mod tests {
             spawned_by: None,
             leg: None,
             unsent: false,
+            full_suite: false,
             was_governor: None,
         }
     }
@@ -5696,6 +5698,7 @@ mod tests {
             spawned_by: None,
             leg: None,
             unsent: false,
+            full_suite: false,
             was_governor: None,
         }
     }
