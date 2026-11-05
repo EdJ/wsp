@@ -742,6 +742,12 @@ pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
     let phases = build(&i);
     let run = run_legs_for(&i, &phases, None);
     let seat = seat_report(&i, &phases, &run, &transcript);
+    figures_of(&phases, &seat)
+}
+
+/// The figures from the phases and the seat report, which `wsp timeline` prints
+/// from too: [`to_json`] and [`seat_json`] are what a test holds this against.
+pub(crate) fn figures_of(phases: &[Phase], seat: &SeatReport) -> RowFigures {
     let mut f = RowFigures::default();
     let a = phases.iter().map(|p| p.start).min().unwrap_or(0);
     let b = phases.iter().map(|p| p.end).max().unwrap_or(0);
@@ -950,6 +956,44 @@ mod tests {
         assert_eq!(p.tools["Edit"], 5);
         let p = &r.phases[2];
         assert_eq!((p.calls, p.tokens_in, p.tokens_out, p.tools["Write"]), (1, 4, 8, 4));
+    }
+
+    #[test]
+    fn the_row_figures_the_effort_report_reads_are_what_timeline_json_prints() {
+        let i = two_legs();
+        let ph = build(&i);
+        let text = [
+            line(118, json!({"type": "user", "message": {"content": "go"}})),
+            asst(120, "q1", (10, 100, 5), None),
+            asst(121, "q1", (10, 100, 5), Some(("t1", "Bash"))),
+            result(126, "t1"),
+            asst(133, "q2", (20, 200, 7), Some(("t2", "Read"))),
+            result(134, "t2"),
+            line(305, json!({"type": "user", "message": {"content": "next"}})),
+            asst(310, "q3", (1, 2, 3), Some(("t3", "Edit"))),
+            result(315, "t3"),
+            asst(455, "q5", (4, 0, 8), Some(("t5", "Write"))),
+            result(459, "t5"),
+        ]
+        .join("\n");
+        let seat = seat_report(&i, &ph, &[], &|s| (s == "s").then(|| text.clone()));
+        let f = figures_of(&ph, &seat);
+        let tl = to_json(&i, &ph);
+        let sj = seat_json(&seat);
+        assert!(f.gap > 0, "the row has a wait in it: {ph:?}");
+        assert_eq!(f.gap, tl["gap_seconds"].as_i64().unwrap(), "gap seconds are the timeline's");
+        assert_eq!(f.waits.values().sum::<i64>(), f.gap, "every wait is under a cause");
+        let first = tl["phases"].as_array().unwrap().iter().map(|p| p["start"].as_str().unwrap().to_string()).min().unwrap();
+        assert_eq!(util::iso_at(f.start), first);
+        let sum = |k: &str| sj["phases"].as_array().unwrap().iter().map(|p| p[k].as_u64().unwrap()).sum::<u64>();
+        assert_eq!(f.model_secs as u64, sum("model_seconds"));
+        assert_eq!(f.calls, sum("calls"));
+        assert_eq!((f.tokens_in, f.cache_read, f.tokens_out), (sum("tokens_in"), sum("tokens_cache_read"), sum("tokens_out")));
+        for k in TOOL_KINDS.iter().chain(["other"].iter()) {
+            let want: i64 = sj["phases"].as_array().unwrap().iter().map(|p| p["tool_seconds"][*k].as_i64().unwrap()).sum();
+            assert_eq!(f.tools.get(*k).copied().unwrap_or(0), want, "tool kind {k}");
+        }
+        assert!(f.model_secs > 0 && f.tools.values().sum::<i64>() > 0, "the transcript was read: {f:?}");
     }
 
     #[test]

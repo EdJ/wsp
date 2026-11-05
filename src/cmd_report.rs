@@ -152,11 +152,12 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn write(path: &PathBuf, text: &str) -> Result<(), String> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
-    }
-    crate::store::write_atomic(path, text).map_err(|e| format!("{}: {e}", path.display()))
+/// Every file goes in through `artefact::put_bytes` (`wsp-376`), so a report
+/// written again keeps the one it replaces beside it as a version and the
+/// passes can be compared. wsp is the writer; `note` says when.
+fn write(slug: &str, file: &str, text: &str, note: &str) -> Result<PathBuf, String> {
+    let who = crate::artefact::Who { row: Some(slug.to_string()), seat: Some("wsp".to_string()) };
+    crate::artefact::put_bytes(&crate::artefact::root(), slug, file, text.as_bytes(), note, &who, false).map(|p| p.path)
 }
 
 // ---- the effort report -------------------------------------------------
@@ -182,6 +183,12 @@ fn n(v: &Value, k: &str) -> u64 {
 
 /// The effort report as the stable `effort.json` object.
 pub fn effort(store: &Store, w: &Worklist, baseline: Option<&str>) -> Value {
+    effort_with(store, w, baseline, &|id| crate::timeline::row_figures(store, id))
+}
+
+/// [`effort`] with the timeline figures of a row handed in, so that a test can
+/// hold the sums to what it hands.
+pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, figures: &dyn Fn(&str) -> crate::timeline::RowFigures) -> Value {
     let groups = w.groups();
     let es = crate::cmd_cost::entries(store, &w.id).unwrap_or_default();
     let cost = crate::cmd_cost::cost_json(&w.id, &es, groups.len());
@@ -199,7 +206,7 @@ pub fn effort(store: &Store, w: &Worklist, baseline: Option<&str>) -> Value {
         let (mut gwall, mut gmodel, mut gtool) = (0i64, 0i64, 0i64);
         let mut members: Vec<Value> = Vec::new();
         for m in &g.members {
-            let f = crate::timeline::row_figures(store, m);
+            let f = figures(m);
             let tool: i64 = f.tools.values().sum();
             gwall += f.wall;
             gmodel += f.model_secs;
@@ -417,14 +424,21 @@ pub fn effort_html(v: &Value) -> String {
     page(&format!("Effort · {}", v["list"].as_str().unwrap_or("")), &b)
 }
 
-/// Write `effort.json` and `effort.html`; the paths.
-pub fn write_effort(store: &Store, w: &Worklist, baseline: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
+/// Write `effort.json` and `effort.html`; the paths. `note` is the version's
+/// note: "effort report, at group 2 of 5".
+pub fn write_effort(store: &Store, w: &Worklist, baseline: Option<&str>, note: &str) -> Result<(PathBuf, PathBuf), String> {
     let v = effort(store, w, baseline);
-    let d = dir(&w.id);
-    let (j, h) = (d.join("effort.json"), d.join("effort.html"));
-    write(&j, &serde_json::to_string_pretty(&v).unwrap_or_default())?;
-    write(&h, &effort_html(&v))?;
+    let j = write(&w.id, "effort.json", &serde_json::to_string_pretty(&v).unwrap_or_default(), note)?;
+    let h = write(&w.id, "effort.html", &effort_html(&v), note)?;
     Ok((h, j))
+}
+
+fn note_now(store: &Store, w: &Worklist) -> String {
+    let pos = crate::worklist::position(store, w, crate::worklist::Reading::Settled);
+    match pos.at {
+        Some(n) => format!("effort report, at group {n} of {}", pos.of),
+        None => format!("effort report, after group {}", pos.of),
+    }
 }
 
 // ---- the work report ---------------------------------------------------
@@ -484,7 +498,7 @@ pub fn write_work(store: &Store, w: &Worklist, last: Option<&str>) -> Result<Opt
     if p.is_file() {
         return Ok(None);
     }
-    write(&p, &work_html(store, w, last))?;
+    write(&w.id, "work.html", &work_html(store, w, last), "work report, at the last barrier")?;
     Ok(Some(p))
 }
 
@@ -496,7 +510,7 @@ pub fn at_last_barrier(store: &Store, w: &Worklist, said: &str, dry: bool) -> Re
         return Ok(());
     }
     if outs.iter().any(|o| o.name == "effort") {
-        let _ = write_effort(store, w, None);
+        let _ = write_effort(store, w, None, "effort report, at the last barrier");
     }
     if outs.iter().any(|o| o.name == "work") {
         let _ = write_work(store, w, Some(said));
@@ -521,7 +535,7 @@ pub fn report(store: &Store, args: &Args) -> i32 {
         return 1;
     };
     let baseline = args.get("baseline");
-    match write_effort(store, &w, baseline.as_deref()) {
+    match write_effort(store, &w, baseline.as_deref(), &note_now(store, &w)) {
         Ok((h, j)) => {
             if args.json() {
                 println!("{}", json!({ "list": w.id, "effort_html": h, "effort_json": j }));
@@ -717,7 +731,7 @@ mod tests {
         let mut then = effort(&store, &w, None);
         then["totals"]["usd_micros"] = json!(2_000_000);
         then["totals"]["turns"] = json!(10);
-        write(&dir("pass1").join("effort.json"), &then.to_string()).unwrap();
+        write("pass1", "effort.json", &then.to_string(), "t").unwrap();
         let mut now = effort(&store, &w, None);
         now["totals"]["usd_micros"] = json!(3_000_000);
         now["totals"]["turns"] = json!(5);
@@ -742,7 +756,7 @@ mod tests {
     #[test]
     fn done_passes_once_the_outputs_exist_and_on_a_list_with_none() {
         let (_e, store, w) = list("ok", &["r-1"]);
-        write_effort(&store, &w, None).unwrap();
+        write_effort(&store, &w, None, "t").unwrap();
         assert_eq!(run(&store, &["done", "ok"], &[]), 1, "work.html is still missing");
         write_work(&store, &w, None).unwrap();
         assert_eq!(run(&store, &["done", "ok"], &[]), 0);
@@ -760,12 +774,62 @@ mod tests {
         assert_eq!(held, ["notes.md"], "named, and the two defaults were written");
         assert!(dir("last").join("effort.html").is_file() && dir("last").join("work.html").is_file());
         assert!(std::fs::read_to_string(dir("last").join("work.html")).unwrap().contains("effort.html"));
-        write(&dir("last").join("notes.md"), "x").unwrap();
+        write("last", "notes.md", "x", "t").unwrap();
         assert!(at_last_barrier(&store, &w2, "fine", false).is_ok());
         // a dry run writes nothing
         let w3 = more(&store, "dry", &["r-2"]);
         assert!(at_last_barrier(&store, &w3, "x", true).is_ok());
         assert!(!dir("dry").join("effort.html").exists());
         let _ = w;
+    }
+
+    #[test]
+    fn two_reports_leave_two_versions_and_a_check_seats_own_work_html_survives() {
+        let (_e, store, w) = list("vers", &["r-1"]);
+        assert_eq!(run(&store, &["report", "vers"], &[]), 0);
+        assert_eq!(run(&store, &["report", "vers"], &[("baseline", "pass0")]), 0);
+        let root = crate::artefact::root();
+        for f in ["effort.html", "effort.json"] {
+            let v = crate::artefact::versions(&root, "vers", f);
+            assert_eq!(v.len(), 2, "{f}: the first report is kept beside the second");
+            assert!(v.iter().all(|x| !x.edited), "{f}: written through put, so nothing is 'changed outside'");
+        }
+        // the check seat puts its own work report first: wsp keeps it
+        let who = crate::artefact::Who { row: None, seat: Some("cpd-1".into()) };
+        crate::artefact::put_bytes(&root, "vers", "work.html", b"its own", "n", &who, false).unwrap();
+        assert!(write_work(&store, &w, None).unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(dir("vers").join("work.html")).unwrap(), "its own");
+        let (_, _) = write_effort(&store, &w, None, "again").unwrap();
+    }
+
+    #[test]
+    fn the_totals_are_the_sum_of_the_members_figures_the_timeline_gives() {
+        use crate::timeline::RowFigures;
+        let (_e, store, w) = list("sums", &["r-1", "r-2"]);
+        store.save_task(&Task::new("r-3", "r-3")).unwrap();
+        assert_eq!(run(&store, &["add", "sums", "r-3"], &[]), 0);
+        let w = store.worklist("sums").unwrap_or(w);
+        let fig = |id: &str| match id {
+            "r-1" => RowFigures { start: 100, end: 400, wall: 300, gap: 40, model_secs: 120, calls: 5, tokens_in: 10, tokens_out: 4, cache_read: 7, waits: [("a tick".to_string(), 25), ("the cap".to_string(), 15)].into(), tools: [("Bash".to_string(), 50)].into(), ..Default::default() },
+            "r-2" => RowFigures { start: 90, end: 300, wall: 210, gap: 30, model_secs: 60, calls: 3, waits: [("a tick".to_string(), 30)].into(), tools: [("Bash".to_string(), 10), ("Read".to_string(), 5)].into(), missing: 1, ..Default::default() },
+            _ => RowFigures { start: 500, end: 600, wall: 100, gap: 0, model_secs: 20, calls: 1, ..Default::default() },
+        };
+        let v = effort_with(&store, &w, None, &fig);
+        let t = &v["totals"];
+        assert_eq!(t["model_seconds"], 200);
+        assert_eq!(t["gap_seconds"], 70);
+        assert_eq!(t["calls"], 9);
+        assert_eq!(t["wall_seconds"], 510, "first spawn to last verdict: 90 to 600");
+        assert_eq!(t["tool_seconds"]["Bash"], 60);
+        assert_eq!(t["tool_seconds_total"], 65);
+        assert_eq!(t["transcripts_missing"], 1);
+        assert_eq!(t["idle_seconds"], (300 - 120 - 50) + (210 - 60 - 15) + (100 - 20));
+        let w0 = v["waits"].as_array().unwrap();
+        assert_eq!((w0[0]["cause"].as_str().unwrap(), w0[0]["seconds"].as_i64().unwrap()), ("a tick", 55), "summed per cause, largest first");
+        assert_eq!(w0[1]["seconds"], 15);
+        let members: Vec<&Value> = v["groups"].as_array().unwrap().iter().flat_map(|g| g["members"].as_array().unwrap()).collect();
+        assert_eq!(members.iter().map(|m| m["model_seconds"].as_i64().unwrap()).sum::<i64>(), 200);
+        assert_eq!(members.iter().map(|m| m["gap_seconds"].as_i64().unwrap()).sum::<i64>(), t["gap_seconds"].as_i64().unwrap());
+        assert_eq!(members[0]["wall_seconds"], 300);
     }
 }

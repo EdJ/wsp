@@ -8500,4 +8500,36 @@ mod tests {
         assert_eq!(h.len(), 1, "{h:?}");
         assert!(h[0].contains("run list was held at its barrier"), "{h:?}");
     }
+
+    /// `wsp-375`, end to end through `go`: the last barrier writes the effort
+    /// report and then the work report, and holds on a declared output a member
+    /// owes; once it is there the same `go` passes.
+    #[test]
+    fn the_last_barrier_goes_through_go_and_holds_on_a_missing_declared_output() {
+        let _env = util::isolated("last-out");
+        let store = scratch("last-out");
+        task(&store, "wl-001", "review");
+        run(&store, &["new", "run", "r"]);
+        run(&store, &["add", "run", "wl-001"]);
+        started(&store, "run");
+        checking(&store, "run", 1, "wl-900");
+        claimed(&store, "wl-900");
+        checks_ending();
+        let out = crate::cmd_report::dir("run");
+        assert_eq!(dispatch(&store, &Args::synth("worklist", &["output", "run", "add", "notes"], &[("kind", "md"), ("from", "wl-001")])), 0);
+
+        // a dry run passes nothing and writes nothing
+        assert_eq!(flagged(&store, &["go", "run", "it", "holds"], &[("dry-run", "true")]), 0);
+        assert!(!out.join("effort.html").exists() && !out.join("work.html").exists());
+
+        assert_eq!(run(&store, &["go", "run", "it", "holds"]), 1, "notes.md is owed");
+        assert!(out.join("effort.html").is_file() && out.join("effort.json").is_file(), "effort first");
+        assert!(out.join("work.html").is_file(), "then the work report");
+        assert!(checks_on(&store, 1).is_empty(), "and the barrier is still shut");
+        assert!(!checks_ending().contains(&"wl-900".to_string()), "its check is not ended");
+
+        std::fs::write(out.join("notes.md"), "from the member").unwrap();
+        assert_eq!(run(&store, &["go", "run", "it", "holds"]), 0);
+        assert!(store.worklist("run").unwrap().groups()[0].verdict.contains("it holds"), "passed, with its sentence on the group");
+    }
 }
