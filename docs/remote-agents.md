@@ -8,7 +8,7 @@ as given: **v1 is connected-only**, and **the worktree is copied across when the
 agent needs it, and its work is copied back** — not pushed git to git, not cloned
 on the far side.
 
-Everything below marked *unverified* has not been run; the proof (group 3 of the
+Everything below marked *unverified* has not been run; the hand proof (group 3 of the
 build, section 9) is what runs it.
 
 ## 1. The shape, in one paragraph
@@ -298,7 +298,7 @@ that machine with `claude setup-token` (Ed's manual step). The spawn command exp
 expansion happening over there), so the secret never crosses the link, appears
 in no seat argv, and is in no wsp log. `claude --bare` stays rejected: it skips
 hooks, and the SessionStart hook is how an agent receives its brief
-(wsp-041's note). *Unverified, and exactly the first thing the proof tries:*
+(wsp-041's note). *Unverified, and exactly the first thing the hand proof (group 3) tries, before any code is built on it:*
 that Claude Code prefers the environment token over a locked keychain, that it
 survives a reboot with nobody logged in, and that the token's own expiry is long
 enough to be a setup step and not a weekly chore.
@@ -306,7 +306,7 @@ enough to be a setup step and not a weekly chore.
 The other two human touches wsp-041 listed, the folder-trust dialog and Claude
 Code's setup offer, are once per machine or per folder. Per folder is a problem
 when each row has its own tree: the plan has the trees under one parent
-(`<exec_dir>/trees`) and the proof checks whether trust on the parent covers the
+(`<exec_dir>/trees`) and the hand proof checks whether trust on the parent covers the
 children; if it does not, the spawn command pre-accepts the folder in the far
 Claude settings. *Unverified.*
 
@@ -317,21 +317,32 @@ eds-macbook-i5 with the token is acceptable *if the proof passes on it*.
 
 ## 9. The build, as groups on the `remote-agents` list
 
+**The order, and why.** The assumptions that parked wsp-018 (auth with nobody
+logged in, folder trust, rsync on that machine, the wire match, and whether a
+cut link really holds the next tool call) need no new wsp code to test, so
+they are tested **first, by hand, on the real machine** (group 3), straight
+after Ed's setup. Groups 4 to 6 build on those answers. If one fails, the plan is
+corrected before any of them starts: a failed token check changes section 8, a
+failed rsync changes the copy row, a gate that does not hold changes section 3.
+The gate is prototyped there as a shell loop; the built gate (group 6) is the
+same idea with the lease file. The full proof of the built system is group 7.
+
 Every group's effort report (wsp-375) records what a remote row cost against a
 local one, including the waits the link adds: copy-up and copy-back bytes and
 seconds, cold and warm far build, per-verb ssh latency, every gate wait with its
-length, and heartbeat misses. The proof row (group 6) runs one local twin of the
-same row for the comparison.
+length, and heartbeat misses. Group 7 runs one local twin of the same row for the
+comparison, and the hand proof records the first numbers.
 
 | group | row | kind | what |
 |---|---|---|---|
-| 2 | Ed's setup on one machine | **manual** | Tailscale (check `direct`, not DERP), sshd and authorised key, the `~/.ssh/config` Host block (ControlMaster, ControlPersist, the three timeouts), Claude installed and `setup-token` stored, a toolchain, `compound-sup` and `compound-render` built from the seat's compound commit, `executor/wsp` shim and hooks installed, `wsp machine add`. |
-| 3 | Machine record and readiness | agent | `wire`, `exec_dir`, `wsp machine check`, doctor line, probe on the tick. |
-| 3 | The copy | agent | manifest, copy-up, copy-back, stale checks, excludes, patches; tested over a local ssh or a stand-in, no real machine. |
-| 4 | `spawn --on` through compound-sup over ssh | agent | per-seat forwards, seat record with machine and both sockets, token launch, tree copy-up, `wsp despawn`. |
-| 5 | Connected-only | agent | heartbeat, gate, shim exit 75 and tree verbs, `unreachable` state in wip/brief/panel/doctor, reap guard on the seat record's machine, wake-spool hold, `machine retire`, `despawn --lost`. |
-| 6 | The proof, on the real machine | **manual** | One small row spawned there; the link cut once mid-turn, within the lease (it resumes in the same turn), and once past a shortened lease (it stops, then resumes after `tell`). Checks listed in the row. Includes the local twin and the cost table. |
-| 7 | Machines view and S picker | agent | the panel half of wsp-050/053/054, after the proof. |
+| 2 | agent-024 Ed's setup on one machine | **manual** | Tailscale (check `direct`, not DERP), sshd and authorised key, the `~/.ssh/config` Host block (ControlMaster, ControlPersist, the three timeouts), Claude installed and `setup-token` stored, a toolchain, `compound-sup` and `compound-render` built from the seat's compound commit, `executor/wsp` shim and hooks installed, `wsp machine add`. Done when `ssh <alias> compound-sup wire-version` prints the seat's wire version. |
+| 3 | agent-031 Hand proof on the real machine | **manual** | Token with the keychain locked and after a reboot; rsync of a small tree over the ControlMaster; folder trust on a parent; wire match; one agent started by hand with a shell-loop gate, link cut once mid-turn for about 90 s, showing it holds and resumes. First cost numbers. |
+| 4 | agent-025 Machine record and readiness | agent | `wire`, `exec_dir`, `wsp machine check`, doctor line, probe on the tick. |
+| 4 | agent-026 The copy | agent | manifest, copy-up, copy-back, stale checks, excludes, patches; tested over a local ssh or a stand-in. |
+| 5 | agent-027 `spawn --on` through compound-sup over ssh | agent | per-seat forwards, seat record with machine and both sockets, token launch, tree copy-up, `wsp despawn`. |
+| 6 | agent-028 Connected-only | agent | heartbeat, gate, shim exit 75 and tree verbs, `unreachable` state in wip/brief/panel/doctor, reap guard on the seat record's machine, wake-spool hold, `machine retire`, `despawn --lost`. |
+| 7 | agent-029 The proof of the built system | **manual** | One small row spawned with `wsp spawn --on`; the link cut once inside the lease (it resumes in the same turn), and once past a shortened lease (it stops, then resumes after `tell`). Local twin and the cost table. |
+| 8 | agent-030 Machines view and S picker | agent | the panel half of wsp-050/053/054, after the proof. |
 
 The groups run in order, and group 2 is manual, so nothing starts without Ed.
 
