@@ -325,6 +325,10 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // are stepped once more, now. `wsp-366`.
     if ended_verdicts || ended_passes_any || ended_legs_any || !ended.is_empty() {
         step_running(store, seats);
+        let owed = crate::cycle::legs_owed(store, seats);
+        if !owed.is_empty() {
+            stamp(store, &format!("legs owed on rows no list runs, started in the place a seat freed: {}", owed.join(" ")));
+        }
     }
     // And their trees, read off the disk rather than off the endings above, so
     // a tree whose seat went some other way — or before this — goes too.

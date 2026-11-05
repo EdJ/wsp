@@ -3922,11 +3922,24 @@ pub fn where_am_i(store: &Store, args: &Args) -> i32 {
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
     let w = Wip::live(store);
+    let cap_waits = crate::room::waiting_lines(store, &w.agents);
     match args.json() {
-        true => println!("{}", serde_json::to_string_pretty(&wip_json(&w)).unwrap_or_default()),
+        true => {
+            let mut v = wip_json(&w);
+            if let (Some(o), false) = (v.as_object_mut(), cap_waits.is_empty()) {
+                o.insert("waiting_at_cap".into(), serde_json::json!(cap_waits));
+            }
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default())
+        }
         false => {
             for l in wip_lines(&w, &Paint::new(), args.terse()) {
                 println!("{l}");
+            }
+            if !cap_waits.is_empty() {
+                println!();
+                for l in cap_waits {
+                    println!("{l}");
+                }
             }
         }
     }

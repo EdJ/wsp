@@ -7681,6 +7681,24 @@ fn only_a_working_screen_is_ever_overruled() {
     /// The repair tick catches a launch that was lost: a begun row with legs ready
     /// and nothing starting them. A row nothing has begun is not started by it.
     #[test]
+    fn an_idle_seat_that_handed_its_row_to_legs_holds_no_place_so_a_held_leg_starts_at_the_next_tick() {
+        let (_env, store) = scratch("legs-owed-idle-seat");
+        store.set_seat_cap(Some(2)).unwrap();
+        task(&store, "other", Status::Doing);
+        store.set_binding("cpd-8", serde_json::json!({ "task_id": "other" }));
+        fanned_out(&store, "begun");
+        store.set_binding("cpd-9", serde_json::json!({ "task_id": "begun" }));
+        let busy_idle = Fixed::new(&[("cpd-8", State::Working), ("cpd-9", State::Idle)]);
+        let _ = spawned();
+
+        let owed = legs_owed(&store, &busy_idle);
+        assert_eq!(owed, ["begun · a".to_string()], "the idle first seat holds nothing, so one place is free and not two");
+        assert!(legs_owed(&store, &busy_idle).is_empty(), "and the second leg waits for a real place");
+        let waiting = store.capped();
+        assert!(waiting.get("begun").is_some_and(|v| v.get("begun · b").is_some()), "{waiting:?}");
+    }
+
+    #[test]
     fn the_tick_starts_legs_owed_on_a_begun_hand_staged_row_and_not_an_unbegun_one() {
         let (_env, store) = scratch("legs-owed");
         fanned_out(&store, "begun");

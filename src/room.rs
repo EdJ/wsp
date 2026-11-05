@@ -25,6 +25,12 @@
 //! nobody can read is not, because a record the run has not yet ended would
 //! otherwise hold the cap for as long as it stood.
 //!
+//! **A seat that holds nothing is not counted unless it is seen working**
+//! (`wsp-353`): the seat of a row run as legs, which handed the row to them
+//! (the legs' own seats are counted as legs), and any seat of a member of a
+//! parked list. Each sat in the cap for ten minutes at `compounding-048`
+//! while the starts it blocked waited.
+//!
 //! **Unfinished work nobody can read is counted.** A backend that does not
 //! answer is the moment the machine is least visible, and the direction to be
 //! wrong in there is starting one agent fewer.
@@ -75,7 +81,11 @@ impl Look {
         if seats.absent(seat) {
             return Look::Gone;
         }
-        match seats.state(seat) {
+        Look::of_state(seats.state(seat))
+    }
+
+    fn of_state(state: Option<State>) -> Look {
+        match state {
             Some(State::Gone | State::Empty) => Look::Gone,
             Some(State::Working) => Look::Working,
             Some(State::Starting) => Look::Starting,
@@ -167,6 +177,12 @@ fn here(seat: &str) -> bool {
     crate::herdr::host_of(seat).is_none()
 }
 
+/// A member of a list somebody parked: nothing of it starts or is read until
+/// the list is resumed, so a seat of its that is not seen working holds no place.
+fn in_parked_list(r: &Records, task: &str) -> bool {
+    crate::worklist::open_list_of(&r.lists, task).is_some_and(|w| w.status() == crate::model::WorklistStatus::Parked)
+}
+
 /// Every agent working on this machine, by the rules in the module docs.
 /// `look` answers for a seat; the caller decides how it was read.
 pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> {
@@ -225,11 +241,12 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     // is counted as the leg, and a seat counted is not counted twice. A leg
     // that has finished is counted only while its seat is seen working.
     for t in r.tasks.iter().filter(|t| t.body.contains("## Legs")) {
+        let parked = in_parked_list(r, &t.id);
         for l in crate::legs::legs(t) {
             let what = crate::legs::label(&t.id, &l.name);
             let running = l.state == crate::legs::State::Running;
             match &l.pane {
-                Some(seat) => take(&mut out, Some(seat), what, !running || l.ending != crate::verification::Ending::Standing, l.started.as_deref()),
+                Some(seat) => take(&mut out, Some(seat), what, parked || !running || l.ending != crate::verification::Ending::Standing, l.started.as_deref()),
                 None if running && l.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false, None),
                 None => {}
             }
@@ -248,7 +265,8 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     held.extend(r.claimed());
     for (seat, id) in held {
         let Some(s) = status(&id) else { continue };
-        take(&mut out, Some(&seat), id, finished(s), None);
+        let holds_nothing = in_parked_list(r, &id) || r.tasks.iter().any(|t| t.id == id && crate::legs::staged(t));
+        take(&mut out, Some(&seat), id, finished(s) || holds_nothing, None);
     }
 
     // A member the run moved to `doing` whose agent has not claimed it yet:
@@ -322,6 +340,36 @@ pub(crate) fn full(store: &Store, seats: &dyn Seats) -> Option<(usize, Vec<Count
     let cap = gate.cap?;
     let now = gate.working();
     (now.len() >= cap).then_some((cap, now))
+}
+
+/// What `wsp wip` says of the starts waiting at the cap, off `capped.json`: each
+/// start, since when, and the seats holding the places. `seen` is the census
+/// `wip` already took, so this asks no backend.
+pub(crate) fn waiting_lines(store: &Store, seen: &[crate::place::Seated]) -> Vec<String> {
+    let Some(cap) = store.seat_cap() else { return Vec::new() };
+    let waits: Vec<(String, String, String)> = store
+        .capped()
+        .into_iter()
+        .flat_map(|(owner, starts)| {
+            starts.as_object().cloned().unwrap_or_default().into_iter().map(move |(what, since)| {
+                (what, owner.clone(), since.as_str().unwrap_or_default().to_string())
+            })
+        })
+        .collect();
+    if waits.is_empty() {
+        return Vec::new();
+    }
+    let states: BTreeMap<&str, State> = seen.iter().map(|s| (s.seat.as_str(), s.state)).collect();
+    let holders = working(&Records::read(store), &|seat| Look::of_state(states.get(seat).copied()));
+    let mut out = vec![format!("waiting at the cap of {cap}, held by {}:", names(&holders))];
+    for (what, owner, since) in waits {
+        let age = match since.is_empty() {
+            true => String::new(),
+            false => format!(" for {}", util::duration_human(util::since(&since))),
+        };
+        out.push(format!("  {what} ({owner}){age}"));
+    }
+    out
 }
 
 /// The agents a list of them reads as, for a log line: the first few, and how
@@ -424,6 +472,24 @@ mod tests {
         assert_eq!(counted(&r, &looks), ["m-1 · fresh", "m-1 · stale"]);
     }
 
+    /// `wsp-353`: the idle seat of a row run as legs and of a parked list's
+    /// member holds no place; the same seats seen working still do.
+    #[test]
+    fn an_idle_seat_that_handed_its_row_to_legs_or_sits_in_a_parked_list_holds_no_place() {
+        use crate::legs::{Leg, State as LegState};
+        let mut legged = task("legged", Status::Doing);
+        crate::legs::write(&mut legged, &[Leg { state: LegState::Pending, ..Leg::pending("build", "do it") }]);
+        let mut r = records(vec![legged, task("parked", Status::Doing), task("plain", Status::Doing)], &[("w1:p1", "legged"), ("w1:p2", "parked"), ("w1:p3", "plain")]);
+        let mut w = Worklist::new("l", "l");
+        w.set_groups(&[crate::model::Group { members: vec!["parked".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Parked);
+        r.lists.push(w);
+        let idle = [("w1:p1", Look::Quiet), ("w1:p2", Look::Quiet), ("w1:p3", Look::Quiet)];
+        assert_eq!(counted(&r, &idle), ["plain"]);
+        let busy = [("w1:p1", Look::Working), ("w1:p2", Look::Working), ("w1:p3", Look::Working)];
+        assert_eq!(counted(&r, &busy), ["legged", "parked", "plain"]);
+    }
+
     /// A governor is not counted, by its pane, even holding a row.
     #[test]
     fn a_governor_seat_is_never_counted() {
@@ -469,6 +535,27 @@ mod tests {
         fn state(&self, _seat: &str) -> Option<State> {
             Some(State::Working)
         }
+    }
+
+    /// `wsp-353`: `wip` names each start waiting at the cap and the seats holding
+    /// the places, and says nothing when nothing waits.
+    #[test]
+    fn wip_names_what_waits_at_the_cap_and_who_holds_the_places() {
+        let env = util::isolated("room-waiting");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_task(&task("h-1", Status::Doing)).unwrap();
+        store.set_binding("w2:p1", json!({ "task_id": "h-1" }));
+        let seat = |s: &str| crate::place::Seated { seat: crate::place::Seat::new(s), state: State::Working, ..Default::default() };
+        let seen = [seat("w2:p1")];
+
+        assert!(waiting_lines(&store, &seen).is_empty(), "no cap");
+        store.set_seat_cap(Some(1)).unwrap();
+        assert!(waiting_lines(&store, &seen).is_empty(), "nothing waits");
+        store.set_capped("run", Some(json!({ "m-2": util::now_iso() })));
+        let lines = waiting_lines(&store, &seen);
+        assert_eq!(lines[0], "waiting at the cap of 1, held by h-1 in w2:p1:");
+        assert!(lines[1].starts_with("  m-2 (run)"), "{lines:?}");
     }
 
     /// What `wsp spawn` by hand reads before it starts anyway: nothing on a
