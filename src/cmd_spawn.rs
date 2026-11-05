@@ -1041,6 +1041,26 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
     }
 }
 
+/// Copy one row's tree to `machine` and return the far path it landed at.
+///
+/// The record of the copy (`treecopy`) is written on the seat, and a copy that
+/// does not match by hash leaves nothing there. Refused when the row is already
+/// copied: a second copy over the agent's tree is the one thing that loses work.
+fn copy_up(store: &Store, machine: &str, row: &str, tree: &str) -> Result<String, String> {
+    let m = store.machine(machine).ok_or_else(|| format!("no machine `{machine}`"))?;
+    if m.exec_dir.is_empty() {
+        return Err(format!("{machine} has no exec_dir — wsp machine set {machine} exec_dir=…"));
+    }
+    let tree = util::expand(tree);
+    let trunk = crate::cmd_checkout::trunk(&tree)
+        .and_then(|t| crate::cmd_checkout::trunk_branch(&t))
+        .ok_or_else(|| format!("cannot tell which branch is the trunk of {}", tree.display()))?;
+    let remote = crate::treecopy::Remote::of_machine(store, &m, &m.exec_dir);
+    let rec = crate::treecopy::Copy::new(store, remote, row, &tree).copy_up(&trunk)?;
+    eprintln!("wsp: {}", rec.line());
+    Ok(rec.far_tree)
+}
+
 /// Which tier the agent is to be started at, checked before anything is opened.
 ///
 /// **Stated when somebody states it, and otherwise inferred from where the work
@@ -2664,6 +2684,22 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         if let Some((key, kind)) = verdict {
             crate::closing::clear_verdict(store, &key, kind);
             order.env.insert("WSP_VERDICT".into(), crate::closing::verdict_path(store, &key, kind).display().to_string());
+        }
+    }
+    // `--on`: the row's tree goes up first and nothing starts on a half copy
+    // (`docs/remote-agents.md` section 6). The seat's record then holds the FAR
+    // path as its directory; the claim keeps the seat's own tree.
+    if let Some(machine) = on.as_deref() {
+        let copied = match (work.task.as_deref(), cwd.as_deref()) {
+            (Some(task), Some(tree)) => copy_up(store, machine, task, tree),
+            _ => Err(format!("--on {machine} needs a task: the copy to {machine} is one row's tree")),
+        };
+        match copied {
+            Ok(far) => order.cwd = Some(far),
+            Err(why) => {
+                eprintln!("wsp: not starting it: {why}");
+                return 1;
+            }
         }
     }
     // The leg is written `running` under the store lock before its seat exists,

@@ -172,6 +172,9 @@ pub struct Compound<'a> {
     /// port stops and asks, and this one did not have to.
     pub insist: bool,
     pub clock: &'a dyn Clock,
+    /// How a far machine is reached, for a seat opened `--on` one
+    /// (`docs/remote-agents.md` section 2). Ssh; a test passes a script.
+    pub far: &'a dyn crate::far::Wire,
 }
 
 impl Compound<'static> {
@@ -187,6 +190,7 @@ impl Compound<'static> {
             poll: Duration::from_millis(150),
             insist: false,
             clock: &util::Wall,
+            far: &crate::far::Ssh,
         }
     }
 
@@ -544,9 +548,21 @@ impl Compound<'_> {
     /// process for the session's whole life — there is no second pid to
     /// reconcile the way a fork-then-exec backend would have to.
     fn state_of(&self, seat: &Seat, rec: &Value, running: &BTreeSet<u32>) -> State {
-        let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) else { return State::Empty };
-        if !running.contains(&(pid as u32)) {
-            return State::Gone;
+        if !str_of(rec, "machine").is_empty() {
+            // A seat on another machine has no pid here; the session is there
+            // while the forwarded socket answers.
+            let socket = str_of(rec, "socket");
+            if socket.is_empty() {
+                return State::Empty;
+            }
+            if UnixStream::connect(&socket).is_err() {
+                return State::Gone;
+            }
+        } else {
+            let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) else { return State::Empty };
+            if !running.contains(&(pid as u32)) {
+                return State::Gone;
+            }
         }
         // No agent recorded: `compound-081`'s bare terminal — a pty with a
         // shell in it and nothing this backend watches for hooks.
@@ -1244,6 +1260,120 @@ impl Compound<'_> {
         Ok(rec)
     }
 
+    /// Start an agent on the machine this seat's record names
+    /// (`docs/remote-agents.md` sections 2 and 8): `compound-sup spawn` over ssh
+    /// with the token exported on the far side, the handshake read from the ssh
+    /// stdout, one forward each for the `.sock` and the `.rsock`, and the machine
+    /// and both forwarded sockets recorded on the seat. Nothing is left half
+    /// done: a forward that fails closes the far session it follows.
+    fn start_far(&self, seat: &Seat, rec: &Value, agent: &Agent) -> Result<()> {
+        let dir = self.dir_of(seat)?;
+        let name = str_of(rec, "machine");
+        let bad = |why: String| Refusal::Backend(why);
+        let m = self.far.machine(&name).ok_or_else(|| bad(format!("no machine `{name}` — wsp machine add")))?;
+        if m.exec_dir.is_empty() {
+            return Err(bad(format!("{name} has no exec_dir — wsp machine set {name} exec_dir=…")));
+        }
+        let cwd = str_of(rec, "cwd");
+        if cwd.is_empty() {
+            return Err(bad(format!("{seat} has no tree on {name}: the copy up was not done")));
+        }
+        let up = |key: &str| {
+            let s = str_of(rec, key);
+            !s.is_empty() && UnixStream::connect(&s).is_ok()
+        };
+        if rec.get("agent").is_some() && up("socket") {
+            return Err(bad(format!("{seat} already has a session running")));
+        }
+        let (sock, rsock) = crate::far::forward_paths(&self.far.dir(&m), seat.as_str());
+        for p in [&sock, &rsock] {
+            if p.as_os_str().len() > crate::tunnel::SUN_PATH_MAX {
+                return Err(bad(format!(
+                    "{} is {} bytes and a unix socket may be {} — the state directory is too deep to forward into",
+                    p.display(),
+                    p.as_os_str().len(),
+                    crate::tunnel::SUN_PATH_MAX
+                )));
+            }
+        }
+        let env: BTreeMap<String, String> = rec
+            .get("env")
+            .and_then(|e| e.as_object())
+            .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
+            .unwrap_or_default();
+        let (program, argv) = crate::agent_commands::command(&agent.kind, &agent.args);
+        let cmd = crate::far::seat_command(&m, seat.as_str(), &cwd, &env, &program, &argv);
+        let out = self
+            .far
+            .run(&m, &cmd, crate::far::SESSION_TIMEOUT)
+            .map_err(|f| bad(format!("compound-sup on {name}: {}", f.why())))?;
+        let hs = crate::far::parse_handshake(&out)
+            .ok_or_else(|| bad(format!("compound-sup on {name} never announced a socket: {}", out.trim())))?;
+
+        let close = |why: String| {
+            let _ = self.far.run(&m, &format!("{} close {}", crate::far::quote(&crate::far::sup_of(&m)), crate::far::quote(&hs.socket)), crate::far::SESSION_TIMEOUT);
+            bad(why)
+        };
+        if let Err(e) = self.far.forward(&m, "forward", &sock, &hs.socket) {
+            return Err(close(format!("forwarding {name}'s {} failed: {e}", hs.socket)));
+        }
+        if let Some(render) = &hs.render {
+            if let Err(e) = self.far.forward(&m, "forward", &rsock, render) {
+                let _ = self.far.forward(&m, "cancel", &sock, &hs.socket);
+                let _ = fs::remove_file(&sock);
+                return Err(close(format!("forwarding {name}'s {render} failed: {e}")));
+            }
+        }
+
+        let mut rec = rec.clone();
+        rec["socket"] = json!(sock.display().to_string());
+        rec["far_socket"] = json!(hs.socket);
+        match &hs.render {
+            Some(render) => {
+                rec["render_socket"] = json!(rsock.display().to_string());
+                rec["far_render_socket"] = json!(render);
+            }
+            None => {}
+        }
+        if let Some(pid) = hs.pid {
+            rec["far_pid"] = json!(pid);
+        }
+        if let Some(sup) = hs.sup {
+            rec["far_sup"] = json!(sup);
+        }
+        rec["started_at"] = json!(util::now_iso());
+        rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
+        write_atomic(&dir.join(SEAT_FILE), &rec.to_string()).map_err(|e| Refusal::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// End a far seat's session: `compound-sup close <far socket>` on the
+    /// machine, then drop both forwards and sweep the local sockets. A link that
+    /// is down refuses (the session would be left running unseen); a command
+    /// that ran and failed means the session is already gone.
+    fn stop_far(&self, rec: &Value) -> Result<()> {
+        let name = str_of(rec, "machine");
+        let m = self.far.machine(&name);
+        let far_sock = str_of(rec, "far_socket");
+        if let (Some(m), false) = (&m, far_sock.is_empty()) {
+            let cmd = format!("{} close {}", crate::far::quote(&crate::far::sup_of(m)), crate::far::quote(&far_sock));
+            if let Err(crate::far::Failed::Link(why)) = self.far.run(m, &cmd, crate::far::SESSION_TIMEOUT) {
+                return Err(Refusal::Backend(format!("cannot reach {name} to close its session: {why}")));
+            }
+        }
+        for (local, far) in [("socket", "far_socket"), ("render_socket", "far_render_socket")] {
+            let (local, far) = (str_of(rec, local), str_of(rec, far));
+            if local.is_empty() {
+                continue;
+            }
+            if let Some(m) = &m {
+                let _ = self.far.forward(m, "cancel", Path::new(&local), &far);
+            }
+            let _ = fs::remove_file(&local);
+        }
+        Ok(())
+    }
+
     /// `SIGTERM` the group, wait, `SIGKILL` if it lingers, and sweep the
     /// socket once nothing answers it. The shared tail of ending whatever
     /// currently occupies a seat's pty — whether the SEAT is going with it
@@ -1284,6 +1414,29 @@ impl Compound<'_> {
     }
 }
 
+/// The forwards the seats on `machine` should have, as `(local socket, far
+/// socket)`, read from the seat records. What the tunnel supervisor re-adds when
+/// a machine's ControlMaster comes back: a master that died took its forwards
+/// with it (`docs/remote-agents.md` section 2).
+pub fn forwards_for(store: &Store, machine: &str) -> Vec<(PathBuf, String)> {
+    let root = store.state.join(SEATS);
+    let mut out = Vec::new();
+    for e in fs::read_dir(&root).into_iter().flatten().flatten() {
+        let rec = read_json(&e.path().join(SEAT_FILE));
+        if str_of(&rec, "machine") != machine {
+            continue;
+        }
+        for (local, far) in [("socket", "far_socket"), ("render_socket", "far_render_socket")] {
+            let (local, far) = (str_of(&rec, local), str_of(&rec, far));
+            if !local.is_empty() && !far.is_empty() {
+                out.push((PathBuf::from(local), far));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Whether compound can tell what an agent of this kind is doing — the kinds
 /// the ported engine has a manifest for (`compound-109`).
 ///
@@ -1315,15 +1468,24 @@ impl Place for Compound<'_> {
     /// because starting an AGENT with nothing to run it in is the failure a
     /// caller asked to hear about.
     fn open(&self, order: &Order) -> Result<Seat> {
-        if order.on.is_some() {
-            // Nothing here reaches a socket on another machine; a compound
-            // session is exactly as local as the pty it owns.
-            return Err(Refusal::Unsupported("run a compound session on another machine"));
-        }
         let seat = self.mint()?;
         let dir = self.dir_of(&seat)?;
         let mut env: BTreeMap<String, String> = order.env.clone();
         env.insert(place::SEAT_ENV.to_string(), seat.to_string());
+        if let Some(machine) = &order.on {
+            // A seat on another machine is a record here and nothing more until
+            // `start`: no bare shell is run over the link, and `cwd` is the FAR
+            // path (the tree was copied up to it), so it is not expanded here.
+            let rec = json!({
+                "label": order.label,
+                "cwd": order.cwd,
+                "env": env,
+                "machine": machine,
+                "opened_at": util::now_iso(),
+            });
+            write_atomic(&dir.join(SEAT_FILE), &rec.to_string()).map_err(|e| Refusal::Backend(e.to_string()))?;
+            return Ok(seat);
+        }
         let rec = json!({
             "label": order.label,
             "cwd": order.cwd.as_deref().map(|c| util::expand(c).display().to_string()),
@@ -1353,6 +1515,9 @@ impl Place for Compound<'_> {
     fn start(&self, seat: &Seat, agent: &Agent) -> Result<()> {
         let rec = self.record(seat)?;
         let dir = self.dir_of(seat)?;
+        if !str_of(&rec, "machine").is_empty() {
+            return self.start_far(seat, &rec, agent);
+        }
         if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
             if alive(&[pid as u32]).contains(&(pid as u32)) {
                 if rec.get("agent").is_some() {
@@ -1448,6 +1613,11 @@ impl Place for Compound<'_> {
     fn stop(&self, seat: &Seat) -> Result<()> {
         let rec = self.record(seat)?;
         let dir = self.dir_of(seat)?;
+        if !str_of(&rec, "machine").is_empty() {
+            self.stop_far(&rec)?;
+            fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
+            return Ok(());
+        }
         // `compound-031` is where the general case (a session whose host is
         // gone and nobody asked it to stop) is filed; this is the one seat
         // this call just ended.
@@ -1692,6 +1862,128 @@ mod tests {
     /// check — each a real process leading its own group, as `compound-sup`
     /// is; the first check is stopped through the close path `wsp despawn`
     /// uses, and the other three are still running.
+    /// A far side from a script: records what it was asked, answers a handshake.
+    struct FarScript {
+        asked: std::cell::RefCell<Vec<String>>,
+        dir: PathBuf,
+        link_down: std::cell::Cell<bool>,
+        forward_fails: bool,
+    }
+
+    impl crate::far::Wire for FarScript {
+        fn machine(&self, name: &str) -> Option<crate::model::Machine> {
+            (name == "mb2").then(|| {
+                let mut m = crate::model::Machine::new("mb2", "mb2");
+                m.exec_dir = "/far/exec".into();
+                m
+            })
+        }
+        fn run(&self, _m: &crate::model::Machine, cmd: &str, _t: Duration) -> std::result::Result<String, crate::far::Failed> {
+            self.asked.borrow_mut().push(format!("run {cmd}"));
+            if self.link_down.get() {
+                return Err(crate::far::Failed::Link("Connection refused".into()));
+            }
+            Ok("sup 11\npid 12\nsocket /far/run/s.sock\nrender /far/run/s.rsock".into())
+        }
+        fn forward(&self, _m: &crate::model::Machine, op: &str, local: &Path, far: &str) -> std::result::Result<(), String> {
+            self.asked.borrow_mut().push(format!("{op} {}:{far}", local.file_name().unwrap().to_string_lossy()));
+            match (self.forward_fails, op) {
+                (true, "forward") => Err("remote port forwarding failed".into()),
+                _ => Ok(()),
+            }
+        }
+        fn dir(&self, _m: &crate::model::Machine) -> PathBuf {
+            self.dir.clone()
+        }
+    }
+
+    fn far_script(name: &str, link_down: bool, forward_fails: bool) -> (FarScript, PathBuf) {
+        // Short: a forwarded socket path may be 103 bytes, and `$TMPDIR` is not.
+        let root = PathBuf::from("/tmp").join(format!("wf-{name}-{}-{}", std::process::id(), util::epoch_nanos() % 100_000));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("fwd")).unwrap();
+        let f = FarScript {
+            asked: Default::default(),
+            dir: root.join("fwd"),
+            link_down: std::cell::Cell::new(link_down),
+            forward_fails,
+        };
+        (f, root)
+    }
+
+    /// `spawn --on`: the seat is a record naming the machine and the far tree,
+    /// `start` runs compound-sup there, forwards both sockets and records them,
+    /// and `stop` closes the far session by its socket, drops the forwards and
+    /// removes the seat.
+    #[test]
+    fn a_seat_on_another_machine_is_started_forwarded_recorded_and_stopped_over_the_link() {
+        let (far, root) = far_script("life", false, false);
+        let place = Compound { far: &far, ..Compound::at(root.join("seats")) };
+        let order = Order {
+            label: "t-1".into(),
+            cwd: Some("/far/exec/trees/t-1".into()),
+            on: Some("mb2".into()),
+            env: BTreeMap::from([("WSP_TASK".to_string(), "t-1".to_string())]),
+            ..Order::default()
+        };
+        let seat = place.open(&order).unwrap();
+        let rec = place.record(&seat).unwrap();
+        assert_eq!(str_of(&rec, "machine"), "mb2");
+        assert_eq!(str_of(&rec, "cwd"), "/far/exec/trees/t-1", "the far path, not expanded here");
+        assert_eq!(str_of(&rec["env"], "WSP_SEAT_ID"), seat.as_str());
+        assert!(far.asked.borrow().is_empty(), "opening runs nothing over the link");
+
+        place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).unwrap();
+        let asked = far.asked.borrow().clone();
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert!(asked[0].contains(&format!("spawn --label '{seat}' --cwd '/far/exec/trees/t-1'")), "{}", asked[0]);
+        assert!(asked[0].contains("WSP_SEAT_ID='") && asked[0].contains("claude-token"), "{}", asked[0]);
+        assert_eq!(asked[1], format!("forward {seat}.sock:/far/run/s.sock"));
+        assert_eq!(asked[2], format!("forward {seat}.rsock:/far/run/s.rsock"));
+
+        let rec = place.record(&seat).unwrap();
+        assert_eq!(str_of(&rec, "socket"), far.dir.join(format!("{seat}.sock")).display().to_string());
+        assert_eq!(str_of(&rec, "render_socket"), far.dir.join(format!("{seat}.rsock")).display().to_string());
+        assert_eq!((str_of(&rec, "far_socket").as_str(), str_of(&rec, "far_render_socket").as_str()), ("/far/run/s.sock", "/far/run/s.rsock"));
+        assert_eq!(rec["far_pid"], json!(12));
+        assert!(rec.get("pid").is_none(), "no local pid: it is not a local process");
+        assert_eq!(place.socket_of(&seat), Some(far.dir.join(format!("{seat}.sock"))));
+        let wanted = place.root.parent().unwrap().to_path_buf();
+        let _ = wanted;
+
+        far.asked.borrow_mut().clear();
+        place.stop(&seat).unwrap();
+        let asked = far.asked.borrow().clone();
+        assert!(asked[0].contains("close '/far/run/s.sock'"), "closed by its socket: {asked:?}");
+        assert!(asked.contains(&format!("cancel {seat}.sock:/far/run/s.sock")) && asked.contains(&format!("cancel {seat}.rsock:/far/run/s.rsock")), "{asked:?}");
+        assert!(place.record(&seat).is_err(), "the seat is gone");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_forward_that_fails_closes_the_far_session_and_a_dead_link_does_not_lose_the_seat() {
+        let (far, root) = far_script("fail", false, true);
+        let place = Compound { far: &far, ..Compound::at(root.join("seats")) };
+        let order = Order { label: "t".into(), cwd: Some("/far/exec/trees/t".into()), on: Some("mb2".into()), ..Order::default() };
+        let seat = place.open(&order).unwrap();
+        let err = place.start(&seat, &Agent { kind: "claude".into(), name: "t".into(), args: vec![] }).unwrap_err();
+        assert!(err.to_string().contains("forwarding"), "{err}");
+        assert!(far.asked.borrow().last().unwrap().contains("close '/far/run/s.sock'"), "nothing left running there: {:?}", far.asked.borrow());
+        assert!(place.socket_of(&seat).is_none(), "and nothing recorded as running");
+
+        // A seat that is up, whose link then drops: stop refuses and keeps the record.
+        let (far, root2) = far_script("down", false, false);
+        let place = Compound { far: &far, ..Compound::at(root2.join("seats")) };
+        let seat = place.open(&order).unwrap();
+        place.start(&seat, &Agent { kind: "claude".into(), name: "t".into(), args: vec![] }).unwrap();
+        far.link_down.set(true);
+        let err = place.stop(&seat).unwrap_err();
+        assert!(err.to_string().contains("cannot reach mb2"), "{err}");
+        assert!(place.record(&seat).is_ok(), "the seat is kept, so the session is not lost track of");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
     #[test]
     fn stopping_one_check_seat_leaves_a_member_a_governor_and_a_second_check_running() {
         use std::os::unix::process::CommandExt;

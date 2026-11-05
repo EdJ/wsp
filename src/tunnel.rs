@@ -57,6 +57,9 @@ struct Tunnel {
     /// check starts an agent and takes seconds, so it runs beside the tick and
     /// never inside it.
     checking: Option<Child>,
+    /// The master was just (re)started, so the seats' forwards on it are gone and
+    /// are re-added once it answers (`docs/remote-agents.md` section 2).
+    readd: bool,
 }
 
 impl Tunnel {
@@ -67,6 +70,7 @@ impl Tunnel {
             next_try: None,
             live: MachineLive { tunnel: "down".into(), ..Default::default() },
             checking: None,
+            readd: false,
         }
     }
 
@@ -244,6 +248,7 @@ impl Supervisor {
             match spawn(store, m, sock) {
                 Ok(child) => {
                     t.child = Some(child);
+                    t.readd = true;
                     t.live.tunnel = "starting".into();
                     // Not reachable yet: ssh has been started, not connected.
                     // Saying otherwise here is how a machine reads as up for
@@ -280,6 +285,10 @@ impl Supervisor {
         if t.live.reachable {
             t.failures = 0;
             t.next_try = None;
+            if t.readd {
+                readd_forwards(store, m);
+                t.readd = false;
+            }
         }
         t.recheck(store, m);
     }
@@ -324,7 +333,7 @@ fn err_log(store: &Store, name: &str) -> PathBuf {
 /// mention of length — which reads as a syntax error in something wsp built,
 /// and sends you reading the flags. Found by putting a store under a scratch
 /// directory 116 characters deep.
-const SUN_PATH_MAX: usize = 103;
+pub(crate) const SUN_PATH_MAX: usize = 103;
 
 /// The `ssh` we hold open, and why each flag is on it.
 fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<Child> {
@@ -369,6 +378,17 @@ fn backend_at(m: &Machine) -> String {
     match m.backend_at.is_empty() {
         true => crate::place_herdr::mirrored_socket(),
         false => m.backend_at.clone(),
+    }
+}
+
+/// Put back the forwards of every seat on `m`, read from the seat records: a
+/// master that died took them with it. Each is added on its own and a failure of
+/// one is no reason to skip the next (the stale local end is swept by
+/// [`crate::far::Wire::forward`], so a re-add is idempotent).
+fn readd_forwards(store: &Store, m: &Machine) {
+    use crate::far::Wire;
+    for (local, far) in crate::place_compound::forwards_for(store, &m.name) {
+        let _ = crate::far::Ssh.forward(m, "forward", &local, &far);
     }
 }
 

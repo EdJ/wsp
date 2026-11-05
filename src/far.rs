@@ -13,7 +13,8 @@
 //! [`check_with`] — which starts a throwaway session and a headless claude —
 //! can make a machine [`Readiness::Ready`].
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -423,14 +424,160 @@ pub fn check_with(m: &Machine, seat_wire: u32, run: &dyn Fn(&str, Duration) -> R
 /// `--no-renderer`: the question here is whether a pty starts, and a renderer
 /// started over ssh is outside the GUI session anyway.
 pub fn start_command(m: &Machine, label: &str) -> String {
+    launch(m, label, &m.exec_dir, "", "", " --no-renderer", "sleep 60")
+}
+
+/// The one shape of far start: `before` runs in the far shell first, `pre` is
+/// what stands in front of `compound-sup` inside the subshell (environment),
+/// `flags` follow `--cwd`, and `tail` is the pty's own argv.
+fn launch(m: &Machine, label: &str, cwd: &str, before: &str, pre: &str, flags: &str, tail: &str) -> String {
     format!(
-        "f=$(mktemp) && ( {sup} spawn --label {label} --cwd {cwd} --no-renderer -- sleep 60 </dev/null >\"$f\" 2>&1 & ); \
+        "{before}f=$(mktemp) && ( {pre}{sup} spawn --label {label} --cwd {cwd}{flags} -- {tail} </dev/null >\"$f\" 2>&1 & ); \
          i=0; while [ $i -lt 100 ] && ! grep -q '^socket ' \"$f\"; do sleep 0.1; i=$((i+1)); done; \
          cat \"$f\"; rm -f \"$f\"",
         sup = quote(&sup_of(m)),
         label = quote(label),
-        cwd = quote(&m.exec_dir),
+        cwd = quote(cwd),
     )
+}
+
+/// Where the machine's Claude token is, as a path on that machine.
+pub fn token_path(m: &Machine) -> String {
+    format!("{}/{TOKEN_FILE}", m.exec_dir.trim_end_matches('/'))
+}
+
+/// The far command that starts a seat's agent (`docs/remote-agents.md` sections
+/// 2 and 8): `compound-sup spawn --label <seat> --cwd <far path> -- <agent>`,
+/// with the Claude token exported **on the far side**.
+///
+/// The token is read from its `0600` file by the far shell (`t=$(cat …)` is in
+/// the command string, quoted here and never expanded here), so it does not cross
+/// the link, is in no argv and is in no wsp log: what this returns holds the
+/// file's path and `"$t"`, and nothing else. A missing or empty file stops the
+/// command with a sentence that says what to do, before a session is started that
+/// could never answer.
+///
+/// `env` rides in front of `compound-sup` as `env K=V`, and an empty value is
+/// `env -u K` — the same "override, never replace" contract the local backend
+/// keeps. Names that are not shell identifiers are dropped.
+pub fn seat_command(m: &Machine, label: &str, cwd: &str, env: &BTreeMap<String, String>, program: &str, args: &[String]) -> String {
+    let token = token_path(m);
+    let msg = format!("no Claude token at {token} on {} (claude setup-token there)", m.name);
+    let before = format!("t=$(cat {} 2>/dev/null) && [ -n \"$t\" ] || {{ echo {} >&2; exit 1; }}; ", quote(&token), quote(&msg));
+    let mut pre = String::from("CLAUDE_CODE_OAUTH_TOKEN=\"$t\" env ");
+    for (k, v) in env {
+        let ident = !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !k.starts_with(|c: char| c.is_ascii_digit());
+        if !ident || k == "CLAUDE_CODE_OAUTH_TOKEN" {
+            continue;
+        }
+        match v.is_empty() {
+            true => pre.push_str(&format!("-u {k} ")),
+            false => pre.push_str(&format!("{k}={} ", quote_plain(v))),
+        }
+    }
+    let mut tail = quote_plain(program);
+    for a in args {
+        tail.push(' ');
+        tail.push_str(&quote_plain(a));
+    }
+    launch(m, label, cwd, &before, &pre, "", &tail)
+}
+
+/// A word quoted for the far shell with no `~/` expansion: an environment value or
+/// an argument is data, even when it starts with `~/`.
+fn quote_plain(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// What `compound-sup spawn` announced: `sup <pid>`, `pid <pid>`, `socket <path>`,
+/// `render <path>`. Only `socket` is required (an older build prints three lines).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Handshake {
+    pub sup: Option<u32>,
+    pub pid: Option<u32>,
+    pub socket: String,
+    pub render: Option<String>,
+}
+
+pub fn parse_handshake(out: &str) -> Option<Handshake> {
+    let socket = socket_of(out)?;
+    let word = |k: &str| out.lines().find_map(|l| l.strip_prefix(k)).map(|p| p.trim().to_string());
+    Some(Handshake {
+        sup: word("sup ").and_then(|p| p.parse().ok()),
+        pid: word("pid ").and_then(|p| p.parse().ok()),
+        socket,
+        render: word("render ").filter(|p| !p.is_empty()),
+    })
+}
+
+/// What a seat's forwards are called here: short (a unix socket path may be 103
+/// bytes) and the seat's own, since a seat id is unique across machines.
+pub fn forward_paths(dir: &Path, seat: &str) -> (PathBuf, PathBuf) {
+    (dir.join(format!("{seat}.sock")), dir.join(format!("{seat}.rsock")))
+}
+
+/// The ssh words for adding (`forward`) or dropping (`cancel`) one forward on the
+/// ControlMaster the tunnel holds.
+pub fn forward_args(m: &Machine, control: &Path, op: &str, local: &Path, far: &str) -> Vec<String> {
+    let s = |x: &str| x.to_string();
+    vec![
+        s("-S"), control.display().to_string(),
+        s("-o"), s("BatchMode=yes"),
+        s("-O"), s(op),
+        s("-L"), format!("{}:{}", local.display(), far),
+        m.ssh.clone(),
+    ]
+}
+
+/// How wsp reaches a far machine: a command, a forward, and the record of the
+/// machine. The real one is [`Ssh`]; a test passes a script and needs no machine.
+pub trait Wire {
+    fn machine(&self, name: &str) -> Option<Machine>;
+    fn run(&self, m: &Machine, cmd: &str, timeout: Duration) -> Result<String, Failed>;
+    /// `op` is `forward` or `cancel`.
+    fn forward(&self, m: &Machine, op: &str, local: &Path, far: &str) -> Result<(), String>;
+    /// The directory a seat's forwarded sockets are made in.
+    fn dir(&self, m: &Machine) -> PathBuf;
+}
+
+/// The real way: ssh, over the machine's ControlMaster.
+pub struct Ssh;
+
+impl Wire for Ssh {
+    fn machine(&self, name: &str) -> Option<Machine> {
+        crate::store::Store::open().machine(name)
+    }
+
+    fn run(&self, m: &Machine, cmd: &str, timeout: Duration) -> Result<String, Failed> {
+        let store = crate::store::Store::open();
+        ssh_run(m, Some(&crate::tunnel::control_path(&store, &m.name)), cmd, timeout)
+    }
+
+    fn forward(&self, m: &Machine, op: &str, local: &Path, far: &str) -> Result<(), String> {
+        let store = crate::store::Store::open();
+        let control = crate::tunnel::control_path(&store, &m.name);
+        // ssh binds the local end and refuses a path that exists: a headstone from
+        // a master that died.
+        if op == "forward" {
+            let _ = std::fs::remove_file(local);
+        }
+        let mut c = Command::new("ssh");
+        c.args(forward_args(m, &control, op, local, far));
+        let out = run_bounded(c, Duration::from_secs(10)).map_err(|e| format!("cannot start ssh: {e}"))?;
+        let Some(out) = out else { return Err(format!("ssh -O {op} did not answer in 10s")) };
+        match out.status.success() {
+            true => Ok(()),
+            false => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("ssh -O failed").trim().to_string())
+            }
+        }
+    }
+
+    fn dir(&self, m: &Machine) -> PathBuf {
+        let store = crate::store::Store::open();
+        store.machine_socket(&m.name).parent().map(Path::to_path_buf).unwrap_or(store.state.clone())
+    }
 }
 
 /// The `socket <path>` line of `compound-sup spawn`'s handshake. (`sup <pid>` is
@@ -604,6 +751,83 @@ mod tests {
         assert!(took < Duration::from_secs(4), "returned on the handshake, not the session ({took:?})");
         assert_eq!(socket_of(&said).as_deref(), Some("/run/x.sock"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_seat_command_reads_the_token_on_the_far_side_and_puts_none_in_the_text() {
+        let m = machine();
+        let env = BTreeMap::from([
+            ("WSP_SEAT_ID".to_string(), "cpd-7".to_string()),
+            ("WSP_TASK".to_string(), "it's".to_string()),
+            ("STRIPPED".to_string(), String::new()),
+            ("bad name".to_string(), "x".to_string()),
+        ]);
+        let cmd = seat_command(&m, "cpd-7", "~/wsp-exec/trees/t-1", &env, "claude", &["--model".into(), "a b".into()]);
+        assert!(cmd.contains("t=$(cat ~/'wsp-exec/claude-token'"), "{cmd}");
+        assert!(cmd.contains("CLAUDE_CODE_OAUTH_TOKEN=\"$t\" env "), "{cmd}");
+        assert!(cmd.contains("-u STRIPPED") && cmd.contains("WSP_SEAT_ID='cpd-7'") && cmd.contains(r"WSP_TASK='it'\''s'"), "{cmd}");
+        assert!(!cmd.contains("bad name"), "a name the shell cannot take is dropped: {cmd}");
+        assert!(cmd.contains("spawn --label 'cpd-7' --cwd ~/'wsp-exec/trees/t-1' -- 'claude' '--model' 'a b'"), "{cmd}");
+        assert!(!cmd.contains("--no-renderer"), "the seat gets its renderer: {cmd}");
+    }
+
+    /// The far shell, run for real: the token reaches `compound-sup`'s
+    /// environment from the file, the handshake comes back on stdout and the
+    /// token does not, and a missing token stops before a session starts.
+    #[test]
+    fn the_seat_command_run_by_a_shell_exports_the_token_and_returns_on_the_handshake() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wsp-far-seat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sup = dir.join("compound-sup");
+        let seen = dir.join("seen");
+        std::fs::write(
+            &sup,
+            format!(
+                "#!/bin/sh\necho \"$CLAUDE_CODE_OAUTH_TOKEN $WSP_SEAT_ID $*\" > {}\necho 'sup 1'; echo 'pid 2'; echo 'socket /run/x.sock'; echo 'render /run/x.rsock'; sleep 6\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut m = Machine::new("mb2", "mb2");
+        m.sup_at = sup.to_string_lossy().into_owned();
+        m.exec_dir = dir.to_string_lossy().into_owned();
+        let env = BTreeMap::from([("WSP_SEAT_ID".to_string(), "cpd-7".to_string())]);
+        let run = |m: &Machine| {
+            let mut sh = Command::new("sh");
+            sh.arg("-c").arg(seat_command(m, "cpd-7", "/work", &env, "agent", &["x".into()]));
+            run_bounded(sh, Duration::from_secs(20)).unwrap().expect("returns")
+        };
+
+        // No token file: refused, and nothing was started.
+        let out = run(&m);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no Claude token"), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!seen.exists());
+
+        std::fs::write(dir.join(TOKEN_FILE), "sekret\n").unwrap();
+        let t0 = Instant::now();
+        let out = run(&m);
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(t0.elapsed() < Duration::from_secs(4), "returned on the handshake, not the session");
+        assert!(!said.contains("sekret"), "the token is not in what comes back: {said}");
+        let hs = parse_handshake(&said).expect("a handshake");
+        assert_eq!(hs, Handshake { sup: Some(1), pid: Some(2), socket: "/run/x.sock".into(), render: Some("/run/x.rsock".into()) });
+        let seen_text = std::fs::read_to_string(&seen).unwrap();
+        assert!(seen_text.starts_with("sekret cpd-7 spawn --label cpd-7 --cwd /work -- agent x"), "{seen_text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_handshake_needs_a_socket_and_takes_the_rest_if_there() {
+        assert_eq!(parse_handshake("sup 1\npid 2\nsocket /a.sock\n").unwrap().render, None);
+        assert!(parse_handshake("error: no such cwd").is_none());
+        let (s, r) = forward_paths(Path::new("/d"), "cpd-9");
+        assert_eq!((s.to_str(), r.to_str()), (Some("/d/cpd-9.sock"), Some("/d/cpd-9.rsock")));
+        let a = forward_args(&machine(), Path::new("/d/cm-mb2"), "forward", &s, "/far/x.sock");
+        assert_eq!(a.join(" "), "-S /d/cm-mb2 -o BatchMode=yes -O forward -L /d/cpd-9.sock:/far/x.sock mb2");
     }
 
     #[test]

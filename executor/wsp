@@ -6,22 +6,21 @@
 # and nothing here to hot-patch. So `wsp` here runs the seat's `wsp`, over the
 # ssh connection the seat is already holding open.
 #
-# Install: on PATH ahead of anything else called wsp, with WSP_SEAT and
-# WSP_MACHINE set for every shell an agent might run in. See the Machines
-# section of wsp's README.
+# Install: on PATH ahead of anything else called wsp, with WSP_SEAT set for
+# every shell an agent might run in. See the Machines section of wsp's README.
 #
 #   WSP_SEAT      the seat's ssh Host alias, as this machine reaches it
-#   WSP_MACHINE   this machine's name in the seat's store — the @mb2 in an id
+#   WSP_SEAT_ID   which seat this is (cpd-N). wsp mints it and puts it in the
+#                 environment of the session it starts here; passed through
 #   WSP_SEAT_BIN  the seat's wsp, if it is not on a non-interactive PATH there
 #
 # Three things this has to get right, and each of them is silent when wrong:
 #
 #   1. Arguments survive the remote shell. `ssh host wsp say "two words"` is
 #      re-split over there; every argument is quoted for it here.
-#   2. Ids are qualified. herdr on this machine numbers its panes from zero, so
-#      HERDR_PANE_ID is `w0:p3` here and means a different pane on the seat.
-#      The seat's wsp routes on the `@machine` suffix, and this is the only
-#      place that knows what to add.
+#   2. The seat is named by WSP_SEAT_ID, which is the seat's own id and needs
+#      no qualifying: wsp mints it and the machine rides on the seat's record,
+#      so no `@machine` is added to anything.
 #   3. The exit status is the seat's. ssh passes it through, and `exec` keeps it
 #      from being anything else's.
 #
@@ -36,11 +35,6 @@ if [ -z "${WSP_SEAT:-}" ]; then
     echo "     See the Machines section of wsp's README." >&2
     exit 2
 fi
-if [ -z "${WSP_MACHINE:-}" ]; then
-    echo "wsp: WSP_MACHINE is not set — without it the seat cannot tell this machine's" >&2
-    echo "     pane ids from its own. See the Machines section of wsp's README." >&2
-    exit 2
-fi
 
 # One argument, quoted so the remote shell hands it back whole.
 q() {
@@ -52,14 +46,9 @@ for a in "$@"; do
     args="$args $(q "$a")"
 done
 
-# Bare here, qualified there. Empty stays empty: a shell that herdr did not
-# start has no pane, and `@mb2` on nothing would name a machine and no pane.
-pane=${HERDR_PANE_ID:+${HERDR_PANE_ID}@${WSP_MACHINE}}
-workspace=${HERDR_WORKSPACE_ID:+${HERDR_WORKSPACE_ID}@${WSP_MACHINE}}
-
 # Only what wsp reads. ssh forwards no environment by default and should not:
 # a seat-shaped PATH or HOME arriving from here would be worse than none.
-env="HERDR_PANE_ID=$(q "$pane") HERDR_WORKSPACE_ID=$(q "$workspace")"
+env="WSP_SEAT_ID=$(q "${WSP_SEAT_ID:-}")"
 env="$env WSP_PROJECT=$(q "${WSP_PROJECT:-}") WSP_TASK=$(q "${WSP_TASK:-}")"
 env="$env WSP_TERSE=$(q "${WSP_TERSE:-}")"
 
