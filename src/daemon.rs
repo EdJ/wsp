@@ -18,7 +18,7 @@
 //! to, so a pass that ran only when something woke us would never run on the
 //! one condition it is for.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -370,7 +370,7 @@ fn is_wsp(rest: &str, sub: &str) -> bool {
 /// The words of that field that are argv: everything before the first
 /// `KEY=value`, which is where the command stops and `ps -E`'s environment
 /// begins.
-fn argv(rest: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn argv(rest: &str) -> impl Iterator<Item = &str> {
     rest.split_whitespace().take_while(|w| !is_env_word(w))
 }
 
@@ -392,9 +392,14 @@ fn is_env_word(w: &str) -> bool {
 /// `WSP_STATE` set, and a check that called that a second daemon would cry wolf
 /// on a machine where sandboxes are the normal way to test a change.
 fn for_store(rest: &str, state: &Path) -> bool {
+    state_of(rest) == state
+}
+
+/// The state directory a `ps -E` line's environment points at.
+pub(crate) fn state_of(rest: &str) -> PathBuf {
     match rest.split_whitespace().find_map(|w| w.strip_prefix("WSP_STATE=")) {
-        Some(v) => Path::new(v) == state,
-        None => state == Store::default_state(),
+        Some(v) => PathBuf::from(v),
+        None => Store::default_state(),
     }
 }
 

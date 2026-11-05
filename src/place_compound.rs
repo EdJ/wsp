@@ -2256,6 +2256,7 @@ mod tests {
         };
         assert!(PathBuf::from(&sup).is_file(), "COMPOUND_SUP is not a file");
 
+        crate::agent_commands::stand_in::allow_real_agents();
         let scratch = Scratch::new("opencode-detect");
         let place = scratch.place();
         let seat = place

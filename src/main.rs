@@ -31,6 +31,7 @@ mod greens;
 mod build_output;
 mod check_tree;
 mod scratch;
+mod leaked_agents;
 mod disk;
 mod arrange;
 mod attention;

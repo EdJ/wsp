@@ -871,11 +871,53 @@ const KNOWN: &[(&str, &'static dyn Kind)] = &[
     ("attention", &crate::kind_attention::Attention),
 ];
 
+/// A test that starts a seat for a model-backed kind gets a script that only
+/// sleeps, so no test leaves a real agent running after it. A live test says so
+/// with [`stand_in::allow_real_agents`].
+#[cfg(test)]
+pub(crate) mod stand_in {
+    use std::cell::Cell;
+    use std::path::PathBuf;
+
+    const MODEL_KINDS: &[&str] = &["claude", "opencode", "pi"];
+
+    thread_local! {
+        static REAL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn allow_real_agents() {
+        REAL.with(|r| r.set(true));
+    }
+
+    pub(crate) fn for_kind(kind: &str) -> Option<String> {
+        if REAL.with(|r| r.get()) || !MODEL_KINDS.contains(&kind.trim()) {
+            return None;
+        }
+        Some(script().display().to_string())
+    }
+
+    fn script() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("wsp-stand-in-agent-{}", std::process::id()));
+        if !path.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            let part = path.with_extension("part");
+            std::fs::write(&part, "#!/bin/sh\nexec sleep 600\n").unwrap();
+            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&part, &path).unwrap();
+        }
+        path
+    }
+}
+
 /// The program and argv a backend that execs a kind runs for it: the kind's
 /// name and `args` unless the kind runs under a program of its own
 /// ([`Kind::program`]). One copy, for the backends that fork or exec — herdr
 /// types the kind's name into a shell and cannot.
 pub fn command(kind: &str, args: &[String]) -> (String, Vec<String>) {
+    #[cfg(test)]
+    if let Some(stand_in) = stand_in::for_kind(kind) {
+        return (stand_in, Vec::new());
+    }
     match of(kind).program() {
         Some(program) => (program.to_string(), args.to_vec()),
         None => (kind.to_string(), args.to_vec()),
@@ -4065,6 +4107,21 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
         // every launch answers it.
         assert_eq!(of("pi").unattended(Some("local/qwen3.8-27b")), None);
         assert_eq!(of("pi").unattended(None), None);
+    }
+
+    #[test]
+    fn a_test_that_starts_a_model_agent_runs_a_stand_in_unless_it_asks_for_the_real_one() {
+        let (program, args) = command("claude", &["--print".into()]);
+        assert!(program.contains("wsp-stand-in-agent"), "{program}");
+        assert!(args.is_empty(), "the stand-in takes no flags: {args:?}");
+        assert_eq!(command("cat", &[]).0, "cat", "a kind that is no model is run as named");
+        std::thread::spawn(|| {
+            stand_in::allow_real_agents();
+            assert_eq!(command("claude", &[]).0, "claude");
+        })
+        .join()
+        .unwrap();
+        assert!(command("claude", &[]).0.contains("wsp-stand-in-agent"), "asking is per test, not per process");
     }
 
     #[test]

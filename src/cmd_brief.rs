@@ -1273,6 +1273,12 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                 .to_string(),
             );
         }
+        // A sandbox store is isolated and its agents are not (`wsp-333`).
+        row(
+            "sandbox",
+            p.dim("`wsp sandbox` still spawns real processes, claude included: a test that spawns uses `wsp sandbox --fake`, and what you start you end (`wsp despawn`, `wsp sandbox rm`); the daemon names agents left for a store no daemon keeps in cycle.log and ends them after 30 min")
+                .to_string(),
+        );
         // Whose the land is and what review follows it (`wsp-306`), said to
         // the agent holding a row and nobody else: a leg's work is landed by
         // its row's finish, and a seat with nothing claimed has no row to end.
