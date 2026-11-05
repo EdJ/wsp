@@ -1857,12 +1857,21 @@ fn prepare_ready(store: &Store, list: &str, at: usize, member: &Task) -> bool {
     if crate::verification::all(&tasks, member).last().is_some_and(|p| p.state == crate::verification::State::Running) {
         return true;
     }
+    // One check per review tip (`wsp-392`): a rebase while the check runs moves
+    // the tip and starts a second, overlapping check. It waits for the first.
+    let before = crate::repair::ready(member);
+    if before.as_deref().is_some_and(|sha| crate::check::running_at(store, member, sha)) {
+        return true;
+    }
     match crate::cmd_checkout::rebase_ready(store, &member.id) {
         Prepared::Unchanged => true,
         Prepared::Rebased { head, branch } => {
             store.locked(|| {
                 if let Some(mut m) = store.find_task(&member.id) {
                     m.log(&format!("{} {head} on {branch}", crate::repair::READY));
+                    if let Some(from) = &before {
+                        crate::check::carry_pass(&mut m, from, &head);
+                    }
                     let _ = store.save_task(&m);
                 }
             });

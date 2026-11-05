@@ -1567,6 +1567,49 @@ pub(crate) fn gate(store: &Store, member: &Task) -> Gate {
     Gate::Wait
 }
 
+/// Is a check of this commit under way for the member, within its budget? The
+/// cycle's rebase waits on it: a rebase mid-run moves the tip, and the gate
+/// would then start a second check at the new one while the first still runs
+/// (`wsp-392`: wsp-379 ran three, two overlapping).
+pub(crate) fn running_at(store: &Store, member: &Task, sha: &str) -> bool {
+    let Some(entry) = v::runs(member).into_iter().rev().find(|r| r.read.as_deref().is_some_and(|x| v::same_commit(x, sha))) else { return false };
+    if entry.state != RunState::Running {
+        return false;
+    }
+    let Ok(tg) = target(store, member, None) else { return false };
+    let stale = stale_after(&plan(store, member, &tg, None).steps);
+    util::epoch_secs() - util::epoch_of(&entry.at) <= stale
+}
+
+/// A check that passed at `from` stands for the same work rebased to `to`: the
+/// rebase added only what the trunk gained, and the barrier runs the whole
+/// suite on the result. Written as a passed entry that says so, so the gate
+/// does not start a second check for the new tip. `false` when `from` has no
+/// passed check, or `to` already has an entry.
+pub(crate) fn carry_pass(t: &mut Task, from: &str, to: &str) -> bool {
+    let mut runs = v::runs(t);
+    let at = |r: &Run, sha: &str| r.read.as_deref().is_some_and(|x| v::same_commit(x, sha));
+    if runs.iter().any(|r| at(r, to)) {
+        return false;
+    }
+    let Some(passed) = runs.iter().rev().find(|r| at(r, from)).filter(|r| r.state == RunState::Passed) else { return false };
+    let took = passed.took;
+    let mut secs = util::epoch_secs();
+    while runs.iter().any(|r| util::epoch_of(&r.at) >= secs) {
+        secs += 1;
+    }
+    let (from12, to12): (String, String) = (from.chars().take(12).collect(), to.chars().take(12).collect());
+    runs.push(Run {
+        at: util::iso_at(secs),
+        state: RunState::Passed,
+        read: Some(to12),
+        took,
+        text: format!("✓ carried · passed at {from12} (rebased onto the trunk since) · not run again"),
+    });
+    v::write_runs(t, &runs);
+    true
+}
+
 /// What `wsp review` says to a member that has recorded no checks: tier 1 is the
 /// member's to write, and a warning rather than a refusal, because design work
 /// has nothing to run. Silent for a project with no repository to run in.
@@ -1779,6 +1822,30 @@ mod tests {
         assert!(begin(&store, "pj-001", &sha, 3600, false).is_none(), "a landing already checked is not checked again");
         assert!(begin(&store, "pj-001", &sha, 3600, true).is_some(), "but a person can ask");
         assert_eq!(v::runs(&store.find_task("pj-001").unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn a_rebase_waits_for_the_check_under_way_and_a_pass_is_carried_to_the_rebased_tip() {
+        let (_env, store, sha) = world("carry", "- ok: true", "exit 0\n");
+        let other = "0123456789abcdef0123456789abcdef01234567";
+        let t = store.find_task("pj-001").unwrap();
+        assert!(!running_at(&store, &t, &sha), "no entry, nothing running");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        let t = store.find_task("pj-001").unwrap();
+        assert!(running_at(&store, &t, &sha), "the rebase must wait for it");
+        assert!(!running_at(&store, &t, other), "another tip has no run");
+        let mut t2 = t.clone();
+        assert!(!carry_pass(&mut t2, &sha, other), "a run still going carries nothing");
+        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None }];
+        settle(&store, "pj-001", &at, &ran, Duration::ZERO);
+        let mut t = store.find_task("pj-001").unwrap();
+        assert!(!running_at(&store, &t, &sha));
+        assert!(carry_pass(&mut t, &sha, other));
+        assert!(!carry_pass(&mut t, &sha, other), "once");
+        let runs = v::runs(&t);
+        assert_eq!(runs.len(), 2);
+        assert!(runs[1].state == RunState::Passed && v::same_commit(runs[1].read.as_deref().unwrap(), other));
+        assert!(!carry_pass(&mut t, "fedcba9876543210fedcba9876543210fedcba98", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "nothing to carry from");
     }
 
     #[test]

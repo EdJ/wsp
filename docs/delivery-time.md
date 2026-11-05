@@ -94,6 +94,13 @@ On wsp-379 the check ran three times (368, 370 and 208 s, the first two
 overlapping) for one review; on wsp-360, wsp-354, wsp-382 and wsp-385 it ran
 twice.
 
+Cause (`wsp-392`): each check started at the tick's ready commit, and the cycle
+rebases a ready member onto the trunk before the gate, so a trunk that moved
+during a six-minute check gave the next tick a new tip and a second check beside
+the first. Now the rebase waits for a check under way, and a check that passed
+at the pre-rebase tip is carried to the rebased one (a `carried` entry under
+## Verification) instead of being run again.
+
 The other three waits:
 
 - **The seat's cap, 3 454 s**: 2 506 s of it is the cap, and the fix
