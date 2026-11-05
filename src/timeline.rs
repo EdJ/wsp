@@ -153,11 +153,12 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             }
         }
         // The leg that ends the row ends with the review, not a `leg done`.
-        let finished = i
-            .events
-            .iter()
-            .find(|(t, k, d)| k == "leg-done" && d["id"] == id && d["leg"] == leg.name.as_str() && *t >= s)
-            .map(|(t, _, _)| *t)
+        let done_event = i.events.iter().find(|(t, k, d)| k == "leg-done" && d["id"] == id && d["leg"] == leg.name.as_str() && *t >= s);
+        // A close that came late (`wsp-372`) carries when the baton was written:
+        // the leg's work ended then, and the rest is the stall, not work.
+        let baton_at = done_event.and_then(|(t, _, d)| d["baton_at"].as_i64().filter(|b| *b >= s && b < t));
+        let finished = baton_at
+            .or_else(|| done_event.map(|(t, _, _)| *t))
             .or_else(|| reviews.iter().copied().find(|r| *r >= s));
         if ready > 0 && s > ready {
             out.push(Phase::gap(format!("gap before leg {}", leg.name), ready, s, wait_name(i, ready, s)));
@@ -171,6 +172,20 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             out.push(Phase::work(label, s, f));
             done.push((leg.name.clone(), f));
             last_end = Some(last_end.map_or(f, |e| e.max(f)));
+            if let (Some(b), Some((closed, _, d))) = (baton_at, done_event) {
+                let by = d["closed_by"].as_str().map(str::to_string).unwrap_or_else(|| "the leg's own seat".into());
+                out.push(Phase::gap(
+                    format!(
+                        "closed late: leg {} done at {}, closed at {}",
+                        leg.name,
+                        util::iso_at(b).get(11..16).unwrap_or_default(),
+                        util::iso_at(*closed).get(11..16).unwrap_or_default()
+                    ),
+                    b,
+                    *closed,
+                    format!("the close — {by} (not work)"),
+                ));
+            }
         }
     }
 
@@ -773,6 +788,21 @@ mod tests {
         let ver = ph.iter().find(|p| p.label.starts_with("review typed → verifier")).unwrap();
         assert_eq!(ver.seconds(), 1);
         assert!(ver.waiting_for.as_deref().unwrap().contains("hand-off"));
+    }
+
+    #[test]
+    fn a_leg_closed_late_is_timed_to_its_baton_and_the_stall_is_a_gap_not_work() {
+        let mut i = row();
+        for e in i.events.iter_mut().filter(|(_, k, d)| k == "leg-done" && d["leg"] == "a") {
+            e.2["baton_at"] = json!(e.0 - 60);
+            e.2["closed_by"] = json!("wsp: seat idle 9m");
+        }
+        let ph = build(&i);
+        let leg = ph.iter().find(|p| p.label.starts_with("leg a (")).expect("the leg is a phase");
+        let late = ph.iter().find(|p| p.label.starts_with("closed late: leg a done at")).expect("the stall is named");
+        assert_eq!(leg.end, late.start, "work ends at the baton");
+        assert_eq!(late.seconds(), 60);
+        assert!(late.gap && late.waiting_for.as_deref().unwrap().contains("wsp: seat idle 9m"), "{late:?}");
     }
 
     #[test]

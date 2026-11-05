@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 mod affected;
 mod after;
+mod closing;
 mod packet;
 mod packet_gen;
 mod agent_commands;
@@ -1668,7 +1669,7 @@ fn help_text() -> String {
   wsp leg after <task> <name> <leg>…|-   replace a pending leg's waits
   wsp leg skip <task> <name> "why"       a pending leg, never run
   wsp leg show <task> [<name>]           the legs, the tier and waits in full
-  wsp leg done <task> --from FILE|- --caption "…"   a leg's seat ends it, at a clean
+  wsp leg done <task> [--from FILE|-] --caption "…"   a leg's seat ends it, at a clean
                                          commit: the baton, the caption, the run poked
   wsp verified <member> --holds|--blocks --from FILE --caption "…"
                                     a verifier's verdict, recorded on the member

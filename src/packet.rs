@@ -213,8 +213,11 @@ pub fn leg_path(order: &str) -> Option<String> {
 /// How a leg ends: `leg done`, or `review` for the leg nothing waits on.
 pub fn leg_finish(task: &str, last: bool) -> String {
     match last {
-        true => format!("You are the last leg: commit, then `wsp review {task} \"...\"` ends the row."),
-        false => format!("Commit, then end with `wsp leg done {task} --from FILE --caption \"...\"` (FILE: your baton)."),
+        true => format!("You are the last leg: commit, then `wsp review {task} \"...\"`, as a Bash call of its own, ends the row."),
+        false => format!(
+            "Commit, write your baton with a heredoc into $WSP_BATON (`cat > \"$WSP_BATON\" <<'EOF'` ... `EOF`), then end with \
+             `wsp leg done {task} --caption \"...\"` as a Bash call of its own, never chained after another command."
+        ),
     }
 }
 

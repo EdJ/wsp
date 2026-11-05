@@ -240,6 +240,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     }
     // A reason a send-back could not type to its pane, typed once the seat reads idle.
     retry_undelivered_tells(store, seats);
+    // And a leg whose seat has stopped without closing it (`wsp-372`): told
+    // once, then closed from its baton or flagged to the person.
+    crate::closing::tick(store, seats);
     // **After** the loop, and for a different reason to every repair above: this
     // one is about a run that has *finished*, so there is no group at a
     // position to read it from. `wsp-136` item 3 — the last barrier's check was
@@ -981,7 +984,7 @@ fn stamp_of(line: &str) -> Option<i64> {
 /// **A refusal is stamped, never retried.** A member whose agent has exited is
 /// the case this exists for and `wsp tell` refuses it for exactly that reason;
 /// the respawn is the fallback, on a later tick.
-fn tell_member(store: &Store, id: &str, text: &str) {
+pub(crate) fn tell_member(store: &Store, id: &str, text: &str) {
     if cfg!(test) {
         #[cfg(test)]
         return crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), text.to_string())));

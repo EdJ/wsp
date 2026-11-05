@@ -163,16 +163,17 @@ pub(crate) fn order_line(task: &str, leg: &str, fetch: bool) -> String {
     format!(
         "{fetch}You are leg {leg} of {task}: one seat in a row run as legs. Your brief is already above, \
          with your order and the batons you were handed; read the tree they point at rather than \
-         re-deriving them. Work in this tree, commit, and end with `wsp leg done {task} --from FILE \
-         --caption \"...\"`. If you are the last leg, `wsp review {task} \"...\"` ends the row. \
-         `wsp ask {task} \"...\"` reaches whoever coordinates this."
+         re-deriving them. Work in this tree, commit, and end with `wsp leg done {task} \
+         --caption \"...\"`. If you are the last leg, `wsp review {task} \"...\"` ends the row. {} \
+         `wsp ask {task} \"...\"` reaches whoever coordinates this.",
+        crate::closing::how_to_close(task, false)
     )
 }
 
 // ---- ending ---------------------------------------------------------------------
 
 /// Tracked changes in a tree, or `None` when it is not a git work tree.
-fn dirty(dir: &str) -> Option<Vec<String>> {
+pub(crate) fn dirty(dir: &str) -> Option<Vec<String>> {
     let out = std::process::Command::new("git")
         .args(["-C", dir, "status", "--porcelain", "--untracked-files=no"])
         .output()
@@ -181,7 +182,7 @@ fn dirty(dir: &str) -> Option<Vec<String>> {
 }
 
 /// Where this seat stands: its binding's tree, else where the process is.
-fn standing_dir(store: &Store, pane: &str) -> Option<String> {
+pub(crate) fn standing_dir(store: &Store, pane: &str) -> Option<String> {
     store
         .bindings()
         .get(pane)
@@ -192,30 +193,48 @@ fn standing_dir(store: &Store, pane: &str) -> Option<String> {
 }
 
 fn ended_line(store: &Store, leg: &Leg, pane: &str, extra: &str) -> String {
+    ended_line_at(store, leg, pane, extra, &util::now_iso())
+}
+
+/// The end line for a leg that ended at `at`, which is the baton's write when a
+/// close came late.
+fn ended_line_at(store: &Store, leg: &Leg, pane: &str, extra: &str, at: &str) -> String {
     let started = leg.started.clone().unwrap_or_default();
-    let secs = util::since(&started);
+    let secs = if started.is_empty() { 0 } else { (util::epoch_of(at) - util::epoch_of(&started)).max(0) };
     let after = if secs > 0 { format!(" after {}", util::duration_human(secs)) } else { String::new() };
     let ran = if started.is_empty() { String::new() } else { crate::cmd_agent::ran_in_seat(store, pane, &started) };
     format!("leg {} ended{after}{extra}{ran}", leg.name)
 }
 
-fn refuse(why: String) -> i32 {
-    eprintln!("wsp: {}", why.trim_start_matches("wsp: "));
-    1
-}
-
-/// The baton: `--from FILE`, or `-` for stdin. Optional, and empty is a leg with
-/// nothing to hand on.
-fn baton_text(args: &Args) -> Result<String, String> {
+/// The baton: `--from FILE`, or `-` for stdin; with neither, the file wsp keeps
+/// for this leg ([`crate::closing::baton_path`], `$WSP_BATON` in the seat) when
+/// it is there. Optional, and empty is a leg with nothing to hand on.
+fn baton_text(store: &Store, args: &Args, row: &str, leg: &str) -> Result<String, String> {
     let src = match args.get("from") {
         Some(v) if v == "true" && args.rest.iter().skip(2).any(|r| r == "-") => "-".to_string(),
         Some(v) if v != "true" => v,
-        _ => return Ok(String::new()),
+        _ => {
+            return Ok(std::fs::read_to_string(crate::closing::baton_path(store, row, leg)).unwrap_or_default());
+        }
     };
     if src == "-" && util::stdin_is_tty() {
         return Err("nothing is piped in — `--from -` reads the baton from a stream".into());
     }
     crate::cmd_task::read_source(&src).map_err(|e| format!("cannot read {src}: {e}"))
+}
+
+/// How a leg came to be closed when it was not at the moment its seat finished.
+pub(crate) struct Late {
+    /// When the baton was written, epoch seconds: the leg's work ended then.
+    pub baton_at: i64,
+    /// Set when wsp closed it for an idle or ended seat: `seat idle 12m`.
+    pub by_wsp: Option<String>,
+}
+
+/// What a finished leg leaves the caller to print.
+pub(crate) struct Finished {
+    pub task: Task,
+    pub legs: Vec<Leg>,
 }
 
 /// `wsp leg done <task> --from FILE --caption "…"`: this seat's leg is finished.
@@ -224,74 +243,62 @@ fn baton_text(args: &Args) -> Result<String, String> {
 /// over its cap — every leg boundary is a commit, so the legs that wait on it can
 /// trust `git log` over the baton. Writes the baton, marks the leg `done`, writes
 /// its end line, and pokes the run.
+///
+/// **A refusal is one plain line on stderr, a non-zero exit, and a line in
+/// `cycle.log`** (wsp-372): a close that was refused must not be mistaken for one
+/// that never ran.
 pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     let Some(task) = args.rest.get(1) else {
-        eprintln!("usage: wsp leg done <task> --from FILE|- --caption \"…\"");
+        eprintln!("usage: wsp leg done <task> --from FILE|- --caption \"…\"   (no --from: $WSP_BATON)");
         return 2;
     };
-    let caption = args.get("caption").map(|c| crate::cmd_task::fold(&c)).filter(|c| c != "true").unwrap_or_default();
-    if caption.is_empty() {
-        return refuse("a leg's end takes a caption: the line a glance reads, --caption \"…\"".into());
+    match done(store, args, task, pane) {
+        Ok(()) => 0,
+        Err(why) => {
+            let why = why.trim_start_matches("wsp: ").to_string();
+            crate::cycle::log_line(
+                store,
+                &format!("leg done {task} refused for {}: {}", pane.unwrap_or("this process"), util::truncate(&crate::cmd_task::fold(&why), 300)),
+            );
+            eprintln!("wsp: {} — the leg is still open", why.lines().next().unwrap_or_default().trim_end_matches(':'));
+            for rest in why.lines().skip(1) {
+                eprintln!("{rest}");
+            }
+            1
+        }
     }
-    let baton = match baton_text(args) {
-        Ok(b) => b,
-        Err(why) => return refuse(why),
-    };
-    let t = match store.task_or_why(task) {
-        Ok(t) => t,
-        Err(why) => return refuse(why),
-    };
+}
+
+fn done(store: &Store, args: &Args, task: &str, pane: Option<&str>) -> Result<(), String> {
+    let caption = args.get("caption").map(|c| crate::cmd_task::fold(&c)).filter(|c| c != "true").unwrap_or_default();
+    let t = store.task_or_why(task)?;
     let old = legs::legs(&t);
     let Some(name) = legs::actor_of(&old, pane) else {
-        return refuse(format!(
+        return Err(format!(
             "{} is not the seat of a running leg of {} — only a leg's own seat ends it",
             pane.unwrap_or("this process"),
             t.id
         ));
     };
-    let pane = pane.unwrap_or_default();
-    if let Some(dir) = standing_dir(store, pane) {
-        if let Some(changed) = dirty(&dir).filter(|c| !c.is_empty()) {
-            let shown: Vec<&str> = changed.iter().take(5).map(String::as_str).collect();
-            return refuse(format!(
-                "{dir} has {} uncommitted change(s) — every leg ends at a commit, so the next leg can trust \
-                 `git log`. Commit, then end the leg again:\n  {}",
-                changed.len(),
-                shown.join("\n  ")
-            ));
-        }
+    let baton = baton_text(store, args, &t.id, &name)?;
+    // The baton file wsp keeps, written some while ago: the leg's work ended
+    // then, and the close is late by the difference.
+    let late = (args.get("from").is_none())
+        .then(|| crate::closing::written_at(&crate::closing::baton_path(store, &t.id, &name)))
+        .flatten()
+        .filter(|at| util::epoch_secs() - at >= crate::closing::LATE_AFTER)
+        .map(|baton_at| Late { baton_at, by_wsp: None });
+    if caption.is_empty() {
+        return Err("a leg's end takes a caption: the line a glance reads, --caption \"…\"".into());
     }
-    let started = old.iter().find(|l| l.name == name).cloned().unwrap_or_else(|| Leg::pending(&name, ""));
-    let line = ended_line(store, &started, pane, "");
-    let ready_line = match ready_signal(store, &t.id, &old, &name, &baton, &caption) {
-        Ok(l) => l,
-        Err(why) => return refuse(why),
-    };
-    let result = store.locked(|| {
-        let mut t = store.find_task(&t.id).ok_or_else(|| format!("no task {}", t.id))?;
-        let old = legs::legs(&t);
-        let new = legs::finish(&old, &name, &baton, &caption, &util::now_iso())?;
-        t.log(&line);
-        if let Some(l) = &ready_line {
-            t.log(l);
-        }
-        legs::write(&mut t, &new);
-        store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
-        Ok::<_, String>((t, new))
-    });
-    let (t, new) = match result {
-        Ok(v) => v,
-        Err(why) => return refuse(why),
-    };
-    store.log_event("leg-done", serde_json::json!({ "id": t.id, "leg": name }));
-    store.git_commit(&format!("wsp: {} leg {name} done", t.id));
-    crate::cycle::poke_task(store, &t.id, "leg-done");
+    let done = finish(store, &t.id, &name, pane.unwrap_or_default(), &baton, &caption, late.as_ref())?;
     let p = Paint::new();
+    let (t, new) = (done.task, done.legs);
     println!("{} {}  leg {name} done · {caption}", p.green("✓"), t.id);
     // A sibling hears early which paths another has also changed; the join's
     // brief carries the same line, read again from the branches when it opens.
     let tree_mine = new.iter().find(|l| l.name == name).is_some_and(|l| l.tree.is_some());
-    if let (true, Some(dir)) = (tree_mine, standing_dir(store, pane)) {
+    if let (true, Some(dir)) = (tree_mine, standing_dir(store, pane.unwrap_or_default())) {
         if let Some(line) = crate::leg_tree::overlap_for(std::path::Path::new(&dir), &t.id, &new, &name) {
             println!("  {}", p.yellow(&line));
         }
@@ -302,7 +309,68 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         (true, false) => println!("  {}", p.dim("nothing is ready yet — legs still running hold the rest")),
         (false, false) => println!("  {}", p.dim(&format!("ready: {}", ready.join(", ")))),
     }
-    0
+    Ok(())
+}
+
+/// Close leg `name` of `row`, whoever is closing it: the seat's own `leg done`,
+/// or wsp on a seat that went idle or ended ([`crate::closing`]). The checks are
+/// the same in both — a clean tree at a commit, a caption, a baton in its cap —
+/// so wsp closing a leg is never wsp closing it more loosely.
+///
+/// A [`Late`] close times the leg to the baton's write, and says it was late.
+pub(crate) fn finish(
+    store: &Store,
+    row: &str,
+    name: &str,
+    pane: &str,
+    baton: &str,
+    caption: &str,
+    late: Option<&Late>,
+) -> Result<Finished, String> {
+    let t = store.task_or_why(row)?;
+    let old = legs::legs(&t);
+    if let Some(dir) = standing_dir(store, pane) {
+        if let Some(changed) = dirty(&dir).filter(|c| !c.is_empty()) {
+            let shown: Vec<&str> = changed.iter().take(5).map(String::as_str).collect();
+            return Err(format!(
+                "{dir} has {} uncommitted change(s) — every leg ends at a commit, so the next leg can trust \
+                 `git log`. Commit, then end the leg again:\n  {}",
+                changed.len(),
+                shown.join("\n  ")
+            ));
+        }
+    }
+    let started = old.iter().find(|l| l.name == name).cloned().unwrap_or_else(|| Leg::pending(name, ""));
+    let at = late.map(|l| util::iso_at(l.baton_at)).unwrap_or_else(util::now_iso);
+    let mut line = ended_line_at(store, &started, pane, "", &at);
+    if let Some(l) = late {
+        line.push_str(&crate::closing::late_clause(l.baton_at, util::epoch_secs(), l.by_wsp.as_deref()));
+    }
+    let ready_line = ready_signal(store, &t.id, &old, name, baton, caption)?;
+    let result = store.locked(|| {
+        let mut t = store.find_task(&t.id).ok_or_else(|| format!("no task {}", t.id))?;
+        let old = legs::legs(&t);
+        let new = legs::finish(&old, name, baton, caption, &at)?;
+        t.log(&line);
+        if let Some(l) = &ready_line {
+            t.log(l);
+        }
+        legs::write(&mut t, &new);
+        store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
+        Ok::<_, String>((t, new))
+    });
+    let (t, new) = result?;
+    let mut data = serde_json::json!({ "id": t.id, "leg": name });
+    if let Some(l) = late {
+        data["baton_at"] = serde_json::json!(l.baton_at);
+        if let Some(w) = &l.by_wsp {
+            data["closed_by"] = serde_json::json!(format!("wsp: {w}"));
+        }
+    }
+    store.log_event("leg-done", data);
+    store.git_commit(&format!("wsp: {} leg {name} done", t.id));
+    crate::cycle::poke_task(store, &t.id, "leg-done");
+    Ok(Finished { task: t, legs: new })
 }
 
 /// The last leg's end is the row's ready signal, as `wsp review` is for a row
@@ -409,8 +477,9 @@ pub(crate) fn brief_lines(tasks: &[Task], pane: &str) -> Option<Vec<String>> {
     }
     let (cap, _) = legs::baton_cap(&all, &name);
     out.push(format!(
-        "finish: commit, then `wsp leg done {} --from FILE --caption \"…\"` — a baton of at most {cap} characters, pointers not a plan; \
-         the last leg types `wsp review {} \"…\"` instead",
+        "finish: commit, then `wsp leg done {} --caption \"…\"` — a baton of at most {cap} characters, pointers not a plan, \
+         written first with a heredoc into $WSP_BATON, which `leg done` reads; the last leg types `wsp review {} \"…\"` instead. \
+         The closing verb is its own Bash call, never chained after another command",
         t.id, t.id
     ));
     Some(out)

@@ -2614,7 +2614,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // needs. Asked here rather than read again below, because the environment
     // is fixed by `open`, which this feeds.
     let custodian = args.has("govern");
-    let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"), occupant, custodian);
+    let mut order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"), occupant, custodian);
+    // A leg's baton has a place wsp knows (`wsp-372`): `wsp leg done` reads it
+    // when `--from` is not given, and the orders say to write it there.
+    if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {
+        order.env.insert("WSP_BATON".into(), crate::closing::baton_path(store, task, name).display().to_string());
+    }
     // The leg is written `running` under the store lock before its seat exists,
     // so it is the key a retried spawn finds, and taken back if no seat comes.
     if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {

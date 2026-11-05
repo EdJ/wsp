@@ -813,7 +813,7 @@ pub(crate) fn barrier_list(t: &Task) -> Option<&str> {
 
 /// The list a row belongs to: itself a member, a verifier under one, or the
 /// barrier row named after the list. Running or not, for the barrier.
-fn list_of(store: &Store, t: &Task) -> Option<Worklist> {
+pub(crate) fn list_of(store: &Store, t: &Task) -> Option<Worklist> {
     let running = worklist::Running::read(store);
     let id = match t.tags.iter().any(|g| g == VERIFY_TAG) {
         true => t.parent.clone().unwrap_or_default(),
