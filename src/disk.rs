@@ -89,7 +89,8 @@ impl Disk {
 pub(crate) fn gb(bytes: u64) -> String {
     match bytes {
         b if b >= 10 * 1024 * 1024 * 1024 => format!("{} GB", b / (1024 * 1024 * 1024)),
-        b => format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0)),
+        b if b >= 1024 * 1024 * 1024 => format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0)),
+        b => format!("{} MB", b / (1024 * 1024)),
     }
 }
 

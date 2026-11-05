@@ -219,18 +219,21 @@ fn stop_running(dir: &Path) -> usize {
 }
 
 /// Take the tree at `dir`, of the repository at `repo`, unless somebody is in
-/// it or something is. What its check left running is stopped first, once no
-/// seat is in it: a watcher rewrites `.dev.log` and holds the tree open.
+/// it or something is. What its check left running is stopped only once the
+/// tree is known to be going; a tree that is kept keeps its servers.
 fn take(repo: &Path, dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
     let path = util::contract(dir);
     if let Some(why) = standing(dir) {
         return Tree::Kept { path, why };
     }
-    stop_running(dir);
     match litter(dir, residue) {
         None => Tree::Kept { path, why: "git could not read it".into() },
         Some(found) if !found.is_empty() => Tree::Kept { path, why: holds_more(&found) },
-        Some(_) => Tree::Removed { path, kept: cmd_checkout::remove(repo, dir).kept },
+        Some(_) => {
+            // Only a tree that is going: a kept one keeps its servers.
+            stop_running(dir);
+            Tree::Removed { path, kept: cmd_checkout::remove(repo, dir).kept }
+        }
     }
 }
 
