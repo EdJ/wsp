@@ -879,7 +879,7 @@ pub(crate) mod stand_in {
     use std::cell::Cell;
     use std::path::PathBuf;
 
-    const MODEL_KINDS: &[&str] = &["claude", "opencode", "pi"];
+    const MODEL_KINDS: &[&str] = &["claude", "opencode"];
 
     thread_local! {
         static REAL: Cell<bool> = const { Cell::new(false) };
