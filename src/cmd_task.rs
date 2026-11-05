@@ -1538,6 +1538,15 @@ pub fn block(store: &Store, args: &Args) -> i32 {
 pub fn review(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
         "wsp review <id> \"what you did, and what you left\"   (or `-` to read it from stdin)";
+    // Given no account: the one written at the place wsp keeps for it (`wsp-374`,
+    // `$WSP_VERDICT`), when it was written in this run of the row.
+    if let Some((from_file, written)) = crate::closing::member_args(store, args) {
+        let code = review(store, &from_file);
+        if code == 0 {
+            crate::closing::note_close(store, &args.rest[0], "review", written, None);
+        }
+        return code;
+    }
     // No id at all is a different mistake and gets the plain usage. The
     // handbook's line is `Finished? wsp review`, *without* one, so this is a
     // sentence agents type — and answering it with a lecture about accounts

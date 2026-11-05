@@ -3641,6 +3641,17 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
+    // Given no words: the verdict the check wrote at the place wsp keeps for it
+    // (`wsp-374`, `$WSP_VERDICT`), when it opens with `go` and was written in this run.
+    if said.trim().is_empty() {
+        if let Some((from_file, written)) = crate::closing::check_args(store, args, "go", &w) {
+            let code = go(store, &from_file);
+            if code == 0 {
+                crate::closing::note_close(store, &w.id, "go", written, None);
+            }
+            return code;
+        }
+    }
     go_with(store, args, w, said, seat, crate::barrier::State::Passes, None)
 }
 
@@ -4271,6 +4282,17 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
+    // Given no reason: the verdict the check wrote at the place wsp keeps for it
+    // (`wsp-374`), when it opens with `hold` and was written in this run.
+    if said.trim().is_empty() {
+        if let Some((from_file, written)) = crate::closing::check_args(store, args, "hold", &w) {
+            let code = hold(store, &from_file);
+            if code == 0 {
+                crate::closing::note_close(store, &w.id, "hold", written, None);
+            }
+            return code;
+        }
+    }
     if said.trim().is_empty() {
         eprintln!("wsp: {} \"why\" — a hold with no reason on it is a run nobody can restart", how("hold", &w, seat));
         eprintln!("     `--from FILE` reads the sentence out of a file and `-` off a stream, where a shell never sees it");

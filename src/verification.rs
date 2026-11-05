@@ -771,6 +771,22 @@ pub(crate) fn supersede(store: &Store, member: &str, seat: &str) -> bool {
 /// as what is owed — the member goes back to `doing`, and its pane is told —
 /// and the run tells its governor once, as the decision it is.
 pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
+    let me = crate::cmd_agent::my_pane();
+    // Given no verdict: the one the verifier wrote at the place wsp keeps for it
+    // (`wsp-374`, `$WSP_VERDICT`), when it was written in this pass.
+    if let Some((from_file, written)) = crate::closing::verifier_args(store, args, me.as_deref()) {
+        let code = verified_as(store, &from_file, me);
+        if code == 0 {
+            crate::closing::note_close(store, &args.rest[0], "verified", written, None);
+        }
+        return code;
+    }
+    verified_as(store, args, me)
+}
+
+/// [`cmd_verified`] as the seat `me`, which is how wsp closes for a verifier that
+/// did not (`wsp-374`): the process is not the verifier's, so its pass is named.
+pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32 {
     const USAGE: &str = "wsp verified <member> --holds|--blocks --from FILE --caption \"…\"   (or `-` for stdin)";
     let state = match (args.has("holds"), args.has("blocks")) {
         (true, false) => State::Holds,
@@ -810,7 +826,6 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    let me = crate::cmd_agent::my_pane();
     // A row sent back while this verifier read it (a failed check, a person) is
     // not landed by the hold: the send-back owns the row until it returns to
     // review, where a fresh verifier reads what comes back.

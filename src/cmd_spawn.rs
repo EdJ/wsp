@@ -2620,6 +2620,21 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {
         order.env.insert("WSP_BATON".into(), crate::closing::baton_path(store, task, name).display().to_string());
     }
+    // And so is the verdict of a member, a verifier and a check (`wsp-374`): the
+    // closing verb reads it when it is given no `--from`, and a file left by an
+    // earlier run of the same row is taken away as the new one starts.
+    if will_start && leg_name.is_none() {
+        let verdict = match (&checking, work.task.as_deref()) {
+            (Some((list, at)), _) => Some((crate::barrier::subject(list, *at), crate::closing::Kind::Check)),
+            (None, Some(task)) if verifying => Some((task.to_string(), crate::closing::Kind::Verifier)),
+            (None, Some(task)) if args.has("agent") && !args.has("govern") => Some((task.to_string(), crate::closing::Kind::Member)),
+            _ => None,
+        };
+        if let Some((key, kind)) = verdict {
+            crate::closing::clear_verdict(store, &key, kind);
+            order.env.insert("WSP_VERDICT".into(), crate::closing::verdict_path(store, &key, kind).display().to_string());
+        }
+    }
     // The leg is written `running` under the store lock before its seat exists,
     // so it is the key a retried spawn finds, and taken back if no seat comes.
     if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {

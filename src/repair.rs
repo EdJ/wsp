@@ -852,6 +852,21 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
 
         let word = state.as_str();
         let already = noticed(&t);
+        // **Closing for the seat** (`wsp-374`): a session that ended with its
+        // row at `doing`, or a seat still idle a window after it was told, has a
+        // review wsp can type for it when the verdict is written and the tree is
+        // clean at a commit — and a person to flag when it cannot. Asked before
+        // the seat is ended, because ending it throws the verdict away.
+        let ended = state == State::Gone;
+        let second = already.is_some_and(|since| since + STALLED_AFTER <= util::epoch_secs());
+        if ended || second {
+            let idle = already.map(|since| (util::epoch_secs() - since + STALLED_AFTER) / 60).unwrap_or(0);
+            let why = if ended { crate::closing::Why::Ended } else { crate::closing::Why::Idle(idle) };
+            if crate::closing::close_member(store, &t, &seat, why) {
+                stamp(store, &format!("{} group {at}: {} ({seat}) was closed by wsp from its verdict — {}", w.id, t.id, why_words(ended, idle)));
+                continue;
+            }
+        }
         if already.is_some_and(|since| since + STALLED_AFTER <= util::epoch_secs()) {
             // Told once, still not working. End it, put the row back where a
             // start can take it, and let the run start it again — the same
@@ -894,7 +909,10 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         tell_member(store, &id, &format!(
             "wsp noticed that {id} is at doing with nothing working on it. If your work is finished, \
              land it and run `wsp review {id}`; if it is not, say what is left. Nobody else is \
-             waiting on this row."
+             waiting on this row. {} If wsp finds it still at doing in {} min it will run the review for you from \
+             that file when the tree is committed, or flag the person.",
+            crate::closing::how_to_close_verdict(crate::closing::Kind::Member, &id),
+            STALLED_AFTER / 60
         ));
         crate::cycle::tell(store, w, &format!(
             "{} in the {} run is at doing with nothing working on it — its seat reads {word} and it \
@@ -902,6 +920,10 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             id, w.id, id
         ));
     }
+}
+
+fn why_words(ended: bool, idle: i64) -> String {
+    if ended { "session ended".to_string() } else { format!("seat idle {idle}m") }
 }
 
 /// Put a member back where a start can take it, and say why on its row.
