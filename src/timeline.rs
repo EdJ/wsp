@@ -31,14 +31,21 @@ pub(crate) struct Phase {
     pub gap: bool,
     /// For a gap: what was being waited for.
     pub waiting_for: Option<String>,
+    /// The group's, not the member's: a barrier phase is one run for every
+    /// member of the group, and a sum over members counts it once per group.
+    pub shared: bool,
 }
 
 impl Phase {
     fn work(label: impl Into<String>, start: i64, end: i64) -> Phase {
-        Phase { label: label.into(), start, end: end.max(start), gap: false, waiting_for: None }
+        Phase { label: label.into(), start, end: end.max(start), gap: false, waiting_for: None, shared: false }
     }
     fn gap(label: impl Into<String>, start: i64, end: i64, why: String) -> Phase {
-        Phase { label: label.into(), start, end: end.max(start), gap: true, waiting_for: Some(why) }
+        Phase { label: label.into(), start, end: end.max(start), gap: true, waiting_for: Some(why), shared: false }
+    }
+    fn shared(mut self) -> Phase {
+        self.shared = true;
+        self
     }
     pub(crate) fn seconds(&self) -> i64 {
         self.end - self.start
@@ -84,10 +91,19 @@ impl Inputs {
     }
 }
 
-/// Why nothing was running between `from` and `to`.
-fn wait_name(i: &Inputs, from: i64, to: i64) -> String {
+/// Why nothing was running between `from` and `to`, for `who`: the row's id, or
+/// `<list> · barrier <n>` for the barrier. A cap line names the one that
+/// waits before ` waits —`; whoever it lists after the colon holds a place.
+fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
     let span = to - from;
-    let cap = i.cycle.iter().any(|(t, l)| *t >= from && *t <= to && l.contains(&format!(": {} waits — the seat is at its cap", i.id)));
+    let cap = i.cycle.iter().any(|(t, l)| {
+        *t >= from
+            && *t <= to
+            && l.split_once(" waits — the seat is at its cap").is_some_and(|(before, _)| {
+                let what = before.rsplit_once(": ").map_or(before, |(_, w)| w);
+                names(what, who)
+            })
+    });
     if cap {
         "the seat's cap (a place to come free)".into()
     } else if span <= HAND_OFF {
@@ -161,7 +177,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             .or_else(|| done_event.map(|(t, _, _)| *t))
             .or_else(|| reviews.iter().copied().find(|r| *r >= s));
         if ready > 0 && s > ready {
-            out.push(Phase::gap(format!("gap before leg {}", leg.name), ready, s, wait_name(i, ready, s)));
+            out.push(Phase::gap(format!("gap before leg {}", leg.name), ready, s, wait_name(i, ready, s, id)));
         }
         let up = i.first_learned_after(s);
         let label = match up {
@@ -208,10 +224,10 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                 Some(c) => {
                     out.push(Phase::work("the row's own check (wsp check, run by review)", r, c));
                     if s > c {
-                        out.push(Phase::gap("row's check ended → verifier spawn requested", c, s, wait_name(i, c, s)));
+                        out.push(Phase::gap("row's check ended → verifier spawn requested", c, s, wait_name(i, c, s, id)));
                     }
                 }
-                None => out.push(Phase::gap("review typed → verifier spawn requested", r, s, wait_name(i, r, s))),
+                None => out.push(Phase::gap("review typed → verifier spawn requested", r, s, wait_name(i, r, s, id))),
             }
             if let Some(u) = up {
                 out.push(Phase::work("verifier seat start", s, u));
@@ -239,33 +255,45 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         let seat_up = i.first_line(from, |l| l.contains(&format!("started {list} · barrier {at}")));
         // The run's own line is written when it ENDS, with its elapsed seconds
         // (lock wait included): it began that long before.
-        let run_head = format!("{list} group {at}: barrier run —");
-        let run = i.cycle.iter().find(|(t, l)| *t >= from && l.contains(&run_head)).map(|(t, l)| (*t, l.as_str()));
+        // Copies of a run share one line of the log, or follow one another; the
+        // longest of those that end together began first, and is the run.
+        let who = format!("{list} · barrier {at}");
+        let head = format!("{list} group {at}: barrier run — ");
+        let mut runs: Vec<(i64, &str)> = Vec::new();
+        for (t, l) in i.cycle.iter().filter(|(t, l)| *t >= from && l.contains(&head)) {
+            runs.extend(l.split(&head).skip(1).map(|seg| (*t, seg)));
+        }
+        let first_end = runs.first().map(|(t, _)| *t);
+        let run = runs
+            .iter()
+            .filter(|(t, _)| first_end.is_some_and(|f| *t <= f + 120))
+            .max_by_key(|(_, seg)| run_seconds(seg).unwrap_or(0))
+            .copied();
         let pass = i.first_line(from, |l| l.starts_with(&format!("tell {list}: Barrier {at} of {list}")));
         let others = if last > verdict.unwrap_or(0) { " (other members' verdicts came later)" } else { "" };
         if let Some((end, line)) = run {
             let secs = run_seconds(line).unwrap_or(0);
             let start = (end - secs).max(from);
             if start > from {
-                out.push(Phase::gap(format!("last verdict → barrier {at} run started{others}"), from, start, wait_name(i, from, start)));
+                out.push(Phase::gap(format!("last verdict → barrier {at} run started{others}"), from, start, wait_name(i, from, start, &who)).shared());
             }
-            out.push(Phase::work(run_label(*at, line), start, end));
+            out.push(Phase::work(run_label(*at, line), start, end).shared());
             // A check seat after the run: its own wait, then its work.
             let seat = req.or(seat_up).filter(|b| *b >= end);
             if let Some(b) = seat {
                 if b > end {
-                    out.push(Phase::gap(format!("barrier {at} run ended → check seat started"), end, b, wait_name(i, end, b)));
+                    out.push(Phase::gap(format!("barrier {at} run ended → check seat started"), end, b, wait_name(i, end, b, &who)).shared());
                 }
                 if let Some(p) = pass.filter(|p| *p >= b) {
-                    out.push(Phase::work(format!("barrier {at} check seat → passed"), b, p));
+                    out.push(Phase::work(format!("barrier {at} check seat → passed"), b, p).shared());
                 }
             } else if let Some(p) = pass.filter(|p| *p >= end) {
-                out.push(Phase::work(format!("barrier {at} run ended → passed"), end, p));
+                out.push(Phase::work(format!("barrier {at} run ended → passed"), end, p).shared());
             }
         } else if let Some(b) = req.or(seat_up) {
-            out.push(Phase::gap(format!("last verdict → barrier {at} started{others}"), from, b, wait_name(i, from, b)));
+            out.push(Phase::gap(format!("last verdict → barrier {at} started{others}"), from, b, wait_name(i, from, b, &who)).shared());
             if let Some(p) = pass.filter(|p| *p >= b) {
-                out.push(Phase::work(format!("barrier {at} runs → passed"), b, p));
+                out.push(Phase::work(format!("barrier {at} runs → passed"), b, p).shared());
             }
         }
     }
@@ -274,17 +302,20 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     out
 }
 
-/// The seconds a `barrier run —` line reports: the run's elapsed time.
-fn run_seconds(line: &str) -> Option<i64> {
-    let after = line.split(" failed, ").nth(1)?;
+/// The seconds a `barrier run —` segment reports: the run's elapsed time.
+fn run_seconds(seg: &str) -> Option<i64> {
+    let after = seg.split(" failed, ").nth(1)?;
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     if after[digits.len()..].starts_with('s') { digits.parse().ok() } else { None }
 }
 
 /// The run's label: its counts, and the seconds of each step that ran.
-fn run_label(at: usize, line: &str) -> String {
-    let counts = line.split("barrier run — ").nth(1).unwrap_or("").split(" · ").next().unwrap_or("");
-    let steps = line.split(" · per step: ").nth(1).map(|s| s.split(" · ").next().unwrap_or(s)).map(|s| format!(" — per step: {s}")).unwrap_or_default();
+fn run_label(at: usize, seg: &str) -> String {
+    let counts = match (seg.split(" failed, ").next(), run_seconds(seg)) {
+        (Some(head), Some(secs)) => format!("{head} failed, {secs}s"),
+        _ => seg.split(" · ").next().unwrap_or("").to_string(),
+    };
+    let steps = seg.split(" · per step: ").nth(1).map(|s| s.split(" · ").next().unwrap_or(s).trim_end()).map(|s| format!(" — per step: {s}")).unwrap_or_default();
     format!("barrier {at} run ({counts}){steps}")
 }
 
@@ -322,6 +353,7 @@ fn to_json(i: &Inputs, phases: &[Phase]) -> Value {
             "seconds": x.seconds(),
             "gap": x.gap,
             "waiting_for": x.waiting_for,
+            "shared": x.shared,
         })).collect::<Vec<_>>(),
         "gap_seconds": phases.iter().filter(|x| x.gap).map(|x| x.seconds()).sum::<i64>(),
     })
@@ -783,6 +815,12 @@ pub(crate) struct RowFigures {
     /// Sessions whose transcript was not found: their calls are not counted.
     pub missing: usize,
     pub sessions: usize,
+    /// The barrier phases (the group's, one run for all its members): their
+    /// seconds, the gap among them, and that gap by what it waited for. They
+    /// are inside `wall`, `gap` and `waits` too, for the row's own view.
+    pub shared: i64,
+    pub shared_gap: i64,
+    pub shared_waits: std::collections::BTreeMap<String, i64>,
 }
 
 pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
@@ -802,9 +840,17 @@ pub(crate) fn figures_of(phases: &[Phase], seat: &SeatReport) -> RowFigures {
     f.wall = (b - a).max(0);
     f.start = a;
     f.end = b;
+    for p in phases.iter().filter(|p| p.shared) {
+        f.shared += p.seconds();
+    }
     for p in phases.iter().filter(|p| p.gap) {
         f.gap += p.seconds();
-        *f.waits.entry(p.waiting_for.clone().unwrap_or_else(|| "unnamed".into())).or_insert(0) += p.seconds();
+        let why = p.waiting_for.clone().unwrap_or_else(|| "unnamed".into());
+        if p.shared {
+            f.shared_gap += p.seconds();
+            *f.shared_waits.entry(why.clone()).or_insert(0) += p.seconds();
+        }
+        *f.waits.entry(why).or_insert(0) += p.seconds();
     }
     f.sessions = seat.sessions.len();
     f.missing = seat.missing.len();
@@ -963,6 +1009,28 @@ mod tests {
         assert!(ph.iter().any(|p| p.label.starts_with("barrier 1 run ended → passed") && p.seconds() == 10), "{ph:?}");
         let unnamed: i64 = ph.iter().filter(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with("nothing the logs"))).map(|p| p.seconds()).sum();
         assert_eq!(unnamed, 0);
+    }
+
+    #[test]
+    fn a_verifier_spawn_waiting_at_the_cap_is_the_cap_and_a_garbled_copied_run_line_reads_as_the_longest_run() {
+        let mut i = row();
+        // The cap line names the waiting step ("r-1 · verifying") before ` waits`.
+        i.events.push(ev(405, "task-checked", json!({"id": "r-1", "took": 95})));
+        i.cycle.retain(|(_, l)| !l.starts_with("spawn r-1 --agent --verify"));
+        i.cycle.push((450, "list group 1: r-1 · verifying waits — the seat is at its cap of 4: x in cpd-1".into()));
+        i.cycle.push((600, "spawn r-1 --agent --verify --kind claude".into()));
+        i.cycle.push((605, "list group 1: started r-1 · verifying".into()));
+        i.events.retain(|(_, k, _)| k != "task-verified");
+        i.events.push(ev(700, "task-verified", json!({"id": "r-1"})));
+        i.group = Some(("list".into(), 1, vec!["r-1".into()]));
+        // Two copies wrote one line; the longer began first.
+        i.cycle.push((1000, "list group 1: barrier run — 1 step(s), 1 reused, 0 ran, 0 failed, 35slist group 1: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 300s".into()));
+        let ph = build(&i);
+        let w = ph.iter().find(|p| p.label.starts_with("row's check ended")).unwrap();
+        assert!(w.waiting_for.as_deref().unwrap().contains("cap"), "{w:?}");
+        let run = ph.iter().find(|p| p.label.starts_with("barrier 1 run (")).unwrap();
+        assert_eq!((run.start, run.end), (700, 1000));
+        assert!(run.label.contains("1 ran, 0 failed, 300s)"), "{}", run.label);
     }
 
     #[test]

@@ -207,26 +207,36 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
         let (mut gwall, mut gmodel, mut gtool) = (0i64, 0i64, 0i64);
         let mut gsuites = 0u64;
         let mut members: Vec<Value> = Vec::new();
+        // The barrier is the group's: one run, however many members. Each
+        // member's figures hold it (their own timeline shows it); the sums take
+        // it out of the members and put it back once per group (`wsp-390`).
+        let mut shared: Option<crate::timeline::RowFigures> = None;
         for m in &g.members {
             let f = figures(m);
+            if shared.as_ref().is_none_or(|s| f.shared > s.shared) {
+                shared = Some(crate::timeline::RowFigures { shared: f.shared, shared_gap: f.shared_gap, shared_waits: f.shared_waits.clone(), ..Default::default() });
+            }
             let suites = crate::throttle::full_suite_runs(&store.state, m);
             gsuites += suites;
             suites_total += suites;
             let tool: i64 = f.tools.values().sum();
-            gwall += f.wall;
+            gwall += f.wall - f.shared;
             gmodel += f.model_secs;
             gtool += tool;
             model += f.model_secs;
-            gap += f.gap;
+            gap += f.gap - f.shared_gap;
             calls += f.calls;
-            idle += (f.wall - f.model_secs - tool).max(0);
+            idle += (f.wall - f.shared - f.model_secs - tool).max(0);
             missing_sessions += f.missing;
             if f.end > 0 {
                 start = start.min(f.start);
                 end = end.max(f.end);
             }
             for (k, v) in &f.waits {
-                *waits.entry(k.clone()).or_insert(0) += v;
+                let own = v - f.shared_waits.get(k).copied().unwrap_or(0);
+                if own > 0 {
+                    *waits.entry(k.clone()).or_insert(0) += own;
+                }
             }
             for (k, v) in &f.tools {
                 *tools.entry(k.clone()).or_insert(0) += v;
@@ -266,6 +276,14 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
                 "transcripts_missing": f.missing, "full_suite_runs": suites,
             }));
         }
+        if let Some(sh) = shared {
+            gwall += sh.shared;
+            gap += sh.shared_gap;
+            idle += sh.shared;
+            for (k, v) in &sh.shared_waits {
+                *waits.entry(k.clone()).or_insert(0) += v;
+            }
+        }
         let gcost = cost["groups"].get(gi).and_then(|c| c.get("total")).cloned().unwrap_or(Value::Null);
         group_json.push(json!({
             "group": gi + 1, "wall_seconds": gwall, "model_seconds": gmodel, "tool_seconds": gtool,
@@ -297,6 +315,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "tool_seconds_total": tool_total,
             "idle_seconds": idle,
             "gap_seconds": gap,
+            "unnamed_wait_seconds": wait_list.iter().filter(|(c, _)| c.starts_with("nothing the logs")).map(|(_, s)| *s).sum::<i64>(),
             "calls": calls,
             "input_tokens": total["input_tokens"],
             "output_tokens": total["output_tokens"],
@@ -839,6 +858,36 @@ mod tests {
         assert_eq!(members.iter().map(|m| m["model_seconds"].as_i64().unwrap()).sum::<i64>(), 200);
         assert_eq!(members.iter().map(|m| m["gap_seconds"].as_i64().unwrap()).sum::<i64>(), t["gap_seconds"].as_i64().unwrap());
         assert_eq!(members[0]["wall_seconds"], 300);
+    }
+
+    #[test]
+    fn a_groups_barrier_is_counted_once_however_many_members_hold_it() {
+        use crate::timeline::RowFigures;
+        let (_e, store, w) = list("once", &["r-1", "r-2"]);
+        let barrier = |wall: i64, own_gap: i64| RowFigures {
+            start: 100,
+            end: 100 + wall,
+            wall,
+            gap: own_gap + 40,
+            model_secs: 50,
+            waits: [("a tick".to_string(), own_gap), ("nothing the logs name — x".to_string(), 40)].into(),
+            // The barrier: a 40 s unnamed wait and a 300 s run, in both members' timelines.
+            shared: 340,
+            shared_gap: 40,
+            shared_waits: [("nothing the logs name — x".to_string(), 40)].into(),
+            ..Default::default()
+        };
+        let fig = |id: &str| if id == "r-1" { barrier(500, 10) } else { barrier(480, 20) };
+        let v = effort_with(&store, &w, None, &fig);
+        let t = &v["totals"];
+        assert_eq!(t["gap_seconds"], 10 + 20 + 40, "the members' own gaps and the barrier's wait once, not twice");
+        assert_eq!(t["unnamed_wait_seconds"], 40, "{v}");
+        let waits = v["waits"].as_array().unwrap();
+        assert_eq!(waits.iter().map(|w| w["seconds"].as_i64().unwrap()).sum::<i64>(), 70);
+        assert_eq!(t["idle_seconds"], (500 - 340 - 50) + (480 - 340 - 50) + 340, "the run is idle for the seats once");
+        assert_eq!(v["groups"][0]["wall_seconds"], (500 - 340) + (480 - 340) + 340);
+        // Each member's own line still holds the phases it saw.
+        assert_eq!(v["groups"][0]["members"][0]["gap_seconds"], 50);
     }
 
     #[test]
