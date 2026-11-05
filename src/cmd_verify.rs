@@ -1584,6 +1584,15 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // A row copied to an executor records the tree hash this ran on, so `review`
+    // can refuse a tree that is not the one that passed (`docs/remote-agents.md`
+    // §6). Nothing happens for a row that was never copied.
+    if failed.is_none() {
+        if let Some(row) = repo.file_name().map(|n| n.to_string_lossy().into_owned()) {
+            crate::treecopy::note_verified(store, &row, &repo);
+        }
+    }
+
     if json_out {
         // The tail rather than the whole thing: a failing cargo run is
         // thousands of lines and the last eighty hold the error.

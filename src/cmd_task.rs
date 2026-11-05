@@ -1587,6 +1587,15 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", account.len()));
+    // A row copied to an executor is reviewed only at the tree `verify` ran on.
+    if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+        if let Some(tree) = crate::cmd_checkout::member_tree(store, &t.id) {
+            if let Err(why) = crate::treecopy::review_refusal(store, &t.id, &tree) {
+                eprintln!("wsp: {why}");
+                return 1;
+            }
+        }
+    }
     // A member of a group wsp runs is not landed by its agent: it is marked
     // ready at its tree's commit, and the verifier that reads that tree lands
     // it. Refused before the row moves when the tree holds uncommitted work.

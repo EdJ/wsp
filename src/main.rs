@@ -102,6 +102,10 @@ mod store;
 mod sync;
 mod throttle;
 mod timeline;
+// The tree copy (remote agents, `docs/remote-agents.md` §6). Its callers — spawn
+// `--on`, the Stop checkpoint — are the next groups; `review` already reads it.
+#[allow(dead_code)]
+mod treecopy;
 mod tunnel;
 mod untaken;
 mod util;
