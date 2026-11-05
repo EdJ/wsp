@@ -8989,13 +8989,15 @@ mod tests {
         assert!(panes.contains(&seat.as_str()), "and compound's, folded into the same census: {panes:?}");
     }
 
-    /// `wsp-250`, through the census rather than around it: a far machine
-    /// that goes silent for one reading — and the watch ticking meanwhile —
-    /// leaves its seat's clock where it was, so when the machine answers
-    /// again a turn two hours old still reads two hours. Only that machine
-    /// answering *without* the seat forgets it.
+    /// `wsp-250` once read a far machine's seats through herdr's fan-out and kept
+    /// their clocks across its silences. herdr no longer asks other machines
+    /// (the row's 16:40 log: a far socket's refusal read, beside compound's own
+    /// answer, as no census here), so `wip` draws this machine's seats alone and
+    /// never dials a far machine's socket. What is kept here is the other half:
+    /// this machine's clocks are not disturbed by a far machine that is in the
+    /// store and answering.
     #[test]
-    fn a_far_machine_silent_for_a_reading_keeps_its_seats_since() {
+    fn a_far_machine_is_not_asked_and_this_machines_seats_keep_their_since() {
         let env = util::isolated("since-far-silent");
         let stage = |pane: &str| {
             crate::fake::Stage::of(vec![crate::fake::Spot::agent(pane, "claude", "t-1", State::Working)])
@@ -9009,8 +9011,12 @@ mod tests {
         let far = crate::fake::Fake::bind(store.machine_socket("mb2"), stage("w2:p1")).expect("mb2's socket");
 
         let w = Wip::live(&store);
-        assert!(w.since.contains_key("w1:p1") && w.since.contains_key("w2:p1@mb2"), "both dated: {:?}", w.since);
-        // Two hours in: the clocks the readings to come must keep.
+        assert!(w.since.contains_key("w1:p1"), "this machine's seat is dated: {:?}", w.since);
+        assert!(!w.since.contains_key("w2:p1@mb2"), "mb2's is not read through herdr: {:?}", w.since);
+        assert!(!w.agents.iter().any(|s| s.seat.as_str() == "w2:p1@mb2"));
+        assert!(far.asked().is_empty(), "the far socket was dialled: {:?}", far.asked());
+
+        // Two hours in: the clock the readings to come must keep.
         let long_ago = util::iso_at(util::epoch_secs() - 7200);
         let file = env.state().join("seat-since.json");
         let mut rec: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -9018,31 +9024,9 @@ mod tests {
             e["since"] = json!(long_ago);
         }
         std::fs::write(&file, rec.to_string()).unwrap();
-        assert_eq!(rec["w2:p1@mb2"]["from"], "herdr@mb2", "filed under the machine it was read from: {rec:#}");
-
-        // mb2 stops answering. `wip` reads it without the seat; the watch ticks.
-        drop(far);
         let w = Wip::live(&store);
-        assert!(!w.agents.iter().any(|s| s.seat.as_str() == "w2:p1@mb2"), "the silence is real");
-        assert_eq!(w.since.get("w2:p1@mb2"), Some(&long_ago), "a silent machine is not a gone seat");
-        assert_eq!(w.since.get("w1:p1"), Some(&long_ago), "and this machine's seat never changed");
-        use crate::cmd_watch::Source;
-        crate::cmd_watch::Poll::new(&store, crate::cmd_watch::Scope::machine(), BTreeSet::new(), None).sample();
-
-        // mb2 is back, same seat, same turn.
-        let far = crate::fake::Fake::bind(store.machine_socket("mb2"), stage("w2:p1")).expect("mb2's socket again");
-        let w = Wip::live(&store);
-        assert_eq!(w.since.get("w2:p1@mb2"), Some(&long_ago), "the turn still reads two hours: {:?}", w.since);
-        let rows = wip_json(&w);
-        let row = rows["agents"].as_array().unwrap().iter().find(|a| a["pane"] == "w2:p1@mb2").unwrap().clone();
-        assert_eq!(row["since"], json!(long_ago));
-
-        // mb2 answers without it: now it is gone, and a seat that comes back
-        // under the same id later is a new reading.
-        far.restage(crate::fake::Stage::of(vec![]));
-        let w = Wip::live(&store);
-        assert_eq!(w.since.get("w2:p1@mb2"), None, "its own machine answered without it: {:?}", w.since);
-        assert_eq!(w.since.get("w1:p1"), Some(&long_ago));
+        assert_eq!(w.since.get("w1:p1"), Some(&long_ago), "and the turn still reads two hours");
+        assert!(far.asked().is_empty());
     }
 
     /// A compound seat directory whose pid is dead, last written `ago` seconds

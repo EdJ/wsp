@@ -355,123 +355,47 @@ fn qualify(id: &mut String, machine: &str) {
     }
 }
 
-/// The machines to ask, besides this one.
+/// Ask this machine, and keep the answer apart.
 ///
-/// Active, and last seen answering. Skipping the rest is not a second opinion
-/// on reachability — it is *using* the daemon's, which is what that field is
-/// for. It matters because a machine whose tunnel is up but whose far end has
-/// wedged costs a full timeout on every call, and this is on the path the panel
-/// takes to draw a frame.
+/// **herdr no longer fans out to other machines.** It did (`wsp-047`): a
+/// listing was asked of this machine and of every machine the daemon last saw
+/// answering, through a forwarded herdr socket. On compound a far machine is not
+/// a herdr — its seats are `compound-sup` sessions reached by ssh — and the
+/// forward it still gets from the tunnel leads to a socket that refuses. The
+/// refusal came back as a silent row, and the census that carried it beside
+/// compound's own `""` answer read, to a host drawing this machine's workspace,
+/// as no census here (`docs/remote-agents.md` section 2; the row's 16:40 log).
+/// A far machine's silence is now filed by name from the machines record
+/// ([`crate::far::silent_machines`]), not from a socket that was never going to
+/// answer.
 ///
-/// A store read per call. Two directory reads when there are no machines, which
-/// is what every seat costs until somebody adds one.
-fn fanout() -> Vec<String> {
-    let store = crate::store::Store::open();
-    let live = store.machines_live();
-    store
-        .machines()
-        .into_iter()
-        .filter(|m| m.is_active())
-        .map(|m| m.name)
-        .filter(|n| live.get(n).map(|l| l.reachable).unwrap_or(false))
-        .collect()
-}
-
-/// Ask this machine, then every reachable one, and keep the answers apart.
-///
-/// **The one line that knows which machine was silent.** Everything downstream
-/// either has this fact or reconstructs it by parsing the ids that came back —
-/// which is `cmd_agent::machine_of` today, and is the coupling
-/// [`crate::place::Census`] exists to remove: an id is the backend's shape and a
-/// caller that reads one has learned herdr's dialect. Here the machine is a
-/// *name*, the same one [`crate::place::Order::on`] sent the work out under, so
-/// nothing between the two ends has to take an id apart.
-///
-/// `""` is this machine, and it is first. An `Err` is a machine that said
-/// nothing; an `Ok(vec![])` is one that answered and holds nothing. Those are
-/// two different facts and no caller that reaps may confuse them.
+/// `""` is this machine. An `Err` is a machine that said nothing; an `Ok(vec![])`
+/// is one that answered and holds nothing. Those are two different facts and no
+/// caller that reaps may confuse them. The shape stays a list of
+/// `(machine, answer)` so the census that consumes it is unchanged.
 fn each<T>(
     one: impl Fn(Option<&str>) -> std::io::Result<Vec<T>>,
 ) -> Vec<(String, std::io::Result<Vec<T>>)> {
-    let mut out = vec![(String::new(), one(None))];
-    out.extend(fanout().into_iter().map(|m| {
-        let said = one(Some(&m));
-        (m, said)
-    }));
-    out
+    vec![(String::new(), one(None))]
 }
 
-/// Ask this machine, then every reachable one, and put the answers together.
-///
-/// **This machine's failure is an error and a far machine's is not.** A herdr
-/// that is not answering here is wsp having nothing to work with; a machine
-/// that has dropped off the tailnet is a partition, and a partition is not a
-/// failed sync. Turning one into the other would empty the panel every time a
-/// laptop closed — and, worse, would hand an empty list to the reap guard,
-/// which is exactly the confusion the guard exists to prevent.
-///
-/// Which is [`each`] with the machines flattened away, and it stays for the
-/// readers that only want the rows. The ones that reap take [`each`].
+/// Ask this machine and return its rows. Its failure is an error: a herdr that
+/// is not answering here is wsp having nothing to work with.
 fn everywhere<T>(one: impl Fn(Option<&str>) -> std::io::Result<Vec<T>>) -> std::io::Result<Vec<T>> {
     let mut out = Vec::new();
-    for (machine, said) in each(one) {
-        match said {
-            Ok(mut more) => out.append(&mut more),
-            Err(e) if machine.is_empty() => return Err(e),
-            Err(_) => {}
-        }
+    for (_, said) in each(one) {
+        out.append(&mut said?);
     }
     Ok(out)
-}
-
-/// Ask every machine **but** this one.
-///
-/// For a reader that already has this machine's answer some other way and
-/// still has to reach the ones only a socket can answer for. herdr's forked
-/// sidebar is the one: its host pushes the panes it is itself running, which
-/// is every pane on this machine and none of the ones anywhere else, so what
-/// is left to ask for is exactly this.
-///
-/// Errors are dropped rather than returned, which is [`everywhere`]'s rule for
-/// a far machine with the local half removed: a partition is not a failure,
-/// and there is no local answer left in here for its absence to matter to.
-fn beyond<T>(one: impl Fn(Option<&str>) -> std::io::Result<Vec<T>>) -> Vec<T> {
-    let mut out = Vec::new();
-    for m in fanout() {
-        if let Ok(mut more) = one(Some(&m)) {
-            out.append(&mut more);
-        }
-    }
-    out
-}
-
-/// Every pane on every machine except this one. See [`beyond`].
-pub fn panes_elsewhere() -> Vec<Pane> {
-    beyond(|m| panes_on(m, "pane.list", "panes"))
-}
-
-/// Every workspace on every machine except this one. See [`beyond`].
-pub fn workspaces_elsewhere() -> Vec<Workspace> {
-    beyond(workspaces_on)
-}
-
-/// Whether there is anywhere else to ask at all.
-///
-/// A single-machine wsp — which is most of them — should not pay a thread and
-/// a clock for a fan-out that would return nothing.
-pub fn anywhere_else() -> bool {
-    !fanout().is_empty()
 }
 
 /// How long a machine gets to answer a listing.
 ///
 /// This machine keeps [`call`]'s three seconds: a local `pane.list` that has
 /// gone quiet means wsp has nothing to work with, and shortening its patience
-/// would turn a busy herdr into an error where it used to be a wait. A far
-/// machine gets less, because a fan-out is on the path the panel takes to draw
-/// a frame and it waits on the slowest machine in it — and a machine that is
-/// slow to list its own panes over an established tunnel is better left out of
-/// this frame than made everybody else's problem.
+/// would turn a busy herdr into an error where it used to be a wait. A named
+/// machine (`--herdr --on`, which still routes by id) gets less, because a
+/// listing is on the path the panel takes to draw a frame.
 fn patience(machine: Option<&str>) -> Duration {
     match machine {
         None => Duration::from_secs(3),
@@ -885,88 +809,15 @@ mod tests {
         assert_eq!(p["task_id"], "t-260816-036");
     }
 
-    /// Two machines, one list, and the same id on both.
-    ///
-    /// `w0:p1` exists here *and* on mb2 — which is not a contrived case, since
-    /// herdr numbers workspaces and panes from zero on every machine it runs
-    /// on. Nothing but the qualification tells them apart, so if the fan-out
-    /// got it wrong the panel would draw one pane and every call about the
-    /// other would land on the wrong machine.
-    ///
-    /// The far machine's ids come back qualified all the way through the
-    /// record, not only in the field it is named by: a pane whose own id said
-    /// `@mb2` while its `workspace_id` did not would route itself correctly and
-    /// route everything asked about its workspace to this machine.
+    /// **herdr asks this machine and no other.** A far machine that the store
+    /// names and the daemon last saw answering used to be asked too, through the
+    /// socket the tunnel forwards; that socket leads nowhere on a machine that
+    /// runs compound, and its refusal reached the census as a silence beside
+    /// compound's own (the row's 16:40 log). A stand-in is bound at exactly the
+    /// path the old fan-out dialled: it must never be connected to.
     #[test]
-    fn two_machines_come_back_as_one_list_with_the_far_one_saying_so() {
-        let env = util::isolated("herdr-fanout");
-        let state = env.state();
-        std::fs::create_dir_all(env.home().join("machines")).unwrap();
-
-        // mb2 exists and the daemon last saw it answering. Both halves are
-        // needed: the fan-out asks the store what exists and state what is up.
-        std::fs::write(
-            env.home().join("machines/mb2.md"),
-            "---\nname: mb2\nssh: mb2\nstatus: active\n---\n",
-        )
-        .unwrap();
-        std::fs::write(
-            state.join("machines.json"),
-            r#"{"mb2":{"reachable":true,"tunnel":"up"}}"#,
-        )
-        .unwrap();
-
-        let here = state.join("here.sock");
-        std::env::set_var("HERDR_SOCKET_PATH", &here);
-        let pane = |cwd: &str| {
-            json!({ "panes": [{ "pane_id": "w0:p1", "workspace_id": "w0", "tab_id": "t1", "cwd": cwd }] })
-        };
-        let local = stand_in(&here, 1, pane("/here"));
-        let far = stand_in(&state.join("sock").join("mb2.sock"), 1, pane("/there"));
-
-        let mut got = panes().expect("this machine answered, so the list is good");
-        let asked_far = far.join().unwrap();
-        local.join().unwrap();
-        got.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
-
-        assert_eq!(got.len(), 2, "one from each machine");
-        assert_eq!(got[0].pane_id, "w0:p1");
-        assert_eq!(got[0].cwd, "/here");
-        assert_eq!(got[1].pane_id, "w0:p1@mb2", "the same id, and not the same pane");
-        assert_eq!(got[1].workspace_id, "w0@mb2", "every id on the record, not just its own");
-        assert_eq!(got[1].tab_id, "t1@mb2");
-        assert_eq!(got[1].cwd, "/there");
-
-        // And the far machine was asked its own question, not ours.
-        assert_eq!(asked_far[0]["method"], "pane.list");
-
-        // A machine that is no longer answering contributes nothing, and does
-        // not turn the whole list into an error. A partition is not a failed
-        // sync — and an empty list handed to the reap guard is the one thing
-        // this design must never produce.
-        let local = stand_in(&here, 1, pane("/here"));
-        let got = panes().expect("mb2 being gone is not this machine's problem");
-        local.join().unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].pane_id, "w0:p1");
-
-        // This machine failing *is* an error: there is nothing to work with.
-        std::env::set_var("HERDR_SOCKET_PATH", state.join("nothing-here.sock"));
-        assert!(panes().is_err());
-    }
-
-    /// The three silences, told apart at the only place that can tell them
-    /// apart — and the flat list that cannot, side by side with it.
-    ///
-    /// `panes()` answers with one pane in every case below. A reader holding
-    /// that list and a record naming a pane on mb2 has to decide whether mb2
-    /// closed the pane or never spoke, and the list says the same thing either
-    /// way: nothing from mb2. That is why the reap reached for the `@mb2`
-    /// suffix, and [`each`] is what it should have been able to reach for
-    /// instead.
-    #[test]
-    fn the_fan_out_knows_a_machine_that_held_nothing_from_one_that_said_nothing() {
-        let env = util::isolated("herdr-each");
+    fn herdr_asks_this_machine_only_and_never_dials_a_far_machines_socket() {
+        let env = util::isolated("herdr-local-only");
         let state = env.state();
         std::fs::create_dir_all(env.home().join("machines")).unwrap();
         std::fs::write(
@@ -978,37 +829,38 @@ mod tests {
             .unwrap();
 
         let here = state.join("here.sock");
-        let there = state.join("sock").join("mb2.sock");
         std::env::set_var("HERDR_SOCKET_PATH", &here);
-        let one = json!({ "panes": [{ "pane_id": "w0:p1", "workspace_id": "w0" }] });
-        let none = json!({ "panes": [] });
-        let listing = || each(|m| panes_on(m, "pane.list", "panes"));
+        let pane = json!({ "panes": [{ "pane_id": "w0:p1", "workspace_id": "w0", "cwd": "/here" }] });
 
-        // mb2 answers, and holds nothing.
-        let local = stand_in(&here, 1, one.clone());
-        let far = stand_in(&there, 1, none);
-        let said = listing();
-        far.join().unwrap();
-        local.join().unwrap();
-        assert_eq!(said.len(), 2, "this machine and the one the store names");
-        assert_eq!(said[0].0, "", "this machine is first and is spelled the same as Order::on");
-        assert_eq!(said[1].0, "mb2");
-        assert!(said[1].1.as_ref().is_ok_and(|p| p.is_empty()), "heard, and holding nothing");
+        let far_sock = state.join("sock").join("mb2.sock");
+        let far = UnixListener::bind(&far_sock).unwrap();
+        far.set_nonblocking(true).unwrap();
 
-        // mb2 says nothing at all: no socket at the end of the tunnel.
-        std::fs::remove_file(&there).unwrap();
-        let local = stand_in(&here, 1, one);
-        let said = listing();
+        // The listing: one machine, this one, spelled the way `Order::on` spells it.
+        let local = stand_in(&here, 1, pane.clone());
+        let said = each(|m| panes_on(m, "pane.list", "panes"));
         local.join().unwrap();
-        assert!(said[0].1.is_ok(), "this machine still answered");
-        assert!(said[1].1.is_err(), "silence is an answer of its own, not an empty list");
+        assert_eq!(said.len(), 1, "this machine and nothing the store names");
+        assert_eq!(said[0].0, "");
+        assert_eq!(said[0].1.as_ref().unwrap().len(), 1);
 
-        // And the flat reading of the same two worlds cannot tell them apart —
-        // which is the defect, stated as a test rather than as a comment.
-        let local = stand_in(&here, 1, json!({ "panes": [{ "pane_id": "w0:p1" }] }));
-        let flat = panes().expect("this machine answered");
+        // The flat readers too, and the workspace list.
+        let local = stand_in(&here, 1, pane);
+        let got = panes().expect("this machine answered");
         local.join().unwrap();
-        assert_eq!(flat.len(), 1, "one pane, whether mb2 was empty or gone");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].pane_id, "w0:p1", "and not qualified: nothing here came from elsewhere");
+
+        assert!(
+            matches!(far.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the far socket was dialled — the fan-out is back"
+        );
+
+        // This machine failing *is* an error: there is nothing to work with.
+        std::env::set_var("HERDR_SOCKET_PATH", state.join("nothing-here.sock"));
+        assert!(panes().is_err());
+        let said = each(|m| panes_on(m, "pane.list", "panes"));
+        assert!(said.len() == 1 && said[0].1.is_err(), "silence is an answer of its own, not an empty list");
     }
 
     /// The end of the wire, with a real socket at the end of it.

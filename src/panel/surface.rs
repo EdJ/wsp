@@ -117,16 +117,6 @@ const PROTOCOL: u32 = 1;
 /// panel does. Nobody has to upgrade the two binaries in step.
 const TOLD_BY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How often the surface asks the *other* machines what they are running.
-///
-/// A host can only push what it is. wsp can be pointed at other machines and
-/// joins their panes into the same tree, and no herdr on this one has anything
-/// to say about those — so they keep a clock, and it is the slow one: a far
-/// listing crosses a tunnel, and a pane on another laptop that turns up three
-/// seconds late is nobody's complaint. Skipped entirely when there are no far
-/// machines, which is the usual case.
-const FAR_POLL: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// How long after the sidebar comes up to look for panel panes an older wsp
 /// left behind.
 ///
@@ -181,8 +171,8 @@ struct Running {
     /// anything, which is also how a host that does not push is recognised —
     /// see [`TOLD_BY`].
     here: Option<(Vec<Workspace>, Vec<Pane>)>,
-    /// Everywhere else. Nothing can push these, so they are polled; see
-    /// [`FAR_POLL`].
+    /// Everywhere else. Always empty since herdr stopped fanning out to
+    /// other machines.
     far: (Vec<Workspace>, Vec<Pane>),
 }
 
@@ -704,33 +694,9 @@ pub fn run(store: &Store) -> i32 {
             }
         });
     }
-    // The machines the host cannot speak for. One thread, one slow clock, and
-    // only when there is somewhere else to ask; see [`FAR_POLL`].
-    if crate::herdr::anywhere_else() {
-        let running = Arc::clone(&running);
-        let tx = tx.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(FAR_POLL);
-            let far = (
-                crate::herdr::workspaces_elsewhere(),
-                crate::herdr::panes_elsewhere(),
-            );
-            let moved = match running.lock() {
-                Ok(mut running) if running.far != far => {
-                    running.far = far;
-                    true
-                }
-                Ok(_) => false,
-                Err(_) => return,
-            };
-            // Only when it moved. A far machine sitting still should cost the
-            // rows nothing: waking the loop would rebuild every row and read
-            // the whole store to draw the same frame.
-            if moved && tx.send(Msg::Herdr(told())).is_err() {
-                return;
-            }
-        });
-    }
+    // No thread for "the machines the host cannot speak for": herdr no longer
+    // fans out to other machines (`herdr::each`), so `Running::far` stays empty
+    // and a far machine's seats are not drawn from here.
 
     // No workspace and no pane: that is what a surface *is*, and it is said
     // here rather than read from the environment, which is herdr's and belongs
@@ -941,7 +907,7 @@ mod tests {
     ///
     /// The far machine is in the same reading because a host can only push
     /// what it is: wsp joins other machines' panes into the same tree, and
-    /// nothing on this one can speak for those — see [`FAR_POLL`].
+    /// nothing on this one can speak for those.
     #[test]
     fn a_surface_that_has_been_told_what_is_running_does_not_ask_for_it() {
         let running = nothing_told();

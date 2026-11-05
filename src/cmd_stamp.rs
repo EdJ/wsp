@@ -311,7 +311,7 @@ fn agents_now(place: &dyn Place) -> Agents {
 /// (`a_compound_only_machine_is_heard_even_though_herdr_never_answers`):
 /// `heard()` stays true, and the stamp still moves when that seat opens and
 /// again when it closes.
-fn combined_census() -> Census {
+fn combined_census(store: &Store) -> Census {
     let mut c: Option<Census> = None;
     for (name, backend) in crate::cmd_spawn::LOCAL_BACKEND_NAMES.iter().zip(crate::cmd_spawn::local_backends()) {
         let asked = backend.census().unwrap_or_else(|why| Census::silent(name, why));
@@ -320,14 +320,22 @@ fn combined_census() -> Census {
             Some(m) => m.and(asked),
         });
     }
-    c.expect("local_backends() is never empty")
+    let c = c.expect("local_backends() is never empty");
+    // And every far machine that said nothing, under its own name. They are
+    // not in any local backend's census, and without them a machine that has
+    // gone quiet is not on record at all; filed under `""` (what the herdr
+    // fan-out did) it would read as this machine being silent.
+    match crate::far::silent_machines(&store.machines(), &store.machines_live()) {
+        Some(far) => c.and(far),
+        None => c,
+    }
 }
 
 fn take(store: &Store) -> Stamps {
     Stamps {
         record: store.fingerprint(),
         attention: store.attention_stamp(),
-        agents: agents_of(&combined_census()),
+        agents: agents_of(&combined_census(store)),
     }
 }
 
@@ -626,6 +634,74 @@ mod tests {
         compound.stop(&seat).expect("the seat was there");
         let closed = take(&store);
         assert_ne!(closed.agents.stamp, opened.agents.stamp, "the seat ending was invisible");
+    }
+
+    /// **The 16:40 defect, stated as a test.** A far machine that is silent, or
+    /// refusing, must leave the local census heard and say so under its own name
+    /// — never `""`, which a host drawing this machine's workspace reads as the
+    /// local census being silent and stops drawing it. The local half here is
+    /// what compound answers (`heard("")`), with herdr's own absence beside it
+    /// under `"herdr"`.
+    #[test]
+    fn a_silent_or_refusing_far_machine_leaves_the_local_census_heard() {
+        use crate::model::Machine;
+        use crate::store::MachineLive;
+        let machines = vec![
+            Machine::new("mb2", "mb2"),   // link down
+            Machine::new("rack", "rack"), // never reported
+            Machine::new("fine", "fine"), // answering: not silent
+        ];
+        let mut live = std::collections::BTreeMap::new();
+        live.insert(
+            "mb2".to_string(),
+            MachineLive { reachable: false, error: "ssh: connect to host mb2: Connection refused".into(), ..Default::default() },
+        );
+        live.insert("fine".to_string(), MachineLive { reachable: true, wire: Some(9), ..Default::default() });
+
+        let local = Census::heard("", vec![seated("cpd-1")])
+            .and(Census::silent("herdr", Refusal::Unreachable("no herdr socket".into())));
+        let far = crate::far::silent_machines(&machines, &live).expect("two machines are silent");
+        // And one that answered, with a refusal of its own kind.
+        let c = local.and(far).and(Census::silent("gpu", Refusal::Backend("refused".into())));
+
+        let agents = agents_of(&c);
+        assert!(agents.heard(), "a far machine's silence is not the local census's");
+        let silent: Vec<&str> = agents.silent.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(silent, ["gpu", "herdr", "mb2", "rack"], "each under its own name; `fine` answered");
+        assert!(!silent.contains(&""), "filed under this machine, a host stops drawing its workspace");
+        let mb2 = agents.silent.iter().find(|(m, _)| m == "mb2").unwrap();
+        assert!(mb2.1.contains("Connection refused"), "and why: {mb2:?}");
+
+        let doc = document(&Stamps { record: 1, attention: 2, agents });
+        assert_eq!(doc["agents"]["heard"], json!(true));
+        assert!(doc["agents"]["silent"].as_array().unwrap().iter().all(|r| r["machine"] != json!("")));
+        assert_eq!(c.on("").count(), 1, "compound's seat is still drawn from the local answer");
+        assert!(c.answered(""), "and this machine answered");
+    }
+
+    /// The same through the real fold: a store with a machine the daemon cannot
+    /// reach, and the whole `wsp stamp` path over it.
+    #[test]
+    fn the_stamp_files_an_unreachable_machine_under_its_name_beside_a_heard_local_census() {
+        let _env = util::isolated("stamp-far-silent");
+        let store = Store::open();
+        store.save_machine(&crate::model::Machine::new("mb2", "mb2")).unwrap();
+        store.set_machine_live(
+            "mb2",
+            &crate::store::MachineLive { reachable: false, error: "no route to host".into(), ..Default::default() },
+        );
+        let s = take(&store);
+        assert!(s.agents.heard(), "compound answers here whatever mb2 does");
+        assert!(s.agents.silent.iter().any(|(m, why)| m == "mb2" && why.contains("no route")), "{:?}", s.agents.silent);
+        assert!(!s.agents.silent.iter().any(|(m, _)| m.is_empty()), "{:?}", s.agents.silent);
+
+        // And an answering machine is not claimed silent.
+        store.set_machine_live(
+            "mb2",
+            &crate::store::MachineLive { reachable: true, wire: Some(9), ..Default::default() },
+        );
+        let s = take(&store);
+        assert!(!s.agents.silent.iter().any(|(m, _)| m == "mb2"), "{:?}", s.agents.silent);
     }
 
     /// Hex and not a number, so that a client wanting to subtract two stamps

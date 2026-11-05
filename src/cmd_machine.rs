@@ -587,7 +587,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     }
     let control = crate::tunnel::control_path(store, &m.name);
     let seat_wire = crate::place_compound::wire_version();
-    let c = far::check_with(&m, seat_wire, &|cmd| far::ssh_run(&m, Some(&control), cmd));
+    let c = far::check_with(&m, seat_wire, &|cmd, t| far::ssh_run(&m, Some(&control), cmd, t));
 
     let now = util::now_iso();
     let mut live = store.machine_live(&m.name).unwrap_or_default();

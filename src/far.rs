@@ -15,6 +15,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::model::Machine;
 use crate::store::MachineLive;
@@ -83,13 +84,25 @@ pub fn parse_wire(out: &str) -> Option<u32> {
     out.trim().parse().ok()
 }
 
-/// Run one command on the machine over ssh and return its stdout.
+/// How long the probe may take: it runs inside the daemon's tick.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The session step: start, read the handshake, stop.
+pub const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// The headless claude. A model call over a bad network must end the check
+/// rather than hang it (and with it the tick's `checking` child, which would
+/// then never recheck).
+pub const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run one command on the machine over ssh and return its stdout, giving up
+/// after `timeout`.
 ///
 /// `control` is the daemon's ControlMaster socket when one is wanted, so this
 /// rides the connection the tunnel already holds. `BatchMode` because nothing
 /// here may prompt, and short timeouts because the tick must not hang on a
-/// machine that has gone away.
-pub fn ssh_run(m: &Machine, control: Option<&Path>, cmd: &str) -> Result<String, Failed> {
+/// machine that has gone away. A command still running at the deadline is
+/// killed and reported as [`Failed::Ran`] (the link answered; the command did
+/// not finish).
+pub fn ssh_run(m: &Machine, control: Option<&Path>, cmd: &str, timeout: Duration) -> Result<String, Failed> {
     let mut c = Command::new("ssh");
     c.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
     c.args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]);
@@ -97,8 +110,10 @@ pub fn ssh_run(m: &Machine, control: Option<&Path>, cmd: &str) -> Result<String,
         c.arg("-o").arg(format!("ControlPath={}", p.display()));
     }
     c.arg(&m.ssh).arg("--").arg(cmd);
-    c.stdin(Stdio::null());
-    let out = c.output().map_err(|e| Failed::Link(format!("cannot start ssh: {e}")))?;
+    let out = run_bounded(c, timeout).map_err(|e| Failed::Link(format!("cannot start ssh: {e}")))?;
+    let Some(out) = out else {
+        return Err(Failed::Ran(format!("no answer in {}s", timeout.as_secs())));
+    };
     let said = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
     if out.status.success() {
         return Ok(said(&out.stdout));
@@ -110,6 +125,41 @@ pub fn ssh_run(m: &Machine, control: Option<&Path>, cmd: &str) -> Result<String,
         Some(127) => Err(Failed::Ran(format!("{} not found on {}", sup_of(m), m.ssh))),
         Some(n) => Err(Failed::Ran(if last.is_empty() { format!("exited {n}") } else { last })),
     }
+}
+
+/// `Command::output` with a deadline: `None` when it was still running at the
+/// deadline and was killed. The pipes are drained on threads so a chatty child
+/// cannot fill one and stall.
+pub fn run_bounded(mut c: Command, timeout: Duration) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn()?;
+    let drain = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = r.read_to_end(&mut buf);
+            buf
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().expect("piped")));
+    let err = drain(Box::new(child.stderr.take().expect("piped")));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    }))
 }
 
 /// What the tick learns from one probe, folded into the machine's live record.
@@ -194,6 +244,46 @@ impl Readiness {
     }
 }
 
+/// The machines that said nothing, each under its own name, as a census.
+///
+/// `None` when no active machine is silent — the common case, and every seat
+/// that has no machine. **Only the silent are filed.** A machine that is
+/// reachable is not claimed to be empty (that is `Census::heard(m, vec![])`,
+/// a statement a reap would act on, and this row does not ask the far
+/// supervisor what it holds); it is simply absent from the census, so nothing
+/// reaps against it. A machine whose silence is filed under `""` instead would
+/// read as *this* machine being silent, which a host drawing this machine's
+/// workspace takes as no census here: hence the name is the machine's, always.
+pub fn silent_machines(
+    machines: &[Machine],
+    live: &std::collections::BTreeMap<String, MachineLive>,
+) -> Option<crate::place::Census> {
+    use crate::place::{Census, Refusal};
+    let mut out: Option<Census> = None;
+    for m in machines.iter().filter(|m| m.is_active() && !m.name.is_empty()) {
+        let why = match live.get(&m.name) {
+            None => "no daemon report yet".to_string(),
+            Some(l) if l.reachable => continue,
+            Some(l) => {
+                let seen = match l.last_seen.as_str() {
+                    "" => "never seen".to_string(),
+                    at => format!("last seen {}s ago", crate::util::since(at)),
+                };
+                match l.error.is_empty() {
+                    true => format!("not answering ({seen})"),
+                    false => format!("{} ({seen})", l.error),
+                }
+            }
+        };
+        let c = Census::silent(&m.name, Refusal::Unreachable(why));
+        out = Some(match out {
+            None => c,
+            Some(prev) => prev.and(c),
+        });
+    }
+    out
+}
+
 /// One step of a check, as the person reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -232,7 +322,7 @@ const PROMPT: &str = "Reply with the single word ok.";
 /// is expanded on the far side (`$(cat …)` is inside the command string, which
 /// is quoted here and not expanded locally), so it never crosses the link and
 /// is in no output this returns.
-pub fn check_with(m: &Machine, seat_wire: u32, run: &dyn Fn(&str) -> Result<String, Failed>) -> Check {
+pub fn check_with(m: &Machine, seat_wire: u32, run: &dyn Fn(&str, Duration) -> Result<String, Failed>) -> Check {
     let mut c = Check::default();
     let step = |c: &mut Check, name: &'static str, r: Result<String, String>| -> bool {
         let (ok, said) = match r {
@@ -244,7 +334,7 @@ pub fn check_with(m: &Machine, seat_wire: u32, run: &dyn Fn(&str) -> Result<Stri
     };
 
     // 1. the wire.
-    let wire = match run(&probe_command(m)) {
+    let wire = match run(&probe_command(m), PROBE_TIMEOUT) {
         Ok(out) => parse_wire(&out).ok_or_else(|| format!("`{}` is not a wire version", out.trim())),
         Err(f) => Err(f.why().to_string()),
     };
@@ -272,32 +362,26 @@ pub fn check_with(m: &Machine, seat_wire: u32, run: &dyn Fn(&str) -> Result<Stri
     // 2. a throwaway session, started and stopped. `sleep` is the agent: the
     // question is whether the supervisor starts a pty here at all.
     let label = format!("wsp-check-{}", std::process::id());
-    let start = format!(
-        "{} spawn --label {} --cwd {} -- sleep 60",
-        quote(&sup_of(m)),
-        quote(&label),
-        quote(&m.exec_dir),
-    );
-    let pid = match run(&start) {
-        Ok(out) => pid_of(&out).ok_or_else(|| "compound-sup spawn gave no `pid` line".to_string()),
+    let sock = match run(&start_command(m, &label), SESSION_TIMEOUT) {
+        Ok(out) => socket_of(&out).ok_or_else(|| format!("compound-sup spawn gave no `socket` line: {}", out.trim())),
         Err(f) => Err(f.why().to_string()),
     };
-    let pid = match pid {
+    let sock = match sock {
         Ok(p) => p,
         Err(e) => {
             step(&mut c, "session", Err(e));
             return c;
         }
     };
-    // `compound-sup` is its own process-group leader (it `setsid`s), so the
-    // group is the whole session.
-    let stopped = run(&format!("kill -TERM -- -{pid}"));
+    // `close <socket>` is the supervisor's own way to end a session, and ends
+    // the agent with it; no pid or process group is guessed at from here.
+    let stopped = run(&format!("{} close {}", quote(&sup_of(m)), quote(&sock)), SESSION_TIMEOUT);
     step(
         &mut c,
         "session",
         match stopped {
-            Ok(_) => Ok(format!("started and stopped (pid {pid})")),
-            Err(f) => Err(format!("started (pid {pid}) but would not stop: {}", f.why())),
+            Ok(_) => Ok(format!("started and stopped ({sock})")),
+            Err(f) => Err(format!("started ({sock}) but would not stop: {}", f.why())),
         },
     );
     if !c.passed() {
@@ -314,7 +398,7 @@ pub fn check_with(m: &Machine, seat_wire: u32, run: &dyn Fn(&str) -> Result<Stri
     step(
         &mut c,
         "claude",
-        match run(&claude) {
+        match run(&claude, CLAUDE_TIMEOUT) {
             Ok(out) if out.trim().is_empty() => Err("claude -p answered nothing".into()),
             Ok(_) => Ok("answered".into()),
             Err(f) => Err(f.why().to_string()),
@@ -323,10 +407,35 @@ pub fn check_with(m: &Machine, seat_wire: u32, run: &dyn Fn(&str) -> Result<Stri
     c
 }
 
-/// The `pid <n>` line of `compound-sup spawn`'s handshake. (`sup <pid>` is the
-/// same number; `pid` is the one that is the group leader.)
-fn pid_of(out: &str) -> Option<u32> {
-    out.lines().find_map(|l| l.strip_prefix("pid ")?.trim().parse().ok())
+/// The far command that starts the throwaway session and returns once the
+/// handshake is read.
+///
+/// `compound-sup spawn` prints `sup`/`pid`/`socket`/`render` and then keeps the
+/// stdout it inherited open for the whole life of the session (which is why
+/// `place_compound::read_handshake` reads with a timeout and never to EOF). Run
+/// under ssh with its stdout on the channel, the call would not return until the
+/// session ended. So its stdout and stderr go to a file, in a backgrounded
+/// subshell with stdin on `/dev/null`, nothing holds the channel, and the shell
+/// polls the file for the `socket` line (up to 10 s) and prints it.
+/// `--no-renderer`: the question here is whether a pty starts, and a renderer
+/// started over ssh is outside the GUI session anyway.
+pub fn start_command(m: &Machine, label: &str) -> String {
+    format!(
+        "f=$(mktemp) && ( {sup} spawn --label {label} --cwd {cwd} --no-renderer -- sleep 60 </dev/null >\"$f\" 2>&1 & ); \
+         i=0; while [ $i -lt 100 ] && ! grep -q '^socket ' \"$f\"; do sleep 0.1; i=$((i+1)); done; \
+         cat \"$f\"; rm -f \"$f\"",
+        sup = quote(&sup_of(m)),
+        label = quote(label),
+        cwd = quote(&m.exec_dir),
+    )
+}
+
+/// The `socket <path>` line of `compound-sup spawn`'s handshake. (`sup <pid>` is
+/// the supervisor and `pid <pid>` the agent: two processes in two process
+/// groups, which is why the session is ended with `close <socket>` and not by
+/// signalling one of them.)
+fn socket_of(out: &str) -> Option<String> {
+    out.lines().find_map(|l| l.strip_prefix("socket ").map(|p| p.trim().to_string())).filter(|p| !p.is_empty())
 }
 
 /// Fold a finished check into the live record, for `machines.json`.
@@ -354,15 +463,15 @@ mod tests {
         wire: &'a str,
         spawn: Result<&'a str, &'a str>,
         claude: Result<&'a str, &'a str>,
-    ) -> impl Fn(&str) -> Result<String, Failed> + 'a {
-        move |cmd: &str| {
+    ) -> impl Fn(&str, Duration) -> Result<String, Failed> + 'a {
+        move |cmd: &str, _t: Duration| {
             asked.borrow_mut().push(cmd.to_string());
             let ran = |r: Result<&str, &str>| r.map(String::from).map_err(|e| Failed::Ran(e.into()));
             if cmd.contains("wire-version") {
                 Ok(wire.into())
             } else if cmd.contains(" spawn ") {
                 ran(spawn)
-            } else if cmd.starts_with("kill") {
+            } else if cmd.contains(" close ") {
                 Ok(String::new())
             } else {
                 ran(claude)
@@ -382,12 +491,12 @@ mod tests {
     fn a_check_that_passes_starts_and_stops_a_session_and_asks_claude_with_the_token() {
         let asked = RefCell::new(Vec::new());
         let m = machine();
-        let c = check_with(&m, 9, &far(&asked, "9", Ok("sup 4242\npid 4242\nsocket /x"), Ok("ok")));
+        let c = check_with(&m, 9, &far(&asked, "9", Ok("sup 4241\npid 4242\nsocket /run/x.sock\nrender /run/x.rsock"), Ok("ok")));
         assert!(c.passed(), "{:?}", c.steps);
         assert_eq!(c.wire, Some(9));
         let asked = asked.borrow();
         assert_eq!(asked.len(), 4, "wire, start, stop, claude: {asked:?}");
-        assert!(asked[2].contains("-4242"), "the session's group is stopped: {}", asked[2]);
+        assert!(asked[2].contains("close") && asked[2].contains("/run/x.sock"), "the session is closed by its socket: {}", asked[2]);
         // The token is read on the far side, by the far shell, from the file.
         assert!(asked[3].contains("$(cat ~/'wsp-exec/claude-token')"), "{}", asked[3]);
         assert!(asked[3].contains("CLAUDE_CODE_OAUTH_TOKEN"), "{}", asked[3]);
@@ -400,7 +509,7 @@ mod tests {
         let none = RefCell::new(Vec::new());
 
         // wire: both numbers, and which side is behind.
-        let c = check_with(&m, 9, &far(&none, "8", Ok("pid 1"), Ok("ok")));
+        let c = check_with(&m, 9, &far(&none, "8", Ok("socket /s"), Ok("ok")));
         assert!(!c.passed());
         assert!(c.why().contains("v9/v8") && c.why().contains("behind"), "{}", c.why());
         assert_eq!(none.borrow().len(), 1, "nothing is started on a machine that speaks another wire");
@@ -410,14 +519,14 @@ mod tests {
         assert!(c.why().starts_with("session: no such cwd"), "{}", c.why());
 
         // no auth: the headless claude fails.
-        let c = check_with(&m, 9, &far(&none, "9", Ok("pid 7"), Err("Invalid API key")));
+        let c = check_with(&m, 9, &far(&none, "9", Ok("socket /s"), Err("Invalid API key")));
         assert!(c.why().starts_with("claude: Invalid API key"), "{}", c.why());
         assert!(c.steps[1].ok, "and the session before it did pass");
 
         // no exec_dir to start it in.
         let mut bare = m.clone();
         bare.exec_dir.clear();
-        let c = check_with(&bare, 9, &far(&none, "9", Ok("pid 7"), Ok("ok")));
+        let c = check_with(&bare, 9, &far(&none, "9", Ok("socket /s"), Ok("ok")));
         assert!(c.why().contains("exec_dir"), "{}", c.why());
     }
 
@@ -456,5 +565,75 @@ mod tests {
         fold_probe(&mut l, Err(Failed::Link("Connection refused".into())), "later");
         assert!(!l.reachable);
         assert_eq!(l.last_seen, "later", "last seen is when it last answered, not when it last failed");
+    }
+
+    /// The defect the first verifier found: the real `compound-sup spawn` prints
+    /// its handshake and then keeps its stdout open for the life of the session,
+    /// so a call that waits for stdout to close waits the session out. This is
+    /// that binary's behaviour in a script (handshake, then a holder of stdout
+    /// for 8 s), and the start command run by a real shell with its stdout on a
+    /// pipe, as ssh has it. It must return on the handshake.
+    #[test]
+    fn the_session_start_returns_once_the_handshake_is_read_not_when_the_session_ends() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wsp-far-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sup = dir.join("compound-sup");
+        std::fs::write(
+            &sup,
+            "#!/bin/sh\necho 'sup 1'; echo 'pid 2'; echo 'socket /run/x.sock'; echo 'render /run/x.rsock'; sleep 8\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut m = Machine::new("mb2", "mb2");
+        m.sup_at = sup.to_string_lossy().into_owned();
+        m.exec_dir = dir.to_string_lossy().into_owned();
+
+        let mut sh = Command::new("sh");
+        sh.arg("-c").arg(start_command(&m, "wsp-check-t"));
+        let t0 = Instant::now();
+        let out = run_bounded(sh, Duration::from_secs(20)).unwrap().expect("the start command must finish");
+        let took = t0.elapsed();
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+
+        assert!(took < Duration::from_secs(4), "returned on the handshake, not the session ({took:?})");
+        assert_eq!(socket_of(&said).as_deref(), Some("/run/x.sock"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_command_that_does_not_finish_is_killed_at_its_deadline() {
+        let mut c = Command::new("sleep");
+        c.arg("30");
+        let t0 = Instant::now();
+        assert!(run_bounded(c, Duration::from_millis(300)).unwrap().is_none());
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    /// By hand, against the installed binary: `cargo test far::tests::real -- --ignored`.
+    /// The generated start command, a real `compound-sup spawn`, a pipe on
+    /// stdout; then `close` must find the session.
+    #[test]
+    #[ignore = "needs a real compound-sup on PATH"]
+    fn real_compound_sup_session_starts_promptly_and_closes() {
+        let run_dir = std::env::temp_dir().join(format!("wsp-far-real-{}", std::process::id()));
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut m = Machine::new("here", "here");
+        m.exec_dir = "/tmp".into();
+        let mut sh = Command::new("sh");
+        sh.arg("-c").arg(start_command(&m, "wsp-check-real")).env("COMPOUND_RUN_DIR", &run_dir);
+        let t0 = Instant::now();
+        let out = run_bounded(sh, Duration::from_secs(30)).unwrap().expect("returns");
+        let took = t0.elapsed();
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        eprintln!("{said}took {took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let sock = socket_of(&said).expect("a socket line");
+        let mut close = Command::new(SUP);
+        close.args(["close", &sock]).env("COMPOUND_RUN_DIR", &run_dir);
+        let closed = run_bounded(close, Duration::from_secs(10)).unwrap().expect("close returns").status;
+        assert!(closed.success());
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 }

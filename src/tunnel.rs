@@ -76,22 +76,18 @@ impl Tunnel {
     /// `add`). Only for a machine whose wire matches: a mismatch is already the
     /// answer, and starting a session on it would be the thing `spawn --on`
     /// refuses.
-    fn recheck(&mut self, m: &Machine) {
+    fn recheck(&mut self, store: &Store, m: &Machine) {
         if let Some(c) = self.checking.as_mut() {
             match c.try_wait() {
                 Ok(None) => return,
                 _ => self.checking = None,
             }
         }
-        let matches = self.live.wire == Some(crate::place_compound::wire_version());
-        if !self.live.reachable || !matches || m.exec_dir.is_empty() {
-            return;
-        }
-        let stale = match self.live.checked.as_str() {
-            "" => true,
-            at => util::since(at) >= crate::far::RECHECK_SECS as i64,
-        };
-        if !stale {
+        // What the last check wrote, before deciding whether it is stale: a
+        // daemon that has just started knows nothing in memory, and asking for
+        // a new check on every restart would be a model call per restart.
+        carry_check(&mut self.live, store.machine_live(&m.name));
+        if !wants_check(&self.live, m, crate::place_compound::wire_version(), util::now_iso().as_str()) {
             return;
         }
         let Ok(exe) = std::env::current_exe() else { return };
@@ -131,6 +127,32 @@ impl Tunnel {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+/// Whether a readiness check is due: the machine answers, its wire is ours (a
+/// mismatch is already the answer, and a session started on it is what
+/// `spawn --on` refuses), there is an `exec_dir` to start one in, and there has
+/// been no check or the last is older than [`crate::far::RECHECK_SECS`].
+/// `now` is passed in so the rule has no clock in it.
+fn wants_check(live: &MachineLive, m: &Machine, seat_wire: u32, now: &str) -> bool {
+    if !live.reachable || live.wire != Some(seat_wire) || m.exec_dir.is_empty() {
+        return false;
+    }
+    match live.checked.as_str() {
+        "" => true,
+        at => crate::util::epoch_of(now) - crate::util::epoch_of(at) >= crate::far::RECHECK_SECS as i64,
+    }
+}
+
+/// Take the check's fields from the file. `wsp machine check` writes its result
+/// to `machines.json` from another process and the tick rewrites the whole
+/// record, so without this the result is gone before anyone reads it.
+fn carry_check(live: &mut MachineLive, on_disk: Option<MachineLive>) {
+    if let Some(d) = on_disk {
+        live.ready = d.ready;
+        live.checked = d.checked;
+        live.check_error = d.check_error;
     }
 }
 
@@ -184,11 +206,7 @@ impl Supervisor {
                 // result is gone before anyone reads it. Not while this tick
                 // has one in flight: its placeholder is the newer fact.
                 if t.checking.is_none() {
-                    if let Some(on_disk) = store.machine_live(&m.name) {
-                        t.live.ready = on_disk.ready;
-                        t.live.checked = on_disk.checked;
-                        t.live.check_error = on_disk.check_error;
-                    }
+                    carry_check(&mut t.live, store.machine_live(&m.name));
                 }
                 store.set_machine_live(&m.name, &t.live);
             }
@@ -252,13 +270,18 @@ impl Supervisor {
         // (`docs/remote-agents.md` section 2). A link that is down is
         // unreachable; a link that is up whose command failed is connected and
         // not ready — `far::fold_probe` keeps those two apart.
-        let probed = crate::far::ssh_run(m, Some(&control_path(store, &m.name)), &crate::far::probe_command(m));
+        let probed = crate::far::ssh_run(
+            m,
+            Some(&control_path(store, &m.name)),
+            &crate::far::probe_command(m),
+            crate::far::PROBE_TIMEOUT,
+        );
         crate::far::fold_probe(&mut t.live, probed, &util::now_iso());
         if t.live.reachable {
             t.failures = 0;
             t.next_try = None;
         }
-        t.recheck(m);
+        t.recheck(store, m);
     }
 
     /// The machines that are answering right now.
@@ -577,5 +600,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    fn due_machine() -> Machine {
+        let mut m = Machine::new("mb2", "mb2");
+        m.exec_dir = "~/exec".into();
+        m
+    }
+
+    /// A check is asked for when there has been none or it is old, and only of a
+    /// machine that answers, at our wire, with somewhere to start a session.
+    #[test]
+    fn a_check_is_due_when_there_has_been_none_or_the_last_is_old() {
+        let w = 9;
+        let up = MachineLive { reachable: true, wire: Some(w), ..Default::default() };
+        let now = "2026-11-05T12:00:00Z";
+        let m = due_machine();
+        assert!(wants_check(&up, &m, w, now), "never checked");
+
+        let fresh = MachineLive { checked: "2026-11-05T11:50:00Z".into(), ready: true, ..up.clone() };
+        assert!(!wants_check(&fresh, &m, w, now), "ten minutes old is trusted");
+        let old = MachineLive { checked: "2026-11-05T11:20:00Z".into(), ready: true, ..up.clone() };
+        assert!(wants_check(&old, &m, w, now), "forty minutes old is asked again");
+
+        assert!(!wants_check(&MachineLive { reachable: false, ..up.clone() }, &m, w, now), "unreachable");
+        assert!(!wants_check(&MachineLive { wire: Some(w - 1), ..up.clone() }, &m, w, now), "wrong wire");
+        assert!(!wants_check(&MachineLive { wire: None, ..up.clone() }, &m, w, now), "no wire");
+        let mut bare = m.clone();
+        bare.exec_dir.clear();
+        assert!(!wants_check(&up, &bare, w, now), "nowhere to start a session");
+    }
+
+    /// The tick rewrites the record whole; the check's answer, written by
+    /// another process, must survive it, and the probe's fields must not be
+    /// replaced by the file's.
+    #[test]
+    fn the_checks_answer_survives_the_ticks_rewrite_of_the_record() {
+        let mut live = MachineLive { reachable: true, wire: Some(9), last_seen: "now".into(), ..Default::default() };
+        let on_disk = MachineLive {
+            reachable: false,
+            wire: Some(1),
+            ready: true,
+            checked: "2026-11-05T11:50:00Z".into(),
+            check_error: "x".into(),
+            ..Default::default()
+        };
+        carry_check(&mut live, Some(on_disk));
+        assert!(live.ready && live.checked == "2026-11-05T11:50:00Z" && live.check_error == "x");
+        assert!(live.reachable && live.wire == Some(9) && live.last_seen == "now", "the probe's facts are the tick's");
+
+        carry_check(&mut live, None);
+        assert!(live.ready, "no file, nothing to carry");
     }
 }

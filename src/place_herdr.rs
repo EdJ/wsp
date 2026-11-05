@@ -1366,19 +1366,16 @@ mod tests {
 
     }
 
-    /// The reap's evidence, end to end: a census over two machines where one of
-    /// them is not there.
-    ///
-    /// Three things have to hold at once, and before [`Census`] no return type
-    /// could hold all three. The seats this machine reported survive — a
-    /// partition is not a failed sync. mb2 is named as unheard rather than
-    /// implied by an absence of rows. And nothing anywhere read the `@mb2` on an
-    /// id to work either of them out: the machine is the name the store gave it
-    /// and the name `--on` would have sent work out under.
+    /// herdr's census is this machine's and no other's. A far machine the store
+    /// names, and the daemon last saw answering, is **not asked**: it was
+    /// (`wsp-047`), and the refusal of a socket that leads nowhere on a compound
+    /// machine arrived beside compound's own answer as a silence the host read
+    /// as no census here (the row's 16:40 log). A far machine's silence is filed
+    /// by name from the machines record instead (`far::silent_machines`).
     ///
     /// One test, because `util::isolated` sets `WSP_STATE` for the process.
     #[test]
-    fn a_census_names_the_machine_that_said_nothing_rather_than_leaving_a_gap() {
+    fn a_census_asks_this_machine_only_and_a_far_herdr_is_never_dialled() {
         let env = util::isolated("adapter-census-fanout");
         std::fs::create_dir_all(env.home().join("machines")).unwrap();
         std::fs::write(
@@ -1399,33 +1396,24 @@ mod tests {
         .unwrap();
         let (k, v) = here.socket_env();
         std::env::set_var(k, v);
-        let far_socket = env.state().join("sock").join("mb2.sock");
-
-        // Both machines up: two seats, and nobody unheard.
         let there = Fake::bind(
-            &far_socket,
+            env.state().join("sock").join("mb2.sock"),
             Stage::of(vec![Spot::agent("w1:p1", "claude", "t-2", State::Idle)]),
         )
         .unwrap();
-        let c = Herdr::new().census().expect("both answered");
-        assert_eq!(c.seats().count(), 2, "one from each machine");
-        assert!(c.on("mb2").any(|s| s.seat == Seat::new("w1:p1@mb2")), "qualified at the door");
-        assert_eq!(c.unheard().count(), 0);
-        drop(there);
-        let _ = std::fs::remove_file(&far_socket);
 
-        // mb2 gone. The call still succeeds, this machine's seat is still
-        // reported, and the silence is a row rather than a missing one.
-        let c = Herdr::new().census().expect("mb2 being gone is not this machine's problem");
-        assert_eq!(c.seats().count(), 1, "what is here is here whoever else went quiet");
+        let c = Herdr::new().census().expect("this machine answered");
+        assert_eq!(c.seats().count(), 1, "this machine's seat and not mb2's");
         assert!(c.answered(""), "this machine spoke");
-        assert!(!c.answered("mb2"), "and mb2 did not — which no list of rows could have said");
-        assert_eq!(c.unheard().map(|(m, _)| m).collect::<Vec<_>>(), ["mb2"]);
+        assert!(!c.answered("mb2") && c.on("mb2").count() == 0, "mb2 is not herdr's to speak for");
+        assert_eq!(c.unheard().count(), 0, "and not herdr's to be silent about either — never under `\"\"`");
+        assert!(there.asked().is_empty(), "the far socket was dialled: {:?}", there.asked());
 
-        // And with this machine gone too there is nothing to work with, which is
-        // the one case that is still a refusal.
+        // And with this machine gone there is nothing to work with, which is the
+        // one case that is still a refusal — and mb2 answering does not hide it.
         here.goes(Quiet::HangsUp);
         assert!(matches!(Herdr::new().census(), Err(Refusal::Unreachable(_))));
+        assert!(there.asked().is_empty());
     }
 
     /// `available()` was a question asked in advance about a socket. This is what
