@@ -73,6 +73,9 @@ pub(crate) struct Inputs {
     pub first_request: Option<i64>,
     /// The list and group the row runs in, and the group's members.
     pub group: Option<(String, usize, Vec<String>)>,
+    /// `(epoch, kind, row)` of the events that end a seat, for the rows a cap
+    /// line named as holders (`wsp-394`).
+    pub holder_events: Vec<(i64, String, String)>,
 }
 
 impl Inputs {
@@ -96,16 +99,17 @@ impl Inputs {
 /// waits before ` waits —`; whoever it lists after the colon holds a place.
 fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
     let span = to - from;
-    let cap = i.cycle.iter().any(|(t, l)| {
-        *t >= from
-            && *t <= to
-            && l.split_once(" waits — the seat is at its cap").is_some_and(|(before, _)| {
-                let what = before.rsplit_once(": ").map_or(before, |(_, w)| w);
-                names(what, who)
-            })
+    let cap = i.cycle.iter().find_map(|(t, l)| {
+        if *t < from || *t > to {
+            return None;
+        }
+        let (before, after) = l.split_once(" waits — the seat is at its cap")?;
+        let what = before.rsplit_once(": ").map_or(before, |(_, w)| w);
+        names(what, who).then(|| after.to_string())
     });
-    if cap {
-        "the seat's cap (a place to come free)".into()
+    if let Some(after) = cap {
+        let held = cap_holders(i, &after, to);
+        if held.is_empty() { "the seat's cap (a place to come free)".into() } else { format!("the seat's cap (a place to come free) — held by {held}") }
     } else if span <= HAND_OFF {
         "the hand-off (a poke and a spawn)".into()
     } else if span <= TICK + HAND_OFF {
@@ -113,6 +117,35 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
     } else {
         "nothing the logs name — the step did not run for longer than a tick".into()
     }
+}
+
+/// The holders a cap line lists after its colon (`x in cpd-1, y starting, 2
+/// more`), each with whether its seat had finished by `to`: a work seat
+/// finishes at its row's review or release, a step's seat (`r · verifying`) at
+/// the row's verdict.
+fn cap_holders(i: &Inputs, after: &str, to: i64) -> String {
+    let list = after.split_once(": ").map_or("", |(_, l)| l);
+    let mut out = Vec::new();
+    for item in list.split(", ").map(str::trim).filter(|s| !s.is_empty()) {
+        let what = item.strip_suffix(" starting").or_else(|| item.rsplit_once(" in ").map(|(w, _)| w)).unwrap_or(item);
+        let (row, step) = match what.split_once(" · ") {
+            Some((r, _)) => (r, true),
+            None => (what, false),
+        };
+        let ended = i
+            .holder_events
+            .iter()
+            .filter(|(t, k, r)| {
+                *t <= to && r == row && if step { k == "task-verified" } else { k == "task-review" || k == "task-released" }
+            })
+            .map(|(t, _, _)| *t)
+            .min();
+        out.push(match ended {
+            Some(t) => format!("{item} (finished {})", clock(t)),
+            None => format!("{item} (running)"),
+        });
+    }
+    out.join(", ")
 }
 
 /// The phases of a row, in time order.
@@ -445,6 +478,36 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             .collect();
     }
     i.group = group;
+    // The rows a cap line named as holders, and when their seats ended.
+    let mut holders: Vec<String> = Vec::new();
+    for (_, l) in &i.cycle {
+        if let Some((_, after)) = l.split_once(" waits — the seat is at its cap") {
+            for item in after.split_once(": ").map_or("", |(_, l)| l).split(", ") {
+                let what = item.trim().strip_suffix(" starting").or_else(|| item.trim().rsplit_once(" in ").map(|(w, _)| w)).unwrap_or(item.trim());
+                let row = what.split_once(" · ").map_or(what, |(r, _)| r);
+                if !row.is_empty() && !holders.iter().any(|h| h == row) {
+                    holders.push(row.to_string());
+                }
+            }
+        }
+    }
+    if !holders.is_empty() {
+        if let Ok(text) = std::fs::read_to_string(store.state_file("events.jsonl")) {
+            for line in text.lines() {
+                if !holders.iter().any(|h| line.contains(h.as_str())) {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                let (Some(ts), Some(kind)) = (v["ts"].as_str(), v["kind"].as_str()) else { continue };
+                if !matches!(kind, "task-review" | "task-released" | "task-verified") {
+                    continue;
+                }
+                if let Some(row) = v["data"]["id"].as_str().filter(|r| holders.iter().any(|h| h == r)) {
+                    i.holder_events.push((util::epoch_of(ts), kind.to_string(), row.to_string()));
+                }
+            }
+        }
+    }
     i.first_request = i.kind("session-learned", id).first().and_then(|(_, d)| d["session"].as_str().map(String::from)).and_then(|s| first_request(&s));
     i
 }
@@ -928,6 +991,7 @@ mod tests {
             legs: vec![LegIn { name: "a".into(), ..Default::default() }],
             first_request: Some(118),
             group: None,
+            holder_events: Vec::new(),
         }
     }
 
@@ -966,6 +1030,20 @@ mod tests {
         let ph = build(&i);
         let gap = ph.iter().find(|p| p.label.starts_with("gap before leg a")).unwrap();
         assert!(gap.waiting_for.as_deref().unwrap().contains("cap"), "{gap:?}");
+    }
+
+    #[test]
+    fn a_cap_wait_names_its_holders_and_says_which_seat_had_finished() {
+        let mut i = row();
+        i.cycle.push((170, "list group 1: r-1 waits — the seat is at its cap of 4: r-9 · verifying in cpd-1, r-8 in cpd-2, r-7 starting".into()));
+        i.holder_events.push((100, "task-verified".into(), "r-9".into()));
+        i.holder_events.push((120, "task-review".into(), "r-8".into()));
+        i.holder_events.push((900, "task-review".into(), "r-7".into()));
+        let ph = build(&i);
+        let why = ph.iter().filter_map(|p| p.waiting_for.clone()).find(|w| w.contains("cap")).expect("a cap wait");
+        assert!(why.contains("r-9 · verifying in cpd-1 (finished "), "{why}");
+        assert!(why.contains("r-8 in cpd-2 (finished "), "{why}");
+        assert!(why.contains("r-7 starting (running)"), "{why}");
     }
 
     #[test]
