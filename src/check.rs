@@ -601,10 +601,10 @@ impl TreeLock {
         Some((pid, it.next().unwrap_or_default().to_string()))
     }
 
-    /// Whether process `pid` holds the lock at `path` and is alive: `kill -0`
+    /// Whether the lock at `path` is held by a process that is alive: `kill -0`
     /// is a better witness of a live process than a `ps` that can fail empty.
-    pub(crate) fn held_by(path: &Path, pid: u32) -> bool {
-        Self::holder(path).is_some_and(|(p, _)| p == pid) && !Self::dead(path)
+    pub(crate) fn live(path: &Path) -> bool {
+        Self::holder(path).is_some() && !Self::dead(path)
     }
 
     /// Whether the pid in the lock is gone, which is the only reason to break one.
@@ -1673,15 +1673,14 @@ mod tests {
         let env = util::isolated("check-lock-said");
         let path = env.state().join("lock");
         let held = TreeLock::take(path.clone(), Duration::from_secs(1)).unwrap();
-        assert!(TreeLock::held_by(&path, std::process::id()));
-        assert!(!TreeLock::held_by(&path, std::process::id() + 1));
+        assert!(TreeLock::live(&path));
         let mut said = Vec::new();
         let r = TreeLock::take_saying(path.clone(), Duration::from_secs(0), |by| said.push(by));
         assert!(r.is_err());
         assert_eq!(said.len(), 1);
         assert_eq!(said[0].as_ref().map(|(p, _)| *p), Some(std::process::id()));
         drop(held);
-        assert!(!TreeLock::held_by(&path, std::process::id()));
+        assert!(!TreeLock::live(&path));
     }
 
     #[test]

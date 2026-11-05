@@ -186,13 +186,21 @@ impl Run {
 /// When process `pid` started, as `ps` says it, or `None` where there is none.
 fn start_of(pid: u32) -> Result<Option<String>, ()> {
     let out = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
-    // `ps` says there is no such process by exiting 1 with nothing printed. Any
-    // other end — killed, out of processes, a failure under load — says nothing
-    // about the pid, and a live run is not read as dead on it.
-    if out.status.code() != Some(0) && !(out.status.code() == Some(1) && out.stdout.iter().all(u8::is_ascii_whitespace)) {
+    ps_says(out.status.code(), &out.stdout)
+}
+
+/// What a finished `ps -o lstart= -p <pid>` says. It says there is no such
+/// process by exiting 1 with nothing on stdout (stderr is free text, and a pid
+/// too large for the system gets a complaint there with the same exit). Any
+/// other end — killed by a signal, or another exit status — says nothing about
+/// the pid, so it is `Err` and a live run is not read as dead on it. A `ps` that
+/// itself fails with exit 1 and prints nothing cannot be told from a missing
+/// pid, and reads as gone: the lock (`open_unless_held`) is what covers that.
+fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
+    if code != Some(0) && !(code == Some(1) && stdout.iter().all(u8::is_ascii_whitespace)) {
         return Err(());
     }
-    let s = String::from_utf8_lossy(&out.stdout);
+    let s = String::from_utf8_lossy(stdout);
     let s = s.split_whitespace().collect::<Vec<_>>().join("_");
     Ok((!s.is_empty()).then_some(s))
 }
@@ -604,6 +612,42 @@ pub(crate) fn open_within(
     changed.then_some(()).and(opened)
 }
 
+/// What [`open_unless_held`] came to.
+pub(crate) enum Opening {
+    /// The open check's run reads as dead and the tree lock is held by a live
+    /// process: the run is alive (or its result is being written), and a copy
+    /// started now would only wait behind it. Nothing was written.
+    Held,
+    Opened(Opened),
+    Nothing,
+}
+
+/// [`open_within`], except that a mechanical run that reads as dead while
+/// `held` says a live process has its tree lock is left alone. **Whoever holds
+/// the lock counts**, not only the pid the entry records: a copy that did start
+/// has replaced that pid with its own (`note_pid`), and the lock is still the
+/// first run's.
+pub(crate) fn open_unless_held(
+    store: &Store,
+    w: &Worklist,
+    at: usize,
+    read: Option<String>,
+    on: Option<String>,
+    mech: Mechanical,
+    gone: &dyn Fn(&str) -> bool,
+    admit: &dyn Fn() -> bool,
+    held: &dyn Fn() -> bool,
+) -> Opening {
+    let died = store.worklist(&w.id).is_some_and(|w| w.groups().get(at - 1).is_some_and(run_died));
+    if died && held() {
+        return Opening::Held;
+    }
+    match open_within(store, w, at, read, on, mech, gone, admit) {
+        Some(o) => Opening::Opened(o),
+        None => Opening::Nothing,
+    }
+}
+
 /// Name the seat of the open check on group `at`. `wsp spawn --check` calls it
 /// once the seat exists and before the agent starts, because the brief it
 /// reads at start-up finds it by this seat.
@@ -718,11 +762,6 @@ pub(crate) fn note_pid(store: &Store, list: &str, at: usize) -> bool {
         }
         None => false,
     })
-}
-
-/// The pid of the open check's mechanical run on `g`, while it reads as running.
-pub(crate) fn run_pid(g: &Group) -> Option<u32> {
-    running(g).filter(|c| c.suite == Some(Suite::Running)).and_then(|c| c.run.as_ref()).map(|r| r.pid)
 }
 
 /// Whether the open check on `g` is a mechanical run whose process has died.
@@ -995,6 +1034,50 @@ fn apply(store: &Store, plan: &Plan) -> Result<usize, String> {
 mod tests {
     use super::*;
     use crate::model::{parse_groups, render_groups};
+
+    #[test]
+    fn only_an_exit_one_with_nothing_printed_from_ps_is_a_pid_that_is_gone() {
+        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026\n"), Ok(Some("Tue_Nov_4_11:19:05_2026".into())));
+        assert_eq!(ps_says(Some(1), b""), Ok(None), "no such process");
+        assert_eq!(ps_says(Some(1), b"\n"), Ok(None));
+        assert_eq!(ps_says(None, b""), Err(()), "killed by a signal says nothing of the pid");
+        assert_eq!(ps_says(Some(2), b""), Err(()));
+        assert_eq!(ps_says(Some(1), b"Tue Nov  4 11:19:05 2026\n"), Err(()));
+    }
+
+    /// `wsp-391`: the run reads dead but holds the tree lock, so the tick starts
+    /// no copy of it; the same record with nobody holding the lock is retaken.
+    #[test]
+    fn a_dead_reading_run_that_holds_the_tree_lock_is_not_started_again() {
+        let (_env, store) = scratch("held-run");
+        let w = list(&store, &[&["m-1"]]);
+        let (_, _retake) = running_with(&store, Run { pid: 2_000_000_000, started: "x".into() });
+        let try_it = |held: bool| open_unless_held(&store, &w, 1, None, None, Mechanical::Yes, &|_: &str| false, &|| true, &|| held);
+        assert!(matches!(try_it(true), Opening::Held));
+        assert_eq!(checks(&store, 1)[0].tries, 1, "nothing was written");
+        assert!(run_died(&store.worklist("run").unwrap().groups()[0]));
+        assert!(matches!(try_it(false), Opening::Opened(o) if o.retaken && o.died == Some(2_000_000_000) && o.tries == 2));
+    }
+
+    /// A copy that did start has put its own pid on the entry; the lock is the
+    /// first run's, and the guard asks the lock, not the pid.
+    #[test]
+    fn a_copys_pid_on_the_entry_does_not_hide_the_first_runs_lock() {
+        let (_env, store) = scratch("copy-pid");
+        let w = list(&store, &[&["m-1"]]);
+        let lock = _env.state().join("lock");
+        let (_, _retake) = running_with(&store, Run { pid: 2_000_000_000, started: "x".into() });
+        let first = crate::check::TreeLock::take(lock.clone(), std::time::Duration::from_secs(1)).unwrap();
+        change(&store, "run", 1, |g| {
+            g.checks.last_mut().unwrap().run = Some(Run { pid: 2_000_000_001, started: "y".into() });
+            true
+        });
+        let held = || crate::check::TreeLock::live(&lock);
+        let t = |h: &dyn Fn() -> bool| open_unless_held(&store, &w, 1, None, None, Mechanical::Yes, &|_: &str| false, &|| true, h);
+        assert!(matches!(t(&held), Opening::Held));
+        drop(first);
+        assert!(matches!(t(&held), Opening::Opened(_)));
+    }
 
     #[test]
     fn this_process_is_not_gone_and_a_pid_nothing_has_is() {

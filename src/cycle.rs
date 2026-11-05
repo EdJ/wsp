@@ -974,11 +974,12 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 // A run that holds the tree lock is alive, whatever a liveness
                 // probe says of its pid: it is not started again, for the
                 // copy would only wait on the lock behind it.
-                if crate::barrier::run_died(g) && crate::barrier_run::holds_lock(store, &w, at) {
-                    if all {
-                        log_line(store, &format!("{} group {at}: its barrier run holds the tree lock — waiting for its result", w.id));
-                    }
-                } else if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, mech, &gone, &admit) {
+                let held = || crate::barrier_run::lock_held(store, &w, at);
+                let opening = crate::barrier::open_unless_held(store, &w, at, trunk_tip(store, &w.id), on, mech, &gone, &admit, &held);
+                if matches!(opening, crate::barrier::Opening::Held) && all {
+                    log_line(store, &format!("{} group {at}: its barrier run holds the tree lock — waiting for its result", w.id));
+                }
+                if let crate::barrier::Opening::Opened(o) = opening {
                     if let Some(pid) = o.died {
                         log_line(store, &format!(
                             "{} group {at}: its barrier run ended without a result (pid {pid}), starting it again (try {} of {})",
@@ -6655,7 +6656,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(drained(&SAID).iter().any(|l| l.contains("already gone")));
     }
 
-    fn drained<T>(k: &'static std::thread::LocalKey<RefCell<Vec<T>>>) -> Vec<T> {
+    pub(crate) fn drained<T>(k: &'static std::thread::LocalKey<RefCell<Vec<T>>>) -> Vec<T> {
         k.with(|s| s.borrow_mut().drain(..).collect())
     }
 

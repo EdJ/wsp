@@ -482,12 +482,10 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     0
 }
 
-/// Whether the run recorded on group `at`'s open check holds the tree lock of
-/// one of its units and is alive: a run in its steps, whatever `ps` says of it.
-pub(crate) fn holds_lock(store: &Store, w: &Worklist, at: usize) -> bool {
-    let groups = w.groups();
-    let Some(pid) = groups.get(at - 1).and_then(barrier::run_pid) else { return false };
-    plan(store, w, at).units.iter().any(|u| check::TreeLock::held_by(&check::barrier_dir(store, &u.project, &u.repo).join("lock"), pid))
+/// Whether a live process holds the tree lock of one of group `at`'s units: a
+/// run in its steps, or writing its result, whatever `ps` says of its pid.
+pub(crate) fn lock_held(store: &Store, w: &Worklist, at: usize) -> bool {
+    plan(store, w, at).units.iter().any(|u| check::TreeLock::live(&check::barrier_dir(store, &u.project, &u.repo).join("lock")))
 }
 
 fn run_unit(store: &Store, unit: &Unit, who: &str) -> Ranged {
@@ -827,6 +825,44 @@ mod tests {
         assert!(!store.state_file("checks").exists(), "nothing was put under checks/");
         assert!(check::barrier_tree_line(&store, "pj", &plan.units[0].repo).contains(&plan.units[0].sha[..12]));
         drop(env);
+    }
+
+    #[test]
+    fn a_live_holder_of_the_barrier_lock_is_seen_from_the_plan() {
+        let (_env, store) = world("lock-held", "exit 0\n", "");
+        let w = store.worklist("run").unwrap();
+        let plan = plan(&store, &w, 1);
+        assert!(!lock_held(&store, &w, 1));
+        let u = &plan.units[0];
+        let lock = check::TreeLock::take(check::barrier_dir(&store, &u.project, &u.repo).join("lock"), std::time::Duration::from_secs(1)).unwrap();
+        assert!(lock_held(&store, &w, 1));
+        drop(lock);
+        assert!(!lock_held(&store, &w, 1));
+    }
+
+    /// `wsp-391`: a copy that waits behind another's lock says so, with whose,
+    /// and its 'barrier run' line is its own steps' time and not the wait.
+    #[test]
+    fn a_run_that_waits_for_the_tree_lock_says_for_whom_and_does_not_count_the_wait() {
+        let (_env, store) = world("waits", "exit 0\n", "");
+        let w = store.worklist("run").unwrap();
+        let plan = plan(&store, &w, 1);
+        let u = &plan.units[0];
+        assert!(barrier::open_within(&store, &w, 1, Some("abc".into()), None, barrier::Mechanical::Yes, &|_: &str| false, &|| true).is_some());
+        let first = check::TreeLock::take(check::barrier_dir(&store, &u.project, &u.repo).join("lock"), std::time::Duration::from_secs(1)).unwrap();
+        let _ = crate::cycle::tests::drained(&crate::cycle::tests::SAID);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            drop(first);
+        });
+        assert_eq!(run(&store, "run", 1), 0);
+        holder.join().unwrap();
+        let said = crate::cycle::tests::drained(&crate::cycle::tests::SAID);
+        let me = format!("pid {}", std::process::id());
+        assert!(said.iter().any(|l| l.contains("waits for the tree lock") && l.contains(&me)), "{said:?}");
+        let line = said.iter().find(|l| l.contains("barrier run —")).unwrap_or_else(|| panic!("{said:?}"));
+        let secs: u64 = line.split(", ").last().unwrap().split('s').next().unwrap().parse().unwrap_or_else(|_| panic!("{line}"));
+        assert!(secs < 10, "the 12 s wait is not in the line: {line}");
     }
 
     #[test]
