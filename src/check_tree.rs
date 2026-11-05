@@ -180,21 +180,57 @@ pub(crate) fn pids_in(lsof: &str, dir: &Path) -> Vec<u32> {
     out
 }
 
+/// The pids in `lsof` output that are `dir`'s to stop: those with their working
+/// directory in it, less `keep`.
+///
+/// **`keep` is every live seat's process tree, and the reason is
+/// `wsp-388`.** A working directory proves a process was started in a tree, not
+/// that it belongs to the check: `compound-sup` took the cwd of whoever ran
+/// `wsp spawn` and held it, and a check's `wsp worklist go` ran inside its tree,
+/// so the members and governors it seated stood in the tree by cwd while
+/// being other seats. Ending the check signalled them (the `TERM`, 1.5s, `KILL`
+/// below is the two seconds between the check going and the others).
+pub(crate) fn strays(lsof: &str, dir: &Path, keep: &[u32]) -> Vec<u32> {
+    pids_in(lsof, dir).into_iter().filter(|p| !keep.contains(p)).collect()
+}
+
+/// Every process of every seat that is open now, on every backend that answers:
+/// the roots and everything under them. A seat's processes are ended by its
+/// own close and by nothing else.
+fn seated() -> Vec<u32> {
+    let herdr_here = crate::herdr::available_now();
+    let mut out = Vec::new();
+    for (backend, name) in
+        crate::cmd_spawn::local_backends().into_iter().zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES)
+    {
+        if name == "herdr" && !herdr_here {
+            continue;
+        }
+        let Ok(census) = backend.census() else { continue };
+        for seat in census.seats() {
+            out.extend(backend.pids(&seat.seat).unwrap_or_default());
+            out.extend(backend.root(&seat.seat));
+        }
+    }
+    out
+}
+
 /// What is running with `dir` as its working directory, other than this process
-/// and its parents.
+/// and its parents, and other than a seat's.
 fn running_in(dir: &Path) -> Vec<u32> {
     let Ok(out) = std::process::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output() else { return Vec::new() };
     let dir = util::real(&dir.display().to_string());
-    let skip = crate::cmd_sandbox::ancestors(&crate::cmd_sandbox::processes());
-    pids_in(&String::from_utf8_lossy(&out.stdout), &dir).into_iter().filter(|p| !skip.contains(p)).collect()
+    let mut keep = crate::cmd_sandbox::ancestors(&crate::cmd_sandbox::processes());
+    keep.extend(seated());
+    strays(&String::from_utf8_lossy(&out.stdout), &dir, &keep)
 }
 
 /// Stop the dev servers and watchers a check left running in its tree (a Vite
 /// server, `tsgo` and Vitest watchers were still up 21 hours after their
-/// check, `wsp-373`): `TERM`, a moment, then `KILL` for what is left. Proved by
-/// cwd alone — a process whose working directory is in the tree is the tree's.
-/// Returns how many were stopped. Not under test: it would signal the machine's
-/// own processes; [`pids_in`] is what the tests drive.
+/// check, `wsp-373`): `TERM`, a moment, then `KILL` for what is left. A process
+/// whose working directory is in the tree is the tree's unless it is a seat's
+/// ([`strays`]). Returns how many were stopped. Not under test: it would signal
+/// the machine's own processes; [`strays`] is what the tests drive.
 fn stop_running(dir: &Path) -> usize {
     if cfg!(test) {
         return 0;
@@ -573,6 +609,19 @@ mod tests {
     fn a_process_is_the_trees_by_its_working_directory() {
         let lsof = "p10\nn/r/.worktrees/web-check-3\np11\nn/r/.worktrees/web-check-3/spikes/web-chrome\np12\nn/r/.worktrees/web-check-30\np13\nn/\np11\nn/r/.worktrees/web-check-3/x\n";
         assert_eq!(pids_in(lsof, Path::new("/r/.worktrees/web-check-3")), vec![10, 11]);
+    }
+
+    /// `wsp-388`: a seat's supervisor can stand in a check's tree by cwd
+    /// (it took the cwd of the `wsp worklist go` that seated it), and ending the
+    /// check signalled it. Of the processes with their cwd in the tree, a
+    /// seat's are not the tree's: the dev server is.
+    #[test]
+    fn a_seat_standing_in_a_checks_tree_by_cwd_is_not_the_trees_to_stop() {
+        let lsof = "p10\nn/r/.worktrees/pre-prep-check-4\np11\nn/r/.worktrees/pre-prep-check-4\np12\nn/r/.worktrees/pre-prep-check-4/web\np13\nn/r\n";
+        let dir = Path::new("/r/.worktrees/pre-prep-check-4");
+        assert_eq!(strays(lsof, dir, &[]), vec![10, 11, 12]);
+        // 11 is a member's supervisor, 13 a governor's; 10 and 12 are servers.
+        assert_eq!(strays(lsof, dir, &[11, 13]), vec![10, 12]);
     }
 
     /// The trees of 2026-11-05: `npm ci` and a dev server left `node_modules/`,

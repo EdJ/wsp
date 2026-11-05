@@ -1186,6 +1186,13 @@ impl Compound<'_> {
             cmd.env_remove(k);
         }
 
+        // The supervisor stands nowhere. It used to keep the cwd of whoever ran
+        // `wsp spawn`, so a seat opened from inside a check's tree had a
+        // supervisor "in" that tree, and ending the check took it for the
+        // check's own (`wsp-388`). The agent's directory is `--cwd`, above.
+        if !cwd.is_empty() {
+            cmd.current_dir("/");
+        }
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
 
         let mut child = cmd.spawn().map_err(|e| Refusal::Backend(format!("{} did not start: {e}", sup.display())))?;
@@ -1643,6 +1650,53 @@ mod tests {
                 let _ = sup.stop(&Seat::new(id));
             }
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// **`wsp-388`: ending one seat ends that seat's process tree and nothing
+    /// else.** Four seats are open — a check, a member, a governor and a second
+    /// check — each a real process leading its own group, as `compound-sup`
+    /// is; the first check is stopped through the close path `wsp despawn`
+    /// uses, and the other three are still running.
+    #[test]
+    fn stopping_one_check_seat_leaves_a_member_a_governor_and_a_second_check_running() {
+        use std::os::unix::process::CommandExt;
+        let scratch = Scratch::new("neighbours");
+        let place = scratch.place();
+        let mut held = Vec::new();
+        let mut seats = Vec::new();
+        for label in ["pre-prep · barrier 4", "wsp-385", "pre-prep governor", "other · barrier 2"] {
+            let seat = place.open(&Order { label: label.into(), ..Order::default() }).unwrap();
+            // The shell under the seat's own group leader, as the supervisor
+            // and its pty child are: ended with the group.
+            let mut leader = std::process::Command::new("sh")
+                .args(["-c", "sleep 60 & wait"])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = leader.id();
+            let mut rec = place.record(&seat).unwrap();
+            rec["pid"] = json!(pid);
+            rec["agent"] = json!({ "kind": "claude", "name": "a", "args": [] });
+            write_atomic(&place.dir_of(&seat).unwrap().join(SEAT_FILE), &rec.to_string()).unwrap();
+            // Reaped when it ends, so `alive` reads it as gone and not a zombie.
+            held.push((pid, std::thread::spawn(move || leader.wait())));
+            seats.push(seat);
+        }
+        let _ends = held.iter().map(|(pid, _)| EndsOnDrop(*pid)).collect::<Vec<_>>();
+        assert!(held.iter().all(|(pid, _)| alive(&[*pid]).contains(pid)));
+
+        place.stop(&seats[0]).expect("the check was there");
+
+        assert!(until(|| alive(&[held[0].0]).is_empty()), "the check's own process tree was ended");
+        for (pid, _) in &held[1..] {
+            assert!(alive(&[*pid]).contains(pid), "pid {pid} belonged to another seat and was ended with the check");
+        }
+        for seat in &seats[1..] {
+            assert!(place.record(seat).is_ok(), "{seat} lost its record with the check");
         }
     }
 
