@@ -2029,6 +2029,21 @@ fn reviewed_since_sent_back(t: &Task) -> bool {
     heads[back + 1..].iter().any(|h| h.starts_with("review:") || *h == "→ review")
 }
 
+/// Whether a member's block has been answered: it has landed something new
+/// since the verifier read, or gone back to review since it was sent back
+/// (`wsp-334`). A verifier is then owed on the new state, and the run must not
+/// tell its governor that nothing has answered the verdict.
+///
+/// **The commits only, never `updated`**: a governor's note moves the member
+/// and answers nothing.
+pub(crate) fn answered_block(t: &Task) -> bool {
+    let landed_again = match (crate::repair::commit_of(t), crate::verification::passes(t).last().and_then(|p| p.read.clone())) {
+        (Some(now), Some(then)) => !crate::verification::same_commit(&now, &then),
+        _ => false,
+    };
+    landed_again || reviewed_since_sent_back(t)
+}
+
 /// How a barrier row's title starts; the list's slug follows it.
 pub(crate) const BARRIER_TITLE: &str = "Barrier: ";
 
@@ -4211,6 +4226,43 @@ pub(crate) mod tests {
         set(&store, "m-1", Status::Review);
         step(&store, &w, &Blind);
         assert_eq!(passes_on(&store, "m-1").len(), 2, "blocked again: the return it answered is above the new send-back");
+        let _ = spawned();
+    }
+
+    /// **`wsp-334`: block -> re-land -> review -> re-verify.** wsp-331 was
+    /// blocked at one commit, landed a fix at another and went back to review;
+    /// the run told its governor that nothing had answered the block. The block
+    /// is answered by the landing and the return, and a fresh verifier opens on
+    /// the new commit.
+    #[test]
+    fn a_member_that_lands_a_fix_after_a_block_and_returns_to_review_is_verified_on_the_new_commit() {
+        let (_env, store) = scratch("relanded");
+        task(&store, "m-1", Status::Review);
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{} af84a9320f7e3bf18fa5f19a6eeaefd867dacc2c", crate::repair::LANDED));
+        store.save_task(&t).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        verdict_all(&store, crate::verification::State::Blocks);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
+        assert!(crate::verification::blocked(&store.tasks_shared(), "m-1").is_some());
+        assert!(!answered_block(&store.find_task("m-1").unwrap()), "nothing has answered it yet");
+
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{} c9a5c581639b54db01dbb88ff344c8892baca5e7", crate::repair::LANDED));
+        t.log("review: answered the finding");
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        assert!(answered_block(&store.find_task("m-1").unwrap()), "a landing and a return to review answer it");
+
+        let _ = spawned();
+        step(&store, &w, &Blind);
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.len(), 2, "a fresh verifier opens on the re-landing");
+        assert_eq!(ps[1].read.as_deref(), Some("c9a5c581639b"), "on the new commit");
+        assert_eq!(ids(spawned()), ["m-1 · verifying".to_string()]);
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 2, "and once");
         let _ = spawned();
     }
 

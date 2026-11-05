@@ -1364,6 +1364,17 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
         for m in blocked {
             let Some(v) = crate::cycle::blocked_verifier(&tasks, m) else { continue };
             let read = v.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default();
+            // `wsp-334`: a block the member has answered — landed again, back
+            // at review — is owed a fresh verifier, which the step opens. It is
+            // not "unanswered", and the governor is not told it is.
+            if tasks.iter().find(|t| t.id == m).is_some_and(crate::cycle::answered_block) {
+                stamp(store, &format!(
+                    "{} group {at}: the barrier waits on {m} — its verifier blocked{read}, {m} has answered it (landed again and \
+                     returned to review), and a fresh verifier is owed on the new commit.",
+                    w.id,
+                ));
+                continue;
+            }
             stamp(store, &format!(
                 "{} group {at}: the barrier still waits on {m} — its verifier blocked{read}: sent back or answered? \
                  `wsp show {m}` has the verdict under ## Verification.",
@@ -3486,6 +3497,37 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         let heard = governed();
         assert!(!heard.iter().any(|t| t.contains("barrier waits on m-1")), "one verdict is told once, a note in between or not: {heard:?}");
         assert!(stamped().iter().any(|l| l.contains("sent back or answered?")), "while cycle.log goes on saying it");
+    }
+
+    /// **`wsp-334`: a block the member answered is not "unanswered".** wsp-331
+    /// landed a fix after its block and returned to review, and the governor was
+    /// told nothing was coming while a fresh verifier was owed.
+    #[test]
+    fn a_block_answered_by_a_landing_and_a_return_to_review_is_not_told_as_unanswered() {
+        let (env, store) = scratch("barrieranswered");
+        landed_member(&env, &store, false);
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let _ = stamped();
+        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "it does not hold", None, None).unwrap();
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{LANDED} c9a5c581639b54db01dbb88ff344c8892baca5e7 on master"));
+        t.log("review: answered the finding");
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        let _ = governed();
+
+        // The notice as it reads before the step has opened the pass the
+        // answer is owed — the tick's step opens it first when nothing holds it
+        // back, and a check gate or the seat's cap can.
+        let w = store.worklist("run").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        assert!(pos.at_barrier());
+        skipped(&store, &w, 1, &pos);
+        let heard = governed();
+        assert!(!heard.iter().any(|t| t.contains("barrier waits on m-1")), "{heard:?}");
+        let said = stamped();
+        assert!(said.iter().any(|l| l.contains("m-1 has answered it") && l.contains("fresh verifier is owed")), "{said:?}");
+        assert!(!said.iter().any(|l| l.contains("sent back or answered?")), "{said:?}");
     }
 
     /// **The reconciler's lines go in `cycle.log`, and that is not the same as
