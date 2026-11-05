@@ -168,6 +168,10 @@ pub struct Project {
     /// slug. See [`Project::code`] for why it is stored empty rather than
     /// filled in.
     pub code_raw: String,
+    /// A shell command run with a tree's root as its cwd just before wsp
+    /// removes that tree (see [`crate::at_stop`]); empty when the project has
+    /// none, and then nothing runs.
+    pub at_stop: String,
     /// Highest number this project has handed out — a hint, not the truth.
     ///
     /// [`crate::store::Store::alloc_task_id`] reads it to skip the directory
@@ -216,6 +220,7 @@ impl Project {
             status: doc.opt("status").unwrap_or_else(|| "active".into()),
             brief: doc.str("brief"),
             code_raw: doc.opt("code").unwrap_or_default(),
+            at_stop: doc.opt("at_stop").unwrap_or_default(),
             seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
             body: doc.body.clone(),
         }
@@ -231,6 +236,10 @@ impl Project {
         d.set_str("status", &self.status);
         d.set_str("brief", &self.brief);
         d.set_str("code", &self.code_raw);
+        // Only where there is one: nearly every project has none.
+        if !self.at_stop.trim().is_empty() {
+            d.set_str("at_stop", &self.at_stop);
+        }
         d.set_str("seq", &self.seq.to_string());
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();

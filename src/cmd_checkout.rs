@@ -880,6 +880,8 @@ fn judge(repo: &Path, onto: &str, task: &str, dir: &Path, closed: bool, passed: 
 /// scrolled away by the time anybody wants it.
 pub(crate) fn remove(repo: &Path, dir: &Path) -> Removed {
     let existed = dir.exists();
+    // The tree's own teardown, while the tree is still there to run it in.
+    crate::at_stop::before(repo, dir);
     // Before the removal: a tree that has gone cannot be asked what it was on.
     // `None` is a detached HEAD, where there is no branch to keep and nothing
     // to delete — [`judge`] refuses such a tree, so only `--rm` reaches here

@@ -658,7 +658,7 @@ pub(crate) struct Ran {
 }
 
 /// The environment a check's commands get: the caller's, less wsp's own.
-fn clean_env(cmd: &mut Command) {
+pub(crate) fn clean_env(cmd: &mut Command) {
     for (k, _) in std::env::vars() {
         if k.starts_with("WSP_") || k.starts_with("HERDR_") || k == "GIT_INDEX_FILE" {
             cmd.env_remove(k);

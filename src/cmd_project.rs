@@ -422,6 +422,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     println!("{}  {}", p.dim(util::pad("parent", 8).as_str()), proj.parent.clone().unwrap_or_else(|| "—".into()));
     println!("{}  {}", p.dim(util::pad("tags", 8).as_str()), index.effective_tags(&proj.id).join(" "));
     println!("{}  {}", p.dim(util::pad("roots", 8).as_str()), proj.roots.join("  "));
+    if !proj.at_stop.is_empty() {
+        println!("{}  {}", p.dim(util::pad("at_stop", 8).as_str()), proj.at_stop);
+    }
     println!("{}  {}", p.dim(util::pad("status", 8).as_str()), proj.status);
 
     let kids = index.children(Some(&proj.id));
@@ -849,8 +852,9 @@ pub fn set(store: &Store, args: &Args) -> i32 {
                     .filter(|s| !s.is_empty())
                     .collect()
             }
+            "at_stop" => proj.at_stop = v.trim().to_string(),
             other => {
-                eprintln!("wsp: cannot set `{other}` (name|brief|status|parent|tags|roots)");
+                eprintln!("wsp: cannot set `{other}` (name|brief|status|parent|tags|roots|at_stop)");
                 return 2;
             }
         }
@@ -882,6 +886,7 @@ pub fn project_json(p: &Project, index: &Index) -> serde_json::Value {
         "tags": p.tags,
         "effective_tags": index.effective_tags(&p.id),
         "roots": p.roots,
+        "at_stop": p.at_stop,
         "status": p.status,
         "brief": p.brief,
         "handbook": crate::model::section_of(&p.body, "Handbook"),

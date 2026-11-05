@@ -307,7 +307,7 @@ fn take(store: &Store, repo: &Path, dir: &Path, residue: &Residue, standing: &dy
 
 /// The repository a project root is in: walked up to the directory holding
 /// `.git`, on disk with no git to run.
-fn repo_of(root: &str) -> Option<PathBuf> {
+pub(crate) fn repo_of(root: &str) -> Option<PathBuf> {
     let mut dir = util::expand(root);
     while !dir.join(".git").exists() {
         dir = dir.parent()?.to_path_buf();

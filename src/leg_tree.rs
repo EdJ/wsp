@@ -484,6 +484,10 @@ fn take(repo: &Path, dir: &Path, name: &str, row_dir: &Path, residue: &Residue, 
         None => Tree::Kept { path, why: "git could not read it".into() },
         Some(found) if !found.is_empty() => Tree::Kept { path, why: crate::check_tree::holds_more(&found) },
         Some(_) => {
+            // A leg's tree does not go through `cmd_checkout::remove` (its
+            // branch is judged against the row's, not the trunk's), so it asks
+            // for the same teardown, from the same place.
+            crate::at_stop::before(repo, dir);
             let _ = git(repo, &["worktree", "remove", "--force", &dir.display().to_string()]);
             let _ = std::fs::remove_dir_all(dir);
             let _ = git(repo, &["worktree", "prune"]);
