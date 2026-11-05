@@ -775,6 +775,32 @@ mod tests {
         assert!(row.exists(), "the row's own tree went");
     }
 
+    /// `wsp-370`: a leg's tree does not go through `cmd_checkout::remove`, so
+    /// its own take asks for the project's `at_stop:` — in that leg's tree, and
+    /// before the tree goes. The row's tree, which stays, is not asked.
+    #[test]
+    fn a_legs_tree_gets_the_projects_at_stop_in_it_before_it_goes() {
+        let (env, store, repo, row) = scratch("at-stop");
+        let mut p = store.project("p").unwrap();
+        p.at_stop = "[ -e .git ] && basename \"$PWD\" >> \"$MARKER_DIR/legs\"".into();
+        store.save_project(&p).unwrap();
+        std::env::set_var("MARKER_DIR", env.path(""));
+        let (mut legs, a, b) = opened(&store, &repo, [("a.txt", "from a\n"), ("b.txt", "from b\n")]);
+        assert!(join(&row, &legs, "fin").clean());
+        for l in legs.iter_mut() {
+            l.ending = crate::verification::Ending::Ended;
+        }
+        record_legs_into(&store, &legs);
+
+        let out = sweep(&store, &nobody);
+        assert_eq!(out.len(), 2, "{}", out.len());
+        assert!(!a.exists() && !b.exists());
+        let mut ran: Vec<String> = std::fs::read_to_string(env.path("legs")).expect("the teardown did not run").lines().map(str::to_string).collect();
+        ran.sort();
+        assert_eq!(ran, ["p-001.a", "p-001.b"], "once per leg tree, in that tree");
+        assert!(row.exists());
+    }
+
     #[test]
     fn a_conflicting_pair_leaves_the_rows_tree_clean_at_a_commit_and_names_the_branch_and_files() {
         let (_env, store, repo, row) = scratch("conflict");
