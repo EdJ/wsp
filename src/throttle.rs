@@ -89,6 +89,17 @@ const AWAY_MINUTES: u64 = 5;
 /// average, is a machine nobody can work on.
 const LOAD_FACTOR: f64 = 1.5;
 
+/// `CPU_Speed_Limit` (percent of the rated clock, `pmset -g therm`) under which
+/// the machine is thermally limited (`wsp-347`). Ed's i7-8559U read 31 under a
+/// fleet of builds; a cool one reads 100, and it sat at 82 with a light load.
+const THERMAL_BELOW: u32 = 70;
+
+/// What a thermally limited machine is held to: heavy builds at once, and jobs
+/// in each, as measured in `compounding/docs/fast-loop/thermal.md`. More
+/// parallel builds add heat, the clock drops, and the total gets worse.
+const HOT_SLOTS: usize = 1;
+const HOT_JOBS: usize = 4;
+
 /// Tools that get a shim when the settings declare none, and the variable that
 /// caps each one's parallelism.
 fn default_tools() -> BTreeMap<String, String> {
@@ -139,6 +150,12 @@ pub(crate) struct Settings {
     /// across the slots.
     pub jobs: Option<usize>,
     pub away_minutes: u64,
+    /// `CPU_Speed_Limit` under which the machine counts as thermally limited.
+    pub thermal_below: u32,
+    /// Slots and jobs while it is. `None` is the measured best ([`HOT_SLOTS`],
+    /// [`HOT_JOBS`]), kept under whatever `slots` and `jobs` already say.
+    pub hot_slots: Option<usize>,
+    pub hot_jobs: Option<usize>,
     /// Tool name to the variable that caps its parallelism. Edited by hand in
     /// the file; the default is cargo.
     pub tools: BTreeMap<String, String>,
@@ -146,7 +163,16 @@ pub(crate) struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { mode: Mode::Auto, slots: None, jobs: None, away_minutes: AWAY_MINUTES, tools: default_tools() }
+        Settings {
+            mode: Mode::Auto,
+            slots: None,
+            jobs: None,
+            away_minutes: AWAY_MINUTES,
+            thermal_below: THERMAL_BELOW,
+            hot_slots: None,
+            hot_jobs: None,
+            tools: default_tools(),
+        }
     }
 }
 
@@ -169,6 +195,11 @@ impl Settings {
         if let Some(n) = v.get("away_minutes").and_then(Value::as_u64) {
             s.away_minutes = n;
         }
+        if let Some(n) = v.get("thermal_below").and_then(Value::as_u64) {
+            s.thermal_below = n.min(100) as u32;
+        }
+        s.hot_slots = v.get("hot_slots").and_then(Value::as_u64).map(|n| n.max(1) as usize);
+        s.hot_jobs = v.get("hot_jobs").and_then(Value::as_u64).map(|n| n.max(1) as usize);
         if let Some(t) = v.get("tools").and_then(Value::as_object) {
             let tools: BTreeMap<String, String> =
                 t.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect();
@@ -186,6 +217,9 @@ impl Settings {
             "slots": self.slots,
             "jobs": self.jobs,
             "away_minutes": self.away_minutes,
+            "thermal_below": self.thermal_below,
+            "hot_slots": self.hot_slots,
+            "hot_jobs": self.hot_jobs,
             "tools": self.tools,
         });
         crate::store::write_atomic(&settings_path(state), &serde_json::to_string_pretty(&v).unwrap_or_default())
@@ -197,6 +231,35 @@ impl Settings {
 
     pub(crate) fn job_cap(&self, cores: usize) -> usize {
         self.jobs.unwrap_or_else(|| (cores.saturating_sub(1) / self.slot_count(cores)).max(1))
+    }
+
+    /// Whether a `CPU_Speed_Limit` reading is a thermally limited machine.
+    /// Unreadable is not: the reading is only there on a Mac, and a cool
+    /// machine must not be held back for want of one.
+    pub(crate) fn is_hot(&self, speed_limit: Option<u32>) -> bool {
+        speed_limit.is_some_and(|l| l < self.thermal_below)
+    }
+
+    /// [`Settings::slot_count`], or while the machine is hot the measured best,
+    /// never more than the ordinary count.
+    pub(crate) fn slots_at(&self, cores: usize, hot: bool) -> usize {
+        match hot {
+            true => self.hot_slots.unwrap_or_else(|| HOT_SLOTS.min(self.slot_count(cores))),
+            false => self.slot_count(cores),
+        }
+    }
+
+    pub(crate) fn jobs_at(&self, cores: usize, hot: bool) -> usize {
+        match hot {
+            true => self.hot_jobs.unwrap_or_else(|| HOT_JOBS.min(self.job_cap(cores))),
+            false => self.job_cap(cores),
+        }
+    }
+
+    /// The agent cap to suggest on a hot machine: agents mostly wait, but each
+    /// one that finishes a step wants a build, so two for each slot.
+    pub(crate) fn hot_agents(&self, cores: usize) -> usize {
+        (2 * self.slots_at(cores, true)).max(1)
     }
 }
 
@@ -221,6 +284,21 @@ pub(crate) fn parse_hid_idle(ioreg: &str) -> Option<u64> {
 fn hid_idle_secs() -> Option<u64> {
     let out = Command::new("ioreg").args(["-c", "IOHIDSystem", "-d", "4"]).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| parse_hid_idle(&String::from_utf8_lossy(&out.stdout))).flatten()
+}
+
+/// `CPU_Speed_Limit 	= 31` in `pmset -g therm` output: percent of the rated
+/// clock the machine is allowed right now.
+pub(crate) fn parse_speed_limit(pmset: &str) -> Option<u32> {
+    let line = pmset.lines().find(|l| l.trim_start().starts_with("CPU_Speed_Limit"))?;
+    line.split('=').nth(1)?.trim().parse().ok()
+}
+
+fn speed_limit() -> Option<u32> {
+    if cfg!(test) {
+        return None;
+    }
+    let out = Command::new("pmset").args(["-g", "therm"]).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| parse_speed_limit(&String::from_utf8_lossy(&out.stdout))).flatten()
 }
 
 /// Three load averages out of `/proc/loadavg` (`0.5 0.4 0.3 1/200 99`) or
@@ -433,6 +511,8 @@ pub(crate) struct Ctx<'a> {
     pub task: String,
     pub cores: usize,
     pub idle: &'a dyn Fn() -> Option<u64>,
+    /// `CPU_Speed_Limit` now, read at each decision: it moves with the build.
+    pub thermal: &'a dyn Fn() -> Option<u32>,
     pub alive: &'a dyn Fn(u32) -> bool,
     pub say: &'a dyn Fn(&str),
     pub poll: Duration,
@@ -557,6 +637,10 @@ pub(crate) fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
         };
         in_force(settings.mode, idle, settings.away_minutes)
     };
+    // A thermally limited machine is throughput, not politeness (`wsp-347`):
+    // the slots and the job cap hold in every mode, `off` included, and the
+    // nice stays the person's.
+    let hot = || settings.is_hot((ctx.thermal)());
     let mut _holds = Vec::new();
     if weight == Weight::Heavy {
         let tree = tree_of(&ctx.cwd);
@@ -567,9 +651,10 @@ pub(crate) fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
             let mut grab = || take(&tree_path(ctx.state, &tree), &rec, ctx.alive);
             _holds.push(wait_for(ctx, "its tree", &mut grab, None));
         }
-        if force() {
-            let n = settings.slot_count(ctx.cores);
+        if force() || hot() {
             let mut grab = || {
+                // Read at each try: a wait that began cool ends hot.
+                let n = settings.slots_at(ctx.cores, hot());
                 let mut seen = Value::Null;
                 for i in 0..n {
                     match take(&slot_path(ctx.state, i), &rec, ctx.alive) {
@@ -579,15 +664,19 @@ pub(crate) fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
                 }
                 Taken::HeldBy(seen)
             };
-            _holds.push(wait_for(ctx, "a build slot", &mut grab, Some(&|| !force())));
+            _holds.push(wait_for(ctx, "a build slot", &mut grab, Some(&|| !force() && !hot())));
         }
         cmd.env(HELD, tree.display().to_string());
     }
     let mut niced = None;
-    if force() {
-        niced = Some(NICE);
+    let limited = hot();
+    if force() || limited {
+        if force() {
+            niced = Some(NICE);
+        }
         if let Some(var) = settings.tools.get(tool) {
-            let wanted = settings.job_cap(ctx.cores);
+            let wanted = settings.jobs_at(ctx.cores, limited);
+            let wanted = if force() && limited { wanted.min(settings.job_cap(ctx.cores)) } else { wanted };
             let theirs = (ctx.env)(var).and_then(|v| v.parse::<usize>().ok());
             cmd.env(var, theirs.map_or(wanted, |t| t.min(wanted)).to_string());
         }
@@ -670,6 +759,7 @@ pub(crate) fn run_raw(argv: &[String]) -> i32 {
     };
     let store = Store::open();
     let idle = hid_idle_secs;
+    let thermal = speed_limit;
     let say = |m: &str| eprintln!("{m}");
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let ctx = Ctx {
@@ -679,6 +769,7 @@ pub(crate) fn run_raw(argv: &[String]) -> i32 {
         task: std::env::var("WSP_TASK").unwrap_or_default(),
         cores: cores(),
         idle: &idle,
+        thermal: &thermal,
         alive: &alive,
         say: &say,
         poll: Duration::from_secs(1),
@@ -760,6 +851,9 @@ pub(crate) struct View {
     pub in_force: bool,
     pub cores: usize,
     pub load: Option<(f64, f64, f64)>,
+    /// `CPU_Speed_Limit`, percent of the rated clock; `None` where there is no
+    /// `pmset`.
+    pub thermal: Option<u32>,
     pub builds: Vec<Build>,
     pub shims: PathBuf,
 }
@@ -778,6 +872,7 @@ impl View {
             in_force,
             cores: cores(),
             load: load_average(),
+            thermal: speed_limit(),
             builds: builds(state, &alive),
             shims: shim_dir(state),
         }
@@ -787,9 +882,53 @@ impl View {
         self.load.is_some_and(|(one, five, _)| load_high(one, five, self.cores))
     }
 
+    /// Thermally limited now (`wsp-347`): in every mode, the slots and jobs
+    /// are the hot ones.
+    pub(crate) fn hot(&self) -> bool {
+        self.settings.is_hot(self.thermal)
+    }
+
+    fn thermal_sentence(&self, agent_cap: Option<usize>) -> String {
+        let s = &self.settings;
+        let limit = self.thermal.unwrap_or(100);
+        let mut out = format!(
+            "the CPU is thermally limited to {limit}% of its clock (under {}%), so builds are held to {} at once and {} job{} each in every mode — more parallel builds add heat and finish fewer",
+            s.thermal_below,
+            s.slots_at(self.cores, true),
+            s.jobs_at(self.cores, true),
+            if s.jobs_at(self.cores, true) == 1 { "" } else { "s" },
+        );
+        let want = s.hot_agents(self.cores);
+        if agent_cap.is_none_or(|c| c > want) {
+            out.push_str(&format!("; fewer agents at once would help: `wsp machine set seat agents={want}`"));
+        }
+        out
+    }
+
+    /// Whatever is wrong with the machine worth a warning line: the load, the
+    /// clock, or both.
+    pub(crate) fn warning(&self, agent_cap: Option<usize>) -> Option<String> {
+        let parts: Vec<String> = [
+            self.load_warning().then(|| self.load_sentence()),
+            self.hot().then(|| self.thermal_sentence(agent_cap)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    fn thermal_cell(&self) -> Option<String> {
+        self.thermal.map(|l| match self.hot() {
+            true => format!("cpu clock {l}% — thermally limited"),
+            false => format!("cpu clock {l}%"),
+        })
+    }
+
     fn force_line(&self) -> String {
         let s = &self.settings;
         match (s.mode, self.in_force) {
+            (Mode::Off, _) if self.hot() => "off — builds run at full priority, but the CPU is thermally limited, so slots and jobs hold".into(),
             (Mode::Off, _) => "off — builds run at full priority, uncapped, with no slot".into(),
             (Mode::On, _) => "on — in force".into(),
             (Mode::Auto, true) => match self.idle {
@@ -814,10 +953,21 @@ impl View {
             s.slot_count(self.cores),
             self.cores
         ));
+        if self.hot() {
+            out.push(format!(
+                "  thermally limited, so in every mode: {} at once machine-wide, {} job{} each",
+                s.slots_at(self.cores, true),
+                s.jobs_at(self.cores, true),
+                if s.jobs_at(self.cores, true) == 1 { "" } else { "s" },
+            ));
+        }
         out.push("  always: one cargo build per tree".into());
         out.push(format!("  shims: {} (first on every spawned seat's PATH)", util::contract(&self.shims)));
         if let Some((a, b, c)) = self.load {
             out.push(format!("load: {a:.1} {b:.1} {c:.1} on {} cores", self.cores));
+        }
+        if let Some(c) = self.thermal_cell() {
+            out.push(format!("thermal: {c} (limited under {}%)", s.thermal_below));
         }
         if self.load_warning() {
             out.push(format!("  ⚠ {}", self.load_sentence()));
@@ -846,7 +996,8 @@ impl View {
                 self.builds.iter().map(|b| who(&b.holder)).collect::<Vec<_>>().join("; ")
             ),
         };
-        format!("throttle: {}{building}", self.force_line())
+        let thermal = self.thermal_cell().map_or(String::new(), |c| format!(" · {c}"));
+        format!("throttle: {}{thermal}{building}", self.force_line())
     }
 
     fn load_sentence(&self) -> String {
@@ -892,8 +1043,7 @@ fn builds(state: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<Build> {
 
 /// The warning alone, for `wsp wip`: absent while the machine is fine.
 pub(crate) fn loud(store: &Store) -> Option<String> {
-    let v = View::read(&store.state);
-    v.load_warning().then(|| v.load_sentence())
+    View::read(&store.state).warning(store.seat_cap())
 }
 
 /// Whether the load is holding builds back now — the warning [`loud`] words —
@@ -911,8 +1061,8 @@ pub(crate) fn status_line(store: &Store) -> String {
 pub(crate) fn health(store: &Store, notes: &mut Vec<String>) {
     let v = View::read(&store.state);
     notes.push(format!("build throttle {}", v.force_line()));
-    if v.load_warning() {
-        notes.push(format!("⚠ {}", v.load_sentence()));
+    if let Some(w) = v.warning(store.seat_cap()) {
+        notes.push(format!("⚠ {w}"));
     }
 }
 
@@ -927,10 +1077,11 @@ pub(crate) fn tidy(store: &Store) {
     }
     reap(&store.state, &alive);
     let v = View::read(&store.state);
-    if v.load_warning() != WARNED.swap(v.load_warning(), Ordering::SeqCst) {
-        match v.load_warning() {
-            true => crate::cycle::log_line(store, &v.load_sentence()),
-            false => crate::cycle::log_line(store, "load is back under the warning line"),
+    let warning = v.warning(store.seat_cap());
+    if warning.is_some() != WARNED.swap(warning.is_some(), Ordering::SeqCst) {
+        match warning {
+            Some(w) => crate::cycle::log_line(store, &w),
+            None => crate::cycle::log_line(store, "load and clock are back under the warning line"),
         }
     }
 }
@@ -970,7 +1121,7 @@ pub(crate) fn throttle(store: &Store, args: &Args) -> i32 {
         ["set", pairs @ ..] if !pairs.is_empty() => {
             for p in pairs {
                 let Some((k, v)) = p.split_once('=') else {
-                    eprintln!("wsp: `{p}` is not k=v — slots=N jobs=N away=MINUTES, or `auto` for the first two");
+                    eprintln!("wsp: `{p}` is not k=v — slots=N jobs=N hot-slots=N hot-jobs=N hot-below=PERCENT away=MINUTES; `auto` for the counts");
                     return 2;
                 };
                 let n = || v.parse::<usize>().ok().filter(|n| *n > 0);
@@ -985,12 +1136,26 @@ pub(crate) fn throttle(store: &Store, args: &Args) -> i32 {
                         Some(n) => s.jobs = Some(n),
                         None => return bad(k, v),
                     },
+                    ("hot-slots", "auto") => s.hot_slots = None,
+                    ("hot-jobs", "auto") => s.hot_jobs = None,
+                    ("hot-slots", _) => match n() {
+                        Some(n) => s.hot_slots = Some(n),
+                        None => return bad(k, v),
+                    },
+                    ("hot-jobs", _) => match n() {
+                        Some(n) => s.hot_jobs = Some(n),
+                        None => return bad(k, v),
+                    },
+                    ("hot-below", _) => match v.parse::<u32>() {
+                        Ok(n) if n <= 100 => s.thermal_below = n,
+                        _ => return bad(k, v),
+                    },
                     ("away", _) => match v.parse::<u64>() {
                         Ok(n) => s.away_minutes = n,
                         Err(_) => return bad(k, v),
                     },
                     _ => {
-                        eprintln!("wsp: no throttle setting `{k}` — slots, jobs, away");
+                        eprintln!("wsp: no throttle setting `{k}` — slots, jobs, away, hot-slots, hot-jobs, hot-below");
                         return 2;
                     }
                 }
@@ -1001,7 +1166,7 @@ pub(crate) fn throttle(store: &Store, args: &Args) -> i32 {
             }
         }
         _ => {
-            eprintln!("usage: wsp throttle [off|on|auto | set slots=N jobs=N away=MINUTES]   (bare: what it is doing now)");
+            eprintln!("usage: wsp throttle [off|on|auto | set slots=N jobs=N hot-slots=N hot-jobs=N hot-below=PERCENT away=MINUTES]   (bare: what it is doing now)");
             return 2;
         }
     }
@@ -1019,11 +1184,28 @@ pub(crate) fn throttle(store: &Store, args: &Args) -> i32 {
                 "jobs": v.settings.job_cap(v.cores),
                 "load": v.load.map(|(a, b, c)| json!([a, b, c])),
                 "load_warning": v.load_warning(),
+                "cpu_speed_limit": v.thermal,
+                "thermal_below": v.settings.thermal_below,
+                "thermally_limited": v.hot(),
+                "hot_slots": v.settings.slots_at(v.cores, true),
+                "hot_jobs": v.settings.jobs_at(v.cores, true),
+                "suggested_agents": v.hot().then(|| v.settings.hot_agents(v.cores)),
+                "agents": store.seat_cap(),
                 "builds": v.builds.iter().map(|b| json!({"holder": b.holder, "slot": b.slot})).collect::<Vec<_>>(),
             }))
             .unwrap_or_default()
         ),
-        false => println!("{}", v.render()),
+        false => {
+            println!("{}", v.render());
+            let cap = store.seat_cap();
+            let want = v.settings.hot_agents(v.cores);
+            if v.hot() && cap.is_none_or(|c| c > want) {
+                println!(
+                    "agents: {} — the machine is thermally limited; fewer agents at once would help: wsp machine set seat agents={want}",
+                    cap.map_or("no cap".to_string(), |c| format!("capped at {c}"))
+                );
+            }
+        }
     }
     0
 }
@@ -1259,6 +1441,7 @@ mod tests {
             task: "wsp-9".into(),
             cores: 8,
             idle,
+            thermal: &|| None,
             alive: &alive,
             say,
             poll: Duration::from_millis(20),
@@ -1351,6 +1534,101 @@ mod tests {
         assert!(line.contains("jobs=none") && at_base_nice(line), "{line}");
         // And the tree hold was taken and released: a second build is not stuck.
         assert!(!tree_path(&rig.state, &tree).exists());
+    }
+
+    const PMSET: &str = "Note: No thermal warning level has been recorded\n2026-11-02 12:00:00 +0100 CPU Power notify\n\tCPU_Scheduler_Limit \t= 100\n\tCPU_Available_CPUs \t= 8\n\tCPU_Speed_Limit \t= 31\n";
+
+    #[test]
+    fn the_speed_limit_is_read_out_of_pmset() {
+        assert_eq!(parse_speed_limit(PMSET), Some(31));
+        assert_eq!(parse_speed_limit("Note: No thermal warning level has been recorded\n"), None);
+        assert_eq!(parse_speed_limit("\tCPU_Speed_Limit \t= x\n"), None);
+    }
+
+    #[test]
+    fn a_hot_machine_gets_the_measured_slots_and_jobs_never_above_the_ordinary_ones() {
+        let st = Settings::default();
+        assert!(st.is_hot(Some(31)) && !st.is_hot(Some(100)) && !st.is_hot(Some(THERMAL_BELOW)) && !st.is_hot(None));
+        assert_eq!((st.slots_at(8, false), st.jobs_at(8, false)), (2, 3));
+        assert_eq!((st.slots_at(8, true), st.jobs_at(8, true)), (HOT_SLOTS.min(2), HOT_JOBS.min(3)));
+        let low = Settings { slots: Some(1), jobs: Some(1), ..Settings::default() };
+        assert_eq!((low.slots_at(8, true), low.jobs_at(8, true)), (1, 1), "never above what was asked for");
+        let own = Settings { hot_slots: Some(3), hot_jobs: Some(5), ..Settings::default() };
+        assert_eq!((own.slots_at(8, true), own.jobs_at(8, true)), (3, 5), "and the hand's own number wins");
+        assert!(st.hot_agents(8) >= 2);
+    }
+
+    #[test]
+    fn the_thermal_settings_are_kept_in_the_file() {
+        let t = crate::util::isolated("throttle-hot-settings");
+        let st = Settings { thermal_below: 55, hot_slots: Some(1), hot_jobs: Some(3), ..Settings::default() };
+        st.save(&t.state()).unwrap();
+        let back = Settings::load(&t.state());
+        assert_eq!((back.thermal_below, back.hot_slots, back.hot_jobs), (55, Some(1), Some(3)));
+    }
+
+    #[test]
+    fn off_still_caps_the_jobs_of_a_thermally_limited_machine_and_does_not_nice_it() {
+        let rig = rig("throttle-run-off-hot");
+        let st = Settings { mode: Mode::Off, slots: Some(4), jobs: Some(4), hot_jobs: Some(1), ..Settings::default() };
+        st.save(&rig.state).unwrap();
+        let (idle, say, env, hot) = (|| Some(0), |_: &str| {}, |_: &str| None, || Some(31));
+        let mut c = ctx(&rig, &idle, &say, &env);
+        c.thermal = &hot;
+        run_in(&c, "cargo", &s(&["test"]));
+        let line = &seen(&rig)[0];
+        assert!(line.contains("jobs=1") && at_base_nice(line), "{line}");
+    }
+
+    #[test]
+    fn off_still_waits_for_the_hot_machines_slot() {
+        let rig = rig("throttle-run-off-hot-slot");
+        let st = Settings { mode: Mode::Off, slots: Some(4), jobs: Some(4), hot_slots: Some(1), ..Settings::default() };
+        st.save(&rig.state).unwrap();
+        fs::create_dir_all(builds_dir(&rig.state)).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec_for(std::process::id()).to_string()).unwrap();
+        let cooled = std::cell::Cell::new(false);
+        let said = RefCell::new(Vec::new());
+        let say = |m: &str| {
+            said.borrow_mut().push(m.to_string());
+            cooled.set(true);
+        };
+        let (idle, env) = (|| Some(0), |_: &str| None);
+        let thermal = || Some(if cooled.get() { 100 } else { 31 });
+        let mut c = ctx(&rig, &idle, &say, &env);
+        c.thermal = &thermal;
+        assert_eq!(run_in(&c, "cargo", &s(&["build"])), 0);
+        assert!(said.borrow()[0].contains("waiting for a build slot"), "{:?}", said.borrow());
+        assert_eq!(seen(&rig).len(), 1, "and the wait ends when the machine cools");
+    }
+
+    #[test]
+    fn a_cool_machine_in_off_takes_no_slot() {
+        let rig = rig("throttle-run-off-cool");
+        let st = Settings { mode: Mode::Off, slots: Some(1), hot_slots: Some(1), ..Settings::default() };
+        st.save(&rig.state).unwrap();
+        fs::create_dir_all(builds_dir(&rig.state)).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec_for(std::process::id()).to_string()).unwrap();
+        let (idle, say, env, cool) = (|| Some(0), |_: &str| panic!("it waited"), |_: &str| None, || Some(100));
+        let mut c = ctx(&rig, &idle, &say, &env);
+        c.thermal = &cool;
+        assert_eq!(run_in(&c, "cargo", &s(&["build"])), 0);
+    }
+
+    #[test]
+    fn a_hot_view_says_so_and_suggests_fewer_agents() {
+        let t = crate::util::isolated("throttle-hot-view");
+        let mut v = View::read(&t.state());
+        v.thermal = Some(31);
+        assert!(v.hot());
+        assert!(v.status_line().contains("cpu clock 31% — thermally limited"), "{}", v.status_line());
+        assert!(v.render().contains("thermally limited, so in every mode"), "{}", v.render());
+        let w = v.warning(None).unwrap();
+        assert!(w.contains("31%") && w.contains("wsp machine set seat agents="), "{w}");
+        assert!(!v.warning(Some(1)).unwrap().contains("wsp machine set"), "a cap already low enough is left alone");
+        v.thermal = Some(90);
+        assert!(!v.hot() && v.warning(None).is_none());
+        assert!(v.status_line().contains("cpu clock 90%") && !v.status_line().contains("limited"));
     }
 
     #[test]
@@ -1567,6 +1845,7 @@ mod tests {
             in_force: true,
             cores: 8,
             load: Some((20.0, 18.0, 10.0)),
+            thermal: None,
             builds: builds(&t.state(), &|p| p == me),
             shims: PathBuf::from("/s"),
         };
@@ -1591,6 +1870,7 @@ mod tests {
                 in_force: in_force(m, idle, 5),
                 cores: 8,
                 load: Some((1.0, 1.0, 1.0)),
+                thermal: None,
                 builds: vec![],
                 shims: PathBuf::from("/s"),
             };
@@ -1607,6 +1887,7 @@ mod tests {
             in_force: true,
             cores: 8,
             load: None,
+            thermal: None,
             builds: vec![Build { holder: rec_for(1), slot: Some(0) }],
             shims: PathBuf::from("/s"),
         };
@@ -1622,6 +1903,7 @@ mod tests {
                 in_force: false,
                 cores: 8,
                 load: Some((30.0, 25.0, 20.0)),
+                thermal: None,
                 builds: vec![],
                 shims: PathBuf::from("/s"),
             };
