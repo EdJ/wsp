@@ -2892,6 +2892,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 t,
                 leg_name.as_deref().unwrap_or_default(),
                 route(how, laid) == Route::Fetch,
+                leg_last,
             )),
             (Some(t), _) => Some(format!(
                 "{}{}",

@@ -157,8 +157,22 @@ pub(crate) fn tier_of(leg: &Leg) -> (String, Option<String>, Option<String>) {
     (kind, model, effort)
 }
 
-/// The leg's own order text, for a work order that is one line.
-pub(crate) fn order_line(task: &str, leg: &str, fetch: bool) -> String {
+/// The one command that ends a leg, in words: a leg that is not last ends with
+/// `leg done`; the last leg ends with `review`, which closes its leg and the
+/// row, unless it adds a leg after itself, which makes `leg done` the end.
+pub(crate) fn ending_clause(task: &str, last: bool) -> String {
+    match last {
+        true => format!(
+            "You are the last leg: end with `wsp review {task} \"...\"`, which closes your leg and ends the row; \
+             if you add a leg after yourself, end with `wsp leg done {task} --caption \"...\"` instead."
+        ),
+        false => format!("End with `wsp leg done {task} --caption \"...\"`."),
+    }
+}
+
+/// The leg's own order text, for a work order that is one line. `last` is
+/// whether the record makes this leg the last (`legs::lasts`).
+pub(crate) fn order_line(task: &str, leg: &str, fetch: bool, last: bool) -> String {
     let fetch = match fetch {
         true => "Please run `wsp brief --session` first — your context is empty. ",
         false => "",
@@ -166,10 +180,10 @@ pub(crate) fn order_line(task: &str, leg: &str, fetch: bool) -> String {
     format!(
         "{fetch}You are leg {leg} of {task}: one seat in a row run as legs. Your brief is already above, \
          with your order and the batons you were handed; read the tree they point at rather than \
-         re-deriving them. Work in this tree, commit, and end with `wsp leg done {task} \
-         --caption \"...\"`. If you are the last leg, `wsp review {task} \"...\"` ends the row. {} \
+         re-deriving them. Work in this tree, commit. {} {} \
          `wsp ask {task} \"...\"` reaches whoever coordinates this.",
-        crate::closing::how_to_close(task, false)
+        ending_clause(task, last),
+        crate::closing::how_to_close(task, last)
     )
 }
 
@@ -482,11 +496,19 @@ pub(crate) fn brief_lines(tasks: &[Task], pane: &str) -> Option<Vec<String>> {
         ));
     }
     let (cap, _) = legs::baton_cap(&all, &name);
+    let last = legs::lasts(&all).first() == Some(&name);
+    let verb = match last {
+        true => format!(
+            "you are the last leg: `wsp review {} \"…\"` closes your leg and ends the row (if you add a leg after yourself, \
+             `wsp leg done` instead)",
+            t.id
+        ),
+        false => format!("`wsp leg done {} --caption \"…\"`", t.id),
+    };
     out.push(format!(
-        "finish: commit, then `wsp leg done {} --caption \"…\"` — a baton of at most {cap} characters, pointers not a plan, \
-         written first with a heredoc into $WSP_BATON, which `leg done` reads; the last leg types `wsp review {} \"…\"` instead. \
+        "finish: commit, then {verb} — a baton of at most {cap} characters, pointers not a plan, \
+         written first with a heredoc into $WSP_BATON, which the closing verb reads. \
          The closing verb is its own Bash call, never chained after another command",
-        t.id, t.id
     ));
     Some(out)
 }
@@ -509,6 +531,15 @@ mod tests {
         let tree = env.home().join("not-a-repo");
         std::fs::create_dir_all(&tree).unwrap();
         (store, tree.display().to_string())
+    }
+
+    #[test]
+    fn an_order_line_names_the_one_command_that_ends_the_leg() {
+        let mid = order_line("m-1", "plan", false, false);
+        assert!(mid.contains("End with `wsp leg done m-1 --caption") && !mid.contains("wsp review"), "{mid}");
+        let last = order_line("m-1", "build", false, true);
+        assert!(last.contains("last leg: end with `wsp review m-1") && last.contains("instead"), "{last}");
+        assert!(!last.contains("separate Bash calls, never chained with anything else: first write the baton, `cat > \"$WSP_BATON\" <<'EOF'` ... `EOF` (a heredoc with its text, never a bare `cat`); then, as a call of its own, `wsp leg done"), "{last}");
     }
 
     fn chain() -> Vec<Leg> {
@@ -597,10 +628,13 @@ mod tests {
         assert!(brief.contains("baton from scout:\nthree layers: store"), "{brief}");
         assert!(brief.contains("your order: decide"), "{brief}");
         assert!(brief_lines(&tasks, "cpd-99").is_none(), "no block for a seat that is no leg's");
+        assert!(brief.contains("finish: commit, then `wsp leg done m-1") && !brief.contains("wsp review"), "{brief}");
 
         // Plan, then build, which is the last leg and types review.
         assert_eq!(done("cpd-32", Some("plan made"), None), 0);
         seat_leg(&store, &tree, "build", "cpd-33");
+        let last = brief_lines(&store.tasks(), "cpd-33").unwrap().join("\n");
+        assert!(last.contains("you are the last leg: `wsp review m-1") && !last.contains("then `wsp leg done"), "{last}");
         on_review(&store, "m-1", "built it", Some("cpd-33")).unwrap();
         let ls = legs::legs(&store.find_task("m-1").unwrap());
         assert!(ls.iter().all(|l| l.state == State::Done), "{ls:?}");
