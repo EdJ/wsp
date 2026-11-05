@@ -41,11 +41,18 @@ What each stretch is made of, and who controls it:
 | review → verifier spawn | 80–509 s, up to three checks on one review | one check per tip, reuse (§3.3) | the check's own commands |
 | verifier reads | 54–914 s, typically 110–180 | reuse of a green (`wsp-389`) | the reading |
 | block → rework → re-review | 11.2, 11.7, 14.5 min (3 of 11 rows) | how fast the finding reaches the seat (1–2 min now) | the fix itself |
-| barrier run | 342–1197 s a group | duplicates, serial steps, no per-step figure | the suite |
+| barrier run | 342–1197 s a group | duplicates, serial steps, no per-step figure; the wait itself is hidden by `wsp-414` (parallel groups, bigger lists; `wsp-362`, `wsp-363`), not shortened here | the suite |
 | run end → check seat started | 2–9 s, but 9.4 min in group 5 | the clone and the retry (§3.5) | |
 | check seat | 136–290 s, 7 min in group 5 | auto-pass, reading verdicts it was given | the stop's judgement |
 | hand-offs between legs | 5–10 s (compounding-061) | nothing worth cutting | |
 | daemon tick (20 s) | no gap in the twelve rows is labelled a tick | nothing worth cutting | |
+
+The barrier run's 56 min is a wait the plan does not try to shorten. Ed's note
+on this plan (2026-11-05): the barrier's own latency is hidden by parallel groups
+and bigger lists (`wsp-414`, picking up `wsp-362` and `wsp-363`), not cut by
+overlapping verifiers or by a faster run. Where this document prices the barrier
+run (§3.8, §4) it says what `wsp-414` hides; the reuse overhead, auto-pass, the
+cap and the label are priced as below.
 
 The group after one starts before the previous check has passed in 3 of 4
 transitions (group 2 at 14:16 against a pass at 14:17, group 3, group 5), so the
@@ -139,7 +146,7 @@ The measure is a figure in the *next pass's* `effort.json` that says it worked.
 | 3.5 | fast check start (`wsp-393`) | 1.9 min average (9.4 min once: 333 s clone, 21 min of "starting", a 3 min back-off), ~30 s on each spawn if the claim time is the clone | S–M | run end → check started ≤ 20 s; spawn → claimed under 20 s median (55 now) |
 | 3.6 | cap held by finished seats (`wsp-385` landed; `wsp-394`) | 4–13 min on group 3 alone (wsp-360 waited ~800 s, wsp-334 ~490 s) | S, to show it | cap seconds per group, with the holder named and whether it had finished; no finished seat in a holder list |
 | 3.7 | auto-pass with stop-checks (`wsp-396`) | check seat 2.3–4.8 min a group, plus a place and a governor turn; 0 until stops are mechanical | S to write, Ed's call to turn on | check-seat seconds in the report; groups passed by wsp |
-| 3.8 | overlap barrier steps (`wsp-395`) | up to the 56 min of runs (suite is serial in one tree), unpriced until 3.1 | M | barrier run seconds per group at the same step count |
+| 3.8 | overlap barrier steps (`wsp-395`) | none on the delivery wall by itself: the 56 min of runs is the wait `wsp-414` hides (parallel groups and bigger lists, from `wsp-362` and `wsp-363`), so the next group no longer sits behind it; overlap only shortens the run itself (suite is serial in one tree), unpriced until 3.1 | M | barrier run seconds per group at the same step count; with `wsp-414`, the next group's start against the previous barrier run's end |
 | 3.9 | governor turns in the wall (`wsp-398`) | unknown: the report prices the governor as cost only; 14.5 min pass → start on group 3 → 4 is unexplained | S | governor seconds between a pass and the next start |
 | 3.10 | name a command waiting on itself (`wsp-397`) | 6 min per occurrence (compounding-061), rate not yet counted | M | stuck-command flags per pass in wip, each with the seconds it held |
 
@@ -149,8 +156,9 @@ Candidates the data does not support, with the reason:
   2026-11-05.** It assumes no verifier blocks. When one does, the overlapped run
   is wasted and has to run again, which makes the turnaround worse (3 of the 11
   rows here were blocked once). The order stays: all verdicts, then the barrier
-  run, then the check. The time inside that order is §3.2, 3.8, 3.7 and the
-  label.
+  run, then the check. The barrier run's wait is what `wsp-414` hides (parallel
+  groups, bigger lists; `wsp-362`, `wsp-363`), not something to overlap with the
+  verifiers. The time inside that order is §3.2, 3.8, 3.7 and the label.
 - **Start the verifier while the row's own check runs**: worth 100–240 s a row
   (the shorter of the check and the verifier's read), with the same trade (one check in the twelve rows failed) and a cap place held meanwhile. Not filed, for Ed.
 - **Start the verifier while the member writes its baton**: no row of the twelve
@@ -180,6 +188,11 @@ pass's effort report:
 | `wsp-391` one barrier run per tip | yes | one `barrier run` line a group |
 | `wsp-393` fast check start | yes | run end → check started ≤ 20 s; spawn → claimed under 20 s |
 | `wsp-394` cap holders named | yes, cheap | cap seconds a group with no finished holder |
+
+The barrier run's 56 min (§1) is not a stage-1 or stage-2 saving: it is the wait
+`wsp-414` hides, through parallel groups and bigger lists (it picks up `wsp-362`
+and `wsp-363`), so those rows are where it is priced and measured, and `wsp-395`
+below only shortens the run.
 
 Stage 2, after stage 1's report gives the figures they need: `wsp-395` (per-step
 seconds), `wsp-396` (Ed decides whether a project turns auto-pass on, after the stop-checks are
