@@ -95,10 +95,13 @@ const LOAD_FACTOR: f64 = 1.5;
 const THERMAL_BELOW: u32 = 70;
 
 /// What a thermally limited machine is held to: heavy builds at once, and jobs
-/// in each, as measured in `compounding/docs/fast-loop/thermal.md`. More
-/// parallel builds add heat, the clock drops, and the total gets worse.
-const HOT_SLOTS: usize = 1;
-const HOT_JOBS: usize = 4;
+/// in each, as measured in `compounding/docs/fast-loop/thermal.md` on the
+/// 4-core, 8-thread i7-8559U: four builds of two jobs finished the most per
+/// hour (about 135) once it was hot, against about 95 for two of four and 55
+/// for one of eight. A warm edit's build is mostly one rustc and a link, so
+/// the slots matter more than the jobs; the total jobs stay at the threads.
+const HOT_SLOTS: usize = 4;
+const HOT_JOBS: usize = 2;
 
 /// Tools that get a shim when the settings declare none, and the variable that
 /// caps each one's parallelism.
@@ -153,7 +156,7 @@ pub(crate) struct Settings {
     /// `CPU_Speed_Limit` under which the machine counts as thermally limited.
     pub thermal_below: u32,
     /// Slots and jobs while it is. `None` is the measured best ([`HOT_SLOTS`],
-    /// [`HOT_JOBS`]), kept under whatever `slots` and `jobs` already say.
+    /// [`HOT_JOBS`]), kept under whatever `slots` and `jobs` a hand set.
     pub hot_slots: Option<usize>,
     pub hot_jobs: Option<usize>,
     /// Tool name to the variable that caps its parallelism. Edited by hand in
@@ -241,25 +244,28 @@ impl Settings {
     }
 
     /// [`Settings::slot_count`], or while the machine is hot the measured best,
-    /// never more than the ordinary count.
+    /// which is not the ordinary count's to cap: a quarter of the cores is
+    /// fewer builds than the machine finishes most with. A hand's `slots` and
+    /// `jobs` still are a ceiling.
     pub(crate) fn slots_at(&self, cores: usize, hot: bool) -> usize {
         match hot {
-            true => self.hot_slots.unwrap_or_else(|| HOT_SLOTS.min(self.slot_count(cores))),
+            true => self.hot_slots.unwrap_or_else(|| self.slots.map_or(HOT_SLOTS, |s| s.min(HOT_SLOTS))),
             false => self.slot_count(cores),
         }
     }
 
     pub(crate) fn jobs_at(&self, cores: usize, hot: bool) -> usize {
         match hot {
-            true => self.hot_jobs.unwrap_or_else(|| HOT_JOBS.min(self.job_cap(cores))),
+            true => self.hot_jobs.unwrap_or_else(|| self.jobs.map_or(HOT_JOBS, |j| j.min(HOT_JOBS))),
             false => self.job_cap(cores),
         }
     }
 
-    /// The agent cap to suggest on a hot machine: agents mostly wait, but each
-    /// one that finishes a step wants a build, so two for each slot.
+    /// The agent cap to suggest on a hot machine: one for each slot, so a
+    /// finished step finds a build slot free more often than not. Not measured;
+    /// the file says so.
     pub(crate) fn hot_agents(&self, cores: usize) -> usize {
-        (2 * self.slots_at(cores, true)).max(1)
+        self.slots_at(cores, true).max(1)
     }
 }
 
@@ -1546,16 +1552,16 @@ mod tests {
     }
 
     #[test]
-    fn a_hot_machine_gets_the_measured_slots_and_jobs_never_above_the_ordinary_ones() {
+    fn a_hot_machine_gets_the_measured_slots_and_jobs_never_above_what_a_hand_set() {
         let st = Settings::default();
         assert!(st.is_hot(Some(31)) && !st.is_hot(Some(100)) && !st.is_hot(Some(THERMAL_BELOW)) && !st.is_hot(None));
         assert_eq!((st.slots_at(8, false), st.jobs_at(8, false)), (2, 3));
-        assert_eq!((st.slots_at(8, true), st.jobs_at(8, true)), (HOT_SLOTS.min(2), HOT_JOBS.min(3)));
+        assert_eq!((st.slots_at(8, true), st.jobs_at(8, true)), (HOT_SLOTS, HOT_JOBS), "the measured best, which is more slots than a quarter of the cores");
         let low = Settings { slots: Some(1), jobs: Some(1), ..Settings::default() };
         assert_eq!((low.slots_at(8, true), low.jobs_at(8, true)), (1, 1), "never above what was asked for");
         let own = Settings { hot_slots: Some(3), hot_jobs: Some(5), ..Settings::default() };
         assert_eq!((own.slots_at(8, true), own.jobs_at(8, true)), (3, 5), "and the hand's own number wins");
-        assert!(st.hot_agents(8) >= 2);
+        assert_eq!(st.hot_agents(8), HOT_SLOTS);
     }
 
     #[test]

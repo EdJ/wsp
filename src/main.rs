@@ -2265,6 +2265,10 @@ fn help_text() -> String {
                                     who is building. One cargo per tree is held
                                     in every mode
   wsp throttle set slots=N jobs=N away=MINUTES   …the sizes (`auto` for the first two)
+  wsp throttle set hot-slots=N hot-jobs=N hot-below=PERCENT
+                                    …what a thermally limited machine (the
+                                    `pmset -g therm` CPU_Speed_Limit under
+                                    PERCENT) is held to, in every mode
   wsp doctor                        integrity check
   wsp say "…" | - | --from FILE     say where you have got to, on your pane;
                                     `--clear` takes the label off again. Prose

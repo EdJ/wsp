@@ -3859,6 +3859,15 @@ are kept apart:
   slots=N jobs=N away=MINUTES` sizes it; the defaults are a quarter of the cores
   in slots and the rest of the cores, less one, shared across them (2 slots of 3
   jobs on 8 cores).
+- **A thermally limited machine** (`wsp-347`) is throughput, not politeness. On
+  Ed's 4-core i7-8559U a fleet of builds drove `CPU_Speed_Limit` (`pmset -g
+  therm`, percent of the rated clock) to 31, and more parallel builds only add
+  heat. Under `hot-below` (default 70) the slots and the job cap drop to the
+  measured best (`compounding/docs/fast-loop/thermal.md`) **in every mode,
+  `off` included**; the nice stays with `auto`. The clock shows on `wsp wip`,
+  `wsp watch --status` and `wsp throttle`, with a suggestion to lower the seat's
+  agent cap (`wsp machine set seat agents=N`), which wsp suggests and does not
+  set. `wsp throttle set hot-slots=N hot-jobs=N hot-below=PERCENT` sizes it.
 - **One cargo build per tree** is correctness: two in one tree segfaulted the
   linker and it read as a compile error. It is held **in every mode**, `off`
   included. The second waits and says who it is waiting for.
