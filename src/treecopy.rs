@@ -358,7 +358,11 @@ fn sh(cmd: &str) -> Result<String, String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        // Both streams: rsync and tar say why on either, and an empty reason
+        // ("rsync up failed: ") is no reason.
+        let err = String::from_utf8_lossy(&out.stderr);
+        let said = String::from_utf8_lossy(&out.stdout);
+        Err(format!("{}{}", err.trim(), if said.trim().is_empty() { String::new() } else { format!(" {}", said.trim()) }).trim().to_string())
     }
 }
 
@@ -783,14 +787,32 @@ impl Copy {
         if !stale.is_empty() {
             return Err(format!("the seat changed files the agent's commits touch, which are not the copied-back ones: {}", stale.join("; ")));
         }
+        let mut revert_failed: Option<String> = None;
         for (p, untracked) in &dirt {
             if *untracked {
                 let _ = fs::remove_file(self.tree.join(p));
                 prune_empty_parents(&self.tree, &self.tree.join(p));
-            } else {
-                git(&self.tree, &["checkout", "HEAD", "--", p])?;
+            } else if let Err(e) = git(&self.tree, &["checkout", "HEAD", "--", p]) {
+                revert_failed = Some(e);
+                break;
             }
             reverted.push(p.clone());
+        }
+        // From here the seat no longer holds what `synced` says for these paths,
+        // so `synced` is made to say what the seat holds *before* anything else can
+        // fail. Then a failed `am` leaves the next `copy_back` seeing far differ
+        // from synced with the seat still equal to it, and the files come again —
+        // instead of a record that says "agreed" over a tree missing the work.
+        let held = Manifest::of_dir(&self.tree)?;
+        for p in &reverted {
+            match held.0.get(p) {
+                Some(e) => synced.0.insert(p.clone(), e.clone()),
+                None => synced.0.remove(p),
+            };
+        }
+        self.write_manifest("synced.manifest", &synced)?;
+        if let Some(e) = revert_failed {
+            return Err(format!("could not put the seat's tree back to its commit: {e}"));
         }
 
         let before = git(&self.tree, &["rev-parse", "HEAD"])?.trim().to_string();
@@ -1115,6 +1137,24 @@ mod tests {
             assert_eq!(n, 1);
             assert_eq!(run(&r.seat, "git log --format=%s -1").trim(), "third change");
         }
+    }
+
+    /// A failed `git am` must not leave the seat missing the agent's files with a
+    /// record that says they are agreed: the next copy-back brings them again.
+    #[test]
+    fn a_failed_am_leaves_the_files_to_come_back() {
+        let r = rig("am-fail", false);
+        r.copy.copy_up("trunk").unwrap();
+        run(&r.far(), "git config user.name A && git config user.email a@f && echo agent-a > src/a.rs && git commit -qam c && echo agent-b > src/b.rs");
+        r.copy.copy_back().unwrap();
+        // The seat's HEAD moves under the checkpoint: a.rs is committed as the
+        // checkpoint left it, so the agent's patch no longer applies.
+        run(&r.seat, "git commit -q -m moved -- src/a.rs");
+        let e = r.copy.sync_back().unwrap_err();
+        assert!(e.contains("git am refused"), "{e}");
+        let b = r.copy.copy_back().unwrap();
+        assert_eq!(b.copied, ["src/b.rs"], "{b:?}");
+        assert_eq!(fs::read_to_string(r.seat.join("src/b.rs")).unwrap(), "agent-b\n");
     }
 
     #[test]
