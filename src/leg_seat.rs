@@ -59,6 +59,8 @@ pub(crate) fn open(store: &Store, id: &str, name: &str) -> Result<Leg, String> {
         }
         legs::write(&mut t, &new);
         store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
+        // A leg opening begins with no baton: any file at its path is an earlier run's.
+        crate::closing::clear_baton(store, id, name);
         new.iter().find(|l| l.name == name).cloned().ok_or_else(|| format!("no leg called {name}"))
     })
 }
@@ -89,6 +91,7 @@ pub(crate) fn reset(store: &Store, id: &str, name: &str) -> Option<Option<String
         let seat = old.iter().find(|l| l.name == name).and_then(|l| l.pane.clone());
         legs::write(&mut t, &new);
         store.save_task(&t).ok()?;
+        crate::closing::clear_baton(store, id, name);
         if let Some(s) = &seat {
             store.clear_binding(s);
         }
@@ -209,12 +212,13 @@ fn ended_line_at(store: &Store, leg: &Leg, pane: &str, extra: &str, at: &str) ->
 /// The baton: `--from FILE`, or `-` for stdin; with neither, the file wsp keeps
 /// for this leg ([`crate::closing::baton_path`], `$WSP_BATON` in the seat) when
 /// it is there. Optional, and empty is a leg with nothing to hand on.
-fn baton_text(store: &Store, args: &Args, row: &str, leg: &str) -> Result<String, String> {
+fn baton_text(store: &Store, args: &Args, row: &str, leg: &str, fresh: bool) -> Result<String, String> {
     let src = match args.get("from") {
         Some(v) if v == "true" && args.rest.iter().skip(2).any(|r| r == "-") => "-".to_string(),
         Some(v) if v != "true" => v,
         _ => {
-            return Ok(std::fs::read_to_string(crate::closing::baton_path(store, row, leg)).unwrap_or_default());
+            let read = || std::fs::read_to_string(crate::closing::baton_path(store, row, leg)).unwrap_or_default();
+            return Ok(if fresh { read() } else { String::new() });
         }
     };
     if src == "-" && util::stdin_is_tty() {
@@ -280,12 +284,14 @@ fn done(store: &Store, args: &Args, task: &str, pane: Option<&str>) -> Result<()
             t.id
         ));
     };
-    let baton = baton_text(store, args, &t.id, &name)?;
-    // The baton file wsp keeps, written some while ago: the leg's work ended
-    // then, and the close is late by the difference.
-    let late = (args.get("from").is_none())
-        .then(|| crate::closing::written_at(&crate::closing::baton_path(store, &t.id, &name)))
-        .flatten()
+    // The baton file wsp keeps, written in this run of the leg: older than the
+    // leg's start it is a previous run's and is not read. Written some while ago,
+    // the leg's work ended then, and the close is late by the difference.
+    let started = old.iter().find(|l| l.name == name).and_then(|l| l.started.clone());
+    let fresh = crate::closing::fresh_baton(store, &t.id, &name, started.as_deref());
+    let baton = baton_text(store, args, &t.id, &name, fresh.is_some())?;
+    let late = fresh
+        .filter(|_| args.get("from").is_none())
         .filter(|at| util::epoch_secs() - at >= crate::closing::LATE_AFTER)
         .map(|baton_at| Late { baton_at, by_wsp: None });
     if caption.is_empty() {

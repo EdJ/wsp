@@ -63,6 +63,21 @@ pub(crate) fn written_at(path: &std::path::Path) -> Option<i64> {
     m.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
 }
 
+/// When leg `leg` of `row` wrote its baton **in this run of it**: a file older
+/// than the leg's start belongs to an earlier run (a `leg reset`, a respawn) and
+/// is not read, told about or closed over.
+pub(crate) fn fresh_baton(store: &Store, row: &str, leg: &str, started: Option<&str>) -> Option<i64> {
+    let at = written_at(&baton_path(store, row, leg))?;
+    let start = started.map(util::epoch_of).unwrap_or(0);
+    (at >= start).then_some(at)
+}
+
+/// A leg starting or starting again begins with no baton: whatever file is at
+/// its path is a previous run's.
+pub(crate) fn clear_baton(store: &Store, row: &str, leg: &str) {
+    let _ = std::fs::remove_file(baton_path(store, row, leg));
+}
+
 /// `HH:MMZ` of an epoch second.
 fn clock(secs: i64) -> String {
     util::iso_at(secs).get(11..16).map(|c| format!("{c}Z")).unwrap_or_default()
@@ -156,7 +171,7 @@ pub(crate) fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
             let key = format!("{}/{}", t.id, l.name);
             open.insert(key.clone());
             let entry = seen.entry(key).or_default();
-            let baton = written_at(&baton_path(store, &t.id, &l.name));
+            let baton = fresh_baton(store, &t.id, &l.name, l.started.as_deref());
             let state = seats.state(&seat);
             // A session that ended with its leg open is not waited on.
             if seats.absent(&seat) || matches!(state, Some(State::Gone | State::Empty)) {
@@ -373,7 +388,7 @@ mod tests {
         let mut leg = Leg::pending("build", "make it");
         leg.state = LegState::Running;
         leg.pane = Some("cpd-1".into());
-        leg.started = Some(util::iso_at(util::epoch_secs() - 3600));
+        leg.started = Some(util::iso_at(util::epoch_secs() - 6 * 3600));
         let mut t = Task::new("a row", "m-1");
         t.set_status(Status::Doing);
         t.body = "## Overview\nthe work\n\n## Log\n- 2026-11-05 started\n".to_string();
@@ -465,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_that_ended_with_a_dirty_tree_or_no_baton_is_flagged_at_once() {
+    fn a_session_that_ended_with_a_dirty_tree_is_flagged_at_once() {
         let env = util::isolated("closing-ended-dirty");
         let (store, tree) = staged(&env);
         write_baton(&store, "pointers\n");
@@ -531,6 +546,74 @@ mod tests {
         let t = store.find_task("m-1").unwrap();
         assert_eq!(legs::legs(&t)[0].baton, "handed on");
         assert!(t.section("Log").unwrap().contains("closed late: done at"), "{}", t.section("Log").unwrap());
+    }
+
+    /// Re-run a leg: a baton hours older than the new run's start.
+    fn rerun_with_an_old_baton(store: &Store) {
+        let p = baton_path(store, "m-1", "build");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "# last run's baton\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 3600);
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+    }
+
+    #[test]
+    fn a_baton_older_than_the_legs_start_is_never_told_about_or_closed_over_working_or_idle() {
+        for state in [State::Working, State::Idle] {
+            let env = util::isolated(&format!("closing-stale-{state:?}"));
+            let (store, _tree) = staged(&env);
+            rerun_with_an_old_baton(&store);
+            assert!(fresh_baton(&store, "m-1", "build", Some(&util::iso_at(util::epoch_secs() - 3600))).is_none());
+            let fake = Fake(RefCell::new(Some(state)), false);
+            crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().clear());
+            let t0 = util::epoch_secs();
+            tick_at(&store, &fake, t0);
+            let late = t0 + TELL_AFTER + SECOND_WINDOW;
+            if state == State::Working {
+                tick_at(&store, &fake, late);
+                assert!(told().is_empty(), "a working seat with only an old baton is working: {:?}", told());
+            } else {
+                // Idle is told (it is idle), but its old baton is not closed over.
+                tick_at(&store, &fake, t0 + TELL_AFTER);
+                tick_at(&store, &fake, late);
+                assert!(!told().iter().any(|(_, t)| t.contains("is closed")), "{:?}", told());
+                assert!(crate::message::raised(&store)[0].text.contains("no baton"), "flagged, not closed");
+            }
+            assert!(running(&store), "{state:?}: the new run's work is not cut off");
+        }
+    }
+
+    #[test]
+    fn opening_or_resetting_a_leg_removes_its_old_baton_and_leg_done_does_not_read_a_stale_one() {
+        let env = util::isolated("closing-clear");
+        let (store, _tree) = staged(&env);
+        rerun_with_an_old_baton(&store);
+        let args = crate::Args::synth("leg", &["done", "m-1"], &[("caption", "c")]);
+        assert_eq!(crate::leg_seat::cmd_done(&store, &args, Some("cpd-1")), 0);
+        let l = legs::legs(&store.find_task("m-1").unwrap()).remove(0);
+        assert_eq!(l.baton, "", "the stale file was not read");
+        assert!(l.closed.as_deref().map(util::epoch_of).unwrap() >= util::epoch_of(l.started.as_deref().unwrap()), "no end before the start");
+    }
+
+    #[test]
+    fn resetting_a_running_leg_removes_its_old_baton() {
+        let env = util::isolated("closing-reset");
+        let (store, _tree) = staged(&env);
+        rerun_with_an_old_baton(&store);
+        assert!(crate::leg_seat::reset(&store, "m-1", "build").is_some());
+        assert!(!baton_path(&store, "m-1", "build").exists());
+    }
+
+    #[test]
+    fn a_session_that_ended_with_no_baton_is_flagged_at_once_and_the_leg_stays_open() {
+        let env = util::isolated("closing-ended-nobaton");
+        let (store, _tree) = staged(&env);
+        let fake = Fake(RefCell::new(Some(State::Gone)), false);
+        tick_at(&store, &fake, util::epoch_secs());
+        assert!(running(&store));
+        let raised = crate::message::raised(&store);
+        assert_eq!(raised.len(), 1);
+        assert!(raised[0].text.contains("no baton") && raised[0].text.contains("session ended"), "{}", raised[0].text);
     }
 
     #[test]
