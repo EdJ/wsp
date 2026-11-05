@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 mod affected;
+mod artefact;
 mod after;
 mod closing;
 mod packet;
@@ -254,9 +255,10 @@ const BOOL_FLAGS: &[&str] = &[
 
 /// Flags whose value may be a lone `-`, the stream. A dash is otherwise read as
 /// the next flag, so `--choices -` would have left `-` a positional and the flag
-/// a bare `true`. Only these two, because a valued flag followed by a payload
-/// `-` is how every other verb spells "nothing given, read the stream".
-const STREAM_VALUED: &[&str] = &["choices", "choice"];
+/// a bare `true`. Only these, because a valued flag followed by a payload
+/// `-` is how every other verb spells "nothing given, read the stream". And
+/// `--note -` on `wsp artefact put`, whose note is prose like the rest (`wsp-376`).
+const STREAM_VALUED: &[&str] = &["choices", "choice", "note"];
 
 /// Flags that keep their meaning inside a command's payload.
 ///
@@ -1197,6 +1199,7 @@ fn main() {
         "burn" => cmd_burn::burn(&store, &args),
         "throttle" => throttle::throttle(&store, &args),
         "timeline" => timeline::timeline(&store, &args),
+        "artefact" => artefact::artefact(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "packet" => packet::packet(&store, &args),
         "attend" => cmd_attend::attend(&store, &args),
@@ -2009,6 +2012,16 @@ fn help_text() -> String {
                                     phase, split at the row's legs (times UTC);
                                     legs from run-leg.sh's timeline.json under the
                                     row's tree, or --legs DIR, else wsp's own
+  wsp artefact put <owner> <file> [--as <name>] [--note "…"|-]
+                                    write an asset for the person into ~/.compound/
+                                    artefacts/<owner>/: the file it replaces moves to
+                                    .versions first, so a new version is another put
+                                    of the same name, never `-v2` and never a copy over
+                                    it (a copy by hand is caught and saved as a version)
+  wsp artefact versions <owner>/<name> [--json]
+                                    every version, oldest first, the current one last
+  wsp artefact restore <owner>/<name> <n>
+                                    make version n current, as a new version
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,
                                     how long to review, and whether it came back

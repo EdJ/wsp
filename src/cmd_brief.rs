@@ -1478,6 +1478,9 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             for (i, l) in asking(&t.id).iter().enumerate() {
                 row(if i == 0 { "ask" } else { "" }, p.dim(l).to_string());
             }
+            // Writing an asset (`wsp-376`): in place, as a version, never under a
+            // new name and never over the file by hand.
+            row("assets", p.dim(crate::artefact::BRIEF_LINE).to_string());
         }
         // A verifier holds nothing either, and is not idle: its whole job is
         // one member and one verb. Two lines, paid once per request, and only
@@ -1901,6 +1904,19 @@ mod tests {
                 assert_eq!(text.contains("wsp release t-001"), told, "{what}: {text}");
                 assert_eq!(text.contains("never `wsp add --parent`"), told, "{what}: {text}");
             }
+        }
+    }
+
+    /// `wsp-376`: a seat holding a row is told to write assets with
+    /// `wsp artefact put`, never under a new name and never over the file.
+    #[test]
+    fn a_seat_with_a_row_is_told_to_put_artefacts_never_rename_or_overwrite() {
+        let r = compose(&briefing());
+        for depth in [Depth::Normal, Depth::Session] {
+            let text = brief_lines(&r, &plain(), depth).join("\n");
+            assert!(text.contains("wsp artefact put <row> FILE"), "{text}");
+            assert!(text.contains("never a new name"), "{text}");
+            assert!(text.contains("never a copy over the file by hand"), "{text}");
         }
     }
 
