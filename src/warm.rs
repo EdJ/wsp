@@ -13,19 +13,32 @@
 //! Anything short of a match copies nothing and says so in one line; the agent
 //! installs or builds as it did before.
 //!
-//! **The clone is bounded** (wsp-393). A clone is one call but costs by entry,
-//! and one took 333s on a trunk `target/` of 160k files while the seat that was
-//! waiting on the tree read nothing. It is made under a hidden name beside its
-//! place and renamed in only when it finishes inside [`LIMIT`]; past that the
+//! **The clone is cheap because the source is kept small** (wsp-393). A clone
+//! costs by entry, and the trunk's `target/debug/deps` held 157,745 leaked
+//! `*.rcgu.o` codegen objects among 4,000 real files: 70s to clone, 0.57s with
+//! them gone. They are rustc's intermediates, unused once linked, so those older
+//! than [`STALE`] are removed from the parent's `target/` before it is cloned
+//! ([`prune_objects`]; the first pass is long, so it stops at [`PRUNE_FOR`] and
+//! the next tree carries on).
+//!
+//! **And the wait is bounded.** The clone is made under a hidden name outside
+//! the tree and renamed in only when it finishes inside [`LIMIT`]; past that the
 //! tree starts cold, the line says so, and the half-made copy is removed once
 //! this process has gone.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The longest a tree waits on one clone. A cold build costs minutes; a seat
-/// that waits on a slow clone costs the same and then builds anyway.
-const LIMIT: Duration = Duration::from_secs(30);
+/// The longest a tree waits on one clone: half a cold build of wsp (about 170s),
+/// for past that a cold start is the cheaper one (an 88s clone is waited out, a
+/// 223s one is not).
+const LIMIT: Duration = Duration::from_secs(90);
+
+/// A leaked codegen object this old is not a build's in flight.
+const STALE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How long one tree spends pruning before it clones what is left.
+const PRUNE_FOR: Duration = Duration::from_secs(20);
 
 /// The dependency directories worth cloning, each with the lockfile that must
 /// match beside it.
@@ -88,24 +101,54 @@ fn one(parent: &Path, child: &Path, rel: &Path, lock: &str) -> String {
     if to.exists() {
         return format!("{shown} not cloned: already present");
     }
-    let started = Instant::now();
     let from = parent.join(rel);
-    match bounded(&from, &to, LIMIT, clone_dir) {
-        Ok(()) => format!("{shown} cloned from the parent tree in {:.2}s", started.elapsed().as_secs_f64()),
+    let pruned = if lock == "Cargo.lock" { prune_objects(&from, STALE, PRUNE_FOR) } else { 0 };
+    let note = if pruned > 0 { format!(" (after removing {pruned} stale codegen objects from it)") } else { String::new() };
+    let started = Instant::now();
+    // Beside the tree, not in it: `git status` never sees the half-made copy.
+    let staging = child.parent().unwrap_or(child);
+    let hidden = format!("{}-{}", child.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), rel.to_string_lossy().replace('/', "_"));
+    match bounded(&from, &to, &staging.join(format!(".{hidden}.cloning-{}", std::process::id())), LIMIT, clone_dir) {
+        Ok(()) => format!("{shown} cloned from the parent tree in {:.2}s{note}", started.elapsed().as_secs_f64()),
         Err(e) => format!("{shown} not cloned ({e}) — install as usual"),
     }
 }
 
-/// Run `clone` from `from` to a hidden name beside `to`, and move it into place
-/// only if it finishes inside `limit`. Past the limit the copy is left to the
+/// Remove the `*.rcgu.o` files older than `older` from every `<target>/<profile>/deps`,
+/// stopping after `spend`, and say how many went. Rustc writes these per codegen
+/// unit and removes them after linking; a build that is killed leaves them, and
+/// they are most of the entries in a trunk `target/` that has seen many.
+fn prune_objects(target: &Path, older: Duration, spend: Duration) -> usize {
+    let started = Instant::now();
+    let now = std::time::SystemTime::now();
+    let mut gone = 0;
+    let Ok(profiles) = std::fs::read_dir(target) else { return 0 };
+    for profile in profiles.flatten() {
+        let Ok(files) = std::fs::read_dir(profile.path().join("deps")) else { continue };
+        for f in files.flatten() {
+            if started.elapsed() > spend {
+                return gone;
+            }
+            if !f.file_name().to_string_lossy().ends_with(".rcgu.o") {
+                continue;
+            }
+            let aged = f.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age > older);
+            if aged && std::fs::remove_file(f.path()).is_ok() {
+                gone += 1;
+            }
+        }
+    }
+    gone
+}
+
+/// Run `clone` from `from` to the hidden name `tmp`, and move it into place at
+/// `to` only if it finishes inside `limit`. Past the limit the copy is left to the
 /// thread still making it and a shell removes it once this process is gone.
-fn bounded<F>(from: &Path, to: &Path, limit: Duration, clone: F) -> Result<(), String>
+fn bounded<F>(from: &Path, to: &Path, tmp: &Path, limit: Duration, clone: F) -> Result<(), String>
 where
     F: FnOnce(&Path, &Path) -> Result<(), String> + Send + 'static,
 {
-    let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = to.with_file_name(format!(".{name}.cloning-{}", std::process::id()));
-    let (src, dst) = (from.to_path_buf(), tmp.clone());
+    let (src, dst, tmp) = (from.to_path_buf(), tmp.to_path_buf(), tmp.to_path_buf());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(clone(&src, &dst));
@@ -208,7 +251,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(400));
             std::fs::create_dir_all(t).map_err(|e| e.to_string())
         };
-        let err = bounded(&d.join("p"), &to, Duration::from_millis(20), slow).unwrap_err();
+        let err = bounded(&d.join("p"), &to, &d.join(".t.cloning"), Duration::from_millis(20), slow).unwrap_err();
         assert!(err.contains("still cloning after"), "{err}");
         assert!(!to.exists(), "a late clone is never moved into place");
         let _ = std::fs::remove_dir_all(&d);
@@ -220,9 +263,53 @@ mod tests {
         let to = d.join("c/target");
         std::fs::create_dir_all(d.join("c")).unwrap();
         let quick = |_: &Path, t: &Path| std::fs::create_dir_all(t).map_err(|e| e.to_string());
-        bounded(&d.join("p"), &to, Duration::from_secs(5), quick).unwrap();
+        bounded(&d.join("p"), &to, &d.join(".t.cloning"), Duration::from_secs(5), quick).unwrap();
         assert!(to.is_dir());
-        assert_eq!(std::fs::read_dir(d.join("c")).unwrap().count(), 1, "no hidden name left beside it");
+        assert_eq!(std::fs::read_dir(&d).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("cloning")).count(), 0, "no hidden name left");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn stale_codegen_objects_go_before_the_clone_and_nothing_else_does() {
+        let d = scratch("prune");
+        let deps = d.join("target/debug/deps");
+        write(&deps.join("old.rcgu.o"), "o");
+        write(&deps.join("new.rcgu.o"), "o");
+        write(&deps.join("old.rlib"), "r");
+        let aged = std::time::SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+        for n in ["old.rcgu.o", "old.rlib"] {
+            std::fs::File::options().write(true).open(deps.join(n)).unwrap().set_modified(aged).unwrap();
+        }
+        assert_eq!(prune_objects(&d.join("target"), STALE, Duration::from_secs(5)), 1);
+        assert!(!deps.join("old.rcgu.o").exists(), "a day-old leaked object goes");
+        assert!(deps.join("new.rcgu.o").exists(), "a build in flight keeps its own");
+        assert!(deps.join("old.rlib").exists(), "only codegen objects are pruned");
+        assert_eq!(prune_objects(&d.join("target"), STALE, Duration::ZERO), 0, "out of time, it stops");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_wait_for_a_clone_is_less_than_the_cold_build_it_saves() {
+        // A cold build of wsp is about 170s; waiting longer than that for the
+        // clone is worse than starting without it.
+        assert!(LIMIT < Duration::from_secs(170) && LIMIT >= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_clone_is_staged_outside_the_tree_it_is_for() {
+        let d = scratch("staged");
+        let (parent, child) = (d.join("p"), d.join("trees/c"));
+        write(&parent.join("Cargo.lock"), "lock");
+        write(&parent.join("target/debug/x"), "bin");
+        write(&child.join("Cargo.lock"), "lock");
+        let lines = clone_from(&parent, &child);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        if cfg!(target_os = "macos") {
+            assert!(lines[0].contains("cloned from the parent"), "{lines:?}");
+            assert!(child.join("target/debug/x").exists());
+        }
+        let hidden: Vec<_> = std::fs::read_dir(&child).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("cloning")).collect();
+        assert!(hidden.is_empty(), "nothing hidden in the tree");
         let _ = std::fs::remove_dir_all(&d);
     }
 

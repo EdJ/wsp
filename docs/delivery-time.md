@@ -157,6 +157,23 @@ The measure is a figure in the *next pass's* `effort.json` that says it worked.
 | 3.9 | governor turns in the wall (`wsp-398`) | unknown: the report prices the governor as cost only; 14.5 min pass → start on group 3 → 4 is unexplained | S | governor seconds between a pass and the next start |
 | 3.10 | name a command waiting on itself (`wsp-397`) | 6 min per occurrence (compounding-061), rate not yet counted | M | stuck-command flags per pass in wip, each with the seconds it held |
 
+**3.5, what `wsp-393` found.** The clone was already one `clonefile(2)`; its cost
+was the source. The trunk `target/debug/deps` held 157 745 leaked `*.rcgu.o`
+codegen objects (rustc's per-unit intermediates, left by killed builds) among 4 088
+real files. Measured on a scratch clone of that `target/`: 70 s to clone it whole
+(28 s on a second, warm run), 0.57 s once those older than six hours were gone
+(removing them was 68 s, once). `wsp` now removes them from the parent's
+`target/` before cloning (20 s a tree until done), stages the clone outside the
+tree, and gives a clone up at 90 s (half a cold build) with a line saying so.
+Group 5's 88–333 s clones were that same entry count. **Not measured:** run end →
+check started and spawn → claimed, before and after; the log's spawn lines are
+dominated by re-spawns into warm trees, so the next pass's `effort.json` is
+where they read. **Handed to `wsp-420`:** the 21 min of "starting". The 5 min
+not-up rule (`untaken::look`, `wsp-335`) was in place and did not end it; it
+acts only when `turn_began_since` is not `Some(true)`, and its clock is the check
+entry's `opened`, so the first thing to read is that seat's `cycle.log` lines
+and whether a turn was recorded on it.
+
 Candidates the data does not support, with the reason:
 
 - **Start the barrier run before every verifier has finished: dropped, Ed,
