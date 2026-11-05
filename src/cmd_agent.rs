@@ -6325,6 +6325,10 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // and the host binary beside it against a build that only touched one of
     // the two — the two shapes `compound-026` was filed for.
     crate::place_compound::wire_health(&mut problems, &mut notes);
+    // And the same wire, asked of every machine the seat drives: one line each
+    // (`docs/remote-agents.md` section 2), so a far compound-sup that is behind
+    // is said before a spawn is refused on it.
+    crate::cmd_machine::health(store, &mut problems, &mut notes);
 
     if args.json() {
         println!("{}", json!({ "problems": problems, "notes": notes }));

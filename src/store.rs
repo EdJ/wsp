@@ -210,9 +210,20 @@ pub struct MachineLive {
     /// rather than recomputed so a reader is talking to the socket the daemon
     /// actually made, not the one it would have made.
     pub socket: String,
-    /// Whatever the far herdr says it is. A protocol that has moved under us is
-    /// worth seeing in a list before it is worth handling.
-    pub herdr_version: String,
+    /// What the far `compound-sup` answered to `wire-version`, on the last
+    /// probe that got an answer (`docs/remote-agents.md` section 2). `None` is
+    /// no answer: not probed yet, or the command ran and failed (then `error`
+    /// says why). A protocol that has moved under us is worth seeing in a list
+    /// before it is worth handling, and `spawn --on` refuses on it.
+    pub wire: Option<u32>,
+    /// `wsp machine check` last passed. Written by that command, carried across
+    /// the tick (which rewrites this record) by `Supervisor::tick`.
+    pub ready: bool,
+    /// When `wsp machine check` last ran, pass or fail. Empty: never.
+    pub checked: String,
+    /// Which step of the last check failed, and what it said. Empty when it
+    /// passed or never ran.
+    pub check_error: String,
     /// Why it is not reachable, in the words of whatever failed. Empty when it
     /// is. This is the whole diagnostic surface for "why is mb2 grey", so it
     /// keeps the message rather than a code.
@@ -227,7 +238,10 @@ impl MachineLive {
             last_seen: s("last_seen"),
             tunnel: s("tunnel"),
             socket: s("socket"),
-            herdr_version: s("herdr_version"),
+            wire: v.get("wire").and_then(|x| x.as_u64()).map(|n| n as u32),
+            ready: v.get("ready").and_then(|x| x.as_bool()).unwrap_or(false),
+            checked: s("checked"),
+            check_error: s("check_error"),
             error: s("error"),
         }
     }
@@ -238,7 +252,10 @@ impl MachineLive {
             "last_seen": self.last_seen,
             "tunnel": self.tunnel,
             "socket": self.socket,
-            "herdr_version": self.herdr_version,
+            "wire": self.wire,
+            "ready": self.ready,
+            "checked": self.checked,
+            "check_error": self.check_error,
             "error": self.error,
         })
     }

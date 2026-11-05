@@ -23,17 +23,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-
-use crate::herdr;
 use crate::model::Machine;
 use crate::store::{MachineLive, Store};
 use crate::util;
-
-/// How long a machine gets to answer a liveness call. Short: this runs inside
-/// the daemon's tick, and a machine that needs more than two seconds to list
-/// its own workspaces over an established tunnel is not well.
-const PROBE: Duration = Duration::from_secs(2);
 
 /// The backoff, in seconds, by consecutive failure. A machine that is switched
 /// off should not be dialled every twenty seconds for a week; a machine that
@@ -61,6 +53,10 @@ struct Tunnel {
     /// When the next attempt is allowed. `None` means now.
     next_try: Option<Instant>,
     live: MachineLive,
+    /// A `wsp machine check` this tick started and has not seen finish. The
+    /// check starts an agent and takes seconds, so it runs beside the tick and
+    /// never inside it.
+    checking: Option<Child>,
 }
 
 impl Tunnel {
@@ -70,7 +66,44 @@ impl Tunnel {
             failures: 0,
             next_try: None,
             live: MachineLive { tunnel: "down".into(), ..Default::default() },
+            checking: None,
         }
+    }
+
+    /// Ask for a readiness check when there has been none, or the last one is
+    /// old (`docs/remote-agents.md` section 7: "on a timer and on `machine add`"
+    /// — a new machine has no check, so its first reachable tick is the one on
+    /// `add`). Only for a machine whose wire matches: a mismatch is already the
+    /// answer, and starting a session on it would be the thing `spawn --on`
+    /// refuses.
+    fn recheck(&mut self, m: &Machine) {
+        if let Some(c) = self.checking.as_mut() {
+            match c.try_wait() {
+                Ok(None) => return,
+                _ => self.checking = None,
+            }
+        }
+        let matches = self.live.wire == Some(crate::place_compound::wire_version());
+        if !self.live.reachable || !matches || m.exec_dir.is_empty() {
+            return;
+        }
+        let stale = match self.live.checked.as_str() {
+            "" => true,
+            at => util::since(at) >= crate::far::RECHECK_SECS as i64,
+        };
+        if !stale {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let mut c = Command::new(exe);
+        c.args(["machine", "check", &m.name]).stdin(Stdio::null());
+        c.stdout(Stdio::null()).stderr(Stdio::null());
+        self.checking = c.spawn().ok();
+        // Marked as asked now, so a check that dies without writing does not
+        // restart every tick; the file the check writes will overwrite this.
+        self.live.checked = util::now_iso();
+        self.live.ready = false;
+        self.live.check_error = crate::far::IN_PROGRESS.into();
     }
 
     fn backoff(&mut self) {
@@ -93,6 +126,10 @@ impl Tunnel {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some(mut c) = self.checking.take() {
+            let _ = c.kill();
+            let _ = c.wait();
         }
     }
 }
@@ -140,7 +177,19 @@ impl Supervisor {
             if before != after {
                 changed.push(m.name.clone());
             }
-            if let Some(t) = self.tunnels.get(&m.name) {
+            if let Some(t) = self.tunnels.get_mut(&m.name) {
+                // `wsp machine check` writes its result straight to the file,
+                // from another process, and this record is rewritten whole
+                // every tick — so take the check's fields from the file or the
+                // result is gone before anyone reads it. Not while this tick
+                // has one in flight: its placeholder is the newer fact.
+                if t.checking.is_none() {
+                    if let Some(on_disk) = store.machine_live(&m.name) {
+                        t.live.ready = on_disk.ready;
+                        t.live.checked = on_disk.checked;
+                        t.live.check_error = on_disk.check_error;
+                    }
+                }
                 store.set_machine_live(&m.name, &t.live);
             }
         }
@@ -198,25 +247,18 @@ impl Supervisor {
 
         // A live child is not a live machine. The socket exists from the
         // moment ssh binds it, whether or not anything is listening at the far
-        // end, so the only honest test is to ask the far herdr a question.
-        match herdr::call_on(Some(&m.name), "workspace.list", json!({}), PROBE) {
-            Ok(_) => {
-                t.failures = 0;
-                t.next_try = None;
-                t.live.reachable = true;
-                t.live.tunnel = "up".into();
-                t.live.last_seen = util::now_iso();
-                t.live.error.clear();
-            }
-            Err(e) => {
-                // The child is up and the far end is not answering. Do not
-                // reach for "unreachable = empty" here either: this is written
-                // down as not reachable, and the reap guard reads it that way.
-                t.live.reachable = false;
-                t.live.tunnel = "starting".into();
-                t.live.error = e.to_string();
-            }
+        // end, so the only honest test is to ask the far side a question: its
+        // `compound-sup wire-version`, which is also the wire check
+        // (`docs/remote-agents.md` section 2). A link that is down is
+        // unreachable; a link that is up whose command failed is connected and
+        // not ready — `far::fold_probe` keeps those two apart.
+        let probed = crate::far::ssh_run(m, Some(&control_path(store, &m.name)), &crate::far::probe_command(m));
+        crate::far::fold_probe(&mut t.live, probed, &util::now_iso());
+        if t.live.reachable {
+            t.failures = 0;
+            t.next_try = None;
         }
+        t.recheck(m);
     }
 
     /// The machines that are answering right now.
@@ -305,6 +347,13 @@ fn backend_at(m: &Machine) -> String {
         true => crate::place_herdr::mirrored_socket(),
         false => m.backend_at.clone(),
     }
+}
+
+/// The ControlMaster socket the tunnel's ssh holds, which the wire probe and
+/// `wsp machine check` ride so they do not each open a connection.
+pub fn control_path(store: &Store, name: &str) -> PathBuf {
+    let sock = store.machine_socket(name);
+    sock.parent().unwrap_or(&store.state).join(format!("cm-{name}"))
 }
 
 /// The ssh we hold open, and why each flag is on it.

@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use crate::far::{self, Readiness, readiness};
 use crate::herdr;
 use crate::model::{valid_machine_name, Machine, Task};
 use crate::place_herdr;
@@ -33,6 +34,7 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "ls" | "list" => list(store, args),
         "show" | "get" => show(store, args),
         "set" => set(store, args),
+        "check" => check(store, args),
         "rm" | "remove" | "retire" => rm(store, args),
         other => {
             eprintln!("wsp machine: unknown subcommand `{other}`");
@@ -129,7 +131,22 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     );
     // Said now rather than discovered later: everything about reaching the
     // machine lives outside wsp, so the next step is not a wsp command.
-    println!("  {}", p.dim(&format!("needs: a `Host {}` block in ~/.ssh/config, and herdr server running there", m.ssh)));
+    println!(
+        "  {}",
+        p.dim(&format!(
+            "needs: a `Host {}` block in ~/.ssh/config, compound-sup and compound-render built there, and a Claude token",
+            m.ssh
+        ))
+    );
+    // Where the far side keeps its trees and its token. Not defaulted: a
+    // directory nobody chose is a path nobody can find when it fills.
+    println!(
+        "  {}",
+        p.dim(&format!(
+            "then wsp machine set {} exec_dir=… (and sup_at=… if compound-sup is not on its PATH); the daemon runs `wsp machine check` once it answers",
+            m.name
+        ))
+    );
     // The mirrored-path assumption, said out loud at the moment it is made
     // rather than discovered as a tunnel that will not come up.
     println!("  {}", p.dim(&format!("forwards {} — wsp machine set {} backend_at=… if that is not where it is", m.backend_at, m.name)));
@@ -416,6 +433,16 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         true => println!("backend   {}", p.dim(&format!("{} — the backend's default", place_herdr::mirrored_socket()))),
         false => println!("backend   {}", m.backend_at),
     }
+    // Where the far side keeps its things, said whether or not it is set: an
+    // unset `exec_dir` is why `wsp machine check` fails at its second step.
+    match m.exec_dir.is_empty() {
+        true => println!("exec_dir  {}", p.dim(&format!("not set — wsp machine set {} exec_dir=…", m.name))),
+        false => println!("exec_dir  {}", m.exec_dir),
+    }
+    match m.sup_at.is_empty() {
+        true => println!("sup       {}", p.dim("compound-sup on the far PATH")),
+        false => println!("sup       {}", m.sup_at),
+    }
     let box_line = [m.os.as_str(), m.arch.as_str()].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
     if !box_line.is_empty() {
         println!("box       {box_line}");
@@ -437,8 +464,16 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         if !l.socket.is_empty() {
             println!("socket    {}", util::contract(std::path::Path::new(&l.socket)));
         }
-        if !l.herdr_version.is_empty() {
-            println!("version   {}", l.herdr_version);
+        if let Some(w) = l.wire {
+            println!("wire      {w}");
+        }
+        if !l.checked.is_empty() {
+            let verdict = match (l.ready, l.check_error.as_str()) {
+                (true, _) => "passed".to_string(),
+                (false, "") => "failed".to_string(),
+                (false, why) => format!("failed — {why}"),
+            };
+            println!("checked   {} ago, {verdict}", util::duration_human(util::since(&l.checked)));
         }
         if !l.error.is_empty() {
             println!("error     {}", p.red(&l.error));
@@ -455,7 +490,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
 pub fn set(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp machine set <name> ssh=… backend_at=… os=… arch=… agents=N status=active|retired");
+        eprintln!("usage: wsp machine set <name> ssh=… backend_at=… exec_dir=… sup_at=… os=… arch=… agents=N status=active|retired");
         return 2;
     };
     if names_seat(&needle) && find(store, &needle).is_none() {
@@ -475,6 +510,8 @@ pub fn set(store: &Store, args: &Args) -> i32 {
         match k {
             "ssh" => m.ssh = v.to_string(),
             "backend_at" => m.backend_at = v.to_string(),
+            "exec_dir" => m.exec_dir = v.to_string(),
+            "sup_at" => m.sup_at = v.to_string(),
             // One release of a name nobody but this repository ever typed, kept
             // because it is in the README's executor section and the error it
             // would otherwise get names every field except the one you meant.
@@ -501,7 +538,7 @@ pub fn set(store: &Store, args: &Args) -> i32 {
                 }
             },
             other => {
-                eprintln!("wsp: machines have no `{other}` — ssh, backend_at, os, arch, agents, status");
+                eprintln!("wsp: machines have no `{other}` — ssh, backend_at, exec_dir, sup_at, os, arch, agents, status");
                 return 2;
             }
         }
@@ -525,6 +562,100 @@ pub fn set(store: &Store, args: &Args) -> i32 {
         println!("{} {}", m.name, Paint::new().dim(&changed.join(" ")));
     }
     0
+}
+
+/// `wsp machine check <name>` — can an agent actually run there?
+///
+/// Starts and stops a throwaway session through the far `compound-sup` and runs
+/// a one-line headless `claude -p` with the machine's token
+/// (`docs/remote-agents.md` section 7). A machine reads `ready` only when this
+/// passes; `connected` is the daemon's ssh answering and has been wrong about
+/// readiness five times running (wsp-050). The daemon runs this itself on a
+/// timer, and for a machine that has never been checked.
+pub fn check(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp machine check <name>");
+        return 2;
+    };
+    let Some(m) = find(store, &needle) else {
+        eprintln!("wsp: no machine matching `{needle}`");
+        return 1;
+    };
+    if !m.is_active() {
+        eprintln!("wsp: `{}` is retired — wsp machine set {} status=active", m.name, m.name);
+        return 1;
+    }
+    let control = crate::tunnel::control_path(store, &m.name);
+    let seat_wire = crate::place_compound::wire_version();
+    let c = far::check_with(&m, seat_wire, &|cmd| far::ssh_run(&m, Some(&control), cmd));
+
+    let now = util::now_iso();
+    let mut live = store.machine_live(&m.name).unwrap_or_default();
+    if c.wire.is_some() {
+        live.wire = c.wire;
+    }
+    far::record(&mut live, &c, &now);
+    store.set_machine_live(&m.name, &live);
+    store.log_event("machine-checked", json!({ "name": m.name, "ready": c.passed(), "why": c.why() }));
+
+    if args.json() {
+        let steps: Vec<Value> =
+            c.steps.iter().map(|s| json!({ "step": s.name, "ok": s.ok, "said": s.said })).collect();
+        println!("{}", json!({ "name": m.name, "ready": c.passed(), "wire": c.wire, "steps": steps }));
+    } else {
+        let p = Paint::new();
+        for s in &c.steps {
+            let mark = if s.ok { p.green("✓") } else { p.red("✗") };
+            println!("{mark} {:<8} {}", s.name, s.said);
+        }
+        match c.passed() {
+            true => println!("{} {} is ready", p.green("✓"), m.name),
+            false => println!("{} {} is connected, not ready", p.red("✗"), m.name),
+        }
+    }
+    if c.passed() { 0 } else { 1 }
+}
+
+/// One line per active machine for `wsp doctor` (`docs/remote-agents.md`
+/// section 2, "the wire version across two machines", check 3). A wire
+/// mismatch, a far `compound-sup` that gave no version, and a failed
+/// readiness check are problems — each has a verb that fixes it; a machine
+/// that is unreachable or not yet checked is a note, because a laptop that is
+/// asleep is not a fault in wsp's store.
+pub fn health(store: &Store, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    let live = store.machines_live();
+    let seat = crate::place_compound::wire_version();
+    for m in store.machines().into_iter().filter(|m| m.is_active()) {
+        let name = &m.name;
+        let Some(l) = live.get(name) else {
+            notes.push(format!("machine {name}: no daemon report yet"));
+            continue;
+        };
+        match readiness(l, seat) {
+            Readiness::Ready => notes.push(format!("machine {name}: ready (wire {seat})")),
+            Readiness::Unreachable => {
+                let seen = match l.last_seen.as_str() {
+                    "" => "never seen".to_string(),
+                    s => format!("last seen {} ago", util::duration_human(util::since(s))),
+                };
+                let why = if l.error.is_empty() { String::new() } else { format!(" — {}", l.error) };
+                notes.push(format!("machine {name}: unreachable ({seen}){why}"));
+            }
+            Readiness::Mismatch { seat, far } => {
+                problems.push(format!("machine {name}: {}", Readiness::mismatch_words(name, seat, far)))
+            }
+            Readiness::NoWire(why) => problems.push(format!(
+                "machine {name}: connected but compound-sup gave no wire version{}",
+                if why.is_empty() { String::new() } else { format!(" — {why}") },
+            )),
+            Readiness::Unchecked => notes.push(format!(
+                "machine {name}: connected, wire {seat}, not checked yet — wsp machine check {name}"
+            )),
+            Readiness::NotReady(why) => problems.push(format!(
+                "machine {name}: connected, not ready — {why} (wsp machine check {name})"
+            )),
+        }
+    }
 }
 
 /// An `agents=` value: a count, or nothing to take the number off. `Err` is
@@ -694,10 +825,25 @@ fn state_of(p: &Paint, m: &Machine, live: Option<&MachineLive>) -> (String, Stri
         return (p.dim("retired"), String::new());
     }
     match live {
-        Some(l) if l.reachable => (
-            p.green("connected"),
-            if l.herdr_version.is_empty() { String::new() } else { format!("herdr {}", l.herdr_version) },
-        ),
+        Some(l) if l.reachable => match readiness(l, crate::place_compound::wire_version()) {
+            Readiness::Ready => (p.green("ready"), l.wire.map(|w| format!("wire {w}")).unwrap_or_default()),
+            Readiness::Unchecked => (
+                p.green("connected"),
+                format!("not ready — not checked yet (wsp machine check {})", m.name),
+            ),
+            Readiness::NotReady(why) => (p.green("connected"), format!("not ready — {why}")),
+            Readiness::Mismatch { seat, far } => {
+                (p.green("connected"), format!("not ready — wire mismatch v{seat}/v{far}"))
+            }
+            Readiness::NoWire(why) => (
+                p.green("connected"),
+                match why.is_empty() {
+                    true => "not ready — no wire version yet".to_string(),
+                    false => format!("not ready — {why}"),
+                },
+            ),
+            Readiness::Unreachable => unreachable!("the arm is reachable"),
+        },
         Some(l) => {
             let seen = match l.last_seen.as_str() {
                 "" => "never seen".to_string(),
@@ -755,6 +901,52 @@ mod tests {
         }
     }
 
+    /// `ready` is a word only a passed check earns; the same connection with no
+    /// check, a failed one, or a wire that is not ours reads `connected` with
+    /// the reason beside it, and `doctor` says one line per machine.
+    #[test]
+    fn a_machine_reads_ready_only_after_its_check_and_doctor_says_why_when_it_is_not() {
+        let p = plain();
+        let m = Machine::new("mb2", "mb2");
+        let ours = crate::place_compound::wire_version();
+        let up = MachineLive { reachable: true, wire: Some(ours), ..Default::default() };
+
+        let (word, note) = state_of(&p, &m, Some(&up));
+        assert_eq!((word.trim(), note.contains("not checked yet")), ("connected", true));
+
+        let failed = MachineLive { checked: util::now_iso(), check_error: "claude: no auth".into(), ..up.clone() };
+        let (word, note) = state_of(&p, &m, Some(&failed));
+        assert_eq!(word.trim(), "connected");
+        assert!(note.contains("no auth"), "{note}");
+
+        let behind = MachineLive { wire: Some(ours - 1), ..up.clone() };
+        let (word, note) = state_of(&p, &m, Some(&behind));
+        assert_eq!(word.trim(), "connected");
+        assert!(note.contains(&format!("v{ours}/v{}", ours - 1)), "{note}");
+
+        let ready = MachineLive { checked: util::now_iso(), ready: true, ..up.clone() };
+        assert_eq!(state_of(&p, &m, Some(&ready)).0.trim(), "ready");
+
+        // doctor: one line per active machine, a problem where something can be fixed.
+        let store = scratch("doctor");
+        for n in ["a-ready", "b-behind", "c-failed", "d-down", "e-new"] {
+            store.save_machine(&Machine::new(n, n)).unwrap();
+        }
+        store.set_machine_live("a-ready", &ready);
+        store.set_machine_live("b-behind", &behind);
+        store.set_machine_live("c-failed", &failed);
+        store.set_machine_live("d-down", &MachineLive { error: "no route".into(), ..Default::default() });
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        health(&store, &mut problems, &mut notes);
+        assert_eq!(problems.len() + notes.len(), 5, "one line each: {problems:?} {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("a-ready") && n.contains("ready")));
+        assert!(problems.iter().any(|n| n.contains("b-behind") && n.contains("wire mismatch")));
+        assert!(problems.iter().any(|n| n.contains("c-failed") && n.contains("no auth")));
+        assert!(notes.iter().any(|n| n.contains("d-down") && n.contains("unreachable")));
+        assert!(notes.iter().any(|n| n.contains("e-new") && n.contains("no daemon report")));
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
     /// A machine that has never answered has no last-seen to report, and
     /// "last seen 56y ago" — the epoch, dressed as a duration — would be worse
     /// than saying nothing.
@@ -790,7 +982,7 @@ mod tests {
         let mut live = BTreeMap::new();
         live.insert(
             "mb2".to_string(),
-            MachineLive { reachable: true, herdr_version: "0.4.1".into(), ..Default::default() },
+            MachineLive { reachable: true, wire: Some(9), ..Default::default() },
         );
         live.insert(
             "rack".to_string(),
@@ -972,6 +1164,8 @@ fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {
         "os": m.os,
         "arch": m.arch,
         "backend_at": m.backend_at,
+        "exec_dir": m.exec_dir,
+        "sup_at": m.sup_at,
         // Null and not 0 when there is no cap: a governor asking for the
         // number wants to be able to tell "nobody has decided" from a number,
         // and `0` is the one answer that reads as an instruction.

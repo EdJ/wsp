@@ -1320,6 +1320,14 @@ pub struct Machine {
     /// breaks. It used to be defaulted here, which put a `crate::herdr` call in
     /// the file that is meant to be nothing but durable entities (robustness-019).
     pub backend_at: String,
+    /// Where trees and per-row state live on the far side
+    /// (`docs/remote-agents.md` section 6): `<exec_dir>/trees/<row>`, the
+    /// machine's Claude token at `<exec_dir>/claude-token`. Written down, not
+    /// discovered, for `backend_at`'s reason. Empty until somebody says.
+    pub exec_dir: String,
+    /// The far `compound-sup`, as a path on that machine (a non-interactive ssh
+    /// has a short `PATH`). Empty means the bare name.
+    pub sup_at: String,
     /// `darwin` | `linux`, and whatever comes next. Free text: nothing branches
     /// on it yet, and a machine you cannot describe is still a machine.
     pub os: String,
@@ -1426,6 +1434,8 @@ impl Machine {
             // the old key — the field was a day old and no store had a machines
             // directory in it — so the migration is a rename and not a read.
             backend_at: doc.str("backend_at"),
+            exec_dir: doc.str("exec_dir"),
+            sup_at: doc.str("sup_at"),
             os: doc.str("os"),
             arch: doc.str("arch"),
             status: doc.opt("status").unwrap_or_else(|| "active".into()),
@@ -1445,6 +1455,14 @@ impl Machine {
         d.set_str("name", &self.name);
         d.set_str("ssh", &self.ssh);
         d.set_str("backend_at", &self.backend_at);
+        // Only when there is one, like `agents`: records written before these
+        // existed stay byte-for-byte what they were.
+        if !self.exec_dir.is_empty() {
+            d.set_str("exec_dir", &self.exec_dir);
+        }
+        if !self.sup_at.is_empty() {
+            d.set_str("sup_at", &self.sup_at);
+        }
         d.set_str("os", &self.os);
         d.set_str("arch", &self.arch);
         d.set_str("status", &self.status);

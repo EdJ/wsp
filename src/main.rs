@@ -69,6 +69,7 @@ mod did;
 mod draw;
 mod ending;
 mod fake;
+mod far;
 mod fm;
 mod history;
 mod guard;

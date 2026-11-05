@@ -1019,7 +1019,20 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
         return Err(format!("`{name}` is retired — wsp machine set {name} status=active"));
     }
     match store.machine_live(&name) {
-        Some(l) if l.reachable => Ok(Some(m.name)),
+        // Connected is not ready, but `--on` works before the proof (section 7):
+        // the one thing refused here is a wire that cannot work, naming both
+        // numbers, because a seat started at the wrong version is not
+        // recoverable by waiting.
+        Some(l) if l.reachable => match crate::far::readiness(&l, crate::place_compound::wire_version()) {
+            crate::far::Readiness::Mismatch { seat, far } => {
+                Err(crate::far::Readiness::mismatch_words(&name, seat, far))
+            }
+            crate::far::Readiness::NoWire(why) => Err(format!(
+                "`{name}` is connected but its compound-sup gave no wire version{}",
+                if why.is_empty() { " yet".to_string() } else { format!(" — {why}") },
+            )),
+            _ => Ok(Some(m.name)),
+        },
         Some(l) if !l.error.is_empty() => Err(format!("`{name}` is not answering — {}", l.error)),
         Some(_) => Err(format!("`{name}` is not answering yet")),
         None => Err(format!(
@@ -5290,8 +5303,21 @@ mod tests {
         let err = placement(&store, &on("mb2")).unwrap_err();
         assert!(err.contains("no route to host"), "what the daemon saw: {err}");
 
+        // Connected with nothing said of its wire is not a spawn target.
         store.set_machine_live("mb2", &MachineLive { reachable: true, ..Default::default() });
-        assert_eq!(placement(&store, &on("mb2")).unwrap().as_deref(), Some("mb2"));
+        let err = placement(&store, &on("mb2")).unwrap_err();
+        assert!(err.contains("no wire version"), "{err}");
+
+        // A wire that is not ours is refused with both numbers and the side that is behind.
+        let ours = crate::place_compound::wire_version();
+        store.set_machine_live("mb2", &MachineLive { reachable: true, wire: Some(ours - 1), ..Default::default() });
+        let err = placement(&store, &on("mb2")).unwrap_err();
+        assert!(err.contains(&format!("v{ours}/v{}", ours - 1)), "both numbers: {err}");
+        assert!(err.contains("compound-sup is behind"), "and which binary: {err}");
+
+        store.set_machine_live("mb2", &MachineLive { reachable: true, wire: Some(ours), ..Default::default() });
+        assert_eq!(placement(&store, &on("mb2")).unwrap().as_deref(), Some("mb2"),
+            "connected and matching is enough to spawn before the check has run");
 
         let mut retired = store.machine("mb2").unwrap();
         retired.status = "retired".into();

@@ -956,6 +956,12 @@ fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Optio
 /// rather than assumed compatible.
 const WIRE_VERSION: u32 = 9;
 
+/// The wire version this wsp speaks, for the far-machine checks that compare it
+/// with what a machine's `compound-sup` answers (`far`, `spawn --on`, `doctor`).
+pub fn wire_version() -> u32 {
+    WIRE_VERSION
+}
+
 /// What `doctor` says about the two ways this constant has already drifted
 /// (`compound-026`), asked of the installed pieces rather than read out of
 /// either repository's source — the same discipline the rest of this file
