@@ -79,9 +79,12 @@ pub fn probe_command(m: &Machine) -> String {
     format!("{} wire-version", quote(&sup_of(m)))
 }
 
-/// `compound-sup wire-version` output → the bare number.
+/// `compound-sup wire-version` output → its VERSION. A current build prints
+/// the accepted range `OLDEST VERSION` (`9 14`); an older build prints a bare
+/// number. VERSION is the last whitespace token in both, which is how
+/// `place_compound::ask_wire_version` reads it.
 pub fn parse_wire(out: &str) -> Option<u32> {
-    out.trim().parse().ok()
+    out.split_whitespace().last()?.parse().ok()
 }
 
 /// How long the probe may take: it runs inside the daemon's tick.
@@ -483,6 +486,7 @@ mod tests {
     fn the_probe_is_compound_sups_wire_version_by_the_recorded_path() {
         assert_eq!(probe_command(&machine()), "~/'bin/compound-sup' wire-version");
         assert_eq!(probe_command(&Machine::new("a", "a")), "'compound-sup' wire-version");
+        assert_eq!(parse_wire("9 14\n"), Some(14));
         assert_eq!(parse_wire(" 9\n"), Some(9));
         assert_eq!(parse_wire("compound-sup: unknown verb"), None);
     }
