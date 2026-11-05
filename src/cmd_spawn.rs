@@ -6942,6 +6942,22 @@ mod tests {
         assert!(argv.iter().any(|a| a == "sonnet") && !argv.iter().any(|a| a.contains("opus")), "{argv:?}");
         let order = place.2.borrow().first().cloned().expect("the order was told to the agent");
         assert!(order.contains("leg scout of t-1") && order.contains("wsp leg done t-1"), "{order}");
+        assert!(!order.contains("wsp review") && !order.contains("last leg"), "a leg that is not last is not told of review: {order}");
+        assert!(!order.contains('\n'), "{order:?}");
+
+        // Scout done, `plan` is the last leg of the record, and its order names
+        // `review` as the one command that ends it (`wsp-354`).
+        // The double reads a seat as busy once it has been told anything.
+        place.2.borrow_mut().clear();
+        let mut t = store.find_task("t-1").unwrap();
+        let mut ls = crate::legs::legs(&t);
+        ls[0].state = crate::legs::State::Done;
+        crate::legs::write(&mut t, &ls);
+        store.save_task(&t).unwrap();
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags("plan"))), 0);
+        let order = place.2.borrow().last().cloned().expect("the last leg's order was told to the agent");
+        assert!(order.contains("leg plan of t-1") && order.contains("last leg: end with `wsp review t-1"), "{order}");
+        assert!(order.contains("as a call of its own, `wsp review t-1"), "{order}");
         assert!(!order.contains('\n'), "{order:?}");
     }
 
