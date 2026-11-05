@@ -13,6 +13,7 @@ mod artefact;
 mod after;
 mod closing;
 mod packet;
+mod pickup;
 mod packet_gen;
 mod agent_commands;
 mod barrier;
@@ -2199,6 +2200,10 @@ fn help_text() -> String {
                                     for wsp's own source). `new` takes them too.
                                     `ls` and `next <slug>` say what a planned list
                                     waits on: room, throttle, after, alone, manual
+  wsp worklist pickup               the daemon's pass over the planned lists, once:
+                                    starts the first that may start (one per tick)
+                                    and says why then. The daemon does this itself
+                                    every minute; `wsp wip` shows the day's starts
   wsp worklist done <slug> [--force why…]
                                     nothing left to want from it. Refused while
                                     a declared output is missing; --force and

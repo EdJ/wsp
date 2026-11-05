@@ -381,6 +381,12 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     for (scope, trigger) in seat_scopes(store) {
         seat_vacant(store, seats, &scope, &trigger);
     }
+    // **Last, so the room it reads is the room this pass left**: every ending
+    // above has freed its place, and a start taken before them would be
+    // judged against seats that have already stopped. A list it starts is a
+    // running list from the next tick's step and governor seating on. One
+    // list a pass (`wsp-384`).
+    crate::pickup::tick(store);
 }
 
 /// The step on every running list: what the tick does first, and again once an

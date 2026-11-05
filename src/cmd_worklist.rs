@@ -139,6 +139,8 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "status" => status(store, args),
         // wsp-383: what a planned list waits on.
         "after" => after(store, args),
+        // wsp-384: the daemon's pickup of planned lists, once, by hand.
+        "pickup" => pickup(store),
         // `wsp-134`: the steps wsp takes itself. Started by the verbs that
         // make one due, and by hand to repair a trigger that was lost.
         "advance" => crate::cycle::advance(store, args),
@@ -3723,6 +3725,31 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
 /// because it defers rather than opts out. `-n` is a dry run of the whole verb:
 /// what it would record, what it would sweep, and what the group that landed
 /// touched, with nothing written and nothing removed.
+/// `wsp worklist pickup`: the daemon's pass over the planned lists (`wsp-384`),
+/// once and now — for a repair when the daemon is not running, and for looking
+/// at the pickup in a sandbox without waiting for a tick. It starts the first
+/// planned list that may start, exactly as the daemon would, and says which.
+fn pickup(store: &Store) -> i32 {
+    match crate::pickup::tick(store) {
+        Some(id) => println!("{id} started — {} ", crate::pickup::wip_lines(store).last().cloned().unwrap_or_default()),
+        None => println!("no planned list may start — `wsp worklist ls` says what each waits on"),
+    }
+    0
+}
+
+/// Start a `planned` list on the daemon's say-so (`wsp-384`): `go`, with the
+/// reason as its sentence and `--if-planned` so the write itself refuses a
+/// list that is no longer planned. 0 started; 3 it was not planned any more;
+/// anything else is `go`'s own refusal (a member already in another run).
+pub(crate) fn start_planned(store: &Store, id: &str, why: &str, caption: &str) -> i32 {
+    let a = Args::synth(
+        "worklist",
+        &["go", id, why],
+        &[("if-planned", "true"), ("caption", caption), ("quiet", "true")],
+    );
+    go(store, &a)
+}
+
 pub fn go(store: &Store, args: &Args) -> i32 {
     let (w, said, seat) = match list_and_words(store, args) {
         Ok(v) => v,
@@ -4011,7 +4038,21 @@ fn go_with(
 
     let msg = format!("go {}", w.id);
     if !dry {
-        let saved = save(store, &mut w, &groups, "go", &msg);
+        // **The daemon's pickup starts only a list that is still `planned`**
+        // (`wsp-384`), and asks it here, at the write, under the store's lock:
+        // a person who set the list back to `init` while the pickup was
+        // deciding wins, and nothing is started. A flag of the verb and not a
+        // private entry, so it is the same `go` and a person may say it too.
+        let saved = store.locked(|| {
+            if args.has("if-planned") {
+                let now = store.worklist(&w.id);
+                if !now.as_ref().is_some_and(|n| n.is_planned() && n.status() == WorklistStatus::Draft) {
+                    eprintln!("wsp: `{}` is not planned any more — nothing started", w.id);
+                    return 3;
+                }
+            }
+            save(store, &mut w, &groups, "go", &msg)
+        });
         if saved != 0 {
             return saved;
         }
@@ -4034,6 +4075,12 @@ fn go_with(
         (false, Some(n)) => crate::cycle::end_checks_when_idle(store, &w.id, n),
         _ => Vec::new(),
     };
+
+    // The daemon's pickup (`wsp-384`) wants the start and nothing printed: its
+    // stdout is a log, and the report below is for a person at a terminal.
+    if args.has("quiet") && !dry {
+        return 0;
+    }
 
     // Read here rather than at the top, because `go` is what puts the list
     // into `running` and a list is only asked ahead of a project chain once it

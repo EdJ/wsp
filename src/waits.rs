@@ -242,16 +242,53 @@ fn free_places(store: &Store) -> Option<usize> {
     Some(cap.saturating_sub(gate.working().len()))
 }
 
+/// What the machine says right now, the two readings [`queue`] cannot get from
+/// the store: the places free under the seat's cap, and the load warning.
+/// Separate from [`read_on`] so a test can say what the machine says.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Machine {
+    /// Places free under the cap; `None` where there is no cap.
+    pub free: Option<usize>,
+    /// The cap itself, for the sentence that says what room there was.
+    pub cap: Option<usize>,
+    pub throttled: bool,
+}
+
+impl Machine {
+    /// The machine as it is: the seats counted as `wsp-353` counts them, and
+    /// `wsp throttle`'s own answer.
+    pub fn now(store: &Store) -> Machine {
+        Machine { free: free_places(store), cap: store.seat_cap(), throttled: crate::throttle::holding_back(store) }
+    }
+}
+
+/// One planned list in queue order: whether it may start, and what its first
+/// group would take, which is what the room was judged against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub id: String,
+    pub wait: Option<Wait>,
+    pub need: usize,
+}
+
 /// The planned lists among `listed`, in queue order, each with what it waits
 /// on. Reads the seats only when there is a planned list to answer for.
 pub fn read(store: &Store, listed: &[Listed]) -> Vec<(String, Option<Wait>)> {
+    read_on(store, listed, None).into_iter().map(|r| (r.id, r.wait)).collect()
+}
+
+/// [`read`] with each list's need beside its answer, and the machine given
+/// where the caller has it already (`None` reads it). The daemon's pickup is
+/// the other caller, and it needs the need to say how much room there was.
+pub fn read_on(store: &Store, listed: &[Listed], machine: Option<Machine>) -> Vec<Row> {
     let planned: Vec<&Listed> = listed.iter().filter(|l| l.phase(store).status == ListStatus::Planned).collect();
     if planned.is_empty() {
         return Vec::new();
     }
     let seat_cap = store.seat_cap();
-    let entries = planned.iter().map(|l| entry_of(store, l, seat_cap)).collect();
-    let mut world = World { free: free_places(store), throttled: crate::throttle::holding_back(store), ..World::default() };
+    let entries: Vec<Entry> = planned.iter().map(|l| entry_of(store, l, seat_cap)).collect();
+    let machine = machine.unwrap_or_else(|| Machine::now(store));
+    let mut world = World { free: machine.free, throttled: machine.throttled, ..World::default() };
     for l in listed {
         match l.phase(store).status {
             ListStatus::Complete | ListStatus::Closed => {
@@ -261,7 +298,27 @@ pub fn read(store: &Store, listed: &[Listed]) -> Vec<(String, Option<Wait>)> {
             _ => {}
         }
     }
+    let need: std::collections::BTreeMap<String, usize> = entries.iter().map(|e| (e.id.clone(), e.need)).collect();
     queue(entries, &world)
+        .into_iter()
+        .map(|(id, wait)| Row { need: need.get(&id).copied().unwrap_or(0), id, wait })
+        .collect()
+}
+
+impl Wait {
+    /// What the wait is, without its numbers: `room`, `after pre-prep`. The
+    /// pickup records this, so the line it tells when the list starts can say
+    /// what it had been waiting on without a different count in it every tick.
+    pub fn kind(&self) -> String {
+        match self {
+            Wait::Room { .. } => "room".into(),
+            Wait::Throttle => "throttle".into(),
+            Wait::After(other) => format!("after {other}"),
+            Wait::Alone(other) => format!("alone with {other}"),
+            Wait::Manual => "manual group".into(),
+            Wait::Empty => "no groups".into(),
+        }
+    }
 }
 
 /// The line `ls` and `next` print after a planned list: `may start`, or what

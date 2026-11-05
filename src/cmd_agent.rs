@@ -3923,11 +3923,20 @@ pub fn where_am_i(store: &Store, args: &Args) -> i32 {
 pub fn wip(store: &Store, args: &Args) -> i32 {
     let w = Wip::live(store);
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
+    // wsp-384: the planned lists wsp started on its own, for a day after.
+    let picked_up = crate::pickup::wip_lines(store);
     match args.json() {
         true => {
             let mut v = wip_json(&w);
             if let (Some(o), false) = (v.as_object_mut(), cap_waits.is_empty()) {
                 o.insert("waiting_at_cap".into(), serde_json::json!(cap_waits));
+            }
+            if let (Some(o), false) = (v.as_object_mut(), picked_up.is_empty()) {
+                let started: Vec<serde_json::Value> = crate::pickup::started_lately(store)
+                    .into_iter()
+                    .map(|(at, id, why)| serde_json::json!({ "at": at, "worklist": id, "why": why }))
+                    .collect();
+                o.insert("planned_started".into(), serde_json::json!(started));
             }
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default())
         }
@@ -3938,6 +3947,12 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
             if !cap_waits.is_empty() {
                 println!();
                 for l in cap_waits {
+                    println!("{l}");
+                }
+            }
+            if !picked_up.is_empty() {
+                println!();
+                for l in picked_up {
                     println!("{l}");
                 }
             }

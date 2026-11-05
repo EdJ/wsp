@@ -736,6 +736,16 @@ impl Store {
         Ok(())
     }
 
+    /// `pickup.json`: what the daemon's pickup of planned lists has seen and
+    /// done (`wsp-384`) — [`crate::pickup`] owns its shape.
+    pub(crate) fn pickup(&self) -> Value {
+        self.read_json("pickup.json")
+    }
+
+    pub(crate) fn update_pickup(&self, f: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+        self.update_json("pickup.json", f)
+    }
+
     /// list -> what the run is holding back at the seat's cap, and since when:
     /// so `cycle.log` says each one once and not on every tick. `wsp-231`.
     pub fn capped(&self) -> BTreeMap<String, Value> {
