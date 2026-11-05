@@ -40,6 +40,7 @@ use std::sync::Mutex;
 
 use crate::cmd_checkout::{self, Tree, WORKTREES};
 use crate::cmd_verify::git;
+use crate::place::Place;
 use crate::store::Store;
 use crate::util;
 
@@ -194,35 +195,48 @@ pub(crate) fn strays(lsof: &str, dir: &Path, keep: &[u32]) -> Vec<u32> {
     pids_in(lsof, dir).into_iter().filter(|p| !keep.contains(p)).collect()
 }
 
-/// Every process of every seat that is open now, on every backend that answers:
-/// the roots and everything under them. A seat's processes are ended by its
-/// own close and by nothing else.
-fn seated() -> Vec<u32> {
-    let herdr_here = crate::herdr::available_now();
+/// Every process of every seat that is open now on `backends`: the roots and
+/// everything under them. A seat's processes are ended by its own close and by
+/// nothing else.
+///
+/// `None` when no backend answered: a census that failed says nothing about
+/// whose processes are whose, so the caller signals nothing.
+fn seated(backends: &[&dyn Place]) -> Option<Vec<u32>> {
     let mut out = Vec::new();
-    for (backend, name) in
-        crate::cmd_spawn::local_backends().into_iter().zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES)
-    {
-        if name == "herdr" && !herdr_here {
-            continue;
-        }
+    let mut heard = false;
+    for backend in backends {
         let Ok(census) = backend.census() else { continue };
+        heard = true;
         for seat in census.seats() {
             out.extend(backend.pids(&seat.seat).unwrap_or_default());
             out.extend(backend.root(&seat.seat));
         }
     }
-    out
+    heard.then_some(out)
 }
 
 /// What is running with `dir` as its working directory, other than this process
-/// and its parents, and other than a seat's.
-fn running_in(dir: &Path) -> Vec<u32> {
+/// and its parents, and other than a seat's of `backends`.
+fn running_among(dir: &Path, backends: &[&dyn Place]) -> Vec<u32> {
     let Ok(out) = std::process::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output() else { return Vec::new() };
+    let Some(seats) = seated(backends) else { return Vec::new() };
     let dir = util::real(&dir.display().to_string());
     let mut keep = crate::cmd_sandbox::ancestors(&crate::cmd_sandbox::processes());
-    keep.extend(seated());
+    keep.extend(seats);
     strays(&String::from_utf8_lossy(&out.stdout), &dir, &keep)
+}
+
+/// [`running_among`] the backends wsp can spawn onto here.
+fn running_in(dir: &Path) -> Vec<u32> {
+    let herdr_here = crate::herdr::available_now();
+    let all = crate::cmd_spawn::local_backends();
+    let here: Vec<&dyn Place> = all
+        .iter()
+        .zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES)
+        .filter(|(_, name)| *name != "herdr" || herdr_here)
+        .map(|(b, _)| b.as_ref())
+        .collect();
+    running_among(dir, &here)
 }
 
 /// Stop the dev servers and watchers a check left running in its tree (a Vite
@@ -622,6 +636,52 @@ mod tests {
         assert_eq!(strays(lsof, dir, &[]), vec![10, 11, 12]);
         // 11 is a member's supervisor, 13 a governor's; 10 and 12 are servers.
         assert_eq!(strays(lsof, dir, &[11, 13]), vec![10, 12]);
+    }
+
+    /// `wsp-388` where it happened: a seat whose process stands in a check's
+    /// tree by cwd, beside a dev server that does too. What `stop_running`
+    /// would signal is the server alone. Dropping the seats from the keep-set
+    /// (`running_among`) makes this fail.
+    #[test]
+    fn what_ending_a_check_would_signal_leaves_a_seat_standing_in_its_tree_alone() {
+        use crate::place::{Order, Seat};
+        use crate::place_compound::Compound;
+        use std::os::unix::process::CommandExt;
+        let root = std::env::temp_dir().join(format!("wsp-388-{}-{}", std::process::id(), util::epoch_nanos()));
+        let tree = root.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let place = Compound::at(root.join("seats"));
+        let seat: Seat = place.open(&Order { label: "member".into(), ..Order::default() }).unwrap();
+        let stood = |group: bool| {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("60").current_dir(&tree).stdin(std::process::Stdio::null());
+            if group {
+                c.process_group(0);
+            }
+            c.spawn().unwrap()
+        };
+        let mut supervisor = stood(true);
+        let mut server = stood(false);
+        place.record_pid_for_test(&seat, supervisor.id());
+
+        let tree = util::real(&tree.display().to_string());
+        let found = running_among(&tree, &[&place as &dyn Place]);
+        let _ = supervisor.kill();
+        let _ = server.kill();
+        let _ = supervisor.wait();
+        let _ = server.wait();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(found.contains(&server.id()), "the server in the tree is the tree's: {found:?}");
+        assert!(!found.contains(&supervisor.id()), "a seat's process was named for stopping: {found:?}");
+    }
+
+    /// With no backend answering there is nothing to tell a seat from a
+    /// stray, so nothing is named.
+    #[test]
+    fn with_no_backend_answering_nothing_is_named_for_stopping() {
+        assert!(seated(&[]).is_none());
+        assert!(running_among(Path::new("/"), &[]).is_empty());
     }
 
     /// The trees of 2026-11-05: `npm ci` and a dev server left `node_modules/`,

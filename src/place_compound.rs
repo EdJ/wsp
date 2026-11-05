@@ -128,7 +128,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -188,6 +188,21 @@ impl Compound<'static> {
             insist: false,
             clock: &util::Wall,
         }
+    }
+
+    /// A test's seat made to name `pid` as its process, for a caller that is
+    /// asking whose processes are whose. `open` may have started a real
+    /// supervisor; it is ended first, since the record that would find it is
+    /// the one being replaced (`compound-127`).
+    #[cfg(test)]
+    pub(crate) fn record_pid_for_test(&self, seat: &Seat, pid: u32) {
+        let mut rec = self.record(seat).unwrap();
+        if let Some(old) = rec.get("pid").and_then(|p| p.as_u64()) {
+            signal_group(old as u32, "KILL");
+        }
+        rec["pid"] = json!(pid);
+        rec["agent"] = json!({ "kind": "claude", "name": "a", "args": [] });
+        write_atomic(&self.dir_of(seat).unwrap().join(SEAT_FILE), &rec.to_string()).unwrap();
     }
 
     /// The same backend, willing to deliver to a seat that cannot vouch for
@@ -1137,25 +1152,12 @@ fn press_enter(stream: &mut UnixStream) -> Result<()> {
 }
 
 impl Compound<'_> {
-    /// `compound-sup spawn --label <seat> …` and nothing more: no `--socket`
-    /// (see the module docs on why this backend does not mint into
-    /// compound's run directory itself), `program`/`args` as the pty's own
-    /// child so a person who attaches sees exactly that and nothing wrapping
-    /// it. Shared by [`Place::start`] (an agent's own argv) and
-    /// [`Place::open`] (a bare shell, `compound-081`) — everything below the
-    /// choice of what runs in the pty is one path, not two.
+    /// The `compound-sup spawn` command for a seat, not yet run.
     ///
-    /// Returns `rec` with `pid`/`socket`/`started_at` folded in; the caller
-    /// decides what else changed (`start` adds `agent`; `open` adds
-    /// nothing) and writes it.
-    fn spawn_sup(&self, seat: &Seat, rec: &Value, program: &str, args: &[String]) -> Result<Value> {
-        let Some(sup) = compound_sup_binary() else {
-            return Err(Refusal::Backend(
-                "compound-sup not found — set $COMPOUND_SUP or put it on PATH".into(),
-            ));
-        };
-
-        let mut cmd = Command::new(&sup);
+    /// A function of its own so what it stands in is asserted without a
+    /// supervisor: `wsp-388`.
+    fn sup_command(sup: &Path, seat: &Seat, rec: &Value, program: &str, args: &[String]) -> Command {
+        let mut cmd = Command::new(sup);
         cmd.arg("spawn").args(["--label", seat.as_str()]);
         let cwd = str_of(rec, "cwd");
         if !cwd.is_empty() {
@@ -1194,7 +1196,28 @@ impl Compound<'_> {
             cmd.current_dir("/");
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd
+    }
 
+    /// `compound-sup spawn --label <seat> …` and nothing more: no `--socket`
+    /// (see the module docs on why this backend does not mint into
+    /// compound's run directory itself), `program`/`args` as the pty's own
+    /// child so a person who attaches sees exactly that and nothing wrapping
+    /// it. Shared by [`Place::start`] (an agent's own argv) and
+    /// [`Place::open`] (a bare shell, `compound-081`) — everything below the
+    /// choice of what runs in the pty is one path, not two.
+    ///
+    /// Returns `rec` with `pid`/`socket`/`started_at` folded in; the caller
+    /// decides what else changed (`start` adds `agent`; `open` adds
+    /// nothing) and writes it.
+    fn spawn_sup(&self, seat: &Seat, rec: &Value, program: &str, args: &[String]) -> Result<Value> {
+        let Some(sup) = compound_sup_binary() else {
+            return Err(Refusal::Backend(
+                "compound-sup not found — set $COMPOUND_SUP or put it on PATH".into(),
+            ));
+        };
+
+        let mut cmd = Self::sup_command(&sup, seat, rec, program, args);
         let mut child = cmd.spawn().map_err(|e| Refusal::Backend(format!("{} did not start: {e}", sup.display())))?;
         let pid = child.id();
         let Some(stdout) = child.stdout.take() else {
@@ -1651,6 +1674,17 @@ mod tests {
             }
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// `wsp-388`: the supervisor is started from `/`, not from the directory
+    /// `wsp spawn` ran in; the agent's own directory is `--cwd`.
+    #[test]
+    fn the_supervisor_is_started_standing_nowhere_and_the_agent_where_it_was_told() {
+        let rec = json!({ "cwd": "/tmp/somewhere" });
+        let cmd = Compound::sup_command(Path::new("compound-sup"), &Seat::new("cpd-1"), &rec, "cat", &[]);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w == ["--cwd", "/tmp/somewhere"]), "{args:?}");
     }
 
     /// **`wsp-388`: ending one seat ends that seat's process tree and nothing
