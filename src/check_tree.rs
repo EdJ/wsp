@@ -243,11 +243,12 @@ fn running_in(dir: &Path) -> Vec<u32> {
 /// server, `tsgo` and Vitest watchers were still up 21 hours after their
 /// check, `wsp-373`): `TERM`, a moment, then `KILL` for what is left. A process
 /// whose working directory is in the tree is the tree's unless it is a seat's
-/// ([`strays`]). Returns how many were stopped. Not under test: it would signal
-/// the machine's own processes; [`strays`] is what the tests drive.
-fn stop_running(dir: &Path) -> usize {
+/// ([`strays`]). Returns the pids sent `TERM` and the pids sent `KILL`. Not
+/// under test: it would signal the machine's own processes; [`strays`] is what
+/// the tests drive.
+fn stop_running(dir: &Path) -> (Vec<u32>, Vec<u32>) {
     if cfg!(test) {
-        return 0;
+        return (Vec::new(), Vec::new());
     }
     let signal = |sig: &str, pids: &[u32]| {
         if !pids.is_empty() {
@@ -261,17 +262,31 @@ fn stop_running(dir: &Path) -> usize {
     };
     let found = running_in(dir);
     signal("-TERM", &found);
+    let mut killed = Vec::new();
     if !found.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        signal("-KILL", &running_in(dir));
+        killed = running_in(dir);
+        signal("-KILL", &killed);
     }
-    found.len()
+    (found, killed)
+}
+
+/// The `cycle.log` line for what ending a tree signalled, so a run read
+/// afterwards says which processes a check's end took (`wsp-388`). `None` when
+/// nothing was signalled.
+pub(crate) fn signalled_line(path: &str, term: &[u32], kill: &[u32]) -> Option<String> {
+    let list = |pids: &[u32]| pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+    match (term.is_empty(), kill.is_empty()) {
+        (true, _) => None,
+        (false, true) => Some(format!("stopped in barrier check tree {path}: TERM {}", list(term))),
+        (false, false) => Some(format!("stopped in barrier check tree {path}: TERM {}, KILL {}", list(term), list(kill))),
+    }
 }
 
 /// Take the tree at `dir`, of the repository at `repo`, unless somebody is in
 /// it or something is. What its check left running is stopped only once the
 /// tree is known to be going; a tree that is kept keeps its servers.
-fn take(repo: &Path, dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
+fn take(store: &Store, repo: &Path, dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
     let path = util::contract(dir);
     if let Some(why) = standing(dir) {
         return Tree::Kept { path, why };
@@ -281,7 +296,10 @@ fn take(repo: &Path, dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> 
         Some(found) if !found.is_empty() => Tree::Kept { path, why: holds_more(&found) },
         Some(_) => {
             // Only a tree that is going: a kept one keeps its servers.
-            stop_running(dir);
+            let (term, kill) = stop_running(dir);
+            if let Some(line) = signalled_line(&path, &term, &kill) {
+                crate::cycle::log_line(store, &line);
+            }
             Tree::Removed { path, kept: cmd_checkout::remove(repo, dir).kept }
         }
     }
@@ -331,7 +349,7 @@ pub(crate) fn discard(store: &Store, name: &str, standing: &dyn Fn(&Path) -> Opt
             why: "its check is still open — the tick takes it once the check has settled".into(),
         };
     }
-    take(&repo, &dir, &Residue::of(store, &repo), standing)
+    take(store, &repo, &dir, &Residue::of(store, &repo), standing)
 }
 
 /// Every check tree on disk whose check is nobody's, taken on the rule.
@@ -352,7 +370,7 @@ pub(crate) fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -
             if in_use(store, &list, at) {
                 continue;
             }
-            out.push(take(&repo, &dir, &residue, standing));
+            out.push(take(store, &repo, &dir, &residue, standing));
         }
     }
     out
@@ -636,6 +654,20 @@ mod tests {
         assert_eq!(strays(lsof, dir, &[]), vec![10, 11, 12]);
         // 11 is a member's supervisor, 13 a governor's; 10 and 12 are servers.
         assert_eq!(strays(lsof, dir, &[11, 13]), vec![10, 12]);
+    }
+
+    /// What a check's end signalled is said in `cycle.log`, by tree and pid.
+    #[test]
+    fn what_ending_a_tree_signalled_is_one_line_naming_the_tree_and_the_pids() {
+        assert_eq!(signalled_line("~/r/.worktrees/x-check-1", &[], &[]), None);
+        assert_eq!(
+            signalled_line("~/r/.worktrees/x-check-1", &[10, 12], &[]).as_deref(),
+            Some("stopped in barrier check tree ~/r/.worktrees/x-check-1: TERM 10 12")
+        );
+        assert_eq!(
+            signalled_line("~/r/.worktrees/x-check-1", &[10, 12], &[12]).as_deref(),
+            Some("stopped in barrier check tree ~/r/.worktrees/x-check-1: TERM 10 12, KILL 12")
+        );
     }
 
     /// `wsp-388` where it happened: a seat whose process stands in a check's
