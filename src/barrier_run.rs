@@ -387,8 +387,13 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     let plan = plan(store, &w, at);
     let started = Instant::now();
     let mut ranged: Vec<Ranged> = Vec::new();
+    // What a copy of this run spent waiting for the tree lock behind another is
+    // not the run's own time, and the line below does not count it.
+    let mut waited = std::time::Duration::ZERO;
     for unit in &plan.units {
-        ranged.push(run_unit(store, unit, &format!("barrier {list} {at}")));
+        let (r, w) = run_unit_timed(store, unit, &format!("barrier {list} {at}"));
+        waited += w;
+        ranged.push(r);
     }
     let landed = crate::worklist::touched(store, &g.members).landed;
     let mut blames = Vec::new();
@@ -448,7 +453,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
         &format!(
             "{list} group {at}: barrier run — {count} step(s), {reused} reused, {ran_n} ran, {} failed, {}s{}{}",
             failed.len(),
-            started.elapsed().as_secs(),
+            started.elapsed().saturating_sub(waited).as_secs(),
             // Per-step seconds of the steps that ran: `wsp timeline` reads them (`wsp-390`).
             if per_step.is_empty() { String::new() } else { format!(" · per step: {}", per_step.join("; ")) },
             if decision.would_pass && !on { " · would pass without an agent (auto-pass is off)" } else { "" }
@@ -477,13 +482,41 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     0
 }
 
+/// Whether the run recorded on group `at`'s open check holds the tree lock of
+/// one of its units and is alive: a run in its steps, whatever `ps` says of it.
+pub(crate) fn holds_lock(store: &Store, w: &Worklist, at: usize) -> bool {
+    let groups = w.groups();
+    let Some(pid) = groups.get(at - 1).and_then(barrier::run_pid) else { return false };
+    plan(store, w, at).units.iter().any(|u| check::TreeLock::held_by(&check::barrier_dir(store, &u.project, &u.repo).join("lock"), pid))
+}
+
 fn run_unit(store: &Store, unit: &Unit, who: &str) -> Ranged {
+    run_unit_timed(store, unit, who).0
+}
+
+/// [`run_unit`], and how long it waited for the tree lock. A wait is said in
+/// the log, with whose lock it was.
+fn run_unit_timed(store: &Store, unit: &Unit, who: &str) -> (Ranged, std::time::Duration) {
     if unit.items.is_empty() {
-        return Ranged::Ran(Vec::new());
+        return (Ranged::Ran(Vec::new()), std::time::Duration::ZERO);
     }
     let dir = check::barrier_dir(store, &unit.project, &unit.repo);
+    let before = Instant::now();
+    let lock = check::TreeLock::take_saying(dir.join("lock"), check::TREE_WAIT, |by| {
+        let by = match by {
+            Some((pid, since)) => format!("pid {pid}, since {since}"),
+            None => "another run".to_string(),
+        };
+        crate::cycle::log_line(store, &format!("{who}: waits for the tree lock in {} — held by {by}", util::contract(&dir)));
+    });
+    // Everything up to the lock is waiting; the checkout and the steps are not.
+    let waited = if lock.is_ok() { before.elapsed() } else { std::time::Duration::ZERO };
+    (run_unit_locked(store, unit, who, &dir, lock), waited)
+}
+
+fn run_unit_locked(store: &Store, unit: &Unit, who: &str, dir: &std::path::Path, lock: Result<check::TreeLock, String>) -> Ranged {
     let tree = dir.join("tree");
-    let lock = match check::TreeLock::take(dir.join("lock"), check::TREE_WAIT) {
+    let lock = match lock {
         Ok(l) => l,
         Err(why) => return Ranged::Could(why),
     };

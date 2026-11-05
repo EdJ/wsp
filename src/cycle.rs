@@ -971,7 +971,14 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 } else {
                     crate::barrier::Mechanical::No
                 };
-                if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, mech, &gone, &admit) {
+                // A run that holds the tree lock is alive, whatever a liveness
+                // probe says of its pid: it is not started again, for the
+                // copy would only wait on the lock behind it.
+                if crate::barrier::run_died(g) && crate::barrier_run::holds_lock(store, &w, at) {
+                    if all {
+                        log_line(store, &format!("{} group {at}: its barrier run holds the tree lock — waiting for its result", w.id));
+                    }
+                } else if let Some(o) = crate::barrier::open_within(store, &w, at, trunk_tip(store, &w.id), on, mech, &gone, &admit) {
                     if let Some(pid) = o.died {
                         log_line(store, &format!(
                             "{} group {at}: its barrier run ended without a result (pid {pid}), starting it again (try {} of {})",

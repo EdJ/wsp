@@ -186,6 +186,12 @@ impl Run {
 /// When process `pid` started, as `ps` says it, or `None` where there is none.
 fn start_of(pid: u32) -> Result<Option<String>, ()> {
     let out = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
+    // `ps` says there is no such process by exiting 1 with nothing printed. Any
+    // other end — killed, out of processes, a failure under load — says nothing
+    // about the pid, and a live run is not read as dead on it.
+    if out.status.code() != Some(0) && !(out.status.code() == Some(1) && out.stdout.iter().all(u8::is_ascii_whitespace)) {
+        return Err(());
+    }
     let s = String::from_utf8_lossy(&out.stdout);
     let s = s.split_whitespace().collect::<Vec<_>>().join("_");
     Ok((!s.is_empty()).then_some(s))
@@ -714,6 +720,11 @@ pub(crate) fn note_pid(store: &Store, list: &str, at: usize) -> bool {
     })
 }
 
+/// The pid of the open check's mechanical run on `g`, while it reads as running.
+pub(crate) fn run_pid(g: &Group) -> Option<u32> {
+    running(g).filter(|c| c.suite == Some(Suite::Running)).and_then(|c| c.run.as_ref()).map(|r| r.pid)
+}
+
 /// Whether the open check on `g` is a mechanical run whose process has died.
 pub(crate) fn run_died(g: &Group) -> bool {
     running(g).is_some_and(Check::run_died)
@@ -984,6 +995,14 @@ fn apply(store: &Store, plan: &Plan) -> Result<usize, String> {
 mod tests {
     use super::*;
     use crate::model::{parse_groups, render_groups};
+
+    #[test]
+    fn this_process_is_not_gone_and_a_pid_nothing_has_is() {
+        let me = Run::this().unwrap();
+        assert!(!me.gone());
+        let none = Run { pid: 4_000_000, started: me.started.clone() };
+        assert!(none.gone());
+    }
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
         let env = util::isolated(&format!("barrier-{tag}"));

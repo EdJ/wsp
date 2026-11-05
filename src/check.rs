@@ -555,7 +555,14 @@ pub(crate) struct TreeLock(PathBuf);
 
 impl TreeLock {
     pub(crate) fn take(path: PathBuf, wait: Duration) -> Result<TreeLock, String> {
+        Self::take_saying(path, wait, |_| {})
+    }
+
+    /// [`take`](Self::take), saying once — to `said`, with who has it and since
+    /// when — if the lock is held, so a run that waits behind another names it.
+    pub(crate) fn take_saying(path: PathBuf, wait: Duration, mut said: impl FnMut(Option<(u32, String)>)) -> Result<TreeLock, String> {
         let start = Instant::now();
+        let mut told = false;
         loop {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -571,6 +578,10 @@ impl TreeLock {
                         let _ = std::fs::remove_file(&path);
                         continue;
                     }
+                    if !told {
+                        told = true;
+                        said(Self::holder(&path));
+                    }
                     if start.elapsed() > wait {
                         return Err(format!("the tree has been in use for {}s", wait.as_secs()));
                     }
@@ -579,6 +590,21 @@ impl TreeLock {
                 Err(e) => return Err(format!("{}: {e}", util::contract(&path))),
             }
         }
+    }
+
+    /// Who holds the lock and since when, as the file says; `None` where it is
+    /// not there or does not read.
+    pub(crate) fn holder(path: &Path) -> Option<(u32, String)> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let mut it = text.split_whitespace();
+        let pid = it.next()?.parse().ok()?;
+        Some((pid, it.next().unwrap_or_default().to_string()))
+    }
+
+    /// Whether process `pid` holds the lock at `path` and is alive: `kill -0`
+    /// is a better witness of a live process than a `ps` that can fail empty.
+    pub(crate) fn held_by(path: &Path, pid: u32) -> bool {
+        Self::holder(path).is_some_and(|(p, _)| p == pid) && !Self::dead(path)
     }
 
     /// Whether the pid in the lock is gone, which is the only reason to break one.
@@ -1640,6 +1666,22 @@ mod tests {
 
     fn step(text: &str) -> Step {
         parse_steps(text, Of::Project).remove(0)
+    }
+
+    #[test]
+    fn a_tree_lock_names_its_holder_and_a_wait_behind_it_says_so_once() {
+        let env = util::isolated("check-lock-said");
+        let path = env.state().join("lock");
+        let held = TreeLock::take(path.clone(), Duration::from_secs(1)).unwrap();
+        assert!(TreeLock::held_by(&path, std::process::id()));
+        assert!(!TreeLock::held_by(&path, std::process::id() + 1));
+        let mut said = Vec::new();
+        let r = TreeLock::take_saying(path.clone(), Duration::from_secs(0), |by| said.push(by));
+        assert!(r.is_err());
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].as_ref().map(|(p, _)| *p), Some(std::process::id()));
+        drop(held);
+        assert!(!TreeLock::held_by(&path, std::process::id()));
     }
 
     #[test]
