@@ -1539,13 +1539,18 @@ pub enum WorklistStatus {
 impl WorklistStatus {
     pub fn parse(s: &str) -> Option<WorklistStatus> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "draft" => Some(WorklistStatus::Draft),
-            "running" => Some(WorklistStatus::Running),
+            // The words of wsp-382's six statuses fold onto the five this
+            // enum has: `init` is the draft, `planned` is a draft somebody
+            // has planned (the stored word is kept — see
+            // [`Worklist::list_status`]), `executing` is the run, and
+            // `complete`/`cancelled` are the run being over.
+            "draft" | "init" | "planned" => Some(WorklistStatus::Draft),
+            "running" | "executing" => Some(WorklistStatus::Running),
             "held" | "hold" => Some(WorklistStatus::Held),
             // The task vocabulary's spellings, because `parked` is the task
             // status this one matches and somebody will type either.
             "parked" | "park" | "paused" | "pause" => Some(WorklistStatus::Parked),
-            "done" | "closed" => Some(WorklistStatus::Done),
+            "done" | "closed" | "complete" | "cancelled" | "canceled" => Some(WorklistStatus::Done),
             _ => None,
         }
     }
@@ -2361,6 +2366,10 @@ pub struct Worklist {
     /// for a list with no outputs at all. Absent is the two defaults, `work`
     /// and `effort`. Read by [`crate::cmd_report`].
     pub outputs: Option<String>,
+    /// `planned:` — when the list was last set `planned` (`wsp-382`), which is
+    /// the queue's tie-break between two lists of one priority. Absent on a
+    /// list never planned.
+    pub planned: Option<String>,
     pub body: String,
 }
 
@@ -2376,6 +2385,7 @@ impl Worklist {
             project: None,
             made_in: None,
             outputs: None,
+            planned: None,
             body: String::new(),
         }
     }
@@ -2396,6 +2406,36 @@ impl Worklist {
         self.status_raw = s.as_str().to_string();
     }
 
+    /// The stored word, lowered: what [`Worklist::list_status`] reads, since
+    /// `planned` and `cancelled` are stored words that [`Worklist::status`]
+    /// folds onto `draft` and `done`.
+    fn stored_word(&self) -> String {
+        self.status_raw.trim().to_ascii_lowercase()
+    }
+
+    /// `planned` is stored as itself and read by every old caller as a draft:
+    /// a planned list has started nothing.
+    pub fn is_planned(&self) -> bool {
+        self.stored_word() == "planned"
+    }
+
+    /// `cancelled` is stored as itself and read by every old caller as `done`:
+    /// the run is over and nothing is left to want from it.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self.stored_word().as_str(), "cancelled" | "canceled")
+    }
+
+    /// `wsp worklist status … planned`: the stored word, and when.
+    pub fn set_planned(&mut self) {
+        self.status_raw = "planned".into();
+        self.planned = Some(util::now_iso());
+    }
+
+    /// `wsp worklist status … cancelled`.
+    pub fn set_cancelled(&mut self) {
+        self.status_raw = "cancelled".into();
+    }
+
     pub fn from_doc(doc: &Doc, fallback_id: &str) -> Worklist {
         let id = doc.opt("id").unwrap_or_else(|| fallback_id.to_string());
         Worklist {
@@ -2408,6 +2448,7 @@ impl Worklist {
             project: doc.opt("project").filter(|p| !p.trim().is_empty()),
             made_in: doc.opt("made_in").filter(|p| !p.trim().is_empty()),
             outputs: doc.opt("outputs").filter(|p| !p.trim().is_empty()),
+            planned: doc.opt("planned").filter(|p| !p.trim().is_empty()),
             body: doc.body.clone(),
         }
     }
@@ -2432,6 +2473,9 @@ impl Worklist {
         }
         if let Some(o) = &self.outputs {
             d.set_str("outputs", o);
+        }
+        if let Some(p) = &self.planned {
+            d.set_str("planned", p);
         }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();

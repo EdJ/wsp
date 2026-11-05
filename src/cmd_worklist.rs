@@ -135,6 +135,8 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "park" | "pause" => park(store, args),
         "resume" | "unpark" => resume(store, args),
         "done" | "finish" => done(store, args),
+        // wsp-382: the status field, and the three words a hand may set.
+        "status" => status(store, args),
         // `wsp-134`: the steps wsp takes itself. Started by the verbs that
         // make one due, and by hand to repair a trigger that was lost.
         "advance" => crate::cycle::advance(store, args),
@@ -1750,7 +1752,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     if args.json() {
         // No collapse and no `--all` here: an abridgement is a thing done for
         // a reader, and a parser is not one.
-        let out: Vec<_> = listed.iter().map(listed_json).collect();
+        let out: Vec<_> = listed.iter().map(|l| listed_json(store, l)).collect();
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -1758,7 +1760,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
         println!("no worklists yet — wsp worklist new <slug> \"title\"");
         return 0;
     }
-    for line in list_lines(&Paint::new(), &listed, all) {
+    for line in list_lines(store, &Paint::new(), &listed, all) {
         println!("{line}");
     }
     0
@@ -1770,7 +1772,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
 /// Built rather than printed so the segmenting can be asserted on. The width
 /// of the id column follows the widest slug drawn, so hiding the closed
 /// segment does not leave the table indented for a name that is not on it.
-fn list_lines(p: &Paint, listed: &[worklist::Listed], all: bool) -> Vec<String> {
+fn list_lines(store: &Store, p: &Paint, listed: &[worklist::Listed], all: bool) -> Vec<String> {
     let drawn: Vec<&worklist::Listed> =
         listed.iter().filter(|l| all || l.segment != Segment::Closed).collect();
     let hidden = listed.len() - drawn.len();
@@ -1779,7 +1781,7 @@ fn list_lines(p: &Paint, listed: &[worklist::Listed], all: bool) -> Vec<String> 
     let mut out = vec![format!(
         "{}  {}  {}  {}  {}  {}",
         p.dim(&util::pad("WORKLIST", w_id)),
-        p.dim(&util::pad("STATUS", 7)),
+        p.dim(&util::pad("STATUS", 9)),
         p.dim("GROUPS"),
         p.dim("AT"),
         p.dim("OPEN"),
@@ -1792,10 +1794,17 @@ fn list_lines(p: &Paint, listed: &[worklist::Listed], all: bool) -> Vec<String> 
             segment = Some(l.segment);
             out.push(p.dim(heading(l.segment)));
         }
+        let phase = l.phase(store);
+        // What an executing list is stood still for follows the title, so the
+        // columns before it keep their widths.
+        let flags = match phase.flags.words() {
+            w if w.is_empty() => String::new(),
+            w => p.dim(&format!("  · {}", w.join(" · "))),
+        };
         out.push(format!(
-            "{}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}{flags}",
             util::pad(&l.list.id, w_id),
-            util::pad(l.list.status().as_str(), 7),
+            util::pad(phase.status.word(), 9),
             util::pad(&l.at.of.to_string(), 6),
             util::pad(&at_mark(l), 2),
             util::pad(&count(l.open), 4),
@@ -1856,8 +1865,8 @@ fn count(n: usize) -> String {
 /// `AT` mark says only that one of them is not empty — so this is where a
 /// caller that wants to know *which* group, or *which* member, reads it
 /// without running `show`.
-fn listed_json(l: &worklist::Listed) -> serde_json::Value {
-    let mut out = worklist_json_at(&l.list, &l.at);
+fn listed_json(store: &Store, l: &worklist::Listed) -> serde_json::Value {
+    let mut out = worklist_json_at(&l.list, &l.at, l.phase(store));
     if let Some(o) = out.as_object_mut() {
         o.insert("segment".into(), json!(l.segment.word()));
         o.insert("open".into(), json!(l.open));
@@ -2158,7 +2167,7 @@ fn show_json(store: &Store, w: &Worklist, shared: &ShowShared, pos: &Position) -
     let groups = w.groups();
     let dangling = worklist::dangling(store, w);
     let past = history::of(w, &groups);
-    let mut head = worklist_json_at(w, pos);
+    let mut head = worklist_json_at(w, pos, worklist::phase(store, w, pos));
     head["project"] = home_json(shared.home(store, w).as_ref());
     let mut v = json!({
                 "worklist": head,
@@ -2289,7 +2298,8 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     println!("{}  {}", p.bold(&w.id), p.dim(&w.title));
     println!();
-    println!("{}  {}", p.dim(&util::pad("status", 8)), w.status().as_str());
+    let phase = worklist::phase(store, &w, &pos);
+    println!("{}  {}", p.dim(&util::pad("status", 8)), phase.text());
     // Where its seat stands (`wsp-263`): the project whose governor it answers
     // to, and which of the three answers that is — a home read off the members
     // moves when they do, and the reader deciding whether to state one wants to
@@ -5235,6 +5245,153 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     0
 }
 
+// ---- status -----------------------------------------------------------
+
+/// `wsp worklist status <slug> [init|planned|cancelled] [--why …]` (`wsp-382`).
+///
+/// **Three words are a hand's, and three are the run's.** `executing` is what
+/// `go` and the run make a list; `complete` is what the run's end makes it;
+/// `closed` is `wsp worklist done`. Setting one of those by hand would say a
+/// run began or ended that did not, so each is refused with the verb that
+/// reaches it. With no word, it says what the list's status is.
+///
+/// `planned` records when (the queue's tie-break), and is for a list nobody
+/// has started: a started list's way back is not a word, it is `park`.
+/// `cancelled` puts the list's open rows back to `todo`, unclaimed, and logs
+/// the why.
+pub fn status(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp worklist status <slug> [init|planned|cancelled] [--why \"…\"|--why -]");
+        return 2;
+    };
+    let mut w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let pos = worklist::position(store, &w, Reading::Settled);
+    let Some(word) = args.rest.get(2).map(|s| s.trim().to_ascii_lowercase()) else {
+        let phase = worklist::phase(store, &w, &pos);
+        if args.json() {
+            println!("{}", json!({ "worklist": w.id, "status": phase.status.word(), "flags": phase.flags.json(), "planned": w.planned }));
+        } else {
+            println!("{}  {}", w.id, phase.text());
+        }
+        return 0;
+    };
+    let why = match reason(args) {
+        Ok(why) => why,
+        Err(code) => return code,
+    };
+    let p = Paint::new();
+    let was = worklist::phase(store, &w, &pos).status;
+    match word.as_str() {
+        "executing" | "complete" | "closed" => {
+            let by = match word.as_str() {
+                "executing" => "`wsp worklist go` starts it, and the run keeps it executing",
+                "complete" => "the run makes a list complete when its last barrier is passed",
+                _ => "`wsp worklist done` closes it",
+            };
+            eprintln!("wsp: `{word}` is not set by hand — {by}");
+            return 1;
+        }
+        "init" | "planned" => {
+            if w.status() != WorklistStatus::Draft {
+                let how = match w.status() {
+                    WorklistStatus::Done if w.is_cancelled() => "it was cancelled",
+                    WorklistStatus::Done => "it is over",
+                    _ => "its run has started — `wsp worklist park` pauses one",
+                };
+                eprintln!("wsp: `{}` cannot go back to {word}: {how}", w.id);
+                return 1;
+            }
+            if word == "planned" {
+                w.set_planned();
+            } else {
+                w.set_status(WorklistStatus::Draft);
+            }
+            w.log(&match &why {
+                Some(why) => format!("status {} → {word} — {why}", was.word()),
+                None => format!("status {} → {word}", was.word()),
+            });
+        }
+        "cancelled" | "canceled" => {
+            if w.status() == WorklistStatus::Done {
+                eprintln!(
+                    "wsp: `{}` is already {} — there is nothing left to cancel",
+                    w.id,
+                    if w.is_cancelled() { "cancelled" } else { "over" }
+                );
+                return 1;
+            }
+            w.set_cancelled();
+            w.log(&match &why {
+                Some(why) => format!("cancelled — {why}"),
+                None => "cancelled".to_string(),
+            });
+        }
+        other => {
+            eprintln!("wsp: `{other}` is not a status a hand sets — init, planned or cancelled");
+            eprintln!("     executing, complete and closed belong to the run: `go`, the run's end, and `done`");
+            return 2;
+        }
+    }
+    let cancelling = w.is_cancelled();
+    let groups = w.groups();
+    let msg = format!("status {} {}", w.id, if cancelling { "cancelled" } else { word.as_str() });
+    let code = save(store, &mut w, &groups, "status", &msg);
+    if code != 0 {
+        return code;
+    }
+    let mut put_back: Vec<String> = Vec::new();
+    if cancelling {
+        // Whatever the run opened goes first, as `done` does, so no agent is
+        // left on a row that is about to be somebody else's again.
+        if matches!(was, worklist::ListStatus::Executing) {
+            crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, crate::cycle::Closing::Done);
+        }
+        let note = match &why {
+            Some(why) => format!("put back to todo: {} was cancelled — {why}", w.id),
+            None => format!("put back to todo: {} was cancelled", w.id),
+        };
+        for id in groups.iter().flat_map(|g| g.members.iter()) {
+            let moved = store.locked(|| {
+                let Some(mut t) = store.find_task(id) else { return false };
+                if !t.status().is_open() {
+                    return false;
+                }
+                let was_claimed = store.clear_claim(&t.id);
+                if matches!(t.status(), Status::Doing | Status::Blocked | Status::Review) {
+                    t.set_status(Status::Todo);
+                    t.log(&note);
+                    t.touch();
+                    return store.save_task(&t).is_ok();
+                }
+                was_claimed
+            });
+            if moved {
+                put_back.push(id.clone());
+            }
+        }
+        if !put_back.is_empty() {
+            store.git_commit(&format!("wsp: worklist {} cancelled, rows put back", w.id));
+        }
+    }
+    store.log_event("worklist-status", json!({ "id": w.id, "from": was.word(), "to": if cancelling { "cancelled" } else { word.as_str() }, "why": why, "put_back": put_back }));
+    let now = if cancelling { "cancelled" } else { word.as_str() };
+    if args.json() {
+        println!("{}", json!({ "worklist": w.id, "status": now, "was": was.word(), "why": why, "planned": w.planned, "put_back": put_back }));
+        return 0;
+    }
+    println!("{} {}", p.bold(&w.id), p.dim(&format!("{} → {now}", was.word())));
+    if !put_back.is_empty() {
+        println!("{}", p.dim(&format!("{} open row(s) put back to todo, unclaimed: {}", put_back.len(), put_back.join(" "))));
+    }
+    0
+}
+
 // ---- edit -------------------------------------------------------------
 
 /// `wsp worklist edit <slug> --overview -` — the prose around the queue.
@@ -5357,7 +5514,8 @@ fn group_captions(store: &Store, groups: &[Group], archive: &std::cell::OnceCell
 /// stands — `project` is its home and how that was found, or `null` for a list
 /// that stands nowhere.
 fn worklist_json(store: &Store, w: &Worklist) -> serde_json::Value {
-    let mut v = worklist_json_at(w, &worklist::position(store, w, Reading::Settled));
+    let at = worklist::position(store, w, Reading::Settled);
+    let mut v = worklist_json_at(w, &at, worklist::phase(store, w, &at));
     v["project"] = home_json(worklist::home(store, w).as_ref());
     v
 }
@@ -5394,12 +5552,17 @@ fn home_line(p: &Paint, id: &str, home: Option<&worklist::Home>) -> String {
 /// `worklist::listing` and must not ask for a second one — two walks of the
 /// same groups is how a `--json` row comes to disagree with the table printed
 /// beside it, and it is the position that both of them are about.
-fn worklist_json_at(w: &Worklist, at: &Position) -> serde_json::Value {
+fn worklist_json_at(w: &Worklist, at: &Position, phase: worklist::Phase) -> serde_json::Value {
     json!({
         "id": w.id,
         "title": w.title,
         "caption": crate::caption::of_worklist(w).json(),
-        "status": w.status().as_str(),
+        // wsp-382: the six words, with the stand-still reasons beside them.
+        // `stored` is the word on the record, for a reader who wants it.
+        "status": phase.status.word(),
+        "flags": phase.flags.json(),
+        "stored": w.status_raw.trim(),
+        "planned": w.planned,
         "created": w.created,
         "groups": at.of,
         "at": at.at,
@@ -8251,7 +8414,7 @@ mod tests {
     }
 
     fn drawn(store: &Store, all: bool) -> Vec<String> {
-        list_lines(&Paint::new(), &worklist::listing(store, store.worklists()), all)
+        list_lines(store, &Paint::new(), &worklist::listing(store, store.worklists()), all)
     }
 
     fn row<'a>(lines: &'a [String], id: &str) -> Option<&'a String> {
@@ -8531,5 +8694,195 @@ mod tests {
         std::fs::write(out.join("notes.md"), "from the member").unwrap();
         assert_eq!(run(&store, &["go", "run", "it", "holds"]), 0);
         assert!(store.worklist("run").unwrap().groups()[0].verdict.contains("it holds"), "passed, with its sentence on the group");
+    }
+
+    // ---- wsp-382: the status field -----------------------------------------
+
+    /// A list on disk as an older build wrote it: the old word, a log, and
+    /// nothing else this build has added.
+    fn old_list(store: &Store, id: &str, status: &str, member: &str) {
+        run(store, &["new", id, id]);
+        run(store, &["add", id, member]);
+        no_outputs(store, id);
+        let mut w = store.worklist(id).unwrap();
+        w.status_raw = status.into();
+        w.log("a line from before, with `backticks` and  odd   spacing");
+        store.save_worklist(&w).unwrap();
+    }
+
+    fn status_of(store: &Store, id: &str) -> (String, serde_json::Value) {
+        let w = store.worklist(id).unwrap();
+        let pos = worklist::position(store, &w, Reading::Settled);
+        let v = worklist_json_at(&w, &pos, worklist::phase(store, &w, &pos));
+        (v["status"].as_str().unwrap().to_string(), v["flags"].clone())
+    }
+
+    /// Each old word is read as its new one — draft→init, running→executing,
+    /// done with rows still standing→complete, done with nothing standing→
+    /// closed — and reading rewrites nothing: the file, log and all, is the
+    /// same bytes after `ls`, `show` and both `--json`s as before.
+    #[test]
+    fn each_old_status_is_read_as_its_new_one_and_the_file_is_untouched() {
+        let (_env, store) = running("migrate");
+        task(&store, "m-1", "todo");
+        task(&store, "m-2", "todo");
+        task(&store, "m-3", "review");
+        task(&store, "m-4", "done");
+        old_list(&store, "a-draft", "draft", "m-1");
+        old_list(&store, "b-running", "running", "m-2");
+        old_list(&store, "c-unjudged", "done", "m-3");
+        old_list(&store, "d-closed", "done", "m-4");
+        crossed(&store, "c-unjudged", 1);
+        crossed(&store, "d-closed", 1);
+
+        let before: Vec<String> = ["a-draft", "b-running", "c-unjudged", "d-closed"]
+            .iter()
+            .map(|id| std::fs::read_to_string(store.worklist_path(id)).unwrap())
+            .collect();
+
+        assert_eq!(status_of(&store, "a-draft").0, "init");
+        assert_eq!(status_of(&store, "b-running").0, "executing");
+        assert_eq!(status_of(&store, "c-unjudged").0, "complete");
+        assert_eq!(status_of(&store, "d-closed").0, "closed");
+
+        assert_eq!(run(&store, &["ls", "--all"]), 0);
+        assert_eq!(flagged(&store, &["ls"], &[("json", "true")]), 0);
+        for id in ["a-draft", "b-running", "c-unjudged", "d-closed"] {
+            assert_eq!(flagged(&store, &["show", id], &[("json", "true")]), 0);
+            assert_eq!(run(&store, &["show", id]), 0);
+        }
+        let after: Vec<String> = ["a-draft", "b-running", "c-unjudged", "d-closed"]
+            .iter()
+            .map(|id| std::fs::read_to_string(store.worklist_path(id)).unwrap())
+            .collect();
+        assert_eq!(before, after, "reading a list does not rewrite it");
+        assert!(after[0].contains("a line from before, with `backticks` and  odd   spacing"));
+
+        let lines = drawn(&store, true);
+        for (id, word) in [("a-draft", "init"), ("b-running", "executing"), ("c-unjudged", "complete"), ("d-closed", "closed")] {
+            let r = row(&lines, id).unwrap_or_else(|| panic!("{id} is drawn: {lines:?}"));
+            assert!(r.contains(word), "{id} reads {word}: {r}");
+        }
+    }
+
+    /// `executing` carries its three stand-stills as flags: held, parked, and
+    /// waiting on Ed (a manual group at the run's position).
+    #[test]
+    fn executing_carries_held_parked_and_waiting_on_ed_as_flags() {
+        let (_env, store) = running("flags");
+        for (i, id) in ["f-1", "f-2", "f-3", "f-4"].iter().enumerate() {
+            task(&store, id, "todo");
+            old_list(&store, &format!("l-{i}"), "running", id);
+        }
+        let set = |id: &str, word: &str| {
+            let mut w = store.worklist(id).unwrap();
+            w.status_raw = word.into();
+            store.save_worklist(&w).unwrap();
+        };
+        set("l-1", "held");
+        set("l-2", "parked");
+        let mut w3 = store.worklist("l-3").unwrap();
+        let mut gs = w3.groups();
+        gs[0].agent = MANUAL.into();
+        w3.set_groups(&gs);
+        store.save_worklist(&w3).unwrap();
+
+        let (s0, f0) = status_of(&store, "l-0");
+        assert_eq!(s0, "executing");
+        assert_eq!(f0, json!({ "held": false, "waiting_on_ed": false, "parked": false }));
+        let (s1, f1) = status_of(&store, "l-1");
+        assert_eq!((s1.as_str(), f1["held"].as_bool()), ("executing", Some(true)));
+        let (s2, f2) = status_of(&store, "l-2");
+        assert_eq!((s2.as_str(), f2["parked"].as_bool()), ("executing", Some(true)));
+        let (s3, f3) = status_of(&store, "l-3");
+        assert_eq!((s3.as_str(), f3["waiting_on_ed"].as_bool()), ("executing", Some(true)));
+
+        let lines = drawn(&store, true);
+        assert!(row(&lines, "l-1").unwrap().contains("held"), "{lines:?}");
+        assert!(row(&lines, "l-3").unwrap().contains("waiting on Ed"), "{lines:?}");
+        assert_eq!(run(&store, &["status", "l-3"]), 0, "no word says the status");
+    }
+
+    /// A hand sets init, planned and cancelled. executing, complete and closed
+    /// are the run's, and are refused with the verb that reaches them.
+    #[test]
+    fn a_hand_sets_init_planned_and_cancelled_and_not_the_runs_three() {
+        let (_env, store) = running("verb");
+        task(&store, "v-1", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "v-1"]);
+
+        for word in ["executing", "complete", "closed"] {
+            assert_eq!(run(&store, &["status", "batch", word]), 1, "{word} is refused");
+            assert_eq!(status_of(&store, "batch").0, "init", "and nothing moved");
+        }
+        assert_eq!(run(&store, &["status", "batch", "bogus"]), 2);
+
+        assert_eq!(run(&store, &["status", "batch", "planned"]), 0);
+        assert_eq!(status_of(&store, "batch").0, "planned");
+        let w = store.worklist("batch").unwrap();
+        assert!(w.planned.is_some(), "when it was planned is on the record");
+        assert_eq!(w.status(), WorklistStatus::Draft, "a planned list has started nothing");
+        assert_eq!(run(&store, &["status", "batch", "init"]), 0);
+        assert_eq!(status_of(&store, "batch").0, "init");
+
+        assert_eq!(run(&store, &["go", "batch"]), 0);
+        assert_eq!(status_of(&store, "batch").0, "executing");
+        assert_eq!(run(&store, &["status", "batch", "planned"]), 1, "a started list is not planned again");
+        assert_eq!(run(&store, &["status", "batch", "init"]), 1);
+    }
+
+    /// `cancelled` puts the open rows back to todo, unclaimed, and logs the
+    /// why; a row already done is left alone.
+    #[test]
+    fn cancelled_puts_open_rows_back_to_todo_unclaimed_and_logs_why() {
+        let (_env, store) = running("cancel");
+        task(&store, "x-1", "doing");
+        task(&store, "x-2", "blocked");
+        task(&store, "x-3", "done");
+        task(&store, "x-4", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "x-1", "x-2", "x-3", "x-4"]);
+        store.set_claim("x-1", json!({ "pane": "p-1" }));
+        store.set_claim("x-4", json!({ "pane": "p-4" }));
+        let mut w = store.worklist("batch").unwrap();
+        w.set_planned();
+        store.save_worklist(&w).unwrap();
+
+        let code = flagged(&store, &["status", "batch", "cancelled"], &[("why", "Ed changed his mind")]);
+        assert_eq!(code, 0);
+
+        assert_eq!(status_of(&store, "batch").0, "cancelled");
+        for id in ["x-1", "x-2", "x-4"] {
+            assert_eq!(store.task(id).unwrap().status(), Status::Todo, "{id} is back to todo");
+        }
+        assert_eq!(store.task("x-3").unwrap().status(), Status::Done, "done work stays done");
+        let claims = store.claims();
+        assert!(!claims.contains_key("x-1") && !claims.contains_key("x-4"), "unclaimed: {claims:?}");
+        let log = store.worklist("batch").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("cancelled — Ed changed his mind"), "{log}");
+        assert!(store.task("x-1").unwrap().body.contains("put back to todo"));
+
+        assert_eq!(run(&store, &["status", "batch", "init"]), 1, "a cancelled list does not come back by a word");
+        assert_eq!(run(&store, &["status", "batch", "cancelled"]), 1, "nor is it cancelled twice");
+        assert!(row(&drawn(&store, true), "batch").unwrap().contains("cancelled"));
+    }
+
+    /// `ls --json` and `show --json` read every status and the three flags.
+    #[test]
+    fn json_reads_every_status_and_the_flags_beside_it() {
+        let (_env, store) = running("json");
+        task(&store, "j-1", "todo");
+        old_list(&store, "j", "running", "j-1");
+        let w = store.worklist("j").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Settled);
+        let v = show_json(&store, &w, &ShowShared::read(&store, &[&w]), &pos);
+        assert_eq!(v["worklist"]["status"], "executing");
+        assert_eq!(v["worklist"]["flags"], json!({ "held": false, "waiting_on_ed": false, "parked": false }));
+        assert_eq!(v["worklist"]["stored"], "running");
+        let listed = worklist::listing(&store, store.worklists());
+        let l = listed_json(&store, &listed[0]);
+        assert_eq!(l["status"], "executing");
+        assert!(l["flags"].is_object());
     }
 }

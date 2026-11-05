@@ -2181,6 +2181,14 @@ fn help_text() -> String {
   wsp worklist resume [<slug>] ["…"]  back to where it was parked, at the same
                                     group or barrier and with the same check
                                     owed. Records no verdict and passes nothing
+  wsp worklist status <slug> [init|planned|cancelled] [--why "…"]
+                                    the list's status: init, planned, executing,
+                                    complete, closed or cancelled (executing
+                                    flags: held, waiting on Ed, parked). A hand
+                                    sets only init, planned and cancelled: the
+                                    run makes it executing, its end complete,
+                                    `done` closed. cancelled puts the open rows
+                                    back to todo, unclaimed. No word: say it
   wsp worklist done <slug> [--force why…]
                                     nothing left to want from it. Refused while
                                     a declared output is missing; --force and

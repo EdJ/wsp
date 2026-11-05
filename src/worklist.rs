@@ -762,6 +762,154 @@ impl Segment {
     }
 }
 
+/// The six words a worklist's `status` is read as (`wsp-382`).
+///
+/// **Read, not stored, for four of them.** The record keeps the word it was
+/// written with — `draft`, `running`, `held`, `parked`, `done`, and now
+/// `planned` and `cancelled` — and a list from before this migrates on read:
+/// draft→init, running→executing, `done` with something still standing (the
+/// segment [`Segment::Unjudged`])→complete, `done` with nothing standing
+/// →closed. Reading rather than rewriting is what leaves every list's log, and
+/// its file, as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListStatus {
+    Init,
+    Planned,
+    Executing,
+    Complete,
+    Closed,
+    Cancelled,
+}
+
+impl ListStatus {
+    pub fn word(&self) -> &'static str {
+        match self {
+            ListStatus::Init => "init",
+            ListStatus::Planned => "planned",
+            ListStatus::Executing => "executing",
+            ListStatus::Complete => "complete",
+            ListStatus::Closed => "closed",
+            ListStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// What an `executing` list is stood still for. Three flags and not three
+/// statuses: the run is still the run, and each clears on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Flags {
+    /// A barrier said hold.
+    pub held: bool,
+    /// A manual group is the one the run is at, or a question only the person
+    /// can close is open on the list.
+    pub waiting_on_ed: bool,
+    /// A person paused it; only `resume` moves it.
+    pub parked: bool,
+}
+
+impl Flags {
+    /// The words, for a table cell: `held`, `waiting on Ed`, `parked`.
+    pub fn words(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.held {
+            out.push("held");
+        }
+        if self.waiting_on_ed {
+            out.push("waiting on Ed");
+        }
+        if self.parked {
+            out.push("parked");
+        }
+        out
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "held": self.held, "waiting_on_ed": self.waiting_on_ed, "parked": self.parked })
+    }
+}
+
+/// A list's status and, if it is executing, the flags on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Phase {
+    pub status: ListStatus,
+    pub flags: Flags,
+}
+
+impl Phase {
+    /// The cell `ls` and `show` print: `executing`, or `executing (held)`.
+    pub fn text(&self) -> String {
+        match self.flags.words() {
+            w if w.is_empty() => self.status.word().to_string(),
+            w => format!("{} ({})", self.status.word(), w.join(", ")),
+        }
+    }
+}
+
+/// Is the person owed something on this list: the group the run is at is
+/// `manual`, or a question only the person may close is open about the list,
+/// one of its groups, or one of its members.
+fn waiting_on_ed(store: &Store, w: &Worklist, at: Option<usize>) -> bool {
+    let groups = w.groups();
+    if at.and_then(|n| groups.get(n.wrapping_sub(1))).is_some_and(|g| g.agent == crate::model::MANUAL) {
+        return true;
+    }
+    use crate::message::About;
+    crate::message::for_the_person(store).iter().any(|m| match &m.about {
+        About::Scope(s) | About::Group { scope: s, .. } => *s == w.id,
+        About::Task(t) => groups.iter().any(|g| g.members.iter().any(|m| m == t)),
+        About::Nothing => false,
+    })
+}
+
+/// The status and flags of a list whose [`Segment`] is already known.
+pub fn phase_of(store: &Store, w: &Worklist, segment: Segment, at: Option<usize>) -> Phase {
+    let status = match segment {
+        Segment::Running if w.status() == WorklistStatus::Draft && w.is_planned() => ListStatus::Planned,
+        Segment::Running if w.status() == WorklistStatus::Draft => ListStatus::Init,
+        Segment::Running | Segment::Parked => ListStatus::Executing,
+        Segment::Unjudged => ListStatus::Complete,
+        Segment::Closed if w.is_cancelled() => ListStatus::Cancelled,
+        Segment::Closed => ListStatus::Closed,
+    };
+    let mut flags = Flags::default();
+    if status == ListStatus::Executing {
+        flags.held = w.status() == WorklistStatus::Held;
+        flags.parked = w.status() == WorklistStatus::Parked;
+        flags.waiting_on_ed = waiting_on_ed(store, w, at);
+    }
+    Phase { status, flags }
+}
+
+/// [`phase_of`] off a reading the caller already has, for the surfaces that
+/// hold a [`Position`] and not a [`Listed`].
+pub fn phase(store: &Store, w: &Worklist, at: &Position) -> Phase {
+    let segment = match w.status() {
+        WorklistStatus::Draft | WorklistStatus::Running | WorklistStatus::Held => Segment::Running,
+        WorklistStatus::Parked => Segment::Parked,
+        WorklistStatus::Done if w.is_cancelled() => Segment::Closed,
+        WorklistStatus::Done => {
+            let gone = dangling(store, w);
+            let renamed = store.renamed_ids();
+            let open = w
+                .groups()
+                .iter()
+                .flat_map(|g| g.members.iter())
+                .filter_map(|m| store.task_now(&renamed, m))
+                .filter(|t| !matches!(Settlement::of(t), Settlement::Closed))
+                .count();
+            if open == 0 && gone.is_empty() && at.unwritten.is_empty() { Segment::Closed } else { Segment::Unjudged }
+        }
+    };
+    phase_of(store, w, segment, at.at)
+}
+
+impl Listed {
+    /// This list's status and flags — what `ls` prints in its status column.
+    pub fn phase(&self, store: &Store) -> Phase {
+        phase_of(store, &self.list, self.segment, self.at.at)
+    }
+}
+
 /// One worklist, read for a list of them.
 ///
 /// **Nothing here starts a process.** Every field is the store — a small file
@@ -934,6 +1082,8 @@ fn listed(store: &Store, w: Worklist) -> Listed {
         // crossed in silence (`at.unwritten`). A list `done` short of its last
         // barrier was closed by a person, so a barrier still shut does not
         // keep it unjudged once its rows are done.
+        // A cancelled list has nothing left to judge: its rows were put back.
+        WorklistStatus::Done if w.is_cancelled() => Segment::Closed,
         WorklistStatus::Done if open == 0 && gone.is_empty() && at.unwritten.is_empty() => {
             Segment::Closed
         }
