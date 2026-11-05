@@ -5689,10 +5689,24 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    if args.get("project").is_some() {
-        return rehome(store, args, w);
+    // `--project` and the queue flags are each a write of their own, and a
+    // call may carry both (wsp-417): the project used to return first and the
+    // queue flags were never read. Both are checked before either is written,
+    // so a bad `--prio` leaves the project as it was.
+    let projecting = args.get("project").is_some();
+    let queueing = args.has("prio") || args.has("alone") || args.has("no-alone");
+    if projecting && queueing {
+        if let Err(code) = set_queue_flags(args, &mut w.clone()) {
+            return code;
+        }
     }
-    if args.has("prio") || args.has("alone") || args.has("no-alone") {
+    if projecting {
+        let code = rehome(store, args, w.clone());
+        if code != 0 || !queueing {
+            return code;
+        }
+    }
+    if queueing {
         return requeue(store, args, w);
     }
     crate::cmd_task::edit_prose(
@@ -8839,6 +8853,27 @@ mod tests {
 
         assert_eq!(flagged(&store, &["new", "other", "o"], &[("project", "nosuch")]), 1, "a project nobody has is refused");
         assert!(store.worklist("other").is_none(), "and nothing is made");
+    }
+
+    /// One `edit` call with `--project`, `--prio` and `--alone` sets all three
+    /// (wsp-417: the project branch returned first and dropped the rest).
+    #[test]
+    fn edit_sets_project_prio_and_alone_in_one_call() {
+        let store = scratch("edit-both");
+        projects(&store, &[("wsp", None), ("render", Some("wsp"))]);
+        assert_eq!(run(&store, &["new", "run", "r"]), 0);
+        assert_eq!(flagged(&store, &["edit", "run"], &[("project", "render"), ("alone", "true")]), 0);
+        let w = store.worklist("run").unwrap();
+        assert_eq!(w.project.as_deref(), Some("render"));
+        assert_eq!(w.alone, Some(true));
+
+        assert_eq!(flagged(&store, &["edit", "run"], &[("project", "wsp"), ("prio", "high"), ("no-alone", "true")]), 0);
+        let w = store.worklist("run").unwrap();
+        assert_eq!((w.project.as_deref(), w.prio.as_deref(), w.alone), (Some("wsp"), Some("high"), Some(false)));
+
+        // A bad queue flag refuses the whole call: the project stays.
+        assert_eq!(flagged(&store, &["edit", "run"], &[("project", "render"), ("prio", "urgent")]), 2);
+        assert_eq!(store.worklist("run").unwrap().project.as_deref(), Some("wsp"));
     }
 
     /// Unstated, the members say: the deepest project every one of them stands
