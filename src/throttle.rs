@@ -1625,6 +1625,8 @@ mod tests {
     fn a_hot_view_says_so_and_suggests_fewer_agents() {
         let t = crate::util::isolated("throttle-hot-view");
         let mut v = View::read(&t.state());
+        // The real load is the fleet's, and a busy one is a warning of its own.
+        v.load = None;
         v.thermal = Some(31);
         assert!(v.hot());
         assert!(v.status_line().contains("cpu clock 31% — thermally limited"), "{}", v.status_line());
