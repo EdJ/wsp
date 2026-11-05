@@ -7663,6 +7663,44 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(drained(&TOLD).join("\n").contains("appended a `rework` leg"));
     }
 
+    /// `wsp-360`: legs a (done) and b (skipped, last). Skipping b leaves nothing
+    /// running or pending, so the row is finished — at review, said on its log,
+    /// its governor told — once; and the repair tick finishes a record that got
+    /// there by hand.
+    #[test]
+    fn a_row_whose_last_leg_is_skipped_is_finished_and_its_governor_told() {
+        let (_env, store) = scratch("legs-skip-out");
+        staged(&store, "m-1", Status::Doing);
+        add_leg(&store, "m-1", "b", &["plan"], None, None);
+        let _ = list(&store, &[(&["m-1"], "claude")]);
+        leg_done_by_hand(&store);
+        let _ = drained(&TOLD);
+        assert!(!crate::leg_seat::finish_skipped_out(&store, "m-1"), "a pending leg remains");
+        edit_legs(&store, "m-1", |old| crate::legs::skip(old, "b", "split into rows of their own", None));
+        assert!(crate::leg_seat::finish_skipped_out(&store, "m-1"));
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Review);
+        assert!(t.section("Log").unwrap().contains("the last, b, was skipped"), "{}", t.section("Log").unwrap());
+        let told = drained(&TOLD).join("\n");
+        assert!(told.contains("m-1") && told.contains("was skipped"), "{told}");
+        assert!(!crate::leg_seat::finish_skipped_out(&store, "m-1"), "once");
+        assert!(drained(&TOLD).is_empty());
+    }
+
+    /// The same record written by hand: the repair tick finds it.
+    #[test]
+    fn the_repair_tick_finishes_a_row_whose_last_leg_was_skipped_by_hand() {
+        let (_env, store) = scratch("legs-skip-out-tick");
+        staged(&store, "m-1", Status::Doing);
+        add_leg(&store, "m-1", "b", &["plan"], None, None);
+        leg_done_by_hand(&store);
+        edit_legs(&store, "m-1", |old| crate::legs::skip(old, "b", "by hand", None));
+        let _ = list(&store, &[(&["m-1"], "claude")]);
+        let _ = drained(&TOLD);
+        crate::repair::finish_skipped_out(&store);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Review);
+    }
+
     fn leg_done_by_hand(store: &Store) {
         edit_legs(store, "m-1", |old| {
             let mut v = old.to_vec();

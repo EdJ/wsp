@@ -2148,7 +2148,13 @@ fn holding(w: &Where, by_a_run: bool, ready: Option<&str>) -> Vec<String> {
 /// `Err` for a tree holding uncommitted work, naming it.
 pub(crate) fn ready_at(store: &Store, task: &str) -> Result<Option<(String, String)>, String> {
     let Ok(cwd) = std::env::current_dir() else { return Ok(None) };
-    let Ok(w) = pick(candidates(store, &cwd, task), task) else { return Ok(None) };
+    ready_from(store, task, &cwd)
+}
+
+/// [`ready_at`] for a caller that is not standing in the row's tree: the run,
+/// which finds the tree wsp made for the row as [`member_tree`] does.
+pub(crate) fn ready_from(store: &Store, task: &str, cwd: &Path) -> Result<Option<(String, String)>, String> {
+    let Ok(w) = pick(candidates(store, cwd, task), task) else { return Ok(None) };
     if !w.dir.join(".git").exists() {
         return Ok(None);
     }

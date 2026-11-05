@@ -405,6 +405,55 @@ fn ready_signal(store: &Store, task: &str, old: &[Leg], name: &str, baton: &str,
     Ok(crate::cmd_checkout::ready_at(store, task)?.map(|(sha, branch)| format!("{} {sha} on {branch}", crate::repair::READY)))
 }
 
+/// A row whose legs have run out with the last one skipped is finished
+/// (`wsp-360`): no seat is left to type `wsp review`, so this does what that
+/// would — the row at `review`, ready at its tree's commit when it is a member
+/// of a run, said on its log — and tells its governor. Once: the line it
+/// writes is the mark. `true` when it finished the row now.
+///
+/// Called by `wsp leg skip` and by the repair tick, for a record that got
+/// there by hand.
+pub(crate) fn finish_skipped_out(store: &Store, row: &str) -> bool {
+    let Some(t) = store.find_task(row) else { return false };
+    if t.status() != crate::model::Status::Doing || !legs::staged(&t) || !legs::ended_in_a_skip(&legs::legs(&t)) {
+        return false;
+    }
+    let all = legs::legs(&t);
+    let last = legs::lasts(&all).into_iter().find(|n| all.iter().any(|l| &l.name == n && l.state == State::Skipped)).unwrap_or_default();
+    let said = format!("every leg is done or skipped, and the last, {last}, was skipped — the row is finished, nothing is left to run");
+    let ready = if crate::worklist::verified_by_a_run(store, row) {
+        crate::cmd_checkout::ready_from(store, row, std::path::Path::new("/")).ok().flatten()
+    } else {
+        None
+    };
+    let done = store.locked(|| {
+        let Some(mut t) = store.find_task(row) else { return false };
+        if t.status() != crate::model::Status::Doing || !legs::ended_in_a_skip(&legs::legs(&t)) {
+            return false;
+        }
+        t.set_status(crate::model::Status::Review);
+        t.log(&format!("review: {said}"));
+        if let Some((sha, branch)) = &ready {
+            t.log(&format!("{} {sha} on {branch}", crate::repair::READY));
+        }
+        store.save_task(&t).is_ok()
+    });
+    if !done {
+        return false;
+    }
+    store.git_commit(&format!("wsp: {row} finished, its last leg skipped"));
+    crate::cycle::log_line(store, &format!("{row}: {said}"));
+    if let Some(w) = crate::worklist::open_list_of(&store.worklists(), row) {
+        crate::cycle::tell(store, &w, &format!(
+            "{row} in the {} run: {said}. It is at review{}.",
+            w.id,
+            if ready.is_some() { " and ready to land" } else { "" }
+        ));
+    }
+    store.log_event("row-finished-by-skips", serde_json::json!({ "id": row }));
+    true
+}
+
 /// `review` typed in a leg's seat. Refused while another leg is running, naming
 /// it. Otherwise the leg is done, the pending legs are skipped, and the end line
 /// is written — and the caller goes on to move the row. Nothing, for a pane that

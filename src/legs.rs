@@ -370,6 +370,17 @@ pub(crate) fn lasts(legs: &[Leg]) -> Vec<String> {
     legs.iter().map(|l| l.name.clone()).filter(|n| !waited.contains(n)).collect()
 }
 
+/// A record that has run out with its last leg skipped: some leg is done, none
+/// is running or pending, and a leg nothing waits on is skipped. No seat is
+/// left to type `wsp review`, so the row is finished by whoever sees it
+/// (`wsp-360`). A record with no leg done is a row being re-staged, not one
+/// that has run.
+pub(crate) fn ended_in_a_skip(legs: &[Leg]) -> bool {
+    legs.iter().any(|l| l.state == State::Done)
+        && legs.iter().all(|l| l.state.settled())
+        && lasts(legs).iter().any(|n| legs.iter().any(|l| &l.name == n && l.state == State::Skipped))
+}
+
 /// The legs a run may open now: pending, with every leg upstream of them, by any
 /// path, `done` or `skipped`.
 ///
@@ -1235,6 +1246,9 @@ fn cmd_skip(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Ok((t, _)) => {
             store.git_commit(&format!("wsp: {} leg {name} skipped", t.id));
             println!("{} {}  leg {name} skipped", Paint::new().green("✓"), t.id);
+            if crate::leg_seat::finish_skipped_out(store, &t.id) {
+                println!("  {}", Paint::new().dim("nothing is left to run — the row is finished and at review"));
+            }
             0
         }
         Err(why) => refuse(why),
