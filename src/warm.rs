@@ -12,9 +12,20 @@
 //!
 //! Anything short of a match copies nothing and says so in one line; the agent
 //! installs or builds as it did before.
+//!
+//! **The clone is bounded** (wsp-393). A clone is one call but costs by entry,
+//! and one took 333s on a trunk `target/` of 160k files while the seat that was
+//! waiting on the tree read nothing. It is made under a hidden name beside its
+//! place and renamed in only when it finishes inside [`LIMIT`]; past that the
+//! tree starts cold, the line says so, and the half-made copy is removed once
+//! this process has gone.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// The longest a tree waits on one clone. A cold build costs minutes; a seat
+/// that waits on a slow clone costs the same and then builds anyway.
+const LIMIT: Duration = Duration::from_secs(30);
 
 /// The dependency directories worth cloning, each with the lockfile that must
 /// match beside it.
@@ -78,10 +89,51 @@ fn one(parent: &Path, child: &Path, rel: &Path, lock: &str) -> String {
         return format!("{shown} not cloned: already present");
     }
     let started = Instant::now();
-    match clone_dir(&parent.join(rel), &to) {
+    let from = parent.join(rel);
+    match bounded(&from, &to, LIMIT, clone_dir) {
         Ok(()) => format!("{shown} cloned from the parent tree in {:.2}s", started.elapsed().as_secs_f64()),
         Err(e) => format!("{shown} not cloned ({e}) — install as usual"),
     }
+}
+
+/// Run `clone` from `from` to a hidden name beside `to`, and move it into place
+/// only if it finishes inside `limit`. Past the limit the copy is left to the
+/// thread still making it and a shell removes it once this process is gone.
+fn bounded<F>(from: &Path, to: &Path, limit: Duration, clone: F) -> Result<(), String>
+where
+    F: FnOnce(&Path, &Path) -> Result<(), String> + Send + 'static,
+{
+    let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = to.with_file_name(format!(".{name}.cloning-{}", std::process::id()));
+    let (src, dst) = (from.to_path_buf(), tmp.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(clone(&src, &dst));
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(())) => std::fs::rename(&tmp, to).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&tmp);
+            e.to_string()
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            remove_when_gone(&tmp);
+            Err(format!("still cloning after {}s, so the tree starts without it", limit.as_secs()))
+        }
+    }
+}
+
+/// Remove `path` after this process has exited, which is when the clone still
+/// running in it has stopped. Best effort: a leftover is only disk.
+fn remove_when_gone(path: &Path) {
+    let script = format!("while kill -0 {} 2>/dev/null; do sleep 1; done; rm -rf \"$1\"", std::process::id());
+    let _ = std::process::Command::new("sh")
+        .args(["-c", &script, "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 #[cfg(target_os = "macos")]
@@ -144,6 +196,33 @@ mod tests {
         // A write in the clone leaves the parent's copy alone.
         std::fs::write(child.join("target/debug/x"), "changed").unwrap();
         assert_eq!(std::fs::read_to_string(parent.join("target/debug/x")).unwrap(), "bin");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_clone_that_runs_past_the_limit_is_given_up_and_leaves_nothing_in_place() {
+        let d = scratch("slow");
+        let to = d.join("c/target");
+        std::fs::create_dir_all(d.join("c")).unwrap();
+        let slow = |_: &Path, t: &Path| {
+            std::thread::sleep(Duration::from_millis(400));
+            std::fs::create_dir_all(t).map_err(|e| e.to_string())
+        };
+        let err = bounded(&d.join("p"), &to, Duration::from_millis(20), slow).unwrap_err();
+        assert!(err.contains("still cloning after"), "{err}");
+        assert!(!to.exists(), "a late clone is never moved into place");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_clone_that_finishes_in_time_is_moved_into_place() {
+        let d = scratch("quick");
+        let to = d.join("c/target");
+        std::fs::create_dir_all(d.join("c")).unwrap();
+        let quick = |_: &Path, t: &Path| std::fs::create_dir_all(t).map_err(|e| e.to_string());
+        bounded(&d.join("p"), &to, Duration::from_secs(5), quick).unwrap();
+        assert!(to.is_dir());
+        assert_eq!(std::fs::read_dir(d.join("c")).unwrap().count(), 1, "no hidden name left beside it");
         let _ = std::fs::remove_dir_all(&d);
     }
 
