@@ -797,8 +797,8 @@ fn told_unlanded(store: &Store, w: &Worklist, t: &Task) {
 /// to the seat alike.
 fn unlanded(id: &str, note: &str) -> String {
     format!(
-        "{id} is at review with {note}, so it has no verifier yet. \
-         Its land is its own agent's act, `wsp land {id}`, and wsp starts the verifier on the land."
+        "{id} is at review with {note}, so it has no verifier yet. {}",
+        crate::cmd_checkout::Flow::Verified.owes(id)
     )
 }
 
@@ -6937,7 +6937,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let told = drained(&TOLD);
         assert_eq!(told.len(), 1, "{told:?}");
         assert!(told[0].contains("m-1 is at review with 1 commit not on master"), "{}", told[0]);
-        assert!(told[0].contains("`wsp land m-1`"), "{}", told[0]);
+        assert!(told[0].contains("`wsp review m-1`") && !told[0].contains("`wsp land m-1`"), "{}", told[0]);
 
         git(&["merge", "--ff-only", "--quiet", "m-1"]);
         told_about_task(&store, "m-1", "review");

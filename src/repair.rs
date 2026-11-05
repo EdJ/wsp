@@ -68,6 +68,7 @@ use crate::model::{Status, Task, Worklist, WorklistStatus};
 use crate::cycle::Seats;
 use crate::place::State;
 use crate::cmd_govern;
+use crate::cmd_checkout::Flow;
 use crate::store::Store;
 use crate::util;
 use crate::worklist::{self, Position, Reading};
@@ -1317,23 +1318,21 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
         let note = s.note();
         let why = if note.is_empty() { "its branch is not on the trunk".to_string() } else { note };
         stamp(store, &format!(
-            "{} group {at}: {} is at {} and nothing was started for it — {why}. `wsp land {}` puts it on \
-             the trunk, and its verifier starts on that.",
+            "{} group {at}: {} is at {} and nothing was started for it — {why}. {}",
             w.id,
             s.id,
             s.settlement.word(),
-            s.id
+            Flow::Verified.owes(&s.id)
         ));
         let said = format!("{WHY_NOT} {} is at {} and not on the trunk: {why}.", s.id, s.settlement.word());
         if told_once(store, &s.id, &said) {
             crate::cycle::tell(store, w, &format!(
                 "{} in the {} run is at {} with nothing started for it — {why}, so no verifier can run \
-                 on it. Its land is its own agent's act, `wsp land {}`, and wsp has told it so; its verifier \
-                 starts on the land.",
+                 on it. {} wsp has told it so.",
                 s.id,
                 w.id,
                 s.settlement.word(),
-                s.id
+                Flow::Verified.owes(&s.id)
             ));
             // `wsp-226`: the seat alone was told, and by its order a governor
             // does not relay — so a member that ran `wsp review` without
@@ -1342,15 +1341,13 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             // marker keys both, so it hears this as often as the seat does.
             tell_member(store, &s.id, &format!(
                 "wsp: {} is at {} but not on the trunk — {why} — so no verifier can start and the {} run \
-                 waits on you. Run `wsp land {}`: the land is yours, as the end of your row, and it rebases your \
-                 branch and fast-forwards the trunk. Review follows it: wsp starts a read-only verifier on the land, \
-                 and the person reads the row before `wsp done`. If the land is refused, `wsp ask` about it; never \
-                 land by hand. If nothing has landed {} min from now and this seat is idle or gone, wsp lands \
+                 waits on you. {} Never `wsp land` it or land by hand; if `wsp review` is refused, `wsp ask` about it. \
+                 If nothing has been recorded {} min from now and this seat is idle or gone, wsp lands \
                  it for you when the rebase is clean, and flags the person when it is not.",
                 s.id,
                 s.settlement.word(),
                 w.id,
-                s.id,
+                Flow::Verified.owes(&s.id),
                 LAND_GRACE / 60
             ));
         }
@@ -3203,7 +3200,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert!(key(&store, "m-1").is_none(), "there is no landing to record");
         assert!(
-            governed().iter().any(|g| g.contains("wsp land m-1")),
+            governed().iter().any(|g| g.contains("`wsp review m-1`") && !g.contains("`wsp land m-1`")),
             "and the run is told to land it instead: {:?}",
             governed()
         );
@@ -3234,13 +3231,13 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         );
         let gov = governed();
         assert_eq!(gov.len(), 1, "and told: {gov:?}");
-        assert!(gov[0].contains("wsp land m-1"), "{}", gov[0]);
+        assert!(gov[0].contains("`wsp review m-1`") && !gov[0].contains("`wsp land m-1`"), "{}", gov[0]);
         // `wsp-226`: and the member, on its own pane, because a governor does
         // not relay and the member is the one who can land.
         let told = member_told();
         assert_eq!(told.len(), 1, "the member is told too: {told:?}");
         assert_eq!(told[0].0, "m-1", "on its own pane: {told:?}");
-        assert!(told[0].1.contains("wsp land m-1"), "with the line that moves it: {}", told[0].1);
+        assert!(told[0].1.contains("`wsp review m-1`") && !told[0].1.contains("`wsp land m-1`"), "with the line that moves it: {}", told[0].1);
 
         // Every pass stamps it; the seat hears it once, because the spool is a
         // queue an agent reads with a whole context behind it.

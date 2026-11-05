@@ -185,12 +185,11 @@ pub fn at_spawn(store: &Store, task: Option<&str>, member: bool, full: bool, no_
 /// The work order a packet row is told, one line because that is what an order
 /// is. The packet itself is fetched, not typed: a pane takes a line, not twenty
 /// kilobytes of pasted source.
-pub fn order(task: &str) -> String {
+pub fn order(task: &str, flow: crate::cmd_checkout::Flow) -> String {
     format!(
         "Your packet is the whole brief. Run `wsp packet {task}` now, read what it prints, \
-         do the change it describes, run its one command. Then commit, run `wsp land {task}`, \
-         and end with `wsp review {task} \"...\"` (or `-` and the summary on stdin): the land \
-         alone leaves the row waiting. Read nothing the packet does not name."
+         do the change it describes, run its one command. {} Read nothing the packet does not name.",
+        flow.order_end(task)
     )
 }
 
@@ -438,6 +437,7 @@ fn print_row(store: &Store, t: &mut Task, root: &Path, args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd_checkout::Flow;
 
     fn row(section: &str) -> Task {
         let mut t = Task::default();
@@ -572,11 +572,31 @@ mod tests {
 
     #[test]
     fn the_order_is_one_line_naming_the_verb_and_the_row() {
-        let o = order("wsp-9");
+        let o = order("wsp-9", Flow::Own);
         assert!(!o.contains('\n') && o.contains("`wsp packet wsp-9`"));
         assert!(o.contains("`wsp land wsp-9`") && o.contains("`wsp review wsp-9 "), "{o}");
         assert!(!o.contains("as your brief says"), "a short start carries almost no brief: {o}");
         assert!(o.is_ascii(), "a spawn once hung on one character");
+    }
+
+    /// `wsp-379`: the order and the banner are one decision. A verified member
+    /// is told to end with `wsp review` and never to land, in both; a plain row
+    /// is told to land, in both.
+    #[test]
+    fn a_verified_member_and_a_plain_row_are_each_told_one_flow_by_order_and_banner() {
+        let verified = order("wsp-9", Flow::of(true));
+        assert!(verified.contains("`wsp review wsp-9 ") && verified.contains("never `wsp land`"), "{verified}");
+        assert!(!verified.contains("run `wsp land"), "{verified}");
+        assert_eq!(Flow::of(true).banner(), crate::cmd_checkout::READY_FLOW);
+        assert!(Flow::of(true).banner().contains("Never `wsp land`"));
+        assert!(Flow::of(true).tree().contains("a verifier lands it"));
+
+        let plain = order("wsp-9", Flow::of(false));
+        assert!(plain.contains("run `wsp land wsp-9`") && plain.contains("`wsp review wsp-9 "), "{plain}");
+        assert!(!plain.contains("never `wsp land`"), "{plain}");
+        assert_eq!(Flow::of(false).banner(), crate::cmd_checkout::LANDING);
+        assert!(Flow::of(false).tree().contains("`wsp land` puts it on the trunk"));
+        assert!(verified.is_ascii() && plain.is_ascii());
     }
 
     // ---- a row with no packet, at spawn ------------------------------------

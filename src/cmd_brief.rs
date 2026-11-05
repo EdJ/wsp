@@ -1258,12 +1258,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     if r.own_tree.is_some() {
         row(
             "tree",
-            p.dim(if in_a_run {
-                "your own, and it is the whole project — commit freely; `wsp review` marks it ready and a verifier lands it, and `git show master:<path>` reads the trunk"
-            } else {
-                "your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk, and `git show master:<path>` reads it"
-            })
-            .to_string(),
+            p.dim(crate::cmd_checkout::Flow::of(in_a_run).tree()).to_string(),
         );
         // Where build dirs and copies outside the tree go (`wsp-373`): wsp
         // removes it when the row closes; anything under `~/.cache` it does not
@@ -1282,7 +1277,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         // the agent holding a row and nobody else: a leg's work is landed by
         // its row's finish, and a seat with nothing claimed has no row to end.
         if r.mine.is_some() && r.leg.is_none() {
-            let said = if in_a_run { crate::cmd_checkout::READY_FLOW } else { crate::cmd_checkout::LANDING };
+            let said = crate::cmd_checkout::Flow::of(in_a_run).banner();
             row("land", p.dim(said).to_string());
         }
     }

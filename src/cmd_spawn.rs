@@ -2886,7 +2886,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             }
             (Some(t), _) if packet_start => Some(match leg_name.as_deref() {
                 Some(l) => crate::packet::leg_order(t, l, leg_last),
-                None => crate::packet::order(t),
+                None => crate::packet::order(t, crate::cmd_checkout::Flow::of_task(store, t)),
             }),
             (Some(t), _) if leg_name.is_some() => Some(leg_seat::order_line(
                 t,

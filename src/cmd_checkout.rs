@@ -208,6 +208,76 @@ pub(crate) const READY_FLOW: &str = "A row in a run wsp runs ends with `wsp revi
      (rebased on the trunk, checks rerun where the trunk moved). A block sends the row back with nothing on the \
      trunk. Never `wsp land` it yourself, and never land by hand.";
 
+/// Which way a row ends, the one fact every text about ending reads (`wsp-379`).
+///
+/// A member of a group wsp runs a verifier for (`Placing::run`) ends with
+/// `wsp review` and never lands: the verifier's `--holds` does. A row in no such
+/// run lands itself, then reviews. The banner, the packet's work order and the
+/// sentences wsp says about a member that did not end properly all ask this,
+/// so no two of them can tell the same row opposite things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flow {
+    /// A member of a verified run: `wsp review` ends it, the verifier lands it.
+    Verified,
+    /// Any other row: its own `wsp land`, then `wsp review`.
+    Own,
+}
+
+impl Flow {
+    /// The flow of a row placed in a list, as `Placing::run` says.
+    pub(crate) fn of(run: bool) -> Flow {
+        if run { Flow::Verified } else { Flow::Own }
+    }
+
+    /// The flow of a row by id, read from the lists that are running.
+    pub(crate) fn of_task(store: &Store, task: &str) -> Flow {
+        Flow::of(crate::worklist::Running::read(store).of(task).is_some_and(|p| p.run))
+    }
+
+    /// The `land` row of the banner.
+    pub(crate) fn banner(self) -> &'static str {
+        match self {
+            Flow::Verified => READY_FLOW,
+            Flow::Own => LANDING,
+        }
+    }
+
+    /// The `tree` row of the banner.
+    pub(crate) fn tree(self) -> &'static str {
+        match self {
+            Flow::Verified => "your own, and it is the whole project — commit freely; `wsp review` marks it ready and a verifier lands it, and `git show master:<path>` reads the trunk",
+            Flow::Own => "your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk, and `git show master:<path>` reads it",
+        }
+    }
+
+    /// How a packet row's one-line order ends.
+    pub(crate) fn order_end(self, task: &str) -> String {
+        match self {
+            Flow::Verified => format!(
+                "Then commit and end with `wsp review {task} \"...\"` (or `-` and the summary on stdin): \
+                 never `wsp land` it, the verifier that reads your tree lands it."
+            ),
+            Flow::Own => format!(
+                "Then commit, run `wsp land {task}`, and end with `wsp review {task} \"...\"` \
+                 (or `-` and the summary on stdin): the land alone leaves the row waiting."
+            ),
+        }
+    }
+
+    /// What a member reviewed with commits not on the trunk, and not ready, owes.
+    pub(crate) fn owes(self, id: &str) -> String {
+        match self {
+            Flow::Verified => format!(
+                "Its work is not recorded ready: it commits what is left in its tree and ends with `wsp review {id}` \
+                 again, and wsp starts the verifier on that. The verifier lands it, never the member."
+            ),
+            Flow::Own => format!(
+                "Its land is its own agent's act, `wsp land {id}`, and wsp starts the verifier on the land."
+            ),
+        }
+    }
+}
+
 /// The working tree a path is in, when it is one of ours.
 ///
 /// A pure path rule on purpose: `overlap` calls it for every pane herdr reports,
