@@ -2370,6 +2370,15 @@ pub struct Worklist {
     /// the queue's tie-break between two lists of one priority. Absent on a
     /// list never planned.
     pub planned: Option<String>,
+    /// `prio:` — `high` or `low`; absent is `normal` (`wsp-383`). The queue's
+    /// first key, ahead of when a list was planned.
+    pub prio: Option<String>,
+    /// `after:` — the slug of a list that must be complete before this one
+    /// may start (`wsp-383`).
+    pub after: Option<String>,
+    /// `alone:` — `on` or `off` where a hand said, absent where nobody did and
+    /// the project's default stands (`wsp-383`).
+    pub alone: Option<bool>,
     pub body: String,
 }
 
@@ -2386,6 +2395,9 @@ impl Worklist {
             made_in: None,
             outputs: None,
             planned: None,
+            prio: None,
+            after: None,
+            alone: None,
             body: String::new(),
         }
     }
@@ -2449,6 +2461,13 @@ impl Worklist {
             made_in: doc.opt("made_in").filter(|p| !p.trim().is_empty()),
             outputs: doc.opt("outputs").filter(|p| !p.trim().is_empty()),
             planned: doc.opt("planned").filter(|p| !p.trim().is_empty()),
+            prio: doc.opt("prio").map(|p| p.trim().to_ascii_lowercase()).filter(|p| matches!(p.as_str(), "high" | "low")),
+            after: doc.opt("after").map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
+            alone: doc.opt("alone").and_then(|a| match a.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" => Some(true),
+                "off" | "false" | "no" => Some(false),
+                _ => None,
+            }),
             body: doc.body.clone(),
         }
     }
@@ -2476,6 +2495,15 @@ impl Worklist {
         }
         if let Some(p) = &self.planned {
             d.set_str("planned", p);
+        }
+        if let Some(p) = &self.prio {
+            d.set_str("prio", p);
+        }
+        if let Some(a) = &self.after {
+            d.set_str("after", a);
+        }
+        if let Some(a) = self.alone {
+            d.set_str("alone", if a { "on" } else { "off" });
         }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();

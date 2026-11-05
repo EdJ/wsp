@@ -137,6 +137,8 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "done" | "finish" => done(store, args),
         // wsp-382: the status field, and the three words a hand may set.
         "status" => status(store, args),
+        // wsp-383: what a planned list waits on.
+        "after" => after(store, args),
         // `wsp-134`: the steps wsp takes itself. Started by the verbs that
         // make one due, and by hand to repair a trigger that was lost.
         "advance" => crate::cycle::advance(store, args),
@@ -373,6 +375,9 @@ pub fn new(store: &Store, args: &Args) -> i32 {
     w.caption = caption;
     w.project = project;
     w.made_in = made_in;
+    if let Err(code) = set_queue_flags(args, &mut w) {
+        return code;
+    }
     if let Err(e) = store.save_worklist(&w) {
         eprintln!("wsp: write failed: {e}");
         return 1;
@@ -1752,7 +1757,21 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     if args.json() {
         // No collapse and no `--all` here: an abridgement is a thing done for
         // a reader, and a parser is not one.
-        let out: Vec<_> = listed.iter().map(|l| listed_json(store, l)).collect();
+        let waits = crate::waits::read(store, &listed);
+        let out: Vec<_> = listed
+            .iter()
+            .map(|l| {
+                let mut o = listed_json(store, l);
+                // A planned list says where it queues and what it waits on;
+                // the rest carry neither key (`wsp-383`).
+                if let Some(n) = waits.iter().position(|(id, _)| *id == l.list.id) {
+                    o["queue"] = json!(n + 1);
+                    o["may_start"] = json!(waits[n].1.is_none());
+                    o["waits"] = json!(waits[n].1.as_ref().map(|w| w.text()));
+                }
+                o
+            })
+            .collect();
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -1788,18 +1807,44 @@ fn list_lines(store: &Store, p: &Paint, listed: &[worklist::Listed], all: bool) 
         p.dim("TITLE")
     )];
 
+    // The planned lists are drawn as a segment of their own, in queue order
+    // and each with what it waits on (`wsp-383`), straight after the running
+    // ones they are queued behind. They are `running` to everything that
+    // reads a [`Segment`]; this is the one place they are told apart.
+    let waits = crate::waits::read(store, listed);
+    let planned_pos = |l: &worklist::Listed| waits.iter().position(|(id, _)| *id == l.list.id);
+    let (mut planned, rest): (Vec<&worklist::Listed>, Vec<&worklist::Listed>) =
+        drawn.iter().copied().partition(|l| planned_pos(l).is_some());
+    planned.sort_by_key(|l| planned_pos(l));
+    let at_running_end = rest.iter().position(|l| l.segment != Segment::Running).unwrap_or(rest.len());
+    let mut shown: Vec<(&worklist::Listed, bool)> = rest.iter().map(|l| (*l, false)).collect();
+    for (i, l) in planned.into_iter().enumerate() {
+        shown.insert(at_running_end + i, (l, true));
+    }
+
     let mut segment = None;
-    for l in &drawn {
-        if segment != Some(l.segment) {
+    let mut in_planned = false;
+    for (l, is_planned) in shown {
+        if is_planned {
+            if !in_planned {
+                in_planned = true;
+                segment = None;
+                out.push(p.dim("planned — in queue order, with what each waits on"));
+            }
+        } else if segment != Some(l.segment) {
             segment = Some(l.segment);
             out.push(p.dim(heading(l.segment)));
         }
         let phase = l.phase(store);
         // What an executing list is stood still for follows the title, so the
         // columns before it keep their widths.
-        let flags = match phase.flags.words() {
-            w if w.is_empty() => String::new(),
-            w => p.dim(&format!("  · {}", w.join(" · "))),
+        let flags = match (is_planned, phase.flags.words()) {
+            (true, _) => {
+                let wait = waits.iter().find(|(id, _)| *id == l.list.id).map(|(_, w)| w.clone()).unwrap_or(None);
+                p.dim(&format!("  · {}", crate::waits::line(&wait)))
+            }
+            (false, w) if w.is_empty() => String::new(),
+            (false, w) => p.dim(&format!("  · {}", w.join(" · "))),
         };
         out.push(format!(
             "{}  {}  {}  {}  {}  {}{flags}",
@@ -1873,6 +1918,8 @@ fn listed_json(store: &Store, l: &worklist::Listed) -> serde_json::Value {
         o.insert("gone".into(), json!(l.gone));
         o.insert("unwritten".into(), json!(l.at.unwritten));
         o.insert("activity".into(), json!(util::iso_at(l.activity)));
+        o.insert("prio".into(), json!(crate::waits::Prio::of(&l.list).word()));
+        o.insert("after".into(), json!(l.list.after));
     }
     out
 }
@@ -3209,6 +3256,32 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
+    // A planned list has no run to report on yet: it says whether it may start
+    // and, if not, the first thing it waits on (`wsp-383`).
+    if w.is_planned() && w.status() == WorklistStatus::Draft {
+        let waits = crate::waits::read(store, &worklist::listing(store, store.worklists()));
+        let at = waits.iter().position(|(id, _)| *id == w.id);
+        let wait = at.and_then(|n| waits[n].1.clone());
+        if args.json() {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "worklist": w.id,
+                    "status": "planned",
+                    "state": "planned",
+                    "queue": at.map(|n| n + 1),
+                    "may_start": wait.is_none(),
+                    "waits": wait.as_ref().map(|w| w.text()),
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            let p = Paint::new();
+            let place = at.map(|n| format!(" · queue {}", n + 1)).unwrap_or_default();
+            println!("{} {}", p.bold(&w.id), p.dim(&format!("planned{place} — {}", crate::waits::line(&wait))));
+        }
+        return 0;
+    }
     let pos = worklist::position(store, &w, Reading::Landed);
     // A list somebody has finished with is not a run, and `next` is a running
     // verb. It answers rather than reporting a barrier that is nobody's to
@@ -5245,6 +5318,148 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     0
 }
 
+
+// ---- where a planned list queues --------------------------------------
+
+/// `--prio high|normal|low`, `--alone` and `--no-alone` onto a list
+/// (`wsp-383`). Returns what changed, in words for the log; an error is the
+/// exit code, said already.
+fn set_queue_flags(args: &Args, w: &mut Worklist) -> Result<Vec<String>, i32> {
+    use crate::waits::Prio;
+    let mut said = Vec::new();
+    if args.has("prio") {
+        let word = args.get("prio").unwrap_or_default();
+        let Some(prio) = Prio::parse(&word) else {
+            eprintln!("wsp: `{word}` is not a priority — high, normal or low");
+            return Err(2);
+        };
+        w.prio = (prio != Prio::Normal).then(|| prio.word().to_string());
+        said.push(format!("prio {}", prio.word()));
+    }
+    if args.has("alone") && args.has("no-alone") {
+        eprintln!("wsp: --alone and --no-alone say opposite things");
+        return Err(2);
+    }
+    if args.has("alone") {
+        w.alone = Some(true);
+        said.push("alone".into());
+    }
+    if args.has("no-alone") {
+        w.alone = Some(false);
+        said.push("not alone".into());
+    }
+    Ok(said)
+}
+
+/// `wsp worklist edit <slug> --prio … --alone|--no-alone`. Allowed at any
+/// point: it moves where a planned list queues and what it waits on, and
+/// nothing about the queue of groups.
+fn requeue(store: &Store, args: &Args, w: Worklist) -> i32 {
+    // Said once, with its own exit code, before the lock is taken.
+    if let Err(code) = set_queue_flags(args, &mut w.clone()) {
+        return code;
+    }
+    let saved = store.locked(|| -> Result<(Worklist, Vec<String>), String> {
+        let mut w = store.worklist(&w.id).ok_or_else(|| format!("wsp: `{}` is gone", w.id))?;
+        let said = set_queue_flags(args, &mut w).map_err(|_| String::new())?;
+        w.log(&said.join(", "));
+        store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
+        Ok((w, said))
+    });
+    let (w, said) = match saved {
+        Ok(v) => v,
+        Err(why) => {
+            if !why.is_empty() {
+                eprintln!("{why}");
+            }
+            return 1;
+        }
+    };
+    store.log_event("worklist-edited", json!({ "id": w.id, "what": "queue", "prio": w.prio, "alone": w.alone }));
+    store.git_commit(&format!("wsp: worklist {} {}", w.id, said.join(", ")));
+    queue_report(args, &w, "queue")
+}
+
+fn queue_report(args: &Args, w: &Worklist, what: &str) -> i32 {
+    let alone = w.alone.map(|a| if a { "on" } else { "off" });
+    if args.json() {
+        println!("{}", json!({ "worklist": w.id, "what": what, "prio": crate::waits::Prio::of(w).word(), "after": w.after, "alone": alone }));
+    } else {
+        let mut bits = vec![format!("prio {}", crate::waits::Prio::of(w).word())];
+        if let Some(a) = &w.after {
+            bits.push(format!("after {a}"));
+        }
+        if let Some(a) = alone {
+            bits.push(format!("alone {a}"));
+        }
+        println!("{}  {}", w.id, bits.join(" · "));
+    }
+    0
+}
+
+/// `wsp worklist after <slug> <other|none>` — start `slug` only once `other`
+/// is complete, or stop saying so. A name that is no list, the list itself,
+/// and a chain that comes back round are refused: each is a list that would
+/// wait for ever.
+pub fn after(store: &Store, args: &Args) -> i32 {
+    let (Some(needle), Some(other)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
+        eprintln!("usage: wsp worklist after <slug> <other|none>");
+        return 2;
+    };
+    let w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let target = match other.trim().to_ascii_lowercase().as_str() {
+        "none" | "-" => None,
+        _ => match worklist_or_why(store, &other) {
+            Ok(o) => Some(o),
+            Err(why) => {
+                eprintln!("{why}");
+                return 1;
+            }
+        },
+    };
+    if let Some(o) = &target {
+        let mut at = Some(o.clone());
+        let mut hops = 0;
+        while let Some(l) = at {
+            if l.id == w.id {
+                eprintln!("wsp: `{}` after `{}` would wait for itself", w.id, o.id);
+                return 1;
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            at = l.after.as_deref().and_then(|a| store.worklist(a));
+        }
+    }
+    let saved = store.locked(|| -> Result<Worklist, String> {
+        let mut w = store.worklist(&w.id).ok_or_else(|| format!("wsp: `{}` is gone", w.id))?;
+        w.after = target.as_ref().map(|o| o.id.clone());
+        w.log(&match &w.after {
+            Some(o) => format!("after {o}"),
+            None => "no longer after any list".to_string(),
+        });
+        store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
+        Ok(w)
+    });
+    let w = match saved {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    store.log_event("worklist-edited", json!({ "id": w.id, "what": "after", "after": w.after }));
+    store.git_commit(&format!("wsp: worklist {} after {}", w.id, w.after.as_deref().unwrap_or("none")));
+    queue_report(args, &w, "after")
+}
+
 // ---- status -----------------------------------------------------------
 
 /// `wsp worklist status <slug> [init|planned|cancelled] [--why …]` (`wsp-382`).
@@ -5417,7 +5632,7 @@ pub fn status(store: &Store, args: &Args) -> i32 {
 /// structure sits in.
 pub fn edit(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp worklist edit <slug> [--overview | --decisions] [-] | --project <p|none>");
+        eprintln!("usage: wsp worklist edit <slug> [--overview | --decisions] [-] | --project <p|none> | --prio high|normal|low | --alone|--no-alone");
         return 2;
     };
     let w = match worklist_or_why(store, &needle) {
@@ -5429,6 +5644,9 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
     };
     if args.get("project").is_some() {
         return rehome(store, args, w);
+    }
+    if args.has("prio") || args.has("alone") || args.has("no-alone") {
+        return requeue(store, args, w);
     }
     crate::cmd_task::edit_prose(
         store,
@@ -8830,6 +9048,93 @@ mod tests {
         assert_eq!(status_of(&store, "batch").0, "executing");
         assert_eq!(run(&store, &["status", "batch", "planned"]), 1, "a started list is not planned again");
         assert_eq!(run(&store, &["status", "batch", "init"]), 1);
+    }
+
+    /// `wsp-383`: `ls` draws the planned lists as a segment of their own, in
+    /// queue order (priority, then when planned), each with what it waits on;
+    /// `next <slug>` says the same for one; the verbs set prio, alone and after.
+    #[test]
+    fn ls_draws_planned_lists_in_queue_order_each_with_what_it_waits_on() {
+        let (_env, store) = running("queue");
+        for id in ["q-1", "q-2", "q-3", "q-4"] {
+            task(&store, id, "todo");
+        }
+        for (slug, member) in [("early", "q-1"), ("late", "q-2"), ("urgent", "q-3"), ("blocked", "q-4")] {
+            assert_eq!(run(&store, &["new", slug, slug]), 0);
+            assert_eq!(run(&store, &["add", slug, member]), 0);
+            assert_eq!(run(&store, &["status", slug, "planned"]), 0);
+            // Planned at distinct times, in the order named.
+            let mut w = store.worklist(slug).unwrap();
+            w.planned = Some(format!("2026-11-05T1{}:00:00Z", ["early", "late", "urgent", "blocked"].iter().position(|s| *s == slug).unwrap()));
+            store.save_worklist(&w).unwrap();
+        }
+        assert_eq!(flagged(&store, &["edit", "urgent"], &[("prio", "high")]), 0);
+        assert_eq!(flagged(&store, &["edit", "late"], &[("prio", "low")]), 0);
+        assert_eq!(flagged(&store, &["edit", "early"], &[("prio", "urgent")]), 2, "not a priority");
+        assert_eq!(run(&store, &["after", "blocked", "early"]), 0);
+        assert_eq!(run(&store, &["after", "early", "blocked"]), 1, "a chain that comes round is refused");
+        assert_eq!(run(&store, &["after", "early", "early"]), 1, "and so is a list after itself");
+        assert_eq!(run(&store, &["after", "early", "nothing-by-that-name"]), 1);
+
+        let lines = drawn(&store, false);
+        let at = |id: &str| lines.iter().position(|l| l.starts_with(id)).unwrap_or_else(|| panic!("{id} in {lines:?}"));
+        assert!(lines.iter().any(|l| l.contains("planned — in queue order")), "{lines:?}");
+        assert!(at("urgent") < at("early") && at("early") < at("blocked") && at("blocked") < at("late"), "{lines:?}");
+        assert!(lines[at("urgent")].contains("may start"), "{lines:?}");
+        assert!(lines[at("blocked")].contains("after early"), "{lines:?}");
+
+        // `next <slug>` says the same, and the JSON carries it.
+        assert_eq!(run(&store, &["next", "blocked"]), 0);
+        let w = store.worklist("blocked").unwrap();
+        assert_eq!(w.after.as_deref(), Some("early"));
+        assert_eq!(run(&store, &["after", "blocked", "none"]), 0);
+        assert_eq!(store.worklist("blocked").unwrap().after, None);
+
+        // alone and not alone are stored; both together are refused.
+        assert_eq!(flagged(&store, &["edit", "late"], &[("alone", "true")]), 0);
+        assert_eq!(store.worklist("late").unwrap().alone, Some(true));
+        assert_eq!(flagged(&store, &["edit", "late"], &[("no-alone", "true")]), 0);
+        assert_eq!(store.worklist("late").unwrap().alone, Some(false));
+        assert_eq!(flagged(&store, &["edit", "late"], &[("alone", "true"), ("no-alone", "true")]), 2);
+    }
+
+    /// An executing list on the same project holds a planned one that runs
+    /// alone, and the room under the seat's cap is counted against the first
+    /// group and a verifier.
+    #[test]
+    fn a_planned_list_is_held_by_an_executing_one_on_its_project_and_by_the_cap() {
+        let (_env, store) = running("queue-world");
+        for id in ["w-1", "w-2", "w-3"] {
+            task(&store, id, "todo");
+        }
+        assert_eq!(run(&store, &["new", "running-one", "r", "-p", "proj"]), 0);
+        let _ = run(&store, &["add", "running-one", "w-1"]);
+        let _ = run(&store, &["new", "next-one", "n"]);
+        let mut p = crate::model::Project::new("proj");
+        p.name = "proj".into();
+        store.save_project(&p).unwrap();
+        let mut w = store.worklist("running-one").unwrap();
+        w.project = Some("proj".into());
+        w.status_raw = "running".into();
+        store.save_worklist(&w).unwrap();
+        let mut n = store.worklist("next-one").unwrap();
+        n.project = Some("proj".into());
+        store.save_worklist(&n).unwrap();
+        assert_eq!(run(&store, &["add", "next-one", "w-2", "w-3"]), 0);
+        assert_eq!(run(&store, &["status", "next-one", "planned"]), 0);
+
+        let line = |store: &Store| drawn(store, false).into_iter().find(|l| l.starts_with("next-one")).unwrap();
+        assert!(line(&store).contains("may start"), "no --alone and not wsp's source: {}", line(&store));
+        assert_eq!(flagged(&store, &["edit", "next-one"], &[("alone", "true")]), 0);
+        assert!(line(&store).contains("alone: running-one executing"), "{}", line(&store));
+
+        assert_eq!(flagged(&store, &["edit", "next-one"], &[("no-alone", "true")]), 0);
+        // Two members and a verifier is three places, and no more than the cap
+        // is ever asked for: a list bigger than the seat is not held for ever.
+        store.set_seat_cap(Some(2)).unwrap();
+        assert!(line(&store).contains("may start"), "{}", line(&store));
+        store.set_seat_cap(Some(3)).unwrap();
+        assert!(line(&store).contains("may start"), "{}", line(&store));
     }
 
     /// `cancelled` puts the open rows back to todo, unclaimed, and logs the

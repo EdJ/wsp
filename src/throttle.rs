@@ -896,6 +896,13 @@ pub(crate) fn loud(store: &Store) -> Option<String> {
     v.load_warning().then(|| v.load_sentence())
 }
 
+/// Whether the load is holding builds back now — the warning [`loud`] words —
+/// for what waits on the machine (`wsp-383`). Never under test, where a load
+/// reading is noise.
+pub(crate) fn holding_back(store: &Store) -> bool {
+    !cfg!(test) && loud(store).is_some()
+}
+
 /// [`View::status_line`], for the surfaces that are not `wsp throttle`.
 pub(crate) fn status_line(store: &Store) -> String {
     View::read(&store.state).status_line()

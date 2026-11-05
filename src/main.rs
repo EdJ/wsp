@@ -111,6 +111,7 @@ mod tunnel;
 mod untaken;
 mod util;
 mod waiting;
+mod waits;
 mod warm;
 mod worklist;
 
@@ -204,7 +205,7 @@ const BOOL_FLAGS: &[&str] = &[
     "herdr", "compound",
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
-    "release", "check", "rm", "alone",
+    "release", "check", "rm", "alone", "no-alone",
     // And `resume`, whose positional is a task or a project.
     "print",
     // And `checkout`, whose positional is a task id.
@@ -2189,6 +2190,15 @@ fn help_text() -> String {
                                     run makes it executing, its end complete,
                                     `done` closed. cancelled puts the open rows
                                     back to todo, unclaimed. No word: say it
+  wsp worklist after <slug> <other|none>
+                                    start <slug> only once <other> is complete
+  wsp worklist edit <slug> [--prio high|normal|low] [--alone|--no-alone]
+                                    where a planned list queues (high first, then
+                                    the earlier planned) and whether it waits for
+                                    any executing list on its project (default on
+                                    for wsp's own source). `new` takes them too.
+                                    `ls` and `next <slug>` say what a planned list
+                                    waits on: room, throttle, after, alone, manual
   wsp worklist done <slug> [--force why…]
                                     nothing left to want from it. Refused while
                                     a declared output is missing; --force and
