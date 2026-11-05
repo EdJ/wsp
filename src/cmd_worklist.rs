@@ -3692,6 +3692,31 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
 
 // ---- go ---------------------------------------------------------------
 
+/// `wsp worklist pickup`: the daemon's pass over the planned lists (`wsp-384`),
+/// once and now — for a repair when the daemon is not running, and for looking
+/// at the pickup in a sandbox without waiting for a tick. It starts the first
+/// planned list that may start, exactly as the daemon would, and says which.
+fn pickup(store: &Store) -> i32 {
+    match crate::pickup::tick(store) {
+        Some(id) => println!("{id} started — {} ", crate::pickup::wip_lines(store).last().cloned().unwrap_or_default()),
+        None => println!("no planned list may start — `wsp worklist ls` says what each waits on"),
+    }
+    0
+}
+
+/// Start a `planned` list on the daemon's say-so (`wsp-384`): `go`, with the
+/// reason as its sentence and `--if-planned` so the write itself refuses a
+/// list that is no longer planned. 0 started; 3 it was not planned any more;
+/// anything else is `go`'s own refusal (a member already in another run).
+pub(crate) fn start_planned(store: &Store, id: &str, why: &str, caption: &str) -> i32 {
+    let a = Args::synth(
+        "worklist",
+        &["go", id, why],
+        &[("if-planned", "true"), ("caption", caption), ("quiet", "true")],
+    );
+    go(store, &a)
+}
+
 /// `wsp worklist go [<slug>] ["the verdict"]` — start a list, or pass a
 /// barrier.
 ///
@@ -3725,31 +3750,6 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
 /// because it defers rather than opts out. `-n` is a dry run of the whole verb:
 /// what it would record, what it would sweep, and what the group that landed
 /// touched, with nothing written and nothing removed.
-/// `wsp worklist pickup`: the daemon's pass over the planned lists (`wsp-384`),
-/// once and now — for a repair when the daemon is not running, and for looking
-/// at the pickup in a sandbox without waiting for a tick. It starts the first
-/// planned list that may start, exactly as the daemon would, and says which.
-fn pickup(store: &Store) -> i32 {
-    match crate::pickup::tick(store) {
-        Some(id) => println!("{id} started — {} ", crate::pickup::wip_lines(store).last().cloned().unwrap_or_default()),
-        None => println!("no planned list may start — `wsp worklist ls` says what each waits on"),
-    }
-    0
-}
-
-/// Start a `planned` list on the daemon's say-so (`wsp-384`): `go`, with the
-/// reason as its sentence and `--if-planned` so the write itself refuses a
-/// list that is no longer planned. 0 started; 3 it was not planned any more;
-/// anything else is `go`'s own refusal (a member already in another run).
-pub(crate) fn start_planned(store: &Store, id: &str, why: &str, caption: &str) -> i32 {
-    let a = Args::synth(
-        "worklist",
-        &["go", id, why],
-        &[("if-planned", "true"), ("caption", caption), ("quiet", "true")],
-    );
-    go(store, &a)
-}
-
 pub fn go(store: &Store, args: &Args) -> i32 {
     let (w, said, seat) = match list_and_words(store, args) {
         Ok(v) => v,
