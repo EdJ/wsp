@@ -4035,8 +4035,9 @@ pub(crate) struct Wip {
     /// tick (`wsp-386`) — [`crate::repair::unsent_seats`]. Drawn as `typed, not
     /// sent` in place of `idle`.
     pub unsent: std::collections::BTreeSet<String>,
-    /// Rows that started a full-suite `cargo test` in their seat (`wsp-389`):
-    /// [`crate::throttle::full_suite_tasks`]. Drawn as `full suite in a member
+    /// Seats that started a full-suite `cargo test` (`wsp-389`):
+    /// [`crate::throttle::full_suite_seats`]. By seat, so a row reopened into a
+    /// new seat is not flagged for the last one's run. Drawn as `full suite in a member
     /// seat`; published as `full_suite`.
     pub full_suite: std::collections::BTreeSet<String>,
 }
@@ -4164,7 +4165,7 @@ impl Wip {
             since,
             spawned: store.spawned(),
             unsent: crate::repair::unsent_seats(store),
-            full_suite: crate::throttle::full_suite_tasks(&store.state),
+            full_suite: crate::throttle::full_suite_seats(&store.state),
         }
     }
 }
@@ -4337,8 +4338,7 @@ pub(crate) struct WipRow {
     /// The prompt holds text that was typed and never submitted, for more than
     /// a tick (`wsp-386`). Drawn as `typed, not sent`; published as `unsent`.
     pub(crate) unsent: bool,
-    /// The row this seat holds, or verifies, has started a full-suite `cargo
-    /// test` in its seat (`wsp-389`). Drawn as `full suite in a member seat`;
+    /// This seat has started a full-suite `cargo test` (`wsp-389`). Drawn as `full suite in a member seat`;
     /// published as `full_suite`.
     pub(crate) full_suite: bool,
     /// The scope this pane was the governor of, when it is gone. **A gone pane
@@ -4655,10 +4655,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             spawned_by,
             leg: leg.cloned(),
             unsent: !a.state.turn_in_flight() && w.unsent.contains(seat),
-            full_suite: bound
-                .map(|t| t.id.as_str())
-                .or_else(|| verifying.get(seat).map(|(m, _)| m.as_str()))
-                .is_some_and(|id| w.full_suite.contains(id)),
+            full_suite: w.full_suite.contains(seat),
             was_governor,
         });
     }
@@ -8438,9 +8435,9 @@ mod tests {
     }
 
     #[test]
-    fn a_seat_whose_row_ran_the_full_suite_says_so_and_the_others_do_not() {
+    fn a_seat_that_ran_the_full_suite_says_so_and_the_others_do_not() {
         let mut w = wip_world();
-        w.full_suite.insert("t-001".into());
+        w.full_suite.insert("w1:p1".into());
         let j = wip_json(&w);
         let row = |pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap().clone();
         assert_eq!(row("w1:p1")["full_suite"], true);

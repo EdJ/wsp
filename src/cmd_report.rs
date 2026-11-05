@@ -201,12 +201,17 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let mut group_json: Vec<Value> = Vec::new();
     let mut rework_rows: Vec<Value> = Vec::new();
     let (mut blocked, mut reopened, mut dropped, mut rework_usd) = (0u64, 0u64, 0u64, 0u64);
+    let mut suites_total = 0u64;
 
     for (gi, g) in groups.iter().enumerate() {
         let (mut gwall, mut gmodel, mut gtool) = (0i64, 0i64, 0i64);
+        let mut gsuites = 0u64;
         let mut members: Vec<Value> = Vec::new();
         for m in &g.members {
             let f = figures(m);
+            let suites = crate::throttle::full_suite_runs(&store.state, m);
+            gsuites += suites;
+            suites_total += suites;
             let tool: i64 = f.tools.values().sum();
             gwall += f.wall;
             gmodel += f.model_secs;
@@ -258,13 +263,13 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
                 "task": m, "wall_seconds": f.wall, "model_seconds": f.model_secs,
                 "tool_seconds": f.tools, "gap_seconds": f.gap, "calls": f.calls,
                 "tokens_in": f.tokens_in, "tokens_cache_read": f.cache_read, "tokens_out": f.tokens_out,
-                "transcripts_missing": f.missing,
+                "transcripts_missing": f.missing, "full_suite_runs": suites,
             }));
         }
         let gcost = cost["groups"].get(gi).and_then(|c| c.get("total")).cloned().unwrap_or(Value::Null);
         group_json.push(json!({
             "group": gi + 1, "wall_seconds": gwall, "model_seconds": gmodel, "tool_seconds": gtool,
-            "cost": gcost, "members": members,
+            "cost": gcost, "full_suite_runs": gsuites, "members": members,
         }));
     }
     let followups: Vec<Value> = crate::cmd_worklist::followups(w).into_iter().map(|(row, ids)| json!({ "by": row, "rows": ids })).collect();
@@ -282,6 +287,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
         "status": w.status().as_str(),
         "scope": {
             "cost": "whole row: every seat — members, verifiers, barrier checks, governors",
+            "full_suite": "full_suite_runs: full-suite `cargo test` runs started in a member's or verifier's seat (the shim's note, wsp-389), by row and group. The barrier's own run is one per group and is not counted here; the aim is zero in seats.",
             "time": "per member row, spawn to verdict (wall, gaps); the seat's model and tool time are its own transcript calls inside those phases, legs only where run-leg timings exist",
         },
         "totals": {
@@ -300,6 +306,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "usd_micros": total["usd_micros"],
             "unmeasured_seats": total["unmeasured"],
             "transcripts_missing": missing_sessions,
+            "full_suite_runs": suites_total,
         },
         "waits": wait_list.iter().map(|(c, s)| json!({ "cause": c, "seconds": s })).collect::<Vec<_>>(),
         "groups": group_json,
@@ -335,7 +342,7 @@ fn against(now: &Value, slug: &str) -> Value {
         "idle_seconds": ratio("idle_seconds"), "gap_seconds": ratio("gap_seconds"),
         "input_tokens": ratio("input_tokens"), "output_tokens": ratio("output_tokens"),
         "cache_read_tokens": ratio("cache_read_tokens"), "cache_write_tokens": ratio("cache_write_tokens"),
-        "turns": ratio("turns"), "usd_micros": ratio("usd_micros"),
+        "turns": ratio("turns"), "usd_micros": ratio("usd_micros"), "full_suite_runs": ratio("full_suite_runs"),
         "waits_seconds": { "now": wa, "baseline": wb, "ratio": (wb > 0).then(|| (wa as f64 / wb as f64 * 100.0).round() / 100.0) },
     })
 }
@@ -384,6 +391,7 @@ pub fn effort_html(v: &Value) -> String {
             vec!["USD".into(), usd(t["usd_micros"].as_u64())],
             vec!["unmeasured seats".into(), n(t, "unmeasured_seats").to_string()],
             vec!["transcripts not found".into(), n(t, "transcripts_missing").to_string()],
+            vec!["full suites run in member or verifier seats".into(), n(t, "full_suite_runs").to_string()],
         ],
     ));
     b.push_str("<h2>2 · Waits between stages, largest first</h2>");
@@ -392,9 +400,9 @@ pub fn effort_html(v: &Value) -> String {
     b.push_str("<h2>3 · Per group, then per member</h2>");
     for g in v["groups"].as_array().into_iter().flatten() {
         let c = &g["cost"];
-        b.push_str(&format!("<h3>group {} · wall {} · model {} · tools {} · {} · {} turns</h3>", g["group"], hms(n(g, "wall_seconds") as i64), hms(n(g, "model_seconds") as i64), hms(n(g, "tool_seconds") as i64), usd(c["usd_micros"].as_u64()), n(c, "turns")));
-        let rows: Vec<Vec<String>> = g["members"].as_array().into_iter().flatten().map(|m| vec![m["task"].as_str().unwrap_or("").into(), hms(n(m, "wall_seconds") as i64), hms(n(m, "model_seconds") as i64), hms(n(m, "gap_seconds") as i64), n(m, "tokens_in").to_string(), n(m, "tokens_out").to_string()]).collect();
-        b.push_str(&table(&["member", "wall", "model", "gaps", "tokens in", "tokens out"], &rows));
+        b.push_str(&format!("<h3>group {} · wall {} · model {} · tools {} · {} · {} turns · {} full suite(s) in seats</h3>", g["group"], hms(n(g, "wall_seconds") as i64), hms(n(g, "model_seconds") as i64), hms(n(g, "tool_seconds") as i64), usd(c["usd_micros"].as_u64()), n(c, "turns"), n(g, "full_suite_runs")));
+        let rows: Vec<Vec<String>> = g["members"].as_array().into_iter().flatten().map(|m| vec![m["task"].as_str().unwrap_or("").into(), hms(n(m, "wall_seconds") as i64), hms(n(m, "model_seconds") as i64), hms(n(m, "gap_seconds") as i64), n(m, "tokens_in").to_string(), n(m, "tokens_out").to_string(), n(m, "full_suite_runs").to_string()]).collect();
+        b.push_str(&table(&["member", "wall", "model", "gaps", "tokens in", "tokens out", "full suites"], &rows));
     }
     let r = &v["rework"];
     b.push_str(&format!("<h2>4 · Rework</h2><p>{} blocked · {} reopened · {} dropped · {}</p>", n(r, "blocked"), n(r, "reopened"), n(r, "dropped"), usd(r["usd_micros"].as_u64())));
@@ -413,7 +421,7 @@ pub fn effort_html(v: &Value) -> String {
     } else if let Some(m) = bl["missing"].as_str() {
         b.push_str(&format!("<p>{}</p>", esc(m)));
     } else {
-        let rows: Vec<Vec<String>> = ["wall_seconds", "model_seconds", "idle_seconds", "gap_seconds", "waits_seconds", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "turns", "usd_micros"]
+        let rows: Vec<Vec<String>> = ["wall_seconds", "model_seconds", "idle_seconds", "gap_seconds", "waits_seconds", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "turns", "usd_micros", "full_suite_runs"]
             .iter()
             .map(|k| vec![k.to_string(), bl[*k]["now"].to_string(), bl[*k]["baseline"].to_string(), bl[*k]["ratio"].as_f64().map_or("—".into(), |r| format!("×{r}"))])
             .collect();
@@ -831,5 +839,21 @@ mod tests {
         assert_eq!(members.iter().map(|m| m["model_seconds"].as_i64().unwrap()).sum::<i64>(), 200);
         assert_eq!(members.iter().map(|m| m["gap_seconds"].as_i64().unwrap()).sum::<i64>(), t["gap_seconds"].as_i64().unwrap());
         assert_eq!(members[0]["wall_seconds"], 300);
+    }
+
+    #[test]
+    fn full_suite_runs_in_seats_are_counted_per_row_per_group_and_in_total() {
+        let (_e, store, w) = list("suites", &["r-1", "r-2"]);
+        let d = store.state.join("full-suite");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("r-1.json"), r#"{"task":"r-1","runs":3,"seats":{"w1:p1":3}}"#).unwrap();
+        let v = effort_with(&store, &w, None, &|_| Default::default());
+        assert_eq!(v["totals"]["full_suite_runs"], 3);
+        let members: Vec<&Value> = v["groups"].as_array().unwrap().iter().flat_map(|g| g["members"].as_array().unwrap()).collect();
+        let runs = |id: &str| members.iter().find(|m| m["task"] == id).unwrap()["full_suite_runs"].as_u64().unwrap();
+        assert_eq!((runs("r-1"), runs("r-2")), (3, 0));
+        let groups: u64 = v["groups"].as_array().unwrap().iter().map(|g| g["full_suite_runs"].as_u64().unwrap()).sum();
+        assert_eq!(groups, 3);
+        assert!(effort_html(&v).contains("full suites"));
     }
 }

@@ -489,28 +489,48 @@ fn full_suite_dir(state: &Path) -> PathBuf {
 /// Note a full-suite `cargo test` started in a row's seat (`wsp-389`): the
 /// suite is the barrier's, once per group. A check or the barrier's own run has
 /// `WSP_*` stripped from its environment, so a task here is a member's or a
-/// verifier's seat. One file per row, with a count; `wsp wip` reads it.
+/// verifier's seat. One file per row, kept (the effort report sums `runs`),
+/// with the runs by seat: `wsp wip` flags a seat that is in it, so a row
+/// reopened into a new seat is not flagged for the last one's run.
 fn note_full_suite(ctx: &Ctx) {
     let path = full_suite_dir(ctx.state).join(format!("{}.json", ctx.task));
-    let runs = fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.get("runs").and_then(Value::as_u64))
-        .unwrap_or(0)
-        + 1;
+    let old = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).unwrap_or(Value::Null);
+    let runs = old.get("runs").and_then(Value::as_u64).unwrap_or(0) + 1;
+    let mut seats = old.get("seats").and_then(Value::as_object).cloned().unwrap_or_default();
+    if let Some(seat) = (ctx.env)(crate::place::SEAT_ENV) {
+        let n = seats.get(&seat).and_then(Value::as_u64).unwrap_or(0) + 1;
+        seats.insert(seat, json!(n));
+    }
     let _ = fs::create_dir_all(full_suite_dir(ctx.state));
-    let rec = json!({"task": ctx.task, "runs": runs, "since": util::epoch_secs(), "tree": tree_of(&ctx.cwd).display().to_string()});
+    let rec = json!({
+        "task": ctx.task, "runs": runs, "seats": seats, "since": util::epoch_secs(),
+        "tree": tree_of(&ctx.cwd).display().to_string(),
+    });
     let _ = crate::store::write_atomic(&path, &rec.to_string());
-    (ctx.say)(&format!(
-        "wsp: that is the full suite, and in a member's or verifier's seat it is noted (`wsp wip` says so). Run the tests for what you changed (`cargo test <module>::`); the full suite runs once per group, at the barrier."
-    ));
+    (ctx.say)(
+        "wsp: that is the full suite, and in a member's or verifier's seat it is noted (`wsp wip` says so). Run the tests for what you changed (`cargo test <module>::`); the full suite runs once per group, at the barrier.",
+    );
 }
 
-/// The rows that have started a full suite in their seat.
-pub(crate) fn full_suite_tasks(state: &Path) -> std::collections::BTreeSet<String> {
+fn full_suite_record(state: &Path, task: &str) -> Value {
+    fs::read_to_string(full_suite_dir(state).join(format!("{task}.json")))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// How many full suites a row's seats have started, ever.
+pub(crate) fn full_suite_runs(state: &Path, task: &str) -> u64 {
+    full_suite_record(state, task).get("runs").and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// The seats that have started a full suite.
+pub(crate) fn full_suite_seats(state: &Path) -> std::collections::BTreeSet<String> {
     let Ok(rd) = fs::read_dir(full_suite_dir(state)) else { return Default::default() };
     rd.flatten()
-        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".json")).map(str::to_string))
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+        .filter_map(|t| serde_json::from_str::<Value>(&t).ok())
+        .flat_map(|v| v.get("seats").and_then(Value::as_object).map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default())
         .collect()
 }
 
@@ -1461,21 +1481,19 @@ mod tests {
         let idle = || None;
         let said = std::cell::RefCell::new(Vec::<String>::new());
         let say = |m: &str| said.borrow_mut().push(m.to_string());
-        let env = |_: &str| None;
+        let env = |k: &str| (k == crate::place::SEAT_ENV).then(|| "w1:p1".to_string());
         let c = ctx(&rig, &idle, &say, &env);
         run_in(&c, "cargo", &["test".into(), "cmd_spawn::".into()]);
-        assert!(full_suite_tasks(&rig.state).is_empty(), "a filtered run is the member's own");
+        assert_eq!(full_suite_runs(&rig.state, "wsp-9"), 0, "a filtered run is the member's own");
         run_in(&c, "cargo", &["test".into()]);
         run_in(&c, "cargo", &["test".into()]);
-        assert_eq!(full_suite_tasks(&rig.state), std::collections::BTreeSet::from(["wsp-9".to_string()]));
-        let rec: Value = serde_json::from_str(&fs::read_to_string(full_suite_dir(&rig.state).join("wsp-9.json")).unwrap()).unwrap();
-        assert_eq!(rec["runs"], 2);
+        assert_eq!(full_suite_runs(&rig.state, "wsp-9"), 2);
+        assert_eq!(full_suite_seats(&rig.state), std::collections::BTreeSet::from(["w1:p1".to_string()]));
         assert!(said.borrow().iter().any(|m| m.contains("full suite") && m.contains("barrier")), "{:?}", said.borrow());
         let mut seatless = ctx(&rig, &idle, &say, &env);
         seatless.task = String::new();
-        let before = full_suite_tasks(&rig.state);
         run_in(&seatless, "cargo", &["test".into()]);
-        assert_eq!(full_suite_tasks(&rig.state), before, "no row, no note");
+        assert_eq!(full_suite_runs(&rig.state, ""), 0, "no row, no note");
     }
 
     #[test]
