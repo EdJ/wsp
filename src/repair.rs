@@ -368,6 +368,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     crate::ending::tick(store, seats);
     // And a governor seat with nothing left to govern (`wsp-337`).
     crate::stand_down::tick(store, seats);
+    // And text typed at a governor's or a member's prompt and never sent
+    // (`wsp-386`): counted here, drawn by `wsp wip`.
+    unsent_tick(store, seats);
     // **Collected first and then visited once each**, which is the whole of the
     // second trigger and the reason it is here rather than in the loop above.
     // A scope on a running list and a scope with a backlog are the same seat, and
@@ -582,6 +585,59 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
     }
 }
 
+// ---- text typed at a prompt and never sent ----------------------------------
+
+/// Where the passes that have found a seat's prompt holding typed text are
+/// counted: seat → how many consecutive ticks.
+const UNSENT_FILE: &str = "typed-unsent.json";
+
+/// How many consecutive ticks a prompt must hold typed text before `wsp wip`
+/// says so. Two: the first reading may be a person or a tell mid-send, and a
+/// line still sitting there a minute later was never submitted.
+const UNSENT_TICKS: u64 = 2;
+
+/// **Typed, not sent** (`wsp-386`). A governor whose prompt held "use
+/// eds-macbook-i5, patches, 20 minute lease" read `idle` for as long as it sat
+/// there, and `idle` is a seat with nothing to do. Counted on the tick, on the
+/// idle governor and member seats only, because a screen read costs and a seat
+/// mid-turn queues what is typed at it by design. A seat that reads anything
+/// else, or whose prompt is empty, or that cannot be read, leaves the record.
+pub(crate) fn unsent_tick(store: &Store, seats: &dyn Seats) {
+    let governors = store.governors();
+    let mut candidates: Vec<String> = governors
+        .keys()
+        .filter_map(|scope| cmd_govern::seat_held(scope, &governors))
+        .map(|s| s.pane)
+        .collect();
+    candidates.extend(store.bindings().keys().cloned());
+    candidates.sort();
+    candidates.dedup();
+    let before = unsent_counts(store);
+    let mut now = std::collections::BTreeMap::new();
+    for seat in candidates {
+        if seats.state(&seat) != Some(State::Idle) || seats.typed(&seat) != Some(true) {
+            continue;
+        }
+        now.insert(seat.clone(), before.get(&seat).copied().unwrap_or(0) + 1);
+    }
+    if now != before {
+        let _ = std::fs::create_dir_all(&store.state);
+        let _ = std::fs::write(store.state.join(UNSENT_FILE), serde_json::json!(now).to_string());
+    }
+}
+
+fn unsent_counts(store: &Store) -> std::collections::BTreeMap<String, u64> {
+    std::fs::read_to_string(store.state.join(UNSENT_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// The seats whose prompts have held typed text for more than a tick.
+pub(crate) fn unsent_seats(store: &Store) -> std::collections::BTreeSet<String> {
+    unsent_counts(store).into_iter().filter(|(_, n)| *n >= UNSENT_TICKS).map(|(s, _)| s).collect()
+}
+
 // ---- a governor seat nobody is in -----------------------------------------
 
 /// A run whose governor seat is standing empty, and whether it is time to fill
@@ -641,7 +697,13 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     let Some(word) = how_it_reads(store, seats, &scope) else { return };
     // This pass's own count, and the record's reading of it, from one write.
     let here = cmd_govern::count_unseated(store, &scope);
-    if !never_filled && !here.overdue(EMPTY_TICKS) {
+    // **A seat that reads `gone` is not waited on** (`wsp-386`). `Empty` is the
+    // reading of a pane between two agents, and that is what the two ticks are
+    // for; `Gone` is a pane closed or an agent released, and nobody is coming
+    // back to it. Waiting two ticks on it left remote-agents unseated for three
+    // hours between two groups, with the only repair a person's `advance`.
+    let gone = word == "gone";
+    if !never_filled && !gone && !here.overdue(EMPTY_TICKS) {
         // Said once, on the way out — the pass that noticed is the interesting
         // one, and the next one is already counting.
         if here.unseated == 1 {
@@ -656,7 +718,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // says it on the seat for as long as it stays true.
     let kind = crate::cmd_spawn::seat_kind(&governors, &scope);
     if !crate::place_compound::reads_kind(&kind) {
-        if here.unseated == EMPTY_TICKS {
+        if here.unseated == if gone { 1 } else { EMPTY_TICKS } {
             stamp(store, &format!("{scope}: the seat reads {word} and {trigger}, but it was a {kind} governor and compound cannot run one — nothing seated"));
         }
         return;
@@ -1649,6 +1711,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// A [`Fake`] whose prompts all hold typed text (`wsp-386`).
+    struct Typing(Fake);
+
+    impl Seats for Typing {
+        fn state(&self, seat: &str) -> Option<State> {
+            self.0.state(seat)
+        }
+        fn typed(&self, _seat: &str) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    /// A governor seat that reads `gone` on a running list is replaced on the
+    /// first tick, with no `advance` and a line saying why (`wsp-386`).
+    #[test]
+    fn a_governor_that_reads_gone_is_reseated_on_the_first_tick_and_the_log_says_why() {
+        let (_env, store) = in_flight("seat-gone-at-once");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]));
+        assert_eq!(reseated(), vec!["run".to_string()]);
+        assert!(stamped().iter().any(|l| l.contains("the seat reads gone and this list is running — seating a successor")));
+    }
+
+    /// Typed text that stays through a second tick is `typed, not sent`; one
+    /// reading is not, and text that goes leaves the record.
+    #[test]
+    fn a_prompt_holding_typed_text_for_more_than_a_tick_is_counted_unsent() {
+        let (_env, store) = in_flight("seat-unsent");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        let idle = Typing(Fake::new(&[("cpd-1", Some(State::Idle))]));
+        unsent_tick(&store, &idle);
+        assert!(unsent_seats(&store).is_empty(), "one tick may be a send in flight");
+        unsent_tick(&store, &idle);
+        assert!(unsent_seats(&store).contains("cpd-1"));
+        unsent_tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]));
+        assert!(unsent_seats(&store).is_empty(), "a prompt that cannot be read, or is empty, leaves the record");
+        unsent_tick(&store, &Typing(Fake::new(&[("cpd-1", Some(State::Working))])));
+        assert!(unsent_seats(&store).is_empty(), "and a seat mid-turn queues what is typed at it");
+    }
+
     /// A [`Fake`] that also says which seats are **positively** not there — every
     /// backend has answered and none has them.
     ///
@@ -2226,20 +2328,17 @@ impl Seats for Absent {
     /// fact and can be acted on at once, and the count is not removed, because
     /// this is still a pane a reading had to be asked about twice.
     #[test]
-    fn a_governor_pane_that_was_closed_is_reseated_after_two_ticks() {
+    fn a_governor_pane_that_was_closed_is_reseated_on_the_first_tick() {
         let (_env, store) = in_flight("seat-closed");
         seated(&store, "run", "w1", "cpd-1", "", "");
         let closed = Absent(vec!["cpd-1".to_string()]);
 
         a_pass(&store, &closed);
-        assert!(reseated().is_empty(), "one tick is not two: {:?}", reseated());
-        assert_eq!(
-            cmd_govern::vacancy(&store.governors(), "run").unseated,
-            1,
-            "and a closed pane is counted like any other emptiness"
+        assert_eq!(reseated(), vec!["run".to_string()], "a closed pane is not waited on (wsp-386)");
+        assert!(
+            stamped().iter().any(|l| l.contains("the seat reads gone") && l.contains("seating a successor")),
+            "and the list's log says why"
         );
-        a_pass(&store, &closed);
-        assert_eq!(reseated(), vec!["run".to_string()], "which is the case that was invisible");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
@@ -2384,12 +2483,12 @@ impl Seats for Absent {
         seated(&store, "run", "w1", "cpd-1", "", "");
         // The backlog trigger, pointed at the seat the list already governs.
         held_for(&store, "run", 2);
-        let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+        let gone = Fake::new(&[("cpd-1", Some(State::Empty))]);
 
         a_pass(&store, &gone);
         let said = stamped();
         assert_eq!(
-            said.iter().filter(|l| l.contains("the seat reads gone")).count(),
+            said.iter().filter(|l| l.contains("the seat reads empty")).count(),
             1,
             "one pass, one notice: {said:?}"
         );

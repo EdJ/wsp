@@ -4031,6 +4031,10 @@ pub(crate) struct Wip {
     /// seat governed (`wsp-249`). Published as `spawned_by`, and what makes a
     /// governor's spawn a `helper`.
     pub spawned: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Seats whose prompt has held typed text, never submitted, for more than a
+    /// tick (`wsp-386`) — [`crate::repair::unsent_seats`]. Drawn as `typed, not
+    /// sent` in place of `idle`.
+    pub unsent: std::collections::BTreeSet<String>,
 }
 
 /// Note this census's seats against `seat-since.json` and say since when each
@@ -4155,6 +4159,7 @@ impl Wip {
             lists,
             since,
             spawned: store.spawned(),
+            unsent: crate::repair::unsent_seats(store),
         }
     }
 }
@@ -4324,6 +4329,15 @@ pub(crate) struct WipRow {
     /// The leg standing in the seat, when it is one (`docs/legs.md`, *Seen*).
     /// Published as `leg: {name, after, index, of}`; `null` for any other seat.
     pub(crate) leg: Option<crate::legs::Standing>,
+    /// The prompt holds text that was typed and never submitted, for more than
+    /// a tick (`wsp-386`). Drawn as `typed, not sent`; published as `unsent`.
+    pub(crate) unsent: bool,
+    /// The scope this pane was the governor of, when it is gone. **A gone pane
+    /// is not a governor** (`wsp-386`): `seat` and the governor role are left
+    /// off it, so a list's seat that vanished does not read as seated; the
+    /// scope is kept here so the row still says whose it was. Published as
+    /// `was_governor`.
+    pub(crate) was_governor: Option<String>,
 }
 
 /// What a seat is, typed, for a reader that places it (`wsp-246`): compound's
@@ -4532,7 +4546,11 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // spelling so the next word herdr adds does not read as work.
         let stopped = a.state.stopped();
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
-        let seat_of_project = cmd_govern::governs(&w.governors, &cmd_govern::seat_query(workspace_id, Some(seat)));
+        let governs = cmd_govern::governs(&w.governors, &cmd_govern::seat_query(workspace_id, Some(seat)));
+        let (seat_of_project, was_governor) = match a.state == State::Gone {
+            true => (None, governs),
+            false => (governs, None),
+        };
         let waiting = crate::waiting::reading(Some(a.state), &w.asks, &w.shells, seat, bound.map(|t| t.id.as_str()).unwrap_or(""));
         // A member waiting on its own shell is stopped on live work and needs
         // nobody (`wsp-214`): the shell wakes it. Every other wait still
@@ -4627,6 +4645,8 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             role,
             spawned_by,
             leg: leg.cloned(),
+            unsent: !a.state.turn_in_flight() && w.unsent.contains(seat),
+            was_governor,
         });
     }
     // A governor's count, once every row has its own reading — off the same
@@ -4747,6 +4767,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "role": r.role.json(),
             "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
             "spawned_by": r.spawned_by,
+            "unsent": r.unsent, "was_governor": r.was_governor,
             "leg": r.leg.as_ref().map(|s| json!({
                 "name": s.leg.name, "after": s.after, "index": s.index, "of": s.of,
             })),
@@ -4778,6 +4799,9 @@ fn wip_json(w: &Wip) -> serde_json::Value {
 /// agents are denied by the decision of 2026-08-19, so the member stopped and
 /// the row sat at `doing`. It says whose verb each is, and what a member does.
 const REVIEW_VERBS: &str = "the person's: wsp done <id> · wsp reopen <id> — a member finishes with wsp review";
+
+/// What the STATE column says of a seat whose prompt holds text nobody sent.
+const UNSENT_WORD: &str = "typed, not sent";
 
 fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
     let rows = wip_rows(w);
@@ -4858,12 +4882,13 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             .map(|r| r.waiting.as_ref().map(|w| waited(r, w).chars().count()).unwrap_or(0))
             .max()
             .unwrap_or(0)
-            .max(8);
+            .max(if rows.iter().any(|r| r.unsent) { UNSENT_WORD.len() } else { 8 });
         for r in &rows {
             let state = match (&r.waiting, r.state.as_str()) {
                 // Before the word, and in place of it: a waiting seat reads
                 // `idle` on its screen, and `idle` is what got one ended.
                 (Some(w), _) => p.yellow(&util::pad(&waited(r, w), sw)),
+                (None, _) if r.unsent => p.yellow(&util::pad(UNSENT_WORD, sw)),
                 (None, "working") => p.green(&util::pad("working", sw)),
                 (None, "idle") => p.dim(&util::pad("idle", sw)),
                 (None, other) => p.dim(&util::pad(other, sw)),
@@ -4886,9 +4911,10 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
                 // something, and says what: the reconciler's to repair, not a
                 // row nobody swept (`wsp-169`).
                 (None, false) => match r.state_typed == State::Gone {
-                    true => holding(&w.tasks, &w.bindings, &w.claims, &w.agents_held, &r.pane)
-                        .map(|t| p.dim(&format!("holds {t}")))
-                        .unwrap_or_default(),
+                    true => match (&r.was_governor, holding(&w.tasks, &w.bindings, &w.claims, &w.agents_held, &r.pane)) {
+                        (Some(scope), _) => p.dim(&format!("was {}", cmd_govern::governor_of(scope))),
+                        (None, held) => held.map(|t| p.dim(&format!("holds {t}"))).unwrap_or_default(),
+                    },
                     false => String::new(),
                 },
             };
@@ -8132,6 +8158,7 @@ mod tests {
             lists: Vec::new(),
             since: Default::default(),
             spawned: Default::default(),
+            unsent: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -8327,6 +8354,7 @@ mod tests {
             lists: Vec::new(),
             since: Default::default(),
             spawned: Default::default(),
+            unsent: Default::default(),
         }
     }
 
@@ -8368,6 +8396,25 @@ mod tests {
     /// home's walk — and a project's governor to nobody. With nobody seated on
     /// the walk it is `null`, and `answers_to_empty` names the home so the
     /// chrome can say "no governor seated" rather than guess.
+    #[test]
+    fn a_gone_pane_is_not_drawn_as_a_governor_and_an_unsent_prompt_is_not_idle() {
+        let mut w = wip_world();
+        w.governors.insert("tonight".into(), json!({ "workspace": "w6", "pane": "w6:p1" }));
+        let mut gone = seated_agent("w6:p1", "idle", "w6:p1");
+        gone.state = State::Gone;
+        w.agents.push(gone);
+        w.agents.push(seated_agent("w7:p1", "idle", "w7:p1"));
+        w.unsent.insert("w7:p1".into());
+        let j = wip_json(&w);
+        let row = |pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap().clone();
+        assert_eq!(row("w6:p1")["seat"], Value::Null, "a gone pane is no governor");
+        assert_eq!(row("w6:p1")["was_governor"], "tonight");
+        assert_eq!(row("w7:p1")["unsent"], true);
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("typed, not sent"), "{text}");
+        assert!(text.contains("was governor · tonight") || text.contains("was "), "{text}");
+    }
+
     #[test]
     fn wip_json_says_a_list_governor_answers_to_its_projects_governor() {
         let mut w = wip_world();

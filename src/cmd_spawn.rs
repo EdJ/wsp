@@ -8676,6 +8676,7 @@ mod tests {
             lists: store.worklists(),
             since: Default::default(),
             spawned: store.spawned(),
+            unsent: Default::default(),
         };
         cmd_agent::wip_rows(&w).into_iter().find(|r| r.pane == seat).expect("the seat is drawn")
     }
