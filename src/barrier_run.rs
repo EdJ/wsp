@@ -396,11 +396,13 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     let mut could_not = Vec::new();
     let mut count = 0;
     let (mut reused, mut ran_n) = (0, 0);
+    let mut per_step: Vec<String> = Vec::new();
     for (u, r) in plan.units.iter().zip(&ranged) {
         match r {
             Ranged::Could(why) => could_not.push(format!("{} — {why}", u.project)),
             Ranged::Ran(ran) => {
                 count += ran.len();
+                per_step.extend(ran.iter().filter(|x| x.reused.is_none()).map(|x| format!("{} {}s", x.step.name, x.took.as_secs())));
                 let (a, b) = check::tally(ran);
                 reused += a;
                 ran_n += b;
@@ -444,9 +446,11 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     log_line(
         store,
         &format!(
-            "{list} group {at}: barrier run — {count} step(s), {reused} reused, {ran_n} ran, {} failed, {}s{}",
+            "{list} group {at}: barrier run — {count} step(s), {reused} reused, {ran_n} ran, {} failed, {}s{}{}",
             failed.len(),
             started.elapsed().as_secs(),
+            // Per-step seconds of the steps that ran: `wsp timeline` reads them (`wsp-390`).
+            if per_step.is_empty() { String::new() } else { format!(" · per step: {}", per_step.join("; ")) },
             if decision.would_pass && !on { " · would pass without an agent (auto-pass is off)" } else { "" }
         ),
     );
