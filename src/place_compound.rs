@@ -1029,12 +1029,14 @@ fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut
     }
 }
 
-/// `compound-sup wire-version` → the bare number, or `None` if the installed
+/// `compound-sup wire-version` → its VERSION, or `None` if the installed
 /// binary predates that verb (an older build, not a broken one) or will not
-/// answer at all.
+/// answer at all. A current build prints the accepted range `OLDEST VERSION`;
+/// VERSION is the last token. An older build prints a bare number, which is
+/// the same token.
 fn ask_wire_version(bin: &std::path::Path) -> Option<u32> {
     let out = Command::new(bin).arg("wire-version").stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok()).flatten()
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).split_whitespace().last()?.parse().ok()).flatten()
 }
 
 fn dial(socket: &PathBuf, timeout: Duration) -> Result<UnixStream> {
@@ -2507,12 +2509,15 @@ mod tests {
     /// disagree with — nothing to say.
     #[test]
     fn wire_health_says_nothing_when_the_installed_pieces_agree() {
-        let scratch = Scratch::new("wire-ok");
-        let sup = fake_sup(&scratch.root, Some(&WIRE_VERSION.to_string()));
-        let (mut problems, mut notes) = (Vec::new(), Vec::new());
-        wire_health_of(&sup, &mut problems, &mut notes);
-        assert!(problems.is_empty(), "{problems:?}");
-        assert!(notes.is_empty(), "{notes:?}");
+        // The range a current build prints, and the bare number an older one does.
+        for (i, reply) in [format!("9 {WIRE_VERSION}"), WIRE_VERSION.to_string()].iter().enumerate() {
+            let scratch = Scratch::new(&format!("wire-ok-{i}"));
+            let sup = fake_sup(&scratch.root, Some(reply));
+            let (mut problems, mut notes) = (Vec::new(), Vec::new());
+            wire_health_of(&sup, &mut problems, &mut notes);
+            assert!(problems.is_empty(), "{reply:?}: {problems:?}");
+            assert!(notes.is_empty(), "{reply:?}: {notes:?}");
+        }
     }
 
     /// `compound-031`'s shape: the installed binary speaks a version this
@@ -2521,16 +2526,18 @@ mod tests {
     /// which file to edit rather than leaving that to be rediscovered.
     #[test]
     fn wire_health_catches_wsps_own_constant_going_stale() {
-        let scratch = Scratch::new("wire-stale-const");
         let other = WIRE_VERSION + 1;
-        let sup = fake_sup(&scratch.root, Some(&other.to_string()));
-        let (mut problems, mut notes) = (Vec::new(), Vec::new());
-        wire_health_of(&sup, &mut problems, &mut notes);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains(&WIRE_VERSION.to_string()), "{}", problems[0]);
-        assert!(problems[0].contains(&other.to_string()), "{}", problems[0]);
-        assert!(problems[0].contains("place_compound.rs"), "{}", problems[0]);
-        assert!(notes.is_empty(), "{notes:?}");
+        for (i, reply) in [format!("9 {other}"), other.to_string()].iter().enumerate() {
+            let scratch = Scratch::new(&format!("wire-stale-const-{i}"));
+            let sup = fake_sup(&scratch.root, Some(reply));
+            let (mut problems, mut notes) = (Vec::new(), Vec::new());
+            wire_health_of(&sup, &mut problems, &mut notes);
+            assert_eq!(problems.len(), 1, "{reply:?}: {problems:?}");
+            assert!(problems[0].contains(&WIRE_VERSION.to_string()), "{}", problems[0]);
+            assert!(problems[0].contains(&other.to_string()), "{}", problems[0]);
+            assert!(problems[0].contains("place_compound.rs"), "{}", problems[0]);
+            assert!(notes.is_empty(), "{notes:?}");
+        }
     }
 
     /// An installed `compound-sup` old enough to predate the `wire-version`
