@@ -119,27 +119,59 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
     }
 }
 
-/// The holders a cap line lists after its colon (`x in cpd-1, y starting, 2
-/// more`), each with whether its seat had finished by `to`: a work seat
-/// finishes at its row's review or release, a step's seat (`r · verifying`) at
-/// the row's verdict.
-fn cap_holders(i: &Inputs, after: &str, to: i64) -> String {
+/// One place a cap line lists after its colon (`x in cpd-1, y starting, 2
+/// more`), and what kind of seat it is.
+enum Held {
+    /// A row's work seat.
+    Work(String),
+    /// A row's step seat (`r · verifying`).
+    Step(String),
+    /// A list's barrier check seat (`list · barrier 2`): the label and the list.
+    Check(String, String, usize),
+    /// `N more`: places nobody named, so nothing to say of them.
+    More,
+}
+
+fn held_in(after: &str) -> Vec<(String, Held)> {
     let list = after.split_once(": ").map_or("", |(_, l)| l);
+    list.split(", ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|item| {
+            let what = item.strip_suffix(" starting").or_else(|| item.rsplit_once(" in ").map(|(w, _)| w)).unwrap_or(item);
+            let held = if item.strip_suffix(" more").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
+                Held::More
+            } else if let Some((list, at)) = crate::barrier::parse_label(what) {
+                Held::Check(what.trim().to_string(), list.to_string(), at)
+            } else if let Some((row, _)) = what.split_once(" · ") {
+                Held::Step(row.to_string())
+            } else {
+                Held::Work(what.to_string())
+            };
+            (item.to_string(), held)
+        })
+        .collect()
+}
+
+/// The holders a cap line lists, each with whether its seat had finished by
+/// `to`: a work seat finishes at its row's review or release, a step's seat
+/// (`r · verifying`) at the row's verdict, a barrier check seat when its
+/// barrier passed.
+fn cap_holders(i: &Inputs, after: &str, to: i64) -> String {
     let mut out = Vec::new();
-    for item in list.split(", ").map(str::trim).filter(|s| !s.is_empty()) {
-        let what = item.strip_suffix(" starting").or_else(|| item.rsplit_once(" in ").map(|(w, _)| w)).unwrap_or(item);
-        let (row, step) = match what.split_once(" · ") {
-            Some((r, _)) => (r, true),
-            None => (what, false),
+    for (item, held) in held_in(after) {
+        let ended = |pred: &dyn Fn(&str, &str) -> bool| {
+            i.holder_events.iter().filter(|(t, k, r)| *t <= to && pred(k, r)).map(|(t, _, _)| *t).min()
         };
-        let ended = i
-            .holder_events
-            .iter()
-            .filter(|(t, k, r)| {
-                *t <= to && r == row && if step { k == "task-verified" } else { k == "task-review" || k == "task-released" }
-            })
-            .map(|(t, _, _)| *t)
-            .min();
+        let ended = match &held {
+            Held::More => {
+                out.push(item);
+                continue;
+            }
+            Held::Work(row) => ended(&|k, r| r == row && (k == "task-review" || k == "task-released")),
+            Held::Step(row) => ended(&|k, r| r == row && k == "task-verified"),
+            Held::Check(label, _, _) => ended(&|k, r| r == label && k == "barrier-passed"),
+        };
         out.push(match ended {
             Some(t) => format!("{item} (finished {})", clock(t)),
             None => format!("{item} (running)"),
@@ -478,15 +510,16 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             .collect();
     }
     i.group = group;
-    // The rows a cap line named as holders, and when their seats ended.
+    // The seats a cap line named as holders, and when they ended.
     let mut holders: Vec<String> = Vec::new();
+    let mut checks: Vec<(String, String, usize)> = Vec::new();
     for (_, l) in &i.cycle {
         if let Some((_, after)) = l.split_once(" waits — the seat is at its cap") {
-            for item in after.split_once(": ").map_or("", |(_, l)| l).split(", ") {
-                let what = item.trim().strip_suffix(" starting").or_else(|| item.trim().rsplit_once(" in ").map(|(w, _)| w)).unwrap_or(item.trim());
-                let row = what.split_once(" · ").map_or(what, |(r, _)| r);
-                if !row.is_empty() && !holders.iter().any(|h| h == row) {
-                    holders.push(row.to_string());
+            for (_, held) in held_in(after) {
+                match held {
+                    Held::Work(r) | Held::Step(r) if !r.is_empty() && !holders.contains(&r) => holders.push(r),
+                    Held::Check(label, list, at) if !checks.iter().any(|c| c.0 == label) => checks.push((label, list, at)),
+                    _ => {}
                 }
             }
         }
@@ -504,6 +537,23 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
                 }
                 if let Some(row) = v["data"]["id"].as_str().filter(|r| holders.iter().any(|h| h == r)) {
                     i.holder_events.push((util::epoch_of(ts), kind.to_string(), row.to_string()));
+                }
+            }
+        }
+    }
+    if !checks.is_empty() {
+        // A check seat ends with its barrier: the line `tell <list>: Barrier <n> of <list> passed`.
+        if let Ok(text) = std::fs::read_to_string(store.state_file("cycle.log")) {
+            for line in text.lines() {
+                if line.len() < 21 || line.as_bytes()[19] != b'Z' || !line.is_char_boundary(20) {
+                    continue;
+                }
+                let (ts, rest) = line.split_at(20);
+                let rest = rest.trim_start();
+                for (label, list, at) in &checks {
+                    if rest.starts_with(&format!("tell {list}: Barrier {at} of {list}")) && rest.contains("passed") {
+                        i.holder_events.push((util::epoch_of(ts), "barrier-passed".to_string(), label.clone()));
+                    }
                 }
             }
         }
@@ -1044,6 +1094,20 @@ mod tests {
         assert!(why.contains("r-9 · verifying in cpd-1 (finished "), "{why}");
         assert!(why.contains("r-8 in cpd-2 (finished "), "{why}");
         assert!(why.contains("r-7 starting (running)"), "{why}");
+    }
+
+    #[test]
+    fn a_barrier_check_holder_that_passed_reads_finished_and_a_more_item_is_left_unlabelled() {
+        let mut i = row();
+        i.cycle.push((170, "list group 1: r-1 waits — the seat is at its cap of 4: other · barrier 2 in cpd-3, list · barrier 3 in cpd-4, 2 more".into()));
+        i.holder_events.push((100, "barrier-passed".into(), "other · barrier 2".into()));
+        i.holder_events.push((900, "barrier-passed".into(), "list · barrier 3".into()));
+        let ph = build(&i);
+        let why = ph.iter().filter_map(|p| p.waiting_for.clone()).find(|w| w.contains("cap")).expect("a cap wait");
+        assert!(why.contains("other · barrier 2 in cpd-3 (finished "), "{why}");
+        assert!(why.contains("list · barrier 3 in cpd-4 (running)"), "{why}");
+        assert!(why.ends_with("2 more"), "{why}");
+        assert!(!why.contains("2 more ("), "{why}");
     }
 
     #[test]
