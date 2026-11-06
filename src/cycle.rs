@@ -2227,7 +2227,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
          - it does not: `wsp verified {m} --blocks --from FILE --caption \"…\"`. {m} goes back to doing with \
          your verdict as what is owed, and its governor is told.\n\n\
          {caption}\n\n\
-         {checked}\n\n\
+         {checked}{reuse}\n\n\
          There is no row of your own: the verdict is recorded on {m} under `## Verification`, \
          and wsp ends this seat once it is in.",
         m = member.id,
@@ -2235,8 +2235,31 @@ fn verifier_base(store: &Store, member: &Task) -> String {
         caption = CAPTION_ORDER,
         checked = CHECKED_ORDER,
         legs = legs_line(member),
+        reuse = crate::check::greens_held(store, member).map(|(sha, held)| reuse_text(&sha, &held)).unwrap_or_default(),
         split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
     )
+}
+
+/// What a verifier is told when the member's own check is green at the commit it
+/// reads (`wsp-425`): the lines of the green, and that they are not to be run
+/// again. Starts with the blank line that sets it off; a carried green says where
+/// it passed and that the inputs are the same.
+pub(crate) fn reuse_text(sha: &str, held: &[(String, crate::greens::Green)]) -> String {
+    let at = &sha[..12.min(sha.len())];
+    let mut out = format!("\n\n**The row's own check is already green at {at}: do not run it again.** It is in the ledger:\n");
+    for (command, g) in held {
+        let command = command.lines().next().unwrap_or_default();
+        let where_ = match g.carried {
+            true => format!("carried from {} (same inputs, rebased since)", &g.sha[..12.min(g.sha.len())]),
+            false => "at this commit".to_string(),
+        };
+        out.push_str(&format!("- `{command}` · {}s · {} · {where_} · by {}, {}\n", g.took, g.env.word(), g.who, g.when));
+    }
+    out.push_str(
+        "Run only what the packet or the row's done-when names that these commands do not cover \
+         (a test they do not run, a build of another target); a verdict does not block on what they covered.",
+    );
+    out
 }
 
 /// The line a verifier's order gains on a row that ran in legs: the table, and

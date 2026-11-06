@@ -1216,6 +1216,26 @@ pub(crate) fn plan_text(store: &Store, t: &Task, tg: &Target) -> String {
     out
 }
 
+/// The row's own green at the commit a verifier reads (`wsp-425`): every step
+/// of its plan with the ledger's green for it, at that commit or carried to it by
+/// the same input hash. `None` when the row has no landing, no plan, or any step
+/// without a green — a red or half-run check keeps the verifier's order as it was.
+pub(crate) fn greens_held(store: &Store, t: &Task) -> Option<(String, Vec<(String, Green)>)> {
+    let tg = target(store, t, None).ok()?;
+    let Plan { steps, .. } = plan(store, t, &tg, None);
+    if steps.is_empty() {
+        return None;
+    }
+    let ledger = greens::Greens::open(store, &tg.project, &tg.repo);
+    let mut held = Vec::new();
+    for s in &steps {
+        let inputs = crate::affected::key(&tg.repo, &tg.sha, &s.command);
+        let g = ledger.lookup_by(&tg.sha, inputs.as_deref(), &s.command, greens::Env::Warm)?;
+        held.push((s.command.clone(), g));
+    }
+    Some((tg.sha, held))
+}
+
 fn plan_line(s: &Step, green: Option<&Green>) -> String {
     let reused = green.map(|g| format!(" · green · reused, {}s", g.took)).unwrap_or_default();
     format!("{} · {} · up to {}s · {} · {}{reused}", s.name, s.command, s.limit.as_secs(), tier(s), why_in(s))
@@ -1850,6 +1870,34 @@ mod tests {
         t.log(&format!("{} {sha} on pj-001", crate::repair::LANDED));
         store.save_task(&t).unwrap();
         (env, store, sha)
+    }
+
+    #[test]
+    fn a_verifiers_order_gives_the_rows_green_at_the_commit_a_carried_green_and_keeps_its_old_text_for_a_red() {
+        let (_env, store, sha) = world("order", "- ok: sh check.sh", "exit 0\n");
+        let t = store.find_task("pj-001").unwrap();
+        let tg = target(&store, &t, None).unwrap();
+        let ledger = greens::Greens::open(&store, &tg.project, &tg.repo);
+        let before = crate::cycle::verifier_order(&store, &t);
+        assert!(!before.contains("do not run it again"), "no green: {before}");
+        assert!(greens_held(&store, &t).is_none());
+
+        // A green carried to this commit: it passed at another one with the same inputs.
+        let from = "0123456789abcdef0123456789abcdef01234567";
+        let key = crate::affected::key(&tg.repo, &sha, "sh check.sh");
+        ledger.record_by(from, key.as_deref(), "sh check.sh", greens::Env::Warm, 12, "pj-001", false);
+        let carried = crate::cycle::verifier_order(&store, &t);
+        assert!(carried.contains("do not run it again"), "{carried}");
+        assert!(carried.contains("`sh check.sh` · 12s · warm · carried from 0123456789ab (same inputs, rebased since)"), "{carried}");
+
+        // A green at this very commit is preferred.
+        ledger.record(&sha, "sh check.sh", greens::Env::Warm, 41, "pj-001", false);
+        let order = crate::cycle::verifier_order(&store, &t);
+        assert!(order.contains(&format!("already green at {}: do not run it again", &sha[..12])), "{order}");
+        assert!(order.contains("`sh check.sh` · 41s · warm · at this commit · by pj-001"), "{order}");
+        assert!(order.contains("Run only what the packet or the row's done-when names that these commands do not cover"), "{order}");
+        let line = crate::cycle::verifier_order_line(&store, &t);
+        assert!(line.contains("do not run it again") && !line.contains('\n'), "{line}");
     }
 
     #[test]
