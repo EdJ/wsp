@@ -446,6 +446,12 @@ pub struct Generated {
 
 /// The section for `t` read from the tree at `root`. Never writes.
 pub fn generate(store: &Store, t: &Task, root: &Path) -> Generated {
+    generate_led(store, t, root, "")
+}
+
+/// [`generate`], with the files `lead` names (a leg's order) inlined before the
+/// ones the pack expects.
+pub fn generate_led(store: &Store, t: &Task, root: &Path, lead: &str) -> Generated {
     let (kind, _) = kind_of(&t.title, &overview_of(t));
     let mut pack = build_pack(store, t, kind, "full");
     let compose = |overview: &str, pack: Option<&Pack>| -> String {
@@ -471,10 +477,16 @@ pub fn generate(store: &Store, t: &Task, root: &Path) -> Generated {
         let shortened = format!("{}\n\n(The overview is cut here to fit the packet; the whole of it is `wsp show {}`.)", &overview[..cut], t.id);
         text = compose(&shortened, pack.as_ref().ok());
     }
-    let candidates: Vec<String> = match &pack {
+    let mut candidates: Vec<String> = named_files(lead, root);
+    let rest = match &pack {
         Ok(p) => p.likely.clone(),
         Err(_) => named_files(&overview, root),
     };
+    for f in rest {
+        if !candidates.contains(&f) {
+            candidates.push(f);
+        }
+    }
     let mut files: Vec<String> = Vec::new();
     let mut spent = text.len() + 160;
     for f in candidates {
@@ -497,7 +509,7 @@ pub fn generate(store: &Store, t: &Task, root: &Path) -> Generated {
 fn named_files(overview: &str, root: &Path) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for word in overview.split_whitespace() {
-        let w = word.trim_matches(|c: char| "`\"'()[],;:*".contains(c)).trim_end_matches('.');
+        let w = word.trim_end_matches(|c: char| "`\"'()[],;:*.".contains(c)).trim_start_matches(|c: char| "`\"'()[],;:*".contains(c));
         let looks = w.contains('/') || w.ends_with(".rs");
         if looks && !w.starts_with("http") && !w.starts_with("..") && !w.starts_with('/') && root.join(w).is_file() && !found.contains(&w.to_string()) {
             found.push(w.to_string());
@@ -518,6 +530,68 @@ pub fn eligible(t: &Task) -> Result<Kind, String> {
     } else {
         Err(format!("it reads as {} work ({reason})", kind.name()))
     }
+}
+
+// ---- a leg's packet ---------------------------------------------------------
+
+/// How much of the row's overview a leg's packet carries as background.
+const ROW_SHARE: usize = 3_000;
+
+/// How much of a finished leg's account a leg's packet carries.
+const AFTER_SHARE: usize = 600;
+
+/// The row as one leg's brief: its order first, then what the legs it follows
+/// said they did, then the row's overview (or its packet, for a row with no
+/// overview). Built as a task so the same generator reads it.
+fn leg_task(t: &Task, leg: &crate::legs::Leg, all: &[crate::legs::Leg]) -> Task {
+    let order = leg.order.lines().filter(|l| !l.trim_start().trim_start_matches("- ").starts_with(crate::packet::LEG_KEY)).collect::<Vec<_>>().join("\n");
+    let order = order.trim();
+    let mut text = format!("{order}\n");
+    let waits = crate::legs::upstream(all, &leg.name);
+    let said: Vec<String> = all
+        .iter()
+        .filter(|l| waits.contains(&l.name))
+        .filter_map(|l| {
+            let account = l.caption.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| head(l.baton.trim(), AFTER_SHARE));
+            (!account.is_empty()).then(|| format!("- {}: {}", l.name, account))
+        })
+        .collect();
+    if !said.is_empty() {
+        text.push_str(&format!("\nLegs before this one:\n{}\n", said.join("\n")));
+    }
+    let row = Some(overview_of(t)).filter(|o| !o.is_empty()).or_else(|| crate::packet::of(t).map(|p| p.text)).unwrap_or_default();
+    if !row.is_empty() {
+        text.push_str(&format!("\nThe row, {} ({}):\n{}\n", t.id, t.title, head(&row, ROW_SHARE)));
+    }
+    let mut lt = t.clone();
+    let first = order.lines().find(|l| !l.trim().is_empty()).unwrap_or(&leg.name);
+    lt.title = head(first.trim(), 100);
+    lt.body = format!("## Overview\n{text}");
+    lt
+}
+
+/// Whether a leg is given a packet unasked: its order names none, does not
+/// decline one, and reads as the kind of work a packet briefs well.
+pub fn leg_eligible(leg: &crate::legs::Leg) -> Result<Kind, String> {
+    if crate::packet::leg_path(&leg.order).is_some() {
+        return Err("it names a packet".into());
+    }
+    if crate::packet::leg_declined(&leg.order) {
+        return Err("it declined one".into());
+    }
+    let first = leg.order.lines().find(|l| !l.trim().is_empty()).unwrap_or(&leg.name);
+    let (kind, reason) = kind_of(first, &leg.order);
+    if kind.small() {
+        Ok(kind)
+    } else {
+        Err(format!("it reads as {} work ({reason})", kind.name()))
+    }
+}
+
+/// The section for one leg of `t`, read from the tree at `root`. Never writes.
+pub fn generate_leg(store: &Store, t: &Task, leg: &crate::legs::Leg, root: &Path) -> Generated {
+    let all = crate::legs::legs(t);
+    generate_led(store, &leg_task(t, leg, &all), root, &leg.order)
 }
 
 /// Write a generated packet into the row. Returns what was written.

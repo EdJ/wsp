@@ -209,6 +209,67 @@ pub fn leg_path(order: &str) -> Option<String> {
     })
 }
 
+/// Whether a leg's order says `packet: off`: it is spawned the ordinary way and
+/// is not given a packet.
+pub fn leg_declined(order: &str) -> bool {
+    order.lines().any(|l| {
+        l.trim().trim_start_matches("- ").trim().strip_prefix(LEG_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("off"))
+    })
+}
+
+/// Where a generated leg packet is kept: in the store, beside the row, so a
+/// person can read and edit it before the leg runs.
+pub fn leg_file(store: &Store, task: &str, leg: &str) -> PathBuf {
+    store.root.join("packets").join(format!("{task}.{leg}.md"))
+}
+
+/// A leg that has no packet and has not declined one is given one at spawn:
+/// generated from its order, the legs before it and the row, written to
+/// [`leg_file`] and named on the leg's order as `packet: FILE`, which is what
+/// `wsp show` and `wsp packet --leg` read. A leg that reads as judgement, or
+/// whose pack names no file, is left as it was; the reason goes to stderr.
+pub fn give_leg(store: &Store, task: &str, leg: &str, root: &Path, full: bool, no_packet: bool, kind_short: bool) {
+    if full || no_packet || !kind_short {
+        return;
+    }
+    // The pack can take two minutes: the lock is held only to write the order.
+    let Some(t) = store.find_task(task) else { return };
+    let all = crate::legs::legs(&t);
+    let Some(leg_at) = all.iter().find(|l| l.name == leg) else { return };
+    if crate::packet_gen::leg_eligible(leg_at).is_err() {
+        return;
+    }
+    let made = crate::packet_gen::generate_leg(store, &t, leg_at, root);
+    match &made.pack {
+        Ok(0) => return eprintln!("wsp: {task} leg {leg} is not given a packet: the pack found no file this leg will touch"),
+        Err(why) => return eprintln!("wsp: {task} leg {leg} is not given a packet: {why}"),
+        Ok(_) => {}
+    }
+    let file = leg_file(store, task, leg);
+    let wrote = file
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|_| std::fs::write(&file, format!("{GENERATED}\n{}\n", made.section)));
+    if let Err(e) = wrote {
+        return eprintln!("wsp: {task} leg {leg} is not given a packet: {}: {e}", util::contract(&file));
+    }
+    store.locked(|| {
+        let Some(mut t) = store.find_task(task) else { return };
+        let mut all = crate::legs::legs(&t);
+        let Some(at) = all.iter().position(|l| l.name == leg) else { return };
+        if crate::packet_gen::leg_eligible(&all[at]).is_err() {
+            return;
+        }
+        all[at].order = format!("{LEG_KEY} {}\n\n{}", file.display(), all[at].order);
+        crate::legs::write(&mut t, &all);
+        if let Err(e) = store.save_task(&t) {
+            return eprintln!("wsp: {task} leg {leg} is not given a packet: {e}");
+        }
+        store.wrote(&file);
+        store.git_commit(&format!("wsp: packet {task} leg {leg} — generated"));
+    });
+}
+
 /// How a leg ends: `leg done`, or `review` for the leg nothing waits on.
 pub fn leg_finish(task: &str, last: bool) -> String {
     match last {
@@ -703,6 +764,79 @@ mod tests {
         let _builder = FakePack::with(&env.path(""), "\"src/a.rs\"");
         assert!(spawn(&store, false, false).is_none());
         assert_eq!(store.find_task("pj-001").unwrap().section(SECTION).unwrap().trim(), "packet: off");
+    }
+
+    /// `pj-001` with two legs: `scout` (done, with a caption) and `edit`, whose
+    /// order is `order`.
+    fn with_legs(store: &Store, order: &str) {
+        let mut t = store.find_task("pj-001").unwrap();
+        let mut scout = crate::legs::Leg::pending("scout", "look at it");
+        scout.state = crate::legs::State::Done;
+        scout.caption = Some("found the size is computed in a.rs".into());
+        crate::legs::write(&mut t, &[scout, crate::legs::Leg::pending("edit", order)]);
+        store.save_task(&t).unwrap();
+    }
+
+    fn edit_order(store: &Store) -> String {
+        crate::legs::legs(&store.find_task("pj-001").unwrap()).into_iter().find(|l| l.name == "edit").unwrap().order
+    }
+
+    #[test]
+    fn a_leg_with_no_packet_is_given_one_beside_the_row_and_starts_short() {
+        let (env, store, repo) = world("leg-given", "Show the packet size", None);
+        std::fs::write(repo.join("src/b.rs"), "pub fn b() {}\n").unwrap();
+        let _builder = FakePack::with(&env.path(""), "\"src/b.rs\", \"src/a.rs\"");
+        with_legs(&store, "Print the size in `src/a.rs`.");
+        give_leg(&store, "pj-001", "edit", &repo, false, false, true);
+        let order = edit_order(&store);
+        let path = leg_path(&order).expect("the order names the packet it was given");
+        assert_eq!(PathBuf::from(&path), leg_file(&store, "pj-001", "edit"));
+        assert!(order.contains("Print the size"), "the author's order is kept: {order}");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with(GENERATED), "{written}");
+        assert!(written.find("file: src/a.rs").unwrap() < written.find("file: src/b.rs").unwrap(), "the order's file leads: {written}");
+        assert!(written.contains("found the size is computed in a.rs"), "the earlier leg's account: {written}");
+        assert!(written.contains("Show the packet size") || written.contains("pj-001"), "the row: {written}");
+        let printed = build_leg("pj-001", "edit", &path, &repo, true).unwrap();
+        assert_eq!(at_leg_spawn("pj-001", "edit", &order, &repo, true, false, false, true), Some(printed.len() as u64));
+        assert!(printed.contains("pub fn a() {}") && printed.contains("wsp review pj-001"), "{printed}");
+        let again = edit_order(&store);
+        give_leg(&store, "pj-001", "edit", &repo, false, false, true);
+        assert_eq!(edit_order(&store), again, "a leg that has one is not given a second");
+    }
+
+    #[test]
+    fn a_leg_that_declined_or_was_spawned_full_is_left_alone() {
+        let (env, store, repo) = world("leg-left", "Show the packet size", None);
+        let _builder = FakePack::with(&env.path(""), "\"src/a.rs\"");
+        with_legs(&store, "packet: off\n\nPrint the size in `src/a.rs`.");
+        give_leg(&store, "pj-001", "edit", &repo, false, false, true);
+        assert_eq!(leg_path(&edit_order(&store)), None, "packet: off");
+        assert_eq!(at_leg_spawn("pj-001", "edit", &edit_order(&store), &repo, true, false, false, true), None);
+        with_legs(&store, "Print the size in `src/a.rs`.");
+        for (full, no_packet, short) in [(true, false, true), (false, true, true), (false, false, false)] {
+            give_leg(&store, "pj-001", "edit", &repo, full, no_packet, short);
+            assert_eq!(leg_path(&edit_order(&store)), None, "full {full} no_packet {no_packet} short {short}");
+        }
+        assert!(!leg_file(&store, "pj-001", "edit").exists());
+    }
+
+    #[test]
+    fn a_leg_that_reads_as_judgement_is_left_alone() {
+        let (env, store, repo) = world("leg-judged", "Show the packet size", None);
+        let _builder = FakePack::with(&env.path(""), "\"src/a.rs\"");
+        with_legs(&store, "Investigate why the size is wrong and measure the cost; this is a spike.");
+        give_leg(&store, "pj-001", "edit", &repo, false, false, true);
+        assert_eq!(leg_path(&edit_order(&store)), None, "discovery work is not briefed by a packet");
+    }
+
+    #[test]
+    fn a_leg_whose_pack_names_no_file_is_left_alone() {
+        let (env, store, repo) = world("leg-nofiles", "Show the packet size", None);
+        let _builder = FakePack::with(&env.path(""), "");
+        with_legs(&store, "Print the size.");
+        give_leg(&store, "pj-001", "edit", &repo, false, false, true);
+        assert_eq!(leg_path(&edit_order(&store)), None, "a pack that names no file");
     }
 
     #[test]

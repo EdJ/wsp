@@ -2619,10 +2619,24 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         None
     } else if let (Some(l), Some(task)) = (&leg_rec, work.task.as_deref()) {
         let root = cwd.as_deref().map(util::expand).unwrap_or_default();
+        // A leg with no packet of its own is given one, as a member row is.
+        crate::packet::give_leg(
+            store,
+            task,
+            &l.name,
+            &root,
+            args.has("full"),
+            args.has("no-packet"),
+            agent_commands::of(&kind).short_start(),
+        );
+        let order = store
+            .find_task(task)
+            .and_then(|t| crate::legs::legs(&t).into_iter().find(|x| x.name == l.name))
+            .map_or_else(|| l.order.clone(), |x| x.order);
         crate::packet::at_leg_spawn(
             task,
             &l.name,
-            &l.order,
+            &order,
             &root,
             leg_last,
             args.has("full"),
