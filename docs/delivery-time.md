@@ -155,7 +155,7 @@ The measure is a figure in the *next pass's* `effort.json` that says it worked.
 | 3.7 | auto-pass with stop-checks (`wsp-396`) | check seat 2.3–4.8 min a group, plus a place and a governor turn; 0 until stops are mechanical | S to write, Ed's call to turn on | check-seat seconds in the report; groups passed by wsp |
 | 3.8 | overlap barrier steps (`wsp-395`) | none on the delivery wall by itself: the 56 min of runs is the wait `wsp-414` hides (parallel groups and bigger lists, from `wsp-362` and `wsp-363`), so the next group no longer sits behind it; overlap only shortens the run itself (suite is serial in one tree), unpriced until 3.1 | M | barrier run seconds per group at the same step count; with `wsp-414`, the next group's start against the previous barrier run's end |
 | 3.9 | governor turns in the wall (`wsp-398`) | unknown: the report prices the governor as cost only; 14.5 min pass → start on group 3 → 4 is unexplained | S | governor seconds between a pass and the next start |
-| 3.10 | name a command waiting on itself (`wsp-397`) | 6 min per occurrence (compounding-061), rate not yet counted | M | stuck-command flags per pass in wip, each with the seconds it held |
+| 3.10 | name a command waiting on itself (`wsp-397`) | 6 min per occurrence (compounding-061), rate not yet counted: `wsp stuck <transcripts>` counts it, and was not run over the fleet's transcripts from the seat that built it | M | stuck-command flags per pass in wip, each with the seconds it held (built: `src/stuck.rs`, `repair::stuck_tick`) |
 
 **3.5, what `wsp-393` found.** The clone was already one `clonefile(2)`; its cost
 was the source. The trunk `target/debug/deps` held 157 745 leaked `*.rcgu.o`

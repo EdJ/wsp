@@ -9090,6 +9090,7 @@ mod tests {
             unsent: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
+            stuck: Default::default(),
             silent: Default::default(),
         };
         cmd_agent::wip_rows(&w).into_iter().find(|r| r.pane == seat).expect("the seat is drawn")

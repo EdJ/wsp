@@ -106,6 +106,7 @@ mod starts;
 mod stand_down;
 mod story;
 mod store;
+mod stuck;
 mod sync;
 mod throttle;
 mod timeline;
@@ -1215,6 +1216,7 @@ fn main() {
         "reopen" => cmd_task::reopen(&store, &args),
         "verified" => verification::cmd_verified(&store, &args),
         "verifications" => cmd_verifications::verifications(&store, &args),
+        "stuck" => stuck::stuck(&args),
         "leg" => legs::dispatch(&store, &args),
         "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
@@ -1724,6 +1726,8 @@ fn help_text() -> String {
                                     whose transcript was read, the share that ran
                                     tests, drove the app and read the diff; the
                                     done-when items checked; blocks by cause
+  wsp stuck <transcript.jsonl>…     the commands in those transcripts that waited on
+                                    themselves or a bare cat, and the seconds each held
   wsp verifications --transcript FILE
                                     the ran/drove/read lines that session's
                                     transcript would give a verdict

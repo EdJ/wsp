@@ -2499,6 +2499,7 @@ impl Source for Poll<'_> {
             unsent: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
+            stuck: Default::default(),
             silent: Default::default(),
         };
         let lists = worklist::Running::read(self.store);
@@ -4637,6 +4638,7 @@ mod tests {
             unsent: false,
             dropped: false,
             full_suite: false,
+            stuck: None,
             was_governor: None,
         }
     }
@@ -5703,6 +5705,7 @@ mod tests {
             unsent: false,
             dropped: false,
             full_suite: false,
+            stuck: None,
             was_governor: None,
         }
     }

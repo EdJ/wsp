@@ -720,7 +720,7 @@ const INSPECT: &[&str] = &[
 /// answerable for.
 const WSP_LOOKS: &[&str] = &[
     "show", "cat", "ls", "list", "help", "wip", "brief", "version", "yours", "attempts", "cost", "burn", "doctor", "say", "note", "verified", "flag", "ask",
-    "commit-help", "stage", "inbox", "next", "log", "history", "verifications", "--version", "-h", "--help",
+    "commit-help", "stage", "inbox", "next", "log", "history", "verifications", "stuck", "--version", "-h", "--help",
 ];
 
 fn inspects(words: &[String]) -> bool {

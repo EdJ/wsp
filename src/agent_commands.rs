@@ -2823,7 +2823,7 @@ impl Ran {
 /// got it from the agent, and `spawn` is a verb agents drive: a session id with
 /// a `/` in it is not a session id, and refusing it here is cheaper than
 /// discovering what it opened.
-fn transcript(session: &str, cwd: &str) -> Option<PathBuf> {
+pub(crate) fn transcript(session: &str, cwd: &str) -> Option<PathBuf> {
     if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }

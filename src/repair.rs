@@ -375,6 +375,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     unsent_tick(store, seats);
     // And a first work order that started no turn (`wsp-420`).
     first_order_tick(store, seats);
+    // And a shell command waiting on itself (`wsp-397`).
+    stuck_tick(store, seats);
     // **Collected first and then visited once each**, which is the whole of the
     // second trigger and the reason it is here rather than in the loop above.
     // A scope on a running list and a scope with a backlog are the same seat, and
@@ -646,6 +648,102 @@ fn unsent_counts(store: &Store) -> std::collections::BTreeMap<String, u64> {
 /// The seats whose prompts have held typed text for more than a tick.
 pub(crate) fn unsent_seats(store: &Store) -> std::collections::BTreeSet<String> {
     unsent_counts(store).into_iter().filter(|(_, n)| *n >= UNSENT_TICKS).map(|(s, _)| s).collect()
+}
+
+// ---- a shell command waiting on itself ---------------------------------------
+
+/// Where the stalled commands a seat is in are kept: seat → [`Held`].
+const STUCK_FILE: &str = "stuck-commands.json";
+
+/// A stalled command a seat is in the middle of.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Held {
+    pub kind: crate::stuck::Kind,
+    pub command: String,
+    /// When the call started, epoch seconds.
+    pub at: i64,
+    /// The seat has been told.
+    pub told: bool,
+}
+
+pub(crate) fn held_all(store: &Store) -> std::collections::BTreeMap<String, Held> {
+    let read = std::fs::read_to_string(store.state.join(STUCK_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let Some(serde_json::Value::Object(map)) = read else { return Default::default() };
+    map.into_iter()
+        .filter_map(|(seat, v)| {
+            Some((seat, Held {
+                kind: crate::stuck::Kind::of_key(v["kind"].as_str()?)?,
+                command: v["command"].as_str()?.to_string(),
+                at: v["at"].as_i64()?,
+                told: v["told"].as_bool().unwrap_or(false),
+            }))
+        })
+        .collect()
+}
+
+fn held_save(store: &Store, all: &std::collections::BTreeMap<String, Held>) {
+    let _ = std::fs::create_dir_all(&store.state);
+    let out: serde_json::Map<String, serde_json::Value> = all
+        .iter()
+        .map(|(seat, h)| (seat.clone(), serde_json::json!({ "kind": h.kind.key(), "command": h.command, "at": h.at, "told": h.told })))
+        .collect();
+    let _ = std::fs::write(store.state.join(STUCK_FILE), serde_json::Value::Object(out).to_string());
+}
+
+/// The seats in a stalled command now, with the seconds each has held it
+/// (`wsp wip`'s `stuck`).
+pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (crate::stuck::Kind, i64)> {
+    let now = util::epoch_secs();
+    held_all(store).into_iter().map(|(s, h)| (s, (h.kind, (now - h.at).max(0)))).collect()
+}
+
+/// **A command waiting on itself, or on a bare `cat`** (`wsp-397`):
+/// `compounding-061` sat six minutes in `until ! pgrep -f …`, which finds its
+/// own shell. Read off the end of the transcript of each seat in a turn. The
+/// first tick that finds a stall in a seat records it, tells the seat what is
+/// wrong with it, and says so in `cycle.log`; the tick that finds it over says
+/// the seconds it held. `wsp wip` draws the record.
+pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
+    stuck_tick_with(store, seats, &|seat| crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs()));
+}
+
+pub(crate) fn stuck_tick_with(store: &Store, seats: &dyn Seats, read: &dyn Fn(&str) -> Vec<crate::stuck::Stall>) {
+    let before = held_all(store);
+    let mut all = before.clone();
+    let mut candidates: Vec<String> = store.bindings().keys().cloned().collect();
+    candidates.extend(before.keys().cloned());
+    candidates.sort();
+    candidates.dedup();
+    let now = util::epoch_secs();
+    for seat in candidates {
+        let working = seats.state(&seat).is_some_and(|s| s.turn_in_flight());
+        let stalls = if working || before.contains_key(&seat) { read(&seat) } else { Vec::new() };
+        let open = stalls.iter().find(|s| s.open).filter(|_| working);
+        match (open, before.get(&seat)) {
+            (Some(s), Some(h)) if h.at == s.at => {}
+            (Some(s), previous) => {
+                if let Some(h) = previous {
+                    stamp(store, &format!("{seat}: the {} it was in ended after {}s", h.kind.word(), (now - h.at).max(0)));
+                }
+                let mut held = Held { kind: s.kind, command: s.command.clone(), at: s.at, told: false };
+                stamp(store, &format!("{seat}: a command has been {} for {}s: {}", s.kind.word(), s.secs, s.command));
+                let text = format!("wsp: your command has been {} for {}s — {}. ({})", s.kind.word(), s.secs, s.kind.advice(), s.command);
+                held.told = matches!(seats.resend(&seat, &text), Some(Ok(_)));
+                all.insert(seat.clone(), held);
+            }
+            (None, Some(h)) => {
+                let secs = stalls.iter().find(|s| s.at == h.at && !s.open).map(|s| s.secs).unwrap_or((now - h.at).max(0));
+                stamp(store, &format!("{seat}: the command {} ended after {secs}s held: {}", h.kind.word(), h.command));
+                all.remove(&seat);
+            }
+            (None, None) => {}
+        }
+    }
+    if all != before {
+        held_save(store, &all);
+    }
 }
 
 // ---- a first work order that never started a turn ---------------------------
@@ -1939,6 +2037,24 @@ pub(crate) mod tests {
         assert_eq!(seat.sent.borrow().len(), 1, "never a third copy");
         let said = stamped();
         assert_eq!(said.iter().filter(|l| l.starts_with("FAILED cpd-1")).count(), 1, "flagged once: {said:?}");
+    }
+
+    fn stall(open: bool, secs: i64) -> crate::stuck::Stall {
+        crate::stuck::Stall { kind: crate::stuck::Kind::SelfWait, command: "until ! pgrep -f x; do sleep 1; done".into(), at: 1000, secs, open }
+    }
+
+    #[test]
+    fn a_stalled_command_is_told_to_the_seat_once_and_the_seconds_it_held_are_logged() {
+        let (_env, store) = in_flight("stuck-self");
+        let working = Orders { state: Some(State::Working), typed: false, sent: Default::default(), pressed: Default::default() };
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 400)]);
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 460)]);
+        assert_eq!(working.sent.borrow().len(), 1, "told once: {:?}", working.sent.borrow());
+        assert!(working.sent.borrow()[0].contains("waiting on itself"), "{:?}", working.sent.borrow());
+        assert_eq!(stuck_seats(&store).get("cpd-1").map(|(k, _)| *k), Some(crate::stuck::Kind::SelfWait));
+        stuck_tick_with(&store, &working, &|_| vec![stall(false, 505)]);
+        assert!(stuck_seats(&store).is_empty());
+        assert!(stamped().iter().any(|l| l.contains("cpd-1") && l.contains("ended after 505s")), "{:?}", stamped());
     }
 
     #[test]

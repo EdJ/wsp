@@ -2310,6 +2310,19 @@ pub(crate) fn secs_of_seat(store: &Store, seat: &str, since: &str) -> Option<(i6
     crate::timeline::session_secs(&session, util::epoch_of(since))
 }
 
+/// The stalled shell commands in the end of a seat's transcript (`wsp-397`),
+/// open ones counted to `now`. Claude Code's transcript only.
+pub(crate) fn stuck_of_seat(store: &Store, seat: &str, now: i64) -> Vec<crate::stuck::Stall> {
+    let Some((kind, session, cwd)) = session_of_seat(store, seat) else { return Vec::new() };
+    if kind != "claude" {
+        return Vec::new();
+    }
+    match crate::agent_commands::transcript(&session, &cwd) {
+        Some(path) => crate::stuck::in_tail(&path, now),
+        None => Vec::new(),
+    }
+}
+
 /// The kind, session and cwd a seat's binding records, when it has a session.
 fn session_of_seat(store: &Store, seat: &str) -> Option<(String, String, String)> {
     let bindings = store.bindings();
@@ -4139,6 +4152,10 @@ pub(crate) struct Wip {
     /// new seat is not flagged for the last one's run. Drawn as `full suite in a member
     /// seat`; published as `full_suite`.
     pub full_suite: std::collections::BTreeSet<String>,
+    /// Seats in a shell command that waits on itself or on a bare `cat`
+    /// (`wsp-397`), with the seconds it has held: [`crate::repair::stuck_seats`].
+    /// Drawn as a flag, published as `stuck`.
+    pub stuck: std::collections::BTreeMap<String, (crate::stuck::Kind, i64)>,
     /// The far machines gone silent, and the seats on them (`docs/remote-agents.md`
     /// section 3): the heading line, drawn as the dead daemon is, and the word
     /// (`unreachable 4m`) each of their seats wears in place of `gone`.
@@ -4270,6 +4287,7 @@ impl Wip {
             unsent: crate::repair::unsent_seats(store),
             dropped: crate::repair::dropped_seats(store),
             full_suite: crate::throttle::full_suite_seats(&store.state),
+            stuck: crate::repair::stuck_seats(store),
             silent: crate::far::Silence::read(store),
         }
     }
@@ -4449,6 +4467,10 @@ pub(crate) struct WipRow {
     /// This seat has started a full-suite `cargo test` (`wsp-389`). Drawn as `full suite in a member seat`;
     /// published as `full_suite`.
     pub(crate) full_suite: bool,
+    /// The seat is in a shell command waiting on itself or on a bare `cat`
+    /// (`wsp-397`), and for how many seconds it has held. Drawn as a flag;
+    /// published as `stuck: {kind, word, secs}`.
+    pub(crate) stuck: Option<(crate::stuck::Kind, i64)>,
     /// The scope this pane was the governor of, when it is gone. **A gone pane
     /// is not a governor** (`wsp-386`): `seat` and the governor role are left
     /// off it, so a list's seat that vanished does not read as seated; the
@@ -4765,6 +4787,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             unsent: !a.state.turn_in_flight() && w.unsent.contains(seat),
             dropped: !a.state.turn_in_flight() && w.dropped.contains(seat),
             full_suite: w.full_suite.contains(seat),
+            stuck: w.stuck.get(seat).copied(),
             was_governor,
         });
     }
@@ -4886,7 +4909,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "role": r.role.json(),
             "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
             "spawned_by": r.spawned_by,
-            "unsent": r.unsent, "dropped": r.dropped, "full_suite": r.full_suite, "was_governor": r.was_governor,
+            "unsent": r.unsent, "dropped": r.dropped, "full_suite": r.full_suite, "stuck": r.stuck.map(|(k, secs)| json!({ "kind": k.key(), "word": k.word(), "secs": secs })), "was_governor": r.was_governor,
             "leg": r.leg.as_ref().map(|s| json!({
                 "name": s.leg.name, "after": s.after, "index": s.index, "of": s.of,
             })),
@@ -5062,6 +5085,12 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             let flag = match r.full_suite {
                 true => format!("{flag} {}", p.yellow(&format!("· {FULL_SUITE_WORD}"))).trim_start().to_string(),
                 false => flag,
+            };
+            let flag = match r.stuck {
+                Some((kind, secs)) => {
+                    format!("{flag} {}", p.red(&format!("· {} {}", kind.word(), util::duration_human(secs)))).trim_start().to_string()
+                }
+                None => flag,
             };
             out.push(format!(
                 "{}  {}  {}  {} {}",
@@ -8432,6 +8461,7 @@ mod tests {
             unsent: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
+            stuck: Default::default(),
             silent: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
@@ -8631,6 +8661,7 @@ mod tests {
             unsent: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
+            stuck: Default::default(),
             silent: Default::default(),
         }
     }
@@ -8716,6 +8747,19 @@ mod tests {
         assert_eq!(row("w2:p1")["full_suite"], false);
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         assert_eq!(text.matches("full suite in a member seat").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_seat_in_a_command_waiting_on_itself_shows_the_flag_with_the_seconds_it_held() {
+        let mut w = wip_world();
+        w.stuck.insert("w1:p1".into(), (crate::stuck::Kind::SelfWait, 372));
+        let j = wip_json(&w);
+        let row = |pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap().clone();
+        assert_eq!(row("w1:p1")["stuck"]["secs"], 372);
+        assert_eq!(row("w1:p1")["stuck"]["kind"], "self");
+        assert!(row("w2:p1")["stuck"].is_null());
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert_eq!(text.matches("waiting on itself 6m").count(), 1, "{text}");
     }
 
     #[test]
