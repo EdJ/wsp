@@ -3112,9 +3112,6 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert_eq!(parse_groups(&render_groups(&gs)), gs);
     }
 
-    /// `stop-checks:` is one item to a line, beside the stop and not in it, and
-    /// a command's own spacing and colons survive a round trip; a wrapped item
-    /// is the one item, and the next group is not made of its words.
     /// `kind:` is a line of the group's own, beside its caption, and round-trips.
     #[test]
     fn a_groups_kind_is_its_own_line_and_round_trips() {
@@ -3129,6 +3126,9 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert!(w.groups()[1].kind.is_empty());
     }
 
+    /// `stop-checks:` is one item to a line, beside the stop and not in it, and
+    /// a command's own spacing and colons survive a round trip; a wrapped item
+    /// is the one item, and the next group is not made of its words.
     #[test]
     fn stop_checks_sit_beside_the_stop_and_round_trip_one_item_to_a_line() {
         let written = "\
