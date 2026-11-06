@@ -77,6 +77,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use crate::util;
 
@@ -341,9 +342,10 @@ impl Done {
 /// with `~/.local/bin/wsp`, because an install with `--to` is a test of the
 /// copy and has no business taking over the machine's daemon.
 ///
-/// Failure here is **not** an install failure. The binary is on disk and every
-/// pane has re-exec'd into it whatever launchd does, so this returns its error
-/// to be printed under a `✓ install` rather than turning a good install red.
+/// The binary is on disk and every pane has re-exec'd into it whatever launchd
+/// does, but a daemon that is not running afterwards is **not** quiet any more
+/// (wsp-449): this returns the error, the install prints it and exits non-zero,
+/// and a note is kept for `wsp wip` until a daemon runs.
 pub(crate) fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> {
     ensure_as(LABEL, &plist_path(), bin, state, path_var)
 }
@@ -365,12 +367,13 @@ fn ensure_as(
     // politeness — the verb that *could* be used here is measurably wrong.
     // `launchctl kickstart -k` on a job that is running waits out
     // `ThrottleInterval` first, measured on this machine at 28 seconds of an
-    // install standing still, and 57 on a job that has stopped; `bootout` plus
-    // `bootstrap` below is instant in both. And there is nothing to restart
-    // for: the daemon re-`exec`s the file that was just installed within a
-    // tick, which is the whole reason the plist points at `~/.local/bin/wsp`
-    // rather than at a build tree.
-    if change == Plan::Unchanged && loaded(&target) {
+    // install standing still, and 57 on a job that has stopped. And there is
+    // nothing to restart for: the daemon re-`exec`s the file that was just
+    // installed within a tick. **The daemon's pid is not touched** by an install
+    // that changes nothing about the plist — that is the check the wsp-449 fix
+    // is held to.
+    let was_loaded = loaded(&target);
+    if change == Plan::Unchanged && was_loaded {
         return Ok(Done { path: path.to_path_buf(), wrote: false, loaded: false });
     }
 
@@ -378,22 +381,142 @@ fn ensure_as(
         crate::store::write_atomic(path, &want)
             .map_err(|e| format!("cannot write {}: {e}", util::contract(path)))?;
     }
-    // `bootout` before `bootstrap`, always, and both because the plist changed
-    // and because `bootstrap` on a loaded label fails with `Input/output error`
-    // and a suggestion to re-run as root. The pair is also the only way to get
-    // the job onto the settings just written — a `bootstrap` that failed is not
-    // going to read the new file — and it is instant where `kickstart` is not:
-    // bootout and bootstrap are a fresh load, with none of the throttle history
-    // a restart inherits. `bootout` failing is the normal case of a job that was
-    // not loaded at all, so its complaint is dropped and `bootstrap`'s is not.
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(&target)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    bootstrap(&domain, path)?;
+    // Booted out only when it is there to be booted out: a job that is not
+    // loaded has nothing to leave, and `bootout` of it is the call that used
+    // to be made blind. When it is loaded the plist has changed, and a job that
+    // is loaded never reads the file just written, so the pair is needed — but
+    // `bootstrap` straight after `bootout` races the old process still
+    // exiting, and that race is `launchctl bootstrap failed: 5: Input/output
+    // error` (2026-11-06, twice). So: wait until the job is gone and its
+    // process with it, then bootstrap, and bootstrap again on that error.
+    if was_loaded {
+        let _ = Command::new("launchctl")
+            .arg("bootout")
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        wait_gone(&target, Duration::from_secs(15));
+    }
+    bootstrap_retrying(&domain, path, 6, Duration::from_secs(1))?;
+    settle(&target, Duration::from_secs(8))?;
     Ok(Done { path: path.to_path_buf(), wrote: change == Plan::Write, loaded: true })
+}
+
+/// What `launchctl print` says the job is doing.
+#[derive(Debug, PartialEq)]
+pub(crate) enum State {
+    /// Not in the domain at all.
+    Absent,
+    /// In the domain with a process.
+    Running(u32),
+    /// In the domain, no process, and the last exit status was this.
+    Idle(Option<i32>),
+}
+
+/// Read a `launchctl print` body. Split from the call so it is testable
+/// without a launchd.
+pub(crate) fn state_from(print: &str) -> State {
+    let mut pid = None;
+    let mut exit = None;
+    for l in print.lines() {
+        let l = l.trim();
+        if let Some(v) = l.strip_prefix("pid = ") {
+            pid = v.trim().parse::<u32>().ok();
+        } else if let Some(v) = l.strip_prefix("last exit code = ") {
+            exit = v.trim().parse::<i32>().ok();
+        }
+    }
+    match pid {
+        Some(p) => State::Running(p),
+        None => State::Idle(exit),
+    }
+}
+
+fn state_of(target: &str) -> State {
+    match Command::new("launchctl").arg("print").arg(target).output() {
+        Ok(o) if o.status.success() => state_from(&String::from_utf8_lossy(&o.stdout)),
+        _ => State::Absent,
+    }
+}
+
+/// Wait for the job to leave the domain and its process to go.
+fn wait_gone(target: &str, limit: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < limit {
+        if state_of(target) == State::Absent {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// After `bootstrap`: the job is in the domain and has a process — or has run
+/// and exited cleanly, which `KeepAlive: SuccessfulExit=false` does not
+/// restart and which is a daemon that stood down on purpose. Anything else is
+/// said, because "bootstrap returned 0" is not "the daemon is running".
+fn settle(target: &str, limit: Duration) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    let mut last = State::Absent;
+    while start.elapsed() < limit {
+        last = state_of(target);
+        match last {
+            State::Running(_) | State::Idle(Some(0)) => return Ok(()),
+            _ => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+    Err(match last {
+        State::Absent => "launchctl bootstrap returned, but `launchctl print` says the job is not loaded".into(),
+        State::Idle(code) => format!(
+            "the job is loaded but the daemon is not running (last exit {})",
+            code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into())
+        ),
+        State::Running(_) => unreachable!(),
+    })
+}
+
+/// [`bootstrap`], tried `tries` times while launchd answers `5: Input/output
+/// error` — which it does when the old process is still going.
+fn bootstrap_retrying(domain: &str, path: &Path, tries: u32, wait: Duration) -> Result<(), String> {
+    let mut last = String::new();
+    for n in 0..tries {
+        match bootstrap(domain, path) {
+            Ok(()) => return Ok(()),
+            Err(why) => {
+                let retry = why.contains("Input/output error") || why.contains(": 5:") || why.contains("exit 5");
+                last = why;
+                if !retry || n + 1 == tries {
+                    break;
+                }
+                std::thread::sleep(wait);
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Where an install that left the daemon not running says so, until one that
+/// does not. `wsp wip` and the brief read it ([`unloaded_note`]).
+fn unloaded_path(state: &Path) -> PathBuf {
+    state.join("daemon-unloaded")
+}
+
+pub(crate) fn note_unloaded(state: &Path, why: &str) {
+    let _ = std::fs::write(unloaded_path(state), format!("{why}\n"));
+}
+
+pub(crate) fn clear_unloaded(state: &Path) {
+    let _ = std::fs::remove_file(unloaded_path(state));
+}
+
+/// The sentence for a daemon the last install could not leave running.
+pub(crate) fn unloaded_note(state: &Path) -> Option<String> {
+    let why = std::fs::read_to_string(unloaded_path(state)).ok()?;
+    let why = why.trim();
+    if why.is_empty() {
+        return None;
+    }
+    Some(format!("the daemon is not running — the last `wsp install` could not leave it loaded: {why} (`wsp install --daemon` loads it)"))
 }
 
 /// Load the job, and turn a refusal into a sentence.
@@ -593,6 +716,28 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "bootout failed: {}", String::from_utf8_lossy(&out.stderr));
         assert!(!loaded(&format!("{domain}/{label}")), "the job outlived its bootout");
+    }
+
+    /// What `launchctl print` says is read as a state, so "loaded" is no longer
+    /// taken for "running" (wsp-449).
+    #[test]
+    fn a_print_body_is_read_as_running_or_idle() {
+        assert_eq!(state_from("x = {\n\tstate = running\n\tpid = 4242\n}"), State::Running(4242));
+        assert_eq!(state_from("x = {\n\tstate = not running\n\tlast exit code = 0\n}"), State::Idle(Some(0)));
+        assert_eq!(state_from("x = {\n\tstate = spawn scheduled\n}"), State::Idle(None));
+    }
+
+    /// An install that could not leave the daemon running leaves a line for
+    /// `wip`, and one that did takes it away.
+    #[test]
+    fn the_unloaded_note_is_kept_until_a_daemon_runs() {
+        let dir = scratch("note");
+        assert_eq!(unloaded_note(&dir), None);
+        note_unloaded(&dir, "launchctl bootstrap failed: 5: Input/output error");
+        let said = unloaded_note(&dir).expect("a note");
+        assert!(said.contains("not running") && said.contains("Input/output error"), "{said}");
+        clear_unloaded(&dir);
+        assert_eq!(unloaded_note(&dir), None);
     }
 
     /// The three things the plist is for, asserted as the plist rather than as

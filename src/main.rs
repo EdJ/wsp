@@ -1863,6 +1863,11 @@ fn help_text() -> String {
                                     that finds it already right leaves it alone,
                                     -n says which it would do, and --to and a
                                     sandbox never touch it
+  wsp install --daemon [-n]         load the launchd agent for any build, copying
+                                    nothing: written if it differs, loaded if it
+                                    is not, its pid untouched if it is right. An
+                                    install that cannot leave the daemon running
+                                    exits 1 and `wsp wip` says so
   wsp install --why - | --why --from FILE
                                     …with the reason read from a stream or a
                                     file, where a shell never sees it — it is

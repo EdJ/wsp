@@ -448,6 +448,26 @@ fn exit_master(ssh: &str, m: &Machine, control: &std::path::Path) -> bool {
     matches!(crate::far::run_bounded(c, Duration::from_secs(5)), Ok(Some(o)) if o.status.success())
 }
 
+/// Ask every ControlMaster this store's daemon left to exit, by socket and
+/// not by pattern: the daemon is ended by `launchctl bootout` (a SIGTERM), which
+/// never reaches `Supervisor::shutdown`, and the master `ssh` is not in the
+/// job's process group in any way launchd waits for. An orphaned master blocks
+/// the machine until someone closes it by hand (wsp-444, 2026-11-06).
+pub fn reap_masters(state: &std::path::Path) {
+    let Ok(dir) = std::fs::read_dir(state.join("sock")) else { return };
+    for e in dir.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with("cm-") {
+            continue;
+        }
+        let path = e.path();
+        let mut c = Command::new("ssh");
+        c.arg("-S").arg(&path).args(["-o", "BatchMode=yes", "-O", "exit", "wsp-reap"]);
+        let _ = crate::far::run_bounded(c, Duration::from_secs(3));
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Put back the forwards of every seat on `m`, read from the seat records: a
 /// master that died took them with it. Each is added on its own and a failure of
 /// one is no reason to skip the next (the stale local end is swept by

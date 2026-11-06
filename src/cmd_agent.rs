@@ -4271,7 +4271,7 @@ impl Wip {
             agents,
             agents_held,
             said: store.said(),
-            daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
+            daemon: crate::daemon::dead(&store.state, crate::daemon::running(&store.state).as_deref(), heard),
             disk: crate::disk::loud(store),
             load: crate::throttle::loud(store),
             throttle: Some(crate::throttle::status_line(store)),

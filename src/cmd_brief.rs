@@ -372,7 +372,7 @@ pub(crate) struct Briefing {
 /// sentence and drawn the same way. `None` when neither is true, which is almost
 /// always, and costs the machines file's read and nothing else.
 pub(crate) fn seat_faults(store: &Store) -> Option<String> {
-    let daemon = crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered());
+    let daemon = crate::daemon::dead(&store.state, crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered());
     let far = crate::far::Silence::read(store).line;
     match (daemon, far) {
         (Some(d), Some(f)) => Some(format!("{d}  {f}")),

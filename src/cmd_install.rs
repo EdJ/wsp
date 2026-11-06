@@ -951,6 +951,23 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         return 2;
     }
 
+    // `wsp install --daemon`: the other half of this verb on its own, for any
+    // build. A second full install is refused when the live build is newer than
+    // the verify tree's, and that left no wsp verb to load a daemon launchd had
+    // dropped (wsp-449). Nothing is copied; the agent is written if it differs,
+    // loaded if it is not, and left alone — pid untouched — if it is both right
+    // and loaded.
+    if args.has("daemon") {
+        let dst = default_dest();
+        let agent = launcher(store, &dst, dry, json_out, &p);
+        if json_out {
+            println!("{}", json!({"ok": !agent_failed(&agent), "daemon": agent}));
+        } else if agent.get("reason").is_some() {
+            println!("{}", p.dim("this is a sandbox or not the machine's own destination — the daemon was not touched"));
+        }
+        return exit_for(&agent);
+    }
+
     // Before the source is resolved, because `--why -` puts a bare `-` exactly
     // where the binary to install goes and this is what takes it back. Reading
     // the stream here also means a `--why` that could not be read is answered
@@ -1128,7 +1145,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         // byte-for-byte identical to the state where the daemon is loaded. So
         // the launcher runs on this path too, and "already live" is not a
         // reason to skip the other half of the verb.
-        return 0;
+        return exit_for(&agent);
     }
 
     let backwards = overtaken(ours.built, written(&dst), recorded, &ours);
@@ -1267,7 +1284,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                     .collect::<Vec<_>>(),
             })
         );
-        return 0;
+        return exit_for(&agent);
     }
 
     println!(
@@ -1285,9 +1302,22 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         p.dim("panels, detail panes and the daemon re-exec into it within a tick — `wsp peek` to look at one")
     );
     keeps_the_old_one(store, &ours, &p);
-    launcher(store, &dst, false, json_out, &p);
+    let agent = launcher(store, &dst, false, json_out, &p);
     pi_extension(&dst, &dst, false, json_out, &p);
-    0
+    exit_for(&agent)
+}
+
+/// Did the daemon step fail — a refusal to run is not one (`installed: false`
+/// with a `reason`), a launchd that left the job unloaded or not running is.
+fn agent_failed(agent: &Value) -> bool {
+    agent.get("error").is_some()
+}
+
+/// The install's exit status for what [`launcher`] said. The binary is on disk
+/// whatever launchd does, but a fleet whose daemon is not running must not read
+/// as a green install (wsp-449): non-zero, and the line is in `wip`.
+fn exit_for(agent: &Value) -> i32 {
+    if agent_failed(agent) { 1 } else { 0 }
 }
 
 /// Write the pi extension where pi loads it — the third thing `wsp install`
@@ -1430,6 +1460,11 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
                       "path": util::contract(&path), "plist": change});
     }
     let done = crate::launchd::ensure(dst, &store.state, &var);
+    // The line `wsp wip` and the brief show until a daemon is running again.
+    match &done {
+        Ok(_) => crate::launchd::clear_unloaded(&store.state),
+        Err(why) => crate::launchd::note_unloaded(&store.state, why),
+    }
     if !json_out {
         match &done {
             Ok(d) => println!("{} {}", p.green("✓"), d.line()),
@@ -1439,9 +1474,8 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
             // would train people to read the red line as "nothing was
             // installed".
             Err(why) => println!(
-                "{} {}",
-                p.yellow("!"),
-                p.dim(&format!("the daemon is not installed as a launchd agent — {why}"))
+                "{} the daemon is not running — {why} (`wsp install --daemon` tries again)",
+                p.red("✗"),
             ),
         }
     }

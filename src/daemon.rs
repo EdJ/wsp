@@ -619,6 +619,65 @@ pub(crate) fn health(
     }
 }
 
+static TERMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_term(_: i32) {
+    TERMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+extern "C" {
+    fn signal(sig: i32, handler: usize) -> usize;
+}
+
+/// Catch SIGTERM and SIGINT; a watcher thread reaps the tunnel masters and
+/// exits 0 (`KeepAlive` is `SuccessfulExit=false`, so launchd does not restart
+/// a daemon that was asked to go). Not under test: a test process must keep
+/// its own signal handling.
+fn reap_on_term(store: &Store) {
+    if cfg!(test) {
+        return;
+    }
+    unsafe {
+        signal(15, on_term as extern "C" fn(i32) as usize);
+        signal(2, on_term as extern "C" fn(i32) as usize);
+    }
+    let state = store.state.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(200));
+        if TERMED.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::tunnel::reap_masters(&state);
+            std::process::exit(0);
+        }
+    });
+}
+
+/// How long `cycle.log` may be quiet before a machine with no daemon process
+/// is told its fleet has stopped (wsp-449).
+const SILENT_SECS: u64 = 60;
+
+/// [`loud`], plus the two things a dropped launchd job leaves: the note an
+/// install that could not load it keeps, and a `cycle.log` quiet for over a
+/// minute. Both only when no daemon process is running — a log can be quiet
+/// for good reasons while one is — so a live daemon is never called dead.
+pub(crate) fn dead(state: &Path, running: Option<&[u32]>, backend_up: bool) -> Option<String> {
+    if let Some(l) = loud(running, backend_up) {
+        return Some(l);
+    }
+    if !matches!(running, Some([])) {
+        return None;
+    }
+    if let Some(n) = crate::launchd::unloaded_note(state) {
+        return Some(n);
+    }
+    let quiet = std::fs::metadata(state.join("cycle.log")).ok()?.modified().ok()?.elapsed().ok()?;
+    (quiet.as_secs() > SILENT_SECS).then(|| {
+        format!(
+            "the daemon is not running — cycle.log has been silent for {} and no daemon process is up (`wsp install --daemon` loads it)",
+            crate::util::duration_human(quiet.as_secs() as i64)
+        )
+    })
+}
+
 pub fn run(store: &Store, verbose: bool) -> i32 {
     if let Some(why) = misdirected(
         std::env::var("HERDR_SESSION").ok().as_deref(),
@@ -684,6 +743,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // An exec-`reload`: same pid, same marker, nothing to write.
         Claim::Keep => {}
     }
+
+    // `launchctl bootout` ends this process with SIGTERM, which skips every
+    // `tunnels.shutdown()` below and leaves the ssh ControlMasters behind;
+    // one orphaned master blocked a machine until closed by hand (wsp-444).
+    // So the signal is caught, and the masters are asked to exit before we do.
+    reap_on_term(store);
 
     let (tx, rx) = mpsc::channel::<()>();
     let far = tx.clone();
@@ -942,6 +1007,25 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// wsp-449: a machine with no daemon process and a `cycle.log` quiet for
+    /// over a minute is told so; a live daemon is never called dead.
+    #[test]
+    fn a_silent_cycle_log_with_no_daemon_process_is_called_dead() {
+        let dir = std::env::temp_dir().join(format!("wsp-449-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(dead(&dir, Some(&[]), false), None, "no log, nothing to say");
+        let log = dir.join("cycle.log");
+        std::fs::write(&log, "x\n").unwrap();
+        assert_eq!(dead(&dir, Some(&[]), false), None, "a fresh log is a quiet minute");
+        let old = std::time::SystemTime::now() - Duration::from_secs(300);
+        std::fs::File::options().write(true).open(&log).unwrap().set_modified(old).unwrap();
+        let said = dead(&dir, Some(&[]), false).expect("a log silent for 5 minutes");
+        assert!(said.contains("not running") && said.contains("cycle.log"), "{said}");
+        assert_eq!(dead(&dir, Some(&[4242]), false), None, "a live daemon is not dead");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// The gate this replaces refused every start with no herdr socket, which
