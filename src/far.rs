@@ -541,6 +541,92 @@ pub trait Wire {
     /// One beat to one seat: `lease <seat> <state>` on the seat's forwarded
     /// controller socket `socket`. `Ok` only when the far side answered.
     fn lease(&self, m: &Machine, socket: &Path, seat: &str, state: &str) -> Result<(), String>;
+    /// Whether the machine `name` is silent right now, and if so when it was
+    /// last heard (empty: never). `None` is a machine that is not silent, or one
+    /// this wire cannot say anything about — a seat on it is not drawn
+    /// unreachable on that evidence.
+    fn silent_for(&self, _name: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Whether a far machine is silent: its link is down, or its seats' beat has gone
+/// unanswered for longer than its lease (`docs/remote-agents.md` section 3).
+/// A machine never beaten (`heard` empty) while the link is up is not silent: it
+/// has simply had no far seat to beat.
+pub fn is_silent(m: &Machine, l: &MachineLive) -> bool {
+    !l.reachable || (!l.heard.is_empty() && crate::util::since(&l.heard) > i64::from(m.lease_secs()))
+}
+
+/// When a silent machine was last heard: the last answered beat, else the
+/// probe's last sight of it. Empty when it never has been.
+pub fn last_heard(l: &MachineLive) -> &str {
+    match l.heard.is_empty() {
+        false => &l.heard,
+        true => &l.last_seen,
+    }
+}
+
+/// How long ago, as `unreachable` prints it: `4m`, or `never heard`.
+pub fn heard_ago(at: &str) -> String {
+    match at {
+        "" => "never heard".to_string(),
+        at => crate::util::duration_human(crate::util::since(at)),
+    }
+}
+
+/// A machine's silence as a seat or a machine row words it: `unreachable 4m`.
+pub fn unreachable_word(at: &str) -> String {
+    format!("unreachable {}", heard_ago(at))
+}
+
+/// What the silent far machines cost the seats on them, read once for a surface
+/// that draws seats: the sentence ([`loud`]) and, per far seat on a silent
+/// machine, the word its row wears (`unreachable 4m`).
+#[derive(Debug, Clone, Default)]
+pub struct Silence {
+    pub line: Option<String>,
+    pub seats: std::collections::BTreeMap<String, String>,
+}
+
+impl Silence {
+    pub fn read(store: &crate::store::Store) -> Silence {
+        let (machines, live) = (store.machines(), store.machines_live());
+        let mut out = Silence { line: loud(&machines, &live), seats: Default::default() };
+        if out.line.is_none() {
+            return out;
+        }
+        for m in machines.iter().filter(|m| m.is_active() && !m.name.is_empty()) {
+            let Some(l) = live.get(&m.name).filter(|l| is_silent(m, l)) else { continue };
+            let word = unreachable_word(last_heard(l));
+            for seat in crate::place_compound::beat_seats(store, &m.name) {
+                out.seats.insert(seat.id, word.clone());
+            }
+        }
+        out
+    }
+}
+
+/// The one sentence four surfaces show when far machines are silent — `wsp wip`'s
+/// heading, a brief's seat line, `wsp doctor`. Drawn the way a dead daemon is
+/// (`wsp-145`): a fault in its own line, not a clause on a census. `None` when no
+/// active machine is silent, which is every machine that has no far seat.
+pub fn loud(machines: &[Machine], live: &std::collections::BTreeMap<String, MachineLive>) -> Option<String> {
+    let words: Vec<String> = machines
+        .iter()
+        .filter(|m| m.is_active() && !m.name.is_empty())
+        .filter_map(|m| {
+            let l = live.get(&m.name)?;
+            is_silent(m, l).then(|| format!("{} ({})", m.name, unreachable_word(last_heard(l))))
+        })
+        .collect();
+    match words.is_empty() {
+        true => None,
+        false => Some(format!(
+            "unreachable: {} — their seats are held, not gone; claims stay, tells wait for the link",
+            words.join(", ")
+        )),
+    }
 }
 
 /// How often the daemon beats each far seat (`docs/remote-agents.md` section 3).
@@ -607,6 +693,12 @@ impl Wire for Ssh {
     fn dir(&self, m: &Machine) -> PathBuf {
         let store = crate::store::Store::open();
         store.machine_socket(&m.name).parent().map(Path::to_path_buf).unwrap_or(store.state.clone())
+    }
+
+    fn silent_for(&self, name: &str) -> Option<String> {
+        let store = crate::store::Store::open();
+        let (m, l) = (store.machine(name)?, store.machines_live().get(name).cloned()?);
+        is_silent(&m, &l).then(|| last_heard(&l).to_string())
     }
 
     fn lease(&self, _m: &Machine, socket: &Path, seat: &str, state: &str) -> Result<(), String> {
@@ -1086,5 +1178,53 @@ mod tests {
         assert!(h["timeout"].as_u64().unwrap() > 300);
         assert!(settings_with_gate("not json", &m, "cpd-7").unwrap_err().contains("not overwriting"));
         assert!(settings_with_gate("[]", &m, "cpd-7").is_err());
+    }
+
+    /// A machine is silent when its link is down, or when its beat has gone
+    /// unanswered past its lease; one never beaten with the link up is not. The
+    /// sentence and the seat word say how long, and a machine that is heard says
+    /// nothing at all (`docs/remote-agents.md` section 3).
+    #[test]
+    fn a_machine_is_silent_on_a_down_link_or_a_stale_beat_and_says_how_long() {
+        let m = Machine::new("mb2", "mb2");
+        let ago = |secs: i64| crate::util::iso_at(crate::util::epoch_secs() - secs);
+        let up = |heard: String| MachineLive { reachable: true, last_seen: ago(5), heard, ..Default::default() };
+
+        assert!(!is_silent(&m, &up(ago(30))), "a fresh beat");
+        assert!(!is_silent(&m, &up(String::new())), "nothing beaten yet is not silence");
+        assert!(is_silent(&m, &up(ago(m.lease_secs() as i64 + 60))), "a beat older than the lease");
+        let down = MachineLive { reachable: false, last_seen: ago(240), heard: ago(300), ..Default::default() };
+        assert!(is_silent(&m, &down), "a down link");
+        assert_eq!(last_heard(&down), down.heard, "the beat, not the probe");
+        assert_eq!(last_heard(&MachineLive { last_seen: ago(9), ..Default::default() }), ago(9), "the probe when never beaten");
+
+        assert_eq!(unreachable_word(&ago(240)), "unreachable 4m");
+        assert_eq!(unreachable_word(""), "unreachable never heard");
+
+        let mut live = std::collections::BTreeMap::new();
+        live.insert("mb2".to_string(), up(ago(10)));
+        assert_eq!(loud(&[m.clone()], &live), None, "a heard machine is not a fault");
+        live.insert("mb2".to_string(), down);
+        let line = loud(&[m.clone()], &live).expect("a silent one is");
+        assert!(line.contains("mb2 (unreachable 5m)") && line.contains("held, not gone"), "{line}");
+        let mut retired = m;
+        retired.status = "retired".into();
+        assert_eq!(loud(&[retired], &live), None, "a retired machine is nobody's fault");
+    }
+
+    /// Every surface that draws seats reads one `Silence`: the sentence, and per
+    /// far seat the word its row wears.
+    #[test]
+    fn silence_names_the_seats_on_a_silent_machine_and_nobody_else() {
+        let env = crate::util::isolated("far-silence");
+        let store = crate::store::Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
+        assert!(Silence::read(&store).line.is_none(), "no report yet is not a silence");
+        let at = crate::util::iso_at(crate::util::epoch_secs() - 240);
+        store.set_machine_live("mb2", &MachineLive { reachable: false, heard: at, ..Default::default() });
+        let silence = Silence::read(&store);
+        assert!(silence.line.as_deref().is_some_and(|l| l.contains("mb2 (unreachable 4m)")));
+        assert!(silence.seats.is_empty(), "no seat is on it here");
     }
 }

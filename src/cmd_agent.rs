@@ -1511,6 +1511,19 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: nothing answers for {seat} — `wsp wip` says who holds what");
         return 1;
     };
+    // A seat on a machine that has gone silent is held, not gone, and a tell to
+    // it waits in the wake spool for the link: `docs/remote-agents.md` section 3.
+    // Only a seat that was found gets here; one nothing answers for was refused
+    // above and nothing was kept for it.
+    if row.state == State::Unreachable {
+        let n = crate::wake::hold_tell(store, &seat, &text);
+        let word = format!("{what} is unreachable — held ({n} waiting), delivered when the link returns");
+        match args.json() {
+            true => println!("{}", json!({ "held": true, "pane": seat, "waiting": n })),
+            false => println!("{} {word}", p.yellow("…")),
+        }
+        return 0;
+    }
     if row.agent.kind.is_empty() {
         eprintln!("wsp: no agent in {seat} — the pane is alive and empty. `wsp spawn {needle}` puts one in it");
         return 1;
@@ -3142,6 +3155,20 @@ pub(crate) fn may_reap(answered: &std::collections::BTreeMap<&str, usize>, id: &
     !id.is_empty() && answered.contains_key(machine_of(id))
 }
 
+/// [`may_reap`], asked of the machine a **seat record** names rather than of an id's
+/// `@mb2` suffix: `machine` is the record's own field (`""` is this machine), and
+/// `census` is who was asked and what came back.
+///
+/// The same rule, one comparison of two names with nothing parsed
+/// ([`answered_by_machine`]'s doc says where this was always going): a machine
+/// that *answered* is believed, even holding nothing — a far machine that
+/// rebooted answers with an empty census, and that is when its claims are reaped
+/// — and one that is silent ([`crate::place::Census::silent`]) or was never asked
+/// is not. `docs/remote-agents.md` section 3.
+pub(crate) fn may_reap_on(census: &crate::place::Census, machine: &str) -> bool {
+    census.answered(machine)
+}
+
 /// What herdr answered with, and the one question a seat record asks of it.
 ///
 /// Four lists rather than two because [`may_reap`] is asked twice and of
@@ -3185,6 +3212,17 @@ impl Census<'_> {
             && !self.panes.contains(&pane);
         room_gone || pane_gone
     }
+}
+
+/// Whether the seat holding this task sits on a far machine that is silent now:
+/// the machine read off the **seat record** (`place_compound::seat_machine`), not
+/// off any id, and asked of [`crate::far::silent_machines`]' census.
+fn claim_on_silent_machine(store: &Store, task_id: &str) -> bool {
+    let Some(far) = crate::far::silent_machines(&store.machines(), &store.machines_live()) else { return false };
+    store.panes_for_task(task_id).iter().any(|pane| {
+        let machine = crate::place_compound::seat_machine(store, pane);
+        !machine.is_empty() && !may_reap_on(&far, &machine) && far.unheard().any(|(m, _)| m == machine)
+    })
 }
 
 pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
@@ -3260,6 +3298,11 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
                 continue;
             }
             if !may_reap(&answered, get("workspace_id")) {
+                continue;
+            }
+            // A claim whose seat sits on a silent far machine is held, whatever
+            // the workspace id says (`docs/remote-agents.md` section 3).
+            if claim_on_silent_machine(store, task_id) {
                 continue;
             }
             let alive = workspaces.iter().any(|w| {
@@ -4059,6 +4102,10 @@ pub(crate) struct Wip {
     /// new seat is not flagged for the last one's run. Drawn as `full suite in a member
     /// seat`; published as `full_suite`.
     pub full_suite: std::collections::BTreeSet<String>,
+    /// The far machines gone silent, and the seats on them (`docs/remote-agents.md`
+    /// section 3): the heading line, drawn as the dead daemon is, and the word
+    /// (`unreachable 4m`) each of their seats wears in place of `gone`.
+    pub silent: crate::far::Silence,
 }
 
 /// Note this census's seats against `seat-since.json` and say since when each
@@ -4186,6 +4233,7 @@ impl Wip {
             unsent: crate::repair::unsent_seats(store),
             dropped: crate::repair::dropped_seats(store),
             full_suite: crate::throttle::full_suite_seats(&store.state),
+            silent: crate::far::Silence::read(store),
         }
     }
 }
@@ -4816,6 +4864,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         // said, and a caller that has to ask "no daemon, or a daemon whose `ps`
         // would not answer?" cannot tell those apart from a flag either.
         "daemon": w.daemon,
+        "unreachable": w.silent.line,
         "disk": w.disk,
         "load": w.load,
         "throttle": w.throttle,
@@ -4836,6 +4885,12 @@ const REVIEW_VERBS: &str = "the person's: wsp done <id> · wsp reopen <id> — a
 
 /// What the STATE column says of a seat whose prompt holds text nobody sent.
 const UNSENT_WORD: &str = "typed, not sent";
+
+/// `unreachable 4m` for a seat on a silent machine; the bare word where the
+/// machine's last-heard time is not to hand.
+fn silent_word(w: &Wip, seat: &str) -> String {
+    w.silent.seats.get(seat).cloned().unwrap_or_else(|| "unreachable".to_string())
+}
 const DROPPED_WORD: &str = "order not received";
 
 /// The note on a row whose seat ran the whole suite (`wsp-389`).
@@ -4849,7 +4904,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
 
     if rows.is_empty() {
         out.push(p.dim("no agents running"));
-        for d in w.daemon.iter().chain(&w.disk).chain(&w.load).chain(&w.idle_memory.warning()) {
+        for d in w.daemon.iter().chain(&w.silent.line).chain(&w.disk).chain(&w.load).chain(&w.idle_memory.warning()) {
             out.push(p.red(d));
         }
         out.extend(w.throttle.iter().map(|t| p.dim(t)));
@@ -4892,7 +4947,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         // Its own line rather than another `·` clause on the heading: it is a
         // fault and the heading is a census, and a heading that goes yellow
         // every hour trains its reader past the yellow.
-        for d in w.daemon.iter().chain(&w.disk).chain(&w.load).chain(&w.idle_memory.warning()) {
+        for d in w.daemon.iter().chain(&w.silent.line).chain(&w.disk).chain(&w.load).chain(&w.idle_memory.warning()) {
             out.push(p.red(d));
         }
         out.extend(w.throttle.iter().map(|t| p.dim(t)));
@@ -4920,6 +4975,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             .map(|r| r.waiting.as_ref().map(|w| waited(r, w).chars().count()).unwrap_or(0))
             .max()
             .unwrap_or(0)
+            .max(rows.iter().filter(|r| r.state == "unreachable").map(|r| silent_word(w, &r.pane).chars().count()).max().unwrap_or(0))
             .max(if rows.iter().any(|r| r.unsent) { UNSENT_WORD.len() } else { 8 })
             .max(if rows.iter().any(|r| r.dropped) { DROPPED_WORD.len() } else { 8 });
         for r in &rows {
@@ -4929,6 +4985,9 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
                 (Some(w), _) => p.yellow(&util::pad(&waited(r, w), sw)),
                 (None, _) if r.unsent => p.yellow(&util::pad(UNSENT_WORD, sw)),
                 (None, _) if r.dropped => p.yellow(&util::pad(DROPPED_WORD, sw)),
+                // A far seat on a silent machine, drawn as a dead daemon is: red,
+                // with how long since it was heard.
+                (None, "unreachable") => p.red(&util::pad(&silent_word(w, &r.pane), sw)),
                 (None, "working") => p.green(&util::pad("working", sw)),
                 (None, "idle") => p.dim(&util::pad("idle", sw)),
                 (None, other) => p.dim(&util::pad(other, sw)),
@@ -5772,6 +5831,9 @@ pub(crate) fn bound_state(
     // cannot answer differently about one seat.
     match rows.iter().find(|r| r.seat.as_str() == seat) {
         Some(r) => match r.state {
+            // A seat on a silent machine is held, not missing: nothing is known
+            // about it until the link is back, and nothing is reaped on it.
+            State::Unreachable => Bound::Unheard,
             s if s.turn_in_flight() => Bound::Turning,
             s if s.is_running() => Bound::Quiet(s),
             // A seat that is still there with nothing running in it. A pane with
@@ -6376,6 +6438,9 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
+    // And whether far machines have gone silent: their seats are held, not
+    // gone, and say so in the daemon's own manner (`wsp-145`).
+    notes.extend(crate::far::Silence::read(store).line);
     // And whether the disk the trees are on is running out (`wsp-327`), naming
     // the largest build output that could go.
     crate::disk::health(store, &mut problems, &mut notes);
@@ -7666,6 +7731,94 @@ mod tests {
         assert!(!may_reap(&panes, "w0:p1@mb2"));
     }
 
+    /// A far seat on a silent machine reads `unreachable <age>` in `wip` — the
+    /// state column, the heading's own line and the JSON — in place of `gone`,
+    /// and a seat on a machine that is heard does not (`docs/remote-agents.md`
+    /// section 3).
+    #[test]
+    fn wip_draws_a_seat_on_a_silent_machine_as_unreachable_with_how_long() {
+        let mut w = wip_world();
+        w.agents[2].state = State::Unreachable;
+        let pane = w.agents[2].seat.as_str().to_string();
+        let plain = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(!plain.contains("unreachable:"), "no heading line without a silent machine:\n{plain}");
+
+        w.silent.line = Some("unreachable: mb2 (unreachable 4m) — their seats are held, not gone".into());
+        w.silent.seats.insert(pane.clone(), "unreachable 4m".into());
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("unreachable: mb2 (unreachable 4m)"), "the heading says it as a dead daemon is said:\n{text}");
+        let row = text.lines().find(|l| l.contains(&pane)).expect("the seat is drawn");
+        assert!(row.contains("unreachable 4m"), "the row wears the word and the age:\n{row}");
+        assert!(!row.contains("gone"), "{row}");
+
+        let j = wip_json(&w);
+        assert_eq!(j["unreachable"], w.silent.line.clone().map(Into::into).unwrap_or(json!(null)));
+        let r = j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane.as_str()).unwrap();
+        assert_eq!(r["state"], "unreachable");
+    }
+
+    /// `may_reap` by machine: a machine that answered is believed even when it
+    /// holds nothing (a far machine that rebooted), a silent one and one nobody
+    /// asked are not — and the machine is the **seat record's**, so a compound
+    /// seat id that names no machine is judged by the machine its record names.
+    #[test]
+    fn may_reap_on_a_machine_believes_an_empty_answer_and_not_a_silent_one() {
+        use crate::place::{Census, Refusal};
+        let heard_empty = Census::heard("mb2", vec![]);
+        assert!(may_reap_on(&heard_empty, "mb2"), "a reboot answers with nothing, and the rule is unchanged");
+        let silent = Census::silent("mb2", Refusal::Unreachable("no route".into()));
+        assert!(!may_reap_on(&silent, "mb2"), "silence is not mb2 being empty");
+        assert!(!may_reap_on(&Census::heard("", vec![]), "mb2"), "nobody asked mb2");
+        assert!(may_reap_on(&Census::heard("", vec![]).and(silent), ""), "this machine answered");
+    }
+
+    /// `reconcile --reap` leaves a claim whose seat sits on a silent machine
+    /// alone, and the machine is read off the seat's record and not off the
+    /// claim's or the seat's id; with the machine heard the same claim is
+    /// examined like any other.
+    #[test]
+    fn a_claim_on_a_silent_machine_is_left_alone_and_one_on_a_heard_machine_is_not() {
+        let env = util::isolated("reap-silent");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_machine(&crate::model::Machine::new("mb2", "mb2")).unwrap();
+        let seat_dir = store.state.join("compound-seats").join("cpd-7");
+        std::fs::create_dir_all(&seat_dir).unwrap();
+        std::fs::write(seat_dir.join("seat.json"), json!({ "machine": "mb2" }).to_string()).unwrap();
+        let near = store.state.join("compound-seats").join("cpd-8");
+        std::fs::create_dir_all(&near).unwrap();
+        std::fs::write(near.join("seat.json"), json!({}).to_string()).unwrap();
+        store.set_binding("cpd-7", json!({ "task_id": "t-far" }));
+        store.set_binding("cpd-8", json!({ "task_id": "t-near" }));
+
+        let down = crate::store::MachineLive { reachable: false, heard: util::iso_at(util::epoch_secs() - 300), ..Default::default() };
+        store.set_machine_live("mb2", &down);
+        assert!(claim_on_silent_machine(&store, "t-far"), "the seat record names mb2 and mb2 is silent");
+        assert!(!claim_on_silent_machine(&store, "t-near"), "a local seat is never held by a far silence");
+        assert!(!claim_on_silent_machine(&store, "t-nobody"), "and a task no seat holds is nobody's");
+
+        let up = crate::store::MachineLive { reachable: true, heard: util::now_iso(), last_seen: util::now_iso(), ..Default::default() };
+        store.set_machine_live("mb2", &up);
+        assert!(!claim_on_silent_machine(&store, "t-far"), "heard again: the reap examines it like any other");
+    }
+
+    /// A seat that reads unreachable is never `Gone` to the check that reaps on
+    /// a bound seat: nothing is known about it, so nothing is done.
+    #[test]
+    fn a_bound_seat_that_reads_unreachable_is_unheard_and_not_gone() {
+        let rows = vec![crate::place::Seated {
+            seat: crate::place::Seat::new("cpd-7"),
+            label: String::new(),
+            cwd: String::new(),
+            agent: crate::place::Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] },
+            state: State::Unreachable,
+            session: String::new(),
+        }];
+        let answered = answered_by_machine(["w0:p1"]);
+        assert!(matches!(bound_state("cpd-7", &rows, &answered), Bound::Unheard));
+        assert!(matches!(bound_state("cpd-9", &[], &answered_by_machine(["cpd-9"])), Bound::Gone), "a seat absent from an answering machine is still gone");
+    }
+
     /// The fault worklist-035 was filed on, at the line that decides it: a
     /// seat empties when its *pane* goes, and the room it was in usually
     /// outlives it.
@@ -8212,6 +8365,7 @@ mod tests {
             unsent: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
+            silent: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -8410,6 +8564,7 @@ mod tests {
             unsent: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
+            silent: Default::default(),
         }
     }
 

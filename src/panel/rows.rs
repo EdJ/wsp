@@ -157,6 +157,11 @@ pub(crate) enum AgentState {
     /// know most about as the one we know nothing about is what this row is for
     /// *not* doing.
     Quiet,
+    /// A far seat whose machine has gone silent (`docs/remote-agents.md` section
+    /// 3): held, not gone. Last, because there is nothing to do about it but
+    /// wait for the link, and drawn as a fault the way a dead daemon is
+    /// (`wsp-145`) so it is not mistaken for a seat nobody has heard from.
+    Unreachable,
 }
 
 impl AgentState {
@@ -171,6 +176,7 @@ impl AgentState {
             AgentState::Working => (Style::Accent, glyph::WORKING),
             AgentState::Spare => (Style::Muted, glyph::IDLE),
             AgentState::Quiet => (Style::Dim, glyph::QUIET),
+            AgentState::Unreachable => (Style::Warn, glyph::UNREACHABLE),
         }
     }
 
@@ -220,6 +226,9 @@ pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>, seat: bool) 
         // task up, and there is as little to do about it as about any other
         // busy agent. The seat only decides what its *silence* means.
         "working" => AgentState::Working,
+        // Before the idle arms: a far seat on a silent machine is held, and the
+        // panel must not read it as spare or as having nothing to say.
+        "unreachable" => AgentState::Unreachable,
         // `done` is a third value herdr sends and nothing here knew about. It
         // is a turn ending rather than an agent leaving: 120s of the event
         // stream held three `working -> done` and three `done -> idle`, and
@@ -3521,6 +3530,7 @@ pub(crate) fn word(state: AgentState) -> &'static str {
         AgentState::Spare => "spare",
         AgentState::Working => "working",
         AgentState::Quiet => "no word yet",
+        AgentState::Unreachable => "unreachable",
     }
 }
 
@@ -4164,5 +4174,18 @@ mod tests {
         );
         assert_eq!(ident_of(&a, Some("render")), "010");
         assert_eq!(ident_of(&b, Some("robustness")), "010");
+    }
+
+    /// A seat on a silent machine is its own state in the panel: not spare, not
+    /// quiet, and drawn as a fault with its own mark and word.
+    #[test]
+    fn an_unreachable_seat_has_its_own_mark_and_word() {
+        let state = agent_state("unreachable", Some(Status::Doing), false);
+        assert_eq!(state, AgentState::Unreachable);
+        assert_eq!(agent_state("unreachable", None, true), AgentState::Unreachable, "a seat does not hide it");
+        assert_eq!(word(state), "unreachable");
+        assert_eq!(state.mark(), (Style::Warn, glyph::UNREACHABLE));
+        assert_ne!(state.mark(), AgentState::Quiet.mark());
+        assert!(AgentState::Quiet < state, "last in the order drawn");
     }
 }

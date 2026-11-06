@@ -750,7 +750,7 @@ fn of_state(spot: &Spot) -> (Option<&str>, &'static str, Option<bool>) {
         false => r,
     };
     match spot.state {
-        State::Empty | State::Gone => (None, "unknown", None),
+        State::Empty | State::Gone | State::Unreachable => (None, "unknown", None),
         State::Starting => (name, "idle", None),
         State::Idle => (name, "idle", ready(Some(true))),
         State::Working => (name, "working", ready(Some(true))),

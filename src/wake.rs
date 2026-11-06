@@ -248,6 +248,9 @@ pub(crate) fn wake(store: &Store, emits: &[Emit], at: i64) {
     for (scope, theirs) in mine {
         deliver_to(store, &crate::cycle::Fleet, &scope, &theirs, at);
     }
+    // And the tells held for seats that could not be reached, now that the pass
+    // has looked at the fleet once more.
+    flush_held_tells_now(store);
 }
 
 /// Whether this seat has already been given the record this edge is about.
@@ -509,6 +512,123 @@ fn say_through(store: &Store, seats: &dyn Seats, scope: &str, text: &str, record
     deliver_to(store, seats, scope, &[], at)
 }
 
+/// How a seat that has tells held for it reads right now.
+pub(crate) enum Seen {
+    /// Every backend answered and none of them has the seat: there is nobody to
+    /// tell, now or later.
+    Missing,
+    /// The seat is there, in this state.
+    Is(crate::place::State),
+}
+
+fn held_key(seat: &str) -> String {
+    format!("{HELD_TELL}{seat}")
+}
+
+/// The spool a `wsp tell` to a seat on a silent machine waits in. Not `wake:`,
+/// whose scopes are governors' and which the reconciler reseats (`scopes_owed`):
+/// a held tell is addressed to a seat, and a seat is not a scope.
+const HELD_TELL: &str = "held-tell:";
+
+/// Hold a tell for a seat that cannot be reached, in the wake spool's own
+/// record (`docs/remote-agents.md` section 3): written before anything else, so
+/// a crash after the answer loses nothing. Returns how many tells the seat now
+/// has held. **Only for a seat that exists** — `wsp tell` to one that does not is
+/// refused before it comes here, and [`flush_held_tells`] drops what is left for
+/// a seat that has gone for good.
+pub(crate) fn hold_tell(store: &Store, seat: &str, text: &str) -> usize {
+    let at = util::epoch_secs();
+    store.update_watch(&held_key(seat), |rec| {
+        Spool::append(rec, vec![Spooled::of(at, Line::Note(crate::cmd_watch::Class::Message, text.to_string()))]);
+    });
+    held_tells(store, seat).len()
+}
+
+/// What is held for this seat, oldest first.
+pub(crate) fn held_tells(store: &Store, seat: &str) -> Vec<(u64, String)> {
+    load(store, &held_key(seat))
+        .held
+        .iter()
+        .filter_map(|h| h.message().map(|text| (h.seq, text.to_string())))
+        .collect()
+}
+
+/// The pass that lets held tells go: each seat with any is read, and
+///
+/// - an idle seat is sent them, oldest first, each settled the moment `send` says
+///   it left (a failed send stops the seat's batch, so order holds);
+/// - a seat that is [`Seen::Missing`] loses them — nobody is coming;
+/// - any other reading, **`Unreachable` included**, leaves them held.
+///
+/// Returns `(sent, dropped)`. `read` and `send` are the seams: the daemon brings
+/// the backends, a test brings a script.
+pub(crate) fn flush_held_tells(
+    store: &Store,
+    read: &dyn Fn(&str) -> Seen,
+    send: &mut dyn FnMut(&str, &str) -> bool,
+) -> (usize, usize) {
+    let (mut sent, mut dropped) = (0, 0);
+    for key in store.watch_keys(HELD_TELL) {
+        let seat = key[HELD_TELL.len()..].to_string();
+        let held = held_tells(store, &seat);
+        if held.is_empty() {
+            continue;
+        }
+        match read(&seat) {
+            Seen::Missing => {
+                settle_key(store, &key, &held.iter().map(|(q, _)| *q).collect::<Vec<_>>());
+                dropped += held.len();
+            }
+            Seen::Is(state) if state.will_take_a_prompt() => {
+                for (seq, text) in &held {
+                    if !send(&seat, text) {
+                        break;
+                    }
+                    settle_key(store, &key, &[*seq]);
+                    sent += 1;
+                }
+            }
+            Seen::Is(_) => {}
+        }
+    }
+    (sent, dropped)
+}
+
+fn settle_key(store: &Store, key: &str, seqs: &[u64]) {
+    store.update_watch(key, |rec| Spool::settle_these(rec, seqs));
+}
+
+/// [`flush_held_tells`] against the machine's own backends: the daemon's call.
+pub(crate) fn flush_held_tells_now(store: &Store) -> (usize, usize) {
+    if store.watch_keys(HELD_TELL).is_empty() {
+        return (0, 0);
+    }
+    let backends = crate::cmd_spawn::local_backends();
+    let read = |seat: &str| {
+        let mut unsure = false;
+        for b in backends.iter() {
+            match b.census() {
+                Ok(c) => {
+                    if let Some(r) = c.seats().find(|r| r.seat.as_str() == seat) {
+                        return Seen::Is(r.state);
+                    }
+                }
+                Err(_) => unsure = true,
+            }
+        }
+        // A backend that could not be asked may be the one that has it.
+        match unsure {
+            true => Seen::Is(crate::place::State::Unknown),
+            false => Seen::Missing,
+        }
+    };
+    let mut send = |seat: &str, text: &str| match crate::cmd_agent::locate_seat(&backends, seat) {
+        Some((place, row)) => agent_commands::of(&row.agent.kind).tell(place.as_ref(), &Pane::new(seat), text).is_ok(),
+        None => false,
+    };
+    flush_held_tells(store, &read, &mut send)
+}
+
 /// The sentences held on a scope's spool, oldest first, as `(seq, at, text)`
 /// — messages only, not the news beside them. See [`crate::cmd_watch::Spooled::message`].
 pub(crate) fn messages_held(store: &Store, scope: &str) -> Vec<(u64, i64, String)> {
@@ -618,6 +738,7 @@ pub(crate) fn held_because(state: crate::place::State) -> Option<&'static str> {
         State::Blocked => Some("the seat is stopped on a prompt only a person can answer"),
         State::Starting => Some("the agent is still coming up"),
         State::Empty | State::Gone => Some("the seat is empty"),
+        State::Unreachable => Some("the seat is unreachable — held until the link returns"),
         State::Unknown => Some("wsp cannot say what the seat is doing"),
     }
 }
@@ -2350,5 +2471,64 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let typed = report.said("the demo seat", &util::Paint::plain());
         assert!(typed.contains("typed"), "a seat that took it and read nothing says so: {typed}");
         assert!(!typed.contains("still owed 0"), "and it is still owed: {typed}");
+    }
+
+    /// **A tell to a seat on a silent machine is held and delivered on
+    /// reconnect; a tell to a seat that does not exist is not held at all, and
+    /// what was held for one that has gone is dropped** (`docs/remote-agents.md`
+    /// section 3). The two are told apart by the reading, not by the spool: the
+    /// spool takes whatever it is handed, so the tell verb must hand it only a
+    /// seat that is there.
+    #[test]
+    fn a_tell_to_an_unreachable_seat_is_held_until_the_link_returns_and_one_to_a_missing_seat_is_dropped() {
+        use crate::place::State;
+        use std::cell::Cell;
+        let env = util::isolated("wake-held-tell");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+
+        // The verb: a seat nothing holds is refused and nothing is kept for it.
+        let args = crate::Args::synth("tell", &["cpd-999", "are you there"], &[]);
+        assert_eq!(crate::cmd_agent::tell(&store, &args), 1, "nothing holds it");
+        assert!(held_tells(&store, "cpd-999").is_empty(), "so nothing is held for it");
+
+        assert_eq!(hold_tell(&store, "cpd-7", "carry on with the second half"), 1);
+        assert_eq!(hold_tell(&store, "cpd-7", "and run the tests"), 2);
+
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let reading = Cell::new(State::Unreachable);
+        let read = |_: &str| Seen::Is(reading.get());
+        let mut send = |seat: &str, text: &str| {
+            sent.borrow_mut().push(format!("{seat}: {text}"));
+            true
+        };
+
+        // Silent, working, blocked, starting or unreadable: held, not sent, not lost.
+        for state in [State::Unreachable, State::Working, State::Blocked, State::Starting, State::Unknown] {
+            reading.set(state);
+            assert_eq!(flush_held_tells(&store, &read, &mut send), (0, 0), "{state:?}");
+        }
+        assert_eq!(held_tells(&store, "cpd-7").len(), 2);
+
+        // The link returns and the seat is at its prompt: both go, in order.
+        reading.set(State::Idle);
+        assert_eq!(flush_held_tells(&store, &read, &mut send), (2, 0));
+        assert_eq!(*sent.borrow(), ["cpd-7: carry on with the second half", "cpd-7: and run the tests"]);
+        assert!(held_tells(&store, "cpd-7").is_empty(), "and are not sent twice");
+        assert_eq!(flush_held_tells(&store, &read, &mut send), (0, 0));
+
+        // A seat that has gone for good loses what was held for it.
+        hold_tell(&store, "cpd-8", "hello?");
+        let gone = |_: &str| Seen::Missing;
+        assert_eq!(flush_held_tells(&store, &gone, &mut send), (0, 1));
+        assert!(held_tells(&store, "cpd-8").is_empty());
+        assert_eq!(sent.borrow().len(), 2, "nothing went to it");
+
+        // A send that fails stops the batch and keeps the rest, in order.
+        hold_tell(&store, "cpd-9", "one");
+        hold_tell(&store, "cpd-9", "two");
+        let mut fails = |_: &str, _: &str| false;
+        assert_eq!(flush_held_tells(&store, &read, &mut fails), (0, 0));
+        assert_eq!(held_tells(&store, "cpd-9").iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), ["one", "two"]);
     }
 }

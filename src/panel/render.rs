@@ -177,6 +177,8 @@ pub(crate) mod glyph {
     pub const WORKING: &str = "●";
     pub const IDLE: &str = "○";
     pub const QUIET: &str = "·";
+    /// A far seat whose machine is silent: held, not gone.
+    pub const UNREACHABLE: &str = "⊘";
     pub const BLOCKED: &str = "■";
     /// Deliberately not yet. The same square as `BLOCKED` because the work is
     /// stopped either way, and smaller and dim because nobody is owed anything

@@ -555,6 +555,14 @@ impl Compound<'_> {
             if socket.is_empty() {
                 return State::Empty;
             }
+            // A machine that has gone silent is a link, not a death: the seat is
+            // held and reads `unreachable` (`docs/remote-agents.md` section 3),
+            // whether or not the local end of its forward still answers. Only a
+            // machine that is answering and whose session is not is the session
+            // gone.
+            if self.far.silent_for(&str_of(rec, "machine")).is_some() {
+                return State::Unreachable;
+            }
             if UnixStream::connect(&socket).is_err() {
                 return State::Gone;
             }
@@ -1464,6 +1472,12 @@ pub fn forwards_for(store: &Store, machine: &str) -> Vec<(PathBuf, String)> {
     out
 }
 
+/// The machine a seat's record names: `""` for a seat on this machine, or one
+/// wsp has no record of.
+pub fn seat_machine(store: &Store, seat: &str) -> String {
+    str_of(&read_json(&store.state.join(SEATS).join(seat).join(SEAT_FILE)), "machine")
+}
+
 /// The far seats on `machine`, as the beat sends to them: every seat record that
 /// names this machine and has a forwarded controller socket. A local seat has no
 /// `machine` and is never in it.
@@ -1721,7 +1735,22 @@ impl Place for Compound<'_> {
     fn census(&self) -> Result<Census> {
         // One machine, and it is this one — a compound session is a local
         // pty and there is no fan-out here for `Census` to speak for.
-        Ok(Census::heard("", self.survey()))
+        let mut census = Census::heard("", self.survey());
+        // A far machine that has gone silent is filed as silent, beside the
+        // local answer: its seats read `unreachable` in the rows above, and a
+        // reap asks `Census::answered` of the machine before it believes an
+        // absence (`docs/remote-agents.md` section 3).
+        let mut silent: BTreeSet<String> = BTreeSet::new();
+        for id in self.ids() {
+            let machine = str_of(&self.record(&Seat::new(id)).unwrap_or(json!({})), "machine");
+            if !machine.is_empty() && self.far.silent_for(&machine).is_some() {
+                silent.insert(machine);
+            }
+        }
+        for machine in silent {
+            census = census.and(Census::silent(&machine, Refusal::Unreachable("no answer from the far seat's machine".into())));
+        }
+        Ok(census)
     }
 
     /// Poll, and say what changed — identical shape to
@@ -1924,6 +1953,8 @@ mod tests {
         settings: std::cell::RefCell<String>,
         /// The lease the machine record carries.
         lease: std::cell::Cell<Option<u32>>,
+        /// The machine has gone silent (`Wire::silent_for`).
+        silent: std::cell::Cell<bool>,
     }
 
     impl crate::far::Wire for FarScript {
@@ -1959,6 +1990,9 @@ mod tests {
         fn dir(&self, _m: &crate::model::Machine) -> PathBuf {
             self.dir.clone()
         }
+        fn silent_for(&self, name: &str) -> Option<String> {
+            (name == "mb2" && self.silent.get()).then(|| "2026-11-06T10:00:00Z".to_string())
+        }
         fn lease(&self, _m: &crate::model::Machine, _s: &Path, _seat: &str, _state: &str) -> std::result::Result<(), String> {
             Ok(())
         }
@@ -1976,6 +2010,7 @@ mod tests {
             forward_fails,
             settings: Default::default(),
             lease: Default::default(),
+            silent: Default::default(),
         };
         (f, root)
     }
@@ -2016,6 +2051,48 @@ mod tests {
             asked.iter().position(|a| a.starts_with("run mkdir ")) < asked.iter().position(|a| a.contains("spawn --label")),
             "before the agent starts"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A far seat whose forward does not answer reads `gone` while its machine
+    /// answers and `unreachable` while its machine is silent — the link blip that
+    /// used to end a seat — and the census files the silent machine as silent,
+    /// so a reap has no empty answer to believe (`docs/remote-agents.md`
+    /// section 3). A local seat is never read this way.
+    #[test]
+    fn a_far_seat_on_a_silent_machine_reads_unreachable_and_not_gone() {
+        let (far, root) = far_script("silent", false, false);
+        let place = Compound { far: &far, ..Compound::at(root.join("seats")) };
+        let order = Order {
+            label: "t-1".into(),
+            cwd: Some("/far/exec/trees/t-1".into()),
+            on: Some("mb2".into()),
+            ..Order::default()
+        };
+        let seat = place.open(&order).unwrap();
+        // As `start` leaves it, without starting anything: the forwarded socket is
+        // a name nobody listens on, the local end of a forward its master took
+        // with it.
+        let mut rec = place.record(&seat).unwrap();
+        rec["socket"] = json!(root.join("fwd").join("dead.sock").display().to_string());
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
+        write_atomic(&place.dir_of(&seat).unwrap().join(SEAT_FILE), &rec.to_string()).unwrap();
+        assert_eq!(place.state(&seat).unwrap(), State::Gone, "an answering machine and no session is a session gone");
+        assert_eq!(place.census().unwrap().unheard().count(), 0, "nobody is silent");
+
+        far.silent.set(true);
+        assert_eq!(place.state(&seat).unwrap(), State::Unreachable, "a silent machine is a link and not a death");
+        let census = place.census().unwrap();
+        let row = census.seats().find(|r| r.seat == seat).expect("still drawn");
+        assert_eq!(row.state, State::Unreachable);
+        assert_eq!(row.state.as_str(), "unreachable");
+        let silent: Vec<&str> = census.unheard().map(|(m, _)| m).collect();
+        assert_eq!(silent, ["mb2"], "the census says who was silent");
+        assert!(!census.answered("mb2"), "and a reap may not believe an absence from it");
+        assert!(census.answered(""), "this machine answered all the same");
+
+        far.silent.set(false);
+        assert_eq!(place.state(&seat).unwrap(), State::Gone, "back to the ordinary reading when the machine is heard");
         let _ = fs::remove_dir_all(&root);
     }
 

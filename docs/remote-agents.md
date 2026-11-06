@@ -143,7 +143,7 @@ line and `wsp doctor`, exactly the way a dead daemon is drawn everywhere a seat
 looks (wsp-145). The machine reads `unreachable (last seen 4m)` in `machine ls`.
 The claim stays held. `reconcile --reap` leaves a claim on a silent machine alone
 (`Census::silent`, section 2). `wsp tell` to it is held in the wake spool and
-delivered on reconnect rather than dropped: *the spool today drops a level
+delivered on reconnect rather than dropped (built: `wake::hold_tell` keeps it under `held-tell:<seat>` and the daemon's pass flushes it once the seat reads idle; a seat nothing answers for is refused by `wsp tell` and keeps nothing, and what was held for a seat that is positively gone is dropped; the panel row wears the word without the age): *the spool today drops a level
 read for seats that do not exist, so the build must prove it tells an
 unreachable seat from a non-existent one.*
 

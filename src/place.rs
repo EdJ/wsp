@@ -658,6 +658,13 @@ pub enum State {
     /// supervisor that watched a pid exit answers it exactly, which is the point
     /// of writing the port in wsp's vocabulary rather than herdr's.
     Gone,
+    /// The seat is on a far machine that has gone silent: the link is down or
+    /// the beat is unanswered past the lease (`docs/remote-agents.md` section 3).
+    /// The agent is held, not dead — its claim stays, a reap leaves it alone and
+    /// a tell to it is held until the link returns. Not [`State::Gone`], which
+    /// is what a blip used to read as, and not [`State::Unknown`], which is a
+    /// backend that cannot say: here wsp knows exactly why it cannot see.
+    Unreachable,
     /// The backend did not say, or could not be asked.
     #[default]
     Unknown,
@@ -672,6 +679,7 @@ impl State {
             State::Working => "working",
             State::Blocked => "blocked",
             State::Gone => "gone",
+            State::Unreachable => "unreachable",
             State::Unknown => "unknown",
         }
     }
@@ -1869,5 +1877,16 @@ mod tests {
         }
         assert_eq!(submit(&dropped, &Seat::new("cpd-3"), "go", &pressing(&clock)), Ok(Delivery::Unconfirmed));
         assert_eq!(dropped.0.pressed.get(), 0);
+    }
+
+    /// A seat on a silent machine is held, not gone: it is not running, will not
+    /// take a prompt, and is not `Gone` (`docs/remote-agents.md` section 3).
+    #[test]
+    fn an_unreachable_seat_is_neither_running_nor_gone_nor_ready_for_a_prompt() {
+        let u = State::Unreachable;
+        assert_eq!(u.as_str(), "unreachable");
+        assert!(!u.is_running() && !u.will_take_a_prompt() && !u.turn_in_flight());
+        assert_ne!(u, State::Gone);
+        assert_ne!(u, State::Unknown);
     }
 }

@@ -367,6 +367,19 @@ pub(crate) struct Briefing {
     pub yours: Vec<(Option<String>, String)>,
 }
 
+/// What the seat line says is wrong with the machine: no daemon (`wsp-145`), and
+/// far machines gone silent (`docs/remote-agents.md` section 3), each in its own
+/// sentence and drawn the same way. `None` when neither is true, which is almost
+/// always, and costs the machines file's read and nothing else.
+pub(crate) fn seat_faults(store: &Store) -> Option<String> {
+    let daemon = crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered());
+    let far = crate::far::Silence::read(store).line;
+    match (daemon, far) {
+        (Some(d), Some(f)) => Some(format!("{d}  {f}")),
+        (d, f) => d.or(f),
+    }
+}
+
 /// Where a brief is *for*, when that is not where the process is.
 ///
 /// [`Briefing::live`] answers "where am I" out of the process environment:
@@ -440,7 +453,7 @@ impl Briefing {
             // absolute or already contracted, and `own_tree` expands whatever
             // is here before asking whether it is a checkout.
             cwd: seat.cwd.map(|c| util::contract(&util::expand(c))),
-            daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered()),
+            daemon: seat_faults(&store),
             yours: crate::cmd_message::census(store),
             world,
         }
@@ -498,7 +511,7 @@ impl Briefing {
             incoming,
             ending_failed,
             cwd: std::env::current_dir().ok().map(|c| util::contract(&c)),
-            daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered()),
+            daemon: seat_faults(&store),
             yours: crate::cmd_message::census(store),
             world,
         }
@@ -3003,5 +3016,23 @@ mod tests {
         let said = super::link_row(true).unwrap();
         assert!(said.contains("75") && said.contains("wait") && said.contains("Do not change course"), "{said}");
         assert_eq!(super::link_row(false), None, "a seat on the primary hears nothing of it");
+    }
+
+    /// The seat line carries a silent far machine in the dead daemon's manner
+    /// (`wsp-145`): its own sentence, beside the daemon's when both are true,
+    /// and nothing at all when the machine is heard.
+    #[test]
+    fn the_seat_line_says_a_far_machine_is_unreachable() {
+        let env = crate::util::isolated("brief-far-silent");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_machine(&crate::model::Machine::new("mb2", "mb2")).unwrap();
+        let ago = |secs: i64| crate::util::iso_at(crate::util::epoch_secs() - secs);
+        store.set_machine_live("mb2", &crate::store::MachineLive { reachable: true, heard: ago(10), last_seen: ago(5), ..Default::default() });
+        assert!(!seat_faults(&store).unwrap_or_default().contains("mb2"), "heard: nothing to say");
+
+        store.set_machine_live("mb2", &crate::store::MachineLive { reachable: false, heard: ago(240), ..Default::default() });
+        let said = seat_faults(&store).expect("silent: said");
+        assert!(said.contains("unreachable: mb2 (unreachable 4m)"), "{said}");
     }
 }

@@ -913,6 +913,16 @@ fn state_of(p: &Paint, m: &Machine, live: Option<&MachineLive>) -> (String, Stri
         return (p.dim("retired"), String::new());
     }
     match live {
+        // Silent is not offline: the link is down, or the far seats' beat has
+        // gone unanswered past the lease. Their seats read `unreachable` too
+        // (`docs/remote-agents.md` section 3), and say it with this word.
+        Some(l) if crate::far::is_silent(m, l) => {
+            let seen = match crate::far::last_heard(l) {
+                "" => "(never seen)".to_string(),
+                at => format!("(last seen {})", crate::far::heard_ago(at)),
+            };
+            (p.red("unreachable"), seen)
+        }
         Some(l) if l.reachable => match readiness(l, crate::place_compound::wire_version()) {
             Readiness::Ready => (p.green("ready"), l.wire.map(|w| format!("wire {w}")).unwrap_or_default()),
             Readiness::Unchecked => (
@@ -932,13 +942,7 @@ fn state_of(p: &Paint, m: &Machine, live: Option<&MachineLive>) -> (String, Stri
             ),
             Readiness::Unreachable => unreachable!("the arm is reachable"),
         },
-        Some(l) => {
-            let seen = match l.last_seen.as_str() {
-                "" => "never seen".to_string(),
-                s => format!("last seen {} ago", util::duration_human(util::since(s))),
-            };
-            (p.yellow("offline"), seen)
-        }
+        Some(_) => unreachable!("a machine whose link is down is silent, above"),
         // No record at all is not the same as a failed dial, and saying
         // "offline" here would blame the machine for the daemon not running.
         None => (p.dim("—"), "no daemon report yet".into()),
@@ -974,7 +978,7 @@ mod tests {
             &m,
             Some(&MachineLive { reachable: false, last_seen: util::now_iso(), ..Default::default() }),
         );
-        assert!(why.starts_with("last seen"), "an offline row says how long, not just that");
+        assert!(why.starts_with("(last seen"), "an unreachable row says how long, not just that");
 
         let mut retired = m.clone();
         retired.status = "retired".into();
@@ -987,6 +991,29 @@ mod tests {
                 assert_ne!(a, b, "two states rendering the same is the confusion this guards");
             }
         }
+    }
+
+    /// A machine that has gone silent reads `unreachable (last seen 4m)` — the
+    /// down link and the beat gone stale alike — and a heard one does not
+    /// (`docs/remote-agents.md` section 3).
+    #[test]
+    fn a_silent_machine_reads_unreachable_with_when_it_was_last_seen() {
+        let p = plain();
+        let m = Machine::new("mb2", "mb2");
+        let ago = |secs: i64| util::iso_at(util::epoch_secs() - secs);
+
+        let down = MachineLive { reachable: false, heard: ago(240), last_seen: ago(600), ..Default::default() };
+        let (word, seen) = state_of(&p, &m, Some(&down));
+        assert_eq!((word.trim(), seen.as_str()), ("unreachable", "(last seen 4m)"), "the beat, not the probe");
+
+        let stale = MachineLive { reachable: true, heard: ago(m.lease_secs() as i64 + 120), last_seen: ago(5), ..Default::default() };
+        assert_eq!(state_of(&p, &m, Some(&stale)).0.trim(), "unreachable", "the link answers and the seat does not");
+
+        let never = MachineLive { reachable: false, ..Default::default() };
+        assert_eq!(state_of(&p, &m, Some(&never)).1, "(never seen)");
+
+        let fresh = MachineLive { reachable: true, heard: ago(20), last_seen: ago(5), ..Default::default() };
+        assert_ne!(state_of(&p, &m, Some(&fresh)).0.trim(), "unreachable");
     }
 
     /// `ready` is a word only a passed check earns; the same connection with no
@@ -1045,7 +1072,7 @@ mod tests {
             &Machine::new("mb2", "mb2"),
             Some(&MachineLive { reachable: false, last_seen: String::new(), ..Default::default() }),
         );
-        assert_eq!(why, "never seen");
+        assert_eq!(why, "(never seen)");
     }
 
     // ---- the whole view, offline -----------------------------------------
@@ -1137,7 +1164,7 @@ mod tests {
 
         // And the three states, in one frame, distinct.
         assert!(text.contains("connected"), "{text}");
-        assert!(text.contains("offline"), "{text}");
+        assert!(text.contains("unreachable"), "{text}");
         assert!(text.contains("no daemon report yet"), "{text}");
         // Why, and cut: an ssh failure is a sentence and a half, and this is
         // one cell of a list. `show` is where the whole of it is.
