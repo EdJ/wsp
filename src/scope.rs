@@ -201,6 +201,9 @@ pub(crate) struct Narrowed {
     pub scope: Scope,
     /// The targets that replaced a full-suite step, by name.
     pub targets: Vec<String>,
+    /// Whether a whole-suite step was removed or replaced. A narrow scope on a
+    /// unit with none (only a member's own script) narrowed nothing (`wsp-439`).
+    pub narrowed: bool,
 }
 
 /// Apply a narrow scope to a unit's items in `tree`, at the commit it stands at.
@@ -211,7 +214,7 @@ pub(crate) struct Narrowed {
 /// nothing for files that are not prose, the full steps stay**: a change the
 /// graph cannot place is not proved covered by running nothing.
 pub(crate) fn narrow(tree: &Path, items: &[Item], scope: &Scope, changed: &[String]) -> Narrowed {
-    let keep = |scope: Scope| Narrowed { items: items.to_vec(), scope, targets: Vec::new() };
+    let keep = |scope: Scope| Narrowed { items: items.to_vec(), scope, targets: Vec::new(), narrowed: false };
     if scope.is_full() || !items.iter().any(|i| i.kind != crate::barrier_run::Kind::Stop && full_suite_command(&i.step.command)) {
         return keep(scope.clone());
     }
@@ -235,7 +238,7 @@ pub(crate) fn narrow(tree: &Path, items: &[Item], scope: &Scope, changed: &[Stri
             push(&mut out, Item { step, kind: item.kind, owners: item.owners.clone() });
         }
     }
-    Narrowed { items: out, scope: scope.clone(), targets }
+    Narrowed { items: out, scope: scope.clone(), targets, narrowed: true }
 }
 
 /// A command named twice runs once, and the owners of both share the answer.
@@ -485,9 +488,21 @@ mod tests {
         assert_eq!(before, "cargo test,sh mine.sh,cargo test", "a full scope changes nothing");
         let docs = narrow(&dir, &items(), &Scope::Narrow { widened: vec![] }, &paths(&["docs/a.md", "cart/README.md"]));
         assert_eq!(commands(&docs), vec!["sh mine.sh", "cargo test"], "prose reaches no test, and the suite step is gone");
+        assert!(docs.narrowed, "a suite step went, so the barrier was narrowed");
         let stray = narrow(&dir, &items(), &Scope::Narrow { widened: vec![] }, &paths(&["scripts/deploy.py"]));
         assert!(matches!(stray.scope, Scope::Full(ref w) if w.contains("reach nothing")), "{:?}", stray.scope);
         assert_eq!(commands(&stray), vec!["cargo test", "sh mine.sh", "cargo test"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_narrow_scope_on_a_unit_with_no_whole_suite_step_narrowed_nothing() {
+        let dir = workspace("nothing");
+        let only_mine: Vec<Item> = items().into_iter().filter(|i| i.step.command == "sh mine.sh").collect();
+        let n = narrow(&dir, &only_mine, &Scope::Narrow { widened: vec![] }, &paths(&["cart/src/lib.rs"]));
+        assert!(!n.narrowed && n.targets.is_empty() && commands(&n) == vec!["sh mine.sh"]);
+        let with_suite = narrow(&dir, &items(), &Scope::Narrow { widened: vec![] }, &paths(&["cart/src/lib.rs"]));
+        assert!(with_suite.narrowed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -417,12 +417,14 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     let mut effective: Vec<Vec<Item>> = Vec::new();
     let mut applied = scope.clone();
     let mut targets: Vec<String> = Vec::new();
+    let mut any_narrowed = false;
     for unit in &plan.units {
         let (r, w, narrowed) = run_unit_scoped(store, unit, &format!("barrier {list} {at}"), Some((&scope, &changed)));
         waited += w;
         ranged.push(r);
         match narrowed {
             Some(n) => {
+                any_narrowed |= n.narrowed;
                 if n.scope.is_full() {
                     applied = n.scope;
                 }
@@ -436,6 +438,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
             None => effective.push(unit.items.clone()),
         }
     }
+    let applied = applied_scope(applied, any_narrowed);
     let mut blames = Vec::new();
     let mut failed = Vec::new();
     let mut could_not = Vec::new();
@@ -484,7 +487,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     let reads: Vec<String> = plan.units.iter().map(|u| u.sha.clone()).collect();
     let results = results_text(&plan, &ranged, &blames, &decision);
     let secs = started.elapsed().saturating_sub(waited).as_secs();
-    let note = scope_note(store, &project, &mut net, list, at, &applied, &targets, &scope, secs, failed.is_empty(), reused, !could_not_any(&ranged));
+    let note = scope_note(store, &project, &mut net, list, at, &applied, &targets, &scope, secs, failed.is_empty(), reused, !could_not_any(&ranged) && !nothing_narrowed(&scope, &applied));
     note.write(store, list, at);
     let results = format!("Scope: {}\n{results}", note.line());
     let file = packet_file(store, list, at);
@@ -597,6 +600,22 @@ fn run_unit_locked(
 
 fn could_not_any(ranged: &[Ranged]) -> bool {
     ranged.iter().any(|r| matches!(r, Ranged::Could(_)))
+}
+
+/// The scope a barrier ran under: a narrow scope that removed no whole-suite
+/// step from any unit narrowed nothing, so it reads as no scope (`wsp-439`).
+fn applied_scope(applied: scope::Scope, any_narrowed: bool) -> scope::Scope {
+    if applied.is_full() || any_narrowed {
+        applied
+    } else {
+        scope::Scope::Full("no whole-suite step to narrow".into())
+    }
+}
+
+/// Whether the scope decided was narrow and nothing came of it: such a run is
+/// neither a scoped barrier nor a full one for the safety net's count.
+fn nothing_narrowed(decided: &scope::Scope, applied: &scope::Scope) -> bool {
+    !decided.is_full() && applied.is_full() && matches!(applied, scope::Scope::Full(w) if w == "no whole-suite step to narrow")
 }
 
 /// What the group's barrier did about scope, and the project's count of scoped
@@ -1075,5 +1094,21 @@ mod tests {
         assert!(red.line().contains("SAFETY-NET RED"));
         red.write(&store, "run", 4);
         assert_eq!(scope::Note::read(&store, "run", 4).unwrap().net_red, red.net_red);
+    }
+
+    #[test]
+    fn a_narrow_scope_that_narrowed_nothing_is_no_scope_and_stays_out_of_the_net() {
+        let (_env, store) = world("nothing", "exit 0\n", "");
+        let narrow = scope::Scope::Narrow { widened: vec![] };
+        let applied = applied_scope(narrow.clone(), false);
+        assert!(applied.is_full() && nothing_narrowed(&narrow, &applied));
+        assert_eq!(applied_scope(narrow.clone(), true), narrow, "one unit narrowed, so the barrier was scoped");
+        let full = scope::Scope::Full("last".into());
+        assert!(!nothing_narrowed(&full, &applied_scope(full.clone(), false)), "a full scope is a full run");
+        let mut net = scope::Net { full_secs: Some(400), since_full: vec!["run/1".into()] };
+        let note = scope_note(&store, "pj", &mut net, "run", 2, &applied, &[], &narrow, 5, true, 0, !nothing_narrowed(&narrow, &applied));
+        assert!(!note.scoped && note.saved() == 0, "{note:?}");
+        assert_eq!(net.since_full, vec!["run/1"], "neither counted as scoped nor taken for a full run");
+        assert_eq!(net.full_secs, Some(400));
     }
 }
