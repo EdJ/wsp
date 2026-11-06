@@ -106,6 +106,31 @@ impl Tunnel {
         self.live.check_error = crate::far::IN_PROGRESS.into();
     }
 
+    /// A master was just started: the seats' forwards on it are gone, and are put
+    /// back once it answers ([`Tunnel::readd_if_due`]).
+    fn started(&mut self, child: Child) {
+        self.child = Some(child);
+        self.readd = true;
+        self.live.tunnel = "starting".into();
+        // Not reachable yet: ssh has been started, not connected.
+        // Saying otherwise here is how a machine reads as up for
+        // the twenty seconds before anyone asks it anything — and
+        // "up" is the word the reap guard is not allowed to be
+        // wrong about.
+        self.live.reachable = false;
+        self.live.error.clear();
+    }
+
+    /// The master answered: if it is a new one, put its forwards back — once.
+    /// The flag is cleared after the attempt, so the next tick on the same
+    /// master asks ssh for nothing.
+    fn readd_if_due(&mut self, store: &Store, m: &Machine, wire: &dyn crate::far::Wire) {
+        if self.readd {
+            readd_forwards(store, m, wire);
+            self.readd = false;
+        }
+    }
+
     fn backoff(&mut self) {
         self.next_try = Some(Instant::now() + wait_after(self.failures));
         self.failures += 1;
@@ -246,18 +271,7 @@ impl Supervisor {
                 return;
             }
             match spawn(store, m, sock) {
-                Ok(child) => {
-                    t.child = Some(child);
-                    t.readd = true;
-                    t.live.tunnel = "starting".into();
-                    // Not reachable yet: ssh has been started, not connected.
-                    // Saying otherwise here is how a machine reads as up for
-                    // the twenty seconds before anyone asks it anything — and
-                    // "up" is the word the reap guard is not allowed to be
-                    // wrong about.
-                    t.live.reachable = false;
-                    t.live.error.clear();
-                }
+                Ok(child) => t.started(child),
                 Err(e) => {
                     t.live.reachable = false;
                     t.live.tunnel = "retrying".into();
@@ -285,10 +299,7 @@ impl Supervisor {
         if t.live.reachable {
             t.failures = 0;
             t.next_try = None;
-            if t.readd {
-                readd_forwards(store, m);
-                t.readd = false;
-            }
+            t.readd_if_due(store, m, &crate::far::Ssh);
         }
         t.recheck(store, m);
     }
@@ -385,10 +396,13 @@ fn backend_at(m: &Machine) -> String {
 /// master that died took them with it. Each is added on its own and a failure of
 /// one is no reason to skip the next (the stale local end is swept by
 /// [`crate::far::Wire::forward`], so a re-add is idempotent).
-fn readd_forwards(store: &Store, m: &Machine) {
-    use crate::far::Wire;
+fn readd_forwards(store: &Store, m: &Machine, wire: &dyn crate::far::Wire) {
     for (local, far) in crate::place_compound::forwards_for(store, &m.name) {
-        let _ = crate::far::Ssh.forward(m, "forward", &local, &far);
+        // ssh binds the local end and refuses a path that exists: the headstone
+        // of the master that died. Swept here, before the wire is asked, so the
+        // re-add does not depend on which wire it is.
+        let _ = std::fs::remove_file(&local);
+        let _ = wire.forward(m, "forward", &local, &far);
     }
 }
 
@@ -620,6 +634,128 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// Records the forwards it is asked for, and whether the local end was still
+    /// on disk when it was asked.
+    struct Script {
+        asked: std::cell::RefCell<Vec<(String, String, bool)>>,
+    }
+
+    impl crate::far::Wire for Script {
+        fn machine(&self, _: &str) -> Option<Machine> {
+            None
+        }
+        fn run(&self, _: &Machine, _: &str, _: Duration) -> Result<String, crate::far::Failed> {
+            Ok(String::new())
+        }
+        fn forward(&self, _: &Machine, op: &str, local: &std::path::Path, far: &str) -> Result<(), String> {
+            assert_eq!(op, "forward");
+            let name = local.file_name().unwrap().to_string_lossy().into_owned();
+            self.asked.borrow_mut().push((name, far.to_string(), local.exists()));
+            Ok(())
+        }
+        fn dir(&self, _: &Machine) -> PathBuf {
+            PathBuf::new()
+        }
+    }
+
+    fn script() -> Script {
+        Script { asked: Default::default() }
+    }
+
+    /// A store under a short scratch directory, with a far seat's record for each
+    /// `(seat, machine)`: both sockets recorded, as `start` does.
+    fn store_with_seats(name: &str, seats: &[(&str, &str)]) -> (Store, PathBuf) {
+        let root = PathBuf::from("/tmp").join(format!("wt-{name}-{}-{}", std::process::id(), util::epoch_nanos() % 100_000));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        let fwd = root.join("state/sock");
+        std::fs::create_dir_all(&fwd).unwrap();
+        for (seat, machine) in seats {
+            let dir = store.state.join("compound-seats").join(seat);
+            std::fs::create_dir_all(&dir).unwrap();
+            let (sock, rsock) = crate::far::forward_paths(&fwd, seat);
+            let rec = serde_json::json!({
+                "machine": machine,
+                "socket": sock.display().to_string(),
+                "render_socket": rsock.display().to_string(),
+                "far_socket": format!("/far/run/{seat}.sock"),
+                "far_render_socket": format!("/far/run/{seat}.rsock"),
+            });
+            std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
+        }
+        (store, root)
+    }
+
+    fn sleeper() -> Child {
+        Command::new("sleep").arg("30").stdin(Stdio::null()).spawn().expect("sleep")
+    }
+
+    /// A master that dies takes its seats' forwards with it. Started again and
+    /// answering, it gets both of a far seat's forwards back — once; the tick
+    /// after asks ssh for nothing, until the master is replaced again.
+    #[test]
+    fn a_master_that_comes_back_gets_a_far_seats_two_forwards_once() {
+        let (store, root) = store_with_seats("readd", &[("cpd-7", "mb2")]);
+        let m = Machine::new("mb2", "mb2");
+        let wire = script();
+        let mut t = Tunnel::new();
+
+        t.started(sleeper());
+        assert!(t.readd, "a started master has lost the forwards");
+        t.live.reachable = true;
+        t.readd_if_due(&store, &m, &wire);
+        let first: Vec<_> = wire.asked.borrow().iter().map(|(l, f, _)| (l.clone(), f.clone())).collect();
+        assert_eq!(
+            first,
+            [
+                ("cpd-7.rsock".to_string(), "/far/run/cpd-7.rsock".to_string()),
+                ("cpd-7.sock".to_string(), "/far/run/cpd-7.sock".to_string()),
+            ],
+            "both the seat's sockets, each to its own far end",
+        );
+
+        t.readd_if_due(&store, &m, &wire);
+        assert_eq!(wire.asked.borrow().len(), 2, "the next tick on the same master adds nothing");
+
+        // The master drops (the step notices the exit and clears the child) and
+        // a new one is started and answers.
+        t.stop();
+        t.started(sleeper());
+        t.readd_if_due(&store, &m, &wire);
+        assert_eq!(wire.asked.borrow().len(), 4, "a new master gets them again, once");
+        t.readd_if_due(&store, &m, &wire);
+        assert_eq!(wire.asked.borrow().len(), 4);
+
+        t.stop();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The headstone of the dead master is swept before the re-add, so ssh is not
+    /// refused a path that exists; and a seat on another machine is neither
+    /// forwarded nor touched.
+    #[test]
+    fn a_stale_local_socket_is_swept_before_the_readd_and_another_machines_seat_is_left() {
+        let (store, root) = store_with_seats("sweep", &[("cpd-7", "mb2"), ("cpd-8", "mb3")]);
+        let fwd = root.join("state/sock");
+        let (mine, mine_r) = crate::far::forward_paths(&fwd, "cpd-7");
+        let (other, other_r) = crate::far::forward_paths(&fwd, "cpd-8");
+        for p in [&mine, &mine_r, &other, &other_r] {
+            std::fs::write(p, "").unwrap();
+        }
+        let m = Machine::new("mb2", "mb2");
+        let wire = script();
+
+        readd_forwards(&store, &m, &wire);
+
+        let asked = wire.asked.borrow().clone();
+        assert_eq!(asked.len(), 2, "only mb2's seat: {asked:?}");
+        assert!(asked.iter().all(|(l, _, existed)| l.starts_with("cpd-7") && !existed), "swept before it was asked: {asked:?}");
+        assert!(!mine.exists() && !mine_r.exists(), "the stale ends are gone");
+        assert!(other.exists() && other_r.exists(), "mb3's seat is not touched");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn due_machine() -> Machine {
