@@ -555,11 +555,19 @@ pub const BEAT_TIMEOUT: Duration = Duration::from_secs(3);
 /// has not begun. Two beats.
 pub const BEAT_GRACE_SECS: i64 = 2 * BEAT_SECS as i64;
 
-/// The line one beat sends, as compound-remote's socket reads it: the verb
-/// `lease <seat> ok|stop` in the render wire's JSON framing. The one place the
-/// frame is written, so a change on the compound side is a change here only.
-pub fn lease_line(wire: u32, seat: &str, state: &str) -> String {
-    format!("{}\n", serde_json::json!({ "ver": wire, "lease": { "seat": seat, "state": state } }))
+/// The controller wire version compound-remote's socket speaks: its
+/// `proto::VERSION`, which docs/remote.md says stays 1. Not
+/// `place_compound::WIRE_VERSION`, which is the compound-sup session wire and
+/// would be refused (`unsupported ver`).
+pub const REMOTE_WIRE: u32 = 1;
+
+/// The line one beat sends, as compound-remote reads it (docs/remote.md, "Lease
+/// and gate"): `{"ver":1,"lease":{"seat":"<seat>","word":"ok"}}`, `word` being
+/// `ok` or `stop`. Written by hand so the key order is the documented one. The
+/// one place the frame is written.
+pub fn lease_line(seat: &str, word: &str) -> String {
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    format!("{{\"ver\":{REMOTE_WIRE},\"lease\":{{\"seat\":{},\"word\":{}}}}}\n", q(seat), q(word))
 }
 
 /// The real way: ssh, over the machine's ControlMaster.
@@ -607,7 +615,7 @@ impl Wire for Ssh {
         let _ = stream.set_write_timeout(Some(BEAT_TIMEOUT));
         let _ = stream.set_read_timeout(Some(BEAT_TIMEOUT));
         stream
-            .write_all(lease_line(crate::place_compound::wire_version(), seat, state).as_bytes())
+            .write_all(lease_line(seat, state).as_bytes())
             .map_err(|e| format!("lease not sent: {e}"))?;
         let mut reply = String::new();
         let n = BufReader::new(&stream).read_line(&mut reply).map_err(|e| format!("no answer to the lease: {e}"))?;
@@ -1018,12 +1026,16 @@ mod tests {
         assert_eq!(seat(false, None).state(), "stop", "no start time to excuse it");
     }
 
+    /// The frame is compound-remote's, character for character: the literals
+    /// are docs/remote.md's "Lease and gate" example, so a drift on either side
+    /// is a red test. The version is the controller's own (1), never the sup
+    /// wire's.
     #[test]
-    fn the_beat_frame_names_the_seat_and_the_state() {
-        let line = lease_line(9, "cpd-7", "stop");
-        assert!(line.ends_with('\n'));
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!((v["ver"].as_u64(), v["lease"]["seat"].as_str(), v["lease"]["state"].as_str()), (Some(9), Some("cpd-7"), Some("stop")));
+    fn the_beat_frame_is_the_one_compound_remote_reads() {
+        assert_eq!(lease_line("cpd-7", "ok"), "{\"ver\":1,\"lease\":{\"seat\":\"cpd-7\",\"word\":\"ok\"}}\n");
+        assert_eq!(lease_line("cpd-7", "stop"), "{\"ver\":1,\"lease\":{\"seat\":\"cpd-7\",\"word\":\"stop\"}}\n");
+        assert_ne!(REMOTE_WIRE, crate::place_compound::wire_version(), "the controller wire is not the sup wire");
+        assert!(!lease_line("cpd-7", "ok").contains("state"));
     }
 
     /// The real wire speaks to a socket: an answer is a line back, a refusal is
@@ -1051,7 +1063,7 @@ mod tests {
         let refused = Ssh.lease(&m, &sock, "cpd-7", "stop").unwrap_err();
         assert!(refused.contains("refused"), "{refused}");
         let got = server.join().unwrap();
-        assert!(got[0].contains("\"state\":\"ok\"") && got[1].contains("\"state\":\"stop\""), "{got:?}");
+        assert!(got[0].contains("\"word\":\"ok\"") && got[1].contains("\"word\":\"stop\""), "{got:?}");
         assert!(Ssh.lease(&m, &dir.join("none.sock"), "cpd-7", "ok").is_err(), "nobody listening");
         let _ = std::fs::remove_dir_all(&dir);
     }

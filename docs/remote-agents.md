@@ -90,7 +90,10 @@ there is no shell loop and no `executor/` script.
   nothing holds the seat any more (its claim is released; a seat opened less than
   two beats ago is still told `ok`, since its claim lands a moment after it
   opens). Only seats whose record names the machine are beaten: a local seat
-  hears nothing. A beat that is answered sets the machine's `heard` time in
+  hears nothing. On the socket a beat is one line,
+  `{"ver":1,"lease":{"seat":"<seat>","word":"ok"}}` (`word` is `ok` or `stop`;
+  `ver` is compound-remote's own controller wire, `far::REMOTE_WIRE`, not the
+  compound-sup session wire). A beat that is answered sets the machine's `heard` time in
   `machines.json`; one that fails changes nothing, so `heard` is the last time
   the far supervisor really answered, which the probe's `last_seen` is not. The
   first beat on a new master is at once, so a held seat is let go as soon as the
