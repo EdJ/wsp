@@ -532,7 +532,7 @@ pub fn set(store: &Store, args: &Args) -> i32 {
             // wants it is on `Machine::agents`, and so is what it does not
             // cover — it counts agents, and `data-018` measured that builds
             // are what saturate.
-            "agents" => match agents(v, &format!("`wsp machine rm {}` retires the machine", m.name)) {
+            "agents" => match agents(v, &format!("`wsp machine retire {}` retires the machine", m.name)) {
                 Ok(n) => m.agents = n,
                 Err(code) => return code,
             },
