@@ -429,23 +429,28 @@ fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<
 /// own control socket, by name and not by pattern; a path nothing answers on is
 /// a plain headstone and is removed.
 fn clear_master(m: &Machine, control: &std::path::Path) {
-    clear_master_with("ssh", m, control);
+    clear_master_with("ssh", m, control, MASTER_EXIT_WITHIN);
 }
 
-/// [`clear_master`] with the ssh program named, so a test can pass a script.
-fn clear_master_with(ssh: &str, m: &Machine, control: &std::path::Path) {
-    let _ = exit_master(ssh, m, control);
+/// How long a master gets to answer `-O exit` over its own socket. A live one
+/// answers in milliseconds; this is the patience for one that is wedged.
+const MASTER_EXIT_WITHIN: Duration = Duration::from_secs(5);
+
+/// [`clear_master`] with the ssh program and the deadline named, so a test can
+/// pass a script and the time it needs to start on a loaded machine.
+fn clear_master_with(ssh: &str, m: &Machine, control: &std::path::Path, within: Duration) {
+    let _ = exit_master(ssh, m, control, within);
     let _ = std::fs::remove_file(control);
 }
 
 /// `ssh -O exit` on `control`: `true` when a master answered and was told to go.
-fn exit_master(ssh: &str, m: &Machine, control: &std::path::Path) -> bool {
+fn exit_master(ssh: &str, m: &Machine, control: &std::path::Path, within: Duration) -> bool {
     if !control.exists() {
         return false;
     }
     let mut c = Command::new(ssh);
     c.args(["-S"]).arg(control).args(["-o", "BatchMode=yes", "-O", "exit"]).arg(&m.ssh);
-    matches!(crate::far::run_bounded(c, Duration::from_secs(5)), Ok(Some(o)) if o.status.success())
+    matches!(crate::far::run_bounded(c, within), Ok(Some(o)) if o.status.success())
 }
 
 /// Ask every ControlMaster this store's daemon left to exit, by socket and
@@ -659,7 +664,13 @@ mod tests {
         std::fs::write(&control, "").unwrap();
         let m = Machine::new("mb2", "mac-mini");
 
-        clear_master_with(fake.to_str().unwrap(), &m, &control);
+        // The deadline is the test's own. The product's is MASTER_EXIT_WITHIN, and
+        // what this test asks is what was said to the master, not how fast a
+        // fresh `/bin/sh` starts: on a saturated machine (load 22 on 8 cores,
+        // 0.4 % idle) a process sits in `_dyld_start` at 0 CPU for seconds before
+        // its first line runs, and the 5 s deadline killed the script unread.
+        let launch = Duration::from_secs(120);
+        clear_master_with(fake.to_str().unwrap(), &m, &control, launch);
 
         let args = std::fs::read_to_string(&said).expect("the stale master was asked");
         assert!(args.contains(&format!("-S {}", control.display())), "{args}");
@@ -668,7 +679,7 @@ mod tests {
 
         // Nothing at the path: nothing is asked, and nothing goes wrong.
         let _ = std::fs::remove_file(&said);
-        clear_master_with(fake.to_str().unwrap(), &m, &control);
+        clear_master_with(fake.to_str().unwrap(), &m, &control, launch);
         assert!(!said.exists(), "no master, no question");
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -679,8 +679,11 @@ mod tests {
         // one failure in a full-suite run, not reproduced in 25 isolated runs
         // under 8 busy loops or in three later suite runs); a pass breaks out
         // on the first sight of the log, so the longer wait costs nothing.
+        // Waited for by what it says, not by the file existing: `>>` creates the
+        // log before `printf` writes to it, and on a saturated machine the gap
+        // is long enough to read an empty file (seen 2026-11-06, `log Ok("")`).
         for _ in 0..400 {
-            if ran.exists() { break }
+            if std::fs::read_to_string(&ran).is_ok_and(|t| t.contains("daemon")) { break }
             std::thread::sleep(Duration::from_millis(50));
         }
         let ran_text = std::fs::read_to_string(&ran);
