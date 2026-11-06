@@ -343,6 +343,15 @@ impl<'a> Gate<'a> {
     }
 }
 
+/// The agents working on this machine now, read whatever the cap is (or is not):
+/// [`Gate::working`] reads no seat where there is no cap. For the reader that asks
+/// whether a list has a seat of its own working (`wsp-435`), not for a start.
+pub(crate) fn working_now(store: &Store, seats: &dyn Seats) -> Vec<Counted> {
+    let r = Records::read(store);
+    let looks: BTreeMap<String, Look> = r.seats().into_iter().map(|s| (s.clone(), Look::of(seats, &s))).collect();
+    working(&r, &|s| looks.get(s).copied().unwrap_or(Look::Unknown))
+}
+
 /// The working agents on this machine and its cap, when there is a cap and it
 /// is reached — what `wsp spawn` by hand says before it starts anyway.
 pub(crate) fn full(store: &Store, seats: &dyn Seats) -> Option<(usize, Vec<Counted>)> {

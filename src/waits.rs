@@ -18,6 +18,9 @@
 //!    `closed`).
 //! 4. **alone** — a list on the same project is executing. On by default for
 //!    wsp's own source, and `--alone` / `--no-alone` on the list say otherwise.
+//!    An executing list that waits on a person (a manual group, or a question
+//!    only the person can close) with no seat of its own working does not count
+//!    as executing (`wsp-435`); it counts again when a seat of it starts.
 //! 5. **manual group** — its next group has no `agent:` line, so wsp would not
 //!    run it.
 //!
@@ -139,6 +142,11 @@ pub struct World {
     pub complete: BTreeSet<String>,
     /// (list, scope) of every executing list.
     pub executing: Vec<(String, Option<String>)>,
+    /// The executing lists that are waiting on a person (their next group is
+    /// manual, or a question only the person can close is open) with no seat of
+    /// their own working. They are in `executing` and **do not hold `alone`**
+    /// (`wsp-435`): a seat of theirs starting takes them out of here again.
+    pub waiting_on_ed: BTreeSet<String>,
 }
 
 /// The queue order: priority, then when planned, then slug.
@@ -176,7 +184,10 @@ fn first_wait(e: &Entry, world: &World, free: Option<usize>) -> Option<Wait> {
         return Some(Wait::After(other.clone()));
     }
     if e.alone {
-        if let Some((other, _)) = world.executing.iter().find(|(id, scope)| *id != e.id && scope.is_some() && *scope == e.scope) {
+        if let Some((other, _)) = world
+            .executing
+            .iter()
+            .find(|(id, scope)| *id != e.id && scope.is_some() && *scope == e.scope && !world.waiting_on_ed.contains(id)) {
             return Some(Wait::Alone(other.clone()));
         }
     }
@@ -298,11 +309,39 @@ pub fn read_on(store: &Store, listed: &[Listed], machine: Option<Machine>) -> Ve
             _ => {}
         }
     }
+    world.waiting_on_ed = idle_on_ed(store, listed);
     let need: std::collections::BTreeMap<String, usize> = entries.iter().map(|e| (e.id.clone(), e.need)).collect();
     queue(entries, &world)
         .into_iter()
         .map(|(id, wait)| Row { need: need.get(&id).copied().unwrap_or(0), id, wait })
         .collect()
+}
+
+/// The executing lists that wait on a person and have no seat of their own
+/// working (`wsp-435`). Reads the seats only when there is such a list.
+fn idle_on_ed(store: &Store, listed: &[Listed]) -> BTreeSet<String> {
+    let waiting: Vec<&Listed> = listed
+        .iter()
+        .filter(|l| {
+            let p = l.phase(store);
+            p.status == ListStatus::Executing && p.flags.waiting_on_ed && !p.flags.parked
+        })
+        .collect();
+    if waiting.is_empty() {
+        return BTreeSet::new();
+    }
+    let working = crate::room::working_now(store, &crate::cycle::Fleet);
+    waiting.into_iter().filter(|l| !has_a_seat_working(&l.list, &working)).map(|l| l.list.id.clone()).collect()
+}
+
+/// Whether one of the working agents is this list's: a member's, by the task it
+/// holds or its verifier's or leg's label, or a barrier check of the list.
+fn has_a_seat_working(w: &Worklist, working: &[crate::room::Counted]) -> bool {
+    let groups = w.groups();
+    working.iter().any(|c| {
+        let head = c.what.split(" · ").next().unwrap_or(&c.what);
+        head == w.id || groups.iter().any(|g| g.members.iter().any(|m| m == head))
+    })
 }
 
 impl Wait {
@@ -405,6 +444,33 @@ mod tests {
         e.alone = true;
         e.scope = None;
         assert_eq!(only(e, &w), None, "a list with no home conflicts with nothing");
+    }
+
+    #[test]
+    fn a_list_waiting_on_ed_does_not_hold_alone() {
+        let mut e = entry("b");
+        e.alone = true;
+        let mut w = world();
+        w.executing.push(("c".into(), Some("proj".into())));
+        assert_eq!(only(e.clone(), &w).unwrap().text(), "alone: c executing");
+        w.waiting_on_ed.insert("c".into());
+        assert_eq!(only(e.clone(), &w), None, "c waits on a person with no seat working");
+        w.executing.push(("d".into(), Some("proj".into())));
+        assert_eq!(only(e, &w).unwrap().text(), "alone: d executing", "another still holds it");
+    }
+
+    #[test]
+    fn a_list_has_a_seat_working_when_a_member_barrier_or_verifier_of_it_is() {
+        let mut w = Worklist::new("l", "l");
+        let mut g = crate::model::Group::default();
+        g.members = vec!["m-1".into()];
+        w.set_groups(&[g]);
+        let at = |what: &str| vec![crate::room::Counted { seat: None, what: what.into() }];
+        assert!(has_a_seat_working(&w, &at("m-1")));
+        assert!(has_a_seat_working(&w, &at("m-1 · verifying")));
+        assert!(has_a_seat_working(&w, &at("l · barrier 1")));
+        assert!(!has_a_seat_working(&w, &at("m-2")));
+        assert!(!has_a_seat_working(&w, &[]));
     }
 
     #[test]

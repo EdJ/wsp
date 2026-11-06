@@ -442,6 +442,56 @@ mod tests {
         assert_eq!(seen_of(&store, "two").kinds, ["alone with one"]);
     }
 
+    /// `wsp-435`: an executing list parked at a manual group, with no seat of its
+    /// own working, does not hold `alone`; once its group is one wsp runs again,
+    /// it does.
+    #[test]
+    fn a_list_waiting_on_ed_does_not_hold_alone_until_it_resumes() {
+        let (_env, store) = setup("alone-ed");
+        let mut p = crate::model::Project::new("proj");
+        p.name = "proj".into();
+        store.save_project(&p).unwrap();
+        planned(&store, "one", "e-1", "2026-11-05T09:00:00Z");
+        planned(&store, "two", "e-2", "2026-11-05T10:00:00Z");
+        planned(&store, "three", "e-3", "2026-11-05T11:00:00Z");
+        for slug in ["one", "two", "three"] {
+            let mut w = store.worklist(slug).unwrap();
+            w.project = Some("proj".into());
+            store.save_worklist(&w).unwrap();
+            assert_eq!(flagged(&store, &["edit", slug], &[("alone", "true")]), 0);
+        }
+        assert_eq!(tick_on(&store, room(8)).as_deref(), Some("one"));
+        assert_eq!(tick_on(&store, room(8)), None, "one is executing: two and three are held");
+        assert_eq!(seen_of(&store, "two").kinds, ["alone with one"]);
+
+        // `one` comes to a group only a person can do, nobody of it working.
+        let set_agent = |agent: &str| {
+            let mut w = store.worklist("one").unwrap();
+            let mut gs = w.groups();
+            gs[0].agent = agent.into();
+            w.set_groups(&gs);
+            store.save_worklist(&w).unwrap();
+        };
+        let was = store.worklist("one").unwrap().groups()[0].agent.clone();
+        set_agent(crate::model::MANUAL);
+        let listed = crate::worklist::listing(&store, store.worklists());
+        let one = listed.iter().find(|l| l.list.id == "one").unwrap();
+        assert!(one.phase(&store).flags.waiting_on_ed);
+        assert_eq!(tick_on(&store, room(8)).as_deref(), Some("two"), "one waits on Ed and holds nothing");
+
+        // `two` is running now, and holds `three` as `one` did.
+        assert_eq!(tick_on(&store, room(8)), None);
+        assert_eq!(seen_of(&store, "three").last, "alone: two executing");
+
+        // Resumed, `one` holds the queue again: close `two` out of the way.
+        set_agent(&was);
+        let mut w = store.worklist("two").unwrap();
+        w.set_status(crate::model::WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(tick_on(&store, room(8)), None, "one is executing again, and three is held by it");
+        assert_eq!(seen_of(&store, "three").last, "alone: one executing");
+    }
+
     #[test]
     fn a_manual_group_stops_pickup_and_so_does_the_load() {
         let (_env, store) = setup("manual");
