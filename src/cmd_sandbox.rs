@@ -1050,6 +1050,9 @@ fn run_in(sb: &Sandbox, cmd: &str, args: &Args, up_secs: f64) -> i32 {
 }
 
 fn ls(store: &Store, args: &Args) -> i32 {
+    if let Some(code) = outside_only(store, "ls") {
+        return code;
+    }
     let p = util::Paint::new();
     let root = store.state.join("sandbox");
 
@@ -1146,6 +1149,27 @@ fn ls(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The sandbox a store is the inside of, when `state` is `<root>/sandbox/<name>/state`.
+///
+/// `rm` and `ls` find sandboxes under the store's own state, so in a shell that
+/// exported a sandbox's variables (which `wsp sandbox` prints, beside "finish
+/// wsp sandbox rm") they looked under the sandbox's own state, found nothing,
+/// and `rm` still said "removed" with its directory and seats left (`wsp-424`).
+fn inside_of(state: &Path) -> Option<String> {
+    let name = state.parent()?.file_name()?.to_str()?;
+    let root = state.parent()?.parent()?;
+    (state.file_name()? == "state" && root.file_name()? == "sandbox" && name.starts_with(PREFIX)).then(|| name.to_string())
+}
+
+/// The refusal for a verb that has to run on the real store, or `None`.
+fn outside_only(store: &Store, verb: &str) -> Option<i32> {
+    let name = inside_of(&store.state)?;
+    eprintln!(
+        "wsp: this shell has sandbox {name}'s variables exported, so `sandbox {verb}` would look in its state and not in the real one — run it outside: `env -u WSP_HOME -u WSP_STATE -u HERDR_SOCKET_PATH wsp sandbox {verb} …`, or in a shell that did not export them"
+    );
+    Some(2)
+}
+
 /// Drop a sandbox: its session, the processes it started, and its directory.
 ///
 /// **`-n` is read here, and `--all` is why.** Every other flag on this verb
@@ -1161,6 +1185,9 @@ fn ls(store: &Store, args: &Args) -> i32 {
 /// than the signal to them. So the counts printed are the counts that would be
 /// reaped, taken from the same place at the same moment.
 fn rm(store: &Store, args: &Args) -> i32 {
+    if let Some(code) = outside_only(store, "rm") {
+        return code;
+    }
     let p = util::Paint::new();
     let dry = args.has("dry-run");
     let root = store.state.join("sandbox");
@@ -1565,6 +1592,25 @@ mod tests {
         // fake from a stray by looking rather than by remembering.
         assert!(fake_socket(&sb.dir).starts_with(&sb.dir));
         assert!(stage_file(&sb.dir).starts_with(&sb.dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `wsp-424`: `sandbox rm` typed in the shell that exported a sandbox's
+    /// variables looked under that sandbox's state, reaped nothing of the seats
+    /// and left the directory while printing "removed". It refuses there.
+    #[test]
+    fn rm_and_ls_refuse_where_a_sandbox_is_the_store() {
+        let inside = Path::new("/h/.local/state/wsp/sandbox/wsp-p424/state");
+        assert_eq!(inside_of(inside).as_deref(), Some("wsp-p424"));
+        assert_eq!(inside_of(Path::new("/h/.local/state/wsp")), None);
+        assert_eq!(inside_of(Path::new("/h/.local/state/wsp/sandbox/wsp-p424")), None);
+        assert_eq!(inside_of(Path::new("/h/other/wsp-p424/state")), None);
+        let dir = scratch("outside-only");
+        let real = Store::at(dir.join("wsp"), dir.join("state"));
+        assert_eq!(outside_only(&real, "rm"), None);
+        let sb = Store::at(dir.join("state/sandbox/wsp-p1/wsp"), dir.join("state/sandbox/wsp-p1/state"));
+        assert_eq!(outside_only(&sb, "rm"), Some(2));
+        assert_eq!(outside_only(&sb, "ls"), Some(2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
