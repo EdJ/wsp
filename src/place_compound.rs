@@ -1187,6 +1187,13 @@ impl Compound<'_> {
         if !cwd.is_empty() {
             cmd.args(["--cwd", &cwd]);
         }
+        // `wsp-432`: a supervisor a TEST starts belongs to the test process
+        // (`compound-129`: it ends when this pid does, panic or abort
+        // included) and stands in a run directory of its own, never the
+        // person's `~/.compound/run`. Here and nowhere else, so a new test
+        // cannot start one without both.
+        #[cfg(test)]
+        test_sups::tie_to_this_test(&mut cmd);
         cmd.arg("--").arg(program).args(args);
 
         let env: BTreeMap<String, String> = rec
@@ -1244,6 +1251,8 @@ impl Compound<'_> {
         let mut cmd = Self::sup_command(&sup, seat, rec, program, args);
         let mut child = cmd.spawn().map_err(|e| Refusal::Backend(format!("{} did not start: {e}", sup.display())))?;
         let pid = child.id();
+        #[cfg(test)]
+        test_sups::note(pid, seat);
         let Some(stdout) = child.stdout.take() else {
             let _ = child.kill();
             return Err(Refusal::Backend("compound-sup gave no handshake pipe".into()));
@@ -1883,6 +1892,127 @@ impl Drop for StopsOnDrop {
     }
 }
 
+/// What keeps a test from leaking a compound session (`wsp-432`).
+///
+/// 212 sessions stood at once on 2026-11-06, opened by `cargo test` through the
+/// real `compound-sup` into the person's `~/.compound/run` and never closed.
+/// Two rules, both kept by [`Compound::sup_command`], the one place a
+/// supervisor's command is built: it is `--ephemeral <this pid>`, and it runs
+/// with `COMPOUND_RUN_DIR` at a directory of this process's own. The third is
+/// a check: a supervisor a test started and left running when the test's
+/// thread ends is killed, named, and ends the run with a failure — so a test
+/// that forgets its cleanup is found the first time it runs, not by a person
+/// counting sessions.
+#[cfg(test)]
+pub(crate) mod test_sups {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// This process's run directory, short because a unix socket path may be
+    /// 104 bytes and `$TMPDIR` on a Mac is not.
+    pub(crate) fn run_dir() -> PathBuf {
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(|| {
+            // The run directories of test processes that have ended: a
+            // supervisor killed rather than closed leaves its sockets behind.
+            let Ok(dirs) = fs::read_dir("/tmp") else { return };
+            for d in dirs.flatten() {
+                let name = d.file_name().to_string_lossy().into_owned();
+                let Some(pid) = name.strip_prefix("wsp-cpd-run-").and_then(|p| p.parse::<u32>().ok()) else { continue };
+                if pid != std::process::id() && alive(&[pid]).is_empty() {
+                    let _ = fs::remove_dir_all(d.path());
+                }
+            }
+        });
+        let dir = PathBuf::from("/tmp").join(format!("wsp-cpd-run-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// The two rules, put on a supervisor's command.
+    pub(crate) fn tie_to_this_test(cmd: &mut Command) {
+        cmd.env("COMPOUND_RUN_DIR", run_dir());
+        cmd.args(["--ephemeral", &std::process::id().to_string()]);
+    }
+
+    /// Whether this command carries both rules. The one assertion every
+    /// supervisor command a test builds is held to.
+    pub(crate) fn tied(cmd: &Command) -> std::result::Result<(), String> {
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let sep = args.iter().position(|a| a == "--").ok_or_else(|| format!("no `--` in {args:?}"))?;
+        let pid = std::process::id().to_string();
+        match args.iter().position(|a| a == "--ephemeral") {
+            Some(at) if at < sep && args.get(at + 1) == Some(&pid) => {}
+            _ => return Err(format!("not `--ephemeral {pid}` before the `--`: {args:?}")),
+        }
+        let run = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "COMPOUND_RUN_DIR")
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from)
+            .ok_or_else(|| "no COMPOUND_RUN_DIR on it".to_string())?;
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".compound");
+        match run.starts_with(&home) {
+            true => Err(format!("runs in {}, under the person's own ~/.compound", run.display())),
+            false => Ok(()),
+        }
+    }
+
+    thread_local! {
+        static OPENED: RefCell<Watch> = const { RefCell::new(Watch(Vec::new())) };
+    }
+
+    /// The supervisors this thread (this test) started.
+    struct Watch(Vec<(u32, String)>);
+
+    pub(crate) fn note(pid: u32, seat: &Seat) {
+        OPENED.with(|w| w.borrow_mut().0.push((pid, seat.to_string())));
+    }
+
+    /// The pids of this thread's supervisors that are still running, after a
+    /// moment for a `kill` just sent to take.
+    fn standing(pids: &[u32]) -> Vec<u32> {
+        let mut left: Vec<u32> = alive(pids).into_iter().collect();
+        for _ in 0..50 {
+            if left.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            left = alive(&left).into_iter().collect();
+        }
+        left
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            let pids: Vec<u32> = self.0.iter().map(|(p, _)| *p).collect();
+            let left = standing(&pids);
+            if left.is_empty() {
+                return;
+            }
+            for pid in &left {
+                signal_group(*pid, "KILL");
+            }
+            let named: Vec<String> = self
+                .0
+                .iter()
+                .filter(|(p, _)| left.contains(p))
+                .map(|(p, s)| format!("{s} (pid {p})"))
+                .collect();
+            eprintln!(
+                "\nwsp-432: test `{}` left compound-sup running past its end: {}.\n  \
+                 Stop the seat (`StopsOnDrop`, `EndsOnDrop`, or the `Scratch` guard) before the test returns. \
+                 Killed here so it does not stand.\n",
+                std::thread::current().name().unwrap_or("?"),
+                named.join(", ")
+            );
+            // The thread's result is already sent, so no assertion can reach
+            // it; the run itself is what fails.
+            std::process::exit(101);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1936,6 +2066,30 @@ mod tests {
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.windows(2).any(|w| w == ["--cwd", "/tmp/somewhere"]), "{args:?}");
+    }
+
+    /// `wsp-432`: a supervisor a test starts is tied to the test process and
+    /// stands in a run directory that is not the person's.
+    #[test]
+    fn a_supervisor_a_test_starts_is_ephemeral_and_runs_outside_the_persons_compound_dir() {
+        let rec = json!({ "cwd": "/tmp/somewhere" });
+        let cmd = Compound::sup_command(Path::new("compound-sup"), &Seat::new("cpd-1"), &rec, "cat", &[]);
+        test_sups::tied(&cmd).unwrap();
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[sep + 1], "cat", "the flag is the supervisor's, before the `--`, and not the child's argv: {args:?}");
+
+        let mut bare = Command::new("compound-sup");
+        bare.args(["spawn", "--label", "cpd-1", "--", "cat"]);
+        assert!(test_sups::tied(&bare).is_err(), "a command built by hand is not tied");
+        let mut after = Command::new("compound-sup");
+        after.args(["spawn", "--", "cat", "--ephemeral", &std::process::id().to_string()]);
+        after.env("COMPOUND_RUN_DIR", test_sups::run_dir());
+        assert!(test_sups::tied(&after).is_err(), "after the `--` it is the child's argument");
+        let mut home = Command::new("compound-sup");
+        home.args(["spawn", "--ephemeral", &std::process::id().to_string(), "--", "cat"]);
+        home.env("COMPOUND_RUN_DIR", PathBuf::from(std::env::var_os("HOME").unwrap()).join(".compound/run"));
+        assert!(test_sups::tied(&home).is_err(), "the person's run directory is refused");
     }
 
     /// **`wsp-388`: ending one seat ends that seat's process tree and nothing
@@ -2192,10 +2346,9 @@ mod tests {
                 .spawn()
                 .unwrap();
             let pid = leader.id();
-            let mut rec = place.record(&seat).unwrap();
-            rec["pid"] = json!(pid);
-            rec["agent"] = json!({ "kind": "claude", "name": "a", "args": [] });
-            write_atomic(&place.dir_of(&seat).unwrap().join(SEAT_FILE), &rec.to_string()).unwrap();
+            // Ends the real supervisor `open` started before its record is
+            // overwritten (`wsp-432`): the record is the only way to it.
+            place.record_pid_for_test(&seat, pid);
             // Reaped when it ends, so `alive` reads it as gone and not a zombie.
             held.push((pid, std::thread::spawn(move || leader.wait())));
             seats.push(seat);
