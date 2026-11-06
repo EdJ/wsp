@@ -667,6 +667,16 @@ fn read_transcript(text: &str) -> (Vec<Call>, Vec<(i64, String, i64)>) {
     (calls, tools)
 }
 
+/// A session's model seconds and tool seconds from `since` on, read off its
+/// Claude Code transcript (`compounding-104`: a verifier's usage lands on its
+/// pass). `None` for a session with no transcript to read.
+pub(crate) fn session_secs(session: &str, since: i64) -> Option<(i64, i64)> {
+    let (calls, tools) = read_transcript(&transcript(session)?);
+    let model = calls.iter().filter(|c| c.at >= since).map(|c| (c.end - c.start).max(0)).sum();
+    let tool = tools.iter().filter(|(at, _, _)| *at >= since).map(|(_, _, s)| *s).sum();
+    Some((model, tool))
+}
+
 /// The seat's own sessions: those learned for the row outside its legs' windows
 /// and before it was first reviewed (a leg's seat and the verifier's are not it).
 fn seat_sessions(i: &Inputs, windows: &[(i64, i64)]) -> Vec<String> {

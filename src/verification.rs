@@ -153,11 +153,35 @@ pub(crate) struct Spent {
     pub turns: usize,
     pub peak: u64,
     pub spend: crate::agent_commands::Spend,
+    /// Seconds the verifier's model calls took, and seconds its tools ran
+    /// (`compounding-104`), read off its transcript when its seat is ended. `0`
+    /// is unread: a kind with no transcript wsp can read.
+    pub model_secs: i64,
+    pub tool_secs: i64,
+    /// The one-minute load average when its seat was named, in hundredths: the
+    /// condition a timing was taken under. `None` where it could not be read.
+    pub load1: Option<u32>,
 }
 
 impl Spent {
     pub(crate) fn of(ran: &crate::agent_commands::Ran) -> Spent {
-        Spent { ran: ran.label(), turns: ran.turns, peak: ran.peak, spend: ran.spend }
+        Spent { ran: ran.label(), turns: ran.turns, peak: ran.peak, spend: ran.spend, ..Spent::default() }
+    }
+
+    /// The reading at the seat's end, with what was written at its start kept:
+    /// the load, and the seconds when a reading of the transcript gave them.
+    pub(crate) fn ending(start: Option<&Spent>, ran: Option<&crate::agent_commands::Ran>, secs: Option<(i64, i64)>) -> Option<Spent> {
+        let mut s = match ran {
+            Some(r) => Spent::of(r),
+            None if start.is_some_and(|s| s.load1.is_some()) => Spent::default(),
+            None => return None,
+        };
+        s.load1 = start.and_then(|s| s.load1);
+        if let Some((model, tool)) = secs {
+            s.model_secs = model;
+            s.tool_secs = tool;
+        }
+        Some(s)
     }
 }
 
@@ -205,6 +229,9 @@ impl Pass {
             clause("turns", &Some(s.turns.to_string()));
             clause("peak", &Some(util::count_human(s.peak)).filter(|_| s.peak > 0));
             clause("spent", &s.spend.clause());
+            clause("model", &Some(format!("{}s", s.model_secs)).filter(|_| s.model_secs > 0));
+            clause("tools", &Some(format!("{}s", s.tool_secs)).filter(|_| s.tool_secs > 0));
+            clause("load1", &s.load1.map(|l| format!("{}.{:02}", l / 100, l % 100)));
         }
         match &self.ending {
             Ending::Standing => {}
@@ -314,6 +341,9 @@ impl Pass {
                     "ran" => p.spent.get_or_insert_with(Spent::default).ran = v.unwrap_or_default(),
                     "turns" => p.spent.get_or_insert_with(Spent::default).turns = v.and_then(|v| v.parse().ok()).unwrap_or(0),
                     "peak" => p.spent.get_or_insert_with(Spent::default).peak = v.and_then(|v| util::count_of(&v)).unwrap_or(0),
+                    "model" => p.spent.get_or_insert_with(Spent::default).model_secs = v.and_then(|v| v.trim_end_matches('s').parse().ok()).unwrap_or(0),
+                    "tools" => p.spent.get_or_insert_with(Spent::default).tool_secs = v.and_then(|v| v.trim_end_matches('s').parse().ok()).unwrap_or(0),
+                    "load1" => p.spent.get_or_insert_with(Spent::default).load1 = v.and_then(|v| v.parse::<f64>().ok()).map(|l| (l * 100.0).round() as u32),
                     "spent" => p.spent.get_or_insert_with(Spent::default).spend = v.and_then(|v| crate::agent_commands::Spend::of_clause(&v)).unwrap_or_default(),
                     _ => {}
                 }
@@ -721,6 +751,11 @@ pub(crate) fn name_seat(store: &Store, member: &str, seat: &str) -> bool {
             return false;
         };
         p.pane = Some(seat.to_string());
+        // The load the verifier starts under (`compounding-104`): a timing is
+        // read against it, and VS-c02 was a false block at load 108.
+        if let Some(one) = crate::throttle::load1() {
+            p.spent.get_or_insert_with(Spent::default).load1 = Some((one * 100.0).round() as u32);
+        }
         write(&mut t, &ps);
         store.save_task(&t).is_ok()
     });
@@ -1209,6 +1244,9 @@ mod tests {
                 turns: 7,
                 peak: 70_000,
                 spend: crate::agent_commands::Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None },
+                model_secs: 41,
+                tool_secs: 23,
+                load1: Some(108),
             }),
             did: None,
             checked: Vec::new(),
@@ -1218,6 +1256,21 @@ mod tests {
         assert_eq!(passes(&t), vec![full, bare], "oldest first, whichever order they were handed in");
         assert!(t.body.find("## Verification").unwrap() < t.body.find("## Log").unwrap(), "and the log stays last");
         assert!(t.body.contains("- 2026-10-06T10:00:00Z blocks · read 55c4839abcde · landed 77aa0000bbbb · pane cpd-12"), "{}", t.body);
+    }
+
+    /// A verifier's usage lands on its pass (`compounding-104`): the load it
+    /// started under is kept through the seat's end, and the seconds come back.
+    #[test]
+    fn a_passes_load_and_seconds_round_trip_and_the_load_survives_the_end() {
+        let mut t = Task::new("t", "t-1");
+        let start = Spent { load1: Some(108), ..Spent::default() };
+        let ended = Spent::ending(Some(&start), None, Some((41, 23))).unwrap();
+        assert_eq!((ended.model_secs, ended.tool_secs, ended.load1), (41, 23, Some(108)), "no session to read still keeps the load");
+        assert_eq!(Spent::ending(None, None, None), None, "nothing known writes nothing");
+        let p = Pass { at: "2026-11-06T10:00:00Z".into(), pane: Some("cpd-1".into()), spent: Some(ended.clone()), ..Pass::opened(None, None) };
+        write(&mut t, &[p]);
+        assert!(t.body.contains("model 41s · tools 23s · load1 1.08"), "{}", t.body);
+        assert_eq!(passes(&t)[0].spent, Some(ended));
     }
 
     /// The lines wsp wrote sit under the verdict and come back as fields: the

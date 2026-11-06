@@ -2140,7 +2140,7 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
             format!("it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`", m = member.id),
         ),
     };
-    format!(
+    let order = format!(
         "Verify **{m}** ({title}){whose}. {started}.\n\n\
          {readonly}{stand}\
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
@@ -2162,7 +2162,13 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
         checked = CHECKED_ORDER,
         legs = legs_line(member),
         split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
-    )
+    );
+    // A React row's verifier is spawned with its packet (`compounding-104`);
+    // any other row's order is what it was.
+    match crate::verifier_packet::build(store, member) {
+        Some(packet) => format!("{order}\n\n{packet}"),
+        None => order,
+    }
 }
 
 /// The line a verifier's order gains on a row that ran in legs: the table, and
@@ -3219,7 +3225,9 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
             }
         };
         // Read before the despawn: it clears the binding the session is found by.
-        let spent = crate::cmd_agent::ran_of_seat(store, &seat, &p.at).map(|r| crate::verification::Spent::of(&r));
+        let ran = crate::cmd_agent::ran_of_seat(store, &seat, &p.at);
+        let secs = crate::cmd_agent::secs_of_seat(store, &seat, &p.at);
+        let spent = crate::verification::Spent::ending(p.spent.as_ref(), ran.as_ref(), secs);
         let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
         let outcome = despawn_seat(&seat).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {

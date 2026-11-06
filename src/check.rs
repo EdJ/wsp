@@ -1192,6 +1192,30 @@ pub(crate) fn tier(s: &Step) -> &'static str {
     }
 }
 
+/// `wsp check <row> --plan` as text, and the greens ledger beside it, for a
+/// verifier's packet (`compounding-104`): what the row's checks are and which
+/// of them the ledger already holds green at the commit.
+pub(crate) fn plan_text(store: &Store, t: &Task, tg: &Target) -> String {
+    let Plan { steps, .. } = plan(store, t, tg, None);
+    if steps.is_empty() {
+        return format!(
+            "{} has no ## Checks, and no rule of {} matches what it changed",
+            t.id,
+            project_of(t).unwrap_or_default()
+        );
+    }
+    let ledger = greens::Greens::open(store, &tg.project, &tg.repo);
+    let mut out = format!("{} at {}\n", t.id, &tg.sha[..12.min(tg.sha.len())]);
+    let mut held = 0;
+    for s in &steps {
+        let g = ledger.lookup(&tg.sha, &s.command, greens::Env::Warm);
+        held += g.is_some() as usize;
+        out.push_str(&format!("  {}\n", plan_line(s, g.as_ref())));
+    }
+    out.push_str(&format!("greens ledger: {held} of {} step(s) green at this commit\n", steps.len()));
+    out
+}
+
 fn plan_line(s: &Step, green: Option<&Green>) -> String {
     let reused = green.map(|g| format!(" · green · reused, {}s", g.took)).unwrap_or_default();
     format!("{} · {} · up to {}s · {} · {}{reused}", s.name, s.command, s.limit.as_secs(), tier(s), why_in(s))

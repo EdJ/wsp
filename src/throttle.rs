@@ -322,6 +322,11 @@ fn load_average() -> Option<(f64, f64, f64)> {
     parse_loadavg(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// The one-minute load average now.
+pub(crate) fn load1() -> Option<f64> {
+    load_average().map(|l| l.0)
+}
+
 pub(crate) fn load_high(one: f64, five: f64, cores: usize) -> bool {
     one.min(five) > LOAD_FACTOR * cores as f64
 }

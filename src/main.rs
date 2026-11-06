@@ -16,6 +16,7 @@ mod closing;
 mod packet;
 mod pickup;
 mod packet_gen;
+mod verifier_packet;
 mod agent_commands;
 mod barrier;
 mod barrier_replay;

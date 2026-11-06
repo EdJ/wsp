@@ -1595,7 +1595,7 @@ mod tests {
         pass.at = "2026-10-18T10:05:00Z".into();
         pass.decided = Some("2026-10-18T10:15:00Z".into());
         pass.state = crate::verification::State::Holds;
-        pass.spent = Some(crate::verification::Spent { ran: "sonnet-5-5/high".into(), turns: 7, peak: 70_000, spend: Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None } });
+        pass.spent = Some(crate::verification::Spent { ran: "sonnet-5-5/high".into(), turns: 7, peak: 70_000, spend: Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None }, ..Default::default() });
         crate::verification::write(&mut t, &[pass]);
 
         let rc = row_cost(&t);
@@ -1642,7 +1642,7 @@ mod tests {
         t.body = "## Overview\nx\n".into();
         let mut p = crate::verification::Pass::opened(None, None);
         p.pane = Some("cpd-9".into());
-        p.spent = Some(crate::verification::Spent { ran: "sonnet-5-5/high".into(), turns: 7, peak: 70_000, spend: Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None } });
+        p.spent = Some(crate::verification::Spent { ran: "sonnet-5-5/high".into(), turns: 7, peak: 70_000, spend: Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None }, ..Default::default() });
         crate::verification::write(&mut t, &[p.clone()]);
         let back = crate::verification::passes(&t);
         assert_eq!(back[0].spent, p.spent);

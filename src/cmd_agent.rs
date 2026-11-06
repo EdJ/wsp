@@ -2290,6 +2290,16 @@ pub(crate) fn did_of_seat(store: &Store, seat: &str, since: &str) -> Option<crat
     crate::agent_commands::of(&kind).did(&session, &cwd, util::epoch_of(since))
 }
 
+/// A seat's model seconds and tool seconds since `since`, from its session's
+/// transcript, for a verifier's pass to keep.
+pub(crate) fn secs_of_seat(store: &Store, seat: &str, since: &str) -> Option<(i64, i64)> {
+    let (kind, session, _) = session_of_seat(store, seat)?;
+    if kind != "claude" {
+        return None;
+    }
+    crate::timeline::session_secs(&session, util::epoch_of(since))
+}
+
 /// The kind, session and cwd a seat's binding records, when it has a session.
 fn session_of_seat(store: &Store, seat: &str) -> Option<(String, String, String)> {
     let bindings = store.bindings();
