@@ -21,10 +21,18 @@
 //! `cycle.log` when it ends. `wsp wip` draws the record. `wsp stuck FILE…`
 //! reads whole transcripts, which is how the rate is counted.
 //!
+//! Two more shapes came from the first count over the fleet's transcripts: a
+//! loop with a `sleep` whose only wait is a background task's `…/tasks/<id>.output`
+//! (or a scratch file) turning up ([`Kind::WatchOutput`]), which is the commonest
+//! stall by far, and any other foreground call held to the tool's timeout
+//! ([`Kind::TimedOut`]).
+//!
 //! # What it cannot see
 //!
-//! A watcher written some other way (a `lsof` loop, a `curl` retry against a
-//! server that is never up) is a stall this does not name. The match of a
+//! A test hung at 0 % CPU inside a call that has not yet reached the timeout is
+//! not named: that is a seat's processes, not its transcript. A watcher written
+//! some other way (a `lsof` loop, a `curl` retry against a server that is never
+//! up) is a stall this does not name until it reaches the timeout. The match of a
 //! `pgrep` pattern against the command is a small matcher over the common
 //! subset of regular expressions; a pattern outside it (a group) is read as not
 //! matching, which is the direction that flags less.
@@ -38,6 +46,12 @@ use serde_json::Value;
 /// stall, in seconds.
 pub(crate) const MIN: i64 = 45;
 
+/// The seconds a foreground call gets when it names no timeout of its own.
+const TIMEOUT: i64 = 600;
+
+/// How far short of its timeout a call may end and still be one the tool cut.
+const SLACK: i64 = 10;
+
 /// How much of the end of a transcript the daemon reads for an open call.
 const TAIL: u64 = 2 * 1024 * 1024;
 
@@ -48,6 +62,11 @@ pub(crate) enum Kind {
     SelfWait,
     /// `cat` with no file, reading a terminal.
     BareCat,
+    /// A loop with a `sleep` whose only wait is a file of a background task's
+    /// output (or the seat's scratch) turning up or holding the line it wants.
+    WatchOutput,
+    /// Any other foreground call held to the tool's timeout.
+    TimedOut,
 }
 
 impl Kind {
@@ -55,6 +74,8 @@ impl Kind {
         match self {
             Kind::SelfWait => "waiting on itself",
             Kind::BareCat => "bare cat on a terminal",
+            Kind::WatchOutput => "watching output that may never come",
+            Kind::TimedOut => "held to the tool timeout",
         }
     }
 
@@ -62,6 +83,8 @@ impl Kind {
         match self {
             Kind::SelfWait => "self",
             Kind::BareCat => "cat",
+            Kind::WatchOutput => "watch",
+            Kind::TimedOut => "timeout",
         }
     }
 
@@ -69,6 +92,8 @@ impl Kind {
         match k {
             "self" => Some(Kind::SelfWait),
             "cat" => Some(Kind::BareCat),
+            "watch" => Some(Kind::WatchOutput),
+            "timeout" => Some(Kind::TimedOut),
             _ => None,
         }
     }
@@ -81,6 +106,11 @@ impl Kind {
                  Interrupt it, and match a pattern the line does not spell (`[c]argo test`), or wait on the pid"
             }
             Kind::BareCat => "`cat` with no file reads a terminal nobody types at. Interrupt it, and name the file",
+            Kind::WatchOutput => {
+                "it polls a file that the command it watches may never write (it ended, failed, or was never started). \
+                 Interrupt it, look at the task directly, and wait with a bound (`timeout 120 …`) or on the pid"
+            }
+            Kind::TimedOut => "a foreground call that runs to the tool's timeout is not waiting on anything it will get. Interrupt it, and run it in the background or with a bound",
         }
     }
 }
@@ -104,8 +134,9 @@ pub(crate) struct Stall {
 /// The stalls in a transcript, oldest first. `now` is what an open call's
 /// seconds are counted to; 0 leaves open calls out.
 pub(crate) fn scan(src: &mut impl BufRead, now: i64) -> Vec<Stall> {
-    // id -> (started, command, kind)
-    let mut pending: HashMap<String, (i64, String, Option<Kind>)> = HashMap::new();
+    // id -> (started, command, kind, foreground, limit): the limit is the
+    // seconds the tool gives the call before it ends it.
+    let mut pending: HashMap<String, (i64, String, Option<Kind>, bool, i64)> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut out: Vec<Stall> = Vec::new();
     let mut buf = String::new();
@@ -117,12 +148,12 @@ pub(crate) fn scan(src: &mut impl BufRead, now: i64) -> Vec<Stall> {
             // Only the id and the stamp, off the text: a result line can be
             // very large and nearly all of them are for calls nobody cares about.
             let Some(id) = field(&buf, "tool_use_id") else { continue };
-            let Some((at, command, kind)) = pending.remove(id) else { continue };
+            let Some((at, command, kind, foreground, limit)) = pending.remove(id) else { continue };
             order.retain(|o| o != id);
             let end = field(&buf, "timestamp").map(crate::util::epoch_of).unwrap_or(0);
-            if let (Some(kind), true) = (kind, end > 0) {
+            if end > 0 && at > 0 {
                 let secs = end - at;
-                if secs >= MIN {
+                if let Some(kind) = named(kind, foreground, limit, secs) {
                     out.push(Stall { kind, command, at, secs, open: false });
                 }
             }
@@ -144,7 +175,11 @@ pub(crate) fn scan(src: &mut impl BufRead, now: i64) -> Vec<Stall> {
                 // A background command returns at once, whatever it runs.
                 let background = b.pointer("/input/run_in_background").and_then(Value::as_bool) == Some(true);
                 let kind = if background { None } else { classify(command) };
-                if pending.insert(id.to_string(), (at, command.to_string(), kind)).is_none() {
+                let limit = match b.pointer("/input/timeout").and_then(Value::as_i64) {
+                    Some(ms) if ms > 0 => ms / 1000,
+                    _ => TIMEOUT,
+                };
+                if pending.insert(id.to_string(), (at, command.to_string(), kind, !background, limit)).is_none() {
                     order.push(id.to_string());
                 }
             }
@@ -152,8 +187,11 @@ pub(crate) fn scan(src: &mut impl BufRead, now: i64) -> Vec<Stall> {
     }
     if now > 0 {
         for id in order {
-            let Some((at, command, Some(kind))) = pending.remove(&id) else { continue };
-            if at > 0 && now - at >= MIN {
+            let Some((at, command, kind, foreground, limit)) = pending.remove(&id) else { continue };
+            if at <= 0 {
+                continue;
+            }
+            if let Some(kind) = named(kind, foreground, limit, now - at) {
                 out.push(Stall { kind, command, at, secs: now - at, open: true });
             }
         }
@@ -162,6 +200,18 @@ pub(crate) fn scan(src: &mut impl BufRead, now: i64) -> Vec<Stall> {
         s.command = one_line(&s.command);
     }
     out
+}
+
+/// What a call held for `secs` is, when it is a stall: its shape if it has one
+/// and held [`MIN`] seconds, else a foreground call held to within [`SLACK`] of
+/// the `limit` the tool gives it.
+fn named(kind: Option<Kind>, foreground: bool, limit: i64, secs: i64) -> Option<Kind> {
+    match kind {
+        Some(k) if secs >= MIN => Some(k),
+        Some(_) => None,
+        None if foreground && secs >= MIN && secs >= limit - SLACK => Some(Kind::TimedOut),
+        None => None,
+    }
 }
 
 /// The stalls in the last [`TAIL`] bytes of a transcript file, open and closed.
@@ -204,9 +254,9 @@ fn one_line(command: &str) -> String {
     }
 }
 
-// ---- the two shapes ---------------------------------------------------------
+// ---- the shapes -------------------------------------------------------------
 
-/// Which of the two shapes a command is, when it is one.
+/// Which of the shapes a command is, when it is one.
 pub(crate) fn classify(command: &str) -> Option<Kind> {
     let simple = simple_commands(command);
     if waits_on_itself(command, &simple) {
@@ -215,7 +265,48 @@ pub(crate) fn classify(command: &str) -> Option<Kind> {
     if simple.iter().any(|c| bare_cat(&c.words, c.after_pipe)) {
         return Some(Kind::BareCat);
     }
+    if watches_output(&simple) {
+        return Some(Kind::WatchOutput);
+    }
     None
+}
+
+/// A loop with a `sleep` whose wait is a file of a background task's output
+/// (`…/tasks/<id>.output`) or of the seat's scratch: `grep -q` on it, or
+/// `[ -s … ]` / `test -s …`. Nothing else in the loop can end it (no pid, no
+/// process search), so it ends when that file is written and not otherwise.
+fn watches_output(simple: &[Simple]) -> bool {
+    let looped = simple.iter().any(|c| c.words.iter().any(|w| matches!(w.as_str(), "while" | "until")));
+    let mut sleeps = false;
+    let mut waits = false;
+    for c in simple {
+        let w = program(&c.words);
+        let Some(prog) = w.first().map(|a| name_of(a)) else { continue };
+        match prog {
+            "sleep" => sleeps = true,
+            "kill" | "pgrep" | "ps" | "pidof" | "wait" | "lsof" | "curl" => return false,
+            "grep" | "egrep" | "fgrep" => {
+                let quiet = w[1..].iter().any(|a| a == "--quiet" || a == "--silent" || (a.starts_with('-') && !a.starts_with("--") && a.contains('q')))
+                    || w[1..].iter().any(|a| a.contains("/dev/null"));
+                if quiet && w[1..].iter().any(|a| is_output_path(a)) {
+                    waits = true;
+                }
+            }
+            "[" | "[[" | "test" => {
+                let by_file = w[1..].iter().any(|a| matches!(a.as_str(), "-s" | "-f" | "-e"));
+                if by_file && w[1..].iter().any(|a| is_output_path(a)) {
+                    waits = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    looped && sleeps && waits
+}
+
+/// A task's output file, or something in the seat's scratch.
+fn is_output_path(w: &str) -> bool {
+    (w.contains("/tasks/") && w.contains(".output")) || w.contains("WSP_SCRATCH") || w.contains("/scratch/")
 }
 
 #[derive(Debug)]
@@ -564,7 +655,7 @@ fn step(items: &[Item], text: &[char]) -> bool {
 
 // ---- the verb ---------------------------------------------------------------
 
-const USAGE: &str = "usage: wsp stuck <transcript.jsonl>…   the commands in these transcripts that waited on themselves or on a bare cat, with the seconds each held";
+const USAGE: &str = "usage: wsp stuck <transcript.jsonl>…   the commands in these transcripts that waited on themselves, on a bare cat or on output that did not come, or were held to the tool timeout, with the seconds each held";
 
 /// `wsp stuck FILE…`: the stalls in whole transcripts, one line each and a
 /// total, which is how the rate is counted (`wsp-397`).
@@ -686,6 +777,73 @@ mod tests {
         ]
         .join("\n");
         assert!(scan(&mut t.as_bytes(), crate::util::epoch_of("2026-11-06T11:00:00Z")).is_empty());
+    }
+
+    fn call_timeout(id: &str, command: &str, timeout_ms: i64) -> String {
+        let command = serde_json::to_string(command).unwrap();
+        format!(r#"{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":{command},"timeout":{timeout_ms}}}}}"#)
+    }
+
+    /// The seconds a call held, from its stamps, through `scan`.
+    fn held(command: &str, timeout_ms: i64, secs: i64) -> Vec<Stall> {
+        let end = crate::util::epoch_of("2026-11-06T10:00:00Z") + secs;
+        let t = [
+            line("assistant", "2026-11-06T10:00:00.000Z", &call_timeout("a", command, timeout_ms)),
+            line("user", &crate::util::iso_at(end), &result("a")),
+        ]
+        .join("\n");
+        scan(&mut t.as_bytes(), 0)
+    }
+
+    // The command lines below are the ones the seats ran, as the transcripts of
+    // wsp-387, wsp-425 and wsp-430 (2026-11-06) hold them, with the seconds each held.
+    const T387: &str = "/private/tmp/claude-501/-Users-edjames-claude-wsp--worktrees-wsp-387/4d79bb3c-6b71-45e9-8bf6-7601a3d2a5f0/tasks";
+    const T425: &str = "/private/tmp/claude-501/-Users-edjames-claude-wsp--worktrees-wsp-425/0e60f7fa-d49c-49d0-8ea8-bcb597098462/tasks";
+    const T430: &str = "/private/tmp/claude-501/-Users-edjames-claude-wsp--worktrees-wsp-430/602aac9d-d093-4a38-a91d-337d2229b3db/tasks";
+
+    #[test]
+    fn the_watchers_on_output_that_never_came_are_flagged_with_their_seconds() {
+        let cases: Vec<(String, i64, i64, Kind)> = vec![
+            // wsp-387
+            (format!("until grep -q \"test result\" {T387}/bkksfjv7b.output || grep -q \"^error\" {T387}/bkksfjv7b.output; do sleep 3; done; tail -40 {T387}/bkksfjv7b.output"), 500_000, 501, Kind::WatchOutput),
+            (format!("until [ -s {T387}/b9idacjuc.output ]; do sleep 5; done; cat {T387}/b9idacjuc.output"), 590_000, 591, Kind::WatchOutput),
+            ("cargo test packet::tests::a_leg_ 2>&1 | tail -30".to_string(), 500_000, 502, Kind::TimedOut),
+            // wsp-425
+            (format!("until grep -q \"test result\\|error\" {T425}/bc9vo3wf0.output; do sleep 5; done; tail -30 {T425}/bc9vo3wf0.output"), 600_000, 602, Kind::WatchOutput),
+            (format!("until [ -s {T425}/bc9vo3wf0.output ]; do sleep 10; done; tail -30 {T425}/bc9vo3wf0.output"), 590_000, 591, Kind::WatchOutput),
+            (format!("F={T425}/bc9vo3wf0.output; while pgrep -f \"cargo test check::tests::a_verifiers_order\" >/dev/null; do sleep 10; done; tail -30 $F"), 590_000, 535, Kind::SelfWait),
+            // wsp-430
+            (format!("until grep -q \"test result\\|error\\[\" {T430}/bjxve98td.output 2>/dev/null; do sleep 5; done; tail -40 {T430}/bjxve98td.output"), 600_000, 602, Kind::WatchOutput),
+            ("pgrep -lx cargo; cargo test ending:: 2>&1 | tail -30".to_string(), 600_000, 603, Kind::TimedOut),
+        ];
+        for (command, timeout, secs, kind) in cases {
+            let got = held(&command, timeout, secs);
+            assert_eq!(got.len(), 1, "{command}: {got:?}");
+            assert_eq!((got[0].kind, got[0].secs, got[0].open), (kind, secs, false), "{command}");
+        }
+    }
+
+    #[test]
+    fn compounding_061_and_078s_commands_are_not_stalls() {
+        // compounding-061: the same `while pgrep -f` watchers, but run in the
+        // background, which returns at once (1.2 s in the transcript).
+        let w = "while pgrep -f \"gate.sh\" >/dev/null; do sleep 15; done; cat /Users/edjames/claude/compounding/.worktrees/compounding-061/docs/workspace-port/both-ways-data/rust-landing/steps.tsv";
+        let t = [
+            line("assistant", "2026-11-06T10:00:00.000Z", &call("a", w, true)),
+            line("user", "2026-11-06T10:00:01.000Z", &result("a")),
+            line("assistant", "2026-11-06T10:00:02.000Z", &call("b", w, true)),
+        ]
+        .join("\n");
+        assert!(scan(&mut t.as_bytes(), crate::util::epoch_of("2026-11-06T10:20:00Z")).is_empty(), "a background watcher is not in the seat's way");
+        // compounding-078: a `pgrep -fl` with no loop, and a `cat > f <<EOF` with a body.
+        assert_eq!(classify("ps -p 4257,34937 -o pid,pgid,command; pgrep -fl \"verifier-trial/run.py\" ; ls docs/verifier-trial/runs-data | head -100"), None);
+        assert_eq!(classify("cd /x/scratchpad && mk() { cat > $1.md <<EOF\nRun part of the runs\nEOF\n}; mk a"), None);
+        // A watcher that has a way out, a file that is not a task's, and a plain slow call.
+        assert_eq!(classify(&format!("until [ -s {T387}/b.output ] || ! kill -0 123; do sleep 5; done")), None, "a pid ends it");
+        assert_eq!(classify("until [ -s /tmp/out.txt ]; do sleep 5; done"), None, "not a task's output nor the scratch");
+        assert!(held("cargo test cmd_spawn::", 600_000, 130).is_empty(), "130 s of 600 is a long call, not a held one");
+        assert!(held("cargo test ending::", 120_000, 20).is_empty());
+        assert_eq!(held("cargo test ending::", 120_000, 118).len(), 1, "held to a 120 s timeout of its own");
     }
 
     #[test]
