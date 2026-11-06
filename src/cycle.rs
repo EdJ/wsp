@@ -3470,16 +3470,35 @@ pub(crate) fn checks_orphaned(store: &Store, seats: &dyn Seats) -> Vec<String> {
 /// `go` launches stands in the check's own tree, and `despawn` kept every one
 /// of them for "you are standing in it" (`wsp-289`).
 pub(crate) fn despawn_seat(seat: &str) -> Result<(), String> {
+    despawn_seat_keeping(seat, false)
+}
+
+/// The argv of `wsp despawn`, with `--keep-tree` when the tree is to stay.
+fn despawn_argv(target: &[&str], keep: bool) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["despawn".into()];
+    argv.extend(target.iter().map(|s| s.to_string()));
+    if keep {
+        argv.push("--keep-tree".into());
+    }
+    argv
+}
+
+/// [`despawn_seat`], leaving the tree when `keep`: a member handed to its
+/// verifier, which reads in it (`wsp-430`).
+pub(crate) fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String> {
     if cfg!(test) {
         #[cfg(test)]
         return tests::ENDED.with(|s| {
             s.borrow_mut().push(seat.to_string());
+            if keep {
+                tests::KEPT.with(|k| k.borrow_mut().push(seat.to_string()));
+            }
             tests::END_FAIL.with(|f| f.borrow().clone()).map_or(Ok(()), Err)
         });
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let out = Command::new(exe)
-        .args(["despawn", "--pane", seat])
+        .args(despawn_argv(&["--pane", seat], keep))
         .current_dir("/")
         .stdin(Stdio::null())
         .output()
@@ -3501,6 +3520,11 @@ pub(crate) fn despawn(store: &Store, id: &str) {
 /// it said. For the caller that has to record an ending exactly once and a
 /// failure exactly once, which a fire-and-forget cannot tell apart.
 pub(crate) fn despawned(store: &Store, id: &str) -> Result<(), String> {
+    despawned_keeping(store, id, false)
+}
+
+/// [`despawned`], with `--keep-tree` when `keep`.
+pub(crate) fn despawned_keeping(store: &Store, id: &str, keep: bool) -> Result<(), String> {
     say_uncommitted(store, id);
     if cfg!(test) {
         #[cfg(test)]
@@ -3509,10 +3533,14 @@ pub(crate) fn despawned(store: &Store, id: &str) -> Result<(), String> {
         }
         #[cfg(test)]
         tests::ENDED.with(|s| s.borrow_mut().push(id.to_string()));
+        #[cfg(test)]
+        if keep {
+            tests::KEPT.with(|s| s.borrow_mut().push(id.to_string()));
+        }
         return Ok(());
     }
     let Ok(exe) = std::env::current_exe() else { return Err("could not find wsp itself".into()) };
-    let out = Command::new(exe).args(["despawn", id]).stdin(Stdio::null()).output();
+    let out = Command::new(exe).args(despawn_argv(&[id], keep)).stdin(Stdio::null()).output();
     let (said, result) = match out {
         Ok(o) if o.status.success() => ("ended".to_string(), Ok(())),
         Ok(o) => {
@@ -3962,7 +3990,7 @@ pub(crate) mod tests {
     /// answer_for` must not hold a barrier — so a test about the *chain* wants
     /// a reader that says nothing rather than one that happens to say idle. The
     /// tests that are about the gate name the seats they need.
-    pub(super) struct Blind;
+    pub(crate) struct Blind;
 
     impl Seats for Blind {
         fn state(&self, _seat: &str) -> Option<State> {
@@ -4013,6 +4041,8 @@ pub(crate) mod tests {
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.
         pub(super) static END_FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// The ends that asked for the tree to be kept (`--keep-tree`).
+        pub(crate) static KEPT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `cycle.log` was told this thread, in order.
         pub(crate) static SAID: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `wsp-147`'s reconciler told a member's seat, as (task, sentence).

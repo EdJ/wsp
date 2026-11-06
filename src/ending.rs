@@ -117,6 +117,10 @@ const ORIGINAL_NOT_ENDED: &str = "wsp: could not end original seat";
 /// wait for: it is landed and no verifier is owed.
 pub(crate) const SETTLED: &str = "ended: landed, no verifier owed, at";
 
+/// The line on a member's row saying its agent was ended when its verifier
+/// started in its tree (`wsp-430`): the seat does not stand while it reads.
+pub(crate) const HANDED_OVER: &str = "ended: handed to its verifier at";
+
 /// How long a landed member with no verifier owed is left before its agent is
 /// ended: the person's chance to type to it first.
 const SETTLE_GRACE_SECS: i64 = if cfg!(test) { 0 } else { 300 };
@@ -137,22 +141,27 @@ pub(crate) struct Holds {
     /// Whether a verdict stands behind this. `false` is a member that is landed
     /// with no verifier owed, settled by the grace instead of by a verdict.
     pub(crate) verdict: bool,
+    /// A verifier's pass is open on the member's work: its seat is ended now and
+    /// its **tree kept**, which the verifier reads in (`wsp-430`).
+    pub(crate) handed: bool,
 }
 
 impl Holds {
     /// The row's record that this was ended, and what [`ended`] looks for.
     fn ended_line(&self) -> String {
-        match self.verdict {
-            true => format!("{ENDED} {}", self.commit),
-            false => format!("{SETTLED} {}", self.commit),
+        match (self.handed, self.verdict) {
+            (true, _) => format!("{HANDED_OVER} {}", self.commit),
+            (false, true) => format!("{ENDED} {}", self.commit),
+            (false, false) => format!("{SETTLED} {}", self.commit),
         }
     }
 
     /// The reason, as a clause in a sentence.
     fn because(&self) -> String {
-        match self.verdict {
-            true => format!("verification holds at {}", self.commit),
-            false => format!("it is landed at {} and no verifier is owed", self.commit),
+        match (self.handed, self.verdict) {
+            (true, _) => format!("its verifier has the work at {}", self.commit),
+            (false, true) => format!("verification holds at {}", self.commit),
+            (false, false) => format!("it is landed at {} and no verifier is owed", self.commit),
         }
     }
 }
@@ -177,7 +186,30 @@ fn holds(tasks: &[Task], member: &Task) -> Option<Holds> {
         }
     }
     let commit = p.read.clone().or(now).unwrap_or_else(|| p.at.clone());
-    Some(Holds { commit, at: util::epoch_of(p.decided.as_deref().unwrap_or(&p.at)), verdict: true })
+    Some(Holds { commit, at: util::epoch_of(p.decided.as_deref().unwrap_or(&p.at)), verdict: true, handed: false })
+}
+
+/// **The member whose verifier is reading** (`wsp-430`, compounding-122): at
+/// review, with a pass open on the commit it is at. A pass opens only once the
+/// row's mechanical check is clear, so this is "reviewed and green", and the
+/// seat has nothing left to do: the verifier reads in the tree, which stays,
+/// and a block starts a rework seat from the verdict
+/// ([`crate::cycle`]'s `sent_back_unseated`). The time is the member's own
+/// review, so a turn begun since is somebody's.
+fn handed(tasks: &[Task], member: &Task) -> Option<Holds> {
+    use crate::verification::{latest, same_commit, State as Verdict};
+    let p = latest(tasks, &member.id)?;
+    if p.state != Verdict::Running {
+        return None;
+    }
+    if let (Some(read), Some(now)) = (p.read.as_deref(), crate::repair::commit_of(member).as_deref()) {
+        if !same_commit(read, now) {
+            return None;
+        }
+    }
+    let at = last_stamp(member, "review:").unwrap_or_else(|| util::epoch_of(&p.at));
+    let commit = format!("{} (pass {})", p.read.clone().unwrap_or_else(|| "no commit".into()), p.at);
+    Some(Holds { commit, at, verdict: false, handed: true })
 }
 
 /// The member as settled: a verdict that holds, or — with no pass at all, no
@@ -188,12 +220,15 @@ fn settled(tasks: &[Task], member: &Task, owed: bool) -> Option<Holds> {
     if let Some(h) = holds(tasks, member) {
         return Some(h);
     }
+    if let Some(h) = handed(tasks, member) {
+        return Some(h);
+    }
     if owed || crate::verification::latest(tasks, &member.id).is_some() {
         return None;
     }
     let commit = crate::repair::landed(member)?;
     let at = ["wsp: landed", "review:"].iter().filter_map(|n| last_stamp(member, n)).max()?;
-    (util::epoch_secs() - at >= SETTLE_GRACE_SECS).then_some(Holds { commit, at, verdict: false })
+    (util::epoch_secs() - at >= SETTLE_GRACE_SECS).then_some(Holds { commit, at, verdict: false, handed: false })
 }
 
 /// When the newest `## Log` line containing `needle` was written.
@@ -338,6 +373,11 @@ fn due(store: &Store, lists: &[Worklist], tasks: &mut Option<Vec<Task>>, m: &Tas
         .is_some_and(|w| w.groups().iter().any(|g| g.members.contains(&m.id) && g.policy_for(&m.id).is_some()));
     let tasks = tasks.get_or_insert_with(|| store.tasks());
     let h = settled(tasks, m, owed)?;
+    // A seat that may have started servers of its own keeps its pane until the
+    // project's `at_stop:` has run, which is when its tree goes.
+    if h.handed && crate::at_stop::declared(store, m) {
+        return None;
+    }
     (!ended(m, &h) && !failed(m, &h.commit)).then_some(h)
 }
 
@@ -466,9 +506,11 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     }
     let pids = reading.pids.unwrap_or_default();
     let claimed = store.claims().contains_key(member);
+    // A seat handed to its verifier leaves its tree to it.
+    let keep = h.handed;
     let ending = match claimed {
-        true => crate::cycle::despawned(store, member),
-        false => crate::cycle::despawn_seat(seat),
+        true => crate::cycle::despawned_keeping(store, member, keep),
+        false => crate::cycle::despawn_seat_keeping(seat, keep),
     };
     match ending.and_then(|()| confirm_gone(seats, &pids)) {
         Ok(()) => {
@@ -888,12 +930,65 @@ mod tests {
         assert!(!member_ended(), "a pass wsp-188 marked superseded is no verdict at all");
     }
 
+    /// `wsp-430`: the member's seat ends when its verifier's pass is open, and
+    /// the tree is kept for the verifier to read in; the verifier is not ended.
     #[test]
-    fn a_verifier_still_running_ends_nothing() {
+    fn a_member_is_ended_when_its_verifier_has_the_work_and_its_tree_is_kept() {
         let (_env, store) = verified("running");
         set_pass(&store, crate::verification::State::Running);
+        drain(&crate::cycle::tests::KEPT);
+        let seats = Fake::at_rest();
+        pass(&store, &seats);
+        assert_eq!(drain(&DESPAWNED), vec!["m-1".to_string()], "the member, and not the verifier that is reading");
+        assert_eq!(drain(&crate::cycle::tests::KEPT), vec!["m-1".to_string()], "with --keep-tree");
+        let log = log_of(&store, "m-1");
+        assert_eq!(log.matches("ended: handed to its verifier at abc1234").count(), 1, "{log}");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Review);
+        pass(&store, &seats);
+        assert!(drain(&DESPAWNED).is_empty(), "once");
+    }
+
+    /// `wsp-430`: a block after the seat has gone starts a rework seat, whose
+    /// brief ends in the verdict as what is owed.
+    #[test]
+    fn a_blocked_member_whose_seat_was_handed_over_gets_a_rework_seat_with_the_verdict() {
+        let (_env, store) = verified("rework");
+        set_pass(&store, crate::verification::State::Running);
         pass(&store, &Fake::at_rest());
-        assert!(drain(&DESPAWNED).is_empty());
+        assert!(member_ended());
+        // What `wsp despawn` does after the ending the test records.
+        store.clear_claim("m-1");
+        store.clear_binding("cpd-1");
+        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "the install is missing", Some("cpd-2"), None).unwrap();
+        let w = store.worklist("run").unwrap();
+        drain(&crate::cycle::tests::SPAWNED);
+        crate::cycle::step(&store, &w, &crate::cycle::tests::Blind);
+        assert_eq!(drain(&crate::cycle::tests::SPAWNED), vec![("m-1".to_string(), "claude".to_string())], "a rework seat, on the member's own kind");
+        let log = log_of(&store, "m-1");
+        assert!(log.contains("sent back:") && log.contains("the install is missing"), "{log}");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
+    }
+
+    /// `wsp-430`: a typed-to seat is somebody's.
+    #[test]
+    fn a_member_someone_typed_to_since_its_review_is_not_handed_over() {
+        let (_env, store) = verified("typed");
+        set_pass(&store, crate::verification::State::Running);
+        let mut seats = Fake::at_rest();
+        seats.typed.insert("cpd-1".into(), true);
+        pass(&store, &seats);
+        assert!(!member_ended());
+    }
+
+    #[test]
+    fn a_pass_that_read_another_commit_than_the_member_is_at_is_not_its_verifier() {
+        let (_env, store) = verified("moved");
+        set_pass(&store, crate::verification::State::Running);
+        let mut m = store.find_task("m-1").unwrap();
+        m.log(&format!("{} def5678", crate::repair::LANDED));
+        store.save_task(&m).unwrap();
+        pass(&store, &Fake::at_rest());
+        assert!(!member_ended(), "the pass read abc1234 and the member is at def5678");
     }
 
     /// "Typed since the verdict" is measured from when the verdict was

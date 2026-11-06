@@ -147,6 +147,20 @@ fn command_for(store: &Store, repo: &Path) -> Option<String> {
         .map(|p| p.at_stop)
 }
 
+/// Whether the project of `t` declares an `at_stop:`, and so its seat may have
+/// servers of its own that only the teardown stops (`wsp-430`).
+pub(crate) fn declared(store: &Store, t: &crate::model::Task) -> bool {
+    let mut at = crate::check::project_of(t);
+    while let Some(id) = at.take() {
+        let Some(p) = store.project(&id) else { return false };
+        if !p.at_stop.trim().is_empty() {
+            return true;
+        }
+        at = p.parent.clone();
+    }
+    false
+}
+
 /// Run the project's teardown for the tree at `dir`, of the repository `repo`,
 /// then say what it came to. Does nothing when the tree is not there, when
 /// nothing in the store says `repo` is a project's, or when that project has no
