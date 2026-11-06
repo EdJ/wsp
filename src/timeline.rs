@@ -200,7 +200,6 @@ fn cap_holders(i: &Inputs, after: &str, to: i64) -> String {
     out.join(", ")
 }
 
-/// The phases of a row, in time order.
 /// When the row's own seat was asked for.
 fn spawn_line(i: &Inputs) -> Option<i64> {
     let id = i.id.as_str();
@@ -214,6 +213,7 @@ const VERIFIER_START: &str = "verifier seat start (spawn → its first transcrip
 const VERIFIER_START_LINE: &str = "verifier seat start (spawn → wsp's started line; the seat's first line unread, so this lags it)";
 const VERIFIER_HELD: &str = "verdict → verifier seat ended (clean-up, alongside what follows)";
 
+/// The phases of a row, in time order.
 pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let id = i.id.as_str();
     let mut out: Vec<Phase> = Vec::new();
@@ -464,10 +464,10 @@ fn render(i: &Inputs, phases: &[Phase], p: &Paint) -> String {
     let (member, verifier, tests, held) = fixed_of(i, phases);
     let secs = |v: Option<i64>| v.map_or("not read".to_string(), |v| format!("{v}s"));
     s.push_str(&format!(
-        "fixed parts: seat spawn → first line {} · verifier spawn → first line {} · verifier test and build {}s · verdict → despawn {}\n",
+        "fixed parts: seat spawn → first line {} · verifier spawn → first line {} · verifier test and build {} · verdict → despawn {}\n",
         secs(member),
         secs(verifier),
-        tests,
+        if i.verifiers.is_empty() { "not read".to_string() } else { format!("{tests}s") },
         secs(held)
     ));
     s
