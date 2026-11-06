@@ -18,8 +18,11 @@
 //!   non-root crate's whole directory; for the root crate `Cargo.toml`,
 //!   `build.rs`, `src/`, `tests/`, `benches/`, `examples/` and every file an
 //!   `include_str!`/`include_bytes!` in them names — plus `Cargo.lock` and the
-//!   root `Cargo.toml`. Anything else reads the whole tree, so its key is the
-//!   commit's tree: reused across a rebase that changed nothing, never more.
+//!   root `Cargo.toml`. A leading `cd <dir> &&` (one, nothing else chained,
+//!   `NAME=$VAR` prefixes allowed) puts the same read under `<dir>`, and for
+//!   `npm run check:box -- <box> <paths>` it is `<dir>`'s tree id. Anything else
+//!   reads the whole tree, so its key is the commit's tree: reused across a
+//!   rebase that changed nothing, never more.
 //!
 //! The hash is of git's object ids at the commit, not of files on disk, so it
 //! is the same whoever computes it and costs one `git ls-tree`.
@@ -41,6 +44,11 @@ pub(crate) struct Crate {
 
 /// The workspace's crates, from `cargo metadata --no-deps` in `tree`.
 pub(crate) fn crates(tree: &Path) -> Option<Vec<Crate>> {
+    crates_of(&metadata(tree)?)
+}
+
+/// `cargo metadata --no-deps` in `tree`.
+fn metadata(tree: &Path) -> Option<serde_json::Value> {
     if !tree.join("Cargo.toml").exists() {
         return None;
     }
@@ -54,8 +62,19 @@ pub(crate) fn crates(tree: &Path) -> Option<Vec<Crate>> {
     if !out.status.success() {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    crates_of(&v)
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Whether a workspace crate has a path dependency outside the workspace,
+/// which the crate graph does not follow.
+fn leaves_workspace(v: &serde_json::Value) -> bool {
+    let Some(root) = v.get("workspace_root").and_then(|r| r.as_str()).map(PathBuf::from) else { return true };
+    let Some(pkgs) = v.get("packages").and_then(|p| p.as_array()) else { return true };
+    pkgs.iter().any(|p| {
+        p.get("dependencies")
+            .and_then(|d| d.as_array())
+            .is_some_and(|d| d.iter().any(|d| d.get("path").and_then(|x| x.as_str()).is_some_and(|x| !Path::new(x).starts_with(&root))))
+    })
 }
 
 /// The crates in a `cargo metadata` answer.
@@ -210,12 +229,105 @@ fn named_crates(command: &str, crates: &[Crate]) -> Vec<String> {
     named
 }
 
-/// The repository paths a command reads, or `None` for the whole tree.
-pub(crate) fn inputs(tree: &Path, command: &str) -> Option<Vec<String>> {
-    if !plain_cargo(command) || command.contains("--manifest-path") {
+/// What a command reads.
+#[derive(Debug, PartialEq, Eq)]
+enum Reads {
+    /// These repository paths (files or directories).
+    Paths(Vec<String>),
+    /// Everything under one directory.
+    Dir(String),
+    /// Anything: the whole tree.
+    Whole,
+}
+
+/// A command split at a leading `cd <dir> &&`: the directory (`""` when there
+/// is none) and what runs there, with its `NAME=value` prefixes dropped. `None`
+/// for a command that chains anything else, or whose directory is not a plain
+/// relative path inside the tree.
+fn scoped(command: &str) -> Option<(String, String)> {
+    let c = command.trim();
+    if c.contains('\n') || c.chars().any(|ch| matches!(ch, ';' | '|' | '>' | '<' | '`' | '(' | ')')) {
         return None;
     }
-    let cs = crates(tree)?;
+    let (dir, rest) = match c.split_once("&&") {
+        None => (String::new(), c),
+        Some((head, rest)) => {
+            let mut words = head.split_whitespace().skip_while(|w| env_word(w));
+            if words.next()? != "cd" {
+                return None;
+            }
+            let d = words.next()?;
+            if words.next().is_some() {
+                return None;
+            }
+            let d = d.strip_prefix("./").unwrap_or(d).trim_end_matches('/');
+            if !plain_path(d) || d.starts_with('/') || d.split('/').any(|p| p.is_empty() || p == "." || p == "..") {
+                return None;
+            }
+            (d.to_string(), rest)
+        }
+    };
+    if rest.contains('&') {
+        return None;
+    }
+    let inner: Vec<&str> = rest.split_whitespace().skip_while(|w| env_word(w)).collect();
+    Some((dir, inner.join(" ")))
+}
+
+/// `NAME=value` where the value is plain text or a `$VAR` such as `$WSP_SCRATCH`.
+fn env_word(w: &str) -> bool {
+    let Some((name, value)) = w.split_once('=') else { return false };
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && value.chars().all(|c| plain_path(&c.to_string()) || matches!(c, '$' | '{' | '}' | ':' | ','))
+}
+
+/// `npm run check:box -- <box> <paths>` with paths that stay in the package.
+fn check_box(inner: &str) -> bool {
+    let Some(args) = inner.strip_prefix("npm run check:box") else { return false };
+    args.split_whitespace().all(|a| a == "--" || (plain_path(a) && !a.starts_with('/') && !a.split('/').any(|p| p == "..")))
+}
+
+/// What a command reads.
+fn reads(tree: &Path, command: &str) -> Reads {
+    let Some((dir, inner)) = scoped(command) else { return Reads::Whole };
+    if plain_cargo(&inner) && !inner.contains("--manifest-path") {
+        return match cargo_inputs(tree, &dir, &inner) {
+            Some(paths) => Reads::Paths(paths),
+            None if !dir.is_empty() => Reads::Dir(dir),
+            None => Reads::Whole,
+        };
+    }
+    if !dir.is_empty() && check_box(&inner) {
+        return Reads::Dir(dir);
+    }
+    Reads::Whole
+}
+
+/// The repository paths a command reads, or `None` for the whole tree or one
+/// directory of it.
+#[cfg(test)]
+pub(crate) fn inputs(tree: &Path, command: &str) -> Option<Vec<String>> {
+    match reads(tree, command) {
+        Reads::Paths(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// The paths a plain cargo command run in `base` (relative to `tree`) reads.
+fn cargo_inputs(tree: &Path, base: &str, command: &str) -> Option<Vec<String>> {
+    let work = tree.join(base);
+    let meta = metadata(&work)?;
+    if !base.is_empty() {
+        // A workspace rooted above `base`, or a dependency outside it, is read
+        // from places this key does not list.
+        let root = PathBuf::from(meta.get("workspace_root")?.as_str()?);
+        if root.canonicalize().ok()? != work.canonicalize().ok()? || leaves_workspace(&meta) {
+            return None;
+        }
+    }
+    let cs = crates_of(&meta)?;
     let mut want = named_crates(command, &cs);
     if want.iter().any(|n| !cs.iter().any(|c| c.name == *n)) {
         return None;
@@ -231,15 +343,16 @@ pub(crate) fn inputs(tree: &Path, command: &str) -> Option<Vec<String>> {
         }
         i += 1;
     }
-    let mut paths = vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()];
+    let at = |p: &str| if base.is_empty() { p.to_string() } else { format!("{base}/{p}") };
+    let mut paths = vec![at("Cargo.lock"), at("Cargo.toml")];
     for c in cs.iter().filter(|c| want.contains(&c.name)) {
         if c.dir.is_empty() {
-            paths.extend(["build.rs", "src", "tests", "benches", "examples"].iter().map(|s| s.to_string()));
             for d in ["build.rs", "src", "tests", "benches", "examples"] {
-                paths.extend(included(tree, Path::new(d)));
+                paths.push(at(d));
+                paths.extend(included(tree, Path::new(&at(d))));
             }
         } else {
-            paths.push(c.dir.clone());
+            paths.push(at(&c.dir));
         }
     }
     paths.sort();
@@ -294,15 +407,22 @@ fn normal(p: &Path) -> Option<String> {
 }
 
 /// The input hash of `command` at `sha`: the command and git's object ids for
-/// what it reads. `None` when git cannot say.
+/// what it reads. `None` when git cannot say. A `cd <dir> &&` in front scopes
+/// the read to `<dir>`: a cargo command's crates there, or for `npm run
+/// check:box` the directory's tree id (`node_modules` is untracked, so not in it).
 pub(crate) fn key(tree: &Path, sha: &str, command: &str) -> Option<String> {
-    let listing = match inputs(tree, command) {
-        Some(paths) => {
+    let whole = || Some(format!("tree {}", git(tree, &["rev-parse", &format!("{sha}^{{tree}}")])?.trim()));
+    let listing = match reads(tree, command) {
+        Reads::Paths(paths) => {
             let mut args = vec!["ls-tree", sha, "--"];
             args.extend(paths.iter().map(String::as_str));
             git(tree, &args)?
         }
-        None => format!("tree {}", git(tree, &["rev-parse", &format!("{sha}^{{tree}}")])?.trim()),
+        Reads::Dir(dir) => match git(tree, &["rev-parse", &format!("{sha}:{dir}")]) {
+            Some(id) => format!("dir {dir} {}", id.trim()),
+            None => whole()?,
+        },
+        Reads::Whole => whole()?,
     };
     Some(digest(&format!("{command}\n{listing}")))
 }
@@ -415,6 +535,54 @@ mod tests {
         assert_ne!(key(&dir, &two, "cargo test --release").unwrap(), k1, "the command is part of the key");
         let three = commit(&dir, "data/d.txt", "three");
         assert_ne!(key(&dir, &three, "cargo test").unwrap(), k1, "an included file is read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_leading_cd_scopes_what_a_command_reads_and_anything_else_stays_whole() {
+        let sc = |c: &str| scoped(c);
+        assert_eq!(sc("cd web && cargo test census::"), Some(("web".into(), "cargo test census::".into())));
+        assert_eq!(sc("cd ./web/src-tauri/ && X=$WSP_SCRATCH/t cargo test"), Some(("web/src-tauri".into(), "cargo test".into())));
+        assert_eq!(sc("cargo test"), Some((String::new(), "cargo test".into())));
+        assert_eq!(sc("cd web && cargo test && rm x"), None);
+        assert_eq!(sc("cd web; cargo test"), None);
+        assert_eq!(sc("cd ../web && cargo test"), None);
+        assert_eq!(sc("cd /web && cargo test"), None);
+        assert_eq!(sc("cd a b && cargo test"), None);
+        assert_eq!(sc("cd web && cargo test | tee x"), None);
+        assert!(check_box("npm run check:box -- pane src/pane/Pane.tsx"));
+        assert!(!check_box("npm run check:box -- pane ../x"));
+        assert!(!check_box("npm run check"));
+        let dir = Path::new("/nonexistent");
+        assert_eq!(reads(dir, "cd web && npm run check:box -- pane src/a.tsx"), Reads::Dir("web".into()));
+        assert_eq!(reads(dir, "cd web && sh ../run.sh"), Reads::Whole);
+        assert_eq!(reads(dir, "npm run check:box -- pane src/a.tsx"), Reads::Whole);
+    }
+
+    #[test]
+    fn a_cd_key_holds_across_a_commit_in_another_directory_and_moves_with_one_in_its_own() {
+        let dir = repo("cd");
+        let g = |a: &[&str]| assert!(Command::new("git").arg("-C").arg(&dir).args(a).output().unwrap().status.success());
+        let head = || String::from_utf8_lossy(&Command::new("git").arg("-C").arg(&dir).args(["rev-parse", "HEAD"]).output().unwrap().stdout).trim().to_string();
+        std::fs::create_dir_all(dir.join("web/src")).unwrap();
+        std::fs::create_dir_all(dir.join("web/node_modules")).unwrap();
+        std::fs::write(dir.join("web/Cargo.toml"), "[package]\nname = \"wj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(dir.join("web/src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("web/package.json"), "{}").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "web"]);
+        let one = head();
+        let cargo = "cd web && cargo test census::";
+        let npm = "cd web && npm run check:box -- pane src/a.tsx";
+        let (kc, kn, kw) = (key(&dir, &one, cargo).unwrap(), key(&dir, &one, npm).unwrap(), key(&dir, &one, "cd web && sh run.sh").unwrap());
+        let two = commit(&dir, "README.md", "two");
+        let moved = commit(&dir, "data/d.txt", "two");
+        assert_eq!(key(&dir, &two, cargo).unwrap(), kc, "a doc elsewhere is not what the cargo command reads");
+        assert_eq!(key(&dir, &moved, npm).unwrap(), kn, "a file in another directory is not in web's tree");
+        assert_ne!(key(&dir, &moved, "cd web && sh run.sh").unwrap(), kw, "a command wsp cannot read reads the whole tree");
+        let three = commit(&dir, "web/src/main.rs", "fn main() { }\n");
+        assert_ne!(key(&dir, &three, cargo).unwrap(), kc, "a source in the crate moves the key");
+        assert_ne!(key(&dir, &three, npm).unwrap(), kn, "a file in the directory moves the key");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
