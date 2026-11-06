@@ -687,7 +687,7 @@ pub(crate) fn say_leg_left(store: &Store, row: &str, leg: &str, seat: &str, why:
 /// passes racing write it once.
 fn record_ended(store: &Store, id: &str, h: &Holds) {
     let line = h.ended_line();
-    store.locked(|| {
+    let wrote = store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return false };
         if ended(&t, h) {
             return false;
@@ -696,6 +696,11 @@ fn record_ended(store: &Store, id: &str, h: &Holds) {
         t.touch();
         store.save_task(&t).is_ok()
     });
+    // Committed with the write, as every store write is (`wsp-433`): this runs
+    // from the daemon's tick, whose caller commits none of it.
+    if wrote {
+        store.git_commit(&format!("wsp: {id}'s seat ended"));
+    }
 }
 
 /// A failed ending: on the row, in `cycle.log`, and to the governor — once,
@@ -858,6 +863,70 @@ mod tests {
 
     fn member_ended() -> bool {
         drain(&DESPAWNED).contains(&"m-1".to_string())
+    }
+
+    /// `wsp-433`: `wsp doctor` found 26 task files with release lines and 43
+    /// worklist files with attempts marked `ended` on disk and in no commit.
+    /// The release (`release_pane`'s claim and log line) and both endings (the
+    /// row's, and the check's on its worklist) leave the store clean.
+    #[test]
+    fn a_release_and_an_attempts_end_leave_the_store_committed() {
+        let (_env, store) = verified("committed");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "wsp@test"],
+            &["config", "user.name", "wsp test"],
+            &["config", "commit.gpgsign", "false"],
+            &["add", "-A"],
+            &["commit", "-q", "-m", "store"],
+        ] {
+            let ok = std::process::Command::new("git").arg("-C").arg(&store.root).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
+            assert!(ok.success(), "git {args:?}");
+        }
+        let loose = || {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&store.root)
+                .args(["status", "--porcelain"])
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(loose(), "", "the baseline is clean");
+
+        // The member's ending, then the release line a seat's ending writes.
+        pass(&store, &Fake::at_rest());
+        assert!(log_of(&store, "m-1").contains("ended: verification holds"), "{}", log_of(&store, "m-1"));
+        assert_eq!(loose(), "", "the row's ending is committed");
+        let (removed, task) = crate::cmd_agent::release_pane(&store, "cpd-1");
+        assert!(removed && task.as_deref() == Some("m-1"));
+        assert!(log_of(&store, "m-1").contains("released"), "{}", log_of(&store, "m-1"));
+        assert_eq!(loose(), "", "the release line is committed");
+
+        // And a check marked ended on its worklist.
+        let mut w = store.worklist("run").unwrap();
+        let mut g = w.groups();
+        g[0].checks.push(crate::barrier::Check {
+            at: "2026-10-06T09:00:00Z".into(),
+            state: crate::barrier::State::Running,
+            read: None,
+            pane: Some("cpd-9".into()),
+            on: Some("claude sonnet/high".into()),
+            ending: crate::barrier::Ending::Standing,
+            was: None,
+            tries: 1,
+            gave_up: false,
+            suite: None,
+            run: None,
+            by: None,
+        });
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        store.git_commit("test: a check");
+        assert_eq!(loose(), "");
+        assert!(crate::barrier::mark_ended(&store, "cpd-9", true));
+        assert!(loose().is_empty(), "the attempt's end is committed: {}", loose());
     }
 
     #[test]

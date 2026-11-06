@@ -5689,6 +5689,41 @@ fn tree_index_loss(root: &std::path::Path) -> Option<u64> {
     Some(index_loss(&staged, &disk))
 }
 
+/// What a path left uncommitted in the store says about the writer that left
+/// it, where the path can tell: a task file is a log line (a seat's release,
+/// a landing, an ending) and a worklist file is a check's state (an attempt
+/// marked `ended`). Anything else is named by its path alone.
+fn uncommitted_writer(path: &str) -> &'static str {
+    match path.split('/').next().unwrap_or("") {
+        "tasks" => "a log line on a task: a seat's release, an ending or a landing",
+        "worklists" => "a worklist: an attempt's end or a check's state",
+        _ => "a store write",
+    }
+}
+
+/// `doctor`'s warning for files in the store that are written and not
+/// committed (`wsp-433`): wsp commits what it writes, so each one is a writer
+/// that skipped it. Says how many, the first three, and who writes such files.
+fn uncommitted_warning(loose: &[String]) -> Option<String> {
+    if loose.is_empty() {
+        return None;
+    }
+    let named: Vec<&str> = loose.iter().take(3).map(|s| s.as_str()).collect();
+    let rest = match loose.len() > named.len() {
+        true => format!(" and {} more", loose.len() - named.len()),
+        false => String::new(),
+    };
+    let mut writers: Vec<&str> = loose.iter().map(|p| uncommitted_writer(p)).collect();
+    writers.sort();
+    writers.dedup();
+    Some(format!(
+        "{} uncommitted in the store: {}{rest} — wsp commits what it writes, so a writer skipped it ({}); commit them by hand",
+        loose.len(),
+        named.join(", "),
+        writers.join("; ")
+    ))
+}
+
 /// What is sitting in the store that no command wrote.
 ///
 /// Every `wsp` command commits the files it writes, so whatever is left is a
@@ -6116,6 +6151,7 @@ fn dangling(subject: &str, kind: &str, name: &str, filed: bool) -> Result<String
 pub fn doctor(store: &Store, args: &Args) -> i32 {
     let mut problems: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     if !store.exists() {
         problems.push(format!("no store at {} — run `wsp init`", util::contract(&store.root)));
@@ -6125,17 +6161,8 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     if !store.root.join(".git").exists() {
         notes.push("store is not a git repo (history disabled)".into());
     } else {
-        let loose = store_uncommitted(&store.root);
-        if !loose.is_empty() {
-            let named: Vec<&str> = loose.iter().take(3).map(|s| s.as_str()).collect();
-            let rest = match loose.len() > named.len() {
-                true => format!(" and {} more", loose.len() - named.len()),
-                false => String::new(),
-            };
-            notes.push(format!(
-                "uncommitted in the store: {}{rest} — wsp commits what it writes, so these are yours to commit",
-                named.join(", ")
-            ));
+        if let Some(w) = uncommitted_warning(&store_uncommitted(&store.root)) {
+            warnings.push(w);
         }
     }
 
@@ -6510,13 +6537,16 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     crate::cmd_machine::health(store, &mut problems, &mut notes);
 
     if args.json() {
-        println!("{}", json!({ "problems": problems, "notes": notes }));
+        println!("{}", json!({ "problems": problems, "warnings": warnings, "notes": notes }));
         return if problems.is_empty() { 0 } else { 1 };
     }
 
     let p = Paint::new();
     for n in &notes {
         println!("{} {}", p.dim("·"), n);
+    }
+    for w in &warnings {
+        println!("{} {}", p.yellow("!"), w);
     }
     for prob in &problems {
         println!("{} {}", p.red("✗"), prob);

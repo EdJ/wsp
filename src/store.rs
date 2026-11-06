@@ -3428,6 +3428,10 @@ impl Store {
             }
             std::thread::sleep(Duration::from_millis(wait));
         }
+        // And kept as written, so the next commit this process makes takes
+        // them too: a path dropped here is uncommitted until a person
+        // notices (`wsp-433`).
+        self.written.borrow_mut().extend(paths.iter().map(|p| self.root.join(p)));
         eprintln!(
             "wsp: could not commit {} — the change is on disk; `git -C {} status`",
             paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" "),

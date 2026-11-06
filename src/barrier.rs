@@ -457,7 +457,7 @@ pub(crate) fn running(g: &Group) -> Option<&Check> {
 /// Write a change to group `at` of `list` under the lock, reading the list
 /// afresh, and say whether it was made. `f` answers whether it changed anything.
 fn change(store: &Store, list: &str, at: usize, f: impl FnOnce(&mut Group) -> bool) -> bool {
-    store.locked(|| {
+    let wrote = store.locked(|| {
         let Some(mut w) = store.worklist(list) else { return false };
         let mut groups = w.groups();
         let Some(g) = groups.get_mut(at - 1) else { return false };
@@ -466,7 +466,13 @@ fn change(store: &Store, list: &str, at: usize, f: impl FnOnce(&mut Group) -> bo
         }
         w.set_groups(&groups);
         store.save_worklist(&w).is_ok()
-    })
+    });
+    // A check's state — an attempt marked `ended` among it — is committed with
+    // the write (`wsp-433`); the daemon's tick that makes it commits none.
+    if wrote {
+        store.git_commit(&format!("wsp: {list} barrier {at}: a check moved"));
+    }
+    wrote
 }
 
 /// Whether opening a check on `g` would write anything now: there is none open,
