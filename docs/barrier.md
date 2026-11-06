@@ -72,7 +72,9 @@ wsp passes the barrier, through `wsp worklist go`, when **nothing needs judgment
 
 - every member's newest verdict holds, and every item it `checked:` was held;
 - at least one check was declared, every one ran, and every one passed;
-- the group's stop has **no prose**.
+- the group's stop has **no prose**;
+- the group is **not the last of its list**: a list never ends on an automatic
+  pass, and the last group always gets its check agent (Ed, 2026-11-05).
 
 The verdict names what ran and where the results are; the group's entry reads
 `passes … suite:green by:wsp`, and `cycle.log` has a line saying why. Anything
@@ -82,10 +84,10 @@ fault each failure reads as. The order tells it not to build or run what wsp
 already ran. A barrier with nothing declared at all is never passed by wsp: with
 nothing run, nobody has looked.
 
-**It is off until a project turns it on**, with `auto-pass: on` under a
-`## Barrier` heading in the project's body, and every project a group ran in must
-have. Off, wsp still runs everything, still hands the agent the packet, and logs
-`would pass without an agent (auto-pass is off)` for each barrier it would have
+**It is on by default** (Ed, 2026-11-05, `wsp-396`), and a project turns it off
+with `auto-pass: off` under a `## Barrier` heading in its body; one project in a
+group saying off is enough. Off, wsp still runs everything, still hands the agent the packet, and logs
+`would pass without an agent (auto-pass is off for a project)` for each barrier it would have
 taken — the measure of what turning it on would do.
 
 ## The replay
@@ -134,13 +136,13 @@ gave.
   the case for leaving the project's switch to the person.
 
 **Decision.** The replay found no hold the rule would have let through, so the
-automatic pass is allowed. It ships **off**: turning it on is a line in a
-project's body, the only project declaring a barrier suite is `wsp`, and the
-follow-ups it would not have found are a cost Ed should choose. For `wsp`:
+automatic pass is allowed. It first shipped off. On 2026-11-05 Ed approved it on
+one condition, the list's last group always gets its check agent, and asked for
+it on by default (`wsp-396`). To keep a project's barriers on an agent:
 
 ```text
 ## Barrier
-auto-pass: on
+auto-pass: off
 ```
 
 The first real signal is the log: with it off, each barrier `wsp` would have

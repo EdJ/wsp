@@ -24,15 +24,18 @@
 //!
 //! The barrier is passed by wsp when nothing needs judgment: every member's
 //! newest verdict holds, every check was run and passed, and the stop has no
-//! prose. The verdict says why, and the entry on the group says `by:wsp`. Any
+//! prose, **and the group is not the list's last** (Ed, 2026-11-05: a list never
+//! ends on an automatic pass). The verdict says why, and the entry on the group
+//! says `by:wsp`. The pass is on unless a project says `auto-pass: off` under
+//! `## Barrier` in its body (`wsp-396`). Any
 //! other barrier gets its agent as before, with the **packet** — members,
 //! verdicts, the stop and these results, inline — in its work order, so the
 //! turns it spent gathering and rebuilding go to what only it can do.
 //!
-//! **The automatic pass is off until a project turns it on**, with `auto-pass:
-//! on` under a `## Barrier` heading in its body. The replay (`docs/barrier.md`)
-//! is what decides that; without the line wsp still runs everything, still logs
-//! `would pass without an agent`, and still hands the agent the packet.
+//! **The automatic pass is on by default** (Ed, 2026-11-05), and a project turns
+//! it off with `auto-pass: off` under a `## Barrier` heading in its body. Off,
+//! wsp still runs everything, still logs `would pass without an agent`, and
+//! still hands the agent the packet.
 //!
 //! # Where it runs
 //!
@@ -237,6 +240,8 @@ pub(crate) struct Decision {
 /// What a barrier's agent-free pass is read from.
 pub(crate) struct Facts<'a> {
     pub enabled: bool,
+    /// The group is the last of its list, which always gets its check agent.
+    pub last: bool,
     pub stop: &'a str,
     /// Each member and whether its newest verdict holds with every item it
     /// checked held.
@@ -249,6 +254,9 @@ pub(crate) struct Facts<'a> {
 
 pub(crate) fn decide(f: &Facts) -> Decision {
     let mut needs = Vec::new();
+    if f.last {
+        needs.push("the list's last group always gets its check agent".to_string());
+    }
     if !f.stop.trim().is_empty() {
         needs.push("the stop condition has prose to read".to_string());
     }
@@ -272,15 +280,14 @@ pub(crate) fn decide(f: &Facts) -> Decision {
     Decision { would_pass, pass: would_pass && f.enabled, needs }
 }
 
-/// Whether every project the group ran in has turned the automatic pass on:
-/// `auto-pass: on` under `## Barrier` in its body.
+/// Whether the automatic pass is on for the group: it is, unless a project the
+/// group ran in says `auto-pass: off` under `## Barrier` in its body.
 pub(crate) fn enabled(store: &Store, plan: &Plan) -> bool {
     !plan.units.is_empty()
         && plan.units.iter().all(|u| {
-            store
-                .project(&u.project)
-                .and_then(|p| p.section("Barrier"))
-                .is_some_and(|s| s.lines().any(|l| matches!(l.trim().replace(' ', "").to_lowercase().as_str(), "auto-pass:on" | "auto-pass:yes" | "auto-pass:true")))
+            !store.project(&u.project).and_then(|p| p.section("Barrier")).is_some_and(|s| {
+                s.lines().any(|l| matches!(l.trim().replace(' ', "").to_lowercase().as_str(), "auto-pass:off" | "auto-pass:no" | "auto-pass:false"))
+            })
         })
 }
 
@@ -433,6 +440,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     let on = enabled(store, &plan);
     let decision = decide(&Facts {
         enabled: on,
+        last: at == groups.len(),
         stop: &g.stop,
         members,
         ran: count,
@@ -456,7 +464,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
             started.elapsed().saturating_sub(waited).as_secs(),
             // Per-step seconds of the steps that ran: `wsp timeline` reads them (`wsp-390`).
             if per_step.is_empty() { String::new() } else { format!(" · per step: {}", per_step.join("; ")) },
-            if decision.would_pass && !on { " · would pass without an agent (auto-pass is off)" } else { "" }
+            if decision.would_pass && !on { " · would pass without an agent (auto-pass is off for a project)" } else { "" }
         ),
     );
     let suite = if failed.is_empty() && decision.needs.iter().all(|n| !n.starts_with("could not run")) { Suite::Green } else { Suite::Red };
@@ -592,6 +600,7 @@ mod tests {
     fn facts<'a>(stop: &'a str) -> Facts<'a> {
         Facts {
             enabled: true,
+            last: false,
             stop,
             members: vec![("a-1".into(), true), ("a-2".into(), true)],
             ran: 3,
@@ -634,6 +643,18 @@ mod tests {
         none.ran = 0;
         let d = decide(&none);
         assert!(!d.would_pass && d.needs[0].contains("nothing was declared"));
+    }
+
+    #[test]
+    fn a_lists_last_group_is_never_passed_by_wsp_and_an_intermediate_one_still_is() {
+        let mut last = facts("");
+        last.last = true;
+        let d = decide(&last);
+        assert!(!d.pass && !d.would_pass, "everything else would pass");
+        assert!(d.needs.iter().any(|n| n.contains("last group always gets its check agent")));
+
+        let mid = decide(&facts(""));
+        assert!(mid.pass && mid.would_pass && mid.needs.is_empty());
     }
 
     #[test]
@@ -736,7 +757,7 @@ mod tests {
             "pj-002's recorded command is the suite, so it runs once and is theirs too; the path rule is not a barrier step"
         );
         assert!(plan.declared() && owed(&store, &w, 1));
-        assert!(!enabled(&store, &plan), "off until the project says so");
+        assert!(enabled(&store, &plan), "on unless the project says off");
     }
 
     #[test]
@@ -759,10 +780,15 @@ mod tests {
     }
 
     #[test]
-    fn the_project_turns_the_automatic_pass_on_under_a_barrier_heading() {
-        let (_env, store) = world("on", "exit 0\n", "## Barrier\nauto-pass: on\n");
+    fn the_automatic_pass_is_on_by_default_and_a_project_turns_it_off_under_a_barrier_heading() {
+        let (_env, store) = world("on", "exit 0\n", "");
         let w = store.worklist("run").unwrap();
-        assert!(enabled(&store, &plan(&store, &w, 1)));
+        assert!(enabled(&store, &plan(&store, &w, 1)), "the default is on");
+
+        let mut p = store.project("pj").unwrap();
+        p.body.push_str("\n## Barrier\nauto-pass: off\n");
+        store.save_project(&p).unwrap();
+        assert!(!enabled(&store, &plan(&store, &w, 1)), "an explicit off holds");
     }
 
     #[test]

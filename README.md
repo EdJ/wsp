@@ -4841,11 +4841,11 @@ output names. The entry on the group says `suite:running`, then `green` or `red`
 
 wsp **passes the barrier itself** only when nothing needs judgment: every
 member's verdict holds, at least one check was declared and all passed, and the
-stop has no prose. The entry reads `passes … by:wsp`. Any other barrier starts its
+stop has no prose and the group is not the last of its list. The entry reads `passes … by:wsp`. Any other barrier starts its
 agent as before, handed a **packet** — members, verdicts, the stop's items and
 what wsp ran and whose fault each failure reads as — and told not to run it
-again. **The automatic pass is off until a project turns it on** with
-`auto-pass: on` under a `## Barrier` heading in its body; off, `cycle.log` says
+again. **The automatic pass is on by default**; a project turns it off with
+`auto-pass: off` under a `## Barrier` heading in its body; off, `cycle.log` says
 `would pass without an agent` for each barrier it would have taken.
 `wsp worklist replay` reads the recorded barriers and says what the rule would
 have done to them. The design, the replay's numbers and the decision are in
