@@ -1301,6 +1301,9 @@ impl Compound<'_> {
             .and_then(|e| e.as_object())
             .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
             .unwrap_or_default();
+        // The gate goes in before the agent does: a session that starts first has
+        // had tool calls the hook never saw.
+        self.install_gate(&m, seat, &cwd)?;
         let (program, argv) = crate::agent_commands::command(&agent.kind, &agent.args);
         let cmd = crate::far::seat_command(&m, seat.as_str(), &cwd, &env, &program, &argv);
         let out = self
@@ -1344,6 +1347,30 @@ impl Compound<'_> {
         rec["started_at"] = json!(util::now_iso());
         rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
         write_atomic(&dir.join(SEAT_FILE), &rec.to_string()).map_err(|e| Refusal::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Write the PreToolUse gate into the far tree's `.claude/settings.json`
+    /// (`docs/remote-agents.md` section 3): `compound-remote gate --exec-dir <d>
+    /// --seat <s> --lease <machine lease>`, merged into whatever the tree
+    /// already has there, with a hook timeout above the lease. Refuses rather
+    /// than start an agent that nothing gates.
+    fn install_gate(&self, m: &crate::model::Machine, seat: &Seat, cwd: &str) -> Result<()> {
+        let bad = |why: String| Refusal::Backend(why);
+        let file = format!("{}/.claude/settings.json", cwd.trim_end_matches('/'));
+        let there = self
+            .far
+            .run(m, &format!("cat {} 2>/dev/null || true", crate::far::quote(&file)), crate::far::SESSION_TIMEOUT)
+            .map_err(|f| bad(format!("reading {file} on {}: {}", m.name, f.why())))?;
+        let text = crate::far::settings_with_gate(&there, m, seat.as_str()).map_err(|why| bad(format!("{}: {why}", m.name)))?;
+        let write = format!(
+            "mkdir -p {} && cat > {} <<'WSP_GATE_EOF'\n{text}\nWSP_GATE_EOF",
+            crate::far::quote(&format!("{}/.claude", cwd.trim_end_matches('/'))),
+            crate::far::quote(&file),
+        );
+        self.far
+            .run(m, &write, crate::far::SESSION_TIMEOUT)
+            .map_err(|f| bad(format!("writing the gate to {file} on {}: {}", m.name, f.why())))?;
         Ok(())
     }
 
@@ -1434,6 +1461,31 @@ pub fn forwards_for(store: &Store, machine: &str) -> Vec<(PathBuf, String)> {
         }
     }
     out.sort();
+    out
+}
+
+/// The far seats on `machine`, as the beat sends to them: every seat record that
+/// names this machine and has a forwarded controller socket. A local seat has no
+/// `machine` and is never in it.
+pub fn beat_seats(store: &Store, machine: &str) -> Vec<crate::far::BeatSeat> {
+    let root = store.state.join(SEATS);
+    let held = crate::ending::held_seats(store);
+    let mut out = Vec::new();
+    for e in fs::read_dir(&root).into_iter().flatten().flatten() {
+        let rec = read_json(&e.path().join(SEAT_FILE));
+        let (socket, id) = (str_of(&rec, "socket"), e.file_name().to_string_lossy().into_owned());
+        if str_of(&rec, "machine") != machine || socket.is_empty() {
+            continue;
+        }
+        let started = str_of(&rec, "started_at");
+        out.push(crate::far::BeatSeat {
+            held: held.contains(&id),
+            age: (!started.is_empty()).then(|| util::since(&started)),
+            socket: PathBuf::from(socket),
+            id,
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
     out
 }
 
@@ -1868,6 +1920,10 @@ mod tests {
         dir: PathBuf,
         link_down: std::cell::Cell<bool>,
         forward_fails: bool,
+        /// What `cat .claude/settings.json` finds on the far side.
+        settings: std::cell::RefCell<String>,
+        /// The lease the machine record carries.
+        lease: std::cell::Cell<Option<u32>>,
     }
 
     impl crate::far::Wire for FarScript {
@@ -1875,6 +1931,7 @@ mod tests {
             (name == "mb2").then(|| {
                 let mut m = crate::model::Machine::new("mb2", "mb2");
                 m.exec_dir = "/far/exec".into();
+                m.lease = self.lease.get();
                 m
             })
         }
@@ -1882,6 +1939,13 @@ mod tests {
             self.asked.borrow_mut().push(format!("run {cmd}"));
             if self.link_down.get() {
                 return Err(crate::far::Failed::Link("Connection refused".into()));
+            }
+            // Reading and writing the gate's settings file.
+            if cmd.starts_with("cat ") {
+                return Ok(self.settings.borrow().clone());
+            }
+            if cmd.starts_with("mkdir ") {
+                return Ok(String::new());
             }
             Ok("sup 11\npid 12\nsocket /far/run/s.sock\nrender /far/run/s.rsock".into())
         }
@@ -1895,6 +1959,9 @@ mod tests {
         fn dir(&self, _m: &crate::model::Machine) -> PathBuf {
             self.dir.clone()
         }
+        fn lease(&self, _m: &crate::model::Machine, _s: &Path, _seat: &str, _state: &str) -> std::result::Result<(), String> {
+            Ok(())
+        }
     }
 
     fn far_script(name: &str, link_down: bool, forward_fails: bool) -> (FarScript, PathBuf) {
@@ -1907,8 +1974,49 @@ mod tests {
             dir: root.join("fwd"),
             link_down: std::cell::Cell::new(link_down),
             forward_fails,
+            settings: Default::default(),
+            lease: Default::default(),
         };
         (f, root)
+    }
+
+    /// The gate `spawn --on` writes carries the machine's lease and a hook
+    /// timeout above it, and keeps what the far tree's settings already held.
+    #[test]
+    fn the_gate_written_on_spawn_on_carries_the_machines_lease_and_keeps_the_trees_settings() {
+        let (far, root) = far_script("gate", false, false);
+        far.lease.set(Some(240));
+        *far.settings.borrow_mut() = r#"{"permissions":{"allow":["Bash(ls)"]},"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"mine.sh"}]}]}}"#.into();
+        let place = Compound { far: &far, ..Compound::at(root.join("seats")) };
+        let order = Order {
+            label: "t-1".into(),
+            cwd: Some("/far/exec/trees/t-1".into()),
+            on: Some("mb2".into()),
+            env: BTreeMap::from([("WSP_TASK".to_string(), "t-1".to_string())]),
+            ..Order::default()
+        };
+        let seat = place.open(&order).unwrap();
+        place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).unwrap();
+
+        let asked = far.asked.borrow().clone();
+        let write = asked.iter().find(|a| a.starts_with("run mkdir ")).expect("the settings were written");
+        assert!(write.contains("'/far/exec/trees/t-1/.claude/settings.json'"), "{write}");
+        let body = write.split_once("<<'WSP_GATE_EOF'\n").unwrap().1.trim_end_matches("\nWSP_GATE_EOF");
+        let doc: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(doc["permissions"]["allow"][0], json!("Bash(ls)"), "the tree's own settings stay");
+        let pre = doc["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre[0]["hooks"][0]["command"], json!("mine.sh"), "its own hook stays");
+        let gate = &pre[1]["hooks"][0];
+        assert_eq!(
+            gate["command"],
+            json!(format!("compound-remote gate --exec-dir '/far/exec' --seat '{seat}' --lease 240"))
+        );
+        assert!(gate["timeout"].as_u64().unwrap() > 240, "the hook outlives the lease: {gate}");
+        assert!(
+            asked.iter().position(|a| a.starts_with("run mkdir ")) < asked.iter().position(|a| a.contains("spawn --label")),
+            "before the agent starts"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// `spawn --on`: the seat is a record naming the machine and the far tree,
@@ -1935,7 +2043,10 @@ mod tests {
 
         place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).unwrap();
         let asked = far.asked.borrow().clone();
-        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert_eq!(asked.len(), 5, "{asked:?}");
+        assert!(asked[0].starts_with("run cat ") && asked[1].starts_with("run mkdir "), "the gate is written first: {asked:?}");
+        let (asked_gate, asked) = (asked[..2].to_vec(), asked[2..].to_vec());
+        assert!(asked_gate[1].contains(&format!("--seat '{seat}' --lease 180")), "{}", asked_gate[1]);
         assert!(asked[0].contains(&format!("spawn --label '{seat}' --cwd '/far/exec/trees/t-1'")), "{}", asked[0]);
         assert!(asked[0].contains("WSP_SEAT_ID='") && asked[0].contains("claude-token"), "{}", asked[0]);
         assert_eq!(asked[1], format!("forward {seat}.sock:/far/run/s.sock"));

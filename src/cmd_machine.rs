@@ -447,6 +447,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     if !box_line.is_empty() {
         println!("box       {box_line}");
     }
+    // The far seat's lease and what a lost link does, said whether or not they
+    // are set: both have a default that decides what an agent does when the
+    // link drops.
+    println!("lease     {}s — a far seat unheard for longer is held", m.lease_secs());
+    println!("link      {}", crate::model::LINK_REQUIRED);
     // Printed whether or not it is set, because "no cap" is the state this
     // knob is in on every machine nobody has thought about, and a line that
     // only appears once somebody has thought about it is a line that never
@@ -490,7 +495,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
 pub fn set(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp machine set <name> ssh=… backend_at=… exec_dir=… sup_at=… os=… arch=… agents=N status=active|retired");
+        eprintln!("usage: wsp machine set <name> ssh=… backend_at=… exec_dir=… sup_at=… os=… arch=… agents=N lease=SECONDS link=required status=active|retired");
         return 2;
     };
     if names_seat(&needle) && find(store, &needle).is_none() {
@@ -530,6 +535,23 @@ pub fn set(store: &Store, args: &Args) -> i32 {
                 Ok(n) => m.agents = n,
                 Err(code) => return code,
             },
+            // How long a far seat may go unheard before its agent is held.
+            "lease" => match v.trim().parse::<u32>() {
+                // `lease=` takes it back off, to the default.
+                _ if v.trim().is_empty() => m.lease = None,
+                Ok(n) if n > 0 => m.lease = Some(n),
+                _ => {
+                    eprintln!("wsp: lease is a number of seconds above 0 (default {}), not `{v}`", crate::model::DEFAULT_LEASE);
+                    return 2;
+                }
+            },
+            "link" => match crate::model::valid_link(v) {
+                Ok(()) => m.link = v.to_string(),
+                Err(why) => {
+                    eprintln!("wsp: {why}");
+                    return 2;
+                }
+            },
             "status" => match v {
                 "active" | "retired" => m.status = v.to_string(),
                 _ => {
@@ -538,7 +560,7 @@ pub fn set(store: &Store, args: &Args) -> i32 {
                 }
             },
             other => {
-                eprintln!("wsp: machines have no `{other}` — ssh, backend_at, exec_dir, sup_at, os, arch, agents, status");
+                eprintln!("wsp: machines have no `{other}` — ssh, backend_at, exec_dir, sup_at, os, arch, agents, lease, link, status");
                 return 2;
             }
         }
@@ -1108,6 +1130,34 @@ mod tests {
         assert_eq!(store.machine("mb2").unwrap().agents, None, "back to nobody having decided");
     }
 
+    /// The lease and the link round-trip through the file; `link` takes only
+    /// `required` and says why when given anything else, and a bad lease is
+    /// refused and changes nothing.
+    #[test]
+    fn a_machine_keeps_its_lease_and_link_and_refuses_an_unknown_link() {
+        let store = scratch("machine-lease");
+        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
+        let set_to = |kv: &str| set(&store, &Args::synth("machine", &["set", "mb2", kv], &[]));
+        assert_eq!(store.machine("mb2").unwrap().lease_secs(), 180, "the default");
+
+        assert_eq!(set_to("lease=240"), 0);
+        assert_eq!(set_to("link=required"), 0);
+        let m = store.machine("mb2").unwrap();
+        assert_eq!((m.lease, m.lease_secs(), m.link.as_str()), (Some(240), 240, "required"), "both are on the file");
+
+        assert_eq!(set_to("link=optional"), 2, "no other mode exists");
+        assert_eq!(set_to("link="), 2, "and empty is not one either");
+        assert_eq!(store.machine("mb2").unwrap().link, "required", "a refusal changes nothing");
+        assert_eq!(set_to("lease=0"), 2);
+        assert_eq!(set_to("lease=soon"), 2);
+        assert_eq!(store.machine("mb2").unwrap().lease, Some(240));
+        assert_eq!(set_to("lease="), 0, "taken back to the default");
+        assert_eq!(store.machine("mb2").unwrap().lease_secs(), 180);
+
+        let why = crate::model::valid_link("optional").unwrap_err();
+        assert!(why.contains("`optional`") && why.contains("`required`"), "{why}");
+    }
+
     /// The seat takes a cap of its own (`wsp-231`) — the box that runs almost
     /// everything, which has no machine record — and only that: everything
     /// else a record carries is about reaching it.
@@ -1170,6 +1220,8 @@ fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {
         // number wants to be able to tell "nobody has decided" from a number,
         // and `0` is the one answer that reads as an instruction.
         "agents": m.agents,
+        "lease": m.lease_secs(),
+        "link": crate::model::LINK_REQUIRED,
         "status": m.status,
         "added": m.added,
         "live": live.map(|l| l.to_value()),

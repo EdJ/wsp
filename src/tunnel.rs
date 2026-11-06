@@ -60,6 +60,8 @@ struct Tunnel {
     /// The master was just (re)started, so the seats' forwards on it are gone and
     /// are re-added once it answers (`docs/remote-agents.md` section 2).
     readd: bool,
+    /// When the far seats are next beaten (`docs/remote-agents.md` section 3).
+    next_beat: Option<Instant>,
 }
 
 impl Tunnel {
@@ -71,7 +73,23 @@ impl Tunnel {
             live: MachineLive { tunnel: "down".into(), ..Default::default() },
             checking: None,
             readd: false,
+            next_beat: None,
         }
+    }
+
+    /// Beat the machine's far seats when [`crate::far::BEAT_SECS`] have passed.
+    /// The first beat after the master answers is at once, so a seat that was
+    /// waiting on the link is let go the moment it is back.
+    fn beat_if_due(&mut self, store: &Store, m: &Machine, wire: &dyn crate::far::Wire) -> Vec<(String, String)> {
+        if self.next_beat.is_some_and(|t| Instant::now() < t) {
+            return Vec::new();
+        }
+        self.next_beat = Some(Instant::now() + Duration::from_secs(crate::far::BEAT_SECS));
+        let seats = crate::place_compound::beat_seats(store, &m.name);
+        if seats.is_empty() {
+            return Vec::new();
+        }
+        crate::far::beat(m, &seats, wire, &mut self.live, &util::now_iso())
     }
 
     /// Ask for a readiness check when there has been none, or the last one is
@@ -111,6 +129,9 @@ impl Tunnel {
     fn started(&mut self, child: Child) {
         self.child = Some(child);
         self.readd = true;
+        // A new master means the seats have been waiting on the link: the first
+        // beat on it is at once.
+        self.next_beat = None;
         self.live.tunnel = "starting".into();
         // Not reachable yet: ssh has been started, not connected.
         // Saying otherwise here is how a machine reads as up for
@@ -300,6 +321,9 @@ impl Supervisor {
             t.failures = 0;
             t.next_try = None;
             t.readd_if_due(store, m, &crate::far::Ssh);
+            // After the re-add: a seat's socket is only there to dial once its
+            // forward is back.
+            let _ = t.beat_if_due(store, m, &crate::far::Ssh);
         }
         t.recheck(store, m);
     }
@@ -640,6 +664,10 @@ mod tests {
     /// on disk when it was asked.
     struct Script {
         asked: std::cell::RefCell<Vec<(String, String, bool)>>,
+        /// `(seat, state, socket file)` of each beat sent.
+        leases: std::cell::RefCell<Vec<(String, String, String)>>,
+        /// Seats whose beat gets no answer.
+        deaf: std::cell::RefCell<Vec<String>>,
     }
 
     impl crate::far::Wire for Script {
@@ -658,10 +686,18 @@ mod tests {
         fn dir(&self, _: &Machine) -> PathBuf {
             PathBuf::new()
         }
+        fn lease(&self, _: &Machine, socket: &std::path::Path, seat: &str, state: &str) -> Result<(), String> {
+            let name = socket.file_name().unwrap().to_string_lossy().into_owned();
+            self.leases.borrow_mut().push((seat.to_string(), state.to_string(), name));
+            match self.deaf.borrow().contains(&seat.to_string()) {
+                true => Err("no answer".into()),
+                false => Ok(()),
+            }
+        }
     }
 
     fn script() -> Script {
-        Script { asked: Default::default() }
+        Script { asked: Default::default(), leases: Default::default(), deaf: Default::default() }
     }
 
     /// A store under a short scratch directory, with a far seat's record for each
@@ -807,5 +843,94 @@ mod tests {
 
         carry_check(&mut live, None);
         assert!(live.ready, "no file, nothing to carry");
+    }
+
+    fn set_started(store: &Store, seat: &str, secs_ago: i64) {
+        let path = store.state.join("compound-seats").join(seat).join("seat.json");
+        let mut rec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let at = crate::util::epoch_of(&util::now_iso()) - secs_ago;
+        rec["started_at"] = serde_json::json!(crate::util::iso_at(at));
+        std::fs::write(path, rec.to_string()).unwrap();
+    }
+
+    /// The beat says `ok` to a seat something still holds and `stop` to one whose
+    /// claim is gone, each on its own socket, to the machine's seats only: a
+    /// local seat and another machine's seat hear nothing.
+    #[test]
+    fn the_beat_sends_ok_and_stop_to_the_machines_far_seats_and_to_no_others() {
+        let (store, root) = store_with_seats("beat", &[("cpd-7", "mb2"), ("cpd-8", "mb2"), ("cpd-9", "mb3"), ("cpd-1", "")]);
+        for s in ["cpd-7", "cpd-8", "cpd-9", "cpd-1"] {
+            set_started(&store, s, 3600);
+        }
+        store.set_binding("cpd-7", serde_json::json!({ "task_id": "t-1" }));
+        let m = Machine::new("mb2", "mb2");
+        let wire = script();
+        let mut t = Tunnel::new();
+
+        let failed = t.beat_if_due(&store, &m, &wire);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(
+            *wire.leases.borrow(),
+            [
+                ("cpd-7".to_string(), "ok".to_string(), "cpd-7.sock".to_string()),
+                ("cpd-8".to_string(), "stop".to_string(), "cpd-8.sock".to_string()),
+            ],
+            "the held seat is told ok and the released one stop; mb3's seat and the local seat are not beaten",
+        );
+        assert!(!t.live.heard.is_empty(), "an answer is the machine heard");
+
+        t.beat_if_due(&store, &m, &wire);
+        assert_eq!(wire.leases.borrow().len(), 2, "not again before the next beat is due");
+        t.started(sleeper());
+        t.beat_if_due(&store, &m, &wire);
+        assert_eq!(wire.leases.borrow().len(), 4, "a new master is beaten at once");
+        t.stop();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A seat opened a moment ago has no claim yet and is not told to stop.
+    #[test]
+    fn a_seat_that_has_only_just_opened_is_told_ok_not_stop() {
+        let (store, root) = store_with_seats("young", &[("cpd-7", "mb2")]);
+        set_started(&store, "cpd-7", 5);
+        let wire = script();
+        Tunnel::new().beat_if_due(&store, &Machine::new("mb2", "mb2"), &wire);
+        assert_eq!(wire.leases.borrow()[0].1, "ok");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Last-heard moves only on an answer: a beat nobody answers leaves it where
+    /// it was, and one answer among several is enough to move it.
+    #[test]
+    fn last_heard_moves_only_when_a_beat_is_answered() {
+        let (store, root) = store_with_seats("heard", &[("cpd-7", "mb2"), ("cpd-8", "mb2")]);
+        let m = Machine::new("mb2", "mb2");
+        let wire = script();
+        *wire.deaf.borrow_mut() = vec!["cpd-7".into(), "cpd-8".into()];
+        let mut t = Tunnel::new();
+        t.live.heard = "2026-11-06T10:00:00Z".into();
+
+        let failed = t.beat_if_due(&store, &m, &wire);
+        assert_eq!(failed.len(), 2, "both said why: {failed:?}");
+        assert_eq!(t.live.heard, "2026-11-06T10:00:00Z", "no answer, no change");
+
+        t.next_beat = None;
+        *wire.deaf.borrow_mut() = vec!["cpd-7".into()];
+        let failed = t.beat_if_due(&store, &m, &wire);
+        assert_eq!(failed.len(), 1);
+        assert_ne!(t.live.heard, "2026-11-06T10:00:00Z", "one answer moves it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A machine with no far seats is not beaten, and does not claim to have
+    /// been heard.
+    #[test]
+    fn a_machine_with_no_far_seats_sends_nothing_and_hears_nothing() {
+        let (store, root) = store_with_seats("none", &[("cpd-1", "")]);
+        let wire = script();
+        let mut t = Tunnel::new();
+        t.beat_if_due(&store, &Machine::new("mb2", "mb2"), &wire);
+        assert!(wire.leases.borrow().is_empty() && t.live.heard.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1386,8 +1386,36 @@ pub struct Machine {
     /// it. Every reader takes the cap as an [`Option<usize>`] rather than a
     /// [`Machine`] for that reason.
     pub agents: Option<usize>,
+    /// How long a far seat may go unheard before its agent is held, in seconds
+    /// (`docs/remote-agents.md` section 3). `None` is [`DEFAULT_LEASE`]; read it
+    /// through [`Machine::lease_secs`]. Short, because the daemon's beat keeps it
+    /// alive every [`crate::far::BEAT_SECS`]: a lease is how long a dead link is
+    /// tolerated, not how long the agent may work.
+    pub lease: Option<u32>,
+    /// What a far seat does when the link is gone. Only `required` exists: the
+    /// agent acts only while it can talk back. Empty is `required`. It is the
+    /// field version 2 widens (section 4) and is a field now so that widening
+    /// is a new word and not a new record shape.
+    pub link: String,
     pub added: String,
     pub body: String,
+}
+
+/// The lease a machine has when none is set: three beats of slack is 90 s, and
+/// two to three minutes is what Ed asked for (agent-028).
+pub const DEFAULT_LEASE: u32 = 180;
+
+/// The one link mode there is.
+pub const LINK_REQUIRED: &str = "required";
+
+/// What `link=` may be set to, or the sentence that says why not.
+pub fn valid_link(word: &str) -> Result<(), String> {
+    match word {
+        LINK_REQUIRED => Ok(()),
+        other => Err(format!(
+            "link `{other}` is not a link mode — the only one is `required` (an agent acts only while it can talk back to the seat); the others are version 2 and are not built"
+        )),
+    }
 }
 
 /// The characters a machine name may use, and why it is not just a filename.
@@ -1454,9 +1482,17 @@ impl Machine {
             // rejected file would be a hand-edit that stops the daemon
             // reaching a machine over a typo in a field nothing dials.
             agents: doc.opt("agents").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0),
+            // Unreadable is the default, for `agents`' reason.
+            lease: doc.opt("lease").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0),
+            link: doc.str("link"),
             added: doc.str("added"),
             body: doc.body.clone(),
         }
+    }
+
+    /// The lease in seconds: what is set, or [`DEFAULT_LEASE`].
+    pub fn lease_secs(&self) -> u32 {
+        self.lease.unwrap_or(DEFAULT_LEASE)
     }
 
     pub fn to_doc(&self) -> Doc {
@@ -1481,6 +1517,13 @@ impl Machine {
         // existed.
         if let Some(n) = self.agents {
             d.set_str("agents", &n.to_string());
+        }
+        // Both only when set, like `agents`.
+        if let Some(n) = self.lease {
+            d.set_str("lease", &n.to_string());
+        }
+        if !self.link.is_empty() {
+            d.set_str("link", &self.link);
         }
         d.set_str("added", &self.added);
         d.set_str("schema", SCHEMA);

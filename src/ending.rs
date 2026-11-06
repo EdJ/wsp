@@ -387,7 +387,7 @@ fn released_from(m: &Task, seat: &str) -> bool {
 }
 
 /// Every seat a binding or a claim's agent holds.
-fn held_seats(store: &Store) -> std::collections::BTreeSet<String> {
+pub(crate) fn held_seats(store: &Store) -> std::collections::BTreeSet<String> {
     let mut out: std::collections::BTreeSet<String> = store.bindings().into_keys().collect();
     let agents = store.agents_held();
     for claim in store.claims().values() {

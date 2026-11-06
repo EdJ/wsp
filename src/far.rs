@@ -538,6 +538,28 @@ pub trait Wire {
     fn forward(&self, m: &Machine, op: &str, local: &Path, far: &str) -> Result<(), String>;
     /// The directory a seat's forwarded sockets are made in.
     fn dir(&self, m: &Machine) -> PathBuf;
+    /// One beat to one seat: `lease <seat> <state>` on the seat's forwarded
+    /// controller socket `socket`. `Ok` only when the far side answered.
+    fn lease(&self, m: &Machine, socket: &Path, seat: &str, state: &str) -> Result<(), String>;
+}
+
+/// How often the daemon beats each far seat (`docs/remote-agents.md` section 3).
+pub const BEAT_SECS: u64 = 30;
+
+/// How long one beat waits for the far side's answer. Short, because beats are
+/// sent from the tick, one seat after another.
+pub const BEAT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a seat with no claim yet is left alone: it is opened a moment
+/// before its claim lands, and a `stop` in that gap would end an agent that
+/// has not begun. Two beats.
+pub const BEAT_GRACE_SECS: i64 = 2 * BEAT_SECS as i64;
+
+/// The line one beat sends, as compound-remote's socket reads it: the verb
+/// `lease <seat> ok|stop` in the render wire's JSON framing. The one place the
+/// frame is written, so a change on the compound side is a change here only.
+pub fn lease_line(wire: u32, seat: &str, state: &str) -> String {
+    format!("{}\n", serde_json::json!({ "ver": wire, "lease": { "seat": seat, "state": state } }))
 }
 
 /// The real way: ssh, over the machine's ControlMaster.
@@ -578,6 +600,123 @@ impl Wire for Ssh {
         let store = crate::store::Store::open();
         store.machine_socket(&m.name).parent().map(Path::to_path_buf).unwrap_or(store.state.clone())
     }
+
+    fn lease(&self, _m: &Machine, socket: &Path, seat: &str, state: &str) -> Result<(), String> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
+        let _ = stream.set_write_timeout(Some(BEAT_TIMEOUT));
+        let _ = stream.set_read_timeout(Some(BEAT_TIMEOUT));
+        stream
+            .write_all(lease_line(crate::place_compound::wire_version(), seat, state).as_bytes())
+            .map_err(|e| format!("lease not sent: {e}"))?;
+        let mut reply = String::new();
+        let n = BufReader::new(&stream).read_line(&mut reply).map_err(|e| format!("no answer to the lease: {e}"))?;
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        if n == 0 {
+            return Err("the far side closed without answering the lease".into());
+        }
+        // A reply that says `error` was heard and refused; the seat is not
+        // known to be there, which is not an answer.
+        match serde_json::from_str::<serde_json::Value>(&reply).ok().and_then(|v| v.get("error").map(|e| e.to_string())) {
+            Some(e) => Err(format!("the far side refused the lease: {e}")),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A far seat as the beat sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeatSeat {
+    pub id: String,
+    /// The seat's forwarded controller socket, on this side.
+    pub socket: PathBuf,
+    /// Whether a claim or a binding still holds the seat.
+    pub held: bool,
+    /// Seconds since the seat was started; `None` when the record does not say.
+    pub age: Option<i64>,
+}
+
+impl BeatSeat {
+    /// `ok` while the seat is held, `stop` once its claim is released. A seat
+    /// younger than [`BEAT_GRACE_SECS`] with no hold yet is still `ok`.
+    pub fn state(&self) -> &'static str {
+        match (self.held, self.age) {
+            (true, _) => "ok",
+            (false, Some(a)) if a < BEAT_GRACE_SECS => "ok",
+            (false, _) => "stop",
+        }
+    }
+}
+
+/// One round of beats to the far seats of `m`: each gets its own `ok` or `stop`
+/// on its own socket. `live.heard` moves to `now` only when at least one beat
+/// was answered; a beat that failed changes nothing. Returns the seats that did
+/// not answer, with why, for the daemon's log.
+pub fn beat(m: &Machine, seats: &[BeatSeat], wire: &dyn Wire, live: &mut MachineLive, now: &str) -> Vec<(String, String)> {
+    let mut failed = Vec::new();
+    let mut answered = false;
+    for s in seats {
+        match wire.lease(m, &s.socket, &s.id, s.state()) {
+            Ok(()) => answered = true,
+            Err(why) => failed.push((s.id.clone(), why)),
+        }
+    }
+    if answered {
+        live.heard = now.to_string();
+    }
+    failed
+}
+
+/// The far `compound-remote`: beside the far `compound-sup` when the record
+/// names where that is, else the bare name.
+pub fn remote_of(m: &Machine) -> String {
+    match m.sup_at.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/compound-remote"),
+        None => "compound-remote".to_string(),
+    }
+}
+
+/// The PreToolUse hook command of a far seat (`docs/remote-agents.md` section 3).
+pub fn gate_command(m: &Machine, seat: &str) -> String {
+    format!(
+        "{} gate --exec-dir {} --seat {} --lease {}",
+        remote_of(m),
+        quote(&m.exec_dir),
+        quote(seat),
+        m.lease_secs()
+    )
+}
+
+/// What the hook may take, in seconds: the gate waits up to the lease, so the
+/// hook's own timeout is above it.
+pub fn gate_timeout(m: &Machine) -> u32 {
+    m.lease_secs() + 60
+}
+
+/// `existing` (the far tree's `.claude/settings.json`, empty when there is none)
+/// with the gate under `hooks.PreToolUse`. An earlier gate entry is replaced and
+/// everything else is kept. An existing file that is not a JSON object is an
+/// error: it is somebody's configuration and is not overwritten.
+pub fn settings_with_gate(existing: &str, m: &Machine, seat: &str) -> Result<String, String> {
+    let mut doc: serde_json::Value = match existing.trim() {
+        "" => serde_json::json!({}),
+        text => serde_json::from_str(text).map_err(|e| format!("the far .claude/settings.json is not JSON ({e}); not overwriting it"))?,
+    };
+    let Some(top) = doc.as_object_mut() else {
+        return Err("the far .claude/settings.json is not a JSON object; not overwriting it".into());
+    };
+    let hooks = top.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let Some(hooks) = hooks.as_object_mut() else { return Err("`hooks` in the far .claude/settings.json is not an object".into()) };
+    let pre = hooks.entry("PreToolUse").or_insert_with(|| serde_json::json!([]));
+    let Some(pre) = pre.as_array_mut() else { return Err("`hooks.PreToolUse` in the far .claude/settings.json is not a list".into()) };
+    pre.retain(|entry| {
+        !entry["hooks"].as_array().into_iter().flatten().any(|h| h["command"].as_str().is_some_and(|c| c.contains(" gate --exec-dir ")))
+    });
+    pre.push(serde_json::json!({
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": gate_command(m, seat), "timeout": gate_timeout(m) }],
+    }));
+    serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())
 }
 
 /// The `socket <path>` line of `compound-sup spawn`'s handshake. (`sup <pid>` is
@@ -863,5 +1002,77 @@ mod tests {
         let closed = run_bounded(close, Duration::from_secs(10)).unwrap().expect("close returns").status;
         assert!(closed.success());
         let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    fn seat(held: bool, age: Option<i64>) -> BeatSeat {
+        BeatSeat { id: "cpd-7".into(), socket: PathBuf::from("/x/cpd-7.sock"), held, age }
+    }
+
+    /// `ok` while something holds the seat, `stop` once nothing does — except in
+    /// the moments after it opened, before its claim has landed.
+    #[test]
+    fn a_held_seat_is_told_ok_and_a_released_one_stop_but_not_before_its_claim_lands() {
+        assert_eq!(seat(true, Some(3600)).state(), "ok");
+        assert_eq!(seat(false, Some(3600)).state(), "stop");
+        assert_eq!(seat(false, Some(5)).state(), "ok", "just opened");
+        assert_eq!(seat(false, None).state(), "stop", "no start time to excuse it");
+    }
+
+    #[test]
+    fn the_beat_frame_names_the_seat_and_the_state() {
+        let line = lease_line(9, "cpd-7", "stop");
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!((v["ver"].as_u64(), v["lease"]["seat"].as_str(), v["lease"]["state"].as_str()), (Some(9), Some("cpd-7"), Some("stop")));
+    }
+
+    /// The real wire speaks to a socket: an answer is a line back, a refusal is
+    /// not an answer, and a socket nobody listens on fails.
+    #[test]
+    fn the_real_beat_reads_an_answer_off_the_socket_and_fails_without_one() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = PathBuf::from("/tmp").join(format!("wl-{}-{}", std::process::id(), crate::util::epoch_nanos() % 100_000));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            for reply in ["{\"ok\":true}\n", "{\"error\":\"no such seat\"}\n"] {
+                let (mut c, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+                got.push(line);
+                c.write_all(reply.as_bytes()).unwrap();
+            }
+            got
+        });
+        let m = machine();
+        assert_eq!(Ssh.lease(&m, &sock, "cpd-7", "ok"), Ok(()));
+        let refused = Ssh.lease(&m, &sock, "cpd-7", "stop").unwrap_err();
+        assert!(refused.contains("refused"), "{refused}");
+        let got = server.join().unwrap();
+        assert!(got[0].contains("\"state\":\"ok\"") && got[1].contains("\"state\":\"stop\""), "{got:?}");
+        assert!(Ssh.lease(&m, &dir.join("none.sock"), "cpd-7", "ok").is_err(), "nobody listening");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hook carries the machine's lease, outlives it, replaces an earlier
+    /// gate rather than doubling it, and will not overwrite a settings file it
+    /// cannot read.
+    #[test]
+    fn the_gate_carries_the_lease_outlives_it_and_is_written_once() {
+        let mut m = machine();
+        m.exec_dir = "/far/exec".into();
+        m.sup_at = "/opt/c/bin/compound-sup".into();
+        m.lease = Some(300);
+        let once = settings_with_gate("", &m, "cpd-7").unwrap();
+        let twice = settings_with_gate(&once, &m, "cpd-7").unwrap();
+        assert_eq!(once, twice, "idempotent");
+        let v: serde_json::Value = serde_json::from_str(&once).unwrap();
+        let h = &v["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert_eq!(h["command"], "/opt/c/bin/compound-remote gate --exec-dir '/far/exec' --seat 'cpd-7' --lease 300");
+        assert!(h["timeout"].as_u64().unwrap() > 300);
+        assert!(settings_with_gate("not json", &m, "cpd-7").unwrap_err().contains("not overwriting"));
+        assert!(settings_with_gate("[]", &m, "cpd-7").is_err());
     }
 }

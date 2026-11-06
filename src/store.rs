@@ -202,6 +202,11 @@ pub struct MachineLive {
     /// When it last answered. Kept across a drop, so an offline row can say how
     /// long it has been offline rather than just that it is.
     pub last_seen: String,
+    /// When a far seat's beat last got an answer (`docs/remote-agents.md`
+    /// section 3). Empty: never. Not `last_seen`, which is the probe's: a link
+    /// can answer a probe while the seat's supervisor does not answer a beat,
+    /// and the lease runs on this one.
+    pub heard: String,
     /// `up` | `down` | `starting` | `retrying`. The ssh connection, which can
     /// be down while the machine itself is fine and is worth telling apart when
     /// you are looking at why nothing is arriving.
@@ -236,6 +241,7 @@ impl MachineLive {
         MachineLive {
             reachable: v.get("reachable").and_then(|x| x.as_bool()).unwrap_or(false),
             last_seen: s("last_seen"),
+            heard: s("heard"),
             tunnel: s("tunnel"),
             socket: s("socket"),
             wire: v.get("wire").and_then(|x| x.as_u64()).map(|n| n as u32),
@@ -250,6 +256,7 @@ impl MachineLive {
         json!({
             "reachable": self.reachable,
             "last_seen": self.last_seen,
+            "heard": self.heard,
             "tunnel": self.tunnel,
             "socket": self.socket,
             "wire": self.wire,

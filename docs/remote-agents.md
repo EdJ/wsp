@@ -80,25 +80,42 @@ the heartbeat is stale the next tool call is held; nothing else is done on the
 agent's behalf. The agent is not killed, not told anything it must remember, and
 does not know it waited.
 
-**Mechanism, three small parts on the far side, none of them wsp state:**
+**Mechanism (revised 2026-11-06, agent-028).** The beat comes from the seat's
+daemon, the lease is short, and the far side is `compound-remote` in compound;
+there is no shell loop and no `executor/` script.
 
-- `executor/heartbeat`, started with the seat by the spawn command and left in its
-  process group so it dies with the seat. Every 10 s it runs `wsp lease <seat>`
-  through the shim; on success it touches `<exec_dir>/lease/<seat>` and writes the
-  seat's answer into it (`ok`, or `stop`, which the seat says when the claim has
-  been released). The ssh uses `ConnectTimeout=5`, `ServerAliveInterval=10`,
-  `ServerAliveCountMax=3`, so a dead link is noticed in about 30 s and a hung
-  call never outlasts the interval.
-- `executor/gate`, a `PreToolUse` hook (the same pattern as the long-timeout
-  `PermissionHold` hook of wsp-301, so long hook timeouts are already in use
-  here). It reads the lease file's age, which is a local `stat` and no network.
-  Fresh (under 30 s) and `ok`: exit 0 at once. Stale: it sleeps and re-reads,
-  for up to the **lease**, 20 minutes by default, set per machine. Back within
-  the lease: exit 0 and the tool call proceeds, so the agent resumes where it was
-  in the same turn. Lease out, or the file says `stop`: exit 2 with a plain line,
-  `seat unreachable beyond the lease — stop work and end your turn`, and every
-  later tool call gets the same until the heartbeat returns. A missing heartbeat
-  process makes the file stale, so the gate **fails closed**.
+- **The beat.** Every 30 s (`far::BEAT_SECS`) the daemon sends each far seat on
+  each reachable machine `lease <seat> ok` through the seat's forwarded
+  controller socket (the `.sock` of section 2), or `lease <seat> stop` once
+  nothing holds the seat any more (its claim is released; a seat opened less than
+  two beats ago is still told `ok`, since its claim lands a moment after it
+  opens). Only seats whose record names the machine are beaten: a local seat
+  hears nothing. A beat that is answered sets the machine's `heard` time in
+  `machines.json`; one that fails changes nothing, so `heard` is the last time
+  the far supervisor really answered, which the probe's `last_seen` is not. The
+  first beat on a new master is at once, so a held seat is let go as soon as the
+  link is back.
+- **The lease.** A machine field, in seconds, default 180 (`wsp machine set mb2
+  lease=240`): how long a far seat may go unheard before its agent is held. Two to
+  three minutes, because a beat every 30 s makes a dead link visible in about one
+  beat and the lease is only the allowance for a laptop lid or a flapping route.
+  It is no longer 20 minutes, which was a bound on work without a seat, not a
+  bound on a missed beat.
+- **The gate.** `compound-remote gate --exec-dir <d> --seat <s> --lease <n>`, a
+  `PreToolUse` hook (the same pattern as the long-timeout `PermissionHold` hook
+  of wsp-301). `spawn --on` writes it into the far tree's `.claude/settings.json`
+  before the agent starts, merged into whatever that file holds, with a hook
+  timeout of the lease plus 60 s so the hook is not cut off while it waits. The
+  gate reads the lease the far `compound-remote` recorded from the last beat
+  (local, no network): fresh and `ok` passes at once; stale it waits up to the
+  lease and passes if the beat returns, so the agent resumes in the same turn;
+  past the lease, or told `stop`, it exits 2 with `seat unreachable beyond the
+  lease — stop work and end your turn`, and so does every later call until a
+  beat returns. No beat at all is stale: the gate **fails closed**. Its
+  semantics live in the compound-remote row; wsp's half is the beat, the two
+  machine fields and the installation.
+- **`link`.** A machine field that takes one word, `required`, and refuses
+  anything else with a sentence. It is the field version 2 widens (section 4).
 - the shim's own exit status. A `wsp` verb that cannot reach the seat exits 75
   (`EX_TEMPFAIL`) with `wsp: the seat is unreachable (link down since <time>)`,
   distinct from a verb that ran and failed, so an agent, a hook and a person can
@@ -132,7 +149,7 @@ within a minute of the link. Then, in order: re-add the per-seat forwards; probe
 the wire version again (a far machine that rebooted may have lost its
 supervisors, in which case its census is `heard` and empty, and *that* is when a
 claim is reaped, with the rule unchanged); take a census; the seat's state
-becomes real again; the heartbeat's next beat touches the lease; the gate
+becomes real again; the daemon's next beat renews the lease; the gate
 passes; held tells flush; and a copy-back checkpoint runs (section 6), because
 an in-flight command may have changed files. If the seat's wsp was the one that
 slept (a laptop lid), the far side sees the same thing and the same lease
@@ -351,6 +368,6 @@ The groups run in order, and group 2 is manual, so nothing starts without Ed.
 1. Patches (`format-patch`/`am`) for the agent's commits, or one snapshot commit
    per copy-back (section 6)? Recommendation: patches.
 2. Which machine for the proof (section 8)? Recommendation: one that stays up.
-3. The lease, 20 minutes by default (section 3): long enough for a laptop sleep,
-   short enough that a lost machine does not hold a row all day.
+3. The lease: decided 2026-11-06 (agent-028) as 180 s with a 30 s beat (section 3),
+   per machine.
 4. Retire wsp-071 as the duplicate of wsp-070.
