@@ -1663,7 +1663,10 @@ mod tests {
             std::fs::write(&from, "read it in the tree; that is the verdict").unwrap();
             let from = from.display().to_string();
             let args = Args::synth("verified", &["m-1", "--from", &from], &[(flag, "true"), ("caption", "it was read in the tree")]);
-            cmd_verified(&self.store, &args)
+            // The seat is said here (none: the member's pass is the newest
+            // running one), not read off the process env, which a sibling test
+            // that sets the seat without the env lock can change mid-run.
+            verified_as(&self.store, &args, None)
         }
         fn trunk(&self) -> String {
             git_t(&self.repo, &["rev-parse", "master"])
@@ -1693,6 +1696,21 @@ mod tests {
         assert_eq!(t.status_raw, "review");
         let again = Pass::parse(&p.line().lines().next().unwrap().to_string()).unwrap();
         assert_eq!(again.landed, p.landed, "the clause reads back");
+    }
+
+    /// A sibling test sets the seat env without the env lock, so a hold read
+    /// as that seat opened a fresh pass at the landed commit and not the one
+    /// read. The verdict names its seat itself and does not read the process's.
+    #[test]
+    fn a_hold_does_not_depend_on_a_seat_set_in_the_process() {
+        let g = ground("seat-env", "", &[("m.txt", "mine\n")], &[("t.txt", "theirs\n")]);
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-other");
+        let code = g.verdict("holds");
+        std::env::remove_var(crate::place::SEAT_ENV);
+        assert_eq!(code, 0);
+        let p = passes(&g.member()).pop().unwrap();
+        assert_eq!(passes(&g.member()).len(), 1, "the open pass closed; no second one opened");
+        assert!(same_commit(p.read.as_deref().unwrap(), &g.ready), "the pass keeps the commit it read");
     }
 
     #[test]
