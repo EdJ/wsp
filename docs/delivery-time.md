@@ -58,8 +58,12 @@ The group after one starts before the previous check has passed in 3 of 4
 transitions (group 2 at 14:16 against a pass at 14:17, group 3, group 5), so the
 check seat is mostly **off** the wall of the next group's start and on the
 wall of the row's landing "and its barrier passed". Group 3 → 4 is the
-exception: 14.5 min between the pass (17:24) and wsp-382's start (17:39), not
-explained here (§3.9).
+exception: 14.5 min between the pass (17:24) and wsp-382's start (17:39). It is
+not the governor (§3.9): group 4's first member, wsp-381, started at the pass
+(17:24:40). wsp-382 was the second, and `cycle.log` has it waiting at 17:32:08
+because the seat was at its cap of 4 — a barrier 2 check idle in cpd-2999, two
+agents and compound-984 — until wsp closed that check at 17:35:25 ("seat idle
+11m"), and then 3.8 min more to its start at 17:39:13. The cap is §3.6's.
 
 ## 2. The 2.2 h of unnamed waits
 
@@ -154,7 +158,7 @@ The measure is a figure in the *next pass's* `effort.json` that says it worked.
 | 3.6 | cap held by finished seats (`wsp-385` landed; `wsp-394`) | 4–13 min on group 3 alone (wsp-360 waited ~800 s, wsp-334 ~490 s) | S, to show it | cap seconds per group, with the holder named and whether it had finished; no finished seat in a holder list |
 | 3.7 | auto-pass with stop-checks (`wsp-396`) | check seat 2.3–4.8 min a group, plus a place and a governor turn; 0 until stops are mechanical | S to write, Ed's call to turn on | check-seat seconds in the report; groups passed by wsp |
 | 3.8 | overlap barrier steps (`wsp-395`) | none on the delivery wall by itself: the 56 min of runs is the wait `wsp-414` hides (parallel groups and bigger lists, from `wsp-362` and `wsp-363`), so the next group no longer sits behind it; overlap only shortens the run itself (suite is serial in one tree), unpriced until 3.1 | M | barrier run seconds per group at the same step count; with `wsp-414`, the next group's start against the previous barrier run's end |
-| 3.9 | governor turns in the wall (`wsp-398`) | unknown: the report prices the governor as cost only; 14.5 min pass → start on group 3 → 4 is unexplained | S | governor seconds between a pass and the next start |
+| 3.9 | governor turns in the wall (`wsp-398`) | the governor was not the 14.5 min on group 3 → 4: the cap was (§1); the effort report now gives governor turns and idle per group from pass to the next start (`wsp-398`) | S | governor seconds between a pass and the next start, per group, in `effort.json` `groups[].governor_wall` |
 | 3.10 | name a command waiting on itself (`wsp-397`) | 716 stalls in 409 of 3 298 transcripts, 2026-10-07 to 11-06, 349 564 s (97 h) held; 292 of them (27 h) are the three named shapes, see below | M | stuck-command flags per pass in wip, each with the seconds it held (built: `src/stuck.rs`, `repair::stuck_tick`) |
 
 **3.10, what `wsp stuck ~/.claude/projects/*/*.jsonl` counted.** A foreground
@@ -219,8 +223,13 @@ Candidates the data does not support, with the reason:
   place, and the cap is the resource the rows already wait on (3.6).
 - **Shorter ticks**: none of the twelve rows has a tick-sized gap; the poke works
   (hand-offs 1–8 s in compounding-102, compound-934 and compounding-061).
-- **The governor skipping a turn when nothing needs judgement**: not priced; the
-  report has no governor wall figure (3.9 gives it one first).
+- **The governor skipping a turn when nothing needs judgement**: priced by the
+  effort report (3.9). In each window from a pass to the next group's last start
+  it gives the governor's turns, model and tool seconds and idle, and the
+  turns that only looked (a watch, a listing, a bare reply) with the model
+  seconds they held — the most a skipped turn gives back. Read it on the next
+  list before deciding; on pre-prep group 3 → 4 the governor's seat was gone from
+  17:27 to 17:29 and the wall was the cap, which a skipped turn does not move.
 
 ## 4. Migration: the first improvement stage
 

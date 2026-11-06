@@ -217,6 +217,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let mut net_red_rows: Vec<Value> = Vec::new();
     let (mut fixed_first, mut fixed_vfirst, mut fixed_held): (Vec<i64>, Vec<i64>, Vec<i64>) = Default::default();
     let mut fixed_tests = 0i64;
+    let mut group_starts: Vec<(i64, i64)> = Vec::new();
 
     for (gi, g) in groups.iter().enumerate() {
         let (mut gwall, mut gmodel, mut gtool) = (0i64, 0i64, 0i64);
@@ -226,8 +227,15 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
         // member's figures hold it (their own timeline shows it); the sums take
         // it out of the members and put it back once per group (`wsp-390`).
         let mut shared: Option<crate::timeline::RowFigures> = None;
+        let (mut gstart, mut glast) = (0i64, 0i64);
         for m in &g.members {
             let f = figures(m);
+            if f.end > 0 && f.start > 0 && (gstart == 0 || f.start < gstart) {
+                gstart = f.start;
+            }
+            if f.end > 0 {
+                glast = glast.max(f.start);
+            }
             if shared.as_ref().is_none_or(|s| f.shared > s.shared) {
                 shared = Some(crate::timeline::RowFigures { shared: f.shared, shared_gap: f.shared_gap, shared_waits: f.shared_waits.clone(), ..Default::default() });
             }
@@ -307,6 +315,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
                 *waits.entry(k.clone()).or_insert(0) += v;
             }
         }
+        group_starts.push((gstart, glast));
         let gcost = cost["groups"].get(gi).and_then(|c| c.get("total")).cloned().unwrap_or(Value::Null);
         // How the group's barrier was scoped, against a full run (`wsp-431`).
         let note = crate::scope::Note::read(store, &w.id, gi + 1);
@@ -328,6 +337,12 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "kind": g.kind, "barrier_scope": note.as_ref().map(|n| n.json()).unwrap_or(Value::Null),
         }));
     }
+    let gov = governor_wall(store, &w.id, &group_starts);
+    for (gi, gj) in group_json.iter_mut().enumerate() {
+        gj["governor_wall"] = gov.get(gi).and_then(|x| x.as_ref()).map_or(Value::Null, GovWall::json);
+    }
+    let govs: Vec<&crate::timeline::GovernorWindow> = gov.iter().flatten().filter_map(|x| x.to_last.as_ref()).collect();
+    let held: i64 = gov.iter().flatten().map(|x| x.last - x.pass).sum();
     let followups: Vec<Value> = crate::cmd_worklist::followups(w).into_iter().map(|(row, ids)| json!({ "by": row, "rows": ids })).collect();
     let mut wait_list: Vec<(String, i64)> = waits.into_iter().collect();
     wait_list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -345,6 +360,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "cost": "whole row: every seat — members, verifiers, barrier checks, governors",
             "full_suite": "full_suite_runs: full-suite `cargo test` runs started in a member's or verifier's seat (the shim's note, wsp-389), by row and group. The barrier's own run is one per group and is not counted here; the aim is zero in seats.",
             "barrier_scope": "groups[].barrier_scope: the barrier's run scoped to what the group touched (wsp-431) — scoped or full and why, the targets it ran, shared paths that widened it, its seconds against the last full run's, and net_red: scoped barriers a red full run stood behind, which is what scoping let through",
+            "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start. null where no group follows or no pass is found; the governor figures are null where its transcript is not found",
             "time": "per member row, spawn to verdict (wall, gaps); the seat's model and tool time are its own transcript calls inside those phases, legs only where run-leg timings exist",
         },
         "totals": {
@@ -365,6 +381,13 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "unmeasured_seats": total["unmeasured"],
             "transcripts_missing": missing_sessions,
             "full_suite_runs": suites_total,
+            "pass_to_last_start_seconds": held,
+            "governor_wall_seconds": govs.iter().map(|g| g.seconds).sum::<i64>(),
+            "governor_wall_turns": govs.iter().map(|g| g.turns).sum::<u64>(),
+            "governor_wall_model_seconds": govs.iter().map(|g| g.model_secs).sum::<i64>(),
+            "governor_wall_idle_seconds": govs.iter().map(|g| g.idle_secs).sum::<i64>(),
+            "governor_looking_turns": govs.iter().map(|g| g.looking_turns).sum::<u64>(),
+            "governor_looking_seconds": govs.iter().map(|g| g.looking_secs).sum::<i64>(),
             "scoped_barriers": scoped_n,
             "full_barriers": full_n,
             "scoped_seconds_saved": saved_secs,
@@ -389,6 +412,96 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
         v["baseline"] = against(&v, b);
     }
     v
+}
+
+/// What the run did between a group's barrier pass and the next group's
+/// starts (`wsp-398`).
+struct GovWall {
+    pass: i64,
+    /// The next group's first member start, and its last (all started).
+    first: i64,
+    last: i64,
+    /// The governor's turns to each; `None` where its transcript is not found.
+    to_first: Option<crate::timeline::GovernorWindow>,
+    to_last: Option<crate::timeline::GovernorWindow>,
+    /// The first line the cycle log wrote in the window saying why a member of
+    /// the next group was waiting.
+    held_by: Option<String>,
+}
+
+impl GovWall {
+    fn json(&self) -> Value {
+        let win = |w: &Option<crate::timeline::GovernorWindow>| {
+            w.as_ref().map_or(Value::Null, |w| {
+                json!({
+                    "turns": w.turns, "model_seconds": w.model_secs, "tool_seconds": w.tool_secs, "idle_seconds": w.idle_secs,
+                    "looking_turns": w.looking_turns, "looking_model_seconds": w.looking_secs,
+                })
+            })
+        };
+        json!({
+            "pass_at": util::iso_at(self.pass),
+            "first_start_at": util::iso_at(self.first), "last_start_at": util::iso_at(self.last),
+            "seconds_to_first_start": self.first - self.pass, "seconds_to_last_start": self.last - self.pass,
+            "governor_to_first_start": win(&self.to_first), "governor_to_last_start": win(&self.to_last),
+            "held_by": self.held_by,
+        })
+    }
+}
+
+/// For each group, the window from its barrier pass (the `worklist-go` that
+/// crossed it) to the next group's first and last member start
+/// (`group_starts[i + 1]`), with the governor's turns in each: `None` for the
+/// last group, a group not yet started, or a pass not found (`wsp-398`).
+/// Group 3 → 4 of pre-prep: the group started at the pass (0 s) and its second
+/// member waited 14.5 min — the seat's cap of 4 — which the last start shows.
+fn governor_wall(store: &Store, list: &str, group_starts: &[(i64, i64)]) -> Vec<Option<GovWall>> {
+    let text = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
+    let mut passes: BTreeMap<u64, i64> = BTreeMap::new();
+    let mut sessions: Vec<String> = Vec::new();
+    for v in text.lines().filter(|l| l.contains("worklist-go") || l.contains("session-learned")).filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        let d = &v["data"];
+        match v["kind"].as_str() {
+            Some("worklist-go") if d["id"] == list => {
+                if let Some(p) = d["passed"].as_u64() {
+                    passes.entry(p).or_insert_with(|| util::epoch_of(v["ts"].as_str().unwrap_or("")));
+                }
+            }
+            Some("session-learned") if d["project"] == list => {
+                if let Some(s) = d["session"].as_str().filter(|s| !sessions.iter().any(|x| x == s)) {
+                    sessions.push(s.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let cycle = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+    (0..group_starts.len())
+        .map(|gi| {
+            let pass = *passes.get(&(gi as u64 + 1))?;
+            let (first, last) = group_starts.get(gi + 1).copied().filter(|(f, _)| *f > 0)?;
+            let (first, last) = (first.max(pass), last.max(first).max(pass));
+            let head = format!("{list} group {}: ", gi + 2);
+            let held_by = cycle
+                .lines()
+                .filter(|l| l.len() > 21 && l.is_char_boundary(21))
+                .filter(|l| {
+                    let t = util::epoch_of(&l[..20]);
+                    t >= pass && t <= last
+                })
+                .map(|l| l[20..].trim_start())
+                .find(|r| r.starts_with(&head) && r.contains(" waits — "))
+                .map(|r| r[head.len()..].to_string());
+            Some(GovWall {
+                pass,
+                first,
+                last,
+                to_first: crate::timeline::governor_window(&sessions, pass, first),
+                to_last: crate::timeline::governor_window(&sessions, pass, last),
+                held_by,
+            })
+        })
+        .collect()
 }
 
 /// The previous pass beside this one, each ratio shown (this ÷ baseline).
@@ -463,6 +576,8 @@ pub fn effort_html(v: &Value) -> String {
             vec!["unmeasured seats".into(), n(t, "unmeasured_seats").to_string()],
             vec!["transcripts not found".into(), n(t, "transcripts_missing").to_string()],
             vec!["full suites run in member or verifier seats".into(), n(t, "full_suite_runs").to_string()],
+            vec!["each pass to the next group's last start: window / governor turns / governor idle".into(), format!("{} / {} / {}", hms(n(t, "pass_to_last_start_seconds") as i64), n(t, "governor_wall_turns"), hms(n(t, "governor_wall_idle_seconds") as i64))],
+            vec!["governor turns that only looked (model time a skipped turn gives back)".into(), format!("{} ({})", n(t, "governor_looking_turns"), hms(n(t, "governor_looking_seconds") as i64))],
             vec!["barriers scoped / full".into(), format!("{} / {}", n(t, "scoped_barriers"), n(t, "full_barriers"))],
             vec!["seconds scoped barriers ran under a full run".into(), n(t, "scoped_seconds_saved").to_string()],
             vec!["safety-net reds scoping let through".into(), n(t, "safety_net_reds").to_string()],
@@ -481,6 +596,20 @@ pub fn effort_html(v: &Value) -> String {
         b.push_str(&format!("<h3>group {} · wall {} · model {} · tools {} · {} · {} turns · {} full suite(s) in seats</h3>", g["group"], hms(n(g, "wall_seconds") as i64), hms(n(g, "model_seconds") as i64), hms(n(g, "tool_seconds") as i64), usd(c["usd_micros"].as_u64()), n(c, "turns"), n(g, "full_suite_runs")));
         let rows: Vec<Vec<String>> = g["members"].as_array().into_iter().flatten().map(|m| vec![m["task"].as_str().unwrap_or("").into(), hms(n(m, "wall_seconds") as i64), hms(n(m, "model_seconds") as i64), hms(n(m, "gap_seconds") as i64), n(m, "tokens_in").to_string(), n(m, "tokens_out").to_string(), n(m, "full_suite_runs").to_string()]).collect();
         b.push_str(&table(&["member", "wall", "model", "gaps", "tokens in", "tokens out", "full suites"], &rows));
+        let gw = &g["governor_wall"];
+        if gw.is_object() {
+            let w = &gw["governor_to_last_start"];
+            let gov = if w.is_object() {
+                format!("governor {} turns · model {} · tools {} · idle {} · {} looked only ({})", n(w, "turns"), hms(n(w, "model_seconds") as i64), hms(n(w, "tool_seconds") as i64), hms(n(w, "idle_seconds") as i64), n(w, "looking_turns"), hms(n(w, "looking_model_seconds") as i64))
+            } else {
+                "governor transcript not found".to_string()
+            };
+            b.push_str(&format!(
+                "<p>next group: first start {} after the pass, last start {} after it · {}{}</p>",
+                hms(n(gw, "seconds_to_first_start") as i64), hms(n(gw, "seconds_to_last_start") as i64), esc(&gov),
+                gw["held_by"].as_str().map_or(String::new(), |h| format!(" · held: {}", esc(h)))
+            ));
+        }
     }
     let r = &v["rework"];
     b.push_str(&format!("<h2>4 · Rework</h2><p>{} blocked · {} reopened · {} dropped · {}</p>", n(r, "blocked"), n(r, "reopened"), n(r, "dropped"), usd(r["usd_micros"].as_u64())));
@@ -786,6 +915,27 @@ mod tests {
         let (_e, _s, w) = list("shown", &["r-1"]);
         let l = line(&w);
         assert!(l.contains("work.html (not yet)") && l.contains("effort.html (not yet)") && l.contains("shown"), "{l}");
+    }
+
+    #[test]
+    fn a_pass_to_the_next_groups_last_start_names_the_wait_that_held_it() {
+        let (_e, store, _w) = list("gw", &["r-1", "r-2"]);
+        store.log_event("worklist-go", json!({ "id": "gw", "passed": 1, "started": false }));
+        let go = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap();
+        // The pass is the one the event log stamped; the starts and the log are placed after it.
+        let pass = util::epoch_of(go.lines().last().and_then(|l| serde_json::from_str::<Value>(l).ok()).unwrap()["ts"].as_str().unwrap());
+        std::fs::write(
+            store.state_file("cycle.log"),
+            format!("{} gw group 2: r-2 waits — the seat is at its cap of 4: a, b, c, d\n", util::iso_at(pass + 5)),
+        )
+        .unwrap();
+        let w = governor_wall(&store, "gw", &[(pass - 100, pass - 50), (pass + 1, pass + 870)]);
+        let g = w[0].as_ref().expect("a window after group 1");
+        assert_eq!((g.first - g.pass, g.last - g.pass), (1, 870));
+        assert_eq!(g.held_by.as_deref(), Some("r-2 waits — the seat is at its cap of 4: a, b, c, d"));
+        assert!(g.to_last.is_none(), "no governor transcript here: named as null, not zero");
+        assert!(w[1].is_none(), "the last group has no next start");
+        assert_eq!(g.json()["seconds_to_last_start"], 870);
     }
 
     #[test]

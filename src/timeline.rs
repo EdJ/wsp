@@ -748,6 +748,8 @@ struct Call {
     tin: u64,
     cache_read: u64,
     out: u64,
+    /// What its tool uses ran: a Bash call's command, another tool's name.
+    cmds: Vec<String>,
 }
 
 const TOOL_KINDS: [&str; 4] = ["Bash", "Read", "Edit", "Write"];
@@ -788,6 +790,8 @@ fn read_transcript(text: &str) -> (Vec<Call>, Vec<(i64, String, i64)>) {
                 c.out = c.out.max(num("output_tokens"));
                 for b in m["content"].as_array().into_iter().flatten() {
                     if b["type"] == "tool_use" {
+                        let ran = b["input"]["command"].as_str().or_else(|| b["name"].as_str()).unwrap_or("");
+                        c.cmds.push(ran.trim().to_string());
                         if let (Some(id), Some(name)) = (b["id"].as_str(), b["name"].as_str()) {
                             pending.entry(id.to_string()).or_insert((t, name.to_string()));
                         }
@@ -825,6 +829,63 @@ pub(crate) fn session_secs(session: &str, since: i64) -> Option<(i64, i64)> {
     let model = calls.iter().filter(|c| c.at >= since).map(|c| (c.end - c.start).max(0)).sum();
     let tool = tools.iter().filter(|(at, _, _)| *at >= since).map(|(_, _, s)| *s).sum();
     Some((model, tool))
+}
+
+/// The governor's turns inside one window of the run: from a group's barrier
+/// pass to the next group's first start (`wsp-398`).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct GovernorWindow {
+    /// The window's length, seconds.
+    pub seconds: i64,
+    /// Model calls the governor began inside it.
+    pub turns: u64,
+    pub model_secs: i64,
+    pub tool_secs: i64,
+    /// The window under neither the governor's model nor its tools: the run
+    /// waiting on something that is not the governor.
+    pub idle_secs: i64,
+    /// Turns that only looked (a watch, a listing, a bare reply) and made no
+    /// change: what a governor that skips a turn when nothing needs judgement
+    /// would not take, and the model seconds they held.
+    pub looking_turns: u64,
+    pub looking_secs: i64,
+}
+
+/// A command that only reads the run: no choice was made by running it.
+fn only_looks(cmd: &str) -> bool {
+    let c = cmd.trim_start();
+    ["wsp watch", "wsp ls", "wsp status", "wsp wip", "wsp worklist next", "wsp worklist show", "wsp timeline", "sleep "]
+        .iter()
+        .any(|p| c.starts_with(p))
+}
+
+/// The governor's figures over `[from, to)` out of the transcripts of its
+/// sessions. `None` when none could be read.
+pub(crate) fn governor_window(sessions: &[String], from: i64, to: i64) -> Option<GovernorWindow> {
+    let texts: Vec<String> = sessions.iter().filter_map(|s| transcript(s)).collect();
+    governor_window_of(&texts, from, to)
+}
+
+fn governor_window_of(texts: &[String], from: i64, to: i64) -> Option<GovernorWindow> {
+    if texts.is_empty() || to < from {
+        return None;
+    }
+    let mut w = GovernorWindow { seconds: to - from, ..Default::default() };
+    for t in texts {
+        let (calls, tools) = read_transcript(t);
+        for c in calls.iter().filter(|c| c.at >= from && c.at < to) {
+            let secs = (c.end - c.start).max(0);
+            w.turns += 1;
+            w.model_secs += secs;
+            if c.cmds.iter().all(|x| only_looks(x)) {
+                w.looking_turns += 1;
+                w.looking_secs += secs;
+            }
+        }
+        w.tool_secs += tools.iter().filter(|(at, _, _)| *at >= from && *at < to).map(|(_, _, s)| *s).sum::<i64>();
+    }
+    w.idle_secs = (w.seconds - w.model_secs - w.tool_secs).max(0);
+    Some(w)
 }
 
 /// The seat's own sessions: those learned for the row outside its legs' windows
@@ -1451,6 +1512,30 @@ mod tests {
         line(t, json!({"type": "assistant", "requestId": rid, "message": {"content": content,
             "usage": {"input_tokens": usage.0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": usage.1, "output_tokens": usage.2}}}))
     }
+    fn bash(t: i64, rid: &str, id: &str, cmd: &str) -> String {
+        line(t, json!({"type": "assistant", "requestId": rid, "message": {"content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}}}))
+    }
+
+    #[test]
+    fn the_governors_window_counts_its_turns_idle_and_the_ones_that_only_looked() {
+        let text = [
+            bash(1000, "r0", "t0", "wsp say x"),
+            bash(1010, "r1", "t1", "wsp watch --once"),
+            result(1012, "t1"),
+            bash(1030, "r2", "t2", "wsp worklist go y"),
+            result(1040, "t2"),
+            bash(1200, "r3", "t3", "wsp say z"),
+        ]
+        .join("\n");
+        let w = governor_window_of(&[text], 1005, 1100).unwrap();
+        assert_eq!((w.seconds, w.turns, w.looking_turns), (95, 2, 1), "{w:?}");
+        assert_eq!(w.tool_secs, 2 + 10);
+        assert_eq!(w.looking_secs, 10);
+        assert_eq!((w.model_secs, w.idle_secs), (28, 55), "{w:?}");
+        assert!(governor_window_of(&[], 1005, 1100).is_none());
+    }
+
     fn result(t: i64, id: &str) -> String {
         line(t, json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": id}]}}))
     }
