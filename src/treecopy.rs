@@ -860,6 +860,63 @@ impl Copy {
     }
 }
 
+/// Set by the executor's `wsp` shim on every call it forwards.
+pub const EXECUTOR_ENV: &str = "WSP_EXECUTOR";
+/// Set by the shim on the tree verbs only (`docs/remote-agents.md` section 5).
+pub const TREE_ENV: &str = "WSP_EXECUTOR_TREE";
+
+/// The sentence for a verb an executor may not run. The shim refuses these
+/// before it asks the seat; the seat says the same if one arrives anyway.
+pub fn executor_refusal(verb: &str) -> Option<String> {
+    matches!(verb, "checkout" | "land").then(|| {
+        format!("`wsp {verb}` is not run from an executor — the seat made this row's worktree and a verifier lands it; finish with `wsp review`")
+    })
+}
+
+/// A tree verb from an executor: bring the agent's work back, and refuse when
+/// it cannot be brought back whole. A stale conflict names every path and
+/// overwrites nothing, and the verb does not run.
+pub fn sync_before(copy: &Copy) -> Result<(), String> {
+    let (_, back) = copy.sync_back()?;
+    if back.refused.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<String> = back.refused.iter().map(Stale::words).collect();
+    Err(format!(
+        "{} cannot be synced back — the seat changed what the agent changed:\n  {}\nresolve those paths on the seat, then run the verb again",
+        copy.row,
+        paths.join("\n  ")
+    ))
+}
+
+/// What the seat does with a verb the shim marked as an executor's: refuse
+/// `checkout` and `land`; for the tree verbs, sync back and return the seat's
+/// tree, which the verb then runs in. `None` for every other call.
+pub fn from_executor(store: &Store, verb: &str) -> Option<Result<PathBuf, String>> {
+    if std::env::var_os(EXECUTOR_ENV).is_none() {
+        return None;
+    }
+    if let Some(why) = executor_refusal(verb) {
+        return Some(Err(why));
+    }
+    if std::env::var_os(TREE_ENV).is_none() {
+        return None;
+    }
+    Some((|| {
+        let row = std::env::var("WSP_TASK").ok().filter(|s| !s.is_empty()).ok_or("`wsp` from an executor needs WSP_TASK to find the row's tree")?;
+        let tree = crate::cmd_checkout::member_tree(store, &row).ok_or_else(|| format!("{row} has no worktree on the seat"))?;
+        let rec = record_of(store, &row).ok_or_else(|| format!("{row} has not been copied to an executor"))?;
+        let m = store
+            .machines()
+            .into_iter()
+            .find(|m| m.ssh == rec.host)
+            .ok_or_else(|| format!("no machine is reached as `{}`, where {row} was copied", rec.host))?;
+        let remote = Remote::of_machine(store, &m, &m.exec_dir);
+        sync_before(&Copy::new(store, remote, &row, &tree))?;
+        Ok(tree)
+    })())
+}
+
 fn prune_empty_parents(root: &Path, file: &Path) {
     let mut d = file.parent();
     while let Some(dir) = d {
@@ -1196,5 +1253,153 @@ mod tests {
         let e = review_refusal(&store, "agent-9", &r.seat).unwrap_err();
         assert!(e.contains("not the one `wsp verify` ran on"), "{e}");
         assert_eq!(note_verified(&store, "agent-8", &r.seat), None, "a row never copied records nothing");
+    }
+
+    #[test]
+    fn a_tree_verb_syncs_back_before_it_runs() {
+        let r = rig("verb-sync", false);
+        r.copy.copy_up("trunk").unwrap();
+        run(&r.far(), "echo agent > src/a.rs");
+        assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "one\n");
+        sync_before(&r.copy).unwrap();
+        assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "agent\n", "the agent's work is on the seat before the verb");
+    }
+
+    #[test]
+    fn a_tree_verb_is_refused_on_a_stale_conflict_and_nothing_is_overwritten() {
+        let r = rig("verb-stale", false);
+        r.copy.copy_up("trunk").unwrap();
+        run(&r.far(), "echo agent > src/a.rs && echo agent-b > src/b.rs");
+        run(&r.seat, "echo person > src/a.rs");
+        let e = sync_before(&r.copy).unwrap_err();
+        assert!(e.contains("src/a.rs") && e.contains("cannot be synced back"), "{e}");
+        assert!(!e.contains("src/b.rs"), "only the conflict is named: {e}");
+        assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "person\n");
+    }
+
+    #[test]
+    fn checkout_and_land_are_refused_from_an_executor_and_the_rest_are_not() {
+        for v in ["checkout", "land"] {
+            let w = executor_refusal(v).unwrap();
+            assert!(w.contains(v) && w.contains("not run from an executor"), "{w}");
+        }
+        for v in ["verify", "review", "commit-help", "say", "note", "lease"] {
+            assert_eq!(executor_refusal(v), None, "{v}");
+        }
+    }
+
+    // ---- the shim itself, with a stand-in ssh -----------------------------
+
+    /// The shim run with `ssh` replaced by `ssh_body` (a shell script body that
+    /// sees the ssh arguments), returning (status, stdout, stderr, link file).
+    fn shim(tag: &str, ssh_body: &str, args: &[&str]) -> (i32, String, String, PathBuf, Dir) {
+        let d = Dir::new(tag);
+        let bin = d.0.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ssh = bin.join("ssh");
+        fs::write(&ssh, format!("#!/bin/sh\n{ssh_body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = d.0.join("link-down");
+        let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("executor/wsp");
+        let out = Command::new("sh")
+            .arg(shim)
+            .args(args)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("WSP_SEAT", "seat")
+            .env("WSP_SEAT_ID", "cpd-3")
+            .env("WSP_LINK_FILE", &link)
+            .env("ARGS_OUT", d.0.join("args"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            link,
+            d,
+        )
+    }
+
+    #[test]
+    fn an_unreachable_seat_is_exit_75_with_the_line() {
+        let (code, _, err, link, _d) = shim("shim-down", "echo 'ssh: connect to host seat port 22: Operation timed out' >&2; exit 255", &["say", "hi"]);
+        assert_eq!(code, 75, "{err}");
+        assert!(err.contains("wsp: the seat is unreachable (link down since "), "{err}");
+        assert!(err.contains(')'), "{err}");
+        let since = fs::read_to_string(&link).unwrap();
+        assert!(err.contains(since.trim()), "the time is the one recorded: {err} / {since}");
+    }
+
+    #[test]
+    fn the_time_is_the_first_failure_and_a_success_clears_it() {
+        let (_, _, _, link, d) = shim("shim-since", "exit 255", &["ls"]);
+        fs::write(&link, "03:04:05\n").unwrap();
+        let (code, _, err, _, _d2) = {
+            // Same link file again: the earlier time stands.
+            let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("executor/wsp");
+            let out = Command::new("sh")
+                .arg(shim)
+                .arg("ls")
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", d.0.join("bin").display()))
+                .env("WSP_SEAT", "seat")
+                .env("WSP_LINK_FILE", &link)
+                .output()
+                .unwrap();
+            (out.status.code().unwrap_or(-1), String::new(), String::from_utf8_lossy(&out.stderr).into_owned(), (), ())
+        };
+        assert_eq!(code, 75);
+        assert!(err.contains("since 03:04:05"), "{err}");
+        // The link comes back: the file goes.
+        fs::write(d.0.join("bin/ssh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("executor/wsp");
+        let ok = Command::new("sh")
+            .arg(shim)
+            .arg("ls")
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", d.0.join("bin").display()))
+            .env("WSP_SEAT", "seat")
+            .env("WSP_LINK_FILE", &link)
+            .status()
+            .unwrap();
+        assert_eq!(ok.code(), Some(0));
+        assert!(!link.exists());
+    }
+
+    #[test]
+    fn a_verb_that_ran_and_failed_keeps_its_own_status() {
+        for want in [1, 2, 3, 74, 76] {
+            let (code, out, err, link, _d) = shim(&format!("shim-ran-{want}"), &format!("echo 'wsp: no such row'; echo refused >&2; exit {want}"), &["show", "x"]);
+            assert_eq!(code, want, "{err}");
+            assert!(out.contains("no such row") && err.contains("refused"));
+            assert!(!err.contains("unreachable"), "{err}");
+            assert!(!link.exists());
+        }
+        let (code, ..) = shim("shim-ok", "exit 0", &["ls"]);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn the_shim_marks_tree_verbs_and_only_those_and_refuses_checkout_and_land() {
+        let record = "printf '%s\\n' \"$*\" > \"$ARGS_OUT\"";
+        for v in ["verify", "review", "commit-help"] {
+            let (code, _, err, _, d) = shim(&format!("shim-tree-{v}"), record, &[v, "--json"]);
+            assert_eq!(code, 0, "{err}");
+            let sent = fs::read_to_string(d.0.join("args")).unwrap();
+            assert!(sent.contains("WSP_EXECUTOR_TREE=1") && sent.contains("WSP_EXECUTOR=1"), "{sent}");
+            assert!(sent.contains("WSP_SEAT_ID='cpd-3'"), "{sent}");
+        }
+        let (_, _, _, _, d) = shim("shim-not-tree", record, &["say", "hello"]);
+        let sent = fs::read_to_string(d.0.join("args")).unwrap();
+        assert!(sent.contains("WSP_EXECUTOR=1") && !sent.contains("WSP_EXECUTOR_TREE"), "{sent}");
+        for v in ["checkout", "land"] {
+            let (code, _, err, _, d) = shim(&format!("shim-no-{v}"), record, &[v, "agent-9"]);
+            assert_eq!(code, 2, "{err}");
+            assert!(err.contains("is not run from an executor"), "{err}");
+            assert!(!d.0.join("args").exists(), "the seat was never asked");
+        }
     }
 }

@@ -14,15 +14,28 @@
 #                 environment of the session it starts here; passed through
 #   WSP_SEAT_BIN  the seat's wsp, if it is not on a non-interactive PATH there
 #
-# Three things this has to get right, and each of them is silent when wrong:
+# Four things this has to get right, and each of them is silent when wrong:
 #
 #   1. Arguments survive the remote shell. `ssh host wsp say "two words"` is
 #      re-split over there; every argument is quoted for it here.
 #   2. The seat is named by WSP_SEAT_ID, which is the seat's own id and needs
 #      no qualifying: wsp mints it and the machine rides on the seat's record,
 #      so no `@machine` is added to anything.
-#   3. The exit status is the seat's. ssh passes it through, and `exec` keeps it
-#      from being anything else's.
+#   3. The exit status is the seat's, with one exception that is the point of it:
+#      ssh itself failing (it exits 255 when it cannot connect; a wsp verb never
+#      does) is exit 75, EX_TEMPFAIL, with `wsp: the seat is unreachable (link
+#      down since <time>)`. A verb that ran and failed keeps its own status, so an
+#      agent, a hook and a person can each tell a refusal from a partition. The
+#      hand proof of 2026-11-05 saw a call made in the gap before the gate held
+#      come back exit 0 behind a pipe; nothing but this status says it did not run.
+#      The time is the first failure since the last success, kept in
+#      $WSP_LINK_FILE (default $WSP_EXEC_DIR/link-down, else ~/.wsp-executor/).
+#   4. Tree verbs (docs/remote-agents.md section 5). `verify`, `review` and
+#      `commit-help` are run with WSP_EXECUTOR_TREE=1, which makes the seat copy
+#      the agent's work back first (refusing on a stale conflict) and run on the
+#      seat's tree. `checkout` and `land` are refused here, with a sentence and
+#      without asking the seat: the row's worktree was made by the seat, and a
+#      verifier lands it.
 #
 # stdin reaches the far side, which `wsp edit --overview -` needs and agents
 # use constantly. There is no tty, so `wsp edit` without `--from` will not find
@@ -35,6 +48,13 @@ if [ -z "${WSP_SEAT:-}" ]; then
     echo "     See the Machines section of wsp's README." >&2
     exit 2
 fi
+
+case "${1:-}" in
+    checkout | land)
+        echo "wsp: \`wsp $1\` is not run from an executor — the seat made this row's worktree and a verifier lands it; finish with \`wsp review\`." >&2
+        exit 2
+        ;;
+esac
 
 # One argument, quoted so the remote shell hands it back whole.
 q() {
@@ -50,6 +70,23 @@ done
 # a seat-shaped PATH or HOME arriving from here would be worse than none.
 env="WSP_SEAT_ID=$(q "${WSP_SEAT_ID:-}")"
 env="$env WSP_PROJECT=$(q "${WSP_PROJECT:-}") WSP_TASK=$(q "${WSP_TASK:-}")"
-env="$env WSP_TERSE=$(q "${WSP_TERSE:-}")"
+env="$env WSP_TERSE=$(q "${WSP_TERSE:-}") WSP_EXECUTOR=1"
+case "${1:-}" in
+    verify | review | commit-help) env="$env WSP_EXECUTOR_TREE=1" ;;
+esac
 
-exec ssh -o BatchMode=yes "$WSP_SEAT" "$env ${WSP_SEAT_BIN:-wsp}$args"
+# Not `exec`: the status is read here. Anything but 255 is the seat's own.
+link_file="${WSP_LINK_FILE:-${WSP_EXEC_DIR:-$HOME/.wsp-executor}/link-down}"
+rc=0
+ssh -o BatchMode=yes "$WSP_SEAT" "$env ${WSP_SEAT_BIN:-wsp}$args" || rc=$?
+
+if [ "$rc" -eq 255 ]; then
+    if [ ! -s "$link_file" ]; then
+        mkdir -p "$(dirname "$link_file")" 2>/dev/null || true
+        date '+%H:%M:%S' >"$link_file" 2>/dev/null || true
+    fi
+    echo "wsp: the seat is unreachable (link down since $(cat "$link_file" 2>/dev/null || date '+%H:%M:%S'))" >&2
+    exit 75
+fi
+rm -f "$link_file" 2>/dev/null || true
+exit "$rc"

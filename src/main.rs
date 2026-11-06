@@ -1175,6 +1175,22 @@ fn main() {
         std::process::exit(2);
     }
 
+    // A call the executor's shim forwarded: its tree verbs sync the agent's work
+    // back first and run on the seat's tree; checkout and land are refused.
+    match treecopy::from_executor(&store, &args.cmd) {
+        Some(Err(why)) => {
+            eprintln!("wsp: {why}");
+            std::process::exit(1);
+        }
+        Some(Ok(tree)) => {
+            if let Err(e) = std::env::set_current_dir(&tree) {
+                eprintln!("wsp: cannot enter {}: {e}", util::contract(&tree));
+                std::process::exit(1);
+            }
+        }
+        None => {}
+    }
+
     let code = match args.cmd.as_str() {
         "init" => cmd_project::init(&store, &args),
 

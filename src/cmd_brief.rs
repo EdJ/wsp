@@ -1217,6 +1217,14 @@ fn asking(id: &str) -> [String; 2] {
     ]
 }
 
+/// What a seat on an executor is told about `wsp` failing: the link to the seat
+/// is the one thing that fails a call without it being the verb's own answer.
+fn link_row(executor: bool) -> Option<&'static str> {
+    executor.then_some(
+        "exit 75 or `the seat is unreachable` from a `wsp` call is the link, not your work: wait, then repeat the same call. Do not change course or stop on account of it; any other failure is the verb's own answer",
+    )
+}
+
 /// The brief as text, one line per element and nothing printed.
 fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     let terse = depth == Depth::Terse;
@@ -1286,6 +1294,10 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             let said = crate::cmd_checkout::Flow::of(in_a_run).banner();
             row("land", p.dim(said).to_string());
         }
+    }
+
+    if let Some(said) = link_row(std::env::var_os(crate::treecopy::EXECUTOR_ENV).is_some()) {
+        row("link", p.dim(said).to_string());
     }
 
     // Standing direction, before anything about the work itself. An agent
@@ -2984,5 +2996,12 @@ mod tests {
         assert_eq!(v["others"].as_array().unwrap().len(), r.far.len(), "json carries the far set whole");
         assert_eq!(v["open"].as_array().unwrap().len(), r.open.len());
         assert_eq!(v["decisions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_executor_seat_is_told_a_failed_call_is_the_link_to_wait_out() {
+        let said = super::link_row(true).unwrap();
+        assert!(said.contains("75") && said.contains("wait") && said.contains("Do not change course"), "{said}");
+        assert_eq!(super::link_row(false), None, "a seat on the primary hears nothing of it");
     }
 }
