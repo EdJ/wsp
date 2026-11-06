@@ -493,15 +493,20 @@ pub fn seat_command(m: &Machine, label: &str, cwd: &str, env: &BTreeMap<String, 
     let msg = format!("no Claude token at {token} on {} (claude setup-token there)", m.name);
     let before = format!("t=$(cat {} 2>/dev/null) && [ -n \"$t\" ] || {{ echo {} >&2; exit 1; }}; ", quote(&token), quote(&msg));
     let mut pre = String::from("CLAUDE_CODE_OAUTH_TOKEN=\"$t\" env ");
-    for (k, v) in env {
-        let ident = !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !k.starts_with(|c: char| c.is_ascii_digit());
-        if !ident || k == "CLAUDE_CODE_OAUTH_TOKEN" {
-            continue;
-        }
-        match v.is_empty() {
-            true => pre.push_str(&format!("-u {k} ")),
-            false => pre.push_str(&format!("{k}={} ", quote_plain(v))),
-        }
+    // `env` stops reading options at the first NAME=value (POSIX, and macOS's), so
+    // every `-u K` goes before any `K=V`.
+    let named: Vec<(&String, &String)> = env
+        .iter()
+        .filter(|(k, _)| {
+            let ident = !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !k.starts_with(|c: char| c.is_ascii_digit());
+            ident && k.as_str() != "CLAUDE_CODE_OAUTH_TOKEN"
+        })
+        .collect();
+    for (k, _) in named.iter().filter(|(_, v)| v.is_empty()) {
+        pre.push_str(&format!("-u {k} "));
+    }
+    for (k, v) in named.iter().filter(|(_, v)| !v.is_empty()) {
+        pre.push_str(&format!("{k}={} ", quote_plain(v)));
     }
     let mut tail = quote_plain(program);
     for a in args {
@@ -1076,6 +1081,53 @@ mod tests {
         assert!(!cmd.contains("bad name"), "a name the shell cannot take is dropped: {cmd}");
         assert!(cmd.contains("spawn --label 'cpd-7' --cwd ~/'wsp-exec/trees/t-1' -- 'claude' '--model' 'a b'"), "{cmd}");
         assert!(!cmd.contains("--no-renderer"), "the seat gets its renderer: {cmd}");
+    }
+
+    /// `env` stops reading options at the first `NAME=value`: a `-u` after one is
+    /// taken as the program (`env: -u: No such file or directory` on macOS).
+    #[test]
+    fn the_seat_command_puts_every_unset_before_any_assignment_and_a_shell_starts_the_program() {
+        use std::os::unix::fs::PermissionsExt;
+        let m = machine();
+        let env = BTreeMap::from([
+            ("A_SET".to_string(), "1".to_string()),
+            ("B_GONE".to_string(), String::new()),
+            ("C_SET".to_string(), "2".to_string()),
+            ("D_GONE".to_string(), String::new()),
+        ]);
+        let cmd = seat_command(&m, "cpd-7", "/work", &env, "agent", &[]);
+        let last_u = cmd.rfind("-u ").expect("an unset");
+        let first_set = cmd.find("A_SET=").expect("an assignment");
+        assert!(last_u < first_set, "every -u comes before any K=V: {cmd}");
+        assert!(cmd.contains("-u B_GONE -u D_GONE A_SET='1' C_SET='2' "), "{cmd}");
+
+        let dir = std::env::temp_dir().join(format!("wsp-far-unset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sup = dir.join("compound-sup");
+        let seen = dir.join("seen");
+        std::fs::write(
+            &sup,
+            format!(
+                "#!/bin/sh\necho \"${{B_GONE-unset}} ${{D_GONE-unset}} $A_SET $C_SET\" > {}\necho 'socket /run/x.sock'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join(TOKEN_FILE), "sekret\n").unwrap();
+        let mut m = Machine::new("mb2", "mb2");
+        m.sup_at = sup.to_string_lossy().into_owned();
+        m.exec_dir = dir.to_string_lossy().into_owned();
+        let mut sh = Command::new("/bin/sh");
+        sh.arg("-c").arg(seat_command(&m, "cpd-7", "/work", &env, "agent", &[]));
+        sh.env("B_GONE", "x").env("D_GONE", "y");
+        let out = run_bounded(sh, Duration::from_secs(20)).unwrap().expect("returns");
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(socket_of(&said).as_deref(), Some("/run/x.sock"), "{said} {err}");
+        assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "unset unset 1 2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The far shell, run for real: the token reaches `compound-sup`'s
