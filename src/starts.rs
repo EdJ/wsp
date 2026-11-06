@@ -13,8 +13,8 @@
 //! many times the run missed is the run's own business. Keyed by the member's id
 //! or the leg's label, and local to the machine as the seats are.
 //!
-//! **The backoff is the check's** ([`crate::barrier::wait_after`]): three
-//! minutes after the first miss, five after the second, and the third is the
+//! **The backoff is the check's** ([`crate::barrier::wait_after`]): thirty
+//! seconds after the first miss, two minutes after the second, and the third is the
 //! last. A miss older than [`FORGOTTEN_AFTER`] starts the count again, so a
 //! start that fails once a day is never "the third".
 //!
@@ -38,7 +38,7 @@ pub(crate) struct Missed {
     /// This was the last try: the person is to be flagged, and only now —
     /// a count already spent says nothing again.
     pub last: bool,
-    /// Minutes until the next start, while there is one.
+    /// Seconds until the next start, while there is one.
     pub again_in: Option<i64>,
 }
 
@@ -56,7 +56,7 @@ pub(crate) fn missed(store: &Store, label: &str) -> Missed {
         out = Missed {
             tries,
             last: spent && before < crate::barrier::TRIES,
-            again_in: crate::barrier::wait_after(tries).map(|s| s / 60),
+            again_in: crate::barrier::wait_after(tries),
         };
         m.insert(label.to_string(), json!({ "tries": tries, "at": now, "spent": spent }));
         m.retain(|_, e| e["spent"].as_bool() == Some(true) || now - e["at"].as_i64().unwrap_or(0) <= 24 * FORGOTTEN_AFTER);
@@ -123,13 +123,13 @@ mod tests {
         assert!(!held(&store, "m-1"), "a start never missed is nobody's to hold");
 
         let one = missed(&store, "m-1");
-        assert_eq!(one, Missed { tries: 1, last: false, again_in: Some(3) });
+        assert_eq!(one, Missed { tries: 1, last: false, again_in: Some(30) });
         assert!(held(&store, "m-1"));
         age(&store, "m-1", 4 * 60);
         assert!(!held(&store, "m-1"), "free once the wait is over");
 
         let two = missed(&store, "m-1");
-        assert_eq!(two, Missed { tries: 2, last: false, again_in: Some(5) });
+        assert_eq!(two, Missed { tries: 2, last: false, again_in: Some(120) });
         age(&store, "m-1", 6 * 60);
         assert!(!held(&store, "m-1"));
 

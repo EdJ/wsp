@@ -501,12 +501,36 @@ pub(crate) struct Opened {
 pub(crate) const TRIES: u32 = 3;
 
 /// How long an open entry waits with no seat after its first start, and after
-/// its second, before the agent is started again (`wsp-328`). Three minutes
+/// its second, before the agent is started again (`wsp-328`). Thirty seconds
 /// first because `wsp spawn` names its seat within seconds of being asked, so
-/// an entry still bare at three is a start that failed or never arrived, and
-/// five after that so a full disk or an overloaded API has room to recover:
-/// three starts over about ten minutes with the spawns' own time.
-const RETRY_BACKOFF: [i64; 2] = [3 * 60, 5 * 60];
+/// an entry still bare at thirty is a start that failed or never arrived, and
+/// two minutes after that so a full disk or an overloaded API has room to
+/// recover (wsp-427: the three and five minutes this was cost react-pass-1 90
+/// minutes on its critical paths).
+const RETRY_BACKOFF: [i64; 2] = [30, 2 * 60];
+
+#[cfg(test)]
+mod retry_waits {
+    use super::*;
+
+    #[test]
+    fn a_start_that_failed_is_tried_again_in_thirty_seconds_then_two_minutes_and_the_third_is_the_last() {
+        assert_eq!(wait_after(0), Some(30));
+        assert_eq!(wait_after(1), Some(30));
+        assert_eq!(wait_after(2), Some(120));
+        assert_eq!(wait_after(TRIES), None);
+        assert_eq!((span(30), span(120)), ("30 s".to_string(), "2 min".to_string()));
+    }
+}
+
+/// A wait as a person reads it: `30 s`, `2 min`.
+pub(crate) fn span(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs} s")
+    } else {
+        format!("{} min", secs / 60)
+    }
+}
 
 /// The wait after `tries` starts, in seconds, and `None` once they are spent.
 pub(crate) fn wait_after(tries: u32) -> Option<i64> {

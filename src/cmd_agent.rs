@@ -3973,11 +3973,28 @@ pub fn where_am_i(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Rows of a running list at `doing` with no seat and no log line for five
+/// minutes (wsp-427), one line each.
+fn silent_lines(store: &Store) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in store.worklists() {
+        if w.status() != crate::model::WorklistStatus::Running {
+            continue;
+        }
+        let ids: Vec<String> = w.groups().iter().flat_map(|g| g.members.iter().cloned()).collect();
+        for (id, quiet) in crate::cycle::silent(store, &ids) {
+            out.push(format!("{id}: no seat and no log line for {} — {}'s start may not have arrived", util::duration_human(quiet), w.id));
+        }
+    }
+    out
+}
+
 pub fn wip(store: &Store, args: &Args) -> i32 {
     let w = Wip::live(store);
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
     // wsp-384: the planned lists wsp started on its own, for a day after.
-    let picked_up = crate::pickup::wip_lines(store);
+    let mut picked_up = crate::pickup::wip_lines(store);
+    picked_up.extend(silent_lines(store));
     match args.json() {
         true => {
             let mut v = wip_json(&w);

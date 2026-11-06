@@ -864,6 +864,9 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     let Some(g) = groups.get(at - 1) else { return started };
     let Some(policy) = g.policy() else { return started };
     let all = starts == Starts::All;
+    if all {
+        name_silent(store, &w);
+    }
     // The seat's cap (`wsp-231`), asked by each of the three starts below
     // inside the lock its record is written under. With no cap it reads
     // nothing and admits everything.
@@ -1384,6 +1387,52 @@ fn wedged(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Valu
     !crate::legs::staged(t) && !claims.contains_key(&t.id) && util::epoch_secs() - util::epoch_of(&t.updated) > WEDGED_AFTER
 }
 
+/// How long a row at `doing` may have no seat and no line in `cycle.log` before
+/// it is named (wsp-427): compounding-121's next seat's first line was 39
+/// minutes after its spawn, with no log line for 33 of them.
+pub(crate) const SILENT_AFTER: i64 = 5 * 60;
+
+/// The marker a silent row's naming carries in `cycle.log`.
+const SILENT_SAID: &str = "has no seat and no log line for";
+
+/// The rows among `ids` at `doing` with no claim, no seat and nothing said of
+/// them — on the row or in `cycle.log` — for [`SILENT_AFTER`], with how long. A
+/// row run as legs holds no claim by design and is never one.
+pub(crate) fn silent(store: &Store, ids: &[String]) -> Vec<(String, i64)> {
+    let now = util::epoch_secs();
+    let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+    let claims = store.claims();
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(t) = store.find_task(id) else { continue };
+        if t.status() != Status::Doing || crate::legs::staged(&t) || claims.contains_key(id) || !store.panes_for_task(id).is_empty() {
+            continue;
+        }
+        let said = log
+            .lines()
+            .rev()
+            .find(|l| l.split_whitespace().any(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-') == id.as_str()))
+            .and_then(|l| l.split_whitespace().next())
+            .map(util::epoch_of)
+            .unwrap_or(0);
+        let quiet = now - said.max(util::epoch_of(&t.updated));
+        if quiet > SILENT_AFTER {
+            out.push((id.clone(), quiet));
+        }
+    }
+    out
+}
+
+/// Name each silent row of the list in `cycle.log`, once per [`SILENT_AFTER`]
+/// (the line it writes is the last said of the row, which is what the next
+/// reading waits on).
+fn name_silent(store: &Store, w: &Worklist) {
+    let ids: Vec<String> = w.groups().iter().flat_map(|g| g.members.iter().cloned()).collect();
+    for (id, quiet) in silent(store, &ids) {
+        log_line(store, &format!("{}: {id} {SILENT_SAID} {} — its start may not have arrived", w.id, util::duration_human(quiet)));
+    }
+}
+
 /// The line `take_member` writes, and how it recognises its own record.
 pub(crate) const STARTED_BY: &str = "started by wsp:";
 
@@ -1654,7 +1703,7 @@ fn start_leg(store: &Store, row: &str, leg: &str, owned: Option<(&str, &str)>) -
     };
     match cmd.output() {
         Ok(o) if o.status.success() => None,
-        Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Ok(o) => Some(why_not(&String::from_utf8_lossy(&o.stderr))),
         Err(e) => Some(e.to_string()),
     }
 }
@@ -2324,6 +2373,15 @@ enum Undo {
     Verifier,
 }
 
+/// Why a `wsp spawn` failed, from what it wrote: its notes about a dependency
+/// clone are left out (wsp-427). A clone that could not be done is a note and the
+/// seat starts cold, so a line saying so is never the reason, and it was the
+/// first thing the 300 characters kept.
+fn why_not(stderr: &str) -> String {
+    let kept: Vec<&str> = stderr.lines().filter(|l| !(l.contains(" not cloned") || l.contains(" cloned from the parent tree "))).collect();
+    kept.join("\n").trim().to_string()
+}
+
 /// Start an agent on a row, and wait for `wsp spawn` to say how it went.
 /// A failure is written on the row and put back per [`Undo`]; the caller
 /// tells the seat. Never silent: a run that cannot start its next agent is
@@ -2391,7 +2449,7 @@ fn start(store: &Store, id: &str, policy: &Policy, owned: (&str, &str), verify: 
         .output();
     match child {
         Ok(o) if o.status.success() => None,
-        Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Ok(o) => Some(why_not(&String::from_utf8_lossy(&o.stderr))),
         Err(e) => Some(e.to_string()),
     }
 }
@@ -2418,7 +2476,7 @@ pub(crate) fn start_check(store: &Store, list: &str, at: usize, policy: &Policy)
     let child = Command::new(exe).args(&argv).stdin(Stdio::null()).output();
     match child {
         Ok(o) if o.status.success() => None,
-        Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Ok(o) => Some(why_not(&String::from_utf8_lossy(&o.stderr))),
         Err(e) => Some(e.to_string()),
     }
 }
@@ -2466,11 +2524,11 @@ pub(crate) fn check_start_failed(store: &Store, w: &Worklist, at: usize, why: &s
         check_gave_up(store, w, at, u.tries, &why);
         return;
     }
-    let wait = crate::barrier::wait_after(u.tries).unwrap_or_default() / 60;
-    log_line(store, &format!("{} group {at}: its check did not start on try {} of {} — {ended}; starting it again in {wait} min", w.id, u.tries, crate::barrier::TRIES));
+    let wait = crate::barrier::span(crate::barrier::wait_after(u.tries).unwrap_or_default());
+    log_line(store, &format!("{} group {at}: its check did not start on try {} of {} — {ended}; starting it again in {wait}", w.id, u.tries, crate::barrier::TRIES));
     tell(store, w, &format!(
         "The {} run's barrier check on group {at} did not start (try {} of {}): {why}. \
-         wsp ended the pane it left and starts the check again in {wait} min.",
+         wsp ended the pane it left and starts the check again in {wait}.",
         w.id, u.tries, crate::barrier::TRIES
     ));
 }
@@ -2531,12 +2589,12 @@ fn member_start_failed(store: &Store, list: &str, id: &str, why: &str) {
         start_gave_up(store, w.as_ref(), id, id, m.tries, &why, &format!("`wsp worklist advance {list}`"));
         return;
     }
-    let wait = m.again_in.unwrap_or_default();
-    log_line(store, &format!("{list}: {id} did not start on try {} of {} — starting it again in {wait} min", m.tries, crate::barrier::TRIES));
+    let wait = crate::barrier::span(m.again_in.unwrap_or_default());
+    log_line(store, &format!("{list}: {id} did not start on try {} of {} — starting it again in {wait}", m.tries, crate::barrier::TRIES));
     if let Some(w) = &w {
         tell(store, w, &format!(
             "wsp could not start an agent on {id} in the {list} run (try {} of {}): {why}. \
-             wsp ended what the start left and starts it again in {wait} min.",
+             wsp ended what the start left and starts it again in {wait}.",
             m.tries, crate::barrier::TRIES
         ));
     }
@@ -2569,7 +2627,7 @@ pub(crate) fn leg_start_failed(store: &Store, w: Option<&Worklist>, row: &str, n
     crate::leg_seat::reset(store, row, name);
     let m = crate::starts::missed(store, &label);
     let why = util::truncate(why, 300);
-    let wait = m.again_in.map_or_else(|| "it is not tried again".to_string(), |min| format!("it starts again in {min} min"));
+    let wait = m.again_in.map_or_else(|| "it is not tried again".to_string(), |s| format!("it starts again in {}", crate::barrier::span(s)));
     store.locked(|| {
         if let Some(mut t) = store.find_task(row) {
             t.log(&format!("wsp could not spawn leg {name} (try {} of {}): {why}", m.tries, crate::barrier::TRIES));
@@ -5975,7 +6033,7 @@ fn only_a_working_screen_is_ever_overruled() {
         l.set_groups(&g);
         store.save_worklist(&l).unwrap();
 
-        age_check(&store, 60);
+        age_check(&store, 10);
         step(&store, &w, &Blind);
         assert!(crate::message::raised(&store).is_empty(), "not yet: a start may be in flight");
         age_check(&store, 4 * 60);
@@ -7488,6 +7546,33 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(leg_state(&store, "m-1", "plan"), crate::legs::State::Pending);
         let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default().to_string();
         assert!(log.contains("could not spawn leg plan (try 1 of 3): no room"), "{log}");
+    }
+
+    /// A start's note about a clone it could not make is not why it failed
+    /// (wsp-427): the real reason is what is left.
+    #[test]
+    fn a_spawn_failure_names_its_cause_and_not_the_note_about_a_dependency_clone() {
+        let err = "wsp: spikes/canvas/target not cloned: this tree has no spikes/canvas/Cargo.lock — install as usual\nwsp: claude started but never became ready\n";
+        assert_eq!(why_not(err), "wsp: claude started but never became ready");
+        assert_eq!(why_not("wsp: no room"), "wsp: no room");
+    }
+
+    /// A row at `doing` with no seat and nothing said of it for five minutes is
+    /// named, in the log and for `wsp wip` (wsp-427).
+    #[test]
+    fn a_row_with_no_seat_and_no_line_for_five_minutes_is_named_once_something_is_said_of_it() {
+        let (_env, store) = scratch("silent-row");
+        task(&store, "m-1", Status::Doing);
+        let ids = vec!["m-1".to_string()];
+        assert!(silent(&store, &ids).is_empty(), "just written");
+        let mut t = store.find_task("m-1").unwrap();
+        t.updated = util::iso_at(util::epoch_secs() - 400);
+        store.save_task(&t).unwrap();
+        let got = silent(&store, &ids);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].1 >= 400);
+        log_line(&store, "list-1: m-1 has no seat and no log line for 6m");
+        assert!(silent(&store, &ids).is_empty(), "the line is a line said of it");
     }
 
     /// A staged row is never given a whole-row worker beside its legs, by any of

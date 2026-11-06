@@ -314,6 +314,19 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_with_no_lockfile_beside_a_parents_target_is_a_note_and_nothing_else() {
+        let d = scratch("nolock");
+        let (parent, child) = (d.join("p"), d.join("c"));
+        write(&parent.join("spikes/canvas/Cargo.lock"), "lock");
+        write(&parent.join("spikes/canvas/target/debug/x"), "bin");
+        write(&child.join("spikes/canvas/src/lib.rs"), "");
+        let lines = clone_from(&parent, &child);
+        assert_eq!(lines, vec!["spikes/canvas/target not cloned: this tree has no spikes/canvas/Cargo.lock — install as usual"]);
+        assert!(!child.join("spikes/canvas/target").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn a_lockfile_that_differs_copies_nothing_and_says_so() {
         let d = scratch("differs");
         let (parent, child) = (d.join("p"), d.join("c"));
