@@ -35,7 +35,8 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "show" | "get" => show(store, args),
         "set" => set(store, args),
         "check" => check(store, args),
-        "rm" | "remove" | "retire" => rm(store, args),
+        "retire" => retire(store, args),
+        "rm" | "remove" => rm(store, args),
         other => {
             eprintln!("wsp machine: unknown subcommand `{other}`");
             2
@@ -772,16 +773,40 @@ fn show_seat(store: &Store, args: &Args) -> i32 {
     0
 }
 
-/// Retire a machine, or with `--force` remove it entirely.
+/// Every row held on a machine, as `(row, seat)`: a binding or a claim whose
+/// seat id carries the machine's name (`w0:p3@mb2`).
 ///
-/// Retiring is the default because the record is what makes a machine that has
-/// gone away a row with a last-seen on it rather than a hole: the agents that
-/// ran there are in the log, and their pane ids still carry its name. Deleting
-/// the file is available for the machine you added by mistake thirty seconds
-/// ago, which is the only case where there is nothing to keep.
-pub fn rm(store: &Store, args: &Args) -> i32 {
+/// Read off the ids and not the claim's `host`, for the reason
+/// `cmd_agent::machine_of` gives: a far agent's claims record the seat's host.
+pub(crate) fn held_on(store: &Store, name: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (seat, b) in store.bindings() {
+        if crate::herdr::host_of(&seat) != Some(name) {
+            continue;
+        }
+        if let Some(task) = b.get("task_id").and_then(|t| t.as_str()) {
+            out.push((task.to_string(), seat));
+        }
+    }
+    for (task, c) in store.claims() {
+        let ws = c.get("workspace_id").and_then(|t| t.as_str()).unwrap_or("");
+        if crate::herdr::host_of(ws) == Some(name) && !out.iter().any(|(t, _)| *t == task) {
+            out.push((task, ws.to_string()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `wsp machine retire <name>`: say the machine is not coming back, and list
+/// every row still held on it (`docs/remote-agents.md` section 3).
+///
+/// Nothing is released here, by design: a claim on a machine that never
+/// returns is let go by a person, one row at a time, with
+/// `wsp despawn <row> --lost`. The list is what to go through.
+pub fn retire(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp machine rm <name> [--force]");
+        eprintln!("usage: wsp machine retire <name>");
         return 2;
     };
     let Some(mut m) = find(store, &needle) else {
@@ -789,12 +814,8 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         return 1;
     };
     let p = Paint::new();
-
-    if !args.has("force") {
-        if !m.is_active() {
-            println!("{}", p.dim(&format!("{} is already retired — --force removes the record", m.name)));
-            return 0;
-        }
+    let was_active = m.is_active();
+    if was_active {
         m.status = "retired".into();
         if let Err(e) = store.save_machine(&m) {
             eprintln!("wsp: write failed: {e}");
@@ -806,13 +827,58 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         store.clear_machine_live(&m.name);
         store.log_event("machine-retired", json!({ "name": m.name }));
         store.git_commit(&format!("wsp: retire machine {}", m.name));
-        if args.json() {
-            println!("{}", json!({ "retired": m.name }));
-        } else {
-            println!("retired {} {}", m.name, p.dim("— still listed, no longer dialled"));
-        }
+    }
+    let held = held_on(store, &m.name);
+    if args.json() {
+        println!(
+            "{}",
+            json!({
+                "retired": m.name,
+                "was_active": was_active,
+                "held": held.iter().map(|(t, s)| json!({ "row": t, "seat": s })).collect::<Vec<_>>(),
+            })
+        );
         return 0;
     }
+    if was_active {
+        println!("retired {} {}", m.name, p.dim("— still listed, no longer dialled"));
+    } else {
+        println!("{}", p.dim(&format!("{} is already retired", m.name)));
+    }
+    if held.is_empty() {
+        println!("  {}", p.dim("no row is held on it"));
+    } else {
+        println!("  {}", p.yellow(&format!("{} row(s) still held on it — nothing is released for you:", held.len())));
+        for (task, seat) in &held {
+            println!("  {task}  {}  {}", p.dim(seat), p.dim(&format!("wsp despawn {task} --lost")));
+        }
+    }
+    0
+}
+
+/// `wsp machine rm <name> --force`: remove the record entirely; without
+/// `--force` it is [`retire`].
+///
+/// Retiring is the default because the record is what makes a machine that has
+/// gone away a row with a last-seen on it rather than a hole: the agents that
+/// ran there are in the log, and their pane ids still carry its name. Deleting
+/// the file is available for the machine you added by mistake thirty seconds
+/// ago, which is the only case where there is nothing to keep.
+pub fn rm(store: &Store, args: &Args) -> i32 {
+    if !args.has("force") {
+        // One verb with one meaning: retiring is `retire`, whatever it is
+        // called. `rm` without `--force` was always that, and still is.
+        return retire(store, args);
+    }
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp machine rm <name> --force");
+        return 2;
+    };
+    let Some(mut m) = find(store, &needle) else {
+        eprintln!("wsp: no machine matching `{needle}`");
+        return 1;
+    };
+    let p = Paint::new();
 
     let path = store.machine_path(&m.name);
     if let Err(e) = std::fs::remove_file(&path) {
@@ -1104,6 +1170,29 @@ mod tests {
         let store = Store::at(root.clone(), root.join("state"));
         store.ensure_dirs().unwrap();
         store
+    }
+
+    /// `retire` changes the status, lists every row held on the machine (by the
+    /// seat id's suffix) and releases none of them; `rm` without `--force` is
+    /// the same verb.
+    #[test]
+    fn retire_lists_the_held_rows_and_changes_the_status() {
+        let store = scratch("machine-retire");
+        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
+        store.set_binding("w1:p1@mb2", json!({ "task_id": "t-1", "pane_id": "w1:p1@mb2" }));
+        store.set_binding("w1:p2", json!({ "task_id": "t-2", "pane_id": "w1:p2" }));
+        store.set_claim("t-3", json!({ "workspace_id": "w9@mb2" }));
+        store.set_claim("t-1", json!({ "workspace_id": "w1@mb2" }));
+
+        assert_eq!(held_on(&store, "mb2"), vec![("t-1".into(), "w1:p1@mb2".into()), ("t-3".into(), "w9@mb2".into())]);
+        assert_eq!(retire(&store, &Args::synth("machine", &["retire", "mb2"], &[])), 0);
+        assert!(!store.machine("mb2").unwrap().is_active(), "it is retired");
+        assert!(store.bindings().contains_key("w1:p1@mb2"), "and nothing is released");
+        assert!(store.claims().contains_key("t-3"));
+
+        store.save_machine(&Machine::new("mb3", "mb3")).unwrap();
+        assert_eq!(rm(&store, &Args::synth("machine", &["rm", "mb3"], &[])), 0);
+        assert!(!store.machine("mb3").unwrap().is_active(), "rm without --force is retire");
     }
 
     /// Setting it, clearing it, and the one value that is refused.

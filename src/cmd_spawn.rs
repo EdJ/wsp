@@ -4278,6 +4278,9 @@ fn end_owed(
 /// Which record should carry it is the state-model half of the translation
 /// layer (the binds note on robustness-061), and is not decided here.
 pub fn despawn(store: &Store, args: &Args) -> i32 {
+    if args.has("lost") {
+        return despawn_lost(store, args);
+    }
     let keep = args.has("keep-tree");
     // [`end_seat_when_idle`]'s wait. Empty is unset, as in [`carry_out_ending`].
     if std::env::var_os(END_WHEN_IDLE).is_some_and(|v| !v.is_empty()) {
@@ -4298,6 +4301,79 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
         pane.as_deref().and_then(|p| cmd_govern::governs(&governors, &crate::place::Seat::new(p)));
     let me = Caller { pane: pane.as_deref(), governs: governs.as_deref() };
     end_work(backend(args).as_ref(), store, args, me, &tidy)
+}
+
+/// `wsp despawn <row> --lost`: let go of a row held on a machine that is not
+/// coming back (`docs/remote-agents.md` section 3, "What is lost").
+///
+/// It releases the claim, returns the row to todo and leaves the last
+/// checkpoint where it is — the seat's worktree is not touched, because it is
+/// the starting point of whoever takes the row next. Nothing is said to the far
+/// seat: it cannot be reached, which is the whole case. The far copy, if the
+/// machine returns, is named in the machine's notes and never read.
+///
+/// Refused for a local seat, which has a stop that can be asked and a plain
+/// `wsp despawn` that does it; "lost" is a claim about a machine, and a verb
+/// that let it be made of one that is answering would release live work.
+fn despawn_lost(store: &Store, args: &Args) -> i32 {
+    let p = Paint::new();
+    let index = Index::new(store.projects());
+    let (seat, task) = match seat_of(store, args, &index) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    };
+    let Some(machine) = crate::herdr::host_of(seat.as_str()).map(str::to_string) else {
+        eprintln!("wsp: {seat} is on this seat, not on a machine that is gone — `wsp despawn` ends it; --lost is for a far seat");
+        return 2;
+    };
+    let (_, ended) = cmd_agent::release_pane(store, seat.as_str());
+    crate::lapse::seat_ended(store, seat.as_str());
+    let task = ended.or(task);
+    for subject in task.iter() {
+        let _ = std::fs::remove_file(brief_path(store, subject));
+    }
+    let mut far = None;
+    if let Some(id) = &task {
+        if let Some(mut t) = store.task(id) {
+            if t.status() == crate::model::Status::Doing {
+                t.set_status(crate::model::Status::Todo);
+            }
+            t.log(&format!("lost with {machine} (seat {seat}) — the last checkpoint is in the seat's worktree"));
+            let _ = store.save_task(&t);
+        }
+        if let Some(mut m) = store.machine(&machine) {
+            let at = match m.exec_dir.trim_end_matches('/') {
+                "" => "its exec_dir".to_string(),
+                d => format!("{d}/trees/{id}"),
+            };
+            if !m.body.is_empty() && !m.body.ends_with('\n') {
+                m.body.push('\n');
+            }
+            m.body.push_str(&format!(
+                "- {} lost {id} (seat {seat}): its copy, if it returns, is at {at} — never read automatically\n",
+                util::now_iso()
+            ));
+            let _ = store.save_machine(&m);
+            far = Some(at);
+        }
+        store.log_event("task-lost", json!({ "id": id, "seat": seat.as_str(), "machine": machine }));
+    }
+    store.git_commit(&format!("wsp: despawn --lost {}", task.as_deref().unwrap_or(seat.as_str())));
+    if args.json() {
+        println!("{}", json!({ "seat": seat.as_str(), "machine": machine, "task": task, "far_copy": far, "tree": "kept" }));
+    } else {
+        match &task {
+            Some(t) => println!("  {}", p.dim(&format!("released {t} — back to todo; its worktree on the seat is kept as it was"))),
+            None => println!("  {}", p.dim("it was holding nothing")),
+        }
+        if let Some(at) = far {
+            println!("  {}", p.dim(&format!("{machine}'s copy ({at}) is named in its notes, and is not read")));
+        }
+    }
+    0
 }
 
 /// Which pane is running this despawn, and what it holds the seat of.
@@ -7681,6 +7757,40 @@ mod tests {
         assert_eq!(code, 2);
         assert!(place.asked.borrow().is_empty(), "it asked the backend to end this pane");
         assert!(store.claims().contains_key("t-260816-095"), "and it dropped its own claim");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A seat on a machine that is not coming back is let go of by name: the
+    /// claim goes, the row is todo, the worktree is not touched, the far copy is
+    /// written into the machine's notes — and a local seat is refused, with the
+    /// claim where it was.
+    #[test]
+    fn despawn_lost_releases_a_far_seat_and_refuses_a_local_one() {
+        let _env = no_backend();
+        let store = seat("despawn-lost");
+        let mut m = crate::model::Machine::new("mb2", "mb2");
+        m.exec_dir = "/far/exec".into();
+        store.save_machine(&m).unwrap();
+        working(&store, "t-260816-095", "w1:p1@mb2");
+        working(&store, "t-260816-096", "w1:p2");
+        let tree = store.root.join("tree-095");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("checkpoint"), "x").unwrap();
+
+        let local = despawn_lost(&store, &Args::synth("despawn", &["096"], &[("lost", "true")]));
+        assert_eq!(local, 2, "a local seat is refused");
+        assert!(store.claims().contains_key("t-260816-096"), "and its claim stays");
+        assert!(store.bindings().contains_key("w1:p2"));
+
+        let far = despawn_lost(&store, &Args::synth("despawn", &["095"], &[("lost", "true")]));
+        assert_eq!(far, 0);
+        assert!(!store.claims().contains_key("t-260816-095"), "the claim is released");
+        assert!(store.panes_for_task("t-260816-095").is_empty());
+        assert_eq!(store.task("t-260816-095").unwrap().status(), crate::model::Status::Todo);
+        assert!(tree.join("checkpoint").exists(), "the worktree is kept");
+        let body = store.machine("mb2").unwrap().body;
+        assert!(body.contains("/far/exec/trees/t-260816-095") && body.contains("never read"), "{body}");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }

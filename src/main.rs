@@ -1920,6 +1920,10 @@ fn help_text() -> String {
                                     its claim; a tree with uncommitted work in it,
                                     or with somebody in it, is kept and said so.
                                     --keep-tree leaves the checkout alone
+  wsp despawn <id> --lost           the seat is on a machine that is not coming
+                                    back: release the claim, the row to todo,
+                                    keep the worktree on the seat. A far seat
+                                    only; a local one is refused
   wsp resume [<id>] [--print]       the agents that were running before herdr
                                     restarted, offered back one row at a time:
                                     ␣ to pick, ↵ to bring those back on the
@@ -2099,7 +2103,9 @@ fn help_text() -> String {
   wsp machine show <name>           ssh target, tunnel, last seen, why not
   wsp machine set <name> k=v…       ssh/backend_at/os/arch/agents/status
   wsp machine set seat agents=N     how many agents the run starts on this box
-  wsp machine rm <name> [--force]   retire it; --force removes the record
+  wsp machine retire <name>         it is not coming back: retire it and list
+                                    every row held on it (none is released)
+  wsp machine rm <name> --force     remove the record entirely
 
 {worklists}
   wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,
