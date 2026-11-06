@@ -414,10 +414,10 @@ mod tests {
 
     #[test]
     fn only_a_whole_suite_command_is_narrowed() {
-        for c in ["cargo test", "cargo test --release", "npm test", "npx vitest run", "vitest run"] {
+        for c in ["cargo test", "cargo test --release", "cargo nextest run", "npm test", "npx vitest run", "vitest run"] {
             assert!(full_suite_command(c), "{c}");
         }
-        for c in ["cargo test -p host", "cargo test throttle::", "cargo test && npm run e2e", "sh suite.sh", "npx vitest related --run a.ts", "cargo build"] {
+        for c in ["cargo test -p host", "cargo nextest run -p host", "cargo nextest list", "cargo test throttle::", "cargo test && npm run e2e", "sh suite.sh", "npx vitest related --run a.ts", "cargo build"] {
             assert!(!full_suite_command(c), "{c}");
         }
     }

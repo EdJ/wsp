@@ -879,6 +879,12 @@ pub(crate) fn tree_of(root: u32) -> Vec<u32> {
 /// would be the sort of half-ending that leaves a build writing into a tree wsp
 /// has told somebody else is free.
 pub(crate) fn signal_group(group: u32, sig: &str) {
+    // Never this process's own group: a record naming our own pid (a test's
+    // stand-in for a live supervisor) would otherwise end us when we are a group
+    // leader, as every test is under `cargo nextest` (wsp-440).
+    if group == std::process::id() {
+        return;
+    }
     let _ = Command::new("kill")
         .arg(format!("-{sig}"))
         .arg(format!("-{group}"))

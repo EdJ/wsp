@@ -564,12 +564,23 @@ pub(crate) fn real_tool(tool: &str, path: &str, shims: &Path) -> Option<PathBuf>
 /// narrowing it. Any bare word after the subcommand is a filter (or a flag's
 /// value, which errs toward calling the run narrow, never the other way).
 pub(crate) fn is_full_suite(tool: &str, args: &[String]) -> bool {
-    if tool != "cargo" || !matches!(subcommand(args), Some("test" | "t")) {
+    if tool != "cargo" {
+        return false;
+    }
+    // `cargo nextest run` is the same suite under a per-test timeout (wsp-440).
+    let nextest = matches!(subcommand(args), Some("nextest"));
+    if !nextest && !matches!(subcommand(args), Some("test" | "t")) {
         return false;
     }
     const NARROW: &[&str] = &["--lib", "--bins", "--bin", "--test", "--tests", "--doc", "--example", "--examples", "--bench", "--benches", "-p", "--package"];
     let at = args.iter().position(|a| !a.starts_with('+') && !a.starts_with('-')).unwrap_or(0);
-    let rest = &args[at + 1..];
+    let mut rest = &args[at + 1..];
+    if nextest {
+        if rest.first().map(String::as_str) != Some("run") {
+            return false;
+        }
+        rest = &rest[1..];
+    }
     !rest.iter().any(|a| !a.starts_with('-') || NARROW.contains(&a.split('=').next().unwrap_or("")))
 }
 
@@ -1769,6 +1780,11 @@ mod tests {
         assert!(!is_full_suite("cargo", &a(&["test", "-p", "x"])));
         assert!(!is_full_suite("cargo", &a(&["test", "--", "name"])));
         assert!(!is_full_suite("cargo", &a(&["build"])));
+        assert!(is_full_suite("cargo", &a(&["nextest", "run"])));
+        assert!(is_full_suite("cargo", &a(&["nextest", "run", "--release"])));
+        assert!(!is_full_suite("cargo", &a(&["nextest", "run", "cmd_spawn::"])));
+        assert!(!is_full_suite("cargo", &a(&["nextest", "run", "-p", "x"])));
+        assert!(!is_full_suite("cargo", &a(&["nextest", "list"])));
         assert!(!is_full_suite("npm", &a(&["test"])));
     }
 
