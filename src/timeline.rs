@@ -518,7 +518,10 @@ fn names(line: &str, id: &str) -> bool {
 /// A session's Claude Code transcript, whole.
 fn transcript(session: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
-    let root = std::path::Path::new(&home).join(".claude/projects");
+    transcript_under(&std::path::Path::new(&home).join(".claude/projects"), session)
+}
+
+fn transcript_under(root: &std::path::Path, session: &str) -> Option<String> {
     for dir in std::fs::read_dir(root).ok()?.flatten() {
         if let Ok(text) = std::fs::read_to_string(dir.path().join(format!("{session}.jsonl"))) {
             return Some(text);
@@ -863,6 +866,14 @@ fn only_looks(cmd: &str) -> bool {
 /// sessions. `None` when none could be read.
 pub(crate) fn governor_window(sessions: &[String], from: i64, to: i64) -> Option<GovernorWindow> {
     let texts: Vec<String> = sessions.iter().filter_map(|s| transcript(s)).collect();
+    governor_window_of(&texts, from, to)
+}
+
+/// [`governor_window`] with the transcripts read under `root` rather than
+/// `~/.claude/projects`.
+#[cfg(test)]
+pub(crate) fn governor_window_under(root: &std::path::Path, sessions: &[String], from: i64, to: i64) -> Option<GovernorWindow> {
+    let texts: Vec<String> = sessions.iter().filter_map(|s| transcript_under(root, s)).collect();
     governor_window_of(&texts, from, to)
 }
 

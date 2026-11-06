@@ -98,16 +98,30 @@ fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_commands::Spend, usize
     }
 }
 
+/// One governor seat of a list: the workspace, the group it counts toward, the
+/// pass it sat through (see [`governors`]), the seconds it held the slot, and
+/// each stretch `[from, to)` it held it — `to` is 0 while it still does
+/// (`wsp-398`: the governor's sessions are the ones learned for this pane inside
+/// a stretch).
+pub(crate) struct GovSeat {
+    pub seat: String,
+    pub group: usize,
+    pub through: Option<usize>,
+    pub seconds: i64,
+    pub spans: Vec<(i64, i64)>,
+}
+
 /// The list's governor seats, each with the group it counts toward: from the
 /// event log in file order, a `worklist-go` raising the run's pass and a
 /// `governor-set` for the slug seating one. A workspace set twice counts at its
 /// first group; `through` is set where it sat through a pass beyond its own group's, since
 /// the pass that rotates it out is the one it was seated for.
-fn governors(store: &Store, slug: &str, groups: usize) -> Vec<(String, usize, Option<usize>, i64)> {
+pub(crate) fn governors(store: &Store, slug: &str, groups: usize) -> Vec<GovSeat> {
     let text = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
     let mut passed = 0usize;
     // seat, first group, group at the end of its tenure, set at, ended at
     let mut seats: Vec<(String, usize, usize, i64, i64)> = Vec::new();
+    let mut spans: Vec<Vec<(i64, i64)>> = Vec::new();
     let mut current: Option<usize> = None;
     for v in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
         let kind = v["kind"].as_str().unwrap_or("");
@@ -125,14 +139,21 @@ fn governors(store: &Store, slug: &str, groups: usize) -> Vec<(String, usize, Op
             "governor-set" | "governor-vacated" if d["project"] == slug => {
                 if let Some(i) = current.take() {
                     seats[i].4 = ts;
+                    if let Some(sp) = spans[i].last_mut().filter(|sp| sp.1 == 0) {
+                        sp.1 = ts;
+                    }
                 }
                 if kind == "governor-set" {
                     let ws = d["workspace"].as_str().unwrap_or("").to_string();
                     let g = (passed + 1).min(groups.max(1));
                     match seats.iter().position(|s| s.0 == ws) {
-                        Some(i) => current = Some(i),
+                        Some(i) => {
+                            spans[i].push((ts, 0));
+                            current = Some(i);
+                        }
                         None => {
                             seats.push((ws, g, g, ts, 0));
+                            spans.push(vec![(ts, 0)]);
                             current = Some(seats.len() - 1);
                         }
                     }
@@ -144,7 +165,14 @@ fn governors(store: &Store, slug: &str, groups: usize) -> Vec<(String, usize, Op
     let now = util::epoch_secs();
     seats
         .into_iter()
-        .map(|(s, g, end, at, until)| (s, g, (end > g).then_some(end), ((if until == 0 { now } else { until }) - at).max(0)))
+        .zip(spans)
+        .map(|((seat, group, end, at, until), spans)| GovSeat {
+            seat,
+            group,
+            through: (end > group).then_some(end),
+            seconds: ((if until == 0 { now } else { until }) - at).max(0),
+            spans,
+        })
         .collect()
 }
 
@@ -169,7 +197,7 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
         fig: Fig::default(),
     };
     let mut gov_seats: BTreeSet<String> = BTreeSet::new();
-    for (seat, g, through, seconds) in governors(store, slug, groups.len()) {
+    for GovSeat { seat, group: g, through, seconds, .. } in governors(store, slug, groups.len()) {
         counted.insert(seat.clone());
         gov_seats.insert(seat.clone());
         let mut e = entry(g, None, "governor", &seat);
