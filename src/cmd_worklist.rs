@@ -424,7 +424,7 @@ fn maker(store: &Store) -> Option<String> {
 // ---- add --------------------------------------------------------------
 
 pub fn add(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "usage: wsp worklist add <slug> <task>… [--group N] [--agent \"kind [model] [effort]\"]\n       wsp worklist add <slug> <parent> --sub";
+    const USAGE: &str = "usage: wsp worklist add <slug> <task>… [--group N] [--agent \"kind [model] [effort]\"] [--move | --also --why \"…\"]\n       wsp worklist add <slug> <parent> --sub";
     let Some(needle) = args.rest.get(1).cloned() else {
         eprintln!("{USAGE}");
         eprintln!("       (`wsp worklist new <slug> \"title\"` makes the list itself)");
@@ -529,6 +529,15 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         w.log(&format!("--sub {} resolved to the {} open now, not live", typed[0], members.len()));
     }
     if let Some(code) = refuse_edges(store, &w, &groups) {
+        return code;
+    }
+    // Last of the refusals and first of the writes: another list's rows are
+    // only touched once everything that could refuse this one has said so.
+    let why = match reason(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    if let Some(code) = settle_other_lists(store, args, &mut w, &members, ordinal, why.as_deref()) {
         return code;
     }
     save(store, &mut w, &groups, "add", &format!("add {}", members.join(" ")));
@@ -690,6 +699,162 @@ fn already_in(groups: &[Group], members: &[String], id: &str) -> Option<i32> {
     for m in members {
         if let Some((i, _)) = groups.iter().enumerate().find(|(_, g)| g.members.contains(m)) {
             eprintln!("wsp: {m} is already in group {} of `{id}` — wsp worklist mv {id} {m} --group N", i + 1);
+            return Some(1);
+        }
+    }
+    None
+}
+
+/// A row some other open list already holds, and where.
+struct Holder {
+    row: String,
+    list: Worklist,
+    /// 1-based, in that list.
+    ordinal: usize,
+}
+
+/// Does `list` still hold `row`, for the rule that a row is in one open list?
+///
+/// Open means anything but `closed` or `cancelled`, `wsp-381`'s words. A
+/// cancelled list holds nothing: the plan was dropped. A list that is over
+/// (`done`) holds a row only while the row is unfinished there — a complete
+/// list with something standing still has that row's work owed — and a row it
+/// finished is free for a follow-up list to take. Every other list holds its
+/// rows, whether it has started or not: a draft is exactly where a primary
+/// seat's earlier filing lives.
+fn holds_row(store: &Store, list: &Worklist, row: &str) -> bool {
+    if list.status() != WorklistStatus::Done {
+        return true;
+    }
+    if list.is_cancelled() {
+        return false;
+    }
+    match store.task_now(&store.renamed_ids(), row) {
+        Some(t) => !worklist::Settlement::of(&t).settled(),
+        None => false,
+    }
+}
+
+/// The open lists other than `this` that hold any of `members`.
+fn held_elsewhere(store: &Store, this: &str, members: &[String]) -> Vec<Holder> {
+    let mut out = Vec::new();
+    for list in store.worklists() {
+        if list.id == this {
+            continue;
+        }
+        let groups = list.groups();
+        for row in members {
+            let Some(i) = groups.iter().position(|g| g.members.contains(row)) else { continue };
+            if holds_row(store, &list, row) {
+                out.push(Holder { row: row.clone(), list: list.clone(), ordinal: i + 1 });
+            }
+        }
+    }
+    out
+}
+
+/// What `add` does about a row another open list already holds: nothing but
+/// say so, unless the caller chose how.
+///
+/// `--move` takes the row out of the other list in the same step, refused when
+/// that list's group has started, since the row's history is there. `--also`
+/// keeps it in both and writes `--why` into both logs. Neither flag and the
+/// row goes in no list at all — Ed, 2026-11-05: delivery-fixes was built over
+/// six rows `delivery-time-cut` held, and compound's sidebar showed each
+/// twice until somebody removed them by hand.
+///
+/// Everything is checked before anything is written. `None` means this list
+/// may go on to its own save.
+fn settle_other_lists(store: &Store, args: &Args, w: &mut Worklist, members: &[String], ordinal: usize, why: Option<&str>) -> Option<i32> {
+    let held = held_elsewhere(store, &w.id, members);
+    let (moving, also) = (args.has("move"), args.has("also"));
+    if moving && also {
+        eprintln!("wsp: --move takes a row out of the other list and --also keeps it in both — not both");
+        return Some(2);
+    }
+    if held.is_empty() {
+        return None;
+    }
+    if !moving && !also {
+        for h in &held {
+            eprintln!(
+                "wsp: {} is already in group {} of `{}` ({}) — not added to `{}`, and nothing changed",
+                h.row, h.ordinal, h.list.id, h.list.status_raw.trim(), w.id
+            );
+        }
+        eprintln!("     `--move` takes it out of there first · `--also --why \"…\"` keeps it in both and logs why in both lists");
+        return Some(1);
+    }
+    if also {
+        if why.is_none() {
+            eprintln!("wsp: --also keeps a row in two lists and says why in both logs — `--why \"…\"` (or `--why -` on stdin)");
+            return Some(2);
+        }
+    }
+
+    // Rewrite each other list once, however many of the rows it holds.
+    let by = crate::cmd_message::caller(store);
+    let mut ids: Vec<&str> = held.iter().map(|h| h.list.id.as_str()).collect();
+    ids.dedup();
+    let mut edits: Vec<(Worklist, Vec<Group>, Vec<String>)> = Vec::new();
+    for id in ids {
+        let other = held.iter().find(|h| h.list.id == id).map(|h| h.list.clone()).unwrap();
+        let mut groups = other.groups();
+        let win = window(store, &other);
+        let mut lines = Vec::new();
+        for h in held.iter().filter(|h| h.list.id == id) {
+            let Some(gi) = groups.iter().position(|g| g.members.contains(&h.row)) else { continue };
+            let there = ordinal;
+            if also {
+                lines.push(format!(
+                    "{} also in {} group {there} · by {by} · {}",
+                    h.row,
+                    w.id,
+                    why.unwrap_or_default()
+                ));
+                w.log(&format!(
+                    "{} also in {} group {} · by {by} · {}",
+                    h.row,
+                    other.id,
+                    h.ordinal,
+                    why.unwrap_or_default()
+                ));
+                continue;
+            }
+            if !win.allows(gi + 1) {
+                eprintln!(
+                    "wsp: {} is in group {} of `{}`, which its run has started — `--move` will not take a row out of a group with history",
+                    h.row, gi + 1, other.id
+                );
+                eprintln!("     `--also --why \"…\"` keeps it in both lists instead");
+                return Some(1);
+            }
+            groups[gi].members.retain(|m| m != &h.row);
+            groups[gi].member_agents.remove(&h.row);
+            if groups[gi].members.is_empty() {
+                groups.remove(gi);
+            }
+            lines.push(format!(
+                "{} moved to {} group {there} · by {by}{}",
+                h.row,
+                w.id,
+                why.map(|y| format!(" · {y}")).unwrap_or_default()
+            ));
+            w.log(&format!("{} moved here from {} group {} · by {by}", h.row, other.id, h.ordinal));
+        }
+        if moving {
+            if let Some(code) = refuse_edges(store, &other, &groups) {
+                return Some(code);
+            }
+        }
+        edits.push((other, groups, lines));
+    }
+    for (mut other, groups, lines) in edits {
+        for l in &lines {
+            other.log(l);
+        }
+        let what = if moving { "move-out" } else { "also" };
+        if save(store, &mut other, &groups, what, &format!("{what} {}", lines.len())) != 0 {
             return Some(1);
         }
     }
@@ -8094,7 +8259,7 @@ mod tests {
         run(&store, &["new", "night", "n"]);
         run(&store, &["add", "night", "wl-001"]);
         run(&store, &["new", "other", "o"]);
-        run(&store, &["add", "other", "wl-001"]);
+        flagged(&store, &["add", "other", "wl-001"], &[("also", "true"), ("why", "a plan over the same row")]);
 
         assert_eq!(run(&store, &["go", "night"]), 0);
         assert_eq!(run(&store, &["go", "other"]), 1, "the same task, in a second run");
@@ -8927,7 +9092,7 @@ mod tests {
         assert_eq!(run(&store, &["new", "made", "m"]), 0);
         std::env::remove_var(crate::place::SEAT_ENV);
         assert_eq!(store.worklist("made").unwrap().made_in.as_deref(), Some("wsp"));
-        assert_eq!(run(&store, &["add", "made", "i-1"]), 0);
+        assert_eq!(flagged(&store, &["add", "made", "i-1"], &[("also", "true"), ("why", "a second list over the same row")]), 0);
         assert_eq!(home_of(&store, "made"), Some(("wsp".into(), worklist::HomeFrom::Maker)));
     }
 
@@ -9271,5 +9436,118 @@ mod tests {
         let l = listed_json(&store, &listed[0]);
         assert_eq!(l["status"], "executing");
         assert!(l["flags"].is_object());
+    }
+
+    // ---- a row is in one open list (wsp-419) ----------------------------
+
+    fn two_lists(tag: &str) -> Store {
+        let store = scratch(tag);
+        for id in ["r-1", "r-2", "r-3"] {
+            task(&store, id, "todo");
+        }
+        assert_eq!(run(&store, &["new", "first", "First"]), 0);
+        assert_eq!(run(&store, &["add", "first", "r-1"]), 0);
+        assert_eq!(run(&store, &["add", "first", "r-2"]), 0);
+        assert_eq!(run(&store, &["new", "second", "Second"]), 0);
+        store
+    }
+
+    fn log_of(store: &Store, id: &str) -> String {
+        store.worklist(id).unwrap().section("Log").unwrap_or_default()
+    }
+
+    /// Ed, 2026-11-05: delivery-fixes was built over rows delivery-time-cut
+    /// held, and wsp took them without a word. Now it names the list and group
+    /// and changes nothing.
+    #[test]
+    fn adding_a_row_another_open_list_holds_is_refused_and_changes_nothing() {
+        let store = two_lists("held-refused");
+        let (first, second) = (store.worklist("first").unwrap().body, store.worklist("second").unwrap().body);
+        assert_eq!(run(&store, &["add", "second", "r-3", "r-1"]), 1);
+        assert_eq!(store.worklist("first").unwrap().body, first);
+        assert_eq!(store.worklist("second").unwrap().body, second, "r-3 did not go in either: nothing changed");
+        assert!(groups_of(&store, "second").is_empty());
+        // A row nobody else holds is as free as ever.
+        assert_eq!(run(&store, &["add", "second", "r-3"]), 0);
+        // And a list's own row is the old refusal, not this one.
+        assert_eq!(run(&store, &["add", "second", "r-3"]), 1);
+        // `--move` and `--also` together say nothing clear.
+        assert_eq!(flagged(&store, &["add", "second", "r-1"], &[("move", "true"), ("also", "true")]), 2);
+    }
+
+    #[test]
+    fn move_takes_the_row_out_of_the_other_list_and_logs_it_there() {
+        let store = two_lists("held-move");
+        assert_eq!(flagged(&store, &["add", "second", "r-1"], &[("move", "true")]), 0);
+        assert_eq!(groups_of(&store, "second")[0].members, vec!["r-1"]);
+        let first = groups_of(&store, "first");
+        assert_eq!(first.len(), 1, "the group it left was emptied and dropped");
+        assert_eq!(first[0].members, vec!["r-2"]);
+        assert!(log_of(&store, "first").contains("r-1 moved to second group 1"), "{}", log_of(&store, "first"));
+        assert!(log_of(&store, "second").contains("r-1 moved here from first group 1"), "{}", log_of(&store, "second"));
+    }
+
+    #[test]
+    fn move_is_refused_once_the_other_lists_group_has_started() {
+        let store = two_lists("held-move-started");
+        let mut w = store.worklist("first").unwrap();
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        let (first, second) = (store.worklist("first").unwrap().body, store.worklist("second").unwrap().body);
+        assert_eq!(flagged(&store, &["add", "second", "r-1"], &[("move", "true")]), 1);
+        assert_eq!(store.worklist("first").unwrap().body, first, "the row's history stays where it is");
+        assert_eq!(store.worklist("second").unwrap().body, second);
+    }
+
+    #[test]
+    fn also_keeps_the_row_in_both_lists_and_needs_a_reason_logged_in_both() {
+        let store = two_lists("held-also");
+        assert_eq!(flagged(&store, &["add", "second", "r-1"], &[("also", "true")]), 2, "no --why");
+        assert!(groups_of(&store, "second").is_empty());
+        assert_eq!(flagged(&store, &["add", "second", "r-1"], &[("also", "true"), ("why", "follow-up pass on the same row")]), 0);
+        assert_eq!(groups_of(&store, "second")[0].members, vec!["r-1"]);
+        assert_eq!(groups_of(&store, "first")[0].members, vec!["r-1"], "still there");
+        for (list, other) in [("first", "second"), ("second", "first")] {
+            let log = log_of(&store, list);
+            assert!(log.contains(&format!("r-1 also in {other} group 1")), "{list}: {log}");
+            assert!(log.contains("follow-up pass on the same row"), "{list}: {log}");
+        }
+    }
+
+    /// A list that finished its row, or was cancelled, no longer has it; a
+    /// complete list with the row still standing does.
+    #[test]
+    fn a_finished_or_cancelled_lists_row_is_free_and_an_unfinished_ones_is_not() {
+        let store = two_lists("held-free");
+        let end = |id: &str, cancelled: bool| {
+            let mut w = store.worklist(id).unwrap();
+            if cancelled {
+                w.set_cancelled();
+            } else {
+                w.set_status(WorklistStatus::Done);
+            }
+            store.save_worklist(&w).unwrap();
+        };
+        // Done with r-1 still at todo: complete, not closed. It holds both.
+        end("first", false);
+        assert_eq!(run(&store, &["add", "second", "r-1"]), 1);
+        // r-1 finished there, r-2 not: the finished one is free, the other is held.
+        task(&store, "r-1", "done");
+        assert_eq!(run(&store, &["add", "second", "r-2"]), 1);
+        assert_eq!(run(&store, &["add", "second", "r-1"]), 0);
+        // Cancelled holds nothing, finished or not.
+        end("first", true);
+        assert_eq!(run(&store, &["add", "second", "r-2"]), 0);
+    }
+
+    /// `mv` moves a member between the groups of one list; it never adds a row
+    /// to a list, so a row another list holds does not touch it.
+    #[test]
+    fn mv_within_a_list_is_not_stopped_by_the_row_being_in_another() {
+        let store = two_lists("held-mv");
+        assert_eq!(flagged(&store, &["add", "second", "r-1"], &[("also", "true"), ("why", "both")]), 0);
+        assert_eq!(run(&store, &["add", "second", "r-3"]), 0);
+        assert_eq!(flagged(&store, &["mv", "second", "r-3"], &[("group", "1")]), 0);
+        assert_eq!(groups_of(&store, "second")[0].members, vec!["r-1", "r-3"]);
     }
 }

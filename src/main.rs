@@ -239,6 +239,9 @@ const BOOL_FLAGS: &[&str] = &[
     // And `worklist add <slug> <parent> --sub`, whose positionals are the list
     // and the parent, and `worklist show <slug> --log|--verdicts|--stops`.
     "sub", "log", "verdicts", "stops",
+    // `worklist add <slug> <task>… --move|--also`: the rows are positionals,
+    // and the flag may sit between them.
+    "move", "also",
     // And the return path. `wsp answer <id> --abandon "the reason"` is the word
     // order somebody types, and without this the reason is eaten as the flag's
     // value and the verb refuses for want of a sentence it was given. `--again`
@@ -2101,6 +2104,11 @@ fn help_text() -> String {
                                     one, its first member's caption names it
   wsp worklist add <slug> <parent> --sub   …or that parent's open sub-tasks as
                                     one group, resolved now and not live
+                                    A row another open list holds is refused,
+                                    naming that list. --move takes it out of
+                                    there first (not once its group has
+                                    started); --also --why "…" keeps it in
+                                    both and logs why in both
   wsp worklist rm <slug> <task>… [-n]
                                     take members out; a group left empty goes,
                                     and -n says which before anything moves
@@ -2848,6 +2856,21 @@ mod tests {
         // Elsewhere it is still a bare flag that leaves the next word alone.
         let a = parse(&["spawn", "--agent", "m-1"]);
         assert_eq!(a.rest, vec!["m-1"]);
+    }
+
+    /// `wsp-419`: `--move` and `--also` are bare flags, so the task ids after
+    /// them are still positionals — `add second --move r-1` must not read
+    /// `r-1` as the flag's value and add nothing.
+    #[test]
+    fn worklist_add_move_and_also_leave_the_rows_after_them_alone() {
+        let parse = |line: &[&str]| crate::Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+        let a = parse(&["worklist", "add", "second", "--move", "r-1", "r-2"]);
+        assert_eq!(a.rest, vec!["add", "second", "r-1", "r-2"]);
+        assert!(a.has("move"));
+        let a = parse(&["worklist", "add", "second", "--also", "--why", "both", "r-1"]);
+        assert_eq!(a.rest, vec!["add", "second", "r-1"]);
+        assert!(a.has("also"));
+        assert_eq!(a.get("why").as_deref(), Some("both"));
     }
 
     /// A rule that names a command nobody dispatches is a rule that does
