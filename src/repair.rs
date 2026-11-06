@@ -373,6 +373,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // And text typed at a governor's or a member's prompt and never sent
     // (`wsp-386`): counted here, drawn by `wsp wip`.
     unsent_tick(store, seats);
+    // And a first work order that started no turn (`wsp-420`).
+    first_order_tick(store, seats);
     // **Collected first and then visited once each**, which is the whole of the
     // second trigger and the reason it is here rather than in the loop above.
     // A scope on a running list and a scope with a backlog are the same seat, and
@@ -644,6 +646,133 @@ fn unsent_counts(store: &Store) -> std::collections::BTreeMap<String, u64> {
 /// The seats whose prompts have held typed text for more than a tick.
 pub(crate) fn unsent_seats(store: &Store) -> std::collections::BTreeSet<String> {
     unsent_counts(store).into_iter().filter(|(_, n)| *n >= UNSENT_TICKS).map(|(s, _)| s).collect()
+}
+
+// ---- a first work order that never started a turn ---------------------------
+
+/// Where the spawns whose first order did not start a turn are kept: seat →
+/// [`Owed`].
+const OWED_FILE: &str = "first-orders.json";
+
+/// How long a seat gets, after a spawn gave up on it, before the order is sent
+/// again, and again before the seat is flagged.
+const OWED_WAIT: i64 = 30;
+
+/// How long an unpaid order stays on the record before it is forgotten.
+const OWED_KEEP: i64 = 900;
+
+/// A first work order a spawn left unpaid.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Owed {
+    pub order: String,
+    /// When the spawn gave up (epoch seconds), and when this was last tried.
+    pub at: i64,
+    /// How many times the order has been sent again or submitted after the
+    /// spawn gave up, the spawn's own resend included: one is all a seat gets
+    /// before it is flagged.
+    pub tries: u32,
+    pub flagged: bool,
+}
+
+fn owed_all(store: &Store) -> std::collections::BTreeMap<String, Owed> {
+    let read = std::fs::read_to_string(store.state.join(OWED_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let Some(serde_json::Value::Object(map)) = read else { return Default::default() };
+    map.into_iter()
+        .filter_map(|(seat, v)| {
+            Some((seat, Owed {
+                order: v["order"].as_str()?.to_string(),
+                at: v["at"].as_i64()?,
+                tries: v["tries"].as_u64()? as u32,
+                flagged: v["flagged"].as_bool().unwrap_or(false),
+            }))
+        })
+        .collect()
+}
+
+fn owed_save(store: &Store, all: &std::collections::BTreeMap<String, Owed>) {
+    let _ = std::fs::create_dir_all(&store.state);
+    let out: serde_json::Map<String, serde_json::Value> = all
+        .iter()
+        .map(|(seat, o)| {
+            (seat.clone(), serde_json::json!({ "order": o.order, "at": o.at, "tries": o.tries, "flagged": o.flagged }))
+        })
+        .collect();
+    let _ = std::fs::write(store.state.join(OWED_FILE), serde_json::Value::Object(out).to_string());
+}
+
+/// **Recorded by a spawn whose first order did not start a turn** (`wsp-420`).
+/// Two seats on 2026-11-05 sat idle on an empty prompt: cpd-3100's order went
+/// to the pane and was dropped, and cpd-3135 never read ready inside the
+/// spawn's sixty seconds, so its order was never sent at all and the prompt was
+/// drawn after the spawn had given up. Both were repaired by hand with
+/// `wsp tell`. `tries` is how many sends the spawn already made.
+pub(crate) fn owe_first_order(store: &Store, seat: &str, order: &str, tries: u32) {
+    let mut all = owed_all(store);
+    all.insert(seat.to_string(), Owed { order: order.to_string(), at: util::epoch_secs(), tries, flagged: false });
+    owed_save(store, &all);
+}
+
+/// The seats whose first order is still owed.
+pub(crate) fn owed_seats(store: &Store) -> std::collections::BTreeSet<String> {
+    owed_all(store).into_keys().collect()
+}
+
+/// Watch the seats [`owe_first_order`] recorded. Once a seat has had
+/// [`OWED_WAIT`] seconds and no turn has begun: an idle seat whose prompt is
+/// holding the order gets a submit; one whose prompt is empty gets the order
+/// again, once, and the log says so. A seat that is still idle another wait on
+/// is flagged in `cycle.log` and left alone. A turn, a gone seat or
+/// [`OWED_KEEP`] seconds ends the record.
+pub(crate) fn first_order_tick(store: &Store, seats: &dyn Seats) {
+    let mut all = owed_all(store);
+    if all.is_empty() {
+        return;
+    }
+    let now = util::epoch_secs();
+    let before = all.clone();
+    for seat in all.keys().cloned().collect::<Vec<_>>() {
+        let owed = all[&seat].clone();
+        let state = seats.state(&seat);
+        let started = state.is_some_and(|s| s.turn_in_flight()) || seats.turn_began_since(&seat, owed.at) == Some(true);
+        if started || now - owed.at > OWED_KEEP || seats.absent(&seat) {
+            all.remove(&seat);
+            continue;
+        }
+        if now - owed.at < OWED_WAIT || state != Some(State::Idle) {
+            continue;
+        }
+        let Some(typed) = seats.typed(&seat) else { continue };
+        let Some(entry) = all.get_mut(&seat) else { continue };
+        if owed.tries >= 1 {
+            if !owed.flagged {
+                entry.flagged = true;
+                stamp(store, &format!(
+                    "FAILED {seat}: its first work order was sent {} times and no turn has started - the seat is idle on {} prompt; `wsp tell {seat} -` sends it by hand",
+                    owed.tries,
+                    if typed { "a full" } else { "an empty" },
+                ));
+            }
+            continue;
+        }
+        entry.tries += 1;
+        entry.at = now;
+        if typed {
+            if seats.press(&seat) {
+                stamp(store, &format!("{seat}: its first work order sat typed and unsent - submitted it"));
+            }
+        } else {
+            match seats.resend(&seat, &owed.order) {
+                Some(Ok(_)) => stamp(store, &format!("{seat}: no turn started on its first work order and the prompt is empty - sent it again")),
+                Some(Err(e)) => stamp(store, &format!("{seat}: sending its first work order again was refused: {e}")),
+                None => entry.tries -= 1,
+            }
+        }
+    }
+    if all != before {
+        owed_save(store, &all);
+    }
 }
 
 // ---- a governor seat nobody is in -----------------------------------------
@@ -1740,6 +1869,91 @@ pub(crate) mod tests {
         a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]));
         assert_eq!(reseated(), vec!["run".to_string()]);
         assert!(stamped().iter().any(|l| l.contains("the seat reads gone and this list is running — seating a successor")));
+    }
+
+    /// A seat that records what it is sent and pressed (`wsp-420`).
+    struct Orders {
+        state: Option<State>,
+        typed: bool,
+        sent: std::cell::RefCell<Vec<String>>,
+        pressed: std::cell::Cell<u32>,
+    }
+
+    impl Orders {
+        fn idle(typed: bool) -> Orders {
+            Orders { state: Some(State::Idle), typed, sent: Default::default(), pressed: Default::default() }
+        }
+    }
+
+    impl Seats for Orders {
+        fn state(&self, _seat: &str) -> Option<State> {
+            self.state
+        }
+        fn typed(&self, _seat: &str) -> Option<bool> {
+            Some(self.typed)
+        }
+        fn press(&self, _seat: &str) -> bool {
+            self.pressed.set(self.pressed.get() + 1);
+            true
+        }
+        fn resend(&self, _seat: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
+            self.sent.borrow_mut().push(text.to_string());
+            Some(Ok(crate::place::Delivery::Unconfirmed))
+        }
+    }
+
+    /// Age the record so the wait has passed.
+    fn aged(store: &Store) {
+        let mut all = owed_all(store);
+        for o in all.values_mut() {
+            o.at -= OWED_WAIT + 1;
+        }
+        owed_save(store, &all);
+    }
+
+    #[test]
+    fn a_first_order_dropped_on_an_empty_prompt_is_sent_again_once_and_the_log_says_so() {
+        let (_env, store) = in_flight("owed-empty");
+        owe_first_order(&store, "cpd-1", "pick up m-1", 0);
+        let seat = Orders::idle(false);
+        first_order_tick(&store, &seat);
+        assert!(seat.sent.borrow().is_empty(), "the wait has not passed");
+        aged(&store);
+        first_order_tick(&store, &seat);
+        assert_eq!(*seat.sent.borrow(), vec!["pick up m-1".to_string()]);
+        assert!(stamped().iter().any(|l| l.contains("cpd-1") && l.contains("sent it again")));
+        first_order_tick(&store, &seat);
+        assert_eq!(seat.sent.borrow().len(), 1, "once, and then it waits");
+        aged(&store);
+        first_order_tick(&store, &seat);
+        first_order_tick(&store, &seat);
+        assert_eq!(seat.sent.borrow().len(), 1, "never a third copy");
+        let said = stamped();
+        assert_eq!(said.iter().filter(|l| l.starts_with("FAILED cpd-1")).count(), 1, "flagged once: {said:?}");
+    }
+
+    #[test]
+    fn a_first_order_typed_and_unsent_is_submitted_not_typed_again() {
+        let (_env, store) = in_flight("owed-typed");
+        owe_first_order(&store, "cpd-1", "pick up m-1", 0);
+        aged(&store);
+        let seat = Orders::idle(true);
+        first_order_tick(&store, &seat);
+        assert_eq!(seat.pressed.get(), 1);
+        assert!(seat.sent.borrow().is_empty());
+        assert!(stamped().iter().any(|l| l.contains("submitted it")));
+    }
+
+    #[test]
+    fn a_first_order_that_started_a_turn_leaves_the_record() {
+        let (_env, store) = in_flight("owed-paid");
+        owe_first_order(&store, "cpd-1", "pick up m-1", 0);
+        aged(&store);
+        let mut seat = Orders::idle(false);
+        seat.state = Some(State::Working);
+        first_order_tick(&store, &seat);
+        assert!(owed_seats(&store).is_empty());
+        assert!(seat.sent.borrow().is_empty());
     }
 
     /// Typed text that stays through a second tick is `typed, not sent`; one

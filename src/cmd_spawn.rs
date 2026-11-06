@@ -3010,10 +3010,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                         // reaches an agent of this kind — its own channel, or
                         // the backend typing at it — is the one decision this
                         // file must not make; see `agent_commands`.
-                        false => match hand_over(place, how, &spawn, text, &Patience::default()) {
+                        false => match confirm_turn(place, how, &spawn, text, &Patience::default()) {
                             Ok(()) => told = true,
                             Err(e) => {
                                 eprintln!("wsp: agent started but not working on it: {e}");
+                                // The spawn has sent it twice by now, or
+                                // left it typed; the repair tick submits a
+                                // typed one, and flags one still dropped.
+                                let tries = if place.typed(&seat) == Some(true) { 0 } else { 1 };
+                                crate::repair::owe_first_order(store, seat.as_str(), text, tries);
                                 // The repair first, and spelled so it can be
                                 // pasted. The pane, not the task: a task names
                                 // its holder, and a verifier's task is held by
@@ -3027,6 +3032,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             }
             Err(e) => {
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
+                // The order was never sent. If the agent draws its prompt
+                // after this gives up (cpd-3135, 2026-11-05), the repair tick
+                // sends it then.
+                if let (Some(text), false) = (&order, in_args) {
+                    crate::repair::owe_first_order(store, seat.as_str(), text, 0);
+                }
                 unreached(how, place, &spawn);
             }
         }
