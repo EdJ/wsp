@@ -6053,7 +6053,9 @@ mod tests {
     /// must be what `show <slug> --json` gives, plus its overview.
     #[test]
     fn show_all_is_each_open_lists_show_plus_its_overview() {
-        let store = scratch("show-all");
+        // `show_json` reads `WSP_ARTEFACTS` (outputs_dir), so the test holds the
+        // env lock like the `running()` tests that set it (wsp-421).
+        let (_env, store) = running("show-all");
         for id in ["a-1", "a-2"] {
             task(&store, id, "todo");
         }
