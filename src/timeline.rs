@@ -862,29 +862,42 @@ fn only_looks(cmd: &str) -> bool {
         .any(|p| c.starts_with(p))
 }
 
+/// One transcript of the governor, and the stretches of the run its pane held
+/// the slot: a turn outside them is not the governor's (`wsp-398`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GovSource {
+    /// An absolute path to the transcript (a seat's `burn.json` names one), or a
+    /// bare session id looked for under `~/.claude/projects` (older events).
+    pub transcript: String,
+    /// `(from, to)` epoch seconds, `to == 0` for still held; empty = unclipped.
+    pub spans: Vec<(i64, i64)>,
+}
+
+fn read_source(src: &GovSource) -> Option<String> {
+    if src.transcript.starts_with('/') {
+        std::fs::read_to_string(&src.transcript).ok()
+    } else {
+        transcript(&src.transcript)
+    }
+}
+
 /// The governor's figures over `[from, to)` out of the transcripts of its
 /// sessions. `None` when none could be read.
-pub(crate) fn governor_window(sessions: &[String], from: i64, to: i64) -> Option<GovernorWindow> {
-    let texts: Vec<String> = sessions.iter().filter_map(|s| transcript(s)).collect();
+pub(crate) fn governor_window(sources: &[GovSource], from: i64, to: i64) -> Option<GovernorWindow> {
+    let texts: Vec<(String, Vec<(i64, i64)>)> = sources.iter().filter_map(|s| read_source(s).map(|t| (t, s.spans.clone()))).collect();
     governor_window_of(&texts, from, to)
 }
 
-/// [`governor_window`] with the transcripts read under `root` rather than
-/// `~/.claude/projects`.
-#[cfg(test)]
-pub(crate) fn governor_window_under(root: &std::path::Path, sessions: &[String], from: i64, to: i64) -> Option<GovernorWindow> {
-    let texts: Vec<String> = sessions.iter().filter_map(|s| transcript_under(root, s)).collect();
-    governor_window_of(&texts, from, to)
-}
-
-fn governor_window_of(texts: &[String], from: i64, to: i64) -> Option<GovernorWindow> {
+fn governor_window_of(texts: &[(String, Vec<(i64, i64)>)], from: i64, to: i64) -> Option<GovernorWindow> {
     if texts.is_empty() || to < from {
         return None;
     }
     let mut w = GovernorWindow { seconds: to - from, ..Default::default() };
-    for t in texts {
+    let now = util::epoch_secs();
+    let held = |spans: &[(i64, i64)], at: i64| spans.is_empty() || spans.iter().any(|&(a, b)| at >= a && at <= if b == 0 { now } else { b });
+    for (t, spans) in texts {
         let (calls, tools) = read_transcript(t);
-        for c in calls.iter().filter(|c| c.at >= from && c.at < to) {
+        for c in calls.iter().filter(|c| c.at >= from && c.at < to && held(spans, c.at)) {
             let secs = (c.end - c.start).max(0);
             w.turns += 1;
             w.model_secs += secs;
@@ -893,7 +906,7 @@ fn governor_window_of(texts: &[String], from: i64, to: i64) -> Option<GovernorWi
                 w.looking_secs += secs;
             }
         }
-        w.tool_secs += tools.iter().filter(|(at, _, _)| *at >= from && *at < to).map(|(_, _, s)| *s).sum::<i64>();
+        w.tool_secs += tools.iter().filter(|(at, _, _)| *at >= from && *at < to && held(spans, *at)).map(|(_, _, s)| *s).sum::<i64>();
     }
     w.idle_secs = (w.seconds - w.model_secs - w.tool_secs).max(0);
     Some(w)
@@ -1539,7 +1552,7 @@ mod tests {
             bash(1200, "r3", "t3", "wsp say z"),
         ]
         .join("\n");
-        let w = governor_window_of(&[text], 1005, 1100).unwrap();
+        let w = governor_window_of(&[(text, vec![])], 1005, 1100).unwrap();
         assert_eq!((w.seconds, w.turns, w.looking_turns), (95, 2, 1), "{w:?}");
         assert_eq!(w.tool_secs, 2 + 10);
         assert_eq!(w.looking_secs, 10);

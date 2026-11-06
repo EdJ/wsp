@@ -360,7 +360,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "cost": "whole row: every seat — members, verifiers, barrier checks, governors",
             "full_suite": "full_suite_runs: full-suite `cargo test` runs started in a member's or verifier's seat (the shim's note, wsp-389), by row and group. The barrier's own run is one per group and is not counted here; the aim is zero in seats.",
             "barrier_scope": "groups[].barrier_scope: the barrier's run scoped to what the group touched (wsp-431) — scoped or full and why, the targets it ran, shared paths that widened it, its seconds against the last full run's, and net_red: scoped barriers a red full run stood behind, which is what scoping let through",
-            "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start. null where no group follows or no pass is found; the governor figures are null where its transcript is not found; its sessions are the ones learned for the pane `governor-set` seated, while it held the slot",
+            "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start. null where no group follows or no pass is found; the governor figures are null where its transcript is not found; its transcript is the one the seat's burn.json names, for each pane `governor-set` seated, clipped to the stretch it held the slot; burn.json holds only a seat's latest session and goes when the seat stops, so the figures are a floor",
             "time": "per member row, spawn to verdict (wall, gaps); the seat's model and tool time are its own transcript calls inside those phases, legs only where run-leg timings exist",
         },
         "totals": {
@@ -459,18 +459,33 @@ fn governor_wall(store: &Store, list: &str, group_starts: &[(i64, i64)]) -> Vec<
     governor_wall_with(store, list, group_starts, &crate::timeline::governor_window)
 }
 
-/// The sessions of the list's governor: the `session-learned` events for a
-/// pane that held the governor slot (`governor-set` to the next `governor-set`
-/// or `governor-vacated`, [`crate::cmd_cost::governors`]'s reading), written
-/// while it held it. A learned session carries `{id, pane, session}`, never the
-/// project, so the pane and the time are what tie it to the list; a member's or
-/// verifier's session in another pane, or in this one after the slot moved on,
-/// is not the governor's. Older events that name the project are kept.
-fn governor_sessions(store: &Store, list: &str, groups: usize) -> Vec<String> {
+/// The transcripts of the list's governor, each with the stretches its pane
+/// held the slot. A governor pane never gets a `session-learned` event; its
+/// session is the one its seat's `burn.json` names (`transcript`), for each
+/// pane [`crate::cmd_cost::governors`] reads from `governor-set`/`-vacated`.
+/// `burn.json` holds only the seat's latest session and goes with the seat's
+/// directory when it stops, so a pane reseated within a tenure, or a seat long
+/// stopped, gives nothing for the earlier session: the figures are a floor,
+/// never a record made up. Older `session-learned` events that name the
+/// project, or a pane that held the slot, are kept.
+fn governor_sources(store: &Store, list: &str, groups: usize) -> Vec<crate::timeline::GovSource> {
+    use crate::timeline::GovSource;
     let seats = crate::cmd_cost::governors(store, list, groups);
+    let mut out: Vec<GovSource> = Vec::new();
+    for s in &seats {
+        for root in ["compound-seats", "seats"] {
+            let rec = crate::place_super::read_json(&store.state.join(root).join(&s.seat).join("burn.json"));
+            if let Some(t) = rec["transcript"].as_str().filter(|t| !t.is_empty()) {
+                match out.iter_mut().find(|o| o.transcript == t) {
+                    Some(o) => o.spans.extend(s.spans.iter().copied()),
+                    None => out.push(GovSource { transcript: t.to_string(), spans: s.spans.clone() }),
+                }
+                break;
+            }
+        }
+    }
     let text = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
     let now = util::epoch_secs();
-    let mut sessions: Vec<String> = Vec::new();
     for v in text.lines().filter(|l| l.contains("session-learned")).filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
         if v["kind"] != "session-learned" {
             continue;
@@ -483,18 +498,20 @@ fn governor_sessions(store: &Store, list: &str, groups: usize) -> Vec<String> {
         if !(held || d["project"] == list) {
             continue;
         }
-        if let Some(s) = d["session"].as_str().filter(|s| !sessions.iter().any(|x| x == s)) {
-            sessions.push(s.to_string());
+        if let Some(s) = d["session"].as_str() {
+            if !out.iter().any(|o| o.transcript.contains(s)) {
+                out.push(GovSource { transcript: s.to_string(), spans: Vec::new() });
+            }
         }
     }
-    sessions
+    out
 }
 
 fn governor_wall_with(
     store: &Store,
     list: &str,
     group_starts: &[(i64, i64)],
-    window: &dyn Fn(&[String], i64, i64) -> Option<crate::timeline::GovernorWindow>,
+    window: &dyn Fn(&[crate::timeline::GovSource], i64, i64) -> Option<crate::timeline::GovernorWindow>,
 ) -> Vec<Option<GovWall>> {
     let text = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
     let mut passes: BTreeMap<u64, i64> = BTreeMap::new();
@@ -506,7 +523,7 @@ fn governor_wall_with(
             }
         }
     }
-    let sessions = governor_sessions(store, list, group_starts.len());
+    let sessions = governor_sources(store, list, group_starts.len());
     let cycle = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
     (0..group_starts.len())
         .map(|gi| {
@@ -516,7 +533,7 @@ fn governor_wall_with(
             let head = format!("{list} group {}: ", gi + 2);
             let held_by = cycle
                 .lines()
-                .filter(|l| l.len() > 21 && l.is_char_boundary(21))
+                .filter(|l| l.len() > 21 && l.is_char_boundary(20) && l.is_char_boundary(21))
                 .filter(|l| {
                     let t = util::epoch_of(&l[..20]);
                     t >= pass && t <= last
@@ -970,43 +987,49 @@ mod tests {
         assert_eq!(g.json()["seconds_to_last_start"], 870);
     }
 
-    /// `wsp-398`, found by the verifier: live `session-learned` events carry
-    /// `{id, kind, pane, session}` and never the project. The governor is the
-    /// pane `governor-set` seated, so its turns are the sessions learned for
-    /// that pane while it held the slot — not a member's, not another pane's,
-    /// not the same pane's after it was vacated.
+    /// `wsp-398`, found by the verifier: a governor's pane never gets a
+    /// `session-learned` event. Its session is the transcript its seat's
+    /// `burn.json` names, so that file is what the fixture writes. A member's
+    /// session on another pane (a `session-learned` event), and a turn of the
+    /// governor's transcript after the slot was vacated, are not counted.
     #[test]
-    fn the_governors_turns_come_from_the_sessions_learned_for_its_pane_while_it_held_it() {
+    fn the_governors_turns_come_from_the_transcript_its_seats_burn_json_names() {
         let (env, store, _w) = list("gv", &["r-1", "r-2"]);
         let t0: i64 = util::epoch_secs() - 10_000;
         let ev = |at: i64, kind: &str, data: Value| json!({ "ts": util::iso_at(at), "kind": kind, "data": data }).to_string();
         let log = [
             ev(t0, "governor-set", json!({ "project": "gv", "workspace": "cpd-1" })),
-            ev(t0 + 5, "session-learned", json!({ "id": "agent-1", "kind": "claude", "pane": "cpd-1", "session": "gov-s" })),
             ev(t0 + 6, "session-learned", json!({ "id": "r-1", "kind": "claude", "pane": "cpd-7", "session": "member-s" })),
             ev(t0 + 100, "worklist-go", json!({ "id": "gv", "passed": 1, "started": false })),
-            ev(t0 + 300, "governor-vacated", json!({ "project": "gv", "workspace": "cpd-1" })),
-            ev(t0 + 400, "session-learned", json!({ "id": "r-2", "kind": "claude", "pane": "cpd-1", "session": "later-s" })),
+            ev(t0 + 180, "governor-vacated", json!({ "project": "gv", "workspace": "cpd-1" })),
         ]
         .join("\n");
         std::fs::write(store.state_file("events.jsonl"), format!("{log}\n")).unwrap();
         let root = env.home().join("transcripts");
-        std::fs::create_dir_all(root.join("proj")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         let turn = |at: i64, rid: &str, cmd: &str| {
             json!({ "type": "assistant", "requestId": rid, "timestamp": util::iso_at(at),
                 "message": { "content": [{ "type": "tool_use", "id": rid, "name": "Bash", "input": { "command": cmd } }], "usage": { "input_tokens": 1, "output_tokens": 1 } } })
             .to_string()
         };
-        let put = |name: &str, lines: Vec<String>| std::fs::write(root.join("proj").join(format!("{name}.jsonl")), lines.join("\n")).unwrap();
-        put("gov-s", vec![turn(t0 + 110, "g1", "wsp say x"), turn(t0 + 150, "g2", "wsp watch --once")]);
+        let put = |name: &str, lines: Vec<String>| {
+            let p = root.join(format!("{name}.jsonl"));
+            std::fs::write(&p, lines.join("\n")).unwrap();
+            p
+        };
+        // The third governor turn is after the slot was vacated (t0 + 180).
+        let gov = put("gov-s", vec![turn(t0 + 110, "g1", "wsp say x"), turn(t0 + 150, "g2", "wsp watch --once"), turn(t0 + 190, "g3", "wsp say y")]);
         put("member-s", vec![turn(t0 + 120, "m1", "cargo test"), turn(t0 + 130, "m2", "cargo test"), turn(t0 + 140, "m3", "cargo test")]);
-        put("later-s", vec![turn(t0 + 160, "l1", "cargo test")]);
-        let sessions = governor_sessions(&store, "gv", 2);
-        assert_eq!(sessions, vec!["gov-s".to_string()], "only the pane the governor held, while it held it");
-        let w = governor_wall_with(&store, "gv", &[(t0, t0 + 50), (t0 + 200, t0 + 250)], &|s, from, to| crate::timeline::governor_window_under(&root, s, from, to));
+        let seat = store.state.join("compound-seats/cpd-1");
+        std::fs::create_dir_all(&seat).unwrap();
+        std::fs::write(seat.join("burn.json"), json!({ "turns": 3, "session_id": "gov-s", "transcript": gov.to_string_lossy() }).to_string()).unwrap();
+        let sources = governor_sources(&store, "gv", 2);
+        assert_eq!(sources.len(), 1, "the governor's transcript only: {sources:?}");
+        assert_eq!(sources[0].transcript, gov.to_string_lossy());
+        let w = governor_wall_with(&store, "gv", &[(t0, t0 + 50), (t0 + 200, t0 + 250)], &crate::timeline::governor_window);
         let g = w[0].as_ref().expect("a window after group 1");
-        let last = g.to_last.as_ref().expect("the governor's turns are found through the events");
-        assert_eq!((last.turns, last.looking_turns), (2, 1), "the governor's two turns, not the member's three: {last:?}");
+        let last = g.to_last.as_ref().expect("the governor's turns are found through burn.json");
+        assert_eq!((last.turns, last.looking_turns), (2, 1), "the governor's two turns inside its tenure, not the member's three: {last:?}");
         assert_eq!(g.json()["governor_to_last_start"]["turns"], 2);
     }
 

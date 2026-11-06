@@ -230,6 +230,12 @@ Candidates the data does not support, with the reason:
   seconds they held — the most a skipped turn gives back. Read it on the next
   list before deciding; on pre-prep group 3 → 4 the governor's seat was gone from
   17:27 to 17:29 and the wall was the cap, which a skipped turn does not move.
+  The governor's turns are read from the transcript its seat's
+  `compound-seats/<pane>/burn.json` names (a governor pane never gets a
+  `session-learned` event), clipped to the stretch the pane held the slot. That
+  file holds only the seat's latest session and goes when the seat stops, so a
+  pane reseated within a tenure, or a seat long stopped, loses its earlier
+  session: the figures are a floor, and null where no transcript is left.
 
 ## 4. Migration: the first improvement stage
 
