@@ -199,7 +199,7 @@ fn owed(store: &Store, w: &Worklist, at: usize, g: &Group, pos: &Position) -> Ve
                 who: format!("{}'s verifier", t.id),
                 seat: p.pane.clone().unwrap_or_default(),
                 since: util::epoch_of(&p.at),
-                order: Some(crate::cmd_task::fold(&cycle::verifier_order(store, &t))),
+                order: Some(cycle::verifier_order_line(store, &t)),
                 replace: Replace::Pass(t.id.clone()),
             });
         } else if crate::legs::staged(&t) {

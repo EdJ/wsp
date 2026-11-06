@@ -231,9 +231,120 @@ pub(crate) fn build(store: &Store, t: &Task) -> Option<String> {
     Some(out)
 }
 
+/// The packet written whole to a file under the store, for the order that has
+/// to be one line. `None` for a row with no packet, or when the file cannot be
+/// written (the order then goes without it, as it did).
+pub(crate) fn file(store: &Store, t: &Task) -> Option<std::path::PathBuf> {
+    let packet = build(store, t)?;
+    let dir = store.state_file("packets");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}.md", t.id));
+    std::fs::write(&path, packet).ok()?;
+    Some(path)
+}
+
+/// What the one-line order says of the packet's file, and the rule for a red,
+/// which is short enough to say in the line itself.
+pub(crate) fn pointer(path: &Path) -> String {
+    format!(
+        "**Your verification packet is in `{}`: read it first, whole.** It is markdown with its lines kept (a diff \
+         cannot be said on one line) and holds the overview, the stop clause, the commits, the seat's review summary, \
+         the check plan, the diff and the one command, so do not read the tree for what it holds. {}",
+        path.display(),
+        RERUN
+    )
+}
+
+/// A React row for a test: a repo under the store with a workspace `web`
+/// declaring `check:box`, a project `pj` rooted there, and a row `pj-001` in
+/// review at a commit that changes `web/src/pane/Pane.tsx` (one line out, one
+/// in) and `pj-002` at one that changes `b.rs`. Returns the first row's commit.
+#[cfg(test)]
+pub(crate) fn react_fixture(store: &Store) -> String {
+    use crate::model::{Project, Status};
+    let repo = store.root.join("react-repo");
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(repo.join("web/src/pane")).unwrap();
+    std::fs::create_dir_all(repo.join("web/scripts")).unwrap();
+    let run = |a: &[&str]| {
+        let o = std::process::Command::new("git").arg("-C").arg(&repo).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap();
+        assert!(o.status.success(), "{a:?}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+    run(&["init", "-q", "-b", "master"]);
+    std::fs::write(repo.join("web/package.json"), "{\"scripts\":{\"check\":\"x\",\"check:box\":\"x\"}}").unwrap();
+    std::fs::write(repo.join("web/scripts/check.mjs"), "const BOXES = {\n  pane: [[\"src/pane\"], \"src/pane\"],\n};\n").unwrap();
+    std::fs::write(repo.join("web/src/pane/Pane.tsx"), "export function a() {\n  old();\n}\n").unwrap();
+    std::fs::write(repo.join("b.rs"), "fn b() {}\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-qm", "init"]);
+    std::fs::write(repo.join("web/src/pane/Pane.tsx"), "export function a() {\n  next();\n}\n").unwrap();
+    run(&["commit", "-qam", "pj-001: the pane calls next"]);
+    let react = crate::cmd_verify::git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    std::fs::write(repo.join("b.rs"), "fn b() { 1; }\n").unwrap();
+    run(&["commit", "-qam", "pj-002: b does one"]);
+    let rust = crate::cmd_verify::git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let mut p = Project::new("pj");
+    p.roots = vec![repo.display().to_string()];
+    store.save_project(&p).unwrap();
+    for (id, sha) in [("pj-001", &react), ("pj-002", &rust)] {
+        let mut t = Task::new("a row", id);
+        t.project = Some("pj".into());
+        t.set_status(Status::Review);
+        t.body = format!("## Overview\nMake it so.\n\nDone when: the pane calls next.\n\n## Log\n\n- 2026-11-06T10:00:00Z review: it is done\n- 2026-11-06T10:00:01Z {} {sha}\n", crate::repair::READY);
+        store.save_task(&t).unwrap();
+    }
+    react
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn world(tag: &str) -> (crate::util::Isolated, Store) {
+        let env = crate::util::isolated(&format!("vpk-{tag}"));
+        (env, Store::open())
+    }
+
+    /// `compounding-104`: a React row's verifier is handed its packet, and the
+    /// order that is typed into a seat as one line names the packet's file
+    /// instead of folding the diff into itself.
+    #[test]
+    fn a_react_rows_verifier_gets_its_packet_whole_and_the_one_line_order_names_the_file() {
+        let (_env, store) = world("react");
+        let sha = react_fixture(&store);
+        let t = store.find_task("pj-001").unwrap();
+
+        let order = crate::cycle::verifier_order(&store, &t);
+        assert!(order.contains("# Verification packet · pj-001"), "{order}");
+        assert!(order.contains("Done when: the pane calls next."), "the stop clause");
+        assert!(order.contains("pj-001: the pane calls next"), "the commit message");
+        assert!(order.contains("it is done"), "the seat's review summary");
+        assert!(order.contains("\n-  old();\n+  next();\n"), "the diff keeps its lines: {order}");
+        assert!(order.contains("npm run check:box -- pane src/pane/Pane.tsx"), "the one command: {order}");
+        assert!(order.contains("rerun") && order.contains("N25"), "{order}");
+
+        let line = crate::cycle::verifier_order_line(&store, &t);
+        assert!(!line.contains('\n'), "what the spawn types is one line: {line:?}");
+        assert!(!line.contains("old();"), "and does not fold the diff into itself");
+        let path = store.state_file("packets").join("pj-001.md");
+        assert!(line.contains(&path.display().to_string()) && line.contains("read it first"), "it names the file: {line}");
+        assert!(line.contains("N25"), "and carries the rule for a red");
+        let packet = std::fs::read_to_string(&path).unwrap();
+        assert!(packet.contains("\n-  old();\n+  next();\n") && packet.contains(&sha[..12]), "the file is the packet, newlines kept: {packet}");
+    }
+
+    /// Nothing is claimed for a row that is not React.
+    #[test]
+    fn a_rust_rows_verifier_gets_no_packet_and_the_same_one_line_order() {
+        let (_env, store) = world("rust");
+        react_fixture(&store);
+        let t = store.find_task("pj-002").unwrap();
+        let order = crate::cycle::verifier_order(&store, &t);
+        assert!(!order.contains("Verification packet"), "{order}");
+        let line = crate::cycle::verifier_order_line(&store, &t);
+        assert_eq!(line, crate::cmd_task::fold(&order));
+        assert!(!store.state_file("packets").exists());
+    }
 
     const MJS: &str = "const BOXES = {\n  pane: [[\"src/pane\"], \"src/pane\"],\n  tabs: [[\"src/tabs\"], \"src/tabs\"],\n};\n";
 

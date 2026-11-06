@@ -2966,7 +2966,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             // kind with an empty context needs no second fetch, and one line is
             // what a kind taking its order in argv can carry at all.
             (Some(t), _) if verifying => {
-                store.find_task(t).map(|m| crate::cmd_task::fold(&crate::cycle::verifier_order(store, &m)))
+                store.find_task(t).map(|m| crate::cycle::verifier_order_line(store, &m))
             }
             (Some(t), _) if packet_start => Some(match leg_name.as_deref() {
                 Some(l) => crate::packet::leg_order(t, l, leg_last),
@@ -7199,6 +7199,40 @@ mod tests {
         assert_eq!(claim["workspace_id"], json!("w9:p1"), "no room, so `worklist next` says it did not record");
         assert_eq!(claim["agent_kind"], json!("opencode"), "the kind waited on a census that never comes");
         assert_eq!(store.bindings()["w9:p1"]["agent_kind"], json!("opencode"));
+    }
+
+    /// `compounding-104`: a React row's verifier is spawned with its packet.
+    /// What the spawn sends is one line, since an argv kind can carry nothing
+    /// longer, so the packet cannot ride in it folded (its diff would lose
+    /// which lines went out and which came in): the line names a file that
+    /// holds it whole.
+    #[test]
+    fn a_react_rows_verifier_spawn_names_its_packet_file_and_the_file_keeps_the_diffs_lines() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("verify-react");
+        let sha = crate::verifier_packet::react_fixture(&store);
+        let mut m = store.find_task("pj-001").unwrap();
+        crate::verification::write(&mut m, &[crate::verification::Pass::opened(Some(sha.clone()), Some("opencode".into()))]);
+        store.save_task(&m).unwrap();
+
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("agent", "true"), ("verify", "true"), ("kind", "opencode"), ("no-tree", "true")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["pj-001"], &flags)), 0);
+        let order = place.0.borrow().first().cloned().expect("nothing was started")
+            .args
+            .windows(2)
+            .find(|w| w[0] == "--prompt")
+            .map(|w| w[1].clone())
+            .expect("no work order in the argv");
+        assert!(!order.contains('\n'), "{order:?}");
+        let file = store.state_file("packets").join("pj-001.md");
+        assert!(order.contains(&file.display().to_string()) && order.contains("read it first"), "{order}");
+        assert!(order.contains("N25"), "the rule for a red rides in the order: {order}");
+        let packet = std::fs::read_to_string(&file).expect("the packet was written");
+        assert!(packet.contains("\n-  old();\n+  next();\n"), "{packet}");
+        assert!(packet.contains("npm run check:box -- pane src/pane/Pane.tsx"), "{packet}");
     }
 
     /// `wsp-188`. A run's verifier is started on the member with `--verify`

@@ -2101,6 +2101,31 @@ pub(crate) fn is_barrier(t: &Task, list: &str, at: usize) -> bool {
 /// what `wsp brief` shows in its seat. Composed from the member and the run it
 /// is in when it is asked, since a verifier has no row to keep it on.
 pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
+    let order = verifier_base(store, member);
+    // A React row's verifier is given its packet (`compounding-104`); any other
+    // row's order is what it was. Whole and multi-line, as `wsp brief` shows it.
+    match crate::verifier_packet::build(store, member) {
+        Some(packet) => format!("{order}\n\n{packet}"),
+        None => order,
+    }
+}
+
+/// The order as one line, for the two places that type it into a seat
+/// (`wsp spawn --verify` and an untaken start), and a kind taking it in argv
+/// can carry nothing longer. **A packet cannot be folded**: its diff and fences
+/// are lines, and one line loses which are removed and which added. So a React
+/// row's packet is written to a file under the store, whole, and the line names
+/// it and says to read it first.
+pub(crate) fn verifier_order_line(store: &Store, member: &Task) -> String {
+    let line = crate::cmd_task::fold(&verifier_base(store, member));
+    match crate::verifier_packet::file(store, member) {
+        Some(path) => format!("{line} {}", crate::verifier_packet::pointer(&path)),
+        None => line,
+    }
+}
+
+/// The order without the packet.
+fn verifier_base(store: &Store, member: &Task) -> String {
     let running = worklist::Running::read(store);
     let list = running.list_of(&member.id).and_then(|l| store.worklist(l));
     let placed = list.as_ref().and_then(|w| {
@@ -2140,7 +2165,7 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
             format!("it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`", m = member.id),
         ),
     };
-    let order = format!(
+    format!(
         "Verify **{m}** ({title}){whose}. {started}.\n\n\
          {readonly}{stand}\
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
@@ -2162,13 +2187,7 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
         checked = CHECKED_ORDER,
         legs = legs_line(member),
         split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
-    );
-    // A React row's verifier is spawned with its packet (`compounding-104`);
-    // any other row's order is what it was.
-    match crate::verifier_packet::build(store, member) {
-        Some(packet) => format!("{order}\n\n{packet}"),
-        None => order,
-    }
+    )
 }
 
 /// The line a verifier's order gains on a row that ran in legs: the table, and
