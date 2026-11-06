@@ -1,0 +1,8 @@
+# wsp-434: a wsp test that waits on something that never comes (a child, a
+# socket, stdin, a lock) held a member's seat at 0 % CPU for over an hour.
+# `cargo nextest run` gives every test its own process and its own timeout:
+# a test slow for 30 s is reported slow, and one slow for 2 minutes is
+# terminated and fails with its name. `cargo test` has no such timeout; there
+# `util::env_lock` ends the run, naming the test, after WSP_TEST_LIMIT_SECS.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }

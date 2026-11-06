@@ -77,10 +77,100 @@ fn store_env_from(
 #[cfg(test)]
 pub static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// How long a test may hold [`ENV`] before the process is ended and the test is
+/// named: `WSP_TEST_LIMIT_SECS`, else five minutes. Every test that touches a
+/// store or a herdr holds the lock, the rest of the suite queues behind it, and
+/// `cargo test` has no per-test timeout, so one test waiting on something that
+/// never comes (a child, a socket, stdin) was a whole run, and a member's seat,
+/// blocked at 0 % CPU until a person killed it (wsp-434: `packet::` for 78
+/// minutes, `check::tests::a_verifiers_order` for 21). The longest test in the
+/// suite holds it for seconds.
+#[cfg(test)]
+pub fn test_limit() -> Duration {
+    let secs = std::env::var("WSP_TEST_LIMIT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    Duration::from_secs(secs)
+}
+
+/// [`ENV`] taken, and a watchdog on the test that holds it: if the guard is not
+/// dropped within [`test_limit`] the watchdog says which test it was and ends
+/// the process with status 1, so a hang is a red run with a name. (A thread
+/// cannot be killed, and a hung test holds the lock everyone else queues on, so
+/// ending the process is the only timeout that works under `cargo test`;
+/// `.config/nextest.toml` gives each test its own process and its own timeout.)
+#[cfg(test)]
+pub struct EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        LAST_CHANGE.store(since_start(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// When [`ENV`] last changed hands (milliseconds since the first take), and who
+/// took it last: what a waiter reports when the lock is held by nobody it can
+/// find. A live holder is the watchdog's; this is for the lock that is never
+/// let go (the `ending::` run that stood 27 minutes with eight tests queued, no
+/// thread holding it, and nothing to say which test had).
+#[cfg(test)]
+static LAST_CHANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static LAST_TAKER: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+#[cfg(test)]
+fn since_start() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Say `said` on the process's own stderr (libtest captures `eprintln!` per
+/// test) and end the run.
+#[cfg(test)]
+fn end_run(said: String) -> ! {
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), said.as_bytes());
+    std::process::exit(1)
+}
+
 /// Take [`ENV`], surviving a test that panicked while holding it.
 #[cfg(test)]
-pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV.lock().unwrap_or_else(|e| e.into_inner())
+pub fn env_lock() -> EnvGuard {
+    use std::sync::atomic::Ordering::SeqCst;
+    let limit = test_limit();
+    let name = std::thread::current().name().unwrap_or("<unnamed test>").to_string();
+    since_start();
+    let lock = loop {
+        match ENV.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let idle = since_start().saturating_sub(LAST_CHANGE.load(SeqCst));
+                if idle > limit.as_millis() as u64 {
+                    let last = LAST_TAKER.lock().map(|l| l.clone()).unwrap_or_default();
+                    end_run(format!("\nTEST HUNG: `{name}` waited for the test environment, which has not changed hands for {}s; it was last taken by `{last}`; ending the run (WSP_TEST_LIMIT_SECS sets the limit)\n", idle / 1000));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    LAST_CHANGE.store(since_start(), SeqCst);
+    *LAST_TAKER.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = done.clone();
+    std::thread::spawn(move || {
+        let until = Instant::now() + limit;
+        while Instant::now() < until {
+            if flag.load(SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        end_run(format!("\nTEST HUNG: `{name}` held the test environment for {}s and has not finished; ending the run (WSP_TEST_LIMIT_SECS sets the limit)\n", limit.as_secs()));
+    });
+    EnvGuard { _lock: lock, done }
 }
 
 /// A store nobody else is using, a backend that does not exist, and this
@@ -128,7 +218,7 @@ pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// longer exist, and the test that runs next is the one that looks broken.
 #[cfg(test)]
 pub struct Isolated {
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: EnvGuard,
     dir: PathBuf,
 }
 
@@ -1263,6 +1353,35 @@ mod tests {
         assert_eq!(money_of("$0"), Some(0));
         assert_eq!(money_of("1.23"), None, "a price says so");
         assert_eq!(money_of("$hat"), None);
+    }
+
+    /// The test the timeout is tried on: it takes the environment and never lets
+    /// go. Ignored, so only [`a_test_that_hangs_fails_within_its_limit`] runs it.
+    #[test]
+    #[ignore = "hangs on purpose: run by a_test_that_hangs_fails_within_its_limit"]
+    fn hangs_on_purpose() {
+        let _env = env_lock();
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
+    /// wsp-434: a test waiting on something that never comes held a member's seat
+    /// at 0 % CPU for over an hour. It now ends the run, naming the test, within
+    /// `WSP_TEST_LIMIT_SECS`.
+    #[test]
+    fn a_test_that_hangs_fails_within_its_limit() {
+        let started = Instant::now();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "util::tests::hangs_on_purpose", "--ignored", "--test-threads=1"])
+            .env("WSP_TEST_LIMIT_SECS", "2")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(started.elapsed() < Duration::from_secs(60), "took {:?}", started.elapsed());
+        assert_eq!(out.status.code(), Some(1), "{said}");
+        assert!(said.contains("TEST HUNG") && said.contains("hangs_on_purpose"), "names the test: {said}");
     }
 }
 
