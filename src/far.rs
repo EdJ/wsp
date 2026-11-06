@@ -80,12 +80,27 @@ pub fn probe_command(m: &Machine) -> String {
     format!("{} wire-version", quote(&sup_of(m)))
 }
 
-/// `compound-sup wire-version` output → its VERSION. A current build prints
-/// the accepted range `OLDEST VERSION` (`9 14`); an older build prints a bare
-/// number. VERSION is the last whitespace token in both, which is how
-/// `place_compound::ask_wire_version` reads it.
-pub fn parse_wire(out: &str) -> Option<u32> {
-    out.split_whitespace().last()?.parse().ok()
+/// `compound-sup wire-version` output → the range it accepts, `(OLDEST,
+/// VERSION)`. A current build prints `OLDEST VERSION` (`9 14`); an older build
+/// prints a bare number, which is the range `VERSION VERSION`. Anything else
+/// (a word, a third token, OLDEST above VERSION) is no answer.
+pub fn parse_wire(out: &str) -> Option<(u32, u32)> {
+    let toks: Vec<u32> = out.split_whitespace().map(|t| t.parse().ok()).collect::<Option<_>>()?;
+    match toks[..] {
+        [v] => Some((v, v)),
+        [o, v] if o <= v => Some((o, v)),
+        _ => None,
+    }
+}
+
+/// Does the machine's recorded range hold the seat's wire version? A record
+/// with no `wire_oldest` (a bare version, or one written before the range was
+/// kept) accepts only its own version.
+pub fn accepts(l: &MachineLive, seat_wire: u32) -> bool {
+    match l.wire {
+        Some(top) => l.wire_oldest.unwrap_or(top) <= seat_wire && seat_wire <= top,
+        None => false,
+    }
 }
 
 /// How long the probe may take: it runs inside the daemon's tick.
@@ -174,11 +189,12 @@ pub fn run_bounded(mut c: Command, timeout: Duration) -> std::io::Result<Option<
 pub fn fold_probe(live: &mut MachineLive, probed: Result<String, Failed>, now: &str) {
     match probed {
         Ok(out) => match parse_wire(&out) {
-            Some(w) => {
+            Some((o, w)) => {
                 live.reachable = true;
                 live.tunnel = "up".into();
                 live.last_seen = now.to_string();
                 live.wire = Some(w);
+                live.wire_oldest = Some(o);
                 live.error.clear();
             }
             None => {
@@ -186,7 +202,8 @@ pub fn fold_probe(live: &mut MachineLive, probed: Result<String, Failed>, now: &
                 live.tunnel = "up".into();
                 live.last_seen = now.to_string();
                 live.wire = None;
-                live.error = format!("compound-sup wire-version answered `{}`, not a number", out.trim());
+                live.wire_oldest = None;
+                live.error = format!("compound-sup wire-version answered `{}`, not a version range", out.trim());
             }
         },
         Err(Failed::Ran(why)) => {
@@ -194,6 +211,7 @@ pub fn fold_probe(live: &mut MachineLive, probed: Result<String, Failed>, now: &
             live.tunnel = "up".into();
             live.last_seen = now.to_string();
             live.wire = None;
+            live.wire_oldest = None;
             live.error = why;
         }
         Err(Failed::Link(why)) => {
@@ -212,7 +230,7 @@ pub enum Readiness {
     /// Connected, but the far `compound-sup` did not give a wire version.
     NoWire(String),
     /// Connected, and the far `compound-sup` speaks another version.
-    Mismatch { seat: u32, far: u32 },
+    Mismatch { seat: u32, oldest: u32, far: u32 },
     /// Connected and the wire matches; `machine check` has not passed yet.
     Unchecked,
     /// `machine check` ran and failed, for this reason.
@@ -227,7 +245,7 @@ pub fn readiness(l: &MachineLive, seat_wire: u32) -> Readiness {
     }
     match l.wire {
         None => Readiness::NoWire(l.error.clone()),
-        Some(w) if w != seat_wire => Readiness::Mismatch { seat: seat_wire, far: w },
+        Some(w) if !accepts(l, seat_wire) => Readiness::Mismatch { seat: seat_wire, oldest: l.wire_oldest.unwrap_or(w), far: w },
         Some(_) if l.checked.is_empty() => Readiness::Unchecked,
         Some(_) if !l.ready && l.check_error == IN_PROGRESS => Readiness::Unchecked,
         Some(_) if !l.ready => Readiness::NotReady(l.check_error.clone()),
@@ -236,15 +254,20 @@ pub fn readiness(l: &MachineLive, seat_wire: u32) -> Readiness {
 }
 
 impl Readiness {
-    /// The sentence for a wire mismatch, naming both numbers and which binary is
-    /// behind. The one place it is worded, so `spawn --on`, `machine ls` and
-    /// `doctor` cannot disagree about it.
-    pub fn mismatch_words(machine: &str, seat: u32, far: u32) -> String {
-        let behind = match far < seat {
-            true => format!("the far compound-sup is behind — rebuild compound-sup and compound-render on {machine} from the seat's compound commit"),
-            false => "this seat's wsp is behind — bump WIRE_VERSION in src/place_compound.rs".to_string(),
+    /// The sentence for a wire mismatch, naming the seat's number, the far
+    /// range, and which binary is behind (seat below OLDEST: this seat's wsp;
+    /// above VERSION: the far compound-sup). The one place it is worded, so
+    /// `spawn --on`, `machine ls` and `doctor` cannot disagree about it.
+    pub fn mismatch_words(machine: &str, seat: u32, oldest: u32, far: u32) -> String {
+        let behind = match seat < oldest {
+            false => format!("the far compound-sup is behind — rebuild compound-sup and compound-render on {machine} from the seat's compound commit"),
+            true => "this seat's wsp is behind — bump WIRE_VERSION in src/place_compound.rs".to_string(),
         };
-        format!("wire mismatch v{seat}/v{far}: this seat speaks {seat}, {machine}'s compound-sup speaks {far} — {behind}")
+        let range = match oldest == far {
+            true => format!("{far}"),
+            false => format!("{oldest} to {far}"),
+        };
+        format!("wire mismatch v{seat}/v{range}: this seat speaks {seat}, {machine}'s compound-sup accepts {range} — {behind}")
     }
 }
 
@@ -299,6 +322,7 @@ pub struct Step {
 #[derive(Debug, Clone, Default)]
 pub struct Check {
     pub wire: Option<u32>,
+    pub wire_oldest: Option<u32>,
     pub steps: Vec<Step>,
 }
 
@@ -343,14 +367,18 @@ pub fn check_with(m: &Machine, seat_wire: u32, run: &dyn Fn(&str, Duration) -> R
         Err(f) => Err(f.why().to_string()),
     };
     match wire {
-        Ok(w) => {
+        Ok((o, w)) => {
             c.wire = Some(w);
-            if w != seat_wire {
-                let words = Readiness::mismatch_words(&m.name, seat_wire, w);
+            c.wire_oldest = Some(o);
+            if seat_wire < o || seat_wire > w {
+                let words = Readiness::mismatch_words(&m.name, seat_wire, o, w);
                 step(&mut c, "wire", Err(words));
                 return c;
             }
-            step(&mut c, "wire", Ok(format!("v{w}")));
+            step(&mut c, "wire", Ok(match o == w {
+                true => format!("v{w}"),
+                false => format!("v{seat_wire} in {o} to {w}"),
+            }));
         }
         Err(e) => {
             step(&mut c, "wire", Err(e));
@@ -872,9 +900,49 @@ mod tests {
     fn the_probe_is_compound_sups_wire_version_by_the_recorded_path() {
         assert_eq!(probe_command(&machine()), "~/'bin/compound-sup' wire-version");
         assert_eq!(probe_command(&Machine::new("a", "a")), "'compound-sup' wire-version");
-        assert_eq!(parse_wire("9 14\n"), Some(14));
-        assert_eq!(parse_wire(" 9\n"), Some(9));
+        assert_eq!(parse_wire("9 14\n"), Some((9, 14)));
+        assert_eq!(parse_wire(" 9\n"), Some((9, 9)), "a bare version is the range VERSION VERSION");
         assert_eq!(parse_wire("compound-sup: unknown verb"), None);
+        assert_eq!(parse_wire("14 9"), None, "OLDEST above VERSION is no answer");
+        assert_eq!(parse_wire("9 10 14"), None);
+    }
+
+    /// The seat's version is tested against the far range, not the top of it.
+    #[test]
+    fn a_machine_is_ready_when_the_seat_wire_lies_in_its_range() {
+        let none = RefCell::new(Vec::new());
+        let m = machine();
+        // inside, at the bottom edge (the reported case: seat 9, far "9 14").
+        let c = check_with(&m, 9, &far(&none, "9 14\n", Ok("socket /s"), Ok("ok")));
+        assert!(c.passed(), "{:?}", c.steps);
+        assert_eq!((c.wire_oldest, c.wire), (Some(9), Some(14)));
+        let c = check_with(&m, 12, &far(&none, "9 14", Ok("socket /s"), Ok("ok")));
+        assert!(c.passed(), "{:?}", c.steps);
+        let c = check_with(&m, 14, &far(&none, "9 14", Ok("socket /s"), Ok("ok")));
+        assert!(c.passed(), "top edge: {:?}", c.steps);
+        // below: the seat's wsp is behind.
+        let c = check_with(&m, 8, &far(&none, "9 14", Ok("socket /s"), Ok("ok")));
+        assert!(!c.passed());
+        assert!(c.why().contains("v8/v9 to 14") && c.why().contains("this seat's wsp is behind"), "{}", c.why());
+        // above: the far compound-sup is behind.
+        let c = check_with(&m, 15, &far(&none, "9 14", Ok("socket /s"), Ok("ok")));
+        assert!(!c.passed());
+        assert!(c.why().contains("v15/v9 to 14") && c.why().contains("the far compound-sup is behind"), "{}", c.why());
+        // a bare version accepts only itself.
+        assert!(check_with(&m, 9, &far(&none, "9", Ok("socket /s"), Ok("ok"))).passed());
+        let c = check_with(&m, 10, &far(&none, "9", Ok("socket /s"), Ok("ok")));
+        assert!(c.why().contains("the far compound-sup is behind"), "{}", c.why());
+
+        // and the recorded range reads the same way.
+        let mut l = MachineLive::default();
+        fold_probe(&mut l, Ok("9 14\n".into()), "now");
+        assert_eq!((l.wire_oldest, l.wire), (Some(9), Some(14)));
+        assert_eq!(readiness(&l, 9), Readiness::Unchecked);
+        assert_eq!(readiness(&l, 14), Readiness::Unchecked);
+        assert_eq!(readiness(&l, 8), Readiness::Mismatch { seat: 8, oldest: 9, far: 14 });
+        assert_eq!(readiness(&l, 15), Readiness::Mismatch { seat: 15, oldest: 9, far: 14 });
+        fold_probe(&mut l, Ok("9\n".into()), "later");
+        assert_eq!(readiness(&l, 10), Readiness::Mismatch { seat: 10, oldest: 9, far: 9 });
     }
 
     #[test]
@@ -924,16 +992,16 @@ mod tests {
     fn a_machine_reads_ready_only_when_the_check_passed() {
         let mut l = MachineLive { reachable: true, wire: Some(9), ..Default::default() };
         assert_eq!(readiness(&l, 9), Readiness::Unchecked, "connected, and wire matching, is not ready");
-        assert_eq!(readiness(&l, 10), Readiness::Mismatch { seat: 10, far: 9 });
+        assert_eq!(readiness(&l, 10), Readiness::Mismatch { seat: 10, oldest: 9, far: 9 });
 
-        let failed = Check { wire: Some(9), steps: vec![Step { name: "claude", ok: false, said: "no auth".into() }] };
+        let failed = Check { wire: Some(9), wire_oldest: Some(9), steps: vec![Step { name: "claude", ok: false, said: "no auth".into() }] };
         record(&mut l, &failed, "2026-11-05T10:00:00Z");
         assert_eq!(readiness(&l, 9), Readiness::NotReady("claude: no auth".into()));
 
-        let passed = Check { wire: Some(9), steps: vec![Step { name: "wire", ok: true, said: "v9".into() }] };
+        let passed = Check { wire: Some(9), wire_oldest: Some(9), steps: vec![Step { name: "wire", ok: true, said: "v9".into() }] };
         record(&mut l, &passed, "2026-11-05T10:01:00Z");
         assert_eq!(readiness(&l, 9), Readiness::Ready);
-        assert_eq!(readiness(&l, 10), Readiness::Mismatch { seat: 10, far: 9 }, "a passed check does not outlive a wire change");
+        assert_eq!(readiness(&l, 10), Readiness::Mismatch { seat: 10, oldest: 9, far: 9 }, "a passed check does not outlive a wire change");
 
         l.reachable = false;
         assert_eq!(readiness(&l, 9), Readiness::Unreachable);

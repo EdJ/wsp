@@ -186,7 +186,7 @@ impl Tunnel {
 /// been no check or the last is older than [`crate::far::RECHECK_SECS`].
 /// `now` is passed in so the rule has no clock in it.
 fn wants_check(live: &MachineLive, m: &Machine, seat_wire: u32, now: &str) -> bool {
-    if !live.reachable || live.wire != Some(seat_wire) || m.exec_dir.is_empty() {
+    if !live.reachable || !crate::far::accepts(live, seat_wire) || m.exec_dir.is_empty() {
         return false;
     }
     match live.checked.as_str() {

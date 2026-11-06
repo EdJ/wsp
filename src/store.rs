@@ -221,6 +221,10 @@ pub struct MachineLive {
     /// says why). A protocol that has moved under us is worth seeing in a list
     /// before it is worth handling, and `spawn --on` refuses on it.
     pub wire: Option<u32>,
+    /// The bottom of the range the far `compound-sup` accepts (`OLDEST` of
+    /// `OLDEST VERSION`). `None`: an older build that printed a bare version,
+    /// which accepts only that one (`wire`), or no answer.
+    pub wire_oldest: Option<u32>,
     /// `wsp machine check` last passed. Written by that command, carried across
     /// the tick (which rewrites this record) by `Supervisor::tick`.
     pub ready: bool,
@@ -245,6 +249,7 @@ impl MachineLive {
             tunnel: s("tunnel"),
             socket: s("socket"),
             wire: v.get("wire").and_then(|x| x.as_u64()).map(|n| n as u32),
+            wire_oldest: v.get("wire_oldest").and_then(|x| x.as_u64()).map(|n| n as u32),
             ready: v.get("ready").and_then(|x| x.as_bool()).unwrap_or(false),
             checked: s("checked"),
             check_error: s("check_error"),
@@ -260,6 +265,7 @@ impl MachineLive {
             "tunnel": self.tunnel,
             "socket": self.socket,
             "wire": self.wire,
+            "wire_oldest": self.wire_oldest,
             "ready": self.ready,
             "checked": self.checked,
             "check_error": self.check_error,

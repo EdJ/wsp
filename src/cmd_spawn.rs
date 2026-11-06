@@ -1024,8 +1024,8 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
         // numbers, because a seat started at the wrong version is not
         // recoverable by waiting.
         Some(l) if l.reachable => match crate::far::readiness(&l, crate::place_compound::wire_version()) {
-            crate::far::Readiness::Mismatch { seat, far } => {
-                Err(crate::far::Readiness::mismatch_words(&name, seat, far))
+            crate::far::Readiness::Mismatch { seat, oldest, far } => {
+                Err(crate::far::Readiness::mismatch_words(&name, seat, oldest, far))
             }
             crate::far::Readiness::NoWire(why) => Err(format!(
                 "`{name}` is connected but its compound-sup gave no wire version{}",

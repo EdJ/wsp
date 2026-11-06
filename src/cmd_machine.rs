@@ -471,7 +471,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             println!("socket    {}", util::contract(std::path::Path::new(&l.socket)));
         }
         if let Some(w) = l.wire {
-            println!("wire      {w}");
+            match l.wire_oldest.filter(|o| *o != w) {
+                Some(o) => println!("wire      {o} to {w}"),
+                None => println!("wire      {w}"),
+            }
         }
         if !l.checked.is_empty() {
             let verdict = match (l.ready, l.check_error.as_str()) {
@@ -616,6 +619,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     let mut live = store.machine_live(&m.name).unwrap_or_default();
     if c.wire.is_some() {
         live.wire = c.wire;
+        live.wire_oldest = c.wire_oldest;
     }
     far::record(&mut live, &c, &now);
     store.set_machine_live(&m.name, &live);
@@ -664,8 +668,8 @@ pub fn health(store: &Store, problems: &mut Vec<String>, notes: &mut Vec<String>
                 let why = if l.error.is_empty() { String::new() } else { format!(" — {}", l.error) };
                 notes.push(format!("machine {name}: unreachable ({seen}){why}"));
             }
-            Readiness::Mismatch { seat, far } => {
-                problems.push(format!("machine {name}: {}", Readiness::mismatch_words(name, seat, far)))
+            Readiness::Mismatch { seat, oldest, far } => {
+                problems.push(format!("machine {name}: {}", Readiness::mismatch_words(name, seat, oldest, far)))
             }
             Readiness::NoWire(why) => problems.push(format!(
                 "machine {name}: connected but compound-sup gave no wire version{}",
@@ -930,8 +934,9 @@ fn state_of(p: &Paint, m: &Machine, live: Option<&MachineLive>) -> (String, Stri
                 format!("not ready — not checked yet (wsp machine check {})", m.name),
             ),
             Readiness::NotReady(why) => (p.green("connected"), format!("not ready — {why}")),
-            Readiness::Mismatch { seat, far } => {
-                (p.green("connected"), format!("not ready — wire mismatch v{seat}/v{far}"))
+            Readiness::Mismatch { seat, oldest, far } => {
+                let range = if oldest == far { far.to_string() } else { format!("{oldest}-{far}") };
+                (p.green("connected"), format!("not ready — wire mismatch v{seat}/v{range}"))
             }
             Readiness::NoWire(why) => (
                 p.green("connected"),
