@@ -1450,6 +1450,27 @@ impl Default for Patience<'static> {
     }
 }
 
+/// What `place_work` waits with: [`Patience::default`], and in a test that asks
+/// for it ([`tests::quick`]) the same loops with nothing to wait for, so a spawn
+/// whose order is dropped can be driven through its whole retry in a moment.
+fn spawn_patience() -> Patience<'static> {
+    let p = Patience::default();
+    #[cfg(test)]
+    if tests::QUICK.with(|q| q.get()) {
+        return Patience {
+            ready: Duration::from_millis(20),
+            taken: Duration::ZERO,
+            poll: Duration::from_millis(1),
+            gone: Duration::from_millis(5),
+            attempts: 0,
+            backoff: Duration::ZERO,
+            rearm: Duration::from_millis(5),
+            ..p
+        };
+    }
+    p
+}
+
 /// Wait until the agent in a seat will take a sentence.
 ///
 /// **Not until it is idle**, which is the first trap this walked into: herdr
@@ -2984,7 +3005,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // `start_agent` now, because the thing worth retrying is the pair — an
         // agent that started and then died failed the spawn exactly as one that
         // never started did, and only the second wait can tell.
-        match start_agent(place, how, &spawn, &agent, &kind, &Patience::default()) {
+        match start_agent(place, how, &spawn, &agent, &kind, &spawn_patience()) {
             Ok(()) => {
                 started = Some(kind.clone());
                 // A task gives an agent something to be told, and so — since
@@ -3010,7 +3031,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                         // reaches an agent of this kind — its own channel, or
                         // the backend typing at it — is the one decision this
                         // file must not make; see `agent_commands`.
-                        false => match confirm_turn(place, how, &spawn, text, &Patience::default()) {
+                        false => match confirm_turn(place, how, &spawn, text, &spawn_patience()) {
                             Ok(()) => told = true,
                             Err(e) => {
                                 eprintln!("wsp: agent started but not working on it: {e}");
@@ -6720,6 +6741,187 @@ mod tests {
         }
     }
 
+    thread_local! {
+        pub(super) static QUICK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Spawn with nothing to wait for; undone when the guard drops.
+    struct Quick;
+
+    fn quick() -> Quick {
+        QUICK.with(|q| q.set(true));
+        Quick
+    }
+
+    impl Drop for Quick {
+        fn drop(&mut self) {
+            QUICK.with(|q| q.set(false));
+        }
+    }
+
+    /// A seat for a kind that is told its order (`wsp-420`): the first
+    /// `drops` sends arrive and start nothing, the way cpd-3100's did, and
+    /// until `ready` is set the agent has not drawn its prompt, the way
+    /// cpd-3135's had not.
+    struct Dropping {
+        drops: u32,
+        ready: std::cell::Cell<bool>,
+        typed: Option<bool>,
+        heard: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Dropping {
+        fn new(drops: u32, ready: bool, typed: Option<bool>) -> Dropping {
+            Dropping { drops, ready: ready.into(), typed, heard: Default::default() }
+        }
+        fn took(&self) -> bool {
+            self.heard.borrow().len() as u32 > self.drops
+        }
+    }
+
+    impl Place for Dropping {
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            Ok(Seat::new("w9:p1"))
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            Ok(())
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            Ok(match (self.ready.get(), self.took()) {
+                (false, _) => State::Starting,
+                (true, true) => State::Working,
+                (true, false) => State::Idle,
+            })
+        }
+        fn typed(&self, _: &Seat) -> Option<bool> {
+            self.typed
+        }
+        fn nudge(&self, _: &Seat) -> crate::place::Result<()> {
+            Ok(())
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            Ok(())
+        }
+        fn tell(&self, _: &Seat, text: &str) -> crate::place::Result<Delivery> {
+            self.heard.borrow_mut().push(text.to_string());
+            Ok(Delivery::Unconfirmed)
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            Ok(crate::place::Census::heard("", Vec::new()))
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("spawn does not wait for anything")
+        }
+        fn here(&self) -> Option<Seat> {
+            panic!("spawn opens a seat rather than asking which one it is in")
+        }
+    }
+
+    /// The repair tick's view of the same seat, and nothing else of it.
+    struct Beside<'a>(&'a Dropping);
+
+    impl crate::cycle::Seats for Beside<'_> {
+        fn state(&self, seat: &str) -> Option<State> {
+            self.0.state(&Seat::new(seat)).ok()
+        }
+        fn typed(&self, seat: &str) -> Option<bool> {
+            self.0.typed(&Seat::new(seat))
+        }
+        fn resend(&self, seat: &str, text: &str) -> Option<crate::place::Result<Delivery>> {
+            Some(self.0.tell(&Seat::new(seat), text))
+        }
+    }
+
+    fn claimed_row(tag: &str) -> Store {
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat(tag);
+        rooted(&store, "core");
+        let mut t = crate::model::Task::new("a member", "t-1");
+        t.project = Some("core".into());
+        store.save_task(&t).unwrap();
+        store
+    }
+
+    fn owed_after(place: &Dropping, tag: &str) -> (i32, Store) {
+        let store = claimed_row(tag);
+        let flags = [("agent", "true"), ("kind", "claude"), ("no-tree", "true")];
+        let code = place_work(place, &store, &Args::synth("spawn", &["t-1"], &flags));
+        (code, store)
+    }
+
+    /// `wsp-420`, cpd-3100: the order is dropped and the spawn sends it again.
+    /// One send that is taken needs nothing owed; two that are dropped leave the
+    /// seat owed with the spawn's resend counted, so the tick only flags.
+    #[test]
+    fn a_spawn_whose_first_order_is_dropped_sends_it_again_and_records_what_is_still_owed() {
+        let _guard = no_backend();
+        let _quick = quick();
+        let place = Dropping::new(1, true, Some(false));
+        let (code, store) = owed_after(&place, "dropped-once");
+        assert_eq!(code, 0, "the resend started a turn");
+        assert_eq!(place.heard.borrow().len(), 2, "sent again once");
+        assert!(crate::repair::owed_seats(&store).is_empty(), "and nothing is owed");
+
+        let place = Dropping::new(5, true, Some(false));
+        let (code, store) = owed_after(&place, "dropped-twice");
+        assert_eq!(code, 1);
+        assert_eq!(place.heard.borrow().len(), 2, "never a third in the spawn");
+        let owed = crate::repair::owed_all(&store);
+        assert_eq!(owed["w9:p1"].tries, 1, "dropped twice: the tick has only the flag left");
+        assert_eq!(owed["w9:p1"].order, place.heard.borrow()[0]);
+    }
+
+    #[test]
+    fn a_spawn_that_leaves_the_order_typed_is_owed_a_submit_not_a_flag() {
+        let _guard = no_backend();
+        let _quick = quick();
+        let place = Dropping::new(5, true, Some(true));
+        let (code, store) = owed_after(&place, "dropped-typed");
+        assert_eq!(code, 1);
+        assert_eq!(place.heard.borrow().len(), 1, "not typed over what is already there");
+        assert_eq!(crate::repair::owed_all(&store)["w9:p1"].tries, 0);
+    }
+
+    /// cpd-3135, driven end to end: the agent has not drawn its prompt when the
+    /// spawn gives up, so nothing is sent; it draws it afterwards, and the tick
+    /// sends the order, starts the turn, and says so in the log.
+    #[test]
+    fn a_spawn_that_gave_up_before_the_prompt_drew_has_its_order_sent_by_the_tick() {
+        let _guard = no_backend();
+        let _quick = quick();
+        let place = Dropping::new(0, false, Some(false));
+        let (code, store) = owed_after(&place, "late-prompt");
+        assert_eq!(code, 1, "the spawn failed");
+        assert!(place.heard.borrow().is_empty(), "and sent nothing");
+        let owed = crate::repair::owed_all(&store);
+        assert_eq!(owed["w9:p1"].tries, 0);
+
+        place.ready.set(true);
+        let mut aged = owed;
+        aged.get_mut("w9:p1").unwrap().at -= 100;
+        crate::repair::owed_save(&store, &aged);
+        crate::repair::first_order_tick(&store, &Beside(&place));
+        assert_eq!(place.heard.borrow().len(), 1, "the tick sent the order");
+        assert!(place.took());
+        let said = crate::cycle::tests::SAID.with(|s| s.borrow().clone());
+        assert!(said.iter().any(|l| l.contains("w9:p1") && l.contains("sent it again")), "{said:?}");
+        crate::repair::first_order_tick(&store, &Beside(&place));
+        assert!(crate::repair::owed_seats(&store).is_empty(), "a turn clears it");
+    }
+
+    /// A kind that takes its order in argv has nothing to resend and nothing owed.
+    #[test]
+    fn an_order_carried_in_argv_is_never_recorded_as_owed() {
+        let _guard = no_backend();
+        let _quick = quick();
+        let store = claimed_row("argv-owed");
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("agent", "true"), ("kind", "opencode"), ("no-tree", "true")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags)), 0);
+        assert!(crate::repair::owed_seats(&store).is_empty());
+    }
+
     /// A backend that remembers what it was asked to open and what it was asked
     /// to start, and answers ready.
     struct Started(std::cell::RefCell<Vec<Agent>>, std::cell::RefCell<Vec<Order>>);
@@ -8724,6 +8926,7 @@ mod tests {
             since: Default::default(),
             spawned: store.spawned(),
             unsent: Default::default(),
+            dropped: Default::default(),
             full_suite: Default::default(),
         };
         cmd_agent::wip_rows(&w).into_iter().find(|r| r.pane == seat).expect("the seat is drawn")

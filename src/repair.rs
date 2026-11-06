@@ -674,7 +674,7 @@ pub(crate) struct Owed {
     pub flagged: bool,
 }
 
-fn owed_all(store: &Store) -> std::collections::BTreeMap<String, Owed> {
+pub(crate) fn owed_all(store: &Store) -> std::collections::BTreeMap<String, Owed> {
     let read = std::fs::read_to_string(store.state.join(OWED_FILE))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
@@ -691,7 +691,7 @@ fn owed_all(store: &Store) -> std::collections::BTreeMap<String, Owed> {
         .collect()
 }
 
-fn owed_save(store: &Store, all: &std::collections::BTreeMap<String, Owed>) {
+pub(crate) fn owed_save(store: &Store, all: &std::collections::BTreeMap<String, Owed>) {
     let _ = std::fs::create_dir_all(&store.state);
     let out: serde_json::Map<String, serde_json::Value> = all
         .iter()
@@ -719,11 +719,20 @@ pub(crate) fn owed_seats(store: &Store) -> std::collections::BTreeSet<String> {
     owed_all(store).into_keys().collect()
 }
 
+/// The seats whose first order was sent again and still started no turn —
+/// flagged by [`first_order_tick`], and drawn by `wsp wip` as `order not
+/// received`.
+pub(crate) fn dropped_seats(store: &Store) -> std::collections::BTreeSet<String> {
+    owed_all(store).into_iter().filter(|(_, o)| o.flagged).map(|(s, _)| s).collect()
+}
+
 /// Watch the seats [`owe_first_order`] recorded. Once a seat has had
 /// [`OWED_WAIT`] seconds and no turn has begun: an idle seat whose prompt is
 /// holding the order gets a submit; one whose prompt is empty gets the order
 /// again, once, and the log says so. A seat that is still idle another wait on
-/// is flagged in `cycle.log` and left alone. A turn, a gone seat or
+/// is flagged in `cycle.log` and in `wsp wip` and left alone. The tick runs once
+/// a minute, so the 30 seconds are 30 to 90 and the flag comes 60 to 150
+/// seconds after the spawn gave up. A turn, a gone seat or
 /// [`OWED_KEEP`] seconds ends the record.
 pub(crate) fn first_order_tick(store: &Store, seats: &dyn Seats) {
     let mut all = owed_all(store);

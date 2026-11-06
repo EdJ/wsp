@@ -4050,6 +4050,10 @@ pub(crate) struct Wip {
     /// tick (`wsp-386`) — [`crate::repair::unsent_seats`]. Drawn as `typed, not
     /// sent` in place of `idle`.
     pub unsent: std::collections::BTreeSet<String>,
+    /// Seats whose first work order was sent again and still started no turn
+    /// (`wsp-420`) — [`crate::repair::dropped_seats`]. Drawn as `order not
+    /// received` in place of `idle`.
+    pub dropped: std::collections::BTreeSet<String>,
     /// Seats that started a full-suite `cargo test` (`wsp-389`):
     /// [`crate::throttle::full_suite_seats`]. By seat, so a row reopened into a
     /// new seat is not flagged for the last one's run. Drawn as `full suite in a member
@@ -4180,6 +4184,7 @@ impl Wip {
             since,
             spawned: store.spawned(),
             unsent: crate::repair::unsent_seats(store),
+            dropped: crate::repair::dropped_seats(store),
             full_suite: crate::throttle::full_suite_seats(&store.state),
         }
     }
@@ -4353,6 +4358,9 @@ pub(crate) struct WipRow {
     /// The prompt holds text that was typed and never submitted, for more than
     /// a tick (`wsp-386`). Drawn as `typed, not sent`; published as `unsent`.
     pub(crate) unsent: bool,
+    /// The seat's first work order was sent again and no turn started on it
+    /// (`wsp-420`). Drawn as `order not received`; published as `dropped`.
+    pub(crate) dropped: bool,
     /// This seat has started a full-suite `cargo test` (`wsp-389`). Drawn as `full suite in a member seat`;
     /// published as `full_suite`.
     pub(crate) full_suite: bool,
@@ -4670,6 +4678,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             spawned_by,
             leg: leg.cloned(),
             unsent: !a.state.turn_in_flight() && w.unsent.contains(seat),
+            dropped: !a.state.turn_in_flight() && w.dropped.contains(seat),
             full_suite: w.full_suite.contains(seat),
             was_governor,
         });
@@ -4792,7 +4801,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "role": r.role.json(),
             "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
             "spawned_by": r.spawned_by,
-            "unsent": r.unsent, "full_suite": r.full_suite, "was_governor": r.was_governor,
+            "unsent": r.unsent, "dropped": r.dropped, "full_suite": r.full_suite, "was_governor": r.was_governor,
             "leg": r.leg.as_ref().map(|s| json!({
                 "name": s.leg.name, "after": s.after, "index": s.index, "of": s.of,
             })),
@@ -4827,6 +4836,7 @@ const REVIEW_VERBS: &str = "the person's: wsp done <id> · wsp reopen <id> — a
 
 /// What the STATE column says of a seat whose prompt holds text nobody sent.
 const UNSENT_WORD: &str = "typed, not sent";
+const DROPPED_WORD: &str = "order not received";
 
 /// The note on a row whose seat ran the whole suite (`wsp-389`).
 const FULL_SUITE_WORD: &str = "full suite in a member seat";
@@ -4910,13 +4920,15 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             .map(|r| r.waiting.as_ref().map(|w| waited(r, w).chars().count()).unwrap_or(0))
             .max()
             .unwrap_or(0)
-            .max(if rows.iter().any(|r| r.unsent) { UNSENT_WORD.len() } else { 8 });
+            .max(if rows.iter().any(|r| r.unsent) { UNSENT_WORD.len() } else { 8 })
+            .max(if rows.iter().any(|r| r.dropped) { DROPPED_WORD.len() } else { 8 });
         for r in &rows {
             let state = match (&r.waiting, r.state.as_str()) {
                 // Before the word, and in place of it: a waiting seat reads
                 // `idle` on its screen, and `idle` is what got one ended.
                 (Some(w), _) => p.yellow(&util::pad(&waited(r, w), sw)),
                 (None, _) if r.unsent => p.yellow(&util::pad(UNSENT_WORD, sw)),
+                (None, _) if r.dropped => p.yellow(&util::pad(DROPPED_WORD, sw)),
                 (None, "working") => p.green(&util::pad("working", sw)),
                 (None, "idle") => p.dim(&util::pad("idle", sw)),
                 (None, other) => p.dim(&util::pad(other, sw)),
@@ -8198,6 +8210,7 @@ mod tests {
             since: Default::default(),
             spawned: Default::default(),
             unsent: Default::default(),
+            dropped: Default::default(),
             full_suite: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
@@ -8395,6 +8408,7 @@ mod tests {
             since: Default::default(),
             spawned: Default::default(),
             unsent: Default::default(),
+            dropped: Default::default(),
             full_suite: Default::default(),
         }
     }
@@ -8454,6 +8468,20 @@ mod tests {
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         assert!(text.contains("typed, not sent"), "{text}");
         assert!(text.contains("was governor · tonight") || text.contains("was "), "{text}");
+    }
+
+    /// `wsp-420`: a seat whose first order was sent again and started no turn
+    /// is drawn as that, and not as `idle`, which is what it reads as.
+    #[test]
+    fn a_seat_whose_first_order_never_started_a_turn_is_not_drawn_as_idle() {
+        let mut w = wip_world();
+        w.agents.push(seated_agent("w7:p1", "idle", "w7:p1"));
+        w.dropped.insert("w7:p1".into());
+        let j = wip_json(&w);
+        let row = j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == "w7:p1").unwrap().clone();
+        assert_eq!(row["dropped"], true);
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("order not received"), "{text}");
     }
 
     #[test]
