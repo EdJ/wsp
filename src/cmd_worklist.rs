@@ -1186,7 +1186,7 @@ pub fn stop_checks(store: &Store, args: &Args) -> i32 {
 
 pub fn group(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
-        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--caption \"…\"|none] [--drop] [--why \"…\"|-]";
+        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--caption \"…\"|none] [--kind contract|components|wiring|insitu|none] [--drop] [--why \"…\"|-]";
     let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
@@ -1222,13 +1222,14 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         return 2;
     }
     let drop = args.has("drop");
-    if !drop && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") {
+    if !drop && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") && !args.has("kind") {
         eprintln!("{USAGE}");
         eprintln!("       --parallel caps the work; --agent says who runs it; --stop is the prose read at the barrier after it");
         eprintln!("       --caption is the line a glance reads for it; --drop takes the group out whole");
+        eprintln!("       --kind says what the group is for, which scopes its barrier's run (docs/scoped-barriers.md)");
         return 2;
     }
-    if drop && (args.has("parallel") || args.has("stop") || args.has("agent") || args.has("caption")) {
+    if drop && (args.has("parallel") || args.has("stop") || args.has("agent") || args.has("caption") || args.has("kind")) {
         eprintln!("wsp: --drop takes the group out whole, so there is nothing of it left to set");
         return 2;
     }
@@ -1240,7 +1241,21 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     // A caption alone is the one edit any group takes, run or not: it is
     // what the group is called, and nothing a member, a verifier or the
     // barrier reads. The window guards what is in flight.
-    let caption_only = args.has("caption") && !args.has("parallel") && !args.has("stop") && !args.has("agent");
+    let caption_only = args.has("caption") && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("kind");
+    // A kind alone is read at the barrier and by nothing in flight, so it is
+    // the other edit a group takes while it runs.
+    let kind_only = args.has("kind") && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption");
+    let kind = match args.get("kind").map(|k| k.trim().to_string()) {
+        None => None,
+        Some(k) if matches!(k.as_str(), "" | "none" | "-" | "true") => Some(String::new()),
+        Some(k) => match crate::scope::GroupKind::parse(&k) {
+            Some(kind) => Some(kind.word().to_string()),
+            None => {
+                eprintln!("wsp: a group's kind is contract, components, wiring or insitu — `none` takes it off, not `{k}`");
+                return 2;
+            }
+        },
+    };
 
     // The reason is settled before any prose is read, since both may want the
     // stream and only one of them can have it.
@@ -1257,7 +1272,7 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     };
 
     let win = window(store, &w);
-    if !caption_only && !win.allows(ordinal) {
+    if !caption_only && !kind_only && !win.allows(ordinal) {
         // The one edit the group being run still takes: its stop, which
         // nothing has read as a barrier yet. See [`amend_running_stop`].
         let only_stop = args.has("stop") && !args.has("parallel") && !args.has("agent");
@@ -1331,6 +1346,10 @@ pub fn group(store: &Store, args: &Args) -> i32 {
             }
             Err(code) => return code,
         }
+    }
+    if let Some(k) = kind {
+        said.push(if k.is_empty() { "no kind".into() } else { format!("kind: {k}") });
+        groups[ordinal - 1].kind = k;
     }
     if let Some(c) = caption {
         said.push(if c.is_empty() { "no caption".into() } else { format!("caption: {c}") });

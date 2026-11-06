@@ -52,6 +52,7 @@ use crate::barrier::{self, Suite};
 use crate::check::{self, Done, Of, Ran, Step};
 use crate::cmd_verify::{git, toplevel};
 use crate::model::{Group, Landed, Task, Worklist};
+use crate::scope;
 use crate::store::Store;
 use crate::util;
 
@@ -397,19 +398,51 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     // What a copy of this run spent waiting for the tree lock behind another is
     // not the run's own time, and the line below does not count it.
     let mut waited = std::time::Duration::ZERO;
+    // What the group touched decides how much of the suite the barrier runs
+    // (`wsp-431`): observed from the landed commits, never declared.
+    let landed = crate::worklist::touched(store, &g.members).landed;
+    let mut changed: Vec<String> = landed.iter().flat_map(|l| l.files.iter().cloned()).collect();
+    changed.sort();
+    changed.dedup();
+    let project = plan.units.first().map(|u| u.project.clone()).unwrap_or_default();
+    let config = scope::Config::of(store, &project);
+    let mut net = scope::Net::read(store, &project);
+    let scope = scope::decide(&scope::Ask {
+        kind: scope::GroupKind::parse(&g.kind),
+        last: at == groups.len(),
+        changed: &changed,
+        config: &config,
+        since_full: net.since_full.len(),
+    });
+    let mut effective: Vec<Vec<Item>> = Vec::new();
+    let mut applied = scope.clone();
+    let mut targets: Vec<String> = Vec::new();
     for unit in &plan.units {
-        let (r, w) = run_unit_timed(store, unit, &format!("barrier {list} {at}"));
+        let (r, w, narrowed) = run_unit_scoped(store, unit, &format!("barrier {list} {at}"), Some((&scope, &changed)));
         waited += w;
         ranged.push(r);
+        match narrowed {
+            Some(n) => {
+                if n.scope.is_full() {
+                    applied = n.scope;
+                }
+                for t in n.targets {
+                    if !targets.contains(&t) {
+                        targets.push(t);
+                    }
+                }
+                effective.push(n.items);
+            }
+            None => effective.push(unit.items.clone()),
+        }
     }
-    let landed = crate::worklist::touched(store, &g.members).landed;
     let mut blames = Vec::new();
     let mut failed = Vec::new();
     let mut could_not = Vec::new();
     let mut count = 0;
     let (mut reused, mut ran_n) = (0, 0);
     let mut per_step: Vec<String> = Vec::new();
-    for (u, r) in plan.units.iter().zip(&ranged) {
+    for ((u, items), r) in plan.units.iter().zip(&effective).zip(&ranged) {
         match r {
             Ranged::Could(why) => could_not.push(format!("{} — {why}", u.project)),
             Ranged::Ran(ran) => {
@@ -418,7 +451,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
                 let (a, b) = check::tally(ran);
                 reused += a;
                 ran_n += b;
-                for (item, ran) in u.items.iter().zip(ran) {
+                for (item, ran) in items.iter().zip(ran) {
                     if matches!(ran.done, Done::Failed { .. } | Done::Malformed(_)) {
                         failed.push(item.step.name.clone());
                         blames.push(blame(item, ran, &landed));
@@ -450,6 +483,10 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     });
     let reads: Vec<String> = plan.units.iter().map(|u| u.sha.clone()).collect();
     let results = results_text(&plan, &ranged, &blames, &decision);
+    let secs = started.elapsed().saturating_sub(waited).as_secs();
+    let note = scope_note(store, &project, &mut net, list, at, &applied, &targets, &scope, secs, failed.is_empty(), reused, !could_not_any(&ranged));
+    note.write(store, list, at);
+    let results = format!("Scope: {}\n{results}", note.line());
     let file = packet_file(store, list, at);
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -459,11 +496,13 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     log_line(
         store,
         &format!(
-            "{list} group {at}: barrier run — {count} step(s), {reused} reused, {ran_n} ran, {} failed, {}s{}{}",
+            "{list} group {at}: barrier run — {count} step(s), {reused} reused, {ran_n} ran, {} failed, {}s{}{}{}",
             failed.len(),
-            started.elapsed().saturating_sub(waited).as_secs(),
+            secs,
             // Per-step seconds of the steps that ran: `wsp timeline` reads them (`wsp-390`).
             if per_step.is_empty() { String::new() } else { format!(" · per step: {}", per_step.join("; ")) },
+            // Scoped against full (`wsp-431`), after the per-step figures so the timeline's reading of them is whole.
+            format!(" · scope: {}", note.line()),
             if decision.would_pass && !on { " · would pass without an agent (auto-pass is off for a project)" } else { "" }
         ),
     );
@@ -496,15 +535,21 @@ pub(crate) fn lock_held(store: &Store, w: &Worklist, at: usize) -> bool {
     plan(store, w, at).units.iter().any(|u| check::TreeLock::live(&check::barrier_dir(store, &u.project, &u.repo).join("lock")))
 }
 
+#[cfg(test)]
 fn run_unit(store: &Store, unit: &Unit, who: &str) -> Ranged {
-    run_unit_timed(store, unit, who).0
+    run_unit_scoped(store, unit, who, None).0
 }
 
-/// [`run_unit`], and how long it waited for the tree lock. A wait is said in
-/// the log, with whose lock it was.
-fn run_unit_timed(store: &Store, unit: &Unit, who: &str) -> (Ranged, std::time::Duration) {
+/// What a scoped run is given: the scope decided for the group, and the paths
+/// its members landed.
+type Scoping<'a> = Option<(&'a scope::Scope, &'a [String])>;
+
+/// [`run_unit`], and how long it waited for the tree lock, and what scoping did
+/// to the unit's steps (so the caller reads results against the steps that ran).
+/// A wait is said in the log, with whose lock it was.
+fn run_unit_scoped(store: &Store, unit: &Unit, who: &str, scoping: Scoping) -> (Ranged, std::time::Duration, Option<scope::Narrowed>) {
     if unit.items.is_empty() {
-        return (Ranged::Ran(Vec::new()), std::time::Duration::ZERO);
+        return (Ranged::Ran(Vec::new()), std::time::Duration::ZERO, None);
     }
     let dir = check::barrier_dir(store, &unit.project, &unit.repo);
     let before = Instant::now();
@@ -517,25 +562,100 @@ fn run_unit_timed(store: &Store, unit: &Unit, who: &str) -> (Ranged, std::time::
     });
     // Everything up to the lock is waiting; the checkout and the steps are not.
     let waited = if lock.is_ok() { before.elapsed() } else { std::time::Duration::ZERO };
-    (run_unit_locked(store, unit, who, &dir, lock), waited)
+    let (ranged, narrowed) = run_unit_locked(store, unit, who, &dir, lock, scoping);
+    (ranged, waited, narrowed)
 }
 
-fn run_unit_locked(store: &Store, unit: &Unit, who: &str, dir: &std::path::Path, lock: Result<check::TreeLock, String>) -> Ranged {
+fn run_unit_locked(
+    store: &Store,
+    unit: &Unit,
+    who: &str,
+    dir: &std::path::Path,
+    lock: Result<check::TreeLock, String>,
+    scoping: Scoping,
+) -> (Ranged, Option<scope::Narrowed>) {
     let tree = dir.join("tree");
     let lock = match lock {
         Ok(l) => l,
-        Err(why) => return Ranged::Could(why),
+        Err(why) => return (Ranged::Could(why), None),
     };
     if let Err(why) = check::checkout(&unit.repo, &tree, &unit.sha) {
         drop(lock);
-        return Ranged::Could(format!("could not put {} in {}: {why}", &unit.sha[..12], util::contract(&tree)));
+        return (Ranged::Could(format!("could not put {} in {}: {why}", &unit.sha[..12], util::contract(&tree))), None);
     }
-    let steps: Vec<Step> = unit.items.iter().map(|i| i.step.clone()).collect();
+    // The steps as scoped, in the tree at the commit: the targets a diff reaches
+    // are read from the crate graph and the module graph there.
+    let narrowed = scoping.map(|(scope, changed)| scope::narrow(&tree, &unit.items, scope, changed));
+    let items = narrowed.as_ref().map(|n| n.items.as_slice()).unwrap_or(&unit.items);
+    let steps: Vec<Step> = items.iter().map(|i| i.step.clone()).collect();
     let greens = crate::greens::Greens::open(store, &unit.project, &unit.repo);
     let reuse = crate::greens::Reuse { greens: &greens, sha: &unit.sha, env: crate::greens::Env::Warm, who };
     let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), Some(&reuse), |_| {});
     drop(lock);
-    Ranged::Ran(ran)
+    (Ranged::Ran(ran), narrowed)
+}
+
+fn could_not_any(ranged: &[Ranged]) -> bool {
+    ranged.iter().any(|r| matches!(r, Ranged::Could(_)))
+}
+
+/// What the group's barrier did about scope, and the project's count of scoped
+/// barriers since its last full one moved on (`wsp-431`).
+///
+/// A scoped run adds the group to the count. A full run empties it, and is
+/// **the safety net's** when scoped barriers stood behind it: red, it names
+/// them, because the graph missed something they let through. A full run that
+/// reused nothing is a figure for what a full run costs, kept to price what the
+/// scoped ones saved.
+#[allow(clippy::too_many_arguments)]
+fn scope_note(
+    store: &Store,
+    project: &str,
+    net: &mut scope::Net,
+    list: &str,
+    at: usize,
+    applied: &scope::Scope,
+    targets: &[String],
+    decided: &scope::Scope,
+    secs: u64,
+    green: bool,
+    reused: usize,
+    ran_all: bool,
+) -> scope::Note {
+    let label = format!("{list}/{at}");
+    let mut note = scope::Note {
+        scoped: !applied.is_full(),
+        why: match applied {
+            scope::Scope::Full(w) => w.clone(),
+            scope::Scope::Narrow { .. } => String::new(),
+        },
+        targets: targets.to_vec(),
+        widened: match decided {
+            scope::Scope::Narrow { widened } if !applied.is_full() => widened.clone(),
+            _ => Vec::new(),
+        },
+        seconds: secs,
+        full_seconds: net.full_secs,
+        net_red: Vec::new(),
+    };
+    if ran_all && !project.is_empty() {
+        if note.scoped {
+            if !net.since_full.contains(&label) {
+                net.since_full.push(label);
+            }
+        } else {
+            let behind: Vec<String> = net.since_full.iter().filter(|l| **l != label).cloned().collect();
+            if !green && !behind.is_empty() {
+                note.net_red = behind;
+            }
+            net.since_full.clear();
+            if green && reused == 0 {
+                net.full_secs = Some(secs);
+            }
+        }
+        net.write(store, project);
+    }
+    note
 }
 
 /// Record the pass through `wsp worklist go`, the one way a barrier is passed.
@@ -930,5 +1050,30 @@ mod tests {
         ran_of(run_unit(&store, &plan.units[0], "barrier run 1"));
         let barrier_state = store.state_file("barrier");
         assert!(crate::disk::candidates(&store).iter().all(|c| !c.starts_with(&barrier_state)));
+    }
+
+    #[test]
+    fn scoped_barriers_are_counted_and_a_red_full_run_behind_them_is_the_safety_nets() {
+        let (_env, store) = world("net", "exit 0\n", "");
+        let mut net = scope::Net::default();
+        let narrow = scope::Scope::Narrow { widened: vec![] };
+        let full = scope::Scope::Full("safety net".into());
+        let note = |net: &mut scope::Net, at: usize, applied: &scope::Scope, secs: u64, green: bool| {
+            scope_note(&store, "pj", net, "run", at, applied, &["crate:a".to_string()], &narrow, secs, green, 0, true)
+        };
+        let full_first = note(&mut net, 1, &full, 400, true);
+        assert!(!full_first.scoped && net.full_secs == Some(400) && net.since_full.is_empty());
+        let a = note(&mut net, 2, &narrow, 40, true);
+        assert!(a.scoped && a.saved() == 360, "{a:?}");
+        note(&mut net, 2, &narrow, 40, true);
+        note(&mut net, 3, &narrow, 50, true);
+        assert_eq!(net.since_full, vec!["run/2", "run/3"], "a group is counted once however often it runs");
+        assert_eq!(scope::Net::read(&store, "pj"), net, "kept between barriers");
+        let red = note(&mut net, 4, &full, 410, false);
+        assert_eq!(red.net_red, vec!["run/2", "run/3"]);
+        assert!(net.since_full.is_empty() && net.full_secs == Some(400), "a red run is not a price for a green one");
+        assert!(red.line().contains("SAFETY-NET RED"));
+        red.write(&store, "run", 4);
+        assert_eq!(scope::Note::read(&store, "run", 4).unwrap().net_red, red.net_red);
     }
 }

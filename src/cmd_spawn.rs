@@ -5712,6 +5712,7 @@ mod tests {
             member_agents: Default::default(),
             checks: Vec::new(),
             stop_checks: Vec::new(),
+            kind: String::new(),
             id: None,
             caption: String::new(),
         }]);
@@ -8715,6 +8716,7 @@ mod tests {
                 member_agents: Default::default(),
                 checks: Vec::new(),
                 stop_checks: Vec::new(),
+                kind: String::new(),
                 id: None,
                 caption: String::new(),
             }]);
@@ -8775,6 +8777,7 @@ mod tests {
                 member_agents: Default::default(),
                 checks: Vec::new(),
                 stop_checks: Vec::new(),
+                kind: String::new(),
                 id: None,
                 caption: String::new(),
             },
@@ -8789,6 +8792,7 @@ mod tests {
                 member_agents: Default::default(),
                 checks: Vec::new(),
                 stop_checks: Vec::new(),
+                kind: String::new(),
                 id: None,
                 caption: String::new(),
             },

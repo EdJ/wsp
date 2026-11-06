@@ -213,6 +213,8 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let mut rework_rows: Vec<Value> = Vec::new();
     let (mut blocked, mut reopened, mut dropped, mut rework_usd) = (0u64, 0u64, 0u64, 0u64);
     let mut suites_total = 0u64;
+    let (mut scoped_n, mut full_n, mut saved_secs, mut net_reds) = (0u64, 0u64, 0u64, 0u64);
+    let mut net_red_rows: Vec<Value> = Vec::new();
     let (mut fixed_first, mut fixed_vfirst, mut fixed_held): (Vec<i64>, Vec<i64>, Vec<i64>) = Default::default();
     let mut fixed_tests = 0i64;
 
@@ -306,9 +308,24 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             }
         }
         let gcost = cost["groups"].get(gi).and_then(|c| c.get("total")).cloned().unwrap_or(Value::Null);
+        // How the group's barrier was scoped, against a full run (`wsp-431`).
+        let note = crate::scope::Note::read(store, &w.id, gi + 1);
+        if let Some(n) = &note {
+            if n.scoped {
+                scoped_n += 1;
+                saved_secs += n.saved();
+            } else {
+                full_n += 1;
+            }
+            net_reds += u64::from(!n.net_red.is_empty());
+            if !n.net_red.is_empty() {
+                net_red_rows.push(json!({ "group": gi + 1, "behind": n.net_red }));
+            }
+        }
         group_json.push(json!({
             "group": gi + 1, "wall_seconds": gwall, "model_seconds": gmodel, "tool_seconds": gtool,
             "cost": gcost, "full_suite_runs": gsuites, "members": members,
+            "kind": g.kind, "barrier_scope": note.as_ref().map(|n| n.json()).unwrap_or(Value::Null),
         }));
     }
     let followups: Vec<Value> = crate::cmd_worklist::followups(w).into_iter().map(|(row, ids)| json!({ "by": row, "rows": ids })).collect();
@@ -327,6 +344,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
         "scope": {
             "cost": "whole row: every seat — members, verifiers, barrier checks, governors",
             "full_suite": "full_suite_runs: full-suite `cargo test` runs started in a member's or verifier's seat (the shim's note, wsp-389), by row and group. The barrier's own run is one per group and is not counted here; the aim is zero in seats.",
+            "barrier_scope": "groups[].barrier_scope: the barrier's run scoped to what the group touched (wsp-431) — scoped or full and why, the targets it ran, shared paths that widened it, its seconds against the last full run's, and net_red: scoped barriers a red full run stood behind, which is what scoping let through",
             "time": "per member row, spawn to verdict (wall, gaps); the seat's model and tool time are its own transcript calls inside those phases, legs only where run-leg timings exist",
         },
         "totals": {
@@ -347,6 +365,11 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "unmeasured_seats": total["unmeasured"],
             "transcripts_missing": missing_sessions,
             "full_suite_runs": suites_total,
+            "scoped_barriers": scoped_n,
+            "full_barriers": full_n,
+            "scoped_seconds_saved": saved_secs,
+            "safety_net_reds": net_reds,
+            "safety_net_misses": net_red_rows,
             "spawn_to_first_line_median_seconds": median(&mut fixed_first),
             "verifier_spawn_to_first_line_median_seconds": median(&mut fixed_vfirst),
             "verifier_test_seconds": fixed_tests,
@@ -440,6 +463,9 @@ pub fn effort_html(v: &Value) -> String {
             vec!["unmeasured seats".into(), n(t, "unmeasured_seats").to_string()],
             vec!["transcripts not found".into(), n(t, "transcripts_missing").to_string()],
             vec!["full suites run in member or verifier seats".into(), n(t, "full_suite_runs").to_string()],
+            vec!["barriers scoped / full".into(), format!("{} / {}", n(t, "scoped_barriers"), n(t, "full_barriers"))],
+            vec!["seconds scoped barriers ran under a full run".into(), n(t, "scoped_seconds_saved").to_string()],
+            vec!["safety-net reds scoping let through".into(), n(t, "safety_net_reds").to_string()],
             vec!["seat spawn to its first line (median per row)".into(), hms(n(t, "spawn_to_first_line_median_seconds") as i64)],
             vec!["verifier spawn to its first line (median per row)".into(), hms(n(t, "verifier_spawn_to_first_line_median_seconds") as i64)],
             vec!["verifier test and build time (all passes)".into(), hms(n(t, "verifier_test_seconds") as i64)],

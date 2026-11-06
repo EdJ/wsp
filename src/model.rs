@@ -1798,6 +1798,14 @@ pub struct Group {
     /// [`Self::member_agents`] documents: `wsp install` after the land, before
     /// a list carrying one is run by an older binary.
     pub stop_checks: Vec<String>,
+    /// `kind:` — what the group is for (`contract`, `components`, `wiring`,
+    /// `insitu`), empty where nobody said. The barrier's scope follows it
+    /// (`wsp-431`, [`crate::scope`]): empty runs the full suite as ever.
+    ///
+    /// **A wsp from before this reads the line as more members**, the hazard
+    /// [`Self::member_agents`] documents: `wsp install` before a list carrying
+    /// one is run by an older binary.
+    pub kind: String,
 }
 
 /// Who a group runs on: the kind, and optionally the model and the effort,
@@ -2109,6 +2117,9 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         } else if let Some(rest) = trimmed.strip_prefix("verdict-caption:") {
             last.verdict_caption = rest.trim().to_string();
             cont = Cont::Members;
+        } else if let Some(rest) = trimmed.strip_prefix("kind:") {
+            last.kind = rest.trim().to_string();
+            cont = Cont::Members;
         } else if let Some(rest) = trimmed.strip_prefix("agent:") {
             // One line, never wrapped: a policy is three words.
             last.agent = rest.trim().to_string();
@@ -2261,6 +2272,9 @@ pub fn render_groups(groups: &[Group]) -> String {
         }
         if !g.caption.trim().is_empty() {
             out.push_str(&format!("  caption: {}\n", g.caption.trim()));
+        }
+        if !g.kind.trim().is_empty() {
+            out.push_str(&format!("  kind: {}\n", g.kind.trim()));
         }
         block(&mut out, "agent", &g.agent);
         // In member order, and only for members still in the group: a line
@@ -3101,6 +3115,20 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
     /// `stop-checks:` is one item to a line, beside the stop and not in it, and
     /// a command's own spacing and colons survive a round trip; a wrapped item
     /// is the one item, and the next group is not made of its words.
+    /// `kind:` is a line of the group's own, beside its caption, and round-trips.
+    #[test]
+    fn a_groups_kind_is_its_own_line_and_round_trips() {
+        let text = "- 1  a-1\n  kind: components\n  caption: c\n- 2  a-2\n";
+        let gs = parse_groups(text);
+        assert_eq!(gs[0].kind, "components");
+        assert_eq!(gs[0].members, vec!["a-1"], "not a member");
+        assert!(gs[1].kind.is_empty());
+        let mut w = Worklist::new("l", "t");
+        w.set_groups(&gs);
+        assert_eq!(w.groups()[0].kind, "components");
+        assert!(w.groups()[1].kind.is_empty());
+    }
+
     #[test]
     fn stop_checks_sit_beside_the_stop_and_round_trip_one_item_to_a_line() {
         let written = "\
