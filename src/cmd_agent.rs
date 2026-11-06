@@ -4018,6 +4018,8 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     // wsp-384: the planned lists wsp started on its own, for a day after.
     let mut picked_up = crate::pickup::wip_lines(store);
     picked_up.extend(silent_lines(store));
+    // wsp-453: a finished row's tree that still has processes.
+    picked_up.extend(crate::check_tree::wip_lines(store));
     match args.json() {
         true => {
             let mut v = wip_json(&w);

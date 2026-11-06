@@ -346,6 +346,12 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
     }
     released_seats(store, seats, &lists, &seated, &mut tasks, &mut asks);
     original_seats(store, seats);
+    // `wsp-453`: what a finished row's tree still has running goes with its
+    // seat, or by the next tick where the seat went some other way. Not in a
+    // test, which would signal the machine's own processes.
+    if !cfg!(test) {
+        crate::check_tree::stop_finished(store, seats);
+    }
 }
 
 fn open_lists(store: &Store) -> Vec<Worklist> {

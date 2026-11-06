@@ -704,6 +704,9 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
             Err(_) => break None,
         }
     };
+    // `wsp-453`: whatever the step started and left in its group (a Vite
+    // server, a Vitest watcher) goes with it, however it ended.
+    let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).stderr(Stdio::null()).status();
     let ok = !timed_out && status.is_some_and(|s| s.success());
     let tail = tail_of(log);
     let done = if ok {
@@ -1790,6 +1793,25 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10), "waited on the sleep");
         assert_eq!(r.done, Done::Failed { exit: None, timed_out: true });
         assert!(why_failed(&r).contains("timed out after 1s"));
+    }
+
+    /// `wsp-453`: a step that passes still has its group killed — the Vite and
+    /// Vitest it started stood for hours after the box check.
+    #[test]
+    fn a_step_that_passes_leaves_nothing_it_started_running() {
+        let (dir, log) = scratch_log("leaves");
+        let pidfile = dir.join("server.pid");
+        let r = run_step(&dir, &sh(&format!("sleep 60 > /dev/null 2>&1 & echo $! > {}", pidfile.display()), 20), &log);
+        assert_eq!(r.done, Done::Passed);
+        let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+        let alive = || {
+            Command::new("kill").args(["-0", &pid]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "the step's background process {pid} is still running");
     }
 
     #[test]
