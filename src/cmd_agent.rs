@@ -6161,6 +6161,13 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut notes,
     );
 
+    // A repository that has stopped packing: a crashed detached gc leaves its
+    // lock behind and every later auto-gc dies on it (`wsp-380`). The store
+    // is looked at with the project roots.
+    let mut gc_roots = vec![store.root.clone()];
+    gc_roots.extend(seen.iter().cloned());
+    crate::gc::health(&gc_roots, args.has("fix"), &mut problems, &mut notes);
+
     // And the binary those trees were built into, which is the one file none
     // of the checks above can see: the stamp travels in the bytes, so it is
     // asked of the installed wsp rather than worked out from a tree.

@@ -75,6 +75,7 @@ mod fake;
 mod far;
 mod fm;
 mod history;
+mod gc;
 mod guard;
 mod herdr;
 mod input;
