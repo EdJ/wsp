@@ -83,8 +83,8 @@ impl Prio {
 pub enum Wait {
     /// This many more places than there are.
     Room { short: usize },
-    /// The load is high and builds are held back.
-    Throttle,
+    /// The machine is held back: which reading, and where it lets go.
+    Throttle(crate::throttle::Pause),
     /// The list it is `after` is not complete yet.
     After(String),
     /// A list on the same project is executing, and this one runs alone.
@@ -101,7 +101,7 @@ impl Wait {
         match self {
             Wait::Room { short: 1 } => "room: 1 slot short".into(),
             Wait::Room { short } => format!("room: {short} slots short"),
-            Wait::Throttle => "throttle: the load holds builds back".into(),
+            Wait::Throttle(hold) => hold.text(),
             Wait::After(other) => format!("after {other}"),
             Wait::Alone(other) => format!("alone: {other} executing"),
             Wait::Manual => "manual group".into(),
@@ -136,8 +136,8 @@ pub struct Entry {
 pub struct World {
     /// Places free under the seat's cap; `None` where there is no cap.
     pub free: Option<usize>,
-    /// The load warning is up.
-    pub throttled: bool,
+    /// What holds new work back, if anything.
+    pub throttled: Option<crate::throttle::Pause>,
     /// Lists complete or closed.
     pub complete: BTreeSet<String>,
     /// (list, scope) of every executing list.
@@ -177,8 +177,8 @@ fn first_wait(e: &Entry, world: &World, free: Option<usize>) -> Option<Wait> {
             return Some(Wait::Room { short: e.need - free });
         }
     }
-    if world.throttled {
-        return Some(Wait::Throttle);
+    if let Some(hold) = world.throttled {
+        return Some(Wait::Throttle(hold));
     }
     if let Some(other) = e.after.as_ref().filter(|o| !world.complete.contains(*o)) {
         return Some(Wait::After(other.clone()));
@@ -262,7 +262,7 @@ pub struct Machine {
     pub free: Option<usize>,
     /// The cap itself, for the sentence that says what room there was.
     pub cap: Option<usize>,
-    pub throttled: bool,
+    pub throttled: Option<crate::throttle::Pause>,
 }
 
 impl Machine {
@@ -351,7 +351,7 @@ impl Wait {
     pub fn kind(&self) -> String {
         match self {
             Wait::Room { .. } => "room".into(),
-            Wait::Throttle => "throttle".into(),
+            Wait::Throttle(_) => "throttle".into(),
             Wait::After(other) => format!("after {other}"),
             Wait::Alone(other) => format!("alone with {other}"),
             Wait::Manual => "manual group".into(),
@@ -416,8 +416,9 @@ mod tests {
     #[test]
     fn the_throttle_holds_a_list_back() {
         let mut w = world();
-        w.throttled = true;
-        assert_eq!(only(entry("a"), &w), Some(Wait::Throttle));
+        w.throttled = Some(crate::throttle::sample_pause());
+        assert_eq!(only(entry("a"), &w), Some(Wait::Throttle(crate::throttle::sample_pause())));
+        assert!(only(entry("a"), &w).unwrap().text().contains("1-minute load is 14.2"));
     }
 
     #[test]
@@ -496,8 +497,8 @@ mod tests {
         assert_eq!(only(e.clone(), &w), Some(Wait::Alone("c".into())));
         w.executing.clear();
         assert_eq!(only(e.clone(), &w), Some(Wait::Manual));
-        w.throttled = true;
-        assert_eq!(only(e.clone(), &w), Some(Wait::Throttle));
+        w.throttled = Some(crate::throttle::sample_pause());
+        assert_eq!(only(e.clone(), &w), Some(Wait::Throttle(crate::throttle::sample_pause())));
         w.free = Some(0);
         assert_eq!(only(e, &w), Some(Wait::Room { short: 3 }));
     }

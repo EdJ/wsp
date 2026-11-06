@@ -331,6 +331,178 @@ pub(crate) fn load_high(one: f64, five: f64, cores: usize) -> bool {
     one.min(five) > LOAD_FACTOR * cores as f64
 }
 
+// ---- what holds new work back (wsp-447) ----------------------------------------
+//
+// 2026-11-06 15:11, after a thrash at 14:20 (load 388): the 1-minute load was
+// back to 4.2 and the 5-minute to 6.9, planned lists were still held, and two
+// of four agent slots stood idle. The hold on new work reads the **recent**
+// machine: the 1-minute load, the free memory and the clock limit. The
+// 5- and 15-minute averages are history by the time a spike is over, and are
+// not read for it ([`load_high`] stays the *warning*, which wants a load that
+// has lasted).
+//
+// Each reading has two lines, the way a thermostat has: it holds at the first
+// and lets go only past the second, so a load hovering at the line does not
+// start and stop lists every tick. The words of what held it last are kept in
+// `hold.json` in the state directory, because the CLI and the daemon are
+// separate processes and a line that remembers nothing is not a hysteresis.
+
+/// The 1-minute load, in cores, at which new work is held, and under which it
+/// is let go again.
+const HOLD_LOAD: f64 = LOAD_FACTOR;
+const RELEASE_LOAD: f64 = 1.0;
+
+/// Free memory, percent (`memory_pressure`): held under the first, let go at
+/// or over the second.
+const HOLD_MEM_FREE: u32 = 10;
+const RELEASE_MEM_FREE: u32 = 20;
+
+/// The clock limit is let go this many points above where it held.
+const RELEASE_THERMAL_ABOVE: u32 = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PauseKind {
+    Load,
+    Memory,
+    Thermal,
+}
+
+impl PauseKind {
+    const ALL: [PauseKind; 3] = [PauseKind::Load, PauseKind::Memory, PauseKind::Thermal];
+
+    fn word(self) -> &'static str {
+        match self {
+            PauseKind::Load => "load",
+            PauseKind::Memory => "memory",
+            PauseKind::Thermal => "thermal",
+        }
+    }
+}
+
+/// One reading that holds new work back, with the reading and the line it is
+/// let go at. Load in tenths, the others in percent, so the value is `Eq` and
+/// `Copy` and rides in a [`crate::waits::Wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pause {
+    pub(crate) kind: PauseKind,
+    pub(crate) reading: u32,
+    pub(crate) release: u32,
+}
+
+impl Pause {
+    /// The sentence `wsp worklist ls` prints: which reading held it, and when
+    /// it will let go.
+    pub fn text(&self) -> String {
+        let tenths = |n: u32| format!("{:.1}", n as f64 / 10.0);
+        match self.kind {
+            PauseKind::Load => format!(
+                "throttle: the 1-minute load is {}, held until it is under {}",
+                tenths(self.reading),
+                tenths(self.release)
+            ),
+            PauseKind::Memory => format!(
+                "throttle: memory is short, {}% free, held until {}% is free",
+                self.reading, self.release
+            ),
+            PauseKind::Thermal => format!(
+                "throttle: the CPU is limited to {}% of its clock, held until it is at {}%",
+                self.reading, self.release
+            ),
+        }
+    }
+}
+
+/// The machine's recent readings, the input of [`decide_hold`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reading {
+    pub one: f64,
+    pub cores: usize,
+    /// Percent of memory free; `None` where it cannot be read.
+    pub mem_free: Option<u32>,
+    /// `CPU_Speed_Limit`; `None` where there is no `pmset`.
+    pub thermal: Option<u32>,
+}
+
+/// Every reading that holds new work back, given the kinds that held it last
+/// time (`was`). A reading that cannot be read does not hold: a machine must
+/// not be held for want of a gauge.
+pub(crate) fn decide_hold(was: &[PauseKind], r: &Reading, s: &Settings) -> Vec<Pause> {
+    let held = |k: PauseKind| was.contains(&k);
+    let tenths = |x: f64| (x * 10.0).round() as u32;
+    let cores = r.cores as f64;
+    let mut out = Vec::new();
+    let load_line = if held(PauseKind::Load) { RELEASE_LOAD } else { HOLD_LOAD } * cores;
+    if r.one > load_line {
+        out.push(Pause { kind: PauseKind::Load, reading: tenths(r.one), release: tenths(RELEASE_LOAD * cores) });
+    }
+    if let Some(free) = r.mem_free {
+        let line = if held(PauseKind::Memory) { RELEASE_MEM_FREE } else { HOLD_MEM_FREE };
+        if free < line {
+            out.push(Pause { kind: PauseKind::Memory, reading: free, release: RELEASE_MEM_FREE });
+        }
+    }
+    if let Some(limit) = r.thermal {
+        let release = (s.thermal_below + RELEASE_THERMAL_ABOVE).min(100);
+        let line = if held(PauseKind::Thermal) { release } else { s.thermal_below };
+        if limit < line {
+            out.push(Pause { kind: PauseKind::Thermal, reading: limit, release });
+        }
+    }
+    out
+}
+
+/// A load hold at 14.2 on 8 cores, for tests that need one to carry.
+#[cfg(test)]
+pub(crate) fn sample_pause() -> Pause {
+    Pause { kind: PauseKind::Load, reading: 142, release: 80 }
+}
+
+fn hold_path(state: &Path) -> PathBuf {
+    state.join("hold.json")
+}
+
+fn held_before(state: &Path) -> Vec<PauseKind> {
+    let Some(v) = fs::read_to_string(hold_path(state)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    else {
+        return Vec::new();
+    };
+    let words: Vec<&str> = v.get("held").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    PauseKind::ALL.into_iter().filter(|k| words.contains(&k.word())).collect()
+}
+
+/// Decide against what held last time and remember the answer. The state
+/// directory is the machine's, so every process that asks sees one memory.
+pub(crate) fn hold_step(state: &Path, r: &Reading, s: &Settings) -> Vec<Pause> {
+    let was = held_before(state);
+    let now = decide_hold(&was, r, s);
+    let kinds: Vec<PauseKind> = now.iter().map(|h| h.kind).collect();
+    if kinds != was {
+        let words: Vec<&str> = kinds.iter().map(|k| k.word()).collect();
+        let _ = crate::store::write_atomic(&hold_path(state), &json!({ "held": words }).to_string());
+    }
+    now
+}
+
+/// Percent of memory free, out of the last line of `memory_pressure`:
+/// `System-wide memory free percentage: 57%`.
+pub(crate) fn parse_mem_free(out: &str) -> Option<u32> {
+    let line = out.lines().find(|l| l.contains("memory free percentage"))?;
+    line.split(':').nth(1)?.trim().trim_end_matches('%').trim().parse().ok()
+}
+
+fn mem_free() -> Option<u32> {
+    if cfg!(test) {
+        return None;
+    }
+    let out = Command::new("memory_pressure").stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| parse_mem_free(&String::from_utf8_lossy(&out.stdout))).flatten()
+}
+
+/// An unreadable load reads as none, so the memory and the clock still count.
+fn reading_now() -> Reading {
+    Reading { one: load_average().map_or(0.0, |l| l.0), cores: cores(), mem_free: mem_free(), thermal: speed_limit() }
+}
+
 /// How many times the readiness wait of a spawn is stretched at this load
 /// (`wsp-335`): once per core's worth of load queued, from 1 to 4. A
 /// `compound-956` agent never became ready inside sixty seconds at load about
@@ -1068,11 +1240,16 @@ pub(crate) fn loud(store: &Store) -> Option<String> {
     View::read(&store.state).warning(store.seat_cap())
 }
 
-/// Whether the load is holding builds back now — the warning [`loud`] words —
-/// for what waits on the machine (`wsp-383`). Never under test, where a load
-/// reading is noise.
-pub(crate) fn holding_back(store: &Store) -> bool {
-    !cfg!(test) && loud(store).is_some()
+/// What holds new work back now, the first reading, for what waits on the
+/// machine (`wsp-383`). Decided on the recent load, memory and clock with
+/// hysteresis (`wsp-447`), not on the warning [`loud`] words. Never under
+/// test, where a reading is noise; [`hold_step`] is what the tests drive.
+pub(crate) fn holding_back(store: &Store) -> Option<Pause> {
+    if cfg!(test) {
+        return None;
+    }
+    let s = Settings::load(&store.state);
+    hold_step(&store.state, &reading_now(), &s).into_iter().next()
 }
 
 /// [`View::status_line`], for the surfaces that are not `wsp throttle`.
@@ -1219,6 +1396,10 @@ pub(crate) fn throttle(store: &Store, args: &Args) -> i32 {
         ),
         false => {
             println!("{}", v.render());
+            match holding_back(store) {
+                Some(h) => println!("new work: held — {}", h.text().trim_start_matches("throttle: ")),
+                None => println!("new work: not held (1-minute load, memory and clock are all fine)"),
+            }
             let cap = store.seat_cap();
             let want = v.settings.hot_agents(v.cores);
             if v.hot() && cap.is_none_or(|c| c > want) {
@@ -1244,6 +1425,62 @@ mod tests {
 
     fn s(w: &[&str]) -> Vec<String> {
         w.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn a_spike_then_recovery_releases_on_the_one_minute_load_not_the_history() {
+        // wsp-447: 8 cores. The 5- and 15-minute averages are not an input at
+        // all, so a series that still carries a 37 behind it releases as soon
+        // as the 1-minute load is under the release line.
+        let t = crate::util::isolated("throttle-hold-series");
+        let st = Settings::default();
+        let at = |one: f64| Reading { one, cores: 8, mem_free: Some(57), thermal: Some(100) };
+        // (seconds since the spike, 1-minute load, held?)
+        let series: [(u32, f64, bool); 9] = [
+            (0, 4.0, false),
+            (30, 388.0, true),
+            (90, 120.0, true),
+            (150, 30.0, true),
+            (210, 11.0, true), // under the hold line, over the release line: still held
+            (270, 8.5, true),
+            (330, 7.9, false), // recovered: released
+            (390, 9.0, false), // between the lines again: not held again, no flap
+            (450, 4.2, false),
+        ];
+        for (secs, one, want) in series {
+            let got = hold_step(&t.state(), &at(one), &st);
+            assert_eq!(!got.is_empty(), want, "at {secs}s, load {one}: {got:?}");
+        }
+        // The hold names the reading, so `wsp worklist ls` can say it.
+        let h = hold_step(&t.state(), &at(14.2), &st);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].text(), "throttle: the 1-minute load is 14.2, held until it is under 8.0");
+    }
+
+    #[test]
+    fn memory_and_the_clock_hold_with_their_own_release_lines() {
+        let t = crate::util::isolated("throttle-hold-mem-heat");
+        let st = Settings::default();
+        let r = |mem: u32, therm: u32| Reading { one: 1.0, cores: 8, mem_free: Some(mem), thermal: Some(therm) };
+        assert!(hold_step(&t.state(), &r(40, 100), &st).is_empty());
+        let m = hold_step(&t.state(), &r(6, 100), &st);
+        assert_eq!(m[0].kind, PauseKind::Memory);
+        assert!(m[0].text().contains("memory is short, 6% free"), "{}", m[0].text());
+        assert_eq!(hold_step(&t.state(), &r(15, 100), &st).len(), 1, "15% is over the line it held at, under the one it lets go at");
+        assert!(hold_step(&t.state(), &r(21, 100), &st).is_empty());
+        let h = hold_step(&t.state(), &r(40, 31), &st);
+        assert_eq!(h[0].kind, PauseKind::Thermal);
+        assert_eq!(hold_step(&t.state(), &r(40, 72), &st).len(), 1, "still under 75");
+        assert!(hold_step(&t.state(), &r(40, 75), &st).is_empty());
+        // No gauge, no hold.
+        let blind = Reading { one: 0.0, cores: 8, mem_free: None, thermal: None };
+        assert!(hold_step(&t.state(), &blind, &st).is_empty());
+    }
+
+    #[test]
+    fn memory_free_is_read_out_of_memory_pressure() {
+        assert_eq!(parse_mem_free("Pageouts: 1 \n\nSystem-wide memory free percentage: 57%\n"), Some(57));
+        assert_eq!(parse_mem_free("nothing"), None);
     }
 
     #[test]

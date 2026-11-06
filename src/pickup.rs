@@ -219,7 +219,7 @@ fn why_started(w: &Worklist, row: &Row, machine: &Machine, seen: &Seen) -> Strin
         }
         _ => s.push_str("; this seat has no cap on agents"),
     }
-    if !machine.throttled {
+    if machine.throttled.is_none() {
         s.push_str("; load is fine");
     }
     s
@@ -359,7 +359,7 @@ mod tests {
     }
 
     fn room(free: usize) -> Option<Machine> {
-        Some(Machine { free: Some(free), cap: Some(8), throttled: false })
+        Some(Machine { free: Some(free), cap: Some(8), throttled: None })
     }
 
     /// Two members and a verifier is three places for a list of two; a list of
@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(seen_of(&store, "by-hand").kinds, ["manual group"]);
 
         planned(&store, "hot", "m-2", "2026-11-05T10:00:00Z");
-        let hot = Some(Machine { free: Some(8), cap: Some(8), throttled: true });
+        let hot = Some(Machine { free: Some(8), cap: Some(8), throttled: Some(crate::throttle::sample_pause()) });
         assert_eq!(tick_on(&store, hot), None);
         assert_eq!(word(&store, "hot"), "planned");
         assert_eq!(tick_on(&store, room(8)).as_deref(), Some("hot"), "the load eased");
@@ -598,7 +598,7 @@ mod tests {
         let mut w = Worklist::new("l", "L");
         w.planned = Some(util::now_iso());
         let row = Row { id: "l".into(), wait: None, need: 3 };
-        let m = Machine { free: Some(5), cap: Some(8), throttled: false };
+        let m = Machine { free: Some(5), cap: Some(8), throttled: None };
         let none = why_started(&w, &row, &m, &Seen::default());
         assert!(none.contains("nothing was in its way") && none.contains("5 of 8 places free"), "{none}");
         assert_eq!(caption_for(&Seen::default()), "planned, nothing was in its way");
@@ -613,6 +613,6 @@ mod tests {
             let c = caption_for(&Seen { kinds: vec![kind.into()], last: String::new() });
             assert!(c.chars().count() <= crate::caption::LIMIT, "{c}");
         }
-        let _ = Wait::Throttle;
+        let _ = Wait::Throttle(crate::throttle::sample_pause());
     }
 }
