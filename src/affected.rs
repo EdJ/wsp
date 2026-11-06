@@ -65,18 +65,6 @@ fn metadata(tree: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&out.stdout).ok()
 }
 
-/// Whether a workspace crate has a path dependency outside the workspace,
-/// which the crate graph does not follow.
-fn leaves_workspace(v: &serde_json::Value) -> bool {
-    let Some(root) = v.get("workspace_root").and_then(|r| r.as_str()).map(PathBuf::from) else { return true };
-    let Some(pkgs) = v.get("packages").and_then(|p| p.as_array()) else { return true };
-    pkgs.iter().any(|p| {
-        p.get("dependencies")
-            .and_then(|d| d.as_array())
-            .is_some_and(|d| d.iter().any(|d| d.get("path").and_then(|x| x.as_str()).is_some_and(|x| !Path::new(x).starts_with(&root))))
-    })
-}
-
 /// The crates in a `cargo metadata` answer.
 pub(crate) fn crates_of(v: &serde_json::Value) -> Option<Vec<Crate>> {
     let root = PathBuf::from(v.get("workspace_root")?.as_str()?);
@@ -293,11 +281,7 @@ fn check_box(inner: &str) -> bool {
 fn reads(tree: &Path, command: &str) -> Reads {
     let Some((dir, inner)) = scoped(command) else { return Reads::Whole };
     if plain_cargo(&inner) && !inner.contains("--manifest-path") {
-        return match cargo_inputs(tree, &dir, &inner) {
-            Some(paths) => Reads::Paths(paths),
-            None if !dir.is_empty() => Reads::Dir(dir),
-            None => Reads::Whole,
-        };
+        return cargo_inputs(tree, &dir, &inner).map_or(Reads::Whole, Reads::Paths);
     }
     if !dir.is_empty() && check_box(&inner) {
         return Reads::Dir(dir);
@@ -315,18 +299,17 @@ pub(crate) fn inputs(tree: &Path, command: &str) -> Option<Vec<String>> {
     }
 }
 
-/// The paths a plain cargo command run in `base` (relative to `tree`) reads.
+/// The paths a plain cargo command run in `base` (relative to `tree`) reads, or
+/// `None` when they cannot be told: the workspace is not inside the tree, or
+/// `cargo metadata` fails. A workspace rooted above `base` is read from its own
+/// root; a path dependency outside the workspace but inside the tree adds its
+/// directory (and its own such dependencies'); one outside the tree is not a
+/// file of this repository, so a commit cannot key it.
 fn cargo_inputs(tree: &Path, base: &str, command: &str) -> Option<Vec<String>> {
-    let work = tree.join(base);
-    let meta = metadata(&work)?;
-    if !base.is_empty() {
-        // A workspace rooted above `base`, or a dependency outside it, is read
-        // from places this key does not list.
-        let root = PathBuf::from(meta.get("workspace_root")?.as_str()?);
-        if root.canonicalize().ok()? != work.canonicalize().ok()? || leaves_workspace(&meta) {
-            return None;
-        }
-    }
+    let top = tree.canonicalize().ok()?;
+    let meta = metadata(&tree.join(base))?;
+    let root = PathBuf::from(meta.get("workspace_root")?.as_str()?);
+    let root_rel = root.canonicalize().ok()?.strip_prefix(&top).ok()?.to_string_lossy().trim_end_matches('/').to_string();
     let cs = crates_of(&meta)?;
     let mut want = named_crates(command, &cs);
     if want.iter().any(|n| !cs.iter().any(|c| c.name == *n)) {
@@ -343,7 +326,11 @@ fn cargo_inputs(tree: &Path, base: &str, command: &str) -> Option<Vec<String>> {
         }
         i += 1;
     }
-    let at = |p: &str| if base.is_empty() { p.to_string() } else { format!("{base}/{p}") };
+    let at = |p: &str| match (root_rel.is_empty(), p.is_empty()) {
+        (true, _) => p.to_string(),
+        (false, true) => root_rel.clone(),
+        (false, false) => format!("{root_rel}/{p}"),
+    };
     let mut paths = vec![at("Cargo.lock"), at("Cargo.toml")];
     for c in cs.iter().filter(|c| want.contains(&c.name)) {
         if c.dir.is_empty() {
@@ -353,6 +340,46 @@ fn cargo_inputs(tree: &Path, base: &str, command: &str) -> Option<Vec<String>> {
             }
         } else {
             paths.push(at(&c.dir));
+        }
+    }
+    // Path dependencies that are not workspace members.
+    let mut seen = vec![root.canonicalize().ok()?];
+    let mut work = vec![(meta, Some(want))];
+    while let Some((m, only)) = work.pop() {
+        let Some(wr) = m.get("workspace_root").and_then(|r| r.as_str()).map(PathBuf::from) else { return None };
+        let wr = wr.canonicalize().ok()?;
+        for p in m.get("packages")?.as_array()? {
+            if only.as_ref().is_some_and(|w| !p.get("name").and_then(|n| n.as_str()).is_some_and(|n| w.iter().any(|x| x == n))) {
+                continue;
+            }
+            for d in p.get("dependencies").and_then(|d| d.as_array()).into_iter().flatten() {
+                let Some(dp) = d.get("path").and_then(|x| x.as_str()) else { continue };
+                let Ok(dp) = Path::new(dp).canonicalize() else { continue };
+                let Ok(rel) = dp.strip_prefix(&top) else { continue };
+                if rel.as_os_str().is_empty() {
+                    return None;
+                }
+                if dp.starts_with(&wr) && dp != wr {
+                    // Inside this workspace: a member is read by the crate graph, anything else by its directory.
+                    paths.push(rel.to_string_lossy().into_owned());
+                } else if !dp.starts_with(&wr) {
+                    paths.push(rel.to_string_lossy().into_owned());
+                    if !seen.iter().any(|s| dp.starts_with(s)) {
+                        seen.push(dp.clone());
+                        let m = metadata(&dp)?;
+                        let above = m.get("workspace_root").and_then(|r| r.as_str()).and_then(|r| Path::new(r).canonicalize().ok());
+                        if let Some(above) = above.filter(|a| a != &dp) {
+                            if let Ok(r) = above.strip_prefix(&top) {
+                                let r = r.to_string_lossy();
+                                let at = |f: &str| if r.is_empty() { f.to_string() } else { format!("{r}/{f}") };
+                                paths.push(at("Cargo.toml"));
+                                paths.push(at("Cargo.lock"));
+                            }
+                        }
+                        work.push((m, None));
+                    }
+                }
+            }
         }
     }
     paths.sort();
@@ -583,6 +610,59 @@ mod tests {
         let three = commit(&dir, "web/src/main.rs", "fn main() { }\n");
         assert_ne!(key(&dir, &three, cargo).unwrap(), kc, "a source in the crate moves the key");
         assert_ne!(key(&dir, &three, npm).unwrap(), kn, "a file in the directory moves the key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn crate_at(dir: &Path, rel: &str, name: &str, deps: &str) {
+        std::fs::create_dir_all(dir.join(rel).join("src")).unwrap();
+        std::fs::write(dir.join(rel).join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\n{deps}")).unwrap();
+        std::fs::write(dir.join(rel).join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    }
+
+    fn commit_all(dir: &Path) -> String {
+        let g = |a: &[&str]| Command::new("git").arg("-C").arg(dir).args(a).output().unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "y"]);
+        String::from_utf8_lossy(&g(&["rev-parse", "HEAD"]).stdout).trim().to_string()
+    }
+
+    #[test]
+    fn a_path_dependency_beside_the_directory_is_read_and_one_outside_the_repo_is_not() {
+        let dir = repo("dep");
+        let out = repo("outside");
+        crate_at(&dir, "shared", "shared", "");
+        crate_at(&out, "far", "far", "");
+        crate_at(&dir, "web", "web", &format!("shared = {{ path = \"../shared\" }}\nfar = {{ path = \"{}\" }}\n", out.join("far").display()));
+        let one = commit_all(&dir);
+        let cmd = "cd web && cargo test";
+        let k1 = key(&dir, &one, cmd).unwrap();
+        match reads(&dir, cmd) {
+            Reads::Paths(p) => assert!(p.iter().any(|x| x == "shared") && !p.iter().any(|x| x.contains("far")), "{p:?}"),
+            other => panic!("{other:?}"),
+        }
+        let two = commit(&dir, "README.md", "two");
+        assert_eq!(key(&dir, &two, cmd).unwrap(), k1, "a doc elsewhere is not read");
+        std::fs::write(dir.join("shared/src/lib.rs"), "pub fn g() {}\n").unwrap();
+        let three = commit_all(&dir);
+        assert_ne!(key(&dir, &three, cmd).unwrap(), k1, "the sibling crate it depends on moved");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_workspace_rooted_above_the_directory_is_read_from_its_root_and_an_unreadable_one_stays_whole() {
+        let dir = repo("above");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"pj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\nmembers = [\"web\"]\n").unwrap();
+        crate_at(&dir, "web", "web", "");
+        let one = commit_all(&dir);
+        let cmd = "cd web && cargo test";
+        let k1 = key(&dir, &one, cmd).unwrap();
+        let two = commit(&dir, "README.md", "two");
+        assert_eq!(key(&dir, &two, cmd).unwrap(), k1);
+        let three = commit(&dir, "Cargo.toml", "[package]\nname = \"pj\"\nversion = \"0.2.0\"\nedition = \"2021\"\n[workspace]\nmembers = [\"web\"]\n");
+        assert_ne!(key(&dir, &three, cmd).unwrap(), k1, "the root manifest is read");
+        // No manifest to read the graph from: the whole tree.
+        assert_eq!(reads(&dir.join("docs"), "cd web && cargo test"), Reads::Whole);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
