@@ -1089,6 +1089,36 @@ impl Supervisor<'_> {
         }
     }
 
+    /// Remove a stopped seat's directory, and **never leave the seat standing
+    /// over a directory that will not go** (`wsp-428`). A dying agent can still
+    /// be writing into it ("Directory not empty", os error 66, seen on
+    /// `cpd-3210`), so the removal is tried a few times; if it still fails, the
+    /// directory is renamed to a dot-name, which [`Self::ids`] and
+    /// [`Self::dir_of`] never read as a seat, and named on stderr. The seat is
+    /// ended either way: the agent has been signalled and the claim is the
+    /// caller's to release.
+    fn take_away(&self, dir: &Path) -> Result<()> {
+        let mut last = None;
+        for _ in 0..5 {
+            match fs::remove_dir_all(dir) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+            self.clock.rest(self.poll);
+        }
+        let why = last.map(|e| e.to_string()).unwrap_or_default();
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let aside = dir.with_file_name(format!(".gone-{name}-{}", std::process::id()));
+        match fs::rename(dir, &aside) {
+            Ok(()) => {
+                eprintln!("wsp: {name} is ended; its directory could not be removed ({why}) and is kept as {}", aside.display());
+                Ok(())
+            }
+            Err(e) => Err(Refusal::Backend(format!("{why}; and it could not be moved aside: {e}"))),
+        }
+    }
+
     /// The seat's own record, or [`Refusal::NoSeat`] where there is no seat.
     fn record(&self, seat: &Seat) -> Result<Value> {
         let dir = self.dir_of(seat)?;
@@ -1494,8 +1524,7 @@ impl Place for Supervisor<'_> {
         // and the orders it was given, and neither is the thing to keep a
         // directory per dead agent for.
         bank_burn(&dir);
-        fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
-        Ok(())
+        self.take_away(&dir)
     }
 
     fn state(&self, seat: &Seat) -> Result<State> {
@@ -1987,6 +2016,37 @@ mod tests {
         }
         assert_eq!(line["seat"], seat.as_str());
         assert_eq!(text.lines().count(), 1);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// `wsp-428`: a directory that will not go (compounding-112's "Directory
+    /// not empty") no longer leaves the seat standing.
+    #[cfg(unix)]
+    #[test]
+    fn stop_ends_a_seat_whose_directory_cannot_be_removed_and_keeps_it_aside() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir()
+            .join(format!("wsp-stuck-{}-{}", std::process::id(), util::epoch_nanos()));
+        let place = Supervisor { poll: Duration::from_millis(1), ..Supervisor::at(base.join("seats")) };
+        fs::create_dir_all(base.join("seats")).unwrap();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = base.join("seats").join(seat.as_str());
+        let stuck = dir.join("stuck");
+        fs::create_dir_all(&stuck).unwrap();
+        fs::write(stuck.join("f"), "x").unwrap();
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = place.stop(&seat);
+        let _ = fs::set_permissions(&stuck, fs::Permissions::from_mode(0o755));
+        outcome.expect("the seat is ended though its directory may have stayed");
+        assert!(!dir.exists(), "and it is no seat any more");
+        assert!(place.ids().is_empty(), "nor listed");
+        // Unless the tests run as root, where nothing refuses, the directory is kept, named.
+        let aside = fs::read_dir(base.join("seats"))
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".gone-"));
+        let root = std::process::Command::new("id").arg("-u").output().is_ok_and(|o| o.stdout == b"0\n");
+        assert!(aside || root, "kept under a dot-name");
         let _ = fs::remove_dir_all(&base);
     }
 

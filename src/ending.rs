@@ -443,14 +443,15 @@ fn failed(m: &Task, commit: &str) -> bool {
 /// and confirmed gone.
 fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str, seat: &str, h: &Holds, asks: &crate::waiting::Asks) -> bool {
     let state = seats.state(seat);
-    let shells = match state {
-        Some(State::Idle) => seats.shells(&[seat]),
-        _ => Default::default(),
-    };
+    // **A shell of its own does not hold a seat whose row is verified or
+    // settled** (`wsp-428`). Its work is in and landed, so the dev server or
+    // watch it left running has nothing to wake the agent for: it stood 55
+    // minutes after its verdict and held its group's barrier. Ending is the
+    // group signalled, and that kills the shell, which is the point. A question
+    // it asked, a prompt, a turn and a person typing still hold it below.
+    let shells = Default::default();
     let reading = Reading {
         state,
-        // An agent with a shell of its own still running is not ended under
-        // it: ending is the group signalled, and that is the shell killed.
         wait: crate::waiting::reading(state, asks, &shells, seat, member),
         governs: crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(seat)),
         typed: seats.turn_began_since(seat, h.at),
@@ -505,10 +506,8 @@ fn original_seats(store: &Store, seats: &dyn Seats) {
                 continue;
             }
             let state = seats.state(&seat);
-            let shells = match state {
-                Some(State::Idle) => seats.shells(&[&seat]),
-                _ => Default::default(),
-            };
+            // As for a member: its work has landed, a shell of its own holds nothing (`wsp-428`).
+            let shells = Default::default();
             let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
             let reading = Reading {
                 state,
@@ -835,6 +834,36 @@ mod tests {
         pass(&store, &seats);
         assert!(drain(&DESPAWNED).is_empty(), "the row's record and the pass's are what make it once");
         assert_eq!(log_of(&store, "m-1").matches("ended: verification holds").count(), 1);
+    }
+
+    /// `wsp-428`: compounding-117's seat stood 55 minutes after its verdict
+    /// because a dev server of its own was running.
+    #[test]
+    fn a_verified_member_with_a_shell_of_its_own_running_is_ended() {
+        struct Shelled(Fake);
+        impl Seats for Shelled {
+            fn state(&self, seat: &str) -> Option<State> {
+                self.0.state(seat)
+            }
+            fn turn_began_since(&self, seat: &str, since: i64) -> Option<bool> {
+                self.0.turn_began_since(seat, since)
+            }
+            fn pids(&self, seat: &str) -> Option<Vec<u32>> {
+                self.0.pids(seat)
+            }
+            fn running(&self, pids: &[u32]) -> Vec<u32> {
+                self.0.running(pids)
+            }
+            fn shells(&self, seats: &[&str]) -> crate::waiting::Shells {
+                match seats.contains(&"cpd-1") {
+                    true => crate::waiting::Shells::one("cpd-1", 1),
+                    false => Default::default(),
+                }
+            }
+        }
+        let (_env, store) = verified("shelled");
+        tick(&store, &Shelled(Fake::at_rest()));
+        assert!(member_ended(), "its work is in; the shell goes with the seat");
     }
 
     #[test]

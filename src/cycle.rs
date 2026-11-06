@@ -1299,10 +1299,11 @@ fn holding_barrier(
         // anything, it has stopped in the middle, and the half-hour report below
         // is for a turn that might be stuck, not for a question somebody owes.
         // Asked only of a seat that answered: `None` still never holds.
-        let shells = match state {
-            Some(State::Idle) => seats.shells(&[&seat]),
-            _ => Default::default(),
-        };
+        // **A shell of its own does not hold the barrier** (`wsp-428`): every
+        // member here is verified, so what its pane still runs is nothing the
+        // group is owed. Group 5 of react-pass-1 waited 51 minutes on a dev
+        // server. A prompt or an open question of its own still holds.
+        let shells = Default::default();
         if let Some(wait) = state.and_then(|st| crate::waiting::reading(Some(st), &asks, &shells, &seat, &s.id)) {
             waiting.push(format!("{seat} ({}) is {}", s.id, wait.sentence()));
             continue;
@@ -4539,6 +4540,31 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_message(&answered).unwrap();
         step(&store, &w, &Fixed::new(&[("cpd-1", State::Idle)]));
         assert_eq!(checks(&store, 1).len(), 1, "answered and idle: it opens");
+    }
+
+    /// `wsp-428`: group 5 of react-pass-1 waited 51 minutes on a verified
+    /// member's dev server. A shell of its own does not hold the barrier.
+    #[test]
+    fn a_barrier_does_not_wait_on_a_verified_members_shell_of_its_own() {
+        struct Shelled;
+        impl Seats for Shelled {
+            fn state(&self, _seat: &str) -> Option<State> {
+                Some(State::Idle)
+            }
+            fn shells(&self, _seats: &[&str]) -> crate::waiting::Shells {
+                crate::waiting::Shells::one("cpd-1", 1)
+            }
+        }
+        let (_env, store) = scratch("shellbarrier");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        let _ = spawned();
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        step(&store, &w, &Shelled);
+        assert_eq!(checks(&store, 1).len(), 1, "the barrier opens over it");
     }
 
     /// **The dependency `wsp-164` names**, and the reason `wsp-160` had to land
