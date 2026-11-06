@@ -342,7 +342,7 @@ mod tests {
         let env = util::isolated(&format!("cold-{name}"));
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_run(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         std::fs::write(repo.join("a.sh"), "exit 0\n").unwrap();
         git_run(&repo, &["add", "."]);
         git_run(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "pj-001: first"]);

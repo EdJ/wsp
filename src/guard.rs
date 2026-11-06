@@ -548,7 +548,7 @@ mod tests {
         let env = crate::util::isolated(&format!("guard-{name}"));
         let dir = env.path("repo");
         std::fs::create_dir_all(&dir).unwrap();
-        ok(&dir, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&dir);
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         ok(&dir, &["add", "f.txt"]);
         ok(&dir, &["commit", "--quiet", "-m", "first"]);
@@ -603,7 +603,7 @@ mod tests {
         let env = crate::util::isolated("guard-inherit");
         let dir = env.path("repo");
         std::fs::create_dir_all(&dir).unwrap();
-        ok(&dir, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&dir);
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         ok(&dir, &["add", "f.txt"]);
         ok(&dir, &["commit", "--quiet", "-m", "first"]);
@@ -661,7 +661,7 @@ mod tests {
         let env = crate::util::isolated("guard-foreign");
         let dir = env.path("repo");
         std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
-        ok(&dir, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&dir);
         let path = dir.join(".git/hooks/reference-transaction");
         std::fs::write(&path, "#!/bin/sh\n# theirs\nexit 0\n").unwrap();
         ensure(&dir);

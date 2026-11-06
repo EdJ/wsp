@@ -6038,17 +6038,11 @@ fn worklist_json_at(w: &Worklist, at: &Position, phase: worklist::Phase) -> serd
 mod tests {
     use super::*;
     use crate::model::Task;
-    use std::path::PathBuf;
 
     /// A store of its own, with no environment touched: nothing in these verbs
     /// reads the ambient store, so the tests can run beside each other.
     fn scratch(tag: &str) -> Store {
-        let root: PathBuf =
-            std::env::temp_dir().join(format!("wsp-wl-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = Store::at(root.clone(), root.join("state"));
-        store.ensure_dirs().unwrap();
-        store
+        crate::testkit::store(&format!("wl-{tag}"))
     }
 
     fn task(store: &Store, id: &str, status: &str) {
@@ -7476,7 +7470,7 @@ mod tests {
 
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_run(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         std::fs::write(repo.join("kept.txt"), "one\n").unwrap();
         git_run(&repo, &["add", "kept.txt"]);
         git_run(&repo, &["commit", "--quiet", "-m", "first"]);

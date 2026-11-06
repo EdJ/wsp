@@ -1876,7 +1876,7 @@ mod tests {
         let env = util::isolated(&format!("check-{name}"));
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_run(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         std::fs::write(repo.join("check.sh"), script).unwrap();
         git_run(&repo, &["add", "check.sh"]);
         git_run(&repo, &["commit", "--quiet", "-m", "pj-001: first"]);
@@ -2220,7 +2220,7 @@ mod tests {
 
     fn repo_at_head(name: &str) -> (PathBuf, PathBuf, String) {
         let (dir, log) = scratch_log(name);
-        git_run(&dir, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&dir);
         std::fs::write(dir.join("f"), "1").unwrap();
         git_run(&dir, &["add", "f"]);
         git_run(&dir, &["commit", "--quiet", "-m", "one"]);

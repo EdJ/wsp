@@ -104,10 +104,7 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
-        let env = util::isolated(tag);
-        let store = Store::at(env.home(), env.state());
-        store.ensure_dirs().unwrap();
-        (env, store)
+        crate::testkit::isolated_store(tag)
     }
 
     fn age(store: &Store, label: &str, secs: i64) {

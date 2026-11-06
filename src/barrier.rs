@@ -1118,10 +1118,7 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
-        let env = util::isolated(&format!("barrier-{tag}"));
-        let store = Store::at(env.home(), env.state());
-        store.ensure_dirs().unwrap();
-        (env, store)
+        crate::testkit::isolated_store(&format!("barrier-{tag}"))
     }
 
     fn list(store: &Store, groups: &[&[&str]]) -> Worklist {

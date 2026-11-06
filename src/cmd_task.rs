@@ -3270,11 +3270,7 @@ pub(crate) mod tests {
     }
 
     fn scratch(tag: &str) -> Store {
-        let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = Store::at(root.clone(), root.join("state"));
-        store.ensure_dirs().unwrap();
-        store
+        crate::testkit::store(tag)
     }
 
     /// `wsp-274`, at the verb compound's flight view reads (§24, FL-1): a
@@ -3366,7 +3362,7 @@ pub(crate) mod tests {
         store.ensure_dirs().unwrap();
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_at(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         git_at(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
         let tree = repo.join(".worktrees").join("wsp-101");
         git_at(&repo, &["worktree", "add", "--quiet", "-b", "wsp-101", &tree.display().to_string(), "master"]);

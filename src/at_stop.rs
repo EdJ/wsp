@@ -238,7 +238,7 @@ mod tests {
         let env = util::isolated(&format!("at-stop-{name}"));
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         std::fs::write(repo.join(".gitignore"), "target/\n.worktrees/\n").unwrap();
         git(&repo, &["add", ".gitignore"]);
         git(&repo, &["commit", "--quiet", "-m", "first"]);
@@ -318,7 +318,7 @@ mod tests {
         let (_env, store, _repo, _dir) = scratch("stranger", "touch ran");
         let other = _env.path("other");
         std::fs::create_dir_all(&other).unwrap();
-        git(&other, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&other);
         git(&other, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
         let tree = other.join("t");
         git(&other, &["worktree", "add", "--quiet", "-b", "t", &tree.display().to_string(), "master"]);

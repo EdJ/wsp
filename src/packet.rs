@@ -718,7 +718,7 @@ mod tests {
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::write(repo.join("src/a.rs"), "pub fn a() {}\n").unwrap();
         std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"pj\"\n").unwrap();
-        git(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         git(&repo, &["add", "."]);
         git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "pj-001: first"]);
         let store = Store::open();

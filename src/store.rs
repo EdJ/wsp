@@ -4322,11 +4322,7 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> Store {
-        let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let store = Store::at(root.clone(), root.join("state"));
-        store.ensure_dirs().unwrap();
-        store
+        crate::testkit::store(tag)
     }
 
     /// A scratch store that is a git repo with one commit behind it, so the

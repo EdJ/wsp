@@ -4065,10 +4065,7 @@ pub(crate) mod tests {
     }
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
-        let env = util::isolated(&format!("cycle-{tag}"));
-        let store = Store::at(env.home(), env.state());
-        store.ensure_dirs().unwrap();
-        (env, store)
+        crate::testkit::isolated_store(&format!("cycle-{tag}"))
     }
 
     fn task(store: &Store, id: &str, status: Status) {
@@ -5475,7 +5472,7 @@ fn only_a_working_screen_is_ever_overruled() {
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        git(&["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         std::fs::write(repo.join("f"), "x").unwrap();
         git(&["add", "f"]);
         git(&["commit", "--quiet", "-m", "one"]);
@@ -5526,7 +5523,7 @@ fn only_a_working_screen_is_ever_overruled() {
             assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };
-        git(&["init", "-q", "-b", "master"]);
+        crate::testkit::repo(&repo);
         git(&["commit", "-q", "--allow-empty", "-m", "first"]);
         git(&["branch", "m-1"]);
         git(&["checkout", "-q", "m-1"]);
@@ -5577,7 +5574,7 @@ fn only_a_working_screen_is_ever_overruled() {
             assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };
-        git(&repo, &["init", "-q", "-b", "master"]);
+        crate::testkit::repo(&repo);
         std::fs::write(repo.join("f"), "base\n").unwrap();
         git(&repo, &["add", "f"]);
         git(&repo, &["commit", "-q", "-m", "first"]);
@@ -7137,7 +7134,7 @@ fn only_a_working_screen_is_ever_overruled() {
                 .unwrap();
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         };
-        git(&["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         git(&["commit", "--quiet", "--allow-empty", "-m", "first"]);
         git(&["checkout", "--quiet", "-b", "m-1"]);
         git(&["commit", "--quiet", "--allow-empty", "-m", "the member's work"]);

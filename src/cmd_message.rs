@@ -1843,11 +1843,7 @@ mod tests {
     use crate::model::Task;
 
     fn scratch(tag: &str) -> Store {
-        let root = std::env::temp_dir().join(format!("wsp-ans-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = Store::at(root.clone(), root.join("state"));
-        store.ensure_dirs().unwrap();
-        store
+        crate::testkit::store(&format!("ans-{tag}"))
     }
 
     fn task(store: &Store, id: &str) -> Task {

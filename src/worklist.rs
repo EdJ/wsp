@@ -1936,7 +1936,7 @@ mod tests {
 
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_run(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         std::fs::write(repo.join("kept.txt"), "one\n").unwrap();
         git_run(&repo, &["add", "kept.txt"]);
         git_run(&repo, &["commit", "--quiet", "-m", "first"]);

@@ -1231,10 +1231,7 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
-        let env = util::isolated(&format!("verification-{tag}"));
-        let store = Store::at(env.home(), env.state());
-        store.ensure_dirs().unwrap();
-        (env, store)
+        crate::testkit::isolated_store(&format!("verification-{tag}"))
     }
 
     /// An entry is read back as it was written — every clause, the ending, and
@@ -1623,7 +1620,7 @@ mod tests {
         store.ensure_dirs().unwrap();
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_t(&repo, &["init", "-q", "-b", "master"]);
+        crate::testkit::repo(&repo);
         std::fs::write(repo.join("f"), "base\n").unwrap();
         git_t(&repo, &["add", "f"]);
         git_t(&repo, &["commit", "-q", "-m", "first"]);

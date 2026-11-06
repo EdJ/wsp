@@ -848,7 +848,7 @@ mod tests {
         let env = util::isolated(&format!("barrier-run-{name}"));
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_run(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         for (f, body) in [("suite.sh", suite), ("mine.sh", "exit 0\n"), ("gate.sh", "exit 0\n")] {
             std::fs::write(repo.join(f), body).unwrap();
         }

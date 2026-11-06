@@ -176,11 +176,7 @@ mod tests {
     use serde_json::{json, Value};
 
     fn scratch(tag: &str) -> Store {
-        let root = std::env::temp_dir().join(format!("wsp-lapse-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = Store::at(root.clone(), root.join("state"));
-        store.ensure_dirs().unwrap();
-        store
+        crate::testkit::store(&format!("lapse-{tag}"))
     }
 
     fn row(store: &Store, id: &str, status: Status) -> Task {

@@ -1195,11 +1195,7 @@ mod tests {
     // ---- the cap --------------------------------------------------------
 
     fn scratch(tag: &str) -> Store {
-        let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = Store::at(root.clone(), root.join("state"));
-        store.ensure_dirs().unwrap();
-        store
+        crate::testkit::store(tag)
     }
 
     /// `retire` changes the status, lists every row held on the machine (by the

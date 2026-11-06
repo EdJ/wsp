@@ -752,7 +752,7 @@ mod tests {
             assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };
-        git(&repo, &["init", "-q", "-b", "master"]);
+        crate::testkit::repo(&repo);
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
         let tree = repo.join(".worktrees").join("m-1");
         git(&repo, &["worktree", "add", "-q", "-b", "m-1", tree.to_str().unwrap(), "master"]);

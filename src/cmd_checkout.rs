@@ -2726,7 +2726,7 @@ mod tests {
     }
 
     fn repo(dir: &Path) {
-        run(dir, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(dir);
         std::fs::write(dir.join("kept.txt"), "one\n").unwrap();
         run(dir, &["add", "kept.txt"]);
         run(dir, &["commit", "--quiet", "-m", "first"]);

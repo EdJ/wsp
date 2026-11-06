@@ -2146,10 +2146,7 @@ impl Seats for Absent {
     }
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
-        let env = util::isolated(&format!("repair-{tag}"));
-        let store = Store::at(env.home(), env.state());
-        store.ensure_dirs().unwrap();
-        (env, store)
+        crate::testkit::isolated_store(&format!("repair-{tag}"))
     }
 
     /// A running list of one group, and the only kind of group the reconciler
@@ -2216,7 +2213,7 @@ impl Seats for Absent {
     /// trunk — its work has landed and its row says nothing about how.
     fn landed_member(env: &util::Isolated, store: &Store, ahead: bool) -> String {
         let repo = repo(env, store);
-        git_in(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
         git_in(&repo, &["checkout", "--quiet", "-b", "m-1"]);
         git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "the member's work"]);
@@ -3632,7 +3629,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     fn a_member_whose_branch_is_still_ahead_gets_no_landing_and_is_told_to_land() {
         let (env, store) = scratch("ahead");
         let repo = repo(&env, &store);
-        git_in(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
         git_in(&repo, &["checkout", "--quiet", "-b", "m-1"]);
         git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "work"]);
@@ -4095,7 +4092,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     fn a_run_whose_member_agent_is_killed_mid_group_reaches_its_barrier_without_a_verb() {
         let (env, store) = scratch("endtoend");
         let repo = repo(&env, &store);
-        git_in(&repo, &["init", "--quiet", "-b", "master"]);
+        crate::testkit::repo(&repo);
         git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
         member(&store, "m-1", Status::Todo);
         member(&store, "m-2", Status::Todo);

@@ -27,6 +27,8 @@ mod choices;
 mod hold;
 mod hold_close;
 mod lapse;
+#[cfg(test)]
+mod testkit;
 mod risk;
 mod check;
 mod greens;
