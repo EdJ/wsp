@@ -328,7 +328,11 @@ Code's setup offer, are once per machine or per folder. Per folder is a problem
 when each row has its own tree: the plan has the trees under one parent
 (`<exec_dir>/trees`) and the hand proof checks whether trust on the parent covers the
 children; if it does not, the spawn command pre-accepts the folder in the far
-Claude settings. *Unverified.*
+Claude settings. *Measured (wsp-445): it does not.* Trust on `<exec_dir>/trees` did not
+cover `trees/demos-002` on eds-macbook-i5, so the far start now trusts the row's own
+tree by name first: `<exec_dir>/bin/wsp-trust add <tree>` (a shell script wsp writes
+there, editing `projects["<tree>"].hasTrustDialogAccepted` in the far `.claude.json`
+through python3 or node, atomically). `wsp-trust remove <tree>` takes the entry out.
 
 Which machine: a laptop that sleeps or locks is the wrong shape regardless of
 auth, because a sleeping machine is an unreachable one. The manual setup row asks

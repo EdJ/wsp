@@ -1321,6 +1321,11 @@ impl Compound<'_> {
         // The gate goes in before the agent does: a session that starts first has
         // had tool calls the hook never saw.
         self.install_gate(&m, seat, &cwd)?;
+        // So is the folder trust: trust on `<exec_dir>/trees` did not cover the
+        // row's tree, and an untrusted folder stops claude at "No, exit" (wsp-445).
+        self.far
+            .run(&m, &crate::far::trust_command(&m, "add", &cwd), crate::far::SESSION_TIMEOUT)
+            .map_err(|f| bad(format!("trusting {cwd} on {name}: {}", f.why())))?;
         let (program, argv) = crate::agent_commands::command(&agent.kind, &agent.args);
         let cmd = crate::far::seat_command(&m, seat.as_str(), &cwd, &env, &program, &argv);
         let out = self
@@ -2274,9 +2279,14 @@ mod tests {
 
         place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).unwrap();
         let asked = far.asked.borrow().clone();
-        assert_eq!(asked.len(), 5, "{asked:?}");
+        assert_eq!(asked.len(), 6, "{asked:?}");
         assert!(asked[0].starts_with("run cat ") && asked[1].starts_with("run mkdir "), "the gate is written first: {asked:?}");
-        let (asked_gate, asked) = (asked[..2].to_vec(), asked[2..].to_vec());
+        assert!(
+            asked[2].starts_with("run mkdir ") && asked[2].ends_with("'/far/exec/bin/wsp-trust' add '/far/exec/trees/t-1'"),
+            "then the row's tree is trusted by name, before claude starts: {}",
+            asked[2]
+        );
+        let (asked_gate, asked) = (asked[..2].to_vec(), asked[3..].to_vec());
         assert!(asked_gate[1].contains(&format!("--seat '{seat}' --lease 180")), "{}", asked_gate[1]);
         assert!(asked[0].contains(&format!("spawn --label '{seat}' --cwd '/far/exec/trees/t-1'")), "{}", asked[0]);
         assert!(asked[0].contains("WSP_SEAT_ID='") && asked[0].contains("claude-token"), "{}", asked[0]);

@@ -516,6 +516,102 @@ pub fn seat_command(m: &Machine, label: &str, cwd: &str, env: &BTreeMap<String, 
     launch(m, label, cwd, &before, &pre, "", &tail)
 }
 
+/// The helper that sets or clears Claude Code's folder trust for one directory
+/// in the far `~/.claude.json` (`docs/remote-agents.md` section 8).
+///
+/// **Trust on `<exec_dir>/trees` did not cover the row's tree** (`wsp-445`): a
+/// far claude started in `trees/<row>` stopped at "Quick safety check", whose
+/// default is "No, exit", so nothing was typed and the order never landed. The
+/// row's own tree is therefore trusted by name, before claude starts.
+///
+/// A shell script that hands the edit to `python3` or else `node`, so no binary
+/// of ours has to be built for the far platform. The file is read, one key
+/// changed, and written beside itself and renamed over, so a claude writing it
+/// at the same moment sees the old or the new and never half. A file that is not
+/// a JSON object is left alone and the helper fails, as `settings_with_gate`
+/// does. No single quote appears in either program, because each sits in a
+/// single-quoted shell string.
+const TRUST_HELPER: &str = r#"#!/bin/sh
+# wsp-trust add|remove <dir>: Claude Code's folder trust for <dir>, in ~/.claude.json
+op=$1; dir=$2
+case "$op" in add|remove) ;; *) echo "usage: wsp-trust add|remove <dir>" >&2; exit 2;; esac
+[ -n "$dir" ] || { echo "wsp-trust: no directory" >&2; exit 2; }
+file="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+PY='
+import json, os, sys, tempfile
+op, d, f = sys.argv[1:4]
+try:
+    with open(f) as h:
+        doc = json.load(h)
+except FileNotFoundError:
+    doc = {}
+if not isinstance(doc, dict):
+    sys.exit("wsp-trust: " + f + " is not a JSON object; not touching it")
+projects = doc.setdefault("projects", {})
+if not isinstance(projects, dict):
+    sys.exit("wsp-trust: projects in " + f + " is not an object; not touching it")
+for n in {d, os.path.realpath(d)}:
+    if op == "add":
+        entry = projects.setdefault(n, {})
+        entry["hasTrustDialogAccepted"] = True
+    else:
+        projects.pop(n, None)
+mode = 0o600
+try:
+    mode = os.stat(f).st_mode & 0o777
+except OSError:
+    pass
+fd, tmp = tempfile.mkstemp(prefix=".claude.json.", dir=os.path.dirname(f) or ".")
+with os.fdopen(fd, "w") as h:
+    json.dump(doc, h, indent=2)
+os.chmod(tmp, mode)
+os.replace(tmp, f)
+'
+JS='
+const fs = require("fs"), path = require("path");
+const [op, d, f] = process.argv.slice(1);
+let doc = {};
+try { doc = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { if (e.code !== "ENOENT") { console.error("wsp-trust: " + f + " is not JSON; not touching it"); process.exit(1); } }
+if (doc === null || typeof doc !== "object" || Array.isArray(doc)) { console.error("wsp-trust: " + f + " is not a JSON object; not touching it"); process.exit(1); }
+if (!doc.projects || typeof doc.projects !== "object") doc.projects = {};
+let real = d; try { real = fs.realpathSync(d); } catch (e) {}
+for (const n of new Set([d, real])) {
+  if (op === "add") { doc.projects[n] = doc.projects[n] || {}; doc.projects[n].hasTrustDialogAccepted = true; }
+  else delete doc.projects[n];
+}
+let mode = 0o600; try { mode = fs.statSync(f).mode & 0o777; } catch (e) {}
+const tmp = path.join(path.dirname(f), ".claude.json." + process.pid);
+fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode });
+fs.renameSync(tmp, f);
+'
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import json' 2>/dev/null; then
+  exec python3 -c "$PY" "$op" "$dir" "$file"
+elif command -v node >/dev/null 2>&1; then
+  exec node -e "$JS" "$op" "$dir" "$file"
+fi
+echo "wsp-trust: neither python3 nor node is on this machine; cannot edit $file" >&2
+exit 1
+"#;
+
+/// Where the trust helper lives on the machine.
+pub fn trust_helper_path(m: &Machine) -> String {
+    format!("{}/bin/wsp-trust", m.exec_dir.trim_end_matches('/'))
+}
+
+/// The far command that trusts `dir` (the row's tree) before claude starts in it:
+/// it writes [`TRUST_HELPER`] under `<exec_dir>/bin` and runs it. `op` is `add`
+/// or `remove`; the helper is rewritten each time so it never lags wsp.
+pub fn trust_command(m: &Machine, op: &str, dir: &str) -> String {
+    let helper = trust_helper_path(m);
+    format!(
+        "mkdir -p {bin} && cat > {h} <<'WSP_TRUST_EOF'\n{body}WSP_TRUST_EOF\nchmod 755 {h} && {h} {op} {dir}",
+        bin = quote(&format!("{}/bin", m.exec_dir.trim_end_matches('/'))),
+        h = quote(&helper),
+        body = TRUST_HELPER,
+        dir = quote(dir),
+    )
+}
+
 /// A word quoted for the far shell with no `~/` expansion: an environment value or
 /// an argument is data, even when it starts with `~/`.
 fn quote_plain(word: &str) -> String {
@@ -1081,6 +1177,62 @@ mod tests {
         assert!(!cmd.contains("bad name"), "a name the shell cannot take is dropped: {cmd}");
         assert!(cmd.contains("spawn --label 'cpd-7' --cwd ~/'wsp-exec/trees/t-1' -- 'claude' '--model' 'a b'"), "{cmd}");
         assert!(!cmd.contains("--no-renderer"), "the seat gets its renderer: {cmd}");
+    }
+
+    /// The row's own tree is trusted by name in the far `~/.claude.json`, kept
+    /// next to whatever else that file holds, and taken out again (`wsp-445`).
+    #[test]
+    fn the_trust_command_trusts_the_trees_own_path_keeps_the_rest_and_removes_it() {
+        let dir = std::env::temp_dir().join(format!("wsp-far-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut m = Machine::new("mb3", "mb3");
+        m.exec_dir = dir.join("exec").display().to_string();
+        let file = home.join(".claude.json");
+        let run = |op: &str| {
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(trust_command(&m, op, "/far/exec/trees/demos-002"))
+                .env("HOME", &home)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap()).unwrap()
+        };
+        // No file yet: one is made.
+        let doc = run("add");
+        assert_eq!(doc["projects"]["/far/exec/trees/demos-002"]["hasTrustDialogAccepted"], true);
+        // A file that holds other things keeps them, and the second add changes nothing.
+        std::fs::write(
+            &file,
+            r#"{"userID":"u","projects":{"/far/exec/trees":{"hasTrustDialogAccepted":true},"/far/exec/trees/demos-002":{"allowedTools":["x"]}}}"#,
+        )
+        .unwrap();
+        let doc = run("add");
+        let again = run("add");
+        assert_eq!(doc, again);
+        assert_eq!(doc["userID"], "u");
+        assert_eq!(doc["projects"]["/far/exec/trees"]["hasTrustDialogAccepted"], true);
+        assert_eq!(doc["projects"]["/far/exec/trees/demos-002"]["allowedTools"][0], "x");
+        assert_eq!(doc["projects"]["/far/exec/trees/demos-002"]["hasTrustDialogAccepted"], true);
+        // Removed with the tree, and the parent's entry is not touched.
+        let doc = run("remove");
+        assert!(doc["projects"].get("/far/exec/trees/demos-002").is_none(), "{doc}");
+        assert_eq!(doc["projects"]["/far/exec/trees"]["hasTrustDialogAccepted"], true);
+        // Not JSON: refused and left as it was.
+        std::fs::write(&file, "not json").unwrap();
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(trust_command(&m, "add", "/far/x"))
+            .env("HOME", &home)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `env` stops reading options at the first `NAME=value`: a `-u` after one is
