@@ -62,6 +62,10 @@ struct Tunnel {
     readd: bool,
     /// When the far seats are next beaten (`docs/remote-agents.md` section 3).
     next_beat: Option<Instant>,
+    /// The machine and control path of the master this tunnel started, so
+    /// [`Tunnel::stop`] can ask it to exit rather than only kill the ssh that
+    /// was started.
+    master: Option<(Machine, PathBuf)>,
 }
 
 impl Tunnel {
@@ -74,6 +78,7 @@ impl Tunnel {
             checking: None,
             readd: false,
             next_beat: None,
+            master: None,
         }
     }
 
@@ -169,6 +174,14 @@ impl Tunnel {
     /// cannot bind it — the tunnel would look permanently broken for a reason
     /// nothing on screen could explain.
     fn stop(&mut self) {
+        // The master is asked to exit first, over its own socket: it is what an
+        // install that drops the daemon would otherwise leave behind, and the
+        // next tunnel would attach to it and exit 0.
+        if let Some((m, control)) = self.master.take() {
+            if self.child.is_some() {
+                clear_master(&m, &control);
+            }
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -292,7 +305,11 @@ impl Supervisor {
                 return;
             }
             match spawn(store, m, sock) {
-                Ok(child) => t.started(child),
+                Ok(child) => {
+                    let dir = sock.parent().unwrap_or(&store.state);
+                    t.master = Some((m.clone(), dir.join(format!("cm-{}", m.name))));
+                    t.started(child)
+                }
                 Err(e) => {
                     t.live.reachable = false;
                     t.live.tunnel = "retrying".into();
@@ -390,30 +407,45 @@ fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<
     // after a daemon that was killed rather than stopped, it will.
     let _ = std::fs::remove_file(sock);
 
+    let control = dir.join(format!("cm-{}", m.name));
+    clear_master(m, &control);
+
     let log = std::fs::File::create(err_log(store, &m.name))?;
 
     let mut c = Command::new("ssh");
-    c.args(ssh_args(m, sock, &dir.join(format!("cm-{}", m.name))));
+    c.args(ssh_args(m, &control));
     c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(log));
     c.spawn()
 }
 
-/// The far end of the forward: what the machine's record says, or the backend's
-/// own default when it says nothing.
+/// Close whatever master is still holding `control`, and sweep its path.
 ///
-/// The default is the adapter's and not the model's, which is the whole of
-/// robustness-019 — a durable record has no business computing a herdr path. This
-/// file is entitled to ask for it, because an `ssh -L` between two unix sockets
-/// is already a sentence in herdr's dialect and not the port's.
-///
-/// Empty is a record written by hand, and it must not become an empty far side:
-/// `ssh -L /s/mb2.sock:` is answered with `Bad local forwarding specification`,
-/// the same unexplained refusal [`SUN_PATH_MAX`] exists to get in front of.
-fn backend_at(m: &Machine) -> String {
-    match m.backend_at.is_empty() {
-        true => crate::place_herdr::mirrored_socket(),
-        false => m.backend_at.clone(),
+/// The supervisor only starts a master when it holds none, so one answering at
+/// the path is somebody's leftover: an orphan from a daemon that dropped without
+/// stopping (an `install` whose `launchctl bootstrap` failed, 2026-11-06). With
+/// `ControlMaster=auto` the new ssh does not become the master, it attaches to
+/// that one as a mux client, does nothing, and exits 0 — the machine reads
+/// "ssh exited 0" for ever while the check passes. It is asked to exit over its
+/// own control socket, by name and not by pattern; a path nothing answers on is
+/// a plain headstone and is removed.
+fn clear_master(m: &Machine, control: &std::path::Path) {
+    clear_master_with("ssh", m, control);
+}
+
+/// [`clear_master`] with the ssh program named, so a test can pass a script.
+fn clear_master_with(ssh: &str, m: &Machine, control: &std::path::Path) {
+    let _ = exit_master(ssh, m, control);
+    let _ = std::fs::remove_file(control);
+}
+
+/// `ssh -O exit` on `control`: `true` when a master answered and was told to go.
+fn exit_master(ssh: &str, m: &Machine, control: &std::path::Path) -> bool {
+    if !control.exists() {
+        return false;
     }
+    let mut c = Command::new(ssh);
+    c.args(["-S"]).arg(control).args(["-o", "BatchMode=yes", "-O", "exit"]).arg(&m.ssh);
+    matches!(crate::far::run_bounded(c, Duration::from_secs(5)), Ok(Some(o)) if o.status.success())
 }
 
 /// Put back the forwards of every seat on `m`, read from the seat records: a
@@ -438,7 +470,7 @@ pub fn control_path(store: &Store, name: &str) -> PathBuf {
 }
 
 /// The ssh we hold open, and why each flag is on it.
-fn ssh_args(m: &Machine, sock: &std::path::Path, control: &std::path::Path) -> Vec<String> {
+fn ssh_args(m: &Machine, control: &std::path::Path) -> Vec<String> {
     let s = |x: &str| x.to_string();
     vec![
         // No command and no tty: this connection exists to carry a forward.
@@ -478,8 +510,11 @@ fn ssh_args(m: &Machine, sock: &std::path::Path, control: &std::path::Path) -> V
         s("-o"), s("ControlMaster=auto"),
         s("-o"), s("ControlPersist=no"),
         s("-o"), format!("ControlPath={}", control.display()),
-        // The whole mechanism, in one flag.
-        s("-L"), format!("{}:{}", sock.display(), backend_at(m)),
+        // No `-L`: the master carries no forward of its own. Compound is two
+        // sockets per seat, added with `ssh -O forward` on this master at spawn
+        // and put back by [`readd_forwards`] (`docs/remote-agents.md` section 2),
+        // so a machine-wide forward to herdr's socket, which compound replaced,
+        // has nothing at its far end and nothing that reads it.
         m.ssh.clone(),
     ]
 }
@@ -568,20 +603,16 @@ mod tests {
     /// terminal to answer a passphrase prompt at, and would hold the connection
     /// open waiting for one rather than failing where the row can say so.
     #[test]
-    fn the_forward_is_the_command_and_the_two_flags_that_must_be_on_it() {
+    fn the_master_is_the_command_and_the_two_flags_that_must_be_on_it() {
         let mut m = Machine::new("mb2", "mac-mini");
         m.backend_at = "/Users/ed/.config/herdr/herdr.sock".into();
-        let args = ssh_args(
-            &m,
-            std::path::Path::new("/s/sock/mb2.sock"),
-            std::path::Path::new("/s/sock/cm-mb2"),
-        );
+        let args = ssh_args(&m, std::path::Path::new("/s/sock/cm-mb2"));
 
         assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(
-            args.contains(&"/s/sock/mb2.sock:/Users/ed/.config/herdr/herdr.sock".to_string()),
-            "the local socket first, the far machine's own path second: {args:?}",
+            !args.contains(&"-L".to_string()),
+            "the master forwards nothing of its own, and never herdr's socket: {args:?}",
         );
         assert_eq!(args.last().unwrap(), "mac-mini", "the Host alias, and it goes last");
         assert!(
@@ -590,28 +621,37 @@ mod tests {
         );
     }
 
-    /// A machine record that does not say where its backend listens still
-    /// forwards somewhere.
-    ///
-    /// The field stopped being defaulted in the model with robustness-019, so
-    /// "empty" is now a shape that reaches this file — a record written by hand
-    /// with nothing but an `ssh:` line. The failure it must not become is an
-    /// empty far side: ssh answers `-L /s/mb2.sock:` with `Bad local forwarding
-    /// specification`, which reads as a bug in something wsp built.
+    /// A master left behind by a daemon that dropped without stopping is asked to
+    /// exit over its own socket before a new one is started, and the path is
+    /// swept either way. Seen 2026-11-06: the orphan held the control path, every
+    /// new tunnel attached to it as a mux client and exited 0.
     #[test]
-    fn a_machine_that_does_not_say_where_its_backend_listens_still_forwards_to_one() {
-        // The default far side is *this* machine's socket path, so the test
-        // reads one — and reading the real one would be this assertion resting
-        // on how the developer's herdr happens to be configured.
-        let _env = crate::util::isolated("tunnel-default-far-side");
+    fn a_stale_master_is_asked_to_exit_and_its_path_swept_before_a_new_one_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wsp-tunnel-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let said = dir.join("said");
+        let fake = dir.join("ssh");
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {}\nexit 0\n", said.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let control = dir.join("cm-mb2");
+        std::fs::write(&control, "").unwrap();
         let m = Machine::new("mb2", "mac-mini");
-        assert!(m.backend_at.is_empty(), "a bare record carries no address");
 
-        let args = ssh_args(&m, std::path::Path::new("/s/sock/mb2.sock"), std::path::Path::new("/s/cm"));
-        let forward = args.iter().find(|a| a.starts_with("/s/sock/mb2.sock:")).expect("a forward");
-        let far = forward.strip_prefix("/s/sock/mb2.sock:").unwrap();
-        assert!(!far.is_empty(), "an empty far side is a forwarding spec ssh refuses");
-        assert!(far.starts_with('/'), "and `~` is not expanded on the far side: {far}");
+        clear_master_with(fake.to_str().unwrap(), &m, &control);
+
+        let args = std::fs::read_to_string(&said).expect("the stale master was asked");
+        assert!(args.contains(&format!("-S {}", control.display())), "{args}");
+        assert!(args.contains("-O exit") && args.trim().ends_with("mac-mini"), "{args}");
+        assert!(!control.exists(), "the path is swept");
+
+        // Nothing at the path: nothing is asked, and nothing goes wrong.
+        let _ = std::fs::remove_file(&said);
+        clear_master_with(fake.to_str().unwrap(), &m, &control);
+        assert!(!said.exists(), "no master, no question");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The limit that is not ours and does not announce itself. ssh answers a

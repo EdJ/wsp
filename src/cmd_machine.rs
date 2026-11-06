@@ -104,8 +104,6 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     // than left empty for the tunnel to fill in: a command is allowed to know
     // which backend it is adding a machine for, and a record that says where it
     // forwards is one a person can correct with `set` before the first dial.
-    // The empty case still works — see `tunnel::backend_at` — it just cannot be
-    // read out of the file.
     m.backend_at = place_herdr::mirrored_socket();
     m.os = args.get("os").unwrap_or_default();
     m.arch = args.get("arch").unwrap_or_default();
