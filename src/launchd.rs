@@ -715,7 +715,18 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "bootout failed: {}", String::from_utf8_lossy(&out.stderr));
-        assert!(!loaded(&format!("{domain}/{label}")), "the job outlived its bootout");
+        // `bootout` returns before the job is gone when the machine is busy
+        // (the full suite, 3 runs of 3), so look again for up to 20 s, as the
+        // log file above is waited for, and say what launchctl still says.
+        let target = format!("{domain}/{label}");
+        let mut last = String::new();
+        for _ in 0..100 {
+            let said = Command::new("launchctl").args(["print", &target]).output().unwrap();
+            if !said.status.success() { last.clear(); break }
+            last = String::from_utf8_lossy(&said.stdout).to_string();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(last.is_empty(), "the job outlived its bootout by 20 s, launchctl still says:\n{last}");
     }
 
     /// What `launchctl print` says is read as a state, so "loaded" is no longer
