@@ -79,6 +79,31 @@ everything else hangs from. The 80 that remain, by direction (with `main` in `to
 | engine → timeline | 5 | `cmd_attempts::attempts_of` priced rows |
 | seats → top, wire → engine, base → …, rest | 20 | `cmd_agent` asks `daemon::health`; `disk` and `memory` are one layer too low |
 
+### The map the layering test reads
+
+`tests/layering.rs` (row `p0`, wsp-400) reads this table: one row per component, lowest first, so a module may use
+its own row and the rows above it in this table, never a row below. It is `assign.py`'s `put(...)` lines with `main`
+in `top`, where §3 puts it (so today's `crate::Args` uses count as upward until `p1` moves `Args` to base), and the
+modules added since the spike placed. A new module goes in this table or the test fails. Every upward use the code
+has today is listed in `docs/components-upward.txt`; the test fails on one not listed and on a listed one the code
+no longer has, and that file may only lose lines. `cargo test --test layering -- --nocapture` prints the per-pair count.
+
+Measured by it on 6 Nov (`ad10223`), with nothing moved yet: **171 upward edges, 335 symbols** (the spike gives the same 171
+with this map; the 80 / 207 of try 3 assume `p1` and `p2` have moved their symbols), and **890 distinct
+cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 499 / 49 below it does not reproduce).
+
+| component | modules |
+|---|---|
+| `base` | `util`, `fm`, `input`, `risk`, `disk`, `memory`, `choices` |
+| `store` | `model`, `store`, `resolve`, `message`, `lapse`, `artefact`, `kind_data`, `sharing`, `scratch`, `cmd_project`, `cmd_migrate`, `cmd_mandate` |
+| `wire` | `herdr`, `place`, `place_herdr`, `place_compound`, `place_super`, `tunnel`, `far`, `sync`, `launchd`, `detect_override` |
+| `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `build_output`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `cold`, `leg_tree`, `affected`, `at_stop`, `gc` |
+| `engine` | `caption`, `stage`, `history`, `after`, `worklist`, `cycle`, `barrier`, `barrier_run`, `barrier_replay`, `verification`, `check`, `did`, `closing`, `ending`, `repair`, `split`, `starts`, `stand_down`, `untaken`, `waiting`, `legs`, `leg_seat`, `cmd_worklist`, `cmd_task`, `packet`, `packet_gen`, `verifier_packet`, `attention`, `kind_attention`, `cmd_attend`, `cmd_message`, `hold`, `hold_close`, `pickup`, `waits`, `scope` |
+| `seats` | `agent_commands`, `cmd_spawn`, `cmd_agent`, `cmd_resume`, `wake`, `room`, `cmd_govern`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_stamp`, `stuck` |
+| `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `cmd_attempts`, `cmd_verifications` |
+| `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |
+| `top` | `main`, `daemon`, `fake`, `leaked_agents` |
+
 **499 distinct symbols cross a component boundary today, and 49 of the 72 possible component pairs have an edge.**
 Those two figures are the seam count to ratchet down, in the sense of `compounding-004` (95 seams to 70).
 

@@ -1,0 +1,476 @@
+//! The layering ratchet (`wsp-400`, `docs/components.md` §5 `p0`).
+//!
+//! Parses `src/` the way `docs/spikes/components/graph.py` does: each
+//! `src/*.rs` and `src/<dir>/` is one module, comments and strings are
+//! stripped, everything from the first `#[cfg(test)] mod` on is test code and
+//! not counted, and an edge is a `crate::m` path or a `use crate::{…}` list,
+//! with the symbol named. Each module's component comes from the table under
+//! "The map the layering test reads" in `docs/components.md`; the table's row
+//! order is the stack, lowest first.
+//!
+//! An edge from a module to one in a higher component is upward. Every upward
+//! edge and symbol the code has today is listed in `docs/components-upward.txt`.
+//! The test fails on an upward edge or symbol not listed (a new one), on a listed
+//! one the code no longer has (delete the line: the list only shrinks), and on a
+//! line the trunk's copy of the list does not have.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+type Edges = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+
+const MAP_HEADING: &str = "### The map the layering test reads";
+const ALLOW: &str = "docs/components-upward.txt";
+
+fn root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Module name → its files.
+fn modules(src: &Path) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut out: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut stack = vec![src.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let rel = p.strip_prefix(src).unwrap();
+                let first = rel.components().next().unwrap().as_os_str().to_string_lossy();
+                let top = first.strip_suffix(".rs").unwrap_or(&first).to_string();
+                out.entry(top).or_default().push(p);
+            }
+        }
+    }
+    out
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Product code and test code: split at the first line that starts a
+/// `#[cfg(test)]` module.
+fn split_test(s: &str) -> (&str, &str) {
+    let mut at = 0;
+    for line in s.split_inclusive('\n') {
+        if let Some(rest) = s[at..].strip_prefix("#[cfg(test)]") {
+            let trimmed = rest.trim_start();
+            let gap = &rest[..rest.len() - trimmed.len()];
+            if gap.contains('\n') {
+                let t = trimmed
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| trimmed.strip_prefix("pub "))
+                    .unwrap_or(trimmed);
+                if let Some(t) = t.strip_prefix("mod ") {
+                    let n = t.chars().take_while(|&c| is_word(c)).map(char::len_utf8).sum::<usize>();
+                    if n > 0 && t[n..].starts_with(" {") {
+                        return (&s[..at], &s[at..]);
+                    }
+                }
+            }
+        }
+        at += line.len();
+    }
+    (s, "")
+}
+
+/// Block comments, then line comments and string literals (roughly, as the
+/// spike does).
+fn strip(s: &str) -> String {
+    let mut no_block = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("/*") {
+        match rest[i + 2..].find("*/") {
+            Some(j) => {
+                no_block.push_str(&rest[..i]);
+                rest = &rest[i + 2 + j + 2..];
+            }
+            None => break,
+        }
+    }
+    no_block.push_str(rest);
+    let mut out = Vec::new();
+    for line in no_block.split('\n') {
+        let b: Vec<char> = line.chars().collect();
+        let (mut i, mut instr, mut res) = (0, false, String::new());
+        while i < b.len() {
+            let c = b[i];
+            if instr {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    instr = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                instr = true;
+                i += 1;
+                continue;
+            }
+            if c == '/' && b.get(i + 1) == Some(&'/') {
+                break;
+            }
+            res.push(c);
+            i += 1;
+        }
+        out.push(res);
+    }
+    out.join("\n")
+}
+
+struct Refs<'a> {
+    top: &'a BTreeSet<String>,
+    out: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Refs<'_> {
+    fn yield_ref(&mut self, path: &str) {
+        let mut path = path.trim();
+        // ` as name` at the end
+        if let Some(i) = path.rfind(" as ") {
+            let name = path[i + 4..].trim_start();
+            if !name.is_empty() && name.chars().all(is_word) {
+                path = path[..i].trim_end();
+            }
+        }
+        let segs: Vec<&str> = path.split("::").filter(|x| !x.is_empty()).collect();
+        let Some(&first) = segs.first() else { return };
+        if self.top.contains(first) || first == "main" {
+            let sym = segs.get(1).copied().unwrap_or("*");
+            self.out.entry(first.to_string()).or_default().insert(sym.to_string());
+        } else {
+            self.out.entry("main".into()).or_default().insert(first.to_string());
+        }
+    }
+
+    fn expand(&mut self, prefix: &str, body: &str) {
+        let mut items = Vec::new();
+        let (mut depth, mut cur) = (0i32, String::new());
+        for ch in body.chars() {
+            if ch == '{' {
+                depth += 1;
+            }
+            if ch == '}' {
+                depth -= 1;
+            }
+            if ch == ',' && depth == 0 {
+                items.push(cur.trim().to_string());
+                cur.clear();
+            } else {
+                cur.push(ch);
+            }
+        }
+        if !cur.trim().is_empty() {
+            items.push(cur.trim().to_string());
+        }
+        for it in items {
+            match (it.find('{'), it.ends_with('}')) {
+                (Some(i), true) => {
+                    let inner = &it[i + 1..it.len() - 1];
+                    self.expand(&format!("{prefix}{}", &it[..i]), inner);
+                }
+                _ => self.yield_ref(&format!("{prefix}{it}")),
+            }
+        }
+    }
+}
+
+/// Every `use<ws>crate::` in `code`: the byte offset just past `crate::`.
+fn uses(code: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = code[from..].find("use") {
+        let at = from + i;
+        from = at + 3;
+        let rest = &code[at + 3..];
+        let t = rest.trim_start();
+        if t.len() == rest.len() {
+            continue;
+        }
+        if let Some(after) = t.strip_prefix("crate::") {
+            out.push(code.len() - after.len());
+        }
+    }
+    out
+}
+
+fn word(s: &str) -> &str {
+    let n = s.chars().take_while(|&c| is_word(c)).map(char::len_utf8).sum();
+    &s[..n]
+}
+
+fn refs(code: &str, top: &BTreeSet<String>) -> BTreeMap<String, BTreeSet<String>> {
+    let mut r = Refs { top, out: BTreeMap::new() };
+    for at in uses(code) {
+        let rest = &code[at..];
+        // use crate::{…};
+        if let Some(body) = rest.strip_prefix('{') {
+            if let Some(end) = body.find("};") {
+                r.expand("", &body[..end]);
+            }
+        }
+        // use crate::a::b[::*][ as x];
+        let p = rest.chars().take_while(|&c| is_word(c) || c == ':').map(char::len_utf8).sum::<usize>();
+        if p > 0 {
+            let mut path = &rest[..p];
+            let mut tail = &rest[p..];
+            if path.ends_with("::") && tail.starts_with('*') {
+                path = &rest[..p + 1];
+                tail = &rest[p + 1..];
+            } else if tail.starts_with("::*") {
+                path = &rest[..p + 3];
+                tail = &rest[p + 3..];
+            }
+            let ok = tail.starts_with(';') || {
+                let t = tail.trim_start();
+                t.len() < tail.len()
+                    && t.strip_prefix("as").is_some_and(|t2| {
+                        let t3 = t2.trim_start();
+                        let w = word(t3);
+                        t3.len() < t2.len() && !w.is_empty() && t3[w.len()..].starts_with(';')
+                    })
+            };
+            if ok && !path.ends_with("::") {
+                r.yield_ref(path);
+            }
+        }
+        // use crate::m::{…};
+        let m = word(rest);
+        if !m.is_empty() {
+            if let Some(body) = rest[m.len()..].strip_prefix("::{") {
+                if let Some(end) = body.find("};") {
+                    r.expand(&format!("{m}::"), &body[..end]);
+                }
+            }
+        }
+    }
+    // inline crate::a[::b]
+    let mut from = 0;
+    while let Some(i) = code[from..].find("crate::") {
+        let at = from + i;
+        from = at + 7;
+        if code[..at].chars().next_back().is_some_and(|c| is_word(c) || c == ':') {
+            continue;
+        }
+        let a = word(&code[at + 7..]);
+        if a.is_empty() {
+            continue;
+        }
+        let after = &code[at + 7 + a.len()..];
+        let b = after.strip_prefix("::").map(word).filter(|w| !w.is_empty());
+        if top.contains(a) {
+            r.out.entry(a.into()).or_default().insert(b.unwrap_or("*").into());
+        } else {
+            r.out.entry("main".into()).or_default().insert(a.into());
+        }
+    }
+    r.out
+}
+
+/// Product edges: module → module → symbols.
+fn product_edges(src: &Path) -> (BTreeSet<String>, Edges) {
+    let mods = modules(src);
+    let top: BTreeSet<String> = mods.keys().cloned().collect();
+    let mut edges = Edges::new();
+    for (m, files) in &mods {
+        for f in files {
+            let raw = fs::read_to_string(f).unwrap();
+            let (prod, _test) = split_test(&raw);
+            for (b, syms) in refs(&strip(prod), &top) {
+                if &b != m {
+                    edges.entry(m.clone()).or_default().entry(b).or_default().extend(syms);
+                }
+            }
+        }
+    }
+    (top, edges)
+}
+
+/// The stack, lowest first, and module → component, from `docs/components.md`.
+fn component_map(doc: &str) -> (Vec<String>, BTreeMap<String, String>) {
+    let mut lines = doc.lines().skip_while(|l| l.trim() != MAP_HEADING).skip(1);
+    let mut order = Vec::new();
+    let mut map = BTreeMap::new();
+    let mut seen_table = false;
+    for l in lines.by_ref() {
+        let l = l.trim();
+        if !l.starts_with('|') {
+            if seen_table {
+                break;
+            }
+            continue;
+        }
+        seen_table = true;
+        let cells: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+        if cells.len() < 2 || cells[0] == "component" || cells[0].starts_with("---") {
+            continue;
+        }
+        let c = cells[0].trim_matches('`').to_string();
+        for m in cells[1].split(',') {
+            let m = m.trim().trim_matches('`');
+            if !m.is_empty() {
+                let old = map.insert(m.to_string(), c.clone());
+                assert!(old.is_none(), "{m} is in two components in the map in docs/components.md");
+            }
+        }
+        order.push(c);
+    }
+    assert!(!order.is_empty(), "no table under {MAP_HEADING:?} in docs/components.md");
+    (order, map)
+}
+
+/// `from -> to: sym, sym` lines; `#` starts a comment.
+fn parse_allow(text: &str) -> BTreeSet<(String, String, String)> {
+    let mut out = BTreeSet::new();
+    for l in text.lines() {
+        let l = l.split('#').next().unwrap().trim();
+        if l.is_empty() {
+            continue;
+        }
+        let (edge, syms) = l.split_once(':').unwrap_or_else(|| panic!("{ALLOW}: no `:` in {l:?}"));
+        let (a, b) = edge.split_once("->").unwrap_or_else(|| panic!("{ALLOW}: no `->` in {l:?}"));
+        for s in syms.split(',') {
+            let s = s.trim();
+            if !s.is_empty() {
+                out.insert((a.trim().to_string(), b.trim().to_string(), s.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn render_allow(up: &BTreeSet<(String, String, String)>, comp: &BTreeMap<String, String>) -> String {
+    let mut by: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+    for (a, b, s) in up {
+        by.entry((a, b)).or_default().push(s);
+    }
+    let mut out = String::new();
+    for ((a, b), syms) in by {
+        out.push_str(&format!("{a} -> {b}: {}  # {} -> {}\n", syms.join(", "), comp[a], comp[b]));
+    }
+    out
+}
+
+#[test]
+fn no_new_upward_edge_and_the_allowlist_only_shrinks() {
+    let root = root();
+    let doc = fs::read_to_string(root.join("docs/components.md")).unwrap();
+    let (order, comp) = component_map(&doc);
+    let rank: BTreeMap<&str, usize> = order.iter().enumerate().map(|(i, c)| (c.as_str(), i)).collect();
+    for c in comp.values() {
+        assert!(rank.contains_key(c.as_str()));
+    }
+    let (mods, edges) = product_edges(&root.join("src"));
+
+    let unmapped: Vec<&String> = mods.iter().filter(|m| !comp.contains_key(*m)).collect();
+    assert!(
+        unmapped.is_empty(),
+        "modules with no component: {unmapped:?}; put each in the table under {MAP_HEADING:?} in docs/components.md"
+    );
+
+    // Distinct cross-component symbols per pair, and the upward edges.
+    let mut pairs: BTreeMap<(&str, &str), BTreeSet<String>> = BTreeMap::new();
+    let mut up = BTreeSet::new();
+    for (a, bs) in &edges {
+        for (b, syms) in bs {
+            let (ca, cb) = (comp[a].as_str(), comp[b].as_str());
+            if ca == cb {
+                continue;
+            }
+            pairs.entry((ca, cb)).or_default().extend(syms.iter().map(|s| format!("{b}::{s}")));
+            if rank[cb] > rank[ca] {
+                for s in syms {
+                    up.insert((a.clone(), b.clone(), s.clone()));
+                }
+            }
+        }
+    }
+    let n = order.len();
+    let total: usize = pairs.values().map(BTreeSet::len).sum();
+    let up_edges: BTreeSet<(&str, &str)> = up.iter().map(|(a, b, _)| (a.as_str(), b.as_str())).collect();
+    println!(
+        "layering: {total} distinct cross-component symbols over {} of {} pairs; {} upward edges, {} symbols",
+        pairs.len(),
+        n * (n - 1),
+        up_edges.len(),
+        up.len()
+    );
+    for ((a, b), s) in &pairs {
+        let dir = if rank[b] > rank[a] { "up" } else { "" };
+        println!("  {a:>9} -> {b:<9} {:4} {dir}", s.len());
+    }
+
+    let allow_path = root.join(ALLOW);
+    let allow_text = fs::read_to_string(&allow_path).unwrap_or_default();
+    let allow = parse_allow(&allow_text);
+    let new: Vec<_> = up.difference(&allow).collect();
+    let gone: Vec<_> = allow.difference(&up).collect();
+    if !new.is_empty() || !gone.is_empty() {
+        let fresh = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).map(|d| d.join("components-upward.txt"));
+        if let Some(f) = &fresh {
+            let _ = fs::write(f, render_allow(&up, &comp));
+        }
+        panic!(
+            "the layering ratchet:\n{}{}{}",
+            if new.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "new upward uses (a lower component using a higher one; move the symbol down or pass it in):\n{}",
+                    new.iter().map(|(a, b, s)| format!("  {a} ({}) -> {b} ({}): {s}\n", comp[a], comp[b])).collect::<String>()
+                )
+            },
+            if gone.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "gone from the code, so delete them from {ALLOW} (it only shrinks):\n{}",
+                    gone.iter().map(|(a, b, s)| format!("  {a} -> {b}: {s}\n")).collect::<String>()
+                )
+            },
+            fresh.map(|f| format!("the list as the code has it now: {}\n", f.display())).unwrap_or_default()
+        );
+    }
+
+    // The trunk's list bounds this one: no line it lacks.
+    let trunk = std::process::Command::new("git")
+        .args(["show", &format!("master:{ALLOW}")])
+        .current_dir(&root)
+        .output();
+    if let Ok(o) = trunk {
+        if o.status.success() {
+            let theirs = parse_allow(&String::from_utf8_lossy(&o.stdout));
+            let grown: Vec<_> = allow.difference(&theirs).collect();
+            assert!(
+                grown.is_empty(),
+                "{ALLOW} has upward uses the trunk's copy does not; the list only shrinks:\n{}",
+                grown.iter().map(|(a, b, s)| format!("  {a} -> {b}: {s}\n")).collect::<String>()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_parser_reads_use_lists_paths_and_skips_comments_strings_and_tests() {
+    let top: BTreeSet<String> = ["store", "model", "util"].iter().map(|s| s.to_string()).collect();
+    let src = "use crate::store::{Store, lock as l};\nuse crate::{model::Task, util::{a, b}};\n\
+               use crate::util::*;\n// crate::model::Hidden\nlet s = \"crate::model::InString\";\n\
+               /* crate::model::Block */ let x = crate::model::Status::Open; crate::Args::new();\n\
+               #[cfg(test)]\nmod tests {\n    use crate::model::TestOnly;\n}\n";
+    let (prod, test) = split_test(src);
+    assert!(test.contains("TestOnly") && !prod.contains("TestOnly"));
+    let r = refs(&strip(prod), &top);
+    let s = |m: &str| r[m].iter().cloned().collect::<Vec<_>>();
+    // `crate::store::{` is also an inline path with no symbol, as in the spike
+    assert_eq!(s("store"), ["*", "Store", "lock"]);
+    assert_eq!(s("model"), ["Status", "Task"]);
+    assert_eq!(s("util"), ["*", "a", "b"]);
+    assert_eq!(s("main"), ["Args"]);
+}
