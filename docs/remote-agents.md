@@ -333,6 +333,12 @@ cover `trees/demos-002` on eds-macbook-i5, so the far start now trusts the row's
 tree by name first: `<exec_dir>/bin/wsp-trust add <tree>` (a shell script wsp writes
 there, editing `projects["<tree>"].hasTrustDialogAccepted` in the far `.claude.json`
 through python3 or node, atomically). `wsp-trust remove <tree>` takes the entry out.
+`wsp despawn` of a far seat takes it out again: it copies back what is owed, then
+removes the far tree, the far state, the seat's copy record
+(`~/.local/state/wsp/trees/<row>`) and the trust entry, so the same row can be
+spawned `--on` again. If the copy-back fails, a path was changed on both sides, or
+the machine does not answer, nothing is removed and the despawn says what it kept
+and why; `despawn --lost` keeps all of it, as it always did.
 
 Which machine: a laptop that sleeps or locks is the wrong shape regardless of
 auth, because a sleeping machine is an unreachable one. The manual setup row asks

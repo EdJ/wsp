@@ -491,6 +491,13 @@ pub struct Back {
     pub refused: Vec<Stale>,
 }
 
+/// What [`Copy::clear`] did: what it did, and what it kept with the reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cleared {
+    pub done: Vec<String>,
+    pub kept: Vec<String>,
+}
+
 fn show(e: Option<&Entry>) -> String {
     e.map_or_else(|| "absent".to_string(), Entry::show)
 }
@@ -690,6 +697,70 @@ impl Copy {
         }
         self.write_manifest("synced.manifest", &synced)?;
         Ok(back)
+    }
+
+    /// End a far row's copy: bring back what is owed, then take away the far
+    /// tree, the far state and the seat's record of the copy, and run `after`
+    /// there (the far trust entry's removal) — or **say what was kept and why**.
+    ///
+    /// Nothing is removed that a copy-back has not first brought home: a copy-back
+    /// that fails, or that leaves a path refused because the seat changed it too,
+    /// keeps the far tree, the far state and the record, so the agent's work is
+    /// still somewhere and the next `despawn` can try again. A machine that does
+    /// not answer keeps all three for the same reason. A row that was never copied
+    /// has nothing here and `None` is the answer.
+    ///
+    /// The trust entry is taken out on its own call, after the tree: failing to
+    /// remove it is named and does not hold the tree, which is gone by then.
+    pub fn clear(&self, after: &str) -> Option<Cleared> {
+        if !self.dir.join("copy.json").exists() {
+            return None;
+        }
+        let mut out = Cleared::default();
+        let (ft, fs_dir) = (self.far_tree(), self.far_state());
+        let kept = |out: &mut Cleared, why: String| {
+            out.kept.push(format!("kept {ft}, {fs_dir} and the copy record {} — {why}", self.dir.display()));
+        };
+        if !self.remote.exec_dir.starts_with('/') || self.row.is_empty() || self.row.contains(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')) {
+            kept(&mut out, format!("`{}` under `{}` is not a path this will remove", self.row, self.remote.exec_dir));
+            return Some(out);
+        }
+        if !self.tree.join(".git").exists() {
+            kept(&mut out, format!("the seat's tree {} is not there to copy back into", self.tree.display()));
+            return Some(out);
+        }
+        match self.copy_back() {
+            Err(e) => {
+                kept(&mut out, format!("copy back failed: {e}"));
+                return Some(out);
+            }
+            Ok(back) if !back.refused.is_empty() => {
+                let names: Vec<&str> = back.refused.iter().map(|s| s.path.as_str()).collect();
+                kept(&mut out, format!("{} path(s) changed on both sides and were not copied back: {}", names.len(), names.join(", ")));
+                return Some(out);
+            }
+            Ok(back) => {
+                if !back.copied.is_empty() || !back.deleted.is_empty() {
+                    out.done.push(format!("copied back {} file(s), {} deletion(s)", back.copied.len(), back.deleted.len()));
+                }
+            }
+        }
+        if let Err(e) = self.remote.run(&format!("rm -rf {} {}", shq(&ft), shq(&fs_dir))) {
+            kept(&mut out, format!("could not remove them on {}: {e}", self.remote.host));
+            return Some(out);
+        }
+        if let Err(e) = fs::remove_dir_all(&self.dir) {
+            out.kept.push(format!("kept the copy record {} — {e}", self.dir.display()));
+        } else {
+            out.done.push(format!("removed {}:{ft}, its state and the copy record", self.remote.host));
+        }
+        if !after.is_empty() {
+            match self.remote.run(after) {
+                Ok(_) => out.done.push(format!("{} no longer trusts {ft}", self.remote.host)),
+                Err(e) => out.kept.push(format!("kept {}'s trust entry for {ft} — {e}", self.remote.host)),
+            }
+        }
+        Some(out)
     }
 
     fn fetch_files(&self, files: &[String]) -> Result<(), String> {
@@ -1100,6 +1171,57 @@ mod tests {
         let e = r.copy.copy_up("no-such-branch").unwrap_err();
         assert!(e.contains("cannot say how far"), "{e}");
         assert!(!r.far().exists());
+    }
+
+    /// A despawn of a far seat brings home what is owed, then clears the far tree,
+    /// the far state and the copy record, and runs the far trust removal — and a
+    /// respawn of the same row copies up again.
+    #[test]
+    fn clear_brings_the_work_home_then_takes_the_far_copy_its_record_and_its_trust_away() {
+        let r = rig("clear", false);
+        r.copy.copy_up("trunk").unwrap();
+        fs::write(r.far().join("src/a.rs"), "changed over there\n").unwrap();
+        let marker = r.far_root.join("trust-removed");
+        let after = format!("touch {}", shq(&marker.display().to_string()));
+        let said = r.copy.clear(&after).expect("a copied row has something to clear");
+        assert!(said.kept.is_empty(), "{said:?}");
+        assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "changed over there\n", "copied back first");
+        assert!(!r.far().exists() && !r.far_root.join("state/agent-9").exists(), "far tree and far state gone");
+        assert!(!r.copy.dir.exists(), "the copy record is gone");
+        assert!(marker.exists(), "the trust removal ran on the far side");
+        assert!(said.done.iter().any(|d| d.contains("copied back 1 file")), "{said:?}");
+        run(&r.seat, "git checkout -q -- src/a.rs");
+        r.copy.copy_up("trunk").expect("the same row copies up again");
+    }
+
+    #[test]
+    fn clear_of_a_row_never_copied_is_nothing() {
+        let r = rig("clear-none", false);
+        assert_eq!(r.copy.clear("true"), None);
+    }
+
+    /// A machine that does not answer, or a path both sides changed, keeps the far
+    /// copy and the record and says so — nothing is removed that is not home.
+    #[test]
+    fn clear_keeps_what_it_could_not_bring_home_and_says_why() {
+        let mut r = rig("clear-keeps", false);
+        r.copy.copy_up("trunk").unwrap();
+        let good = r.copy.remote.ssh.clone();
+        r.copy.remote.ssh = "false".into();
+        let marker = r.far_root.join("trust-removed");
+        let after = format!("touch {}", shq(&marker.display().to_string()));
+        let said = r.copy.clear(&after).unwrap();
+        assert_eq!(said.kept.len(), 1, "{said:?}");
+        assert!(said.kept[0].contains("copy back failed") && said.kept[0].contains(&r.far().display().to_string()), "{said:?}");
+        assert!(r.far().exists() && r.copy.dir.join("copy.json").exists() && !marker.exists());
+
+        r.copy.remote.ssh = good;
+        fs::write(r.far().join("src/a.rs"), "far\n").unwrap();
+        fs::write(r.seat.join("src/a.rs"), "seat\n").unwrap();
+        let said = r.copy.clear(&after).unwrap();
+        assert!(said.kept[0].contains("changed on both sides") && said.kept[0].contains("src/a.rs"), "{said:?}");
+        assert!(r.far().exists() && r.copy.dir.join("copy.json").exists() && !marker.exists());
+        assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "seat\n", "the seat's own change is left alone");
     }
 
     #[test]

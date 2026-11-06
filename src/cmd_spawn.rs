@@ -4401,6 +4401,8 @@ struct Leftovers {
     legs: Vec<Tree>,
     /// Build trees that were keyed on the workspace the seat took with it.
     builds: Vec<String>,
+    /// A far seat's copy: what was cleared there and what was kept, with why.
+    far: Option<crate::treecopy::Cleared>,
 }
 
 /// The tree and the build trees, once the seat has gone.
@@ -4461,6 +4463,14 @@ fn swept_up(
     let a_leg = task.is_some_and(|t| {
         store.find_task(t).is_some_and(|t| crate::legs::legs(&t).iter().any(|l| l.pane.as_deref() == Some(seat.as_str())))
     });
+    // A far row's copy goes first: what the agent made there comes home into
+    // the seat's tree before that tree is judged below, and the far tree, the
+    // far state, the copy record and the far trust entry go with it — or the
+    // despawn says what stayed and why.
+    let far = match task.filter(|_| !a_leg) {
+        Some(t) => far_cleared(store, seat.as_str(), t, cmd_checkout::tree_of(cmd_checkout::candidates(store, &cwd, t), t)),
+        None => None,
+    };
     let tree = match task.filter(|_| !keep && !a_leg) {
         // A barrier check's tree is taken on its own rule (`wsp-289`): nothing
         // in it beyond `target/`, and its check no longer anybody's.
@@ -4486,7 +4496,34 @@ fn swept_up(
         Some(t) if crate::check_tree::named(store, t).is_none() => crate::leg_tree::discard(store, t, &standing),
         _ => Vec::new(),
     };
-    Leftovers { tree, legs, builds }
+    Leftovers { tree, legs, builds, far }
+}
+
+/// A far row's copy, ended with its seat (`docs/remote-agents.md` section 3):
+/// [`crate::treecopy::Copy::clear`] on the machine the row was copied to, with
+/// the far trust entry removed in the same ending. `None` for a row that was
+/// never copied, which is every local one.
+fn far_cleared(store: &Store, seat: &str, row: &str, tree: Option<std::path::PathBuf>) -> Option<crate::treecopy::Cleared> {
+    let rec = crate::treecopy::record_of(store, row)?;
+    let m = crate::herdr::host_of(seat)
+        .and_then(|h| store.machine(h))
+        .filter(|m| m.ssh == rec.host)
+        .or_else(|| store.machines().into_iter().find(|m| m.ssh == rec.host));
+    let Some(m) = m else {
+        return Some(crate::treecopy::Cleared {
+            done: Vec::new(),
+            kept: vec![format!("kept {} and the copy record — no machine of ours is `{}` any more", rec.far_tree, rec.host)],
+        });
+    };
+    let remote = crate::treecopy::Remote::of_machine(store, &m, &m.exec_dir);
+    let Some(tree) = tree else {
+        return Some(crate::treecopy::Cleared {
+            done: Vec::new(),
+            kept: vec![format!("kept {}:{} and the copy record — the seat's tree for {row} is not there to copy back into", rec.host, rec.far_tree)],
+        });
+    };
+    let after = crate::far::trust_command(&m, "remove", &remote.tree_of(row));
+    crate::treecopy::Copy::new(store, remote, row, &tree).clear(&after)
 }
 
 /// Which seat a despawn is about: the one named, or the one holding the task.
@@ -4720,7 +4757,7 @@ fn end_work(
     // Last, and only now: the tree is the one step a person can still do by
     // hand afterwards, so it must not be the step that stops the claim being
     // released. Everything before this line is what `despawn` has always done.
-    let Leftovers { tree, legs, builds } = tidy(&seat, task.as_deref().or(check.as_deref()), workspace.as_deref());
+    let Leftovers { tree, legs, builds, far } = tidy(&seat, task.as_deref().or(check.as_deref()), workspace.as_deref());
 
     if args.json() {
         println!(
@@ -4743,6 +4780,7 @@ fn end_work(
                     Tree::Kept { path, why } => json!({ "removed": false, "path": path, "why": why }),
                 }).collect::<Vec<_>>(),
                 "builds": builds,
+                "far": far.as_ref().map(|f| json!({ "done": f.done, "kept": f.kept })),
             })
         );
     } else {
@@ -4784,6 +4822,14 @@ fn end_work(
         }
         if !builds.is_empty() {
             println!("  {}", p.dim(&format!("removed {} build tree(s) keyed on the workspace", builds.len())));
+        }
+        for f in far.iter() {
+            for d in &f.done {
+                println!("  {}", p.dim(d));
+            }
+            for k in &f.kept {
+                println!("  {}", p.yellow(k));
+            }
         }
     }
     0
@@ -7169,7 +7215,7 @@ mod tests {
         // And the ending takes it away. A brief left behind is a stale answer
         // waiting to be handed to whoever is spawned onto the task next.
         assert_eq!(end_work(&place, &store, &Args::synth("despawn", &["t-1"], &[]), Caller::default(), &|_, _, _| {
-            Leftovers { tree: Tree::Absent, legs: Vec::new(), builds: Vec::new() }
+            Leftovers { tree: Tree::Absent, legs: Vec::new(), builds: Vec::new(), far: None }
         }), 0);
         assert!(!std::path::Path::new(&named).exists(), "the brief outlived the seat: {named}");
     }
@@ -7628,7 +7674,7 @@ mod tests {
         fn f(&self) -> impl Fn(&Seat, Option<&str>, Option<&str>) -> Leftovers + '_ {
             |seat: &Seat, task: Option<&str>, _ws: Option<&str>| {
                 self.0.borrow_mut().push((seat.as_str().to_string(), task.map(String::from)));
-                Leftovers { tree: Tree::Absent, legs: Vec::new(), builds: Vec::new() }
+                Leftovers { tree: Tree::Absent, legs: Vec::new(), builds: Vec::new(), far: None }
             }
         }
     }

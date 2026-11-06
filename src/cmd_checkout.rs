@@ -1753,6 +1753,12 @@ fn pick(repos: Vec<PathBuf>, task: &str) -> Result<Where, String> {
     }
 }
 
+/// The task's checkout when one stands, from the same candidates `discard` reads.
+pub(crate) fn tree_of(repos: Vec<PathBuf>, task: &str) -> Option<PathBuf> {
+    let w = pick(repos, task).ok()?;
+    w.dir.join(".git").exists().then_some(w.dir)
+}
+
 fn locate(store: &Store, args: &Args) -> Result<Where, String> {
     let cwd = std::env::current_dir().map_err(|_| "cannot read the current directory".to_string())?;
     // The task first, because it is what says which repositories to consider.
