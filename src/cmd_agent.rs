@@ -2292,6 +2292,16 @@ pub(crate) fn did_of_seat(store: &Store, seat: &str, since: &str) -> Option<crat
 
 /// A seat's model seconds and tool seconds since `since`, from its session's
 /// transcript, for a verifier's pass to keep.
+/// What the seat's transcript says of its fixed parts (`wsp-429`): the seconds
+/// its test and build commands ran, and when its first line was written.
+pub(crate) fn fixed_of_seat(store: &Store, seat: &str) -> Option<(i64, String)> {
+    let (kind, session, _) = session_of_seat(store, seat)?;
+    if kind != "claude" {
+        return None;
+    }
+    crate::timeline::session_fixed(&session)
+}
+
 pub(crate) fn secs_of_seat(store: &Store, seat: &str, since: &str) -> Option<(i64, i64)> {
     let (kind, session, _) = session_of_seat(store, seat)?;
     if kind != "claude" {

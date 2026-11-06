@@ -186,6 +186,17 @@ pub fn effort(store: &Store, w: &Worklist, baseline: Option<&str>) -> Value {
     effort_with(store, w, baseline, &|id| crate::timeline::row_figures(store, id))
 }
 
+/// The median of the figures read, `0` for none (the row count is not hidden:
+/// each member's own figure is beside it).
+fn median(v: &mut [i64]) -> i64 {
+    v.sort_unstable();
+    match v.len() {
+        0 => 0,
+        n if n % 2 == 1 => v[n / 2],
+        n => (v[n / 2 - 1] + v[n / 2]) / 2,
+    }
+}
+
 /// [`effort`] with the timeline figures of a row handed in, so that a test can
 /// hold the sums to what it hands.
 pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, figures: &dyn Fn(&str) -> crate::timeline::RowFigures) -> Value {
@@ -202,6 +213,8 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let mut rework_rows: Vec<Value> = Vec::new();
     let (mut blocked, mut reopened, mut dropped, mut rework_usd) = (0u64, 0u64, 0u64, 0u64);
     let mut suites_total = 0u64;
+    let (mut fixed_first, mut fixed_vfirst, mut fixed_held): (Vec<i64>, Vec<i64>, Vec<i64>) = Default::default();
+    let mut fixed_tests = 0i64;
 
     for (gi, g) in groups.iter().enumerate() {
         let (mut gwall, mut gmodel, mut gtool) = (0i64, 0i64, 0i64);
@@ -274,7 +287,15 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
                 "tool_seconds": f.tools, "gap_seconds": f.gap, "calls": f.calls,
                 "tokens_in": f.tokens_in, "tokens_cache_read": f.cache_read, "tokens_out": f.tokens_out,
                 "transcripts_missing": f.missing, "full_suite_runs": suites,
+                "spawn_to_first_line_seconds": f.spawn_to_first,
+                "verifier_spawn_to_first_line_seconds": f.verifier_spawn_to_first,
+                "verifier_test_seconds": f.verifier_test_secs,
+                "verdict_to_despawn_seconds": f.verdict_to_despawn,
             }));
+            fixed_first.extend(f.spawn_to_first);
+            fixed_vfirst.extend(f.verifier_spawn_to_first);
+            fixed_tests += f.verifier_test_secs;
+            fixed_held.extend(f.verdict_to_despawn);
         }
         if let Some(sh) = shared {
             gwall += sh.shared;
@@ -326,6 +347,10 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "unmeasured_seats": total["unmeasured"],
             "transcripts_missing": missing_sessions,
             "full_suite_runs": suites_total,
+            "spawn_to_first_line_median_seconds": median(&mut fixed_first),
+            "verifier_spawn_to_first_line_median_seconds": median(&mut fixed_vfirst),
+            "verifier_test_seconds": fixed_tests,
+            "verdict_to_despawn_median_seconds": median(&mut fixed_held),
         },
         "waits": wait_list.iter().map(|(c, s)| json!({ "cause": c, "seconds": s })).collect::<Vec<_>>(),
         "groups": group_json,
@@ -362,6 +387,10 @@ fn against(now: &Value, slug: &str) -> Value {
         "input_tokens": ratio("input_tokens"), "output_tokens": ratio("output_tokens"),
         "cache_read_tokens": ratio("cache_read_tokens"), "cache_write_tokens": ratio("cache_write_tokens"),
         "turns": ratio("turns"), "usd_micros": ratio("usd_micros"), "full_suite_runs": ratio("full_suite_runs"),
+        "spawn_to_first_line_median_seconds": ratio("spawn_to_first_line_median_seconds"),
+        "verifier_spawn_to_first_line_median_seconds": ratio("verifier_spawn_to_first_line_median_seconds"),
+        "verifier_test_seconds": ratio("verifier_test_seconds"),
+        "verdict_to_despawn_median_seconds": ratio("verdict_to_despawn_median_seconds"),
         "waits_seconds": { "now": wa, "baseline": wb, "ratio": (wb > 0).then(|| (wa as f64 / wb as f64 * 100.0).round() / 100.0) },
     })
 }
@@ -411,6 +440,10 @@ pub fn effort_html(v: &Value) -> String {
             vec!["unmeasured seats".into(), n(t, "unmeasured_seats").to_string()],
             vec!["transcripts not found".into(), n(t, "transcripts_missing").to_string()],
             vec!["full suites run in member or verifier seats".into(), n(t, "full_suite_runs").to_string()],
+            vec!["seat spawn to its first line (median per row)".into(), hms(n(t, "spawn_to_first_line_median_seconds") as i64)],
+            vec!["verifier spawn to its first line (median per row)".into(), hms(n(t, "verifier_spawn_to_first_line_median_seconds") as i64)],
+            vec!["verifier test and build time (all passes)".into(), hms(n(t, "verifier_test_seconds") as i64)],
+            vec!["verdict to the verifier's despawn (median per row)".into(), hms(n(t, "verdict_to_despawn_median_seconds") as i64)],
         ],
     ));
     b.push_str("<h2>2 · Waits between stages, largest first</h2>");
@@ -837,8 +870,8 @@ mod tests {
         assert_eq!(run(&store, &["add", "sums", "r-3"], &[]), 0);
         let w = store.worklist("sums").unwrap_or(w);
         let fig = |id: &str| match id {
-            "r-1" => RowFigures { start: 100, end: 400, wall: 300, gap: 40, model_secs: 120, calls: 5, tokens_in: 10, tokens_out: 4, cache_read: 7, waits: [("a tick".to_string(), 25), ("the cap".to_string(), 15)].into(), tools: [("Bash".to_string(), 50)].into(), ..Default::default() },
-            "r-2" => RowFigures { start: 90, end: 300, wall: 210, gap: 30, model_secs: 60, calls: 3, waits: [("a tick".to_string(), 30)].into(), tools: [("Bash".to_string(), 10), ("Read".to_string(), 5)].into(), missing: 1, ..Default::default() },
+            "r-1" => RowFigures { start: 100, end: 400, wall: 300, gap: 40, model_secs: 120, calls: 5, tokens_in: 10, tokens_out: 4, cache_read: 7, waits: [("a tick".to_string(), 25), ("the cap".to_string(), 15)].into(), tools: [("Bash".to_string(), 50)].into(), spawn_to_first: Some(20), verifier_spawn_to_first: Some(7), verifier_test_secs: 40, verdict_to_despawn: Some(180), ..Default::default() },
+            "r-2" => RowFigures { start: 90, end: 300, wall: 210, gap: 30, model_secs: 60, calls: 3, waits: [("a tick".to_string(), 30)].into(), tools: [("Bash".to_string(), 10), ("Read".to_string(), 5)].into(), missing: 1, spawn_to_first: Some(10), verifier_spawn_to_first: Some(9), verifier_test_secs: 5, verdict_to_despawn: Some(60), ..Default::default() },
             _ => RowFigures { start: 500, end: 600, wall: 100, gap: 0, model_secs: 20, calls: 1, ..Default::default() },
         };
         let v = effort_with(&store, &w, None, &fig);
@@ -850,6 +883,13 @@ mod tests {
         assert_eq!(t["tool_seconds"]["Bash"], 60);
         assert_eq!(t["tool_seconds_total"], 65);
         assert_eq!(t["transcripts_missing"], 1);
+        // The fixed parts: each row's own, a median over the rows that read one, and the tests summed.
+        assert_eq!(t["spawn_to_first_line_median_seconds"], 15);
+        assert_eq!(t["verifier_spawn_to_first_line_median_seconds"], 8);
+        assert_eq!(t["verifier_test_seconds"], 45);
+        assert_eq!(t["verdict_to_despawn_median_seconds"], 120);
+        let first = v["groups"][0]["members"].as_array().unwrap().iter().find(|m| m["task"] == "r-1").unwrap();
+        assert_eq!((first["spawn_to_first_line_seconds"].as_i64(), first["verifier_test_seconds"].as_i64(), first["verdict_to_despawn_seconds"].as_i64()), (Some(20), Some(40), Some(180)));
         assert_eq!(t["idle_seconds"], (300 - 120 - 50) + (210 - 60 - 15) + (100 - 20));
         let w0 = v["waits"].as_array().unwrap();
         assert_eq!((w0[0]["cause"].as_str().unwrap(), w0[0]["seconds"].as_i64().unwrap()), ("a tick", 55), "summed per cause, largest first");

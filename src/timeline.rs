@@ -76,6 +76,26 @@ pub(crate) struct Inputs {
     /// `(epoch, kind, row)` of the events that end a seat, for the rows a cap
     /// line named as holders (`wsp-394`).
     pub holder_events: Vec<(i64, String, String)>,
+    /// The first line of the row's own seat's transcript, whatever it is.
+    pub seat_first: Option<i64>,
+    /// The verifier seats the row's sessions name, read off their transcripts.
+    pub verifiers: Vec<VerifierSeat>,
+}
+
+/// One verifier seat as its own transcript has it (`wsp-429`). wsp's
+/// `started <row> · verifying` line is written when the step that spawned the
+/// seat finishes, after every `wsp spawn` it ran has returned and each of those
+/// waits for its agent: it lags the seat's real start by that long (100 s or
+/// more on 9 of 17 verifiers in react-pass-1). The transcript's first line is
+/// the start.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct VerifierSeat {
+    /// When wsp learned the session.
+    pub learned: i64,
+    /// The first line of its transcript.
+    pub first: i64,
+    /// Seconds its test and build commands ran ([`is_test_command`]).
+    pub test_secs: i64,
 }
 
 impl Inputs {
@@ -181,19 +201,34 @@ fn cap_holders(i: &Inputs, after: &str, to: i64) -> String {
 }
 
 /// The phases of a row, in time order.
+/// When the row's own seat was asked for.
+fn spawn_line(i: &Inputs) -> Option<i64> {
+    let id = i.id.as_str();
+    i.first_line(0, |l| {
+        (l.contains(&format!("starting {id} on ")) || (l.starts_with(&format!("spawn {id} --agent")) && !l.contains("--leg") && !l.contains("--verify")))
+            || l.contains(&format!(": starting {id} on "))
+    })
+}
+
+const VERIFIER_START: &str = "verifier seat start (spawn → its first transcript line)";
+const VERIFIER_START_LINE: &str = "verifier seat start (spawn → wsp's started line; the seat's first line unread, so this lags it)";
+const VERIFIER_HELD: &str = "verdict → verifier seat ended (clean-up, alongside what follows)";
+
 pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let id = i.id.as_str();
     let mut out: Vec<Phase> = Vec::new();
     let claimed = i.kind("task-claimed", id).first().map(|(t, _)| *t);
-    let released = i.kind("task-released", id).first().map(|(t, _)| *t);
     let reviews: Vec<i64> = i.kind("task-review", id).into_iter().map(|(t, _)| t).collect();
+    // A release before the first review is a seat handing its row to legs. One
+    // after it is the seat's end, long after its verdict: it is not where the
+    // seat's work stopped (`wsp-429`: compounding-114 and 117 read as one seat
+    // phase to the release, with the verifier and the barrier inside it).
+    let released = i.kind("task-released", id).first().map(|(t, _)| *t).filter(|t| reviews.first().is_none_or(|r| t <= r));
+    let released_last = i.kind("task-released", id).last().map(|(t, _)| *t);
     let learned = i.kind("session-learned", id).first().map(|(t, _)| *t);
 
     // Spawn → the seat is up → its first request.
-    let spawn = i.first_line(0, |l| {
-        (l.contains(&format!("starting {id} on ")) || (l.starts_with(&format!("spawn {id} --agent")) && !l.contains("--leg") && !l.contains("--verify")))
-            || l.contains(&format!(": starting {id} on "))
-    });
+    let spawn = spawn_line(i);
     let begin = spawn.or(claimed);
     if let (Some(s), Some(c)) = (spawn, claimed) {
         out.push(Phase::work("spawn requested → seat claimed", s, c));
@@ -271,13 +306,17 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     }
 
     // Review → verifier → verdict.
-    let review = reviews.last().copied();
+    // The last review that a verdict followed: a row typed `wsp review` again
+    // after it had landed (to say what it did for the barrier, say) has a later
+    // review nothing verified.
+    let verdicts: Vec<i64> = i.kind("task-verified", id).into_iter().map(|(t, _)| t).collect();
+    let review = reviews.iter().copied().rev().find(|r| verdicts.iter().any(|v| v >= r)).or_else(|| reviews.last().copied());
     if let (Some(r), Some(e)) = (review, last_end) {
         if r > e {
             out.push(Phase::gap("after the last leg → review typed", e, r, "the row's own seat finishing (not wsp)".into()));
         }
     }
-    let verdict = i.kind("task-verified", id).into_iter().map(|(t, _)| t).find(|t| review.is_none_or(|r| *t >= r));
+    let verdict = verdicts.iter().copied().find(|t| review.is_none_or(|r| *t >= r));
     if let Some(r) = review {
         let spawned = i.first_line(r.saturating_sub(1), |l| l.starts_with(&format!("spawn {id} --agent --verify")));
         let up = spawned.and_then(|s| i.first_line(s, |l| l.contains(&format!("started {id} · verifying"))));
@@ -294,8 +333,12 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                 }
                 None => out.push(Phase::gap("review typed → verifier spawn requested", r, s, wait_name(i, r, s, id))),
             }
-            if let Some(u) = up {
-                out.push(Phase::work("verifier seat start", s, u));
+            // The seat's own first line, when its transcript was read; wsp's line
+            // is the fallback, and says it lags.
+            let first = i.verifiers.iter().map(|v| v.first).find(|f| *f >= s && verdict.is_none_or(|v| *f <= v));
+            let started = first.map(|f| (f, VERIFIER_START)).or(up.map(|u| (u, VERIFIER_START_LINE)));
+            if let Some((u, label)) = started {
+                out.push(Phase::work(label, s, u));
                 if let Some(v) = verdict {
                     out.push(Phase::work("verifier reads → verdict recorded (landed on a hold)", u, v));
                 }
@@ -304,7 +347,20 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     }
     if let Some(v) = verdict {
         if let Some(e) = i.first_line(v, |l| l.starts_with("ended ") && l.contains(&format!("which verified {id}"))) {
-            out.push(Phase::work("verdict → verifier seat ended (clean-up, alongside what follows)", v, e));
+            out.push(Phase::work(VERIFIER_HELD, v, e));
+        }
+    }
+
+    // The seat released after its verdict: it stayed up, and was asked for the
+    // barrier's fix or let go late. Alongside the barrier, which it overlaps.
+    if let (Some(v), Some(rel)) = (verdict, released_last) {
+        if rel > v && released != Some(rel) {
+            let again = reviews.iter().copied().find(|r| *r > v);
+            let label = match again {
+                Some(r) => format!("the row's own seat after the verdict → released (reviewed again at {}; alongside what follows)", util::iso_at(r).get(11..16).unwrap_or_default()),
+                None => "the row's own seat after the verdict → released (alongside what follows)".to_string(),
+            };
+            out.push(Phase::work(label, v, rel));
         }
     }
 
@@ -405,6 +461,15 @@ fn render(i: &Inputs, phases: &[Phase], p: &Paint) -> String {
     }
     let gaps: i64 = phases.iter().filter(|x| x.gap).map(|x| x.seconds()).sum();
     s.push_str(&format!("gaps total {}s of {}s\n", gaps, b - a));
+    let (member, verifier, tests, held) = fixed_of(i, phases);
+    let secs = |v: Option<i64>| v.map_or("not read".to_string(), |v| format!("{v}s"));
+    s.push_str(&format!(
+        "fixed parts: seat spawn → first line {} · verifier spawn → first line {} · verifier test and build {}s · verdict → despawn {}\n",
+        secs(member),
+        secs(verifier),
+        tests,
+        secs(held)
+    ));
     s
 }
 
@@ -421,6 +486,17 @@ fn to_json(i: &Inputs, phases: &[Phase]) -> Value {
             "shared": x.shared,
         })).collect::<Vec<_>>(),
         "gap_seconds": phases.iter().filter(|x| x.gap).map(|x| x.seconds()).sum::<i64>(),
+        "fixed": fixed_json(i, phases),
+    })
+}
+
+fn fixed_json(i: &Inputs, phases: &[Phase]) -> Value {
+    let (member, verifier, tests, held) = fixed_of(i, phases);
+    json!({
+        "spawn_to_first_line_seconds": member,
+        "verifier_spawn_to_first_line_seconds": verifier,
+        "verifier_test_seconds": tests,
+        "verdict_to_despawn_seconds": held,
     })
 }
 
@@ -449,6 +525,52 @@ fn transcript(session: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The first line of a transcript that carries a time: the seat's first act.
+fn first_stamp(text: &str) -> Option<i64> {
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v.get("timestamp").and_then(|t| t.as_str()).map(util::epoch_of).filter(|t| *t > 0))
+}
+
+/// A command a verifier runs to test or build: what `scripts/row-cost/measure.py`
+/// counts as test and build seconds (compounding-122), so that the two agree.
+pub(crate) fn is_test_command(cmd: &str) -> bool {
+    let c = cmd.trim_start();
+    if c.starts_with("echo") || c.starts_with("cat >") {
+        return false;
+    }
+    ["check:box", "vitest", "cargo test", "cargo build", "playwright"].iter().any(|k| c.contains(k))
+}
+
+/// Seconds the Bash calls in a transcript that [`is_test_command`] names took,
+/// from a call to its result.
+pub(crate) fn test_secs(text: &str) -> i64 {
+    let mut pending: std::collections::HashMap<String, (i64, bool)> = Default::default();
+    let mut total = 0;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(t) = v["timestamp"].as_str().map(util::epoch_of).filter(|t| *t > 0) else { continue };
+        for b in v["message"]["content"].as_array().into_iter().flatten() {
+            match (v["type"].as_str(), b["type"].as_str()) {
+                (Some("assistant"), Some("tool_use")) if b["name"] == "Bash" => {
+                    if let Some(id) = b["id"].as_str() {
+                        pending.entry(id.to_string()).or_insert((t, is_test_command(b["input"]["command"].as_str().unwrap_or(""))));
+                    }
+                }
+                (Some("user"), Some("tool_result")) => {
+                    if let Some((at, test)) = b["tool_use_id"].as_str().and_then(|id| pending.remove(id)) {
+                        if test {
+                            total += (t - at).max(0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    total
 }
 
 /// The first prompt a session was given, from its Claude Code transcript.
@@ -558,6 +680,27 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             }
         }
     }
+    // The seat's own first line, and the verifier seats': the sessions learned
+    // for the row after its first review that are not the seat's.
+    let first_review = i.kind("task-review", id).first().map(|(t, _)| *t);
+    let learned: Vec<(i64, String)> = i
+        .kind("session-learned", id)
+        .into_iter()
+        .filter(|(_, d)| d.get("leg").is_none())
+        .filter_map(|(t, d)| d["session"].as_str().map(|s| (t, s.to_string())))
+        .collect();
+    let mine: Vec<&String> = learned.iter().filter(|(t, _)| first_review.is_none_or(|r| *t <= r)).map(|(_, s)| s).collect();
+    i.seat_first = mine.first().and_then(|s| transcript(s)).as_deref().and_then(first_stamp);
+    // The verifier seats' own first lines and test seconds, which wsp wrote on
+    // each pass when it ended the seat (the binding that names the session is
+    // gone after the despawn).
+    if let Some(t) = store.find_task(id) {
+        for p in crate::verification::passes(&t) {
+            let Some(sp) = p.spent.as_ref() else { continue };
+            let Some(first) = sp.first_line.as_deref().map(util::epoch_of).filter(|t| *t > 0) else { continue };
+            i.verifiers.push(VerifierSeat { learned: util::epoch_of(&p.at), first, test_secs: sp.test_secs });
+        }
+    }
     i.first_request = i.kind("session-learned", id).first().and_then(|(_, d)| d["session"].as_str().map(String::from)).and_then(|s| first_request(&s));
     i
 }
@@ -665,6 +808,13 @@ fn read_transcript(text: &str) -> (Vec<Call>, Vec<(i64, String, i64)>) {
         prev = Some(t);
     }
     (calls, tools)
+}
+
+/// A session's test and build seconds and the time of its first line, as
+/// `util::iso_at` writes it: what a verifier's pass keeps (`wsp-429`).
+pub(crate) fn session_fixed(session: &str) -> Option<(i64, String)> {
+    let text = transcript(session)?;
+    Some((test_secs(&text), util::iso_at(first_stamp(&text)?)))
 }
 
 /// A session's model seconds and tool seconds from `since` on, read off its
@@ -944,6 +1094,28 @@ pub(crate) struct RowFigures {
     pub shared: i64,
     pub shared_gap: i64,
     pub shared_waits: std::collections::BTreeMap<String, i64>,
+    /// The fixed parts the phases above hide (`wsp-429`): the row's seat from
+    /// the spawn to its first transcript line; the verifier's from its spawn to
+    /// its first line; the seconds its test and build commands ran, summed over
+    /// its passes; and the seat's hold from the verdict to its despawn. `None`
+    /// is not read (no transcript, no verifier, no despawn line yet).
+    pub spawn_to_first: Option<i64>,
+    pub verifier_spawn_to_first: Option<i64>,
+    pub verifier_test_secs: i64,
+    pub verdict_to_despawn: Option<i64>,
+}
+
+/// The fixed parts of a row, from what [`gather`] read and the phases [`build`] made.
+pub(crate) fn fixed_of(i: &Inputs, phases: &[Phase]) -> (Option<i64>, Option<i64>, i64, Option<i64>) {
+    let spawn = spawn_line(i).or_else(|| phases.iter().map(|p| p.start).min());
+    let member = match (spawn, i.seat_first) {
+        (Some(a), Some(b)) if b >= a => Some(b - a),
+        _ => None,
+    };
+    // Only a phase that ends at the seat's own first line is that figure.
+    let verifier = phases.iter().find(|p| p.label == VERIFIER_START).map(|p| p.seconds());
+    let held = phases.iter().find(|p| p.label == VERIFIER_HELD).map(|p| p.seconds());
+    (member, verifier, i.verifiers.iter().map(|v| v.test_secs).sum(), held)
 }
 
 pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
@@ -951,7 +1123,9 @@ pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
     let phases = build(&i);
     let run = run_legs_for(&i, &phases, None);
     let seat = seat_report(&i, &phases, &run, &transcript);
-    figures_of(&phases, &seat)
+    let mut f = figures_of(&phases, &seat);
+    (f.spawn_to_first, f.verifier_spawn_to_first, f.verifier_test_secs, f.verdict_to_despawn) = fixed_of(&i, &phases);
+    f
 }
 
 /// The figures from the phases and the seat report, which `wsp timeline` prints
@@ -1052,7 +1226,79 @@ mod tests {
             first_request: Some(118),
             group: None,
             holder_events: Vec::new(),
+            ..Default::default()
         }
+    }
+
+    /// The verifier's seat is up long before wsp says `started` (`wsp-429`): the
+    /// line is written when the step that spawned it ends.
+    #[test]
+    fn the_verifier_phase_starts_at_the_seats_first_line_not_wsps_started_line() {
+        let mut i = row();
+        i.verifiers = vec![VerifierSeat { learned: 306, first: 313, test_secs: 21 }];
+        i.cycle[3].0 = 430;
+        let ph = build(&i);
+        let start = ph.iter().find(|p| p.label == VERIFIER_START).expect("from the first line");
+        assert_eq!((start.start, start.end), (306, 313));
+        let reads = ph.iter().find(|p| p.label.starts_with("verifier reads")).unwrap();
+        assert_eq!(reads.start, 313, "the reading starts at the first line");
+        assert!(!ph.iter().any(|p| p.label == VERIFIER_START_LINE));
+        let (member, verifier, tests, _) = fixed_of(&i, &ph);
+        assert_eq!((verifier, tests), (Some(7), 21));
+        assert_eq!(member, None, "no transcript of the row's own seat was read");
+    }
+
+    #[test]
+    fn without_the_first_line_wsps_started_line_is_the_start_and_says_it_lags() {
+        let ph = build(&row());
+        let start = ph.iter().find(|p| p.label == VERIFIER_START_LINE).expect("the fallback");
+        assert_eq!((start.start, start.end), (306, 310));
+        assert_eq!(fixed_of(&row(), &ph).1, None, "that is not the seat's first line, so it is not read");
+    }
+
+    #[test]
+    fn the_seat_s_spawn_to_first_line_and_the_hold_after_the_verdict_are_read() {
+        let mut i = row();
+        i.seat_first = Some(104);
+        i.cycle.push((385, "ended cpd-9, which verified r-1 (holds)".into()));
+        let ph = build(&i);
+        let (member, _, _, held) = fixed_of(&i, &ph);
+        assert_eq!((member, held), (Some(4), Some(5)));
+    }
+
+    /// compounding-114 and 117: reviewed, verified, then reviewed again (a fix
+    /// for the barrier) and released. The release is the seat's end, not where its
+    /// work stopped, and the last review is not the one the verdict followed.
+    #[test]
+    fn a_row_reviewed_again_after_its_verdict_keeps_its_verifier_and_barrier_phases() {
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k != "task-released" && k != "leg-added");
+        i.legs.clear();
+        i.events.push(ev(500, "task-review", json!({"id": "r-1"})));
+        i.events.push(ev(900, "task-released", json!({"id": "r-1"})));
+        let ph = build(&i);
+        assert!(ph.iter().any(|p| p.label.starts_with("verifier reads") && p.end == 380), "{ph:?}");
+        assert!(ph.iter().any(|p| p.label.starts_with("the seat's work until review") && p.end == 305), "{ph:?}");
+        let after = ph.iter().find(|p| p.label.starts_with("the row's own seat after the verdict → released")).expect("named");
+        assert_eq!((after.start, after.end), (380, 900));
+    }
+
+    #[test]
+    fn test_and_build_commands_are_what_measure_py_counts_and_their_seconds_are_summed() {
+        assert!(is_test_command("cd app && cargo test cmd_spawn::"));
+        assert!(is_test_command("npm run check:box"));
+        assert!(!is_test_command("echo cargo test"));
+        assert!(!is_test_command("cat > t.sh <<EOF\ncargo test\nEOF"));
+        assert!(!is_test_command("git status"));
+        let text = [
+            line(10, json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "cargo test x"}}]}})),
+            line(40, json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "a"}]}})),
+            line(41, json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "git diff"}}]}})),
+            line(50, json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "b"}]}})),
+        ]
+        .join("\n");
+        assert_eq!(test_secs(&text), 30);
+        assert_eq!(first_stamp(&text), Some(10));
     }
 
     #[test]

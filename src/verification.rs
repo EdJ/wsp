@@ -158,12 +158,26 @@ pub(crate) struct Spent {
     /// is unread: a kind with no transcript wsp can read.
     pub model_secs: i64,
     pub tool_secs: i64,
+    /// Seconds its test and build commands ran, and the time of its transcript's
+    /// first line (`wsp-429`), as `util::now_iso` writes it: the seat's real
+    /// start, which wsp's `started` line lags. `None` is unread.
+    pub test_secs: i64,
+    pub first_line: Option<String>,
     /// The one-minute load average when its seat was named, in hundredths: the
     /// condition a timing was taken under. `None` where it could not be read.
     pub load1: Option<u32>,
 }
 
 impl Spent {
+    /// What the transcript says of the fixed parts, kept on the reading.
+    pub(crate) fn with_session(spent: Option<Spent>, read: Option<(i64, String)>) -> Option<Spent> {
+        let Some((test, first)) = read else { return spent };
+        let mut s = spent.unwrap_or_default();
+        s.test_secs = test;
+        s.first_line = Some(first);
+        Some(s)
+    }
+
     pub(crate) fn of(ran: &crate::agent_commands::Ran) -> Spent {
         Spent { ran: ran.label(), turns: ran.turns, peak: ran.peak, spend: ran.spend, ..Spent::default() }
     }
@@ -231,6 +245,8 @@ impl Pass {
             clause("spent", &s.spend.clause());
             clause("model", &Some(format!("{}s", s.model_secs)).filter(|_| s.model_secs > 0));
             clause("tools", &Some(format!("{}s", s.tool_secs)).filter(|_| s.tool_secs > 0));
+            clause("tested", &Some(format!("{}s", s.test_secs)).filter(|_| s.first_line.is_some()));
+            clause("first", &s.first_line);
             clause("load1", &s.load1.map(|l| format!("{}.{:02}", l / 100, l % 100)));
         }
         match &self.ending {
@@ -343,6 +359,8 @@ impl Pass {
                     "peak" => p.spent.get_or_insert_with(Spent::default).peak = v.and_then(|v| util::count_of(&v)).unwrap_or(0),
                     "model" => p.spent.get_or_insert_with(Spent::default).model_secs = v.and_then(|v| v.trim_end_matches('s').parse().ok()).unwrap_or(0),
                     "tools" => p.spent.get_or_insert_with(Spent::default).tool_secs = v.and_then(|v| v.trim_end_matches('s').parse().ok()).unwrap_or(0),
+                    "tested" => p.spent.get_or_insert_with(Spent::default).test_secs = v.and_then(|v| v.trim_end_matches('s').parse().ok()).unwrap_or(0),
+                    "first" => p.spent.get_or_insert_with(Spent::default).first_line = v,
                     "load1" => p.spent.get_or_insert_with(Spent::default).load1 = v.and_then(|v| v.parse::<f64>().ok()).map(|l| (l * 100.0).round() as u32),
                     "spent" => p.spent.get_or_insert_with(Spent::default).spend = v.and_then(|v| crate::agent_commands::Spend::of_clause(&v)).unwrap_or_default(),
                     _ => {}
@@ -1246,6 +1264,8 @@ mod tests {
                 spend: crate::agent_commands::Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None },
                 model_secs: 41,
                 tool_secs: 23,
+                test_secs: 17,
+                first_line: Some("2026-10-06T10:01:07Z".into()),
                 load1: Some(108),
             }),
             did: None,
@@ -1267,6 +1287,9 @@ mod tests {
         let ended = Spent::ending(Some(&start), None, Some((41, 23))).unwrap();
         assert_eq!((ended.model_secs, ended.tool_secs, ended.load1), (41, 23, Some(108)), "no session to read still keeps the load");
         assert_eq!(Spent::ending(None, None, None), None, "nothing known writes nothing");
+        let kept = Spent::with_session(Some(ended.clone()), Some((17, "2026-10-06T10:01:07Z".into()))).unwrap();
+        assert_eq!((kept.test_secs, kept.first_line.as_deref(), kept.load1), (17, Some("2026-10-06T10:01:07Z"), Some(108)), "the transcript's two figures join the reading");
+        assert_eq!(Spent::with_session(None, None), None, "an unread transcript adds nothing");
         let p = Pass { at: "2026-11-06T10:00:00Z".into(), pane: Some("cpd-1".into()), spent: Some(ended.clone()), ..Pass::opened(None, None) };
         write(&mut t, &[p]);
         assert!(t.body.contains("model 41s · tools 23s · load1 1.08"), "{}", t.body);

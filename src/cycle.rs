@@ -3328,7 +3328,9 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
         // Read before the despawn: it clears the binding the session is found by.
         let ran = crate::cmd_agent::ran_of_seat(store, &seat, &p.at);
         let secs = crate::cmd_agent::secs_of_seat(store, &seat, &p.at);
+        let fixed = crate::cmd_agent::fixed_of_seat(store, &seat);
         let spent = crate::verification::Spent::ending(p.spent.as_ref(), ran.as_ref(), secs);
+        let spent = crate::verification::Spent::with_session(spent, fixed);
         let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
         let outcome = despawn_seat(&seat).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {
