@@ -160,7 +160,9 @@ pub fn at_spawn(store: &Store, task: Option<&str>, member: bool, full: bool, no_
         let root = tree_root(store, &t);
         let made = crate::packet_gen::generate(store, &t, &root);
         match &made.pack {
-            Ok(0) => eprintln!("wsp: {} is not given a packet: the pack found no file this row will touch", t.id),
+            // A pack that names no file still leaves the overview, which is the
+            // brief: the row is given a packet of the overview alone rather than
+            // left to a start that hangs on a hook delivering it (`wsp-446`).
             Ok(_) => {
                 if let Err(why) = crate::packet_gen::write(store, &mut t, &made.section) {
                     eprintln!("wsp: {} is not given a packet: {why}", t.id);
@@ -866,11 +868,16 @@ mod tests {
     }
 
     #[test]
-    fn a_pack_that_names_no_file_leaves_the_row_to_the_ordinary_start() {
+    fn a_pack_that_names_no_file_still_gives_the_row_its_overview_as_the_packet() {
         let (env, store, _) = world("nofiles", "Show the packet size", None);
         let _builder = FakePack::with(&env.path(""), "");
-        assert!(spawn(&store, false, false).is_none());
-        assert!(store.find_task("pj-001").unwrap().section(SECTION).is_none());
+        let bytes = spawn(&store, false, false).expect("a short start, not an empty one");
+        let t = store.find_task("pj-001").unwrap();
+        let written = t.section(SECTION).expect("written into the row");
+        assert!(!written.contains("file:"), "{written}");
+        let printed = build(&t, &tree_root(&store, &t)).unwrap();
+        assert_eq!(bytes as usize, printed.len());
+        assert!(printed.contains("Show the size in"), "the packet the agent is handed holds the overview: {printed}");
     }
 
     #[test]
