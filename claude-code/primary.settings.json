@@ -1,0 +1,11 @@
+{
+  "_comment": "Passed to the primary seat's Claude Code with --settings (wsp-473), written beside ~/.claude/settings.json by `wsp install`. These verbs check the caller's role themselves; the allow rule only gets the call to wsp.",
+  "permissions": {
+    "allow": [
+      "Bash(wsp despawn:*)",
+      "Bash(wsp done:*)",
+      "Bash(wsp reap:*)",
+      "Bash(wsp daemon reload)"
+    ]
+  }
+}

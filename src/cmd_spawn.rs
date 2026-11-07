@@ -592,7 +592,10 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              nothing waits on your permission. Say what you are doing with `wsp say`, and when \
              nothing needs you, stop: you are told when it does. A group with no `agent:` line \
              is run by hand (`wsp worklist next` names what may start), and when you pass its \
-             barrier, make `wsp govern {subject} --rotate` your last act. \
+             barrier, make `wsp govern {subject} --rotate` your last act. Two verbs beyond a \
+             member's, for {subject}'s own rows only: `wsp despawn <row> --why \"...\"` for a \
+             seat left idle, and `wsp reap <pid>` (`--list` names candidates) for a leftover dev \
+             server in a member's tree; wsp refuses either outside {subject} and names the scope. \
              Work that is not {subject}'s (a row for another project, an agent spawned for the \
              person, the machine's load, a message for another seat) is the primary \
              interface's: say so, or with the person's yes pass it on with `wsp govern primary \
@@ -616,7 +619,11 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              \"...\"`, and only for words they typed this turn, never for an answer you worked out. \
              File work that no project's seat owns with `wsp add -p <project>`, naming the \
              project every time because you stand in none, and spawn or end an agent when the \
-             person asks. {STAGE_WHEN_FILED} Carry a message to a seat with `wsp govern <scope> --tell -`; the \
+             person asks. Four verbs are yours beyond a member's, each checked by wsp: \
+             `wsp despawn <row> --why \"...\"` (not mid-turn without `--now`), `wsp done <row>` \
+             (rows at review whose verifier held), `wsp reap <pid>` (`--list` names candidates; \
+             by pid, never a pattern) and `wsp daemon reload` (only when no daemon answers). \
+             {STAGE_WHEN_FILED} Carry a message to a seat with `wsp govern <scope> --tell -`; the \
              seat that receives it decides it, not you. A project's decisions are its \
              custodian's and a list's are its governor's: carry the person's sentence there \
              rather than making the change, unless the person says you should, and then note on \
@@ -2962,7 +2969,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             // spawn the old way.
             brief: brief_at.as_deref().filter(|_| laid == Laid::Written),
         };
-        let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
+        let mut spawn_args = how.args(&spawn);
+        // The primary seat and each governor get a settings file of their own
+        // (`wsp-473`); nobody else does.
+        if args.has("govern") {
+            let scope = work.list.as_deref().or(work.project.as_deref());
+            spawn_args.extend(crate::cmd_role::settings_args(&kind, scope, work.primary));
+        }
+        let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args };
         let far_start = args.get("on").is_some();
         // Two waits, and they are different questions: `start` comes back when
         // the agent exists, `wait_ready` when it will listen. Both are inside
@@ -3729,7 +3743,9 @@ fn rotate_as(
         resume: None,
         brief: None,
     };
-    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: how.args(&spawn) };
+    let mut spawn_args = how.args(&spawn);
+    spawn_args.extend(crate::cmd_role::settings_args(&kind, Some(&scope), work.primary));
+    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: spawn_args };
 
     // Step 2. Started, then heard from: a turn running is the only evidence
     // that the handover was taken, and everything after this point depends on
@@ -4539,6 +4555,13 @@ fn end_work(
             return 2;
         }
     };
+
+    // Who is asking decides how far this reaches (`wsp-473`): the primary seat
+    // any seat, with a why and not mid-turn; a governor the seats of rows on
+    // its own list. A caller in no seat is as free as ever.
+    if let Err(code) = crate::cmd_role::gate_despawn(store, args, (me.pane, me.governs), seat.as_str(), task.as_deref()) {
+        return code;
+    }
 
     // Ending the seat you are standing in kills this process partway through,
     // which is the one case where stopping first cannot work: there would be

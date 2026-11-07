@@ -403,6 +403,34 @@ fn ensure_as(
     Ok(Done { path: path.to_path_buf(), wrote: change == Plan::Write, loaded: true })
 }
 
+/// Put the machine's daemon job back: `bootstrap` when launchd no longer has
+/// it, `kickstart` when it has it and nothing is running. The caller has
+/// already established that no daemon answers (`wsp daemon reload`), so this
+/// never restarts a live one. Returns a sentence for what was done.
+pub fn reload() -> Result<String, String> {
+    let path = plist_path();
+    if !path.exists() {
+        return Err(format!("{} is not there — `wsp install --daemon` writes it", util::contract(&path)));
+    }
+    let domain = domain()?;
+    let target = format!("{domain}/{LABEL}");
+    let how = if loaded(&target) {
+        let out = Command::new("launchctl")
+            .args(["kickstart", &target])
+            .output()
+            .map_err(|e| format!("cannot run launchctl: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("launchctl kickstart failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        "kickstarted"
+    } else {
+        bootstrap_retrying(&domain, &path, 6, Duration::from_secs(1))?;
+        "bootstrapped"
+    };
+    settle(&target, Duration::from_secs(8))?;
+    Ok(format!("{LABEL} {how}"))
+}
+
 /// What `launchctl print` says the job is doing.
 #[derive(Debug, PartialEq)]
 pub enum State {

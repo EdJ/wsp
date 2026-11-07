@@ -3316,21 +3316,6 @@ pub const VERBS: &[crate::verbs::Verb] = &[
         ],
     },
     crate::verbs::Verb {
-        names: &["done", "close"],
-        run: done,
-        help: &[
-            crate::verbs::Help {
-                section: crate::verbs::Section::Tasks,
-                order: 200,
-                text: r##"  wsp done <id> [--force]           the person's verb (a member finishes with
-                                    `wsp review`); complete; --force over open sub-tasks. Its
-                                    worktree and branch go too when the work is
-                                    on the trunk and nobody is in it; otherwise
-                                    kept and said why. --keep-tree leaves it"##,
-            },
-        ],
-    },
-    crate::verbs::Verb {
         names: &["block"],
         run: block,
         help: &[

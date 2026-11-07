@@ -1010,12 +1010,21 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
 pub const VERBS: &[crate::verbs::Verb] = &[
     crate::verbs::Verb {
         names: &["daemon"],
-        run: |store, args| run(store, args.has("verbose")),
+        run: |store, args| match args.rest.first().map(String::as_str) {
+            Some("reload") => crate::cmd_role::daemon_reload(store, running(&store.state)),
+            _ => run(store, args.has("verbose")),
+        },
         help: &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
                 order: 80,
                 text: r##"  wsp daemon [-v]                   events + refresh loop (herdr [[startup]])"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 81,
+                text: r##"  wsp daemon reload                 put the launchd job back when no daemon
+                                    answers; the primary seat's, refused if one does"##,
             },
         ],
     },

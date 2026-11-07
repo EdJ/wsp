@@ -228,15 +228,28 @@ fn running_among(dir: &Path, backends: &[&dyn Place]) -> Vec<u32> {
 
 /// [`running_among`] the backends wsp can spawn onto here.
 fn running_in(dir: &Path) -> Vec<u32> {
-    let herdr_here = crate::herdr::available_now();
     let all = crate::place::local_backends();
-    let here: Vec<&dyn Place> = all
-        .iter()
+    running_among(dir, &here_of(&all))
+}
+
+/// The backends of `all` that answer on this machine now.
+fn here_of(all: &[Box<dyn Place>; 2]) -> Vec<&dyn Place> {
+    let herdr_here = crate::herdr::available_now();
+    all.iter()
         .zip(crate::place::LOCAL_BACKEND_NAMES)
         .filter(|(_, name)| *name != "herdr" || herdr_here)
         .map(|(b, _)| b.as_ref())
-        .collect();
-    running_among(dir, &here)
+        .collect()
+}
+
+/// Every process of every live seat here, and this process's ancestors: what
+/// `wsp reap` never stops. `None` when no backend answered — a census that
+/// failed says nothing about whose processes are whose.
+pub fn live_seat_pids() -> Option<Vec<u32>> {
+    let all = crate::place::local_backends();
+    let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
+    keep.extend(seated(&here_of(&all))?);
+    Some(keep)
 }
 
 /// Send `sig` to `pids`, and say nothing of it: a process that has gone is the

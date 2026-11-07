@@ -280,6 +280,12 @@ AGENTS
                                     session they were on. With an id, that one —
                                     which may reach further back than the last
                                     census. --print says how to do it by hand
+  wsp reap <pid>… | --list          stop processes by pid, never by pattern: a dev
+                                    or test tool over an hour old in the tree of a
+                                    row not at doing, a zsh busy loop, a test
+                                    binary idle 15 min in a finished tree. Never
+                                    a live seat's. The primary any such pid; a
+                                    governor those in its list's trees
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
   wsp govern [<proj>]               who is in every seat, or in the one named.
                                     Reports only: it never takes a seat
@@ -630,6 +636,8 @@ PLUMBING
                                     out. Started by herdr, not by a person
   wsp sync [--force]                push tokens to herdr once
   wsp daemon [-v]                   events + refresh loop (herdr [[startup]])
+  wsp daemon reload                 put the launchd job back when no daemon
+                                    answers; the primary seat's, refused if one does
   wsp hook <event>                  herdr event-hook entrypoint
   wsp report <hook>                 a headless agent's Claude Code hook, saying
                                     what it is doing; silent outside a seat

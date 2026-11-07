@@ -1459,6 +1459,8 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
         return json!({"installed": false, "label": crate::launchd::LABEL,
                       "path": util::contract(&path), "plist": change});
     }
+    // The primary and governor seats' settings (wsp-473), beside the seat's own.
+    crate::cmd_role::write_settings();
     let done = crate::launchd::ensure(dst, &store.state, &var);
     // The line `wsp wip` and the brief show until a daemon is running again.
     match &done {

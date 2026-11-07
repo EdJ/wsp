@@ -144,7 +144,6 @@
       "Bash(wsp say:*)"
     ],
     "deny": [
-      "Bash(wsp done:*)",
       "Bash(wsp rm:*)",
       "Bash(wsp mv:*)",
       "Bash(wsp project rm:*)",

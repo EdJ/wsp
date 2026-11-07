@@ -1,0 +1,9 @@
+{
+  "_comment": "Passed to each governor seat's Claude Code with --settings (wsp-473). wsp refuses a despawn or reap outside the governor's own list and names the scope it would have needed.",
+  "permissions": {
+    "allow": [
+      "Bash(wsp despawn:*)",
+      "Bash(wsp reap:*)"
+    ]
+  }
+}
