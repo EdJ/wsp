@@ -364,13 +364,17 @@ fn left_in_finished_by(store: &Store, seats: &dyn Seats) -> Option<Vec<crate::ch
 /// Run by the tick, so a row that reaches review has nothing of its own
 /// running by the next one. Returns the lines said.
 pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
-    let Some(found) = left_in_finished_by(store, seats).filter(|f| !f.is_empty()) else { return Vec::new() };
+    let Some(found) = left_in_finished_by(store, seats) else { return Vec::new() };
+    let mut said = say_spared(store, &found);
+    let found: Vec<_> = found.into_iter().filter(|l| !l.pids.is_empty()).collect();
+    if found.is_empty() {
+        return said;
+    }
     let all = |l: &[crate::check_tree::Left]| l.iter().flat_map(|t| t.pids.clone()).collect::<Vec<u32>>();
     crate::check_tree::signal("-TERM", &all(&found));
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let still = left_in_finished_by(store, seats).unwrap_or_default();
     crate::check_tree::signal("-KILL", &all(&still));
-    let mut said = Vec::new();
     for t in &found {
         let kill: Vec<u32> = still.iter().filter(|s| s.tree == t.tree).flat_map(|s| s.pids.clone()).collect();
         let path = util::contract(std::path::Path::new(&t.tree));
@@ -385,10 +389,28 @@ pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     said
 }
 
+/// What the sweep let be, said in `cycle.log` once per pid for as long as this
+/// process lives (`wsp-478`). Returns the lines said.
+fn say_spared(store: &Store, found: &[crate::check_tree::Left]) -> Vec<String> {
+    static SAID: std::sync::Mutex<std::collections::BTreeSet<u32>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut said = Vec::new();
+    let mut seen = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    for l in found {
+        for (pid, why) in &l.spared {
+            if seen.insert(*pid) {
+                let line = crate::check_tree::spared_line(l, *pid, why);
+                crate::store::log_line(store, &line);
+                said.push(line);
+            }
+        }
+    }
+    said
+}
+
 /// The lines `wsp wip` draws for finished trees that still have processes.
 pub(crate) fn finished_wip_lines(store: &Store) -> Vec<String> {
     let Some(found) = left_in_finished_by(store, &crate::cycle::Fleet) else { return Vec::new() };
-    found.iter().map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect()
+    found.iter().filter(|l| !l.pids.is_empty()).map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect()
 }
 
 fn open_lists(store: &Store) -> Vec<Worklist> {
@@ -1555,7 +1577,9 @@ mod tests {
     /// `wsp-453` where it happened: a check left a server in a row's tree (here
     /// a `sleep`, in a group of its own the way `vite` leaves one), and the row
     /// reached review. The tick's stop ends it; a row still `doing`, and a row
-    /// with a seat open, keep theirs.
+    /// with a seat open, keep theirs. The server is a `sleep` under a shell
+    /// that stands in the tree; a plain `sleep` started from elsewhere with its
+    /// cwd in the tree is not the tree's (`wsp-478`), and `f-4` is that.
     #[test]
     fn a_server_a_check_left_in_a_finished_rows_tree_is_stopped_and_a_working_rows_is_not() {
         use std::os::unix::process::CommandExt;
@@ -1568,14 +1592,23 @@ mod tests {
             ("f-1", crate::model::Status::Review),
             ("f-2", crate::model::Status::Doing),
             ("f-3", crate::model::Status::Review),
+            ("f-4", crate::model::Status::Review),
         ] {
             let mut t = crate::model::Task::new(id, id);
             t.set_status(status);
             store.save_task(&t).unwrap();
             let tree = root.join(crate::cmd_checkout::WORKTREES).join(id);
             std::fs::create_dir_all(&tree).unwrap();
-            let child = std::process::Command::new("sleep")
-                .arg("60")
+            let mut cmd = if id == "f-4" {
+                let mut c = std::process::Command::new("sleep");
+                c.arg("60");
+                c
+            } else {
+                let mut c = std::process::Command::new("sh");
+                c.args(["-c", "sleep 60; true"]);
+                c
+            };
+            let child = cmd
                 .current_dir(&tree)
                 .stdin(std::process::Stdio::null())
                 .process_group(0)
@@ -1590,14 +1623,17 @@ mod tests {
             // A signalled child of ours is reaped at once; one alive is not.
             std::thread::sleep(std::time::Duration::from_millis(50));
             ended.push((*id, child.try_wait().unwrap().is_some()));
+            // The group, for the `sleep` under the shell.
+            let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
             let _ = child.kill();
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(ended, vec![("f-1", true), ("f-2", false), ("f-3", false)], "said: {said:?}");
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(said[0].contains("finished row f-1"), "{said:?}");
-        assert!(crate::check_tree::left_line(&crate::check_tree::Left { row: "f-1".into(), tree: "/r/.worktrees/f-1".into(), pids: vec![1, 2] }, 2048).contains("2 processes (2 MB)"));
+        assert_eq!(ended, vec![("f-1", true), ("f-2", false), ("f-3", false), ("f-4", false)], "said: {said:?}");
+        assert!(said.iter().any(|l| l.starts_with("stopped in finished row f-1")), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with("spared") && l.contains("row f-4")), "{said:?}");
+        assert!(!said.iter().any(|l| l.contains("f-2") || l.contains("f-3")), "{said:?}");
+        assert!(crate::check_tree::left_line(&crate::check_tree::Left { row: "f-1".into(), tree: "/r/.worktrees/f-1".into(), pids: vec![1, 2], spared: vec![] }, 2048).contains("2 processes (2 MB)"));
     }
 
 }
