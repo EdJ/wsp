@@ -193,6 +193,68 @@ pub(crate) fn full_suite_command(command: &str) -> bool {
     )
 }
 
+/// The React whole suite: `npm run check`, or `npm run check:box` with no box,
+/// optionally after one leading `cd <dir> &&`. Returns the `cd <dir> && ` prefix
+/// (empty without one) and the directory (`""` without one). A box, a path, or
+/// anything else chained is somebody's own choice and stays as written (`wsp-468`).
+pub(crate) fn react_suite_command(command: &str) -> Option<(String, String)> {
+    let c = command.trim();
+    if c.chars().any(|ch| matches!(ch, ';' | '|' | '>' | '<' | '`' | '$' | '(' | '\n')) {
+        return None;
+    }
+    let (dir, inner) = match c.strip_prefix("cd ") {
+        Some(rest) => {
+            let (d, i) = rest.split_once("&&")?;
+            let d = d.trim();
+            if d.is_empty() || d.contains(char::is_whitespace) || d.starts_with('/') || d.split('/').any(|p| p == "..") {
+                return None;
+            }
+            (d.trim_end_matches('/').to_string(), i.trim())
+        }
+        None => (String::new(), c),
+    };
+    if inner.contains('&') {
+        return None;
+    }
+    let words: Vec<&str> = inner.split_whitespace().collect();
+    match words.as_slice() {
+        ["npm", "run", "check"] | ["npm", "run", "check:box"] | ["npm", "run", "check:box", "--"] => {}
+        _ => return None,
+    }
+    let prefix = if dir.is_empty() { String::new() } else { format!("cd {dir} && ") };
+    Some((prefix, dir))
+}
+
+/// Directories under a React package's `src/` that fan out to every box.
+const SHARED_BOXES: [&str; 3] = ["contract", "services", "shell"];
+
+/// The boxes of the package at `dir` that `changed` touched, or `None` when the
+/// run cannot be proved to stay in them: a shared box, the package's own
+/// manifest, a file in the package outside `src/<box>/`, or nothing in the
+/// package to place. (Paths the project declares `shared:` arrive as the
+/// scope's `widened`.)
+fn boxes_touched(dir: &str, changed: &[String]) -> Option<Vec<String>> {
+    let root = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+    let mut boxes: Vec<String> = Vec::new();
+    for p in changed.iter().filter(|p| !prose(p)) {
+        let Some(rel) = p.strip_prefix(root.as_str()) else { continue };
+        let mut parts = rel.split('/');
+        let (Some("src"), Some(b), Some(_)) = (parts.next(), parts.next(), parts.next()) else { return None };
+        if SHARED_BOXES.contains(&b) {
+            return None;
+        }
+        if !boxes.iter().any(|x| x == b) {
+            boxes.push(b.to_string());
+        }
+    }
+    if boxes.is_empty() {
+        None
+    } else {
+        boxes.sort();
+        Some(boxes)
+    }
+}
+
 /// What narrowing did to a unit's steps.
 pub(crate) struct Narrowed {
     pub items: Vec<Item>,
@@ -215,21 +277,48 @@ pub(crate) struct Narrowed {
 /// graph cannot place is not proved covered by running nothing.
 pub(crate) fn narrow(tree: &Path, items: &[Item], scope: &Scope, changed: &[String]) -> Narrowed {
     let keep = |scope: Scope| Narrowed { items: items.to_vec(), scope, targets: Vec::new(), narrowed: false };
-    if scope.is_full() || !items.iter().any(|i| i.kind != crate::barrier_run::Kind::Stop && full_suite_command(&i.step.command)) {
+    let whole = |i: &Item| i.kind != crate::barrier_run::Kind::Stop && full_suite_command(&i.step.command);
+    let react = |i: &Item| react_suite_command(&i.step.command).is_some();
+    if scope.is_full() || !items.iter().any(|i| whole(i) || react(i)) {
         return keep(scope.clone());
     }
-    let derived = crate::affected::derived(tree, changed);
-    let real = changed.iter().any(|p| !prose(p));
-    if derived.is_empty() && real {
-        return keep(Scope::Full("the crate and module graphs reach nothing for the changed files".into()));
+    let widened = matches!(scope, Scope::Narrow { widened } if !widened.is_empty());
+    let mut derived = Vec::new();
+    if items.iter().any(whole) {
+        derived = crate::affected::derived(tree, changed);
+        let real = changed.iter().any(|p| !prose(p));
+        if derived.is_empty() && real {
+            return keep(Scope::Full("the crate and module graphs reach nothing for the changed files".into()));
+        }
     }
     let mut out: Vec<Item> = Vec::new();
     let mut targets: Vec<String> = Vec::new();
+    let mut narrowed = false;
     for item in items {
-        if item.kind == crate::barrier_run::Kind::Stop || !full_suite_command(&item.step.command) {
+        if let Some((prefix, dir)) = react_suite_command(&item.step.command) {
+            // The React suite in a middle group: the boxes touched, unless a
+            // shared path changed (`wsp-468`).
+            match boxes_touched(&dir, changed).filter(|_| !widened) {
+                Some(boxes) => {
+                    narrowed = true;
+                    for b in boxes {
+                        let name = format!("{}:{b}", item.step.name);
+                        if !targets.contains(&name) {
+                            targets.push(name.clone());
+                        }
+                        let step = Step { name, command: format!("{prefix}npm run check:box -- {b}"), ..item.step.clone() };
+                        push(&mut out, Item { step, kind: item.kind, owners: item.owners.clone() });
+                    }
+                }
+                None => push(&mut out, item.clone()),
+            }
+            continue;
+        }
+        if !whole(item) {
             push(&mut out, item.clone());
             continue;
         }
+        narrowed = true;
         for (step, _) in &derived {
             if !targets.contains(&step.name) {
                 targets.push(step.name.clone());
@@ -238,7 +327,7 @@ pub(crate) fn narrow(tree: &Path, items: &[Item], scope: &Scope, changed: &[Stri
             push(&mut out, Item { step, kind: item.kind, owners: item.owners.clone() });
         }
     }
-    Narrowed { items: out, scope: scope.clone(), targets, narrowed: true }
+    Narrowed { items: out, scope: scope.clone(), targets, narrowed }
 }
 
 /// A command named twice runs once, and the owners of both share the answer.
@@ -504,5 +593,46 @@ mod tests {
         let with_suite = narrow(&dir, &items(), &Scope::Narrow { widened: vec![] }, &paths(&["cart/src/lib.rs"]));
         assert!(with_suite.narrowed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_middle_groups_react_check_narrows_to_the_boxes_touched_and_a_shared_path_keeps_it_whole() {
+        let dir = workspace("react");
+        let step = |name: &str, command: &str| Step {
+            name: name.into(),
+            command: command.into(),
+            limit: std::time::Duration::from_secs(600),
+            of: crate::check::Of::Project,
+            on: Vec::new(),
+            barrier: true,
+            end: false,
+        };
+        let stop = |c: &str| vec![Item { step: step("stop:full", c), kind: crate::barrier_run::Kind::Stop, owners: vec![] }];
+        let narrow_scope = Scope::Narrow { widened: vec![] };
+        let cmd = "cd spikes/web-chrome && npm run check";
+        let n = narrow(&dir, &stop(cmd), &narrow_scope, &paths(&["spikes/web-chrome/src/pane/Pane.tsx", "spikes/web-chrome/src/tabs/Tabs.tsx", "spikes/web-chrome/src/pane/x.test.tsx", "docs/a.md"]));
+        assert_eq!(commands(&n), vec!["cd spikes/web-chrome && npm run check:box -- pane", "cd spikes/web-chrome && npm run check:box -- tabs"]);
+        assert!(n.narrowed && n.items.iter().all(|i| i.kind == crate::barrier_run::Kind::Stop));
+        for shared in ["spikes/web-chrome/src/services/api.ts", "spikes/web-chrome/src/contract/t.ts", "spikes/web-chrome/src/shell/App.tsx", "spikes/web-chrome/package.json", "spikes/web-chrome/src/main.tsx"] {
+            let n = narrow(&dir, &stop(cmd), &narrow_scope, &paths(&["spikes/web-chrome/src/pane/Pane.tsx", shared]));
+            assert_eq!(commands(&n), vec![cmd], "{shared}");
+            assert!(!n.narrowed);
+        }
+        let n = narrow(&dir, &stop(cmd), &Scope::Narrow { widened: vec!["spikes/web-chrome/src/lib/a.ts".into()] }, &paths(&["spikes/web-chrome/src/pane/Pane.tsx"]));
+        assert_eq!(commands(&n), vec![cmd], "a path the project calls shared");
+        let n = narrow(&dir, &stop(cmd), &Scope::Full("last".into()), &paths(&["spikes/web-chrome/src/pane/Pane.tsx"]));
+        assert_eq!(commands(&n), vec![cmd], "a last group runs it whole");
+        let n = narrow(&dir, &stop("cd spikes/web-chrome && npm run check:box -- pane"), &narrow_scope, &paths(&["spikes/web-chrome/src/tabs/T.tsx"]));
+        assert!(!n.narrowed, "a box already named stays as written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_react_whole_suite_is_read_as_one() {
+        assert_eq!(react_suite_command("npm run check"), Some((String::new(), String::new())));
+        assert_eq!(react_suite_command("cd web && npm run check:box"), Some(("cd web && ".into(), "web".into())));
+        for c in ["npm run check:box -- pane", "cd web && npm run check && echo", "cd /abs && npm run check", "cd ../x && npm run check", "npm test", "npm run check; x"] {
+            assert_eq!(react_suite_command(c), None, "{c}");
+        }
     }
 }

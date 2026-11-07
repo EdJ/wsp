@@ -65,7 +65,12 @@ full-every: 5
    with a reason, or narrow.
 2. Each unit's steps are narrowed *in the barrier tree at the trunk's tip* (`scope::narrow`), because the targets come
    from that tree's graphs. A step is replaced only if it is a whole suite (`cargo test` with no filter, `npm test`,
-   `npx vitest run`); a stop check, a filtered command, a member's own script stay as written. A member's recorded check
+   `npx vitest run`); a stop check, a filtered command, a member's own script stay as written. The one exception is the
+   React whole suite (`wsp-468`): `npm run check`, or `npm run check:box` with no box, optionally after `cd <dir> &&`,
+   even as a stop check, is replaced in a narrow scope by `cd <dir> && npm run check:box -- <box>` per box touched
+   (`<dir>/src/<box>/…` in the landed files). It stays whole when a `shared:` path, `src/contract|services|shell/`,
+   the package manifest or any file in the package outside a box changed, or nothing in the package can be placed;
+   and on the last group and the in-situ group, as every full scope. A member's recorded check
    that *is* the suite is narrowed with it and keeps its owners, so blame is unchanged. A target two steps name runs
    once.
 3. The results are read against the steps that ran (`effective` items), so blame, the failed list and the packet agree
