@@ -5681,6 +5681,12 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     close(store, args, w, crate::cycle::Closing::Done)
 }
 
+/// What a clear launches for the timing retro (`wsp-472`): the verb, the list
+/// it is for, and the flag that says it is the clear and not a hand.
+fn at_clear_argv(list: &str) -> Vec<String> {
+    vec!["retro".into(), list.into(), "--at-clear".into()]
+}
+
 /// [`done`] once the list is found, and the whole of it: the record, and
 /// everything the run opened ended with it.
 ///
@@ -5781,7 +5787,8 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     );
 
     // `wsp-472`: a clear gets a timing retro, if its guards pass.
-    crate::cycle::launch_out(store, &["retro", &w.id, "--at-clear"]);
+    let argv = at_clear_argv(&w.id);
+    crate::cycle::launch_out(store, &argv.iter().map(String::as_str).collect::<Vec<_>>());
 
     if args.json() {
         println!(
@@ -6319,6 +6326,11 @@ mod tests {
     /// reads the ambient store, so the tests can run beside each other.
     fn scratch(tag: &str) -> Store {
         crate::testkit::store(&format!("wl-{tag}"))
+    }
+
+    #[test]
+    fn a_clear_launches_the_retro_verb_naming_the_list_it_cleared() {
+        assert_eq!(at_clear_argv("fleet-fixes"), ["retro", "fleet-fixes", "--at-clear"]);
     }
 
     fn task(store: &Store, id: &str, status: &str) {
