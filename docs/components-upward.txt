@@ -82,7 +82,7 @@ cold -> check: *, Done, Ran, Step, self  # trees -> engine
 cold -> cycle: launch_out  # trees -> engine
 cold -> main: Args  # trees -> top
 cold -> worklist: touched  # trees -> engine
-cycle -> agent_commands: SETTLED_AFTER, opencode_finished_at  # engine -> seats
+cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
 cycle -> cmd_agent: did_of_seat, fixed_of_seat, notice, ran_of_seat, secs_of_seat  # engine -> seats
 cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
 cycle -> cmd_spawn: end_seat_when_idle, list_root, rotate_on_behalf, wait_for_pane  # engine -> seats
