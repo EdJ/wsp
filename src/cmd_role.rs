@@ -574,13 +574,27 @@ fn signal(sig: &str, pid: u32) {
     let _ = std::process::Command::new("kill").args([sig, &pid.to_string()]).status();
 }
 
+/// Why `role` may not run `wsp reap` (`list` is the read-only form), if it may
+/// not. Only stopping a pid is gated on the seat; listing changes nothing and is
+/// open to every role.
+pub(crate) fn reap_gate(role: &Role, list: bool) -> Option<&'static str> {
+    (*role == Role::Seat && !list).then_some("a member, verifier or check seat does not reap")
+}
+
+/// The role whose scope `--list` shows. A seat has no scope of its own to reap
+/// in, so it sees every candidate, as the primary would; every other role sees
+/// what it could stop.
+pub(crate) fn scope_for(role: &Role, list: bool) -> Role {
+    if list && *role == Role::Seat { Role::Primary } else { role.clone() }
+}
+
 /// `wsp reap <pid>…` and `wsp reap --list`.
 pub fn reap(store: &Store, args: &Args) -> i32 {
     let role = role(store);
-    if role == Role::Seat {
-        return refuse(store, "reap", &role, "a member, verifier or check seat does not reap");
-    }
     let list = args.has("list");
+    if let Some(why) = reap_gate(&role, list) {
+        return refuse(store, "reap", &role, why);
+    }
     let mut asked: Vec<u32> = Vec::new();
     for w in &args.rest {
         match w.parse::<u32>() {
@@ -620,9 +634,10 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
     let list_of = |n: &str| list_of_row(store, n);
     let check_list = |n: &str| crate::check_tree::named(store, n).map(|(l, _)| l);
 
+    let scope = scope_for(&role, list);
     let judge = |p: &Proc| -> Result<Proof, String> {
         let proof = prove(p, cwds.get(&p.pid).map(String::as_str), &facts)?;
-        in_scope(&role, &proof, &list_of, &check_list)?;
+        in_scope(&scope, &proof, &list_of, &check_list)?;
         Ok(proof)
     };
 
@@ -979,6 +994,30 @@ mod tests {
         assert!(in_scope(&gov("fleet"), &p(None), &list_of, &check_list).is_err(), "a busy loop is the primary's");
         assert!(in_scope(&Role::Primary, &p(None), &list_of, &check_list).is_ok());
         assert!(in_scope(&Role::Seat, &p(Some("wsp-2")), &list_of, &check_list).is_err());
+    }
+
+    #[test]
+    fn reap_list_is_open_to_every_role_and_a_pid_stays_gated_for_a_seat() {
+        // a check seat, a member seat and a verifier seat are all `Role::Seat`
+        for role in [Role::Seat, Role::Outside, Role::Primary, Role::Governor("fleet".into())] {
+            assert_eq!(reap_gate(&role, true), None, "{role:?} may list");
+        }
+        assert_eq!(reap_gate(&Role::Seat, false), Some("a member, verifier or check seat does not reap"));
+        for role in [Role::Outside, Role::Primary, Role::Governor("fleet".into())] {
+            assert_eq!(reap_gate(&role, false), None, "{role:?} may reap");
+        }
+    }
+
+    #[test]
+    fn a_seat_lists_every_candidate_but_stopping_one_stays_refused() {
+        let list_of = |_: &str| None;
+        let check_list = |_: &str| None;
+        let p = Proof { tree: Some("wsp-2".into()), text: "x".into() };
+        assert!(in_scope(&scope_for(&Role::Seat, true), &p, &list_of, &check_list).is_ok());
+        let why = in_scope(&scope_for(&Role::Seat, false), &p, &list_of, &check_list).unwrap_err();
+        assert!(why.contains("does not reap"), "{why}");
+        let gov = Role::Governor("fleet".into());
+        assert_eq!(scope_for(&gov, true), gov, "a governor still sees its own scope");
     }
 
     #[test]
