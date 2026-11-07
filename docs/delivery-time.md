@@ -1,5 +1,7 @@
 # Cutting delivery time
 
+The effort report is read at every clear by the timing retro: see `docs/retro.md` (wsp-472).
+
 `wsp-377`, 2026-11-05. A plan, not code. Delivery time is the wall from a row
 being started to it landing, verified, and its group's barrier passed.
 

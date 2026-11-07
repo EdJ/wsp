@@ -405,4 +405,30 @@ mod tests {
         assert_eq!(done(&store, &Args::synth("retro", &["done", "m", &bad], &[])), 1);
         assert_eq!(done(&store, &Args::synth("retro", &["done", "m", &ok], &[])), 0);
     }
+
+    #[test]
+    fn a_rerun_notes_the_open_row_and_a_strategic_finding_goes_to_the_ask_list() {
+        let (env, store) = crate::testkit::isolated_store("retro-rerun");
+        let mut w = Worklist::new("n", "A list");
+        w.body = "## Groups\n\n1. a-1\n".into();
+        store.save_worklist(&w).unwrap();
+        start(&store, &w, true).unwrap();
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ev = put(&tmp, "ev", "start waited 20m unclaimed");
+        let fx = put(&tmp, "fx", "claim sooner");
+        let dw = put(&tmp, "dw", "start under 2m");
+        let args = |rest: &[&str], flags: &[(&str, &str)]| Args::synth("retro", rest, flags);
+        let flags = [("defect", ""), ("title", "Unclaimed start waits twenty minutes"), ("evidence", ev.as_str()), ("fix", fx.as_str()), ("done-when", dw.as_str())];
+        assert_eq!(file(&store, &args(&["file", "n"], &flags)), 0);
+        // the same finding again is refused, and a note goes on the open row instead
+        assert_eq!(file(&store, &args(&["file", "n"], &flags)), 1);
+        let rows = store.worklist("retro-1").unwrap().groups()[0].members.clone();
+        assert_eq!(rows.len(), 1, "no duplicate");
+        let nt = put(&tmp, "nt", "seen again: 18m unclaimed");
+        assert_eq!(note(&store, &args(&["note", "n", &rows[0], &nt], &[])), 0);
+        assert!(store.task(&rows[0]).unwrap().body.contains("seen again: 18m unclaimed"));
+        assert_eq!(store.worklist("retro-1").unwrap().groups()[0].members.len(), 1);
+        assert!(store.worklist("retro-ask-1").is_none());
+    }
 }
