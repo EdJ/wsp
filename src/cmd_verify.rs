@@ -247,7 +247,7 @@ use serde_json::json;
 use crate::sharing::{self, Share};
 use crate::store::Store;
 use crate::util;
-use crate::Args;
+use crate::base::args::Args;
 
 pub(crate) use crate::base::git::{git, git_ok, toplevel};
 

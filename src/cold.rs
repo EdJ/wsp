@@ -18,7 +18,8 @@ use crate::cmd_verify::git;
 use crate::greens::{Env, Greens, Reuse};
 use crate::model::{Landed, WorklistStatus};
 use crate::store::Store;
-use crate::{util, Args};
+use crate::base::args::Args;
+use crate::util;
 
 const USAGE: &str = "wsp cold <list|project> [--plan] [--at COMMIT] [--keep]";
 

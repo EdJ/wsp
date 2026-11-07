@@ -6,7 +6,7 @@ use crate::model::Project;
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// What a store *is* when it is new, without saying so.
 ///

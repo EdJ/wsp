@@ -20,7 +20,7 @@ use crate::herdr;
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// Whether work in `project` is inside the mandate on `mandated`.
 ///

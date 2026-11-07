@@ -4,7 +4,6 @@
 affected -> check: *, Of, Step, captures  # trees -> engine
 after -> main: Args  # engine -> top
 artefact -> cmd_agent: my_pane  # store -> seats
-artefact -> main: Args  # store -> top
 at_stop -> check: clean_env, project_of  # trees -> engine
 attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume  # engine -> seats
 attention -> main: build_stamp  # engine -> top
@@ -35,13 +34,11 @@ cmd_burn -> main: Args  # timeline -> top
 cmd_checkout -> check: Step, TREE_WAIT, Target, TreeLock, affected, after_land, owed, passed, plan, run_all, target  # trees -> engine
 cmd_checkout -> cmd_agent: Whereabouts, locate  # trees -> seats
 cmd_checkout -> cmd_spawn: list_root  # trees -> seats
-cmd_checkout -> main: Args  # trees -> top
 cmd_cost -> main: Args  # timeline -> top
 cmd_govern -> main: Args  # seats -> top
 cmd_install -> main: Args, stamp_word  # seats -> top
 cmd_machine -> main: Args  # seats -> top
 cmd_mandate -> herdr: *  # store -> wire
-cmd_mandate -> main: Args  # store -> top
 cmd_message -> agent_commands: of  # engine -> seats
 cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message  # engine -> seats
 cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
@@ -49,7 +46,6 @@ cmd_message -> main: Args  # engine -> top
 cmd_message -> wake: held_because, say  # engine -> seats
 cmd_project -> cmd_govern: Slot, governor_of, slots  # store -> seats
 cmd_project -> cmd_task: Prose, edit_prose, paint_prio  # store -> engine
-cmd_project -> main: Args  # store -> top
 cmd_project -> worklist: home_of_scope  # store -> engine
 cmd_report -> main: Args  # timeline -> top
 cmd_resume -> main: Args  # seats -> top
@@ -64,7 +60,6 @@ cmd_task -> cmd_spawn: kind_or_default  # engine -> seats
 cmd_task -> main: Args  # engine -> top
 cmd_task -> panel: glyph  # engine -> surface
 cmd_verifications -> main: Args  # timeline -> top
-cmd_verify -> main: Args  # trees -> top
 cmd_watch -> daemon: a_backend_answered, loud, running  # seats -> top
 cmd_watch -> main: Args, build_stamp  # seats -> top
 cmd_worklist -> cmd_agent: claim_where, named_project  # engine -> seats
@@ -74,7 +69,6 @@ cmd_worklist -> cmd_report: at_last_barrier, declared, dir, gate_done, line, out
 cmd_worklist -> main: Args  # engine -> top
 cold -> barrier_run: repo_of, tip_of  # trees -> engine
 cold -> check: *, Done, Ran, Step, self  # trees -> engine
-cold -> main: Args  # trees -> top
 cold -> worklist: touched  # trees -> engine
 cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
 cycle -> cmd_agent: did_of_seat, fixed_of_seat, notice, ran_of_seat, secs_of_seat  # engine -> seats
@@ -119,7 +113,6 @@ place_super -> agent_commands: command  # wire -> seats
 place_super -> cmd_burn: cost, cost_of  # wire -> timeline
 place_super -> hold: SECS, hold  # wire -> engine
 place_super -> hold_close: closes, heard  # wire -> engine
-place_super -> main: Args  # wire -> top
 repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats
 repair -> cmd_govern: *  # engine -> seats
@@ -128,19 +121,16 @@ repair -> leaked_agents: tidy  # engine -> top
 repair -> stuck: Kind, Stall  # engine -> seats
 repair -> wake: owed_to, scopes_owed  # engine -> seats
 scratch -> leg_tree: row_of  # store -> trees
-scratch -> main: Args  # store -> top
 stage -> cmd_agent: sentence  # engine -> seats
 stage -> cmd_govern: needs_a_person  # engine -> seats
 stand_down -> cmd_govern: *  # engine -> seats
 stand_down -> wake: owed_to  # engine -> seats
-store -> main: build_stamp  # store -> top
 store -> worklist: Running  # store -> engine
 story -> main: Args  # surface -> top
 stuck -> main: Args  # seats -> top
 sync -> attention: standing  # wire -> engine
 sync -> cmd_agent: answered_by_machine, learn_sessions, may_reap, task_scope  # wire -> seats
 sync -> cmd_govern: learn_seats  # wire -> seats
-throttle -> main: Args  # trees -> top
 timeline -> main: Args  # timeline -> top
 verification -> cmd_attempts: Row, attempts_of  # engine -> timeline
 verification -> main: Args  # engine -> top

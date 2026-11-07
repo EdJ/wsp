@@ -291,11 +291,11 @@ removed per risk; `p0` and `c0-fixtures` are first because they are independent 
 | row | crate | gate before the next cut |
 |---|---|---|
 | `c1` | workspace skeleton + `wsp-base` (+ `wsp-testkit`). `wsp verify`, declared `## Checks`, `affected`, `packet_gen` taught `-p` | install the result; edit `wsp-base` once and time it; the 2534 count |
-| `c2` | `wsp-surface` (3 edges, nothing depends on it) | edit it, time `cargo test --no-run`: **under half the 21–32s, else stop** |
-| `c3` | `wsp-timeline` (7 edges) | |
-| `c4` | `wsp-wire` | |
-| `c5` | `wsp-store`, with `store-contract` | measure the contract-change share of the next 20 commits |
-| `c6` | `wsp-trees` | |
+| `c2` | `wsp-store`, after its seams (wsp-460) | edit it once and time it; the count of tests |
+| `c3` | `wsp-wire`, after its seams | |
+| `c4` | `wsp-trees`, after its seams | |
+
+After phase 2 (`engine` and `seats` cut): `wsp-surface` and `wsp-timeline`. The **surface build gate** (formerly `c2`) moves there: edit `wsp-surface`, time `cargo test --no-run`, **under half the 21–32s, else stop**. It is measurable only once `engine` and `seats` are cut, because until then nothing below `surface` is a crate to rebuild around.
 
 **Phase 2, gated:** `engine` and `seats` (63k lines, 50% of the code) are cut only after `p5` has held for a
 fortnight and the contract-change share is known. If the share is above ~35% the gain is under 40% and the cut is not

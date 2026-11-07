@@ -34,7 +34,7 @@
 //! below take it explicitly, so a test never touches the real one.
 
 use crate::util;
-use crate::Args;
+use crate::base::args::Args;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;

@@ -710,7 +710,7 @@ fn pi_extension_health_in(agent_dir: &Path, problems: &mut Vec<String>, notes: &
 /// record is written into an existing directory or not at all, because a
 /// `SessionEnd` racing a [`Place::stop`] would otherwise recreate a seat that
 /// nothing would ever clear.
-pub fn report(store: &crate::store::Store, args: &crate::Args) -> i32 {
+pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i32 {
     let hook = args.rest.first().cloned().unwrap_or_default();
     let Some(seat) = place::seat_from_env() else { return 0 };
     // `PostToolUse` says nothing about what the agent is doing, so it has no

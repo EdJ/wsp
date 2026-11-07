@@ -1071,7 +1071,7 @@ impl Store {
     }
 
     fn heads_key() -> String {
-        format!("{INDEX_SCHEMA}:{}", crate::build_stamp())
+        format!("{INDEX_SCHEMA}:{}", crate::base::stamp::build_stamp())
     }
 
     fn load_heads(&self) -> BTreeMap<String, (Stamp, TaskHead)> {

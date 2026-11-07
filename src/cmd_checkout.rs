@@ -175,7 +175,7 @@ use crate::cmd_verify::{git, git_ok, toplevel};
 use crate::place::Place;
 use crate::store::Store;
 use crate::util;
-use crate::Args;
+use crate::base::args::Args;
 
 pub(crate) use crate::base::git::{trunk, trunk_branch, trunk_tip, WORKTREES};
 

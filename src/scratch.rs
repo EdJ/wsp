@@ -266,7 +266,7 @@ pub(crate) fn tidy(store: &Store) {
 
 /// `wsp scratch [sweep] [-n] [--json]`: list the scratch of closed rows with
 /// sizes, and with no `-n` remove it, reporting the space really gained.
-pub(crate) fn scratch(store: &Store, args: &crate::Args) -> i32 {
+pub(crate) fn scratch(store: &Store, args: &crate::base::args::Args) -> i32 {
     let dry = args.has("dry-run");
     let found = sized(store);
     let volume_of = |p: &Path| crate::disk::free_at(p);
