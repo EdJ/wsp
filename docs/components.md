@@ -137,7 +137,9 @@ not a structure problem (row `c0-fixtures` below).
 |---|---|---|---|---|
 | `wsp` (root) | `src/` | — | every module not yet cut; the binary, `build.rs`, the stamp (`src/base/stamp.rs`) | this file |
 | `wsp-base` | `crates/base` | `c1` (wsp-408) | `util`, `fm`, `input`, `risk`, `choices`, `base::{args, git, labels, seat, term}` | `crates/base/MAP.md` |
-| `wsp-testkit` | `crates/testkit` | `c1` (wsp-408) | the git repository fixture (`repo`, `repo_at`, `git`); the store-backed half stays in `src/testkit.rs` until `wsp-store` is cut | its `lib.rs` |
+| `wsp-testkit` | `crates/testkit` | `c1` (wsp-408) | the git repository fixture (`repo`, `repo_at`, `git`); the store-backed half is in `crates/store/src/testkit.rs` (a `wsp-testkit` that depended on `wsp-store` would give the store's own unit tests a second `Store`) | its `lib.rs` |
+| `wsp-store` | `crates/store` | `c5` (wsp-412) | `model`, `store`, `resolve`, `message`, `lapse`, `sharing`, `checks`, `caption`, `governors`, `agent_kind`, `log`, `decisions`, `tags`, `verbs`; the store-backed test kit | `crates/store/MAP.md` |
+| `wsp-store-contract` | `crates/store-contract` | `c5` (wsp-412) | the constants the records name (`SCHEMA`, the section lists, `DEFAULT_LEASE`, the policy words); the types stay in `wsp-store` while they carry inherent methods | its `lib.rs` |
 
 `disk` and `memory` are mapped to `base` in the layering table but stay in the root package: each reaches up
 (`cmd_checkout`, `place`). Dependencies are `serde_json` only; the members are path dependencies in the workspace.

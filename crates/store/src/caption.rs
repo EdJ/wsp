@@ -275,7 +275,7 @@ fn strip_tag(t: &str) -> Option<&str> {
 /// Capitalise a plain lowercase word, and only that: `gpui`, `host-gpui`,
 /// `parity.md` and `docs/AGENTS` are names and keep their case. The
 /// prototype's `^[a-z]+(?![-._/\w])`.
-pub(crate) fn capital(t: &str) -> String {
+pub fn capital(t: &str) -> String {
     let run = t.bytes().take_while(|b| b.is_ascii_lowercase()).count();
     let next = t[run..].chars().next();
     let plain = run > 0 && !next.is_some_and(|c| c.is_alphanumeric() || "_-./".contains(c));
@@ -319,7 +319,7 @@ pub fn check(raw: &str) -> Result<(String, Option<String>), String> {
 /// this flag's only when `from_is_ours` — on `worklist group` it already
 /// belongs to `--stop`, and the caller decides who gets it. The note past
 /// [`AIM`] goes to stderr here, so every verb says it in the same words.
-pub fn flag(args: &crate::Args, from_is_ours: bool) -> Result<Option<String>, i32> {
+pub fn flag(args: &crate::base::args::Args, from_is_ours: bool) -> Result<Option<String>, i32> {
     let Some(raw) = args.get("caption") else { return Ok(None) };
     let streams = matches!(raw.trim(), "-" | "true");
     let from = if from_is_ours { args.get("from") } else { None };
@@ -460,7 +460,7 @@ pub fn own(verdict: &str) -> Option<String> {
 /// `verified` reads [`flag`] itself and has no exemption: only an agent wsp
 /// spawned runs it. `word` is what wsp puts in front (`passed`, `held`), so
 /// the refusal says what a caption is in terms of the line it will make.
-pub fn required(args: &crate::Args, verdict: &str, word: &str) -> Result<Option<String>, i32> {
+pub fn required(args: &crate::base::args::Args, verdict: &str, word: &str) -> Result<Option<String>, i32> {
     match flag(args, false)? {
         Some(c) if !c.is_empty() => return Ok(Some(c)),
         _ => {}

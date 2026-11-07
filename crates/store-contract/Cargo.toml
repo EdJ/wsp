@@ -1,0 +1,8 @@
+[package]
+name = "wsp-store-contract"
+version = "0.1.0"
+edition = "2021"
+description = "wsp-store's contract: the constants and (later) types other components may name; no logic"
+
+[lib]
+path = "src/lib.rs"

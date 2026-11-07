@@ -2407,7 +2407,7 @@ pub fn all(store: &Store) -> Vec<Message> {
 /// one, so a rule for resolving scope names would be tested against fixtures
 /// alone. When a scope-raising path lands, this is the check that grows the
 /// other arm.
-pub(crate) fn health(
+pub fn health(
     store: &Store,
     tasks: &[crate::model::Task],
     archived: &[String],

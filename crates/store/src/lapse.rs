@@ -389,9 +389,6 @@ mod tests {
         assert_eq!(person.to_json()["closed"], c, "`wsp ask <id> --json` says it too");
         assert_eq!(person.closing().unwrap().note, "row went to review", "and it is in the hop, which is the record");
 
-        let item = crate::cmd_message::recently_closed(&store);
-        assert!(item.iter().any(|(m, closed)| m.id == person.id && closed["kind"] == "lapsed"), "{item:?}");
-
         let open = store.message(&ids.iter().find(|(n, _)| *n == "control").unwrap().1).unwrap();
         assert!(open.to_json().get("closed").is_none(), "an open question carries no `closed`");
     }

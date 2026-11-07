@@ -5,7 +5,7 @@ use crate::model::Task;
 
 /// Apply `+tag`, `-tag` and bare `tag` changes in order. Returns the tags a
 /// removal named that the task did not carry.
-pub(crate) fn adjust(t: &mut Task, changes: &[String]) -> Vec<String> {
+pub fn adjust(t: &mut Task, changes: &[String]) -> Vec<String> {
     let mut absent: Vec<String> = Vec::new();
     for c in changes {
         if let Some(add) = c.strip_prefix('+') {

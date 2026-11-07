@@ -75,7 +75,7 @@ pub fn seat_of_scope(scope: &str, governors: &BTreeMap<String, Value>) -> Option
     governors.get(scope).and_then(|rec| seat_of(scope, rec))
 }
 
-pub(crate) fn seat_of(scope: &str, rec: &Value) -> Option<Seat> {
+pub fn seat_of(scope: &str, rec: &Value) -> Option<Seat> {
     let host = rec.get("host").and_then(Value::as_str).unwrap_or("");
     if !host.is_empty() && host != util::hostname() {
         return None;
@@ -98,7 +98,7 @@ pub(crate) fn seat_of(scope: &str, rec: &Value) -> Option<Seat> {
     })
 }
 
-pub(crate) fn str_at(rec: &Value, key: &str) -> String {
+pub fn str_at(rec: &Value, key: &str) -> String {
     rec.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
@@ -279,7 +279,7 @@ pub const STOOD_DOWN: &str = "stood_down";
 /// different subset of those three would be a reader whose idea of "claimed" is
 /// not the reconciler's.** A hand-edited `0` and a hand-edited `"soon"` both mean
 /// nothing here, and both mean the claim is not held.
-pub(crate) fn at_of(rec: &Value, key: &str) -> Option<i64> {
+pub fn at_of(rec: &Value, key: &str) -> Option<i64> {
     let at = util::epoch_of(&str_at(rec, key));
     (at > 0).then_some(at)
 }
@@ -347,7 +347,7 @@ pub fn vacancy(governors: &BTreeMap<String, Value>, scope: &str) -> Vacancy {
 impl Vacancy {
     /// The markers as one record carries them. `None` is a record with none of
     /// them, which is every record written before `wsp-148`.
-    pub(crate) fn of(rec: &Value) -> Vacancy {
+    pub fn of(rec: &Value) -> Vacancy {
         Vacancy {
             unseated: rec.get("unseated").and_then(Value::as_u64).unwrap_or(0),
             reseating: at_of(rec, "reseating"),

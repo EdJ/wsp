@@ -195,15 +195,15 @@ pub enum Address {
 /// The efforts `pi` takes. Held here, below the registry, so `model::Policy`
 /// can tell an effort word from a model name without reaching up to
 /// `agent_commands`.
-pub(crate) const PI_THINKING: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+pub const PI_THINKING: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// The efforts `claude` takes.
-pub(crate) const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// The effort levels a kind accepts: what `agent_commands::of(kind).efforts()`
 /// answers, which only `pi` and `claude` give (a data kind and the rest have no
 /// such knob).
-pub(crate) fn efforts_of(kind: &str) -> &'static [&'static str] {
+pub fn efforts_of(kind: &str) -> &'static [&'static str] {
     match kind.trim() {
         "claude" => CLAUDE_EFFORTS,
         "pi" => PI_THINKING,

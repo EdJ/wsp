@@ -375,7 +375,7 @@ fn no_new_upward_edge_and_the_allowlist_only_shrinks() {
     for c in comp.values() {
         assert!(rank.contains_key(c.as_str()));
     }
-    let (mods, edges) = product_edges(&[root.join("src"), root.join("crates/base/src")]);
+    let (mods, edges) = product_edges(&[root.join("src"), root.join("crates/base/src"), root.join("crates/store/src")]);
 
     let unmapped: Vec<&String> = mods.iter().filter(|m| !comp.contains_key(*m)).collect();
     assert!(

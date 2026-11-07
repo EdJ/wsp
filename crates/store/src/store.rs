@@ -115,13 +115,13 @@ impl Found {
 /// more — about 2 ms on an 1800-task store — so a hand edit, a `git checkout`
 /// or another process's write moves it as surely as this process's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Generations {
-    pub(crate) tasks: u64,
-    pub(crate) projects: u64,
-    pub(crate) worklists: u64,
+pub struct Generations {
+    pub tasks: u64,
+    pub projects: u64,
+    pub worklists: u64,
     /// Every state JSON file's stamp, folded: these are one file each, and
     /// the stamp is the whole of what changed about one.
-    pub(crate) state: u64,
+    pub state: u64,
 }
 
 pub struct Store {
@@ -274,6 +274,11 @@ impl MachineLive {
     }
 }
 
+/// The build stamp of the binary that links this crate. `build.rs` writes the
+/// variables it is made of for the root package only, so the binary hands the
+/// function over once, at start (`main`), and the index key reads it here.
+pub static BUILD_STAMP: std::sync::OnceLock<fn() -> String> = std::sync::OnceLock::new();
+
 impl Store {
     pub fn open() -> Store {
         // The default store is the developer's own, at `~/wsp`, and a test that
@@ -283,7 +288,7 @@ impl Store {
         // this is the line that makes a test that reads the live store
         // impossible to write by accident rather than merely discouraged. It
         // compiles out of the binary entirely, so no shipped path can tell.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         assert!(
             std::env::var_os("WSP_HOME").is_some() && std::env::var_os("WSP_STATE").is_some(),
             "a test opened the live store — take crate::util::isolated() instead"
@@ -751,11 +756,11 @@ impl Store {
 
     /// `pickup.json`: what the daemon's pickup of planned lists has seen and
     /// done (`wsp-384`) — [`crate::pickup`] owns its shape.
-    pub(crate) fn pickup(&self) -> Value {
+    pub fn pickup(&self) -> Value {
         self.read_json("pickup.json")
     }
 
-    pub(crate) fn update_pickup(&self, f: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+    pub fn update_pickup(&self, f: impl FnOnce(&mut serde_json::Map<String, Value>)) {
         self.update_json("pickup.json", f)
     }
 
@@ -788,7 +793,7 @@ impl Store {
         }
     }
 
-    pub(crate) fn update_starts(&self, f: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+    pub fn update_starts(&self, f: impl FnOnce(&mut serde_json::Map<String, Value>)) {
         self.update_json("starts.json", f);
     }
 
@@ -833,7 +838,7 @@ impl Store {
     /// of `worklists/` still happens — a `stat` per file, which is what notices
     /// a hand edit — and only the copying and deriving are saved. One memo: a
     /// second kind of answer replaces the first.
-    pub(crate) fn derived_from_worklists<T: 'static>(&self, derive: impl Fn(&[Worklist]) -> T) -> std::rc::Rc<T> {
+    pub fn derived_from_worklists<T: 'static>(&self, derive: impl Fn(&[Worklist]) -> T) -> std::rc::Rc<T> {
         let generation = self.generations().worklists;
         if let Some((g, r)) = &*self.running_memo.borrow() {
             if *g == generation {
@@ -851,7 +856,7 @@ impl Store {
     ///
     /// Inside [`Store::steady`] this is read once and then trusted until this
     /// process writes something, rather than walked again on every asking.
-    pub(crate) fn generations(&self) -> Generations {
+    pub fn generations(&self) -> Generations {
         if self.steady_depth.get() == 0 {
             return self.walk_generations();
         }
@@ -878,7 +883,7 @@ impl Store {
     /// was most of what an idle daemon still cost once the parsing was cached.
     /// This thread's own writes are noticed at once, because every one of
     /// them goes through `replace` or [`Store::wrote`].
-    pub(crate) fn steady<T>(&self, f: impl FnOnce() -> T) -> T {
+    pub fn steady<T>(&self, f: impl FnOnce() -> T) -> T {
         self.steady_depth.set(self.steady_depth.get() + 1);
         let out = f();
         self.steady_depth.set(self.steady_depth.get() - 1);
@@ -954,7 +959,7 @@ impl Store {
     /// goes stale the day one more is read, and keyed on all of them it is only
     /// ever recomputed too often. A write the reading itself makes moves the
     /// generations too, so the next asking derives afresh.
-    pub(crate) fn remembered<T: 'static>(&self, name: &'static str, derive: impl FnOnce() -> T) -> std::rc::Rc<T> {
+    pub fn remembered<T: 'static>(&self, name: &'static str, derive: impl FnOnce() -> T) -> std::rc::Rc<T> {
         let now = self.generations();
         if let Some((at, v)) = self.memos.borrow().get(name) {
             if *at == now {
@@ -1075,7 +1080,7 @@ impl Store {
     }
 
     fn heads_key() -> String {
-        format!("{INDEX_SCHEMA}:{}", crate::base::stamp::build_stamp())
+        format!("{INDEX_SCHEMA}:{}", BUILD_STAMP.get().map(|f| f()).unwrap_or_default())
     }
 
     fn load_heads(&self) -> BTreeMap<String, (Stamp, TaskHead)> {
@@ -1990,7 +1995,7 @@ impl Store {
 
     // ---- ephemeral state ------------------------------------------------
 
-    pub(crate) fn state_file(&self, name: &str) -> PathBuf {
+    pub fn state_file(&self, name: &str) -> PathBuf {
         self.state.join(name)
     }
 
@@ -2103,7 +2108,7 @@ impl Store {
     /// A file that cannot be stat'd is read and not kept, as in
     /// [`Store::cached_dir`]; a file that is not there reads as `{}`, and is
     /// not kept either, so its appearance is noticed on the next call.
-    pub(crate) fn read_json_shared(&self, name: &str) -> std::rc::Rc<Value> {
+    pub fn read_json_shared(&self, name: &str) -> std::rc::Rc<Value> {
         let path = self.state_file(name);
         let stamp = fs::metadata(&path).ok().as_ref().and_then(stamp_of);
         if let Some(stamp) = stamp {
@@ -2531,7 +2536,7 @@ impl Store {
 
     /// Put one back, for the tests that drive the migration and for nothing
     /// else — there is no verb that writes this file any more.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_legacy_flag(&self, task: &str, value: Value) {
         self.update_json("flags.json", |f| {
             f.insert(task.to_string(), value);
@@ -2688,12 +2693,12 @@ impl Store {
 
     /// pane (or `pid:N`) -> watch record: scope, pid, and when it last ticked.
     /// One watch record, without copying the rest of `watches.json` out.
-    pub(crate) fn watch(&self, key: &str) -> Option<Value> {
+    pub fn watch(&self, key: &str) -> Option<Value> {
         self.read_json_shared("watches.json").get(key).cloned()
     }
 
     /// The keys of `watches.json` that start with `prefix`.
-    pub(crate) fn watch_keys(&self, prefix: &str) -> Vec<String> {
+    pub fn watch_keys(&self, prefix: &str) -> Vec<String> {
         match &*self.read_json_shared("watches.json") {
             Value::Object(m) => m.keys().filter(|k| k.starts_with(prefix)).cloned().collect(),
             _ => Vec::new(),
@@ -3587,10 +3592,10 @@ fn replace(path: &Path, contents: &str, durable: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// What `cycle.log` was told this thread, in order.
-    pub(crate) static SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub static SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// One dated line in `cycle.log`, **appended to the file**, and the one way a
@@ -3614,14 +3619,14 @@ thread_local! {
 /// twice (`wsp-217`); the daemon's is `daemon.log`. A terminal or an agent's
 /// pipe is somebody reading what the verb they ran did, which is what `stamp`
 /// gave them and what they still get.
-pub(crate) fn log_line(store: &Store, line: &str) {
+pub fn log_line(store: &Store, line: &str) {
     // The in-memory record is for the tests to read what was said; the file is
     // written whatever that says, because a test asserting on a record the same
     // function produced proves nothing about the file. The isolated store a
     // test uses is a throwaway directory, so writing it costs nothing and keeps
     // this assertion honest. Nothing is echoed under test: the harness's stdout
     // is whatever ran it, and the decision is [`a_reader`]'s, tested alone.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     SAID.with(|s| s.borrow_mut().push(line.to_string()));
     let at = util::now_iso();
     if let Ok(mut out) = std::fs::OpenOptions::new()
@@ -3632,7 +3637,7 @@ pub(crate) fn log_line(store: &Store, line: &str) {
         use std::io::Write;
         let _ = writeln!(out, "{at} {line}");
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     if a_reader(stdout_meta().as_ref()) {
         use std::io::Write;
         let _ = writeln!(std::io::stdout(), "{at} {line}");
@@ -3645,11 +3650,11 @@ pub(crate) fn log_line(store: &Store, line: &str) {
 /// itself under [`launch`], `daemon.log` under launchd. Anything else — a
 /// terminal, an agent's pipe, `/dev/null`, or a stdout nobody could look at — is
 /// echoed to, which costs nothing where nobody reads it.
-pub(crate) fn a_reader(stdout: Option<&std::fs::Metadata>) -> bool {
+pub fn a_reader(stdout: Option<&std::fs::Metadata>) -> bool {
     !stdout.is_some_and(|m| m.is_file())
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn stdout_meta() -> Option<std::fs::Metadata> {
     use std::os::fd::AsFd;
     let fd = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
@@ -4794,29 +4799,6 @@ mod tests {
         let _ = fs::remove_dir_all(&store.root);
     }
 
-    /// [`Store::running`] answers again from its memo while no list has moved,
-    /// and derives afresh the moment one has — including a list written by
-    /// hand, which nothing in this process was told about.
-    #[test]
-    fn running_is_remembered_until_a_list_moves() {
-        let store = scratch("running-memo");
-        store.save_worklist(&Worklist::new("l", "a list")).unwrap();
-        let first = crate::worklist::Running::read(&store);
-        assert!(std::rc::Rc::ptr_eq(&first, &crate::worklist::Running::read(&store)), "nothing moved and it was derived again");
-
-        let path = store.worklist_path("l");
-        let text = fs::read_to_string(&path).unwrap();
-        fs::write(&path, text.replace("a list", "a list, edited by hand")).unwrap();
-        assert!(!std::rc::Rc::ptr_eq(&first, &crate::worklist::Running::read(&store)), "a hand edit was answered from the memo");
-
-        fs::remove_file(&path).unwrap();
-        let after = crate::worklist::Running::read(&store);
-        assert!(!std::rc::Rc::ptr_eq(&first, &after));
-        assert!(std::rc::Rc::ptr_eq(&after, &crate::worklist::Running::read(&store)));
-
-        let _ = fs::remove_dir_all(&store.root);
-    }
-
     /// [`Generations`] moves for every kind of change a derived reading could
     /// have read — this process's own write, a hand edit, another process's
     /// state write, a file gone — and stands still while nothing moved.
@@ -4965,7 +4947,7 @@ mod tests {
         written(&store, "wsp-001", "## Verification\n- pass\n");
         written(&store, "wsp-002", "## Overview\nplain\n");
         let tasks = Store::at(store.root.clone(), store.state.clone())
-            .tasks_with_sections(&[crate::verification::SECTION]);
+            .tasks_with_sections(&["Verification"]);
         assert_eq!(tasks.len(), 2);
         assert!(tasks[0].body.contains("## Verification"), "the body asked for was not read");
         assert!(tasks[1].body.is_empty(), "a body not asked for was read");

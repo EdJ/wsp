@@ -256,7 +256,7 @@ mod tests {
         let mut p = Project::new("x");
         assert!(!p.render().contains("at_stop"), "an empty key was written");
         p.at_stop = "[ -x a ] && a stop".into();
-        let back = Project::from_doc(&crate::fm::parse(&p.render()), "x");
+        let back = Project::from_doc(&wsp_base::fm::parse(&p.render()), "x");
         assert_eq!(back.at_stop, "[ -x a ] && a stop");
     }
 

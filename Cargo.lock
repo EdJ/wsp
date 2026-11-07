@@ -97,6 +97,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "wsp-base",
+ "wsp-store",
  "wsp-testkit",
 ]
 
@@ -106,6 +107,19 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
+
+[[package]]
+name = "wsp-store"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-base",
+ "wsp-store-contract",
+]
+
+[[package]]
+name = "wsp-store-contract"
+version = "0.1.0"
 
 [[package]]
 name = "wsp-testkit"

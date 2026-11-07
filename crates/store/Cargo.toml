@@ -1,0 +1,19 @@
+[package]
+name = "wsp-store"
+version = "0.1.0"
+edition = "2021"
+description = "wsp's records: Task, Project, Worklist, Message, Machine and the Store that writes them"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+wsp-base = { path = "../base" }
+wsp-store-contract = { path = "../store-contract" }
+
+[dev-dependencies]
+wsp-base = { path = "../base", features = ["test-support"] }
+
+[features]
+test-support = []

@@ -12,31 +12,31 @@ use crate::store::Store;
 
 /// What `wsp land` writes in a task's `## Log` when its branch reaches the trunk
 /// (the full story is on [`crate::repair`]'s use of it).
-pub(crate) const LANDED: &str = "wsp: landed";
+pub const LANDED: &str = "wsp: landed";
 
 /// Append a dated entry to a task's log; the caller saves.
-pub(crate) fn append(t: &mut Task, line: &str) {
+pub fn append(t: &mut Task, line: &str) {
     append_dated(&mut t.body, "Log", line);
 }
 
 /// Append a dated entry to a worklist's log; the caller saves.
-pub(crate) fn append_to_list(w: &mut Worklist, line: &str) {
+pub fn append_to_list(w: &mut Worklist, line: &str) {
     append_dated_in_order(&mut w.body, "Log", line, &WORKLIST_SECTIONS);
 }
 
 /// Append a dated entry to a bare body (a record edited as text).
-pub(crate) fn append_to_body(body: &mut String, line: &str) {
+pub fn append_to_body(body: &mut String, line: &str) {
     append_dated(body, "Log", line);
 }
 
 /// Record an entry on a task and save it.
-pub(crate) fn note(store: &Store, t: &mut Task, line: &str) -> std::io::Result<()> {
+pub fn note(store: &Store, t: &mut Task, line: &str) -> std::io::Result<()> {
     append(t, line);
     store.save_task(t)
 }
 
 /// Record an entry on a worklist and save it.
-pub(crate) fn note_to_list(store: &Store, w: &mut Worklist, line: &str) -> std::io::Result<()> {
+pub fn note_to_list(store: &Store, w: &mut Worklist, line: &str) -> std::io::Result<()> {
     append_to_list(w, line);
     store.save_worklist(w)
 }

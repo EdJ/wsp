@@ -1924,6 +1924,29 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
+    /// [`Store::running`] answers again from its memo while no list has moved,
+    /// and derives afresh the moment one has — including a list written by
+    /// hand, which nothing in this process was told about.
+    #[test]
+    fn running_is_remembered_until_a_list_moves() {
+        let store = crate::testkit::store("running-memo");
+        store.save_worklist(&Worklist::new("l", "a list")).unwrap();
+        let first = Running::read(&store);
+        assert!(std::rc::Rc::ptr_eq(&first, &Running::read(&store)), "nothing moved and it was derived again");
+
+        let path = store.worklist_path("l");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("a list", "a list, edited by hand")).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&first, &Running::read(&store)), "a hand edit was answered from the memo");
+
+        std::fs::remove_file(&path).unwrap();
+        let after = Running::read(&store);
+        assert!(!std::rc::Rc::ptr_eq(&first, &after));
+        assert!(std::rc::Rc::ptr_eq(&after, &Running::read(&store)));
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
     /// A store of its own, a repository beside it, and the project pointing at
     /// the second — which is what the landing question walks. The process is
     /// pointed at the store as well: `Repos` reads `ids.json` through it and

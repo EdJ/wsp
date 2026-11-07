@@ -9,12 +9,10 @@ use std::collections::{HashMap, HashSet};
 
 mod affected;
 mod base;
-pub(crate) use wsp_base::{choices, fm, input, risk, util};
+pub(crate) use wsp_base::{choices, input, risk, util};
+pub(crate) use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, log, message, model, resolve, sharing, store, tags, verbs};
 mod at_stop;
 mod artefact;
-mod verbs;
-mod log;
-mod tags;
 mod registry;
 mod after;
 mod closing;
@@ -24,18 +22,14 @@ mod packet_gen;
 mod verifier_packet;
 mod agent_commands;
 mod barrier;
-mod checks;
 mod barrier_replay;
 mod barrier_run;
 mod cold;
-mod caption;
 mod hold;
 mod hold_close;
-mod lapse;
 #[cfg(test)]
 mod testkit;
 mod check;
-mod decisions;
 mod greens;
 mod build_output;
 mod check_tree;
@@ -52,8 +46,6 @@ mod cmd_burn;
 mod cmd_cost;
 mod cmd_report;
 mod cmd_checkout;
-mod governors;
-mod agent_kind;
 mod cmd_govern;
 mod cmd_install;
 mod cmd_machine;
@@ -95,8 +87,6 @@ mod kind_attention;
 mod cmd_attend;
 mod launchd;
 mod memory;
-mod message;
-mod model;
 mod overlap;
 mod panel;
 mod place;
@@ -104,15 +94,12 @@ mod place_compound;
 mod place_herdr;
 mod place_super;
 mod repair;
-mod resolve;
 mod room;
-mod sharing;
 mod split;
 mod stage;
 mod starts;
 mod stand_down;
 mod story;
-mod store;
 mod stuck;
 mod sync;
 mod throttle;
@@ -500,6 +487,7 @@ fn needs_store(args: &Args) -> bool {
 
 fn main() {
     die_on_broken_pipe();
+    let _ = store::BUILD_STAMP.set(base::stamp::build_stamp);
     cmd_checkout::install_engine(cmd_checkout::Engine {
         passed: worklist::passed_by_running,
         poke_task: cycle::poke_task,

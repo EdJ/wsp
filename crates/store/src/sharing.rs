@@ -104,14 +104,14 @@ use std::process::Command;
 /// directory — 295M for this crate, several gigabytes for a large one — and the
 /// leak this replaces was thirty trees and 9.6G. Beyond three, a build takes
 /// the private cold tree rather than waiting.
-pub(crate) const WARM_TREES: usize = 3;
+pub const WARM_TREES: usize = 3;
 
 /// A warm build tree, held for the length of one build.
 ///
 /// The lock is the whole point: two builds in one tree at once would be the
 /// shared-checkout failure this arrangement exists to prevent, arriving from
 /// the other side.
-pub(crate) struct Warm {
+pub struct Warm {
     /// The directory holding `tree` and `target`.
     pub dir: PathBuf,
     /// Which one it is, for saying so out loud.
@@ -127,12 +127,12 @@ impl Drop for Warm {
 
 impl Warm {
     /// The worktree that gets reset to the caller's HEAD and patched.
-    pub(crate) fn tree(&self) -> PathBuf {
+    pub fn tree(&self) -> PathBuf {
         self.dir.join("tree")
     }
 
     /// Its `CARGO_TARGET_DIR`, which is the part worth keeping.
-    pub(crate) fn target(&self) -> PathBuf {
+    pub fn target(&self) -> PathBuf {
         self.dir.join("target")
     }
 }
@@ -142,7 +142,7 @@ impl Warm {
 /// Keyed on the repository rather than on the agent or the task, which is the
 /// whole change: an agent is new every spawn and a task is new every day, so
 /// either key guarantees a cold build. The repository is the thing that stays.
-pub(crate) fn warm(state: &Path, repo: &Path, slots: usize) -> Option<Warm> {
+pub fn warm(state: &Path, repo: &Path, slots: usize) -> Option<Warm> {
     let name = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     claim(&state.join("warm"), &crate::util::slugify(name), slots, alive)
 }
@@ -153,7 +153,7 @@ pub(crate) fn warm(state: &Path, repo: &Path, slots: usize) -> Option<Warm> {
 /// away. Held ones are left where they are: a build standing in a tree is the
 /// one thing that must not have it removed underneath it, and the next `--rm`
 /// will find it free.
-pub(crate) fn warm_each(state: &Path, repo: &Path, slots: usize) -> Vec<Warm> {
+pub fn warm_each(state: &Path, repo: &Path, slots: usize) -> Vec<Warm> {
     let name = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     let root = state.join("warm");
     let repo = crate::util::slugify(name);
@@ -165,7 +165,7 @@ pub(crate) fn warm_each(state: &Path, repo: &Path, slots: usize) -> Vec<Warm> {
 /// For `wsp verify --rm`, which knows exactly which tree it wants: the one this
 /// agent's last build went to, read back off the pointer that build left. A
 /// held tree comes back `None` and stays where it is.
-pub(crate) fn warm_named(dir: &Path) -> Option<Warm> {
+pub fn warm_named(dir: &Path) -> Option<Warm> {
     let root = dir.parent()?;
     let name = dir.file_name()?.to_str()?;
     let (repo, slot) = name.rsplit_once('-')?;
@@ -229,7 +229,7 @@ fn claim_at(
 /// Held by the caller for the length of the build and dropped after it, which
 /// is the whole lifetime: a registration that outlived its build would make
 /// every later build smaller for nothing.
-pub(crate) struct Share {
+pub struct Share {
     /// Cargo jobs this build may run at once.
     pub jobs: usize,
     /// What the machine has.
@@ -258,7 +258,7 @@ impl Drop for Share {
 /// bargain every other machine-local fact wsp keeps makes. It costs a `wsp
 /// sandbox` its own budget, and that is the right way round: a sandbox exists
 /// so that nothing it does reaches what the real agents read.
-pub(crate) fn take(state: &Path) -> Share {
+pub fn take(state: &Path) -> Share {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let dir = state.join("building");
     let _ = std::fs::create_dir_all(&dir);
@@ -281,7 +281,7 @@ impl Share {
     /// `CARGO_BUILD_JOBS` rather than `--jobs`, because the argv is the thing
     /// this command prints and an agent reading `cargo test --quiet -j2` in the
     /// output would reasonably try to reproduce it by typing it.
-    pub(crate) fn apply(&self, cmd: &mut Command) {
+    pub fn apply(&self, cmd: &mut Command) {
         cmd.env("CARGO_BUILD_JOBS", self.jobs.to_string());
     }
 
@@ -291,7 +291,7 @@ impl Share {
     /// a quarter of the cores is the answer to "why did this take four minutes
     /// today and one minute yesterday", which is what the swing has been
     /// costing. A machine to itself says nothing at all.
-    pub(crate) fn note(&self) -> Option<String> {
+    pub fn note(&self) -> Option<String> {
         (self.live > 1)
             .then(|| format!("{} of {} jobs · {} builds here", self.jobs, self.cores, self.live))
     }
@@ -302,8 +302,8 @@ impl Share {
 /// For tests that reach a `cargo` call they never intend to let run: the
 /// registration is the only part with a side effect, and a test that took a
 /// real one would be counted by every build running beside it.
-#[cfg(test)]
-pub(crate) fn unregistered() -> Share {
+#[cfg(any(test, feature = "test-support"))]
+pub fn unregistered() -> Share {
     Share { jobs: 1, cores: 1, live: 1, slot: None }
 }
 

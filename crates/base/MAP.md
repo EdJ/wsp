@@ -25,8 +25,8 @@ package turns on for its dev build only.
 ## Does not hold
 
 - the build stamp (`build_stamp`, `stamp_word`) — `src/base/stamp.rs` in `wsp`, because `build.rs` writes `WSP_COMMIT`
-- the store, `Task`, `Project` — `src/store.rs`, `src/model.rs` (`wsp`, later `wsp-store`)
-- the git repo test fixture — `crates/testkit`; the store-backed fixture — `src/testkit.rs`
+- the store, `Task`, `Project` — `crates/store` (`wsp-store`)
+- the git repo test fixture — `crates/testkit`; the store-backed fixture — `crates/store/src/testkit.rs`
 - `disk`, `memory` — still in `wsp`; each reaches up (`cmd_checkout`, `place`)
 
 ## Tests

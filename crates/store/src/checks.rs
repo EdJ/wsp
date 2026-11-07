@@ -6,7 +6,7 @@ use crate::util;
 
 /// Where a check is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum State {
+pub enum State {
     /// Opened, and no verdict yet. Its seat may not exist yet either.
     Running,
     /// `go`: the barrier is passed.
@@ -24,7 +24,7 @@ pub(crate) enum State {
 }
 
 impl State {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             State::Running => "running",
             State::Passes => "passes",
@@ -48,7 +48,7 @@ impl State {
     }
 
     /// What a reader is told it said.
-    pub(crate) fn said(self) -> &'static str {
+    pub fn said(self) -> &'static str {
         match self {
             State::Running => "checking",
             State::Passes => "passed",
@@ -63,7 +63,7 @@ impl State {
 /// Whether the check's seat has been ended. **Failed is terminal**, for
 /// `verification::Ending`'s reason: tried once, said once in `cycle.log`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum Ending {
+pub enum Ending {
     #[default]
     Standing,
     Ended,
@@ -72,7 +72,7 @@ pub(crate) enum Ending {
 
 /// One check on one barrier.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Check {
+pub struct Check {
     /// When it was opened, as `util::now_iso` writes it.
     pub at: String,
     pub state: State,
@@ -107,7 +107,7 @@ pub(crate) struct Check {
 
 /// The process of a barrier's mechanical run: `pid:25037@Tue_Nov_4_11:19:05_2026`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Run {
+pub struct Run {
     pub pid: u32,
     /// `ps -o lstart=` for the pid, its spaces written as `_`.
     pub started: String,
@@ -115,7 +115,7 @@ pub(crate) struct Run {
 
 impl Run {
     /// The running process's own.
-    pub(crate) fn this() -> Option<Run> {
+    pub fn this() -> Option<Run> {
         let pid = std::process::id();
         Some(Run { pid, started: start_of(pid).ok()?? })
     }
@@ -131,7 +131,7 @@ impl Run {
 
     /// Whether the process is gone: no such pid, or one that started at another
     /// time. A `ps` that cannot be run says nothing, and the run is believed.
-    pub(crate) fn gone(&self) -> bool {
+    pub fn gone(&self) -> bool {
         match start_of(self.pid) {
             Ok(now) => now.as_deref() != Some(self.started.as_str()),
             Err(()) => false,
@@ -152,7 +152,7 @@ fn start_of(pid: u32) -> Result<Option<String>, ()> {
 /// the pid, so it is `Err` and a live run is not read as dead on it. A `ps` that
 /// itself fails with exit 1 and prints nothing cannot be told from a missing
 /// pid, and reads as gone: the lock (`open_unless_held`) is what covers that.
-pub(crate) fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
+pub fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
     if code != Some(0) && !(code == Some(1) && stdout.iter().all(u8::is_ascii_whitespace)) {
         return Err(());
     }
@@ -164,14 +164,14 @@ pub(crate) fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>
 /// Where the barrier's mechanical run is: the project's full suite, the
 /// members' recorded checks and the stop condition's `stop-checks`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Suite {
+pub enum Suite {
     Running,
     Green,
     Red,
 }
 
 impl Suite {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Suite::Running => "running",
             Suite::Green => "green",
@@ -190,7 +190,7 @@ impl Suite {
 }
 
 impl Check {
-    pub(crate) fn opened(read: Option<String>, on: Option<String>) -> Check {
+    pub fn opened(read: Option<String>, on: Option<String>) -> Check {
         Check {
             at: util::now_iso(),
             state: State::Running,
@@ -209,7 +209,7 @@ impl Check {
 
     /// Its mechanical run was started by a process that is no longer there, and
     /// left no result.
-    pub(crate) fn run_died(&self) -> bool {
+    pub fn run_died(&self) -> bool {
         self.suite == Some(Suite::Running) && self.pane.is_none() && self.run.as_ref().is_some_and(Run::gone)
     }
 
@@ -218,7 +218,7 @@ impl Check {
     /// never. A run known to be dead waits for nothing (while it has tries
     /// left, each retake being one); one whose process is alive, or unknown, is
     /// believed for [`SUITE_WEDGED_AFTER`] at most.
-    pub(crate) fn wait_before_next_try(&self) -> Option<i64> {
+    pub fn wait_before_next_try(&self) -> Option<i64> {
         if self.run_died() {
             return (self.tries < TRIES).then_some(-1);
         }
@@ -229,23 +229,23 @@ impl Check {
     }
 
     /// Still somebody's: opened and not yet settled.
-    pub(crate) fn open(&self) -> bool {
+    pub fn open(&self) -> bool {
         self.state == State::Running
     }
 
     /// A seat that has not been ended.
-    pub(crate) fn standing(&self) -> Option<&str> {
+    pub fn standing(&self) -> Option<&str> {
         self.pane.as_deref().filter(|_| self.ending == Ending::Standing)
     }
 
     /// An open entry with no agent in it and no more starts to give it.
-    pub(crate) fn spent(&self) -> bool {
+    pub fn spent(&self) -> bool {
         self.open() && self.pane.is_none() && self.tries >= TRIES
     }
 }
 
 /// Whether a token starts an entry: an instant as `now_iso` writes one.
-pub(crate) fn instant(tok: &str) -> bool {
+pub fn instant(tok: &str) -> bool {
     let b = tok.as_bytes();
     b.len() == 20 && b[4] == b'-' && b[10] == b'T' && b[19] == b'Z' && b[0].is_ascii_digit()
 }
@@ -253,7 +253,7 @@ pub(crate) fn instant(tok: &str) -> bool {
 /// One token stream of a `checks:` block, folded into the entries already read
 /// — the walk `model::landed_push` does, for the same reason: a continuation
 /// line is the same walk run again, so wrapping is free.
-pub(crate) fn push(acc: &mut Vec<Check>, text: &str) {
+pub fn push(acc: &mut Vec<Check>, text: &str) {
     for tok in text.split_whitespace() {
         if tok == "·" {
             continue;
@@ -301,7 +301,7 @@ pub(crate) fn push(acc: &mut Vec<Check>, text: &str) {
 }
 
 /// A `checks:` block as the file holds it: the inverse of [`push`].
-pub(crate) fn text(checks: &[Check]) -> String {
+pub fn text(checks: &[Check]) -> String {
     let mut out: Vec<String> = Vec::new();
     for c in checks {
         let mut e = vec![c.at.clone(), c.state.as_str().to_string()];
@@ -344,7 +344,7 @@ pub(crate) fn text(checks: &[Check]) -> String {
 
 /// How many times an entry's agent is started before the run stops trying and
 /// flags the person (`wsp-328`).
-pub(crate) const TRIES: u32 = 3;
+pub const TRIES: u32 = 3;
 
 /// How long an open entry waits with no seat after its first start, and after
 /// its second, before the agent is started again (`wsp-328`). Thirty seconds
@@ -353,10 +353,10 @@ pub(crate) const TRIES: u32 = 3;
 /// two minutes after that so a full disk or an overloaded API has room to
 /// recover (wsp-427: the three and five minutes this was cost react-pass-1 90
 /// minutes on its critical paths).
-pub(crate) const RETRY_BACKOFF: [i64; 2] = [30, 2 * 60];
+pub const RETRY_BACKOFF: [i64; 2] = [30, 2 * 60];
 
 /// The wait after `tries` starts, in seconds, and `None` once they are spent.
-pub(crate) fn wait_after(tries: u32) -> Option<i64> {
+pub fn wait_after(tries: u32) -> Option<i64> {
     match tries {
         0 => RETRY_BACKOFF.first().copied(),
         n => RETRY_BACKOFF.get(n as usize - 1).copied().filter(|_| n < TRIES),
@@ -365,5 +365,5 @@ pub(crate) fn wait_after(tries: u32) -> Option<i64> {
 
 /// And while its suite is running: the longest a barrier's run is believed,
 /// the steps' own limits being what end it sooner.
-pub(crate) const SUITE_WEDGED_AFTER: i64 = 3 * 60 * 60;
+pub const SUITE_WEDGED_AFTER: i64 = 3 * 60 * 60;
 
