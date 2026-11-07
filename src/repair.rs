@@ -76,10 +76,9 @@ use crate::worklist::{self, Position, Reading};
 /// How long an agent may sit at a prompt with its row still at `doing` before
 /// the row stops being taken at face value.
 ///
-/// Ten minutes, and it is the same number as `cycle`'s `WEDGED_AFTER` on
-/// purpose: one threshold for "a start that has not got going", so a reader
-/// asking why a member is being repaired does not have to learn two. An agent
-/// that has *stopped* is not slow, and nothing downstream notices — its row
+/// Ten minutes. (`cycle`'s `WEDGED_AFTER`, for a start that never claimed, is
+/// a minute since wsp-469; this is a seat that claimed and then went quiet.) An
+/// agent that has *stopped* is not slow, and nothing downstream notices — its row
 /// says `doing` and its claim says held, so every reading of the run agrees it
 /// is going.
 const STALLED_AFTER: i64 = 10 * 60;

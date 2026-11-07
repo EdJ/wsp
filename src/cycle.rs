@@ -66,7 +66,7 @@
 //! **The choices the doc left open (v1, Ed 2026-10-18: take the conventional
 //! one and keep going):**
 //!
-//! - **A leg's start is retaken like a member's**, ten minutes after it was
+//! - **A leg's start is retaken like a member's**, a minute after it was
 //!   opened with no seat ([`WEDGED_AFTER`]). A leg whose seat *died* mid-run is
 //!   not repaired here: the row stalls with a leg `running`, which `wsp wip` and
 //!   `wsp leg show` show, and a person or `wsp leg skip` decides.
@@ -1267,15 +1267,16 @@ fn bound_seat(store: &Store, member: &str) -> Option<String> {
 
 /// How long a start may take to show up as a claim before wsp reads it as
 /// one that never happened — an advance killed between its record and its
-/// spawn, or a spawn that died without saying so. `wsp spawn` claims within a
-/// minute when it works; ten leaves a slow one alone.
-const WEDGED_AFTER: i64 = 10 * 60;
+/// spawn, or a spawn that died without saying so. `wsp spawn` claims within
+/// seconds when it works, so a minute is the longest a start in flight is left
+/// alone (wsp-469: compounding-132's start never claimed and waited ~10 min).
+const WEDGED_AFTER: i64 = 60;
 
 /// Unclaimed, and written long enough ago that a start in flight would have
 /// claimed it by now.
 ///
 /// **Never a row run as legs** (`docs/legs.md`, *The run*): it holds no claim by
-/// design, so "unclaimed for ten minutes" is its ordinary state, and starting a
+/// design, so "unclaimed for a minute" is its ordinary state, and starting a
 /// whole-row worker on it would put one beside the legs. Excluded by having the
 /// section and not by a leg running, since between two legs none does.
 fn wedged(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
@@ -2571,6 +2572,7 @@ pub(crate) fn leg_start_failed(store: &Store, w: Option<&Worklist>, row: &str, n
 fn retry_lost_start(store: &Store, row: &str, label: &str, what: &str, remedy: &str) -> bool {
     let m = crate::starts::missed(store, label);
     if !m.last {
+        log_line(store, &format!("{label}: the start made no claim within {WEDGED_AFTER} s — starting again, try {} of {}", m.tries + 1, crate::barrier::TRIES));
         return true;
     }
     log_line(store, &format!("{label}: the last start never arrived, on try {} of {} — giving up", m.tries, crate::barrier::TRIES));
@@ -6716,7 +6718,7 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// A start that fails puts the member back and says so; one that never
-    /// arrived is taken again once it has had its ten minutes.
+    /// arrived is taken again once it has had its minute.
     #[test]
     fn a_failed_or_lost_start_is_put_back_told_and_taken_again() {
         let (_env, store) = scratch("wedge");
@@ -6747,7 +6749,7 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert_eq!(spawned().len(), 1, "a start that never claimed it is taken again");
 
-        // And a pass whose agent never came: no seat on it, ten minutes on.
+        // And a pass whose agent never came: no seat on it, a minute on.
         set(&store, "m-1", Status::Review);
         step(&store, &w, &Blind);
         let _ = spawned();
@@ -7420,7 +7422,7 @@ fn only_a_working_screen_is_ever_overruled() {
             Ok(v)
         });
         step(&store, &w, &Blind);
-        assert_eq!(ids(spawned()), ["m-1 · plan".to_string()], "ten minutes on with no seat: taken again");
+        assert_eq!(ids(spawned()), ["m-1 · plan".to_string()], "a minute on with no seat: taken again");
         step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "and the new opening is the key");
     }
@@ -7447,6 +7449,19 @@ fn only_a_working_screen_is_ever_overruled() {
         let err = "wsp: spikes/canvas/target not cloned: this tree has no spikes/canvas/Cargo.lock — install as usual\nwsp: claude started but never became ready\n";
         assert_eq!(why_not(err), "wsp: claude started but never became ready");
         assert_eq!(why_not("wsp: no room"), "wsp: no room");
+    }
+
+    /// A start that has not claimed within a minute is taken again, and a
+    /// younger one is left alone (wsp-469).
+    #[test]
+    fn a_start_with_no_claim_is_wedged_after_a_minute_and_not_before() {
+        let (_env, store) = scratch("wedged-minute");
+        task(&store, "m-1", Status::Doing);
+        let mut t = store.find_task("m-1").unwrap();
+        t.updated = util::iso_at(util::epoch_secs() - 30);
+        assert!(!wedged(&t, &store.claims()), "30 s old: still in flight");
+        t.updated = util::iso_at(util::epoch_secs() - 90);
+        assert!(wedged(&t, &store.claims()), "90 s with no claim: taken again");
     }
 
     /// A row at `doing` with no seat and nothing said of it for five minutes is
