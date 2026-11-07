@@ -2436,11 +2436,7 @@ fn leaving(store: &Store, pane: &str, workspace: &str, taking: &str) -> Vec<Stri
 /// writes it; anything that is not `- <stamp> blocked: …` is somebody else's
 /// log line and is not treated as one.
 pub(crate) fn blocked_question(t: &Task) -> Option<String> {
-    t.section("Log")?.lines().rev().find_map(|l| {
-        let (_stamp, rest) = l.trim().strip_prefix("- ")?.split_once(' ')?;
-        let q = rest.strip_prefix("blocked:")?.trim();
-        (!q.is_empty()).then(|| q.to_string())
-    })
+    t.blocked_question()
 }
 
 /// Why claiming finished work is refused, in one sentence.

@@ -1077,6 +1077,21 @@ impl Task {
         crate::log::append(self, line);
     }
 
+    /// The question a `wsp block` left behind, if it can still be found.
+    ///
+    /// `block` records it as a `blocked: …` line in the task's log. The last one
+    /// wins — a task blocked twice is waiting on the second question. The date
+    /// is stepped over rather than matched, because [`Task::log`] is what writes
+    /// it; anything that is not `- <stamp> blocked: …` is somebody else's log
+    /// line and is not treated as one.
+    pub fn blocked_question(&self) -> Option<String> {
+        self.section("Log")?.lines().rev().find_map(|l| {
+            let (_stamp, rest) = l.trim().strip_prefix("- ")?.split_once(' ')?;
+            let q = rest.strip_prefix("blocked:")?.trim();
+            (!q.is_empty()).then(|| q.to_string())
+        })
+    }
+
     /// The paths the row's own words name — its overview and its packet — that
     /// read as files of a repository: a `/` in them and an extension, or `.rs`.
     /// Relative only; a URL, `..`, `~` or an absolute path is somewhere else.

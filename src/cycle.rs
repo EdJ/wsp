@@ -1385,7 +1385,7 @@ fn escalate_the_blocked(store: &Store, w: &Worklist, at: usize, pos: &worklist::
         if lines[blocked_at..].iter().any(|l| l.contains(ESCALATED)) {
             continue;
         }
-        let question = crate::cmd_agent::blocked_question(&t).unwrap_or_else(|| "a decision is owed".to_string());
+        let question = t.blocked_question().unwrap_or_else(|| "a decision is owed".to_string());
         let mins = quiet / 60;
         t.log(&format!("{ESCALATED} {mins} min — the person is flagged and the governor told"));
         let _ = store.save_task(&t);
