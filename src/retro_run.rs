@@ -37,7 +37,8 @@ fn mins(s: i64) -> String {
 pub fn html(_store: &Store, w: &Worklist, s: &Value) -> String {
     let mut b = format!("<h1>Retro · {}</h1><p>{}</p>", esc(&w.id), esc(&w.title));
     b.push_str("<p class=\"dim\">Time and cost are in <a href=\"effort.html\">effort.html</a>; the work in <a href=\"work.html\">work.html</a>.</p>");
-    let base: Vec<&Value> = arr(s, "baseline").iter().collect();
+    // A baseline list with no bucket figures (an older `effort.json`) has no figure.
+    let base: Vec<&Value> = arr(s, "baseline").iter().filter(|f| f["buckets"].as_object().is_some_and(|o| o.values().filter_map(Value::as_i64).sum::<i64>() > 0)).collect();
     b.push_str("<h2>Where the time went</h2><table><thead><tr><th>bucket</th><th>this list</th><th>baseline</th><th>ratio</th></tr></thead><tbody>");
     for (name, secs) in s["buckets"].as_object().into_iter().flatten() {
         let secs = secs.as_i64().unwrap_or(0);
@@ -45,13 +46,13 @@ pub fn html(_store: &Store, w: &Worklist, s: &Value) -> String {
         let avg = if others.is_empty() { None } else { Some(others.iter().sum::<i64>() / others.len() as i64) };
         let ratio = match avg {
             Some(a) if a > 0 => format!("{:.1}×", secs as f64 / a as f64),
-            _ => "—".into(),
+            _ => if avg.is_none() { "no figure".into() } else { "—".into() },
         };
         b.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{ratio}</td></tr>",
             esc(name),
             mins(secs),
-            avg.map(mins).unwrap_or_else(|| "—".into())
+            avg.map(mins).unwrap_or_else(|| "no figure".into())
         ));
     }
     b.push_str("</tbody></table>");
@@ -87,7 +88,9 @@ pub fn html(_store: &Store, w: &Worklist, s: &Value) -> String {
         b.push_str("</ul>");
     }
     if let Some(t) = s["summary"].as_str() {
-        b.push_str(&format!("<h2>Summary</h2><pre>{}</pre>", esc(t)));
+        // A seat that handed `done` JSON still gets its summary shown as text.
+        let text = serde_json::from_str::<Value>(t).ok().and_then(|v| v["summary"].as_str().map(str::to_string)).unwrap_or_else(|| t.to_string());
+        b.push_str(&format!("<h2>Summary</h2><pre>{}</pre>", esc(&text)));
     } else {
         b.push_str("<p class=\"dim\">The retro seat has not finished.</p>");
     }
@@ -430,5 +433,22 @@ mod tests {
         assert!(store.task(&rows[0]).unwrap().body.contains("seen again: 18m unclaimed"));
         assert_eq!(store.worklist("retro-1").unwrap().groups()[0].members.len(), 1);
         assert!(store.worklist("retro-ask-1").is_none());
+    }
+
+    #[test]
+    fn retro_html_shows_the_summary_as_prose_and_an_old_baseline_as_no_figure() {
+        let w = Worklist::new("h", "A list");
+        let (_env, store) = crate::testkit::isolated_store("retro-html");
+        let s = json!({
+            "buckets": { "working": 600, "waiting": 300 },
+            "baseline": [{ "list": "old", "wall": 7200, "buckets": { "working": 0, "waiting": 0 } }, { "list": "older", "wall": 100, "buckets": {} }],
+            "summary": "{\"summary\":\"the wall was a wrong-repo stall\"}",
+        });
+        let h = html(&store, &w, &s);
+        assert!(h.contains("no figure"), "{h}");
+        assert!(!h.contains("0m</td><td>—"), "{h}");
+        assert!(h.contains("the wall was a wrong-repo stall") && !h.contains("{&quot;summary") && !h.contains("{\"summary"), "{h}");
+        let plain = html(&store, &w, &json!({ "buckets": {}, "summary": "nothing to file: inside the baseline" }));
+        assert!(plain.contains("<pre>nothing to file: inside the baseline</pre>"));
     }
 }

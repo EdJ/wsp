@@ -48,11 +48,15 @@ impl Figures {
             list: effort["list"].as_str().unwrap_or("").to_string(),
             wall: secs(wb, "wall_seconds").max(secs(&effort["totals"], "wall_seconds")),
             rows,
-            buckets: BUCKETS.iter().map(|b| (b.to_string(), secs(wb, &format!("{b}_seconds")))).collect(),
+            // An older list left no `wall_buckets`: it has no figure, not zeros.
+            buckets: if wb.is_object() { BUCKETS.iter().map(|b| (b.to_string(), secs(wb, &format!("{b}_seconds")))).collect() } else { Vec::new() },
         }
     }
 
     fn line(&self) -> String {
+        if self.buckets.is_empty() {
+            return format!("{} · {} rows · wall {} · no bucket figures", self.list, self.rows, mins(self.wall));
+        }
         let parts: Vec<String> = self.buckets.iter().map(|(b, s)| format!("{b} {}", mins(*s))).collect();
         format!("{} · {} rows · wall {} · {}", self.list, self.rows, mins(self.wall), parts.join(" · "))
     }
@@ -148,8 +152,8 @@ pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures]
     for r in [
         "Attribute the wall to its causes within 10 %: the causes you name must add up to the wall to within a tenth of it.",
         "Name every cause that is over 10 minutes in total or over 10 % of the wall — even one with nothing to fix.",
-        "Search the open rows before you file anything: `wsp ls`, then `wsp show <row>` on what looks like it.",
-        "Where an open row already covers a cause, add the new evidence to it with `wsp retro note` — do not file a duplicate.",
+        "Search every project's rows before you file anything: `wsp ls --all` (every project, rows at review included, and the `landed` ones too — a bare `wsp ls` lists only your own project), then `wsp show <row>` on what looks like it.",
+        "Where an open row already covers a cause, add the new evidence to it with `wsp retro note` — do not file a duplicate. Where a `landed` row already fixed the cause, note it on that row (\"recurs / fixed by\") instead of filing it again.",
         &format!("File at most {MAX_NEW} new rows."),
         "A **defect** is something that did not do what it was built or documented to do: a bug, a stall that a documented rule should have prevented, a measurement that is wrong. It goes on the planned retro list. A **strategic** question is a choice between ways of working — cap, parallelism, ordering, the shape of a plan, what to spend — where nothing is broken and a person must decide. It goes on the asked list, with `--ask`. When in doubt, strategic.",
         "A retro never edits a plan, a project file, a setting or any other list. It files rows, notes rows, and ends with `done`.",
@@ -159,7 +163,7 @@ pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures]
 
     o.push_str("\n## How you file\n\nOnly through these verbs; each FILE is a file you wrote (prose goes through a file, written with `<<'EOF'`):\n\n```\n");
     o.push_str(SYNTAX);
-    o.push_str("\n```\n\n`done` takes JSON: a `summary` and an `attribution` table of `{cause, seconds, row?}` entries covering the wall.\n\n");
+    o.push_str("\n```\n\n`done` takes prose: a summary in plain text, with the causes you attributed the wall to and what you filed or noted. Nothing in it is parsed; `retro.html` shows it as written.\n\n");
 
     o.push_str(&format!("## The wall: {}\n\n", mins(f.wall)));
     for (b, s) in &f.buckets {
@@ -349,7 +353,7 @@ mod tests {
         let w = list(&store, "l");
         let base = vec![Figures::of(&effort("old-1"))];
         let p = packet_from(&store, &w, &effort("l"), &base, "x l group 2: waits — room\nx other\n");
-        for want in ["within 10 %", "10 minutes", "at most 5 new rows", "When in doubt, strategic", "never edits a plan", SYNTAX, "blocked on a person", "a-2 — blocked", "### a-1 (group 1)", "waits — room", "old-1 · 3 rows · wall 120m", "\"wall_seconds\": 7200"] {
+        for want in ["wsp ls --all", "`landed` row already fixed", "`done` takes prose", "within 10 %", "10 minutes", "at most 5 new rows", "When in doubt, strategic", "never edits a plan", SYNTAX, "blocked on a person", "a-2 — blocked", "### a-1 (group 1)", "waits — room", "old-1 · 3 rows · wall 120m", "\"wall_seconds\": 7200"] {
             assert!(p.contains(want), "packet lacks `{want}`:\n{p}");
         }
         assert!(!p.contains("x other"), "only the list's own cycle lines");
