@@ -250,7 +250,7 @@ impl Supervisor<'static> {
 /// in epoch seconds — [`crate::place::Place::quiet_since`] for both backends
 /// that keep a directory per seat. The directory counts too: a file replaced
 /// by rename moves the directory's time and not always the new file's.
-pub(crate) fn last_written(dir: &Path) -> Option<i64> {
+pub fn last_written(dir: &Path) -> Option<i64> {
     let secs = |p: &Path| {
         let m = std::fs::metadata(p).ok()?.modified().ok()?;
         Some(m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64)
@@ -262,12 +262,12 @@ pub(crate) fn last_written(dir: &Path) -> Option<i64> {
 /// The ledger of what stopped seats spent, one JSON line each, beside the seat
 /// roots (`<state>/spent.jsonl`). `stop()` deletes the seat's directory and
 /// its `burn.json` with it; this is the one copy that outlives it (wsp-264).
-pub(crate) const SPENT_FILE: &str = "spent.jsonl";
+pub const SPENT_FILE: &str = "spent.jsonl";
 
 /// Append the seat's burn record to the ledger before its directory goes.
 /// Best effort and silent: a stop that cannot write a receipt still stops.
 /// Same field names as `wsp burn --json`, so one reader serves both.
-pub(crate) fn bank_burn(dir: &Path) {
+pub fn bank_burn(dir: &Path) {
     let rec = read_json(&dir.join(BURN_FILE));
     if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
         return;
@@ -330,7 +330,7 @@ pub(crate) fn bank_burn(dir: &Path) {
 /// a ranking. A seat with *no* file is the case the doc used to name, and it is
 /// dropped by the same line for a better reason — there is nothing there to
 /// read.
-pub(crate) fn burn_under(root: &Path) -> Vec<(String, Value)> {
+pub fn burn_under(root: &Path) -> Vec<(String, Value)> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -469,7 +469,7 @@ impl Recipe {
 /// `will_take_a_prompt` says no to it. The hook's own name is written to
 /// `said.json` beside the state, so the fact is kept rather than dropped and
 /// nothing has to be re-plumbed to read it.
-pub(crate) fn said_by(hook: &str) -> Option<State> {
+pub fn said_by(hook: &str) -> Option<State> {
     Some(match hook.trim() {
         // The launch window closes here, and this is the whole of the readiness
         // question herdr answers by looking for a missing field.
@@ -505,7 +505,7 @@ pub(crate) fn said_by(hook: &str) -> Option<State> {
 /// | session A | no `session_id` | no — nothing to judge it by, so it is believed, as before |
 /// | session A | session A | no |
 /// | session A | session B | **yes** |
-pub(crate) fn a_childs(was: &Value, payload: &Value) -> bool {
+pub fn a_childs(was: &Value, payload: &Value) -> bool {
     let theirs = str_of(payload, "session_id");
     let seats = str_of(was, "session_id");
     // `/clear` starts its new session with `source: "clear"`; a `claude -p`
@@ -521,7 +521,7 @@ pub(crate) fn a_childs(was: &Value, payload: &Value) -> bool {
 /// is read as (`wsp-301`): `PermissionRequest` and `Elicitation` are `Working`
 /// to [`said_by`] because `State` has no word for *waiting on a person*, so the
 /// fact is kept here where a reader can ask for it. `null` for every other hook.
-pub(crate) fn needs_of(hook: &str, payload: &Value) -> Value {
+pub fn needs_of(hook: &str, payload: &Value) -> Value {
     match hook.trim() {
         "PermissionRequest" | "Elicitation" => {
             json!({ "who": "person", "hook": hook.trim(), "tool": str_of(payload, "tool_name") })
@@ -631,7 +631,7 @@ pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) 
 /// So `wsp install` writes it, and writes *this* copy — asked of the binary it
 /// just installed by `wsp agent pi-extension` — because the process doing the
 /// installing is the old binary, and its copy is the one being replaced.
-pub const PI_EXTENSION: &str = include_str!("../pi/wsp-session.ts");
+pub const PI_EXTENSION: &str = include_str!("../../../pi/wsp-session.ts");
 
 /// Where pi keeps its agent directory on this machine — `$PI_CODING_AGENT_DIR`,
 /// or `~/.pi/agent`, which is pi's own rule for the same variable.
@@ -806,7 +806,7 @@ fn child_env(cmd: &mut Command, seat: &Seat, env: &BTreeMap<String, String>) {
 ///
 /// `ps` failing to run answers the root alone — not empty, so a caller asking
 /// "is any of it still running?" still has the one pid it can certainly name.
-pub(crate) fn tree_of(root: u32) -> Vec<u32> {
+pub fn tree_of(root: u32) -> Vec<u32> {
     let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid=,pgid="]).output() else {
         return vec![root];
     };
@@ -842,7 +842,7 @@ pub(crate) fn tree_of(root: u32) -> Vec<u32> {
 /// `Bash` tool call is a shell under the agent, and a `stop` that left it running
 /// would be the sort of half-ending that leaves a build writing into a tree wsp
 /// has told somebody else is free.
-pub(crate) fn signal_group(group: u32, sig: &str) {
+pub fn signal_group(group: u32, sig: &str) {
     // Never this process's own group: a record naming our own pid (a test's
     // stand-in for a live supervisor) would otherwise end us when we are a group
     // leader, as every test is under `cargo nextest` (wsp-440).
@@ -859,11 +859,11 @@ pub(crate) fn signal_group(group: u32, sig: &str) {
 
 /// A file read as JSON, or an empty object — a seat whose record is missing is
 /// the caller's question rather than this function's.
-pub(crate) fn read_json(path: &PathBuf) -> Value {
+pub fn read_json(path: &PathBuf) -> Value {
     fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}))
 }
 
-pub(crate) fn str_of(v: &Value, key: &str) -> String {
+pub fn str_of(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
@@ -894,7 +894,7 @@ pub(crate) fn str_of(v: &Value, key: &str) -> String {
 ///
 /// Written for [`heard`], which every hook reaches; best-effort like everything
 /// else on that path.
-pub(crate) fn tally_burn(dir: &PathBuf, payload: &Value) {
+pub fn tally_burn(dir: &PathBuf, payload: &Value) {
     let path = str_of(payload, "transcript_path");
     if path.is_empty() {
         return;
@@ -1046,7 +1046,7 @@ impl Supervisor<'_> {
     /// read is whether it is a *file name*. Without it a seat called `../..` is
     /// a `stop` that removes somebody's home directory, which is not a
     /// hypothetical worth leaving to good manners.
-    pub(crate) fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
+    pub fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
         let id = seat.as_str();
         let plain = !id.is_empty()
             && !id.starts_with('.')
@@ -1622,7 +1622,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 /// are a tenth and a quarter, so integer arithmetic in millionths loses
 /// nothing. Floating point in a ranking would be a rounding argument nobody
 /// asked for.
-pub(crate) struct Price {
+pub struct Price {
     input: u64,
     output: u64,
     /// What a cache read bills at, as a fraction of `input`. A tenth on most
@@ -1635,7 +1635,7 @@ pub(crate) struct Price {
 /// Printed under the report, so the reader sees the age of the quote beside
 /// the money it produced. Move it only when the page has actually been
 /// re-read: the date is a claim about what the table was checked against.
-pub(crate) const PRICES_READ: &str = "2026-10-18";
+pub const PRICES_READ: &str = "2026-10-18";
 
 /// **List prices, first-party Anthropic API, read on [`PRICES_READ`].** This is
 /// the thing in wsp that goes stale without saying so, which is why it is a
@@ -1668,7 +1668,7 @@ pub(crate) const PRICES_READ: &str = "2026-10-18";
 /// **first row**, which is the dearest: a report answering *where did the money
 /// go* must never make an unrecognised spender look cheap, and the model column
 /// shows the name that was not recognised.
-pub(crate) const PRICES: &[(&str, Price)] = &[
+pub const PRICES: &[(&str, Price)] = &[
     ("claude-fable-5-1", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 40) }),
     ("claude-mythos-5-1", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 40) }),
     ("claude-fable", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 10) }),
@@ -1695,7 +1695,7 @@ const UNKNOWN: Price = Price { input: 10_000_000, output: 50_000_000, cache_read
 /// Whether [`PRICES`] has a row for this model. A model id that is not Claude's
 /// (`opencode/x-free`) is priced by [`cost`] at [`UNKNOWN`], which is right for a
 /// seat's burn and wrong for a row that should say nothing instead.
-pub(crate) fn known(model: &str) -> bool {
+pub fn known(model: &str) -> bool {
     PRICES.iter().any(|(prefix, _)| model.starts_with(prefix))
 }
 
@@ -1719,7 +1719,7 @@ const CACHE_WRITE: (u64, u64) = (5, 4);
 /// because a session that changed tier partway through has no single model to
 /// price its totals against — the request does. The report reads the
 /// accumulated number and does not re-derive it.
-pub(crate) fn cost(model: &str, input: u64, output: u64, cache_read: u64, cache_write: u64) -> u64 {
+pub fn cost(model: &str, input: u64, output: u64, cache_read: u64, cache_write: u64) -> u64 {
     let p = PRICES
         .iter()
         .find(|(prefix, _)| model.starts_with(prefix))
@@ -1741,7 +1741,7 @@ pub(crate) fn cost(model: &str, input: u64, output: u64, cache_read: u64, cache_
 /// and a tally that started its cost at zero would report the night as costing
 /// whatever the next few turns did. Priced at the stored model, which for a
 /// pre-existing record is the only model it remembers.
-pub(crate) fn cost_of(r: &serde_json::Value) -> u64 {
+pub fn cost_of(r: &serde_json::Value) -> u64 {
     match r.get("cost").and_then(|v| v.as_u64()) {
         Some(c) => c,
         None => cost(

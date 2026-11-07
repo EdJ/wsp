@@ -138,7 +138,7 @@ use serde_json::{json, Value};
 use crate::place::{self, Agent, Census, Delivery, Event, Order, Place, Refusal, Result, Seat, Seated, State};
 use crate::util::alive;
 use crate::place_super::{read_json, signal_group, str_of, tally_burn};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::place_super::said_by;
 use crate::store::{write_atomic, Store};
 use crate::util::{self, Clock};
@@ -199,8 +199,8 @@ impl Compound<'static> {
     /// asking whose processes are whose. `open` may have started a real
     /// supervisor; it is ended first, since the record that would find it is
     /// the one being replaced (`compound-127`).
-    #[cfg(test)]
-    pub(crate) fn record_pid_for_test(&self, seat: &Seat, pid: u32) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_pid_for_test(&self, seat: &Seat, pid: u32) {
         let mut rec = self.record(seat).unwrap();
         if let Some(old) = rec.get("pid").and_then(|p| p.as_u64()) {
             signal_group(old as u32, "KILL");
@@ -396,7 +396,7 @@ fn composer(screen: &str) -> Option<bool> {
 }
 
 impl Compound<'_> {
-    pub(crate) fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
+    pub fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
         let id = seat.as_str();
         let plain = !id.is_empty()
             && !id.starts_with('.')
@@ -413,7 +413,7 @@ impl Compound<'_> {
     /// one question a verb that is handed a bare id can ask of this backend
     /// without a census. A stat, so `wsp peek` and `wsp tell` can ask it of
     /// every needle they are given (`wsp-156`).
-    pub(crate) fn holds(&self, seat: &Seat) -> bool {
+    pub fn holds(&self, seat: &Seat) -> bool {
         self.dir_of(seat).map(|d| d.is_dir()).unwrap_or(false)
     }
 
@@ -687,7 +687,7 @@ impl Compound<'_> {
     /// never announced one (an older binary, from before the split).
     /// Reachable only while a renderer is actually up; [`Compound::vitals_osc_title`]
     /// is the durable half's own answer for when it is not.
-    pub(crate) fn render_socket_of(&self, seat: &Seat) -> Option<PathBuf> {
+    pub fn render_socket_of(&self, seat: &Seat) -> Option<PathBuf> {
         self.record(seat).ok().and_then(|rec| {
             let s = str_of(&rec, "render_socket");
             (!s.is_empty()).then(|| PathBuf::from(s))
@@ -742,7 +742,7 @@ impl Compound<'_> {
         trust_prompt(seat, &self.read_screen(seat).ok()?)
     }
 
-    pub(crate) fn read_screen(&self, seat: &Seat) -> Result<String> {
+    pub fn read_screen(&self, seat: &Seat) -> Result<String> {
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
         let render = compound_render_binary().ok_or_else(|| {
             Refusal::Backend("compound-render not found — set $COMPOUND_RENDER or put it on PATH".into())
@@ -821,7 +821,7 @@ impl Compound<'_> {
     /// those. The reconciler runs it once a minute, on one seat at a time, and
     /// can say what it did in `cycle.log` — which a function returning a
     /// `State` cannot.
-    pub(crate) fn session_of(&self, seat: &Seat) -> String {
+    pub fn session_of(&self, seat: &Seat) -> String {
         str_of(&self.said(seat), "session_id")
     }
 
@@ -1193,7 +1193,7 @@ impl Compound<'_> {
         // included) and stands in a run directory of its own, never the
         // person's `~/.compound/run`. Here and nowhere else, so a new test
         // cannot start one without both.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_sups::tie_to_this_test(&mut cmd);
         cmd.arg("--").arg(program).args(args);
 
@@ -1252,7 +1252,7 @@ impl Compound<'_> {
         let mut cmd = Self::sup_command(&sup, seat, rec, program, args);
         let mut child = cmd.spawn().map_err(|e| Refusal::Backend(format!("{} did not start: {e}", sup.display())))?;
         let pid = child.id();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_sups::note(pid, seat);
         let Some(stdout) = child.stdout.take() else {
             let _ = child.kill();
@@ -1526,7 +1526,7 @@ pub fn beat_seats(store: &Store, machine: &str) -> Vec<crate::far::BeatSeat> {
 /// `Unknown` for ever, and never be confirmed as seated — the
 /// `tokenhub-spec-sync` shape, a pane that never comes up paid for every
 /// twenty minutes. [`crate::repair`] asks this before it spends anything.
-pub(crate) fn reads_kind(kind: &str) -> bool {
+pub fn reads_kind(kind: &str) -> bool {
     matches!(kind, "claude" | "opencode" | "pi")
 }
 
@@ -1829,8 +1829,8 @@ impl Place for Compound<'_> {
 ///
 /// Declare it AFTER the env guard so it drops BEFORE one — the seat has to be
 /// stopped while the state directory naming it still exists.
-#[cfg(test)]
-pub(crate) struct StopsOnDrop {
+#[cfg(any(test, feature = "test-support"))]
+pub struct StopsOnDrop {
     seat: Seat,
     // The ROOT, pinned when the guard is made, not read again at drop.
     // `Compound::new()` resolves it from the environment, and `util::isolated`
@@ -1843,9 +1843,9 @@ pub(crate) struct StopsOnDrop {
     pid: Option<u32>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl StopsOnDrop {
-    pub(crate) fn new(seat: Seat) -> StopsOnDrop {
+    pub fn new(seat: Seat) -> StopsOnDrop {
         let place = Compound::new();
         // The pid as well as the seat, read NOW. `stop` is the right verb and
         // is tried first, but it can only work through the seat record, and a
@@ -1873,17 +1873,17 @@ impl StopsOnDrop {
 /// (`compound-127`). The remedy is to read the pid the supervisor really has
 /// BEFORE the record is rewritten, and end that process directly rather than
 /// through a record the test is about to falsify.
-#[cfg(test)]
-pub(crate) struct EndsOnDrop(pub(crate) u32);
+#[cfg(any(test, feature = "test-support"))]
+pub struct EndsOnDrop(pub u32);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for EndsOnDrop {
     fn drop(&mut self) {
         signal_group(self.0, "KILL");
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for StopsOnDrop {
     fn drop(&mut self) {
         // Best effort by construction: a seat whose supervisor already exited
@@ -1909,14 +1909,14 @@ impl Drop for StopsOnDrop {
 /// thread ends is killed, named, and ends the run with a failure — so a test
 /// that forgets its cleanup is found the first time it runs, not by a person
 /// counting sessions.
-#[cfg(test)]
-pub(crate) mod test_sups {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_sups {
     use super::*;
     use std::cell::RefCell;
 
     /// This process's run directory, short because a unix socket path may be
     /// 104 bytes and `$TMPDIR` on a Mac is not.
-    pub(crate) fn run_dir() -> PathBuf {
+    pub fn run_dir() -> PathBuf {
         static SWEPT: std::sync::Once = std::sync::Once::new();
         SWEPT.call_once(|| {
             // The run directories of test processes that have ended: a
@@ -1936,14 +1936,14 @@ pub(crate) mod test_sups {
     }
 
     /// The two rules, put on a supervisor's command.
-    pub(crate) fn tie_to_this_test(cmd: &mut Command) {
+    pub fn tie_to_this_test(cmd: &mut Command) {
         cmd.env("COMPOUND_RUN_DIR", run_dir());
         cmd.args(["--ephemeral", &std::process::id().to_string()]);
     }
 
     /// Whether this command carries both rules. The one assertion every
     /// supervisor command a test builds is held to.
-    pub(crate) fn tied(cmd: &Command) -> std::result::Result<(), String> {
+    pub fn tied(cmd: &Command) -> std::result::Result<(), String> {
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let sep = args.iter().position(|a| a == "--").ok_or_else(|| format!("no `--` in {args:?}"))?;
         let pid = std::process::id().to_string();
@@ -1971,7 +1971,7 @@ pub(crate) mod test_sups {
     /// The supervisors this thread (this test) started.
     struct Watch(Vec<(u32, String)>);
 
-    pub(crate) fn note(pid: u32, seat: &Seat) {
+    pub fn note(pid: u32, seat: &Seat) {
         OPENED.with(|w| w.borrow_mut().0.push((pid, seat.to_string())));
     }
 
@@ -2900,7 +2900,6 @@ mod tests {
         };
         assert!(PathBuf::from(&sup).is_file(), "COMPOUND_SUP is not a file");
 
-        crate::agent_commands::stand_in::allow_real_agents();
         let scratch = Scratch::new("opencode-detect");
         let place = scratch.place();
         let seat = place

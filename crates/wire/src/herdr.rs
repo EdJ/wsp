@@ -26,7 +26,7 @@ use crate::util;
 /// that matters most: a `wsp` started by herdr's own plugin runner inherits
 /// whatever `PATH` herdr was launched with, which is why `run.sh` looks the
 /// binary up by hand rather than trusting it. Same reasoning, same fallback.
-pub(crate) fn herdr_bin() -> PathBuf {
+pub fn herdr_bin() -> PathBuf {
     if let Some(v) = std::env::var_os("HERDR_BIN") {
         let p = PathBuf::from(v);
         if !p.as_os_str().is_empty() {
@@ -50,7 +50,7 @@ pub fn socket_path() -> PathBuf {
     // were renaming this machine's `w1` on every run. The argument, and the
     // guard that ends it, are in [`crate::util::isolated`]; this compiles out
     // of the binary entirely.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     assert!(
         std::env::var_os("HERDR_SOCKET_PATH").is_some(),
         "a test reached for the live herdr — take crate::util::isolated() instead"
@@ -112,7 +112,7 @@ fn probe() -> bool {
 /// hundreds of invocations wearing one process, and `who_is_standing` is the
 /// call this whole audit is about getting right on a real socket, not the
 /// call to trust that artifact through.
-pub(crate) fn available_now() -> bool {
+pub fn available_now() -> bool {
     probe()
 }
 

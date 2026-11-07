@@ -500,18 +500,7 @@ impl std::fmt::Display for Slot {
     }
 }
 
-/// Where a pane is on screen, in cells.
-///
-/// Read, never written; see rule 5. It is here because two questions need it and
-/// neither can be answered from a list: which pane is widest, and which of these
-/// is on the left.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Rect {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
+pub use crate::place::Rect;
 
 /// One pane, as the backend currently sees it.
 ///

@@ -9,17 +9,19 @@ name = "wsp"
 path = "src/main.rs"
 
 [workspace]
-members = ["crates/base", "crates/store", "crates/store-contract", "crates/testkit"]
+members = ["crates/wire", "crates/base", "crates/store", "crates/store-contract", "crates/testkit"]
 
 [dependencies]
 serde_json = "1"
 wsp-base = { path = "crates/base" }
 wsp-store = { path = "crates/store" }
+wsp-wire = { path = "crates/wire" }
 
 [dev-dependencies]
 wsp-testkit = { path = "crates/testkit" }
 wsp-base = { path = "crates/base", features = ["test-support"] }
 wsp-store = { path = "crates/store", features = ["test-support"] }
+wsp-wire = { path = "crates/wire", features = ["test-support"] }
 
 [profile.release]
 opt-level = 2

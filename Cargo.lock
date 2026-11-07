@@ -99,6 +99,7 @@ dependencies = [
  "wsp-base",
  "wsp-store",
  "wsp-testkit",
+ "wsp-wire",
 ]
 
 [[package]]
@@ -124,6 +125,16 @@ version = "0.1.0"
 [[package]]
 name = "wsp-testkit"
 version = "0.1.0"
+
+[[package]]
+name = "wsp-wire"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-base",
+ "wsp-store",
+ "wsp-testkit",
+]
 
 [[package]]
 name = "zmij"

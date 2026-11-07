@@ -87,7 +87,7 @@ use crate::util;
 /// mechanism on a machine that may have several logins, and a launchd label is
 /// what `launchctl print` and `bootout` take, so it has to be the string in the
 /// plist and nowhere else.
-pub(crate) const LABEL: &str = "com.wsp.daemon";
+pub const LABEL: &str = "com.wsp.daemon";
 
 /// How long launchd waits before restarting a job that keeps dying. Without it
 /// the default is ten seconds, which is fast enough to be noise in a log nobody
@@ -96,7 +96,7 @@ const THROTTLE: u32 = 30;
 
 /// Where the plist goes. A *user* agent: a daemon on somebody's machine,
 /// started at their login, and not something to be installed system-wide.
-pub(crate) fn plist_path() -> PathBuf {
+pub fn plist_path() -> PathBuf {
     util::home().join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
 }
 
@@ -109,7 +109,7 @@ pub(crate) fn plist_path() -> PathBuf {
 /// belonging to the live herdr, and would then sync and reap against it, which
 /// is the leak `robustness-021` was filed for. A throwaway `WSP_HOME` is the
 /// most common way that happens.
-pub(crate) fn sandboxed() -> bool {
+pub fn sandboxed() -> bool {
     sandboxed_in(
         std::env::var_os("WSP_HOME").as_deref(),
         std::env::var_os("WSP_STATE").as_deref(),
@@ -134,7 +134,7 @@ fn sandboxed_in(home: Option<&OsStr>, state: Option<&OsStr>, bin: Option<&OsStr>
 /// build put them. `~/.local/bin` goes first for the reason
 /// [`crate::cmd_install::default_dest`] implies: it is where `wsp` itself goes,
 /// and a job that found a different `wsp` would be a loop of the wrong one.
-pub(crate) fn path_for(installer: Option<&OsStr>) -> String {
+pub fn path_for(installer: Option<&OsStr>) -> String {
     let mut dirs: Vec<PathBuf> = vec![util::home().join(".local/bin")];
     if let Some(p) = installer {
         dirs.extend(std::env::split_paths(p).filter(|d| d.is_dir()));
@@ -150,7 +150,7 @@ pub(crate) fn path_for(installer: Option<&OsStr>) -> String {
 /// codebase builds things: the paths in it are facts about *this* machine, and
 /// a template would leave three of them to be filled in by a caller with no way
 /// to forget one.
-pub(crate) fn plist(bin: &Path, state: &Path, path_var: &str) -> String {
+pub fn plist(bin: &Path, state: &Path, path_var: &str) -> String {
     plist_as(LABEL, bin, state, path_var)
 }
 
@@ -236,7 +236,7 @@ fn escape(s: &str) -> String {
 /// "writes a plist" run twice on a machine somebody also restarts is how a file
 /// nobody can account for appears in `~/Library/LaunchAgents`.
 #[derive(Debug, PartialEq)]
-pub(crate) enum Plan {
+pub enum Plan {
     /// Nothing there, or what is there is not what this machine wants.
     Write,
     /// Byte for byte what is already there. Nothing is written and nothing is
@@ -244,7 +244,7 @@ pub(crate) enum Plan {
     Unchanged,
 }
 
-pub(crate) fn plan(want: &str, path: &Path) -> Plan {
+pub fn plan(want: &str, path: &Path) -> Plan {
     match std::fs::read_to_string(path) {
         Ok(have) if have == want => Plan::Unchanged,
         _ => Plan::Write,
@@ -310,7 +310,7 @@ fn loaded(target: &str) -> bool {
 /// line about a binary now knows whether the daemon is covered — which is the
 /// question the dead daemon cost a week to answer.
 #[derive(Debug, PartialEq)]
-pub(crate) struct Done {
+pub struct Done {
     /// Where the plist is.
     pub path: PathBuf,
     /// Whether the file was rewritten. `false` on a second install, and the
@@ -323,7 +323,7 @@ pub(crate) struct Done {
 }
 
 impl Done {
-    pub(crate) fn line(&self) -> String {
+    pub fn line(&self) -> String {
         format!(
             "{} {} · {} — the daemon is a launchd agent now, and it comes back on its own",
             util::contract(&self.path),
@@ -346,7 +346,7 @@ impl Done {
 /// does, but a daemon that is not running afterwards is **not** quiet any more
 /// (wsp-449): this returns the error, the install prints it and exits non-zero,
 /// and a note is kept for `wsp wip` until a daemon runs.
-pub(crate) fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> {
+pub fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> {
     ensure_as(LABEL, &plist_path(), bin, state, path_var)
 }
 
@@ -405,7 +405,7 @@ fn ensure_as(
 
 /// What `launchctl print` says the job is doing.
 #[derive(Debug, PartialEq)]
-pub(crate) enum State {
+pub enum State {
     /// Not in the domain at all.
     Absent,
     /// In the domain with a process.
@@ -416,7 +416,7 @@ pub(crate) enum State {
 
 /// Read a `launchctl print` body. Split from the call so it is testable
 /// without a launchd.
-pub(crate) fn state_from(print: &str) -> State {
+pub fn state_from(print: &str) -> State {
     let mut pid = None;
     let mut exit = None;
     for l in print.lines() {
@@ -501,16 +501,16 @@ fn unloaded_path(state: &Path) -> PathBuf {
     state.join("daemon-unloaded")
 }
 
-pub(crate) fn note_unloaded(state: &Path, why: &str) {
+pub fn note_unloaded(state: &Path, why: &str) {
     let _ = std::fs::write(unloaded_path(state), format!("{why}\n"));
 }
 
-pub(crate) fn clear_unloaded(state: &Path) {
+pub fn clear_unloaded(state: &Path) {
     let _ = std::fs::remove_file(unloaded_path(state));
 }
 
 /// The sentence for a daemon the last install could not leave running.
-pub(crate) fn unloaded_note(state: &Path) -> Option<String> {
+pub fn unloaded_note(state: &Path) -> Option<String> {
     let why = std::fs::read_to_string(unloaded_path(state)).ok()?;
     let why = why.trim();
     if why.is_empty() {

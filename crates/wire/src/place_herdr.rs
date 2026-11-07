@@ -384,7 +384,7 @@ fn of_status(agent: &str, status: &str) -> State {
 /// be answering a question it has asked itself. Split out rather than reached
 /// with a placeholder agent name, which is how a translation table acquires a
 /// second, subtly different copy.
-pub(crate) fn of_word(status: &str) -> State {
+pub fn of_word(status: &str) -> State {
     match status.trim() {
         "working" => State::Working,
         "idle" | "done" => State::Idle,
@@ -439,7 +439,7 @@ pub fn state_of_agent(p: &herdr::Pane) -> State {
 /// sends no `interactive_ready` at all, so the absence is not evidence — as
 /// [`State::Unknown`], and a census that cannot see an agent is exactly what
 /// robustness-083 was opened about.
-pub(crate) fn state_of_pane(p: &herdr::Pane) -> State {
+pub fn state_of_pane(p: &herdr::Pane) -> State {
     of_status(&p.agent, &p.agent_status)
 }
 
@@ -473,7 +473,7 @@ fn turning(seat: &Seat) -> bool {
 /// Pulled out of [`Herdr::census`] so `cmd_watch`'s `Probe` — which already
 /// holds both listings for its own reason and would rather not ask herdr a
 /// second time to get the rows this way — can build the same census.
-pub(crate) fn seated_rows(agents: &[herdr::Pane], panes: &[herdr::Pane]) -> Vec<Seated> {
+pub fn seated_rows(agents: &[herdr::Pane], panes: &[herdr::Pane]) -> Vec<Seated> {
     panes
         .iter()
         .map(|p| match agents.iter().find(|a| a.pane_id == p.pane_id) {

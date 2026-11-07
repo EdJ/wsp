@@ -169,7 +169,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::arrange::Rect;
+use crate::place::Rect;
 use crate::place::{Agent, Event, Seat, Seated, State};
 
 /// What the fake was asked, in wsp's words rather than herdr's.

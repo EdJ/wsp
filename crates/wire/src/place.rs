@@ -1234,7 +1234,7 @@ pub trait Place {
 }
 
 /// How long [`submit`] watches a typed sentence, and how often it presses again.
-pub(crate) struct Pressing<'a> {
+pub struct Pressing<'a> {
     /// How long each look lasts before the next press, in order. One more
     /// window than presses: the last is the look after the last press.
     ///
@@ -1287,7 +1287,7 @@ impl Default for Pressing<'static> {
 /// `Err(Refusal::Unsubmitted)` is the text still sitting there after the last
 /// press, and a backend's [`Refusal::NotTaken`] is treated as the first look
 /// rather than as an answer, because it is the same story told earlier.
-pub(crate) fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing) -> Result<Delivery> {
+pub fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing) -> Result<Delivery> {
     // A backend that cannot read the prompt takes the path it always took,
     // call for call: nothing below has anything to go on without the reading.
     if place.typed(seat).is_none() {
@@ -1346,7 +1346,7 @@ pub(crate) fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing)
 
 /// What the backends and the hook verb ask of the layers above wire, which `main`
 /// installs at startup ([`install_above`]): wire does not name them.
-pub(crate) struct Above {
+pub struct Above {
     /// The program and argv an agent of a kind starts as (`agent_commands::command`).
     pub command: fn(&str, &[String]) -> (String, Vec<String>),
     /// Whether a hook can end a question (`hold_close::closes`).
@@ -1361,16 +1361,12 @@ pub(crate) struct Above {
 
 static ABOVE: std::sync::OnceLock<Above> = std::sync::OnceLock::new();
 
-pub(crate) fn install_above(a: Above) {
+pub fn install_above(a: Above) {
     let _ = ABOVE.set(a);
 }
 
-/// The installed answers. A unit test gets the real ones ([`tests::REAL`]); a
-/// process that installed none starts the kind's own name, closes and holds nothing.
-pub(crate) fn above() -> &'static Above {
-    #[cfg(test)]
-    return &tests::REAL;
-    #[cfg(not(test))]
+/// The installed answers. A process that installed none starts the kind's own name, closes and holds nothing.
+pub fn above() -> &'static Above {
     {
         static NONE: Above = Above {
             command: |kind, args| (kind.to_string(), args.to_vec()),
@@ -1383,16 +1379,22 @@ pub(crate) fn above() -> &'static Above {
     }
 }
 
+/// Where a pane is on screen, in cells.
+///
+/// Read, never written; see rule 5. It is here because two questions need it and
+/// neither can be answered from a list: which pane is widest, and which of these
+/// is on the left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    pub(super) static REAL: Above = Above {
-        command: crate::agent_commands::command,
-        closes: crate::hold_close::closes,
-        heard: crate::hold_close::heard,
-        hold: crate::hold::hold,
-        hold_secs: crate::hold::SECS,
-    };
     use crate::util::{is_agent_id, new_agent_id};
 
     /// What a seat's occupant must not find, and where the line is drawn.
@@ -1907,7 +1909,7 @@ mod tests {
 /// has herdr's. The order matters only for the case that should not exist —
 /// both set — and the supervisor wins it because it is the backend that forked
 /// this process, whatever multiplexer the shell it came from was in.
-pub(crate) fn my_pane() -> Option<String> {
+pub fn my_pane() -> Option<String> {
     let seat = match crate::place_super::Supervisor::new().here() {
         Some(s) => Some(s),
         None => crate::place_herdr::Herdr::new().here(),
@@ -1926,7 +1928,7 @@ pub(crate) fn my_pane() -> Option<String> {
 /// The same "one copy" argument [`backend`] makes: a reader that built its
 /// own array would be a second list to update when a fifth implementor
 /// lands.
-pub(crate) fn local_backends() -> [Box<dyn Place>; 2] {
+pub fn local_backends() -> [Box<dyn Place>; 2] {
     [Box::new(crate::place_herdr::Herdr::new()), Box::new(crate::place_compound::Compound::new())]
 }
 
@@ -1947,7 +1949,7 @@ pub(crate) fn local_backends() -> [Box<dyn Place>; 2] {
 /// machine's, and this is that name. Only herdr's WHOLESALE refusal is labelled
 /// here; when its census answers, `place_herdr` names each row by machine
 /// itself.
-pub(crate) const LOCAL_BACKEND_NAMES: [&str; 2] = ["herdr", "compound"];
+pub const LOCAL_BACKEND_NAMES: [&str; 2] = ["herdr", "compound"];
 
 /// The scope this workspace is the custodian of — a project or a worklist — if
 /// it is the custodian of one.

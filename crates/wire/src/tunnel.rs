@@ -385,7 +385,7 @@ fn err_log(store: &Store, name: &str) -> PathBuf {
 /// mention of length — which reads as a syntax error in something wsp built,
 /// and sends you reading the flags. Found by putting a store under a scratch
 /// directory 116 characters deep.
-pub(crate) const SUN_PATH_MAX: usize = 103;
+pub const SUN_PATH_MAX: usize = 103;
 
 /// The `ssh` we hold open, and why each flag is on it.
 fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<Child> {
