@@ -12,7 +12,7 @@ barrier -> main: Args  # engine -> top
 barrier_replay -> main: Args  # engine -> top
 build_output -> verification: verified  # trees -> engine
 build_output -> worklist: crossed  # trees -> engine
-caption -> main: Args  # engine -> top
+caption -> main: Args  # store -> top
 check -> main: Args  # engine -> top
 check_tree -> check: captures  # trees -> engine
 check_tree -> cmd_sandbox: ancestors, processes  # trees -> seats
@@ -44,9 +44,7 @@ cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_mess
 cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
 cmd_message -> main: Args  # engine -> top
 cmd_message -> wake: held_because, say  # engine -> seats
-cmd_project -> cmd_govern: Slot, governor_of, slots  # store -> seats
-cmd_project -> cmd_task: Prose, edit_prose, paint_prio  # store -> engine
-cmd_project -> worklist: home_of_scope  # store -> engine
+cmd_project -> cmd_govern: Slot, governor_of, slots  # engine -> seats
 cmd_report -> main: Args  # timeline -> top
 cmd_resume -> main: Args  # seats -> top
 cmd_resume -> panel: stty  # seats -> surface
@@ -91,7 +89,6 @@ kanban -> main: Args  # surface -> top
 kind_attention -> agent_commands: Kind, Spawn  # engine -> seats
 kind_data -> agent_commands: *, Kind, Plain, Spawn  # store -> seats
 kind_data -> place: *, Delivery, Place, Pressing, Result, Seat, submit  # store -> wire
-lapse -> worklist: crossed  # store -> engine
 leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
 leg_seat -> main: Args  # engine -> top
 leg_tree -> legs: *, Leg, State, self  # trees -> engine
@@ -99,10 +96,7 @@ legs -> cmd_attempts: Attempt, attempts_of, priced  # engine -> timeline
 legs -> main: Args  # engine -> top
 memory -> cmd_spawn: local_backends  # base -> seats
 memory -> place: *, Seat, Seated, State  # base -> wire
-message -> caption: *, Caption, self  # store -> engine
 model -> agent_commands: *  # store -> seats
-model -> barrier: Check, push, text  # store -> engine
-model -> caption: of_task  # store -> engine
 overlap -> panel: PANEL_LABEL, VIEW_LABEL  # trees -> surface
 packet -> main: Args  # engine -> top
 panel -> daemon: surface_drawing, wsp_panes  # surface -> top
@@ -125,7 +119,6 @@ stage -> cmd_agent: sentence  # engine -> seats
 stage -> cmd_govern: needs_a_person  # engine -> seats
 stand_down -> cmd_govern: *  # engine -> seats
 stand_down -> wake: owed_to  # engine -> seats
-store -> worklist: Running  # store -> engine
 story -> main: Args  # surface -> top
 stuck -> main: Args  # seats -> top
 sync -> attention: standing  # wire -> engine

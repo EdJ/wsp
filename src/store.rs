@@ -156,7 +156,7 @@ pub struct Store {
     /// Derived readings, by name, and the [`Generations`] each was derived at.
     /// See [`Store::remembered`].
     memos: RefCell<BTreeMap<&'static str, (Generations, std::rc::Rc<dyn std::any::Any>)>>,
-    running_memo: RefCell<Option<(u64, std::rc::Rc<crate::worklist::Running>)>>,
+    running_memo: RefCell<Option<(u64, std::rc::Rc<dyn std::any::Any>)>>,
     /// The last parse of each state JSON file, by name, and the stamp it was
     /// parsed at. See [`Store::read_json`].
     json_cache: RefCell<BTreeMap<String, (Stamp, std::rc::Rc<Value>)>>,
@@ -824,21 +824,25 @@ impl Store {
         out
     }
 
-    /// [`crate::worklist::Running`] over this store's lists, derived again only
-    /// when a list file has moved since the last answer (`wsp-320`).
+    /// What `derive` makes of this store's lists — the engine's `Running` is the
+    /// one asker — derived again only when a list file has moved since the last
+    /// answer (`wsp-320`).
     ///
     /// The wake walk asks it once per seat, and each asking was every list
     /// copied out and re-read for an answer that had not changed. The reading
     /// of `worklists/` still happens — a `stat` per file, which is what notices
-    /// a hand edit — and only the copying and deriving are saved.
-    pub(crate) fn running(&self) -> std::rc::Rc<crate::worklist::Running> {
+    /// a hand edit — and only the copying and deriving are saved. One memo: a
+    /// second kind of answer replaces the first.
+    pub(crate) fn derived_from_worklists<T: 'static>(&self, derive: impl Fn(&[Worklist]) -> T) -> std::rc::Rc<T> {
         let generation = self.generations().worklists;
         if let Some((g, r)) = &*self.running_memo.borrow() {
             if *g == generation {
-                return r.clone();
+                if let Ok(r) = r.clone().downcast::<T>() {
+                    return r;
+                }
             }
         }
-        let r = std::rc::Rc::new(crate::worklist::Running::over(&self.worklists()));
+        let r = std::rc::Rc::new(derive(&self.worklists()));
         *self.running_memo.borrow_mut() = Some((generation, r.clone()));
         r
     }
@@ -4797,18 +4801,18 @@ mod tests {
     fn running_is_remembered_until_a_list_moves() {
         let store = scratch("running-memo");
         store.save_worklist(&Worklist::new("l", "a list")).unwrap();
-        let first = store.running();
-        assert!(std::rc::Rc::ptr_eq(&first, &store.running()), "nothing moved and it was derived again");
+        let first = crate::worklist::Running::read(&store);
+        assert!(std::rc::Rc::ptr_eq(&first, &crate::worklist::Running::read(&store)), "nothing moved and it was derived again");
 
         let path = store.worklist_path("l");
         let text = fs::read_to_string(&path).unwrap();
         fs::write(&path, text.replace("a list", "a list, edited by hand")).unwrap();
-        assert!(!std::rc::Rc::ptr_eq(&first, &store.running()), "a hand edit was answered from the memo");
+        assert!(!std::rc::Rc::ptr_eq(&first, &crate::worklist::Running::read(&store)), "a hand edit was answered from the memo");
 
         fs::remove_file(&path).unwrap();
-        let after = store.running();
+        let after = crate::worklist::Running::read(&store);
         assert!(!std::rc::Rc::ptr_eq(&first, &after));
-        assert!(std::rc::Rc::ptr_eq(&after, &store.running()));
+        assert!(std::rc::Rc::ptr_eq(&after, &crate::worklist::Running::read(&store)));
 
         let _ = fs::remove_dir_all(&store.root);
     }

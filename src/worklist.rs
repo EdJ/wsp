@@ -554,13 +554,13 @@ impl Position {
 /// because [`Running`] asks it too, and has to get the answer `position` gets
 /// without the git half `position` may be asked to pay for.
 fn floor(groups: &[Group]) -> usize {
-    groups.iter().rposition(|g| !g.verdict.trim().is_empty()).map_or(0, |i| i + 1)
+    crate::model::crossed(groups)
 }
 
 /// How many barriers the run has passed — [`floor`], for the ask that was
 /// raised at one: it is over when its ordinal is at or below this.
 pub(crate) fn crossed(groups: &[Group]) -> usize {
-    floor(groups)
+    crate::model::crossed(groups)
 }
 
 pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
@@ -1661,7 +1661,7 @@ pub struct Running {
 
 impl Running {
     pub fn read(store: &Store) -> std::rc::Rc<Running> {
-        store.running()
+        store.derived_from_worklists(Running::over)
     }
 
     /// The same reading, of lists already in hand — `wsp wip` has read them

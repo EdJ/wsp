@@ -95,10 +95,10 @@ cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 
 | component | modules |
 |---|---|
 | `base` | `base`, `util`, `fm`, `input`, `risk`, `disk`, `memory`, `choices` |
-| `store` | `model`, `store`, `resolve`, `message`, `lapse`, `artefact`, `kind_data`, `sharing`, `scratch`, `cmd_project`, `cmd_migrate`, `cmd_mandate`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags` |
+| `store` | `model`, `checks`, `caption`, `store`, `resolve`, `message`, `lapse`, `artefact`, `kind_data`, `sharing`, `scratch`, `cmd_migrate`, `cmd_mandate`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags` |
 | `wire` | `herdr`, `place`, `place_herdr`, `place_compound`, `place_super`, `tunnel`, `far`, `sync`, `launchd`, `detect_override` |
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `build_output`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `cold`, `leg_tree`, `affected`, `at_stop`, `gc` |
-| `engine` | `caption`, `stage`, `history`, `after`, `worklist`, `cycle`, `barrier`, `barrier_run`, `barrier_replay`, `verification`, `check`, `did`, `closing`, `ending`, `repair`, `split`, `starts`, `stand_down`, `untaken`, `waiting`, `legs`, `leg_seat`, `cmd_worklist`, `cmd_task`, `packet`, `packet_gen`, `verifier_packet`, `attention`, `kind_attention`, `cmd_attend`, `cmd_message`, `hold`, `hold_close`, `pickup`, `waits`, `scope` |
+| `engine` | `cmd_project`, `stage`, `history`, `after`, `worklist`, `cycle`, `barrier`, `barrier_run`, `barrier_replay`, `verification`, `check`, `did`, `closing`, `ending`, `repair`, `split`, `starts`, `stand_down`, `untaken`, `waiting`, `legs`, `leg_seat`, `cmd_worklist`, `cmd_task`, `packet`, `packet_gen`, `verifier_packet`, `attention`, `kind_attention`, `cmd_attend`, `cmd_message`, `hold`, `hold_close`, `pickup`, `waits`, `scope` |
 | `seats` | `agent_commands`, `cmd_spawn`, `cmd_agent`, `cmd_resume`, `wake`, `room`, `cmd_govern`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_stamp`, `stuck` |
 | `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `cmd_attempts`, `cmd_verifications` |
 | `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |

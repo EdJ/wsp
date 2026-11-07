@@ -1787,7 +1787,7 @@ pub struct Group {
     pub member_agents: BTreeMap<String, String>,
     /// Every check of the barrier after this group, oldest first: `wsp-230`'s
     /// record of a check that has no row. See [`crate::barrier`].
-    pub checks: Vec<crate::barrier::Check>,
+    pub checks: Vec<crate::checks::Check>,
     /// `stop-checks:` — the mechanical part of the stop condition: commands
     /// whose exit code is the answer, one item each in the form of a project's
     /// `## Checks` (`name (limit): command`). wsp runs them with the barrier's
@@ -2069,7 +2069,7 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
                     continue;
                 }
                 Cont::Checks => {
-                    crate::barrier::push(&mut last.checks, trimmed);
+                    crate::checks::push(&mut last.checks, trimmed);
                     continue;
                 }
                 Cont::StopChecks => {
@@ -2134,7 +2134,7 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
             label_indent = indent;
         } else if let Some(rest) = trimmed.strip_prefix("checks:") {
             last.checks.clear();
-            crate::barrier::push(&mut last.checks, rest);
+            crate::checks::push(&mut last.checks, rest);
             cont = Cont::Checks;
             label_indent = indent;
         } else if let Some(rest) = trimmed.strip_prefix("stop-checks:") {
@@ -2147,7 +2147,7 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
                 Cont::Stop => join(&mut last.stop, trimmed),
                 Cont::Verdict => join(&mut last.verdict, trimmed),
                 Cont::Landed => landed_push(&mut last.landed, trimmed),
-                Cont::Checks => crate::barrier::push(&mut last.checks, trimmed),
+                Cont::Checks => crate::checks::push(&mut last.checks, trimmed),
                 Cont::StopChecks => stop_check_push(&mut last.stop_checks, trimmed),
                 Cont::Members => {
                     last.members.extend(trimmed.split_whitespace().map(|t| t.to_string()))
@@ -2300,7 +2300,7 @@ pub fn render_groups(groups: &[Group]) -> String {
         if !g.verdict_caption.trim().is_empty() {
             out.push_str(&format!("  verdict-caption: {}\n", g.verdict_caption.trim()));
         }
-        block(&mut out, "checks", &crate::barrier::text(&g.checks));
+        block(&mut out, "checks", &crate::checks::text(&g.checks));
         block(&mut out, "landed", &landed_text(&g.landed));
     }
     out
@@ -2616,6 +2616,13 @@ impl Worklist {
     pub fn render(&self) -> String {
         fm::emit(&self.to_doc())
     }
+}
+
+/// How many barriers the run has passed: the groups up to the last one carrying
+/// a verdict. The ask that was raised at a barrier is over when its ordinal is
+/// at or below this; `worklist` stands its position on it.
+pub(crate) fn crossed(groups: &[Group]) -> usize {
+    groups.iter().rposition(|g| !g.verdict.trim().is_empty()).map_or(0, |i| i + 1)
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ mod packet_gen;
 mod verifier_packet;
 mod agent_commands;
 mod barrier;
+mod checks;
 mod barrier_replay;
 mod barrier_run;
 mod cold;
@@ -502,6 +503,7 @@ fn main() {
     cmd_checkout::install_engine(cmd_checkout::Engine {
         passed: worklist::passed_by_running,
         poke_task: cycle::poke_task,
+        runs: |store, task| worklist::Running::read(store).of(task).is_some_and(|p| p.run),
     });
 
     let argv: Vec<String> = std::env::args().skip(1).collect();

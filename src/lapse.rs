@@ -152,7 +152,7 @@ pub fn list_moved(store: &Store, w: &Worklist) -> Vec<String> {
         WorklistStatus::Parked => Some("list was parked"),
         _ => None,
     };
-    let crossed = crate::worklist::crossed(&w.groups());
+    let crossed = crate::model::crossed(&w.groups());
     close_where(store, &Party::lapsed(), |m| {
         if !of_it(m) {
             return None;

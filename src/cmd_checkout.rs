@@ -227,7 +227,7 @@ impl Flow {
 
     /// The flow of a row by id, read from the lists that are running.
     pub(crate) fn of_task(store: &Store, task: &str) -> Flow {
-        Flow::of(store.running().of(task).is_some_and(|p| p.run))
+        Flow::of((engine().runs)(store, task))
     }
 
     /// The `land` row of the banner.
@@ -1748,6 +1748,8 @@ pub(crate) struct Engine {
     pub passed: fn(&Store) -> std::collections::BTreeSet<String>,
     /// After a status verb: start the steps this may have made due (`cycle::poke_task`).
     pub poke_task: fn(&Store, &str, &str),
+    /// Whether a running list's group holds the row to a run of its own (`Running::of`'s `run`).
+    pub runs: fn(&Store, &str) -> bool,
 }
 
 static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
@@ -1758,7 +1760,7 @@ pub(crate) fn install_engine(e: Engine) {
 
 /// The installed answers; before any is installed (a unit test) nothing is passed and nothing is poked.
 fn engine() -> &'static Engine {
-    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {} };
+    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {}, runs: |_, _| false };
     ENGINE.get().unwrap_or(&NONE)
 }
 
