@@ -1942,7 +1942,7 @@ fn close_locked(
     // work again.
     if q.for_person && act == Act::Answered {
         let landed = if let Some(mut t) = q.about.task().and_then(|id| store.task(id)) {
-            crate::model::append_decision(&mut t.body, &format!("answering {}: {}", q.id, text.trim()), &[]);
+            crate::decisions::decide_task(&mut t, &format!("answering {}: {}", q.id, text.trim()), &[]);
             t.touch();
             Some(match store.save_task(&t) {
                 Ok(()) => Landed::Task(t.id.clone()),

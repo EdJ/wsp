@@ -1894,7 +1894,7 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
         }
         let said = from.map(|src| format!("{} characters from {src}", text.len()));
         return mutate_saying(store, args, "decided", said.as_deref(), |t| {
-            crate::model::append_decision(&mut t.body, &text, &supersedes);
+            crate::decisions::decide_task(t, &text, &supersedes);
         });
     }
 
@@ -1906,7 +1906,7 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
     if let Err(code) = check_supersedes(&p.body, &supersedes, &p.id) {
         return code;
     }
-    crate::model::append_decision(&mut p.body, &text, &supersedes);
+    crate::decisions::decide_project(&mut p, &text, &supersedes);
     if let Err(e) = store.save_project(&p) {
         eprintln!("wsp: write failed: {e}");
         return 1;

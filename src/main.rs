@@ -34,6 +34,7 @@ mod lapse;
 mod testkit;
 mod risk;
 mod check;
+mod decisions;
 mod greens;
 mod build_output;
 mod check_tree;

@@ -1146,20 +1146,20 @@ mod tests {
     /// then invisible, so the words have to carry it.
     #[test]
     fn a_superseded_decision_is_marked_in_the_abridged_block() {
-        let mut body = String::new();
-        let old = crate::model::append_decision(
-            &mut body,
+        let mut proj = Project::default();
+        let old = crate::decisions::decide_project(
+            &mut proj,
             "an uncommitted file in ~/wsp is not yours. The store autocommits with git add -A.",
             &[],
         );
-        crate::model::append_decision(
-            &mut body,
+        crate::decisions::decide_project(
+            &mut proj,
             "the commit is scoped to the paths a command wrote. Anything else you commit yourself.",
             &[old],
         );
 
         let p = Paint::new();
-        let decided = crate::model::decisions_of(&body);
+        let decided = crate::model::decisions_of(&proj.body);
         let lines = decision_lines(&p, &decided, false, "wsp");
 
         assert!(lines[0].contains("d1"), "the id is the handle the mark needs:\n{lines:#?}");
