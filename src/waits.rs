@@ -269,7 +269,10 @@ impl Machine {
     /// The machine as it is: the seats counted as `wsp-353` counts them, and
     /// `wsp throttle`'s own answer.
     pub fn now(store: &Store) -> Machine {
-        Machine { free: free_places(store), cap: store.seat_cap(), throttled: crate::throttle::holding_back(store) }
+        // `holding_back` guards on `cfg!(test)` inside the trees crate, which is not under
+        // test when this crate's tests run: on a throttled machine the live reading
+        // held every planned list. The guard is asked here, in the crate under test.
+        Machine { free: free_places(store), cap: store.seat_cap(), throttled: (!cfg!(test)).then(|| crate::throttle::holding_back(store)).flatten() }
     }
 }
 
