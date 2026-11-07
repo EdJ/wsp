@@ -740,6 +740,9 @@ pub(crate) struct SeatReport {
     pub phases: Vec<SeatPhase>,
     /// Where the leg boundaries came from.
     pub source: String,
+    /// When the seat was in a model call or a tool, from the transcripts read
+    /// (not merged): what the wall-time buckets call a member working.
+    pub active: Vec<(i64, i64)>,
 }
 
 /// One model call, once per requestId.
@@ -1044,6 +1047,8 @@ pub(crate) fn seat_report(i: &Inputs, phases: &[Phase], run_legs: &[Span], load:
             continue;
         };
         let (calls, tools) = read_transcript(&text);
+        r.active.extend(calls.iter().filter(|c| c.end > c.start).map(|c| (c.start, c.end)));
+        r.active.extend(tools.iter().filter(|(_, _, secs)| *secs > 0).map(|(at, _, secs)| (*at, at + secs)));
         for c in calls {
             let inside = windows.iter().any(|(a, b)| c.at >= *a && c.at < *b);
             let found = r.phases.iter_mut().enumerate().find(|(n, p)| p.holds(c.at, *n == last)).map(|(_, p)| p);
@@ -1188,6 +1193,42 @@ pub(crate) struct RowFigures {
     pub verifier_spawn_to_first: Option<i64>,
     pub verifier_test_secs: i64,
     pub verdict_to_despawn: Option<i64>,
+    /// What the wall-time buckets read (`wsp-470`): the row's own phases by what
+    /// kind of time they are, when its seat was in a model call or a tool
+    /// (merged), and when it stood blocked.
+    pub spans: Vec<crate::wallbuckets::Span>,
+    pub active: Vec<(i64, i64)>,
+    pub blocked: Vec<(i64, i64)>,
+    /// Every transcript the seat's calls come from was found: where one was
+    /// not, its seat time cannot be told from idle and is not called waiting.
+    pub measured: bool,
+}
+
+/// When the row stood blocked: from each `task-blocked` to the next event that
+/// moves its status (a release, a todo, a reopen, a review, a park), or to the
+/// row's last phase end.
+pub(crate) fn blocked_spans(i: &Inputs, end: i64) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    let mut from: Option<i64> = None;
+    let mut evs: Vec<&(i64, String, Value)> = i.events.iter().filter(|(_, _, d)| d["id"] == i.id.as_str()).collect();
+    evs.sort_by_key(|e| e.0);
+    for (t, k, _) in evs {
+        match k.as_str() {
+            "task-blocked" => {
+                from.get_or_insert(*t);
+            }
+            "task-todo" | "task-doing" | "task-reopen" | "task-review" | "task-released" | "task-parked" | "task-done" | "task-claimed" => {
+                if let Some(f) = from.take() {
+                    out.push((f, (*t).max(f)));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(f) = from {
+        out.push((f, end.max(f)));
+    }
+    out
 }
 
 /// The fixed parts of a row, from what [`gather`] read and the phases [`build`] made.
@@ -1209,6 +1250,7 @@ pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
     let run = run_legs_for(&i, &phases, None);
     let seat = seat_report(&i, &phases, &run, &transcript);
     let mut f = figures_of(&phases, &seat);
+    f.blocked = blocked_spans(&i, f.end);
     (f.spawn_to_first, f.verifier_spawn_to_first, f.verifier_test_secs, f.verdict_to_despawn) = fixed_of(&i, &phases);
     f
 }
@@ -1236,6 +1278,9 @@ pub(crate) fn figures_of(phases: &[Phase], seat: &SeatReport) -> RowFigures {
     }
     f.sessions = seat.sessions.len();
     f.missing = seat.missing.len();
+    f.measured = f.missing == 0 && f.sessions > 0;
+    f.active = crate::wallbuckets::merge(&seat.active);
+    f.spans = phases.iter().map(crate::wallbuckets::Span::of).collect();
     for p in &seat.phases {
         f.calls += p.calls;
         f.model_secs += p.model_secs;

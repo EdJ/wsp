@@ -89,6 +89,7 @@ mod story;
 mod stuck;
 mod sync;
 mod timeline;
+mod wallbuckets;
 mod untaken;
 mod waiting;
 mod waits;

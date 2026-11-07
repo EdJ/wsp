@@ -100,7 +100,7 @@ cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `at_stop`, `gc` |
 | `engine` | `stage`, `history`, `after`, `worklist`, `cycle`, `barrier`, `barrier_run`, `barrier_replay`, `verification`, `check`, `leg_tree`, `cold`, `affected`, `build_output`, `did`, `closing`, `ending`, `repair`, `split`, `starts`, `stand_down`, `untaken`, `waiting`, `legs`, `leg_seat`, `cmd_worklist`, `cmd_task`, `packet`, `packet_gen`, `verifier_packet`, `attention`, `kind_attention`, `cmd_attend`, `cmd_message`, `hold`, `hold_close`, `pickup`, `waits`, `scope` |
 | `seats` | `agent_commands`, `kind_data`, `cmd_project`, `cmd_spawn`, `cmd_agent`, `cmd_resume`, `wake`, `room`, `cmd_govern`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_role`, `cmd_stamp`, `stuck`, `sync` |
-| `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `cmd_attempts`, `cmd_verifications` |
+| `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `wallbuckets`, `cmd_attempts`, `cmd_verifications` |
 | `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |
 | `top` | `main`, `registry`, `daemon`, `leaked_agents` |
 
@@ -123,7 +123,7 @@ on 8 cores** (so read it as an order of magnitude, and the shape matters more th
 | `wsp-trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `build_output`, `throttle`, `warm`, `guard`, `leg_tree`, `overlap`, `disk` | 8.9k | 196 | 187.0 | worktrees, `.git`, build trees |
 | `wsp-engine` | `worklist`, `cycle`, `repair`, `verification`, `check`, `barrier*`, `legs`, `closing`, `ending`, `hold*`, `cmd_task`, `cmd_worklist`, `cmd_message`, `stage`, `caption`, `history`, `after`, `packet*`, `attention` | 32.8k | 814 | 197.7 | the run's rows |
 | `wsp-seats` | `cmd_spawn`, `cmd_agent`, `agent_commands`, `cmd_resume`, `cmd_govern`, `wake`, `room`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_stamp` | 30.1k | 634 | 33.4 | seat bindings, wakes |
-| `wsp-timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `cmd_attempts`, `cmd_verifications` | 3.8k | 59 | 1.7 | nothing (reads) |
+| `wsp-timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `wallbuckets`, `cmd_attempts`, `cmd_verifications` | 3.8k | 59 | 1.7 | nothing (reads) |
 | `wsp-surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` | 21.2k | 370 | 1.1 | nothing (reads, then asks) |
 | `wsp` (bin) | `main`, `daemon`, `fake`; the verb loop | 5.4k | 66 | 0.1 | the process |
 
