@@ -460,6 +460,38 @@ fn signpost(verb: &str) -> &'static [&'static str] {
 /// before dispatch, so the one command documented as needing nothing exited 2
 /// with "no store — run wsp init first" on exactly the machine it was written
 /// for. A seam that a gate three files away can close is not a seam.
+/// Start this process's record. Cheap: the sub-verb check reads the help text
+/// that is already in the binary.
+fn record_call(args: &Args) {
+    let mut flags: Vec<String> = args.flag_names().into_iter().map(str::to_string).collect();
+    flags.sort();
+    let verb = if args.cmd.is_empty() && args.has("version") { "version" } else { args.cmd.as_str() };
+    wsp_base::calls::begin(verb, &sub_of(args), flags);
+}
+
+/// The first word after the verb, if the help documents `wsp <verb> <word>`.
+fn sub_of(args: &Args) -> String {
+    let Some(first) = args.rest.first() else { return String::new() };
+    let word = first.as_str();
+    if word.is_empty() || word.len() > 24 || !word.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+        return String::new();
+    }
+    let documented = registry::ALL
+        .iter()
+        .flat_map(|vs| vs.iter())
+        .flat_map(|v| v.help.iter())
+        .any(|h| documents(h.text, &args.cmd, word));
+    if documented { word.to_string() } else { String::new() }
+}
+
+/// Whether a help entry has a line beginning `wsp <verb> <word>`.
+fn documents(help: &str, verb: &str, word: &str) -> bool {
+    let want = format!("wsp {verb} {word}");
+    help.lines().any(|l| {
+        l.trim_start().strip_prefix(&want).is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+    })
+}
+
 fn needs_store(args: &Args) -> bool {
     if matches!(args.cmd.as_str(), "init" | "doctor" | "throttle" | "calls") {
         return false;
@@ -501,7 +533,7 @@ fn main() {
     }
     let args = Args::parse(argv);
     // `wsp-481`: what this call costs, written when it exits. See `calls`.
-    cmd_calls::begin(&args);
+    record_call(&args);
 
     if args.has("version") || args.cmd == "version" {
         println!("wsp {}", version());
@@ -1005,6 +1037,25 @@ mod tests {
 
     /// `wsp help` is the same bytes it was before the verbs carried their own
     /// help — everything after the version line, which names the build.
+    /// Prose, ids and anything not in the help never reach the file as a
+    /// sub-verb; a documented word does.
+    #[test]
+    fn only_a_documented_word_is_a_sub_verb() {
+        assert_eq!(super::sub_of(&super::Args::synth("worklist", &["next"], &[])), "next");
+        assert_eq!(super::sub_of(&super::Args::synth("tell", &["cpd-3", "hello there"], &[])), "");
+        assert_eq!(super::sub_of(&super::Args::synth("say", &["hello"], &[])), "");
+        assert_eq!(super::sub_of(&super::Args::synth("wip", &[], &[])), "");
+        assert_eq!(super::sub_of(&super::Args::synth("note", &["wsp-481"], &[])), "");
+    }
+
+    #[test]
+    fn a_help_line_documents_a_word_only_at_the_start_of_its_words() {
+        let h = "  wsp worklist next <list>   the next row\n  wsp worklistx foo";
+        assert!(super::documents(h, "worklist", "next"));
+        assert!(!super::documents(h, "worklist", "nex"));
+        assert!(!super::documents(h, "worklist", "foo"));
+    }
+
     #[test]
     fn the_help_is_what_it_was_before_the_registry() {
         let help = super::help_text();
@@ -1475,19 +1526,19 @@ mod tests {
     #[test]
     fn the_storyboard_runs_with_no_store() {
         use super::{needs_store, Args};
-        assert!(!needs_store(&Args::synth("panel", &["storyboard"], &[])));
-        assert!(!needs_store(&Args::synth("init", &[], &[])));
-        assert!(!needs_store(&Args::synth("doctor", &[], &[])));
-        assert!(!needs_store(&Args::synth("agent", &["pi-extension"], &[])));
+        assert!(!needs_store(&super::Args::synth("panel", &["storyboard"], &[])));
+        assert!(!needs_store(&super::Args::synth("init", &[], &[])));
+        assert!(!needs_store(&super::Args::synth("doctor", &[], &[])));
+        assert!(!needs_store(&super::Args::synth("agent", &["pi-extension"], &[])));
 
         // The exemption is that one subcommand and no more of `panel`: the
         // live panel reads the store on its first frame, and letting it start
         // without one trades a clear refusal for an empty tree.
-        assert!(needs_store(&Args::synth("panel", &[], &[])));
-        assert!(needs_store(&Args::synth("panel", &["install"], &[])));
-        assert!(needs_store(&Args::synth("ls", &[], &[])));
+        assert!(needs_store(&super::Args::synth("panel", &[], &[])));
+        assert!(needs_store(&super::Args::synth("panel", &["install"], &[])));
+        assert!(needs_store(&super::Args::synth("ls", &[], &[])));
         // And it is `panel storyboard`, not the word anywhere in the line.
-        assert!(needs_store(&Args::synth("storyboard", &[], &[])));
+        assert!(needs_store(&super::Args::synth("storyboard", &[], &[])));
     }
 
     /// The half of `worklist-036` that a read tally alone cannot reach: a flag

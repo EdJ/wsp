@@ -2,9 +2,10 @@
 //!
 //! The recording is `wsp_base::calls`: every `wsp` process appends one line to
 //! `$WSP_STATE/calls.jsonl` as it exits, and the daemon one per tick. This is the
-//! reading half, and the glue `main` calls first: [`begin`] reduces the command
-//! line to the three things that are safe to write down — the verb, a sub-verb
-//! that is one of the words the help documents, and the flag *names*.
+//! reading half. The start of the record is `record_call` in `main.rs`, which
+//! reduces the command line to the three things that are safe to write down — the
+//! verb, a sub-verb that is one of the words the help documents, and the flag
+//! *names*.
 //!
 //! **Never prose, ids or file contents.** `wsp tell cpd-3 "…"` is recorded as
 //! `tell`, with no sub-verb because `cpd-3` is no documented word, and no flag
@@ -17,39 +18,7 @@ use wsp_base::calls::{self, By, Row};
 
 use crate::store::Store;
 use crate::util;
-use crate::Args;
-
-/// Start this process's record. Cheap: the sub-verb check reads the help text
-/// that is already in the binary.
-pub fn begin(args: &Args) {
-    let mut flags: Vec<String> = args.flag_names().into_iter().map(str::to_string).collect();
-    flags.sort();
-    let verb = if args.cmd.is_empty() && args.has("version") { "version" } else { args.cmd.as_str() };
-    calls::begin(verb, &sub_of(args), flags);
-}
-
-/// The first word after the verb, if the help documents `wsp <verb> <word>`.
-fn sub_of(args: &Args) -> String {
-    let Some(first) = args.rest.first() else { return String::new() };
-    let word = first.as_str();
-    if word.is_empty() || word.len() > 24 || !word.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
-        return String::new();
-    }
-    let documented = crate::registry::ALL
-        .iter()
-        .flat_map(|vs| vs.iter())
-        .flat_map(|v| v.help.iter())
-        .any(|h| documents(h.text, &args.cmd, word));
-    if documented { word.to_string() } else { String::new() }
-}
-
-/// Whether a help entry has a line beginning `wsp <verb> <word>`.
-fn documents(help: &str, verb: &str, word: &str) -> bool {
-    let want = format!("wsp {verb} {word}");
-    help.lines().any(|l| {
-        l.trim_start().strip_prefix(&want).is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
-    })
-}
+use crate::base::args::Args;
 
 /// `90`, `90s`, `15m`, `1h`, `2d`, as seconds.
 fn window(text: &str) -> Option<i64> {
@@ -237,17 +206,6 @@ mod tests {
         Args::synth(cmd, rest, flags)
     }
 
-    /// Prose, ids and anything not in the help never reach the file as a
-    /// sub-verb; a documented word does.
-    #[test]
-    fn only_a_documented_word_is_a_sub_verb() {
-        assert_eq!(sub_of(&args("worklist", &["next"], &[])), "next");
-        assert_eq!(sub_of(&args("tell", &["cpd-3", "hello there"], &[])), "");
-        assert_eq!(sub_of(&args("say", &["hello"], &[])), "");
-        assert_eq!(sub_of(&args("wip", &[], &[])), "");
-        assert_eq!(sub_of(&args("note", &["wsp-481"], &[])), "");
-    }
-
     #[test]
     fn a_span_is_seconds_minutes_hours_or_days() {
         assert_eq!(window("90"), Some(90));
@@ -256,14 +214,6 @@ mod tests {
         assert_eq!(window("2d"), Some(172_800));
         assert_eq!(window("x"), None);
         assert_eq!(window("5w"), None);
-    }
-
-    #[test]
-    fn a_help_line_documents_a_word_only_at_the_start_of_its_words() {
-        let h = "  wsp worklist next <list>   the next row\n  wsp worklistx foo";
-        assert!(documents(h, "worklist", "next"));
-        assert!(!documents(h, "worklist", "nex"));
-        assert!(!documents(h, "worklist", "foo"));
     }
 
     /// The report reads the file `begin`/`exit` and the daemon write, in the
