@@ -1,3 +1,6 @@
+# Upward uses the code has today: `from -> to: symbols`, one module pair per line (wsp-400).
+# The layering test (tests/layering.rs) fails on an upward use not here and on a line the code no longer has.
+# This file only shrinks: delete a line or a symbol when the code stops using it; never add one.
 affected -> check: *, Of, Step, captures  # trees -> engine
 after -> main: Args  # engine -> top
 artefact -> cmd_agent: my_pane  # store -> seats
