@@ -1,0 +1,408 @@
+//! The running half of the timing retro (`wsp-472`): the trigger when a list
+//! clears, the three verbs the retro seat files through, `retro.html` and
+//! `retro.json` beside the other reports, and the line in `wsp yours`.
+
+use serde_json::{json, Value};
+
+use crate::cmd_report::{dir, esc, write};
+use crate::model::{Status, Task, Worklist};
+use crate::retro::{self, Figures, MAX_NEW};
+use crate::retro_series as series;
+use crate::store::Store;
+use crate::util;
+use crate::Args;
+
+const FILE: &str = "retro.json";
+
+pub fn state(slug: &str) -> Value {
+    std::fs::read_to_string(dir(slug).join(FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
+}
+
+fn save(store: &Store, w: &Worklist, s: &Value, note: &str) -> Result<(), String> {
+    write(&w.id, FILE, &serde_json::to_string_pretty(s).unwrap_or_default(), note)?;
+    write(&w.id, "retro.html", &html(store, w, s), note)?;
+    Ok(())
+}
+
+fn arr<'a>(s: &'a Value, k: &str) -> &'a [Value] {
+    s[k].as_array().map(Vec::as_slice).unwrap_or(&[])
+}
+
+fn mins(s: i64) -> String {
+    format!("{}m", (s.max(0) + 30) / 60)
+}
+
+/// `retro.html`: where the wall went against the baseline, each cause linked
+/// to its row, the defects apart from the questions waiting for the person.
+pub fn html(_store: &Store, w: &Worklist, s: &Value) -> String {
+    let mut b = format!("<h1>Retro · {}</h1><p>{}</p>", esc(&w.id), esc(&w.title));
+    b.push_str("<p class=\"dim\">Time and cost are in <a href=\"effort.html\">effort.html</a>; the work in <a href=\"work.html\">work.html</a>.</p>");
+    let base: Vec<&Value> = arr(s, "baseline").iter().collect();
+    b.push_str("<h2>Where the time went</h2><table><thead><tr><th>bucket</th><th>this list</th><th>baseline</th><th>ratio</th></tr></thead><tbody>");
+    for (name, secs) in s["buckets"].as_object().into_iter().flatten() {
+        let secs = secs.as_i64().unwrap_or(0);
+        let others: Vec<i64> = base.iter().filter_map(|f| f["buckets"][name].as_i64()).collect();
+        let avg = if others.is_empty() { None } else { Some(others.iter().sum::<i64>() / others.len() as i64) };
+        let ratio = match avg {
+            Some(a) if a > 0 => format!("{:.1}×", secs as f64 / a as f64),
+            _ => "—".into(),
+        };
+        b.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{ratio}</td></tr>",
+            esc(name),
+            mins(secs),
+            avg.map(mins).unwrap_or_else(|| "—".into())
+        ));
+    }
+    b.push_str("</tbody></table>");
+    let filed = arr(s, "filed");
+    let row = |f: &Value| {
+        format!(
+            "<tr><td>{}</td><td><a href=\"wsp:{}\">{}</a></td><td>{}</td></tr>",
+            esc(f["cause"].as_str().unwrap_or("")),
+            esc(f["row"].as_str().unwrap_or("")),
+            esc(f["row"].as_str().unwrap_or("")),
+            esc(f["list"].as_str().unwrap_or(""))
+        )
+    };
+    for (kind, head) in [("defect", "Defects"), ("question", "Questions waiting for the person")] {
+        let mine: Vec<&Value> = filed.iter().filter(|f| f["kind"] == kind).collect();
+        b.push_str(&format!("<h2>{head}</h2>"));
+        if mine.is_empty() {
+            b.push_str("<p>None.</p>");
+        } else {
+            b.push_str("<table><thead><tr><th>cause</th><th>row</th><th>list</th></tr></thead><tbody>");
+            for f in mine {
+                b.push_str(&row(f));
+            }
+            b.push_str("</tbody></table>");
+        }
+    }
+    let notes = arr(s, "notes");
+    if !notes.is_empty() {
+        b.push_str("<h2>Noted on existing rows</h2><ul>");
+        for n in notes {
+            b.push_str(&format!("<li><a href=\"wsp:{0}\">{0}</a> — {1}</li>", esc(n["row"].as_str().unwrap_or("")), esc(n["text"].as_str().unwrap_or(""))));
+        }
+        b.push_str("</ul>");
+    }
+    if let Some(t) = s["summary"].as_str() {
+        b.push_str(&format!("<h2>Summary</h2><pre>{}</pre>", esc(t)));
+    } else {
+        b.push_str("<p class=\"dim\">The retro seat has not finished.</p>");
+    }
+    b
+}
+
+/// A row for the retro seat to sit on: its packet is the row's overview.
+fn seat_row(store: &Store, w: &Worklist) -> Result<Task, String> {
+    let project = crate::worklist::home(store, w).map(|h| h.project).or_else(|| w.project.clone());
+    let id = store.alloc_task_id(project.as_deref()).map_err(|e| format!("cannot allocate id: {e}"))?;
+    let mut t = Task::new(&format!("Timing retro of {}", w.id), &id);
+    t.project = project.clone();
+    if project.is_none() {
+        t.status_raw = "inbox".into();
+    }
+    crate::model::set_section_in(&mut t.body, "Overview", retro::packet(store, w).trim());
+    store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
+    store.log_event("task-added", json!({ "id": t.id, "project": t.project, "title": t.title }));
+    Ok(t)
+}
+
+/// Start a retro seat over `w`: a row carrying the packet, a record on the
+/// list so a clear has one, the evidence file, and the spawn. `by_hand` skips
+/// the guards (and the one-per-clear record) but not the evidence.
+pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, String> {
+    if !by_hand {
+        retro::eligible(store, w)?;
+    }
+    let t = seat_row(store, w)?;
+    let mut w = store.worklist(&w.id).unwrap_or_else(|| w.clone());
+    w.retro = Some((util::now_iso(), t.id.clone()));
+    w.log(&format!("timing retro — {} {}", t.id, if by_hand { "by hand" } else { "at the clear" }));
+    store.save_worklist(&w).map_err(|e| format!("write failed: {e}"))?;
+    let f = Figures::of(&crate::cmd_report::effort(store, &w, None));
+    let mut s = match state(&w.id) {
+        Value::Object(o) => Value::Object(o),
+        _ => json!({ "filed": [], "notes": [] }),
+    };
+    s["list"] = json!(w.id);
+    s["row"] = json!(t.id);
+    s["started"] = json!(util::now_iso());
+    s["wall"] = json!(f.wall);
+    s["rows"] = json!(f.rows);
+    s["buckets"] = json!(f.buckets.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, Value>>());
+    s["baseline"] = json!(retro::baseline(store, &w).iter().map(|b| json!({ "list": b.list, "wall": b.wall, "buckets": b.buckets.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, Value>>() })).collect::<Vec<_>>());
+    s["done"] = json!(false);
+    s["summary"] = Value::Null;
+    save(store, &w, &s, "timing retro started")?;
+    store.log_event("retro-started", json!({ "list": w.id, "row": t.id, "by_hand": by_hand }));
+    crate::cycle::launch_out(store, &["spawn", &t.id, "--agent", "--kind", "claude", "--model", "sonnet", "--effort", "high"]);
+    Ok(t.id)
+}
+
+/// When a list clears: a retro if the guards pass. Quiet when they do not.
+pub fn at_clear(store: &Store, w: &Worklist) {
+    let Some(w) = store.worklist(&w.id) else { return };
+    if w.is_cancelled() {
+        return;
+    }
+    if let Err(why) = start(store, &w, false) {
+        store.log_event("retro-skipped", json!({ "list": w.id, "why": why }));
+    }
+}
+
+fn read(path: &str) -> Result<String, String> {
+    use std::io::Read;
+    let mut s = String::new();
+    if path == "-" {
+        std::io::stdin().read_to_string(&mut s).map_err(|e| e.to_string())?;
+    } else {
+        s = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    }
+    Ok(s)
+}
+
+fn words(t: &str) -> std::collections::BTreeSet<String> {
+    t.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 2).map(str::to_string).collect()
+}
+
+/// The open row whose title the new one is too close to, if any.
+fn near_duplicate(store: &Store, title: &str) -> Option<(String, String)> {
+    let a = words(title);
+    if a.is_empty() {
+        return None;
+    }
+    store.tasks().into_iter().filter(|t| t.status() != Status::Done).find_map(|t| {
+        let b = words(&t.title);
+        let both = a.intersection(&b).count() as f64;
+        let any = a.union(&b).count() as f64;
+        (any > 0.0 && both / any >= 0.6).then(|| (t.id.clone(), t.title.clone()))
+    })
+}
+
+fn fail(msg: &str) -> i32 {
+    eprintln!("wsp: {msg}");
+    1
+}
+
+fn list_of(store: &Store, args: &Args) -> Result<(Worklist, Value), i32> {
+    let Some(slug) = args.rest.get(1) else {
+        eprintln!("usage:\n{}", retro::SYNTAX);
+        return Err(2);
+    };
+    let Some(w) = store.worklist(slug) else { return Err(fail(&format!("no list `{slug}`"))) };
+    let s = state(&w.id);
+    if s.is_null() || s["done"] == true {
+        return Err(fail(&format!("{} has no retro running — `wsp retro {}` starts one", w.id, w.id)));
+    }
+    Ok((w, s))
+}
+
+pub fn file(store: &Store, args: &Args) -> i32 {
+    let (w, mut s) = match list_of(store, args) {
+        Ok(x) => x,
+        Err(c) => return c,
+    };
+    let (defect, strategic) = (args.has("defect"), args.has("strategic"));
+    if defect == strategic {
+        return fail("say --defect or --strategic, one of them");
+    }
+    let Some(title) = args.get("title") else { return fail("--title is needed") };
+    let run = s["row"].as_str().unwrap_or("").to_string();
+    let this_run = arr(&s, "filed").iter().filter(|f| f["run"] == run.as_str()).count();
+    if this_run >= MAX_NEW {
+        return fail(&format!("{MAX_NEW} rows filed already — a retro files at most {MAX_NEW}. List the rest in your summary (`wsp retro done`)"));
+    }
+    if let Some((id, t)) = near_duplicate(store, &title) {
+        return fail(&format!("`{title}` is too close to the open row {id} ({t}) — add what you found with `wsp retro note {} {id} FILE` instead", w.id));
+    }
+    let get = |flag: &str| -> Result<String, i32> {
+        let p = args.get(flag).ok_or_else(|| fail(&format!("--{flag} FILE is needed")))?;
+        read(&p).map_err(|e| fail(&e))
+    };
+    let project = crate::worklist::home(store, &w).map(|h| h.project).or_else(|| w.project.clone());
+    let made = if defect {
+        let (e, f, d) = match (get("evidence"), get("fix"), get("done-when")) {
+            (Ok(e), Ok(f), Ok(d)) => (e, f, d),
+            (Err(c), _, _) | (_, Err(c), _) | (_, _, Err(c)) => return c,
+        };
+        series::file_defect(store, &title, &e, &f, &d, project.as_deref()).map(|id| (id, series::DEFECTS))
+    } else {
+        let (e, a) = match (get("evidence"), get("ask")) {
+            (Ok(e), Ok(a)) => (e, a),
+            (Err(c), _) | (_, Err(c)) => return c,
+        };
+        let ask: Value = match serde_json::from_str(&a) {
+            Ok(v) => v,
+            Err(e) => return fail(&format!("--ask is not JSON: {e}")),
+        };
+        series::file_question(store, &title, &e, &ask, project.as_deref()).map(|id| (id, series::QUESTIONS))
+    };
+    match made {
+        Ok((id, series_name)) => {
+            let list = store.worklists().into_iter().find(|l| l.groups().iter().any(|g| g.members.contains(&id))).map(|l| l.id).unwrap_or_else(|| series_name.to_string());
+            let mut f = arr(&s, "filed").to_vec();
+            f.push(json!({ "kind": if defect { "defect" } else { "question" }, "row": id, "list": list, "cause": title, "run": run }));
+            s["filed"] = json!(f);
+            if let Err(e) = save(store, &w, &s, "timing retro filed a row") {
+                return fail(&e);
+            }
+            println!("{id} filed on {list} ({} of {MAX_NEW})", this_run + 1);
+            0
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+pub fn note(store: &Store, args: &Args) -> i32 {
+    let (w, mut s) = match list_of(store, args) {
+        Ok(x) => x,
+        Err(c) => return c,
+    };
+    let (Some(row), Some(path)) = (args.rest.get(2), args.rest.get(3)) else {
+        eprintln!("usage: wsp retro note <list> <row> FILE");
+        return 2;
+    };
+    let text = match read(path) {
+        Ok(t) => t,
+        Err(e) => return fail(&e),
+    };
+    if let Err(e) = series::add_note(store, row, &format!("timing retro of {}: {}", w.id, text.trim())) {
+        return fail(&e);
+    }
+    let mut n = arr(&s, "notes").to_vec();
+    n.push(json!({ "row": row, "text": text.trim() }));
+    s["notes"] = json!(n);
+    if let Err(e) = save(store, &w, &s, "timing retro noted a row") {
+        return fail(&e);
+    }
+    println!("{row} noted");
+    0
+}
+
+pub fn done(store: &Store, args: &Args) -> i32 {
+    let (w, mut s) = match list_of(store, args) {
+        Ok(x) => x,
+        Err(c) => return c,
+    };
+    let Some(path) = args.rest.get(2) else {
+        eprintln!("usage: wsp retro done <list> FILE");
+        return 2;
+    };
+    let text = match read(path) {
+        Ok(t) => t,
+        Err(e) => return fail(&e),
+    };
+    let none = arr(&s, "filed").is_empty() && arr(&s, "notes").is_empty();
+    if text.trim().is_empty() || (none && !text.to_lowercase().contains("nothing")) {
+        return fail("you filed and noted nothing — say so in the summary (\"nothing to file, because …\")");
+    }
+    s["summary"] = json!(text.trim());
+    s["done"] = json!(true);
+    s["finished"] = json!(util::now_iso());
+    if let Err(e) = save(store, &w, &s, "timing retro finished") {
+        return fail(&e);
+    }
+    if let Some(mut t) = s["row"].as_str().and_then(|r| store.task(r)) {
+        t.status_raw = "review".into();
+        t.log("retro done");
+        let _ = store.save_task(&t);
+    }
+    store.log_event("retro-done", json!({ "list": w.id }));
+    println!("{} retro recorded", w.id);
+    0
+}
+
+/// The lines `wsp yours` adds: one per list whose retro finished in the last
+/// two days.
+pub fn yours_lines(store: &Store) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in store.worklists() {
+        if w.retro.is_none() {
+            continue;
+        }
+        let s = state(&w.id);
+        if s["done"] != true || util::since(s["finished"].as_str().unwrap_or("")) > 2 * 86400 {
+            continue;
+        }
+        let of = |k: &str| -> (usize, String) {
+            let mine: Vec<&Value> = arr(&s, "filed").iter().filter(|f| f["kind"] == k).collect();
+            (mine.len(), mine.first().and_then(|f| f["list"].as_str()).unwrap_or("—").to_string())
+        };
+        let (k, dl) = of("defect");
+        let (q, ql) = of("question");
+        let n = k + q + arr(&s, "notes").len();
+        out.push(format!(
+            "{} cleared in {}; {n} causes; {k} defects on {dl}; {q} questions on {ql}",
+            w.id,
+            util::duration_human(s["wall"].as_i64().unwrap_or(0))
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put(dirp: &std::path::Path, name: &str, text: &str) -> String {
+        let p = dirp.join(name);
+        std::fs::write(&p, text).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_clear_starts_a_retro_the_verbs_file_and_yours_says_so() {
+        let (env, store) = crate::testkit::isolated_store("retro-run");
+        let mut w = Worklist::new("l", "A list");
+        w.body = "## Groups\n\n1. a-1 a-2 a-3\n".into();
+        for id in ["a-1", "a-2", "a-3"] {
+            let mut t = Task::new(&format!("row {id}"), id);
+            t.status_raw = "done".into();
+            store.save_task(&t).unwrap();
+        }
+        store.save_worklist(&w).unwrap();
+        // the eligibility figures: 3 rows, 2 hours of wall
+        assert!(retro::eligible_with(&store, &w, 3, 7200).is_ok());
+        assert!(start(&store, &w, false).is_err(), "no wall recorded, so the automatic path declines");
+        let seat = start(&store, &w, true).unwrap();
+        assert!(store.task(&seat).is_some());
+        assert!(store.worklist("l").unwrap().retro.is_some());
+        assert!(dir("l").join("retro.html").is_file());
+
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let args = |rest: &[&str], flags: &[(&str, &str)]| Args::synth("retro", rest, flags);
+        let ev = put(&tmp, "ev", "start waited 20m unclaimed");
+        let fx = put(&tmp, "fx", "claim sooner");
+        let dw = put(&tmp, "dw", "start under 2m");
+        let code = file(&store, &args(&["file", "l"], &[("defect", ""), ("title", "Unclaimed start waits twenty minutes"), ("evidence", &ev), ("fix", &fx), ("done-when", &dw)]));
+        assert_eq!(code, 0);
+        assert!(store.worklist("retro-1").is_some());
+        let dup = file(&store, &args(&["file", "l"], &[("defect", ""), ("title", "Unclaimed start waits twenty minutes"), ("evidence", &ev), ("fix", &fx), ("done-when", &dw)]));
+        assert_eq!(dup, 1, "a near title is refused");
+        let sum = put(&tmp, "sum", "one defect filed");
+        assert_eq!(done(&store, &args(&["done", "l", &sum], &[])), 0);
+        let html = std::fs::read_to_string(dir("l").join("retro.html")).unwrap();
+        assert!(html.contains("Defects") && html.contains("Unclaimed start"));
+        let lines = yours_lines(&store);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("l cleared in") && lines[0].contains("1 defects on retro-1") && lines[0].contains("0 questions"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_seat_that_files_nothing_says_so() {
+        let (env, store) = crate::testkit::isolated_store("retro-nothing");
+        let mut w = Worklist::new("m", "A list");
+        w.body = "## Groups\n\n1. a-1\n".into();
+        store.save_worklist(&w).unwrap();
+        start(&store, &w, true).unwrap();
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let bad = put(&tmp, "bad", "all fine");
+        let ok = put(&tmp, "ok", "nothing to file: the wall was inside the baseline");
+        assert_eq!(done(&store, &Args::synth("retro", &["done", "m", &bad], &[])), 1);
+        assert_eq!(done(&store, &Args::synth("retro", &["done", "m", &ok], &[])), 0);
+    }
+}

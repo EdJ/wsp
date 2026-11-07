@@ -241,8 +241,14 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
 
 /// `wsp retro <list> --packet | --check`.
 pub fn retro(store: &Store, args: &Args) -> i32 {
+    match args.rest.first().map(String::as_str) {
+        Some("file") if args.rest.len() > 1 => return crate::retro_run::file(store, args),
+        Some("note") if args.rest.len() > 1 => return crate::retro_run::note(store, args),
+        Some("done") if args.rest.len() > 1 => return crate::retro_run::done(store, args),
+        _ => {}
+    }
     let Some(slug) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp retro <list> --packet | --check");
+        eprintln!("usage: wsp retro <list> [--packet | --check]\n{SYNTAX}");
         return 2;
     };
     let Some(w) = store.worklist(&slug) else {
@@ -260,8 +266,17 @@ pub fn retro(store: &Store, args: &Args) -> i32 {
         }
         return 0;
     }
-    eprintln!("usage: wsp retro <list> --packet | --check");
-    2
+    // By hand: a seat over the evidence there is, whatever ran before.
+    match crate::retro_run::start(store, &w, true) {
+        Ok(row) => {
+            println!("{} retro started on {row}", w.id);
+            0
+        }
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            1
+        }
+    }
 }
 
 #[cfg(test)]

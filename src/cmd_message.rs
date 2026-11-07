@@ -1201,6 +1201,7 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
                 "project": project,
                 "items": items.iter().map(|q| item_json(store, q)).collect::<Vec<_>>(),
                 "review": review,
+                "retro": crate::retro_run::yours_lines(store),
                 // The person's questions closed in the last ten minutes, so a
                 // reader can tell *answered in the pane* from *gone*.
                 "closed": recently_closed(store)
@@ -1240,6 +1241,9 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
         if items.iter().any(|q| q.choices.is_some()) {
             println!("{}", p.dim("one with options takes `--choice 'Question=Label'` (or `--other 'Question=words'`)"));
         }
+    }
+    for line in crate::retro_run::yours_lines(store) {
+        println!("{}", p.dim(&line));
     }
     if review > 0 {
         println!("{}", p.dim(&format!("{review} at review, waiting on `wsp done` — not items")));

@@ -81,6 +81,7 @@ mod memory;
 mod panel;
 mod repair;
 mod retro;
+mod retro_run;
 mod retro_series;
 mod room;
 mod split;

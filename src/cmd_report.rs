@@ -148,14 +148,14 @@ pub fn line(w: &Worklist) -> String {
     format!("{} · {}", names.join(", "), dir(&w.id).display())
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// Every file goes in through `artefact::put_bytes` (`wsp-376`), so a report
 /// written again keeps the one it replaces beside it as a version and the
 /// passes can be compared. wsp is the writer; `note` says when.
-fn write(slug: &str, file: &str, text: &str, note: &str) -> Result<PathBuf, String> {
+pub(crate) fn write(slug: &str, file: &str, text: &str, note: &str) -> Result<PathBuf, String> {
     let who = crate::artefact::Who { row: Some(slug.to_string()), seat: Some("wsp".to_string()) };
     crate::artefact::put_bytes(&crate::artefact::root(), slug, file, text.as_bytes(), note, &who, false).map(|p| p.path)
 }
