@@ -1916,6 +1916,9 @@ fn save(store: &Store, w: &mut Worklist, groups: &[Group], what: &str, msg: &str
     }
     store.log_event("worklist-edited", json!({ "id": w.id, "what": what }));
     store.git_commit(&format!("wsp: worklist {} {msg}", w.id));
+    for line in crate::after::chains(store, w, None) {
+        eprintln!("note: {line}");
+    }
     0
 }
 

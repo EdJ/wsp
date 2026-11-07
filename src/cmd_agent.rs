@@ -2435,7 +2435,7 @@ fn leaving(store: &Store, pane: &str, workspace: &str, taking: &str) -> Vec<Stri
 /// The date is stepped over rather than matched, because `Task::log` is what
 /// writes it; anything that is not `- <stamp> blocked: …` is somebody else's
 /// log line and is not treated as one.
-fn blocked_question(t: &Task) -> Option<String> {
+pub(crate) fn blocked_question(t: &Task) -> Option<String> {
     t.section("Log")?.lines().rev().find_map(|l| {
         let (_stamp, rest) = l.trim().strip_prefix("- ")?.split_once(' ')?;
         let q = rest.strip_prefix("blocked:")?.trim();
@@ -5089,6 +5089,14 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             out.push(format!("{}  {}", p.red(&util::pad("BLOCKED", 8)), blocked.len()));
             for t in &blocked {
                 named(&mut out, t);
+                if let Some(since) = crate::cycle::blocked_since(t) {
+                    let quiet = util::epoch_secs() - since;
+                    let flagged = quiet >= crate::cycle::BLOCKED_ESCALATES_AFTER;
+                    out.push(format!(
+                        "      {}",
+                        p.dim(&format!("blocked {}{}", util::duration_human(quiet), if flagged { " — flagged" } else { "" }))
+                    ));
+                }
             }
         }
     }

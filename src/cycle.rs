@@ -944,7 +944,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 let _ = step_in(store, other, seats, Starts::Finishing);
             }
         }
-        let cap = g.parallelism(None);
+        let own_cap = g.parallelism(None);
+        let (cap, raised) = raised_cap(&g.kind, own_cap, gate.cap);
+        let going_before = members_going(store, &g.members, "", &store.claims());
+        let mut began = 0usize;
         for s in &pos.members {
             if let Some(on) = holds.get(&s.id) {
                 log_line(store, &format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
@@ -963,11 +966,26 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 if spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string())) {
                     started.push(s.id.clone());
                 }
+                began += 1;
+            }
+        }
+        // Said when it made a difference, and not on every pass.
+        if let (true, Some(own)) = (raised, own_cap) {
+            if going_before + began > own {
+                log_line(store, &format!(
+                    "{} group {at}: x{own} raised to the seat's free places — a components group's rows touch disjoint files, \
+                     so {} are going where x{own} would have allowed {own}",
+                    w.id,
+                    going_before + began
+                ));
             }
         }
     }
 
     say_capped(store, &w.id, at, gate.cap, gate.take_held(), all);
+    if all {
+        escalate_the_blocked(store, &w, at, &pos);
+    }
 
     // 3a. And the one `wsp-164`'s gate cannot reach: **a barrier that already
     // opened**, before the member was sent back. `wsp-163` found the gap — a
@@ -1326,6 +1344,83 @@ fn name_silent(store: &Store, w: &Worklist) {
     let ids: Vec<String> = w.groups().iter().flat_map(|g| g.members.iter().cloned()).collect();
     for (id, quiet) in silent(store, &ids) {
         log_line(store, &format!("{}: {id} {SILENT_SAID} {} — its start may not have arrived", w.id, util::duration_human(quiet)));
+    }
+}
+
+/// How long a member may stand blocked, or on a question only a person can
+/// answer, before the run escalates it (`wsp-471`). compounding-125 held its
+/// whole group five hours and nothing said so.
+pub(crate) const BLOCKED_ESCALATES_AFTER: i64 = 20 * 60;
+
+/// What the run writes on a member it has escalated, once per block.
+const ESCALATED: &str = "wsp: blocked and unanswered for";
+
+/// When the member's newest `blocked:` line was written, if it is blocked.
+pub(crate) fn blocked_since(t: &Task) -> Option<i64> {
+    if t.status() != Status::Blocked {
+        return None;
+    }
+    t.section("Log")?.lines().rev().find_map(|l| {
+        let (stamp, rest) = l.trim().strip_prefix("- ")?.split_once(' ')?;
+        rest.starts_with("blocked:").then(|| util::epoch_of(stamp)).filter(|e| *e > 0)
+    })
+}
+
+/// A member of the running group that has stood blocked for
+/// [`BLOCKED_ESCALATES_AFTER`]: a line on the row (so `wsp wip` and `wsp show`
+/// say it, and it is said once per block), a flag to the person, and the
+/// list's governor told what would unblock it.
+fn escalate_the_blocked(store: &Store, w: &Worklist, at: usize, pos: &worklist::Position) {
+    let now = util::epoch_secs();
+    for s in &pos.members {
+        let Some(mut t) = store.find_task(&s.id) else { continue };
+        let Some(since) = blocked_since(&t) else { continue };
+        let quiet = now - since;
+        if quiet < BLOCKED_ESCALATES_AFTER {
+            continue;
+        }
+        let log = t.section("Log").unwrap_or_default().to_string();
+        let lines: Vec<&str> = log.lines().collect();
+        let blocked_at = lines.iter().rposition(|l| l.contains(" blocked:")).unwrap_or(0);
+        if lines[blocked_at..].iter().any(|l| l.contains(ESCALATED)) {
+            continue;
+        }
+        let question = crate::cmd_agent::blocked_question(&t).unwrap_or_else(|| "a decision is owed".to_string());
+        let mins = quiet / 60;
+        t.log(&format!("{ESCALATED} {mins} min — the person is flagged and the governor told"));
+        let _ = store.save_task(&t);
+        log_line(store, &format!("{} group {at}: {} blocked for {mins} min — flagged", w.id, t.id));
+        let text = format!(
+            "{}: blocked for {mins} min, and the {} run waits on it\n\n\
+             It asked: {question}\n\nAnswering it is what lets group {at} go on: tell the seat (`wsp tell {}`) or `wsp reopen {} \"what is owed\"`.",
+            t.id, w.id, t.id, t.id
+        );
+        let m = crate::message::Message::new(crate::message::Party::wsp(), crate::message::Kind::Note, &text)
+            .about(crate::message::About::Task(t.id.clone()));
+        let _ = crate::message::raise(store, &m);
+        tell(store, w, &format!(
+            "{} ({}) has been blocked for {mins} min and the {} run waits on it; the person is flagged. \
+             It is waiting on: {question} — an answer to that (`wsp tell {}`) or `wsp reopen {} \"what is owed\"` is what unblocks it.",
+            t.id, util::truncate(&t.title, 60), w.id, t.id, t.id
+        ));
+    }
+}
+
+/// The cap a group's members are counted against (`wsp-471`).
+///
+/// A group's `xN` is a belief that its rows sit near each other. A
+/// `components` group's rows are, by the kind's definition, units on disjoint
+/// files, so under a seat's cap the group's own `xN` only stretches the wall
+/// while places are free: the group's number is dropped and the seat's cap —
+/// which [`crate::room::Gate::admits`] holds under the lock — is the limit, so
+/// the group runs as many as there are free places. With no seat cap there are
+/// no free places to speak of, and `xN` stands. Returns the cap and whether it
+/// was raised.
+fn raised_cap(kind: &str, own: Option<usize>, seat: Option<usize>) -> (Option<usize>, bool) {
+    let components = crate::scope::GroupKind::parse(kind) == Some(crate::scope::GroupKind::Components);
+    match (components, own, seat) {
+        (true, Some(_), Some(_)) => (None, true),
+        _ => (own, false),
     }
 }
 
@@ -6569,6 +6664,78 @@ fn only_a_working_screen_is_ever_overruled() {
         let mut ids: Vec<String> = spawned().into_iter().map(|(id, _)| id).collect();
         ids.sort();
         assert_eq!(ids, ["m-1", "m-3"]);
+    }
+
+    fn capped_group(store: &Store, kind: &str, n: usize, cap: usize) -> Worklist {
+        let ids: Vec<String> = (1..=n).map(|i| format!("m-{i}")).collect();
+        for m in &ids {
+            task(store, m, Status::Todo);
+        }
+        let mut w = list(store, &[(&ids.iter().map(String::as_str).collect::<Vec<_>>(), "claude")]);
+        let mut g = w.groups();
+        g[0].cap = Some(cap);
+        g[0].kind = kind.into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        w
+    }
+
+    /// `wsp-471`: a components group of six at x2 with four free places runs four.
+    #[test]
+    fn a_components_group_at_x2_runs_as_many_as_the_seat_has_free_places() {
+        let (_env, store) = scratch("raised-cap");
+        store.set_seat_cap(Some(4)).unwrap();
+        let w = capped_group(&store, "components", 6, 2);
+        let _ = drained(&SAID);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().len(), 4, "x2 raised to the seat's four");
+        assert!(drained(&SAID).join("\n").contains("x2 raised"), "and it says so");
+    }
+
+    #[test]
+    fn a_group_that_is_not_components_keeps_its_cap() {
+        let (_env, store) = scratch("kept-cap");
+        store.set_seat_cap(Some(4)).unwrap();
+        let w = capped_group(&store, "wiring", 6, 2);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().len(), 2);
+    }
+
+    #[test]
+    fn a_components_group_with_no_seat_cap_keeps_its_own() {
+        let (_env, store) = scratch("kept-cap-no-seat");
+        let w = capped_group(&store, "components", 6, 2);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().len(), 2, "no seat cap, no free places to speak of");
+    }
+
+    /// `wsp-471`: a member blocked for 20 minutes is flagged, told to the governor and
+    /// marked once; before that nothing is said.
+    #[test]
+    fn a_member_blocked_for_twenty_minutes_raises_a_flag_once() {
+        let (_env, store) = scratch("blocked-escalates");
+        task(&store, "m-1", Status::Blocked);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let blocked_at = |ago: i64| {
+            let mut t = store.find_task("m-1").unwrap();
+            t.body = format!("## Log\n- {} blocked: which one?\n", util::iso_at(util::epoch_secs() - ago));
+            store.save_task(&t).unwrap();
+        };
+        blocked_at(10 * 60);
+        let _ = drained(&TOLD);
+        step(&store, &w, &Blind);
+        assert!(flags_on(&store, "m-1").is_empty() && drained(&TOLD).is_empty(), "ten minutes is not yet");
+        blocked_at(25 * 60);
+        step(&store, &w, &Blind);
+        let flags = flags_on(&store, "m-1");
+        assert_eq!(flags.len(), 1, "{flags:?}");
+        assert!(flags[0].text.contains("which one?"));
+        let told = drained(&TOLD);
+        assert!(told.len() == 1 && told[0].contains("which one?") && told[0].contains("25 min"), "{told:?}");
+        assert!(store.find_task("m-1").unwrap().section("Log").unwrap().contains(ESCALATED));
+        step(&store, &w, &Blind);
+        assert_eq!(flags_on(&store, "m-1").len(), 1, "once per block");
+        assert!(drained(&TOLD).is_empty());
     }
 
     /// An edge to a task the list does not hold is carried and never held on:

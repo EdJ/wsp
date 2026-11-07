@@ -102,6 +102,13 @@ pub fn run(store: &Store, args: &Args) -> i32 {
     });
     // A same-group edge cannot change under a started group (refusal 5), so
     // nothing the run is doing is changed by this. No poke.
+    if !args.json() {
+        for w in store.worklists().iter().filter(|w| w.status() != WorklistStatus::Done) {
+            for line in chains(store, w, Some(&t.id)) {
+                eprintln!("note: on `{}`, {line}", w.id);
+            }
+        }
+    }
     print(store, args, &t)
 }
 
@@ -339,6 +346,60 @@ pub fn waiting(store: &Store, g: &Group) -> BTreeMap<String, Vec<String>> {
     out
 }
 
+/// The `after:` chains inside one group of `w`, reported at planning
+/// (`wsp-471`): a member that rests on another of its own group is not started
+/// until that one has landed, so a chain of `n` members costs `n` turns of the
+/// group's wall whatever `parallel` allows (react-pass-2's compounding-133 sat
+/// an hour on compounding-132). Each line names the chain and the two ways out
+/// — a later group, or acceptance. `only` limits it to the groups holding that
+/// task.
+pub fn chains(store: &Store, w: &Worklist, only: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, g) in w.groups().iter().enumerate() {
+        if only.is_some_and(|t| !g.members.iter().any(|m| m == t)) {
+            continue;
+        }
+        let edges: BTreeMap<&str, Vec<&str>> = g
+            .members
+            .iter()
+            .filter_map(|m| store.find_task(m).map(|t| (m.as_str(), t)))
+            .map(|(m, t)| (m, g.members.iter().map(String::as_str).filter(|o| t.after.iter().any(|a| a == o)).collect()))
+            .collect();
+        // Longest chain ending at each member, by depth; chains are short.
+        fn depth<'a>(m: &'a str, edges: &BTreeMap<&'a str, Vec<&'a str>>, seen: &mut Vec<&'a str>) -> Vec<&'a str> {
+            if seen.contains(&m) {
+                return vec![m];
+            }
+            seen.push(m);
+            let best = edges.get(m).into_iter().flatten().map(|o| depth(o, edges, seen)).max_by_key(Vec::len).unwrap_or_default();
+            seen.pop();
+            let mut c = best;
+            c.push(m);
+            c
+        }
+        let mut longest: Vec<&str> = Vec::new();
+        for m in edges.keys() {
+            let c = depth(m, &edges, &mut Vec::new());
+            if c.len() > longest.len() {
+                longest = c;
+            }
+        }
+        if longest.len() >= 2 {
+            out.push(format!(
+                "group {}: {} run one after another, since each waits for the one before to land — the group's wall is \
+                 {} turns whatever its parallel allows. Split them into groups (`wsp worklist mv {} {} --group {}`) or accept it.",
+                i + 1,
+                longest.join(" → "),
+                longest.len(),
+                w.id,
+                longest.last().copied().unwrap_or_default(),
+                i + 2
+            ));
+        }
+    }
+    out
+}
+
 /// Whether a member's work is on the trunk — the event a hold waits for.
 ///
 /// **The member's own record first**: `wsp land` writes [`crate::repair::LANDED`]
@@ -416,6 +477,29 @@ mod tests {
             .collect();
         w.set_groups(&gs);
         store.save_worklist(&w).unwrap();
+    }
+
+    /// `wsp-471`: a chain inside one group is reported at planning; independent
+    /// members and a chain across two groups are not.
+    #[test]
+    fn a_chain_inside_one_group_is_reported_and_nothing_else_is() {
+        let store = store_named("chains");
+        task(&store, "a", &[]);
+        task(&store, "b", &["a"]);
+        task(&store, "c", &["b"]);
+        task(&store, "d", &[]);
+        list(&store, "one", &[&["a", "b", "c", "d"]], WorklistStatus::Draft);
+        let w = store.worklist("one").unwrap();
+        let lines = chains(&store, &w, None);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("a → b → c") && lines[0].contains("3 turns"), "{lines:?}");
+        assert!(chains(&store, &w, Some("zzz")).is_empty(), "a task in no such group");
+
+        list(&store, "two", &[&["a", "d"], &["b", "c"]], WorklistStatus::Draft);
+        let w = store.worklist("two").unwrap();
+        let lines = chains(&store, &w, None);
+        assert_eq!(lines.len(), 1, "only the b → c in group 2: {lines:?}");
+        assert!(lines[0].starts_with("group 2:") && lines[0].contains("b → c"), "{lines:?}");
     }
 
     fn after(store: &Store, words: &[&str], flags: &[(&str, &str)]) -> i32 {
