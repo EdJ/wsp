@@ -8,11 +8,11 @@
 use std::collections::{HashMap, HashSet};
 
 mod affected;
+pub(crate) use wsp_trees::{at_stop, check_tree, cmd_checkout, cmd_verify, gc, greens, guard, overlap, throttle, treecopy, warm};
 mod base;
 pub(crate) use wsp_base::{choices, input, risk, util};
 pub(crate) use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, log, message, model, resolve, sharing, store, tags, verbs};
 pub(crate) use wsp_wire::{detect_override, fake, far, herdr, launchd, place, place_compound, place_herdr, place_super, tunnel};
-mod at_stop;
 mod artefact;
 mod registry;
 mod after;
@@ -31,9 +31,7 @@ mod hold_close;
 #[cfg(test)]
 mod testkit;
 mod check;
-mod greens;
 mod build_output;
-mod check_tree;
 mod scope;
 mod scratch;
 mod leaked_agents;
@@ -46,7 +44,6 @@ mod cmd_brief;
 mod cmd_burn;
 mod cmd_cost;
 mod cmd_report;
-mod cmd_checkout;
 mod cmd_govern;
 mod cmd_install;
 mod cmd_machine;
@@ -60,7 +57,6 @@ mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;
 mod cmd_verifications;
-mod cmd_verify;
 mod leg_seat;
 mod leg_tree;
 mod legs;
@@ -75,15 +71,12 @@ mod did;
 mod draw;
 mod ending;
 mod history;
-mod gc;
-mod guard;
 mod kanban;
 mod live;
 mod kind_data;
 mod kind_attention;
 mod cmd_attend;
 mod memory;
-mod overlap;
 mod panel;
 mod repair;
 mod room;
@@ -94,16 +87,10 @@ mod stand_down;
 mod story;
 mod stuck;
 mod sync;
-mod throttle;
 mod timeline;
-// The tree copy (remote agents, `docs/remote-agents.md` §6). Its callers — spawn
-// `--on`, the Stop checkpoint — are the next groups; `review` already reads it.
-#[allow(dead_code)]
-mod treecopy;
 mod untaken;
 mod waiting;
 mod waits;
-mod warm;
 mod worklist;
 
 pub use base::args::*;

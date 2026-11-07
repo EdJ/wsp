@@ -36,7 +36,7 @@ use crate::util;
 /// The ordering is the point: it is what lets a caller take the head of the
 /// list and get precisely the panes that can reach the files under its hands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Relation {
+pub enum Relation {
     /// The same directory, or one inside the other. Both are in the same
     /// working tree and either can overwrite what the other is editing.
     SameCwd,
@@ -58,11 +58,11 @@ pub(crate) enum Relation {
 impl Relation {
     /// Whether this pane can reach the files the asking pane is working on.
     /// The line between a warning and a mention.
-    pub(crate) fn is_near(&self) -> bool {
+    pub fn is_near(&self) -> bool {
         matches!(self, Relation::SameCwd | Relation::SameRoot)
     }
 
-    pub(crate) fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             // "tree" rather than "directory": herdr reports where a pane's
             // *shell* started, which for an agent launched from `~/claude` is
@@ -81,7 +81,7 @@ impl Relation {
 /// Another pane, placed: where it is standing, what it is holding, and how
 /// close that puts it to the one asking.
 #[derive(Debug, Clone)]
-pub(crate) struct Standing {
+pub struct Standing {
     pub pane: String,
     /// The workspace label rather than its id — the id is herdr's business and
     /// the label is what a person recognises.
@@ -107,7 +107,7 @@ pub(crate) struct Standing {
 }
 
 impl Standing {
-    pub(crate) fn json(&self) -> Value {
+    pub fn json(&self) -> Value {
         json!({
             "pane": self.pane,
             "workspace": self.workspace,
@@ -136,7 +136,7 @@ impl Standing {
     /// `blocked`, which is a permission prompt. Both read as busy, and this is
     /// the definition the brief leads with — so an agent's neighbour could stop
     /// dead and every session started beside it would be told all was well.
-    pub(crate) fn needs_you(&self) -> bool {
+    pub fn needs_you(&self) -> bool {
         self.agent
             && crate::place_herdr::of_word(&self.state).stopped()
             && self.task.as_ref().map(|t| t.status() == crate::model::Status::Doing).unwrap_or(false)
@@ -144,7 +144,7 @@ impl Standing {
 
     /// What to call it in one column: the task it claimed, else the terminal's
     /// title, else the pane id — in the order of how much each actually says.
-    pub(crate) fn name(&self) -> String {
+    pub fn name(&self) -> String {
         if let Some(t) = &self.task {
             return t.title.clone();
         }
@@ -163,7 +163,7 @@ impl Standing {
 /// Everything the reckoning reads, taken in rather than fetched — so a test can
 /// stand six panes in a fabricated tree with no herdr and no store, the same
 /// bargain [`crate::panel`] makes with its `Snapshot`.
-pub(crate) struct World {
+pub struct World {
     pub panes: Vec<herdr::Pane>,
     pub workspaces: Vec<herdr::Workspace>,
     pub tasks: Vec<Task>,
@@ -178,7 +178,7 @@ pub(crate) struct World {
 
 impl World {
     /// The live join: herdr for what exists, the store for who holds what.
-    pub(crate) fn live(store: &Store) -> World {
+    pub fn live(store: &Store) -> World {
         let (panes, workspaces) = if herdr::available() {
             (herdr::panes().unwrap_or_default(), herdr::workspaces().unwrap_or_default())
         } else {
@@ -247,7 +247,7 @@ fn same_tree(a: &str, b: &str) -> bool {
 /// `my_cwd` overrides what herdr believes about the asking pane, because a
 /// process knows its own directory better than the pane it is running in does —
 /// herdr reports the shell's cwd, which is stale the moment anyone `cd`s.
-pub(crate) fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standing> {
+pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standing> {
     let label_of = |ws: &str| {
         w.workspaces.iter().find(|x| x.id == ws).map(|x| x.label.clone()).unwrap_or_default()
     };

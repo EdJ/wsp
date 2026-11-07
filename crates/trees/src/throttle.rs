@@ -77,7 +77,7 @@ use crate::base::args::Args;
 /// Set in the environment of a build wsp is holding, so a build nested in it
 /// passes through. `WSP_`-prefixed so a spawned seat sheds it
 /// ([`crate::cmd_spawn`]'s `unowned`) and is never born inside someone's hold.
-pub(crate) const HELD: &str = "WSP_BUILD_HELD";
+pub const HELD: &str = "WSP_BUILD_HELD";
 
 /// How much a throttled build is niced by.
 const NICE: i32 = 12;
@@ -117,14 +117,14 @@ const HEAVY: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
+pub enum Mode {
     Off,
     On,
     Auto,
 }
 
 impl Mode {
-    pub(crate) fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             Mode::Off => "off",
             Mode::On => "on",
@@ -145,7 +145,7 @@ impl Mode {
 /// The machine's choice, in `throttle.json` under the state directory: it is
 /// this machine's and not the store's, so it is not committed or synced.
 #[derive(Clone, Debug)]
-pub(crate) struct Settings {
+pub struct Settings {
     pub mode: Mode,
     /// Heavy builds at once across the fleet. `None` is a quarter of the cores.
     pub slots: Option<usize>,
@@ -184,7 +184,7 @@ fn settings_path(state: &Path) -> PathBuf {
 }
 
 impl Settings {
-    pub(crate) fn load(state: &Path) -> Settings {
+    pub fn load(state: &Path) -> Settings {
         let mut s = Settings::default();
         let Some(v) = fs::read_to_string(settings_path(state)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
         else {
@@ -213,7 +213,7 @@ impl Settings {
         s
     }
 
-    pub(crate) fn save(&self, state: &Path) -> std::io::Result<()> {
+    pub fn save(&self, state: &Path) -> std::io::Result<()> {
         let _ = fs::create_dir_all(state);
         let v = json!({
             "mode": self.mode.word(),
@@ -228,18 +228,18 @@ impl Settings {
         crate::store::write_atomic(&settings_path(state), &serde_json::to_string_pretty(&v).unwrap_or_default())
     }
 
-    pub(crate) fn slot_count(&self, cores: usize) -> usize {
+    pub fn slot_count(&self, cores: usize) -> usize {
         self.slots.unwrap_or((cores / 4).max(1))
     }
 
-    pub(crate) fn job_cap(&self, cores: usize) -> usize {
+    pub fn job_cap(&self, cores: usize) -> usize {
         self.jobs.unwrap_or_else(|| (cores.saturating_sub(1) / self.slot_count(cores)).max(1))
     }
 
     /// Whether a `CPU_Speed_Limit` reading is a thermally limited machine.
     /// Unreadable is not: the reading is only there on a Mac, and a cool
     /// machine must not be held back for want of one.
-    pub(crate) fn is_hot(&self, speed_limit: Option<u32>) -> bool {
+    pub fn is_hot(&self, speed_limit: Option<u32>) -> bool {
         speed_limit.is_some_and(|l| l < self.thermal_below)
     }
 
@@ -247,14 +247,14 @@ impl Settings {
     /// which is not the ordinary count's to cap: a quarter of the cores is
     /// fewer builds than the machine finishes most with. A hand's `slots` and
     /// `jobs` still are a ceiling.
-    pub(crate) fn slots_at(&self, cores: usize, hot: bool) -> usize {
+    pub fn slots_at(&self, cores: usize, hot: bool) -> usize {
         match hot {
             true => self.hot_slots.unwrap_or_else(|| self.slots.map_or(HOT_SLOTS, |s| s.min(HOT_SLOTS))),
             false => self.slot_count(cores),
         }
     }
 
-    pub(crate) fn jobs_at(&self, cores: usize, hot: bool) -> usize {
+    pub fn jobs_at(&self, cores: usize, hot: bool) -> usize {
         match hot {
             true => self.hot_jobs.unwrap_or_else(|| self.jobs.map_or(HOT_JOBS, |j| j.min(HOT_JOBS))),
             false => self.job_cap(cores),
@@ -264,7 +264,7 @@ impl Settings {
     /// The agent cap to suggest on a hot machine: one for each slot, so a
     /// finished step finds a build slot free more often than not. Not measured;
     /// the file says so.
-    pub(crate) fn hot_agents(&self, cores: usize) -> usize {
+    pub fn hot_agents(&self, cores: usize) -> usize {
         self.slots_at(cores, true).max(1)
     }
 }
@@ -272,7 +272,7 @@ impl Settings {
 /// Whether the throttle holds right now. When `auto` cannot read the idle time
 /// it holds: wrongly throttling an idle machine costs minutes, and wrongly
 /// not throttling one with a person at it costs the person.
-pub(crate) fn in_force(mode: Mode, idle_secs: Option<u64>, away_minutes: u64) -> bool {
+pub fn in_force(mode: Mode, idle_secs: Option<u64>, away_minutes: u64) -> bool {
     match mode {
         Mode::Off => false,
         Mode::On => true,
@@ -281,7 +281,7 @@ pub(crate) fn in_force(mode: Mode, idle_secs: Option<u64>, away_minutes: u64) ->
 }
 
 /// `"HIDIdleTime" = 4294967296` in `ioreg -c IOHIDSystem` output, nanoseconds.
-pub(crate) fn parse_hid_idle(ioreg: &str) -> Option<u64> {
+pub fn parse_hid_idle(ioreg: &str) -> Option<u64> {
     let line = ioreg.lines().find(|l| l.contains("\"HIDIdleTime\""))?;
     let ns: u64 = line.split('=').nth(1)?.trim().parse().ok()?;
     Some(ns / 1_000_000_000)
@@ -294,7 +294,7 @@ fn hid_idle_secs() -> Option<u64> {
 
 /// `CPU_Speed_Limit 	= 31` in `pmset -g therm` output: percent of the rated
 /// clock the machine is allowed right now.
-pub(crate) fn parse_speed_limit(pmset: &str) -> Option<u32> {
+pub fn parse_speed_limit(pmset: &str) -> Option<u32> {
     let line = pmset.lines().find(|l| l.trim_start().starts_with("CPU_Speed_Limit"))?;
     line.split('=').nth(1)?.trim().parse().ok()
 }
@@ -309,7 +309,7 @@ fn speed_limit() -> Option<u32> {
 
 /// Three load averages out of `/proc/loadavg` (`0.5 0.4 0.3 1/200 99`) or
 /// `sysctl -n vm.loadavg` (`{ 0.5 0.4 0.3 }`).
-pub(crate) fn parse_loadavg(s: &str) -> Option<(f64, f64, f64)> {
+pub fn parse_loadavg(s: &str) -> Option<(f64, f64, f64)> {
     let mut n = s.split(|c: char| c.is_whitespace() || c == '{' || c == '}').filter(|w| !w.is_empty());
     Some((n.next()?.parse().ok()?, n.next()?.parse().ok()?, n.next()?.parse().ok()?))
 }
@@ -323,11 +323,11 @@ fn load_average() -> Option<(f64, f64, f64)> {
 }
 
 /// The one-minute load average now.
-pub(crate) fn load1() -> Option<f64> {
+pub fn load1() -> Option<f64> {
     load_average().map(|l| l.0)
 }
 
-pub(crate) fn load_high(one: f64, five: f64, cores: usize) -> bool {
+pub fn load_high(one: f64, five: f64, cores: usize) -> bool {
     one.min(five) > LOAD_FACTOR * cores as f64
 }
 
@@ -361,7 +361,7 @@ const RELEASE_MEM_FREE: u32 = 20;
 const RELEASE_THERMAL_ABOVE: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PauseKind {
+pub enum PauseKind {
     Load,
     Memory,
     Thermal,
@@ -384,9 +384,9 @@ impl PauseKind {
 /// `Copy` and rides in a [`crate::waits::Wait`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pause {
-    pub(crate) kind: PauseKind,
-    pub(crate) reading: u32,
-    pub(crate) release: u32,
+    pub kind: PauseKind,
+    pub reading: u32,
+    pub release: u32,
 }
 
 impl Pause {
@@ -414,7 +414,7 @@ impl Pause {
 
 /// The machine's recent readings, the input of [`decide_hold`].
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Reading {
+pub struct Reading {
     pub one: f64,
     pub cores: usize,
     /// Percent of memory free; `None` where it cannot be read.
@@ -426,7 +426,7 @@ pub(crate) struct Reading {
 /// Every reading that holds new work back, given the kinds that held it last
 /// time (`was`). A reading that cannot be read does not hold: a machine must
 /// not be held for want of a gauge.
-pub(crate) fn decide_hold(was: &[PauseKind], r: &Reading, s: &Settings) -> Vec<Pause> {
+pub fn decide_hold(was: &[PauseKind], r: &Reading, s: &Settings) -> Vec<Pause> {
     let held = |k: PauseKind| was.contains(&k);
     let tenths = |x: f64| (x * 10.0).round() as u32;
     let cores = r.cores as f64;
@@ -489,8 +489,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     },
 ];
 
-#[cfg(test)]
-pub(crate) fn sample_pause() -> Pause {
+#[cfg(any(test, feature = "test-support"))]
+pub fn sample_pause() -> Pause {
     Pause { kind: PauseKind::Load, reading: 142, release: 80 }
 }
 
@@ -509,7 +509,7 @@ fn held_before(state: &Path) -> Vec<PauseKind> {
 
 /// Decide against what held last time and remember the answer. The state
 /// directory is the machine's, so every process that asks sees one memory.
-pub(crate) fn hold_step(state: &Path, r: &Reading, s: &Settings) -> Vec<Pause> {
+pub fn hold_step(state: &Path, r: &Reading, s: &Settings) -> Vec<Pause> {
     let was = held_before(state);
     let now = decide_hold(&was, r, s);
     let kinds: Vec<PauseKind> = now.iter().map(|h| h.kind).collect();
@@ -522,7 +522,7 @@ pub(crate) fn hold_step(state: &Path, r: &Reading, s: &Settings) -> Vec<Pause> {
 
 /// Percent of memory free, out of the last line of `memory_pressure`:
 /// `System-wide memory free percentage: 57%`.
-pub(crate) fn parse_mem_free(out: &str) -> Option<u32> {
+pub fn parse_mem_free(out: &str) -> Option<u32> {
     let line = out.lines().find(|l| l.contains("memory free percentage"))?;
     line.split(':').nth(1)?.trim().trim_end_matches('%').trim().parse().ok()
 }
@@ -546,13 +546,13 @@ fn reading_now() -> Reading {
 /// 60 on 8 cores; the same agent is up in twenty on a quiet machine, so the
 /// wait grows with the load rather than for everyone. The cap is four minutes:
 /// past that the start is better ended and tried again on the backoff.
-pub(crate) fn readiness_scale(one: f64, cores: usize) -> u32 {
+pub fn readiness_scale(one: f64, cores: usize) -> u32 {
     ((one / cores.max(1) as f64).ceil() as u32).clamp(1, 4)
 }
 
 /// [`readiness_scale`] for the machine as it is now. 1 when the load cannot be
 /// read, and under test, where the clock is a dial and a load reading is noise.
-pub(crate) fn readiness_scale_now() -> u32 {
+pub fn readiness_scale_now() -> u32 {
     if cfg!(test) {
         return 1;
     }
@@ -569,7 +569,7 @@ fn subcommand(args: &[String]) -> Option<&str> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Weight {
+pub enum Weight {
     /// Compiles and finishes: holds the tree and takes a slot.
     Heavy,
     /// Compiles and may then stay up (`cargo run`): niced and capped like a
@@ -579,7 +579,7 @@ pub(crate) enum Weight {
     Light,
 }
 
-pub(crate) fn weight(tool: &str, args: &[String]) -> Weight {
+pub fn weight(tool: &str, args: &[String]) -> Weight {
     if tool != "cargo" {
         return Weight::Heavy;
     }
@@ -606,7 +606,7 @@ fn fnv(s: &str) -> String {
 /// The tree a build is in: the nearest ancestor with a `.git`, else the
 /// directory itself. A worktree has a `.git` file, so each agent's tree is its
 /// own.
-pub(crate) fn tree_of(cwd: &Path) -> PathBuf {
+pub fn tree_of(cwd: &Path) -> PathBuf {
     let start = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     start.ancestors().find(|d| d.join(".git").exists()).unwrap_or(&start).to_path_buf()
 }
@@ -633,7 +633,7 @@ fn holder_pid(v: &Value) -> u32 {
 }
 
 /// A hold taken. Dropping it releases the file, if it is still ours.
-pub(crate) struct Hold {
+pub struct Hold {
     path: PathBuf,
 }
 
@@ -724,7 +724,7 @@ fn who(v: &Value) -> String {
 // ---- running a build --------------------------------------------------------
 
 /// Everything a build decision reads, so it can be made against a fake.
-pub(crate) struct Ctx<'a> {
+pub struct Ctx<'a> {
     pub state: &'a Path,
     pub cwd: PathBuf,
     pub path_var: String,
@@ -761,7 +761,7 @@ fn is_shim(p: &Path) -> bool {
 }
 
 /// The first `tool` on `path` that is not one of ours.
-pub(crate) fn real_tool(tool: &str, path: &str, shims: &Path) -> Option<PathBuf> {
+pub fn real_tool(tool: &str, path: &str, shims: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     path.split(':')
         .filter(|d| !d.is_empty() && Path::new(d) != shims)
@@ -772,7 +772,7 @@ pub(crate) fn real_tool(tool: &str, path: &str, shims: &Path) -> Option<PathBuf>
 /// Whether `cargo test` is the whole suite: no filter, no target or package
 /// narrowing it. Any bare word after the subcommand is a filter (or a flag's
 /// value, which errs toward calling the run narrow, never the other way).
-pub(crate) fn is_full_suite(tool: &str, args: &[String]) -> bool {
+pub fn is_full_suite(tool: &str, args: &[String]) -> bool {
     if tool != "cargo" {
         return false;
     }
@@ -831,12 +831,12 @@ fn full_suite_record(state: &Path, task: &str) -> Value {
 }
 
 /// How many full suites a row's seats have started, ever.
-pub(crate) fn full_suite_runs(state: &Path, task: &str) -> u64 {
+pub fn full_suite_runs(state: &Path, task: &str) -> u64 {
     full_suite_record(state, task).get("runs").and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// The seats that have started a full suite.
-pub(crate) fn full_suite_seats(state: &Path) -> std::collections::BTreeSet<String> {
+pub fn full_suite_seats(state: &Path) -> std::collections::BTreeSet<String> {
     let Ok(rd) = fs::read_dir(full_suite_dir(state)) else { return Default::default() };
     rd.flatten()
         .filter_map(|e| fs::read_to_string(e.path()).ok())
@@ -845,7 +845,7 @@ pub(crate) fn full_suite_seats(state: &Path) -> std::collections::BTreeSet<Strin
         .collect()
 }
 
-pub(crate) fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
+pub fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
     let settings = Settings::load(ctx.state);
     let shims = shim_dir(ctx.state);
     let Some(real) = real_tool(tool, &ctx.path_var, &shims) else {
@@ -983,7 +983,7 @@ fn finish(mut cmd: Command, nice: Option<i32>) -> i32 {
 
 /// `wsp throttle run <tool> args…`, before argument parsing: the args are the
 /// tool's, flags and all.
-pub(crate) fn run_raw(argv: &[String]) -> i32 {
+pub fn run_raw(argv: &[String]) -> i32 {
     let Some((tool, args)) = argv.split_first() else {
         eprintln!("usage: wsp throttle run <tool> [args…]");
         return 2;
@@ -1024,7 +1024,7 @@ fn shim_text(tool: &str) -> String {
 }
 
 /// Write the shims the settings name, leaving a right one alone.
-pub(crate) fn ensure_shims(state: &Path, settings: &Settings) -> PathBuf {
+pub fn ensure_shims(state: &Path, settings: &Settings) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = shim_dir(state);
     let _ = fs::create_dir_all(&dir);
@@ -1047,7 +1047,7 @@ pub(crate) fn ensure_shims(state: &Path, settings: &Settings) -> PathBuf {
 /// launchd-started daemon has a thin `PATH` and the seat's shell has the
 /// person's; replacing the second with the first would take cargo away. When
 /// there is nothing to wrap, nothing is set.
-pub(crate) fn seat_env() -> BTreeMap<String, String> {
+pub fn seat_env() -> BTreeMap<String, String> {
     let state = match std::env::var_os("WSP_STATE") {
         Some(v) => PathBuf::from(v),
         // A test that has not isolated itself must not write shims into the
@@ -1058,7 +1058,7 @@ pub(crate) fn seat_env() -> BTreeMap<String, String> {
     seat_env_in(&state, &std::env::var("PATH").unwrap_or_default())
 }
 
-pub(crate) fn seat_env_in(state: &Path, path: &str) -> BTreeMap<String, String> {
+pub fn seat_env_in(state: &Path, path: &str) -> BTreeMap<String, String> {
     let settings = Settings::load(state);
     let shims = shim_dir(state);
     if !settings.tools.keys().any(|t| real_tool(t, path, &shims).is_some()) {
@@ -1071,12 +1071,12 @@ pub(crate) fn seat_env_in(state: &Path, path: &str) -> BTreeMap<String, String> 
 
 // ---- seeing it ----------------------------------------------------------------
 
-pub(crate) struct Build {
+pub struct Build {
     pub holder: Value,
     pub slot: Option<usize>,
 }
 
-pub(crate) struct View {
+pub struct View {
     pub settings: Settings,
     pub idle: Option<u64>,
     pub in_force: bool,
@@ -1090,7 +1090,7 @@ pub(crate) struct View {
 }
 
 impl View {
-    pub(crate) fn read(state: &Path) -> View {
+    pub fn read(state: &Path) -> View {
         let settings = Settings::load(state);
         let idle = match settings.mode {
             Mode::Auto => hid_idle_secs(),
@@ -1109,13 +1109,13 @@ impl View {
         }
     }
 
-    pub(crate) fn load_warning(&self) -> bool {
+    pub fn load_warning(&self) -> bool {
         self.load.is_some_and(|(one, five, _)| load_high(one, five, self.cores))
     }
 
     /// Thermally limited now (`wsp-347`): in every mode, the slots and jobs
     /// are the hot ones.
-    pub(crate) fn hot(&self) -> bool {
+    pub fn hot(&self) -> bool {
         self.settings.is_hot(self.thermal)
     }
 
@@ -1138,7 +1138,7 @@ impl View {
 
     /// Whatever is wrong with the machine worth a warning line: the load, the
     /// clock, or both.
-    pub(crate) fn warning(&self, agent_cap: Option<usize>) -> Option<String> {
+    pub fn warning(&self, agent_cap: Option<usize>) -> Option<String> {
         let parts: Vec<String> = [
             self.load_warning().then(|| self.load_sentence()),
             self.hot().then(|| self.thermal_sentence(agent_cap)),
@@ -1174,7 +1174,7 @@ impl View {
         }
     }
 
-    pub(crate) fn render(&self) -> String {
+    pub fn render(&self) -> String {
         let s = &self.settings;
         let mut out = vec![format!("throttle: {}", self.force_line())];
         out.push(format!(
@@ -1219,7 +1219,7 @@ impl View {
 
     /// The one line `wsp wip` and `wsp watch --status` carry in every mode: the
     /// mode, whether it holds this minute, and who is building.
-    pub(crate) fn status_line(&self) -> String {
+    pub fn status_line(&self) -> String {
         let building = match self.builds.is_empty() {
             true => String::new(),
             false => format!(
@@ -1273,7 +1273,7 @@ fn builds(state: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<Build> {
 }
 
 /// The warning alone, for `wsp wip`: absent while the machine is fine.
-pub(crate) fn loud(store: &Store) -> Option<String> {
+pub fn loud(store: &Store) -> Option<String> {
     View::read(&store.state).warning(store.seat_cap())
 }
 
@@ -1281,7 +1281,7 @@ pub(crate) fn loud(store: &Store) -> Option<String> {
 /// machine (`wsp-383`). Decided on the recent load, memory and clock with
 /// hysteresis (`wsp-447`), not on the warning [`loud`] words. Never under
 /// test, where a reading is noise; [`hold_step`] is what the tests drive.
-pub(crate) fn holding_back(store: &Store) -> Option<Pause> {
+pub fn holding_back(store: &Store) -> Option<Pause> {
     if cfg!(test) {
         return None;
     }
@@ -1290,11 +1290,11 @@ pub(crate) fn holding_back(store: &Store) -> Option<Pause> {
 }
 
 /// [`View::status_line`], for the surfaces that are not `wsp throttle`.
-pub(crate) fn status_line(store: &Store) -> String {
+pub fn status_line(store: &Store) -> String {
     View::read(&store.state).status_line()
 }
 
-pub(crate) fn health(store: &Store, notes: &mut Vec<String>) {
+pub fn health(store: &Store, notes: &mut Vec<String>) {
     let v = View::read(&store.state);
     notes.push(format!("build throttle {}", v.force_line()));
     if let Some(w) = v.warning(store.seat_cap()) {
@@ -1307,7 +1307,7 @@ static WARNED: AtomicBool = AtomicBool::new(false);
 /// The daemon's half: drop holds whose process is gone, and log the load
 /// warning when it starts and when it clears. Not under test; [`reap`] and
 /// [`View`] are.
-pub(crate) fn tidy(store: &Store) {
+pub fn tidy(store: &Store) {
     if cfg!(test) {
         return;
     }
@@ -1322,7 +1322,7 @@ pub(crate) fn tidy(store: &Store) {
     }
 }
 
-pub(crate) fn reap(state: &Path, alive: &dyn Fn(u32) -> bool) -> usize {
+pub fn reap(state: &Path, alive: &dyn Fn(u32) -> bool) -> usize {
     let mut n = 0;
     for e in fs::read_dir(builds_dir(state)).into_iter().flatten().flatten() {
         let path = e.path();
@@ -1342,7 +1342,7 @@ pub(crate) fn reap(state: &Path, alive: &dyn Fn(u32) -> bool) -> usize {
 
 // ---- the verb -----------------------------------------------------------------
 
-pub(crate) fn throttle(store: &Store, args: &Args) -> i32 {
+pub fn throttle(store: &Store, args: &Args) -> i32 {
     let mut s = Settings::load(&store.state);
     let words: Vec<&str> = args.rest.iter().map(String::as_str).collect();
     match words.as_slice() {

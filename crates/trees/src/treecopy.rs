@@ -1423,7 +1423,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
         let link = d.0.join("link-down");
-        let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("executor/wsp");
+        let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../executor/wsp");
         let out = Command::new("sh")
             .arg(shim)
             .args(args)
@@ -1461,7 +1461,7 @@ mod tests {
         fs::write(&link, "03:04:05\n").unwrap();
         let (code, _, err, _, _d2) = {
             // Same link file again: the earlier time stands.
-            let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("executor/wsp");
+            let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../executor/wsp");
             let out = Command::new("sh")
                 .arg(shim)
                 .arg("ls")
@@ -1477,7 +1477,7 @@ mod tests {
         assert!(err.contains("since 03:04:05"), "{err}");
         // The link comes back: the file goes.
         fs::write(d.0.join("bin/ssh"), "#!/bin/sh\nexit 0\n").unwrap();
-        let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("executor/wsp");
+        let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../executor/wsp");
         let ok = Command::new("sh")
             .arg(shim)
             .arg("ls")

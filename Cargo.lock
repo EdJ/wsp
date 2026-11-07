@@ -99,6 +99,7 @@ dependencies = [
  "wsp-base",
  "wsp-store",
  "wsp-testkit",
+ "wsp-trees",
  "wsp-wire",
 ]
 
@@ -125,6 +126,17 @@ version = "0.1.0"
 [[package]]
 name = "wsp-testkit"
 version = "0.1.0"
+
+[[package]]
+name = "wsp-trees"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-base",
+ "wsp-store",
+ "wsp-testkit",
+ "wsp-wire",
+]
 
 [[package]]
 name = "wsp-wire"

@@ -22,13 +22,13 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// git's own `gc.auto` default: past this many loose objects it wants to pack.
-pub(crate) const LOOSE: usize = 6700;
+pub const LOOSE: usize = 6700;
 
 /// A lock with no pid in it is only called stale once it has sat this long.
 const AGE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct Finding {
+pub struct Finding {
     /// Lock and pid files whose owner is gone.
     pub stale: Vec<PathBuf>,
     /// A gc that is really running there: the repository is left entirely alone.
@@ -48,7 +48,7 @@ fn pid_of(file: &Path) -> Option<u32> {
     std::fs::read_to_string(file).ok()?.split_whitespace().next()?.parse().ok()
 }
 
-pub(crate) fn alive(pid: u32) -> bool {
+pub fn alive(pid: u32) -> bool {
     pid != 0
         && Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
@@ -76,7 +76,7 @@ fn committing(git: &Path) -> bool {
 
 /// What is wrong with the repository whose git dir is `git`. `alive` answers
 /// whether a pid is a running process; `age` is how old a pid-less lock must be.
-pub(crate) fn inspect(git: &Path, alive: &dyn Fn(u32) -> bool, age: Duration) -> Finding {
+pub fn inspect(git: &Path, alive: &dyn Fn(u32) -> bool, age: Duration) -> Finding {
     let mut f = Finding { loose: loose_in(git), busy: committing(git), ..Finding::default() };
     let (pid, lock) = (git.join("gc.pid"), git.join("gc.log.lock"));
     if pid.exists() {
@@ -102,7 +102,7 @@ pub(crate) fn inspect(git: &Path, alive: &dyn Fn(u32) -> bool, age: Duration) ->
 
 /// The git dirs worth looking at: the store and every declared root that is a
 /// repository of its own, once each.
-pub(crate) fn repos(roots: &[PathBuf]) -> Vec<PathBuf> {
+pub fn repos(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for r in roots {
         let g = r.join(".git");
@@ -115,7 +115,7 @@ pub(crate) fn repos(roots: &[PathBuf]) -> Vec<PathBuf> {
 
 /// Clear the stale files, stop the detach that crashes, and pack. Returns what
 /// was done, in words.
-pub(crate) fn fix(git: &Path, f: &Finding, threshold: usize) -> Vec<String> {
+pub fn fix(git: &Path, f: &Finding, threshold: usize) -> Vec<String> {
     let mut done = Vec::new();
     if f.live || !f.wants_attention_at(threshold) {
         return done;
@@ -173,7 +173,7 @@ fn describe(root: &Path, f: &Finding) -> String {
 
 /// The doctor's pass over `roots`. A stale lock is a problem (the repository
 /// has stopped packing); loose objects alone are a note.
-pub(crate) fn health(roots: &[PathBuf], fixing: bool, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+pub fn health(roots: &[PathBuf], fixing: bool, problems: &mut Vec<String>, notes: &mut Vec<String>) {
     health_with(roots, fixing, &alive, problems, notes)
 }
 

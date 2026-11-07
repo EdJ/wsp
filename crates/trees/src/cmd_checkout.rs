@@ -177,7 +177,7 @@ use crate::store::Store;
 use crate::util;
 use crate::base::args::Args;
 
-pub(crate) use crate::base::git::{trunk, trunk_branch, trunk_tip, WORKTREES};
+pub use crate::base::git::{trunk, trunk_branch, trunk_tip, WORKTREES};
 
 
 /// What a land is and what follows it, said to the agent whose row it is.
@@ -191,7 +191,7 @@ pub(crate) use crate::base::git::{trunk, trunk_branch, trunk_tip, WORKTREES};
 /// settings or their own typing can. What wsp can say truly is whose act the
 /// land is, what it does, what review follows, and what to do when a land is
 /// refused — never a hand-rolled rebase and fast-forward (`robustness-071`).
-pub(crate) const LANDING: &str = "A row ends with its own agent's `wsp land`, which rebases the row's \
+pub const LANDING: &str = "A row ends with its own agent's `wsp land`, which rebases the row's \
      branch and fast-forwards the trunk; review follows it: wsp starts a read-only verifier on the land, and \
      the person reads the row before `wsp done`. A land that is refused is asked about with `wsp ask`, never \
      done by hand.";
@@ -199,7 +199,7 @@ pub(crate) const LANDING: &str = "A row ends with its own agent's `wsp land`, wh
 /// What a member of a group wsp runs is told instead of [`LANDING`]: it does not
 /// land. `wsp review` is its whole last step, and the verifier that reads its
 /// tree lands it on a hold.
-pub(crate) const READY_FLOW: &str = "A row in a run wsp runs ends with `wsp review`, which records the commit it is \
+pub const READY_FLOW: &str = "A row in a run wsp runs ends with `wsp review`, which records the commit it is \
      ready at and does not land: a verifier reads your tree, and its `wsp verified --holds` lands the row \
      (rebased on the trunk, checks rerun where the trunk moved). A block sends the row back with nothing on the \
      trunk. Never `wsp land` it yourself, and never land by hand.";
@@ -212,7 +212,7 @@ pub(crate) const READY_FLOW: &str = "A row in a run wsp runs ends with `wsp revi
 /// sentences wsp says about a member that did not end properly all ask this,
 /// so no two of them can tell the same row opposite things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Flow {
+pub enum Flow {
     /// A member of a verified run: `wsp review` ends it, the verifier lands it.
     Verified,
     /// Any other row: its own `wsp land`, then `wsp review`.
@@ -221,17 +221,17 @@ pub(crate) enum Flow {
 
 impl Flow {
     /// The flow of a row placed in a list, as `Placing::run` says.
-    pub(crate) fn of(run: bool) -> Flow {
+    pub fn of(run: bool) -> Flow {
         if run { Flow::Verified } else { Flow::Own }
     }
 
     /// The flow of a row by id, read from the lists that are running.
-    pub(crate) fn of_task(store: &Store, task: &str) -> Flow {
+    pub fn of_task(store: &Store, task: &str) -> Flow {
         Flow::of((engine().runs)(store, task))
     }
 
     /// The `land` row of the banner.
-    pub(crate) fn banner(self) -> &'static str {
+    pub fn banner(self) -> &'static str {
         match self {
             Flow::Verified => READY_FLOW,
             Flow::Own => LANDING,
@@ -239,7 +239,7 @@ impl Flow {
     }
 
     /// The `tree` row of the banner.
-    pub(crate) fn tree(self) -> &'static str {
+    pub fn tree(self) -> &'static str {
         match self {
             Flow::Verified => "your own, and it is the whole project — commit freely; `wsp review` marks it ready and a verifier lands it, and `git show master:<path>` reads the trunk",
             Flow::Own => "your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk, and `git show master:<path>` reads it",
@@ -247,7 +247,7 @@ impl Flow {
     }
 
     /// How a packet row's one-line order ends.
-    pub(crate) fn order_end(self, task: &str) -> String {
+    pub fn order_end(self, task: &str) -> String {
         match self {
             Flow::Verified => format!(
                 "Then commit and end with `wsp review {task} \"...\"` (or `-` and the summary on stdin): \
@@ -261,7 +261,7 @@ impl Flow {
     }
 
     /// What a member reviewed with commits not on the trunk, and not ready, owes.
-    pub(crate) fn owes(self, id: &str) -> String {
+    pub fn owes(self, id: &str) -> String {
         match self {
             Flow::Verified => format!(
                 "Its work is not recorded ready: it commits what is left in its tree and ends with `wsp review {id}` \
@@ -285,7 +285,7 @@ impl Flow {
 /// distinction rather than a boolean: two paths are in the same working tree
 /// only when this agrees about both, and "both in no worktree" is as much an
 /// agreement as "both in that one".
-pub(crate) fn worktree_of(p: &Path) -> Option<PathBuf> {
+pub fn worktree_of(p: &Path) -> Option<PathBuf> {
     let mut prefix = PathBuf::new();
     let mut parts = p.components();
     while let Some(c) = parts.next() {
@@ -306,7 +306,7 @@ pub(crate) fn worktree_of(p: &Path) -> Option<PathBuf> {
 /// Where a task's tree lives. The task id is the directory name and the branch
 /// name both: it is already unique, and a worktree left behind names the task
 /// that abandoned it.
-pub(crate) fn checkout_dir(trunk: &Path, task: &str) -> PathBuf {
+pub fn checkout_dir(trunk: &Path, task: &str) -> PathBuf {
     let base = trunk.join(WORKTREES);
     let dir = base.join(task);
     if dir.join(".git").exists() {
@@ -361,9 +361,9 @@ struct Orphan {
 /// Two answers rather than one because the second is a *finding* and not a
 /// result: the tree was made either way, and [`Orphan`] is what nobody was
 /// looking at.
-pub(crate) struct Made {
+pub struct Made {
     /// Whether the tree was new.
-    pub(crate) fresh: bool,
+    pub fresh: bool,
     orphan: Option<Orphan>,
 }
 
@@ -435,7 +435,7 @@ fn orphan(repo: &Path, onto: &str, task: &str) -> Option<Orphan> {
 /// adopting the old branch is the worse answer — but it no longer does it
 /// silently, and the finding rides out on [`Made`] rather than being printed
 /// from here, because two callers want it in two shapes.
-pub(crate) fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<Made, String> {
+pub fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<Made, String> {
     // Before the early return, because the guard is a property of the
     // repository rather than of this tree: a second agent arriving at a tree
     // that already exists is exactly who it is for. See `crate::guard` for why
@@ -493,7 +493,7 @@ pub(crate) fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<
 /// for a claim with no recorded cwd, and the same sentence is waiting on the
 /// next `wsp checkout` of the task, which is where somebody is actually
 /// deciding what to do with the work.
-pub(crate) fn tree_for(root: &str, task: &str) -> Option<String> {
+pub fn tree_for(root: &str, task: &str) -> Option<String> {
     let root = util::expand(root);
     let repo = toplevel(&root)?;
     let trunk = trunk(&repo)?;
@@ -536,7 +536,7 @@ fn n_commits(n: usize) -> String {
 /// A distinction rather than a sentence, because the three are not equally sure
 /// and [`sweep`] acts on only two of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Why {
+pub enum Why {
     /// The task is closed. Somebody decided the work was over, which is the
     /// only fact here strong enough to remove a directory on — and it holds
     /// however much is in the tree, because that is a fact about the work.
@@ -576,7 +576,7 @@ impl Why {
     /// standing. Naming them there is how the ending came to be half-done every
     /// time. [`crate::cmd_spawn::despawn`] is the verb that finishes it, and it
     /// removes the tree on the way.
-    pub(crate) fn fix(&self, task: &str, seated: bool) -> String {
+    pub fn fix(&self, task: &str, seated: bool) -> String {
         match (self, seated) {
             (_, true) => despawn_hint(task),
             (Why::Closed | Why::Landed, false) => "`wsp checkout --sweep`".into(),
@@ -591,12 +591,12 @@ impl Why {
 /// they have to point at the same thing: while an agent is still in a seat on
 /// this task, taking the tree leaves the agent, the claim and the workspace
 /// standing, which is how the ending came to be half-done every time.
-pub(crate) fn despawn_hint(task: &str) -> String {
+pub fn despawn_hint(task: &str) -> String {
     format!("`wsp despawn {task}`")
 }
 
 /// A tree that is finished with: which task's, why, and how to say so.
-pub(crate) struct Stale {
+pub struct Stale {
     pub task: String,
     pub why: Why,
     /// The reason as a reader wants it, since only this function knows the name
@@ -620,7 +620,7 @@ pub(crate) struct Stale {
 /// even if it has uncommitted work in it, which is a fact about the work; and
 /// whether a worklist has passed the group a task was in is a fact about a
 /// plan. See [`Why::Landed`] for what the second one is and is not.
-pub(crate) fn stale(
+pub fn stale(
     root: &Path,
     closed: &dyn Fn(&str) -> bool,
     passed: &dyn Fn(&str) -> bool,
@@ -659,7 +659,7 @@ pub(crate) fn stale(
 /// git refuses to delete it, which is precisely when it still holds commits.
 /// The sweep that made it says so once, on stdout, and nothing mentions it
 /// again.
-pub(crate) struct Stray {
+pub struct Stray {
     /// The branch. A branch name and never assumed to be a task id, for the
     /// reason [`judge`] gives about reading it off a tree.
     pub branch: String,
@@ -672,7 +672,7 @@ pub(crate) struct Stray {
 
 /// What the store makes of a branch's name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Whose {
+pub enum Whose {
     /// A task the store still knows by this name. Nothing here is lost, only
     /// unattended: [`ensure`] reuses `refs/heads/<task>` when it is there, so
     /// `wsp checkout <name>` builds the tree again from this very branch.
@@ -719,7 +719,7 @@ fn worktree_branches(repo: &Path) -> BTreeSet<String> {
 ///
 /// The trunk's own branch drops out without a special case, because the trunk
 /// is a working tree and [`worktree_branches`] sees it.
-pub(crate) fn strays(repo: &Path, whose: &dyn Fn(&str) -> Whose) -> Vec<Stray> {
+pub fn strays(repo: &Path, whose: &dyn Fn(&str) -> Whose) -> Vec<Stray> {
     let Some(trunk) = trunk(repo) else { return Vec::new() };
     let Some(onto) = trunk_branch(&trunk) else { return Vec::new() };
     let held = worktree_branches(repo);
@@ -846,7 +846,7 @@ fn judge(repo: &Path, onto: &str, task: &str, dir: &Path, closed: bool, passed: 
 /// check out. The other half is [`strays`], which finds that branch again on
 /// every `doctor` afterwards, because a name printed once is a name that has
 /// scrolled away by the time anybody wants it.
-pub(crate) fn remove(repo: &Path, dir: &Path) -> Removed {
+pub fn remove(repo: &Path, dir: &Path) -> Removed {
     let existed = dir.exists();
     // The tree's own teardown, while the tree is still there to run it in.
     crate::at_stop::before(repo, dir);
@@ -890,18 +890,18 @@ fn foresee(repo: &Path, dir: &Path, onto: &str) -> Removed {
     Removed { existed: dir.exists(), kept }
 }
 
-pub(crate) struct Removed {
+pub struct Removed {
     existed: bool,
     /// The branch that outlived the tree, named rather than flagged: it is what
     /// a reader has to type to get the work back, and it is not always the
     /// task's id. `None` is a branch that went with the tree, having nothing
     /// the trunk had not got.
-    pub(crate) kept: Option<String>,
+    pub kept: Option<String>,
 }
 
 /// What one sweep did, and what it declined to do.
 #[derive(Default)]
-pub(crate) struct Swept {
+pub struct Swept {
     /// Tasks whose trees went.
     pub removed: Vec<String>,
     /// The branches that outlived their tree because they still hold commits
@@ -953,7 +953,7 @@ pub(crate) struct Swept {
 /// branch half is [`strays`], and the two refusals it makes are the two above
 /// in different clothes: a branch still holding work is named and never taken,
 /// and a branch that is not wsp's is not touched at all.
-pub(crate) fn sweep(
+pub fn sweep(
     root: &Path,
     closed: &dyn Fn(&str) -> bool,
     passed: &dyn Fn(&str) -> bool,
@@ -1013,7 +1013,7 @@ pub(crate) fn sweep(
 /// Marked dead until `wsp worklist go` lands, which is the convention
 /// [`crate::worklist`] states: the attribute is the marker for "its caller has
 /// not landed yet", not for something nobody wants.
-pub(crate) struct Passed {
+pub struct Passed {
     pub task: String,
     pub trunk: PathBuf,
     pub trunk_branch: String,
@@ -1049,7 +1049,7 @@ pub(crate) struct Passed {
 ///
 /// A member with no tree is not a finding. Most of them will have none: a tree
 /// swept at an earlier barrier, or work that never took a checkout at all.
-pub(crate) fn sweep_passed(
+pub fn sweep_passed(
     members: &[Passed],
     closed: &dyn Fn(&str) -> bool,
     busy: &dyn Fn(&str, &Path) -> Option<String>,
@@ -1122,7 +1122,7 @@ fn closed_members(trunks: &[(PathBuf, String)], id: &str) -> Vec<Passed> {
 ///
 /// Every root the row's project names, not where the caller stands: `done` is
 /// typed from anywhere, and most often by somebody who was never in the tree.
-pub(crate) fn sweep_closed(store: &Store, ids: &[String], dry: bool) -> Swept {
+pub fn sweep_closed(store: &Store, ids: &[String], dry: bool) -> Swept {
     let index = crate::resolve::Index::new(store.projects());
     let mut members = Vec::new();
     for id in ids {
@@ -1150,7 +1150,7 @@ pub(crate) fn sweep_closed(store: &Store, ids: &[String], dry: bool) -> Swept {
 }
 
 /// What [`sweep_closed`] did, in lines: nothing for a row that had no tree.
-pub(crate) fn closed_lines(out: &Swept) -> Vec<String> {
+pub fn closed_lines(out: &Swept) -> Vec<String> {
     let mut lines: Vec<String> = out.removed.iter().map(|t| format!("removed {t}'s tree — its work is on the trunk")).collect();
     lines.extend(out.branches.iter().map(|b| format!("branch {b} kept — it has commits the trunk has not")));
     lines.extend(out.kept.iter().map(|(t, why)| format!("kept {t}'s tree — {why}")));
@@ -1176,7 +1176,7 @@ pub(crate) fn closed_lines(out: &Swept) -> Vec<String> {
 /// the tree, so either error becomes the one `Err` for the whole merge, and
 /// every tree this run checks is kept on it rather than some trees seeing the
 /// error and others silently not.
-pub(crate) fn who_is_standing() -> Result<Vec<(String, String)>, String> {
+pub fn who_is_standing() -> Result<Vec<(String, String)>, String> {
     let herdr_seen: Result<Vec<(String, String)>, String> = match crate::herdr::available_now() {
         false => Ok(Vec::new()),
         true => crate::herdr::panes()
@@ -1210,20 +1210,20 @@ pub(crate) fn who_is_standing() -> Result<Vec<(String, String)>, String> {
 /// gone — and none of them can be made wrong by a backend having a bad moment;
 /// an unreadable backend is the one case that keeps every tree this call is
 /// asked about, not just the one it happened to be asked about first.
-pub(crate) struct Occupied {
+pub struct Occupied {
     here: PathBuf,
     seen: Result<Vec<(String, String)>, String>,
     claimed: Vec<String>,
 }
 
 impl Occupied {
-    pub(crate) fn now(store: &Store) -> Occupied {
+    pub fn now(store: &Store) -> Occupied {
         let here = std::env::current_dir().map(|c| util::real(&c.display().to_string())).unwrap_or_default();
         Occupied { here, seen: who_is_standing(), claimed: store.claims().keys().cloned().collect() }
     }
 
     /// Why `task`'s tree at `dir` has to be left standing, or `None`.
-    pub(crate) fn of(&self, task: &str, dir: &Path) -> Option<String> {
+    pub fn of(&self, task: &str, dir: &Path) -> Option<String> {
         let dir = util::real(&dir.display().to_string());
         if self.here.starts_with(&dir) {
             return Some("you are standing in it".into());
@@ -1257,7 +1257,7 @@ impl Occupied {
 /// standing — and the second is the only one that needs them to do something.
 /// Reporting them the same way is the fault this whole verb was written
 /// against: a step that says it finished when it did nothing.
-pub(crate) enum Tree {
+pub enum Tree {
     /// No tree for this task in any repository it could be in. The ordinary
     /// answer for work that never took a checkout.
     Absent,
@@ -1289,7 +1289,7 @@ pub(crate) enum Tree {
 /// tree — and comes in as a closure for the reason [`sweep`]'s `busy` does: the
 /// rule is worth testing and a live herdr is not worth needing in order to test
 /// it.
-pub(crate) fn discard(
+pub fn discard(
     repos: Vec<PathBuf>,
     task: &str,
     standing: &dyn Fn(&Path) -> Option<String>,
@@ -1320,7 +1320,7 @@ fn dirty(dir: &Path) -> bool {
 
 /// How many paths in a tree are uncommitted, tracked or not — `0` for a tree
 /// git cannot read, which is the same answer [`dirty`] has always given it.
-pub(crate) fn uncommitted(dir: &Path) -> usize {
+pub fn uncommitted(dir: &Path) -> usize {
     git(dir, &["status", "--porcelain", "--untracked-files=all"])
         .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(0)
@@ -1377,14 +1377,14 @@ fn untracked(dir: &Path) -> bool {
 
 /// The commits on `branch` that the trunk does not have, newest first.
 ///
-/// `pub(crate)` for the worklist barrier, which asks this same question of
+/// `pub` for the worklist barrier, which asks this same question of
 /// every member of a group and opens on the answer. Nothing about it changed
 /// to leave the module — but note what it cannot tell a caller from here: a
 /// branch that does not exist is not an error to `git log`, so the answer for
 /// one is the same empty list as for one that has landed. `land` and [`stale`]
 /// both hold a tree, so a branch is a given for them;
 /// [`crate::worklist::Landing`] does not and asks first.
-pub(crate) fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String> {
+pub fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String> {
     git(repo, &["log", "--format=%h %s", &format!("{trunk_branch}..{branch}")])
         .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default()
@@ -1437,14 +1437,14 @@ pub(crate) fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String
 /// means the member changed nothing, and `None` means nobody knows what it
 /// changed. Reporting the second as the first is a clean bill of health nothing
 /// checked, which is the `batch`'s absence-as-evidence all over again.
-pub(crate) struct Landings {
+pub struct Landings {
     /// The trunk's values, newest first, each with the reflog's own account of
     /// how the trunk came to hold it.
     values: Vec<(String, String)>,
 }
 
 impl Landings {
-    pub(crate) fn read(repo: &Path, trunk_branch: &str) -> Landings {
+    pub fn read(repo: &Path, trunk_branch: &str) -> Landings {
         let values = git(repo, &["reflog", "show", "--format=%H %gs", trunk_branch])
             .map(|s| {
                 s.lines()
@@ -1501,7 +1501,7 @@ impl Landings {
     /// will grow. It was added for [`crate::model::Group::landed`], which
     /// writes the association between member and commits down before the sweep
     /// deletes the only other place it lived.
-    pub(crate) fn placed(&self, repo: &Path, branch: &str) -> Option<Placed> {
+    pub fn placed(&self, repo: &Path, branch: &str) -> Option<Placed> {
         let named = format!("merge {branch}:");
         let mut out: BTreeSet<String> = BTreeSet::new();
         let mut commit = String::new();
@@ -1521,7 +1521,7 @@ impl Landings {
 
 /// What one branch put on the trunk, as [`Landings::placed`] answers it: the
 /// merge commit of its newest land, and every file across all of its lands.
-pub(crate) struct Placed {
+pub struct Placed {
     pub commit: String,
     pub files: Vec<String>,
 }
@@ -1640,7 +1640,7 @@ impl Where {
 /// Deduplicated through [`util::real`], because the overwhelmingly common case
 /// is the two agreeing and neither the search nor the "where I looked" message
 /// should say the same repository twice.
-pub(crate) fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> {
+pub fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut add = |repo: Option<PathBuf>| {
         let Some(repo) = repo else { return };
@@ -1721,7 +1721,7 @@ fn pick(repos: Vec<PathBuf>, task: &str) -> Result<Where, String> {
 }
 
 /// The task's checkout when one stands, from the same candidates `discard` reads.
-pub(crate) fn tree_of(repos: Vec<PathBuf>, task: &str) -> Option<PathBuf> {
+pub fn tree_of(repos: Vec<PathBuf>, task: &str) -> Option<PathBuf> {
     let w = pick(repos, task).ok()?;
     w.dir.join(".git").exists().then_some(w.dir)
 }
@@ -1742,7 +1742,7 @@ fn locate(store: &Store, args: &Args) -> Result<Where, String> {
 
 /// What this module asks of the run engine above it, which installs the answers at
 /// startup ([`install_engine`]): the trees do not name the engine.
-pub(crate) struct Engine {
+pub struct Engine {
     /// The trees a running list's passed groups left to clear (`worklist::passed_by_running`).
     pub passed: fn(&Store) -> std::collections::BTreeSet<String>,
     /// After a status verb: start the steps this may have made due (`cycle::poke_task`).
@@ -1760,7 +1760,7 @@ pub(crate) struct Engine {
 }
 
 /// How a rerun after a rebase onto a moved trunk ended.
-pub(crate) enum Rerun {
+pub enum Rerun {
     /// The checks it can affect could not be planned: why.
     Unplanned(String),
     /// Planned, and none of it affected.
@@ -1775,7 +1775,7 @@ pub(crate) enum Rerun {
 
 static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
 
-pub(crate) fn install_engine(e: Engine) {
+pub fn install_engine(e: Engine) {
     let _ = ENGINE.set(e);
 }
 
@@ -2084,7 +2084,7 @@ fn swept(store: &Store, args: &Args) -> i32 {
 /// `n branches`, singular at one — [`n_commits`]'s neighbour and there for the
 /// same reason: `doctor` and `--sweep` count the same refs and say so with the
 /// same words.
-pub(crate) fn n_branches(n: usize) -> String {
+pub fn n_branches(n: usize) -> String {
     match n {
         1 => "1 branch".to_string(),
         n => format!("{n} branches"),
@@ -2103,7 +2103,7 @@ pub(crate) fn n_branches(n: usize) -> String {
 /// urgent: a branch still under its own task's name is one `wsp checkout` away,
 /// and a former id is not reachable through wsp at all — so that one names the
 /// git command, which is the only thing that gets the work back.
-pub(crate) fn stranded_line(s: &Stray) -> String {
+pub fn stranded_line(s: &Stray) -> String {
     let held = format!("branch {} holds {} and has no tree", s.branch, n_commits(s.commits));
     match &s.whose {
         Whose::Former(now) => format!(
@@ -2134,7 +2134,7 @@ pub(crate) fn stranded_line(s: &Stray) -> String {
 /// An id the store has never heard of is *not* finished. That is the answer
 /// that keeps a store pointed somewhere else — `WSP_HOME` in a sandbox, a fresh
 /// checkout with no store at all — from reading as a repository full of litter.
-pub(crate) fn finished(store: &Store) -> impl Fn(&str) -> bool {
+pub fn finished(store: &Store) -> impl Fn(&str) -> bool {
     let tasks = store.tasks();
     let archived = store.archived_ids();
     move |id: &str| {
@@ -2160,7 +2160,7 @@ pub(crate) fn finished(store: &Store) -> impl Fn(&str) -> bool {
 /// [`finished`] gives for the same reason, and here it carries more weight: it
 /// is what keeps a sweep run against a store pointed somewhere else from
 /// reading every branch in the repository as litter.
-pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Whose {
+pub fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Whose {
     let known: BTreeSet<String> =
         store.tasks().into_iter().map(|t| t.id).chain(store.archived_ids()).collect();
     let renamed = store.renamed_ids();
@@ -2199,7 +2199,7 @@ pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Who
 ///
 /// `by_a_run` and `ready` are the engine's answers (a verifier lands the row;
 /// the commit its newest ready line names), asked by the caller.
-pub(crate) fn outstanding(store: &Store, task: &str, by_a_run: bool, ready: Option<String>) -> Vec<String> {
+pub fn outstanding(store: &Store, task: &str, by_a_run: bool, ready: Option<String>) -> Vec<String> {
     let Ok(cwd) = std::env::current_dir() else { return Vec::new() };
     match pick(candidates(store, &cwd, task), task) {
         Ok(w) => holding(&w, by_a_run, ready.as_deref()),
@@ -2237,14 +2237,14 @@ fn holding(w: &Where, by_a_run: bool, ready: Option<&str>) -> Vec<String> {
 /// at and the branch, when that branch is ahead of the trunk. `Ok(None)` for no
 /// repository or nothing ahead (design-only rows, rows that landed themselves);
 /// `Err` for a tree holding uncommitted work, naming it.
-pub(crate) fn ready_at(store: &Store, task: &str) -> Result<Option<(String, String)>, String> {
+pub fn ready_at(store: &Store, task: &str) -> Result<Option<(String, String)>, String> {
     let Ok(cwd) = std::env::current_dir() else { return Ok(None) };
     ready_from(store, task, &cwd)
 }
 
 /// [`ready_at`] for a caller that is not standing in the row's tree: the run,
 /// which finds the tree wsp made for the row as [`member_tree`] does.
-pub(crate) fn ready_from(store: &Store, task: &str, cwd: &Path) -> Result<Option<(String, String)>, String> {
+pub fn ready_from(store: &Store, task: &str, cwd: &Path) -> Result<Option<(String, String)>, String> {
     let Ok(w) = pick(candidates(store, cwd, task), task) else { return Ok(None) };
     if !w.dir.join(".git").exists() {
         return Ok(None);
@@ -2263,7 +2263,7 @@ pub(crate) fn ready_from(store: &Store, task: &str, cwd: &Path) -> Result<Option
 }
 
 /// What preparing a ready member's tree for its verifier found.
-pub(crate) enum Prepared {
+pub enum Prepared {
     /// No tree for the task, or the branch already sits on the trunk's tip.
     Unchanged,
     /// The branch was rebased onto the trunk; the member is ready at this commit now.
@@ -2273,7 +2273,7 @@ pub(crate) enum Prepared {
 }
 
 /// The tree wsp made for `task`, when it is there.
-pub(crate) fn member_tree(store: &Store, task: &str) -> Option<PathBuf> {
+pub fn member_tree(store: &Store, task: &str) -> Option<PathBuf> {
     let repos = candidates(store, Path::new("/"), task);
     let w = pick(repos, task).ok()?;
     w.dir.join(".git").exists().then_some(w.dir)
@@ -2283,7 +2283,7 @@ pub(crate) fn member_tree(store: &Store, task: &str) -> Option<PathBuf> {
 /// its own tree, which has the warm `target/`. Idempotent — a branch already on
 /// the trunk's tip is left alone and costs one `merge-base` call. A conflict is
 /// aborted so the tree is as the member left it.
-pub(crate) fn rebase_ready(store: &Store, task: &str) -> Prepared {
+pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
     let repos = candidates(store, Path::new("/"), task);
     let Ok(w) = pick(repos, task) else { return Prepared::Unchanged };
     if !w.dir.join(".git").exists() {
@@ -2323,7 +2323,7 @@ fn abort_rebase(dir: &Path, onto: &str, why: &str) -> String {
 }
 
 /// What reached the trunk.
-pub(crate) struct Landed {
+pub struct Landed {
     /// The commits that landed, newest first.
     pub commits: Vec<String>,
     /// The stat lines of what they changed.
@@ -2336,7 +2336,7 @@ pub(crate) struct Landed {
 
 /// Why a land did not happen. Each carries what to print.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Refusal {
+pub enum Refusal {
     Dirty(String),
     Detached(String),
     RebaseConflict(String),
@@ -2346,7 +2346,7 @@ pub(crate) enum Refusal {
 }
 
 impl Refusal {
-    pub(crate) fn text(&self) -> &str {
+    pub fn text(&self) -> &str {
         match self {
             Refusal::Dirty(s) | Refusal::Detached(s) | Refusal::RebaseConflict(s) | Refusal::NotFastForward(s) | Refusal::Nothing(s) => s,
         }
@@ -2567,7 +2567,7 @@ fn still_wants_review(status: Option<crate::model::Status>, task: &str) -> Optio
 }
 
 /// What the verifier's hold did to the trunk.
-pub(crate) enum Verdict {
+pub enum Verdict {
     /// Nothing to land: no tree, nothing ahead, a row that landed itself.
     Nothing,
     Landed {
@@ -2585,7 +2585,7 @@ const ROUNDS: usize = 3;
 /// on only by a fast-forward of exactly what was checked: when it moved since,
 /// the branch is rebased onto it and only the checks the rebase can have
 /// affected are rerun ([`crate::check::affected`]), up to [`ROUNDS`] times.
-pub(crate) fn land_verdict(store: &Store, task: &str) -> Verdict {
+pub fn land_verdict(store: &Store, task: &str) -> Verdict {
     let Ok(w) = pick(candidates(store, Path::new("/"), task), task) else { return Verdict::Nothing };
     if !w.dir.join(".git").exists() {
         return Verdict::Nothing;
@@ -2756,7 +2756,7 @@ mod tests {
     }
 
     fn repo(dir: &Path) {
-        crate::testkit::repo(dir);
+        wsp_testkit::repo(dir);
         std::fs::write(dir.join("kept.txt"), "one\n").unwrap();
         run(dir, &["add", "kept.txt"]);
         run(dir, &["commit", "--quiet", "-m", "first"]);

@@ -249,7 +249,7 @@ use crate::store::Store;
 use crate::util;
 use crate::base::args::Args;
 
-pub(crate) use crate::base::git::{git, git_ok, toplevel};
+pub use crate::base::git::{git, git_ok, toplevel};
 
 
 /// Which agent is asking.
@@ -290,7 +290,7 @@ pub fn agent_key() -> String {
 /// Named for the repository and keyed on the agent. `repo` has to be the trunk
 /// for the name to mean anything, which is why [`scratch`] resolves it rather
 /// than passing whatever tree the caller is standing in.
-pub(crate) fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
+pub fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
     let name = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     store.state.join("build").join(format!("{}-{}", util::slugify(name), key))
 }
@@ -393,7 +393,7 @@ fn keyed_on(name: &str, workspace: &str) -> bool {
 /// worktree` registration is pruned by [`ensure_tree`] or `checkout` the next
 /// time either touches the repository, and pruning it here would mean guessing
 /// which repository the tree came from.
-pub(crate) fn clear_build_key(store: &Store, workspace: &str) -> Vec<String> {
+pub fn clear_build_key(store: &Store, workspace: &str) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(store.state.join("build")) else { return Vec::new() };
     let mut gone = Vec::new();
     for e in entries.flatten() {
@@ -418,7 +418,7 @@ pub(crate) fn clear_build_key(store: &Store, workspace: &str) -> Vec<String> {
 /// build this produced, and used to compute the directory itself — from the
 /// tree it was standing in rather than the trunk, so inside a checkout it
 /// looked somewhere `verify` had never written.
-pub(crate) struct Scratch {
+pub struct Scratch {
     /// Holds the private index, the patch, and `tree`. What `--rm` removes.
     pub dir: PathBuf,
     /// The source tree that gets built: HEAD, reset and re-patched every run.
@@ -439,7 +439,7 @@ pub(crate) struct Scratch {
 /// [`crate::cmd_checkout::worktree_of`] names. Asking git which worktree owns a
 /// path costs a process, and the layout is ours to define, so the answer is
 /// already in the path — the same bargain `overlap` makes for the same reason.
-pub(crate) fn scratch(store: &Store, repo: &Path, key: &str) -> Scratch {
+pub fn scratch(store: &Store, repo: &Path, key: &str) -> Scratch {
     if crate::cmd_checkout::worktree_of(repo).as_deref() == Some(repo) {
         // Under `target/` rather than a dotted directory of its own: it is
         // build output, it is already gitignored in every cargo project, and
@@ -466,7 +466,7 @@ pub(crate) fn scratch(store: &Store, repo: &Path, key: &str) -> Scratch {
 /// stopped being derivable: a build now lands in whichever warm tree was free,
 /// and `wsp install` — which looks for the release binary this command produced
 /// — cannot work that out from the checkout it is standing in.
-pub(crate) const BUILT_AT: &str = "built-at";
+pub const BUILT_AT: &str = "built-at";
 
 /// What the last build here wrote down, or `None` if none has — or if it names
 /// a tree that has since gone, which `--rm` makes ordinary rather than exotic.
@@ -475,7 +475,7 @@ pub(crate) const BUILT_AT: &str = "built-at";
 /// second reason: whether it may name a path in "nothing built to install". A
 /// build lands in whichever warm tree was free, so the only path anybody can
 /// honestly name is the one a build wrote down.
-pub(crate) fn built_at(dir: &Path) -> Option<PathBuf> {
+pub fn built_at(dir: &Path) -> Option<PathBuf> {
     std::fs::read_to_string(dir.join(BUILT_AT))
         .ok()
         .map(|s| PathBuf::from(s.trim()))
@@ -488,7 +488,7 @@ pub(crate) fn built_at(dir: &Path) -> Option<PathBuf> {
 /// Falls back to [`scratch`] when there is no pointer or it names something
 /// gone, which is both the pre-warm-tree arrangement and the honest answer for
 /// a checkout that has never run a build.
-pub(crate) fn last_build(store: &Store, repo: &Path, key: &str) -> Scratch {
+pub fn last_build(store: &Store, repo: &Path, key: &str) -> Scratch {
     let sc = scratch(store, repo, key);
     match built_at(&sc.dir) {
         Some(target) => {
@@ -794,7 +794,7 @@ fn pump(mut r: impl std::io::Read, echo: bool, is_err: bool) -> String {
 
 /// One test the run reported as failed: where it panicked, and what it said.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Failure {
+pub struct Failure {
     pub name: String,
     pub at: Option<String>,
     pub message: Option<String>,

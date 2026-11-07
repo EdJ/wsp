@@ -122,7 +122,7 @@ exit 0
 
 /// What is standing at the hook path in one repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum State {
+pub enum State {
     /// This binary's guard, byte for byte.
     Ours,
     /// A guard wsp wrote, from a different version of this file.
@@ -176,7 +176,7 @@ fn git(repo: &Path, args: &[&str]) -> Option<PathBuf> {
 }
 
 /// What is at the hook path of this repository.
-pub(crate) fn state(repo: &Path) -> State {
+pub fn state(repo: &Path) -> State {
     let hooks = git(repo, &["rev-parse", "--git-path", "hooks"]);
     let common = git(repo, &["rev-parse", "--git-common-dir"]);
     let existing = hooks
@@ -193,7 +193,7 @@ pub(crate) fn state(repo: &Path) -> State {
 /// moment wsp knows an agent is about to work in a repository is the moment the
 /// guard is owed. Silent, and it never fails anything — a spawn that could not
 /// write a hook file is still a spawn, and `doctor` says the guard is missing.
-pub(crate) fn ensure(repo: &Path) {
+pub fn ensure(repo: &Path) {
     match state(repo) {
         State::Missing | State::Stale => {}
         _ => return,
@@ -235,7 +235,7 @@ fn supported(version: &str) -> bool {
 /// running under wsp can put an entry here, so an entry means either a person
 /// at a shell or work stranded before the guard existed. Either way every agent
 /// in every worktree can see it and one of them can `pop` it.
-pub(crate) fn stashed(repo: &Path) -> Vec<String> {
+pub fn stashed(repo: &Path) -> Vec<String> {
     let Ok(out) = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -255,7 +255,7 @@ pub(crate) fn stashed(repo: &Path) -> Vec<String> {
 /// same thing to different readers at different moments, and prose that exists
 /// twice diverges — which is the failure this whole module is about, one level
 /// up. The first line stands alone; the rest are indented detail.
-pub(crate) fn stash_lines(held: &[String]) -> Vec<String> {
+pub fn stash_lines(held: &[String]) -> Vec<String> {
     let Some(first) = held.first() else {
         return Vec::new();
     };
@@ -274,7 +274,7 @@ pub(crate) fn stash_lines(held: &[String]) -> Vec<String> {
 /// `look` and `list` are passed in so the tests can state a repository's answer
 /// instead of needing one, the bargain [`crate::detect_override::health`] makes
 /// for the same reason.
-pub(crate) fn health(
+pub fn health(
     roots: &[PathBuf],
     look: impl Fn(&Path) -> State,
     list: impl Fn(&Path) -> Vec<String>,
@@ -340,7 +340,7 @@ pub(crate) fn health(
 }
 
 /// This machine's git version, for [`health`].
-pub(crate) fn git_version() -> String {
+pub fn git_version() -> String {
     std::process::Command::new("git")
         .arg("--version")
         .output()
@@ -548,7 +548,7 @@ mod tests {
         let env = crate::util::isolated(&format!("guard-{name}"));
         let dir = env.path("repo");
         std::fs::create_dir_all(&dir).unwrap();
-        crate::testkit::repo(&dir);
+        wsp_testkit::repo(&dir);
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         ok(&dir, &["add", "f.txt"]);
         ok(&dir, &["commit", "--quiet", "-m", "first"]);
@@ -603,7 +603,7 @@ mod tests {
         let env = crate::util::isolated("guard-inherit");
         let dir = env.path("repo");
         std::fs::create_dir_all(&dir).unwrap();
-        crate::testkit::repo(&dir);
+        wsp_testkit::repo(&dir);
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         ok(&dir, &["add", "f.txt"]);
         ok(&dir, &["commit", "--quiet", "-m", "first"]);
@@ -661,7 +661,7 @@ mod tests {
         let env = crate::util::isolated("guard-foreign");
         let dir = env.path("repo");
         std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
-        crate::testkit::repo(&dir);
+        wsp_testkit::repo(&dir);
         let path = dir.join(".git/hooks/reference-transaction");
         std::fs::write(&path, "#!/bin/sh\n# theirs\nexit 0\n").unwrap();
         ensure(&dir);

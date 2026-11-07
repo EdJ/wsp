@@ -35,7 +35,7 @@ use crate::store::Store;
 use crate::util;
 
 /// How long the command has before its process group is killed.
-pub(crate) const LIMIT: Duration = Duration::from_secs(30);
+pub const LIMIT: Duration = Duration::from_secs(30);
 
 /// How much of the end of the command's output is kept in what is said.
 const TAIL_LINES: usize = 5;
@@ -43,7 +43,7 @@ const TAIL_CHARS: usize = 400;
 
 /// How a teardown command ended.
 #[derive(Debug, PartialEq)]
-pub(crate) enum Ended {
+pub enum Ended {
     Exited(i32),
     /// Killed by a signal that was not ours.
     Signalled,
@@ -55,7 +55,7 @@ pub(crate) enum Ended {
 
 /// What running the command came to: how it ended and the tail of its output.
 #[derive(Debug)]
-pub(crate) struct Ran {
+pub struct Ran {
     pub ended: Ended,
     pub tail: String,
 }
@@ -63,7 +63,7 @@ pub(crate) struct Ran {
 /// Run `command` under `sh -c` in `dir`, its output to a file read back for its
 /// tail. A file and not a pipe: a command that leaves a daemon running holds a
 /// pipe's write end open, and reading to the end would wait on the daemon.
-pub(crate) fn run_command(dir: &Path, command: &str, limit: Duration) -> Ran {
+pub fn run_command(dir: &Path, command: &str, limit: Duration) -> Ran {
     use std::os::unix::process::CommandExt;
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let log = std::env::temp_dir().join(format!(
@@ -149,7 +149,7 @@ fn command_for(store: &Store, repo: &Path) -> Option<String> {
 
 /// Whether the project of `t` declares an `at_stop:`, and so its seat may have
 /// servers of its own that only the teardown stops (`wsp-430`).
-pub(crate) fn declared(store: &Store, t: &crate::model::Task) -> bool {
+pub fn declared(store: &Store, t: &crate::model::Task) -> bool {
     let mut at = crate::model::project_of(t);
     while let Some(id) = at.take() {
         let Some(p) = store.project(&id) else { return false };
@@ -165,7 +165,7 @@ pub(crate) fn declared(store: &Store, t: &crate::model::Task) -> bool {
 /// then say what it came to. Does nothing when the tree is not there, when
 /// nothing in the store says `repo` is a project's, or when that project has no
 /// `at_stop:`.
-pub(crate) fn run_for(store: &Store, repo: &Path, dir: &Path, limit: Duration) -> Option<Ran> {
+pub fn run_for(store: &Store, repo: &Path, dir: &Path, limit: Duration) -> Option<Ran> {
     if !dir.join(".git").exists() {
         return None;
     }
@@ -188,7 +188,7 @@ pub(crate) fn run_for(store: &Store, repo: &Path, dir: &Path, limit: Duration) -
 
 /// The call every tree's removal makes first. Opens the store itself, because
 /// the removal does not carry one.
-pub(crate) fn before(repo: &Path, dir: &Path) {
+pub fn before(repo: &Path, dir: &Path) {
     // A test that is not about this has no store of its own to open, and
     // opening the live one is refused (see [`Store::open`]).
     if cfg!(test) && (std::env::var_os("WSP_HOME").is_none() || std::env::var_os("WSP_STATE").is_none()) {
@@ -200,7 +200,7 @@ pub(crate) fn before(repo: &Path, dir: &Path) {
 
 #[cfg(test)]
 thread_local! {
-    pub(crate) static TEST_LIMIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    pub static TEST_LIMIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 fn limit() -> Duration {
@@ -237,7 +237,7 @@ mod tests {
         let env = util::isolated(&format!("at-stop-{name}"));
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        crate::testkit::repo(&repo);
+        wsp_testkit::repo(&repo);
         std::fs::write(repo.join(".gitignore"), "target/\n.worktrees/\n").unwrap();
         git(&repo, &["add", ".gitignore"]);
         git(&repo, &["commit", "--quiet", "-m", "first"]);
@@ -291,7 +291,7 @@ mod tests {
         let mut w = crate::model::Worklist::new("run", "p");
         let mut g = crate::model::Group::default();
         g.members = vec!["p-001".into()];
-        crate::barrier::push(&mut g.checks, "2026-10-17T10:00:00Z passes pane:cpd-1 ended");
+        crate::checks::push(&mut g.checks, "2026-10-17T10:00:00Z passes pane:cpd-1 ended");
         w.set_groups(&[g]);
         store.save_worklist(&w).unwrap();
         let _ = dir;
@@ -317,7 +317,7 @@ mod tests {
         let (_env, store, _repo, _dir) = scratch("stranger", "touch ran");
         let other = _env.path("other");
         std::fs::create_dir_all(&other).unwrap();
-        crate::testkit::repo(&other);
+        wsp_testkit::repo(&other);
         git(&other, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
         let tree = other.join("t");
         git(&other, &["worktree", "add", "--quiet", "-b", "t", &tree.display().to_string(), "master"]);

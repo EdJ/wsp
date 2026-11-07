@@ -21,13 +21,13 @@ use crate::util;
 const KEEP_DAYS: i64 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Env {
+pub enum Env {
     Warm,
     Cold,
 }
 
 impl Env {
-    pub(crate) fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             Env::Warm => "warm",
             Env::Cold => "cold",
@@ -37,7 +37,7 @@ impl Env {
 
 /// A pass the ledger holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Green {
+pub struct Green {
     pub env: Env,
     pub took: u64,
     pub when: String,
@@ -49,13 +49,13 @@ pub(crate) struct Green {
     pub carried: bool,
 }
 
-pub(crate) struct Greens {
+pub struct Greens {
     file: PathBuf,
 }
 
 /// What a run needs to reuse and record greens: the ledger, the commit the tree
 /// stands at, the environment, and who is asking.
-pub(crate) struct Reuse<'a> {
+pub struct Reuse<'a> {
     pub greens: &'a Greens,
     pub sha: &'a str,
     pub env: Env,
@@ -67,7 +67,7 @@ fn escape(s: &str) -> String {
 }
 
 impl Greens {
-    pub(crate) fn open(store: &Store, project: &str, repo: &Path) -> Greens {
+    pub fn open(store: &Store, project: &str, repo: &Path) -> Greens {
         let name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         Greens { file: store.state_file("greens").join(format!("{project}-{name}.tsv")) }
     }
@@ -99,13 +99,13 @@ impl Greens {
 
     /// The newest green of exactly this command at exactly this commit that
     /// satisfies `env`: a cold green satisfies either, a warm one only a warm ask.
-    pub(crate) fn lookup(&self, sha: &str, command: &str, env: Env) -> Option<Green> {
+    pub fn lookup(&self, sha: &str, command: &str, env: Env) -> Option<Green> {
         self.lookup_by(sha, None, command, env)
     }
 
     /// The same, or a green of the command at another commit whose input hash
     /// is `inputs`. One at this very commit is preferred.
-    pub(crate) fn lookup_by(&self, sha: &str, inputs: Option<&str>, command: &str, env: Env) -> Option<Green> {
+    pub fn lookup_by(&self, sha: &str, inputs: Option<&str>, command: &str, env: Env) -> Option<Green> {
         let want = escape(command);
         let lines = self.lines();
         let fits: Vec<(Option<String>, Green)> = lines
@@ -122,13 +122,13 @@ impl Greens {
         fits.into_iter().find(|(k, _)| k.as_deref() == Some(want)).map(|(_, g)| Green { carried: true, ..g })
     }
 
-    #[cfg(test)]
-    pub(crate) fn record(&self, sha: &str, command: &str, env: Env, took: u64, who: &str, flaky: bool) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record(&self, sha: &str, command: &str, env: Env, took: u64, who: &str, flaky: bool) {
         self.record_by(sha, None, command, env, took, who, flaky);
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_by(&self, sha: &str, inputs: Option<&str>, command: &str, env: Env, took: u64, who: &str, flaky: bool) {
+    pub fn record_by(&self, sha: &str, inputs: Option<&str>, command: &str, env: Env, took: u64, who: &str, flaky: bool) {
         let Some(dir) = self.file.parent() else { return };
         let _ = std::fs::create_dir_all(dir);
         let keep: Vec<String> =
@@ -154,7 +154,7 @@ impl Greens {
 }
 
 /// Whether `tree` is clean at HEAD and HEAD is `sha`; ignored files do not count.
-pub(crate) fn clean_at(tree: &Path, sha: &str) -> bool {
+pub fn clean_at(tree: &Path, sha: &str) -> bool {
     let Some(head) = git(tree, &["rev-parse", "HEAD"]) else { return false };
     head.trim() == sha && git(tree, &["status", "--porcelain"]).is_some_and(|s| s.trim().is_empty())
 }

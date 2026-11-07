@@ -49,7 +49,7 @@ use crate::util;
 /// A name is only a check's when it parses as one **and** the list it names
 /// exists **and** no task has that id: `parse_subject` alone would read a
 /// project called `x-check`'s task `x-check-012` as list `x`'s twelfth group.
-pub(crate) fn named(store: &Store, name: &str) -> Option<(String, usize)> {
+pub fn named(store: &Store, name: &str) -> Option<(String, usize)> {
     let (list, at) = crate::util::parse_subject(name)?;
     if store.task(name).is_some() || store.worklist(list).is_none() {
         return None;
@@ -60,7 +60,7 @@ pub(crate) fn named(store: &Store, name: &str) -> Option<(String, usize)> {
 /// Whether group `at` of `list` still has a check that is somebody's: one
 /// still reading, or a seat not yet ended. A fresh check on the same group is
 /// started in the same tree, and its entry is written before its seat exists.
-pub(crate) fn in_use(store: &Store, list: &str, at: usize) -> bool {
+pub fn in_use(store: &Store, list: &str, at: usize) -> bool {
     store
         .worklist(list)
         .and_then(|w| w.groups().into_iter().nth(at.saturating_sub(1)))
@@ -68,7 +68,7 @@ pub(crate) fn in_use(store: &Store, list: &str, at: usize) -> bool {
 }
 
 /// The heading a project lists extra residue globs under, one per bullet.
-pub(crate) const RESIDUE_SECTION: &str = "Residue";
+pub const RESIDUE_SECTION: &str = "Residue";
 
 /// What a build leaves behind that git ignores and nobody wrote: dropping it
 /// costs a rebuild and nothing else. A glob without a `/` (after a trailing one
@@ -97,13 +97,13 @@ const RESIDUE: &[&str] = &[
 
 /// The ignored paths a tree may hold and still count as having nothing in it.
 /// Only an ignored path is ever residue: an untracked one is somebody's.
-pub(crate) struct Residue {
+pub struct Residue {
     extra: Vec<String>,
 }
 
 impl Residue {
     /// The built-in list and every `## Residue` bullet of a project rooted in `repo`.
-    pub(crate) fn of(store: &Store, repo: &Path) -> Residue {
+    pub fn of(store: &Store, repo: &Path) -> Residue {
         let here = util::real(&repo.display().to_string());
         let extra = store
             .projects()
@@ -141,7 +141,7 @@ fn glob_of(line: &str) -> Option<String> {
 /// What is in a tree besides build output, by path — `None` when git cannot
 /// read it, which keeps it. A top-level `target` is never counted; an ignored
 /// path is not counted when `residue` covers it.
-pub(crate) fn litter(dir: &Path, residue: &Residue) -> Option<Vec<String>> {
+pub fn litter(dir: &Path, residue: &Residue) -> Option<Vec<String>> {
     let out = git(dir, &["status", "--porcelain", "--ignored=matching", "--untracked-files=normal"])?;
     Some(
         out.lines()
@@ -154,7 +154,7 @@ pub(crate) fn litter(dir: &Path, residue: &Residue) -> Option<Vec<String>> {
 }
 
 /// Why a tree is kept for what [`litter`] found in it.
-pub(crate) fn holds_more(found: &[String]) -> String {
+pub fn holds_more(found: &[String]) -> String {
     let shown = found.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
     let more = if found.len() > 3 { format!(" and {} more", found.len() - 3) } else { String::new() };
     format!("it holds more than build output: {shown}{more}")
@@ -162,7 +162,7 @@ pub(crate) fn holds_more(found: &[String]) -> String {
 
 /// The pids in `lsof -d cwd -Fpn` output whose working directory is `dir` or
 /// below it — the one fact that proves a process belongs to a tree.
-pub(crate) fn pids_in(lsof: &str, dir: &Path) -> Vec<u32> {
+pub fn pids_in(lsof: &str, dir: &Path) -> Vec<u32> {
     let mut out = Vec::new();
     let mut pid = None;
     for line in lsof.lines() {
@@ -191,7 +191,7 @@ pub(crate) fn pids_in(lsof: &str, dir: &Path) -> Vec<u32> {
 /// so the members and governors it seated stood in the tree by cwd while
 /// being other seats. Ending the check signalled them (the `TERM`, 1.5s, `KILL`
 /// below is the two seconds between the check going and the others).
-pub(crate) fn strays(lsof: &str, dir: &Path, keep: &[u32]) -> Vec<u32> {
+pub fn strays(lsof: &str, dir: &Path, keep: &[u32]) -> Vec<u32> {
     pids_in(lsof, dir).into_iter().filter(|p| !keep.contains(p)).collect()
 }
 
@@ -241,7 +241,7 @@ fn running_in(dir: &Path) -> Vec<u32> {
 
 /// Send `sig` to `pids`, and say nothing of it: a process that has gone is the
 /// outcome wanted.
-pub(crate) fn signal(sig: &str, pids: &[u32]) {
+pub fn signal(sig: &str, pids: &[u32]) {
     if !pids.is_empty() {
         let _ = std::process::Command::new("kill")
             .arg(sig)
@@ -276,10 +276,10 @@ fn stop_running(dir: &Path) -> (Vec<u32>, Vec<u32>) {
 
 /// A finished row's tree that still has processes standing in it (`wsp-453`).
 #[derive(Debug, PartialEq)]
-pub(crate) struct Left {
-    pub(crate) row: String,
-    pub(crate) tree: String,
-    pub(crate) pids: Vec<u32>,
+pub struct Left {
+    pub row: String,
+    pub tree: String,
+    pub pids: Vec<u32>,
 }
 
 /// The tree a working directory is in, as `(its name, its root)`: the
@@ -306,7 +306,7 @@ fn tree_named(cwd: &str) -> Option<(String, String)> {
 /// is a row's to stop because its working directory is in that row's tree, the
 /// row is finished, and nobody holds the row ([`strays`] is why `keep` is every
 /// live seat's processes).
-pub(crate) fn finished_trees(lsof: &str, finished: &dyn Fn(&str) -> bool, keep: &[u32]) -> Vec<Left> {
+pub fn finished_trees(lsof: &str, finished: &dyn Fn(&str) -> bool, keep: &[u32]) -> Vec<Left> {
     let mut out: Vec<Left> = Vec::new();
     let mut pid = None;
     for line in lsof.lines() {
@@ -336,7 +336,7 @@ pub(crate) fn finished_trees(lsof: &str, finished: &dyn Fn(&str) -> bool, keep: 
 ///
 /// `None` when no backend answered: a census that failed says nothing about
 /// which rows have a seat, so the caller signals and names nothing.
-pub(crate) fn left_in_finished(
+pub fn left_in_finished(
     store: &Store,
     census: Vec<(String, String)>,
     pids: &dyn Fn(&str) -> Option<Vec<u32>>,
@@ -361,14 +361,14 @@ pub(crate) fn left_in_finished(
 }
 
 /// The resident memory of `pids` in kilobytes.
-pub(crate) fn rss_kb(pids: &[u32]) -> u64 {
+pub fn rss_kb(pids: &[u32]) -> u64 {
     let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     let Ok(out) = std::process::Command::new("ps").args(["-o", "rss=", "-p", &list]).output() else { return 0 };
     String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<u64>().ok()).sum()
 }
 
 /// The sentence `wsp wip` says of a finished tree with processes in it.
-pub(crate) fn left_line(l: &Left, kb: u64) -> String {
+pub fn left_line(l: &Left, kb: u64) -> String {
     let n = l.pids.len();
     format!(
         "{} is finished and has no seat, and {n} process{} ({} MB) still stand in {}: the tick stops them",
@@ -382,7 +382,7 @@ pub(crate) fn left_line(l: &Left, kb: u64) -> String {
 /// The `cycle.log` line for what ending a tree signalled, so a run read
 /// afterwards says which processes a check's end took (`wsp-388`). `None` when
 /// nothing was signalled.
-pub(crate) fn signalled_line(path: &str, term: &[u32], kill: &[u32]) -> Option<String> {
+pub fn signalled_line(path: &str, term: &[u32], kill: &[u32]) -> Option<String> {
     let list = |pids: &[u32]| pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
     match (term.is_empty(), kill.is_empty()) {
         (true, _) => None,
@@ -415,7 +415,7 @@ fn take(store: &Store, repo: &Path, dir: &Path, residue: &Residue, standing: &dy
 
 /// The repository a project root is in: walked up to the directory holding
 /// `.git`, on disk with no git to run.
-pub(crate) fn repo_of(root: &str) -> Option<PathBuf> {
+pub fn repo_of(root: &str) -> Option<PathBuf> {
     let mut dir = util::expand(root);
     while !dir.join(".git").exists() {
         dir = dir.parent()?.to_path_buf();
@@ -427,7 +427,7 @@ pub(crate) fn repo_of(root: &str) -> Option<PathBuf> {
 /// up to the directory holding `.git` — on disk, with no git to run, because
 /// the tick asks this every twenty seconds and nearly always finds nothing.
 /// A root that is itself a linked tree is skipped; its trunk is a root too.
-pub(crate) fn repos(store: &Store) -> Vec<PathBuf> {
+pub fn repos(store: &Store) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for dir in store.projects().iter().flat_map(|p| p.roots.iter()).filter_map(|r| repo_of(r)) {
@@ -439,7 +439,7 @@ pub(crate) fn repos(store: &Store) -> Vec<PathBuf> {
 }
 
 /// `despawn`'s half: the tree of the check named `name`, taken on the rule.
-pub(crate) fn discard(store: &Store, name: &str, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
+pub fn discard(store: &Store, name: &str, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
     let Some((list, at)) = named(store, name) else { return Tree::Absent };
     let Some((repo, dir)) = repos(store)
         .into_iter()
@@ -462,7 +462,7 @@ pub(crate) fn discard(store: &Store, name: &str, standing: &dyn Fn(&Path) -> Opt
 
 /// Every check tree on disk whose check is nobody's, taken on the rule.
 /// `standing` is asked only once there is a tree to ask it about.
-pub(crate) fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -> Vec<Tree> {
+pub fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -> Vec<Tree> {
     let mut out = Vec::new();
     for repo in repos(store) {
         let Ok(entries) = std::fs::read_dir(repo.join(WORKTREES)) else { continue };
@@ -496,7 +496,7 @@ static SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// Not under test: a fixture's project may be rooted at a real checkout, and
 /// the census is a live backend's. The tests drive [`sweep`] with a scratch
 /// repository and a `standing` of their own.
-pub(crate) fn tidy(store: &Store, ended: &[String]) {
+pub fn tidy(store: &Store, ended: &[String]) {
     if cfg!(test) {
         return;
     }
@@ -559,7 +559,7 @@ mod tests {
         let env = util::isolated(&format!("check-tree-{name}"));
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        crate::testkit::repo(&repo);
+        wsp_testkit::repo(&repo);
         std::fs::write(repo.join(".gitignore"), "target/\n.worktrees/\n").unwrap();
         run(&repo, &["add", ".gitignore"]);
         run(&repo, &["commit", "--quiet", "-m", "first"]);
@@ -570,7 +570,7 @@ mod tests {
         let mut w = Worklist::new("run", "p");
         let mut g = Group::default();
         g.members = vec!["p-001".into()];
-        crate::barrier::push(&mut g.checks, checks);
+        crate::checks::push(&mut g.checks, checks);
         w.set_groups(&[g]);
         store.save_worklist(&w).unwrap();
         (env, store, repo)
@@ -705,7 +705,7 @@ mod tests {
             let mut w = store.worklist("run").unwrap();
             let mut groups = w.groups();
             groups[0].checks.clear();
-            crate::barrier::push(&mut groups[0].checks, checks);
+            crate::checks::push(&mut groups[0].checks, checks);
             w.set_groups(&groups);
             store.save_worklist(&w).unwrap();
             assert!(sweep(&store, &nobody).is_empty(), "a tree was swept while its check was somebody's: {checks}");

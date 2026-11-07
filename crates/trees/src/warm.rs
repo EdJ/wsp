@@ -54,7 +54,7 @@ const SKIP: &[&str] = &[".git", ".worktrees", "node_modules", "target", "dist", 
 /// say what happened, one line each. Nothing at all when the parent has no
 /// lockfile with its directory beside it — the first tree has nothing to give,
 /// and the line about installing there is the order's, not this one's.
-pub(crate) fn clone_from(parent: &Path, child: &Path) -> Vec<String> {
+pub fn clone_from(parent: &Path, child: &Path) -> Vec<String> {
     let mut found = Vec::new();
     lockfiles(parent, Path::new(""), 0, &mut found);
     found.sort();
