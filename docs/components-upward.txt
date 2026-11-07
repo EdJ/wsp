@@ -3,7 +3,6 @@
 # This file only shrinks: delete a line or a symbol when the code stops using it; never add one.
 affected -> check: *, Of, Step, captures  # trees -> engine
 after -> main: Args  # engine -> top
-artefact -> cmd_agent: my_pane  # store -> seats
 at_stop -> check: clean_env, project_of  # trees -> engine
 attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume  # engine -> seats
 attention -> main: build_stamp  # engine -> top
@@ -38,13 +37,11 @@ cmd_cost -> main: Args  # timeline -> top
 cmd_govern -> main: Args  # seats -> top
 cmd_install -> main: Args, stamp_word  # seats -> top
 cmd_machine -> main: Args  # seats -> top
-cmd_mandate -> herdr: *  # store -> wire
 cmd_message -> agent_commands: of  # engine -> seats
 cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message  # engine -> seats
 cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
 cmd_message -> main: Args  # engine -> top
 cmd_message -> wake: held_because, say  # engine -> seats
-cmd_project -> cmd_govern: Slot, governor_of, slots  # engine -> seats
 cmd_report -> main: Args  # timeline -> top
 cmd_resume -> main: Args  # seats -> top
 cmd_resume -> panel: stty  # seats -> surface
@@ -87,8 +84,6 @@ disk -> store: Store  # base -> store
 ending -> cmd_attempts: attempts_of  # engine -> timeline
 kanban -> main: Args  # surface -> top
 kind_attention -> agent_commands: Kind, Spawn  # engine -> seats
-kind_data -> agent_commands: *, Kind, Plain, Spawn  # store -> seats
-kind_data -> place: *, Delivery, Place, Pressing, Result, Seat, submit  # store -> wire
 leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
 leg_seat -> main: Args  # engine -> top
 leg_tree -> legs: *, Leg, State, self  # trees -> engine
@@ -96,7 +91,6 @@ legs -> cmd_attempts: Attempt, attempts_of, priced  # engine -> timeline
 legs -> main: Args  # engine -> top
 memory -> cmd_spawn: local_backends  # base -> seats
 memory -> place: *, Seat, Seated, State  # base -> wire
-model -> agent_commands: *  # store -> seats
 overlap -> panel: PANEL_LABEL, VIEW_LABEL  # trees -> surface
 packet -> main: Args  # engine -> top
 panel -> daemon: surface_drawing, wsp_panes  # surface -> top
@@ -114,7 +108,6 @@ repair -> cmd_spawn: seat_kind  # engine -> seats
 repair -> leaked_agents: tidy  # engine -> top
 repair -> stuck: Kind, Stall  # engine -> seats
 repair -> wake: owed_to, scopes_owed  # engine -> seats
-scratch -> leg_tree: row_of  # store -> trees
 stage -> cmd_agent: sentence  # engine -> seats
 stage -> cmd_govern: needs_a_person  # engine -> seats
 stand_down -> cmd_govern: *  # engine -> seats

@@ -1860,7 +1860,7 @@ pub struct Pi;
 /// here. `off` and `minimal` are pi's own and have no claude word; they are
 /// taken because they are the cheap end of the ladder this kind is mostly for,
 /// a local model where thinking is the whole of what a turn costs.
-const PI_THINKING: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const PI_THINKING: &[&str] = crate::agent_kind::PI_THINKING;
 
 /// One row of `pi --list-models`: the name `--model` takes, and whether the
 /// model thinks at all — the column the effort check reads.
@@ -2411,7 +2411,7 @@ const MODELS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
 /// refused here, because Claude Code 2.1.234 accepts `--model haiku --effort
 /// high` without complaint and it is not wsp's business to be stricter than the
 /// runtime about a combination that costs nothing.
-const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const EFFORTS: &[&str] = crate::agent_kind::CLAUDE_EFFORTS;
 
 /// The tiers whose panes open in manual mode, and so cannot be left alone.
 ///

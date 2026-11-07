@@ -61,7 +61,7 @@ pub struct Who {
 impl Who {
     fn here() -> Who {
         let row = std::env::var("WSP_TASK").ok().filter(|s| !s.is_empty());
-        Who { row, seat: crate::cmd_agent::my_pane() }
+        Who { row, seat: crate::place::my_pane() }
     }
     fn json(&self) -> Value {
         json!({ "row": self.row, "seat": self.seat })

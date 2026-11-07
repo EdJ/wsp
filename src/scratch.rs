@@ -208,7 +208,7 @@ pub(crate) fn find(store: &Store) -> Vec<Found> {
     let cached = std::fs::read_dir(cache_dir()).into_iter().flatten().flatten().map(|e| e.path());
     for dir in owned.chain(cached) {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
-        let row = crate::leg_tree::row_of(name.strip_suffix("-verify").unwrap_or(&name)).to_string();
+        let row = crate::util::row_of(name.strip_suffix("-verify").unwrap_or(&name)).to_string();
         if !dir.is_dir() || !seen.insert(dir.clone()) || !closed(store, &row) {
             continue;
         }

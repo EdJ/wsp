@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::agent_commands;
+use crate::agent_kind;
 use crate::fm::{self, Doc, Val};
 use crate::util;
 
@@ -1825,7 +1825,7 @@ pub struct Policy {
 /// read by, since model names are open-ended.
 ///
 /// Kept public as the fixed-answer half; kind-aware callers use
-/// `agent_commands::of(kind).efforts()` instead.
+/// `agent_kind::efforts_of(kind)` instead.
 #[allow(dead_code)]
 pub fn is_effort(word: &str) -> bool {
     matches!(word, "low" | "medium" | "high" | "xhigh" | "max")
@@ -1854,7 +1854,7 @@ impl Policy {
             return None;
         }
         let mut p = Policy { kind: kind.to_string(), model: None, effort: None };
-        let efforts = agent_commands::of(kind).efforts();
+        let efforts = agent_kind::efforts_of(kind);
         let is_effort = |t: &str| efforts.contains(&t);
         for t in toks {
             match is_effort(t) {
@@ -1894,7 +1894,7 @@ impl Policy {
     pub fn of_label(label: &str) -> Option<Policy> {
         let mut toks = label.split_whitespace();
         let mut p = Policy { kind: toks.next()?.to_string(), model: None, effort: None };
-        let efforts = agent_commands::of(&p.kind).efforts();
+        let efforts = agent_kind::efforts_of(&p.kind);
         let is_effort = |t: &str| efforts.contains(&t);
         for t in toks {
             match t.rsplit_once('/') {

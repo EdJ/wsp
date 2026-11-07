@@ -1095,6 +1095,15 @@ pub fn terminal_output(text: &str) -> Option<String> {
     Some(format!("it is terminal output rather than prose — {named} in it"))
 }
 
+/// The row a name belongs to: a leg's name is `<row>.<leg>`, a row's is its
+/// own. A task id carries no `.` (`legs::name_ok` keeps leg names clear of
+/// one too), so a name with a dot is a leg's and a name without one is
+/// returned as it is. Lives here so `scratch` can ask without reaching up to
+/// `leg_tree`, which re-exports it.
+pub fn row_of(name: &str) -> &str {
+    name.split_once('.').map_or(name, |(row, _)| row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

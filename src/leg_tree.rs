@@ -60,14 +60,7 @@ pub(crate) fn tree_name(task: &str, leg: &str) -> String {
     format!("{task}.{leg}")
 }
 
-/// The row a tree or branch name belongs to: everything before the first `.`.
-///
-/// A task id carries no `.` (`legs::name_ok` keeps leg names clear of one too),
-/// so a name with a dot is a leg's and a name without one is returned as it is.
-/// One place for `finished`, `naming`, `doctor` and the sweep to agree.
-pub(crate) fn row_of(name: &str) -> &str {
-    name.split_once('.').map_or(name, |(row, _)| row)
-}
+pub(crate) use crate::util::row_of;
 
 /// The legs that run beside `name`: neither waits on the other, by any path.
 pub(crate) fn siblings(legs: &[Leg], name: &str) -> Vec<String> {
