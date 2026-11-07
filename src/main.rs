@@ -80,6 +80,7 @@ mod cmd_attend;
 mod memory;
 mod panel;
 mod repair;
+mod retro;
 mod room;
 mod split;
 mod stage;

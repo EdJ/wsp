@@ -27,7 +27,7 @@ pub const BOOL_FLAGS: &[&str] = &[
     "herdr", "compound",
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
-    "release", "check", "rm", "alone", "no-alone",
+    "release", "check", "rm", "alone", "no-alone", "no-retro", "packet",
     // And `resume`, whose positional is a task or a project.
     "print",
     // And `checkout`, whose positional is a task id.

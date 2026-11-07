@@ -2440,11 +2440,12 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
                 order: 200,
-                text: r##"  wsp worklist edit <slug> [--prio high|normal|low] [--alone|--no-alone]
+                text: r##"  wsp worklist edit <slug> [--prio high|normal|low] [--alone|--no-alone] [--no-retro]
                                     where a planned list queues (high first, then
                                     the earlier planned) and whether it waits for
                                     any executing list on its project (default on
-                                    for wsp's own source). `new` takes them too.
+                                    for wsp's own source). `--no-retro` gives the list no
+                                    timing retro when it clears. `new` takes them too.
                                     `ls` and `next <slug>` say what a planned list
                                     waits on: room, throttle, after, alone, manual"##,
             },
@@ -5848,6 +5849,10 @@ fn set_queue_flags(args: &Args, w: &mut Worklist) -> Result<Vec<String>, i32> {
         w.alone = Some(false);
         said.push("not alone".into());
     }
+    if args.has("no-retro") {
+        w.no_retro = true;
+        said.push("no retro".into());
+    }
     Ok(said)
 }
 
@@ -5874,7 +5879,7 @@ fn requeue(store: &Store, args: &Args, w: Worklist) -> i32 {
             return 1;
         }
     };
-    store.log_event("worklist-edited", json!({ "id": w.id, "what": "queue", "prio": w.prio, "alone": w.alone }));
+    store.log_event("worklist-edited", json!({ "id": w.id, "what": "queue", "prio": w.prio, "alone": w.alone, "no_retro": w.no_retro }));
     store.git_commit(&format!("wsp: worklist {} {}", w.id, said.join(", ")));
     queue_report(args, &w, "queue")
 }
@@ -6146,7 +6151,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
     // queue flags were never read. Both are checked before either is written,
     // so a bad `--prio` leaves the project as it was.
     let projecting = args.get("project").is_some();
-    let queueing = args.has("prio") || args.has("alone") || args.has("no-alone");
+    let queueing = args.has("prio") || args.has("alone") || args.has("no-alone") || args.has("no-retro");
     if projecting && queueing {
         if let Err(code) = set_queue_flags(args, &mut w.clone()) {
             return code;

@@ -2397,6 +2397,12 @@ pub struct Worklist {
     /// `alone:` — `on` or `off` where a hand said, absent where nobody did and
     /// the project's default stands (`wsp-383`).
     pub alone: Option<bool>,
+    /// `no_retro:` — `on` where the list was run with `--no-retro` (`wsp-472`):
+    /// no timing retro when it clears.
+    pub no_retro: bool,
+    /// `retro_at:` / `retro_seat:` — when the retro for this list's clear ran,
+    /// and the seat that ran it, so one clear is one retro (`wsp-472`).
+    pub retro: Option<(String, String)>,
     pub body: String,
 }
 
@@ -2416,6 +2422,8 @@ impl Worklist {
             prio: None,
             after: None,
             alone: None,
+            no_retro: false,
+            retro: None,
             body: String::new(),
         }
     }
@@ -2486,6 +2494,8 @@ impl Worklist {
                 "off" | "false" | "no" => Some(false),
                 _ => None,
             }),
+            no_retro: doc.opt("no_retro").is_some_and(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes")),
+            retro: doc.opt("retro_at").filter(|a| !a.trim().is_empty()).map(|at| (at.trim().to_string(), doc.opt("retro_seat").unwrap_or_default().trim().to_string())),
             body: doc.body.clone(),
         }
     }
@@ -2522,6 +2532,13 @@ impl Worklist {
         }
         if let Some(a) = self.alone {
             d.set_str("alone", if a { "on" } else { "off" });
+        }
+        if self.no_retro {
+            d.set_str("no_retro", "on");
+        }
+        if let Some((at, seat)) = &self.retro {
+            d.set_str("retro_at", at);
+            d.set_str("retro_seat", seat);
         }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
