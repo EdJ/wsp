@@ -62,6 +62,9 @@ struct Tunnel {
     readd: bool,
     /// When the far seats are next beaten (`docs/remote-agents.md` section 3).
     next_beat: Option<Instant>,
+    /// Per seat, what the last beat said — the failure's words, or empty for an
+    /// answer — so `cycle.log` hears of a change and not of every beat.
+    beat_said: BTreeMap<String, String>,
     /// The machine and control path of the master this tunnel started, so
     /// [`Tunnel::stop`] can ask it to exit rather than only kill the ssh that
     /// was started.
@@ -78,6 +81,7 @@ impl Tunnel {
             checking: None,
             readd: false,
             next_beat: None,
+            beat_said: BTreeMap::new(),
             master: None,
         }
     }
@@ -94,7 +98,34 @@ impl Tunnel {
         if seats.is_empty() {
             return Vec::new();
         }
+        // The controller's forward is dialled before it is used: one that is not
+        // there (a master that was replaced, a daemon that restarted) is put back
+        // rather than beaten into (wsp-475).
+        if let Err(why) = ensure_controller(store, m, wire) {
+            return seats.into_iter().map(|s| (s.id, why.clone())).collect();
+        }
         crate::far::beat(m, &seats, wire, &mut self.live, &util::now_iso())
+    }
+
+    /// Say in `cycle.log` what the beat's failures are, once per seat per change:
+    /// a seat that stays deaf for the same reason is said once, and one that
+    /// answers again after failing is said once too.
+    fn say_beats(&mut self, store: &Store, m: &Machine, failed: &[(String, String)]) {
+        let seats = crate::place_compound::beat_seats(store, &m.name);
+        for s in &seats {
+            let now = failed.iter().find(|(id, _)| id == &s.id).map(|(_, why)| why.clone()).unwrap_or_default();
+            let before = self.beat_said.get(&s.id).cloned();
+            if before.as_deref() == Some(now.as_str()) || (before.is_none() && now.is_empty()) {
+                continue;
+            }
+            let line = match now.is_empty() {
+                true => format!("wsp: {}: lease beat to {} answers again", m.name, s.id),
+                false => format!("wsp: {}: lease beat to {} failed: {now}", m.name, s.id),
+            };
+            crate::store::log_line(store, &line);
+            self.beat_said.insert(s.id.clone(), now);
+        }
+        self.beat_said.retain(|id, _| seats.iter().any(|s| &s.id == id));
     }
 
     /// Ask for a readiness check when there has been none, or the last one is
@@ -340,7 +371,8 @@ impl Supervisor {
             t.readd_if_due(store, m, &crate::far::Ssh);
             // After the re-add: a seat's socket is only there to dial once its
             // forward is back.
-            let _ = t.beat_if_due(store, m, &crate::far::Ssh);
+            let failed = t.beat_if_due(store, m, &crate::far::Ssh);
+            t.say_beats(store, m, &failed);
         }
         t.recheck(store, m);
     }
@@ -478,6 +510,11 @@ pub fn reap_masters(state: &std::path::Path) {
 /// one is no reason to skip the next (the stale local end is swept by
 /// [`crate::far::Wire::forward`], so a re-add is idempotent).
 fn readd_forwards(store: &Store, m: &Machine, wire: &dyn crate::far::Wire) {
+    // The machine's controller first: the beat rides it, and a gate waits on the
+    // beat. Forced, because the master is new and the old socket is a headstone.
+    if let Err(why) = forward_controller(store, m, wire) {
+        crate::store::log_line(store, &format!("wsp: {}: controller forward not restored: {why}", m.name));
+    }
     for (local, far) in crate::place_compound::forwards_for(store, &m.name) {
         // ssh binds the local end and refuses a path that exists: the headstone
         // of the master that died. Swept here, before the wire is asked, so the
@@ -485,6 +522,31 @@ fn readd_forwards(store: &Store, m: &Machine, wire: &dyn crate::far::Wire) {
         let _ = std::fs::remove_file(&local);
         let _ = wire.forward(m, "forward", &local, &far);
     }
+}
+
+/// Forward the machine's controller socket to its local end, when the machine
+/// has far seats. The local end is swept first (ssh refuses a path that exists).
+fn forward_controller(store: &Store, m: &Machine, wire: &dyn crate::far::Wire) -> Result<(), String> {
+    if crate::place_compound::beat_seats(store, &m.name).is_empty() {
+        return Ok(());
+    }
+    let far = crate::far::controller_far(m);
+    if far.is_empty() {
+        return Err("the machine has no exec_dir, so no controller socket to forward (wsp machine set <m> exec_dir=…)".into());
+    }
+    let local = crate::far::controller_local(store.machine_socket(&m.name).parent().unwrap_or(&store.state), &m.name);
+    let _ = std::fs::remove_file(&local);
+    wire.forward(m, "forward", &local, &far)
+}
+
+/// The controller forward, there when the beat needs it: dialled, and put back
+/// when nothing answers at the local end.
+fn ensure_controller(store: &Store, m: &Machine, wire: &dyn crate::far::Wire) -> Result<(), String> {
+    let local = crate::far::controller_local(store.machine_socket(&m.name).parent().unwrap_or(&store.state), &m.name);
+    if std::os::unix::net::UnixStream::connect(&local).is_ok() {
+        return Ok(());
+    }
+    forward_controller(store, m, wire).map_err(|e| format!("the controller forward is not there and could not be added: {e}"))
 }
 
 /// The ControlMaster socket the tunnel's ssh holds, which the wire probe and
@@ -795,6 +857,13 @@ mod tests {
         (store, root)
     }
 
+    /// A far machine that says where its controller is.
+    fn far_machine() -> Machine {
+        let mut m = Machine::new("mb2", "mb2");
+        m.exec_dir = "/far/exec".into();
+        m
+    }
+
     fn sleeper() -> Child {
         Command::new("sleep").arg("30").stdin(Stdio::null()).spawn().expect("sleep")
     }
@@ -934,7 +1003,7 @@ mod tests {
             set_started(&store, s, 3600);
         }
         store.set_binding("cpd-7", serde_json::json!({ "task_id": "t-1" }));
-        let m = Machine::new("mb2", "mb2");
+        let m = far_machine();
         let wire = script();
         let mut t = Tunnel::new();
 
@@ -943,8 +1012,8 @@ mod tests {
         assert_eq!(
             *wire.leases.borrow(),
             [
-                ("cpd-7".to_string(), "ok".to_string(), "cpd-7.sock".to_string()),
-                ("cpd-8".to_string(), "stop".to_string(), "cpd-8.sock".to_string()),
+                ("cpd-7".to_string(), "ok".to_string(), "ctl-mb2.sock".to_string()),
+                ("cpd-8".to_string(), "stop".to_string(), "ctl-mb2.sock".to_string()),
             ],
             "the held seat is told ok and the released one stop; mb3's seat and the local seat are not beaten",
         );
@@ -965,7 +1034,7 @@ mod tests {
         let (store, root) = store_with_seats("young", &[("cpd-7", "mb2")]);
         set_started(&store, "cpd-7", 5);
         let wire = script();
-        Tunnel::new().beat_if_due(&store, &Machine::new("mb2", "mb2"), &wire);
+        Tunnel::new().beat_if_due(&store, &far_machine(), &wire);
         assert_eq!(wire.leases.borrow()[0].1, "ok");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -975,7 +1044,7 @@ mod tests {
     #[test]
     fn last_heard_moves_only_when_a_beat_is_answered() {
         let (store, root) = store_with_seats("heard", &[("cpd-7", "mb2"), ("cpd-8", "mb2")]);
-        let m = Machine::new("mb2", "mb2");
+        let m = far_machine();
         let wire = script();
         *wire.deaf.borrow_mut() = vec!["cpd-7".into(), "cpd-8".into()];
         let mut t = Tunnel::new();
@@ -1000,8 +1069,80 @@ mod tests {
         let (store, root) = store_with_seats("none", &[("cpd-1", "")]);
         let wire = script();
         let mut t = Tunnel::new();
-        t.beat_if_due(&store, &Machine::new("mb2", "mb2"), &wire);
+        t.beat_if_due(&store, &far_machine(), &wire);
         assert!(wire.leases.borrow().is_empty() && t.live.heard.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    fn cycle_log(store: &Store) -> String {
+        std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default()
+    }
+
+    /// The beat rides the machine's controller socket and never the seat's
+    /// session socket; a new master gets the controller forward back before the
+    /// seats' own, and a beat that finds it gone adds it again (wsp-475).
+    #[test]
+    fn the_beat_dials_the_controller_and_a_new_master_gets_it_back() {
+        let (store, root) = store_with_seats("ctl", &[("cpd-7", "mb2"), ("cpd-8", "mb2")]);
+        let m = far_machine();
+        let wire = script();
+        let mut t = Tunnel::new();
+
+        let seats = crate::place_compound::beat_seats(&store, "mb2");
+        assert!(seats.iter().all(|s| s.socket.file_name().unwrap() == "ctl-mb2.sock"), "{seats:?}");
+
+        t.started(sleeper());
+        t.live.reachable = true;
+        t.readd_if_due(&store, &m, &wire);
+        let asked: Vec<_> = wire.asked.borrow().iter().map(|(l, f, _)| (l.clone(), f.clone())).collect();
+        assert!(asked.contains(&("ctl-mb2.sock".to_string(), "/far/exec/controller.msock".to_string())), "{asked:?}");
+        assert_eq!(asked.len(), 5, "the controller once, and each seat's two: {asked:?}");
+
+        // Nothing listens at the local end in a test, so the beat adds it again.
+        t.beat_if_due(&store, &m, &wire);
+        assert_eq!(wire.asked.borrow().len(), 6);
+        assert_eq!(wire.leases.borrow().len(), 2);
+        assert_eq!(t.live.leases.len(), 2, "the last answer per seat is kept");
+        t.stop();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A machine with no `exec_dir` cannot name its controller: every seat fails
+    /// with that said, rather than the beat dialling something else.
+    #[test]
+    fn a_machine_without_exec_dir_fails_every_seat_and_says_why() {
+        let (store, root) = store_with_seats("noexec", &[("cpd-7", "mb2")]);
+        let wire = script();
+        let failed = Tunnel::new().beat_if_due(&store, &Machine::new("mb2", "mb2"), &wire);
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].1.contains("exec_dir"), "{failed:?}");
+        assert!(wire.leases.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A beat that fails is said in `cycle.log` once per seat per change, and
+    /// the seat answering again is said once.
+    #[test]
+    fn a_failed_beat_is_said_once_and_the_recovery_once() {
+        let (store, root) = store_with_seats("said", &[("cpd-7", "mb2")]);
+        let m = far_machine();
+        let wire = script();
+        *wire.deaf.borrow_mut() = vec!["cpd-7".into()];
+        let mut t = Tunnel::new();
+        for _ in 0..3 {
+            t.next_beat = None;
+            let failed = t.beat_if_due(&store, &m, &wire);
+            t.say_beats(&store, &m, &failed);
+        }
+        let log = cycle_log(&store);
+        assert_eq!(log.matches("lease beat to cpd-7 failed: no answer").count(), 1, "{log}");
+        wire.deaf.borrow_mut().clear();
+        for _ in 0..2 {
+            t.next_beat = None;
+            let failed = t.beat_if_due(&store, &m, &wire);
+            t.say_beats(&store, &m, &failed);
+        }
+        let log = cycle_log(&store);
+        assert_eq!(log.matches("answers again").count(), 1, "{log}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

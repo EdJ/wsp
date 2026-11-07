@@ -1422,8 +1422,15 @@ impl Default for Patience<'static> {
 /// What `place_work` waits with: [`Patience::default`], and in a test that asks
 /// for it ([`tests::quick`]) the same loops with nothing to wait for, so a spawn
 /// whose order is dropped can be driven through its whole retry in a moment.
-fn spawn_patience() -> Patience<'static> {
-    let p = Patience::default();
+fn spawn_patience(far: bool) -> Patience<'static> {
+    let mut p = Patience::default();
+    // A far machine starts slower (wsp-475: an older i5, auth over the wire, was
+    // at its prompt after the sixty seconds had run out): ninety, stretched with
+    // the load the same way. If even that runs out the order is owed to the first
+    // prompt (`repair::owe_first_order`), not dropped.
+    if far {
+        p.ready = Duration::from_millis(90_000) * crate::throttle::readiness_scale_now();
+    }
     #[cfg(test)]
     if tests::QUICK.with(|q| q.get()) {
         return Patience {
@@ -2956,12 +2963,13 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             brief: brief_at.as_deref().filter(|_| laid == Laid::Written),
         };
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
+        let far_start = args.get("on").is_some();
         // Two waits, and they are different questions: `start` comes back when
         // the agent exists, `wait_ready` when it will listen. Both are inside
         // `start_agent` now, because the thing worth retrying is the pair — an
         // agent that started and then died failed the spawn exactly as one that
         // never started did, and only the second wait can tell.
-        match start_agent(place, how, &spawn, &agent, &kind, &spawn_patience()) {
+        match start_agent(place, how, &spawn, &agent, &kind, &spawn_patience(far_start)) {
             Ok(()) => {
                 started = Some(kind.clone());
                 // A task gives an agent something to be told, and so — since
@@ -2987,7 +2995,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                         // reaches an agent of this kind — its own channel, or
                         // the backend typing at it — is the one decision this
                         // file must not make; see `agent_commands`.
-                        false => match confirm_turn(place, how, &spawn, text, &spawn_patience()) {
+                        false => match confirm_turn(place, how, &spawn, text, &spawn_patience(far_start)) {
                             Ok(()) => told = true,
                             Err(e) => {
                                 eprintln!("wsp: agent started but not working on it: {e}");

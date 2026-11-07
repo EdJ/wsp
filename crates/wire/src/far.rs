@@ -645,6 +645,23 @@ pub fn forward_paths(dir: &Path, seat: &str) -> (PathBuf, PathBuf) {
     (dir.join(format!("{seat}.sock")), dir.join(format!("{seat}.rsock")))
 }
 
+/// The controller's socket on the far machine: `compound-remote`'s, under the
+/// machine's `exec_dir`. Empty when the machine has no `exec_dir` to say where.
+/// **Not the seat's session socket**, which is `compound-sup`'s and does not
+/// speak the lease line (wsp-475).
+pub fn controller_far(m: &Machine) -> String {
+    match m.exec_dir.trim_end_matches('/') {
+        "" => String::new(),
+        d => format!("{d}/controller.msock"),
+    }
+}
+
+/// Where the machine's controller socket is forwarded to here: one per machine,
+/// since the lease line names the seat. `dir` is where the seats' forwards are.
+pub fn controller_local(dir: &Path, machine: &str) -> PathBuf {
+    dir.join(format!("ctl-{machine}.sock"))
+}
+
 /// The ssh words for adding (`forward`) or dropping (`cancel`) one forward on the
 /// ControlMaster the tunnel holds.
 pub fn forward_args(m: &Machine, control: &Path, op: &str, local: &Path, far: &str) -> Vec<String> {
@@ -857,7 +874,8 @@ impl Wire for Ssh {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeatSeat {
     pub id: String,
-    /// The seat's forwarded controller socket, on this side.
+    /// The machine's forwarded controller socket, on this side — not the seat's
+    /// own session socket.
     pub socket: PathBuf,
     /// Whether a claim or a binding still holds the seat.
     pub held: bool,
@@ -886,13 +904,17 @@ pub fn beat(m: &Machine, seats: &[BeatSeat], wire: &dyn Wire, live: &mut Machine
     let mut answered = false;
     for s in seats {
         match wire.lease(m, &s.socket, &s.id, s.state()) {
-            Ok(()) => answered = true,
+            Ok(()) => {
+                answered = true;
+                live.leases.insert(s.id.clone(), now.to_string());
+            }
             Err(why) => failed.push((s.id.clone(), why)),
         }
     }
     if answered {
         live.heard = now.to_string();
     }
+    live.leases.retain(|id, _| seats.iter().any(|s| &s.id == id));
     failed
 }
 

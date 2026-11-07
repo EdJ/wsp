@@ -1494,10 +1494,13 @@ pub fn seat_machine(store: &Store, seat: &str) -> String {
 }
 
 /// The far seats on `machine`, as the beat sends to them: every seat record that
-/// names this machine and has a forwarded controller socket. A local seat has no
-/// `machine` and is never in it.
+/// names this machine and has a session. Every one is beaten on the machine's
+/// **controller** socket ([`crate::far::controller_local`]), never on its own
+/// session socket, which is compound-sup's and does not speak the lease line
+/// (wsp-475). A local seat has no `machine` and is never in it.
 pub fn beat_seats(store: &Store, machine: &str) -> Vec<crate::far::BeatSeat> {
     let root = store.state.join(SEATS);
+    let controller = crate::far::controller_local(store.machine_socket(machine).parent().unwrap_or(&store.state), machine);
     let held = store.held_seats();
     let mut out = Vec::new();
     for e in fs::read_dir(&root).into_iter().flatten().flatten() {
@@ -1510,7 +1513,7 @@ pub fn beat_seats(store: &Store, machine: &str) -> Vec<crate::far::BeatSeat> {
         out.push(crate::far::BeatSeat {
             held: held.contains(&id),
             age: (!started.is_empty()).then(|| util::since(&started)),
-            socket: PathBuf::from(socket),
+            socket: controller.clone(),
             id,
         });
     }

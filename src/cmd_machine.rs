@@ -468,6 +468,14 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         if !l.socket.is_empty() {
             println!("socket    {}", util::contract(std::path::Path::new(&l.socket)));
         }
+        // The last lease each far seat answered: a seat that never has is the
+        // one whose agent the gate is holding (wsp-475).
+        for seat in crate::place_compound::beat_seats(store, &m.name) {
+            match l.leases.get(&seat.id) {
+                Some(at) => println!("beat      {} answered {} ago", seat.id, crate::far::heard_ago(at)),
+                None => println!("beat      {} {}", seat.id, p.red("never answered")),
+            }
+        }
         if let Some(w) = l.wire {
             match l.wire_oldest.filter(|o| *o != w) {
                 Some(o) => println!("wire      {o} to {w}"),

@@ -207,6 +207,9 @@ pub struct MachineLive {
     /// can answer a probe while the seat's supervisor does not answer a beat,
     /// and the lease runs on this one.
     pub heard: String,
+    /// Far seat -> when its last lease beat was answered (`wsp machine show`).
+    /// A seat that never answered is not in it.
+    pub leases: BTreeMap<String, String>,
     /// `up` | `down` | `starting` | `retrying`. The ssh connection, which can
     /// be down while the machine itself is fine and is worth telling apart when
     /// you are looking at why nothing is arriving.
@@ -246,6 +249,11 @@ impl MachineLive {
             reachable: v.get("reachable").and_then(|x| x.as_bool()).unwrap_or(false),
             last_seen: s("last_seen"),
             heard: s("heard"),
+            leases: v
+                .get("leases")
+                .and_then(|x| x.as_object())
+                .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
+                .unwrap_or_default(),
             tunnel: s("tunnel"),
             socket: s("socket"),
             wire: v.get("wire").and_then(|x| x.as_u64()).map(|n| n as u32),
@@ -262,6 +270,7 @@ impl MachineLive {
             "reachable": self.reachable,
             "last_seen": self.last_seen,
             "heard": self.heard,
+            "leases": self.leases,
             "tunnel": self.tunnel,
             "socket": self.socket,
             "wire": self.wire,
