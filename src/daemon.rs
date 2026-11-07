@@ -971,6 +971,8 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // look for the same answer.
         if repair_pass.due(now) {
             store.steady(|| crate::repair::tick(store, &crate::cycle::Fleet, &mut repair_pass));
+            // Answered retro questions plan their list (`wsp-472`); idempotent.
+            store.steady(|| crate::retro_series::sweep(store));
         }
 
         let fingerprint = store.fingerprint();
