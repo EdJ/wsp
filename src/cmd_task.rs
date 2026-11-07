@@ -2263,20 +2263,7 @@ pub fn tag(store: &Store, args: &Args) -> i32 {
     }
     let mut absent: Vec<String> = Vec::new();
     let code = mutate(store, args, "tagged", |t| {
-        for c in &changes {
-            if let Some(add) = c.strip_prefix('+') {
-                if !add.is_empty() && !t.tags.iter().any(|x| x == add) {
-                    t.tags.push(add.to_string());
-                }
-            } else if let Some(rm) = c.strip_prefix('-') {
-                if !t.tags.iter().any(|x| x == rm) {
-                    absent.push(rm.to_string());
-                }
-                t.tags.retain(|x| x != rm);
-            } else if !t.tags.iter().any(|x| x == c) {
-                t.tags.push(c.clone());
-            }
-        }
+        absent = crate::tags::adjust(t, &changes);
     });
     if code != 0 {
         return code;
