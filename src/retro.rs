@@ -141,6 +141,28 @@ fn row_life(store: &Store, id: &str) -> String {
     tail(&lines.join("\n"), 8)
 }
 
+/// The retro doc, compiled in: its `## Standing questions` section goes into every packet.
+const DOC: &str = include_str!("../docs/retro.md");
+
+/// The body of the `## Standing questions` section of `doc`, up to the next `## ` heading.
+pub fn standing_questions(doc: &str) -> String {
+    let mut out = Vec::new();
+    let mut on = false;
+    for l in doc.lines() {
+        if l.starts_with("## ") {
+            if on {
+                break;
+            }
+            on = l.trim_end() == "## Standing questions";
+            continue;
+        }
+        if on {
+            out.push(l);
+        }
+    }
+    out.join("\n").trim().to_string()
+}
+
 /// The packet for the retro seat, off the figures handed in.
 pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures], cycle: &str) -> String {
     let mut o = String::new();
@@ -164,6 +186,13 @@ pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures]
     o.push_str("\n## How you file\n\nOnly through these verbs; each FILE is a file you wrote (prose goes through a file, written with `<<'EOF'`):\n\n```\n");
     o.push_str(SYNTAX);
     o.push_str("\n```\n\n`done` takes prose: a summary in plain text, with the causes you attributed the wall to and what you filed or noted. Nothing in it is parsed; `retro.html` shows it as written.\n\n");
+
+    let standing = standing_questions(DOC);
+    if !standing.is_empty() {
+        o.push_str("## Standing questions\n\nAnswer each standing question below for this list in `done` — a sentence or two, with figures from effort.json. File under `--strategic` only when this list's evidence makes the case; a question with nothing to show is answered \"nothing here\", not filed.\n\n");
+        o.push_str(&standing);
+        o.push_str("\n\n");
+    }
 
     o.push_str(&format!("## The wall: {}\n\n", mins(f.wall)));
     for (b, s) in &f.buckets {
@@ -363,6 +392,27 @@ mod tests {
             assert!(p.contains(want), "packet lacks `{want}`:\n{p}");
         }
         assert!(!p.contains("x other"), "only the list's own cycle lines");
+    }
+
+    #[test]
+    fn the_packet_carries_the_standing_questions_verbatim() {
+        let (_env, store) = crate::testkit::isolated_store("retro-standing");
+        let w = list(&store, "l");
+        let p = packet_from(&store, &w, &effort("l"), &[], "");
+        let want = standing_questions(DOC);
+        assert!(want.contains("The governor cycle"), "docs/retro.md lacks the governor-cycle question:\n{want}");
+        assert!(p.contains("## Standing questions\n"), "{p}");
+        assert!(p.contains(&want), "the section is carried verbatim:\n{p}");
+        assert!(p.contains("Answer each standing question"), "{p}");
+        assert!(p.contains("only when this list's evidence makes the case"), "{p}");
+        assert!(p.find("## Standing questions") < p.find("## The wall"));
+    }
+
+    #[test]
+    fn the_section_ends_at_the_next_heading() {
+        let doc = "# T\n\n## Standing questions\n\n- **A.** q\n\n## Other\n\nx\n";
+        assert_eq!(standing_questions(doc), "- **A.** q");
+        assert_eq!(standing_questions("# T\n## Other\n"), "");
     }
 
     #[test]
