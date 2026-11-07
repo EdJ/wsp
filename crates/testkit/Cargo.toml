@@ -1,0 +1,8 @@
+[package]
+name = "wsp-testkit"
+version = "0.1.0"
+edition = "2021"
+description = "wsp's test kit: the git repository fixture (the store-backed half stays beside Store)"
+
+[lib]
+path = "src/lib.rs"

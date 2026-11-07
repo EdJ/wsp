@@ -340,12 +340,43 @@ pub struct Pack {
 /// A command for the test the pack names, when the builder could not give one:
 /// the builder knows compound's layout and leaves the line empty elsewhere.
 fn test_command(repo: &Path, path: &str) -> Option<String> {
-    let rest = path.strip_prefix("src/")?.strip_suffix(".rs")?;
     if !repo.join("Cargo.toml").is_file() {
         return None;
     }
+    // A file of a workspace member names its package: `crates/base/src/util.rs`
+    // is `cargo test -p wsp-base util::`. The root package's files need no `-p`.
+    let (package, src) = match path.strip_prefix("crates/") {
+        Some(rest) => {
+            let (dir, src) = rest.split_once("/src/")?;
+            (Some(package_name(&repo.join("crates").join(dir))?), src)
+        }
+        None => (None, path.strip_prefix("src/")?),
+    };
+    let rest = src.strip_suffix(".rs")?;
     let module = rest.strip_suffix("/mod").unwrap_or(rest).replace('/', "::");
-    Some(format!("cargo test {module}::"))
+    // A crate's root file holds the crate's own tests, with no module path.
+    let filter = if package.is_some() && matches!(module.as_str(), "lib" | "main") { String::new() } else { format!(" {module}::") };
+    Some(match package {
+        Some(name) => format!("cargo test -p {name}{filter}"),
+        None => format!("cargo test{filter}"),
+    })
+}
+
+/// The `name = "…"` of the package in `dir/Cargo.toml`.
+fn package_name(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package {
+            if let Some(v) = line.strip_prefix("name").map(str::trim_start).and_then(|v| v.strip_prefix('=')) {
+                return Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The pack's own text, tidied for a section a person reads: the empty `verify`
@@ -668,6 +699,20 @@ mod tests {
         assert!(out.starts_with("CONTEXT PACK  wsp@abc"), "{out}");
         assert!(out.contains("verify  cargo test cmd_attempts::\n        in src/cmd_attempts.rs: a_test"), "{out}");
         assert!(!out.contains("search more") && !out.contains("809 tokens"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_of_a_workspace_member_is_tested_with_its_package() {
+        let dir = std::env::temp_dir().join(format!("wsp-packet-member-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crates/base")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"wsp\"\n").unwrap();
+        std::fs::write(dir.join("crates/base/Cargo.toml"), "[package]\nname = \"wsp-base\"\nversion = \"0.1.0\"\n[dependencies]\nname = 1\n").unwrap();
+        assert_eq!(test_command(&dir, "crates/base/src/util.rs").as_deref(), Some("cargo test -p wsp-base util::"));
+        assert_eq!(test_command(&dir, "crates/base/src/base/mod.rs").as_deref(), Some("cargo test -p wsp-base base::"));
+        assert_eq!(test_command(&dir, "crates/base/src/lib.rs").as_deref(), Some("cargo test -p wsp-base"));
+        assert_eq!(test_command(&dir, "crates/gone/src/x.rs"), None);
+        assert_eq!(test_command(&dir, "src/x.rs").as_deref(), Some("cargo test x::"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

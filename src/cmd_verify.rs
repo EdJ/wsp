@@ -910,7 +910,7 @@ fn rerun_alone(tree: &Path, target: &Path, name: &str, share: &Share) -> Option<
     if name.is_empty() || name.split_whitespace().count() != 1 {
         return None;
     }
-    let (ok, text) = cargo(tree, target, &["test", "--quiet", "--", "--exact", name], false, share);
+    let (ok, text) = cargo(tree, target, &["test", "--workspace", "--quiet", "--", "--exact", name], false, share);
     if !ok {
         return Some(false);
     }
@@ -961,7 +961,7 @@ const ALONE_TIMEOUT: Duration = Duration::from_secs(300);
 /// halves separate on the leading brace — which is also how a compile failure
 /// gets reported here without printing a build log made of objects.
 fn test_binaries(tree: &Path, target: &Path, share: &Share) -> Result<Vec<PathBuf>, String> {
-    let argv = &["test", "--no-run", "--message-format=json"];
+    let argv = &["test", "--workspace", "--no-run", "--message-format=json"];
     let (ok, text) = cargo(tree, target, argv, false, share);
     if !ok {
         let msg: Vec<&str> = text.lines().filter(|l| !l.starts_with('{')).collect();
@@ -1190,7 +1190,7 @@ fn alone(
             if let Some(note) = share.note() {
                 println!("{} {}", p.dim("machine"), p.dim(&note));
             }
-            println!("{} cargo test --no-run", p.dim("→"));
+            println!("{} cargo test --workspace --no-run", p.dim("→"));
         }
         match test_binaries(tree, target, &share) {
             Ok(e) => e,
@@ -1489,9 +1489,9 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
 
     let mut steps: Vec<(&str, Vec<&str>)> = Vec::new();
     if args.has("check") {
-        steps.push(("check", vec!["check", "--quiet"]));
+        steps.push(("check", vec!["check", "--workspace", "--quiet"]));
     } else {
-        steps.push(("test", vec!["test", "--quiet"]));
+        steps.push(("test", vec!["test", "--workspace", "--quiet"]));
     }
     if args.has("release") {
         steps.push(("release", vec!["build", "--release", "--quiet"]));

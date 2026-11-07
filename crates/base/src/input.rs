@@ -23,7 +23,7 @@
 /// "down", which is unanswerable once a prompt needs a literal `j` — so the
 /// meaning is decided by the reducer, which knows the mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Key {
+pub enum Key {
     Up,
     Down,
     Left,
@@ -59,15 +59,15 @@ const MAX_PARAMS: usize = 16;
 /// what it means: `ESC [` · private marker · parameters · intermediates ·
 /// final byte.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub(crate) struct Csi {
+pub struct Csi {
     /// `<`, `=`, `>` or `?` when the sequence is a private one. This is what
     /// tells an SGR mouse report from a cursor key.
-    pub(crate) private: Option<u8>,
+    pub private: Option<u8>,
     /// `;`-separated, an omitted one reading as 0 — which is what the standard
     /// means by a default.
-    pub(crate) params: Vec<u16>,
+    pub params: Vec<u16>,
     /// The letter at the end, which is mostly what a sequence *is*.
-    pub(crate) final_byte: u8,
+    pub final_byte: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,7 +92,7 @@ enum State {
 }
 
 /// The terminal's byte stream, one key at a time.
-pub(crate) struct Keys {
+pub struct Keys {
     state: State,
     seq: Csi,
     /// The parameter under construction. `Some` also means "a parameter has
@@ -101,7 +101,7 @@ pub(crate) struct Keys {
 }
 
 impl Keys {
-    pub(crate) fn new() -> Keys {
+    pub fn new() -> Keys {
         Keys { state: State::Ground, seq: Csi::default(), pending: None }
     }
 
@@ -109,7 +109,7 @@ impl Keys {
     /// and can emit two: `ESC` followed by an ordinary character is a real
     /// `ESC` and then that character, in that order, which is what typing fast
     /// after pressing it looks like.
-    pub(crate) fn feed(&mut self, b: u8, out: &mut Vec<Key>) {
+    pub fn feed(&mut self, b: u8, out: &mut Vec<Key>) {
         match self.state {
             State::Ground if b == ESC => self.state = State::Esc,
             State::Ground => ground(b, out),
@@ -156,7 +156,7 @@ impl Keys {
     /// terminal writes one in a single go: if 100ms of silence has landed in
     /// the middle of it, what is in hand is not a sequence, and keeping the
     /// state would eat the next thing typed as parameters.
-    pub(crate) fn idle(&mut self, out: &mut Vec<Key>) {
+    pub fn idle(&mut self, out: &mut Vec<Key>) {
         if let State::Esc = self.state {
             out.push(Key::Esc);
         }

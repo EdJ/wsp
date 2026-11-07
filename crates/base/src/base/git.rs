@@ -13,7 +13,7 @@ use crate::util;
 /// staging rather than the repository, and `worktree add` would write the new
 /// worktree's index over it. The two commands that genuinely want a private
 /// index set it themselves, on themselves.
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
+pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -27,7 +27,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// The same, when the output is not wanted but the failure is. Returns git's
 /// stderr on failure, because "what did git say" is the whole diagnostic.
-pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
+pub fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -45,7 +45,7 @@ pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
 /// The repository containing `dir`, resolved through git rather than by walking
 /// up looking for `.git` — a worktree's `.git` is a file, and a submodule's is
 /// somewhere else again.
-pub(crate) fn toplevel(dir: &Path) -> Option<PathBuf> {
+pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     let out = git(dir, &["rev-parse", "--show-toplevel"])?;
     let line = out.trim();
     (!line.is_empty()).then(|| PathBuf::from(line))
@@ -56,7 +56,7 @@ pub(crate) fn toplevel(dir: &Path) -> Option<PathBuf> {
 /// Dotted so it is out of the way of an `ls`, and one directory rather than one
 /// per task at the root so a single `.gitignore` line covers every tree that
 /// will ever exist here.
-pub(crate) const WORKTREES: &str = ".worktrees";
+pub const WORKTREES: &str = ".worktrees";
 
 /// The repository's main working tree — the trunk that gets reviewed.
 ///
@@ -64,14 +64,14 @@ pub(crate) const WORKTREES: &str = ".worktrees";
 /// walking up from `.git`: inside a linked worktree `.git` is a file pointing
 /// somewhere under the main repository's `.git/worktrees`, and reconstructing
 /// the main tree's path from that is arithmetic on git's private layout.
-pub(crate) fn trunk(dir: &Path) -> Option<PathBuf> {
+pub fn trunk(dir: &Path) -> Option<PathBuf> {
     let out = git(dir, &["worktree", "list", "--porcelain"])?;
     let line = out.lines().find_map(|l| l.strip_prefix("worktree "))?;
     Some(PathBuf::from(line.trim()))
 }
 
 /// The commit the trunk branch of the repository at `root` points at, in full.
-pub(crate) fn trunk_tip(root: &str) -> Option<String> {
+pub fn trunk_tip(root: &str) -> Option<String> {
     let repo = toplevel(Path::new(&util::expand(root)))?;
     let trunk = trunk(&repo)?;
     let branch = trunk_branch(&trunk)?;
@@ -83,7 +83,7 @@ pub(crate) fn trunk_tip(root: &str) -> Option<String> {
 /// What `land` fast-forwards, and what a new task branch starts from. Read from
 /// the trunk rather than assumed to be `master`, because the name of the trunk
 /// branch is a fact about the repository and not about wsp.
-pub(crate) fn trunk_branch(trunk: &Path) -> Option<String> {
+pub fn trunk_branch(trunk: &Path) -> Option<String> {
     let out = git(trunk, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let name = out.trim().to_string();
     (!name.is_empty()).then_some(name)

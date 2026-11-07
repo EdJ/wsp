@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::process::{Command, Stdio};
 
-pub(crate) fn stty(args: &[&str]) {
+pub fn stty(args: &[&str]) {
     if let Ok(tty) = File::open("/dev/tty") {
         let _ = Command::new("stty")
             .args(args)

@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// Flags that never consume the following token.
-pub(crate) const BOOL_FLAGS: &[&str] = &[
+pub const BOOL_FLAGS: &[&str] = &[
     "for-run",
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full", "no-packet", "regen",
@@ -93,7 +93,7 @@ pub(crate) const BOOL_FLAGS: &[&str] = &[
 /// a bare `true`. Only these, because a valued flag followed by a payload
 /// `-` is how every other verb spells "nothing given, read the stream". And
 /// `--note -` on `wsp artefact put`, whose note is prose like the rest (`wsp-376`).
-pub(crate) const STREAM_VALUED: &[&str] = &["choices", "choice", "note"];
+pub const STREAM_VALUED: &[&str] = &["choices", "choice", "note"];
 
 /// Flags that keep their meaning inside a command's payload.
 ///
@@ -103,7 +103,7 @@ pub(crate) const STREAM_VALUED: &[&str] = &["choices", "choice", "note"];
 /// them safe to go on reading after [`LITERAL_AFTER`] has stopped flag
 /// parsing: `wsp note 028 "…" --json` still prints JSON, while `-ui` and
 /// `--parent …` reach the command as the text and the tag edits they are.
-pub(crate) const GLOBAL_FLAGS: &[&str] = &["json", "help", "version", "no-commit", "terse", "quiet", "verbose"];
+pub const GLOBAL_FLAGS: &[&str] = &["json", "help", "version", "no-commit", "terse", "quiet", "verbose"];
 
 /// Commands whose arguments stop being flags once they have their subject, and
 /// how many positionals that subject takes.
@@ -126,7 +126,7 @@ pub(crate) const GLOBAL_FLAGS: &[&str] = &["json", "help", "version", "no-commit
 /// A payload that is *nothing but* a flag-shaped word is refused rather than
 /// recorded — see [`swallowed_flag`] — and `--` is how a caller who meant
 /// those words as the text says so.
-pub(crate) const LITERAL_AFTER: &[Literal] = &[
+pub const LITERAL_AFTER: &[Literal] = &[
     Literal { cmd: "note", subject: 1, payload: "log entry", stream: true },
     Literal { cmd: "block", subject: 1, payload: "question", stream: true },
     Literal { cmd: "park", subject: 1, payload: "reason", stream: true },
@@ -160,14 +160,14 @@ pub(crate) const LITERAL_AFTER: &[Literal] = &[
 /// One table rather than three keyed alike, because the refusal below needs
 /// two more facts about exactly these six verbs and a second list of them
 /// would drift the first time a seventh is added.
-pub(crate) struct Literal {
-    pub(crate) cmd: &'static str,
+pub struct Literal {
+    pub cmd: &'static str,
     /// How many positionals the subject takes before the payload begins.
-    pub(crate) subject: usize,
+    pub subject: usize,
     /// What the payload becomes, named the way the verb's own output names it.
     /// The refusal says what was about to be written, and "recorded as the log
     /// entry" is a sentence the caller can check against what they meant.
-    pub(crate) payload: &'static str,
+    pub payload: &'static str,
     /// Whether `--from` inside the payload is read rather than recorded.
     ///
     /// It is not in [`OWNED_AFTER`] because it is deliberately *not* parsed as
@@ -176,11 +176,11 @@ pub(crate) struct Literal {
     /// it invisible to [`swallowed_flag`], which would otherwise refuse the one
     /// spelling the handbook teaches. `rename` and `tag` have no stream form,
     /// so on them `--from` is the mistake it looks like.
-    pub(crate) stream: bool,
+    pub stream: bool,
 }
 
 /// The [`LITERAL_AFTER`] row for a verb, if it has one.
-pub(crate) fn literal(cmd: &str) -> Option<&'static Literal> {
+pub fn literal(cmd: &str) -> Option<&'static Literal> {
     LITERAL_AFTER.iter().find(|l| l.cmd == cmd)
 }
 
@@ -196,7 +196,7 @@ pub(crate) fn literal(cmd: &str) -> Option<&'static Literal> {
 ///
 /// The cost is exact and small — a decision whose text is the bare word
 /// `--supersedes` — and `--` still ends flag parsing everywhere.
-pub(crate) const OWNED_AFTER: &[(&str, &str)] = &[
+pub const OWNED_AFTER: &[(&str, &str)] = &[
     ("decide", "supersedes"),
     // The verdict's own two words, which come after the member as often as not.
     ("verified", "holds"),
@@ -239,7 +239,7 @@ pub(crate) const OWNED_AFTER: &[(&str, &str)] = &[
 /// on the top-level verb only, which is all [`Args::parse`] has read when this
 /// table is consulted — `wsp project add` and its siblings share one entry,
 /// and none of them reads `--status` as a mode.
-pub(crate) const VALUED_ON: &[(&str, &str)] = &[
+pub const VALUED_ON: &[(&str, &str)] = &[
     ("ls", "status"),
     ("list", "status"),
     ("find", "status"),
@@ -264,7 +264,7 @@ pub(crate) const VALUED_ON: &[(&str, &str)] = &[
 /// they read a token that follows — the long form refuses any `-`-led word,
 /// the short form only `--` — and the two agreeing *here* is what keeps
 /// `-s done` and `--status done` meaning the same thing.
-pub(crate) fn bool_flag(name: &str, valued_on: &[&str]) -> bool {
+pub fn bool_flag(name: &str, valued_on: &[&str]) -> bool {
     BOOL_FLAGS.contains(&name) && !valued_on.contains(&name)
 }
 
@@ -281,22 +281,22 @@ pub(crate) fn bool_flag(name: &str, valued_on: &[&str]) -> bool {
 /// One entry, and it should stay short. A verb that has genuinely stopped
 /// taking a flag deletes it from here and from [`BOOL_FLAGS`] together, which
 /// is the moment the refusal is the right answer.
-pub(crate) const ACCEPTED_UNREAD: &[(&str, &str)] = &[("spawn", "no-focus")];
+pub const ACCEPTED_UNREAD: &[(&str, &str)] = &[("spawn", "no-focus")];
 
 pub struct Args {
     pub cmd: String,
     pub rest: Vec<String>,
-    pub(crate) flags: HashMap<String, Vec<String>>,
+    pub flags: HashMap<String, Vec<String>>,
     /// Flag names that took a word off the command line — `--from FILE`,
     /// `--title=T` — as against the ones that stand for themselves.
     ///
     /// This is half of the answer to `worklist-036`'s second question, and
     /// [`Args::dropped`] is the other half.
-    pub(crate) valued: HashSet<String>,
+    pub valued: HashSet<String>,
     /// Which flags anything actually looked at. Interior mutability because
     /// every command takes `&Args` and a read is a read whether or not the
     /// caller holds it mutably; nothing here crosses a thread.
-    pub(crate) read: RefCell<HashSet<String>>,
+    pub read: RefCell<HashSet<String>>,
     /// Whether a bare `--` ended flag parsing.
     ///
     /// The only thing that tells `wsp note <id> -- --body -`, which means
@@ -305,11 +305,11 @@ pub struct Args {
     /// two tokens, so [`swallowed_flag`] cannot tell them apart from the
     /// payload alone — and refusing the first would take away the escape hatch
     /// the help sends people to.
-    pub(crate) escaped: bool,
+    pub escaped: bool,
 }
 
 impl Args {
-    pub(crate) fn parse(argv: Vec<String>) -> Args {
+    pub fn parse(argv: Vec<String>) -> Args {
         // Twice, because the rule depends on the command and the command is
         // itself the first thing the scan finds. The first pass is only ever
         // read for `cmd`: a leading flag may swallow a token that the strict
@@ -327,7 +327,7 @@ impl Args {
 
     /// One pass over argv. `literal_after`, when set, is how many positionals
     /// this command parses normally before the rest of the line is its payload.
-    pub(crate) fn scan(argv: &[String], literal_after: Option<usize>, owned: &[&str], valued_on: &[&str]) -> Args {
+    pub fn scan(argv: &[String], literal_after: Option<usize>, owned: &[&str], valued_on: &[&str]) -> Args {
         let mut positional: Vec<String> = Vec::new();
         let mut flags: HashMap<String, Vec<String>> = HashMap::new();
         // Which of them ate a word. See [`Args::dropped`]: a flag that stands
@@ -454,7 +454,7 @@ impl Args {
     /// had looked at it. The read tally is what catches a verb wrongly listed
     /// as reading `-n`, so the check that decides on the strength of the list
     /// must not be the thing that silences the tally.
-    pub(crate) fn given(&self, name: &str) -> bool {
+    pub fn given(&self, name: &str) -> bool {
         self.flags.contains_key(name)
     }
     pub fn get(&self, name: &str) -> Option<String> {
@@ -512,7 +512,7 @@ impl Args {
     }
     /// A flag was looked at. Every read goes through here, and that is the
     /// whole of the bookkeeping [`Args::dropped`] needs.
-    pub(crate) fn mark(&self, name: &str) {
+    pub fn mark(&self, name: &str) {
         self.read.borrow_mut().insert(name.to_string());
     }
 
@@ -583,7 +583,7 @@ impl Args {
     }
 }
 
-pub(crate) fn expand_short(s: &str) -> String {
+pub fn expand_short(s: &str) -> String {
     match s {
         "p" => "project".into(),
         "t" => "tag".into(),

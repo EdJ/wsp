@@ -131,6 +131,19 @@ The two heavy test sets are **`trees` (196 tests, 187s) and `engine` (814 tests,
 components with 40% of the tests, and the cost in `trees` is `git init` per test, which is a fixture problem and
 not a structure problem (row `c0-fixtures` below).
 
+### Where the cuts stand
+
+| crate | path | cut | holds now | map |
+|---|---|---|---|---|
+| `wsp` (root) | `src/` | — | every module not yet cut; the binary, `build.rs`, the stamp (`src/base/stamp.rs`) | this file |
+| `wsp-base` | `crates/base` | `c1` (wsp-408) | `util`, `fm`, `input`, `risk`, `choices`, `base::{args, git, labels, seat, term}` | `crates/base/MAP.md` |
+| `wsp-testkit` | `crates/testkit` | `c1` (wsp-408) | the git repository fixture (`repo`, `repo_at`, `git`); the store-backed half stays in `src/testkit.rs` until `wsp-store` is cut | its `lib.rs` |
+
+`disk` and `memory` are mapped to `base` in the layering table but stay in the root package: each reaches up
+(`cmd_checkout`, `place`). Dependencies are `serde_json` only; the members are path dependencies in the workspace.
+The test count is `cargo test --workspace -- --list` = 2756 at `c1` (2754 `#[test]`, the same before and after, plus
+the two layering tests); the 2534 above is the figure of 5 Nov.
+
 ### The contract of each, and who writes what
 
 The rules are `docs/widget-contract.md` in compounding, applied rather than copied:

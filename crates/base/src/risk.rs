@@ -50,7 +50,7 @@ impl Risk {
 }
 
 /// Every rule's name, in the order the section lists them.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub const RULES: [&str; 9] = [
     "deletes",
     "rewrites-history",

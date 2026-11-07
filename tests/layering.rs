@@ -275,8 +275,16 @@ fn refs(code: &str, top: &BTreeSet<String>) -> BTreeMap<String, BTreeSet<String>
 }
 
 /// Product edges: module → module → symbols.
-fn product_edges(src: &Path) -> (BTreeSet<String>, Edges) {
-    let mods = modules(src);
+fn product_edges(srcs: &[PathBuf]) -> (BTreeSet<String>, Edges) {
+    let mut mods: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for src in srcs {
+        for (m, files) in modules(src) {
+            // A crate's `lib.rs` only declares its modules.
+            if m != "lib" {
+                mods.entry(m).or_default().extend(files);
+            }
+        }
+    }
     let top: BTreeSet<String> = mods.keys().cloned().collect();
     let mut edges = Edges::new();
     for (m, files) in &mods {
@@ -367,7 +375,7 @@ fn no_new_upward_edge_and_the_allowlist_only_shrinks() {
     for c in comp.values() {
         assert!(rank.contains_key(c.as_str()));
     }
-    let (mods, edges) = product_edges(&root.join("src"));
+    let (mods, edges) = product_edges(&[root.join("src"), root.join("crates/base/src")]);
 
     let unmapped: Vec<&String> = mods.iter().filter(|m| !comp.contains_key(*m)).collect();
     assert!(

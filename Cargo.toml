@@ -8,8 +8,16 @@ description = "Workspace and task control plane for herdr"
 name = "wsp"
 path = "src/main.rs"
 
+[workspace]
+members = ["crates/base", "crates/testkit"]
+
 [dependencies]
 serde_json = "1"
+wsp-base = { path = "crates/base" }
+
+[dev-dependencies]
+wsp-testkit = { path = "crates/testkit" }
+wsp-base = { path = "crates/base", features = ["test-support"] }
 
 [profile.release]
 opt-level = 2

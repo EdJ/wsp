@@ -2,10 +2,10 @@
 
 /// herdr's label on the panes we install. Ours are furniture and never appear
 /// in the tree as work.
-pub(crate) const PANEL_LABEL: &str = "wsp";
+pub const PANEL_LABEL: &str = "wsp";
 
 /// The label herdr carries on a detail pane, so we can find ours again.
-pub(crate) const VIEW_LABEL: &str = "wsp:view";
+pub const VIEW_LABEL: &str = "wsp:view";
 
 /// And on the panel `Z` opens in a tab of its own — the whole tree, at the
 /// width of the workspace.
@@ -25,7 +25,7 @@ pub(crate) const VIEW_LABEL: &str = "wsp:view";
 ///
 /// A tab hides nothing, herdr's own switcher lists it, and closing it puts you
 /// back where you were.
-pub(crate) const FULL_LABEL: &str = "wsp:full";
+pub const FULL_LABEL: &str = "wsp:full";
 
 /// And on a board's. Furniture like the other two, and marked so for the same
 /// two reasons: the tree must not draw it as a pane somebody is working in, and
@@ -34,4 +34,4 @@ pub(crate) const FULL_LABEL: &str = "wsp:full";
 /// Its own label rather than [`VIEW_LABEL`] shared: `inspect` and `close_view`
 /// find the detail pane by that string, and a board wearing it would be closed
 /// by `esc` and mistaken for a detail pane that already exists.
-pub(crate) const BOARD_LABEL: &str = "wsp:board";
+pub const BOARD_LABEL: &str = "wsp:board";

@@ -1,10 +1,7 @@
-//! The bottom layer: the command line, the build stamp, git, and the names every
-//! other layer shares. It owns no state. Each item is re-exported at the path it
-//! had before the move, so no caller changes.
+//! The bottom layer, as the root package sees it: the command line, git, labels
+//! and the seat names live in `wsp-base` (`crates/base`) and are re-exported at
+//! the paths they always had. The build stamp stays here, because `build.rs`
+//! writes the variables it reads.
 
-pub(crate) mod args;
-pub(crate) mod git;
-pub(crate) mod labels;
-pub(crate) mod seat;
+pub(crate) use wsp_base::base::{args, git, labels, seat, term};
 pub(crate) mod stamp;
-pub(crate) mod term;

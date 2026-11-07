@@ -74,7 +74,7 @@ fn store_env_from(
 /// id, a session marker, a credential the shed is being asked about. A test that
 /// can reach a store or a herdr wants [`isolated`], which takes this lock and
 /// points all three of the pointing-variables at something of its own.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How long a test may hold [`ENV`] before the process is ended and the test is
@@ -85,7 +85,7 @@ pub static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// blocked at 0 % CPU until a person killed it (wsp-434: `packet::` for 78
 /// minutes, `check::tests::a_verifiers_order` for 21). The longest test in the
 /// suite holds it for seconds.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_limit() -> Duration {
     let secs = std::env::var("WSP_TEST_LIMIT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     Duration::from_secs(secs)
@@ -97,13 +97,13 @@ pub fn test_limit() -> Duration {
 /// cannot be killed, and a hung test holds the lock everyone else queues on, so
 /// ending the process is the only timeout that works under `cargo test`;
 /// `.config/nextest.toml` gives each test its own process and its own timeout.)
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct EnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         self.done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -116,12 +116,12 @@ impl Drop for EnvGuard {
 /// find. A live holder is the watchdog's; this is for the lock that is never
 /// let go (the `ending::` run that stood 27 minutes with eight tests queued, no
 /// thread holding it, and nothing to say which test had).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static LAST_CHANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static LAST_TAKER: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn since_start() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
@@ -129,14 +129,14 @@ fn since_start() -> u64 {
 
 /// Say `said` on the process's own stderr (libtest captures `eprintln!` per
 /// test) and end the run.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn end_run(said: String) -> ! {
     let _ = std::io::Write::write_all(&mut std::io::stderr(), said.as_bytes());
     std::process::exit(1)
 }
 
 /// Take [`ENV`], surviving a test that panicked while holding it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn env_lock() -> EnvGuard {
     use std::sync::atomic::Ordering::SeqCst;
     let limit = test_limit();
@@ -216,13 +216,13 @@ pub fn env_lock() -> EnvGuard {
 /// drop rather than at the end of the test body, because a test that fails while
 /// holding them leaves the process pointed at a store and a socket that no
 /// longer exist, and the test that runs next is the one that looks broken.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct Isolated {
     _lock: EnvGuard,
     dir: PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn isolated(name: &str) -> Isolated {
     let lock = env_lock();
     let dir = std::env::temp_dir().join(format!("wsp-t-{name}-{}", std::process::id()));
@@ -243,7 +243,7 @@ pub fn isolated(name: &str) -> Isolated {
     Isolated { _lock: lock, dir }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Isolated {
     /// The store — `WSP_HOME`. Empty, and a test that wants a task in it writes
     /// one.
@@ -264,7 +264,7 @@ impl Isolated {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for Isolated {
     fn drop(&mut self) {
         for key in ["WSP_HOME", "WSP_STATE", "HERDR_SOCKET_PATH"] {
@@ -334,14 +334,14 @@ impl Clock for Wall {
 /// the point is that the waiting loop and the events it is waiting for are no
 /// longer racing. The socket under a fake backend is still real; only the clock
 /// is not.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct Dial<'a> {
     at: std::cell::Cell<Instant>,
     began: Instant,
     due: std::cell::RefCell<Vec<(Duration, Box<dyn Fn() + 'a>)>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<'a> Dial<'a> {
     pub fn new() -> Dial<'a> {
         let began = Instant::now();
@@ -361,7 +361,7 @@ impl<'a> Dial<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Clock for Dial<'_> {
     fn now(&self) -> Instant {
         self.at.get()
@@ -975,7 +975,7 @@ impl Paint {
     /// a machine with no tty `Paint::new()` and `Paint::plain()` are the same
     /// object, so a test that a sink chose the right one would pass without
     /// being able to fail. Compiled out of the binary.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn painted() -> Self {
         Paint { on: true }
     }
@@ -987,7 +987,7 @@ impl Paint {
     /// paints render identically, so the assertion passes on a machine that
     /// could never have shown the fault — which is the quiet pass
     /// [`Paint::plain`]'s own docs warn about.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn on(&self) -> bool {
         self.on
     }
@@ -1458,7 +1458,7 @@ pub fn is_agent_id(s: &str) -> bool {
 /// the process table looking exactly like a running one. Reporting it as alive
 /// is the same class of defect as robustness-041 with the sign flipped: an agent
 /// declared healthy while its corpse cools.
-pub(crate) fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
+pub fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
     if pids.is_empty() {
         return std::collections::BTreeSet::new();
     }
@@ -1501,11 +1501,11 @@ pub(crate) fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
 /// first reason exactly: `## Groups` is read line by line too, so a blank line
 /// inside a `stop:` block ends the block, and prose stored with one comes back
 /// next read truncated at the gap.
-pub(crate) fn fold(text: &str) -> String {
+pub fn fold(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(crate) fn read_source(src: &str) -> std::io::Result<String> {
+pub fn read_source(src: &str) -> std::io::Result<String> {
     let raw = if src == "-" {
         use std::io::Read;
         let mut s = String::new();
@@ -1527,7 +1527,7 @@ pub(crate) fn read_source(src: &str) -> std::io::Result<String> {
 }
 
 /// The list and group a barrier check's name (`<list>-check-<n>`) names, if it is one.
-pub(crate) fn parse_subject(name: &str) -> Option<(&str, usize)> {
+pub fn parse_subject(name: &str) -> Option<(&str, usize)> {
     let (list, at) = name.rsplit_once("-check-")?;
     Some((list, at.parse().ok()?))
 }
