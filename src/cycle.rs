@@ -101,7 +101,7 @@
 use std::process::{Command, Stdio};
 
 use crate::model::{Group, Policy, Status, Task, Worklist, WorklistStatus};
-use crate::place::{Seat, State};
+use crate::place::State;
 use crate::store::Store;
 use crate::util;
 use crate::worklist::{self, Reading, Settlement};
@@ -268,130 +268,6 @@ pub(crate) trait Seats {
 /// function returning a [`State`] has nowhere to put.
 pub(crate) struct Fleet;
 
-impl Seats for Fleet {
-    /// **The store is not a parameter**, and that is the one thing here worth
-    /// stating: this overrule logs, and logging means naming the store whose
-    /// `cycle.log` the line goes in. [`Seats::state`] carries only the seat, so
-    /// there is no [`log_line`] to call here. The overrule's own line is therefore said by
-    /// [`crate::repair`], which has the store and says it once per pass anyway.
-    fn state(&self, seat: &str) -> Option<State> {
-        let seat_id = Seat::new(seat);
-        let compound = crate::place_compound::Compound::new();
-        let raw = Fleet::here(seat).find_map(|b| b.state(&seat_id).ok())?;
-        Some(self.overrule_frozen_opencode(&compound, seat, raw))
-    }
-
-    /// **`false` the moment any backend asked answers with anything but
-    /// [`crate::place::Refusal::NoSeat`]**, which is the whole of it: a fan-out
-    /// that ends in `NoSeat` on every backend is a fact about the seat, and one
-    /// that ends in an error on any backend is a fact about a machine.
-    ///
-    /// **Two calls where [`Fleet::state`] makes one, and not an optimisation to
-    /// make later.** This runs once a minute, on the one seat the reconciler is
-    /// asking about, and only on the passes where `state` answered `None` — so
-    /// the cost is a second look on a seat that is already unreadable, and the
-    /// saving would be to fold two different questions into one answer, which is
-    /// what [`Seats::state`]'s `None` was.
-    fn absent(&self, seat: &str) -> bool {
-        let seat_id = Seat::new(seat);
-        Fleet::here(seat).all(|b| matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_))))
-    }
-
-    fn turn_began_since(&self, seat: &str, since: i64) -> Option<bool> {
-        let seat_id = Seat::new(seat);
-        Fleet::here(seat).find_map(|b| b.turn_began_since(&seat_id, since))
-    }
-
-    fn pids(&self, seat: &str) -> Option<Vec<u32>> {
-        let seat_id = Seat::new(seat);
-        Fleet::here(seat).find_map(|b| b.pids(&seat_id))
-    }
-
-    fn typed(&self, seat: &str) -> Option<bool> {
-        let seat_id = Seat::new(seat);
-        Fleet::here(seat).find_map(|b| b.typed(&seat_id))
-    }
-
-    fn shells(&self, seats: &[&str]) -> crate::waiting::Shells {
-        crate::waiting::Shells::read(seats.iter().copied())
-    }
-
-    /// Pressed by the backend that holds the seat, and no other: a press is a
-    /// keystroke, and every backend that is not this seat's answers `NoSeat`.
-    fn press(&self, seat: &str) -> bool {
-        let seat_id = Seat::new(seat);
-        Fleet::here(seat).find(|b| b.state(&seat_id).is_ok()).is_some_and(|b| b.nudge(&seat_id).is_ok())
-    }
-
-    fn resend(&self, seat: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
-        crate::cmd_message::type_at(seat, text)
-    }
-
-    fn census(&self) -> Option<Vec<(String, String)>> {
-        let herdr_here = crate::herdr::available_now();
-        let mut heard = false;
-        let mut out = Vec::new();
-        for (backend, name) in crate::place::local_backends().into_iter().zip(crate::place::LOCAL_BACKEND_NAMES) {
-            if name == "herdr" && !herdr_here {
-                continue;
-            }
-            if let Ok(census) = backend.census() {
-                heard = true;
-                out.extend(census.seats().map(|s| (s.seat.as_str().to_string(), s.label.clone())));
-            }
-        }
-        heard.then_some(out)
-    }
-}
-
-impl Fleet {
-    /// The backends that could hold this seat: every local one, less herdr when
-    /// no herdr is running here to hold it. See [`Fleet`].
-    fn here(seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {
-        let herdr_here = crate::herdr::split_host(seat).1.is_some() || crate::herdr::available_now();
-        crate::place::local_backends()
-            .into_iter()
-            .zip(crate::place::LOCAL_BACKEND_NAMES)
-            .filter(move |(_, name)| *name != "herdr" || herdr_here)
-            .map(|(b, _)| b)
-    }
-
-    /// A compound opencode seat reading `Working` that opencode's own database
-    /// says finished with, more than a minute ago.
-    ///
-    /// **Only that one state, and only for opencode.** The frozen screen has
-    /// been seen to lie in exactly one direction — `working` for ever, on a
-    /// busy frame it never repainted — and `idle` is the safe direction to be
-    /// wrong in: a seat wrongly called idle gets a sentence typed at it, and a
-    /// seat wrongly called working waits for ever.
-    ///
-    /// **A live turn still reads `working`,** which is the half of the test that
-    /// keeps this honest: `opencode_settled` requires a *completed* turn older
-    /// than the threshold, so a session mid-stream is untouched whatever the
-    /// screen says.
-    ///
-    /// Said every pass rather than once per seat, and that is deliberate here
-    /// where it is not for the others: the repair is the reconciler's *finding*,
-    /// and a governor reading `cycle.log` after a frozen seat has been sitting
-    /// there for an hour wants to see it said for the whole hour. It costs one
-    /// line a minute on a seat that is broken, which is nothing against a run
-    /// that has stalled on it.
-    fn overrule_frozen_opencode(
-        &self,
-        compound: &crate::place_compound::Compound,
-        seat: &str,
-        raw: State,
-    ) -> State {
-        if raw != State::Working {
-            return raw;
-        }
-        let session = compound.session_of(&Seat::new(seat));
-        let finished = (!session.is_empty())
-            .then(|| crate::agent_commands::opencode_finished_at(&session))
-            .flatten();
-        overrule(raw, finished, util::epoch_secs())
-    }
-}
 
 /// The half of [`Fleet::overrule_frozen_opencode`] that decides, split out so a
 /// test can drive it without an opencode, a database and a frozen TUI.
