@@ -177,12 +177,8 @@ use crate::store::Store;
 use crate::util;
 use crate::Args;
 
-/// The directory under a repository root that holds the per-task worktrees.
-///
-/// Dotted so it is out of the way of an `ls`, and one directory rather than one
-/// per task at the root so a single `.gitignore` line covers every tree that
-/// will ever exist here.
-pub(crate) const WORKTREES: &str = ".worktrees";
+pub(crate) use crate::base::git::{trunk, trunk_branch, trunk_tip, WORKTREES};
+
 
 /// What a land is and what follows it, said to the agent whose row it is.
 /// `wsp-306`.
@@ -304,36 +300,8 @@ pub(crate) fn worktree_of(p: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The repository's main working tree — the trunk that gets reviewed.
-///
-/// From `git worktree list`, whose first entry is the main one, rather than by
-/// walking up from `.git`: inside a linked worktree `.git` is a file pointing
-/// somewhere under the main repository's `.git/worktrees`, and reconstructing
-/// the main tree's path from that is arithmetic on git's private layout.
-pub(crate) fn trunk(dir: &Path) -> Option<PathBuf> {
-    let out = git(dir, &["worktree", "list", "--porcelain"])?;
-    let line = out.lines().find_map(|l| l.strip_prefix("worktree "))?;
-    Some(PathBuf::from(line.trim()))
-}
 
-/// The commit the trunk branch of the repository at `root` points at, in full.
-pub(crate) fn trunk_tip(root: &str) -> Option<String> {
-    let repo = toplevel(Path::new(&util::expand(root)))?;
-    let trunk = trunk(&repo)?;
-    let branch = trunk_branch(&trunk)?;
-    git(&trunk, &["rev-parse", &branch]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
 
-/// The branch the trunk has checked out, or `None` if it is detached.
-///
-/// What `land` fast-forwards, and what a new task branch starts from. Read from
-/// the trunk rather than assumed to be `master`, because the name of the trunk
-/// branch is a fact about the repository and not about wsp.
-pub(crate) fn trunk_branch(trunk: &Path) -> Option<String> {
-    let out = git(trunk, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-    let name = out.trim().to_string();
-    (!name.is_empty()).then_some(name)
-}
 
 /// Where a task's tree lives. The task id is the directory name and the branch
 /// name both: it is already unique, and a worktree left behind names the task

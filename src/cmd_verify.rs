@@ -249,51 +249,8 @@ use crate::store::Store;
 use crate::util;
 use crate::Args;
 
-/// Run git somewhere and take its stdout, or `None` if it failed.
-///
-/// `GIT_INDEX_FILE` is stripped on the way in, always. Two different callers
-/// would otherwise be wrong in two different ways: an agent partway through
-/// `wsp commit-help` has one exported and every read here would inspect its
-/// staging rather than the repository, and `worktree add` would write the new
-/// worktree's index over it. The two commands that genuinely want a private
-/// index set it themselves, on themselves.
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_INDEX_FILE")
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
+pub(crate) use crate::base::git::{git, git_ok, toplevel};
 
-/// The same, when the output is not wanted but the failure is. Returns git's
-/// stderr on failure, because "what did git say" is the whole diagnostic.
-pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(if msg.is_empty() { format!("git {} failed", args.join(" ")) } else { msg })
-}
-
-/// The repository containing `dir`, resolved through git rather than by walking
-/// up looking for `.git` — a worktree's `.git` is a file, and a submodule's is
-/// somewhere else again.
-pub(crate) fn toplevel(dir: &Path) -> Option<PathBuf> {
-    let out = git(dir, &["rev-parse", "--show-toplevel"])?;
-    let line = out.trim();
-    (!line.is_empty()).then(|| PathBuf::from(line))
-}
 
 /// Which agent is asking.
 ///

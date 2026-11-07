@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use crate::kanban;
 use crate::live::{self, AgentRef};
 use crate::store::Store;
 use crate::util::exe_stamp;
+pub(crate) use crate::base::term::stty;
 
 use super::keys::{apply_input, say, Chore, Effect, Input, Mode, View};
 use super::render::{frame, to_ansi};
@@ -53,16 +54,6 @@ pub(super) struct HerdrEvent {
     pub(super) focus: bool,
 }
 
-pub(crate) fn stty(args: &[&str]) {
-    if let Ok(tty) = File::open("/dev/tty") {
-        let _ = Command::new("stty")
-            .args(args)
-            .stdin(Stdio::from(tty))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
 
 /// How wide and how tall the pane is, asked of the terminal itself.
 ///
