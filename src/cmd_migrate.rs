@@ -631,6 +631,64 @@ pub fn code(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["migrate"],
+        run: run,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 390,
+                text: r##"  wsp migrate [-n] [--all]          renumber dated ids into each project's own
+                                    space, rewriting every reference; -n plans it
+                                    and writes nothing. Old ids go on resolving"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 400,
+                text: r##"  wsp migrate --refs <path> [-n]    …and bring a source tree's comments forward"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 410,
+                text: r##"  wsp migrate --verify-rows [-n]    every Verify row wsp filed, moved onto its
+                                    member's ## Verification and archived; rows
+                                    made by hand are named and left alone"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 420,
+                text: r##"  wsp migrate --barrier-rows [-n]   every settled Barrier row wsp filed, moved
+                                    onto its group's checks: and archived; open
+                                    rows and hand-made ones are named and left"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 430,
+                text: r##"  wsp migrate --run-notices [-n]    the run's notices raised before wsp-272 as
+                                    a person's hands: from wsp, and for the
+                                    seat they were handed to"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["code"],
+        run: code,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 380,
+                text: r##"  wsp code [<proj> [<code>]]        the prefix a project's ids take, so a long
+                                    slug can still number short: strata-prototype
+                                    with code sp gives sp-062. Defaults to the
+                                    slug; tasks already handed out keep theirs"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

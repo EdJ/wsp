@@ -1590,6 +1590,28 @@ impl Place for Supervisor<'_> {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    // Not `hook`, deliberately, and the two are not variants of one thing.
+    // That one is herdr's plugin channel — a multiplexer saying a pane
+    // exited — and it ends in a full `sync` over the socket. This is an
+    // agent saying what *it* is doing, from inside its own hook, several
+    // times a turn, and it must touch nothing but its own seat's file.
+    crate::verbs::Verb {
+        names: &["report"],
+        run: report,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 100,
+                text: r##"  wsp report <hook>                 a headless agent's Claude Code hook, saying
+                                    what it is doing; silent outside a seat"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

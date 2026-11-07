@@ -2643,6 +2643,57 @@ pub(crate) fn rerun_steps(
     Ok(crate::check::affected(&crate::check::plan(store, &t, &tg, Some(new_head)).steps, pulled_in, ours))
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["checkout"],
+        run: checkout,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 70,
+                text: r##"  wsp checkout [<id>] [-n]          a working tree of your own for the task in
+                                    hand, under .worktrees/, on its own branch —
+                                    nobody else's edits are in it and yours are
+                                    in nobody else's commit"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 80,
+                text: r##"  wsp checkout [<id>] --rm [--force] [-n]  end it, when the task is genuinely
+                                    over; the branch stays if it holds work, and
+                                    --force is needed to lose uncommitted work.
+                                    -n on any of the three says what it would do
+                                    and does none of it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 90,
+                text: r##"  wsp checkout --sweep [-n]         …or every tree here whose task is closed and
+                                    nobody removed; skips any tree somebody is
+                                    standing in or has work in, -n to look first"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["land"],
+        run: land,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 100,
+                text: r##"  wsp land [<id>]                   rebase it onto the trunk and fast-forward the
+                                    trunk onto it; prints what actually moved.
+                                    The tree stays — landing is not finishing.
+                                    A member of a run does not type it: `wsp
+                                    review` marks it ready and the verifier's
+                                    `wsp verified --holds` lands it"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -327,6 +327,24 @@ pub(crate) fn when_away(store: &Store) {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["cold"],
+        run: cold,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 60,
+                text: r##"  wsp cold <list|project> [--plan] [--at COMMIT] [--keep]
+                                    one cold build in a fresh checkout: the project's `at barrier`
+                                    then `at end` steps; started once as a list closes"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -112,3 +112,19 @@ pub(crate) fn set_focus(store: &Store, workspace: &str, focus: &Focus) {
 pub(crate) fn get_focus(store: &Store, workspace: &str) -> Focus {
     read_all(store).get(workspace).map(Focus::from_json).unwrap_or(Focus::Nothing)
 }
+
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["view"],
+        run: run,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 20,
+                text: r##"  wsp view [<id>]                   detail pane; follows the panel unless given an id"##,
+            },
+        ],
+    },
+];

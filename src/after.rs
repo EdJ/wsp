@@ -363,6 +363,27 @@ fn landed(store: &Store, repos: &mut Option<Repos>, id: &str) -> bool {
     worklist::member(store, repos, id, Reading::Landed).finished()
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["after"],
+        run: run,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 330,
+                text: r##"  wsp after <id> <on>…              it rests on those: a wait, never where it
+                                    came from (that is --parent). A run starts
+                                    it once each one in its own group has
+                                    landed; --clear empties it, bare reads it.
+                                    Refused on itself, a cycle, or a list with
+                                    <on> in a later group or this group started"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

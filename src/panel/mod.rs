@@ -32,6 +32,65 @@ pub(crate) use keys::{apply_input, Effect, Input, View};
 // The reducer's inner door: one key, no pane size, no focus. Every input the
 // live loop takes now goes through `apply_input`, so the only callers left are
 // the tests that predate it and are about a key alone.
+/// `wsp panel` and its subcommands.
+pub fn verb(store: &crate::store::Store, args: &crate::Args) -> i32 {
+    match args.rest.first().map(|s| s.as_str()) {
+        Some("install") => install(store, args),
+        Some("uninstall" | "remove") => uninstall(store, args),
+        Some("storyboard") => crate::story::run(args),
+        // `--full` is the panel `Z` opens in a tab: the same panel, at the
+        // width of the workspace, and quit rather than kept.
+        _ => run(store, args.has("full")),
+    }
+}
+
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["panel"],
+        run: verb,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 10,
+                text: r##"  wsp panel [--full]                the sidebar replacement (runs in a pane);
+                                    --full is the whole tree at the width of the
+                                    workspace, which Z in the panel opens in a tab"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 40,
+                text: r##"  wsp panel install [--all]         split it into a workspace, or all of them —
+                                    the way it works without a herdr that draws
+                                    the sidebar itself; skipped automatically
+                                    while `wsp surface` is running"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 50,
+                text: r##"  wsp panel uninstall [-w ws]       take it back out"##,
+            },
+        ],
+    },
+    // The same panel, drawn by a host that owns the cells rather than by a
+    // terminal: JSON in on stdin, frames out on stdout. Not for people —
+    // herdr's forked sidebar spawns it.
+    crate::verbs::Verb {
+        names: &["surface"],
+        run: |store, _| surface(store),
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 60,
+                text: r##"  wsp surface                       the panel for a host that owns the cells:
+                                    one JSON object per line each way, frames
+                                    out. Started by herdr, not by a person"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 pub(crate) use keys::apply_key;
 // The card a raised hand becomes, and the mode it holds the keyboard in. Out

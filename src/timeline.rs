@@ -1279,6 +1279,29 @@ pub fn timeline(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["timeline"],
+        run: timeline,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 620,
+                text: r##"  wsp timeline <row> [--json] [--legs DIR]
+                                    where a row's wall time goes, spawn to barrier:
+                                    one line per phase, and the gaps where nothing
+                                    ran named for what they waited on
+                                    then the seat's own model time and tokens per
+                                    phase, split at the row's legs (times UTC);
+                                    legs from run-leg.sh's timeline.json under the
+                                    row's tree, or --legs DIR, else wsp's own"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

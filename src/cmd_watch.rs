@@ -4452,6 +4452,93 @@ fn status(store: &Store, args: &Args) -> i32 {
 // vocabulary of named predicates: adding to it later is a new variant, not a
 // new interface.
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["watch"],
+        run: watch,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 530,
+                text: r##"  wsp watch [<project>] [<signal>…]  the few facts a governor acts on, as they
+                                    become true: needs-a-person, review,
+                                    blocked, flag, unanswered, agent-gone, and
+                                    seat-stalled — the one whose subject is a
+                                    governor rather than a piece of work. No
+                                    arguments is this seat's whole scope. It
+                                    says what it is watching, one line per
+                                    change, a heartbeat while nothing happens,
+                                    and why it stopped"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 540,
+                text: r##"  wsp watch --json                  …the same stream as one document per line.
+                                    Every line names its class in a `class`
+                                    field, and the text stream names it in the
+                                    second column. The whole vocabulary is
+                                    {classes}
+                                    — key a filter on one of those words and
+                                    never on the wording of a line"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 550,
+                text: r##"  wsp watch --wake [--defer-max 4h]  …or for a reader who is not there: a line
+                                    printed has been judged worth a context
+                                    read, and everything else is held and
+                                    rides the next one. Nothing is dropped.
+                                    A held fact older than --defer-max is a
+                                    wake by itself, so a quiet fleet still
+                                    delivers its backlog.
+                                    A governor needs none of this: the daemon
+                                    runs the same triage for every seat and
+                                    types the result at it, so there is
+                                    nothing to start and nothing to remember.
+                                    `wsp govern <scope> --clear` is the off
+                                    switch, and it holds rather than drops"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 560,
+                text: r##"  wsp watch --drain                 print what is being held for this seat and
+                                    clear it — free, because you are already
+                                    awake to be reading it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 570,
+                text: r##"  wsp watch --now                   …or the level read on its own: everything
+                                    up right now, correct after any restart —
+                                    the one call that says "nothing is up"
+                                    rather than merely saying nothing"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 580,
+                text: r##"  wsp watch --once                  …or one tick against the last one's ledger,
+                                    for a caller that holds no process"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 590,
+                text: r##"  wsp watch --for 2h | --until <id> | --every 30s | --settle 5m
+                                    when to stop, how often to look, and how
+                                    long a stopped agent must stay stopped"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 600,
+                text: r##"  wsp watch --status [--forget <k>]   who is watching, and whether they still
+                                    are; a watch whose process died is a line
+                                    in `wsp doctor` rather than a silence"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

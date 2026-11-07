@@ -1653,6 +1653,37 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["verify"],
+        run: verify,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 150,
+                text: r##"  wsp verify [<path>…] [--check] [--release] [--rm [--all] [-n]]
+                                    build and test your change at HEAD, in one
+                                    of a few warm trees this machine shares —
+                                    yours alone while it builds, and cold only
+                                    when they are all busy; --rm drops the one
+                                    you built in, --all every free one and the
+                                    build residue no other verb can reach. -n
+                                    names all of it and removes none"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 160,
+                text: r##"  wsp verify --alone                …or every test in a process of its own,
+                                    ~90s, naming the failures and nothing
+                                    else — what to reach for when a test goes
+                                    red and then green"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

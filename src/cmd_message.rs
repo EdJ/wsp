@@ -1837,6 +1837,140 @@ fn find(store: &Store, needle: &str) -> Result<Message, i32> {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    // The return path. `flag` and `tell` are one-directional and stay that
+    // way; these three are the case where something is owed back, and the
+    // answer is a record before it is a sentence in somebody's pane.
+    crate::verbs::Verb {
+        names: &["ask"],
+        run: ask,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 210,
+                text: r##"  wsp ask|flag <id> --caption "…"   the line a glance names it by, under 60;
+                                    without one a flag's --title, else the
+                                    first clause with any `Ed:` off"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 230,
+                text: r##"  wsp ask <id> ["…"|-|--from F]     a question about a task, with a return path:
+                                    the answer comes back to you and lands on a
+                                    task's log. `wsp tell` is still for prose"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 240,
+                text: r##"  wsp ask <list> [--group N] "…"    …about a worklist, from a barrier check that
+                                    holds no task: its governor is asked, and
+                                    the answer lands on the list's log"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 250,
+                text: r##"  wsp ask                           what is open, who is waiting, and how long"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 280,
+                text: r##"  wsp ask --cancel <mid> ["why"]    the person's dismissal of any ask, one only
+                                    the person may close included: closed as
+                                    cancelled by the person, and the asker told
+                                    as an answer would tell it. A row going to
+                                    review, done, parked or the archive, an
+                                    agent closing, or a barrier passing closes
+                                    what it raised by itself, with the reason"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 290,
+                text: r##"  wsp ask <id> --person --choices F|-   a question with options (F: JSON {kind:
+                                    ask|plan|permission, questions:[{question,
+                                    header, multi, options:[{label,
+                                    description, preview?}]}], plan?, tool?,
+                                    command?}); the text may be left out, and a
+                                    surface that ignores choices still reads it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 320,
+                text: r##"  wsp ask <id> --person --wait [--timeout S] [--choices F|-] ["…"]
+                                    ask inside the turn: blocks, prints the
+                                    answer (label, free text, `talk: …`,
+                                    `allow`/`deny: …`), exit 0; exit 3 with the
+                                    reason on stderr if abandoned or timed out
+                                    (the question stays open on a timeout)"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 330,
+                text: r##"  wsp ask <mid> --wait [--timeout S]  wait again on one that stayed open"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 340,
+                text: r##"  wsp ask <id|list> --person "…"    a question only the person may answer: it is
+                                    in `wsp yours`, holds the barrier of the
+                                    group it names, and a seat or an agent may
+                                    raise one and never close one"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["answer"],
+        run: answer,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 260,
+                text: r##"  wsp answer <mid> "…"|-|--from F   close one: the log first, then whoever asked"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 270,
+                text: r##"  wsp answer <mid> --abandon "…"    the other ending, and it also goes home"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 300,
+                text: r##"  wsp answer <mid> --choice 'Q=Label' [--choice …] [--other 'Q=words']
+                                    answer one that has options: a label or an
+                                    Other, refused with the options named
+                                    otherwise; `--choice allow|deny "…"` on a
+                                    plan or permission; `--choice F|-` takes
+                                    {answers:{Q: label|{pick}|{other}}} or
+                                    {behavior, message?, rule?, mode?}"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["yours"],
+        run: yours,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 350,
+                text: r##"  wsp yours [-p <proj>] [--json]    what waits on the person, and how many rows
+                                    wait at review (a count, not items)"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["ack"],
+        run: ack,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 310,
+                text: r##"  wsp ack <mid>                     an answer read, or a notification taken on"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

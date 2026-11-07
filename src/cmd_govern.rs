@@ -169,6 +169,81 @@ pub use crate::governors::{
 };
 use crate::governors::{seat_of, str_at};
 pub use crate::place::{governs, seat_query};
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["govern"],
+        run: govern,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 330,
+                text: r##"  wsp govern [<proj>]               who is in every seat, or in the one named.
+                                    Reports only: it never takes a seat"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 340,
+                text: r##"  wsp govern <proj> --take          take the custodial seat on a project: raised
+                                    hands under it arrive here instead of on a
+                                    person's panel, and this pane stops reading
+                                    as an agent that has stalled. Refused to a
+                                    pane that has ever verified"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 350,
+                text: r##"  wsp govern [<proj>] --clear       stand down and leave the seat open; --remove
+                                    takes the seat off the project altogether"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 360,
+                text: r##"  wsp govern <proj> --tell "…" | -  say something to whoever is in that seat —
+                                    the panel's T, from a shell. Direction is
+                                    long prose full of identifiers, so reach for
+                                    `--tell -`, or `--from FILE`: between double
+                                    quotes a shell runs every backtick in it, and
+                                    the message arrives fluent with the nouns gone"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 370,
+                text: r##"  wsp govern <proj> --rotate        the handover as one verb, and a custodian's
+                                    last act: seats the successor, waits until
+                                    its first turn starts, moves the seat, and
+                                    ends your pane itself once it exits — the
+                                    successor is never asked to. Failing says
+                                    so, exits non-zero, and you are still the seat"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 380,
+                text: r##"  wsp govern <proj> --ending        end the pane a rotation replaced; --rotate
+                                    starts it for you, detached. By hand, only
+                                    from that pane, when --rotate said it failed"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 390,
+                text: r##"  wsp govern <proj> --reseat        fill a slot nobody is in, on the kind and
+                                    tier the seat was running at. The daemon
+                                    does this by itself for a list that is
+                                    running; by hand is for a post nobody has
+                                    started yet"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 400,
+                text: r##"  wsp govern <proj> --model M [--effort E]
+                                    the tier this seat's successors start on,
+                                    recorded without touching the pane in it"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 use crate::governors::seat_above;
 

@@ -1541,6 +1541,58 @@ fn keeps_the_old_one(store: &Store, ours: &Built, p: &crate::util::Paint) {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["install"],
+        run: install,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 170,
+                text: r##"  wsp install [<path>] [--why "…"] [-n] [--force] [--to PATH]
+                                    put that build at ~/.local/bin/wsp, one
+                                    install at a time — the one file nothing can
+                                    isolate; defaults to your verify tree's
+                                    release build, -n to look without touching it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 180,
+                text: r##"  wsp install → ~/Library/LaunchAgents/com.wsp.daemon.plist
+                                    …and writes and loads the launchd agent that
+                                    keeps `wsp daemon` alive, so it comes back
+                                    after a crash and at every login. An install
+                                    that finds it already right leaves it alone,
+                                    -n says which it would do, and --to and a
+                                    sandbox never touch it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 190,
+                text: r##"  wsp install --daemon [-n]         load the launchd agent for any build, copying
+                                    nothing: written if it differs, loaded if it
+                                    is not, its pid untouched if it is right. An
+                                    install that cannot leave the daemon running
+                                    exits 1 and `wsp wip` says so"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 200,
+                text: r##"  wsp install --why - | --why --from FILE
+                                    …with the reason read from a stream or a
+                                    file, where a shell never sees it — it is
+                                    the sentence the next agent reads off the
+                                    lock, and prose typed between double quotes
+                                    has every backtick in it run. The binary
+                                    stays the positional: `--from` is where the
+                                    sentence comes from, not the build"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

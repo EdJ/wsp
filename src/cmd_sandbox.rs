@@ -1272,6 +1272,44 @@ fn rm(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["sandbox"],
+        run: sandbox,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 210,
+                text: r##"  wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own herdr session,
+                                    store and state — and the exports to use it;
+                                    inside it `wsp` is the binary you ran"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 220,
+                text: r##"  wsp sandbox --run "cmd" [--keep]  …or run one thing in it and take it down"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 230,
+                text: r##"  wsp sandbox --fake [--stage F]    …or with no herdr at all: a backend that
+                                    answers the socket out of a state you write
+                                    down, so wsp can be driven through the ones
+                                    a real herdr cannot be put in"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 250,
+                text: r##"  wsp sandbox ls|rm [<name>] [--all] [-n]  what is up, and how to drop it —
+                                    --all drops every one, so -n names them
+                                    first"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

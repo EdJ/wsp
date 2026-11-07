@@ -4807,6 +4807,104 @@ pub(crate) fn cmd_agent_claim(store: &Store, task: &str, flags: &[(&str, &str)])
     crate::cmd_agent::claim(store, &Args::synth("claim", &[task], flags))
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["spawn"],
+        run: spawn,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 270,
+                text: r##"  wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
+                 [--model <m>] [--effort <e>] [--subagents] [--herdr]
+                                    open a workspace on it and claim it there;
+                                    in a compound session by default — --herdr
+                                    opens it in the fork instead, and
+                                    --headless in a supervisor with no terminal
+                                    at all. --agent starts an agent in it too. --focus
+                                    to go there, --on to run it on another
+                                    machine, --full to start it with sub-agents,
+                                    workflows and the MCP servers it is
+                                    otherwise spawned without.
+                                    -p beside an id says where that work sits
+                                    rather than replacing it, and the two may
+                                    not disagree
+                                    --subagents keeps just the Agent tool, for
+                                    exploration-heavy work whose searching would
+                                    otherwise pile up in the session's own
+                                    context; --model fable|opus|sonnet|haiku,
+                                    any with [1m], and --effort
+                                    low|medium|high|xhigh|max say what tier to
+                                    start it at; say neither and it starts on
+                                    your settings file, as before.
+                                    haiku opens in manual mode, so it is refused
+                                    unless --focus says you will be at the pane
+                                    --verify is a run's verifier on a member: no
+                                    claim, the seat written on its open pass
+                                    --leg <name> is one leg of a row run as legs:
+                                    no claim either, the seat written on the
+                                    leg's entry and the pane bound to the row,
+                                    at the leg's own tier (sonnet unless it
+                                    says why)"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 280,
+                text: r##"  wsp spawn <list> --agent --check N  a run's barrier check on group N: no row
+                                    and no claim, the seat written on the
+                                    group's open check, the order the barrier's"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 410,
+                text: r##"  wsp spawn -p <proj> --govern      fill an empty seat directly: a workspace on
+                                    the project, an agent in it, the seat taken,
+                                    and a custodial work order rather than a
+                                    claim. For handover, use --rotate above"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 420,
+                text: r##"  wsp spawn --primary               the primary interface: one standing seat that
+                                    is no project's, where the person talks to
+                                    the fleet. Seats an agent on the compound
+                                    backend if nobody holds it — else names who
+                                    does and seats nothing. Holds no claim, is
+                                    outside the cap, and is never refilled by
+                                    the daemon. Stands in wsp's root; --cwd
+                                    elsewhere. `wsp govern primary` says who
+                                    holds it, --tell speaks to it"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["despawn"],
+        run: despawn,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 290,
+                text: r##"  wsp despawn <id> | --pane <seat>  the other end of it, and the whole ending:
+                                    end the agent, release the claim, remove the
+                                    worktree. A seat that will not close keeps
+                                    its claim; a tree with uncommitted work in it,
+                                    or with somebody in it, is kept and said so.
+                                    --keep-tree leaves the checkout alone"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 300,
+                text: r##"  wsp despawn <id> --lost           the seat is on a machine that is not coming
+                                    back: release the claim, the row to todo,
+                                    keep the worktree on the seat. A far seat
+                                    only; a local one is refused"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

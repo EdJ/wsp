@@ -452,6 +452,43 @@ pub(crate) fn decide_hold(was: &[PauseKind], r: &Reading, s: &Settings) -> Vec<P
 }
 
 /// A load hold at 14.2 on 8 cores, for tests that need one to carry.
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["throttle"],
+        run: throttle,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 120,
+                text: r##"  wsp throttle [off|on|auto] [--json]
+                                    how builds are held back for the person at
+                                    the machine: niced, capped in jobs, and a
+                                    slot for each heavy one across the fleet.
+                                    `auto` (the default) holds it only while the
+                                    person is at the machine; bare, it shows the
+                                    mode, whether it is in force, the load and
+                                    who is building. One cargo per tree is held
+                                    in every mode"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 130,
+                text: r##"  wsp throttle set slots=N jobs=N away=MINUTES   …the sizes (`auto` for the first two)"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 140,
+                text: r##"  wsp throttle set hot-slots=N hot-jobs=N hot-below=PERCENT
+                                    …what a thermally limited machine (the
+                                    `pmset -g therm` CPU_Speed_Limit under
+                                    PERCENT) is held to, in every mode"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 pub(crate) fn sample_pause() -> Pause {
     Pause { kind: PauseKind::Load, reading: 142, release: 80 }

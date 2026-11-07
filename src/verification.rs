@@ -1038,6 +1038,29 @@ pub(crate) fn deliver_unless_reworked(store: &Store, member: &str, text: &str) {
 /// The store half of [`verified`]: the pass written, and the member moved when
 /// the verdict blocks. Separate so the choice of pass can be tested without a
 /// process environment to read a pane out of.
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["verified"],
+        run: cmd_verified,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 160,
+                text: r##"  wsp verified <member> --holds|--blocks --from FILE --caption "…"
+                                    a verifier's verdict, recorded on the member
+                                    under ## Verification. --blocks sends it back
+                                    with the verdict as what is owed, and its
+                                    governor is told; a governor answering a
+                                    block by hand writes --holds in their name.
+                                    --caption is required: the reason in under
+                                    60, read after the holds/blocks wsp adds"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: Option<&str>, caption: Option<&str>) -> Result<Pass, String> {
     record_checked(store, member, state, text, me, caption, Vec::new())

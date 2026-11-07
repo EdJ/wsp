@@ -2231,6 +2231,273 @@ fn hold_caption(w: &Worklist) -> Option<crate::caption::Told> {
 }
 
 /// `worklist show --json`'s groups.
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    // The verbs that compose a list. Running one — `next`, `go`, `hold`,
+    // `done` — extends this same dispatch and lands after it.
+    crate::verbs::Verb {
+        names: &["worklist", "wl"],
+        run: dispatch,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 10,
+                text: r##"  wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,
+                                    outside the projects its members live in —
+                                    it references them, nothing moves.
+                                    --caption "…" is its line for a glance;
+                                    -p <project> is where it stands, whose
+                                    governor its seat answers to — unsaid,
+                                    the project its members share"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 20,
+                text: r##"  wsp worklist add <slug> <task>…   one call, one group; its members run at
+                                    the same time. --group N joins a group
+                                    that exists instead of making one;
+                                    --agent "kind [model] [effort]" says who
+                                    runs a new group, and it is otherwise the
+                                    group before's, or claude. Joining one,
+                                    it is those members' own line instead.
+                                    --caption "…" names a new group; without
+                                    one, its first member's caption names it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 30,
+                text: r##"  wsp worklist add <slug> <parent> --sub   …or that parent's open sub-tasks as
+                                    one group, resolved now and not live
+                                    A row another open list holds is refused,
+                                    naming that list. --move takes it out of
+                                    there first (not once its group has
+                                    started); --also --why "…" keeps it in
+                                    both and logs why in both"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 40,
+                text: r##"  wsp worklist rm <slug> <task>… [-n]
+                                    take members out; a group left empty goes,
+                                    and -n says which before anything moves"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 50,
+                text: r##"  wsp worklist mv <slug> <task> --group N   between groups, or --after N for a
+                                    new one between two that exist"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 60,
+                text: r##"  wsp worklist group <slug> N [--parallel N|none] [--agent "kind [model] [effort]"|manual] [--stop "…"|-] [--drop] [--why "…"|-]
+                                    a cap on the work, and the prose read at
+                                    the barrier after that group — `-` reads it
+                                    from a stream and --stop --from FILE out of
+                                    a file, where a shell never sees it. --why
+                                    is logged with the edit. --drop [-n] takes
+                                    the group out whole: the running one too,
+                                    with --why, until its barrier opens.
+                                    --caption "…"|none renames it, run or not"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 70,
+                text: r##"  wsp worklist member <slug> <task> --agent "kind [model] [effort]"|none
+                                    one member on its own line beside the
+                                    group's — its spawn and its verifier run
+                                    on it. Editable until that member starts,
+                                    even in the group being run"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 80,
+                text: r##"  wsp worklist edit <slug> --overview -    what has to be true before group 1
+                                    starts — there is no barrier in front of it
+                                    to carry a stop condition, so the list does"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 90,
+                text: r##"  wsp worklist edit <slug> --project <p>|none
+                                    move where it stands, at any point in the
+                                    run; none goes back to its members' answer"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 100,
+                text: r##"  wsp worklist ls [--all]           every list, most recently active first, in
+                                    three segments: running, unjudged — the run
+                                    is over and its rows are not — and closed,
+                                    which is counted rather than drawn. --all
+                                    draws the closed ones too"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 110,
+                text: r##"  wsp worklist show <slug> [--verdicts|--stops]
+                                    one list: the groups, where it is up to, and
+                                    which of them may still be edited. A verdict
+                                    past a few lines is counted rather than
+                                    drawn; --verdicts draws them whole. Behind
+                                    where it is up to a long stop condition is
+                                    counted the same way — the one at the live
+                                    barrier always reads whole; --stops draws
+                                    every block back. --json gives each group
+                                    an id no renumbering changes, and the
+                                    history the log holds: made, checks,
+                                    events, joined, follow_up_of, and the
+                                    list's dropped groups. A check that held
+                                    says `hold` there, never `holds`, which in
+                                    a member's verification means it passes
+  Editing is write-ahead-only: a group at or behind where the list is up to has
+  either run or is running, and is refused with what may be edited instead. Two
+  exceptions: a member's own agent line may change until that member starts,
+  and the running group's stop may be corrected with a --why until its barrier
+  row opens.
+"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 120,
+                text: r##"  wsp worklist next [<slug>]        what may start now, what is holding it, or
+                                    the prose to read at a barrier — with what
+                                    the group behind it landed and which of its
+                                    members touched one file. No slug when the
+                                    workspace holds the seat"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 130,
+                text: r##"  wsp worklist go [<slug>] ["…"|-|--from FILE]   start the list, or pass a
+                                    barrier: records the verdict, sweeps the
+                                    trees of the groups behind it, and says
+                                    which members of the group that just landed
+                                    touched one file. --caption "…" is required
+                                    on a verdict, unless it is one sentence
+                                    under 60 and so its own; hold and followup
+                                    take it the same way"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 140,
+                text: r##"  wsp worklist hold [<slug>] "why"|-|--from FILE   the barrier's "does not
+                                    pass": start nothing more. What is already
+                                    running is left to finish — work in flight
+                                    cannot be unwound. `go` is one way back, and
+                                    `go` passes the barrier; `wsp reopen` of a
+                                    member the check held on is the other: the
+                                    run goes back to that group, reseats the
+                                    member and checks the barrier afresh"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 150,
+                text: r##"  wsp worklist followup <slug> <task>… --blocking|--next --from FILE
+                                    the barrier check's verdict with up to four
+                                    rows attached: --blocking holds, and they
+                                    join the group; --next passes, and they are
+                                    the next group. One round, and only the
+                                    check's own seat may run it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 160,
+                text: r##"  wsp worklist park [<slug>] "why"|-|--from FILE   a person's pause: nothing
+                                    starts, no barrier is checked, its seat is
+                                    not refilled, nothing is ended. `go` and
+                                    `hold` refuse it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 170,
+                text: r##"  wsp worklist resume [<slug>] ["…"]  back to where it was parked, at the same
+                                    group or barrier and with the same check
+                                    owed. Records no verdict and passes nothing"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 180,
+                text: r##"  wsp worklist status <slug> [init|planned|cancelled] [--why "…"]
+                                    the list's status: init, planned, executing,
+                                    complete, closed or cancelled (executing
+                                    flags: held, waiting on Ed, parked). A hand
+                                    sets only init, planned and cancelled: the
+                                    run makes it executing, its end complete,
+                                    `done` closed. cancelled puts the open rows
+                                    back to todo, unclaimed. No word: say it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 190,
+                text: r##"  wsp worklist after <slug> <other|none>
+                                    start <slug> only once <other> is complete"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 200,
+                text: r##"  wsp worklist edit <slug> [--prio high|normal|low] [--alone|--no-alone]
+                                    where a planned list queues (high first, then
+                                    the earlier planned) and whether it waits for
+                                    any executing list on its project (default on
+                                    for wsp's own source). `new` takes them too.
+                                    `ls` and `next <slug>` say what a planned list
+                                    waits on: room, throttle, after, alone, manual"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 210,
+                text: r##"  wsp worklist pickup               the daemon's pass over the planned lists, once:
+                                    starts the first that may start (one per tick)
+                                    and says why then. The daemon does this itself
+                                    every minute; `wsp wip` shows the day's starts"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 220,
+                text: r##"  wsp worklist done <slug> [--force why…]
+                                    nothing left to want from it. Refused while
+                                    a declared output is missing; --force and
+                                    a why goes past it, logged"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 230,
+                text: r##"  wsp worklist output <slug> [add <name> [--from <member>|--barrier|--wsp] [--kind html|md|json|png]|rm <name>|--none]
+                                    what the list hands back, in ~/.compound/
+                                    artefacts/<slug>/: work and effort unless
+                                    --none takes them off"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 240,
+                text: r##"  wsp worklist report <slug> [--baseline <slug>]
+                                    (re)write effort.html and effort.json from
+                                    cost, timeline and attempts, any time"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 250,
+                text: r##"  wsp worklist advance [<slug>]     take the steps a run owes now: spawn its
+                                    members, a read-only verifier on each that
+                                    has landed, and an agent to check the
+                                    barrier. The verbs that make a step due run
+                                    it for you; by hand it repairs a lost one
+  A barrier with prose at it will not pass until `go` is given a sentence, and
+  the sentence is dated onto the group. A group with an `agent:` line — every new
+  one, set by `add --agent` or inherited from the group before — is run by wsp:
+  members, verifiers and the barrier check are spawned on it, a pass starts the
+  next group and rotates the seat, and the governor is told. `manual` or no line
+  is run by hand: `next` names the members and the governor spawns them.
+  Every sentence here — a stop condition, a verdict, a reason to hold — takes
+  `-` for a stream and `--from FILE` for a file, because a shell runs every
+  backtick inside the double quotes a paragraph needs."##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 fn groups_json(store: &Store, w: &Worklist, pos: &Position, tasks: &[crate::model::Task], h: &History) -> serde_json::Value {
     let archive = std::cell::OnceCell::new();

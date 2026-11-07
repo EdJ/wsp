@@ -1131,6 +1131,40 @@ fn outcome_colour(p: &Paint, o: Outcome) -> String {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["attempts"],
+        run: attempts,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 660,
+                text: r##"  wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
+                                    spawned at, the tier that actually served it,
+                                    how long to review, and whether it came back"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 670,
+                text: r##"  wsp attempts --task <id>[,<id>…] | --list <worklist> [--json]
+                                    only those rows' attempts, in one process"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 680,
+                text: r##"  wsp attempts <task> --cost [--list <worklist>] [--json]
+                                    what a row cost: each attempt, leg and
+                                    verifier pass with tier, turns, peak context
+                                    and dollars, the row's wall time beside its
+                                    legs' summed, and a legs not on Sonnet with
+                                    their why"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

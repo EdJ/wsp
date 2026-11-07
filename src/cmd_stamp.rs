@@ -177,6 +177,32 @@
 use serde_json::{json, Value};
 
 use crate::place::{Census, Seated};
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["stamp"],
+        run: stamp,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 520,
+                text: r##"  wsp stamp [--headless] [--json]   has anything changed? Three opaque tokens
+                                    for a separate process polling on an
+                                    interval — the records, the raised hands,
+                                    and the agent census, which no file in the
+                                    store can answer for and which is asked of
+                                    whatever backend runs the agents. Compared
+                                    for equality and never ordered or
+                                    subtracted. The census answers `heard`
+                                    before it answers a stamp: `no signal` is
+                                    nobody having answered, which is not a
+                                    change and is not an empty census either"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 use crate::place::Place;
 use crate::store::Store;

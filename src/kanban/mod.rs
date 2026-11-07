@@ -487,6 +487,23 @@ impl Board {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["kanban", "board"],
+        run: run,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 30,
+                text: r##"  wsp kanban|board [<proj>] [--done]  the work as todo/doing/review/done columns;
+                                    K in the panel opens it in a tab"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

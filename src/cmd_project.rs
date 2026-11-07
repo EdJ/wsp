@@ -893,6 +893,78 @@ pub fn project_json(p: &Project, index: &Index) -> serde_json::Value {
     })
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["init"],
+        run: init,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 10,
+                text: r##"  wsp init                          create the store at ~/wsp"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["project", "proj", "p"],
+        run: dispatch,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 20,
+                text: r##"  wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 30,
+                text: r##"  wsp project ls|projects [--tag T] list projects"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 50,
+                text: r##"  wsp project show <id> [--decisions] [--handbook]  brief, tags, roots, tasks"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 60,
+                text: r##"  wsp project edit <id> --handbook -   what an arriving agent is told: what the
+                                    work is for, and which file in the repo
+                                    holds the map of the code"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 70,
+                text: r##"  wsp project set <id> k=v…         name/parent/status/brief/tags/roots"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 80,
+                text: r##"  wsp project rm <id> [--force] [-n]  retire it to the archive; --force orphans
+                                    the tasks and children it still held, and -n
+                                    names them without moving anything"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["projects"],
+        run: list,
+        help: &[],
+    },
+    crate::verbs::Verb {
+        names: &["tree"],
+        run: tree,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 40,
+                text: r##"  wsp tree                          hierarchy with open counts"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

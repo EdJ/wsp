@@ -362,6 +362,33 @@ fn print_lines(d: &Did) {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["verifications"],
+        run: verifications,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 170,
+                text: r##"  wsp verifications [<project>] [--since DATE|Nd] [--until DATE] [--by project|week|month|project,week] [--json]
+                                    what verifiers did, added up: of the passes
+                                    whose transcript was read, the share that ran
+                                    tests, drove the app and read the diff; the
+                                    done-when items checked; blocks by cause"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 190,
+                text: r##"  wsp verifications --transcript FILE
+                                    the ran/drove/read lines that session's
+                                    transcript would give a verdict"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

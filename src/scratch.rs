@@ -311,6 +311,24 @@ pub(crate) fn scratch(store: &Store, args: &crate::Args) -> i32 {
     0
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["scratch"],
+        run: scratch,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 240,
+                text: r##"  wsp scratch [-n]                  the scratch of closed rows ($WSP_SCRATCH and
+                                    ~/.cache/<row-id>): list with sizes, then
+                                    remove what the row did not keep"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

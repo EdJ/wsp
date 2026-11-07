@@ -243,6 +243,23 @@ pub fn attend(store: &Store, args: &Args) -> i32 {
     1
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["attend"],
+        run: attend,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 50,
+                text: r##"  wsp attend <id>                   one attention-harness attempt on a row, to its checks'
+                                    result: what `spawn --kind attention` runs; nobody types it"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

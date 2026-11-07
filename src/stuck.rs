@@ -692,6 +692,23 @@ pub fn stuck(args: &crate::Args) -> i32 {
     0
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["stuck"],
+        run: |_, args| stuck(args),
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 180,
+                text: r##"  wsp stuck <transcript.jsonl>…     the commands in those transcripts that waited on
+                                    themselves or a bare cat, and the seconds each held"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

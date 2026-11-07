@@ -371,6 +371,24 @@ fn thousands(n: u64) -> String {
     out
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["burn"],
+        run: burn,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 110,
+                text: r##"  wsp burn [--json]                 tokens by seat, dearest first — input,
+                                    output and cache, tallied per hook from
+                                    the transcript; where core-049's cuts land"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

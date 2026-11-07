@@ -504,6 +504,29 @@ fn print_row(store: &Store, t: &mut Task, root: &Path, args: &Args) -> i32 {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["packet"],
+        run: packet,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 40,
+                text: r##"  wsp packet <id> [--regen [--force]|--from FILE|-]
+                                    print a row's ## Packet and the files it names, under a cap;
+                                    a row with none gets one generated (the overview, the context
+                                    pack, the likely files) and written; a small row is spawned
+                                    with one and the short start unless `--no-packet`;
+                                    `--leg NAME` prints that leg's packet (an order line
+                                    `packet: FILE`, or `wsp leg add … --packet FILE`), which
+                                    also starts the leg short"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -255,6 +255,55 @@ fn named_by(command: &str) -> String {
     util::truncate(base, 30)
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["check"],
+        run: check,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 110,
+                text: r##"  wsp check --inner [<id>] [--run]  the steps this tree's changes call for,
+                                    narrowest first; --run runs them here and
+                                    records nothing"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 120,
+                text: r##"  wsp check --affected [<id>] [--run]
+                                    those, with the tests the crate graph
+                                    (cargo metadata) and Vitest's module graph
+                                    reach, narrowest first; --run in a tree
+                                    clean at HEAD reuses and records greens by
+                                    input hash, and says how many were reused"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 130,
+                text: r##"  wsp check <project> --tiers       its declared steps by tier (inner, row,
+                                    barrier, end) and what it leaves out"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 140,
+                text: r##"  wsp check <id> [--plan] [--at <commit>]
+                                    run a task's mechanical checks — its
+                                    project's ## Checks, then the task's own —
+                                    at the commit it landed, in a warm tree of
+                                    wsp's, and record each step under ##
+                                    Verification. A failure on a row at review
+                                    sends it back with the step as what is owed;
+                                    wsp runs it by itself on a ready or landed
+                                    row, before any verifier. --plan lists the steps with
+                                    their tier and any green already held, --at
+                                    runs another commit and writes nothing"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 fn matches(glob: &str, path: &str) -> bool {
     captures(glob, path).is_some()

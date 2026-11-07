@@ -1493,6 +1493,27 @@ pub fn ask_on_startup(store: &Store) -> usize {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["resume"],
+        run: resume,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 310,
+                text: r##"  wsp resume [<id>] [--print]       the agents that were running before herdr
+                                    restarted, offered back one row at a time:
+                                    ␣ to pick, ↵ to bring those back on the
+                                    session they were on. With an id, that one —
+                                    which may reach further back than the last
+                                    census. --print says how to do it by hand"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -509,6 +509,39 @@ fn cmd_restore(root: &Path, args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["artefact"],
+        run: artefact,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 630,
+                text: r##"  wsp artefact put <owner> <file> [--as <name>] [--note "…"|-]
+                                    write an asset for the person into ~/.compound/
+                                    artefacts/<owner>/: the file it replaces moves to
+                                    .versions first, so a new version is another put
+                                    of the same name, never `-v2` and never a copy over
+                                    it (a copy by hand is caught and saved as a version)"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 640,
+                text: r##"  wsp artefact versions <owner>/<name> [--json]
+                                    every version, oldest first, the current one last"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 650,
+                text: r##"  wsp artefact restore <owner>/<name> <n>
+                                    make version n current, as a new version"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

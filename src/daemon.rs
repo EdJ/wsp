@@ -1005,6 +1005,22 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["daemon"],
+        run: |store, args| run(store, args.has("verbose")),
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 80,
+                text: r##"  wsp daemon [-v]                   events + refresh loop (herdr [[startup]])"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     /// wsp-449: a machine with no daemon process and a `cycle.log` quiet for

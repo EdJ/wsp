@@ -708,6 +708,47 @@ pub(crate) fn add(old: &[Leg], new: New, actor: Option<&str>) -> Result<Vec<Leg>
 
 /// The record with `name` skipped, for a reason. A pending leg only; a running
 /// leg whose seat is gone goes through [`skip_seen`].
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["leg"],
+        run: dispatch,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 110,
+                text: r##"  wsp leg add <task> <name> --order FILE|- [--agent "claude opus high" --why "…"] [--after <leg>,…|-] [--before <leg>]
+                                    a leg of a row (docs/legs.md): appended under
+                                    ## Legs, waiting on the last leg unless
+                                    --after says otherwise. No --agent is claude
+                                    sonnet medium; another tier needs --why"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 120,
+                text: r##"  wsp leg after <task> <name> <leg>…|-   replace a pending leg's waits"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 130,
+                text: r##"  wsp leg skip <task> <name> "why"       a pending leg, never run"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 140,
+                text: r##"  wsp leg show <task> [<name>]           the legs, the tier and waits in full"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 150,
+                text: r##"  wsp leg done <task> [--from FILE|-] --caption "…"   a leg's seat ends it, at a clean
+                                         commit: the baton, the caption, the run poked"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 pub(crate) fn skip(old: &[Leg], name: &str, why: &str, actor: Option<&str>) -> Result<Vec<Leg>, String> {
     skip_seen(old, name, why, actor, &|_| true)

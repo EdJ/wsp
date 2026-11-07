@@ -952,6 +952,54 @@ fn state_of(p: &Paint, m: &Machine, live: Option<&MachineLive>) -> (String, Stri
     }
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["machine", "machines"],
+        run: dispatch,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Machines,
+                order: 10,
+                text: r##"  wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is
+                                    a Host alias from ~/.ssh/config, not an address"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Machines,
+                order: 20,
+                text: r##"  wsp machine ls|machines           what exists, and whether it is answering"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Machines,
+                order: 30,
+                text: r##"  wsp machine show <name>           ssh target, tunnel, last seen, why not"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Machines,
+                order: 40,
+                text: r##"  wsp machine set <name> k=v…       ssh/backend_at/os/arch/agents/status"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Machines,
+                order: 50,
+                text: r##"  wsp machine set seat agents=N     how many agents the run starts on this box"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Machines,
+                order: 60,
+                text: r##"  wsp machine retire <name>         it is not coming back: retire it and list
+                                    every row held on it (none is released)"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Machines,
+                order: 70,
+                text: r##"  wsp machine rm <name> --force     remove the record entirely"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

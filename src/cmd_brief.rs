@@ -1786,6 +1786,41 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["brief"],
+        run: brief,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 10,
+                text: r##"  wsp brief                         what this pane is for, and who else is working"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 20,
+                text: r##"  wsp brief --session               …and the work itself: the task's prose, what
+                                    binds it, what it names, the handbook. The
+                                    SessionStart hook's call — paid once at the
+                                    top of a session, not on every brief after"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["commit-help"],
+        run: commit_help,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 30,
+                text: r##"  wsp commit-help                   how to commit in a tree somebody else is in"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

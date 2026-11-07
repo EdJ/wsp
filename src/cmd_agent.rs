@@ -6785,6 +6785,281 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// `wsp reconcile` — rebuild bindings from claims, and say what it did.
+pub fn reconcile_verb(store: &Store, args: &crate::Args) -> i32 {
+    let r = reconcile(store, args.has("reap"));
+    println!("reconciled {} binding(s) from claims", r.bound);
+    println!("named {} pane(s) after the task they hold", r.named);
+    if args.has("reap") {
+        println!("ended {} claim(s) whose workspace is gone", r.reaped);
+        println!("emptied {} seat(s) whose agent is gone", r.stood_down);
+        println!("forgot {} panel record(s) whose workspace is gone", r.forgotten);
+    }
+    0
+}
+
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["claim"],
+        run: claim,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 260,
+                text: r##"  wsp claim <id>                    bind this pane to a task, leaving the last"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["release"],
+        run: release,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 430,
+                text: r##"  wsp release                       unbind this pane, leaving whatever is in it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 440,
+                text: r##"  wsp release <id>                  …or end that task's claim, wherever it is
+                                    held — including a claim no pane is under"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["pin"],
+        run: pin,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 450,
+                text: r##"  wsp pin <proj> [-w ws]            pin a workspace to a project"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 460,
+                text: r##"  wsp pin --top [-w ws]             pin it outside the tree entirely"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["unpin"],
+        run: unpin,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 470,
+                text: r##"  wsp unpin [-w ws]                 take the pin off again"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["where"],
+        run: where_am_i,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 480,
+                text: r##"  wsp where                         what project am I in, and why"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["agent"],
+        run: agent,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 490,
+                text: r##"  wsp agent kinds [--json]          the agent kinds wsp has behaviour for — name,
+                                    default, resume, models, efforts — for a menu
+                                    that should not keep its own list. Any other
+                                    kind herdr can start is passed by --kind"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 500,
+                text: r##"  wsp agent pi-extension            the pi extension this binary carries, which
+                                    `wsp install` writes into pi's extensions"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["wip", "status"],
+        run: wip,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 510,
+                text: r##"  wsp wip                           everything in flight, with agents"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["overlap"],
+        run: overlap,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 610,
+                text: r##"  wsp overlap                       who else is standing in this tree"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["peek"],
+        run: peek,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 690,
+                text: r##"  wsp peek [panel|view|board|<task>] [--source recent] [--lines N]
+                                    what is on that pane, or the frame the
+                                    sidebar surface last drew; --source recent
+                                    reaches back through what has scrolled past,
+                                    for when the question is what happened
+                                    rather than what is showing"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["sync"],
+        run: sync_once,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 70,
+                text: r##"  wsp sync [--force]                push tokens to herdr once"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["hook"],
+        run: hook,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 90,
+                text: r##"  wsp hook <event>                  herdr event-hook entrypoint"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["doctor"],
+        run: doctor,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 150,
+                text: r##"  wsp doctor                        integrity check"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["adopt"],
+        run: adopt,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 370,
+                text: r##"  wsp adopt [--yes]                 turn live workspaces into tasks"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["say"],
+        run: say,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 160,
+                text: r##"  wsp say "…" | - | --from FILE     say where you have got to, on your pane;
+                                    `--clear` takes the label off again. Prose
+                                    through a stream, the spelling every other
+                                    prose verb takes — a bare `-` with nothing
+                                    piped in is refused rather than worn"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["tell"],
+        run: tell,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 700,
+                text: r##"  wsp tell <id> "…" | - | --from F  say something to the agent holding that
+                                    task, without ending it — `-` reads the
+                                    message from stdin, --from from a file. The
+                                    repair for an agent whose turn stopped: the
+                                    conversation is intact, and a respawn throws
+                                    it away.
+                                    The same sentence twice inside two minutes
+                                    is read as a retry and refused; `--again`
+                                    means it. A seat that cannot say whether it
+                                    is at a prompt is refused rather than typed
+                                    at, because the text would land in whatever
+                                    dialog is holding the keyboard; look with
+                                    `wsp peek`, then `--anyway` takes the
+                                    decision yourself"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["flag"],
+        run: flag,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 170,
+                text: r##"  wsp flag <id> ["why"]             raise a hand on a task — at the seat that
+                                    governs it, or on every panel if there is none"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 180,
+                text: r##"  wsp flag <id> --title T --body -  …with a card: a heading and a paragraph"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 190,
+                text: r##"  wsp flag <id> --from FILE         …with that paragraph out of a file, the
+                                    spelling every other prose verb takes"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 200,
+                text: r##"  wsp flag <id> --ask claim         …and a question a keypress answers"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 220,
+                text: r##"  wsp flag [--clear <id>] [--seen <id>] [--seat] [--person]
+                                    what is raised, and whose it is; --seat
+                                    narrows it to this seat's own, --person to
+                                    the person's (no notice wsp wrote for a
+                                    seat); --clear lowers one, and --seen puts
+                                    the card away and leaves the hand up"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["reconcile"],
+        run: reconcile_verb,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 360,
+                text: r##"  wsp reconcile [--reap]            rebuild bindings from claims, and rename;
+                                    --reap ends claims whose workspace is gone"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

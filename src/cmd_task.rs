@@ -3205,6 +3205,338 @@ fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["add", "new"],
+        run: add,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 10,
+                text: r##"  wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 20,
+                text: r##"  wsp add "title" --parent <id>     a sub-task, filed where its parent is; refused from
+                                    a seat working that member, which stages legs instead
+                                    (`--anyway` files it, unrun)"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 30,
+                text: r##"  wsp add "title" --caption "…"     …with the line a glance reads, under 60"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 40,
+                text: r##"  wsp add "title" --after <id>[,<id>…]   …that rests on those, as `wsp after`"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["ls", "list"],
+        run: list,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 50,
+                text: r##"  wsp ls [-p proj] [-t tag] [-s status] [--all]"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["find", "search"],
+        run: find,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 60,
+                text: r##"  wsp find <text> [-p proj] [--all] [--full]
+                                    every task the words are in — the title or
+                                    the prose; the project you are in and open
+                                    work only, unless --all, which also reaches
+                                    the archive. It says when the answer is
+                                    somewhere you did not look. Stops at 20
+                                    hits and says how many more; --full for
+                                    all of them"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["inbox"],
+        run: inbox,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 70,
+                text: r##"  wsp inbox                         tasks with no project"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["show", "cat"],
+        run: show,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 80,
+                text: r##"  wsp show <id> [--log]             full task, including notes. The log is
+                                    the last few entries and says how many
+                                    earlier ones it did not print; --log for
+                                    all of them"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["decide"],
+        run: decide,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 230,
+                text: r##"  wsp decide <task|proj> "…"      record what was settled, and why"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 240,
+                text: r##"  wsp decide <t|p> "…" --supersedes d1   …and which earlier one it replaces"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["note"],
+        run: note,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 250,
+                text: r##"  wsp note <id> "text"              append to the log"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["start", "doing"],
+        run: |store, args| set_status(store, args, crate::model::Status::Doing),
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 90,
+                text: r##"  wsp start|review <id>           move through the workflow"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["done", "close"],
+        run: done,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 200,
+                text: r##"  wsp done <id> [--force]           the person's verb (a member finishes with
+                                    `wsp review`); complete; --force over open sub-tasks. Its
+                                    worktree and branch go too when the work is
+                                    on the trunk and nobody is in it; otherwise
+                                    kept and said why. --keep-tree leaves it"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["block"],
+        run: block,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 210,
+                text: r##"  wsp block <id> "reason"           stop it: somebody owes you an answer"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 260,
+                text: r##"  wsp block|park|decide|note <id> - | --from FILE
+                                    …and `wsp say` the same way, with no id
+                                    …or from stdin, or a file. A paragraph
+                                    typed between double quotes is rewritten by
+                                    the shell — every backtick in it runs a
+                                    command — and `-` is the path that never
+                                    meets one. For the log, one entry is one
+                                    line, so what arrives on several is folded"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["park", "pause"],
+        run: park,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 220,
+                text: r##"  wsp park <id> "reason"            not yet, deliberately — say what brings
+                                    it back. Open work, sorted last and drawn
+                                    quiet, and not counted as wanting you"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["review"],
+        run: review,
+        help: &[],
+    },
+    crate::verbs::Verb {
+        names: &["reopen"],
+        run: reopen,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 100,
+                text: r##"  wsp reopen|todo <id> "what is owed" [--no-seat]
+                                send work back: moves the row, tells
+                                its pane, and stops the run reading it as
+                                finished (`todo` sets the status and takes no prose).
+                                A row whose agent is gone is seated again:
+                                by its run, or with the kind and tier it ran
+                                with; --no-seat leaves it to you"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["todo"],
+        run: |store, args| set_status(store, args, crate::model::Status::Todo),
+        help: &[],
+    },
+    crate::verbs::Verb {
+        names: &["mv", "move"],
+        run: mv,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 310,
+                text: r##"  wsp mv <id> -p proj               reassign, sub-tree and all"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 320,
+                text: r##"  wsp mv <id> --parent <id>|none    re-parent it, or detach it"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["tag"],
+        run: tag,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 340,
+                text: r##"  wsp tag <id> +dsp -ui             adjust tags"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["ref"],
+        run: reference,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 350,
+                text: r##"  wsp ref <id> +PATH -PATH          the files this row names outside its own
+                                    tree. A spawned agent may reach them
+                                    without asking, and nothing above its tree
+                                    is reachable however it is written"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["prio", "priority"],
+        run: prio,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 360,
+                text: r##"  wsp prio <id> high|normal|low     what comes first inside its project"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["next"],
+        run: next,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 370,
+                text: r##"  wsp next [-p proj]                highest-priority actionable task"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["edit"],
+        run: edit,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 270,
+                text: r##"  wsp edit <id> [--overview|--details|--decisions]  prose, in $EDITOR"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 280,
+                text: r##"  wsp edit <id> --overview --from F|-    …or from a file, or stdin"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["rename"],
+        run: rename,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 290,
+                text: r##"  wsp rename <id> "title"           retitle it; the old title goes in the log"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["caption"],
+        run: caption,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 300,
+                text: r##"  wsp caption <id|slug> "…"|-|--clear   the line a glance reads, refused past
+                                    60; with none, the title's first clause.
+                                    `wsp review` asks for one"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["rm", "remove"],
+        run: rm,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 380,
+                text: r##"  wsp rm <id>                       retire it to the archive"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["archive"],
+        run: archive,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 390,
+                text: r##"  wsp archive [--days N] [-n] [--full]
+                                    sweep done tasks older than 30d into
+                                    archive/tasks/<month>/; --days 0 for every
+                                    finished task there is, -n for which ones
+                                    first and --full for all of that list"##,
+            },
+        ],
+    },
+];
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
