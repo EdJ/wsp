@@ -4967,6 +4967,14 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
         rotate_on_behalf(store, scope)
     }
 
+    fn end_when_idle(&self, store: &Store, seat: &str) -> Result<(), String> {
+        end_seat_when_idle(store, seat)
+    }
+
+    fn wait_idle(&self, seat: &str) {
+        wait_for_pane(seat)
+    }
+
     fn census(&self) -> Option<Vec<(String, String)>> {
         let herdr_here = crate::herdr::available_now();
         let mut heard = false;

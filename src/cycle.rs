@@ -246,6 +246,17 @@ pub(crate) trait Seats {
     fn rotate(&self, _store: &Store, _scope: &str) -> i32 {
         0
     }
+
+    /// Arrange the seat's ending for once it is not mid-turn —
+    /// `cmd_spawn::end_seat_when_idle`. Does nothing by default, and says so as
+    /// success: a fake that ended panes would be ending them out of a fixture.
+    fn end_when_idle(&self, _store: &Store, _seat: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Block until the pane is not mid-turn, or twenty minutes have passed —
+    /// `cmd_spawn::wait_for_pane`. Returns at once by default.
+    fn wait_idle(&self, _seat: &str) {}
 }
 
 /// The real reading, over the backends on this machine — with opencode's own
@@ -2752,7 +2763,7 @@ pub(crate) fn end_checks_when_idle(store: &Store, list: &str, at: usize) -> Vec<
 fn end_check(store: &Store, list: &str, id: &str) {
     let pane = store.panes_for_task(id).into_iter().next();
     if let Some(pane) = pane.as_deref().filter(|_| !cfg!(test)) {
-        crate::cmd_spawn::wait_for_pane(pane);
+        Seats::wait_idle(&Fleet, pane);
     }
     if !store.claims().contains_key(id) {
         log_line(store, &format!("{list}: {id} settled its barrier and has already gone — nothing to end"));
@@ -2766,7 +2777,7 @@ fn end_check(store: &Store, list: &str, id: &str) {
 /// with no row, which holds no claim — its standing entry is the test.
 fn end_check_seat(store: &Store, list: &str, seat: &str) {
     if !cfg!(test) {
-        crate::cmd_spawn::wait_for_pane(seat);
+        Seats::wait_idle(&Fleet, seat);
     }
     if crate::barrier::seat_of(store, seat).is_none() {
         log_line(store, &format!("{list}: the check in {seat} settled its barrier and has already gone — nothing to end"));
@@ -3103,7 +3114,7 @@ pub(crate) fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String
         tests::ENDED.with(|s| s.borrow_mut().push(seat.to_string()));
         return Ok(());
     }
-    crate::cmd_spawn::end_seat_when_idle(store, seat)
+    Seats::end_when_idle(&Fleet, store, seat)
 }
 
 /// Every agent this run opened that has nothing left to do, and holds a claim.

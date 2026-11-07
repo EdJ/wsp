@@ -85,7 +85,7 @@ cold -> worklist: touched  # trees -> engine
 cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
 cycle -> cmd_agent: did_of_seat, fixed_of_seat, notice, ran_of_seat, secs_of_seat  # engine -> seats
 cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
-cycle -> cmd_spawn: end_seat_when_idle, list_root, wait_for_pane  # engine -> seats
+cycle -> cmd_spawn: list_root  # engine -> seats
 cycle -> main: Args  # engine -> top
 cycle -> room: Counted, Gate, names  # engine -> seats
 cycle -> wake: messages_held, say, settle_held  # engine -> seats
