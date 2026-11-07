@@ -107,6 +107,22 @@ impl Tunnel {
         crate::far::beat(m, &seats, wire, &mut self.live, &util::now_iso())
     }
 
+    /// Whether [`Tunnel::beat_if_due`] would beat on this tick.
+    fn beat_due(&self) -> bool {
+        !self.next_beat.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// One daemon tick of beating: beat when due, and say the result only for a
+    /// tick that beat. A tick that did not beat has heard nothing from any seat,
+    /// so it must not read as "answered" (wsp-475).
+    fn beat_tick(&mut self, store: &Store, m: &Machine, wire: &dyn crate::far::Wire) {
+        if !self.beat_due() {
+            return;
+        }
+        let failed = self.beat_if_due(store, m, wire);
+        self.say_beats(store, m, &failed);
+    }
+
     /// Say in `cycle.log` what the beat's failures are, once per seat per change:
     /// a seat that stays deaf for the same reason is said once, and one that
     /// answers again after failing is said once too.
@@ -371,8 +387,7 @@ impl Supervisor {
             t.readd_if_due(store, m, &crate::far::Ssh);
             // After the re-add: a seat's socket is only there to dial once its
             // forward is back.
-            let failed = t.beat_if_due(store, m, &crate::far::Ssh);
-            t.say_beats(store, m, &failed);
+            t.beat_tick(store, m, &crate::far::Ssh);
         }
         t.recheck(store, m);
     }
@@ -1128,21 +1143,28 @@ mod tests {
         let wire = script();
         *wire.deaf.borrow_mut() = vec!["cpd-7".into()];
         let mut t = Tunnel::new();
+        // Ticks between beats: next_beat stays set, so only the first tick of
+        // each beat period beats, as the daemon's does.
         for _ in 0..3 {
-            t.next_beat = None;
-            let failed = t.beat_if_due(&store, &m, &wire);
-            t.say_beats(&store, &m, &failed);
+            for _ in 0..4 {
+                t.beat_tick(&store, &m, &wire);
+            }
+            assert!(!cycle_log(&store).contains("answers again"), "{}", cycle_log(&store));
+            t.next_beat = Some(Instant::now() - Duration::from_secs(1));
         }
         let log = cycle_log(&store);
         assert_eq!(log.matches("lease beat to cpd-7 failed: no answer").count(), 1, "{log}");
+        assert!(!log.contains("answers again"), "{log}");
         wire.deaf.borrow_mut().clear();
         for _ in 0..2 {
-            t.next_beat = None;
-            let failed = t.beat_if_due(&store, &m, &wire);
-            t.say_beats(&store, &m, &failed);
+            for _ in 0..4 {
+                t.beat_tick(&store, &m, &wire);
+            }
+            t.next_beat = Some(Instant::now() - Duration::from_secs(1));
         }
         let log = cycle_log(&store);
         assert_eq!(log.matches("answers again").count(), 1, "{log}");
+        assert_eq!(log.matches("lease beat to cpd-7 failed").count(), 1, "{log}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
