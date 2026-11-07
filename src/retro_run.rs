@@ -4,7 +4,8 @@
 
 use serde_json::{json, Value};
 
-use crate::cmd_report::{dir, esc, write};
+use crate::cmd_report::{esc, write};
+use crate::retro_yours::{arr, state, FILE};
 use crate::model::{Status, Task, Worklist};
 use crate::retro::{self, Figures, MAX_NEW};
 use crate::retro_series as series;
@@ -12,20 +13,10 @@ use crate::store::Store;
 use crate::util;
 use crate::base::args::Args;
 
-const FILE: &str = "retro.json";
-
-pub fn state(slug: &str) -> Value {
-    std::fs::read_to_string(dir(slug).join(FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
-}
-
 fn save(store: &Store, w: &Worklist, s: &Value, note: &str) -> Result<(), String> {
     write(&w.id, FILE, &serde_json::to_string_pretty(s).unwrap_or_default(), note)?;
     write(&w.id, "retro.html", &html(store, w, s), note)?;
     Ok(())
-}
-
-fn arr<'a>(s: &'a Value, k: &str) -> &'a [Value] {
-    s[k].as_array().map(Vec::as_slice).unwrap_or(&[])
 }
 
 fn mins(s: i64) -> String {
@@ -317,37 +308,10 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     0
 }
 
-/// The lines `wsp yours` adds: one per list whose retro finished in the last
-/// two days.
-pub fn yours_lines(store: &Store) -> Vec<String> {
-    let mut out = Vec::new();
-    for w in store.worklists() {
-        if w.retro.is_none() {
-            continue;
-        }
-        let s = state(&w.id);
-        if s["done"] != true || util::since(s["finished"].as_str().unwrap_or("")) > 2 * 86400 {
-            continue;
-        }
-        let of = |k: &str| -> (usize, String) {
-            let mine: Vec<&Value> = arr(&s, "filed").iter().filter(|f| f["kind"] == k).collect();
-            (mine.len(), mine.first().and_then(|f| f["list"].as_str()).unwrap_or("—").to_string())
-        };
-        let (k, dl) = of("defect");
-        let (q, ql) = of("question");
-        let n = k + q + arr(&s, "notes").len();
-        out.push(format!(
-            "{} cleared in {}; {n} causes; {k} defects on {dl}; {q} questions on {ql}",
-            w.id,
-            util::duration_human(s["wall"].as_i64().unwrap_or(0))
-        ));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd_report::dir;
 
     fn put(dirp: &std::path::Path, name: &str, text: &str) -> String {
         let p = dirp.join(name);
@@ -389,7 +353,7 @@ mod tests {
         assert_eq!(done(&store, &args(&["done", "l", &sum], &[])), 0);
         let html = std::fs::read_to_string(dir("l").join("retro.html")).unwrap();
         assert!(html.contains("Defects") && html.contains("Unclaimed start"));
-        let lines = yours_lines(&store);
+        let lines = crate::retro_yours::yours_lines(&store);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("l cleared in") && lines[0].contains("1 defects on retro-1") && lines[0].contains("0 questions"), "{}", lines[0]);
     }

@@ -5781,7 +5781,7 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     );
 
     // `wsp-472`: a clear gets a timing retro, if its guards pass.
-    crate::retro_run::at_clear(store, &w);
+    crate::cycle::launch_out(store, &["retro", &w.id, "--at-clear"]);
 
     if args.json() {
         println!(

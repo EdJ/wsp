@@ -259,6 +259,12 @@ pub fn retro(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no list `{slug}`");
         return 1;
     };
+    if args.has("at-clear") {
+        // What a clear launches (`cycle::launch_out`), so the engine names no
+        // module above it: the guards run here, and a skip is logged.
+        crate::retro_run::at_clear(store, &w);
+        return 0;
+    }
     if args.has("packet") {
         print!("{}", packet(store, &w));
         return 0;
