@@ -491,7 +491,7 @@ impl Briefing {
             // otherwise resolve to whichever project's root it is, and hand it
             // that project's handbook, backlog and decisions as though it were
             // their custodian.
-            project: match governed.as_deref().is_some_and(cmd_govern::is_primary) {
+            project: match governed.as_deref().is_some_and(crate::governors::is_primary) {
                 true => None,
                 false => current_project(store, args, &world.index).unwrap_or(None),
             },
@@ -520,7 +520,7 @@ impl Briefing {
 
 /// The scope this pane holds the slot of: asked with the pane when there is
 /// one, and with the room only when there is not, which is
-/// [`cmd_govern::seat_query`]'s order.
+/// [`crate::place::seat_query`]'s order.
 ///
 /// Both readings used to ask only when there was a room, and a room here is
 /// `HERDR_WORKSPACE_ID`. A compound seat has none, so after a rotation the
@@ -530,7 +530,7 @@ impl Briefing {
 /// cannot disagree.
 fn held(governors: &std::collections::BTreeMap<String, serde_json::Value>, workspace: Option<&str>, pane: Option<&str>) -> Option<String> {
     let who = pane.filter(|p| !p.is_empty()).or(workspace)?;
-    cmd_govern::governs(governors, &crate::place::Seat::new(who))
+    crate::place::governs(governors, &crate::place::Seat::new(who))
 }
 
 /// The brief, composed: every decision made and nothing drawn yet.
@@ -589,7 +589,7 @@ pub(crate) struct Brief {
     /// wsp: the brief is re-read on every request of every session, so a line
     /// that is present when nobody is coordinating is a line paid tens of
     /// thousands of times a night for a fact that is always the same.
-    pub seat: Option<(cmd_govern::Seat, bool)>,
+    pub seat: Option<(crate::governors::Seat, bool)>,
 
     /// Which group of a running worklist the task in hand is a member of.
     ///
@@ -903,7 +903,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
             // The row's walk, the seat whose work order started it before its
             // project's (`wsp-216`) — the one this agent's `wsp ask` reaches.
             Some(t) => cmd_govern::seat_for_task(&b.governors, index, b.lists.list_for(t), t, b.project.as_deref()),
-            None => cmd_govern::seat_for(&b.governors, index, None, b.project.as_deref()),
+            None => crate::governors::seat_for(&b.governors, index, None, b.project.as_deref()),
         }
         .map(|s| {
             // The pane's and not the room's: a worker beside a custodian was
@@ -1344,7 +1344,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // draws only under a seat, and the brief is re-read on every request of
     // every session.
     let awake = r.daemon.as_ref().map(|d| format!("  {}", p.yellow(d)));
-    if r.custodian.as_deref().is_some_and(cmd_govern::is_primary) {
+    if r.custodian.as_deref().is_some_and(crate::governors::is_primary) {
         row(
             "seat",
             format!(
@@ -2008,7 +2008,7 @@ mod tests {
     #[test]
     fn the_primary_interface_is_told_it_governs_nothing() {
         let mut r = compose(&briefing());
-        r.custodian = Some(cmd_govern::PRIMARY.into());
+        r.custodian = Some(crate::governors::PRIMARY.into());
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("primary interface") && text.contains("governs nothing"), "{text}");
         assert!(!text.contains("governor of"), "{text}");

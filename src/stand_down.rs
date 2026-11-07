@@ -80,7 +80,7 @@ fn rotating(store: &Store, scope: &str) -> bool {
 fn stand_down_done_lists(store: &Store) {
     let governors = store.governors();
     for w in store.worklists().iter().filter(|w| w.status() == WorklistStatus::Done) {
-        if cmd_govern::seat_of_scope(&w.id, &governors).is_some() && !rotating(store, &w.id) {
+        if crate::governors::seat_of_scope(&w.id, &governors).is_some() && !rotating(store, &w.id) {
             crate::cycle::stand_down_own_seat(store, &w.id);
         }
     }
@@ -111,10 +111,10 @@ fn stand_down_idle_projects(store: &Store, seats: &dyn Seats, now: i64, idle_sec
     let index = crate::resolve::Index::new(projects.clone());
     let governors = store.governors();
     for (scope, rec) in governors.iter() {
-        if cmd_govern::is_primary(scope) || !projects.iter().any(|p| &p.id == scope) {
+        if crate::governors::is_primary(scope) || !projects.iter().any(|p| &p.id == scope) {
             continue;
         }
-        let Some(seat) = cmd_govern::seat_of_scope(scope, &governors) else { continue };
+        let Some(seat) = crate::governors::seat_of_scope(scope, &governors) else { continue };
         // A seat that cannot be read is held, as everywhere: only an agent at
         // a prompt is idle.
         let at_a_prompt = seats.state(&seat.pane) == Some(State::Idle);
@@ -143,12 +143,12 @@ fn stand_down_idle_projects(store: &Store, seats: &dyn Seats, now: i64, idle_sec
 }
 
 fn stand_down_project(store: &Store, scope: &str, minutes: i64) {
-    let Some(seat) = cmd_govern::seat_of_scope(scope, &store.governors()) else { return };
+    let Some(seat) = crate::governors::seat_of_scope(scope, &store.governors()) else { return };
     // Read before the vacate, which empties the record the room is found by.
     let sitting = crate::cycle::occupied(store, &seat);
     cmd_govern::vacate(store, scope);
     let said = |tail: &str| {
-        crate::cycle::log_line(store, &format!("{scope}: nothing under its seat for {minutes} minutes — stood its seat down{tail}"))
+        crate::store::log_line(store, &format!("{scope}: nothing under its seat for {minutes} minutes — stood its seat down{tail}"))
     };
     let Some(pane) = sitting else { return said("; nobody was sitting in it") };
     match crate::cycle::end_seat_when_idle(store, &pane) {
@@ -197,7 +197,7 @@ mod tests {
     }
 
     fn seated(store: &Store, scope: &str) -> bool {
-        cmd_govern::seat_of_scope(scope, &store.governors()).is_some()
+        crate::governors::seat_of_scope(scope, &store.governors()).is_some()
     }
 
     fn a_list(store: &Store, id: &str, status: WorklistStatus, member: &str) {
@@ -221,7 +221,7 @@ mod tests {
         tick_at(&store, &idle(), T0 + 30 * MIN, 30);
         assert_eq!(ended(), vec!["cpd-1".to_string()]);
         assert!(!seated(&store, "p"), "vacated");
-        assert!(cmd_govern::stood_at(&store.governors(), "p").is_none(), "not a person's decision: a new ask seats it");
+        assert!(crate::governors::stood_at(&store.governors(), "p").is_none(), "not a person's decision: a new ask seats it");
         tick_at(&store, &idle(), T0 + 31 * MIN, 30);
         assert!(ended().is_empty(), "once");
     }
@@ -294,13 +294,13 @@ mod tests {
     fn the_primary_and_a_zero_idle_time_are_never_stood_down() {
         let (_env, store) = world("primary");
         store.set_governor(
-            cmd_govern::PRIMARY,
+            crate::governors::PRIMARY,
             serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1", "host": util::hostname() }),
         );
-        store.save_project(&crate::model::Project::new(cmd_govern::PRIMARY)).unwrap();
+        store.save_project(&crate::model::Project::new(crate::governors::PRIMARY)).unwrap();
         tick_at(&store, &idle(), T0, 30);
         tick_at(&store, &idle(), T0 + 90 * MIN, 30);
-        assert!(seated(&store, cmd_govern::PRIMARY), "the person's seat stays");
+        assert!(seated(&store, crate::governors::PRIMARY), "the person's seat stays");
         ended();
         tick_at(&store, &idle(), T0 + 200 * MIN, 0);
         assert!(ended().is_empty(), "0 is off");
@@ -322,7 +322,7 @@ mod tests {
         tick_at(&store, &idle(), T0, 0);
         assert_eq!(ended(), vec!["cpd-7".to_string()]);
         assert!(!seated(&store, "run"));
-        assert!(cmd_govern::stood_at(&store.governors(), "run").is_some(), "stood down, so the reconciler does not refill it");
+        assert!(crate::governors::stood_at(&store.governors(), "run").is_some(), "stood down, so the reconciler does not refill it");
         tick_at(&store, &idle(), T0, 0);
         assert!(ended().is_empty(), "once");
     }

@@ -246,7 +246,7 @@ fn caption_for(seen: &Seen) -> String {
 /// A start, said where it is read: `cycle.log`, and the record `wip` draws.
 /// (The list's own log has it already, as `go`'s `started` line.)
 fn told(store: &Store, id: &str, why: &str) {
-    crate::cycle::log_line(store, &format!("{id}: {why}"));
+    crate::store::log_line(store, &format!("{id}: {why}"));
     let at = util::now_iso();
     store.update_pickup(|m| {
         let mut started: Vec<Value> = m.get("started").and_then(|s| s.as_array()).cloned().unwrap_or_default();
@@ -264,7 +264,7 @@ fn told(store: &Store, id: &str, why: &str) {
 
 /// `go` turned the list away: said once, and not tried again for a while.
 fn refuse(store: &Store, id: &str, code: i32) {
-    crate::cycle::log_line(
+    crate::store::log_line(
         store,
         &format!("{id}: planned and first in the queue, but go refused it (exit {code}) — daemon.log has the reason; tried again in {}", util::duration_human(REFUSED_FOR)),
     );

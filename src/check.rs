@@ -1034,7 +1034,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         Ok(tg) => Target { since: args.get("since"), ..tg },
         Err(why) => {
             if auto {
-                crate::cycle::log_line(store, &format!("check {}: not run — {why}", t.id));
+                crate::store::log_line(store, &format!("check {}: not run — {why}", t.id));
             } else {
                 eprintln!("wsp: {why}");
             }
@@ -1172,7 +1172,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     }
     if settled == Settled::Malformed {
         let ask = owed(&ran, &tg.sha).replace("<id>", &t.id);
-        crate::cycle::log_line(store, &format!("check {}: malformed — {ask}", t.id));
+        crate::store::log_line(store, &format!("check {}: malformed — {ask}", t.id));
         crate::cmd_task::deliver_notice(store, &t.id, &ask);
     }
     if record {
@@ -1595,7 +1595,7 @@ fn gave_up(store: &Store, id: &str, entry: Option<&str>, why: &str) -> i32 {
     if let Some(at) = entry {
         abandon(store, id, at);
     }
-    crate::cycle::log_line(store, &format!("check {id}: not run — {why}"));
+    crate::store::log_line(store, &format!("check {id}: not run — {why}"));
     eprintln!("wsp: check {id}: not run — {why}");
     1
 }

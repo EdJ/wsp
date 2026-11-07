@@ -200,7 +200,7 @@ impl Asks {
                 .about
                 .task()
                 .and_then(|id| store.find_task(id))
-                .and_then(|t| crate::cmd_govern::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref()))
+                .and_then(|t| crate::governors::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref()))
                 .map(|s| On::Seat(s.scope))
                 .filter(|_| !held)
                 .unwrap_or(On::Person);
@@ -341,7 +341,7 @@ impl Shells {
         if cfg!(test) {
             return Shells::default();
         }
-        let backends = crate::cmd_spawn::local_backends();
+        let backends = crate::place::local_backends();
         let roots: Vec<(String, u32)> = seats
             .into_iter()
             .filter_map(|s| {

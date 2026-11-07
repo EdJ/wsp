@@ -22,7 +22,7 @@
 //! The tier says what served an attempt and the outcome says what came of it;
 //! neither says what it consumed, and a routing policy is an argument about
 //! spend. So a third clause was added to the same line, in
-//! [`crate::agent_commands::Spend`]'s units — read from the cache, read for the
+//! [`crate::agent_kind::Spend`]'s units — read from the cache, read for the
 //! first time, produced — plus a price for the kind that publishes one.
 //!
 //! **Both kinds are read in the same units on purpose.** opencode publishes
@@ -74,7 +74,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use crate::agent_commands::Spend;
+use crate::agent_kind::Spend;
 use crate::model::Task;
 use crate::resolve::Index;
 use crate::store::Store;
@@ -203,7 +203,7 @@ fn agrees(spawned: &str, ran: &str) -> bool {
     // splitting at the first did for every label already on record: `opus[1m]`
     // and `opus-5/high` both parse the same either way.
     //
-    // The one shape that would still be ambiguous is a [`crate::agent_commands::Ran`]
+    // The one shape that would still be ambiguous is a [`crate::agent_kind::Ran`]
     // whose model contains a slash and which states no effort — `label` omits
     // the half when there is none. `core-029` is where the kind that would
     // produce one arrived, and what it does instead is write `default`: an
@@ -256,7 +256,7 @@ impl Row {
 /// the part that cannot be filled in: `core-045` says a turn that died
 /// upstream records as one that ran without a clause at all, so a sum over the
 /// clauses is a floor on what was spent and never the bill. A stated zero
-/// survives — [`crate::agent_commands::Spend::micros`] holds `Some(0)` for a
+/// survives — [`crate::agent_kind::Spend::micros`] holds `Some(0)` for a
 /// free model, and that is a fact the runtime stated rather than one computed
 /// here — but a mix of priced and unpriced attempts answers `None` rather than
 /// a number that quietly means *the priced ones only*.
@@ -742,7 +742,7 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
             util::pad("task", w_task),
             util::pad("tier", w_tier),
             // `turns` and not `reqs`: one word for one thing, the same one the
-            // log line and [`crate::agent_commands::Ran`] use. What it counts
+            // log line and [`crate::agent_kind::Ran`] use. What it counts
             // is API requests — see there — and a report with a second name
             // for it would be two vocabularies for one number.
             util::pad("turns", 5),
@@ -1067,7 +1067,7 @@ fn cost_table(p: &Paint, rc: &RowCost) -> String {
         out.push(p.dim(&line));
     }
     for (leg, tier, why) in &rc.off_default {
-        let why = if why.is_empty() { "no why: recorded".to_string() } else { crate::cmd_task::fold(why) };
+        let why = if why.is_empty() { "no why: recorded".to_string() } else { crate::util::fold(why) };
         out.push(p.dim(&format!("  leg {leg} on {tier} — {why}")));
     }
     out.join("\n")

@@ -588,12 +588,12 @@ pub(crate) fn say(store: &Store, tree: Tree) {
     match tree {
         Tree::Removed { path, kept } => {
             let branch = kept.map(|b| format!(" (branch {b} kept)")).unwrap_or_default();
-            crate::cycle::log_line(store, &format!("removed leg tree {path}: its leg is over and merged{branch}"));
+            crate::store::log_line(store, &format!("removed leg tree {path}: its leg is over and merged{branch}"));
         }
         Tree::Kept { path, why } => {
             let line = format!("kept leg tree {path}: {why}");
             if SAID.lock().map(|mut s| s.insert(line.clone())).unwrap_or(true) {
-                crate::cycle::log_line(store, &line);
+                crate::store::log_line(store, &line);
             }
         }
         Tree::Absent => {}

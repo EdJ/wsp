@@ -69,7 +69,7 @@ pub fn from_map(
     workspace: Option<&str>,
 ) -> Option<String> {
     let rec = agent
-        .filter(|a| crate::place::is_agent_id(a))
+        .filter(|a| crate::util::is_agent_id(a))
         .and_then(|a| mandates.get(a))
         .or_else(|| workspace.and_then(|w| mandates.get(w)))?;
     // A mandate names a machine as well as its key: a workspace id is
@@ -255,7 +255,7 @@ mod tests {
         assert!(store.agents_held().is_empty(), "nobody has claimed here yet");
 
         let minted = store.agent_for_seat("w1:p1");
-        assert!(crate::place::is_agent_id(&minted), "{minted}");
+        assert!(crate::util::is_agent_id(&minted), "{minted}");
         assert_eq!(
             store.agents_held().get(&minted).and_then(|a| a.get("seat")).and_then(|s| s.as_str()),
             Some("w1:p1")

@@ -8,12 +8,12 @@ use crate::message::{self, Ask, Message, Shape};
 use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
 use crate::store::Store;
-use crate::util::{self, Paint};
+use crate::util::{self, fold, read_source, Paint};
 use crate::Args;
 
 pub fn add(store: &Store, args: &Args) -> i32 {
     // Asked only of a sub-task: the seat matters to nothing else `add` does.
-    let pane = args.get("parent").and_then(|_| crate::cmd_agent::my_pane());
+    let pane = args.get("parent").and_then(|_| crate::place::my_pane());
     add_from(store, args, pane.as_deref())
 }
 
@@ -1316,7 +1316,7 @@ fn reseat(store: &Store, args: &Args, run: Option<String>) {
         0 => format!("reseated after reopen: wsp {}", argv.join(" ")),
         _ => format!("reseat after reopen failed: {said}"),
     };
-    crate::cycle::log_line(store, &format!("{id}: {line}"));
+    crate::store::log_line(store, &format!("{id}: {line}"));
 }
 
 /// `spawn <id> --agent` with the kind, model and effort the row last ran with,
@@ -1446,7 +1446,7 @@ pub(crate) fn deliver(store: &Store, id: &str, line: &str) -> bool {
     {
         Ok(c) => c,
         Err(e) => {
-            crate::cycle::log_line(store, &format!("tell {id}: could not run `wsp tell` ({e})"));
+            crate::store::log_line(store, &format!("tell {id}: could not run `wsp tell` ({e})"));
             return false;
         }
     };
@@ -1459,9 +1459,9 @@ pub(crate) fn deliver(store: &Store, id: &str, line: &str) -> bool {
         Ok(o) => (false, format!("not delivered — {}", util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120))),
         Err(e) => (false, format!("not delivered — {e}")),
     };
-    crate::cycle::log_line(store, &format!("tell {id}: {said}"));
+    crate::store::log_line(store, &format!("tell {id}: {said}"));
     if !delivered {
-        crate::cycle::log_line(store, &format!(
+        crate::store::log_line(store, &format!(
             "{id} is at doing with the reason on its row, but its pane did not get it — wsp retries when its seat reads idle, or `wsp tell {id} --anyway -`"
         ));
     }
@@ -1628,7 +1628,7 @@ pub fn review(store: &Store, args: &Args) -> i32 {
     // the last running leg the rest are skipped (`docs/legs.md`, *A leg is a
     // seat*). Refused before the row moves.
     if let Some(needle) = args.rest.first() {
-        if let Err(why) = crate::leg_seat::on_review(store, needle, &account, crate::cmd_agent::my_pane().as_deref()) {
+        if let Err(why) = crate::leg_seat::on_review(store, needle, &account, crate::place::my_pane().as_deref()) {
             eprintln!("wsp: {why}");
             return 1;
         }
@@ -1719,27 +1719,6 @@ pub(crate) fn payload_source(payload: &[String]) -> Option<String> {
         [flag, path] if flag == "--from" => Some(path.clone()),
         _ => None,
     }
-}
-
-/// One entry is one line, so text that arrives on several becomes one.
-///
-/// Not tidying: the `## Log` section is read line-by-line by everything that
-/// reads it — `brief` shows the last few *lines* as the last few entries,
-/// `blocked_question` scans for one, `localise_dates` rewrites the stamp at the
-/// head of each. A forty-line survey pasted in whole is forty entries to all of
-/// them, and it would push every other entry out of the brief that every
-/// session on the task pays for. Folding keeps every word and costs the
-/// paragraph breaks; the alternative costs the reader.
-///
-/// `cmd_install` folds its `--why` through here for the neighbouring reason: a
-/// lock line is one sentence long — "held by w1:p6 for 3s — installing fdefcab"
-/// — and a paragraph pasted into one is a line nobody can read either side of.
-/// `cmd_worklist` folds stop prose and barrier verdicts through it for the
-/// first reason exactly: `## Groups` is read line by line too, so a blank line
-/// inside a `stop:` block ends the block, and prose stored with one comes back
-/// next read truncated at the gap.
-pub(crate) fn fold(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The prose for a log entry or a decision: the rest of the line, or the stream
@@ -2766,27 +2745,6 @@ pub(crate) fn prose_source(args: &Args) -> Option<String> {
         Some(v) if v == "true" => Some("-".into()),
         other => other,
     }
-}
-
-pub(crate) fn read_source(src: &str) -> std::io::Result<String> {
-    let raw = if src == "-" {
-        use std::io::Read;
-        let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s)?;
-        s
-    } else {
-        std::fs::read_to_string(util::expand(src))?
-    };
-    // A stream is the safe path and still not a trusted one: `wsp note <id> -`
-    // with a build's log on the other end of the pipe is the same damage as
-    // the substitution in [`crate::util::terminal_output`], arrived by hand.
-    // Checked here rather than at each caller because this is the one door
-    // every stream comes through, and every caller already prints what it
-    // could not read.
-    if let Some(why) = util::terminal_output(&raw) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, why));
-    }
-    Ok(raw)
 }
 
 /// Edit prose without ever showing anyone the frontmatter.

@@ -110,7 +110,7 @@ pub(crate) fn late_clause(baton_at: i64, now: i64, by_wsp: Option<&str>) -> Stri
 pub(crate) fn caption_of(baton: &str) -> String {
     let first = baton.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
     let first = first.trim_start_matches(['#', '-', '*', '>', ' ']);
-    util::truncate(&crate::cmd_task::fold(first), 100)
+    util::truncate(&crate::util::fold(first), 100)
 }
 
 /// The words every order about closing carries (wsp-372): its own call, never
@@ -252,7 +252,7 @@ pub(crate) fn note_close(store: &Store, row: &str, what: &str, written: i64, by_
     }
     let clause = late_clause(written, now, by_wsp).replace("baton written", "verdict written");
     let line = format!("{what}{clause}");
-    crate::cycle::log_line(store, &format!("{row}: {line}"));
+    crate::store::log_line(store, &format!("{row}: {line}"));
     let id = row.to_string();
     store.locked(|| {
         let Some(mut t) = store.find_task(&id) else { return false };
@@ -449,7 +449,7 @@ fn tell_to_close(store: &Store, row: &str, leg: &str, seat: &str, idle_min: i64)
         util::contract(&baton),
         SECOND_WINDOW / 60
     );
-    crate::cycle::log_line(store, &format!("leg {leg} of {row}: {seat} idle {idle_min} min with the leg open — told to close it"));
+    crate::store::log_line(store, &format!("leg {leg} of {row}: {seat} idle {idle_min} min with the leg open — told to close it"));
     crate::repair::tell_member(store, seat, &text);
 }
 
@@ -538,7 +538,7 @@ fn settle(store: &Store, row: &str, leg: &str, seat: &str, baton_at: Option<i64>
     let late = crate::leg_seat::Late { baton_at: baton_at.unwrap_or(now), by_wsp: Some(why.words()) };
     match crate::leg_seat::finish(store, row, leg, seat, &baton, &caption, Some(&late)) {
         Ok(_) => {
-            crate::cycle::log_line(
+            crate::store::log_line(
                 store,
                 &format!("leg {leg} of {row}: closed by wsp: {}, baton written at {}", why.words(), clock(baton_at.unwrap_or(now))),
             );
@@ -549,8 +549,8 @@ fn settle(store: &Store, row: &str, leg: &str, seat: &str, baton_at: Option<i64>
             true
         }
         Err(refused) => {
-            crate::cycle::log_line(store, &format!("leg {leg} of {row}: wsp's close for {seat} was refused: {}", util::truncate(&crate::cmd_task::fold(&refused), 300)));
-            flag(store, row, leg, seat, &format!("{}; wsp tried the close and it was refused: {}", evidence("closing it was tried"), util::truncate(&crate::cmd_task::fold(&refused), 300)));
+            crate::store::log_line(store, &format!("leg {leg} of {row}: wsp's close for {seat} was refused: {}", util::truncate(&crate::util::fold(&refused), 300)));
+            flag(store, row, leg, seat, &format!("{}; wsp tried the close and it was refused: {}", evidence("closing it was tried"), util::truncate(&crate::util::fold(&refused), 300)));
             true
         }
     }
@@ -571,7 +571,7 @@ fn flag(store: &Store, row: &str, leg: &str, seat: &str, evidence: &str) {
 /// the list to tell when the row is not a task of one (a check's).
 fn flag_about(store: &Store, row: &str, what: &str, seat: &str, evidence: &str, fix: &str, list: Option<&Worklist>, governor: bool) {
     use crate::message::{self, About, Kind, Message, Party};
-    crate::cycle::log_line(store, &format!("{what} of {row}: needs a person — {evidence}"));
+    crate::store::log_line(store, &format!("{what} of {row}: needs a person — {evidence}"));
     let text = format!("{row}: {what} is open and its seat {seat} is not closing it\n\n{evidence}.\n\n{fix}");
     let about = match list {
         Some(w) => About::Scope(w.id.clone()),
@@ -604,7 +604,7 @@ fn tell_verdict(store: &Store, kind: Kind, key: &str, seat: &str, idle_min: i64,
         util::contract(&path),
         SECOND_WINDOW / 60
     );
-    crate::cycle::log_line(store, &format!("{what}: {seat} idle {idle_min} min with it open — told to close it"));
+    crate::store::log_line(store, &format!("{what}: {seat} idle {idle_min} min with it open — told to close it"));
     crate::repair::tell_member(store, seat, &text);
 }
 
@@ -662,7 +662,7 @@ pub(crate) fn close_member(store: &Store, t: &crate::model::Task, seat: &str, wh
             }
             return true;
         }
-        crate::cycle::log_line(store, &format!("{id}: wsp's `wsp review` for {seat} was refused (exit {code})"));
+        crate::store::log_line(store, &format!("{id}: wsp's `wsp review` for {seat} was refused (exit {code})"));
         let evidence = verdict_evidence(store, id, Kind::Member, written, &tree, why, "wsp tried the review and it was refused");
         flag_member(store, t, seat, &evidence, start, !matches!(why, Why::Ended));
         return false;
@@ -747,7 +747,7 @@ fn settle_verifier(store: &Store, member: &str, seat: &str, start: Option<i64>, 
         }
         return true;
     }
-    crate::cycle::log_line(store, &format!("{member}: wsp's `wsp verified` for {seat} was refused (exit {code}) at {}", clock(now)));
+    crate::store::log_line(store, &format!("{member}: wsp's `wsp verified` for {seat} was refused (exit {code}) at {}", clock(now)));
     let evidence = verdict_evidence(store, member, Kind::Verifier, written, &tree, why, "wsp tried the verdict and it was refused");
     flag_about(store, member, "the verifier", seat, &evidence, &fix, None, true);
     true
@@ -813,7 +813,7 @@ fn settle_check(store: &Store, w: &Worklist, at: usize, seat: &str, start: Optio
         }
         return true;
     }
-    crate::cycle::log_line(store, &format!("{}: wsp's `{word}` for {seat} was refused (exit {code}) at {}", w.id, clock(now)));
+    crate::store::log_line(store, &format!("{}: wsp's `{word}` for {seat} was refused (exit {code}) at {}", w.id, clock(now)));
     let evidence = verdict_evidence(store, &key, Kind::Check, written, &tree, why, &format!("wsp tried `{word}` and it was refused"));
     flag_about(store, &w.id, &what, seat, &evidence, &fix, Some(w), true);
     true

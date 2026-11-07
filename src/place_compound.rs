@@ -23,7 +23,7 @@
 //! exist, and the answer is: the same ones `place_super` already uses.
 //! Claude Code fires the same lifecycle hooks whether its stdin is a `tail
 //! -f` or a real pty — a hook does not know what is on the other end of its
-//! stdio — so [`crate::place_super::said_by`], [`crate::place_super::alive`]
+//! stdio — so [`crate::place_super::said_by`], [`crate::util::alive`]
 //! and [`crate::place_super::tally_burn`] are reused verbatim rather than
 //! copied. What differs is only what a seat *records*: a `compound-sup`
 //! socket and pid instead of a `tail`/agent process pair. Two directories,
@@ -136,7 +136,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::place::{self, Agent, Census, Delivery, Event, Order, Place, Refusal, Result, Seat, Seated, State};
-use crate::place_super::{alive, read_json, signal_group, str_of, tally_burn};
+use crate::util::alive;
+use crate::place_super::{read_json, signal_group, str_of, tally_burn};
 #[cfg(test)]
 use crate::place_super::said_by;
 use crate::store::{write_atomic, Store};

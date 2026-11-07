@@ -829,12 +829,12 @@ fn why_given(args: &Args) -> Result<Why, i32> {
                 eprintln!("     a backtick inside double quotes runs a command. `--why -` reads the sentence from a stream, where a shell never sees it");
                 return Err(2);
             }
-            return Ok(Why { text: Some(crate::cmd_task::fold(&s)), took_dash });
+            return Ok(Why { text: Some(crate::util::fold(&s)), took_dash });
         }
         Reason::Stream => (piped()?, "stdin".to_string()),
         Reason::File(path) => {
             let named = util::contract(&util::expand(&path));
-            match crate::cmd_task::read_source(&path) {
+            match crate::util::read_source(&path) {
                 Ok(text) => (text, named),
                 Err(e) => {
                     eprintln!("wsp: cannot read {named}: {e}");
@@ -849,7 +849,7 @@ fn why_given(args: &Args) -> Result<Why, i32> {
     // one is a line nobody can read either side of. Folding keeps every word
     // and costs the paragraph breaks, which is the trade `note` makes for the
     // same reason.
-    let text = crate::cmd_task::fold(&raw);
+    let text = crate::util::fold(&raw);
     if text.is_empty() {
         // An empty stream reads exactly like no `--why` at all, and the two
         // want different things done about them: one is a caller who left the
@@ -924,7 +924,7 @@ fn piped() -> Result<String, i32> {
         eprintln!("wsp: nothing is piped in — `--why -` reads the sentence from a stream");
         return Err(2);
     }
-    crate::cmd_task::read_source("-").map_err(|e| {
+    crate::util::read_source("-").map_err(|e| {
         eprintln!("wsp: cannot read stdin: {e}");
         1
     })
@@ -1524,7 +1524,7 @@ fn stale_watchers(store: &Store, ours: &Built) -> Vec<crate::cmd_watch::Register
         .into_iter()
         .filter(|w| w.watching() && !w.daemon && !w.build.is_empty() && w.build != live)
         .collect();
-    let alive = crate::place_super::alive(&watches.iter().map(|w| w.pid).collect::<Vec<_>>());
+    let alive = crate::util::alive(&watches.iter().map(|w| w.pid).collect::<Vec<_>>());
     watches.into_iter().filter(|w| alive.contains(&w.pid)).collect()
 }
 

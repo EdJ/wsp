@@ -490,7 +490,7 @@ pub(crate) fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> 
     }
     let bindings = store.bindings();
     let governors = store.governors();
-    for backend in crate::cmd_spawn::local_backends() {
+    for backend in crate::place::local_backends() {
         let Ok(c) = backend.census() else { continue };
         for s in c.seats() {
             let seat = s.seat.as_str();
@@ -499,7 +499,7 @@ pub(crate) fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> 
                 continue;
             }
             let workspace = seat.split(':').next().unwrap_or(seat);
-            let governs = crate::cmd_govern::governs(&governors, &crate::cmd_govern::seat_query(workspace, Some(seat))).is_some();
+            let governs = crate::place::governs(&governors, &crate::place::seat_query(workspace, Some(seat))).is_some();
             let agent = match crate::cmd_govern::needs_a_person(s.state.stopped(), true, governs) {
                 true => Agent::WantsYou,
                 false => Agent::Working,

@@ -86,7 +86,7 @@ use serde_json::json;
 // both parsed line by line, so a divergence between two implementations would
 // be a divergence in what each section can hold. `worklist-045` made it
 // `pub(crate)` for its second caller; this is the third.
-use crate::cmd_task::fold;
+use crate::util::fold;
 use crate::history::{self, History};
 use crate::model::{Group, Landed, Status, Worklist, WorklistStatus, DEFAULT_POLICY, MANUAL};
 use crate::store::Store;
@@ -411,7 +411,7 @@ fn maker(store: &Store) -> Option<String> {
     let pane = crate::place::seat_from_env()
         .map(|s| s.to_string())
         .or_else(|| crate::herdr::Env::read().pane_id.filter(|p| !p.is_empty()))?;
-    if let Some(scope) = crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(&pane)) {
+    if let Some(scope) = crate::place::governs(&store.governors(), &crate::place::Seat::new(&pane)) {
         return match store.worklist(&scope) {
             Some(list) => worklist::home(store, &list).map(|h| h.project),
             None => Some(scope),
@@ -1615,7 +1615,7 @@ fn reason(args: &Args) -> Result<Option<String>, i32> {
         eprintln!("wsp: nothing is piped in — `--why -` reads the reason from a stream");
         return Err(2);
     }
-    match crate::cmd_task::read_source("-") {
+    match crate::util::read_source("-") {
         Ok(text) => match fold(&text) {
             t if t.is_empty() => {
                 eprintln!("wsp: nothing on stdin — `--why -` wants the reason there");
@@ -1852,7 +1852,7 @@ fn stop_prose(args: &Args) -> Result<String, i32> {
         eprintln!("wsp: nothing is piped in — `--stop -` reads the prose from a stream");
         return Err(2);
     }
-    match crate::cmd_task::read_source(&src) {
+    match crate::util::read_source(&src) {
         Ok(text) => {
             let text = fold(&text);
             if text.is_empty() {
@@ -3223,7 +3223,7 @@ fn words(args: &Args, from: usize) -> Result<String, i32> {
         eprintln!("wsp: nothing is piped in — `-` reads the sentence from a stream");
         return Err(2);
     }
-    match crate::cmd_task::read_source(&src) {
+    match crate::util::read_source(&src) {
         Ok(text) => {
             let text = fold(&text);
             if text.is_empty() {
@@ -3258,9 +3258,9 @@ fn seated(store: &Store, args: &Args) -> Option<Worklist> {
     // already resolves either way.
     let who = match args.get("workspace") {
         Some(ws) => crate::place::Seat::new(ws),
-        None => crate::place::Seat::new(crate::cmd_agent::my_pane()?),
+        None => crate::place::Seat::new(crate::place::my_pane()?),
     };
-    let scope = crate::cmd_govern::governs(&store.governors(), &who)?;
+    let scope = crate::place::governs(&store.governors(), &who)?;
     store.worklist(&scope)
 }
 
@@ -4395,7 +4395,7 @@ fn go_with(
             // its own scope. The project chain is a list run by hand's answer.
             // Not where somebody stood it down, or where it is held from another
             // machine: the reconciler leaves both alone, and so must the sentence.
-            let stood = crate::cmd_govern::stood_at(&store.governors(), &w.id).is_some();
+            let stood = crate::governors::stood_at(&store.governors(), &w.id).is_some();
             let until = match (w.runs_itself(), rest) {
                 (true, SeatOn::Nobody) if !stood => "wsp seats its own governor on the daemon's next tick".to_string(),
                 (true, _) => format!("nothing is seated for it · wsp govern {} --take", w.id),
@@ -4431,7 +4431,7 @@ fn go_with(
 /// Checked here because this is where somebody can act on it — the moment a
 /// list starts, and every barrier after it, since a group ahead of the work can
 /// be edited between two of them. What it protects is the routing step in front
-/// of `cmd_govern::seat_for`, which has to have one answer: a hand raised at 3am
+/// of `crate::governors::seat_for`, which has to have one answer: a hand raised at 3am
 /// must reach whoever is running the list this task is in tonight, and two
 /// running lists holding it is a question with no answer.
 ///
@@ -4479,7 +4479,7 @@ enum SeatOn {
     Elsewhere(String),
 }
 
-/// The first step of [`crate::cmd_govern::seat_for`]'s walk, asked of the list
+/// The first step of [`crate::governors::seat_for`]'s walk, asked of the list
 /// rather than of a task: a member's raised hand tries its list's seat and
 /// falls through to the member's own project chain when nobody is in it.
 ///
@@ -4765,7 +4765,7 @@ const FOLLOWUP_MAX: usize = 4;
 pub fn followup(store: &Store, args: &Args) -> i32 {
     let mut here = rows_here(store);
     // And the seat itself, which is what names a check with no row.
-    here.extend(crate::cmd_agent::my_pane());
+    here.extend(crate::place::my_pane());
     followup_by(store, args, &here)
 }
 
@@ -4773,7 +4773,7 @@ pub fn followup(store: &Store, args: &Args) -> i32 {
 /// made by the agent sitting there. Two readings because a binding is derived
 /// and free to be lost (`store`'s claims doc), while the claim outlives it.
 fn rows_here(store: &Store) -> Vec<String> {
-    let Some(pane) = crate::cmd_agent::my_pane() else { return Vec::new() };
+    let Some(pane) = crate::place::my_pane() else { return Vec::new() };
     let mut out: Vec<String> = Vec::new();
     if let Some(t) = store.bindings().get(&pane).and_then(|b| b.get("task_id")).and_then(|t| t.as_str()) {
         out.push(t.to_string());
@@ -8121,7 +8121,7 @@ mod tests {
         started(&store, "batch");
         store.set_governor("batch", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
         assert_eq!(worklist::home_of_scope(&store, "batch").as_deref(), Some("wsp"), "the walk has a home to climb");
-        assert!(crate::cmd_govern::seat_above_in(&store, "batch").is_none(), "and nobody seated on it");
+        assert!(crate::worklist::seat_above_in(&store, "batch").is_none(), "and nobody seated on it");
 
         std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
         let asked = crate::cmd_message::ask(&store, &Args::synth("ask", &["wl-001", "ship it with the panic unexplained?"], &[]));

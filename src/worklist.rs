@@ -1492,7 +1492,7 @@ pub fn landed_at_of(store: &Store, id: &str) -> Option<(String, String)> {
 // ---- where a task sits in a run -----------------------------------------
 //
 // Membership rather than progress, and the routing step in front of
-// `cmd_govern::seat_for`. Appended as one block: `worklist-005` and
+// `crate::governors::seat_for`. Appended as one block: `worklist-005` and
 // `worklist-006` are both adding to this file in the same group, and two
 // blocks at the end of it merge where two sets of interleaved edits do not.
 
@@ -1507,7 +1507,7 @@ pub fn landed_at_of(store: &Store, id: &str) -> Option<(String, String)> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placing {
     /// The slug, which is also the scope its seat is keyed on — see
-    /// [`crate::cmd_govern::seat_for`], whose first step is this.
+    /// [`crate::governors::seat_for`], whose first step is this.
     pub list: String,
     /// 1-based, because it is the number printed and the number typed.
     pub group: usize,
@@ -3404,4 +3404,15 @@ mod tests {
             "the row moved two days after the run wrote its last line",
         );
     }
+}
+
+/// [`seat_above`], reading what it needs: the governors, the projects, and the
+/// scope's home if it is a list.
+pub fn seat_above_in(store: &Store, scope: &str) -> Option<crate::governors::Seat> {
+    let governors = store.governors();
+    if governors.is_empty() {
+        return None;
+    }
+    let home = home_of_scope(store, scope);
+    crate::governors::seat_above(&governors, &crate::resolve::Index::new(store.projects()), scope, home.as_deref())
 }

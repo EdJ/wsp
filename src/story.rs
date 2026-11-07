@@ -361,7 +361,7 @@ fn quiet_world() -> Snapshot {
 
 /// A member task, with a log that says what its attempts recorded.
 ///
-/// The clause is [`crate::agent_commands::Spend::clause`]'s own format, written
+/// The clause is [`crate::agent_kind::Spend::clause`]'s own format, written
 /// the way a release line writes it — the fixture must not be able to draw a
 /// cost the reader could not also find by reading `wsp show`.
 fn member(id: &str, project: &str, status: &str, spend: &str) -> Task {

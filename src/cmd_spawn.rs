@@ -35,6 +35,7 @@ use crate::agent_commands;
 use crate::cmd_agent;
 use crate::cmd_checkout::{self, Tree};
 use crate::cmd_govern;
+pub(crate) use crate::place::local_backends;
 use crate::leg_seat;
 use crate::place::{Agent, Order, Place, Refusal, Seat, State};
 use crate::place_herdr::Herdr;
@@ -104,7 +105,7 @@ impl Handover {
     /// The order a seat on `scope` is handed: the primary interface's for its
     /// own scope, a custodian's for every other.
     pub fn of_seat(scope: &str) -> Handover {
-        match cmd_govern::is_primary(scope) {
+        match crate::governors::is_primary(scope) {
             true => Handover::Primary,
             false => Handover::Custodian,
         }
@@ -894,7 +895,7 @@ fn seat_env_over(
 /// or a run step, which `cycle::launch` starts with nobody's seat on purpose.
 ///
 /// The caller's seat is [`cmd_agent::my_pane`], the reading `wsp say` and
-/// `wsp ask` take, and its scope is [`cmd_govern::governs`], the one that
+/// `wsp ask` take, and its scope is [`crate::place::governs`], the one that
 /// decides whether a seat is a governor everywhere else. So a member that
 /// spawns is recorded with a `null` scope, and stays an `agent` in `wip`:
 /// only a governor's spawn makes a helper.
@@ -903,7 +904,7 @@ pub(crate) fn spawner(governors: &BTreeMap<String, Value>, caller: Option<&str>)
     // The primary interface spawns at the person's word and governs nothing,
     // so what it starts is nobody's helper: recorded like a member's spawn,
     // the seat said and the scope null, and drawn where its own work puts it.
-    let scope = cmd_govern::governs(governors, &Seat::new(seat)).filter(|s| !cmd_govern::is_primary(s));
+    let scope = crate::place::governs(governors, &Seat::new(seat)).filter(|s| !crate::governors::is_primary(s));
     Some(json!({ "seat": seat, "scope": scope }))
 }
 
@@ -1165,7 +1166,7 @@ const GOVERNED_EFFORT: &str = "medium";
 
 /// Where a piece of work sits, for the one question [`governed`] asks of it.
 ///
-/// The four arguments [`cmd_govern::seat_for`] takes, carried in rather than
+/// The four arguments [`crate::governors::seat_for`] takes, carried in rather than
 /// looked up. `place_work` has a store and has read all of this by the time it
 /// calls [`tier`]; reaching for one *here* would cost the property that makes
 /// every refusal above checkable — a function you can put four literals into
@@ -1177,7 +1178,7 @@ struct Scope<'a> {
     index: &'a Index,
     /// The **running** worklist this work is a member of, which is the front of
     /// the walk and `None` in the ordinary state where nothing is running. See
-    /// [`cmd_govern::seat_for`], which is where that ordering is argued.
+    /// [`crate::governors::seat_for`], which is where that ordering is argued.
     list: Option<&'a str>,
     /// The work's project, or `None` for work that has none.
     project: Option<&'a str>,
@@ -1188,7 +1189,7 @@ struct Scope<'a> {
 /// **A flat default at the spawn, not the per-task router `wsp-058` d4
 /// parked.** No complexity estimate, no new field on a task, no reading of the
 /// prose. The sole inference is whether the work has a filled seat above it,
-/// which is [`cmd_govern::seat_for`]'s existing walk over the running list, the
+/// which is [`crate::governors::seat_for`]'s existing walk over the running list, the
 /// project and its ancestors — the same walk a raised hand takes, so a spawn
 /// routes down exactly where a hand would route up.
 ///
@@ -1235,7 +1236,7 @@ fn governed(args: &Args, kind: &str, agent: bool, scope: &Scope) -> (Option<Stri
     if agent_commands::of(kind).tier(Some(GOVERNED_MODEL), Some(GOVERNED_EFFORT)).is_err() {
         return unstated;
     }
-    let Some(seat) = cmd_govern::seat_for(scope.governors, scope.index, scope.list, scope.project)
+    let Some(seat) = crate::governors::seat_for(scope.governors, scope.index, scope.list, scope.project)
     else {
         return unstated;
     };
@@ -1499,7 +1500,7 @@ fn spawn_patience() -> Patience<'static> {
 fn wait_ready(
     place: &dyn Place,
     how: &dyn agent_commands::Kind,
-    spawn: &agent_commands::Spawn,
+    spawn: &crate::agent_commands::Spawn,
     kind: &str,
     wait: &Patience,
 ) -> Result<(), String> {
@@ -1575,7 +1576,7 @@ fn wait_ready(
 fn start_agent(
     place: &dyn Place,
     how: &dyn agent_commands::Kind,
-    spawn: &agent_commands::Spawn,
+    spawn: &crate::agent_commands::Spawn,
     agent: &Agent,
     kind: &str,
     wait: &Patience,
@@ -1705,7 +1706,7 @@ fn re_arm(place: &dyn Place, seat: &Seat, wait: &Patience) -> Result<(), String>
 fn hand_over(
     place: &dyn Place,
     how: &dyn agent_commands::Kind,
-    spawn: &agent_commands::Spawn,
+    spawn: &crate::agent_commands::Spawn,
     text: &str,
     wait: &Patience,
 ) -> Result<(), String> {
@@ -1823,7 +1824,7 @@ fn took_it(place: &dyn Place, seat: &Seat, wait: &Patience) -> bool {
 fn confirm_turn(
     place: &dyn Place,
     how: &dyn agent_commands::Kind,
-    spawn: &agent_commands::Spawn,
+    spawn: &crate::agent_commands::Spawn,
     text: &str,
     wait: &Patience,
 ) -> Result<(), String> {
@@ -1858,7 +1859,7 @@ fn confirm_turn(
 /// The order of the two lines at the call sites is load-bearing: the caller
 /// prints *why* the spawn failed and then calls this, so the wait inside delays
 /// the advice and never the diagnosis.
-pub(crate) fn unreached(how: &dyn agent_commands::Kind, place: &dyn Place, spawn: &agent_commands::Spawn) {
+pub(crate) fn unreached(how: &dyn agent_commands::Kind, place: &dyn Place, spawn: &crate::agent_commands::Spawn) {
     if let Some(line) = agent_commands::recovery(how.address(place, spawn)) {
         eprintln!("wsp: {line}");
     }
@@ -1874,7 +1875,7 @@ pub(crate) fn unreached(how: &dyn agent_commands::Kind, place: &dyn Place, spawn
 pub(crate) fn ready(
     place: &dyn Place,
     how: &dyn agent_commands::Kind,
-    spawn: &agent_commands::Spawn,
+    spawn: &crate::agent_commands::Spawn,
     kind: &str,
 ) -> Result<(), String> {
     wait_ready(place, how, spawn, kind, &Patience::default())
@@ -1972,7 +1973,7 @@ fn primary_work() -> Work {
         project: None,
         list: None,
         primary: true,
-        label: cmd_govern::governor_of(cmd_govern::PRIMARY),
+        label: cmd_govern::governor_of(crate::governors::PRIMARY),
     }
 }
 
@@ -1986,7 +1987,7 @@ fn resolve_needle(
 ) -> Option<Result<Work, String>> {
     // The name a rotation and a reseat resolve the primary seat by, since both
     // hand `resolve` the scope they read off the record.
-    if args.has("govern") && cmd_govern::is_primary(needle) {
+    if args.has("govern") && crate::governors::is_primary(needle) {
         return Some(Ok(primary_work()));
     }
     if args.has("govern") || args.get("check").is_some() {
@@ -2105,7 +2106,7 @@ fn primary_root(index: &Index) -> Option<String> {
 /// a governor is.
 fn seat_primary(place: &dyn Place, seats: &dyn crate::cycle::Seats, store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
-    let scope = cmd_govern::PRIMARY;
+    let scope = crate::governors::PRIMARY;
     if let Some(extra) = args.rest.first() {
         eprintln!("wsp: --primary seats the primary interface, which is no project's - `{extra}` has no place in it");
         return 2;
@@ -2261,21 +2262,6 @@ pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
     }
 }
 
-/// Every backend wsp can spawn onto, for the readers that do not get to ask —
-/// `wsp wip` folds all of them into one census (`Wip::live`, `wsp-100`+
-/// `compound-078`) and `wsp tell` (`compound-077`) has to find the ONE that
-/// answers for a seat before it knows how to reach it. `headless` is left
-/// out: `place_super` has no terminal to fold into a listing and no prose to
-/// receive that is not already reachable through its own `agent.prompt` —
-/// see `robustness-022`'s three fates.
-///
-/// The same "one copy" argument [`backend`] makes: a reader that built its
-/// own array would be a second list to update when a fifth implementor
-/// lands.
-pub(crate) fn local_backends() -> [Box<dyn Place>; 2] {
-    [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new())]
-}
-
 /// The same two, with compound willing to deliver to a seat that cannot vouch
 /// for itself (`compound-097`).
 ///
@@ -2287,25 +2273,6 @@ pub(crate) fn local_backends() -> [Box<dyn Place>; 2] {
 pub(crate) fn insisting_backends() -> [Box<dyn Place>; 2] {
     [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new().insisting())]
 }
-
-/// The name a whole backend's own silence is filed under — `wsp stamp`
-/// (`compound-064` item 2), paired with [`local_backends`] by position, so
-/// this file stays the one place that ordering is named rather than
-/// re-assumed at a call site. `""` is herdr's own local machine
-/// ([`Census::heard`]'s spelling, unchanged); `"compound"` distinguishes
-/// the second backend's total refusal from a machine of that name, since a
-/// backend is not a machine and the two silences must not collide in a
-/// listing.
-/// `herdr` rather than `""`: the empty string is unique among BACKENDS but
-/// collides with the MACHINE namespace, where `cmd_stamp::named` reads it as
-/// "this machine". Since `compound-112` herdr is normally absent, so its total
-/// refusal is the ordinary case, and under `""` it drew as the whole machine
-/// having gone silent while `heard` was true and compound had answered in full
-/// — `cmd_stamp`'s own doc asks for a name that cannot be mistaken for a
-/// machine's, and this is that name. Only herdr's WHOLESALE refusal is labelled
-/// here; when its census answers, `place_herdr` names each row by machine
-/// itself.
-pub(crate) const LOCAL_BACKEND_NAMES: [&str; 2] = ["herdr", "compound"];
 
 fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
@@ -2348,7 +2315,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         index: &index,
         // A `--govern` spawn names its own list; a task spawn is a member of
         // whatever is running over it. Either way this is the front of the
-        // walk — see `cmd_govern::seat_for`.
+        // walk — see `crate::governors::seat_for`.
         list: work.list.as_deref().or(row_list.as_deref()),
         project: work.project.as_deref(),
     };
@@ -2671,7 +2638,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         .or_else(|| checking.as_ref().map(|(l, at)| crate::barrier::subject(l, *at)))
         .or_else(|| work.list.clone())
         .or_else(|| work.project.clone())
-        .or_else(|| work.primary.then(|| cmd_govern::PRIMARY.to_string()))
+        .or_else(|| work.primary.then(|| crate::governors::PRIMARY.to_string()))
         .unwrap_or_default();
     // Where this seat's brief will be written, when the kind is one that reads
     // a brief out of a file. Named now and written later: the environment has
@@ -2856,7 +2823,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // brief`, and a slot recorded a second later is a custodian whose first
     // sight of itself is a brief about holding nothing.
     // The scope the slot is keyed on, which is a project id or a worklist slug
-    // — see [`cmd_govern::seat_for`]. Everything below reads it as a name to
+    // — see [`crate::governors::seat_for`]. Everything below reads it as a name to
     // record a seat under and to tell an agent what it is custodian of, and
     // neither of those cares which of the two it is.
     let governing: Option<String> = match args.has("govern") {
@@ -2864,7 +2831,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             .list
             .clone()
             .or_else(|| work.project.clone())
-            .or_else(|| work.primary.then(|| cmd_govern::PRIMARY.to_string())),
+            .or_else(|| work.primary.then(|| crate::governors::PRIMARY.to_string())),
         false => None,
     };
     if let Some(project) = &governing {
@@ -2961,7 +2928,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             _ if checking.is_some() => checking
                 .as_ref()
                 .and_then(|(l, at)| crate::cycle::check_order(store, l, *at))
-                .map(|o| crate::cmd_task::fold(&o)),
+                .map(|o| crate::util::fold(&o)),
             // The whole order, folded to one line: it is self-contained, so a
             // kind with an empty context needs no second fetch, and one line is
             // what a kind taking its order in argv can carry at all.
@@ -2995,7 +2962,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // a seat from starting an agent in it, so wsp holds the seat before
         // there is anything sitting there to ask. That ordering is what makes
         // the handle knowable in advance rather than discovered afterwards.
-        let spawn = agent_commands::Spawn {
+        let spawn = crate::agent_commands::Spawn {
             full: args.has("full"),
             subagents: args.has("subagents"),
             packet: packet_start,
@@ -3281,7 +3248,7 @@ fn rotate_on(
 /// helper waits for it to stop turning — [`END_WHEN_IDLE`].
 pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
     let governors = store.governors();
-    let Some(seat) = cmd_govern::seat_of_scope(scope, &governors) else {
+    let Some(seat) = crate::governors::seat_of_scope(scope, &governors) else {
         println!("wsp: nobody holds the {scope} seat - nothing to rotate");
         return 0;
     };
@@ -3541,7 +3508,7 @@ fn rotate_as(
         // Nobody holds this slot and nobody is being moved out of it, so there
         // is no caller's standing to check and no predecessor to name.
         Hand::Vacant => (String::new(), true),
-        Hand::Own => match crate::cmd_agent::my_pane() {
+        Hand::Own => match crate::place::my_pane() {
             Some(me) => (me, false),
             None => {
                 eprintln!("wsp: {scope} is rotated by whoever holds its seat, from its own pane");
@@ -3556,7 +3523,7 @@ fn rotate_as(
     // reconciler holds no seat and is asking precisely because nobody does, so
     // there is no standing to check and nothing above to protect.
     if !held && !vacant {
-        match cmd_govern::governs(&governors, &crate::place::Seat::new(&me)) {
+        match crate::place::governs(&governors, &crate::place::Seat::new(&me)) {
             Some(held) if held == scope => {}
             Some(other) => {
                 eprintln!("wsp: this pane holds the {other} seat, not {scope}");
@@ -3567,7 +3534,7 @@ fn rotate_as(
             // Either way this pane does not hold what it is trying to hand over,
             // and every branch here stops before anything is opened.
             None => {
-                match cmd_govern::seat_of_scope(&scope, &governors) {
+                match crate::governors::seat_of_scope(&scope, &governors) {
                     Some(_) => eprintln!(
                         "wsp: the {scope} seat is held by {} - only that pane can rotate it",
                         cmd_govern::room_of(&governors, &scope)
@@ -3665,7 +3632,7 @@ fn rotate_as(
         .list
         .clone()
         .or_else(|| work.project.clone())
-        .or_else(|| work.primary.then(|| cmd_govern::PRIMARY.to_string()))
+        .or_else(|| work.primary.then(|| crate::governors::PRIMARY.to_string()))
         .unwrap_or_default();
 
     let how = agent_commands::of(&kind);
@@ -3765,7 +3732,7 @@ fn rotate_as(
         false => order_text,
     };
     let in_args = how.order_in_args();
-    let spawn = agent_commands::Spawn {
+    let spawn = crate::agent_commands::Spawn {
         full: false,
         subagents: false, packet: false,
         name: &subject,
@@ -3931,7 +3898,7 @@ fn rotate_as(
 /// `tokenhub-spec-sync` did exactly that on 2026-10-05: each attempt opened a
 /// compound agent whose renderer never came up, and the seat was empty at the
 /// end of all of them. The claim is the bound on that,
-/// [`crate::cmd_govern::SEAT_CLAIMED_FOR`] between attempts, and `reseat_failed`
+/// [`crate::governors::SEAT_CLAIMED_FOR`] between attempts, and `reseat_failed`
 /// is what lets `wsp watch --status` say `retrying` rather than `reseating` for
 /// the twenty minutes in between — a claim held by a process that has already
 /// given up is not a governor on its way.
@@ -4167,7 +4134,7 @@ fn end_owed(
         store.clear_handover(scope);
         return 0;
     }
-    if cmd_govern::governs(&store.governors(), &Seat::new(&from)).as_deref() == Some(scope) {
+    if crate::place::governs(&store.governors(), &Seat::new(&from)).as_deref() == Some(scope) {
         let why = format!("the slot never moved off {from}, so it is still the seat");
         eprintln!("wsp: {why}");
         mark_ending_failed(store, scope, &why);
@@ -4298,7 +4265,7 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
     // compound-hosted seat has no workspace to read, only the pane already
     // read above, and `governs` matches an exact pane on its own.
     let governs =
-        pane.as_deref().and_then(|p| cmd_govern::governs(&governors, &crate::place::Seat::new(p)));
+        pane.as_deref().and_then(|p| crate::place::governs(&governors, &crate::place::Seat::new(p)));
     let me = Caller { pane: pane.as_deref(), governs: governs.as_deref() };
     end_work(backend(args).as_ref(), store, args, me, &tidy)
 }
@@ -4679,7 +4646,7 @@ fn end_work(
     // when nobody claims the seat keeps `--headless` working, since a
     // supervisor is not in `local_backends()`, and keeps the existing
     // "already gone" reading for a herdr seat this census can no longer see.
-    let backends = crate::cmd_spawn::local_backends();
+    let backends = crate::place::local_backends();
     let target: &dyn Place = match crate::cmd_agent::locate_seat(&backends, seat.as_str()) {
         Some((found, _)) => found.as_ref(),
         None => place,
@@ -6244,11 +6211,11 @@ mod tests {
     struct Says(Option<bool>, std::cell::Cell<u32>);
 
     impl agent_commands::Kind for Says {
-        fn running(&self, _: &agent_commands::Spawn) -> Option<bool> {
+        fn running(&self, _: &crate::agent_commands::Spawn) -> Option<bool> {
             self.1.set(self.1.get() + 1);
             self.0
         }
-        fn args(&self, _: &agent_commands::Spawn) -> Vec<String> {
+        fn args(&self, _: &crate::agent_commands::Spawn) -> Vec<String> {
             Vec::new()
         }
         fn tier(&self, _: Option<&str>, _: Option<&str>) -> std::result::Result<(), String> {
@@ -6257,14 +6224,14 @@ mod tests {
         fn address(
             &self,
             _: &dyn Place,
-            _: &agent_commands::Spawn,
-        ) -> Option<agent_commands::Address> {
+            _: &crate::agent_commands::Spawn,
+        ) -> Option<crate::agent_kind::Address> {
             None
         }
         fn tell(&self, _: &dyn Place, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
             panic!("readiness does not deliver work orders")
         }
-        fn ran(&self, _: &str, _: &str, _: i64) -> Option<agent_commands::Ran> {
+        fn ran(&self, _: &str, _: &str, _: i64) -> Option<crate::agent_kind::Ran> {
             None
         }
     }
@@ -6287,7 +6254,7 @@ mod tests {
         clock: &util::Dial,
     ) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, subagents: false, packet: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None, brief: None };
+            crate::agent_commands::Spawn { full: false, subagents: false, packet: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None, brief: None };
         // The retry fields come from `retrying` because this test is about a
         // single attempt: a literal here would have to be updated every time the
         // retry's numbers move, for a wait that never reads them.
@@ -6366,7 +6333,7 @@ mod tests {
 
     fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, subagents: false, packet: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None, brief: None };
+            crate::agent_commands::Spawn { full: false, subagents: false, packet: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None, brief: None };
         let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new() };
         start_agent(place, how, &spawn, &agent, "claude", wait)
     }
@@ -6631,7 +6598,7 @@ mod tests {
         fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> crate::place::Result<Delivery> {
             place.tell(seat, text)
         }
-        fn args(&self, _: &agent_commands::Spawn) -> Vec<String> {
+        fn args(&self, _: &crate::agent_commands::Spawn) -> Vec<String> {
             Vec::new()
         }
         fn tier(&self, _: Option<&str>, _: Option<&str>) -> std::result::Result<(), String> {
@@ -6640,21 +6607,21 @@ mod tests {
         fn address(
             &self,
             _: &dyn Place,
-            _: &agent_commands::Spawn,
-        ) -> Option<agent_commands::Address> {
+            _: &crate::agent_commands::Spawn,
+        ) -> Option<crate::agent_kind::Address> {
             None
         }
-        fn running(&self, _: &agent_commands::Spawn) -> Option<bool> {
+        fn running(&self, _: &crate::agent_commands::Spawn) -> Option<bool> {
             None
         }
-        fn ran(&self, _: &str, _: &str, _: i64) -> Option<agent_commands::Ran> {
+        fn ran(&self, _: &str, _: &str, _: i64) -> Option<crate::agent_kind::Ran> {
             None
         }
     }
 
     fn handing_over(place: &Composer, clock: &util::Dial) -> Result<(), String> {
         let seat = Seat::new("w3M:p1");
-        let spawn = agent_commands::Spawn {
+        let spawn = crate::agent_commands::Spawn {
             full: false,
             subagents: false, packet: false,
             name: "robustness-035",
@@ -6688,7 +6655,7 @@ mod tests {
         assert!(repair_line(&place, &seat).starts_with("a return in w3M:p1"), "{}", repair_line(&place, &seat));
 
         let dial = util::Dial::new();
-        let spawn = agent_commands::Spawn {
+        let spawn = crate::agent_commands::Spawn {
             full: false,
             subagents: false, packet: false,
             name: "robustness-035",
@@ -8465,7 +8432,7 @@ mod tests {
         stop_being_a_seat();
 
         assert_eq!(code, 1, "which is the state this is about");
-        let v = cmd_govern::vacancy(&store.governors(), "core");
+        let v = crate::governors::vacancy(&store.governors(), "core");
         assert!(
             v.reseating.is_some(),
             "the claim is held, so the next pass cannot open a second pane: {v:?}"
@@ -8524,7 +8491,7 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(place.started.get(), 0, "no agent in a seat nobody can record");
         assert_eq!(place.stopped.get(), 1, "and the pane is not left behind");
-        let v = cmd_govern::vacancy(&store.governors(), "core");
+        let v = crate::governors::vacancy(&store.governors(), "core");
         assert!(v.reseating.is_some() && v.failed.is_some(), "claim held, failure on it: {v:?}");
         assert!(!cmd_govern::claim_seat(&store, "core"), "so the next pass backs off");
         assert_eq!(store.governors()["core"]["last"]["model"], "opus", "and the tier is still there for it");
@@ -8683,7 +8650,7 @@ mod tests {
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
             assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 2);
             assert!(place.opened.borrow().is_empty(), "nothing was opened");
-            assert!(cmd_govern::governs(&store.governors(), &cmd_govern::seat_query("w1", Some("w1:p9"))).is_some(),
+            assert!(crate::place::governs(&store.governors(), &crate::place::seat_query("w1", Some("w1:p9"))).is_some(),
                 "and the seat stayed where it was");
         }
 
@@ -8775,7 +8742,7 @@ mod tests {
             assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 1);
             assert!(place.opened.borrow().is_empty(), "no successor was seated");
             assert_eq!(
-                cmd_govern::governs(&store.governors(), &cmd_govern::seat_query("w1", Some("w1:p9"))).as_deref(),
+                crate::place::governs(&store.governors(), &crate::place::seat_query("w1", Some("w1:p9"))).as_deref(),
                 Some("batch"),
                 "the caller keeps the seat",
             );
@@ -9033,7 +9000,7 @@ mod tests {
         assert_eq!(rec["pane"], "w9:p2", "the seat is the successor's");
         assert_eq!(rec["workspace"], "w9:p2", "and recorded under the seat itself");
         assert_eq!(
-            cmd_govern::governs(&store.governors(), &Seat::new("cpd-1")),
+            crate::place::governs(&store.governors(), &Seat::new("cpd-1")),
             None,
             "the predecessor holds nothing, so ending it is not ending a seat"
         );
@@ -9337,18 +9304,18 @@ mod tests {
         let order = place.0.borrow()[0].args.join(" ");
         assert!(order.contains("You are the primary interface"), "its own order: {order}");
         assert!(!order.contains("custodian of"), "not a custodian's: {order}");
-        let held = cmd_govern::seat_held(cmd_govern::PRIMARY, &store.governors()).expect("the slot is taken");
+        let held = cmd_govern::seat_held(crate::governors::PRIMARY, &store.governors()).expect("the slot is taken");
         assert_eq!(held.pane, "w9:p1");
         assert!(store.claims().is_empty() && store.bindings().is_empty(), "it holds no claim");
         assert!(
-            cmd_govern::vacancy(&store.governors(), cmd_govern::PRIMARY).reseating.is_none(),
+            crate::governors::vacancy(&store.governors(), crate::governors::PRIMARY).reseating.is_none(),
             "the duplicate guard went when the seat was taken"
         );
 
         // The census now has somebody at the prompt in that pane.
         assert_eq!(press(&place, &Census(Some(State::Idle), false), &store), 0, "held is an answer, not a failure");
         assert_eq!(place.1.borrow().len(), 1, "and nothing was opened for it");
-        assert_eq!(cmd_govern::seat_held(cmd_govern::PRIMARY, &store.governors()).map(|s| s.pane).as_deref(), Some("w9:p1"));
+        assert_eq!(cmd_govern::seat_held(crate::governors::PRIMARY, &store.governors()).map(|s| s.pane).as_deref(), Some("w9:p1"));
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
@@ -9360,11 +9327,11 @@ mod tests {
         let _guard = no_backend();
         let (store, _) = primary_store("primary-gone");
         standing_in(None);
-        store.set_governor(cmd_govern::PRIMARY, json!({ "workspace": "cpd-3", "pane": "cpd-3", "host": util::hostname() }));
+        store.set_governor(crate::governors::PRIMARY, json!({ "workspace": "cpd-3", "pane": "cpd-3", "host": util::hostname() }));
         let place = started();
         assert_eq!(press(&place, &NOBODY, &store), 0);
         assert_eq!(place.1.borrow().len(), 1, "a fresh seat");
-        assert_eq!(cmd_govern::seat_held(cmd_govern::PRIMARY, &store.governors()).map(|s| s.pane).as_deref(), Some("w9:p1"));
+        assert_eq!(cmd_govern::seat_held(crate::governors::PRIMARY, &store.governors()).map(|s| s.pane).as_deref(), Some("w9:p1"));
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
@@ -9375,11 +9342,11 @@ mod tests {
         let _guard = no_backend();
         let (store, _) = primary_store("primary-unreadable");
         let rec = json!({ "workspace": "cpd-3", "pane": "cpd-3", "host": util::hostname() });
-        store.set_governor(cmd_govern::PRIMARY, rec.clone());
+        store.set_governor(crate::governors::PRIMARY, rec.clone());
         let place = started();
         assert_eq!(press(&place, &Census(None, false), &store), 1);
         assert!(place.1.borrow().is_empty(), "nothing opened");
-        assert_eq!(store.governors()[cmd_govern::PRIMARY], rec, "and the record untouched");
+        assert_eq!(store.governors()[crate::governors::PRIMARY], rec, "and the record untouched");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
@@ -9389,7 +9356,7 @@ mod tests {
     fn a_press_while_the_primary_seat_is_being_filled_opens_nothing() {
         let _guard = no_backend();
         let (store, _) = primary_store("primary-racing");
-        assert!(cmd_govern::claim_seat(&store, cmd_govern::PRIMARY), "the first press's claim");
+        assert!(cmd_govern::claim_seat(&store, crate::governors::PRIMARY), "the first press's claim");
         let place = started();
         assert_eq!(press(&place, &NOBODY, &store), 0);
         assert!(place.1.borrow().is_empty());
@@ -9407,7 +9374,7 @@ mod tests {
         assert_eq!(press(&place, &NOBODY, &store), 2, "wsp has no root here, so there is nowhere to stand");
         assert!(place.1.borrow().is_empty());
         assert!(
-            cmd_govern::claim_seat(&store, cmd_govern::PRIMARY),
+            cmd_govern::claim_seat(&store, crate::governors::PRIMARY),
             "the claim is free for the next press"
         );
         let _ = std::fs::remove_dir_all(&store.root);
@@ -9439,7 +9406,7 @@ mod tests {
         assert_eq!(press(&started(), &NOBODY, &store), 0);
         let row = wip_row(&store, "w9:p1");
         assert_eq!(row.role.json(), json!({ "is": "primary" }));
-        assert_eq!(row.seat.as_deref(), Some(cmd_govern::PRIMARY));
+        assert_eq!(row.seat.as_deref(), Some(crate::governors::PRIMARY));
         assert_eq!((row.answers_to, row.answers_to_empty), (None, None), "the person, and no walk named");
         assert!(!row.needs_you, "idle between asks is the job, as a governor's is");
         let _ = std::fs::remove_dir_all(&store.root);
@@ -9451,7 +9418,7 @@ mod tests {
     fn a_seat_the_primary_interface_spawns_is_not_its_helper() {
         let _guard = no_backend();
         let store = governed_core("primary-spawns");
-        store.set_governor(cmd_govern::PRIMARY, json!({ "workspace": "cpd-1", "pane": "cpd-1", "host": util::hostname() }));
+        store.set_governor(crate::governors::PRIMARY, json!({ "workspace": "cpd-1", "pane": "cpd-1", "host": util::hostname() }));
         standing_in(Some("cpd-1"));
         let code = place_work(&started(), &store, &Args::synth("spawn", &["t-1"], &AN_AGENT));
         standing_in(None);
@@ -9479,7 +9446,7 @@ mod tests {
     fn the_custodian_sends_outside_work_to_the_primary_interface_which_quotes_the_person() {
         let custodian = work_order("core", Handover::Custodian);
         assert!(custodian.contains("`wsp govern primary --tell -`"), "{custodian}");
-        let primary = work_order(cmd_govern::PRIMARY, Handover::of_seat(cmd_govern::PRIMARY));
+        let primary = work_order(crate::governors::PRIMARY, Handover::of_seat(crate::governors::PRIMARY));
         assert!(primary.contains("--as-person") && primary.contains("govern nothing"), "{primary}");
         assert!(!primary.contains('\n'), "one line, for a kind that takes it in argv");
     }
@@ -9490,7 +9457,7 @@ mod tests {
     fn the_seats_that_file_rows_are_told_to_split_a_big_one_into_member_sub_tasks_when_planning_it() {
         let cases = [
             ("a custodian or list governor", work_order("core", Handover::Custodian), true),
-            ("the primary interface", work_order(cmd_govern::PRIMARY, Handover::Primary), true),
+            ("the primary interface", work_order(crate::governors::PRIMARY, Handover::Primary), true),
             ("a member", work_order("m-1", Handover::Spawned), false),
         ];
         for (who, order, told) in cases {

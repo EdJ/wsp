@@ -70,7 +70,7 @@ fn of_reading(r: &Value, turns_hint: usize, seconds: i64) -> Fig {
     }
 }
 
-fn of_clause(ran: &str, s: &crate::agent_commands::Spend, turns: usize, seconds: i64) -> Fig {
+fn of_clause(ran: &str, s: &crate::agent_kind::Spend, turns: usize, seconds: i64) -> Fig {
     if s.nothing() {
         return Fig { turns, seconds, ..Fig::default() };
     }
@@ -88,7 +88,7 @@ fn of_clause(ran: &str, s: &crate::agent_commands::Spend, turns: usize, seconds:
 }
 
 /// The figures for a seat: its reading, else the clause, else unmeasured.
-fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_commands::Spend, usize)>, seconds: i64) -> Fig {
+fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_kind::Spend, usize)>, seconds: i64) -> Fig {
     if let Some(r) = crate::cmd_burn::reading(seat) {
         return of_reading(&r, clause.map_or(0, |c| c.2), seconds);
     }

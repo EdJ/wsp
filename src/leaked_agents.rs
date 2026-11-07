@@ -169,7 +169,7 @@ pub(crate) fn tidy(store: &Store) {
         return;
     }
     for act in judge(&mut seen, &leaks, util::epoch_secs()) {
-        crate::cycle::log_line(store, &sentence(&act));
+        crate::store::log_line(store, &sentence(&act));
         match act {
             Act::Name(_) => {}
             Act::Term(l) => signal(l.pid, "TERM"),

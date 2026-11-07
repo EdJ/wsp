@@ -299,7 +299,6 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub use crate::base::seat::SEAT_ENV;
@@ -722,48 +721,6 @@ impl State {
     pub fn stopped(&self) -> bool {
         self.is_running() && !self.turn_in_flight()
     }
-}
-
-/// One seat, as the backend currently sees it.
-///
-/// An id for an agent that outlives the agent's sessions.
-///
-/// **The identity `compound-092` exists to create**, and the decision behind it
-/// is Ed's: *"we can keep the IDs between agent sessions, since it's technically
-/// the same agent."* So it cannot be a session id, a pane id or a seat id —
-/// all three end and come back, and the thing this names does not. `wsp resume`
-/// carries it across a restart and across a change of BACKEND, which is what
-/// makes `compound-065`'s cutover — close down in herdr, come back in compound,
-/// on the same claim — a move rather than a replacement. `wsp govern --rotate`
-/// does not carry it: a successor is a different agent and mints its own.
-///
-/// Minted by wsp and never by a backend (`compound` d9: *"wsp mints and holds
-/// the id, and the backend's own name for a thing becomes an attribute of it
-/// rather than its identity"*).
-///
-/// # Why it is shaped like a message id and not like a uuid
-///
-/// Ed asked for a uuid and this is the same guarantee by a cheaper route. wsp
-/// takes one dependency — `serde_json` — so a uuid crate would be the second,
-/// for a value that never leaves this machine's own store. What actually
-/// matters is the property `message::new_id` documents and a uuid would give
-/// only by accident: **an agent id must live outside the task id space.**
-/// `Store::rename_tasks` rewrites a renumbering through the raw text of every
-/// state file, matching whole `[A-Za-z0-9_-]` tokens against a map of old task
-/// ids — so an id that could collide with one would be silently rewritten by a
-/// `wsp mv`, and the claim naming it would lose its agent. Task ids end in
-/// digits after their last `-`; this ends in `p` plus base 36, which no task id
-/// has ever had.
-pub fn new_agent_id() -> String {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("a-{}-p{:x}{:x}", crate::util::base36(crate::util::epoch_nanos()), std::process::id(), n)
-}
-
-/// Is this one of ours? The complement of a task id, asserted in both
-/// directions by the test, exactly as `message::is_message_id` is.
-pub fn is_agent_id(s: &str) -> bool {
-    s.starts_with("a-") && s.rsplit('-').next().is_some_and(|tail| tail.starts_with('p'))
 }
 
 /// The census row. `session` is the agent's own session id where the backend
@@ -1390,6 +1347,7 @@ pub(crate) fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::{is_agent_id, new_agent_id};
 
     /// What a seat's occupant must not find, and where the line is drawn.
     ///
@@ -1869,4 +1827,186 @@ mod tests {
         assert_ne!(u, State::Gone);
         assert_ne!(u, State::Unknown);
     }
+}
+
+/// Which seat this process is standing in, or none.
+///
+/// The one reading of it, and it is now the port's rather than herdr's:
+/// `place::Place::here` is the verb, and which variable carries the answer is
+/// the adapter's business. Every agent-side verb — `claim`, `say`, `release` —
+/// is downstream of this, and so is `despawn`'s refusal to end the seat it is
+/// running in.
+///
+/// A `String` because that is what the callers below hold — a claim's `pane`,
+/// a binding's key, the `--pane` a person types are all the same string, and
+/// converting them all is `place::Seat`'s own migration rather than this one's.
+///
+/// No socket is opened: [`Herdr::here`] reads what herdr set before this process
+/// existed, which is a rule of the port and not an optimisation. Constructing
+/// the backend costs four durations and a clock reference.
+///
+/// # Which backend is this process standing in
+///
+/// Two backends can seat an agent and each has its own name for the seat it
+/// hands its occupant — `HERDR_PANE_ID` for a pane, `place::SEAT_ENV` for a
+/// supervisor. Neither adapter is allowed to read the other's:
+/// `place_herdr::here` says why in as many words, and the mirror image holds —
+/// two answers to *which seat is this* is a way to be in two seats, and under
+/// herdr a stale `WSP_SEAT_ID` would bind a task to a pane that backend never
+/// issued.
+///
+/// So the choice is made here, one level up, and it is made by **which name the
+/// seat arrived under** rather than by asking anything. A process started by a
+/// supervisor has the supervisor's variable and nothing else; a shell in a pane
+/// has herdr's. The order matters only for the case that should not exist —
+/// both set — and the supervisor wins it because it is the backend that forked
+/// this process, whatever multiplexer the shell it came from was in.
+pub(crate) fn my_pane() -> Option<String> {
+    let seat = match crate::place_super::Supervisor::new().here() {
+        Some(s) => Some(s),
+        None => crate::place_herdr::Herdr::new().here(),
+    };
+    seat.map(|s| s.to_string())
+}
+
+/// Every backend wsp can spawn onto, for the readers that do not get to ask —
+/// `wsp wip` folds all of them into one census (`Wip::live`, `wsp-100`+
+/// `compound-078`) and `wsp tell` (`compound-077`) has to find the ONE that
+/// answers for a seat before it knows how to reach it. `headless` is left
+/// out: `place_super` has no terminal to fold into a listing and no prose to
+/// receive that is not already reachable through its own `agent.prompt` —
+/// see `robustness-022`'s three fates.
+///
+/// The same "one copy" argument [`backend`] makes: a reader that built its
+/// own array would be a second list to update when a fifth implementor
+/// lands.
+pub(crate) fn local_backends() -> [Box<dyn Place>; 2] {
+    [Box::new(crate::place_herdr::Herdr::new()), Box::new(crate::place_compound::Compound::new())]
+}
+
+/// The name a whole backend's own silence is filed under — `wsp stamp`
+/// (`compound-064` item 2), paired with [`local_backends`] by position, so
+/// this file stays the one place that ordering is named rather than
+/// re-assumed at a call site. `""` is herdr's own local machine
+/// ([`Census::heard`]'s spelling, unchanged); `"compound"` distinguishes
+/// the second backend's total refusal from a machine of that name, since a
+/// backend is not a machine and the two silences must not collide in a
+/// listing.
+/// `herdr` rather than `""`: the empty string is unique among BACKENDS but
+/// collides with the MACHINE namespace, where `cmd_stamp::named` reads it as
+/// "this machine". Since `compound-112` herdr is normally absent, so its total
+/// refusal is the ordinary case, and under `""` it drew as the whole machine
+/// having gone silent while `heard` was true and compound had answered in full
+/// — `cmd_stamp`'s own doc asks for a name that cannot be mistaken for a
+/// machine's, and this is that name. Only herdr's WHOLESALE refusal is labelled
+/// here; when its census answers, `place_herdr` names each row by machine
+/// itself.
+pub(crate) const LOCAL_BACKEND_NAMES: [&str; 2] = ["herdr", "compound"];
+
+/// The scope this workspace is the custodian of — a project or a worklist — if
+/// it is the custodian of one.
+///
+/// **One agent, one governorship.** Ed, 2026-08-17, reversing what
+/// wsp-063 built for. That task argued a night coordinating `robustness`
+/// while answering for `wsp` above it was one agent and not two, which
+/// described the night accurately and is still the wrong model: it makes two
+/// questions unanswerable in principle rather than merely hard. Which row draws
+/// the agent, when it is in two positions at once? And what does a vacancy look
+/// like when the same occupant fills both? One slot to an agent settles both by
+/// construction, and the answer to *"who answers for `wsp` while the
+/// `robustness` custodian is busy"* is the chain [`seat_for`] already walks —
+/// upwards, to a different agent.
+///
+/// So this is an `Option` rather than a list, and the invariant lives in the
+/// type: [`take`] stands the workspace down from whatever it held before, the
+/// way a claim hands off the task it is leaving. A store that already holds two
+/// — this one did, the night the rule changed — answers with the first in id
+/// order and heals the next time anybody takes a seat.
+///
+/// No workspace is no seat, never a seat. A pane herdr answered for without a
+/// workspace id, or a caller outside herdr entirely, would otherwise match a
+/// record whose own field failed to parse — and the answer to "am I the seat"
+/// would come back yes for a process that is not in a workspace at all.
+///
+/// # `pane` — and why the exact read is the pane's and not the room's
+///
+/// The record is keyed on the workspace and that is still right: it is what
+/// survives an agent being cleared and restarted, and it is what the panel
+/// draws under. But **a workspace can hold more than one agent**, and asking
+/// this question of the *room* answers yes for every one of them. worklist-035,
+/// driven on `796c2d2`: a seat's pane was ended, two later spawns landed in
+/// that same workspace, and both were told they were the custodian — which
+/// exempted both from [`needs_a_person`] for their whole lives, one of them a
+/// member of a running worklist on an unattended night. One line of `wip` held
+/// the fact and the silence together.
+///
+/// So a caller with a pane in hand passes it, and a record that names a pane is
+/// only that pane's. `None` is for the caller that genuinely has no pane —
+/// naming the *room* after its seat ([`rename_seat`], the workspace token in
+/// `sync`) is a question about the workspace, and answering it per pane would
+/// be answering a different question.
+///
+/// **The case for the other answer, stated rather than assumed.** A custodian
+/// that splits its own workspace to run something gets told, in the second
+/// pane, that it is nobody's seat. That is the cost, it is real, and it is the
+/// cheaper of the two: wsp cannot tell that pane from a worker's, and the two
+/// failures are not the same size. A seat told *this workspace is nobody's
+/// seat* gets a sentence naming the repair and types `wsp govern` again. A
+/// worker told it **is** the seat is told nothing at all — it is exempted from
+/// the one predicate an unattended run depends on, and stays exempt until
+/// somebody happens to read a panel. Silence is the failure this is being
+/// repaired for, so the ambiguity is resolved towards the noisy answer.
+///
+/// A record with no pane on it — hand-written, or written by `wsp govern -w`
+/// naming a room this process is not standing in — falls back to the room,
+/// because there is nothing better to compare and a seat with no address is
+/// still a seat.
+pub fn governs(governors: &std::collections::BTreeMap<String, serde_json::Value>, seat: &Seat) -> Option<String> {
+    let who = seat.as_str();
+    if who.is_empty() {
+        return None;
+    }
+    // Off the record's own fields, read raw, rather than through [`seat_of`]
+    // and [`Seat::sat_in`] — deliberately, so this reads as the row that
+    // leaves `Seat::workspace` unused: nothing here names the struct field,
+    // so deleting it costs this function nothing to keep answering right.
+    //
+    // A pane id already carries its workspace (`"w1:p1"`), which is what
+    // makes one string enough where two used to be needed: an exact pane
+    // match no longer has to be confirmed against a separate workspace,
+    // because two different rooms cannot mint the same qualified pane id.
+    // What a bare workspace comparison bought — matching *any* pane of the
+    // room, and matching a `wsp govern -w` record that names no pane at all
+    // — is recovered the same way: `who == workspace` catches the caller
+    // that is asking about the room by name, and the prefix check catches
+    // the caller standing in a pane of a room a `-w` record claimed without
+    // ever learning that pane's id.
+    governors
+        .iter()
+        .find(|(_, rec)| {
+            let host = rec.get("host").and_then(serde_json::Value::as_str).unwrap_or("");
+            if !host.is_empty() && host != crate::util::hostname() {
+                return false;
+            }
+            let workspace = rec.get("workspace").and_then(serde_json::Value::as_str).unwrap_or_default();
+            if workspace.is_empty() {
+                return false;
+            }
+            let pane = rec.get("pane").and_then(serde_json::Value::as_str).unwrap_or_default();
+            who == pane || who == workspace || (pane.is_empty() && who.starts_with(&format!("{workspace}:")))
+        })
+        .map(|(p, _)| p.clone())
+}
+
+/// The seat a caller means, from what it has in hand: the pane if there is
+/// one, the workspace itself otherwise.
+///
+/// The bridge between the shape most callers still carry — a workspace and
+/// maybe a pane, straight off a herdr record or a stored claim — and the one
+/// [`governs`] now asks for. `pane` wins when it is not empty because it is
+/// the more exact of the two; `workspace` alone is the room-wide question
+/// `wsp govern -w` and a bare `--clear` ask, and is exactly what a caller
+/// passes when it has no pane to be exact about.
+pub fn seat_query(workspace: &str, pane: Option<&str>) -> Seat {
+    Seat::new(pane.filter(|p| !p.is_empty()).unwrap_or(workspace))
 }

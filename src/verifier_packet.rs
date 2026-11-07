@@ -342,7 +342,7 @@ mod tests {
         let order = crate::cycle::verifier_order(&store, &t);
         assert!(!order.contains("Verification packet"), "{order}");
         let line = crate::cycle::verifier_order_line(&store, &t);
-        assert_eq!(line, crate::cmd_task::fold(&order));
+        assert_eq!(line, crate::util::fold(&order));
         assert!(!store.state_file("packets").exists());
     }
 

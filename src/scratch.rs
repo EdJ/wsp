@@ -259,7 +259,7 @@ pub(crate) fn tidy(store: &Store) {
         };
         let line = format!("removed scratch of {}: its row is closed{freed}", f.row);
         if SAID.lock().map(|mut s| s.insert(line.clone())).unwrap_or(true) {
-            crate::cycle::log_line(store, &line);
+            crate::store::log_line(store, &line);
         }
     }
 }

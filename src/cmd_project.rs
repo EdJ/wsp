@@ -97,7 +97,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     // And the one name in it that is neither (`wsp-279`): the primary
     // interface's slot is keyed on it, and a project of that name would be a
     // project whose custodian is the seat that governs nothing.
-    if crate::cmd_govern::is_primary(&slug) {
+    if crate::governors::is_primary(&slug) {
         eprintln!("wsp: `{slug}` is not free: the primary interface's seat is keyed on it");
         return 1;
     }

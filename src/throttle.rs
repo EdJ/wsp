@@ -1279,8 +1279,8 @@ pub(crate) fn tidy(store: &Store) {
     let warning = v.warning(store.seat_cap());
     if warning.is_some() != WARNED.swap(warning.is_some(), Ordering::SeqCst) {
         match warning {
-            Some(w) => crate::cycle::log_line(store, &w),
-            None => crate::cycle::log_line(store, "load and clock are back under the warning line"),
+            Some(w) => crate::store::log_line(store, &w),
+            None => crate::store::log_line(store, "load and clock are back under the warning line"),
         }
     }
 }

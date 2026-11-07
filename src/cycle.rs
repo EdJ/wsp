@@ -228,7 +228,7 @@ pub(crate) trait Seats {
     /// Which of these are still running. A parameter for the same reason
     /// [`Seats::state`] is: a test names pids that were never processes.
     fn running(&self, pids: &[u32]) -> Vec<u32> {
-        crate::place_super::alive(pids).into_iter().collect()
+        crate::util::alive(pids).into_iter().collect()
     }
 
     /// Every seat the backends here hold, with its label — for the sweeps that
@@ -331,7 +331,7 @@ impl Seats for Fleet {
         let herdr_here = crate::herdr::available_now();
         let mut heard = false;
         let mut out = Vec::new();
-        for (backend, name) in crate::cmd_spawn::local_backends().into_iter().zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES) {
+        for (backend, name) in crate::place::local_backends().into_iter().zip(crate::place::LOCAL_BACKEND_NAMES) {
             if name == "herdr" && !herdr_here {
                 continue;
             }
@@ -349,9 +349,9 @@ impl Fleet {
     /// no herdr is running here to hold it. See [`Fleet`].
     fn here(seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {
         let herdr_here = crate::herdr::split_host(seat).1.is_some() || crate::herdr::available_now();
-        crate::cmd_spawn::local_backends()
+        crate::place::local_backends()
             .into_iter()
-            .zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES)
+            .zip(crate::place::LOCAL_BACKEND_NAMES)
             .filter(move |(_, name)| *name != "herdr" || herdr_here)
             .map(|(b, _)| b)
     }
@@ -1946,7 +1946,7 @@ fn prepare_ready(store: &Store, list: &str, at: usize, member: &Task) -> bool {
                 }
             });
             crate::verification::deliver_unless_reworked(store, &member.id, &text);
-            log_line(store, &format!("{list} group {at}: {} sent back — {}", member.id, crate::cmd_task::fold(&text)));
+            log_line(store, &format!("{list} group {at}: {} sent back — {}", member.id, crate::util::fold(&text)));
             store.git_commit(&format!("wsp: {} sent back — the rebase onto the trunk does not apply", member.id));
             false
         }
@@ -2167,7 +2167,7 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
 /// row's packet is written to a file under the store, whole, and the line names
 /// it and says to read it first.
 pub(crate) fn verifier_order_line(store: &Store, member: &Task) -> String {
-    let line = crate::cmd_task::fold(&verifier_base(store, member));
+    let line = crate::util::fold(&verifier_base(store, member));
     match crate::verifier_packet::file(store, member) {
         Some(path) => format!("{line} {}", crate::verifier_packet::pointer(&path)),
         None => line,
@@ -3175,11 +3175,11 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
 /// leaves it.
 pub(crate) fn stand_down_own_seat(store: &Store, list: &str) {
     let governors = store.governors();
-    let Some(seat) = crate::cmd_govern::seat_of_scope(list, &governors) else {
+    let Some(seat) = crate::governors::seat_of_scope(list, &governors) else {
         let empty = governors
             .get(list)
             .is_some_and(|rec| rec.get("workspace").and_then(serde_json::Value::as_str).unwrap_or_default().is_empty());
-        if empty && crate::cmd_govern::stood_at(&governors, list).is_none() {
+        if empty && crate::governors::stood_at(&governors, list).is_none() {
             crate::cmd_govern::mark_stood_down(store, list);
             log_line(store, &format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
         }
@@ -3206,11 +3206,11 @@ pub(crate) fn stand_down_own_seat(store: &Store, list: &str) {
 /// The pane a seat's agent is in now, through the port, as
 /// [`rotate_on_behalf`](crate::cmd_spawn::rotate_on_behalf) finds the one it
 /// replaces; under test, the recorded one.
-pub(crate) fn occupied(store: &Store, seat: &crate::cmd_govern::Seat) -> Option<String> {
+pub(crate) fn occupied(store: &Store, seat: &crate::governors::Seat) -> Option<String> {
     if cfg!(test) {
         return (!seat.pane.is_empty()).then(|| seat.pane.clone());
     }
-    let backends = crate::cmd_spawn::local_backends();
+    let backends = crate::place::local_backends();
     crate::cmd_govern::occupant(store, &backends, seat).map(|(_, found)| found.seat.as_str().to_string())
 }
 
@@ -3605,7 +3605,7 @@ fn say_uncommitted(store: &Store, id: &str) {
 /// first member. A list wsp runs has only its own; see [`the_chain`].
 fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
     let governors = store.governors();
-    the_chain(store, w).into_iter().find(|s| crate::cmd_govern::seat_of_scope(s, &governors).is_some())
+    the_chain(store, w).into_iter().find(|s| crate::governors::seat_of_scope(s, &governors).is_some())
 }
 
 /// The scope whose seat is *meant* to answer for this run — the first in the
@@ -3621,7 +3621,7 @@ fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
 /// project two governors for one question. Since `wsp-202` that shape is only a
 /// list run by hand's: a list wsp runs is its own post, and nothing above it governs
 /// the run — its home project's seat is above it only for what it cannot
-/// answer (`wsp-263`, [`crate::cmd_govern::seat_above`]).
+/// answer (`wsp-263`, [`crate::governors::seat_above`]).
 ///
 /// So the chain is walked once and read two ways, and the scope this names is
 /// the one whose record the repair will look at. It is [`governing_scope`] with
@@ -3635,7 +3635,7 @@ pub(crate) fn governing_post(store: &Store, w: &Worklist) -> Option<String> {
 }
 
 /// `list, then the project of its first member that has one, then that project's
-/// ancestors` — the walk [`crate::cmd_govern::seat_for`] documents and this
+/// ancestors` — the walk [`crate::governors::seat_for`] documents and this
 /// file has now asked for twice.
 ///
 /// One walk rather than two, because the two readers above have to agree about
@@ -3726,7 +3726,7 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
 /// **The governor's rule for where a self-run list's sentences go**
 /// (`wsp-216`, cpd-413's call). While the post is seated or a reseat is in
 /// flight, they wait on the list's scope — `wsp-202`, and
-/// [`crate::cmd_govern::seat_for`] for a member's ask. Once nobody is coming —
+/// [`crate::governors::seat_for`] for a member's ask. Once nobody is coming —
 /// the list is done, its post was stood down, or its reseat failed and backed
 /// off — they go to the nearest filled seat above, saying whose they were.
 /// A late answer from the project's seat beats none; that seat is still never
@@ -3737,10 +3737,10 @@ pub(crate) fn nobody_coming(store: &Store, list: &str) -> Option<String> {
         return Some("the list is done".into());
     }
     let governors = store.governors();
-    if let Some(at) = crate::cmd_govern::stood_at(&governors, list) {
+    if let Some(at) = crate::governors::stood_at(&governors, list) {
         return Some(format!("its seat was stood down at {}", util::local_hm(at)));
     }
-    if crate::cmd_govern::vacancy(&governors, list).backed_off() {
+    if crate::governors::vacancy(&governors, list).backed_off() {
         let why = crate::cmd_govern::reseat_why(&governors, list).map(|w| format!(" — {}", util::truncate(&w, 120)));
         return Some(format!("its reseat failed{}", why.unwrap_or_default()));
     }
@@ -3828,7 +3828,7 @@ fn heard(w: &Worklist, event: &str, passed: Option<usize>) -> Option<String> {
 /// governor hears its lists** (`wsp-263`). A barrier passed, held or followed
 /// up, a list started, parked, resumed or done — so the custodian knows what
 /// its lists are doing without polling them, now that a list's seat answers
-/// to it ([`crate::cmd_govern::seat_above`]).
+/// to it ([`crate::governors::seat_above`]).
 ///
 /// Spooled, like everything that reaches a seat, so a busy custodian hears it
 /// on its next idle rather than having it typed over a turn. Recorded rather
@@ -3854,7 +3854,7 @@ pub(crate) fn tell_above(store: &Store, w: &Worklist, text: &str) {
 /// sentence; and a custodian that typed the verb itself does not need its own
 /// words back.
 pub(crate) fn hand_it_up(store: &Store, w: &Worklist, text: &str) -> Option<String> {
-    let above = crate::cmd_govern::seat_above_in(store, &w.id)?;
+    let above = crate::worklist::seat_above_in(store, &w.id)?;
     if governing_scope(store, w).as_deref() == Some(above.scope.as_str()) {
         return None;
     }
@@ -3915,72 +3915,13 @@ fn rotate(store: &Store, w: &Worklist) {
     log_line(store, &format!("rotate {scope}: exit {code}"));
 }
 
-/// One dated line in `cycle.log`, **appended to the file**, and the one way a
-/// run or a repair says anything.
-///
-/// **The file, whoever is running this.** A run step is taken by three kinds of
-/// process, and stdout is a different place in each: a `wsp worklist advance`
-/// this module [`launch`]es has `cycle.log` as its stdout, the daemon's tick
-/// takes [`step`] inline and its stdout is launchd's `daemon.log`, and a verb a
-/// person or an agent runs has their terminal. There used to be two writers:
-/// `stamp`, stdout only, which every run step used, and this, file only, which
-/// the reconciler used because the daemon's stdout is a file nobody reads for a
-/// run. Then the daemon's tick started a verifier inline (`wsp-222`, on
-/// `wsp-212`'s live proof): its `spawn wsp-217 --agent --verify` and `started
-/// wsp-217` went to `daemon.log`, and a governor reading `cycle.log` saw the
-/// barrier go from waiting to a verdict with nothing started in between. A
-/// `wsp reopen`'s `tell` lines were the same, on the caller's terminal only.
-///
-/// **Echoed to stdout only when stdout is not a file** — see [`a_reader`]. A
-/// launched child's stdout *is* `cycle.log`, and echoing there wrote every line
-/// twice (`wsp-217`); the daemon's is `daemon.log`. A terminal or an agent's
-/// pipe is somebody reading what the verb they ran did, which is what `stamp`
-/// gave them and what they still get.
-pub(crate) fn log_line(store: &Store, line: &str) {
-    // The in-memory record is for the tests to read what was said; the file is
-    // written whatever that says, because a test asserting on a record the same
-    // function produced proves nothing about the file. The isolated store a
-    // test uses is a throwaway directory, so writing it costs nothing and keeps
-    // this assertion honest. Nothing is echoed under test: the harness's stdout
-    // is whatever ran it, and the decision is [`a_reader`]'s, tested alone.
-    #[cfg(test)]
-    tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
-    let at = util::now_iso();
-    if let Ok(mut out) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(store.state_file("cycle.log"))
-    {
-        use std::io::Write;
-        let _ = writeln!(out, "{at} {line}");
-    }
-    #[cfg(not(test))]
-    if a_reader(stdout_meta().as_ref()) {
-        use std::io::Write;
-        let _ = writeln!(std::io::stdout(), "{at} {line}");
-    }
-}
-
-/// Whether this process's stdout is somebody reading, from what it is.
-///
-/// **A regular file is a log, and not one of ours to write twice**: `cycle.log`
-/// itself under [`launch`], `daemon.log` under launchd. Anything else — a
-/// terminal, an agent's pipe, `/dev/null`, or a stdout nobody could look at — is
-/// echoed to, which costs nothing where nobody reads it.
-fn a_reader(stdout: Option<&std::fs::Metadata>) -> bool {
-    !stdout.is_some_and(|m| m.is_file())
-}
-
-#[cfg(not(test))]
-fn stdout_meta() -> Option<std::fs::Metadata> {
-    use std::os::fd::AsFd;
-    let fd = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
-    std::fs::File::from(fd).metadata().ok()
-}
+pub(crate) use crate::store::log_line;
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::store::a_reader;
+    pub(crate) use crate::store::SAID;
     use std::cell::RefCell;
 
     /// No backend answers for any seat.
@@ -4043,8 +3984,6 @@ pub(crate) mod tests {
         pub(super) static END_FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// The ends that asked for the tree to be kept (`--keep-tree`).
         pub(crate) static KEPT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-        /// What `cycle.log` was told this thread, in order.
-        pub(crate) static SAID: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `wsp-147`'s reconciler told a member's seat, as (task, sentence).
         /// Distinct from `TOLD`, which is the run's *governing* seat: a repair
         /// tells both and they are answers to different questions.
@@ -5240,12 +5179,12 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(!ended.contains(&"b-1".to_string()), "the check whose `go` this is reviews its row first: {ended:?}");
         assert!(drained(&ROTATED).is_empty(), "no successor for a run that is over");
         let governors = store.governors();
-        assert!(crate::cmd_govern::seat_of_scope("run", &governors).is_none(), "the list's seat is vacated");
+        assert!(crate::governors::seat_of_scope("run", &governors).is_none(), "the list's seat is vacated");
         assert!(
-            crate::cmd_govern::stood_at(&governors, "run").is_some(),
+            crate::governors::stood_at(&governors, "run").is_some(),
             "and recorded as stood down, so the reconciler does not fill it again"
         );
-        assert!(crate::cmd_govern::seat_of_scope("p", &governors).is_some(), "the project's seat is still held");
+        assert!(crate::governors::seat_of_scope("p", &governors).is_some(), "the project's seat is still held");
     }
 
     /// The record a failed reseat leaves on a list's post: its markers and no
@@ -5280,7 +5219,7 @@ fn only_a_working_screen_is_ever_overruled() {
         after_pass(&store, &Exits, &w, 1);
 
         let governors = store.governors();
-        assert!(crate::cmd_govern::stood_at(&governors, "run").is_some(), "the empty post is stood down: {governors:?}");
+        assert!(crate::governors::stood_at(&governors, "run").is_some(), "the empty post is stood down: {governors:?}");
         let said = drained(&SAID);
         assert!(
             said.iter().any(|l| l == "run is closing — stood its own seat down; nobody was sitting in it"),
@@ -5348,7 +5287,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let mut w = store.worklist("run").unwrap();
         w.set_status(WorklistStatus::Done);
         store.save_worklist(&w).unwrap();
-        store.edit_governor("run", |rec| rec.as_object_mut().is_some_and(|o| o.remove(crate::cmd_govern::STOOD_DOWN).is_some()));
+        store.edit_governor("run", |rec| rec.as_object_mut().is_some_and(|o| o.remove(crate::governors::STOOD_DOWN).is_some()));
         assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("p"), "a done list answers for nothing");
     }
 
@@ -5418,7 +5357,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(drained(&ROTATED), vec!["run".to_string()], "a fresh governor for the next group");
         assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Running);
         assert!(!drained(&ENDED).contains(&"cpd-7".to_string()), "the seat still has a barrier to answer for");
-        assert!(crate::cmd_govern::seat_of_scope("run", &store.governors()).is_some());
+        assert!(crate::governors::seat_of_scope("run", &store.governors()).is_some());
     }
 
     /// A hold is waiting on a decision, and the list's seat is who makes it; a
@@ -5430,7 +5369,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
         end_what_the_run_opened(&store, &Exits, "run", Some(1), Closing::Held);
         assert!(!drained(&ENDED).contains(&"cpd-7".to_string()), "a held run keeps its governor");
-        assert!(crate::cmd_govern::seat_of_scope("run", &store.governors()).is_some());
+        assert!(crate::governors::seat_of_scope("run", &store.governors()).is_some());
 
         end_what_the_run_opened(&store, &Exits, "run", None, Closing::Done);
         let ended = drained(&ENDED);

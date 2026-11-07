@@ -233,7 +233,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
             };
             let governors = store.governors();
             let index = crate::resolve::Index::new(store.projects());
-            let seat = crate::cmd_govern::seat_for(&governors, &index, Some(&w.id), None);
+            let seat = crate::governors::seat_for(&governors, &index, Some(&w.id), None);
             let to = match &seat {
                 Some(s) => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::whereabouts(&governors, s)),
                 None => "asked of every panel — no governor above it".into(),
@@ -253,7 +253,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     let own = seat.as_ref().map(|s| s.scope.clone()).filter(|s| me.scope() == Some(s.as_str()));
     let (seat, to) = match &own {
         Some(scope) => {
-            let above = crate::cmd_govern::seat_above_in(store, scope);
+            let above = crate::worklist::seat_above_in(store, scope);
             let to = match &above {
                 Some(s) => format!(
                     "asked of the {} governor, above {scope} · {}",
@@ -271,7 +271,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // is where the person sits, so a seat on the walk that answered it would be
     // answering the person's own side of the conversation — and it joins
     // compound's *Require Attention* only as `for: "person"`.
-    let for_person = args.has("person") || me.scope().is_some_and(crate::cmd_govern::is_primary);
+    let for_person = args.has("person") || me.scope().is_some_and(crate::governors::is_primary);
     let mut q = Message::question(
         me.clone(),
         kind,
@@ -1268,7 +1268,7 @@ fn tell_the_list(store: &Store, closed: &message::Closed, args: &Args) {
     }
     let governors = store.governors();
     let index = crate::resolve::Index::new(store.projects());
-    let Some(seat) = crate::cmd_govern::seat_for(&governors, &index, Some(&list), None) else { return };
+    let Some(seat) = crate::governors::seat_for(&governors, &index, Some(&list), None) else { return };
     let what = match (&closed.question.about, group) {
         (About::Task(t), Some(g)) => format!("{t}, a member of group {g} of {list}"),
         (_, Some(g)) => format!("barrier {g} of {list}"),
@@ -1542,7 +1542,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // used to gate on `herdr::available()` and then scan `herdr::panes()`, so
     // an answer addressed to a compound-hosted agent was filed as "no herdr
     // socket" and never delivered, on a machine where the agent was running.
-    let backends = crate::cmd_spawn::local_backends();
+    let backends = crate::place::local_backends();
     let Some((place, found)) = crate::cmd_agent::locate_seat(&backends, &pane) else {
         receipt(false, false, &format!("nothing answers for {pane} any more — the answer is written"));
         return 0;
@@ -1633,7 +1633,7 @@ pub(crate) fn deliver_held(store: &Store, seats: &dyn crate::cycle::Seats) -> Ve
 /// The typing, over every backend here: `None` where nothing answers for the
 /// pane or nothing in it is an agent, which a later tick asks again.
 pub(crate) fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
-    let backends = crate::cmd_spawn::local_backends();
+    let backends = crate::place::local_backends();
     let (place, found) = crate::cmd_agent::locate_seat(&backends, pane)?;
     if found.agent.kind.trim().is_empty() {
         return None;
@@ -1773,10 +1773,10 @@ pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
     // one place that picks it — a supervisor's `WSP_SEAT_ID` first, herdr's
     // `HERDR_PANE_ID` after — so a caller outside herdr is not told it is
     // nobody just because this file used to reach for herdr's own variable.
-    let pane = crate::cmd_agent::my_pane();
+    let pane = crate::place::my_pane();
     let scope = pane
         .as_deref()
-        .and_then(|p| crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(p)));
+        .and_then(|p| crate::place::governs(&store.governors(), &crate::place::Seat::new(p)));
     match (scope, &pane) {
         (Some(scope), _) => (Party::seat(&scope), pane.clone()),
         (None, Some(p)) => (
@@ -1804,7 +1804,7 @@ pub(crate) fn caller(store: &Store) -> String {
         .map(|s| s.to_string())
         .or_else(|| herdr::Env::read().pane_id.filter(|p| !p.is_empty()));
     match pane {
-        Some(p) => crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
+        Some(p) => crate::place::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
         None => "person".into(),
     }
 }
@@ -2316,7 +2316,7 @@ mod tests {
         w.set_status(crate::model::WorklistStatus::Running);
         store.save_worklist(&w).unwrap();
         store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
-        store.set_governor(crate::cmd_govern::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
+        store.set_governor(crate::governors::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
 
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
         assert_eq!(ask(&store, &crate::Args::synth("ask", &["m-1", "which first, 457 or 458?"], &[])), 0);
@@ -2324,7 +2324,7 @@ mod tests {
 
         let q = message::all(&store).into_iter().next().expect("raised");
         assert_eq!(q.to_json()["for"], "person", "the person's, not ux-next's: {}", q.to_json());
-        assert_eq!(q.from.scope(), Some(crate::cmd_govern::PRIMARY), "and it says who asked");
+        assert_eq!(q.from.scope(), Some(crate::governors::PRIMARY), "and it says who asked");
     }
 
     /// `wsp-276`'s done-when: an authored caption is the question's line in

@@ -31,7 +31,7 @@
 //! - *What stops it re-raising every fifteen minutes?* It never re-raises,
 //!   because it never arrives. [`Ledger`] emits on change and never on state.
 //! - *Does it go to a governor that has itself stopped?* [`addressee`] walks
-//!   [`cmd_govern::seat_for`], which terminates at *everyone*, so a signal
+//!   [`crate::governors::seat_for`], which terminates at *everyone*, so a signal
 //!   about *work* is delivered to this pass's sink whatever state the seat it
 //!   names is in — the address is a label on a line in `events.jsonl`, not a
 //!   process that has to be alive to receive it.
@@ -54,7 +54,7 @@
 //!
 //!   **[`cmd_watch::Kind::SeatStalled`] is that fact, and this pass is its only
 //!   reader** — worklist-041. The subject is the seat's scope and the address
-//!   is [`cmd_govern::seat_above`], the routing walk started one step past the
+//!   is [`crate::governors::seat_above`], the routing walk started one step past the
 //!   seat it is about, because that seat is what failed. It is derived in
 //!   [`cmd_watch::stalled_seats`] and not here, for the reason every other
 //!   predicate is: the census, the store sweep and the routing have to be one

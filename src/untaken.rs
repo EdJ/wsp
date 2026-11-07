@@ -34,7 +34,7 @@
 //! the step is not taken again while it is there, and the step after waits
 //! [`AFTER`] from its date. Not the member's `## Log`, which every future spawn
 //! on the row is handed, and which a check has none of. The lines are written
-//! with [`crate::cycle::log_line`], which writes the file whatever stdout is, because from the
+//! with [`crate::store::log_line`], which writes the file whatever stdout is, because from the
 //! daemon's tick stdout is `daemon.log` and a record written there is a record
 //! this would never find — every tick would press again.
 //!
@@ -231,7 +231,7 @@ fn owed(store: &Store, w: &Worklist, at: usize, g: &Group, pos: &Position) -> Ve
                 who: "the barrier check".into(),
                 seat: seat.to_string(),
                 since: util::epoch_of(&c.at),
-                order: cycle::check_order(store, &w.id, at).map(|o| crate::cmd_task::fold(&o)),
+                order: cycle::check_order(store, &w.id, at).map(|o| crate::util::fold(&o)),
                 replace: Replace::Check,
             });
         }

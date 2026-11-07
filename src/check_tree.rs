@@ -229,10 +229,10 @@ fn running_among(dir: &Path, backends: &[&dyn Place]) -> Vec<u32> {
 /// [`running_among`] the backends wsp can spawn onto here.
 fn running_in(dir: &Path) -> Vec<u32> {
     let herdr_here = crate::herdr::available_now();
-    let all = crate::cmd_spawn::local_backends();
+    let all = crate::place::local_backends();
     let here: Vec<&dyn Place> = all
         .iter()
-        .zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES)
+        .zip(crate::place::LOCAL_BACKEND_NAMES)
         .filter(|(_, name)| *name != "herdr" || herdr_here)
         .map(|(b, _)| b.as_ref())
         .collect();
@@ -376,7 +376,7 @@ pub(crate) fn stop_finished(store: &Store, seats: &dyn crate::cycle::Seats) -> V
         if !kill.is_empty() {
             line.push_str(&format!(", KILL {}", list(&kill)));
         }
-        crate::cycle::log_line(store, &line);
+        crate::store::log_line(store, &line);
         said.push(line);
     }
     said
@@ -434,7 +434,7 @@ fn take(store: &Store, repo: &Path, dir: &Path, residue: &Residue, standing: &dy
             // Only a tree that is going: a kept one keeps its servers.
             let (term, kill) = stop_running(dir);
             if let Some(line) = signalled_line(&path, &term, &kill) {
-                crate::cycle::log_line(store, &line);
+                crate::store::log_line(store, &line);
             }
             Tree::Removed { path, kept: cmd_checkout::remove(repo, dir).kept }
         }
@@ -546,12 +546,12 @@ pub(crate) fn tidy(store: &Store, ended: &[String]) {
         match tree {
             Tree::Removed { path, kept } => {
                 let branch = kept.map(|b| format!(" (branch {b} kept — it has commits the trunk has not)")).unwrap_or_default();
-                crate::cycle::log_line(store, &format!("removed barrier check tree {path}: its check is over{branch}"));
+                crate::store::log_line(store, &format!("removed barrier check tree {path}: its check is over{branch}"));
             }
             Tree::Kept { path, why } => {
                 let line = format!("kept barrier check tree {path}: {why}");
                 if SAID.lock().map(|mut s| s.insert(line.clone())).unwrap_or(true) {
-                    crate::cycle::log_line(store, &line);
+                    crate::store::log_line(store, &line);
                 }
             }
             Tree::Absent => {}

@@ -370,7 +370,7 @@ pub(crate) fn packet_for(store: &Store, list: &str, at: usize, read: Option<&str
 /// `wsp worklist advance <list> --barrier-run <n>`: run what group `n`'s
 /// barrier owes, record it, and either pass the barrier or start its agent.
 pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
-    use crate::cycle::log_line;
+    use crate::store::log_line;
     let Some(w) = store.worklist(list) else { return 1 };
     if barrier::suite_of(store, list, at) != Some(Suite::Running) {
         log_line(store, &format!("{list} group {at}: the barrier's run was asked for and nothing is waiting on it"));
@@ -561,7 +561,7 @@ fn run_unit_scoped(store: &Store, unit: &Unit, who: &str, scoping: Scoping) -> (
             Some((pid, since)) => format!("pid {pid}, since {since}"),
             None => "another run".to_string(),
         };
-        crate::cycle::log_line(store, &format!("{who}: waits for the tree lock in {} — held by {by}", util::contract(&dir)));
+        crate::store::log_line(store, &format!("{who}: waits for the tree lock in {} — held by {by}", util::contract(&dir)));
     });
     // Everything up to the lock is waiting; the checkout and the steps are not.
     let waited = if lock.is_ok() { before.elapsed() } else { std::time::Duration::ZERO };

@@ -323,7 +323,7 @@ pub fn leg_order(task: &str, leg: &str, last: bool) -> String {
 /// in a leg's seat reads the leg's packet, as the short start's system prompt
 /// tells it to.
 fn my_leg(t: &Task) -> Option<String> {
-    let pane = crate::cmd_agent::my_pane()?;
+    let pane = crate::place::my_pane()?;
     crate::legs::actor_of(&crate::legs::legs(t), Some(&pane))
 }
 
@@ -422,7 +422,7 @@ pub fn packet(store: &Store, args: &Args) -> i32 {
         }
     };
     if let Some(from) = crate::cmd_task::prose_source(args) {
-        let text = crate::cmd_task::read_source(&from).map_err(|e| format!("{from}: {e}"));
+        let text = crate::util::read_source(&from).map_err(|e| format!("{from}: {e}"));
         let text = match text {
             Ok(t) => t,
             Err(e) => {

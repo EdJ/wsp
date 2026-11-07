@@ -495,7 +495,7 @@ pub fn claimed_project(
         if !get("host").is_empty() && get("host") != host {
             continue;
         }
-        let names_it = match (agent.filter(|a| crate::place::is_agent_id(a)), workspace_id, workspace_label) {
+        let names_it = match (agent.filter(|a| crate::util::is_agent_id(a)), workspace_id, workspace_label) {
             (Some(a), _, _) if get("agent_id") == a => true,
             (_, Some(id), _) if !id.is_empty() && get("workspace_id") == id => true,
             (_, _, Some(l)) if !l.is_empty() && get("workspace_label") == l => true,
@@ -531,7 +531,7 @@ pub fn resolve(
     // in, and for the same reason: this is a mandate with a different word on
     // it (`compound-106`).
     let pinned = agent
-        .filter(|a| crate::place::is_agent_id(a))
+        .filter(|a| crate::util::is_agent_id(a))
         .and_then(|a| pins.get(a))
         .or_else(|| workspace_id.and_then(|ws| pins.get(ws)));
     if let Some(p) = pinned {

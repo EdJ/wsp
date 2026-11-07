@@ -120,11 +120,11 @@ pub(crate) fn tidy(store: &Store) {
     let busy = |row: &str, dir: &Path| occupied.get_or_init(|| cmd_checkout::Occupied::now(store)).of(row, dir);
     for build in sweep(store, &busy) {
         match build {
-            Build::Dropped { path } => crate::cycle::log_line(store, &format!("dropped build output of {path}: its row is landed and released")),
+            Build::Dropped { path } => crate::store::log_line(store, &format!("dropped build output of {path}: its row is landed and released")),
             Build::Kept { path, why } => {
                 let line = format!("kept build output of {path}: {why}");
                 if SAID.lock().map(|mut s| s.insert(line.clone())).unwrap_or(true) {
-                    crate::cycle::log_line(store, &line);
+                    crate::store::log_line(store, &line);
                 }
             }
         }

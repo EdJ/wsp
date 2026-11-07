@@ -896,7 +896,7 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
     let spawn =
         // No tier: a resumed session picks up the thread it was on, and the
         // model it was started with is that session's, not this command's.
-        agent_commands::Spawn {
+        crate::agent_commands::Spawn {
             full: false,
             // Same answer as `full`, and for the same reason: resume rebuilds
             // the preamble of a session that already exists, and what it

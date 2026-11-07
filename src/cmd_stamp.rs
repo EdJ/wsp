@@ -123,7 +123,7 @@
 //! selects — singular, herdr by default — on the reasoning directly below,
 //! now stale: `Census` keys by machine, not backend, so two backends folded
 //! with [`Census::and`] file under `"herdr"` and `"compound"`
-//! ([`crate::cmd_spawn::LOCAL_BACKEND_NAMES`]) rather than colliding on one
+//! ([`crate::place::LOCAL_BACKEND_NAMES`]) rather than colliding on one
 //! name, which is the fact that makes the fold safe. It had to change because
 //! `Wip::live` went plural first (`compound-078`): `wsp wip --json` already
 //! shows a `compound` session with no flag asked of its caller, while this
@@ -299,7 +299,7 @@ fn agents_now(place: &dyn Place) -> Agents {
 ///
 /// **The decision this function makes: a silent BACKEND reads the same way
 /// a silent MACHINE already does.** A backend's own [`Refusal`] becomes
-/// [`Census::silent`] under [`crate::cmd_spawn::LOCAL_BACKEND_NAMES`]'s name
+/// [`Census::silent`] under [`crate::place::LOCAL_BACKEND_NAMES`]'s name
 /// for it, and [`Census::and`] folds it in exactly as it folds a far
 /// machine's silence — one list, one digest, one `unheard` to read either
 /// kind of gap off. No second rule: [`Census::was_heard`] is reused rather
@@ -313,7 +313,7 @@ fn agents_now(place: &dyn Place) -> Agents {
 /// again when it closes.
 fn combined_census(store: &Store) -> Census {
     let mut c: Option<Census> = None;
-    for (name, backend) in crate::cmd_spawn::LOCAL_BACKEND_NAMES.iter().zip(crate::cmd_spawn::local_backends()) {
+    for (name, backend) in crate::place::LOCAL_BACKEND_NAMES.iter().zip(crate::place::local_backends()) {
         let asked = backend.census().unwrap_or_else(|why| Census::silent(name, why));
         c = Some(match c {
             None => asked,
@@ -596,7 +596,7 @@ mod tests {
     /// `compound-064` item 2's own decision, proven against real backends:
     /// a machine with `compound` sessions and no herdr up at all is HEARD —
     /// herdr's own total refusal folds in as a silent row under `"herdr"`
-    /// (`crate::cmd_spawn::LOCAL_BACKEND_NAMES`), never as the whole answer
+    /// (`crate::place::LOCAL_BACKEND_NAMES`), never as the whole answer
     /// going to `None`. `stamp` (the CLI verb) is what this file used to ask
     /// a single, flag-selected backend for; asking `combined_census` proves
     /// the fold `stamp` now runs on rather than a hand-built `Agents`.

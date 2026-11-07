@@ -98,7 +98,7 @@ fn message(packet: &str, id: &str, steps: &[check::Step]) -> String {
 /// started.
 type Ended = Result<Option<i32>, String>;
 
-fn clause(ran: Option<&agent_commands::Ran>, cap_cents: u64, exit: &Ended) -> String {
+fn clause(ran: Option<&crate::agent_kind::Ran>, cap_cents: u64, exit: &Ended) -> String {
     let spent = ran
         .map(|r| {
             let what = r.spend.clause().unwrap_or_else(|| "nothing measured".into());

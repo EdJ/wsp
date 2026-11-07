@@ -476,7 +476,7 @@ impl Report {
 /// it did not, so a sentence addressed to a scope whose governor had died was
 /// dropped on the floor rather than held: `wsp ask`, `wsp flag` and
 /// `wsp govern --tell` all reached this, and all of them lost. It also asked with
-/// [`cmd_govern::seat_of_scope`], which stops at the top level of a record — so a
+/// [`crate::governors::seat_of_scope`], which stops at the top level of a record — so a
 /// record `reconcile` vacated reads as *no seat at all* rather than as a seat
 /// with nobody in it. Live on the trunk: `tokenhub-spec-sync` reading `no seat
 /// on this scope` while `governors.json` for the same scope carried
@@ -603,7 +603,7 @@ pub(crate) fn flush_held_tells_now(store: &Store) -> (usize, usize) {
     if store.watch_keys(HELD_TELL).is_empty() {
         return (0, 0);
     }
-    let backends = crate::cmd_spawn::local_backends();
+    let backends = crate::place::local_backends();
     let read = |seat: &str| {
         let mut unsure = false;
         for b in backends.iter() {
@@ -802,13 +802,13 @@ fn nobody_there(store: &Store, seats: &dyn Seats, scope: &str) -> Option<String>
 /// `Spool::depth` over the same record.
 fn unseated(store: &Store, scope: &str) -> String {
     let held = load(store, &key_for(scope)).depth();
-    let v = cmd_govern::vacancy(&store.governors(), scope);
+    let v = crate::governors::vacancy(&store.governors(), scope);
     let up = store
         .daemon_holder()
         .map(|(pid, _)| pid)
         // The daemon asking about itself needs no `ps` (`wsp-320`): this runs
         // once per vacant seat on every pass, and that was a fork each.
-        .is_some_and(|pid| pid == std::process::id() || crate::place_super::alive(&[pid]).contains(&pid));
+        .is_some_and(|pid| pid == std::process::id() || crate::util::alive(&[pid]).contains(&pid));
     // **Five readings and not two, and each is one a reader can act on
     // differently.** `reseating` and `daemon down` were the two `wsp-148` asked
     // for; the other three are states that arrived with it and that those two
@@ -827,7 +827,7 @@ fn unseated(store: &Store, scope: &str) -> String {
         (Some(at), Some(_), _) => format!(
             "reseat failed · {} · next try {}",
             cmd_govern::reseat_why(&store.governors(), scope).unwrap_or_else(|| "no reason recorded".into()),
-            util::local_hm(at + cmd_govern::SEAT_CLAIMED_FOR)
+            util::local_hm(at + crate::governors::SEAT_CLAIMED_FOR)
         ),
         (Some(_), None, _) => "reseating".to_string(),
         (None, _, false) => "daemon down".to_string(),
@@ -848,7 +848,7 @@ fn unseated(store: &Store, scope: &str) -> String {
         },
         (true, true) => tail,
     };
-    let tail = match cmd_govern::stood_at(&store.governors(), scope) {
+    let tail = match crate::governors::stood_at(&store.governors(), scope) {
         Some(at) => format!("stood down at {}", util::local_hm(at)),
         None => tail,
     };
@@ -920,7 +920,7 @@ impl Sink for Tell<'_> {
             self.why = NOT_FOUND.into();
             return false;
         };
-        let backends = crate::cmd_spawn::local_backends();
+        let backends = crate::place::local_backends();
         let Some((place, found)) = cmd_govern::occupant(self.store, &backends, &seat) else {
             self.why = NOT_FOUND.into();
             return false;
@@ -1747,7 +1747,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
             say_through(store, &Gone, "core", "owed", None).why
         };
         assert_eq!(
-            crate::cmd_govern::vacancy(&store.governors(), "core").reseating,
+            crate::governors::vacancy(&store.governors(), "core").reseating,
             None,
             "no claim: nothing is in flight"
         );
@@ -2377,7 +2377,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         assert_eq!(spool_of(&store, "run").depth(), 1, "the verdict waits for the list's own governor");
         assert_eq!(spool_of(&store, "demo").depth(), 1, "and what the project already held stays where it was");
 
-        store.set_governor("run", json!({ "host": util::hostname(), cmd_govern::STOOD_DOWN: util::now_iso() }));
+        store.set_governor("run", json!({ "host": util::hostname(), crate::governors::STOOD_DOWN: util::now_iso() }));
         assert!(
             !crate::cycle::hand_it_to_the_governor(&store, &w, "group 1 is at its barrier"),
             "a stood-down list has nobody coming, and the project is not its answer either"

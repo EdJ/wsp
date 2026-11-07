@@ -499,7 +499,7 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     let reading = Reading {
         state,
         wait: crate::waiting::reading(state, asks, &shells, seat, member),
-        governs: crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(seat)),
+        governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat)),
         typed: seats.turn_began_since(seat, h.at),
         pids: seats.pids(seat),
     };
@@ -520,7 +520,7 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     };
     match ending.and_then(|()| confirm_gone(seats, &pids)) {
         Ok(()) => {
-            crate::cycle::log_line(store, &format!("{by} {member} ({seat}) ended — {}, and no pid of it is running", h.because()));
+            crate::store::log_line(store, &format!("{by} {member} ({seat}) ended — {}, and no pid of it is running", h.because()));
             true
         }
         Err(why) => {
@@ -560,7 +560,7 @@ fn original_seats(store: &Store, seats: &dyn Seats) {
             let reading = Reading {
                 state,
                 wait: crate::waiting::reading(state, asks, &shells, &seat, &row.id),
-                governs: crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(seat.as_str())),
+                governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat.as_str())),
                 typed: seats.turn_began_since(&seat, at),
                 pids: seats.pids(&seat),
             };
@@ -568,7 +568,7 @@ fn original_seats(store: &Store, seats: &dyn Seats) {
                 if !why.passes() {
                     let line = format!("wsp: original seat {seat} is left running: {}", why.sentence());
                     if once(store, &row.id, &line) {
-                        crate::cycle::log_line(store, &format!("{}: {}", row.id, line.trim_start_matches("wsp: ")));
+                        crate::store::log_line(store, &format!("{}: {}", row.id, line.trim_start_matches("wsp: ")));
                     }
                 }
                 continue;
@@ -580,7 +580,7 @@ fn original_seats(store: &Store, seats: &dyn Seats) {
                 Err(why) => format!("{ORIGINAL_NOT_ENDED} {seat} — {}", util::truncate(why, 160)),
             };
             if once(store, &row.id, &line) {
-                crate::cycle::log_line(store, &format!("{}: {}", row.id, line.trim_start_matches("wsp: ")));
+                crate::store::log_line(store, &format!("{}: {}", row.id, line.trim_start_matches("wsp: ")));
             }
         }
     }
@@ -667,7 +667,7 @@ pub(crate) fn say_verifier_left(store: &Store, w: Option<&Worklist>, member: &st
         return;
     }
     let by = w.map_or(member, |w| w.id.as_str());
-    crate::cycle::log_line(store, &format!("{by} {member}: {}", line.trim_start_matches("wsp: ")));
+    crate::store::log_line(store, &format!("{by} {member}: {}", line.trim_start_matches("wsp: ")));
     if let Some(w) = w {
         crate::cycle::tell(store, w, &format!(
             "The verifier of {member} in {seat} is left running: {}. \
@@ -685,7 +685,7 @@ pub(crate) fn say_leg_left(store: &Store, row: &str, leg: &str, seat: &str, why:
     }
     let line = format!("wsp: leg {leg}'s seat {seat} is left running: {}", why.sentence());
     if once(store, row, &line) {
-        crate::cycle::log_line(store, &format!("{row}: {}", line.trim_start_matches("wsp: ")));
+        crate::store::log_line(store, &format!("{row}: {}", line.trim_start_matches("wsp: ")));
     }
 }
 
@@ -717,7 +717,7 @@ fn not_ended(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, h: &
     if !once(store, member, &line) {
         return;
     }
-    crate::cycle::log_line(store, &format!("{} {member}: {}", w.map_or(member, |w| w.id.as_str()), line.trim_start_matches("wsp: ")));
+    crate::store::log_line(store, &format!("{} {member}: {}", w.map_or(member, |w| w.id.as_str()), line.trim_start_matches("wsp: ")));
     if let Some(w) = w {
         crate::cycle::tell(store, w, &format!(
             "{member}: {}, and ending its agent ({seat}) failed: {}. \
@@ -735,7 +735,7 @@ fn say_left(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, why: 
     if !once(store, member, &line) {
         return;
     }
-    crate::cycle::log_line(store, &format!("{} {member}: {}", w.map_or(member, |w| w.id.as_str()), line.trim_start_matches("wsp: ")));
+    crate::store::log_line(store, &format!("{} {member}: {}", w.map_or(member, |w| w.id.as_str()), line.trim_start_matches("wsp: ")));
     if let Some(w) = w {
         crate::cycle::tell(store, w, &format!(
             "{member}: {}, and its agent ({seat}) is left running: {}.",

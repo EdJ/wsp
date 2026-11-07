@@ -62,7 +62,7 @@
 //! # What is deliberately NOT on the record
 //!
 //! **`to`.** Addressing is derived at read time, by the walk
-//! `cmd_govern::seat_for` already makes — and which `wsp-095` Part 12 extends
+//! `crate::governors::seat_for` already makes — and which `wsp-095` Part 12 extends
 //! to a `seats_for` returning the whole chain, the head being the addressee and
 //! the tail observers who owe no disposition. That extension is routing rather
 //! than record and is not in this change. The reason `to` is not stored is
@@ -841,7 +841,7 @@ impl Awaited {
 
     /// Whether the waiter is still there to be handed the answer.
     pub fn alive(&self) -> bool {
-        crate::place_super::alive(&[self.pid]).contains(&self.pid)
+        crate::util::alive(&[self.pid]).contains(&self.pid)
     }
 }
 

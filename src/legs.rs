@@ -207,7 +207,7 @@ impl Leg {
         match &self.ending {
             Ending::Standing => {}
             Ending::Ended => out.push_str(" · ended"),
-            Ending::Failed(why) => out.push_str(&format!(" · end failed: {}", crate::cmd_task::fold(why))),
+            Ending::Failed(why) => out.push_str(&format!(" · end failed: {}", crate::util::fold(why))),
         }
         out
     }
@@ -454,7 +454,7 @@ pub(crate) fn newest_caption(t: &Task) -> Option<String> {
         .filter(|(_, l)| l.closed.is_some() && l.caption.as_deref().is_some_and(|c| !c.trim().is_empty()))
         .max_by_key(|(i, l)| (l.closed.clone(), *i))
         .map(|(_, l)| l)?;
-    Some(format!("{}: {}", l.name, crate::cmd_task::fold(l.caption.as_deref()?)))
+    Some(format!("{}: {}", l.name, crate::util::fold(l.caption.as_deref()?)))
 }
 
 /// The path a cycle goes round, first leg repeated at the end, in the arrow form
@@ -881,7 +881,7 @@ pub(crate) fn end_by_review(old: &[Leg], name: &str, account: &str, at: &str) ->
     if leg.state == State::Running {
         leg.state = State::Done;
         leg.closed = Some(at.to_string());
-        leg.caption.get_or_insert_with(|| util::truncate(&crate::cmd_task::fold(account), 100));
+        leg.caption.get_or_insert_with(|| util::truncate(&crate::util::fold(account), 100));
     }
     for l in legs.iter_mut().filter(|l| l.state == State::Pending) {
         l.state = State::Skipped;
@@ -1058,10 +1058,10 @@ pub(crate) fn table(legs: &[Leg]) -> String {
         let after = if w.is_empty() { "-".to_string() } else { w.join(", ") };
         let mut line = format!("- {} · {} · {state} · after {after}", l.name, policy_line(&l.policy));
         if let Some(why) = &l.why {
-            line.push_str(&format!(" · why {}", util::truncate(&crate::cmd_task::fold(why), 80)));
+            line.push_str(&format!(" · why {}", util::truncate(&crate::util::fold(why), 80)));
         }
         if let Some(c) = l.caption.as_deref().or(l.skipped.as_deref()) {
-            line.push_str(&format!(" · {}", util::truncate(&crate::cmd_task::fold(c), 80)));
+            line.push_str(&format!(" · {}", util::truncate(&crate::util::fold(c), 80)));
         }
         out.push(line);
     }
@@ -1085,7 +1085,7 @@ const USAGE: &str = "usage:
   wsp leg done <task> --from FILE|- --caption \"…\"   a leg's seat ends it, at a commit";
 
 pub fn dispatch(store: &Store, args: &Args) -> i32 {
-    let me = crate::cmd_agent::my_pane();
+    let me = crate::place::my_pane();
     run(store, args, me.as_deref())
 }
 
@@ -1141,7 +1141,7 @@ fn order_text(args: &Args) -> Result<String, String> {
     if src == "-" && util::stdin_is_tty() {
         return Err("nothing is piped in — `--order -` reads the order from a stream".into());
     }
-    crate::cmd_task::read_source(&src).map_err(|e| format!("cannot read {src}: {e}"))
+    crate::util::read_source(&src).map_err(|e| format!("cannot read {src}: {e}"))
 }
 
 /// `--packet FILE` as the order line a leg names its packet on: the path
@@ -1303,7 +1303,7 @@ fn cmd_reset(store: &Store, args: &Args) -> i32 {
     crate::starts::forgive(store, &label(&t.id, name));
     store.locked(|| {
         if let Some(mut row) = store.find_task(&t.id) {
-            row.log(&format!("leg {name} reset by hand: {}", crate::cmd_task::fold(&why)));
+            row.log(&format!("leg {name} reset by hand: {}", crate::util::fold(&why)));
             let _ = store.save_task(&row);
         }
     });

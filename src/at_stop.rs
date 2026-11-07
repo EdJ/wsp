@@ -173,7 +173,7 @@ pub(crate) fn run_for(store: &Store, repo: &Path, dir: &Path, limit: Duration) -
     let ran = run_command(dir, &command, limit);
     let path = util::contract(dir);
     let line = said(&path, &ran);
-    crate::cycle::log_line(store, &line);
+    crate::store::log_line(store, &line);
     // A seat's tree is named for its row; a check's or a leg's is not, and has
     // no row of its own to write to.
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

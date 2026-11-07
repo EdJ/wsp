@@ -339,7 +339,7 @@ pub fn flag(args: &crate::Args, from_is_ours: bool) -> Result<Option<String>, i3
                 eprintln!("wsp: nothing is piped in — `--caption -` reads the caption from a stream");
                 return Err(2);
             }
-            match crate::cmd_task::read_source(&src) {
+            match crate::util::read_source(&src) {
                 Ok(text) => text,
                 Err(e) => {
                     eprintln!("wsp: cannot read {}: {e}", if src == "-" { "stdin".into() } else { util::contract(&util::expand(&src)) });

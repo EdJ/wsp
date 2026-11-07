@@ -11,7 +11,7 @@ use crate::herdr;
 use crate::message::{self, About, Ask, Hand, Kind, Message, Party, Shape, Waiting};
 use crate::model::{Status, Task};
 use crate::place::{Delivery, Place, Refusal, State};
-use crate::place_herdr::Herdr;
+pub(crate) use crate::place::my_pane;
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::sync;
@@ -233,46 +233,6 @@ pub(crate) fn named_project(args: &Args, index: &Index) -> Option<Result<Option<
 
 fn pane_id(args: &Args) -> Option<String> {
     args.get("pane").or_else(my_pane)
-}
-
-/// Which seat this process is standing in, or none.
-///
-/// The one reading of it, and it is now the port's rather than herdr's:
-/// `place::Place::here` is the verb, and which variable carries the answer is
-/// the adapter's business. Every agent-side verb — `claim`, `say`, `release` —
-/// is downstream of this, and so is `despawn`'s refusal to end the seat it is
-/// running in.
-///
-/// A `String` because that is what the callers below hold — a claim's `pane`,
-/// a binding's key, the `--pane` a person types are all the same string, and
-/// converting them all is `place::Seat`'s own migration rather than this one's.
-///
-/// No socket is opened: [`Herdr::here`] reads what herdr set before this process
-/// existed, which is a rule of the port and not an optimisation. Constructing
-/// the backend costs four durations and a clock reference.
-///
-/// # Which backend is this process standing in
-///
-/// Two backends can seat an agent and each has its own name for the seat it
-/// hands its occupant — `HERDR_PANE_ID` for a pane, `place::SEAT_ENV` for a
-/// supervisor. Neither adapter is allowed to read the other's:
-/// `place_herdr::here` says why in as many words, and the mirror image holds —
-/// two answers to *which seat is this* is a way to be in two seats, and under
-/// herdr a stale `WSP_SEAT_ID` would bind a task to a pane that backend never
-/// issued.
-///
-/// So the choice is made here, one level up, and it is made by **which name the
-/// seat arrived under** rather than by asking anything. A process started by a
-/// supervisor has the supervisor's variable and nothing else; a shell in a pane
-/// has herdr's. The order matters only for the case that should not exist —
-/// both set — and the supervisor wins it because it is the backend that forked
-/// this process, whatever multiplexer the shell it came from was in.
-pub(crate) fn my_pane() -> Option<String> {
-    let seat = match crate::place_super::Supervisor::new().here() {
-        Some(s) => Some(s),
-        None => Herdr::new().here(),
-    };
-    seat.map(|s| s.to_string())
 }
 
 /// The width every label wsp writes is cut to — the 44 characters `sync`
@@ -608,7 +568,7 @@ pub(crate) fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
         // This pane's, not the room's: a worker finishing a task in a
         // custodian's workspace was renamed `governor · <project>` — it took
         // the seat's name off a seat it does not hold. worklist-035.
-        let governs = cmd_govern::governs(&store.governors(), &cmd_govern::seat_query(&p.workspace_id, Some(pane)));
+        let governs = crate::place::governs(&store.governors(), &crate::place::seat_query(&p.workspace_id, Some(pane)));
         let _ = match &governs {
             Some(project) => herdr::rename_pane(pane, &cmd_govern::governor_of(project)),
             None => herdr::rename_pane(pane, UNASSIGNED_LABEL),
@@ -848,7 +808,7 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         _ => None,
     };
     let body = match &source {
-        Some(src) => match crate::cmd_task::read_source(src) {
+        Some(src) => match crate::util::read_source(src) {
             Ok(text) => text,
             Err(e) => {
                 match src.as_str() {
@@ -1223,7 +1183,7 @@ fn hand_rows(m: &Message, p: &Paint) -> Vec<String> {
 fn hand_aside(
     governors: &std::collections::BTreeMap<String, serde_json::Value>,
     m: &Message,
-    seat: Option<&cmd_govern::Seat>,
+    seat: Option<&crate::governors::Seat>,
     held_here: bool,
 ) -> String {
     let mut out: Vec<String> = Vec::new();
@@ -1349,7 +1309,7 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     // workspace to read, only the seat, and `my_pane()` already picks the
     // right one either way.
     let mine =
-        my_pane().and_then(|pane| cmd_govern::governs(&governors, &crate::place::Seat::new(pane)));
+        my_pane().and_then(|pane| crate::place::governs(&governors, &crate::place::Seat::new(pane)));
     let only_mine = args.has("seat");
     // Asked for an inbox from a pane that has no seat. Said plainly, because
     // "nothing raised for you" and "you are not the seat" look identical from
@@ -1505,7 +1465,7 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // waiting; see `place_compound::Compound::insist`.
     let backends = match args.has("anyway") {
         true => crate::cmd_spawn::insisting_backends(),
-        false => crate::cmd_spawn::local_backends(),
+        false => crate::place::local_backends(),
     };
     let Some((place, row)) = locate_seat(&backends, &seat) else {
         eprintln!("wsp: nothing answers for {seat} — `wsp wip` says who holds what");
@@ -1876,7 +1836,7 @@ pub(crate) fn from_source(args: &Args, typed: &str) -> Result<String, i32> {
     if matches!(path.as_str(), "true" | "-") {
         return piped_message();
     }
-    match crate::cmd_task::read_source(&path) {
+    match crate::util::read_source(&path) {
         Ok(text) if text.trim().is_empty() => {
             eprintln!("wsp: {path} is empty — nothing sent");
             Err(2)
@@ -1917,7 +1877,7 @@ pub(crate) fn piped_message() -> Result<String, i32> {
         eprintln!("wsp: nothing is piped in — `-` reads the message from a stream");
         return Err(2);
     }
-    match crate::cmd_task::read_source("-") {
+    match crate::util::read_source("-") {
         Ok(raw) if raw.trim().is_empty() => {
             eprintln!("wsp: nothing on stdin — nothing sent");
             Err(2)
@@ -2197,7 +2157,7 @@ pub fn worked_line(w: &serde_json::Value) -> String {
 /// *whatever the settings file says, at high effort*, which is precisely what
 /// was asked for and reads back unambiguously. What it does **not** do is
 /// name the model — because at the moment of the claim wsp does not know it,
-/// and the record that does is [`crate::agent_commands::Ran`], read off the
+/// and the record that does is [`crate::agent_kind::Ran`], read off the
 /// transcript when the claim ends.
 ///
 /// Empty for a spawn that stated neither, so the ordinary claim line is
@@ -2256,7 +2216,7 @@ pub(crate) fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
 ///
 /// Same line, same reading, one more clause: `242M cache 4.7M in 875k out`,
 /// and a price where the runtime states one. The argument for the units is on
-/// [`crate::agent_commands::Spend`] and the argument for writing it here
+/// [`crate::agent_kind::Spend`] and the argument for writing it here
 /// rather than reading it at report time is the one above — evidence has to be
 /// durable and a transcript is not.
 ///
@@ -2278,7 +2238,7 @@ pub(crate) fn ran_in_seat(store: &Store, seat: &str, since: &str) -> String {
 
 /// What a seat's session served since `since`, from the seat's own binding. A
 /// verifier's seat is read the same way, and its pass keeps the reading.
-pub(crate) fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::agent_commands::Ran> {
+pub(crate) fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::agent_kind::Ran> {
     let (kind, session, cwd) = session_of_seat(store, seat)?;
     crate::agent_commands::of(&kind).ran(&session, &cwd, util::epoch_of(since))
 }
@@ -2351,7 +2311,7 @@ fn ran_clause(kind: &str, session: &str, cwd: &str, since: &str) -> String {
 /// The clauses a release line and a leg's end line carry: ` · ran opus-5/high ·
 /// 96 turns · peak 180k · 242M cache 4.7M in 875k out`. The peak is left out
 /// where the runtime read none, so a line written before it reads as it did.
-fn ran_text(ran: &crate::agent_commands::Ran) -> String {
+fn ran_text(ran: &crate::agent_kind::Ran) -> String {
     let peak = match ran.peak {
         0 => String::new(),
         n => format!(" · peak {}", util::count_human(n)),
@@ -2717,7 +2677,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // because `agent_in_seat` answers with the newest row and this writes one.
     let agent_id = store
         .agent_in_seat(&pane)
-        .unwrap_or_else(crate::place::new_agent_id);
+        .unwrap_or_else(crate::util::new_agent_id);
 
     store.locked(|| {
         for other in &displaced {
@@ -4211,14 +4171,14 @@ fn checking(lists: &[crate::model::Worklist], tasks: &[Task]) -> std::collection
 
 impl Wip {
     pub(crate) fn live(store: &Store) -> Wip {
-        let backends = crate::cmd_spawn::local_backends();
+        let backends = crate::place::local_backends();
         let mut agents = Vec::new();
         let mut heard = false;
         // Which source each seat was read from, and which sources answered:
         // a seat is forgotten only by its own machine answering without it.
         let mut from: BTreeMap<String, String> = BTreeMap::new();
         let mut answered: BTreeSet<String> = BTreeSet::new();
-        for (backend, name) in backends.iter().zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES) {
+        for (backend, name) in backends.iter().zip(crate::place::LOCAL_BACKEND_NAMES) {
             let Ok(census) = backend.census() else { continue };
             heard = true;
             for (machine, seats) in census.answers() {
@@ -4372,7 +4332,7 @@ pub(crate) fn holding(
 /// draws its `▣` from.
 pub(crate) fn governs_seat(governors: &BTreeMap<String, Value>, seat: &str) -> bool {
     let workspace = seat.split(':').next().unwrap_or(seat);
-    cmd_govern::governs(governors, &cmd_govern::seat_query(workspace, Some(seat))).is_some()
+    crate::place::governs(governors, &crate::place::seat_query(workspace, Some(seat))).is_some()
 }
 
 /// One agent, as `wip` wants it.
@@ -4687,7 +4647,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // spelling so the next word herdr adds does not read as work.
         let stopped = a.state.stopped();
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
-        let governs = cmd_govern::governs(&w.governors, &cmd_govern::seat_query(workspace_id, Some(seat)));
+        let governs = crate::place::governs(&w.governors, &crate::place::seat_query(workspace_id, Some(seat)));
         let (seat_of_project, was_governor) = match a.state == State::Gone {
             true => (None, governs),
             false => (governs, None),
@@ -4719,7 +4679,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             // A scope is a list when a worklist has its slug, whether or
             // not it has started — the order `cmd_govern::scope_of` reads
             // the one key space in.
-            (Some(id), ..) if cmd_govern::is_primary(id) => Role::Primary,
+            (Some(id), ..) if crate::governors::is_primary(id) => Role::Primary,
             (Some(id), ..) => Role::Governor { list: w.lists.iter().any(|l| &l.id == id), id: id.clone() },
             (None, Some(t), ..) => Role::Member {
                 task: t.id.clone(),
@@ -4829,14 +4789,14 @@ fn wip_queues(w: &Wip) -> (Vec<&Task>, Vec<&Task>, usize) {
 ///
 /// The walks are the ones the questions already take, so a row is drawn under
 /// the seat its `wsp ask` would reach:
-/// - a **member**, [`cmd_govern::seat_for`] over the running list it is in and
+/// - a **member**, [`crate::governors::seat_for`] over the running list it is in and
 ///   its project's ancestors — what [`cmd_govern::answering_seat`] asks;
 /// - a **verifier**, its member's, since it hangs beside the member it reads;
 /// - a **leg**, its row's, since it works the row;
 /// - a **barrier check**, its list's, falling through to the project its
 ///   group's work is in;
 /// - a **list's governor**, the governor of the project the list stands in
-///   ([`cmd_govern::seat_above`] from its home, `wsp-263`);
+///   ([`crate::governors::seat_above`] from its home, `wsp-263`);
 /// - a **project's governor**, nobody: the census is a tree of lists under
 ///   projects, and a project custodian is a root of it, so both halves are
 ///   `None`;
@@ -4863,7 +4823,7 @@ fn answers_to(
         Role::Governor { list: false, .. } | Role::Primary => return (None, None),
         Role::Governor { list: true, id } => {
             let home = homes.get(id).map(String::as_str);
-            return match cmd_govern::seat_above(&w.governors, &w.index, id, home) {
+            return match crate::governors::seat_above(&w.governors, &w.index, id, home) {
                 Some(s) => (Some(s.scope), None),
                 None => (None, home.map(str::to_string)),
             };
@@ -4881,7 +4841,7 @@ fn answers_to(
     // before its project's, as its `wsp ask` and its review go.
     let found = match task {
         Some(t) => cmd_govern::seat_for_task(&w.governors, &w.index, list, t, project),
-        None => cmd_govern::seat_for(&w.governors, &w.index, list, project),
+        None => crate::governors::seat_for(&w.governors, &w.index, list, project),
     };
     match found {
         // A post wsp is filling is where the row's ask waits, and it is empty:
@@ -9524,7 +9484,7 @@ mod tests {
         rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
         std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
 
-        let backends = crate::cmd_spawn::local_backends();
+        let backends = crate::place::local_backends();
         let (_, row) = locate_seat(&backends, seat.as_str())
             .unwrap_or_else(|| panic!("{} answers for itself even with no herdr up", seat.as_str()));
         assert_eq!(row.seat, seat);
@@ -10736,7 +10696,7 @@ mod tests {
     /// peak between the turns and the spend, and left out where none was read.
     #[test]
     fn the_ran_clauses_carry_the_peak_between_turns_and_spend() {
-        use crate::agent_commands::{Ran, Spend};
+        use crate::agent_kind::{Ran, Spend};
         let mut ran = Ran {
             models: vec!["sonnet-5-5".into()],
             efforts: vec!["high".into()],

@@ -152,7 +152,7 @@ pub(crate) struct Spent {
     pub ran: String,
     pub turns: usize,
     pub peak: u64,
-    pub spend: crate::agent_commands::Spend,
+    pub spend: crate::agent_kind::Spend,
     /// Seconds the verifier's model calls took, and seconds its tools ran
     /// (`compounding-104`), read off its transcript when its seat is ended. `0`
     /// is unread: a kind with no transcript wsp can read.
@@ -178,13 +178,13 @@ impl Spent {
         Some(s)
     }
 
-    pub(crate) fn of(ran: &crate::agent_commands::Ran) -> Spent {
+    pub(crate) fn of(ran: &crate::agent_kind::Ran) -> Spent {
         Spent { ran: ran.label(), turns: ran.turns, peak: ran.peak, spend: ran.spend, ..Spent::default() }
     }
 
     /// The reading at the seat's end, with what was written at its start kept:
     /// the load, and the seconds when a reading of the transcript gave them.
-    pub(crate) fn ending(start: Option<&Spent>, ran: Option<&crate::agent_commands::Ran>, secs: Option<(i64, i64)>) -> Option<Spent> {
+    pub(crate) fn ending(start: Option<&Spent>, ran: Option<&crate::agent_kind::Ran>, secs: Option<(i64, i64)>) -> Option<Spent> {
         let mut s = match ran {
             Some(r) => Spent::of(r),
             None if start.is_some_and(|s| s.load1.is_some()) => Spent::default(),
@@ -254,7 +254,7 @@ impl Pass {
             Ending::Ended => out.push_str(" · ended"),
             // One line: a reason from stderr can run to several, and a line
             // break inside a clause would end the entry.
-            Ending::Failed(why) => out.push_str(&format!(" · end failed: {}", crate::cmd_task::fold(why))),
+            Ending::Failed(why) => out.push_str(&format!(" · end failed: {}", crate::util::fold(why))),
         }
         // Last, because it is the one clause made of somebody's words: a ` · `
         // inside a caption would otherwise end it and start a clause nobody
@@ -362,7 +362,7 @@ impl Pass {
                     "tested" => p.spent.get_or_insert_with(Spent::default).test_secs = v.and_then(|v| v.trim_end_matches('s').parse().ok()).unwrap_or(0),
                     "first" => p.spent.get_or_insert_with(Spent::default).first_line = v,
                     "load1" => p.spent.get_or_insert_with(Spent::default).load1 = v.and_then(|v| v.parse::<f64>().ok()).map(|l| (l * 100.0).round() as u32),
-                    "spent" => p.spent.get_or_insert_with(Spent::default).spend = v.and_then(|v| crate::agent_commands::Spend::of_clause(&v)).unwrap_or_default(),
+                    "spent" => p.spent.get_or_insert_with(Spent::default).spend = v.and_then(|v| crate::agent_kind::Spend::of_clause(&v)).unwrap_or_default(),
                     _ => {}
                 }
             }
@@ -824,7 +824,7 @@ pub(crate) fn supersede(store: &Store, member: &str, seat: &str) -> bool {
 /// as what is owed — the member goes back to `doing`, and its pane is told —
 /// and the run tells its governor once, as the decision it is.
 pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
-    let me = crate::cmd_agent::my_pane();
+    let me = crate::place::my_pane();
     // Given no verdict: the one the verifier wrote at the place wsp keeps for it
     // (`wsp-374`, `$WSP_VERDICT`), when it was written in this pass.
     if let Some((from_file, written)) = crate::closing::verifier_args(store, args, me.as_deref()) {
@@ -1072,7 +1072,7 @@ pub(crate) fn send_back(t: &mut Task, now: String, by: &str, read: Option<&str>,
         "{} {by}{}: {} — the whole verdict is under ## Verification",
         crate::cycle::SENT_BACK,
         read.map(|r| format!(" at {r}")).unwrap_or_default(),
-        util::truncate(&crate::cmd_task::fold(text), 300)
+        util::truncate(&crate::util::fold(text), 300)
     ));
     // A row run as legs is sent back to a leg of its own: one `rework`
     // leg after the last, whose order is the verdict (`docs/legs.md`,
@@ -1258,7 +1258,7 @@ mod tests {
                 ran: "sonnet-5-5/high".into(),
                 turns: 7,
                 peak: 70_000,
-                spend: crate::agent_commands::Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None },
+                spend: crate::agent_kind::Spend { cache: 4_000_000, input: 200_000, output: 10_000, micros: None },
                 model_secs: 41,
                 tool_secs: 23,
                 test_secs: 17,

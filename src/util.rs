@@ -1404,3 +1404,124 @@ pub fn base36(mut n: u64) -> String {
     out.reverse();
     String::from_utf8(out).unwrap_or_default()
 }
+
+/// One seat, as the backend currently sees it.
+///
+/// An id for an agent that outlives the agent's sessions.
+///
+/// **The identity `compound-092` exists to create**, and the decision behind it
+/// is Ed's: *"we can keep the IDs between agent sessions, since it's technically
+/// the same agent."* So it cannot be a session id, a pane id or a seat id —
+/// all three end and come back, and the thing this names does not. `wsp resume`
+/// carries it across a restart and across a change of BACKEND, which is what
+/// makes `compound-065`'s cutover — close down in herdr, come back in compound,
+/// on the same claim — a move rather than a replacement. `wsp govern --rotate`
+/// does not carry it: a successor is a different agent and mints its own.
+///
+/// Minted by wsp and never by a backend (`compound` d9: *"wsp mints and holds
+/// the id, and the backend's own name for a thing becomes an attribute of it
+/// rather than its identity"*).
+///
+/// # Why it is shaped like a message id and not like a uuid
+///
+/// Ed asked for a uuid and this is the same guarantee by a cheaper route. wsp
+/// takes one dependency — `serde_json` — so a uuid crate would be the second,
+/// for a value that never leaves this machine's own store. What actually
+/// matters is the property `message::new_id` documents and a uuid would give
+/// only by accident: **an agent id must live outside the task id space.**
+/// `Store::rename_tasks` rewrites a renumbering through the raw text of every
+/// state file, matching whole `[A-Za-z0-9_-]` tokens against a map of old task
+/// ids — so an id that could collide with one would be silently rewritten by a
+/// `wsp mv`, and the claim naming it would lose its agent. Task ids end in
+/// digits after their last `-`; this ends in `p` plus base 36, which no task id
+/// has ever had.
+pub fn new_agent_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("a-{}-p{:x}{:x}", crate::util::base36(crate::util::epoch_nanos()), std::process::id(), n)
+}
+
+/// Is this one of ours? The complement of a task id, asserted in both
+/// directions by the test, exactly as `message::is_message_id` is.
+pub fn is_agent_id(s: &str) -> bool {
+    s.starts_with("a-") && s.rsplit('-').next().is_some_and(|tail| tail.starts_with('p'))
+}
+
+/// Which of these pids are running, in one ask.
+///
+/// One `ps` rather than one `kill -0` each, because [`Place::census`] would
+/// otherwise fork once per seat. An empty list forks nothing.
+///
+/// **A zombie is not alive**, and that arm is not hypothetical. `wsp spawn`
+/// starts the agent and then polls its readiness from the same process, so an
+/// agent that dies in its first second is a child nobody has reaped and sits in
+/// the process table looking exactly like a running one. Reporting it as alive
+/// is the same class of defect as robustness-041 with the sign flipped: an agent
+/// declared healthy while its corpse cools.
+pub(crate) fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
+    if pids.is_empty() {
+        return std::collections::BTreeSet::new();
+    }
+    let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    let out = match std::process::Command::new("ps").args(["-o", "pid=,state=", "-p", &list]).output() {
+        Ok(o) => o,
+        // Not an empty set: `ps` failing to run is not evidence that every agent
+        // on this machine has stopped, and a caller that reaped on the strength
+        // of it would end every claim at once. The rule is `sync.rs:41`'s and is
+        // older than this file.
+        Err(_) => return pids.iter().copied().collect(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid: u32 = it.next()?.parse().ok()?;
+            match it.next().unwrap_or("").starts_with('Z') {
+                true => None,
+                false => Some(pid),
+            }
+        })
+        .collect()
+}
+
+/// One entry is one line, so text that arrives on several becomes one.
+///
+/// Not tidying: the `## Log` section is read line-by-line by everything that
+/// reads it — `brief` shows the last few *lines* as the last few entries,
+/// `blocked_question` scans for one, `localise_dates` rewrites the stamp at the
+/// head of each. A forty-line survey pasted in whole is forty entries to all of
+/// them, and it would push every other entry out of the brief that every
+/// session on the task pays for. Folding keeps every word and costs the
+/// paragraph breaks; the alternative costs the reader.
+///
+/// `cmd_install` folds its `--why` through here for the neighbouring reason: a
+/// lock line is one sentence long — "held by w1:p6 for 3s — installing fdefcab"
+/// — and a paragraph pasted into one is a line nobody can read either side of.
+/// `cmd_worklist` folds stop prose and barrier verdicts through it for the
+/// first reason exactly: `## Groups` is read line by line too, so a blank line
+/// inside a `stop:` block ends the block, and prose stored with one comes back
+/// next read truncated at the gap.
+pub(crate) fn fold(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(crate) fn read_source(src: &str) -> std::io::Result<String> {
+    let raw = if src == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    } else {
+        std::fs::read_to_string(self::expand(src))?
+    };
+    // A stream is the safe path and still not a trusted one: `wsp note <id> -`
+    // with a build's log on the other end of the pipe is the same damage as
+    // the substitution in [`crate::self::terminal_output`], arrived by hand.
+    // Checked here rather than at each caller because this is the one door
+    // every stream comes through, and every caller already prints what it
+    // could not read.
+    if let Some(why) = self::terminal_output(&raw) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, why));
+    }
+    Ok(raw)
+}

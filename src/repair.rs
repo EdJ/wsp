@@ -152,7 +152,7 @@ const EVERY: i64 = 60;
 /// for one question, which is `wsp-114`'s shape arrived at by a different road.
 ///
 /// **Two ticks is two minutes and it is counted, not timed.** The count lives on
-/// the governor record ([`crate::cmd_govern::Vacancy`]) rather than in
+/// the governor record ([`crate::governors::Vacancy`]) rather than in
 /// [`Pass`], because the daemon `exec`s itself when an install lands underneath
 /// it — which is exactly when a person is most likely to be installing, mid-run,
 /// with a governor dead.
@@ -504,7 +504,7 @@ fn seat_scopes_owing(store: &Store, owed: Vec<(String, usize)>) -> Vec<(String, 
     // `--tell` landed while it was empty would start an agent at 3am that
     // nobody talks to (README, *Does the daemon refill it unprompted?*).
     for (scope, owed) in owed {
-        if governors.contains_key(&scope) && !paused.contains(&scope) && !crate::cmd_govern::is_primary(&scope) {
+        if governors.contains_key(&scope) && !paused.contains(&scope) && !crate::governors::is_primary(&scope) {
             // The count in the sentence is the count this walk counted, so the
             // line cannot claim a scope owes an answer without a number behind it.
             add(scope, format!("it owes {owed} and nothing is answering it"), &mut out);
@@ -548,9 +548,9 @@ const RUNNING: &str = "this list is running";
 /// the daemon where the store already exists, and because a repair's lines and
 /// the run steps' have to land in the *same file*: the reconciler's stdout is
 /// launchd's `daemon.log`, so "through stdout" would have put them in a file
-/// nobody reads for a run. See [`crate::cycle::log_line`].
+/// nobody reads for a run. See [`crate::store::log_line`].
 fn stamp(store: &Store, line: &str) {
-    crate::cycle::log_line(store, line);
+    crate::store::log_line(store, line);
 }
 
 /// Every seat whose screen this pass overruled, said once each.
@@ -928,7 +928,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // to be filled must not be counted towards a threshold that will not be
     // crossed, and must not stamp a line into `cycle.log` claiming a governor is
     // on its way. Silence is the correct report for a decision somebody made.
-    if cmd_govern::stood_at(&governors, &scope).is_some() {
+    if crate::governors::stood_at(&governors, &scope).is_some() {
         return;
     }
     // Somebody else's machine is somebody else's seat. Absent record is ours.
@@ -1906,7 +1906,7 @@ fn undated(line: &str) -> &str {
 
 /// One dated line in `cycle.log`.
 ///
-/// Through [`crate::cycle::log_line`], so a repair's lines and the run steps' are
+/// Through [`crate::store::log_line`], so a repair's lines and the run steps' are
 /// in one file in one order — and **recorded in memory under `cfg(test)`** as
 /// well as written, so a test can read what was said from either.
 
@@ -2328,7 +2328,7 @@ impl Seats for Absent {
 
         let fills = reseated();
         assert!(fills.is_empty(), "a governor at a prompt is not a vacancy: {fills:?}");
-        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 0);
+        assert_eq!(crate::governors::vacancy(&store.governors(), "run").unseated, 0);
     }
 
     /// **The two ticks are the whole delay, and a test that skipped them would
@@ -2345,7 +2345,7 @@ impl Seats for Absent {
         let fills = reseated();
         assert!(fills.is_empty(), "one tick is not two: {fills:?}");
         assert_eq!(
-            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            crate::governors::vacancy(&store.governors(), "run").unseated,
             1,
             "and the count is on the record, where a daemon that execs on install cannot lose it"
         );
@@ -2368,7 +2368,7 @@ impl Seats for Absent {
 
         let mut fills = Vec::new();
         a_pass(&store, &gone);
-        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 1, "one so far");
+        assert_eq!(crate::governors::vacancy(&store.governors(), "run").unseated, 1, "one so far");
         a_pass(&store, &gone);
         fills.extend(reseated());
         a_pass(&store, &gone);
@@ -2376,7 +2376,7 @@ impl Seats for Absent {
         fills.extend(reseated());
         assert_eq!(fills, vec!["run".to_string()], "two ticks seat one successor and no more: {fills:?}");
         assert!(
-            cmd_govern::vacancy(&store.governors(), "run").reseating.is_some(),
+            crate::governors::vacancy(&store.governors(), "run").reseating.is_some(),
             "the claim is what stopped the second, and it is on the record for the process that took it"
         );
     }
@@ -2396,7 +2396,7 @@ impl Seats for Absent {
 
         let fills = reseated();
         assert!(fills.is_empty(), "an absence is not a death: {fills:?}");
-        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 0);
+        assert_eq!(crate::governors::vacancy(&store.governors(), "run").unseated, 0);
     }
 
     /// The other half of `wsp-148`: a list that starts with no seat on its scope
@@ -2439,7 +2439,7 @@ impl Seats for Absent {
         }
         assert!(reseated().is_empty(), "and lines owed to it do not undo the pause");
         assert_eq!(
-            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            crate::governors::vacancy(&store.governors(), "run").unseated,
             0,
             "not counted either: a count is a governor on its way"
         );
@@ -2540,11 +2540,11 @@ impl Seats for Absent {
         let (_env, store) = in_flight("seat-recovers");
         seated(&store, "run", "w1", "cpd-1", "", "");
         a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Empty))]));
-        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 1);
+        assert_eq!(crate::governors::vacancy(&store.governors(), "run").unseated, 1);
 
         a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Working))]));
         assert_eq!(
-            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            crate::governors::vacancy(&store.governors(), "run").unseated,
             0,
             "a seat with somebody in it is the receipt, and the receipt clears the count"
         );
@@ -2576,7 +2576,7 @@ impl Seats for Absent {
 
         let gone = Fake::empty();
         a_pass(&store, &gone);
-        assert_eq!(cmd_govern::vacancy(&store.governors(), "quiet").unseated, 1, "counted first");
+        assert_eq!(crate::governors::vacancy(&store.governors(), "quiet").unseated, 1, "counted first");
         a_pass(&store, &gone);
 
         assert!(reseated().contains(&"quiet".to_string()), "nothing else would ever seat this");
@@ -2606,7 +2606,7 @@ impl Seats for Absent {
 
             assert!(reseated().is_empty(), "{}: nobody is seated for a list with no next step", status.as_str());
             assert_eq!(
-                cmd_govern::vacancy(&store.governors(), "run").unseated,
+                crate::governors::vacancy(&store.governors(), "run").unseated,
                 0,
                 "{}: and it is not even counted towards one",
                 status.as_str()
@@ -2700,7 +2700,7 @@ impl Seats for Absent {
         a_pass(&store, &Fake::new(&[("cpd-1", None)]));
 
         assert!(reseated().is_empty(), "silence is not absence: {:?}", reseated());
-        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 0);
+        assert_eq!(crate::governors::vacancy(&store.governors(), "run").unseated, 0);
     }
 
     /// **A seat that reads `gone`, in the shape `reconcile` leaves behind.** Found
@@ -2727,7 +2727,7 @@ impl Seats for Absent {
 
         a_pass(&store, &closed);
         assert_eq!(
-            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            crate::governors::vacancy(&store.governors(), "run").unseated,
             1,
             "a vacated seat is read through `last` and counted like any other"
         );
@@ -2782,7 +2782,7 @@ impl Seats for Absent {
         }
 
         assert!(reseated().is_empty(), "{:?}", reseated());
-        assert!(cmd_govern::vacancy(&store.governors(), "run").reseating.is_none(), "nothing claimed");
+        assert!(crate::governors::vacancy(&store.governors(), "run").reseating.is_none(), "nothing claimed");
         let said: Vec<String> = stamped().into_iter().filter(|l| l.contains("compound cannot run")).collect();
         assert_eq!(said.len(), 1, "once, not once a pass: {said:?}");
         let _ = std::fs::remove_dir_all(&store.root);
@@ -2837,7 +2837,7 @@ impl Seats for Absent {
             "one pass, one notice: {said:?}"
         );
         assert_eq!(
-            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            crate::governors::vacancy(&store.governors(), "run").unseated,
             1,
             "and one pass is one tick however many triggers named it"
         );
@@ -2852,7 +2852,7 @@ impl Seats for Absent {
     /// way, and on 2026-10-05 they did not.** `tooling`'s record reads
     /// `workspace: compound, pane: ""`: a workspace with nobody in it. The
     /// reconciler counted that as a vacancy and launched `govern --reseat`, and
-    /// the verb — asking [`crate::cmd_govern::seat_of_scope`], which stops at the
+    /// the verb — asking [`crate::governors::seat_of_scope`], which stops at the
     /// workspace — refused it. The claim was left on a post nobody was ever
     /// going to fill, for twenty minutes, while the seat stayed empty.
     ///
@@ -2872,7 +2872,7 @@ impl Seats for Absent {
         let gone = Fake::empty();
 
         a_pass(&store, &gone);
-        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 1, "counted as empty");
+        assert_eq!(crate::governors::vacancy(&store.governors(), "run").unseated, 1, "counted as empty");
         a_pass(&store, &gone);
         assert_eq!(
             reseated(),
@@ -2938,7 +2938,7 @@ fn a_seat_a_person_stood_down_is_never_reseated_however_much_is_held_for_it() {
     assert!(reseated().is_empty(), "a decision is not a vacancy to be repaired: {:?}", reseated());
     let rec = &store.governors()["run"];
     assert_eq!(
-        cmd_govern::vacancy(&store.governors(), "run").unseated,
+        crate::governors::vacancy(&store.governors(), "run").unseated,
         0,
         "and it is not counted towards a threshold it will never cross: {rec}"
     );
@@ -2960,9 +2960,9 @@ fn the_primary_seat_is_never_reseated_by_the_daemon_however_much_is_held_for_it(
     // No list at all: a running list's own unfilled post would be seated on
     // the first pass, and is not what this is about.
     let (_env, store) = scratch("seat-primary");
-    seated(&store, cmd_govern::PRIMARY, "cpd-1", "cpd-1", "", "");
-    held_for(&store, cmd_govern::PRIMARY, 3);
-    cmd_govern::vacate(&store, cmd_govern::PRIMARY);
+    seated(&store, crate::governors::PRIMARY, "cpd-1", "cpd-1", "", "");
+    held_for(&store, crate::governors::PRIMARY, 3);
+    cmd_govern::vacate(&store, crate::governors::PRIMARY);
 
     let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
     for _ in 0..(EMPTY_TICKS + 2) {
@@ -2971,7 +2971,7 @@ fn the_primary_seat_is_never_reseated_by_the_daemon_however_much_is_held_for_it(
 
     let seated_by_a_tick = reseated();
     assert!(seated_by_a_tick.is_empty(), "filled on demand, never by a tick: {seated_by_a_tick:?}");
-    assert!(!will_seat(&store, cmd_govern::PRIMARY), "so `--status` says nobody is coming");
+    assert!(!will_seat(&store, crate::governors::PRIMARY), "so `--status` says nobody is coming");
     let _ = std::fs::remove_dir_all(&store.root);
 }
 
@@ -2988,7 +2988,7 @@ fn a_seat_stays_stood_down_through_a_reconcile_that_vacates_it_again() {
     // The reconciler's own empty-the-occupancy, on a record somebody closed.
     cmd_govern::vacate(&store, "run");
     assert!(
-        cmd_govern::stood_at(&store.governors(), "run").is_some(),
+        crate::governors::stood_at(&store.governors(), "run").is_some(),
         "a vacating that did not fill the seat did not lift the decision: {:?}",
         store.governors()["run"]
     );
@@ -3014,12 +3014,12 @@ fn taking_a_stood_down_seat_lifts_the_decision_so_the_next_death_is_ordinary() {
     let (_env, store) = in_flight("seat-stood-retake");
     seated(&store, "run", "w1", "cpd-1", "", "");
     cmd_govern::mark_stood_down(&store, "run");
-    assert!(cmd_govern::stood_at(&store.governors(), "run").is_some());
+    assert!(crate::governors::stood_at(&store.governors(), "run").is_some());
 
     // A person filling it by hand, which is `wsp govern` in the seat's own pane.
     cmd_govern::take(&store, "run", "w1", "cpd-1").unwrap();
     assert!(
-        cmd_govern::stood_at(&store.governors(), "run").is_none(),
+        crate::governors::stood_at(&store.governors(), "run").is_none(),
         "a seat somebody is in is not a stood-down seat: {:?}",
         store.governors()["run"]
     );

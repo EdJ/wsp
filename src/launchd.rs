@@ -613,7 +613,7 @@ mod tests {
             })
             .unwrap_or_default();
         let pids: Vec<u32> = stale.iter().map(|(pid, _)| *pid).chain(dirs.iter().map(|(pid, _)| *pid)).collect();
-        let running = crate::place_super::alive(&pids);
+        let running = crate::util::alive(&pids);
         for (pid, label) in stale {
             if !running.contains(&pid) {
                 let _ = Command::new("launchctl")

@@ -1010,7 +1010,7 @@ impl Store {
         if Some(scope) == excluding {
             return None;
         }
-        if crate::cmd_govern::is_primary(scope) {
+        if crate::governors::is_primary(scope) {
             return Some("the primary interface's seat is keyed on it".into());
         }
         if self.worklist(scope).is_some() {
@@ -2299,7 +2299,7 @@ impl Store {
     /// copies of "mint or reuse" is how they drift.
     pub fn agent_for_seat(&self, seat: &str) -> String {
         self.agent_in_seat(seat).unwrap_or_else(|| {
-            let id = crate::place::new_agent_id();
+            let id = crate::util::new_agent_id();
             self.set_agent(&id, json!({ "seat": seat, "started": util::now_iso() }));
             id
         })
@@ -3584,6 +3584,75 @@ fn replace(path: &Path, contents: &str, durable: bool) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// What `cycle.log` was told this thread, in order.
+    pub(crate) static SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One dated line in `cycle.log`, **appended to the file**, and the one way a
+/// run or a repair says anything.
+///
+/// **The file, whoever is running this.** A run step is taken by three kinds of
+/// process, and stdout is a different place in each: a `wsp worklist advance`
+/// this module [`launch`]es has `cycle.log` as its stdout, the daemon's tick
+/// takes [`step`] inline and its stdout is launchd's `daemon.log`, and a verb a
+/// person or an agent runs has their terminal. There used to be two writers:
+/// `stamp`, stdout only, which every run step used, and this, file only, which
+/// the reconciler used because the daemon's stdout is a file nobody reads for a
+/// run. Then the daemon's tick started a verifier inline (`wsp-222`, on
+/// `wsp-212`'s live proof): its `spawn wsp-217 --agent --verify` and `started
+/// wsp-217` went to `daemon.log`, and a governor reading `cycle.log` saw the
+/// barrier go from waiting to a verdict with nothing started in between. A
+/// `wsp reopen`'s `tell` lines were the same, on the caller's terminal only.
+///
+/// **Echoed to stdout only when stdout is not a file** — see [`a_reader`]. A
+/// launched child's stdout *is* `cycle.log`, and echoing there wrote every line
+/// twice (`wsp-217`); the daemon's is `daemon.log`. A terminal or an agent's
+/// pipe is somebody reading what the verb they ran did, which is what `stamp`
+/// gave them and what they still get.
+pub(crate) fn log_line(store: &Store, line: &str) {
+    // The in-memory record is for the tests to read what was said; the file is
+    // written whatever that says, because a test asserting on a record the same
+    // function produced proves nothing about the file. The isolated store a
+    // test uses is a throwaway directory, so writing it costs nothing and keeps
+    // this assertion honest. Nothing is echoed under test: the harness's stdout
+    // is whatever ran it, and the decision is [`a_reader`]'s, tested alone.
+    #[cfg(test)]
+    SAID.with(|s| s.borrow_mut().push(line.to_string()));
+    let at = util::now_iso();
+    if let Ok(mut out) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store.state_file("cycle.log"))
+    {
+        use std::io::Write;
+        let _ = writeln!(out, "{at} {line}");
+    }
+    #[cfg(not(test))]
+    if a_reader(stdout_meta().as_ref()) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "{at} {line}");
+    }
+}
+
+/// Whether this process's stdout is somebody reading, from what it is.
+///
+/// **A regular file is a log, and not one of ours to write twice**: `cycle.log`
+/// itself under [`launch`], `daemon.log` under launchd. Anything else — a
+/// terminal, an agent's pipe, `/dev/null`, or a stdout nobody could look at — is
+/// echoed to, which costs nothing where nobody reads it.
+pub(crate) fn a_reader(stdout: Option<&std::fs::Metadata>) -> bool {
+    !stdout.is_some_and(|m| m.is_file())
+}
+
+#[cfg(not(test))]
+fn stdout_meta() -> Option<std::fs::Metadata> {
+    use std::os::fd::AsFd;
+    let fd = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
+    std::fs::File::from(fd).metadata().ok()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Group, WorklistStatus};
@@ -4255,7 +4324,7 @@ mod tests {
     fn agent_for_seat_mints_once_and_reuses_it() {
         let store = scratch("agent-for-seat");
         let first = store.agent_for_seat("w1:p1");
-        assert!(crate::place::is_agent_id(&first), "{first}");
+        assert!(crate::util::is_agent_id(&first), "{first}");
         assert_eq!(store.agent_for_seat("w1:p1"), first, "the same seat, the same agent");
         assert_eq!(store.agents_held().len(), 1, "one row, not two");
     }
@@ -4314,7 +4383,7 @@ mod tests {
         {
             for key in keys {
                 assert!(
-                    crate::place::is_agent_id(&key),
+                    crate::util::is_agent_id(&key),
                     "{file} took a fresh write keyed on `{key}`, which is not an agent id"
                 );
             }

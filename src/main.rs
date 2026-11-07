@@ -47,6 +47,8 @@ mod cmd_burn;
 mod cmd_cost;
 mod cmd_report;
 mod cmd_checkout;
+mod governors;
+mod agent_kind;
 mod cmd_govern;
 mod cmd_install;
 mod cmd_machine;

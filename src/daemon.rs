@@ -517,7 +517,7 @@ fn pane_of(rest: &str) -> Option<String> {
 /// call sites — and four call sites that had drifted into three answers is the
 /// failure the doc on [`loud`] claims not to have.
 pub(crate) fn a_backend_answered() -> bool {
-    crate::cmd_spawn::local_backends().iter().any(|b| b.census().is_ok())
+    crate::place::local_backends().iter().any(|b| b.census().is_ok())
 }
 
 /// The one sentence four surfaces show when this machine has no daemon.
@@ -689,7 +689,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         return 2;
     }
     let backend_ok: Vec<bool> =
-        crate::cmd_spawn::local_backends().iter().map(|b| b.census().is_ok()).collect();
+        crate::place::local_backends().iter().map(|b| b.census().is_ok()).collect();
     if nothing_answered(&backend_ok) {
         eprintln!(
             "wsp: no backend answered — no herdr socket at {} and compound has nothing to run for either",

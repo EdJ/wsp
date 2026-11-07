@@ -1144,7 +1144,7 @@ pub(crate) struct Signal {
     ///
     /// Read off the level rather than re-derived at delivery, and that is the
     /// whole of `worklist-039`'s daemon half. [`crate::attention::deliver`]
-    /// used to walk [`cmd_govern::seat_for`] per *edge*, at the moment the edge
+    /// used to walk [`crate::governors::seat_for`] per *edge*, at the moment the edge
     /// was sent, which addresses a raise and its clearing by two different
     /// readings of a routing that moves under both. Driven on 2026-08-20
     /// against a fake herdr: one flag, one seat swap in between, and the log
@@ -1263,7 +1263,7 @@ impl Signal {
     /// splits a seat's inbox into what it is the **addressee** for and what it
     /// merely **observes**, and the split needs `seats_for` — the untruncated
     /// routing walk — which is `wsp-095`'s to write. Until it exists this watch
-    /// subscribes only to what [`cmd_govern::seat_for`] addresses here, so the
+    /// subscribes only to what [`crate::governors::seat_for`] addresses here, so the
     /// field is a constant, and it is present so the second value is a value
     /// rather than a schema change.
     /// The signal as the two persisted records hold it.
@@ -1905,7 +1905,7 @@ pub(crate) struct Scope {
     /// And the pane in it, so that end condition is read exactly. A workspace
     /// holds more than one agent, and a subscription that survived because a
     /// *neighbour* was still in the room would be a seat's watch going on after
-    /// the seat did — see [`cmd_govern::governs`]. Empty for a scope that was
+    /// the seat did — see [`crate::place::governs`]. Empty for a scope that was
     /// named rather than sat in, where there is no pane to speak of.
     pub(crate) pane: String,
     /// Every task, with no membership test at all. See [`Scope::machine`].
@@ -1918,7 +1918,7 @@ impl Scope {
     /// Deliberately not reachable from argv. `wsp watch` is a *subscription*
     /// and a subscription is to a scope somebody answers for; the daemon is not
     /// a subscriber, it is the process that runs anyway, and what it derives is
-    /// addressed per signal by [`cmd_govern::seat_for`] rather than by having
+    /// addressed per signal by [`crate::governors::seat_for`] rather than by having
     /// been asked for. Putting a `--all` on the verb would give a governor a
     /// way to subscribe to work it cannot act on, which is the noise
     /// `wsp-095` Part 9 asks to be kept out.
@@ -2279,7 +2279,7 @@ fn stalled_seats(
         e.0.insert(list);
         e.1.push(t.id.as_str());
     }
-    // Per seat and not per row, because [`cmd_govern::governs`] falls back to the
+    // Per seat and not per row, because [`crate::place::governs`] falls back to the
     // *room* for a record naming no pane — `wsp govern -w` writes one — and a
     // workspace holds more than one agent. Asked row by row, a seat with a busy
     // pane and an idle pane in the same room would report itself stalled out of
@@ -2303,11 +2303,11 @@ fn stalled_seats(
             0..=3 => ids.join(" "),
             n => format!("{} +{}", ids[..3].join(" "), n - 3),
         };
-        // **Never to the seat this is about.** [`cmd_govern::seat_for`] stops at
+        // **Never to the seat this is about.** [`crate::governors::seat_for`] stops at
         // the first seat it finds, which here is the one that failed;
-        // [`cmd_govern::seat_above`] is the same walk started one step past it,
+        // [`crate::governors::seat_above`] is the same walk started one step past it,
         // terminating at [`EVERYONE`].
-        let above = cmd_govern::seat_above(governors, index, scope, homes.get(scope).map(String::as_str))
+        let above = crate::governors::seat_above(governors, index, scope, homes.get(scope).map(String::as_str))
             .map(|s| s.scope)
             .unwrap_or_else(|| EVERYONE.to_string());
         let detail = format!(
@@ -2378,7 +2378,7 @@ impl<'a> Poll<'a> {
     ///
     /// Addressed the way everything in a run is addressed, through its members
     /// and [`addressed_to`]: a seat sitting on the list answers because the
-    /// list step fronts [`cmd_govern::seat_for`]'s chain, and a project seat
+    /// list step fronts [`crate::governors::seat_for`]'s chain, and a project seat
     /// answers because its members' work is what the verdict judges. One
     /// definition of *mine* across both halves, or the two halves would learn
     /// to disagree about whose run it is.
@@ -2951,7 +2951,7 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>) {
     if watches.is_empty() {
         return;
     }
-    let live = crate::place_super::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
+    let live = crate::util::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
     let now = util::epoch_secs();
     for w in &watches {
         // **A seat's wake record fails in a way no liveness check can see.**
@@ -3579,7 +3579,7 @@ impl Spec {
     /// in prose.
     ///
     /// A `Spec` is the description of a subscription, and a wake delivered to a
-    /// governor is one — to exactly what `cmd_govern::seat_for` addresses there.
+    /// governor is one — to exactly what `crate::governors::seat_for` addresses there.
     /// So the wake path builds one rather than growing a second vocabulary for
     /// the same four questions [`Stream`] asks: which mode, which document, who
     /// it is for, and how long a fact may wait.
@@ -3721,13 +3721,13 @@ fn scope_of(store: &Store, named: Option<String>) -> Result<Scope, String> {
         // redundant.
         let here = cmd_agent::my_pane().unwrap_or_default();
         let seated = !here.is_empty()
-            && cmd_govern::governs(&governors, &crate::place::Seat::new(&here)).as_deref() == Some(name.as_str());
+            && crate::place::governs(&governors, &crate::place::Seat::new(&here)).as_deref() == Some(name.as_str());
         return Ok(Scope { seated, name, workspace, pane: here, all: false });
     }
     let Some(here) = cmd_agent::my_pane() else {
         return Err("wsp: no scope — nowhere to ask from. Run this from the seat, or say `wsp watch -p <project>`".into());
     };
-    match cmd_govern::governs(&governors, &crate::place::Seat::new(&here)) {
+    match crate::place::governs(&governors, &crate::place::Seat::new(&here)) {
         Some(name) => Ok(Scope { name, seated: true, workspace: here.clone(), pane: here, all: false }),
         None => Err("wsp: this seat is nobody's, so there is no scope to watch.\n\
                      \x20    `wsp watch <project>` watches one, `wsp govern <project> --take` takes the seat"
@@ -4096,9 +4096,9 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         // A seat's subscription ends when the seat does. Free, and it is the
         // natural end the flag asks callers to supply.
         if spec.scope.seated
-            && cmd_govern::governs(
+            && crate::place::governs(
                 &store.governors(),
-                &cmd_govern::seat_query(&spec.scope.workspace, Some(&spec.scope.pane)),
+                &crate::place::seat_query(&spec.scope.workspace, Some(&spec.scope.pane)),
             )
             .as_deref()
                 != Some(spec.scope.name.as_str())
@@ -4313,7 +4313,7 @@ fn held(w: &Registered) -> String {
 
 /// `wsp-338`: the idle panes' memory, off every local backend's census.
 fn idle_memory(store: &Store) -> crate::memory::IdleMemory {
-    let agents: Vec<crate::place::Seated> = crate::cmd_spawn::local_backends()
+    let agents: Vec<crate::place::Seated> = crate::place::local_backends()
         .iter()
         .filter_map(|b| b.census().ok())
         .flat_map(|c| c.seats().cloned().collect::<Vec<_>>())
@@ -4378,7 +4378,7 @@ fn status(store: &Store, args: &Args) -> i32 {
         println!("{}", p.dim("nobody is watching · `wsp watch` starts one"));
         return 0;
     }
-    let live = crate::place_super::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
+    let live = crate::util::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
     for w in &watches {
         // A seat's wake record answers a different question from a watcher's,
         // so it gets a different sentence rather than a watcher's sentence with
@@ -5563,7 +5563,7 @@ mod tests {
         }
 
         /// A project, and its parent where it has one — the chain
-        /// [`cmd_govern::seat_above`] walks.
+        /// [`crate::governors::seat_above`] walks.
         fn projects(mut self, of: &[(&str, Option<&str>)]) -> Night {
             self.index = Index::new(
                 of.iter()

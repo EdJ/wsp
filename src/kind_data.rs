@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::agent_commands::{Kind, Plain, Spawn};
+use crate::agent_commands::{Kind, Plain};
+use crate::agent_commands::Spawn;
 use crate::place::{Delivery, Place, Result, Seat};
 
 /// The only shape of a kind file wsp reads.
@@ -73,7 +74,7 @@ impl Kind for DataKind {
         Plain.tier(model, effort)
     }
 
-    fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<crate::agent_commands::Address> {
+    fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<crate::agent_kind::Address> {
         None
     }
 
@@ -85,7 +86,7 @@ impl Kind for DataKind {
         None
     }
 
-    fn ran(&self, _session: &str, _cwd: &str, _since: i64) -> Option<crate::agent_commands::Ran> {
+    fn ran(&self, _session: &str, _cwd: &str, _since: i64) -> Option<crate::agent_kind::Ran> {
         None
     }
 

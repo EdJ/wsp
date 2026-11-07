@@ -120,7 +120,7 @@ pub(crate) fn attach(store: &Store, id: &str, name: &str, seat: &str, stand: &St
         let old = legs::legs(&t);
         let Ok(new) = legs::attach(&old, name, seat) else { return false };
         let Some(leg) = new.iter().find(|l| l.name == name) else { return false };
-        let why = leg.why.as_deref().map(|w| format!(" · why {}", crate::cmd_task::fold(w))).unwrap_or_default();
+        let why = leg.why.as_deref().map(|w| format!(" · why {}", crate::util::fold(w))).unwrap_or_default();
         t.log(&format!(
             "leg {name} started by pane {seat}{}{why}",
             crate::cmd_agent::spawned_at(leg.policy.model.as_deref(), leg.policy.effort.as_deref())
@@ -238,7 +238,7 @@ fn baton_text(store: &Store, args: &Args, row: &str, leg: &str, fresh: bool) -> 
     if src == "-" && util::stdin_is_tty() {
         return Err("nothing is piped in — `--from -` reads the baton from a stream".into());
     }
-    crate::cmd_task::read_source(&src).map_err(|e| format!("cannot read {src}: {e}"))
+    crate::util::read_source(&src).map_err(|e| format!("cannot read {src}: {e}"))
 }
 
 /// How a leg came to be closed when it was not at the moment its seat finished.
@@ -274,9 +274,9 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Ok(()) => 0,
         Err(why) => {
             let why = why.trim_start_matches("wsp: ").to_string();
-            crate::cycle::log_line(
+            crate::store::log_line(
                 store,
-                &format!("leg done {task} refused for {}: {}", pane.unwrap_or("this process"), util::truncate(&crate::cmd_task::fold(&why), 300)),
+                &format!("leg done {task} refused for {}: {}", pane.unwrap_or("this process"), util::truncate(&crate::util::fold(&why), 300)),
             );
             eprintln!("wsp: {} — the leg is still open", why.lines().next().unwrap_or_default().trim_end_matches(':'));
             for rest in why.lines().skip(1) {
@@ -288,7 +288,7 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
 }
 
 fn done(store: &Store, args: &Args, task: &str, pane: Option<&str>) -> Result<(), String> {
-    let caption = args.get("caption").map(|c| crate::cmd_task::fold(&c)).filter(|c| c != "true").unwrap_or_default();
+    let caption = args.get("caption").map(|c| crate::util::fold(&c)).filter(|c| c != "true").unwrap_or_default();
     let t = store.task_or_why(task)?;
     let old = legs::legs(&t);
     let Some(name) = legs::actor_of(&old, pane) else {
@@ -442,7 +442,7 @@ pub(crate) fn finish_skipped_out(store: &Store, row: &str) -> bool {
         return false;
     }
     store.git_commit(&format!("wsp: {row} finished, its last leg skipped"));
-    crate::cycle::log_line(store, &format!("{row}: {said}"));
+    crate::store::log_line(store, &format!("{row}: {said}"));
     if let Some(w) = crate::worklist::open_list_of(&store.worklists(), row) {
         crate::cycle::tell(store, &w, &format!(
             "{row} in the {} run: {said}. It is at review{}.",

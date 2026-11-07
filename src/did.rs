@@ -426,7 +426,7 @@ pub(crate) fn take_checked(text: &str) -> Result<(String, Vec<Checked>), String>
                 crate::util::truncate(l.trim(), 100)
             ));
         }
-        checked.push(Checked { item: crate::cmd_task::fold(item), held });
+        checked.push(Checked { item: crate::util::fold(item), held });
     }
     while kept.last().is_some_and(|l| l.trim().is_empty()) {
         kept.pop();

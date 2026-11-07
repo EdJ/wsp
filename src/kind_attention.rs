@@ -43,7 +43,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::agent_commands::{Address, Kind, Ran, Spawn, Spend};
+use crate::agent_commands::Kind;
+use crate::agent_commands::Spawn;
+use crate::agent_kind::{Address, Ran, Spend};
 use crate::place::{Delivery, Place, Refusal, Result, Seat};
 
 pub struct Attention;
