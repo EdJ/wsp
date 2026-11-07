@@ -44,7 +44,6 @@ cmd_message -> wake: held_because, say  # engine -> seats
 cmd_report -> main: Args  # timeline -> top
 cmd_resume -> main: Args  # seats -> top
 cmd_resume -> panel: stty  # seats -> surface
-cmd_sandbox -> fake: serve_forever  # seats -> top
 cmd_sandbox -> main: Args  # seats -> top
 cmd_spawn -> main: Args  # seats -> top
 cmd_stamp -> main: Args  # seats -> top
