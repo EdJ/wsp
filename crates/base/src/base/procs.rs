@@ -32,6 +32,25 @@ pub fn processes() -> Vec<(u32, u32, String)> {
         .collect()
 }
 
+/// Every process as `(pid, ppid, "")`: the parent links alone, for a caller that
+/// only walks [`ancestors`]. Without `-E` the table is a fifth of the work to
+/// read, and an environment is what a caller of [`processes`] is there for.
+pub fn parents() -> Vec<(u32, u32, String)> {
+    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace().map(|x| x.parse::<u32>().ok());
+            Some((it.next()??, it.next()??, String::new()))
+        })
+        .collect()
+}
+
 /// One line of that, as `(pid, ppid, the rest)`.
 ///
 /// Its own function because it is the part that was wrong, and wrong silently:

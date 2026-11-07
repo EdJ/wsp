@@ -356,7 +356,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
 
 /// [`crate::check_tree::left_in_finished`], asked of a fleet's seats.
 fn left_in_finished_by(store: &Store, seats: &dyn Seats) -> Option<Vec<crate::check_tree::Left>> {
-    crate::check_tree::left_in_finished(store, seats.census()?, &|seat| seats.pids(seat), &crate::legs::staged)
+    // One `ps` for the whole scan, not one per seat (`wsp-480`); each scan takes
+    // its own, so the look after a signal is a fresh one.
+    crate::place_super::one_ps(|| crate::check_tree::left_in_finished(store, seats.census()?, &|seat| seats.pids(seat), &crate::legs::staged))
 }
 
 /// Stop what the finished rows left running (`wsp-453`): `TERM`, a moment,
@@ -407,10 +409,38 @@ fn say_spared(store: &Store, found: &[crate::check_tree::Left]) -> Vec<String> {
     said
 }
 
+/// How long the lines `wsp wip` draws for finished trees are good for.
+const WIP_LINES_FOR_SECS: i64 = 30;
+
 /// The lines `wsp wip` draws for finished trees that still have processes.
+///
+/// **One scan for every caller in the half minute** (`wsp-480`): it is an
+/// `lsof` over the whole machine and four `ps` runs, 0.35 s of CPU on a
+/// thermally limited one, and compound's host asks `wsp wip` every three
+/// seconds. The scan leaves its lines in `finished-wip.json`; a `wip` within
+/// [`WIP_LINES_FOR_SECS`] of it draws those. The tick, which stops what the
+/// lines name, scans for itself and never reads this.
 pub(crate) fn finished_wip_lines(store: &Store) -> Vec<String> {
+    let file = store.state_file("finished-wip.json");
+    let now = util::epoch_secs();
+    if !cfg!(test) {
+        let held = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        if let Some(v) = held.filter(|v| now - v["at"].as_i64().unwrap_or(0) < WIP_LINES_FOR_SECS) {
+            if let Some(lines) = v["lines"].as_array() {
+                return lines.iter().filter_map(|l| l.as_str().map(str::to_string)).collect();
+            }
+        }
+    }
     let Some(found) = left_in_finished_by(store, &crate::cycle::Fleet) else { return Vec::new() };
-    found.iter().filter(|l| !l.pids.is_empty()).map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect()
+    let lines: Vec<String> =
+        found.iter().filter(|l| !l.pids.is_empty()).map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect();
+    if !cfg!(test) {
+        let tmp = file.with_extension(format!("json.{}", std::process::id()));
+        if std::fs::write(&tmp, serde_json::json!({ "at": now, "lines": lines }).to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
+        }
+    }
+    lines
 }
 
 fn open_lists(store: &Store) -> Vec<Worklist> {
@@ -1529,6 +1559,26 @@ mod tests {
         store.save_task(&plain).unwrap();
         handed_to_legs(&store, "p-1", "cpd-8", &serde_json::json!({}));
         assert!(!log_of(&store, "p-1").contains("handed the row"), "a row with no legs has no first seat to track");
+    }
+
+    #[test]
+    fn a_scope_of_one_ps_answers_every_tree_from_the_table_it_took_first() {
+        let me = std::process::id();
+        let (a, b) = crate::place_super::one_ps(|| {
+            let a = crate::place_super::tree_of(me);
+            // A child started inside the scope is not in the table the scope holds.
+            let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+            let b = crate::place_super::tree_of(me);
+            let _ = child.kill();
+            let _ = child.wait();
+            (a, b)
+        });
+        assert_eq!(a, b, "the second look in the scope is the first one's table");
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let after = crate::place_super::tree_of(me);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(after.contains(&child.id()), "outside the scope every look is a fresh ps");
     }
 
     #[test]

@@ -807,33 +807,67 @@ fn child_env(cmd: &mut Command, seat: &Seat, env: &BTreeMap<String, String>) {
 /// `ps` failing to run answers the root alone — not empty, so a caller asking
 /// "is any of it still running?" still has the one pid it can certainly name.
 pub fn tree_of(root: u32) -> Vec<u32> {
-    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid=,pgid="]).output() else {
-        return vec![root];
-    };
-    let rows: Vec<(u32, u32, u32)> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace().map(|x| x.parse::<u32>().ok());
-            Some((it.next()??, it.next()??, it.next()??))
-        })
-        .collect();
+    let Some(rows) = process_rows() else { return vec![root] };
+    let rows = &*rows;
     let mut tree = vec![root];
     let mut i = 0;
     while i < tree.len() {
         let parent = tree[i];
-        for &(pid, ppid, _) in &rows {
+        for &(pid, ppid, _) in rows {
             if ppid == parent && !tree.contains(&pid) {
                 tree.push(pid);
             }
         }
         i += 1;
     }
-    for &(pid, _, pgid) in &rows {
+    for &(pid, _, pgid) in rows {
         if pgid == root && !tree.contains(&pid) {
             tree.push(pid);
         }
     }
     tree
+}
+
+thread_local! {
+    /// The process table a [`one_ps`] scope holds: `None` outside one, and inside
+    /// one `None` until the first [`tree_of`] has read it.
+    static TABLE: std::cell::RefCell<Option<Option<std::rc::Rc<Vec<(u32, u32, u32)>>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Every process as (pid, ppid, pgid), from one `ps` — or, inside [`one_ps`],
+/// from the one that scope has already made. `None` when `ps` would not run.
+fn process_rows() -> Option<std::rc::Rc<Vec<(u32, u32, u32)>>> {
+    let held = TABLE.with(|t| t.borrow().clone());
+    if let Some(Some(rows)) = held {
+        return Some(rows);
+    }
+    let rows = Command::new("ps").args(["-A", "-o", "pid=,ppid=,pgid="]).output().ok().map(|out| {
+        std::rc::Rc::new(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace().map(|x| x.parse::<u32>().ok());
+                    Some((it.next()??, it.next()??, it.next()??))
+                })
+                .collect::<Vec<(u32, u32, u32)>>(),
+        )
+    });
+    if let (Some(_), Some(_)) = (&held, &rows) {
+        TABLE.with(|t| *t.borrow_mut() = Some(rows.clone()));
+    }
+    rows
+}
+
+/// Run `f` with every [`tree_of`] in it answering from **one** `ps` taken at
+/// its first call, rather than one per call (`wsp-480`). A scan that asks for
+/// the tree of each seat of a fleet cost seventy `ps` runs, 12 s of a thermally
+/// limited machine, for what one table answers. Nothing is kept past `f`: a
+/// caller that signals and looks again takes a scope for each look.
+pub fn one_ps<T>(f: impl FnOnce() -> T) -> T {
+    let outer = TABLE.with(|t| t.borrow_mut().replace(None));
+    let out = f();
+    TABLE.with(|t| *t.borrow_mut() = outer);
+    out
 }
 
 /// Signal a whole process group, by the id of the group's leader.

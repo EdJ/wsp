@@ -491,7 +491,7 @@ pub fn left_in_finished(
     staged: &dyn Fn(&crate::model::Task) -> bool,
 ) -> Option<Vec<Left>> {
     let mut live = BTreeSet::new();
-    let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
+    let mut keep = crate::base::procs::ancestors(&crate::base::procs::parents());
     for (seat, label) in census {
         live.insert(label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string());
         keep.extend(pids(&seat).unwrap_or_default());
@@ -507,6 +507,10 @@ pub fn left_in_finished(
     let out = std::process::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output().ok()?;
     let lsof = String::from_utf8_lossy(&out.stdout);
     let found = finished_trees(&lsof, &finished, &keep);
+    // The executables are read only for processes there are to sort (`wsp-480`).
+    if found.is_empty() {
+        return Some(found);
+    }
     Some(sorted(&lsof, found, &exes()))
 }
 
