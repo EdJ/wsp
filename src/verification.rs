@@ -574,7 +574,7 @@ pub(crate) fn write(t: &mut Task, passes: &[Pass]) {
 }
 
 /// [`write`] for the check runs, keeping the passes.
-pub(crate) fn write_runs(t: &mut Task, runs: &[Run]) {
+fn write_runs(t: &mut Task, runs: &[Run]) {
     let kept = passes(t);
     write_entries(t, &kept, runs);
 }
@@ -585,6 +585,35 @@ pub(crate) fn write_runs(t: &mut Task, runs: &[Run]) {
 pub(crate) fn save_runs(store: &Store, t: &mut Task, runs: &[Run]) -> std::io::Result<()> {
     write_runs(t, runs);
     store.save_task(t)
+}
+
+/// A check that passed at `from` stands for the same work rebased to `to`: the
+/// rebase added only what the trunk gained, and the barrier runs the whole
+/// suite on the result. Written as a passed entry that says so, so the gate
+/// does not start a second check for the new tip. `false` when `from` has no
+/// passed check, or `to` already has an entry.
+pub(crate) fn carry_pass(t: &mut Task, from: &str, to: &str) -> bool {
+    let mut runs = runs(t);
+    let at = |r: &Run, sha: &str| r.read.as_deref().is_some_and(|x| same_commit(x, sha));
+    if runs.iter().any(|r| at(r, to)) {
+        return false;
+    }
+    let Some(passed) = runs.iter().rev().find(|r| at(r, from)).filter(|r| r.state == RunState::Passed) else { return false };
+    let took = passed.took;
+    let mut secs = util::epoch_secs();
+    while runs.iter().any(|r| util::epoch_of(&r.at) >= secs) {
+        secs += 1;
+    }
+    let (from12, to12): (String, String) = (from.chars().take(12).collect(), to.chars().take(12).collect());
+    runs.push(Run {
+        at: util::iso_at(secs),
+        state: RunState::Passed,
+        read: Some(to12),
+        took,
+        text: format!("✓ carried · passed at {from12} (rebased onto the trunk since) · not run again"),
+    });
+    write_runs(t, &runs);
+    true
 }
 
 fn write_entries(t: &mut Task, passes: &[Pass], runs: &[Run]) {

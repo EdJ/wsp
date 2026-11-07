@@ -975,7 +975,6 @@ pub(crate) fn settle(store: &Store, id: &str, at: &str, ran: &[Ran], took: Durat
         run.took = Some(secs(took));
         run.text = account(ran);
         let read = run.read.clone();
-        v::write_runs(&mut t, &runs);
         let mut out = if state == RunState::Passed { Settled::Passed } else { Settled::Failed };
         if ran.iter().any(|r| matches!(r.done, Done::Malformed(_))) {
             out = Settled::Malformed;
@@ -984,7 +983,7 @@ pub(crate) fn settle(store: &Store, id: &str, at: &str, ran: &[Ran], took: Durat
             v::send_back(&mut t, util::now_iso(), "wsp check failed", read.as_deref(), &owes, Some(CHECK_HEAD));
             out = Settled::SentBack;
         }
-        if store.save_task(&t).is_err() {
+        if v::save_runs(store, &mut t, &runs).is_err() {
             return Settled::Lost;
         }
         out
@@ -1652,34 +1651,7 @@ pub(crate) fn running_at(store: &Store, member: &Task, sha: &str) -> bool {
     util::epoch_secs() - util::epoch_of(&entry.at) <= stale
 }
 
-/// A check that passed at `from` stands for the same work rebased to `to`: the
-/// rebase added only what the trunk gained, and the barrier runs the whole
-/// suite on the result. Written as a passed entry that says so, so the gate
-/// does not start a second check for the new tip. `false` when `from` has no
-/// passed check, or `to` already has an entry.
-pub(crate) fn carry_pass(t: &mut Task, from: &str, to: &str) -> bool {
-    let mut runs = v::runs(t);
-    let at = |r: &Run, sha: &str| r.read.as_deref().is_some_and(|x| v::same_commit(x, sha));
-    if runs.iter().any(|r| at(r, to)) {
-        return false;
-    }
-    let Some(passed) = runs.iter().rev().find(|r| at(r, from)).filter(|r| r.state == RunState::Passed) else { return false };
-    let took = passed.took;
-    let mut secs = util::epoch_secs();
-    while runs.iter().any(|r| util::epoch_of(&r.at) >= secs) {
-        secs += 1;
-    }
-    let (from12, to12): (String, String) = (from.chars().take(12).collect(), to.chars().take(12).collect());
-    runs.push(Run {
-        at: util::iso_at(secs),
-        state: RunState::Passed,
-        read: Some(to12),
-        took,
-        text: format!("✓ carried · passed at {from12} (rebased onto the trunk since) · not run again"),
-    });
-    v::write_runs(t, &runs);
-    true
-}
+pub(crate) use crate::verification::carry_pass;
 
 /// What `wsp review` says to a member that has recorded no checks: tier 1 is the
 /// member's to write, and a warning rather than a refusal, because design work
@@ -1985,11 +1957,12 @@ mod tests {
     fn a_running_entry_nobody_finished_is_taken_again_after_its_budget() {
         let (_env, store, sha) = world("stale", "- ok: true", "exit 0\n");
         let mut t = store.find_task("pj-001").unwrap();
-        v::write_runs(
+        v::save_runs(
+            &store,
             &mut t,
             &[Run { at: "2026-01-01T00:00:00Z".into(), state: RunState::Running, read: Some(sha[..12].into()), took: None, text: String::new() }],
-        );
-        store.save_task(&t).unwrap();
+        )
+        .unwrap();
         assert!(begin(&store, "pj-001", &sha, 3600, false).is_some());
         assert_eq!(v::runs(&store.find_task("pj-001").unwrap()).len(), 1, "the dead entry was replaced, not kept");
     }

@@ -5437,8 +5437,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let mut t = store.find_task("m-1").unwrap();
         let mut done = crate::verification::runs(&t);
         done[0].state = crate::verification::RunState::Passed;
-        crate::verification::write_runs(&mut t, &done);
-        store.save_task(&t).unwrap();
+        crate::verification::save_runs(&store, &mut t, &done).unwrap();
         step(&store, &w, &Blind);
         assert_eq!(spawned(), vec![("m-1 · verifying".into(), "claude".into())], "the check passed, and now the verifier");
     }
