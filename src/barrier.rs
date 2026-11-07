@@ -48,7 +48,7 @@ use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
 #[cfg(test)]
-use crate::checks::{ps_says, push, text};
+pub(crate) use crate::checks::{ps_says, push, text};
 pub(crate) use crate::checks::{wait_after, RETRY_BACKOFF, TRIES, instant, Check, Ending, Run, State, Suite};
 
 /// What `wsp wip` and the seat's own label call a check: against its list,
