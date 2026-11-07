@@ -452,9 +452,13 @@ mod tests {
         assert!(p.iter().any(|x| x.contains("read by no herdr")), "{p:?}");
     }
 
-    /// A directory of override files, named for the test that wrote it.
+    /// A directory of override files, one of its own per call: a clock reading
+    /// alone gave two parallel tests the same directory, and each read the
+    /// other's `claude.toml`.
     fn write(files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("wsp-detect-override-{}", util::epoch_nanos()));
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("wsp-detect-override-{}-{}-{n}", std::process::id(), util::epoch_nanos()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         for (name, body) in files {
             std::fs::write(dir.join(name), body).expect("write override");
