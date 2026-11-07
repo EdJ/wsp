@@ -4265,7 +4265,8 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
     // read above, and `governs` matches an exact pane on its own.
     let governs =
         pane.as_deref().and_then(|p| crate::place::governs(&governors, &crate::place::Seat::new(p)));
-    let me = Caller { pane: pane.as_deref(), governs: governs.as_deref() };
+    let bound = crate::cmd_role::bound_here(store, pane.as_deref());
+    let me = Caller { pane: pane.as_deref(), governs: governs.as_deref(), bound };
     end_work(backend(args).as_ref(), store, args, me, &tidy)
 }
 
@@ -4357,6 +4358,8 @@ struct Caller<'a> {
     /// this is the fact that changes: `None` until the slot moves, the scope
     /// afterwards.
     governs: Option<&'a str>,
+    /// Whether the pane is a member, verifier or check seat's (`wsp-473`).
+    bound: bool,
 }
 
 /// What the ending took away after the seat itself.
@@ -4559,7 +4562,7 @@ fn end_work(
     // Who is asking decides how far this reaches (`wsp-473`): the primary seat
     // any seat, with a why and not mid-turn; a governor the seats of rows on
     // its own list. A caller in no seat is as free as ever.
-    if let Err(code) = crate::cmd_role::gate_despawn(store, args, (me.pane, me.governs), seat.as_str(), task.as_deref()) {
+    if let Err(code) = crate::cmd_role::gate_despawn(store, args, (me.pane, me.governs, me.bound), seat.as_str(), task.as_deref()) {
         return code;
     }
 
@@ -9206,7 +9209,7 @@ mod tests {
         let tidied = Tidied::default();
         let ending = Args::synth("despawn", &[], &[("pane", "w1:p1")]);
         // The successor, mid-rotation: named `to`, holding no slot yet.
-        let early = Caller { pane: Some("w9:p2"), governs: None };
+        let early = Caller { pane: Some("w9:p2"), governs: None, ..Caller::default() };
         assert_eq!(end_work(&place, &store, &ending, early, &tidied.f()), 1);
         assert!(place.asked.borrow().is_empty(), "nothing was ended");
         assert!(store.handovers().contains_key("core"), "and the ending is still owed");
@@ -9220,7 +9223,7 @@ mod tests {
         // Once the slot has moved the guard stands aside. That is the state
         // `--ending` runs in, and a person's despawn after it goes through too.
         cmd_govern::take(&store, "core", "w9", "w9:p2").unwrap();
-        let now = Caller { pane: Some("w9:p2"), governs: Some("core") };
+        let now = Caller { pane: Some("w9:p2"), governs: Some("core"), ..Caller::default() };
         assert_eq!(end_work(&place, &store, &ending, now, &tidied.f()), 0);
         assert_eq!(place.asked.borrow().len(), 1, "the predecessor was ended");
         assert!(!store.handovers().contains_key("core"), "and the record is consumed");

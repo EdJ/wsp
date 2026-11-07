@@ -6301,6 +6301,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // of the checks above can see: the stamp travels in the bytes, so it is
     // asked of the installed wsp rather than worked out from a tree.
     crate::cmd_install::health(&seen, &mut notes);
+    crate::cmd_role::health(&mut warnings);
 
     // Both "unknown" checks below ask the archive before they say the word —
     // see [`dangling`] for why that is a correctness fix and not a politeness.

@@ -1461,6 +1461,13 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
     }
     // The primary and governor seats' settings (wsp-473), beside the seat's own.
     crate::cmd_role::write_settings();
+    // A deny beats the primary's allow, so the old `wsp done` deny goes.
+    if crate::cmd_role::remove_stale_done_deny() && !json_out {
+        println!(
+            "{} removed the stale Bash(wsp done:*) deny from ~/.claude/settings.json — the role gate in wsp replaces it",
+            p.green("✓")
+        );
+    }
     let done = crate::launchd::ensure(dst, &store.state, &var);
     // The line `wsp wip` and the brief show until a daemon is running again.
     match &done {

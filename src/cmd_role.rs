@@ -99,11 +99,24 @@ pub(crate) fn role(store: &Store) -> Role {
     Role::of(pane.as_deref(), governs.as_deref(), bound)
 }
 
-/// The role a `Caller` (already resolved by `despawn`) stands for. A seat that
-/// is neither primary nor a governor is left to the permission layer here, as
-/// it always was: `despawn` is also what a seat's own deferred ending runs.
-pub(crate) fn role_of_caller(pane: Option<&str>, governs: Option<&str>) -> Role {
-    Role::of(pane, governs, false)
+/// Whether the process in `pane` is a seat wsp spawned or bound to a row, and so
+/// a member, verifier or check unless it holds a slot.
+///
+/// The one exemption is by name: a seat's own deferred ending (`wsp despawn
+/// --pane <seat> --keep-tree`, run detached under `WSP_END_WHEN_IDLE`) is the
+/// seat finishing, not a reach into somebody else's, so it reads as unbound.
+pub(crate) fn bound_here(store: &Store, pane: Option<&str>) -> bool {
+    if std::env::var_os("WSP_END_WHEN_IDLE").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    let spawned = std::env::var_os(crate::base::seat::SEAT_ENV).is_some_and(|v| !v.is_empty());
+    spawned || pane.is_some_and(|p| store.bindings().contains_key(p))
+}
+
+/// The role a `Caller` (already resolved by `despawn`) stands for. `bound` is
+/// [`bound_here`]: a member, verifier or check seat is refused by wsp itself.
+pub(crate) fn role_of_caller(pane: Option<&str>, governs: Option<&str>, bound: bool) -> Role {
+    Role::of(pane, governs, bound)
 }
 
 fn refuse(store: &Store, verb: &str, role: &Role, why: &str) -> i32 {
@@ -159,11 +172,11 @@ pub(crate) fn despawn_allowed(
 pub(crate) fn gate_despawn(
     store: &Store,
     args: &Args,
-    caller: (Option<&str>, Option<&str>),
+    caller: (Option<&str>, Option<&str>, bool),
     seat: &str,
     task: Option<&str>,
 ) -> Result<(), i32> {
-    let role = role_of_caller(caller.0, caller.1);
+    let role = role_of_caller(caller.0, caller.1, caller.2);
     if role == Role::Outside {
         return Ok(());
     }
@@ -408,6 +421,9 @@ pub(crate) struct Facts<'a> {
     pub keep: &'a [u32],
     /// Seconds a process has been idle (CPU time unchanged), at most its age.
     pub idle_for: &'a dyn Fn(&Proc) -> u64,
+    /// Whether a compound-sup label names a seat that is bound to a row or holds
+    /// a governor's slot.
+    pub seat_live: &'a dyn Fn(&str) -> bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -426,6 +442,9 @@ pub(crate) fn prove(p: &Proc, cwd: Option<&str>, f: &Facts) -> Result<Proof, Str
     }
     if is_busy_loop(p) {
         return Ok(Proof { tree: None, text: format!("busy loop: zsh `while :` at {:.0}% CPU, parent 1", p.cpu) });
+    }
+    if let Some(label) = session_label(&p.command) {
+        return prove_session(p, &label, cwd, f);
     }
     let Some(cwd) = cwd else {
         return Err("it is no busy loop, and its working directory could not be read".into());
@@ -463,7 +482,42 @@ pub(crate) fn prove(p: &Proc, cwd: Option<&str>, f: &Facts) -> Result<Proof, Str
         }
         return Ok(Proof { tree: Some(name), text: format!("dev/test tool {} min old; {done_with}", p.age / 60) });
     }
-    Err("it is not a dev or test tool, a test binary or a busy loop".into())
+    Err("it is not a dev or test tool, a test binary, a busy loop or a leaked test session".into())
+}
+
+/// The `cpd-*` label of a compound-sup session: `compound-sup spawn --label cpd-N …`.
+pub(crate) fn session_label(command: &str) -> Option<String> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let first = words.first()?.rsplit('/').next()?;
+    if first != "compound-sup" || words.get(1) != Some(&"spawn") {
+        return None;
+    }
+    let at = words.iter().position(|w| *w == "--label")?;
+    let label = words.get(at + 1)?;
+    (label.starts_with("cpd-") && label[4..].chars().all(|c| c.is_ascii_digit()) && label.len() > 4).then(|| label.to_string())
+}
+
+/// A leaked compound-sup test session: its label is no live seat (no binding, no
+/// governor slot, none of the live seats' processes), it is older than an hour,
+/// and the row whose tree it stands in, if any, is not held and not at doing.
+fn prove_session(p: &Proc, label: &str, cwd: Option<&str>, f: &Facts) -> Result<Proof, String> {
+    if (f.seat_live)(label) {
+        return Err(format!("{label} is a live seat — bound to a row or holding a governor's slot"));
+    }
+    if p.age < TOOL_AGE {
+        return Err(format!("it is {} min old — a leaked session is stopped after an hour", p.age / 60));
+    }
+    let mut tree = None;
+    if let Some((name, _)) = cwd.and_then(tree_named) {
+        if (f.held)(&name) {
+            return Err(format!("{name} is held by a live seat or a claim"));
+        }
+        if (f.status_of)(&name) == Some(Status::Doing) {
+            return Err(format!("{name} is at doing"));
+        }
+        tree = Some(name);
+    }
+    Ok(Proof { tree, text: format!("leaked test session {label}, {} min old, no live row", p.age / 60) })
 }
 
 /// Whether a governor of `scope` may reap what `proof` found: only pids in the
@@ -557,7 +611,12 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
     let check_in_use = |n: &str| crate::check_tree::named(store, n).map(|(l, at)| crate::check_tree::in_use(store, &l, at));
     let held = |n: &str| claims.contains_key(n) || !store.panes_for_task(n).is_empty();
     let idle_for = |p: &Proc| idle.get(&p.pid).copied().unwrap_or(0);
-    let facts = Facts { status_of: &status_of, check_in_use: &check_in_use, held: &held, keep: &keep, idle_for: &idle_for };
+    let bindings = store.bindings();
+    let governors = store.governors();
+    let seat_live = |label: &str| {
+        bindings.contains_key(label) || crate::place::governs(&governors, &crate::place::Seat::new(label)).is_some()
+    };
+    let facts = Facts { status_of: &status_of, check_in_use: &check_in_use, held: &held, keep: &keep, idle_for: &idle_for, seat_live: &seat_live };
     let list_of = |n: &str| list_of_row(store, n);
     let check_list = |n: &str| crate::check_tree::named(store, n).map(|(l, _)| l);
 
@@ -624,6 +683,100 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
 
 fn settings_path(file: &str) -> std::path::PathBuf {
     util::home().join(".claude").join(file)
+}
+
+/// The deny rule the primary's `wsp done` used to hit. A deny beats any allow in
+/// any `--settings` layer, so it has to go for the primary's allow to count; the
+/// role gate in [`done`] is what stands in its place.
+pub(crate) const STALE_DONE_DENY: &str = "\"Bash(wsp done:*)\"";
+
+/// Whether `settings` (a `settings.json`) still denies `Bash(wsp done:*)`.
+pub(crate) fn has_stale_done_deny(settings: &str) -> bool {
+    strip_done_deny(settings).is_some()
+}
+
+/// `settings` without the `Bash(wsp done:*)` entry of `permissions.deny`, or
+/// `None` when it has none. Text in, text out, so the rest of the file —
+/// its key order, its spacing, its comments' neighbours — is byte for byte as it
+/// was; the result is checked to parse and to differ from the original by that one
+/// entry, or nothing is returned.
+pub(crate) fn strip_done_deny(settings: &str) -> Option<String> {
+    let before: Value = serde_json::from_str(settings).ok()?;
+    let deny = before.pointer("/permissions/deny")?.as_array()?;
+    if !deny.iter().any(|v| v.as_str() == Some("Bash(wsp done:*)")) {
+        return None;
+    }
+    // The array is the one after the `"deny"` key inside `"permissions"`.
+    let perm = settings.find("\"permissions\"")?;
+    let key = perm + settings[perm..].find("\"deny\"")?;
+    let open = key + settings[key..].find('[')?;
+    // Walk to the matching `]`, splitting on commas outside strings.
+    let (mut parts, mut start, mut in_str, mut esc, mut close) = (Vec::new(), open + 1, false, false, None);
+    for (i, c) in settings[open + 1..].char_indices().map(|(i, c)| (i + open + 1, c)) {
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, '\\') => esc = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            ',' => {
+                parts.push(&settings[start..i]);
+                start = i + 1;
+            }
+            ']' => {
+                parts.push(&settings[start..i]);
+                close = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let tail = &parts.last()?[parts.last()?.trim_end().len()..];
+    let mut kept: Vec<&str> = parts.iter().copied().filter(|p| p.trim() != STALE_DONE_DENY).collect();
+    if kept.len() == parts.len() {
+        return None;
+    }
+    let mut body = match kept.pop() {
+        Some(last) => {
+            let mut b = kept.join(",");
+            if !kept.is_empty() {
+                b.push(',');
+            }
+            b.push_str(last.trim_end());
+            b
+        }
+        None => String::new(),
+    };
+    body.push_str(tail);
+    let out = format!("{}{}{}", &settings[..open + 1], body, &settings[close..]);
+    let mut want = before;
+    want.pointer_mut("/permissions/deny")?.as_array_mut()?.retain(|v| v.as_str() != Some("Bash(wsp done:*)"));
+    (serde_json::from_str::<Value>(&out).ok()? == want).then_some(out)
+}
+
+/// Take the stale `Bash(wsp done:*)` deny out of `~/.claude/settings.json`,
+/// touching nothing else in it. Whether it did.
+pub(crate) fn remove_stale_done_deny() -> bool {
+    let path = settings_path("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    match strip_done_deny(&text) {
+        Some(out) => crate::store::write_atomic(&path, &out).is_ok(),
+        None => false,
+    }
+}
+
+/// What `doctor` says about the seat's settings: the deny that would still stop
+/// the primary's `wsp done`.
+pub(crate) fn health(warnings: &mut Vec<String>) {
+    if std::fs::read_to_string(settings_path("settings.json")).is_ok_and(|s| has_stale_done_deny(&s)) {
+        warnings.push("~/.claude/settings.json denies Bash(wsp done:*), which beats the primary's allow — `wsp install` removes it".into());
+    }
 }
 
 /// Write the two settings files beside the seat's other settings. Called by
@@ -714,7 +867,7 @@ mod tests {
         let check = |n: &str| (n == "L-check-1").then_some(false);
         let held = |n: &str| w.held.contains(&n);
         let idle_for = |_: &Proc| idle;
-        let facts = Facts { status_of: &status_of, check_in_use: &check, held: &held, keep: &[7], idle_for: &idle_for };
+        let facts = Facts { status_of: &status_of, check_in_use: &check, held: &held, keep: &[7], idle_for: &idle_for, seat_live: &|l| l == "cpd-9" };
         prove(p, Some(cwd), &facts)
     }
 
@@ -744,6 +897,43 @@ mod tests {
         assert!(why.contains("held"), "{why}");
         let why = judge(&world(), &proc(7, 9000, 0.0, VITE), "/r/.worktrees/wsp-2", 0).unwrap_err();
         assert!(why.contains("live seat"), "{why}");
+    }
+
+    #[test]
+    fn a_leaked_compound_sup_session_with_no_live_row_is_reaped() {
+        let sess = |l: &str| format!("/u/.local/bin/compound-sup spawn --label {l} --cwd /r/.worktrees/wsp-2 -- /bin/zsh");
+        let ok = judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-2", 0).unwrap();
+        assert!(ok.text.contains("cpd-5"), "{}", ok.text);
+        assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-9")), "/r/.worktrees/wsp-2", 0).is_err(), "live seat");
+        assert!(judge(&world(), &proc(10, 100, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-2", 0).is_err(), "young");
+        assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-1", 0).is_err(), "doing");
+        assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-3", 0).is_err(), "held");
+        assert_eq!(session_label("compound-sup spawn --socket /x -- /bin/zsh"), None, "no label, no pattern");
+        assert_eq!(session_label("vim --label cpd-5"), None);
+    }
+
+    #[test]
+    fn the_stale_done_deny_comes_out_and_nothing_else_does() {
+        let old = "{\n  \"model\": \"x\",\n  \"permissions\": {\n    \"allow\": [\"Bash(ls:*)\"],\n    \"deny\": [\n      \"Bash(git push:*)\",\n      \"Bash(wsp done:*)\",\n      \"Bash(rm -rf:*)\"\n    ]\n  },\n  \"zed\": 1\n}\n";
+        assert!(has_stale_done_deny(old));
+        let out = strip_done_deny(old).unwrap();
+        assert_eq!(out, old.replace("      \"Bash(wsp done:*)\",\n", ""));
+        assert!(!has_stale_done_deny(&out));
+        // last in the list, and alone
+        let last = "{\"permissions\":{\"deny\":[\"Bash(a)\", \"Bash(wsp done:*)\"]}}";
+        assert_eq!(strip_done_deny(last).unwrap(), "{\"permissions\":{\"deny\":[\"Bash(a)\"]}}");
+        let only = "{\"permissions\":{\"deny\":[\"Bash(wsp done:*)\"]}}";
+        assert_eq!(strip_done_deny(only).unwrap(), "{\"permissions\":{\"deny\":[]}}");
+        // one without it is left alone
+        assert_eq!(strip_done_deny("{\"permissions\":{\"deny\":[\"Bash(a)\"]}}"), None);
+        assert_eq!(strip_done_deny("{}"), None);
+        assert_eq!(strip_done_deny("not json"), None);
+    }
+
+    #[test]
+    fn a_member_is_a_seat_and_not_outside_for_despawn() {
+        assert_eq!(role_of_caller(Some("cpd-3"), None, true), Role::Seat);
+        assert_eq!(role_of_caller(Some("w1:p1"), None, false), Role::Outside);
     }
 
     #[test]
