@@ -397,6 +397,22 @@ pub trait Kind {
         false
     }
 
+    /// Whether, for a kind that takes its order in argv, the first turn running
+    /// on it is what "ready" means — [`State::Working`] — rather than an idle
+    /// composer.
+    ///
+    /// Only meaningful beside [`Kind::order_in_args`] and a [`Spawn::order`]
+    /// that is set. With an order on the command line there is no composer to
+    /// wait for: the session opens and starts the turn itself, so an idle
+    /// reading is the window *before* it has (or a turn already over), and
+    /// working is the one reading that says the order was taken. It also lets a
+    /// rotation count the start as its confirmation, which an argv kind
+    /// otherwise cannot give (see `cmd_spawn::rotate_as`). `false` for the
+    /// kinds measured before this existed, whose idle reading stays as it was.
+    fn turn_marks_ready(&self) -> bool {
+        false
+    }
+
     /// What this kind's seat needs in its environment, beyond what every seat
     /// gets.
     ///
@@ -2487,12 +2503,46 @@ impl Kind for Claude {
             argv.push(flag.into());
             argv.push(session.to_string());
         }
+        // The order, last and after `--`, so one starting `-` is never read as
+        // a flag and nothing that takes a value can eat it; see
+        // [`Kind::order_in_args`]. Folded to one line because herdr refuses a
+        // control character in an `agent.start` arg, and the packet's start is
+        // one line already.
+        if let Some(order) = spawn.order {
+            argv.push("--".into());
+            argv.push(crate::util::fold(order));
+        }
         argv
     }
 
     /// `--resume`.
     fn resume_flag(&self) -> Option<&'static str> {
         Some("--resume")
+    }
+
+    /// Yes — `claude "<order>"` starts the interactive session with that text
+    /// as its first user message (Ed, 2026-11-07, wsp-476). Typed delivery
+    /// failed four ways in one week: an order typed before Claude listened
+    /// (wsp-252), "typed at the seat — no turn seen yet" governor readings,
+    /// starts that never claimed (wsp-469), and a `--on eds-macbook-i5` spawn
+    /// that gave up on readiness before the slower machine was ready, so the
+    /// order was never sent. argv has nothing to type and no readiness to
+    /// guess, and the folder-trust prompt of a far tree only delays the turn:
+    /// the order is already in the process.
+    ///
+    /// **Not measured here:** the five local and three `--on eds-macbook-i5`
+    /// spawns the row asked for need live panes and a second machine, which the
+    /// row's seat did not have; the argv shape is the one pi was measured with
+    /// (`--` then the order). The check is that `Claude::args` ends with
+    /// `-- <order>` and that `cmd_spawn` sends no tell for it; a first real
+    /// spawn on each machine is the measurement still owed.
+    fn order_in_args(&self) -> bool {
+        true
+    }
+
+    /// The first turn running, watched to the readiness deadline.
+    fn turn_marks_ready(&self) -> bool {
+        true
     }
 
     fn short_start(&self) -> bool {
@@ -3486,8 +3536,21 @@ mod tests {
     #[test]
     fn only_a_kind_that_takes_its_order_in_argv_says_so() {
         assert!(of("opencode").order_in_args(), "measured: typed input is discarded for ~2s");
-        assert!(!of("claude").order_in_args(), "Claude Code is told, and the trim is not an order");
+        assert!(of("claude").order_in_args(), "wsp-476: `claude \"<order>\"` is the first user message");
         assert!(!of("codex").order_in_args(), "an unmeasured kind claims nothing");
+    }
+
+    #[test]
+    fn claudes_order_is_the_last_argument_after_a_double_dash() {
+        let seat = Seat::new("w1:p1");
+        let sp = Spawn { order: Some("-dash order\nsecond line"), ..spawn(false, "wsp-476", &seat) };
+        let argv = of("claude").args(&sp);
+        let n = argv.len();
+        assert_eq!(&argv[n - 2..], ["--", "-dash order second line"], "after `--`, on one line");
+        assert!(argv.iter().all(|a| !a.contains('\n')), "herdr refuses a control character in an arg");
+        let bare = of("claude").args(&spawn(false, "wsp-476", &seat));
+        assert!(!bare.contains(&"--".to_string()), "no order, no `--`");
+        assert!(of("claude").turn_marks_ready() && !of("pi").turn_marks_ready());
     }
 
     #[test]

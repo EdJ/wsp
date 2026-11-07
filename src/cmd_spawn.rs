@@ -1490,9 +1490,15 @@ fn wait_ready(
     let now = || wait.clock.now();
     let deadline = now() + wait.ready;
     let mut empty_since: Option<Instant> = None;
+    // An order on the command line has no composer to wait for: the session
+    // opens and starts the turn by itself, so for a kind that says so ready is
+    // that turn running (`wsp-476`), watched to the same deadline. Idle here is
+    // the window before it starts, and a folder-trust prompt reads blocked.
+    let by_turn = spawn.order.is_some() && how.order_in_args() && how.turn_marks_ready();
     loop {
         match place.state(seat) {
-            Ok(s) if s.will_take_a_prompt() => return Ok(()),
+            Ok(s) if by_turn && s.turn_in_flight() => return Ok(()),
+            Ok(s) if !by_turn && s.will_take_a_prompt() => return Ok(()),
             Ok(State::Empty) | Ok(State::Gone) => {
                 let since = *empty_since.get_or_insert_with(now);
                 if now().saturating_duration_since(since) >= wait.gone {
@@ -2942,9 +2948,9 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             (None, Some(p)) => Some(handover(p, Handover::of_seat(p), route(how, laid))),
             (None, None) => None,
         };
-        // Only for a kind that takes it that way. Handing it to every kind's
-        // `args` would put the whole work order on Claude Code's command line,
-        // where nothing reads it and every byte of it is visible in `ps`.
+        // Only for a kind that takes it that way. Handing it to a kind that is
+        // told instead would put the whole work order on a command line where
+        // nothing reads it and every byte of it is visible in `ps`.
         let in_args = how.order_in_args();
         // The seat is passed in because the agent is named after it, and it can
         // be passed in because `open` has happened above: the port splits opening
@@ -3597,7 +3603,7 @@ fn rotate_as(
     // Before anything is opened, like every other refusal here. The evidence
     // step two turns on is a turn wsp can see; a kind whose order goes out on
     // the command line gives none, ever.
-    if agent_commands::of(&kind).order_in_args() {
+    if agent_commands::of(&kind).order_in_args() && !agent_commands::of(&kind).turn_marks_ready() {
         eprintln!(
             "wsp: {kind} takes its work order in argv, where no turn can be confirmed - \
              the slot would move on a promise"
@@ -7208,7 +7214,7 @@ mod tests {
 
     fn owed_after(place: &Dropping, tag: &str) -> (i32, Store) {
         let store = claimed_row(tag);
-        let flags = [("agent", "true"), ("kind", "claude"), ("no-tree", "true")];
+        let flags = [("agent", "true"), ("kind", "codex"), ("no-tree", "true")];
         let code = place_work(place, &store, &Args::synth("spawn", &["t-1"], &flags));
         (code, store)
     }
@@ -7335,7 +7341,10 @@ mod tests {
             Ok(())
         }
         fn state(&self, _: &Seat) -> crate::place::Result<State> {
-            Ok(match self.2.borrow().is_empty() {
+            // Busy once told anything, or once started with an order in argv
+            // (`--` then the order): that start begins its turn on its own.
+            let in_argv = self.0.borrow().last().is_some_and(|a| a.args.iter().any(|x| x == "--"));
+            Ok(match self.2.borrow().is_empty() && !in_argv {
                 true => State::Idle,
                 false => State::Working,
             })
@@ -7612,22 +7621,25 @@ mod tests {
         let argv = place.0.borrow()[0].args.clone();
         assert_eq!(place.0.borrow()[0].kind, "claude", "the entry's kind, not the flag's");
         assert!(argv.iter().any(|a| a == "sonnet") && !argv.iter().any(|a| a.contains("opus")), "{argv:?}");
-        let order = place.2.borrow().first().cloned().expect("the order was told to the agent");
+        // Claude takes it in argv (`wsp-476`): last, after `--`, and never told.
+        assert!(place.2.borrow().is_empty(), "no tell for an order that went out in argv");
+        let order = argv.last().cloned().expect("the order is the last argument");
+        assert_eq!(argv[argv.len() - 2], "--");
         assert!(order.contains("leg scout of t-1") && order.contains("wsp leg done t-1"), "{order}");
         assert!(!order.contains("wsp review") && !order.contains("last leg"), "a leg that is not last is not told of review: {order}");
         assert!(!order.contains('\n'), "{order:?}");
 
         // Scout done, `plan` is the last leg of the record, and its order names
         // `review` as the one command that ends it (`wsp-354`).
-        // The double reads a seat as busy once it has been told anything.
-        place.2.borrow_mut().clear();
+        place.0.borrow_mut().clear();
         let mut t = store.find_task("t-1").unwrap();
         let mut ls = crate::legs::legs(&t);
         ls[0].state = crate::legs::State::Done;
         crate::legs::write(&mut t, &ls);
         store.save_task(&t).unwrap();
         assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags("plan"))), 0);
-        let order = place.2.borrow().last().cloned().expect("the last leg's order was told to the agent");
+        let order = place.0.borrow().last().and_then(|a| a.args.last().cloned()).expect("the last leg's order is in argv");
+        assert!(place.2.borrow().is_empty(), "and not told");
         assert!(order.contains("leg plan of t-1") && order.contains("last leg: end with `wsp review t-1"), "{order}");
         assert!(order.contains("as a call of its own, `wsp review t-1"), "{order}");
         assert!(!order.contains('\n'), "{order:?}");
@@ -8724,7 +8736,7 @@ mod tests {
         assert_eq!(place.stopped.get(), 1, "the seat it opened was ended");
         let why = cmd_govern::reseat_why(&store.governors(), "core").unwrap_or_default();
         assert!(why.contains("w9:p2 was ended"), "the seat says what became of the pane: {why}");
-        assert!(why.contains("work order"), "and why the attempt failed: {why}");
+        assert!(why.contains("never became ready"), "and why the attempt failed: {why}");
         let said = crate::cycle::tests::SAID.with(|s| s.borrow().clone());
         assert!(
             said.iter().any(|l| l.starts_with("core: the reseat failed") && l.contains("the next attempt is after")),
