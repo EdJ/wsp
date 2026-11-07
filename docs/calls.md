@@ -56,10 +56,15 @@ window, dearest first. `--by verb` and `--by caller` print each of the top rows'
 children under it. `--by child` ranks by wall (CPU is not split by program).
 `--by phase` and the end of the default report show the daemon's ticks.
 
+Every report, text and `--json` (`covers`), says what the file really covers: the
+oldest and newest record read, the sizes of both files, and — when the oldest
+record is newer than the start of the window asked for — `SHORT: asked for 2d …`,
+so a rotated or new file cannot pass for the whole window.
+
 ## Keeping it cheap
 
 `WSP_NO_CALLS=1` turns it off. The file rotates to `calls.1.jsonl` at 20 MB, so
-it holds at most about 40 MB. A record costs about 0.1 ms
+it holds at most about 40 MB (a test drives it past several caps and checks the older generation is dropped and live + old stay under 2 × cap). A record costs about 0.1 ms
 (`the_record_an_exit_writes_costs_under_a_millisecond`; `--release --nocapture`
 prints it). Under test builds, nothing is written unless `WSP_STATE` is set, so
 a test that was not isolated cannot reach the real file.

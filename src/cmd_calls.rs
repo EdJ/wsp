@@ -88,15 +88,17 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
         println!("wsp calls: nothing recorded in {} yet (WSP_NO_CALLS={})", util::contract(&store.state.join(calls::FILE)), if calls::off() { "set" } else { "unset" });
         return 0;
     }
+    let cov = calls::Coverage::of(&lines, &store.state);
     let (ticks, n_ticks) = calls::summarize_ticks(&lines, since);
     let tick_json = |rows: &[Row]| -> Vec<Value> {
         rows.iter().map(|r| json!({"phase": r.name, "ticks": r.count, "p50_ms": r.p(0.5), "p95_ms": r.p(0.95), "total_ms": (r.walls.iter().sum::<f64>() * 10.0).round() / 10.0})).collect()
     };
     if by == "phase" {
         if args.json() {
-            println!("{}", json!({"since": span, "ticks": n_ticks, "phases": tick_json(&ticks)}));
+            println!("{}", json!({"since": span, "covers": cov.json(since), "ticks": n_ticks, "phases": tick_json(&ticks)}));
             return 0;
         }
+        println!("  {}", coverage_text(&cov, span, since));
         print_phases(&ticks, n_ticks, span);
         return 0;
     }
@@ -114,6 +116,7 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
             "{}",
             json!({
                 "since": span,
+                "covers": cov.json(since),
                 "by": by,
                 "calls": n_calls,
                 "cpu_s": (total / 100.0).round() / 10.0,
@@ -134,6 +137,7 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
     let span_text = util::duration_human(span);
     if which == By::Child {
         println!("{}", p.bold(&format!("wsp calls by child — last {span_text}: {:.1} s of child wall", child_wall / 1000.0)));
+        println!("  {}", coverage_text(&cov, span, since));
         println!("  {:<22} {:>7} {:>8} {:>8} {:>9} {:>6}", "child", "runs", "p50 ms", "p95 ms", "wall s", "share");
         for r in rows.iter().take(25) {
             let w: f64 = r.walls.iter().sum();
@@ -151,6 +155,7 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     println!("{}", p.bold(&format!("wsp calls by {by} — last {span_text}: {n_calls} calls, {:.1} CPU-s", total / 1000.0)));
+    println!("  {}", coverage_text(&cov, span, since));
     println!("  {:<34} {:>7} {:>8} {:>8} {:>9} {:>6}", by, "count", "p50 ms", "p95 ms", "CPU-s", "share");
     for (i, r) in rows.iter().take(25).enumerate() {
         println!(
@@ -174,6 +179,10 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
         print_phases(&ticks, n_ticks, span);
     }
     0
+}
+
+fn coverage_text(cov: &calls::Coverage, span: i64, since: i64) -> String {
+    cov.line(span, since)
 }
 
 fn print_phases(rows: &[Row], n: u64, span: i64) {
@@ -232,6 +241,7 @@ mod tests {
         }
         calls::append(&env.state(), &json!({"k":"tick","t":now,"wall_ms":50.0,"phases":{"sync":40.0}}), calls::CAP);
         assert_eq!(calls(&store, &args("calls", &[], &[("json", "1")])), 0);
+        assert_eq!(calls(&store, &args("calls", &[], &[("since", "2d")])), 0);
         let (rows, total) = calls::summarize(&calls::read_all(&env.state()), 0, By::Verb);
         assert_eq!(rows[0].name, "wip --json");
         assert_eq!(rows[0].count, 2);

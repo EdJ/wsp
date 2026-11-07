@@ -830,6 +830,81 @@ pub fn read_all(dir: &Path) -> Vec<Value> {
     out
 }
 
+
+/// What the file actually covers, which is not what was asked for once it has
+/// rotated, or been switched off for a while, or is new. `wsp calls --since 2d`
+/// over a file that starts three hours ago would otherwise read as two days.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Coverage {
+    /// Epoch seconds of the oldest and newest record read, if any.
+    pub first: Option<i64>,
+    pub last: Option<i64>,
+    pub live_bytes: u64,
+    pub old_bytes: u64,
+}
+
+impl Coverage {
+    pub fn of(lines: &[Value], dir: &Path) -> Coverage {
+        let times = lines.iter().map(|v| crate::util::epoch_of(s(v, "t"))).filter(|t| *t > 0);
+        let size = |n: &str| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0);
+        Coverage {
+            first: times.clone().min(),
+            last: times.max(),
+            live_bytes: size(FILE),
+            old_bytes: size(OLD),
+        }
+    }
+
+    /// Seconds from the oldest record to the newest.
+    pub fn span(&self) -> i64 {
+        match (self.first, self.last) {
+            (Some(a), Some(b)) => (b - a).max(0),
+            _ => 0,
+        }
+    }
+
+    /// Whether the oldest record is newer than the start of the window asked
+    /// for, so the figures describe less than the window says.
+    pub fn short(&self, since: i64) -> bool {
+        self.first.is_some_and(|f| f > since)
+    }
+
+    /// The line that says so. `asked` is the window in seconds, `since` its start.
+    pub fn line(&self, asked: i64, since: i64) -> String {
+        let (Some(a), Some(b)) = (self.first, self.last) else {
+            return "the file has no records".to_string();
+        };
+        let size = |n: u64| format!("{:.1} MB", n as f64 / 1_048_576.0);
+        let mut out = format!(
+            "file covers {} ({} to {}); calls.jsonl {} + calls.1.jsonl {}",
+            crate::util::duration_human(self.span()),
+            crate::util::iso_at(a),
+            crate::util::iso_at(b),
+            size(self.live_bytes),
+            size(self.old_bytes)
+        );
+        if self.short(since) {
+            out.push_str(&format!(
+                " — SHORT: asked for {}, the oldest record is {} old, so these figures cover less than the window",
+                crate::util::duration_human(asked),
+                crate::util::duration_human((crate::util::epoch_secs() - a).max(0)),
+            ));
+        }
+        out
+    }
+
+    pub fn json(&self, since: i64) -> Value {
+        json!({
+            "first": self.first.map(crate::util::iso_at),
+            "last": self.last.map(crate::util::iso_at),
+            "span_s": self.span(),
+            "live_bytes": self.live_bytes,
+            "old_bytes": self.old_bytes,
+            "short": self.short(since),
+        })
+    }
+}
+
 pub fn state_path() -> Option<PathBuf> {
     state_dir()
 }
@@ -909,21 +984,75 @@ mod tests {
         assert_eq!(v["t"], "2026-11-07T10:40:00Z");
     }
 
-    /// The file grows by one line per append and rotates once past the cap, so
-    /// it never exceeds roughly the cap plus one line.
+    /// Driven past several caps: the live file stays under one cap, the
+    /// previous generation is kept in `calls.1.jsonl`, anything older is gone
+    /// from both, and the two together stay under two caps plus a line — which
+    /// is the "never over ~40 MB" of the real 20 MiB cap.
     #[test]
-    fn the_file_rotates_at_its_cap() {
+    fn the_file_rotates_at_its_cap_and_drops_the_older_generation() {
         let dir = std::env::temp_dir().join(format!("wsp-calls-rot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let line = json!({"k":"call","pad":"x".repeat(200)});
-        for _ in 0..100 {
-            append(&dir, &line, 4096);
+        let cap = 4096u64;
+        let pad = "x".repeat(200);
+        let mut line_len = 0;
+        let mut worst = 0;
+        let n = 120; // ~28 KB written: seven caps' worth
+        for i in 0..n {
+            let line = json!({"k":"call","m":format!("m{i:04}"),"pad":pad});
+            line_len = line.to_string().len() as u64 + 1;
+            append(&dir, &line, cap);
+            let size = |f: &str| std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0);
+            let (live, old) = (size(FILE), size(OLD));
+            assert!(live < cap + line_len, "live {live} past cap + one line at line {i}");
+            worst = worst.max(live + old);
         }
-        let live = std::fs::metadata(dir.join(FILE)).unwrap().len();
-        assert!(live < 4096 + 300, "the live file stays under cap + one line: {live}");
-        assert!(dir.join(OLD).exists(), "the full file moved to calls.1.jsonl");
+        assert!(worst <= 2 * cap + line_len, "live + old reached {worst}, past 2 x cap + a line");
+        let live = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        let old = std::fs::read_to_string(dir.join(OLD)).unwrap();
+        let last = format!("m{:04}", n - 1);
+        assert!(live.contains(&last), "the newest line is in the live file");
+        assert!(!old.contains(&last) && !live.contains("m0000") && !old.contains("m0000"), "the first line is gone from both files");
+        // The old generation is the one just before the live one: its newest
+        // line is the line just before the live file's first.
+        let first_live: usize = live.lines().next().unwrap().split("\"m\":\"m").nth(1).unwrap()[..4].parse().unwrap();
+        assert!(old.contains(&format!("m{:04}", first_live - 1)), "calls.1.jsonl is the previous generation");
         assert!(read_all(&dir).iter().all(|v| v["k"] == "call"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound Ed asked for is in the constant, not just in the test's cap.
+    #[test]
+    fn the_real_cap_is_twenty_mebibytes_so_both_files_stay_under_forty() {
+        assert_eq!(CAP, 20 * 1024 * 1024);
+    }
+
+    /// The file's coverage is read off its records, not off the window asked
+    /// for, and a window longer than the file says so.
+    #[test]
+    fn coverage_says_when_the_file_is_shorter_than_the_window() {
+        let dir = std::env::temp_dir().join(format!("wsp-calls-cov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = crate::util::epoch_secs();
+        let line = |ago: i64| json!({"k":"call","t":crate::util::iso_at(now - ago),"verb":"x"});
+        append(&dir, &line(3 * 3600 + 600), CAP);
+        append(&dir, &json!({"k":"tick","t":crate::util::iso_at(now - 60)}), CAP);
+        let lines = read_all(&dir);
+        let cov = Coverage::of(&lines, &dir);
+        assert_eq!(cov.span(), 3 * 3600 + 540);
+        let two_days = 2 * 86_400;
+        assert!(cov.short(now - two_days));
+        let said = cov.line(two_days, now - two_days);
+        assert!(said.contains("file covers 3h"), "{said}");
+        assert!(said.contains("SHORT: asked for 2d"), "{said}");
+        assert!(!cov.short(now - 3 * 3600), "a window the file spans is not short");
+        assert!(!cov.line(3 * 3600, now - 3 * 3600).contains("SHORT"));
+        assert!(cov.short(now - 4 * 3600), "a 4h window over a 3h10m file is short");
+        let j = cov.json(now - two_days);
+        assert_eq!(j["short"], true);
+        assert_eq!(j["span_s"], 3 * 3600 + 540);
+        assert!(j["first"].is_string() && j["last"].is_string() && j["live_bytes"].as_u64().unwrap() > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
