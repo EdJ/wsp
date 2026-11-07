@@ -579,6 +579,14 @@ pub(crate) fn write_runs(t: &mut Task, runs: &[Run]) {
     write_entries(t, &kept, runs);
 }
 
+/// The verb other modules call to record check runs: the runs go under the
+/// heading, the passes stay, and the row is saved. This module is the only one
+/// that edits `## Verification`.
+pub(crate) fn save_runs(store: &Store, t: &mut Task, runs: &[Run]) -> std::io::Result<()> {
+    write_runs(t, runs);
+    store.save_task(t)
+}
+
 fn write_entries(t: &mut Task, passes: &[Pass], runs: &[Run]) {
     let mut all: Vec<(String, String)> = passes.iter().map(|p| (p.at.clone(), p.line())).collect();
     all.extend(runs.iter().map(|r| (r.at.clone(), r.line())));

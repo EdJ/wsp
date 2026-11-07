@@ -930,8 +930,7 @@ pub(crate) fn begin(store: &Store, id: &str, sha: &str, stale: i64, again: bool)
         }
         let at = util::iso_at(secs);
         runs.push(Run { at: at.clone(), state: RunState::Running, read: Some(read), took: None, text: String::new() });
-        v::write_runs(&mut t, &runs);
-        store.save_task(&t).ok()?;
+        v::save_runs(store, &mut t, &runs).ok()?;
         Some(at)
     })?;
     store.git_commit(&format!("wsp: checking {id}"));
@@ -944,8 +943,7 @@ fn abandon(store: &Store, id: &str, at: &str) {
     store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return };
         let runs: Vec<Run> = v::runs(&t).into_iter().filter(|r| r.at != at).collect();
-        v::write_runs(&mut t, &runs);
-        let _ = store.save_task(&t);
+        let _ = v::save_runs(store, &mut t, &runs);
     });
 }
 
