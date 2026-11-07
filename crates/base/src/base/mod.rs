@@ -5,5 +5,6 @@
 pub mod args;
 pub mod git;
 pub mod labels;
+pub mod procs;
 pub mod seat;
 pub mod term;

@@ -1681,6 +1681,7 @@ mod tests {
             runs: |_, _| false,
             after_land: crate::check::after_land,
             rerun: crate::check::rerun,
+            held: |_| None,
         });
         let env = util::isolated(&format!("hold-{tag}"));
         let store = Store::at(env.home(), env.state());

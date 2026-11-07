@@ -2406,7 +2406,7 @@ fn trunk_tip(store: &Store, list: &str) -> Option<String> {
         return None;
     }
     let index = crate::resolve::Index::new(store.projects());
-    let root = crate::cmd_spawn::list_root(store, &index, list)?;
+    let root = crate::resolve::list_root(store, &index, list)?;
     crate::cmd_checkout::trunk_tip(&root)
 }
 
@@ -5487,6 +5487,7 @@ fn only_a_working_screen_is_ever_overruled() {
             runs: |_, _| false,
             after_land: crate::check::after_land,
             rerun: crate::check::rerun,
+            held: |_| None,
         });
         let (env, store, tree, w) = ready_tree(tag, member_file, trunk_file);
         let ran = env.path("ran.log");

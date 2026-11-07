@@ -8,7 +8,6 @@ attention -> wake: wake  # engine -> seats
 barrier -> main: Args  # engine -> top
 barrier_replay -> main: Args  # engine -> top
 check -> main: Args  # engine -> top
-check_tree -> cmd_sandbox: ancestors, processes  # trees -> seats
 closing -> main: Args  # engine -> top
 cmd_agent -> cmd_attempts: attempts_of  # seats -> timeline
 cmd_agent -> daemon: a_backend_answered, dead, health, running, surface_drawing  # seats -> top
@@ -22,8 +21,6 @@ cmd_attend -> main: Args  # engine -> top
 cmd_brief -> daemon: a_backend_answered, dead, running  # seats -> top
 cmd_brief -> main: Args  # seats -> top
 cmd_burn -> main: Args  # timeline -> top
-cmd_checkout -> cmd_agent: Whereabouts, locate  # trees -> seats
-cmd_checkout -> cmd_spawn: list_root  # trees -> seats
 cmd_cost -> main: Args  # timeline -> top
 cmd_govern -> main: Args  # seats -> top
 cmd_install -> main: Args, stamp_word  # seats -> top
@@ -55,7 +52,6 @@ cmd_worklist -> main: Args  # engine -> top
 cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
 cycle -> cmd_agent: did_of_seat, fixed_of_seat, notice, ran_of_seat, secs_of_seat  # engine -> seats
 cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
-cycle -> cmd_spawn: list_root  # engine -> seats
 cycle -> main: Args  # engine -> top
 cycle -> room: Counted, Gate, names  # engine -> seats
 cycle -> wake: messages_held, say, settle_held  # engine -> seats
@@ -76,7 +72,6 @@ legs -> cmd_attempts: Attempt, attempts_of, priced  # engine -> timeline
 legs -> main: Args  # engine -> top
 memory -> cmd_spawn: local_backends  # base -> seats
 memory -> place: *, Seat, Seated, State  # base -> wire
-overlap -> panel: PANEL_LABEL, VIEW_LABEL  # trees -> surface
 packet -> main: Args  # engine -> top
 panel -> daemon: surface_drawing, wsp_panes  # surface -> top
 panel -> main: Args  # surface -> top

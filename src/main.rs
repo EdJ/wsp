@@ -485,6 +485,7 @@ fn main() {
         runs: |store, task| worklist::Running::read(store).of(task).is_some_and(|p| p.run),
         after_land: check::after_land,
         rerun: check::rerun,
+        held: |store| cmd_agent::locate(&cmd_agent::Whereabouts::live(store)).task.map(|t| t.id),
     });
 
     place::install_above(place::Above {

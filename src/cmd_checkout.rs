@@ -1583,9 +1583,8 @@ fn task_of(store: &Store, args: &Args) -> Result<String, String> {
     if let Some(id) = args.rest.first() {
         return Ok(id.clone());
     }
-    let w = crate::cmd_agent::Whereabouts::live(store);
-    match crate::cmd_agent::locate(&w).task {
-        Some(t) => Ok(t.id),
+    match (engine().held)(store) {
+        Some(id) => Ok(id),
         None => Err("no task in hand — `wsp claim <id>` first, or name one".into()),
     }
 }
@@ -1670,7 +1669,7 @@ pub(crate) fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> 
     // task, and lives in the repository its list is run in.
     if let Some((list, _)) = util::parse_subject(task) {
         let index = crate::resolve::Index::new(store.projects());
-        add(crate::cmd_spawn::list_root(store, &index, list).and_then(|r| toplevel(&util::expand(&r))));
+        add(crate::resolve::list_root(store, &index, list).and_then(|r| toplevel(&util::expand(&r))));
     }
     out
 }
@@ -1756,6 +1755,8 @@ pub(crate) struct Engine {
     /// (`check::rerun`): the arguments are the task, the tree, the new head, the old
     /// base, the paths the rebase pulled in and the paths the branch changed.
     pub rerun: fn(&Store, &str, &Path, &str, &str, &[String], &[String]) -> Rerun,
+    /// The task this pane holds, when it holds one (`cmd_agent::locate`'s `task`).
+    pub held: fn(&Store) -> Option<String>,
 }
 
 /// How a rerun after a rebase onto a moved trunk ended.
@@ -1780,7 +1781,7 @@ pub(crate) fn install_engine(e: Engine) {
 
 /// The installed answers; before any is installed (a unit test) nothing is passed and nothing is poked.
 fn engine() -> &'static Engine {
-    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {}, runs: |_, _| false, after_land: |_, _| {}, rerun: |_, _, _, _, _, _, _| Rerun::Nothing };
+    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {}, runs: |_, _| false, after_land: |_, _| {}, rerun: |_, _, _, _, _, _, _| Rerun::Nothing, held: |_| None };
     ENGINE.get().unwrap_or(&NONE)
 }
 

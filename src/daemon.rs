@@ -407,7 +407,7 @@ pub(crate) fn state_of(rest: &str) -> PathBuf {
 /// process list could not be read at all — which no caller may read as "none",
 /// because a machine with no processes on it is a machine that cannot answer.
 pub(crate) fn running(state: &Path) -> Option<Vec<u32>> {
-    let all = crate::cmd_sandbox::processes();
+    let all = crate::base::procs::processes();
     if all.is_empty() {
         return None;
     }
@@ -452,7 +452,7 @@ fn daemons(all: &[(u32, u32, String)], me: u32, state: &Path) -> Vec<u32> {
 /// round as before this existed: an unanswerable process list should not stop
 /// a panel being installed on a machine that has no fork on it at all.
 pub(crate) fn surface_drawing(state: &Path) -> bool {
-    crate::cmd_sandbox::processes()
+    crate::base::procs::processes()
         .iter()
         .any(|(_, _, rest)| is_wsp(rest, "surface") && for_store(rest, state))
 }
@@ -478,7 +478,7 @@ pub(crate) fn surface_drawing(state: &Path) -> bool {
 /// running anywhere" — that is a list of every panel on the machine to close.
 /// Same rule, same reason, as [`running`].
 pub(crate) fn wsp_panes(state: &Path) -> Option<std::collections::HashSet<String>> {
-    let all = crate::cmd_sandbox::processes();
+    let all = crate::base::procs::processes();
     if all.is_empty() {
         return None;
     }

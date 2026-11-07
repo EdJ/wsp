@@ -569,6 +569,38 @@ pub fn resolve(
     Resolution { project: None, source: "none" }
 }
 
+/// Where a worklist's custodian stands: where its project's governor stands,
+/// the root of the project its members are in. Where they span projects, the
+/// one holding most rows, the first-seen on a tie.
+///
+/// **Not home, which `wsp-203` chose and `wsp-219` reversed.** `wsp-203`
+/// stated a cwd rather than leave it to the backend, because compound starts
+/// the agent as a child of the caller and so in the caller's directory, and a
+/// governor spawned from a member's pane stood in that member's tree. That
+/// half holds. But it chose `~`, and Claude Code opens `~` (and `/`, the
+/// daemon's directory under launchd) behind its folder-trust prompt with
+/// "No, exit" selected: the Enter that submits the work order exits the agent,
+/// and the reseat reads as a renderer socket that never appeared. That was 57
+/// failed list reseats, while project seats, which stand in their root,
+/// reseated fine. A trunk is nobody's tree as much as home is, since a member
+/// works in `.worktrees/<id>` beneath it.
+///
+/// `None` when no member has a project with a root, which `grounded` refuses.
+pub fn list_root(store: &crate::store::Store, index: &Index, list: &str) -> Option<String> {
+    let mut tally: Vec<(String, usize)> = Vec::new();
+    let members = store.worklist(list).map(|l| l.groups()).unwrap_or_default();
+    for id in members.iter().flat_map(|g| g.members.iter()) {
+        let Some(task) = store.find_task(id) else { continue };
+        let Some(root) = task.project.as_deref().and_then(|p| index.root_for(p, &task.refs)) else { continue };
+        match tally.iter_mut().find(|(r, _)| *r == root) {
+            Some((_, n)) => *n += 1,
+            None => tally.push((root, 1)),
+        }
+    }
+    // `max_by_key` keeps the last of equals; reversed, it keeps the first.
+    tally.into_iter().rev().max_by_key(|(_, n)| *n).map(|(r, _)| r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

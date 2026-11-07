@@ -221,7 +221,7 @@ fn running_among(dir: &Path, backends: &[&dyn Place]) -> Vec<u32> {
     let Ok(out) = std::process::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output() else { return Vec::new() };
     let Some(seats) = seated(backends) else { return Vec::new() };
     let dir = util::real(&dir.display().to_string());
-    let mut keep = crate::cmd_sandbox::ancestors(&crate::cmd_sandbox::processes());
+    let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
     keep.extend(seats);
     strays(&String::from_utf8_lossy(&out.stdout), &dir, &keep)
 }
@@ -343,7 +343,7 @@ pub(crate) fn left_in_finished(
     staged: &dyn Fn(&crate::model::Task) -> bool,
 ) -> Option<Vec<Left>> {
     let mut live = BTreeSet::new();
-    let mut keep = crate::cmd_sandbox::ancestors(&crate::cmd_sandbox::processes());
+    let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
     for (seat, label) in census {
         live.insert(label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string());
         keep.extend(pids(&seat).unwrap_or_default());

@@ -296,7 +296,7 @@ pub(crate) fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<
         // Our own furniture is not company. Every workspace has a panel and
         // most have a view, and reporting them would bury the one pane that
         // matters under the ones we installed ourselves.
-        if p.label == crate::panel::PANEL_LABEL || p.label == crate::panel::VIEW_LABEL {
+        if p.label == crate::base::labels::PANEL_LABEL || p.label == crate::base::labels::VIEW_LABEL {
             continue;
         }
 
@@ -511,9 +511,9 @@ mod tests {
     #[test]
     fn our_own_furniture_is_not_company() {
         let mut panel = pane("p", "w1", "/home/ed/claude/wsp");
-        panel.label = crate::panel::PANEL_LABEL.into();
+        panel.label = crate::base::labels::PANEL_LABEL.into();
         let mut view = pane("v", "w1", "/home/ed/claude/wsp");
-        view.label = crate::panel::VIEW_LABEL.into();
+        view.label = crate::base::labels::VIEW_LABEL.into();
         let w = world(vec![pane("me", "w0", "/home/ed/claude/wsp"), panel, view]);
         assert!(standing_beside(&w, "me", None).is_empty());
     }

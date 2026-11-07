@@ -157,11 +157,11 @@ pub(crate) fn tidy(store: &Store) {
     if cfg!(test) {
         return;
     }
-    let all = crate::cmd_sandbox::processes();
+    let all = crate::base::procs::processes();
     if all.is_empty() {
         return;
     }
-    let spare = crate::cmd_sandbox::ancestors(&all);
+    let spare = crate::base::procs::ancestors(&all);
     let kept = |state: &Path| crate::daemon::running(state).is_none_or(|d| !d.is_empty());
     let leaks = find(&all, &store.state, &spare, &kept);
     let mut seen = read(store);
