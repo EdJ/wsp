@@ -238,6 +238,14 @@ pub(crate) trait Seats {
     fn census(&self) -> Option<Vec<(String, String)>> {
         None
     }
+
+    /// Hand the governing seat of `scope` to a fresh successor on wsp's own
+    /// initiative — `cmd_spawn::rotate_on_behalf`. The exit code of the
+    /// rotation. **Does nothing by default**, for [`Seats::absent`]'s reason: a
+    /// fake that rotated would be starting agents out of a fixture.
+    fn rotate(&self, _store: &Store, _scope: &str) -> i32 {
+        0
+    }
 }
 
 /// The real reading, over the backends on this machine — with opencode's own
@@ -530,7 +538,7 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
 fn after_pass(store: &Store, seats: &dyn Seats, w: &Worklist, n: usize) {
     end_behind(store, seats, w, n);
     if n < w.groups().len() {
-        rotate(store, w);
+        rotate(store, seats, w);
         return;
     }
     let Some(now) = store.worklist(&w.id) else { return };
@@ -3777,15 +3785,15 @@ pub(crate) fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -
 }
 
 /// A pass hands the governing seat to a fresh successor, on wsp's own
-/// initiative: `cmd_spawn::rotate_on_behalf` carries the argument.
-fn rotate(store: &Store, w: &Worklist) {
+/// initiative: [`Seats::rotate`] carries the argument.
+fn rotate(store: &Store, seats: &dyn Seats, w: &Worklist) {
     if cfg!(test) {
         #[cfg(test)]
         tests::ROTATED.with(|s| s.borrow_mut().push(w.id.clone()));
         return;
     }
     let Some(scope) = governing_scope(store, w) else { return };
-    let code = crate::cmd_spawn::rotate_on_behalf(store, &scope);
+    let code = seats.rotate(store, &scope);
     log_line(store, &format!("rotate {scope}: exit {code}"));
 }
 

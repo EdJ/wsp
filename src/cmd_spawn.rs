@@ -4963,6 +4963,10 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
         crate::cmd_message::type_at(seat, text)
     }
 
+    fn rotate(&self, store: &Store, scope: &str) -> i32 {
+        rotate_on_behalf(store, scope)
+    }
+
     fn census(&self) -> Option<Vec<(String, String)>> {
         let herdr_here = crate::herdr::available_now();
         let mut heard = false;
