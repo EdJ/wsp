@@ -1077,6 +1077,28 @@ impl Task {
         crate::log::append(self, line);
     }
 
+    /// The paths the row's own words name — its overview and its packet — that
+    /// read as files of a repository: a `/` in them and an extension, or `.rs`.
+    /// Relative only; a URL, `..`, `~` or an absolute path is somewhere else.
+    /// What a multi-root project picks the row's root by (`Index::root_for`).
+    pub fn named_paths(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for name in ["Overview", "Packet"] {
+            for word in self.section(name).unwrap_or_default().split_whitespace() {
+                let w = word
+                    .trim_end_matches(|c: char| "`\"'()[],;:*.".contains(c))
+                    .trim_start_matches(|c: char| "`\"'()[],;:*".contains(c));
+                let last = w.rsplit('/').next().unwrap_or("");
+                let ext = last.rsplit_once('.').is_some_and(|(stem, e)| !stem.is_empty() && !e.is_empty());
+                let looks = (w.contains('/') && ext) || w.ends_with(".rs");
+                if looks && !w.contains("://") && !w.starts_with("..") && !w.starts_with('/') && !w.starts_with('~') && !out.iter().any(|o| o == w) {
+                    out.push(w.to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// The text under `## <name>`, heading excluded.
     pub fn section(&self, name: &str) -> Option<String> {
         section_of(&self.body, name)

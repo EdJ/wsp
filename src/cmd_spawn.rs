@@ -2431,13 +2431,21 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // `root_for` rather than `root_of`: a project with one root answers the
     // same either way, but `compound`'s two roots mean `root_of`'s silent
     // first-root default is exactly wsp-112's bug — every row in that project
-    // landing in `~/claude/compound` whatever its code is. A task whose work
-    // is the other root names it with `wsp add --ref`, which `root_for` checks
-    // before falling back to the same first root `root_of` always gave.
-    let refs = work.task.as_deref().and_then(|t| store.task(t)).map(|t| t.refs).unwrap_or_default();
+    // landing in `~/claude/compound` whatever its code is. The root is the first
+    // one that holds the files the row's overview and packet name; never one
+    // its `refs` name (wsp-451), which are files it reads outside its own
+    // repository: `compounding-125` and `-128` each carried `refs:
+    // ~/claude/compound` and were given trees there, where their work was not.
+    let task_row = work.task.as_deref().and_then(|t| store.task(t));
+    let named = task_row.as_ref().map(|t| t.named_paths()).unwrap_or_default();
+    let project_root = work.project.as_deref().and_then(|p| index.root_for(p, &named));
+    if project_root.is_none() && args.get("cwd").is_none() && work.project.as_deref().is_some_and(|p| index.roots_of(p).is_some_and(|r| !r.is_empty())) {
+        eprintln!("wsp: not starting it: {}", crate::resolve::NO_ROOT_HOLDS);
+        return 1;
+    }
     let cwd = args
         .get("cwd")
-        .or_else(|| work.project.as_deref().and_then(|p| index.root_for(p, &refs)))
+        .or(project_root)
         .or_else(|| work.list.as_deref().and_then(|l| crate::resolve::list_root(store, &index, l)))
         .or_else(|| work.primary.then(|| primary_root(&index)).flatten());
 
@@ -2489,7 +2497,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let mut prepared = crate::leg_tree::Prepared::default();
     let cwd = match (&leg_rec, work.task.as_deref(), cwd.as_deref(), &leg_name) {
         (Some(_), Some(task), Some(row_cwd), Some(name)) if !no_tree => {
-            let root = work.project.as_deref().and_then(|p| index.root_for(p, &refs)).unwrap_or_else(|| row_cwd.to_string());
+            let root = work.project.as_deref().and_then(|p| index.root_for(p, &named)).unwrap_or_else(|| row_cwd.to_string());
             match crate::leg_tree::prepare(store, &root, row_cwd, task, name) {
                 Ok(p) => {
                     let here = p.cwd.clone().or(cwd.clone());
@@ -6038,7 +6046,7 @@ mod tests {
 
     /// wsp-112: a project with one root answers `root_for` exactly as
     /// `root_of` does — the ordinary case is unaffected by a project ever
-    /// having a second root.
+    /// having a second root, and by whatever the row names.
     #[test]
     fn a_project_with_one_root_answers_root_for_the_same_as_root_of() {
         let mut wsp = Project::new("wsp");
@@ -6046,30 +6054,45 @@ mod tests {
         let index = Index::new(vec![wsp]);
         assert_eq!(index.root_for("wsp", &[]), index.root_of("wsp"));
         assert_eq!(
-            index.root_for("wsp", &["~/some/unrelated/ref.md".into()]),
+            index.root_for("wsp", &["no/such/file.rs".into()]),
             Some("~/claude/wsp".into()),
-            "a ref that names no root is not a match and does not change the answer"
+            "a file no root holds does not change a one-root project's answer"
         );
     }
 
-    /// wsp-112: `compound`'s shape. A project with two roots sends a task to
-    /// the one its own `--ref` names, not the first — `root_of`'s old
-    /// behaviour, which is `compound-121`'s bug: every row in that project
-    /// got a tree in `~/claude/compound` whatever its code was in.
+    /// wsp-451: a project with two roots sends a row to the first root that
+    /// holds the files it names, and a ref to the *other* root — a file the row
+    /// reads — decides nothing. `compounding-125` and `-128` carried
+    /// `refs: ~/claude/compound` and had their trees built there, though their
+    /// work was `spikes/web-chrome` in `compounding`.
     #[test]
-    fn a_task_whose_ref_names_the_other_root_is_sent_there() {
-        let mut compound = Project::new("compound");
-        compound.roots = vec!["~/claude/compound".into(), "~/claude/wsp".into()];
-        let index = Index::new(vec![compound]);
+    fn a_row_is_rooted_by_the_files_it_names_never_by_its_refs() {
+        let env = crate::util::isolated("root-for-named");
+        let (compound, compounding) = (env.path("compound"), env.path("compounding"));
+        crate::testkit::repo_at(&compound, &[("canvas-gpui/lib.rs", "")], "compound: first");
+        crate::testkit::repo_at(&compounding, &[("spikes/web-chrome/app.ts", "")], "compounding: first");
+        let mut p = Project::new("compounding");
+        p.roots = vec![compound.display().to_string(), compounding.display().to_string()];
+        let index = Index::new(vec![p]);
+
+        let mut t = Task::new("tidy the chrome", "compounding-125");
+        t.project = Some("compounding".into());
+        t.refs = vec![compound.display().to_string()];
+        t.body = "## Overview\nChange `spikes/web-chrome/app.ts`.\n\n## Packet\nfile: spikes/web-chrome/app.ts\n".into();
+        assert_eq!(t.named_paths(), vec!["spikes/web-chrome/app.ts".to_string()]);
         assert_eq!(
-            index.root_for("compound", &["~/claude/wsp".into()]),
-            Some("~/claude/wsp".into())
+            index.root_for("compounding", &t.named_paths()),
+            Some(compounding.display().to_string()),
+            "the ref names compound, the files are in compounding"
         );
-        assert_eq!(
-            index.root_for("compound", &[]),
-            Some("~/claude/compound".into()),
-            "no ref names either root, so the first is still the silent default"
-        );
+        // And the tree is made there.
+        let root = index.root_for("compounding", &t.named_paths()).unwrap();
+        let tree = crate::cmd_checkout::tree_for(&root, "compounding-125");
+        assert!(tree.as_deref().is_some_and(|d| d.contains("compounding/.worktrees/compounding-125")), "{tree:?}");
+
+        // A row naming nothing keeps the first root; one naming files no root holds has none.
+        assert_eq!(index.root_for("compounding", &[]), Some(compound.display().to_string()));
+        assert_eq!(index.root_for("compounding", &["spikes/gone/x.ts".into()]), None, "{}", crate::resolve::NO_ROOT_HOLDS);
     }
 
     /// wsp-112: `roots_of` is `root_of`'s walk with nothing dropped — every

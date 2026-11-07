@@ -387,7 +387,7 @@ fn render(head: &str, p: &Packet, root: &Path, who: &str, tail: &str) -> Result<
 fn tree_root(store: &Store, t: &Task) -> PathBuf {
     t.project
         .as_deref()
-        .and_then(|p| crate::resolve::Index::new(store.projects()).root_of(p))
+        .and_then(|p| crate::resolve::Index::new(store.projects()).root_for(p, &t.named_paths()))
         .map(|r| util::expand(&r))
         .unwrap_or_default()
 }

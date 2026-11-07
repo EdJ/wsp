@@ -421,7 +421,9 @@ fn with_verify(text: String, likely: &[String], repo: &Path) -> String {
 pub fn build_pack(store: &Store, t: &Task, kind: Kind, depth: &str) -> Result<Pack, String> {
     let bin = pack_bin()?;
     let project = t.project.clone().ok_or("the row has no project")?;
-    let root = crate::resolve::Index::new(store.projects()).root_of(&project).ok_or_else(|| format!("{project} has no root"))?;
+    let root = crate::resolve::Index::new(store.projects())
+        .root_for(&project, &t.named_paths())
+        .ok_or_else(|| format!("{project} has no root"))?;
     let repo = crate::cmd_verify::toplevel(&util::expand(&root)).ok_or_else(|| format!("{root} is not a repository"))?;
     let rev = crate::cmd_checkout::trunk_tip(&root).ok_or("the trunk has no tip")?;
     let dir = store.state_file(&format!("packet/{project}"));

@@ -8,6 +8,10 @@ use std::collections::{BTreeMap, HashSet};
 use crate::model::{Project, Status, Task};
 use crate::util;
 
+/// What a spawn says when a multi-root project's row names files that none of
+/// its roots holds: a tree there could not do the work.
+pub const NO_ROOT_HOLDS: &str = "the files this row names are in none of its project's roots, so no tree could do its work";
+
 pub struct Index {
     pub projects: Vec<Project>,
 }
@@ -127,27 +131,27 @@ impl Index {
     /// Which of a project's roots a task's own work is in, when there is more
     /// than one to choose from.
     ///
-    /// A project with one root answers with it, exactly as [`root_of`] does —
-    /// the ordinary case is every project but `compound-127`'s, and this must
-    /// not change it. Where a project carries several, `spawn` has to choose
-    /// before any branch exists to search for, so the choice cannot be made
-    /// the way the worklist's [`crate::worklist::Repos`] makes it — a task's
-    /// own `refs` is where that choice is recorded instead, and this looks
-    /// there for a ref that names one of the roots exactly (`wsp add --ref
-    /// ~/claude/wsp` on the row). No match, and none of the ordinary
-    /// behaviour before this row existed had a way to know either — it falls
-    /// back to the first root, the same silent default `root_of` always gave,
-    /// rather than refusing a spawn that used to work.
-    pub fn root_for(&self, project: &str, refs: &[String]) -> Option<String> {
+    /// A project with one root answers with it, exactly as [`root_of`] does.
+    /// Where a project carries several, `spawn` has to choose before any
+    /// branch exists to search for, so the choice is made by the files the row
+    /// itself names (`named`, from [`Task::named_paths`]: its overview and its
+    /// packet): the first root that holds one of them. **Never from `refs`**
+    /// (wsp-451): a ref is a file the row *reads* outside its own repository,
+    /// and `compounding-125` and `-128`, each with `refs: ~/claude/compound`,
+    /// had their trees built in `compound` while their work was in
+    /// `compounding`. A row that names no file at all gets the first root, the
+    /// silent default `root_of` always gave. `None` is the one answer that
+    /// matters here: the row names files and no root holds any of them, so
+    /// [`NO_ROOT_HOLDS`] is the sentence for a spawn to refuse with.
+    pub fn root_for(&self, project: &str, named: &[String]) -> Option<String> {
         let roots = self.roots_of(project)?;
-        if roots.len() <= 1 {
+        if roots.len() <= 1 || named.is_empty() {
             return roots.into_iter().next();
         }
-        let hit = refs.iter().find_map(|r| {
-            let target = util::real(r);
-            roots.iter().find(|root| util::real(root) == target).cloned()
-        });
-        hit.or_else(|| roots.into_iter().next())
+        roots.into_iter().find(|root| {
+            let dir = util::expand(root);
+            named.iter().any(|n| dir.join(n).exists())
+        })
     }
 
     pub fn ancestors(&self, id: &str) -> Vec<String> {
@@ -591,7 +595,7 @@ pub fn list_root(store: &crate::store::Store, index: &Index, list: &str) -> Opti
     let members = store.worklist(list).map(|l| l.groups()).unwrap_or_default();
     for id in members.iter().flat_map(|g| g.members.iter()) {
         let Some(task) = store.find_task(id) else { continue };
-        let Some(root) = task.project.as_deref().and_then(|p| index.root_for(p, &task.refs)) else { continue };
+        let Some(root) = task.project.as_deref().and_then(|p| index.root_for(p, &task.named_paths())) else { continue };
         match tally.iter_mut().find(|(r, _)| *r == root) {
             Some((_, n)) => *n += 1,
             None => tally.push((root, 1)),
