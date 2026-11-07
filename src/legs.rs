@@ -1344,8 +1344,7 @@ fn cmd_reset(store: &Store, args: &Args) -> i32 {
     crate::starts::forgive(store, &label(&t.id, name));
     store.locked(|| {
         if let Some(mut row) = store.find_task(&t.id) {
-            row.log(&format!("leg {name} reset by hand: {}", crate::util::fold(&why)));
-            let _ = store.save_task(&row);
+            let _ = crate::log::note(store, &mut row, &format!("leg {name} reset by hand: {}", crate::util::fold(&why)));
         }
     });
     store.git_commit(&format!("wsp: {} leg {name} reset by hand", t.id));

@@ -1124,7 +1124,7 @@ impl Task {
     /// written went under that heading instead — a log that had stopped being
     /// the log without anything failing.
     pub fn log(&mut self, line: &str) {
-        append_dated(&mut self.body, "Log", line);
+        crate::log::append(self, line);
     }
 
     /// The text under `## <name>`, heading excluded.
@@ -2610,7 +2610,7 @@ impl Worklist {
     /// Append a timestamped line under `## Log`, in this record's own section
     /// order — see [`append_dated_in_order`].
     pub fn log(&mut self, line: &str) {
-        append_dated_in_order(&mut self.body, "Log", line, &WORKLIST_SECTIONS);
+        crate::log::append_to_list(self, line);
     }
 
     pub fn render(&self) -> String {

@@ -12,6 +12,7 @@ mod base;
 mod at_stop;
 mod artefact;
 mod verbs;
+mod log;
 mod registry;
 mod after;
 mod closing;

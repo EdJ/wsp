@@ -256,8 +256,7 @@ pub(crate) fn note_close(store: &Store, row: &str, what: &str, written: i64, by_
     let id = row.to_string();
     store.locked(|| {
         let Some(mut t) = store.find_task(&id) else { return false };
-        t.log(&line);
-        store.save_task(&t).is_ok()
+        crate::log::note(store, &mut t, &line).is_ok()
     });
 }
 

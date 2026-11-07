@@ -832,8 +832,7 @@ mod tests {
         store.ensure_dirs().unwrap();
         let mut m = Task::new("m-1", "m-1");
         m.set_status(Status::Review);
-        m.log(&format!("{} abc1234", crate::repair::LANDED));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} abc1234", crate::repair::LANDED)).unwrap();
         set_pass(&store, crate::verification::State::Holds);
         let mut w = Worklist::new("run", "run");
         w.set_status(WorklistStatus::Running);
@@ -995,8 +994,7 @@ mod tests {
     fn a_verdict_a_later_landing_superseded_ends_nothing() {
         let (_env, store) = verified("superseded");
         let mut m = store.find_task("m-1").unwrap();
-        m.log(&format!("{} def5678", crate::repair::LANDED));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} def5678", crate::repair::LANDED)).unwrap();
         pass(&store, &Fake::at_rest());
         assert!(!member_ended(), "abc1234 held, and def5678 has not been read");
 
@@ -1060,8 +1058,7 @@ mod tests {
         let (_env, store) = verified("moved");
         set_pass(&store, crate::verification::State::Running);
         let mut m = store.find_task("m-1").unwrap();
-        m.log(&format!("{} def5678", crate::repair::LANDED));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} def5678", crate::repair::LANDED)).unwrap();
         pass(&store, &Fake::at_rest());
         assert!(!member_ended(), "the pass read abc1234 and the member is at def5678");
     }
@@ -1176,8 +1173,7 @@ mod tests {
         let (env, store) = verified(tag);
         let mut m = store.find_task("m-1").unwrap();
         m.log("claimed by pane cpd-1 · spawned at sonnet/high");
-        m.log("released after 1h · ran sonnet-5-5/high · 9 turns");
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, "released after 1h · ran sonnet-5-5/high · 9 turns").unwrap();
         store.clear_claim("m-1");
         store.clear_binding("cpd-1");
         let mut seats = Fake::at_rest();
@@ -1395,8 +1391,7 @@ mod tests {
         legs[0].state = crate::legs::State::Done;
         crate::legs::write(&mut t, &legs);
         t.set_status(Status::Review);
-        t.log(&format!("{} abc1234", crate::repair::LANDED));
-        store.save_task(&t).unwrap();
+        crate::log::note(store, &mut t, &format!("{} abc1234", crate::repair::LANDED)).unwrap();
     }
 
     fn seat_ended() -> bool {

@@ -225,8 +225,7 @@ fn record(store: &Store, label: &str, built: &[Built], secs: u64, log: &Path) {
     let sha = built.first().map(|b| b.sha.as_str()).unwrap_or_default();
     let sha12 = &sha[..12.min(sha.len())];
     if let Some(mut w) = store.worklist(label) {
-        w.log(&format!("wsp: cold build at {sha12}: {steps} steps, {} failed, {secs}s", failed.len()));
-        let _ = store.save_worklist(&w);
+        let _ = crate::log::note_to_list(store, &mut w, &format!("wsp: cold build at {sha12}: {steps} steps, {} failed, {secs}s", failed.len()));
     }
     store.log_event(
         "cold-built",

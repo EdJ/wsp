@@ -2981,7 +2981,7 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
     // So the edit is allowed and it leaves a mark: the log says the section was
     // edited by hand, which is exactly what the record was protecting.
     if crate::model::section_of(&body, "Decisions").unwrap_or_default() != decisions_before {
-        crate::model::append_dated(&mut body, "Log", "decisions edited by hand");
+        crate::log::append_to_body(&mut body, "decisions edited by hand");
     }
 
     let saved = match item.what {
@@ -3555,8 +3555,7 @@ pub(crate) mod tests {
         let mut t = Task::new(id, id);
         t.set_status(Status::Review);
         t.log(claim);
-        t.log("released after 28m · ran sonnet-5-5/high · 93 turns");
-        store.save_task(&t).unwrap();
+        crate::log::note(store, &mut t, "released after 28m · ran sonnet-5-5/high · 93 turns").unwrap();
     }
 
     fn scratch(tag: &str) -> Store {

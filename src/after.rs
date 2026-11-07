@@ -597,12 +597,9 @@ mod tests {
         // Going is not landed: a hold is on the trunk, not on the status.
         let mut t1 = s.find_task("t-1").unwrap();
         t1.status_raw = "doing".into();
-        t1.log("wsp: something else");
-        s.save_task(&t1).unwrap();
+        crate::log::note(&s, &mut t1, "wsp: something else").unwrap();
         assert!(waiting(&s, &g).contains_key("t-2"));
-
-        t1.log(&format!("{} 1234567abc on master", crate::repair::LANDED));
-        s.save_task(&t1).unwrap();
+        crate::log::note(&s, &mut t1, &format!("{} 1234567abc on master", crate::repair::LANDED)).unwrap();
         assert!(waiting(&s, &g).is_empty(), "landed is the whole test");
     }
 }

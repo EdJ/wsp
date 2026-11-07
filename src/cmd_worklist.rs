@@ -5385,8 +5385,7 @@ fn refuse_round(store: &Store, w: Worklist, at: usize, row: &str, prior: &str, m
     // writing it back whole would undo anything saved since.
     let saved = store.locked(|| -> Result<(), i32> {
         let mut fresh = store.worklist(&w.id).ok_or(1)?;
-        fresh.log(&format!("{FOLLOWUP_REFUSED} {row}: {} · one round, spent by {prior} · sent to the governor", members.join(" ")));
-        store.save_worklist(&fresh).map_err(|e| {
+        crate::log::note_to_list(store, &mut fresh, &format!("{FOLLOWUP_REFUSED} {row}: {} · one round, spent by {prior} · sent to the governor", members.join(" "))).map_err(|e| {
             eprintln!("wsp: write failed: {e}");
             1
         })
@@ -5860,8 +5859,7 @@ fn requeue(store: &Store, args: &Args, w: Worklist) -> i32 {
     let saved = store.locked(|| -> Result<(Worklist, Vec<String>), String> {
         let mut w = store.worklist(&w.id).ok_or_else(|| format!("wsp: `{}` is gone", w.id))?;
         let said = set_queue_flags(args, &mut w).map_err(|_| String::new())?;
-        w.log(&said.join(", "));
-        store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
+        crate::log::note_to_list(store, &mut w, &said.join(", ")).map_err(|e| format!("wsp: write failed: {e}"))?;
         Ok((w, said))
     });
     let (w, said) = match saved {
@@ -7203,8 +7201,7 @@ mod tests {
         let store = at_barrier_one_seated("id-joined");
         // `go` writes the start; the fixture only sets the status.
         let mut w = store.worklist("run").unwrap();
-        w.log("started · go");
-        store.save_worklist(&w).unwrap();
+        crate::log::note_to_list(&store, &mut w, "started · go").unwrap();
         task(&store, "wl-004", "todo");
         task(&store, "wl-005", "todo");
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
@@ -9095,8 +9092,7 @@ mod tests {
         // Landed, and it is ready.
         let mut t = store.find_task("h-1").unwrap();
         t.status_raw = "review".into();
-        t.log(&format!("{} 1234567abc on master", crate::repair::LANDED));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{} 1234567abc on master", crate::repair::LANDED)).unwrap();
         let (_, v) = read(&store);
         assert_eq!(v["start"], json!(["h-2"]), "{v}");
         assert!(v["waiting"].as_array().unwrap().iter().all(|m| m["id"] != "h-2"), "{v}");
@@ -9453,8 +9449,7 @@ mod tests {
         no_outputs(store, id);
         let mut w = store.worklist(id).unwrap();
         w.status_raw = status.into();
-        w.log("a line from before, with `backticks` and  odd   spacing");
-        store.save_worklist(&w).unwrap();
+        crate::log::note_to_list(store, &mut w, "a line from before, with `backticks` and  odd   spacing").unwrap();
     }
 
     fn status_of(store: &Store, id: &str) -> (String, serde_json::Value) {

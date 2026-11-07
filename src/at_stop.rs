@@ -178,8 +178,7 @@ pub(crate) fn run_for(store: &Store, repo: &Path, dir: &Path, limit: Duration) -
     // no row of its own to write to.
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     if let Some(mut task) = store.task(&name) {
-        task.log(&line);
-        let _ = store.save_task(&task);
+        let _ = crate::log::note(store, &mut task, &line);
     }
     if ran.ended != Ended::Exited(0) {
         eprintln!("wsp: {line}");

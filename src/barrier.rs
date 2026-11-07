@@ -1364,8 +1364,7 @@ mod tests {
         gs[0].verdict = "2026-10-07T09:37:36Z go".into();
         gs[1].verdict = "2026-10-07T12:04:11Z passes, with follow-ups m-9 as group 3".into();
         w.set_groups(&gs);
-        w.log("follow-up by c-2 passes: m-9 · group 3 (new), ahead of 1 planned");
-        store.save_worklist(&w).unwrap();
+        crate::log::note_to_list(&store, &mut w, "follow-up by c-2 passes: m-9 · group 3 (new), ahead of 1 planned").unwrap();
 
         row(&store, "c-1", 1, "2026-10-07T09:00:00Z", Status::Review, "- 2026-10-07 claimed by pane cpd-480 · spawned at opus/high");
         row(&store, "c-2", 2, "2026-10-07T11:51:51Z", Status::Review, "- 2026-10-07 claimed by pane cpd-481");

@@ -6624,8 +6624,7 @@ fn section_damage(
                 // the log. A change to a body that nobody can see afterwards is
                 // the failure this whole task is about, so it says so in the
                 // one place that is read for that.
-                t.log("sections folded back under the prose they were written in (`wsp doctor --fix`)");
-                store.save_task(&t)
+                crate::log::note(store, &mut t, "sections folded back under the prose they were written in (`wsp doctor --fix`)")
             }),
         };
         match saved {

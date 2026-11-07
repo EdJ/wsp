@@ -2884,8 +2884,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         by.as_ref().and_then(|b| b.get("scope")).and_then(Value::as_str),
     ) {
         if let Some(mut t) = store.task(task) {
-            t.log(&format!("{}{scope} · {seat}", cmd_govern::ORDERED_BY));
-            let _ = store.save_task(&t);
+            let _ = crate::log::note(store, &mut t, &format!("{}{scope} · {seat}", cmd_govern::ORDERED_BY));
         }
     }
 
@@ -4308,8 +4307,7 @@ fn despawn_lost(store: &Store, args: &Args) -> i32 {
             if t.status() == crate::model::Status::Doing {
                 t.set_status(crate::model::Status::Todo);
             }
-            t.log(&format!("lost with {machine} (seat {seat}) — the last checkpoint is in the seat's worktree"));
-            let _ = store.save_task(&t);
+            let _ = crate::log::note(store, &mut t, &format!("lost with {machine} (seat {seat}) — the last checkpoint is in the seat's worktree"));
         }
         if let Some(mut m) = store.machine(&machine) {
             let at = match m.exec_dir.trim_end_matches('/') {

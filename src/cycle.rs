@@ -479,8 +479,7 @@ pub(crate) fn reopened(store: &Store, id: &str, reason: &str) -> Option<(String,
             return None;
         }
         w.set_status(WorklistStatus::Running);
-        w.log(&format!("started again · {id} sent back, no verdict recorded: {}", util::truncate(reason, 200)));
-        store.save_worklist(&w).ok()?;
+        crate::log::note_to_list(store, &mut w, &format!("started again · {id} sent back, no verdict recorded: {}", util::truncate(reason, 200))).ok()?;
         Some((w, at))
     });
     let (w, at) = taken?;
@@ -2654,8 +2653,7 @@ pub(crate) fn leg_start_failed(store: &Store, w: Option<&Worklist>, row: &str, n
     let wait = m.again_in.map_or_else(|| "it is not tried again".to_string(), |s| format!("it starts again in {}", crate::barrier::span(s)));
     store.locked(|| {
         if let Some(mut t) = store.find_task(row) {
-            t.log(&format!("wsp could not spawn leg {name} (try {} of {}): {why}", m.tries, crate::barrier::TRIES));
-            let _ = store.save_task(&t);
+            let _ = crate::log::note(store, &mut t, &format!("wsp could not spawn leg {name} (try {} of {}): {why}", m.tries, crate::barrier::TRIES));
         }
     });
     log_line(store, &format!("{label}: its start did not take on try {} of {} — {ended}; {wait}", m.tries, crate::barrier::TRIES));
@@ -4297,8 +4295,7 @@ pub(crate) mod tests {
         let (_env, store) = scratch("samecommit");
         task(&store, "m-1", Status::Review);
         let mut t = store.find_task("m-1").unwrap();
-        t.log(&format!("{} 323faba83e4ce0ea6ae7253674a1e919cee27f78", crate::repair::LANDED));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{} 323faba83e4ce0ea6ae7253674a1e919cee27f78", crate::repair::LANDED)).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
         verdict_all(&store, crate::verification::State::Blocks);
@@ -4340,8 +4337,7 @@ pub(crate) mod tests {
         let (_env, store) = scratch("relanded");
         task(&store, "m-1", Status::Review);
         let mut t = store.find_task("m-1").unwrap();
-        t.log(&format!("{} af84a9320f7e3bf18fa5f19a6eeaefd867dacc2c", crate::repair::LANDED));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{} af84a9320f7e3bf18fa5f19a6eeaefd867dacc2c", crate::repair::LANDED)).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
         verdict_all(&store, crate::verification::State::Blocks);
@@ -4651,8 +4647,7 @@ fn only_a_working_screen_is_ever_overruled() {
         // Sent back after its verdict was in, before the barrier opened.
         let mut t = store.find_task("m-1").unwrap();
         t.set_status(Status::Doing);
-        t.log("sent back: install and drive delivery live");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "sent back: install and drive delivery live").unwrap();
 
         step(&store, &w, &Blind);
         assert!(checks(&store, 1).is_empty(), "no barrier over a member holding work");
@@ -4678,8 +4673,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
         let mut t = store.find_task("m-1").unwrap();
         t.set_status(Status::Doing);
-        t.log("sent back: install and drive delivery live");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "sent back: install and drive delivery live").unwrap();
 
         step(&store, &w, &Blind);
         assert!(
@@ -4975,13 +4969,11 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
         // The helper, spawned while group 1 was going and never named by it.
         let mut helper = Task::new("Install master and drive delivery live", "h-1");
-        helper.log(&format!("{} run group 1", OWNED));
-        store.save_task(&helper).unwrap();
+        crate::log::note(&store, &mut helper, &format!("{} run group 1", OWNED)).unwrap();
         store.set_claim("h-1", serde_json::json!({ "workspace": "w" }));
         // And a helper of another group, which this pass must not touch.
         let mut other = Task::new("Something else entirely", "h-2");
-        other.log(&format!("{} run group 2", OWNED));
-        store.save_task(&other).unwrap();
+        crate::log::note(&store, &mut other, &format!("{} run group 2", OWNED)).unwrap();
         store.set_claim("h-2", serde_json::json!({ "workspace": "w2" }));
 
         end_group(&store, &Exits, &w, 1);
@@ -5011,8 +5003,7 @@ fn only_a_working_screen_is_ever_overruled() {
         check.set_status(Status::Doing);
         store.save_task(&check).unwrap();
         let mut helper = Task::new("Install master", "h-1");
-        helper.log(&format!("{} run group 1", OWNED));
-        store.save_task(&helper).unwrap();
+        crate::log::note(&store, &mut helper, &format!("{} run group 1", OWNED)).unwrap();
         for id in ["m-1", &check.id, "h-1"] {
             store.set_claim(id, serde_json::json!({ "workspace": "w" }));
         }
@@ -5044,17 +5035,14 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
         let mut ours = Task::new(&barrier_title("run", 1), "b-1");
         ours.tags = vec![BARRIER_TAG.into()];
-        ours.log(&format!("{} run group 1", OWNED));
-        store.save_task(&ours).unwrap();
+        crate::log::note(&store, &mut ours, &format!("{} run group 1", OWNED)).unwrap();
         // The other run's check, and a helper of the same group number: the
         // first was what got ended, the second shares every word but the list.
         let mut theirs = Task::new(&barrier_title("other", 7), "b-2");
         theirs.tags = vec![BARRIER_TAG.into()];
-        theirs.log(&format!("{} other group 7", OWNED));
-        store.save_task(&theirs).unwrap();
+        crate::log::note(&store, &mut theirs, &format!("{} other group 7", OWNED)).unwrap();
         let mut helper = Task::new("Install master", "h-2");
-        helper.log(&format!("{} other group 1", OWNED));
-        store.save_task(&helper).unwrap();
+        crate::log::note(&store, &mut helper, &format!("{} other group 1", OWNED)).unwrap();
         for id in ["b-1", "b-2", "h-2"] {
             store.set_claim(id, serde_json::json!({ "workspace": "w" }));
         }
@@ -5082,8 +5070,7 @@ fn only_a_working_screen_is_ever_overruled() {
             check.tags = vec![BARRIER_TAG.into()];
             check.set_status(Status::Doing);
             // What the claim writes, from the environment `start` gave it.
-            check.log(&format!("{} run group {at}", OWNED));
-            store.save_task(&check).unwrap();
+            crate::log::note(&store, &mut check, &format!("{} run group {at}", OWNED)).unwrap();
             store.set_claim(id, serde_json::json!({ "workspace": "w" }));
         }
         set(&store, "b-1", Status::Review);
@@ -5108,11 +5095,9 @@ fn only_a_working_screen_is_ever_overruled() {
         let mut check = Task::new(&barrier_title("run", 1), "b-1");
         check.tags = vec![BARRIER_TAG.into()];
         check.set_status(Status::Doing);
-        check.log(&format!("{} run group 1", OWNED));
-        store.save_task(&check).unwrap();
+        crate::log::note(&store, &mut check, &format!("{} run group 1", OWNED)).unwrap();
         let mut helper = Task::new("Install master", "h-1");
-        helper.log(&format!("{} run group 1", OWNED));
-        store.save_task(&helper).unwrap();
+        crate::log::note(&store, &mut helper, &format!("{} run group 1", OWNED)).unwrap();
         for id in ["b-1", "h-1"] {
             store.set_claim(id, serde_json::json!({ "workspace": "w" }));
         }
@@ -5147,8 +5132,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let mut check = Task::new(&barrier_title("run", 1), "b-1");
         check.tags = vec![BARRIER_TAG.into()];
         check.set_status(Status::Doing);
-        check.log(&format!("{} run group 1", OWNED));
-        store.save_task(&check).unwrap();
+        crate::log::note(&store, &mut check, &format!("{} run group 1", OWNED)).unwrap();
         store.set_claim("b-1", serde_json::json!({ "workspace": "w" }));
         seated(&store, "run", "cpd-7");
         seated(&store, "p", "cpd-340");
@@ -5423,8 +5407,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let mut m = store.find_task("m-1").unwrap();
         m.project = Some("m".into());
-        m.log(&format!("{} {sha} on master", crate::repair::LANDED));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} {sha} on master", crate::repair::LANDED)).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
 
         step(&store, &w, &Blind);
@@ -5481,8 +5464,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(passes_on(&store, "m-1").is_empty(), "reviewed without a ready line: today's told-to-land path");
 
         let mut m = store.find_task("m-1").unwrap();
-        m.log(&format!("{} {tip} on m-1", crate::repair::READY));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} {tip} on m-1", crate::repair::READY)).unwrap();
         step(&store, &w, &Blind);
         let ps = passes_on(&store, "m-1");
         assert_eq!(ps.len(), 1, "a ready member owes a verifier");
@@ -5531,8 +5513,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let mut m = store.find_task("m-1").unwrap();
         m.project = Some("p".into());
-        m.log(&format!("{} {tip} on m-1", crate::repair::READY));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} {tip} on m-1", crate::repair::READY)).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
         (env, store, tree, w)
     }
@@ -5778,8 +5759,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let (_env, store) = scratch("note");
         task(&store, "m-1", Status::Review);
         let mut m = store.find_task("m-1").unwrap();
-        m.log(&format!("{} abc1234 on master", crate::repair::LANDED));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} abc1234 on master", crate::repair::LANDED)).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
         assert_eq!(passes_on(&store, "m-1")[0].read.as_deref(), Some("abc1234"), "the first pass, which read abc1234");
@@ -5800,8 +5780,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
         // The member comes back with a fix, which is a new commit on the trunk.
         let mut m = store.find_task("m-1").unwrap();
-        m.log(&format!("{} def5678 on master", crate::repair::LANDED));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} def5678 on master", crate::repair::LANDED)).unwrap();
         step(&store, &w, &Blind);
         let ps = passes_on(&store, "m-1");
         assert_eq!(ps.len(), 2, "a new landing is new work, and a fresh agent reads it");
@@ -5820,8 +5799,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let (_env, store) = scratch("supersede");
         task(&store, "m-1", Status::Review);
         let mut m = store.find_task("m-1").unwrap();
-        m.log(&format!("{} abc1234 on master", crate::repair::LANDED));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} abc1234 on master", crate::repair::LANDED)).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
         crate::verification::name_seat(&store, "m-1", "cpd-1");
@@ -5831,8 +5809,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(drained(&SPAWNED).is_empty() && drained(&ENDED).is_empty(), "the same landing: one pass, left reading");
 
         let mut m = store.find_task("m-1").unwrap();
-        m.log(&format!("{} def5678 on master", crate::repair::LANDED));
-        store.save_task(&m).unwrap();
+        crate::log::note(&store, &mut m, &format!("{} def5678 on master", crate::repair::LANDED)).unwrap();
         step(&store, &w, &Exits);
         assert_eq!(drained(&ENDED), vec!["cpd-1".to_string()], "the verifier reading the old commit is ended at once");
         assert_eq!(drained(&SPAWNED), vec![("m-1 · verifying".to_string(), "claude".to_string())], "and a fresh one starts");
@@ -6660,8 +6637,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(spawned().is_empty(), "m-1 is going and has not landed");
 
         let mut m1 = store.find_task("m-1").unwrap();
-        m1.log(&format!("{} 1234567abc on master", crate::repair::LANDED));
-        store.save_task(&m1).unwrap();
+        crate::log::note(&store, &mut m1, &format!("{} 1234567abc on master", crate::repair::LANDED)).unwrap();
         step(&store, &w, &Blind);
         let ids: Vec<String> = spawned().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, ["m-2"], "landed is what frees it");
@@ -6941,8 +6917,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
         let mut t = store.find_task("m-1").unwrap();
         t.set_status(Status::Review);
-        t.log("review: installed and driven live");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "review: installed and driven live").unwrap();
         step(&store, &w, &Blind);
         let c = checks(&store, 1);
         assert_eq!(
@@ -6966,8 +6941,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
         let mut t = store.find_task("m-1").unwrap();
         t.log("claimed by pane cpd-1 · spawned at opus/high");
-        t.log("released after 5m");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "released after 5m").unwrap();
 
         let reopen = Args::synth("reopen", &["m-1", "one more thing"], &[]);
         assert_eq!(crate::cmd_task::reopen(&store, &reopen), 0);
@@ -6990,8 +6964,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
         let mut t = store.find_task("m-1").unwrap();
         t.log("claimed by pane cpd-1 · spawned at opus/high");
-        t.log("released after 5m");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "released after 5m").unwrap();
 
         let reopen = Args::synth("reopen", &["m-1", "the regression"], &[]);
         assert_eq!(crate::cmd_task::reopen(&store, &reopen), 0);
@@ -7134,8 +7107,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let (_env, store) = scratch("tickinline");
         task(&store, "m-1", Status::Review);
         let mut t = store.find_task("m-1").unwrap();
-        t.log(&format!("{} 323faba83e4ce0ea6ae7253674a1e919cee27f78", crate::repair::LANDED));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{} 323faba83e4ce0ea6ae7253674a1e919cee27f78", crate::repair::LANDED)).unwrap();
         let _ = list(&store, &[(&["m-1"], "claude")]);
 
         crate::repair::tick(&store, &Blind, &mut crate::repair::Pass::new());

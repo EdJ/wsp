@@ -2464,8 +2464,7 @@ mod tests {
 
         let tip = git_out(&dir, &["rev-parse", "HEAD"]);
         let mut t = store.find_task("wsp-1").unwrap();
-        t.log(&format!("{} {tip} on wsp-1", crate::repair::READY));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{} {tip} on wsp-1", crate::repair::READY)).unwrap();
         let p = position(&store, &w, Reading::Landed);
         assert!(p.members[0].ready && p.members[0].owes_a_verifier());
         assert!(!p.members[0].finished(), "its work is not on the trunk");

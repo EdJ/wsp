@@ -1426,8 +1426,7 @@ const TELL_DELIVERED: &str = "wsp: the sent-back reason reached its pane";
 pub(crate) fn note_tell_pending(store: &Store, id: &str) {
     store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return };
-        t.log(TELL_PENDING);
-        let _ = store.save_task(&t);
+        let _ = crate::log::note(store, &mut t, TELL_PENDING);
     });
 }
 
@@ -1466,8 +1465,7 @@ fn retry_undelivered_tells(store: &Store, seats: &dyn Seats) {
         if crate::cmd_task::deliver(store, &t.id, &format!("wsp sent {} back: {reason}", t.id)) {
             store.locked(|| {
                 let Some(mut t) = store.find_task(&t.id) else { return };
-                t.log(TELL_DELIVERED);
-                let _ = store.save_task(&t);
+                let _ = crate::log::note(store, &mut t, TELL_DELIVERED);
             });
             stamp(store, &format!("{}: the send-back that did not reach {seat} was typed to it, now it reads idle", t.id));
         }
@@ -1884,8 +1882,7 @@ fn told_of_verdict(store: &Store, id: &str, said: &str) -> bool {
         if log.lines().any(|l| undated(l.trim()) == said) {
             return false;
         }
-        t.log(said);
-        store.save_task(&t).is_ok()
+        crate::log::note(store, &mut t, said).is_ok()
     })
 }
 
@@ -3463,8 +3460,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         store.clear_binding("cpd-1");
         claim(&store, "m-1", "cpd-2");
         let mut t = store.find_task("m-1").unwrap();
-        t.log("claimed by pane cpd-2");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "claimed by pane cpd-2").unwrap();
         let _ = stamped();
 
         let fresh = Fake::new(&[("cpd-2", Some(State::Idle))]);
@@ -3742,8 +3738,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         let repo = env.path("repo");
         let tip = git_in(&repo, &["rev-parse", "m-1"]);
         let mut t = store.find_task("m-1").unwrap();
-        t.log(&format!("{READY} {} on m-1", tip.trim()));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{READY} {} on m-1", tip.trim())).unwrap();
         assert_eq!(ready(&t).as_deref(), Some(tip.trim()));
         assert!(landed(&t).is_none(), "ready is not landed");
         assert_eq!(commit_of(&t).as_deref(), Some(tip.trim()));
@@ -3761,8 +3756,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         member(&store, "m-1", Status::Doing);
         let mut t = store.find_task("m-1").unwrap();
         t.log("sent back: wsp check failed at abc1234: tests");
-        t.log(&format!("{LANDED} 94f8684aaaaa on master"));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{LANDED} 94f8684aaaaa on master")).unwrap();
         list(&store, &["m-1"], "claude");
 
         tick(&store, &Fake::empty(), &mut Pass::new());
@@ -3779,8 +3773,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     fn a_landed_row_held_by_a_seat_is_left_at_doing() {
         let (_env, store) = in_flight("landedheld");
         let mut t = store.find_task("m-1").unwrap();
-        t.log(&format!("{LANDED} 94f8684aaaaa on master"));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{LANDED} 94f8684aaaaa on master")).unwrap();
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "a claimed row has a seat");
     }
@@ -3791,8 +3784,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         member(&store, "m-1", Status::Doing);
         let mut t = store.find_task("m-1").unwrap();
         t.log(&format!("{LANDED} 94f8684aaaaa on master"));
-        t.log("sent back: the verifier blocked: not held");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "sent back: the verifier blocked: not held").unwrap();
         list(&store, &["m-1"], "claude");
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "the landing is older than the send-back");
@@ -3802,8 +3794,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     fn a_send_back_that_did_not_reach_its_pane_is_typed_when_the_seat_reads_idle_and_once() {
         let (_env, store) = in_flight("pendingtell");
         let mut t = store.find_task("m-1").unwrap();
-        t.log("sent back: wsp check failed at abc1234: tests exit 7");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "sent back: wsp check failed at abc1234: tests exit 7").unwrap();
         note_tell_pending(&store, "m-1");
         let _ = member_told();
 

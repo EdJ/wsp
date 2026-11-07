@@ -1908,8 +1908,7 @@ mod tests {
         let mut t = Task::new("a row", "pj-001");
         t.project = Some("pj".into());
         t.set_status(Status::Review);
-        t.log(&format!("{} {sha} on pj-001", crate::repair::LANDED));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{} {sha} on pj-001", crate::repair::LANDED)).unwrap();
         (env, store, sha)
     }
 
@@ -2175,8 +2174,7 @@ mod tests {
         git_run(&repo, &["commit", "--quiet", "-m", "someone else's work"]);
         let tip = git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let mut t = store.find_task("pj-001").unwrap();
-        t.log(&format!("{} {tip} on master · since {sha}", crate::repair::LANDED));
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, &format!("{} {tip} on master · since {sha}", crate::repair::LANDED)).unwrap();
         let t = store.find_task("pj-001").unwrap();
         let tg = target(&store, &t, None).unwrap();
         assert_eq!(since_of(&t).as_deref(), Some(sha.as_str()));

@@ -1965,8 +1965,7 @@ fn close_locked(
             let mine = waiting.task.as_str();
             if !mine.is_empty() && mine != on {
                 if let Some(mut own) = store.task(mine) {
-                    own.log(&format!("{} by {} on {}: {text}", act.as_str(), by.byline(), q.about.task().or(q.about.scope()).unwrap_or(on)));
-                    let _ = store.save_task(&own);
+                    let _ = crate::log::note(store, &mut own, &format!("{} by {} on {}: {text}", act.as_str(), by.byline(), q.about.task().or(q.about.scope()).unwrap_or(on)));
                 }
             }
             return finish(store, id, by, act, text, stored, waiting, landed);

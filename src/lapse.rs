@@ -444,8 +444,7 @@ mod tests {
             .for_the_person();
         message::raise(&store, &q).unwrap();
         let mut t = store.task("t-1").unwrap();
-        t.log("a verifier read it");
-        store.save_task(&t).unwrap();
+        crate::log::note(&store, &mut t, "a verifier read it").unwrap();
         assert!(store.message(&q.id).unwrap().is_open());
         // …until the person is finished with it.
         t.set_status(Status::Done);

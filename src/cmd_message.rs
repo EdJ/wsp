@@ -966,13 +966,11 @@ pub(crate) fn asked_of_the_person(store: &Store, q: &Message, subject: &str) {
     let line = format!("asked of the person by {}: {} · {}", q.from.byline(), util::truncate(q.title(), 160), q.id);
     let saved = match store.task(subject) {
         Some(mut t) => {
-            t.log(&line);
-            store.save_task(&t).is_ok()
+            crate::log::note(store, &mut t, &line).is_ok()
         }
         None => match store.worklist(subject) {
             Some(mut w) => {
-                w.log(&line);
-                store.save_worklist(&w).is_ok()
+                crate::log::note_to_list(store, &mut w, &line).is_ok()
             }
             None => false,
         },

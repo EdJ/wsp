@@ -1010,8 +1010,7 @@ fn note_landing(store: &Store, member: &str, l: &crate::cmd_checkout::Landed, re
         let pass = last.clone();
         write(&mut t, &ps);
         let again = if reran.is_empty() { String::new() } else { format!(" · reran {} after the trunk moved, green", reran.join(", ")) };
-        t.log(&format!("wsp: the verifier's hold landed {} commit(s) at {}{again}", l.commits.len(), short(&l.sha)));
-        store.save_task(&t).ok()?;
+        crate::log::note(store, &mut t, &format!("wsp: the verifier's hold landed {} commit(s) at {}{again}", l.commits.len(), short(&l.sha))).ok()?;
         Some(pass)
     })
 }
