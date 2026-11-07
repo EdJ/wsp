@@ -1696,6 +1696,7 @@ fn deliver_held_through(store: &Store, seats: &dyn crate::cycle::Seats, type_at:
             Some(Ok(how)) => {
                 let turn = match how {
                     crate::place::Delivery::Started => "a turn started on it",
+                    crate::place::Delivery::Acked => "delivered, acknowledged by the seat",
                     crate::place::Delivery::Unconfirmed => "no turn seen yet",
                 };
                 end(message::Act::Sent, &format!("typed at {pane} — {turn}"));

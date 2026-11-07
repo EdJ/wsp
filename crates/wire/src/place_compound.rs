@@ -1158,6 +1158,57 @@ fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// `compound-sup deliver <socket> <id> TEXT`, and its one-line answer read:
+/// `delivered <id>` is [`Delivery::Acked`], `failed <id> <why>` is
+/// [`Refusal::Failed`] (wsp-477). The id is minted here and is the sup's key for
+/// "exactly once", so a second call for the same sentence would not double it.
+///
+/// The text goes on stdin, not argv, so a sentence of any length or shape is
+/// one argument fewer to quote.
+fn deliver_through(sup: &Path, session: &Path, seat: &Seat, text: &str) -> Result<Delivery> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!(
+        "wsp-{}-{}-{}",
+        std::process::id(),
+        util::epoch_secs(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let mut child = Command::new(sup)
+        .arg("deliver")
+        .arg(session)
+        .arg(&id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Refusal::Backend(format!("compound-sup deliver: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| Refusal::Backend(format!("compound-sup deliver: {e}")))?;
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    read_deliver(&stdout, &stderr, out.status.success(), &id, seat)
+}
+
+/// The answer to a `deliver`, as a function of what it printed.
+fn read_deliver(stdout: &str, stderr: &str, ok: bool, id: &str, seat: &Seat) -> Result<Delivery> {
+    let line = stdout.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let mut words = line.splitn(3, ' ');
+    match (words.next(), words.next()) {
+        (Some("delivered"), Some(got)) if got == id => Ok(Delivery::Acked),
+        (Some("failed"), Some(got)) if got == id => {
+            Err(Refusal::Failed(format!("{seat}: {}", words.next().unwrap_or("no reason given").trim())))
+        }
+        // No session to ask: the seat is gone, which is its own answer.
+        _ if stderr.starts_with("no session at") => Err(Refusal::NoSeat(seat.clone())),
+        _ if ok => Err(Refusal::Backend(format!("compound-sup deliver answered `{line}`, which is neither delivered nor failed"))),
+        _ => Err(Refusal::Backend(format!(
+            "compound-sup deliver: {}",
+            [line, stderr.trim()].iter().find(|s| !s.is_empty()).unwrap_or(&"no answer")
+        ))),
+    }
+}
+
 /// The submit key, as the render wire names it.
 ///
 /// One definition, because a work order that is typed and not submitted and a
@@ -1184,6 +1235,11 @@ impl Compound<'_> {
     fn sup_command(sup: &Path, seat: &Seat, rec: &Value, program: &str, args: &[String]) -> Command {
         let mut cmd = Command::new(sup);
         cmd.arg("spawn").args(["--label", seat.as_str()]);
+        // wsp-477: the kind the supervisor reads a composer for, which its
+        // `deliver` needs — a seat spawned without one answers `failed`.
+        if let Some(kind) = rec.get("agent").map(|a| str_of(a, "kind")).filter(|k| reads_kind(k)) {
+            cmd.args(["--agent", &kind]);
+        }
         let cwd = str_of(rec, "cwd");
         if !cwd.is_empty() {
             cmd.args(["--cwd", &cwd]);
@@ -1611,7 +1667,9 @@ impl Place for Compound<'_> {
             }
         }
         let (program, argv) = (crate::place::above().command)(&agent.kind, &agent.args);
-        let mut rec = self.spawn_sup(seat, &rec, &program, &argv)?;
+        let mut told = rec.clone();
+        told["agent"] = json!({ "kind": agent.kind });
+        let mut rec = self.spawn_sup(seat, &told, &program, &argv)?;
         rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
         write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
             .map_err(|e| Refusal::Backend(e.to_string()))?;
@@ -1636,6 +1694,13 @@ impl Place for Compound<'_> {
         }
         if let Some(why) = self.at_trust_prompt(seat) {
             return Err(Refusal::Backend(why));
+        }
+        // wsp-477: a seat whose supervisor can be asked is told through its
+        // `deliver` verb and the answer is read, not inferred from a
+        // transcript. The supervisor owns the retry; `failed` is the only
+        // thing wsp escalates.
+        if let (Some(sup), Some(session)) = (compound_sup_binary(), self.socket_of(seat)) {
+            return deliver_through(&sup, &session, seat, text);
         }
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
         type_and_submit(&socket, text)?;
@@ -2064,6 +2129,59 @@ mod tests {
             }
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// wsp-477: a tell on a seat whose supervisor can be asked is its `deliver`
+    /// verb and its one-line answer, read: `delivered` is acknowledged, `failed`
+    /// is a failure that names the supervisor's reason, and neither is inferred
+    /// from a transcript. The text rides on stdin.
+    #[test]
+    fn a_delivery_is_the_supervisors_answer_read_and_a_failed_names_its_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("deliver");
+        let sup = scratch.root.join("sup");
+        let said = scratch.root.join("said");
+        let script = |answer: &str| {
+            format!("#!/bin/sh\n[ \"$1\" = deliver ] || exit 2\ncat > '{}'\n{answer}\n", said.display())
+        };
+        let (seat, session) = (Seat::new("cpd-1"), scratch.root.join("s.sock"));
+
+        fs::write(&sup, script("echo \"delivered $3\"")).unwrap();
+        fs::set_permissions(&sup, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(deliver_through(&sup, &session, &seat, "go and do it"), Ok(Delivery::Acked));
+        assert_eq!(fs::read_to_string(&said).unwrap(), "go and do it", "the sentence reaches the supervisor whole");
+
+        fs::write(&sup, script("echo \"failed $3 no composer\"; exit 1")).unwrap();
+        assert_eq!(
+            deliver_through(&sup, &session, &seat, "go"),
+            Err(Refusal::Failed("cpd-1: no composer".into()))
+        );
+
+        // An answer about some other delivery is not this one's receipt.
+        fs::write(&sup, script("echo 'delivered someone-else'")).unwrap();
+        assert!(matches!(deliver_through(&sup, &session, &seat, "go"), Err(Refusal::Backend(_))));
+    }
+
+    #[test]
+    fn an_agent_seat_is_spawned_with_the_kind_its_supervisor_delivers_to() {
+        let rec = json!({ "agent": { "kind": "claude" } });
+        let args = |rec: &Value| -> Vec<String> {
+            Compound::sup_command(Path::new("compound-sup"), &Seat::new("cpd-1"), rec, "claude", &[])
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert!(args(&rec).windows(2).any(|w| w == ["--agent", "claude"]));
+        assert!(!args(&json!({})).contains(&"--agent".to_string()), "a bare shell has no composer");
+    }
+
+    #[test]
+    fn a_session_that_is_gone_is_no_seat_and_not_a_failed_delivery() {
+        let seat = Seat::new("cpd-1");
+        assert_eq!(
+            read_deliver("", "no session at /x: No such file or directory (os error 2)\n", false, "i", &seat),
+            Err(Refusal::NoSeat(seat))
+        );
     }
 
     /// `wsp-388`: the supervisor is started from `/`, not from the directory

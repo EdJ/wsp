@@ -928,6 +928,11 @@ pub enum Refusal {
     Unsupported(&'static str),
     /// The backend said no, in its own words.
     Backend(String),
+    /// The seat's own supervisor answered `failed` to a delivery
+    /// (`compound-sup deliver`), with its reason. Not [`Refusal::Backend`]: a
+    /// supervisor that owns the retry has already retried, so this is the one
+    /// answer wsp escalates (wsp-477).
+    Failed(String),
 }
 
 /// What became of a sentence [`Place::tell`] delivered.
@@ -964,6 +969,10 @@ pub enum Delivery {
     /// that report is worklist-010, where a governor retried a message that had
     /// arrived and sent the same paragraph three times.
     Unconfirmed,
+    /// The seat's supervisor acknowledged the delivery (`delivered`): the
+    /// sentence reached the agent exactly once, and the supervisor owns any
+    /// retry. Nothing is owed and nothing is looked for after it (wsp-477).
+    Acked,
 }
 
 impl std::fmt::Display for Refusal {
@@ -976,6 +985,7 @@ impl std::fmt::Display for Refusal {
             Refusal::Unsubmitted(s) => write!(f, "typed into {s} and not submitted — it is sitting in the prompt"),
             Refusal::Unsupported(w) => write!(f, "this backend cannot {w}"),
             Refusal::Backend(w) => write!(f, "{w}"),
+            Refusal::Failed(w) => write!(f, "the seat's supervisor could not deliver it: {w}"),
         }
     }
 }
@@ -1300,6 +1310,9 @@ pub fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing) -> Res
     let since = crate::util::epoch_secs();
     let first = match place.tell(seat, text) {
         Ok(Delivery::Started) => return Ok(Delivery::Started),
+        // The supervisor's own acknowledgement: it owns the retry, so wsp
+        // neither watches for a turn nor presses (wsp-477).
+        Ok(Delivery::Acked) => return Ok(Delivery::Acked),
         Ok(Delivery::Unconfirmed) => Ok(Delivery::Unconfirmed),
         Err(Refusal::NotTaken) => Err(Refusal::NotTaken),
         Err(e) => return Err(e),

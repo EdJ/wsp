@@ -1682,14 +1682,14 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
                 json!({
                     "target": target, "pane": pane, "chars": chars, "id": id,
                     "at": util::epoch_secs(),
-                    "turn": matches!(how, Delivery::Started),
+                    "turn": matches!(how, Delivery::Started | Delivery::Acked),
                 }),
             );
             if *json {
                 println!(
                     "{}",
                     json!({ "target": target, "pane": pane, "id": id, "told": true,
-                            "turn": matches!(how, Delivery::Started) })
+                            "turn": matches!(how, Delivery::Started | Delivery::Acked) })
                 );
             } else {
                 // The tail is on the unconfirmed one only, and it is not a
@@ -1698,6 +1698,7 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
                 // that started on it.
                 let tail = match how {
                     Delivery::Started => String::new(),
+                    Delivery::Acked => format!(" · {}", p.dim("delivered")),
                     Delivery::Unconfirmed => format!(" · {}", p.dim("delivered, no turn seen")),
                 };
                 println!("{}{}", p.dim(&format!("→ {what} · {pane}")), tail);

@@ -61,6 +61,20 @@ report() {
   printf '%s' "$payload" | wsp report "$1" >/dev/null 2>&1 || true
 }
 
+# `compound-sup submitted <socket>` with the hook payload on stdin. The socket
+# is the seat's session socket, which is in its record (`socket`), not in its
+# environment. Best-effort like everything here: no sup, no record, no socket,
+# a far seat — nothing to say, and nothing to fail.
+submitted() {
+  command -v compound-sup >/dev/null 2>&1 || return 0
+  rec="${WSP_STATE:-$HOME/.local/state/wsp}/compound-seats/$WSP_SEAT_ID/seat.json"
+  [ -f "$rec" ] || return 0
+  grep -q '"machine"[[:space:]]*:[[:space:]]*"[^"]' "$rec" 2>/dev/null && return 0
+  sock="$(sed -n 's/.*"socket"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$rec" 2>/dev/null | head -n 1)"
+  [ -n "$sock" ] || return 0
+  printf '%s' "$payload" | compound-sup submitted "$sock" >/dev/null 2>&1 || true
+}
+
 case "$action" in
   start|SessionStart)
     # stdout from a SessionStart hook is added to the session's context. This
@@ -112,6 +126,14 @@ case "$action" in
     # that `wsp` stops waiting a little before Claude Code would kill it and
     # can say so on the question. Keep the two equal.
     printf '%s' "$payload" | wsp report PermissionRequest --hold "${2:-86400}" 2>/dev/null || true
+    ;;
+  UserPromptSubmit)
+    # wsp-477: the seat's supervisor is told the prompt was submitted, which is
+    # what acknowledges a `compound-sup deliver` (exactly once). Local seats
+    # only: a far seat's session socket is on the far machine, and its record
+    # here names a `machine`. Then reported as every other hook is.
+    submitted
+    report "$action"
     ;;
   *)
     # UserPromptSubmit, Stop, StopFailure, PermissionRequest, Elicitation — the

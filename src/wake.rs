@@ -686,6 +686,24 @@ pub(crate) struct Tell<'a> {
 }
 
 impl<'a> Tell<'a> {
+    /// A `failed` from the seat's supervisor (wsp-477): a line in `cycle.log`
+    /// every time, and a note raised on the scope once while the last is open.
+    fn escalate(&self, why: &str) {
+        use crate::message::{self, About, Kind, Message, Party};
+        crate::store::log_line(self.store, &format!("told {}: delivery failed — {why}", self.scope));
+        let about = About::Scope(self.scope.clone());
+        let open = message::raised(self.store)
+            .iter()
+            .any(|m| m.about == about && m.text.starts_with(FAILED_DELIVERY));
+        if !open {
+            let text = format!(
+                "{FAILED_DELIVERY}{why}\n\nThe seat's supervisor (`compound-sup deliver`) answered `failed`; \
+                 it owns the retry, so wsp holds the sentence and tries again on the next tick."
+            );
+            let _ = message::raise(self.store, &Message::new(Party::wsp(), Kind::Note, &text).about(about));
+        }
+    }
+
     fn new(store: &'a Store, seats: &'a dyn Seats, scope: &str) -> Tell<'a> {
         Tell { store, seats, scope: scope.to_string(), why: NOT_YET.into(), typed: false, typed_at: None }
     }
@@ -697,6 +715,10 @@ const NOT_YET: &str = "nothing worth a wake yet";
 
 /// A scope nobody has ever governed: no record, so nothing to fill and nobody
 /// filling it. The one case with genuinely no addressee — see [`nobody_there`].
+/// What a raised `failed` delivery begins with, so a second tick finding the
+/// first still open raises nothing more.
+const FAILED_DELIVERY: &str = "delivery to the seat failed: ";
+
 const NO_SEAT: &str = "no seat on this scope";
 
 /// The seat reads occupied and the agent in it could not be found to type at.
@@ -1073,6 +1095,17 @@ impl Sink for Tell<'_> {
         let before = util::epoch_secs();
         match how.tell(place.as_ref(), &addressee, &text) {
             Ok(crate::place::Delivery::Started) => true,
+            // The seat's supervisor acknowledged it (wsp-477): delivered
+            // exactly once, nothing owed, no turn to wait for.
+            Ok(crate::place::Delivery::Acked) => true,
+            // The supervisor owns the retry, so `failed` is final and the one
+            // thing wsp escalates: said in `cycle.log`, held for the next tick,
+            // and raised once on the scope for a person.
+            Err(crate::place::Refusal::Failed(why)) => {
+                self.why = format!("the seat's supervisor failed to deliver it: {why}");
+                self.escalate(&why);
+                false
+            }
             Ok(crate::place::Delivery::Unconfirmed)
             | Err(crate::place::Refusal::NotTaken)
             | Err(crate::place::Refusal::Unsubmitted(_)) => {
