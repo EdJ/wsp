@@ -1158,21 +1158,53 @@ fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// `compound-sup deliver <socket> <id> TEXT`, and its one-line answer read:
-/// `delivered <id>` is [`Delivery::Acked`], `failed <id> <why>` is
-/// [`Refusal::Failed`] (wsp-477). The id is minted here and is the sup's key for
-/// "exactly once", so a second call for the same sentence would not double it.
-///
-/// The text goes on stdin, not argv, so a sentence of any length or shape is
-/// one argument fewer to quote.
-fn deliver_through(sup: &Path, session: &Path, seat: &Seat, text: &str) -> Result<Delivery> {
+/// How long one tick waits on a `deliver` before leaving it pending (wsp-477).
+/// compound's `deliver` waits for a busy seat to go idle (minutes) and for an
+/// unacknowledged order (about a minute); the governor tick is not a place to
+/// sit through either.
+const DELIVER_WAIT: Duration = Duration::from_secs(30);
+
+/// The seat's file naming the delivery still being asked about, so the next
+/// tick asks again under the same id (the sup answers an id asked again with
+/// the same answer: exactly once).
+const DELIVER_PENDING: &str = "deliver.pending";
+
+/// A pending delivery is the same sentence asked again for this long; after it
+/// a repeat of the words is a new tell.
+const DELIVER_PENDING_FOR: i64 = 900;
+
+/// The id this sentence is delivered under: the one still pending for the same
+/// words, or a fresh one, recorded in the seat's directory.
+fn delivery_id(dir: &Path, text: &str) -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file = dir.join(DELIVER_PENDING);
+    let rec = read_json(&file);
+    let id = str_of(&rec, "id");
+    let fresh = util::epoch_secs() - rec.get("at").and_then(Value::as_i64).unwrap_or(0) < DELIVER_PENDING_FOR;
+    if !id.is_empty() && fresh && rec.get("text").and_then(Value::as_str) == Some(text) {
+        return id;
+    }
     let id = format!(
         "wsp-{}-{}-{}",
         std::process::id(),
         util::epoch_secs(),
         N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
+    let _ = write_atomic(&file, &json!({ "id": id, "text": text, "at": util::epoch_secs() }).to_string());
+    id
+}
+
+/// `compound-sup deliver <socket> <id>` with the text on stdin, and its
+/// one-line answer read: `delivered <id>` is [`Delivery::Acked`], `failed <id>
+/// <why>` is [`Refusal::Failed`] (wsp-477). The id is the sup's key for
+/// "exactly once": it is kept in the seat's directory until an answer is read,
+/// so a wait that ran out is asked again, not doubled.
+///
+/// The wait is bounded by `wait`: past it the call is left pending (an error
+/// that is not [`Refusal::Failed`], so nothing is escalated and nothing is
+/// stamped as typed) and the next tick asks again.
+fn deliver_through(sup: &Path, session: &Path, dir: &Path, seat: &Seat, text: &str, wait: Duration) -> Result<Delivery> {
+    let id = delivery_id(dir, text);
     let mut child = Command::new(sup)
         .arg("deliver")
         .arg(session)
@@ -1182,12 +1214,42 @@ fn deliver_through(sup: &Path, session: &Path, seat: &Seat, text: &str) -> Resul
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Refusal::Backend(format!("compound-sup deliver: {e}")))?;
+    let pid = child.id();
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
+        let said = text.to_string();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(said.as_bytes());
+        });
     }
-    let out = child.wait_with_output().map_err(|e| Refusal::Backend(format!("compound-sup deliver: {e}")))?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = match rx.recv_timeout(wait) {
+        Ok(out) => out.map_err(|e| Refusal::Backend(format!("compound-sup deliver: {e}")))?,
+        Err(_) => {
+            let _ = Command::new("kill").arg(pid.to_string()).stderr(Stdio::null()).status();
+            return Err(Refusal::Backend(format!(
+                "{seat}: delivery still pending after {}s, asked again next tick under the same id",
+                wait.as_secs()
+            )));
+        }
+    };
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    read_deliver(&stdout, &stderr, out.status.success(), &id, seat)
+    let answer = read_deliver(&stdout, &stderr, out.status.success(), &id, seat);
+    // An answer read is the end of that id: `failed` asked again under it would
+    // only be answered `failed` again, and a retry is a new delivery.
+    if matches!(answer, Ok(Delivery::Acked) | Err(Refusal::Failed(_)) | Err(Refusal::NoSeat(_))) {
+        let _ = fs::remove_file(dir.join(DELIVER_PENDING));
+    }
+    answer
+}
+
+/// Whether this seat's supervisor is one that can be asked to `deliver`: the
+/// seat was spawned for it by this wsp. A record from before (every seat
+/// already running) has no such mark and keeps the typed path.
+fn delivers(rec: &Value) -> bool {
+    rec.get("deliver").and_then(Value::as_bool) == Some(true)
 }
 
 /// The answer to a `deliver`, as a function of what it printed.
@@ -1671,6 +1733,10 @@ impl Place for Compound<'_> {
         told["agent"] = json!({ "kind": agent.kind });
         let mut rec = self.spawn_sup(seat, &told, &program, &argv)?;
         rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
+        // wsp-477: spawned with `--agent`, so its supervisor can `deliver`.
+        if reads_kind(&agent.kind) {
+            rec["deliver"] = json!(true);
+        }
         write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
             .map_err(|e| Refusal::Backend(e.to_string()))?;
         Ok(())
@@ -1699,8 +1765,16 @@ impl Place for Compound<'_> {
         // `deliver` verb and the answer is read, not inferred from a
         // transcript. The supervisor owns the retry; `failed` is the only
         // thing wsp escalates.
-        if let (Some(sup), Some(session)) = (compound_sup_binary(), self.socket_of(seat)) {
-            return deliver_through(&sup, &session, seat, text);
+        //
+        // **Only a seat spawned for it** (`"deliver": true` in its record, set
+        // by [`Place::start`] with `--agent`): a supervisor built before
+        // compound-999 drops the connection on a `Deliver` frame, and every seat
+        // already running is one. Those keep the typed path below.
+        if let (Some(sup), Some(session), Ok(rec)) = (compound_sup_binary(), self.socket_of(seat), self.record(seat)) {
+            if delivers(&rec) {
+                let dir = self.dir_of(seat)?;
+                return deliver_through(&sup, &session, &dir, seat, text, DELIVER_WAIT);
+            }
         }
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
         type_and_submit(&socket, text)?;
@@ -2131,35 +2205,86 @@ mod tests {
         }
     }
 
+    /// A `sup` that is a shell script: it reads the text from stdin, records
+    /// the id it was asked under, and then runs `answer`.
+    fn script_sup(scratch: &Scratch, answer: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let sup = scratch.root.join("sup");
+        let said = scratch.root.join("said");
+        let asked = scratch.root.join("asked");
+        let body = format!(
+            "#!/bin/sh\n[ \"$1\" = deliver ] || exit 2\necho \"$3\" > '{}'\ncat > '{}'\n{answer}\n",
+            asked.display(),
+            said.display()
+        );
+        let tmp = scratch.root.join("sup.tmp");
+        fs::write(&tmp, body).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&tmp, &sup).unwrap();
+        (sup, said, asked)
+    }
+
     /// wsp-477: a tell on a seat whose supervisor can be asked is its `deliver`
     /// verb and its one-line answer, read: `delivered` is acknowledged, `failed`
     /// is a failure that names the supervisor's reason, and neither is inferred
     /// from a transcript. The text rides on stdin.
     #[test]
     fn a_delivery_is_the_supervisors_answer_read_and_a_failed_names_its_reason() {
-        use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new("deliver");
-        let sup = scratch.root.join("sup");
-        let said = scratch.root.join("said");
-        let script = |answer: &str| {
-            format!("#!/bin/sh\n[ \"$1\" = deliver ] || exit 2\ncat > '{}'\n{answer}\n", said.display())
-        };
         let (seat, session) = (Seat::new("cpd-1"), scratch.root.join("s.sock"));
+        let wait = Duration::from_secs(20);
 
-        fs::write(&sup, script("echo \"delivered $3\"")).unwrap();
-        fs::set_permissions(&sup, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(deliver_through(&sup, &session, &seat, "go and do it"), Ok(Delivery::Acked));
+        let (sup, said, _) = script_sup(&scratch, "echo \"delivered $3\"");
+        assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "go and do it", wait), Ok(Delivery::Acked));
         assert_eq!(fs::read_to_string(&said).unwrap(), "go and do it", "the sentence reaches the supervisor whole");
 
-        fs::write(&sup, script("echo \"failed $3 no composer\"; exit 1")).unwrap();
+        script_sup(&scratch, "echo \"failed $3 no composer\"; exit 1");
         assert_eq!(
-            deliver_through(&sup, &session, &seat, "go"),
+            deliver_through(&sup, &session, &scratch.root, &seat, "go", wait),
             Err(Refusal::Failed("cpd-1: no composer".into()))
         );
 
         // An answer about some other delivery is not this one's receipt.
-        fs::write(&sup, script("echo 'delivered someone-else'")).unwrap();
-        assert!(matches!(deliver_through(&sup, &session, &seat, "go"), Err(Refusal::Backend(_))));
+        script_sup(&scratch, "echo 'delivered someone-else'");
+        assert!(matches!(deliver_through(&sup, &session, &scratch.root, &seat, "go", wait), Err(Refusal::Backend(_))));
+    }
+
+    /// wsp-477, the verifier's block 3: a wait that runs out is an answer that is
+    /// not `failed`, and the same words asked again are asked under the same id,
+    /// so the sup's exactly-once covers it. An answer read ends that id.
+    #[test]
+    fn a_delivery_that_outlasts_its_wait_is_asked_again_under_the_same_id() {
+        let scratch = Scratch::new("deliver-wait");
+        let (seat, session) = (Seat::new("cpd-1"), scratch.root.join("s.sock"));
+
+        let (sup, _, asked) = script_sup(&scratch, "sleep 8; echo \"delivered $3\"");
+        let t = Instant::now();
+        let r = deliver_through(&sup, &session, &scratch.root, &seat, "go", Duration::from_millis(2500));
+        assert!(t.elapsed() < Duration::from_secs(6), "bounded, not the sup's own wait");
+        assert!(matches!(&r, Err(Refusal::Backend(w)) if w.contains("pending")), "{r:?}");
+        let first = fs::read_to_string(&asked).unwrap();
+
+        script_sup(&scratch, "echo \"delivered $3\"");
+        assert_eq!(
+            deliver_through(&sup, &session, &scratch.root, &seat, "go", Duration::from_secs(20)),
+            Ok(Delivery::Acked)
+        );
+        assert_eq!(fs::read_to_string(&asked).unwrap(), first, "the same sentence, the same id");
+
+        assert_eq!(
+            deliver_through(&sup, &session, &scratch.root, &seat, "go", Duration::from_secs(20)),
+            Ok(Delivery::Acked)
+        );
+        assert_ne!(fs::read_to_string(&asked).unwrap(), first, "an answered id is spent: the next tell is new");
+    }
+
+    /// wsp-477, the verifier's block 1: only a seat spawned for it is delivered
+    /// to. A record from before has no mark, and its supervisor drops the
+    /// connection on a `Deliver` frame.
+    #[test]
+    fn only_a_seat_spawned_for_deliver_is_delivered_to() {
+        assert!(!delivers(&json!({ "agent": { "kind": "claude" } })), "a seat already running");
+        assert!(delivers(&json!({ "deliver": true })));
     }
 
     #[test]

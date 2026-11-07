@@ -686,19 +686,20 @@ pub(crate) struct Tell<'a> {
 }
 
 impl<'a> Tell<'a> {
-    /// A `failed` from the seat's supervisor (wsp-477): a line in `cycle.log`
-    /// every time, and a note raised on the scope once while the last is open.
+    /// A `failed` from the seat's supervisor (wsp-477): a note raised on the
+    /// scope once while the last is open, and the `cycle.log` line with it — a
+    /// failure that goes on failing is said once, not every tick.
     fn escalate(&self, why: &str) {
         use crate::message::{self, About, Kind, Message, Party};
-        crate::store::log_line(self.store, &format!("told {}: delivery failed — {why}", self.scope));
         let about = About::Scope(self.scope.clone());
         let open = message::raised(self.store)
             .iter()
             .any(|m| m.about == about && m.text.starts_with(FAILED_DELIVERY));
         if !open {
+            crate::store::log_line(self.store, &format!("told {}: delivery failed — {why}", self.scope));
             let text = format!(
-                "{FAILED_DELIVERY}{why}\n\nThe seat's supervisor (`compound-sup deliver`) answered `failed`; \
-                 it owns the retry, so wsp holds the sentence and tries again on the next tick."
+                "{FAILED_DELIVERY}{why}\n\nThe seat's supervisor (`compound-sup deliver`) answered `failed` \
+                 after its own retries; wsp holds the sentence and does not retype it at once."
             );
             let _ = message::raise(self.store, &Message::new(Party::wsp(), Kind::Note, &text).about(about));
         }
@@ -720,6 +721,12 @@ const NOT_YET: &str = "nothing worth a wake yet";
 const FAILED_DELIVERY: &str = "delivery to the seat failed: ";
 
 const NO_SEAT: &str = "no seat on this scope";
+
+/// A `failed` reason that says nothing reached the seat, so the sentence is
+/// still wholly owed and trying again is safe (wsp-477).
+fn took_nothing(why: &str) -> bool {
+    ["no_composer", "no composer", "session_gone", "session gone"].iter().any(|r| why.contains(r))
+}
 
 /// The seat reads occupied and the agent in it could not be found to type at.
 /// Not a vacancy, and deliberately not worded as one: see [`Tell::deliver`].
@@ -1093,17 +1100,35 @@ impl Sink for Tell<'_> {
         // whole seconds while the type is still returning, so a stamp taken
         // after would postdate the very turn it is waiting for.
         let before = util::epoch_secs();
-        match how.tell(place.as_ref(), &addressee, &text) {
+        let outcome = how.tell(place.as_ref(), &addressee, &text);
+        self.settle(outcome, before)
+    }
+}
+
+impl Tell<'_> {
+    /// What became of a typing, as the batch's fate: `true` clears it.
+    fn settle(&mut self, outcome: crate::place::Result<crate::place::Delivery>, before: i64) -> bool {
+        match outcome {
             Ok(crate::place::Delivery::Started) => true,
             // The seat's supervisor acknowledged it (wsp-477): delivered
             // exactly once, nothing owed, no turn to wait for.
-            Ok(crate::place::Delivery::Acked) => true,
+            Ok(crate::place::Delivery::Acked) => {
+                crate::store::log_line(self.store, &format!("told {}: delivered, acknowledged by the seat", self.scope));
+                true
+            }
             // The supervisor owns the retry, so `failed` is final and the one
-            // thing wsp escalates: said in `cycle.log`, held for the next tick,
-            // and raised once on the scope for a person.
+            // thing wsp escalates: raised once on the scope for a person.
+            // Unless it names a seat that took nothing (`no_composer`,
+            // `session_gone`), the supervisor has typed the sentence up to four
+            // times, so it is stamped as typed and held for [`RETYPED`] rather
+            // than typed again under a new id on every tick.
             Err(crate::place::Refusal::Failed(why)) => {
                 self.why = format!("the seat's supervisor failed to deliver it: {why}");
                 self.escalate(&why);
+                if !took_nothing(&why) {
+                    self.typed = true;
+                    self.typed_at = Some(before);
+                }
                 false
             }
             Ok(crate::place::Delivery::Unconfirmed)
@@ -1729,6 +1754,50 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         });
         let report = deliver_to(&store, &Working, "core", &[], 20);
         assert!(report.why.starts_with("unseated"), "an empty slot is a vacancy: {}", report.why);
+        let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// **wsp-477: what the seat's supervisor answered is the batch's fate.**
+    /// `delivered` clears it and is said in `cycle.log`; `failed` raises the row
+    /// once and, because the supervisor has already typed it, stamps it typed so
+    /// no tick types it again under a new id — unless the reason is one where
+    /// nothing reached the seat.
+    #[test]
+    fn a_supervisors_delivered_clears_and_is_said_and_its_failed_raises_once_and_is_not_retyped() {
+        use crate::place::{Delivery, Refusal};
+        let env = util::isolated("wake-acked");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let log = || std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        let raised = || {
+            crate::message::raised(&store).into_iter().filter(|m| m.text.starts_with(FAILED_DELIVERY)).count()
+        };
+        let before = util::epoch_secs();
+
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(tell.settle(Ok(Delivery::Acked), before), "delivered clears the batch");
+        assert!(!tell.typed && tell.typed_at.is_none());
+        assert!(log().contains("told demo: delivered, acknowledged"), "and cycle.log says so: {}", log());
+        assert_eq!(raised(), 0);
+
+        // A failed after the supervisor's own retries: raised, and held as typed.
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(!tell.settle(Err(Refusal::Failed("cpd-1: no turn after 4 tries".into())), before));
+        assert!(tell.typed && tell.typed_at == Some(before), "stamped, so the next tick does not type it again");
+        assert_eq!(raised(), 1, "the row is raised");
+        assert!(log().contains("delivery failed — cpd-1: no turn after 4 tries"), "{}", log());
+
+        // The same failure on the next tick raises nothing more and says nothing more.
+        let lines = log().lines().count();
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(!tell.settle(Err(Refusal::Failed("cpd-1: no turn after 4 tries".into())), before + 20));
+        assert_eq!(raised(), 1, "raised once while the last is open");
+        assert_eq!(log().lines().count(), lines, "and cycle.log does not repeat it every tick");
+
+        // Nothing reached the seat: still wholly owed, and safe to try again.
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(!tell.settle(Err(Refusal::Failed("cpd-1: no_composer".into())), before));
+        assert!(!tell.typed && tell.typed_at.is_none(), "not stamped: nothing was typed");
         let _ = std::fs::remove_dir_all(&env.state());
     }
 
