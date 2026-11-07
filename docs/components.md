@@ -100,7 +100,7 @@ cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `at_stop`, `gc` |
 | `engine` | `stage`, `history`, `after`, `worklist`, `cycle`, `barrier`, `barrier_run`, `barrier_replay`, `verification`, `check`, `leg_tree`, `cold`, `affected`, `build_output`, `did`, `closing`, `ending`, `repair`, `split`, `starts`, `stand_down`, `untaken`, `waiting`, `legs`, `leg_seat`, `cmd_worklist`, `cmd_task`, `packet`, `packet_gen`, `verifier_packet`, `attention`, `kind_attention`, `cmd_attend`, `cmd_message`, `hold`, `hold_close`, `pickup`, `waits`, `scope` |
 | `seats` | `agent_commands`, `kind_data`, `cmd_project`, `cmd_spawn`, `cmd_agent`, `cmd_resume`, `wake`, `room`, `cmd_govern`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_role`, `cmd_stamp`, `stuck`, `sync` |
-| `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `wallbuckets`, `cmd_attempts`, `cmd_verifications` |
+| `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `wallbuckets`, `cmd_attempts`, `cmd_verifications`, `retro`, `retro_run`, `retro_series` |
 | `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |
 | `top` | `main`, `registry`, `daemon`, `leaked_agents` |
 

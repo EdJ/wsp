@@ -10,7 +10,7 @@ use crate::retro::{self, Figures, MAX_NEW};
 use crate::retro_series as series;
 use crate::store::Store;
 use crate::util;
-use crate::Args;
+use crate::base::args::Args;
 
 const FILE: &str = "retro.json";
 

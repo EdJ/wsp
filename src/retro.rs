@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::model::Worklist;
 use crate::store::Store;
-use crate::Args;
+use crate::base::args::Args;
 
 /// A list under three rows, or under half an hour of wall, has nothing a
 /// retro would learn from.
