@@ -138,7 +138,7 @@ The rules are `docs/widget-contract.md` in compounding, applied rather than copi
 - **R1, one writer per relation.** Every durable fact has one owning crate. Any other crate that wants it changed
   calls the owner's verb; none edits the record. A section of a record (`## Verification`, `## Log`, `## Decisions`)
   is a relation.
-  Section owners today: `## Verification` → `verification.rs` (`save_runs`, `carry_pass`, `write`; `write_runs` is private to it, and `check.rs`/`cycle.rs` call the verbs); `## Checks` → `check.rs`; `## Legs` → `legs.rs`. `## Log`, `## Decisions`, claims and tags are wsp-455..458 (next group).
+  Section owners today: `## Verification` → `verification.rs` (`save_runs`, `carry_pass`, `write`; `write_runs` is private to it, and `check.rs`/`cycle.rs` call the verbs); `## Checks` → `check.rs`; `## Legs` → `legs.rs`; claims (`claims.json`) → `store.rs` (`set_claim`, `clear_claim`, `reap_claims`; no other module opens the file, and callers go through the verbs). `## Log`, `## Decisions` and tags are wsp-456..458 (next group).
 - **R2, a contract is a crate with no logic.** Types, traits and constants only, for the symbols that cross. Others
   depend on `<crate>-contract`, never on `<crate>`; only the binary depends on implementations. This is what keeps
   an edit in an implementation from rebuilding its dependents.
