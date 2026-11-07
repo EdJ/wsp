@@ -96,10 +96,10 @@ cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 
 |---|---|
 | `base` | `base`, `util`, `fm`, `input`, `risk`, `disk`, `memory`, `choices` |
 | `store` | `model`, `checks`, `caption`, `store`, `resolve`, `message`, `lapse`, `sharing`, `scratch`, `cmd_migrate`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags` |
-| `wire` | `herdr`, `place`, `place_herdr`, `place_compound`, `place_super`, `artefact`, `cmd_mandate`, `tunnel`, `far`, `sync`, `launchd`, `detect_override` |
+| `wire` | `herdr`, `place`, `place_herdr`, `place_compound`, `place_super`, `artefact`, `cmd_mandate`, `tunnel`, `far`, `launchd`, `detect_override` |
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `build_output`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `cold`, `leg_tree`, `affected`, `at_stop`, `gc` |
 | `engine` | `stage`, `history`, `after`, `worklist`, `cycle`, `barrier`, `barrier_run`, `barrier_replay`, `verification`, `check`, `did`, `closing`, `ending`, `repair`, `split`, `starts`, `stand_down`, `untaken`, `waiting`, `legs`, `leg_seat`, `cmd_worklist`, `cmd_task`, `packet`, `packet_gen`, `verifier_packet`, `attention`, `kind_attention`, `cmd_attend`, `cmd_message`, `hold`, `hold_close`, `pickup`, `waits`, `scope` |
-| `seats` | `agent_commands`, `kind_data`, `cmd_project`, `cmd_spawn`, `cmd_agent`, `cmd_resume`, `wake`, `room`, `cmd_govern`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_stamp`, `stuck` |
+| `seats` | `agent_commands`, `kind_data`, `cmd_project`, `cmd_spawn`, `cmd_agent`, `cmd_resume`, `wake`, `room`, `cmd_govern`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_stamp`, `stuck`, `sync` |
 | `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_report`, `cmd_attempts`, `cmd_verifications` |
 | `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |
 | `top` | `main`, `registry`, `daemon`, `fake`, `leaked_agents` |
@@ -119,7 +119,7 @@ on 8 cores** (so read it as an order of magnitude, and the shape matters more th
 |---|---|---|---|---|---|
 | `wsp-base` | `util`, `fm`, `input`, `risk`, `choices`, `Args`, stamp, git helpers, the glyph table | 3.1k | 61 | 0.2 | nothing durable |
 | `wsp-store` | `model`, `store`, `resolve`, `message`, `lapse`, `artefact`, `kind_data`, `sharing`, `scratch`, project/migrate/mandate verbs | 12.4k | 199 | 20.2 | **the records** |
-| `wsp-wire` | `herdr`, `place` and its three backends, `tunnel`, `far`, `sync`, `launchd`, `detect_override`, `memory` | 8.3k | 135 | 4.4 | the herdr/compound sockets |
+| `wsp-wire` | `herdr`, `place` and its three backends, `tunnel`, `far`, `launchd`, `detect_override`, `memory` | 8.3k | 135 | 4.4 | the herdr/compound sockets |
 | `wsp-trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `build_output`, `throttle`, `warm`, `guard`, `leg_tree`, `overlap`, `disk` | 8.9k | 196 | 187.0 | worktrees, `.git`, build trees |
 | `wsp-engine` | `worklist`, `cycle`, `repair`, `verification`, `check`, `barrier*`, `legs`, `closing`, `ending`, `hold*`, `cmd_task`, `cmd_worklist`, `cmd_message`, `stage`, `caption`, `history`, `after`, `packet*`, `attention` | 32.8k | 814 | 197.7 | the run's rows |
 | `wsp-seats` | `cmd_spawn`, `cmd_agent`, `agent_commands`, `cmd_resume`, `cmd_govern`, `wake`, `room`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_stamp` | 30.1k | 634 | 33.4 | seat bindings, wakes |

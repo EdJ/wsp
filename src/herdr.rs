@@ -20,6 +20,30 @@ use serde_json::{json, Value};
 
 use crate::util;
 
+/// herdr, wherever it is.
+///
+/// `Command::new("herdr")` is right nearly always, and wrong in the one case
+/// that matters most: a `wsp` started by herdr's own plugin runner inherits
+/// whatever `PATH` herdr was launched with, which is why `run.sh` looks the
+/// binary up by hand rather than trusting it. Same reasoning, same fallback.
+pub(crate) fn herdr_bin() -> PathBuf {
+    if let Some(v) = std::env::var_os("HERDR_BIN") {
+        let p = PathBuf::from(v);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join("herdr");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    util::home().join(".local/bin/herdr")
+}
+
 pub fn socket_path() -> PathBuf {
     // A test that reads this without saying where is pointed at the live herdr
     // — a server, with somebody's windows in it. Three tests in `cmd_govern`

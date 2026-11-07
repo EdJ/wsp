@@ -494,6 +494,14 @@ fn main() {
         runs: |store, task| worklist::Running::read(store).of(task).is_some_and(|p| p.run),
     });
 
+    place::install_above(place::Above {
+        command: agent_commands::command,
+        closes: hold_close::closes,
+        heard: hold_close::heard,
+        hold: hold::hold,
+        hold_secs: hold::SECS,
+    });
+
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Before parsing: what follows `run` is the build tool's own command line,
     // flags and all, and `Args` would take `--release` for one of ours.

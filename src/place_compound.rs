@@ -1327,7 +1327,7 @@ impl Compound<'_> {
         self.far
             .run(&m, &crate::far::trust_command(&m, "add", &cwd), crate::far::SESSION_TIMEOUT)
             .map_err(|f| bad(format!("trusting {cwd} on {name}: {}", f.why())))?;
-        let (program, argv) = crate::agent_commands::command(&agent.kind, &agent.args);
+        let (program, argv) = (crate::place::above().command)(&agent.kind, &agent.args);
         let cmd = crate::far::seat_command(&m, seat.as_str(), &cwd, &env, &program, &argv);
         let out = self
             .far
@@ -1498,7 +1498,7 @@ pub fn seat_machine(store: &Store, seat: &str) -> String {
 /// `machine` and is never in it.
 pub fn beat_seats(store: &Store, machine: &str) -> Vec<crate::far::BeatSeat> {
     let root = store.state.join(SEATS);
-    let held = crate::ending::held_seats(store);
+    let held = store.held_seats();
     let mut out = Vec::new();
     for e in fs::read_dir(&root).into_iter().flatten().flatten() {
         let rec = read_json(&e.path().join(SEAT_FILE));
@@ -1607,7 +1607,7 @@ impl Place for Compound<'_> {
                 self.end_process(seat, &rec);
             }
         }
-        let (program, argv) = crate::agent_commands::command(&agent.kind, &agent.args);
+        let (program, argv) = (crate::place::above().command)(&agent.kind, &agent.args);
         let mut rec = self.spawn_sup(seat, &rec, &program, &argv)?;
         rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
         write_atomic(&dir.join(SEAT_FILE), &rec.to_string())

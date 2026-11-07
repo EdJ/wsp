@@ -405,7 +405,7 @@ fn released_seats(
     asks: &mut Option<crate::waiting::Asks>,
 ) {
     let Some(census) = seats.census() else { return };
-    let held = held_seats(store);
+    let held = store.held_seats();
     for (seat, label) in census {
         let id = label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string();
         if held.contains(&seat) || seated.contains(&id) {
@@ -430,17 +430,6 @@ fn released_from(m: &Task, seat: &str) -> bool {
         .iter()
         .rfind(|a| a.leg.is_none())
         .is_some_and(|a| a.pane == seat && !a.until.is_empty())
-}
-
-/// Every seat a binding or a claim's agent holds.
-pub(crate) fn held_seats(store: &Store) -> std::collections::BTreeSet<String> {
-    let mut out: std::collections::BTreeSet<String> = store.bindings().into_keys().collect();
-    let agents = store.agents_held();
-    for claim in store.claims().values() {
-        let seat = claim.get("agent_id").and_then(|a| a.as_str()).and_then(|a| agents.get(a)).and_then(|a| a.get("seat")?.as_str());
-        out.extend(seat.map(str::to_string));
-    }
-    out
 }
 
 /// Every row a seat is held for: by a claim or by a binding that is not a leg's,

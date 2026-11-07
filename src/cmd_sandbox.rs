@@ -246,32 +246,8 @@ fn path_with(shim: &Path, current: Option<&str>) -> String {
     }
 }
 
-/// herdr, wherever it is.
-///
-/// `Command::new("herdr")` is right nearly always, and wrong in the one case
-/// that matters most: a `wsp` started by herdr's own plugin runner inherits
-/// whatever `PATH` herdr was launched with, which is why `run.sh` looks the
-/// binary up by hand rather than trusting it. Same reasoning, same fallback.
-pub(crate) fn herdr_bin() -> PathBuf {
-    if let Some(v) = std::env::var_os("HERDR_BIN") {
-        let p = PathBuf::from(v);
-        if !p.as_os_str().is_empty() {
-            return p;
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join("herdr");
-            if p.is_file() {
-                return p;
-            }
-        }
-    }
-    util::home().join(".local/bin/herdr")
-}
-
 fn herdr(args: &[&str]) -> Result<String, String> {
-    let out = Command::new(herdr_bin())
+    let out = Command::new(crate::herdr::herdr_bin())
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -327,7 +303,7 @@ fn session(name: &str) -> Option<(bool, PathBuf)> {
 /// starts the processes.
 fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
     let name = &sb.name;
-    let mut c = Command::new(herdr_bin());
+    let mut c = Command::new(crate::herdr::herdr_bin());
     c.args(["--session", name, "server"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

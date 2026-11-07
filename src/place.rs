@@ -1344,9 +1344,55 @@ pub(crate) fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing)
     first
 }
 
+/// What the backends and the hook verb ask of the layers above wire, which `main`
+/// installs at startup ([`install_above`]): wire does not name them.
+pub(crate) struct Above {
+    /// The program and argv an agent of a kind starts as (`agent_commands::command`).
+    pub command: fn(&str, &[String]) -> (String, Vec<String>),
+    /// Whether a hook can end a question (`hold_close::closes`).
+    pub closes: fn(&str) -> bool,
+    /// What a hook says about the questions its session holds (`hold_close::heard`).
+    pub heard: fn(&crate::store::Store, &str, &serde_json::Value) -> usize,
+    /// Wait on the person for a permission request (`hold::hold`).
+    pub hold: fn(&crate::store::Store, &serde_json::Value, u64) -> i32,
+    /// How long that waits unless told otherwise (`hold::SECS`).
+    pub hold_secs: u64,
+}
+
+static ABOVE: std::sync::OnceLock<Above> = std::sync::OnceLock::new();
+
+pub(crate) fn install_above(a: Above) {
+    let _ = ABOVE.set(a);
+}
+
+/// The installed answers. A unit test gets the real ones ([`tests::REAL`]); a
+/// process that installed none starts the kind's own name, closes and holds nothing.
+pub(crate) fn above() -> &'static Above {
+    #[cfg(test)]
+    return &tests::REAL;
+    #[cfg(not(test))]
+    {
+        static NONE: Above = Above {
+            command: |kind, args| (kind.to_string(), args.to_vec()),
+            closes: |_| false,
+            heard: |_, _, _| 0,
+            hold: |_, _, _| 0,
+            hold_secs: 86_400,
+        };
+        ABOVE.get().unwrap_or(&NONE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) static REAL: Above = Above {
+        command: crate::agent_commands::command,
+        closes: crate::hold_close::closes,
+        heard: crate::hold_close::heard,
+        hold: crate::hold::hold,
+        hold_secs: crate::hold::SECS,
+    };
     use crate::util::{is_agent_id, new_agent_id};
 
     /// What a seat's occupant must not find, and where the line is drawn.

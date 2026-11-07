@@ -2972,7 +2972,7 @@ fn parse_listing(json: &str) -> Vec<Live> {
 
 /// Claude Code, wherever it is.
 ///
-/// The same reasoning as `cmd_sandbox::herdr_bin`, which records it: a `wsp`
+/// The same reasoning as `herdr::herdr_bin`, which records it: a `wsp`
 /// started by herdr's plugin runner inherits whatever `PATH` herdr was launched
 /// with, so the binary is looked up by hand rather than trusted to be on it.
 fn claude_bin() -> PathBuf {

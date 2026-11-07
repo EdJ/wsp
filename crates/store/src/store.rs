@@ -2265,6 +2265,17 @@ impl Store {
         }
     }
 
+    /// Every seat a binding or a claim's agent holds.
+    pub fn held_seats(&self) -> std::collections::BTreeSet<String> {
+        let mut out: std::collections::BTreeSet<String> = self.bindings().into_keys().collect();
+        let agents = self.agents_held();
+        for claim in self.claims().values() {
+            let seat = claim.get("agent_id").and_then(|a| a.as_str()).and_then(|a| agents.get(a)).and_then(|a| a.get("seat")?.as_str());
+            out.extend(seat.map(str::to_string));
+        }
+        out
+    }
+
     pub fn set_agent(&self, id: &str, value: Value) {
         self.update_json("agents.json", |a| {
             a.insert(id.to_string(), value);

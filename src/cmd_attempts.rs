@@ -836,7 +836,7 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
 /// What a recorded spend cost in dollars, in micro-dollars.
 ///
 /// The runtime's own price where it states one (opencode). Otherwise the tokens
-/// the record kept, priced at [`crate::cmd_burn::PRICES`] on the model that ran:
+/// the record kept, priced at [`crate::place_super::PRICES`] on the model that ran:
 /// the log keeps only a total, so a session that moved tier mid-flight
 /// (`haiku-4-5→opus-5`) is priced at the **dearest** it named, which cannot make
 /// the attempt look cheap. **A floor, too:** the record's `in` is input plus cache
@@ -855,10 +855,10 @@ pub fn priced(ran: &str, s: &Spend) -> Option<u64> {
     let mut dearest: Option<u64> = None;
     for m in models.split('→') {
         let id = format!("claude-{m}");
-        if !crate::cmd_burn::known(&id) {
+        if !crate::place_super::known(&id) {
             return None;
         }
-        let c = crate::cmd_burn::cost(&id, s.input, s.output, s.cache, 0);
+        let c = crate::place_super::cost(&id, s.input, s.output, s.cache, 0);
         dearest = Some(dearest.map_or(c, |d| d.max(c)));
     }
     dearest
@@ -1108,7 +1108,7 @@ fn cost_report(store: &Store, args: &Args, tasks: Vec<Task>) -> i32 {
         println!("{}  {}", p.bold(&format!("{} rows", rows.len())), p.bold(&money(total)));
     }
     println!();
-    println!("{}", p.dim(&format!("priced at Anthropic list prices read {}; a cache write is counted at the input rate, so a total is a floor", crate::cmd_burn::PRICES_READ)));
+    println!("{}", p.dim(&format!("priced at Anthropic list prices read {}; a cache write is counted at the input rate, so a total is a floor", crate::place_super::PRICES_READ)));
     0
 }
 
