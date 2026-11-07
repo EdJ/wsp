@@ -513,7 +513,7 @@ fn launch(store: &Store, argv: &[&str]) {
     cmd.args(argv)
         // Nobody's pane: a spawn started from here must not read itself as
         // the agent whose verb triggered it.
-        .env_remove(crate::place::SEAT_ENV)
+        .env_remove(crate::base::seat::SEAT_ENV)
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_WORKSPACE_ID")
         .stdin(Stdio::null())

@@ -164,7 +164,6 @@ sync -> cmd_govern: governs, learn_seats, seat_query  # wire -> seats
 throttle -> cycle: log_line  # trees -> engine
 throttle -> main: Args  # trees -> top
 timeline -> main: Args  # timeline -> top
-util -> place: SEAT_ENV  # base -> wire
 verification -> agent_commands: Ran, Spend  # engine -> seats
 verification -> cmd_agent: my_pane  # engine -> seats
 verification -> cmd_attempts: Row, attempts_of  # engine -> timeline

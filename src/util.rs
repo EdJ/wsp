@@ -239,7 +239,7 @@ pub fn isolated(name: &str) -> Isolated {
     // `my_pane()` reads the seat variable ahead of herdr's, so a `cargo test`
     // run from inside an agent's seat (as `wsp verify` is) would answer every
     // "who am I" with the outer seat. A test that wants a seat sets its own.
-    std::env::remove_var(crate::place::SEAT_ENV);
+    std::env::remove_var(crate::base::seat::SEAT_ENV);
     Isolated { _lock: lock, dir }
 }
 

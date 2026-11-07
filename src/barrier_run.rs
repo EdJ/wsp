@@ -704,7 +704,7 @@ fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet:
         .args(["worklist", "go", list, "--from"])
         .arg(&file)
         .args(["--caption", &caption])
-        .env_remove(crate::place::SEAT_ENV)
+        .env_remove(crate::base::seat::SEAT_ENV)
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_WORKSPACE_ID")
         .stdin(std::process::Stdio::null())

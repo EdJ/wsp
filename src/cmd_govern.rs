@@ -3010,15 +3010,15 @@ pub(crate) mod tests {
 
         // A stale WSP_SEAT_ID inside a herdr pane must be ignored, or the
         // record names a pane that backend never listed.
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-stale");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-stale");
         assert_eq!(
             room_and_pane(None, &herdr),
             (Some("w1".to_string()), Some("w1:p6".to_string())),
             "herdr's own variables outrank a WSP_SEAT_ID inherited from somewhere",
         );
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
 
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-60");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-60");
         assert_eq!(
             room_and_pane(None, &nowhere),
             (Some("cpd-60".to_string()), Some("cpd-60".to_string())),

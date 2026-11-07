@@ -1578,7 +1578,7 @@ mod tests {
 
         std::env::remove_var("HERDR_PANE_ID");
         std::env::remove_var("HERDR_PLUGIN_EVENT_JSON");
-        std::env::set_var(crate::place::SEAT_ENV, "sup-7");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "sup-7");
         assert_eq!(place.here(), None, "a seat name from another backend was believed");
 
         std::env::set_var("HERDR_PANE_ID", "w31:p1");
@@ -1593,6 +1593,6 @@ mod tests {
         assert_eq!(place.here(), None, "an emptied variable is not a seat called nothing");
 
         std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
     }
 }

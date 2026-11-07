@@ -1956,10 +1956,10 @@ mod tests {
 
         // The check's own seat, which is who is waiting: said here rather than
         // inherited from whatever seat runs the suite.
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-77");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
         let args = crate::Args::synth("ask", &["run", "does group 1 own the chrome?"], &[("group", "1")]);
         let code = ask(&store, &args);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!(code, 0, "a worklist is somewhere for the answer to live");
         let q = message::open_questions(&store).pop().expect("the question");
         assert_eq!(q.about, About::Group { scope: "run".into(), group: 1 });
@@ -2275,7 +2275,7 @@ mod tests {
         store.save_worklist(&w).unwrap();
         store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
 
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-893");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
         let asked = |id: &str, text: &str, flags: &[(&str, &str)]| -> String {
             let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
             assert_eq!(ask(&store, &crate::Args::synth("ask", &[id, text], flags)), 0);
@@ -2284,7 +2284,7 @@ mod tests {
         let governed = asked("m-1", "could you paste the panic?", &[]);
         let persons = asked("m-1", "keep the bump?", &[("person", "")]);
         let lone = asked("lone-1", "which crate?", &[]);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
 
         let route = |id: &str| store.message(id).unwrap().to_json()["for"].clone();
         assert_eq!(route(&governed), serde_json::json!({ "seat": "ux-next" }), "the list's governor answers it");
@@ -2318,9 +2318,9 @@ mod tests {
         store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
         store.set_governor(crate::cmd_govern::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
 
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
         assert_eq!(ask(&store, &crate::Args::synth("ask", &["m-1", "which first, 457 or 458?"], &[])), 0);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
 
         let q = message::all(&store).into_iter().next().expect("raised");
         assert_eq!(q.to_json()["for"], "person", "the person's, not ux-next's: {}", q.to_json());
@@ -2336,7 +2336,7 @@ mod tests {
         let _env = util::isolated("ask-caption");
         let store = scratch("ask-caption");
         task(&store, "lone-1");
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-977");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-977");
         let asked = |text: &str, flags: &[(&str, &str)]| -> Option<Message> {
             let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
             let code = ask(&store, &crate::Args::synth("ask", &["lone-1", text], flags));
@@ -2348,7 +2348,7 @@ mod tests {
         let authored = asked(long, &[("caption", "could you paste the panic lines from the window's tab?")]).unwrap();
         let derived = asked(long, &[]).unwrap();
         let refused = asked(long, &[("caption", &"x".repeat(61))]);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
 
         let caption = |m: &Message| store.message(&m.id).unwrap().to_json()["caption"].clone();
         assert_eq!(caption(&authored), json!({ "text": "could you paste the panic lines from the window's tab?", "from": "authored" }));
@@ -2473,7 +2473,7 @@ mod tests {
         let store = scratch("ask-choices");
         task(&store, "lone-1");
         // An asker has to be somewhere, and this agent's own seat is not it.
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-893");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
         let file = env.path("choices.json");
         std::fs::write(&file, two_questions().to_string()).unwrap();
         let f = file.to_string_lossy().to_string();
@@ -2524,7 +2524,7 @@ mod tests {
         assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1", "no options here"], &[("person", "")])), 0);
         let plain = message::all(&store).pop().unwrap();
         assert!(plain.choices.is_none() && plain.to_json()["choices"].is_null());
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
     }
 
     #[test]
@@ -2946,7 +2946,7 @@ mod tests {
         let env = util::isolated("ask-wait");
         let store = scratch("ask-wait");
         task(&store, "lone-1");
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-893");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
         let file = env.path("choices.json");
         std::fs::write(&file, one_question().to_string()).unwrap();
         let f = file.to_string_lossy().to_string();
@@ -3012,7 +3012,7 @@ mod tests {
         let retry = crate::Args::synth("ask", &[q.id.as_str()], &[("wait", "")]);
         assert_eq!(ask_with(&store, &retry, &Fake::new()), 0);
         assert!(message::held_replies(&store).is_empty(), "returned once, through the call, and not typed after");
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
     }
 
     #[test]

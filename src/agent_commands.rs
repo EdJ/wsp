@@ -45,7 +45,7 @@
 //! wsp already holds the key, and one call turns it into the handle. Verified
 //! 2026-08-17 against the exact pair recorded as underivable.
 //!
-//! The handle therefore travels one way, unlike [`crate::place::SEAT_ENV`]'s,
+//! The handle therefore travels one way, unlike [`crate::base::seat::SEAT_ENV`]'s,
 //! and no `SessionStart` round-trip is needed.
 //!
 //! # What is still missing is the transport, not the address

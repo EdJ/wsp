@@ -771,7 +771,7 @@ fn note_full_suite(ctx: &Ctx) {
     let old = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).unwrap_or(Value::Null);
     let runs = old.get("runs").and_then(Value::as_u64).unwrap_or(0) + 1;
     let mut seats = old.get("seats").and_then(Value::as_object).cloned().unwrap_or_default();
-    if let Some(seat) = (ctx.env)(crate::place::SEAT_ENV) {
+    if let Some(seat) = (ctx.env)(crate::base::seat::SEAT_ENV) {
         let n = seats.get(&seat).and_then(Value::as_u64).unwrap_or(0) + 1;
         seats.insert(seat, json!(n));
     }
@@ -2032,7 +2032,7 @@ mod tests {
         let idle = || None;
         let said = std::cell::RefCell::new(Vec::<String>::new());
         let say = |m: &str| said.borrow_mut().push(m.to_string());
-        let env = |k: &str| (k == crate::place::SEAT_ENV).then(|| "w1:p1".to_string());
+        let env = |k: &str| (k == crate::base::seat::SEAT_ENV).then(|| "w1:p1".to_string());
         let c = ctx(&rig, &idle, &say, &env);
         run_in(&c, "cargo", &["test".into(), "cmd_spawn::".into()]);
         assert_eq!(full_suite_runs(&rig.state, "wsp-9"), 0, "a filtered run is the member's own");

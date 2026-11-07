@@ -1701,9 +1701,9 @@ mod tests {
     #[test]
     fn a_hold_does_not_depend_on_a_seat_set_in_the_process() {
         let g = ground("seat-env", "", &[("m.txt", "mine\n")], &[("t.txt", "theirs\n")]);
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-other");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-other");
         let code = g.verdict("holds");
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!(code, 0);
         let p = passes(&g.member()).pop().unwrap();
         assert_eq!(passes(&g.member()).len(), 1, "the open pass closed; no second one opened");

@@ -6940,9 +6940,9 @@ mod tests {
         store.save_worklist(&w).unwrap();
         task(&store, "wl-004", "todo");
         task(&store, "wl-005", "todo");
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-77");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
         assert_eq!(flagged(&store, &["add", "run", "wl-004"], &[("group", "2")]), 0);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         let herdr = std::env::var_os("HERDR_PANE_ID");
         std::env::remove_var("HERDR_PANE_ID");
         assert_eq!(flagged(&store, &["add", "run", "wl-005"], &[("group", "2")]), 0);
@@ -8123,9 +8123,9 @@ mod tests {
         assert_eq!(worklist::home_of_scope(&store, "batch").as_deref(), Some("wsp"), "the walk has a home to climb");
         assert!(crate::cmd_govern::seat_above_in(&store, "batch").is_none(), "and nobody seated on it");
 
-        std::env::set_var(crate::place::SEAT_ENV, "w1:p1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
         let asked = crate::cmd_message::ask(&store, &Args::synth("ask", &["wl-001", "ship it with the panic unexplained?"], &[]));
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!(asked, 0);
 
         let q = message::raised(&store).pop().expect("the question");
@@ -9092,7 +9092,7 @@ mod tests {
         let store = scratch("home-nowhere");
         projects(&store, &[("wsp", None)]);
         in_project(&store, "i-1", None);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         std::env::remove_var("HERDR_PANE_ID");
         assert_eq!(run(&store, &["new", "run", "r"]), 0);
         assert_eq!(home_of(&store, "run"), None, "nothing to read a home off");
@@ -9103,9 +9103,9 @@ mod tests {
 
         // The seat that runs `new` is remembered, and answers when nothing else does.
         store.set_governor("wsp", json!({ "workspace": "w1", "pane": "cpd-1" }));
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
         assert_eq!(run(&store, &["new", "made", "m"]), 0);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!(store.worklist("made").unwrap().made_in.as_deref(), Some("wsp"));
         assert_eq!(flagged(&store, &["add", "made", "i-1"], &[("also", "true"), ("why", "a second list over the same row")]), 0);
         assert_eq!(home_of(&store, "made"), Some(("wsp".into(), worklist::HomeFrom::Maker)));

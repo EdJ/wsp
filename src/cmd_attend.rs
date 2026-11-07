@@ -139,7 +139,7 @@ fn wsp(verb: &str, task: &str, account: &str) -> bool {
 /// the checks' end, so nothing treats the seat as idle mid-attempt.
 fn say(hook: &str, session: &str) {
     use std::io::Write;
-    if std::env::var_os(crate::place::SEAT_ENV).is_none() {
+    if std::env::var_os(crate::base::seat::SEAT_ENV).is_none() {
         return;
     }
     let Ok(exe) = std::env::current_exe() else { return };
@@ -184,7 +184,7 @@ pub fn attend(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: cannot make {}: {e}", dir.display());
         return 1;
     }
-    if let Ok(seat) = std::env::var(crate::place::SEAT_ENV) {
+    if let Ok(seat) = std::env::var(crate::base::seat::SEAT_ENV) {
         crate::cmd_agent::learn_sessions(store, std::iter::once((seat.as_str(), session.as_str(), "attention")));
     }
 

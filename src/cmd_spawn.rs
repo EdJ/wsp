@@ -3361,7 +3361,7 @@ fn when_idle(store: &Store, argv: &[&str]) -> Result<(), String> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(argv)
         .env(END_WHEN_IDLE, "1")
-        .env_remove(crate::place::SEAT_ENV)
+        .env_remove(crate::base::seat::SEAT_ENV)
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_WORKSPACE_ID")
         .stdin(std::process::Stdio::null())
@@ -4067,7 +4067,7 @@ fn arrange_ending(store: &Store, scope: &str, args: &Args) -> Result<(), String>
         }
     }
     cmd.env(ROTATED_BY, std::process::id().to_string())
-        .env_remove(crate::place::SEAT_ENV)
+        .env_remove(crate::base::seat::SEAT_ENV)
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_WORKSPACE_ID")
         .stdin(std::process::Stdio::null())
@@ -5693,7 +5693,7 @@ mod tests {
             crate::cycle::OWNED_LIST,
             crate::cycle::OWNED_GROUP,
             "WSP_TERSE",
-            crate::place::SEAT_ENV,
+            crate::base::seat::SEAT_ENV,
             "WSP_SOMETHING_ADDED_LATER",
             "WSP_HOME",
             "WSP_STATE",
@@ -9102,8 +9102,8 @@ mod tests {
         std::env::remove_var("HERDR_PANE_ID");
         std::env::remove_var("HERDR_WORKSPACE_ID");
         match seat {
-            Some(s) => std::env::set_var(crate::place::SEAT_ENV, s),
-            None => std::env::remove_var(crate::place::SEAT_ENV),
+            Some(s) => std::env::set_var(crate::base::seat::SEAT_ENV, s),
+            None => std::env::remove_var(crate::base::seat::SEAT_ENV),
         }
     }
 

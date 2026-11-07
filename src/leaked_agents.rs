@@ -6,7 +6,7 @@
 //! them when the sandbox went.
 //!
 //! **A leak** is an agent in a seat (its environment carries
-//! [`crate::place::SEAT_ENV`]) whose store is not this daemon's and has no
+//! [`crate::base::seat::SEAT_ENV`]) whose store is not this daemon's and has no
 //! daemon of its own. A sandbox with its daemon running is somebody's work and
 //! is left alone; an agent with no `WSP_STATE` is the default store's.
 //!
@@ -61,7 +61,7 @@ fn kind_of(rest: &str) -> Option<&'static str> {
 }
 
 fn seat_of(rest: &str) -> Option<&str> {
-    rest.split_whitespace().find_map(|w| w.strip_prefix(&format!("{}=", crate::place::SEAT_ENV)))
+    rest.split_whitespace().find_map(|w| w.strip_prefix(&format!("{}=", crate::base::seat::SEAT_ENV)))
 }
 
 /// The agents in a `ps -E` table that are in a seat of a store that is not

@@ -7007,11 +7007,11 @@ mod tests {
         // A compound seat's record names the seat as its room as well as its pane.
         store.set_governor("tooling", json!({ "workspace": "cpd-41", "pane": "cpd-41", "host": util::hostname() }));
         std::env::remove_var("HERDR_PANE_ID");
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-41");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-41");
         let governs = raise_one(&store, &["wsp-001", "possibly moot"], &[]);
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-42");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-42");
         let agent = raise_one(&store, &["wsp-001", "found something"], &[]);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!((governs, agent), (0, 0));
 
         let up = crate::message::raised(&store);
@@ -8423,11 +8423,11 @@ mod tests {
         t.status_raw = "doing".into();
         store.save_task(&t).unwrap();
         store.set_binding("cpd-9", json!({ "task_id": "wsp-900", "pane_id": "cpd-9" }));
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-9");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-9");
         assert!(!herdr::available_now(), "the case the row is about: nothing listening");
 
         let code = say(&store, &Args::synth("say", &["running the suite"], &[]));
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!(code, 0, "no herdr is not a reason to refuse a status line");
 
         let said = store.said();
@@ -8530,9 +8530,9 @@ mod tests {
         let iso = util::isolated("looking-no-herdr");
         let store = Store::at(iso.home(), iso.state());
         store.ensure_dirs().unwrap();
-        std::env::set_var(crate::place::SEAT_ENV, "cpd-9");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-9");
         say_looking(&store, &[], Some("wsp"), true);
-        std::env::remove_var(crate::place::SEAT_ENV);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!(sentence(&store.said(), "cpd-9", None).as_deref(), Some("looking for work in wsp"));
         drop(iso);
     }
