@@ -1685,6 +1685,12 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
                     "turn": matches!(how, Delivery::Started | Delivery::Acked),
                 }),
             );
+            // The seat's supervisor acknowledged it (wsp-477): the same line the
+            // wake path writes for a governor scope, so a direct tell to a
+            // compound seat leaves its acknowledgement in cycle.log too.
+            if matches!(how, Delivery::Acked) {
+                crate::store::log_line(store, &format!("told {target}: delivered, acknowledged by the seat"));
+            }
             if *json {
                 println!(
                     "{}",
@@ -7077,6 +7083,31 @@ mod tests {
         let store = Store::open();
         store.ensure_dirs().unwrap();
         (env, store)
+    }
+
+    /// A direct `wsp tell` that the seat's supervisor acknowledged leaves the
+    /// same cycle.log line the wake path writes (wsp-490); one that only
+    /// started a turn leaves none.
+    #[test]
+    fn an_acknowledged_direct_tell_is_told_in_cycle_log() {
+        let (_env, store) = scratch("acked-tell");
+        let sent = |id: &str| Sent {
+            target: "wsp-491".into(),
+            what: "wsp-491".into(),
+            pane: "w1:p1".into(),
+            peek: String::new(),
+            chars: 2,
+            id: id.into(),
+            json: true,
+        };
+        crate::store::SAID.with(|s| s.borrow_mut().clear());
+        assert_eq!(delivered(&store, Ok(Delivery::Started), &sent("a")), 0);
+        assert!(crate::store::SAID.with(|s| s.borrow().is_empty()), "a started turn says nothing here");
+        assert_eq!(delivered(&store, Ok(Delivery::Acked), &sent("b")), 0);
+        let said = crate::store::SAID.with(|s| s.borrow().clone());
+        assert_eq!(said, vec!["told wsp-491: delivered, acknowledged by the seat".to_string()]);
+        let file = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
+        assert!(file.contains("told wsp-491: delivered, acknowledged by the seat"), "{file}");
     }
 
     /// The row's own line, `wsp add "-p" -p demo`: the first `-p` takes the
