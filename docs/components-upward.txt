@@ -6,13 +6,11 @@ after -> main: Args  # engine -> top
 artefact -> cmd_agent: my_pane  # store -> seats
 artefact -> main: Args  # store -> top
 at_stop -> check: clean_env, project_of  # trees -> engine
-at_stop -> cycle: log_line  # trees -> engine
 attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume  # engine -> seats
 attention -> main: build_stamp  # engine -> top
 attention -> wake: wake  # engine -> seats
 barrier -> main: Args  # engine -> top
 barrier_replay -> main: Args  # engine -> top
-build_output -> cycle: log_line  # trees -> engine
 build_output -> verification: verified  # trees -> engine
 build_output -> worklist: crossed  # trees -> engine
 caption -> main: Args  # engine -> top
@@ -20,8 +18,7 @@ check -> main: Args  # engine -> top
 check_tree -> barrier: parse_subject  # trees -> engine
 check_tree -> check: captures  # trees -> engine
 check_tree -> cmd_sandbox: ancestors, processes  # trees -> seats
-check_tree -> cmd_spawn: LOCAL_BACKEND_NAMES, local_backends  # trees -> seats
-check_tree -> cycle: Fleet, Seats, log_line  # trees -> engine
+check_tree -> cycle: Fleet, Seats  # trees -> engine
 check_tree -> legs: staged  # trees -> engine
 closing -> main: Args  # engine -> top
 cmd_agent -> cmd_attempts: attempts_of  # seats -> timeline
@@ -50,14 +47,12 @@ cmd_install -> main: Args, stamp_word  # seats -> top
 cmd_machine -> main: Args  # seats -> top
 cmd_mandate -> herdr: *  # store -> wire
 cmd_mandate -> main: Args  # store -> top
-cmd_mandate -> place: is_agent_id  # store -> wire
 cmd_message -> agent_commands: of  # engine -> seats
-cmd_message -> cmd_agent: Sent, delivered, locate_seat, my_pane, prose, twice, typed_message  # engine -> seats
-cmd_message -> cmd_govern: answering_seat, governs, is_primary, room_of, seat_above_in, seat_for, whereabouts  # engine -> seats
-cmd_message -> cmd_spawn: local_backends  # engine -> seats
+cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message  # engine -> seats
+cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
 cmd_message -> main: Args  # engine -> top
 cmd_message -> wake: held_because, say  # engine -> seats
-cmd_project -> cmd_govern: Slot, governor_of, is_primary, slots  # store -> seats
+cmd_project -> cmd_govern: Slot, governor_of, slots  # store -> seats
 cmd_project -> cmd_task: Prose, edit_prose, paint_prio  # store -> engine
 cmd_project -> main: Args  # store -> top
 cmd_project -> worklist: home_of_scope  # store -> engine
@@ -68,7 +63,7 @@ cmd_sandbox -> fake: serve_forever  # seats -> top
 cmd_sandbox -> main: Args  # seats -> top
 cmd_spawn -> main: Args  # seats -> top
 cmd_stamp -> main: Args  # seats -> top
-cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, my_pane, say_looking, unname_after_task, worked_line  # engine -> seats
+cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, say_looking, unname_after_task, worked_line  # engine -> seats
 cmd_task -> cmd_resume: thread_for_task  # engine -> seats
 cmd_task -> cmd_spawn: kind_or_default  # engine -> seats
 cmd_task -> main: Args  # engine -> top
@@ -77,9 +72,9 @@ cmd_verifications -> main: Args  # timeline -> top
 cmd_verify -> main: Args  # trees -> top
 cmd_watch -> daemon: a_backend_answered, loud, running  # seats -> top
 cmd_watch -> main: Args, build_stamp  # seats -> top
-cmd_worklist -> cmd_agent: claim_where, my_pane, named_project  # engine -> seats
+cmd_worklist -> cmd_agent: claim_where, named_project  # engine -> seats
 cmd_worklist -> cmd_cost: cost  # engine -> timeline
-cmd_worklist -> cmd_govern: governs, slots, stood_at  # engine -> seats
+cmd_worklist -> cmd_govern: slots  # engine -> seats
 cmd_worklist -> cmd_report: at_last_barrier, declared, dir, gate_done, line, output, report  # engine -> timeline
 cmd_worklist -> main: Args  # engine -> top
 cold -> barrier_run: repo_of, tip_of  # trees -> engine
@@ -89,8 +84,8 @@ cold -> main: Args  # trees -> top
 cold -> worklist: touched  # trees -> engine
 cycle -> agent_commands: SETTLED_AFTER, opencode_finished_at  # engine -> seats
 cycle -> cmd_agent: did_of_seat, fixed_of_seat, notice, ran_of_seat, secs_of_seat  # engine -> seats
-cycle -> cmd_govern: Seat, last_seat, mark_stood_down, occupant, reseat_why, seat_above_in, seat_of_scope, stood_at, vacancy, vacate  # engine -> seats
-cycle -> cmd_spawn: LOCAL_BACKEND_NAMES, end_seat_when_idle, list_root, local_backends, rotate_on_behalf, wait_for_pane  # engine -> seats
+cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
+cycle -> cmd_spawn: end_seat_when_idle, list_root, rotate_on_behalf, wait_for_pane  # engine -> seats
 cycle -> main: Args  # engine -> top
 cycle -> room: Counted, Gate, names  # engine -> seats
 cycle -> wake: messages_held, say, settle_held  # engine -> seats
@@ -104,28 +99,23 @@ disk -> model: Status  # base -> store
 disk -> scratch: find  # base -> store
 disk -> store: Store  # base -> store
 ending -> cmd_attempts: attempts_of  # engine -> timeline
-ending -> cmd_govern: governs  # engine -> seats
 kanban -> main: Args  # surface -> top
-kind_attention -> agent_commands: *, Address, Kind, Ran, Spawn, Spend  # engine -> seats
-kind_data -> agent_commands: *, Address, Kind, Plain, Ran, Spawn  # store -> seats
+kind_attention -> agent_commands: Kind, Spawn  # engine -> seats
+kind_data -> agent_commands: *, Kind, Plain, Spawn  # store -> seats
 kind_data -> place: *, Delivery, Place, Pressing, Result, Seat, submit  # store -> wire
 lapse -> worklist: crossed  # store -> engine
 leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
 leg_seat -> main: Args  # engine -> top
-leg_tree -> cycle: log_line  # trees -> engine
 leg_tree -> legs: *, Leg, State, self  # trees -> engine
-legs -> cmd_agent: my_pane  # engine -> seats
 legs -> cmd_attempts: Attempt, attempts_of, priced  # engine -> timeline
 legs -> main: Args  # engine -> top
 memory -> cmd_spawn: local_backends  # base -> seats
 memory -> place: *, Seat, Seated, State  # base -> wire
 message -> caption: *, Caption, self  # store -> engine
-message -> place_super: alive  # store -> wire
 model -> agent_commands: *  # store -> seats
 model -> barrier: Check, push, text  # store -> engine
 model -> caption: of_task  # store -> engine
 overlap -> panel: PANEL_LABEL, VIEW_LABEL  # trees -> surface
-packet -> cmd_agent: my_pane  # engine -> seats
 packet -> main: Args  # engine -> top
 panel -> daemon: surface_drawing, wsp_panes  # surface -> top
 panel -> main: Args  # surface -> top
@@ -138,36 +128,26 @@ place_super -> hold_close: closes, heard  # wire -> engine
 place_super -> main: Args  # wire -> top
 repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats
-repair -> cmd_govern: *, is_primary  # engine -> seats
+repair -> cmd_govern: *  # engine -> seats
 repair -> cmd_spawn: seat_kind  # engine -> seats
 repair -> leaked_agents: tidy  # engine -> top
 repair -> stuck: Kind, Stall  # engine -> seats
 repair -> wake: owed_to, scopes_owed  # engine -> seats
-resolve -> place: is_agent_id  # store -> wire
-scratch -> cycle: log_line  # store -> engine
 scratch -> leg_tree: row_of  # store -> trees
 scratch -> main: Args  # store -> top
 stage -> cmd_agent: sentence  # engine -> seats
-stage -> cmd_govern: governs, needs_a_person, seat_query  # engine -> seats
-stage -> cmd_spawn: local_backends  # engine -> seats
+stage -> cmd_govern: needs_a_person  # engine -> seats
 stand_down -> cmd_govern: *  # engine -> seats
 stand_down -> wake: owed_to  # engine -> seats
-store -> cmd_govern: is_primary  # store -> seats
 store -> main: build_stamp  # store -> top
-store -> place: new_agent_id  # store -> wire
 store -> worklist: Running  # store -> engine
 story -> main: Args  # surface -> top
 stuck -> main: Args  # seats -> top
 sync -> attention: standing  # wire -> engine
 sync -> cmd_agent: answered_by_machine, learn_sessions, may_reap, task_scope  # wire -> seats
-sync -> cmd_govern: governs, learn_seats, seat_query  # wire -> seats
-throttle -> cycle: log_line  # trees -> engine
+sync -> cmd_govern: learn_seats  # wire -> seats
 throttle -> main: Args  # trees -> top
 timeline -> main: Args  # timeline -> top
-verification -> agent_commands: Ran, Spend  # engine -> seats
-verification -> cmd_agent: my_pane  # engine -> seats
 verification -> cmd_attempts: Row, attempts_of  # engine -> timeline
 verification -> main: Args  # engine -> top
-waiting -> cmd_govern: seat_for  # engine -> seats
-waiting -> cmd_spawn: local_backends  # engine -> seats
 waits -> room: Counted, Gate, working_now  # engine -> seats
