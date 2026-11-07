@@ -227,7 +227,7 @@ impl Flow {
 
     /// The flow of a row by id, read from the lists that are running.
     pub(crate) fn of_task(store: &Store, task: &str) -> Flow {
-        Flow::of(crate::worklist::Running::read(store).of(task).is_some_and(|p| p.run))
+        Flow::of(store.running().of(task).is_some_and(|p| p.run))
     }
 
     /// The `land` row of the banner.
@@ -1668,7 +1668,7 @@ pub(crate) fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> 
     }
     // A barrier check's tree (`wsp-230`) is named for the check and not for a
     // task, and lives in the repository its list is run in.
-    if let Some((list, _)) = crate::barrier::parse_subject(task) {
+    if let Some((list, _)) = util::parse_subject(task) {
         let index = crate::resolve::Index::new(store.projects());
         add(crate::cmd_spawn::list_root(store, &index, list).and_then(|r| toplevel(&util::expand(&r))));
     }
@@ -1739,6 +1739,27 @@ fn locate(store: &Store, args: &Args) -> Result<Where, String> {
         ));
     }
     pick(repos, &task)
+}
+
+/// What this module asks of the run engine above it, which installs the answers at
+/// startup ([`install_engine`]): the trees do not name the engine.
+pub(crate) struct Engine {
+    /// The trees a running list's passed groups left to clear (`worklist::passed_by_running`).
+    pub passed: fn(&Store) -> std::collections::BTreeSet<String>,
+    /// After a status verb: start the steps this may have made due (`cycle::poke_task`).
+    pub poke_task: fn(&Store, &str, &str),
+}
+
+static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
+
+pub(crate) fn install_engine(e: Engine) {
+    let _ = ENGINE.set(e);
+}
+
+/// The installed answers; before any is installed (a unit test) nothing is passed and nothing is poked.
+fn engine() -> &'static Engine {
+    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {} };
+    ENGINE.get().unwrap_or(&NONE)
 }
 
 pub fn checkout(store: &Store, args: &Args) -> i32 {
@@ -1981,7 +2002,7 @@ fn swept(store: &Store, args: &Args) -> i32 {
     // go` has not been run is how the trees that accumulated before any of this
     // existed finally go. Free when nothing is running, which is most of the
     // time — see [`crate::worklist::passed_by_running`].
-    let passed = crate::worklist::passed_by_running(store);
+    let passed = (engine().passed)(store);
     let occupied = Occupied::now(store);
     let busy = |task: &str| -> Option<String> { occupied.of(task, &checkout_dir(&trunk, task)) };
 
@@ -2152,10 +2173,11 @@ pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Who
 /// [`crate::cmd_task::review`] prints one per line it gets — a verb that said
 /// "nothing committed" to every row that correctly had nothing to commit would
 /// be teaching its readers to stop reading it.
-pub(crate) fn outstanding(store: &Store, task: &str) -> Vec<String> {
+///
+/// `by_a_run` and `ready` are the engine's answers (a verifier lands the row;
+/// the commit its newest ready line names), asked by the caller.
+pub(crate) fn outstanding(store: &Store, task: &str, by_a_run: bool, ready: Option<String>) -> Vec<String> {
     let Ok(cwd) = std::env::current_dir() else { return Vec::new() };
-    let by_a_run = crate::worklist::verified_by_a_run(store, task);
-    let ready = store.find_task(task).and_then(|t| crate::repair::ready(&t));
     match pick(candidates(store, &cwd, task), task) {
         Ok(w) => holding(&w, by_a_run, ready.as_deref()),
         // Nothing to say and nothing wrong: a task whose project has no root
@@ -2436,7 +2458,7 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
     let base = git(&w.trunk, &["rev-parse", &format!("{sha}~{}", landed.len())]).map(|b| b.trim().to_string());
     if !sha.is_empty() {
         if let Some(mut t) = store.find_task(&w.task) {
-            let line = format!("{} {sha} on {on}", crate::repair::LANDED);
+            let line = format!("{} {sha} on {on}", crate::log::LANDED);
             if !t.section("Log").is_some_and(|l| l.contains(&line)) {
                 let since = base.as_ref().map(|b| format!(" · since {b}")).unwrap_or_default();
                 t.log(&format!("{line}{since}"));
@@ -2480,7 +2502,7 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     };
 
     // `wsp-134`: a member reviewed before it landed is verified once it has.
-    crate::cycle::poke_task(store, &w.task, "land");
+    (engine().poke_task)(store, &w.task, "land");
     crate::check::after_land(store, &w.task);
 
     if args.json() {

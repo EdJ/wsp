@@ -1,6 +1,3 @@
-# Upward uses the code has today: `from -> to: symbols`, one module pair per line (wsp-400).
-# The layering test (tests/layering.rs) fails on an upward use not here and on a line the code no longer has.
-# This file only shrinks: delete a line or a symbol when the code stops using it; never add one.
 affected -> check: *, Of, Step, captures  # trees -> engine
 after -> main: Args  # engine -> top
 artefact -> cmd_agent: my_pane  # store -> seats
@@ -15,7 +12,6 @@ build_output -> verification: verified  # trees -> engine
 build_output -> worklist: crossed  # trees -> engine
 caption -> main: Args  # engine -> top
 check -> main: Args  # engine -> top
-check_tree -> barrier: parse_subject  # trees -> engine
 check_tree -> check: captures  # trees -> engine
 check_tree -> cmd_sandbox: ancestors, processes  # trees -> seats
 check_tree -> cycle: Fleet, Seats  # trees -> engine
@@ -33,14 +29,10 @@ cmd_attend -> main: Args  # engine -> top
 cmd_brief -> daemon: a_backend_answered, dead, running  # seats -> top
 cmd_brief -> main: Args  # seats -> top
 cmd_burn -> main: Args  # timeline -> top
-cmd_checkout -> barrier: parse_subject  # trees -> engine
 cmd_checkout -> check: Step, TREE_WAIT, Target, TreeLock, affected, after_land, owed, passed, plan, run_all, target  # trees -> engine
 cmd_checkout -> cmd_agent: Whereabouts, locate  # trees -> seats
 cmd_checkout -> cmd_spawn: list_root  # trees -> seats
-cmd_checkout -> cycle: poke_task  # trees -> engine
 cmd_checkout -> main: Args  # trees -> top
-cmd_checkout -> repair: LANDED, ready  # trees -> engine
-cmd_checkout -> worklist: Running, passed_by_running, verified_by_a_run  # trees -> engine
 cmd_cost -> main: Args  # timeline -> top
 cmd_govern -> main: Args  # seats -> top
 cmd_install -> main: Args, stamp_word  # seats -> top
@@ -79,7 +71,6 @@ cmd_worklist -> cmd_report: at_last_barrier, declared, dir, gate_done, line, out
 cmd_worklist -> main: Args  # engine -> top
 cold -> barrier_run: repo_of, tip_of  # trees -> engine
 cold -> check: *, Done, Ran, Step, self  # trees -> engine
-cold -> cycle: launch_out  # trees -> engine
 cold -> main: Args  # trees -> top
 cold -> worklist: touched  # trees -> engine
 cycle -> agent_commands: SETTLED_AFTER  # engine -> seats

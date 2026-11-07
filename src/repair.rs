@@ -113,7 +113,7 @@ const WAITING: &str = "wsp: held while waiting —";
 /// the key for the re-verify is the whole of `wsp-136` item 1: `updated` moves
 /// on any write at all, so a governor's `wsp note` used to buy a fresh verifier
 /// on code nobody had touched.
-pub(crate) const LANDED: &str = "wsp: landed";
+pub(crate) use crate::log::LANDED;
 
 /// The marker in a member's `## Log` saying its work is finished and waits for a
 /// verifier, and the commit it is finished at: `wsp: ready <sha> on <branch>`.
@@ -364,7 +364,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // (`wsp-331`).
     crate::throttle::tidy(store);
     // And a cold build for a tip that has none, while the person is away (`wsp-342`).
-    crate::cold::when_away(store);
+    crate::cold::when_away(store, &crate::cycle::launch_out);
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
     crate::ending::tick(store, seats);

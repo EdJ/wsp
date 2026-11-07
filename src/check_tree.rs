@@ -50,7 +50,7 @@ use crate::util;
 /// exists **and** no task has that id: `parse_subject` alone would read a
 /// project called `x-check`'s task `x-check-012` as list `x`'s twelfth group.
 pub(crate) fn named(store: &Store, name: &str) -> Option<(String, usize)> {
-    let (list, at) = crate::barrier::parse_subject(name)?;
+    let (list, at) = crate::util::parse_subject(name)?;
     if store.task(name).is_some() || store.worklist(list).is_none() {
         return None;
     }

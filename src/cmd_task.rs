@@ -1570,7 +1570,7 @@ pub fn review(store: &Store, args: &Args) -> i32 {
             p.dim("it goes in the log, which is what `wsp show` prints last and what a barrier reads")
         );
         if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
-            for line in crate::cmd_checkout::outstanding(store, &t.id) {
+            for line in outstanding_for(store, &t.id) {
                 eprintln!("     {}", p.dim(&line));
             }
         }
@@ -1655,7 +1655,7 @@ pub fn review(store: &Store, args: &Args) -> i32 {
     // itself and the row that had nothing to land.
     let p = Paint::new();
     if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
-        for line in crate::cmd_checkout::outstanding(store, &t.id) {
+        for line in outstanding_for(store, &t.id) {
             eprintln!("  {}", p.yellow(&line));
         }
         if let Some(line) = crate::check::review_hint(store, &t) {
@@ -3523,6 +3523,14 @@ pub const VERBS: &[crate::verbs::Verb] = &[
         ],
     },
 ];
+
+/// What the tree of `task` still holds, said with the engine's two answers: whether a
+/// run's verifier lands the row, and the commit its newest ready line names.
+fn outstanding_for(store: &Store, task: &str) -> Vec<String> {
+    let by_a_run = crate::worklist::verified_by_a_run(store, task);
+    let ready = store.find_task(task).and_then(|t| crate::repair::ready(&t));
+    crate::cmd_checkout::outstanding(store, task, by_a_run, ready)
+}
 
 #[cfg(test)]
 pub(crate) mod tests {

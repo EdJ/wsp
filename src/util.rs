@@ -1525,3 +1525,9 @@ pub(crate) fn read_source(src: &str) -> std::io::Result<String> {
     }
     Ok(raw)
 }
+
+/// The list and group a barrier check's name (`<list>-check-<n>`) names, if it is one.
+pub(crate) fn parse_subject(name: &str) -> Option<(&str, usize)> {
+    let (list, at) = name.rsplit_once("-check-")?;
+    Some((list, at.parse().ok()?))
+}

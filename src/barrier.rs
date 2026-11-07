@@ -406,8 +406,7 @@ pub(crate) fn subject(list: &str, at: usize) -> String {
 
 /// The list and group a [`subject`] names, if it is one.
 pub(crate) fn parse_subject(name: &str) -> Option<(&str, usize)> {
-    let (list, at) = name.rsplit_once("-check-")?;
-    Some((list, at.parse().ok()?))
+    crate::util::parse_subject(name)
 }
 
 /// Every standing check seat, by pane: the list and the group it is reading.

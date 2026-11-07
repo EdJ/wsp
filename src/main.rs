@@ -503,6 +503,10 @@ fn needs_store(args: &Args) -> bool {
 
 fn main() {
     die_on_broken_pipe();
+    cmd_checkout::install_engine(cmd_checkout::Engine {
+        passed: worklist::passed_by_running,
+        poke_task: cycle::poke_task,
+    });
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Before parsing: what follows `run` is the build tool's own command line,

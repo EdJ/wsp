@@ -10,6 +10,10 @@
 use crate::model::{append_dated, append_dated_in_order, Task, Worklist, WORKLIST_SECTIONS};
 use crate::store::Store;
 
+/// What `wsp land` writes in a task's `## Log` when its branch reaches the trunk
+/// (the full story is on [`crate::repair`]'s use of it).
+pub(crate) const LANDED: &str = "wsp: landed";
+
 /// Append a dated entry to a task's log; the caller saves.
 pub(crate) fn append(t: &mut Task, line: &str) {
     append_dated(&mut t.body, "Log", line);

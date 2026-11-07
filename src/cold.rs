@@ -107,10 +107,10 @@ pub(crate) fn owed(store: &Store, p: &Plan) -> bool {
 }
 
 /// Ask for the cold build of a list that has just closed, once. Nothing waits on it.
-pub(crate) fn at_close(store: &Store, list: &str) {
+pub(crate) fn at_close(store: &Store, list: &str, launch: &dyn Fn(&Store, &[&str])) {
     let Ok(p) = plan_of(store, list, None) else { return };
     if owed(store, &p) {
-        crate::cycle::launch_out(store, &["cold", list]);
+        launch(store, &["cold", list]);
     }
 }
 
@@ -297,7 +297,7 @@ pub(crate) fn away_wants(owed: bool, list_running: bool, away: bool, last: Optio
 
 /// The daemon's tick: build cold for a project whose tip has none while the
 /// person is away (`throttle` auto mode, idle past `away_minutes`).
-pub(crate) fn when_away(store: &Store) {
+pub(crate) fn when_away(store: &Store, launch: &dyn Fn(&Store, &[&str])) {
     if cfg!(test) {
         return;
     }
@@ -322,7 +322,7 @@ pub(crate) fn when_away(store: &Store) {
         }
         let _ = std::fs::create_dir_all(dir_of(store));
         let _ = std::fs::write(&stamp, now.to_string());
-        crate::cycle::launch_out(store, &["cold", &pr.id]);
+        launch(store, &["cold", &pr.id]);
     }
 }
 
