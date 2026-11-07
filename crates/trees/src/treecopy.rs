@@ -30,7 +30,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 
 use serde_json::{json, Value};
 

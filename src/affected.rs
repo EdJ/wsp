@@ -28,7 +28,8 @@
 //! is the same whoever computes it and costs one `git ls-tree`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 
 use crate::check::{Of, Step};
 use crate::cmd_verify::git;

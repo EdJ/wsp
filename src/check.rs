@@ -74,7 +74,8 @@
 pub(crate) use crate::model::project_of;
 pub(crate) use crate::util::{captures, clean_env};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::time::{Duration, Instant};
 
 use crate::cmd_verify::{git, git_ok};
@@ -650,7 +651,6 @@ pub(crate) struct Ran {
 /// Run one step in `dir`, its output to `log`, killed with its process group
 /// at the limit.
 pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
-    use std::os::unix::process::CommandExt;
     let start = Instant::now();
     let failed = |why: String| Ran {
         step: step.clone(),

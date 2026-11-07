@@ -3320,7 +3320,6 @@ pub(crate) fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String
 /// Run `wsp <argv>` detached, under [`END_WHEN_IDLE`], with its output in the
 /// handover log.
 fn when_idle(store: &Store, argv: &[&str]) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -3328,7 +3327,7 @@ fn when_idle(store: &Store, argv: &[&str]) -> Result<(), String> {
         .open(store.handover_log())
         .map_err(|e| format!("{}: {e}", util::contract(&store.handover_log())))?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = wsp_base::calls::Command::new(exe);
     cmd.args(argv)
         .env(END_WHEN_IDLE, "1")
         .env_remove(crate::base::seat::SEAT_ENV)
@@ -4023,7 +4022,6 @@ const ROTATED_BY: &str = "WSP_ROTATED_BY";
 /// pane it is ending. The backend flags this rotation was given are passed on,
 /// so the helper looks where the rotation looked.
 fn arrange_ending(store: &Store, scope: &str, args: &Args) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -4031,7 +4029,7 @@ fn arrange_ending(store: &Store, scope: &str, args: &Args) -> Result<(), String>
         .open(store.handover_log())
         .map_err(|e| format!("{}: {e}", util::contract(&store.handover_log())))?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = wsp_base::calls::Command::new(exe);
     cmd.args(["govern", scope, "--ending"]);
     for flag in ["herdr", "compound", "headless"] {
         if args.has(flag) {
@@ -6380,7 +6378,7 @@ mod tests {
         let tree = env.path("wsp-148");
         std::fs::create_dir_all(&tree).unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let ok = std::process::Command::new("git").arg("-C").arg(dir).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
+            let ok = wsp_base::calls::Command::new("git").arg("-C").arg(dir).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
             assert!(ok.success(), "git {args:?}");
         };
         git(&tree, &["init", "--quiet"]);
@@ -7717,7 +7715,7 @@ mod tests {
             vec!["init", "--quiet", "-b", "master"],
             vec!["commit", "--quiet", "--allow-empty", "-m", "first"],
         ] {
-            let out = std::process::Command::new("git")
+            let out = wsp_base::calls::Command::new("git")
                 .arg("-C")
                 .arg(&root)
                 .args(&argv)

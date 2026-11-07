@@ -129,7 +129,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -2594,7 +2595,7 @@ mod tests {
             let seat = place.open(&Order { label: label.into(), ..Order::default() }).unwrap();
             // The shell under the seat's own group leader, as the supervisor
             // and its pty child are: ended with the group.
-            let mut leader = std::process::Command::new("sh")
+            let mut leader = wsp_base::calls::Command::new("sh")
                 .args(["-c", "sleep 60 & wait"])
                 .process_group(0)
                 .stdin(Stdio::null())

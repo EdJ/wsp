@@ -87,12 +87,11 @@ fn changed(started_as: Option<(u64, u64)>, now: Option<(u64, u64)>) -> Option<(u
 /// to the sync either: this is called at the top of the loop, where the last
 /// one has finished and the next has not begun.
 fn reload(verbose: bool) -> std::io::Error {
-    use std::os::unix::process::CommandExt;
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => return e,
     };
-    let mut c = std::process::Command::new(exe);
+    let mut c = wsp_base::calls::Command::new(exe);
     c.arg("daemon");
     // Carried across deliberately: a daemon that went quiet the first time it
     // reloaded would look exactly like one that had died.
@@ -646,7 +645,7 @@ fn reap_on_term(store: &Store) {
         std::thread::sleep(Duration::from_millis(200));
         if TERMED.load(std::sync::atomic::Ordering::SeqCst) {
             crate::tunnel::reap_masters(&state);
-            std::process::exit(0);
+            wsp_base::calls::exit(0);
         }
     });
 }
@@ -679,6 +678,8 @@ pub(crate) fn dead(state: &Path, running: Option<&[u32]>, backend_up: bool) -> O
 }
 
 pub fn run(store: &Store, verbose: bool) -> i32 {
+    // Its own record is one line per tick (`wsp-481`), not one for the process.
+    wsp_base::calls::quiet();
     if let Some(why) = misdirected(
         std::env::var("HERDR_SESSION").ok().as_deref(),
         std::env::var("HERDR_SOCKET_PATH").ok().as_deref(),
@@ -843,6 +844,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             while rx.try_recv().is_ok() {}
         }
 
+        // `wsp-481`: one line in `calls.jsonl` per pass of this loop, with ms
+        // per phase, so a slow phase shows up by name. The debounce above is a
+        // sleep, not work, and is left out of it.
+        wsp_base::calls::tick_begin();
+        wsp_base::calls::phase("standing");
+
         // Both of the next two checks are here, at the top, because it is the
         // one point in the loop where nothing is half-done: no sync in flight,
         // no store lock held, the debounce already drained. Everything below
@@ -899,6 +906,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // not an event herdr has any way to tell us about, and a tunnel that
         // fell over five minutes ago must not wait for a sidebar hover to be
         // noticed.
+        wsp_base::calls::phase("tunnels");
         let moved = tunnels.tick(store);
         watch_machines(&tunnels, &readers, &far, verbose);
         if verbose && !moved.is_empty() {
@@ -926,6 +934,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // at a time the due check did not make it due for.
         let now = crate::util::epoch_secs();
         let mut attention_moved = false;
+        wsp_base::calls::phase("attention");
         if pass.due(now) {
             // One walk of the store for the whole pass (`wsp-320`): it reads
             // the tasks once per seat, and a `stat` of every task per reading
@@ -972,22 +981,28 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         if repair_pass.due(now) {
             store.steady(|| crate::repair::tick(store, &crate::cycle::Fleet, &mut repair_pass));
             // Answered retro questions plan their list (`wsp-472`); idempotent.
+            wsp_base::calls::phase("retro");
             store.steady(|| crate::retro_series::sweep(store));
         }
 
+        wsp_base::calls::phase("fingerprint");
         let fingerprint = store.fingerprint();
         let store_changed = fingerprint != last_fingerprint;
         last_fingerprint = fingerprint;
 
         let force = last_refresh.elapsed() >= REFRESH;
         if !woken && !store_changed && !force && !attention_moved {
+            wsp_base::calls::tick_end();
             continue;
         }
         if force {
             last_refresh = Instant::now();
         }
 
-        match sync::sync(store, &mut cache, force) {
+        wsp_base::calls::phase("sync");
+        let synced = sync::sync(store, &mut cache, force);
+        wsp_base::calls::tick_end();
+        match synced {
             Ok(r) => {
                 if verbose && (r.workspaces > 0 || r.panes > 0 || r.reaped > 0) {
                     eprintln!(

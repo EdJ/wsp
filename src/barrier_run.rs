@@ -700,7 +700,7 @@ fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet:
     if cfg!(test) {
         return false;
     }
-    std::process::Command::new(exe)
+    wsp_base::calls::Command::new(exe)
         .args(["worklist", "go", list, "--from"])
         .arg(&file)
         .args(["--caption", &caption])
@@ -838,7 +838,7 @@ mod tests {
     }
 
     fn git_run(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        let out = wsp_base::calls::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
@@ -1055,7 +1055,7 @@ mod tests {
         assert_ne!(before.units[0].sha, after.units[0].sha);
         let ran = ran_of(run_unit(&store, &after.units[0], "barrier run 1"));
         assert!(ran.iter().all(|r| r.done == Done::Passed && r.reused.is_none()), "a new commit has no green");
-        let list = std::process::Command::new("git").arg("-C").arg(env.path("repo")).args(["worktree", "list"]).output().unwrap();
+        let list = wsp_base::calls::Command::new("git").arg("-C").arg(env.path("repo")).args(["worktree", "list"]).output().unwrap();
         let list = String::from_utf8_lossy(&list.stdout).into_owned();
         assert_eq!(list.lines().filter(|l| l.contains("/state/barrier/")).count(), 1, "{list}");
         assert_eq!(list.lines().count(), 2, "the repository and the one barrier tree: {list}");

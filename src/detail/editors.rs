@@ -421,7 +421,7 @@ mod tests {
         let slot = std::env::temp_dir().join(format!("wsp-test-slot-{}", std::process::id()));
         let _ = std::fs::remove_file(&slot);
         let cmd = editor_loop("details", "/bin/true", &slot.display().to_string());
-        let out = std::process::Command::new("/bin/sh")
+        let out = wsp_base::calls::Command::new("/bin/sh")
             .arg("-c")
             .arg(&cmd)
             .output()
@@ -451,7 +451,7 @@ mod tests {
         std::fs::set_permissions(&stub, perms).unwrap();
 
         let cmd = editor_loop("details", &stub.display().to_string(), &slot.display().to_string());
-        let out = std::process::Command::new("/bin/sh").arg("-c").arg(&cmd).output().expect("sh");
+        let out = wsp_base::calls::Command::new("/bin/sh").arg("-c").arg(&cmd).output().expect("sh");
         assert!(out.status.success());
         let ran = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(ran.contains("--details"), "never opened the section it started on: {ran}");
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn the_editor_loop_is_valid_shell() {
         let l = editor_loop("overview", "'/usr/bin/wsp' 'edit' 't-1'", "'/tmp/s'");
-        let out = std::process::Command::new("sh")
+        let out = wsp_base::calls::Command::new("sh")
             .arg("-n")
             .arg("-c")
             .arg(&l)
@@ -628,7 +628,7 @@ mod tests {
             &fake,
             &crate::util::shell_quote(&slot.display().to_string()),
         );
-        let out = std::process::Command::new("sh")
+        let out = wsp_base::calls::Command::new("sh")
             .arg("-c")
             .arg(&script)
             .output()

@@ -163,7 +163,7 @@ fn verdict(hooks: Option<&Path>, common: Option<&Path>, existing: Option<&str>) 
 /// `core.hooksPath` — so what comes back is where git will actually look, which
 /// is the only path worth writing to.
 fn git(repo: &Path, args: &[&str]) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = wsp_base::calls::Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -236,7 +236,7 @@ fn supported(version: &str) -> bool {
 /// at a shell or work stranded before the guard existed. Either way every agent
 /// in every worktree can see it and one of them can `pop` it.
 pub fn stashed(repo: &Path) -> Vec<String> {
-    let Ok(out) = std::process::Command::new("git")
+    let Ok(out) = wsp_base::calls::Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["stash", "list"])
@@ -341,7 +341,7 @@ pub fn health(
 
 /// This machine's git version, for [`health`].
 pub fn git_version() -> String {
-    std::process::Command::new("git")
+    wsp_base::calls::Command::new("git")
         .arg("--version")
         .output()
         .ok()
@@ -525,7 +525,7 @@ mod tests {
     // `pop` corrupts the reflog.
 
     fn run(dir: &Path, args: &[&str]) -> std::process::Output {
-        std::process::Command::new("git")
+        wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)

@@ -351,7 +351,7 @@ mod tests {
     use crate::model::{Group, Project, Task, Worklist};
 
     fn git_run(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        let out = wsp_base::calls::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 

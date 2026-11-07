@@ -536,7 +536,7 @@ struct Stamp {
 
 /// `wsp 0.1.0 (c52f3c8+dirty)` → `Stamp`. `None` if it did not answer at all.
 fn ask(bin: &Path) -> Option<Stamp> {
-    let out = std::process::Command::new(bin)
+    let out = wsp_base::calls::Command::new(bin)
         .arg("--version")
         .stderr(std::process::Stdio::null())
         .output()
@@ -1347,7 +1347,7 @@ fn pi_extension(bin: &Path, dst: &Path, dry: bool, json_out: bool, p: &util::Pai
     }
     let path = crate::place_super::pi_extension_path();
     let shown = util::contract(&path);
-    let carried = std::process::Command::new(bin)
+    let carried = wsp_base::calls::Command::new(bin)
         .args(["agent", "pi-extension"])
         .stderr(std::process::Stdio::null())
         .output()
@@ -2033,7 +2033,7 @@ mod tests {
         let repo = dir.join("repo");
         fs::create_dir_all(repo.join("src")).unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = wsp_base::calls::Command::new("git")
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
@@ -2167,7 +2167,7 @@ mod tests {
         let repo = dir.join("repo");
         fs::create_dir_all(&repo).unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = wsp_base::calls::Command::new("git")
                 .arg("-C")
                 .arg(&repo)
                 .args(args)

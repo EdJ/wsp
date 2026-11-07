@@ -15,7 +15,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::time::{Duration, Instant};
 
 use crate::model::Machine;

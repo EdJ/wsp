@@ -2910,7 +2910,7 @@ mod tests {
 
     /// A pid that has exited, for a waiter that was killed.
     fn a_dead_pid() -> u32 {
-        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let mut c = wsp_base::calls::Command::new("true").spawn().unwrap();
         let pid = c.id();
         c.wait().unwrap();
         pid

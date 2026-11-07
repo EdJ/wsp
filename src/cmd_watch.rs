@@ -6388,7 +6388,7 @@ mod tests {
     /// a fabricated number is a guess and a guess here would be a seat that
     /// reads `Gone` or reads `Working` depending on what the machine is doing.
     fn dead_pid() -> u32 {
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child = wsp_base::calls::Command::new("/bin/sh")
             .args(["-c", "exit 0"])
             .spawn()
             .expect("a shell");

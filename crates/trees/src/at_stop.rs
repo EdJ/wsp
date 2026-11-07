@@ -28,7 +28,8 @@
 //! business (`dev.sh stop` does).
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::time::{Duration, Instant};
 
 use crate::store::Store;
@@ -64,7 +65,6 @@ pub struct Ran {
 /// tail. A file and not a pipe: a command that leaves a daemon running holds a
 /// pipe's write end open, and reading to the end would wait on the daemon.
 pub fn run_command(dir: &Path, command: &str, limit: Duration) -> Ran {
-    use std::os::unix::process::CommandExt;
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let log = std::env::temp_dir().join(format!(
         "wsp-at-stop-{}-{}.log",

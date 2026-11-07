@@ -8,7 +8,8 @@
 //! A verb is added here and nowhere else: its key, its prompt, its entry in
 //! the map, and the command it becomes.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::json;

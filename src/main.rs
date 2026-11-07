@@ -42,6 +42,7 @@ mod cmd_agent;
 mod cmd_attempts;
 mod cmd_brief;
 mod cmd_burn;
+mod cmd_calls;
 mod cmd_cost;
 mod cmd_report;
 mod cmd_role;
@@ -460,7 +461,7 @@ fn signpost(verb: &str) -> &'static [&'static str] {
 /// with "no store — run wsp init first" on exactly the machine it was written
 /// for. A seam that a gate three files away can close is not a seam.
 fn needs_store(args: &Args) -> bool {
-    if matches!(args.cmd.as_str(), "init" | "doctor" | "throttle") {
+    if matches!(args.cmd.as_str(), "init" | "doctor" | "throttle" | "calls") {
         return false;
     }
     if args.cmd == "agent" && matches!(args.rest.first().map(String::as_str), Some("kinds" | "pi-extension")) {
@@ -494,17 +495,22 @@ fn main() {
     // flags and all, and `Args` would take `--release` for one of ours.
     if let [verb, run, rest @ ..] = argv.as_slice() {
         if verb == "throttle" && run == "run" {
-            std::process::exit(throttle::run_raw(rest));
+            wsp_base::calls::begin("throttle", "run", Vec::new());
+            wsp_base::calls::exit(throttle::run_raw(rest));
         }
     }
     let args = Args::parse(argv);
+    // `wsp-481`: what this call costs, written when it exits. See `calls`.
+    cmd_calls::begin(&args);
 
     if args.has("version") || args.cmd == "version" {
         println!("wsp {}", version());
+        wsp_base::calls::set_code(0);
         return;
     }
     if args.cmd.is_empty() || args.cmd == "help" || args.has("help") {
         help();
+        wsp_base::calls::set_code(0);
         return;
     }
 
@@ -513,7 +519,7 @@ fn main() {
     if args.given("dry-run") {
         let (reads, verb) = dry_run(&args);
         if !reads {
-            std::process::exit(refuse_dry_run(&verb));
+            wsp_base::calls::exit(refuse_dry_run(&verb));
         }
     }
 
@@ -521,7 +527,7 @@ fn main() {
     // written into the record has to be refused before the record is opened.
     // See [`swallowed_flag`].
     if let Some((l, name, value)) = swallowed_flag(&args) {
-        std::process::exit(refuse_swallowed(l, &name, value.as_deref()));
+        wsp_base::calls::exit(refuse_swallowed(l, &name, value.as_deref()));
     }
 
     if args.has("no-commit") {
@@ -534,7 +540,7 @@ fn main() {
             "wsp: no store at {}. Run `wsp init` first.",
             util::contract(&store.root)
         );
-        std::process::exit(2);
+        wsp_base::calls::exit(2);
     }
 
     // A call the executor's shim forwarded: its tree verbs sync the agent's work
@@ -542,12 +548,12 @@ fn main() {
     match treecopy::from_executor(&store, &args.cmd) {
         Some(Err(why)) => {
             eprintln!("wsp: {why}");
-            std::process::exit(1);
+            wsp_base::calls::exit(1);
         }
         Some(Ok(tree)) => {
             if let Err(e) = std::env::set_current_dir(&tree) {
                 eprintln!("wsp: cannot enter {}: {e}", util::contract(&tree));
-                std::process::exit(1);
+                wsp_base::calls::exit(1);
             }
         }
         None => {}
@@ -560,7 +566,7 @@ fn main() {
             2
         }
     };
-    std::process::exit(misheard(&args, code));
+    wsp_base::calls::exit(misheard(&args, code));
 }
 
 /// Say what the command line gave and wsp did not hear, and fail if there was
@@ -1042,7 +1048,7 @@ mod tests {
     /// tarball is allowed to have no stamp, and `build.rs` says so.
     #[test]
     fn a_binary_built_in_a_checkout_knows_which_commit_it_is() {
-        let head = std::process::Command::new("git")
+        let head = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(env!("CARGO_MANIFEST_DIR"))
             .args(["rev-parse", "--short", "HEAD"])

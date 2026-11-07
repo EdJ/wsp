@@ -1922,7 +1922,7 @@ mod tests {
     use super::*;
     use crate::model::{Project, Worklist};
     use std::path::Path;
-    use std::process::Command;
+    use wsp_base::calls::Command;
 
     /// [`Store::running`] answers again from its memo while no list has moved,
     /// and derives afresh the moment one has — including a list written by

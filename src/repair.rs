@@ -210,17 +210,21 @@ pub(crate) fn finish_skipped_out(store: &Store) {
 /// and starts nothing twice.
 pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     pass.last = Some(util::epoch_secs());
+    wsp_base::calls::phase("repair:frozen");
     say_frozen_screens(store, seats);
     // **Not about a running list at all**, and first for that reason: an answer
     // held for an asker that was mid-turn (`wsp-204`) is owed whatever any list
     // is doing, and an asker sitting idle on an answered question is the hand
     // relay `wsp-144` exists to remove. See [`crate::cmd_message::deliver_held`].
+    wsp_base::calls::phase("repair:held");
     for line in crate::cmd_message::deliver_held(store, seats) {
         stamp(store, &line);
     }
     // And what is held for a post nobody will sit in again: a done list's
     // (`wsp-216`). Its own lines, through `cycle.log`.
+    wsp_base::calls::phase("repair:done-lists-held");
     crate::cycle::hand_on_what_done_lists_held(store);
+    wsp_base::calls::phase("cycle");
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         // **A landing nobody recorded is written down before the step**, so
         // the pass the step opens on that member reads the commit. After it,
@@ -250,9 +254,11 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         landed_for_an_idle_seat(store, seats, &w, at, &pos);
     }
     // A reason a send-back could not type to its pane, typed once the seat reads idle.
+    wsp_base::calls::phase("repair:tells");
     retry_undelivered_tells(store, seats);
     // And a leg whose seat has stopped without closing it (`wsp-372`): told
     // once, then closed from its baton or flagged to the person.
+    wsp_base::calls::phase("closing");
     crate::closing::tick(store, seats);
     // A row whose legs ran out with the last one skipped, by a record written
     // by hand: no seat is left to type `wsp review` (`wsp-360`).
@@ -280,6 +286,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // reading one is `position` plus every task in the store, so the cost of this
     // loop was growing by a list per run, every tick, to find nothing. The
     // claims are read once for the whole loop.
+    wsp_base::calls::phase("barrier");
     let mut claimed = None;
     for w in store.worklists().into_iter().filter(|w| {
         matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked | WorklistStatus::Done)
@@ -293,6 +300,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // And every verifier whose verdict is recorded, whichever group it read.
     // `wsp-158` — a verifier's turn ends with its own verdict and it was then
     // left sitting in its seat holding a claim for the rest of the night.
+    wsp_base::calls::phase("ending");
     let verdicts = crate::cycle::verdicts_recorded(store);
     if !verdicts.is_empty() {
         stamp(store, &format!(
@@ -327,6 +335,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     }
     // And every barrier check whose verdict is in (`wsp-230`): it holds no
     // claim either, so the claim-keyed ending above never sees one.
+    wsp_base::calls::phase("ending:checks");
     let mut ended = crate::cycle::checks_finished(store, seats);
     ended.extend(crate::cycle::checks_orphaned(store, seats));
     if !ended.is_empty() {
@@ -347,30 +356,40 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // And their trees, read off the disk rather than off the endings above, so
     // a tree whose seat went some other way — or before this — goes too.
     // `wsp-289`, after compound's disk filled with 56 of them.
+    wsp_base::calls::phase("sweep:check-trees");
     crate::check_tree::tidy(store, &ended);
     // And a finished leg's (wsp-297): the same read off the disk.
     crate::leg_tree::tidy(store, &[ended.clone(), ended_legs].concat());
     // And the build output of a landed row nobody is working in any more
     // (`wsp-327`): `wsp done` takes the tree, and rows wait at review for days.
+    wsp_base::calls::phase("sweep:build-output");
     crate::build_output::tidy(store);
     // And whether the disk those trees are on is running out.
     // And the scratch of rows that have closed (`wsp-373`).
+    wsp_base::calls::phase("sweep:scratch");
     crate::scratch::tidy(store);
     // And agents running for a store no daemon keeps (`wsp-333`).
+    wsp_base::calls::phase("sweep:leaked-agents");
     crate::leaked_agents::tidy(store);
+    wsp_base::calls::phase("sweep:disk");
     crate::disk::tidy(store);
     // And the build holds of processes that died, and the load warning's edges
     // (`wsp-331`).
+    wsp_base::calls::phase("sweep:throttle");
     crate::throttle::tidy(store);
     // And a cold build for a tip that has none, while the person is away (`wsp-342`).
+    wsp_base::calls::phase("sweep:cold");
     crate::cold::when_away(store, &crate::cycle::launch_out);
     // And every member whose verification holds — `wsp-193`, which has its own
     // never-end rules and its own once-only record. See [`crate::ending`].
+    wsp_base::calls::phase("ending:verification");
     crate::ending::tick(store, seats);
     // And a governor seat with nothing left to govern (`wsp-337`).
+    wsp_base::calls::phase("stand-down");
     crate::stand_down::tick(store, seats);
     // And text typed at a governor's or a member's prompt and never sent
     // (`wsp-386`): counted here, drawn by `wsp wip`.
+    wsp_base::calls::phase("repair:unsent");
     unsent_tick(store, seats);
     // And a first work order that started no turn (`wsp-420`).
     first_order_tick(store, seats);
@@ -383,6 +402,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // counted it twice and seated on the first tick — the two ticks `wsp-148`
     // asks for were spent by one pass. Found by running it, in a sandbox, and the
     // two log lines carried the same second on them.
+    wsp_base::calls::phase("seats");
     for (scope, trigger) in seat_scopes(store) {
         seat_vacant(store, seats, &scope, &trigger);
     }
@@ -391,6 +411,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // judged against seats that have already stopped. A list it starts is a
     // running list from the next tick's step and governor seating on. One
     // list a pass (`wsp-384`).
+    wsp_base::calls::phase("pickup");
     crate::pickup::tick(store);
 }
 
@@ -1338,7 +1359,7 @@ pub(crate) fn tell_member(store: &Store, id: &str, text: &str) {
         return crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), text.to_string())));
     }
     let Ok(exe) = std::env::current_exe() else { return };
-    let child = std::process::Command::new(exe)
+    let child = wsp_base::calls::Command::new(exe)
         .args(["tell", id, "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -1816,7 +1837,7 @@ fn land_for_the_run(id: &str) -> Result<(), String> {
         });
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let out = std::process::Command::new(exe)
+    let out = wsp_base::calls::Command::new(exe)
         .args(["land", id, "--for-run"])
         .current_dir("/")
         .stdin(std::process::Stdio::null())
@@ -1913,7 +1934,7 @@ pub(crate) mod tests {
     use crate::cycle::tests::{ENDED, MEMBER_TOLD, RESEATED, SPAWNED, TOLD};
     use crate::model::{Group, WorklistStatus};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use wsp_base::calls::Command;
 
     thread_local! {
         /// The members the run landed for itself on this thread (`wsp-328`).

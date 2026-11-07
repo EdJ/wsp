@@ -98,7 +98,8 @@
 //! ending signals its group — with its output in `cycle.log` in the state
 //! directory, since nobody is reading the pane it started from.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 
 use crate::model::{Group, Policy, Status, Task, Worklist, WorklistStatus};
 use crate::place::State;
@@ -398,7 +399,6 @@ fn launch(store: &Store, argv: &[&str]) {
     if cfg!(test) || std::env::var_os(OFF).is_some() {
         return;
     }
-    use std::os::unix::process::CommandExt;
     let Ok(exe) = std::env::current_exe() else { return };
     let log = store.state_file("cycle.log");
     let Ok(out) = std::fs::OpenOptions::new().create(true).append(true).open(&log) else { return };
@@ -1139,7 +1139,7 @@ fn tell_barrier(store: &Store, w: &Worklist, check: &str, members: &[String]) {
         return;
     }
     let Ok(exe) = std::env::current_exe() else { return };
-    let mut child = match std::process::Command::new(exe)
+    let mut child = match wsp_base::calls::Command::new(exe)
         .args(["tell", check, "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -5427,7 +5427,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = wsp_base::calls::Command::new("git")
                 .arg("-C").arg(&repo).args(args)
                 .env_remove("GIT_INDEX_FILE")
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
@@ -5477,7 +5477,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = wsp_base::calls::Command::new("git")
                 .arg("-C").arg(dir).args(args)
                 .env_remove("GIT_INDEX_FILE")
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
@@ -5520,7 +5520,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(passes_on(&store, "m-1").len(), 1);
         let repo = tree.parent().unwrap().parent().unwrap().to_path_buf();
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).env_remove("GIT_INDEX_FILE")
+            let out = wsp_base::calls::Command::new("git").arg("-C").arg(dir).args(args).env_remove("GIT_INDEX_FILE")
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
                 .output().unwrap();
             assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -5550,7 +5550,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let (_env, store, tree, w) = ready_tree("rebase-clean", "g", "h");
         let before = crate::repair::ready(&store.find_task("m-1").unwrap()).unwrap();
         step(&store, &w, &Blind);
-        let head = String::from_utf8(std::process::Command::new("git").arg("-C").arg(&tree).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap();
+        let head = String::from_utf8(wsp_base::calls::Command::new("git").arg("-C").arg(&tree).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap();
         let head = head.trim();
         assert!(!crate::verification::same_commit(head, &before), "the branch moved");
         let m = store.find_task("m-1").unwrap();
@@ -5598,7 +5598,7 @@ fn only_a_working_screen_is_ever_overruled() {
     impl Run {
         fn commit_on_trunk(&self, file: &str, text: &str) {
             let git = |args: &[&str]| {
-                let out = std::process::Command::new("git").arg("-C").arg(&self.repo).args(args).env_remove("GIT_INDEX_FILE")
+                let out = wsp_base::calls::Command::new("git").arg("-C").arg(&self.repo).args(args).env_remove("GIT_INDEX_FILE")
                     .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
                     .output().unwrap();
                 assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -5611,7 +5611,7 @@ fn only_a_working_screen_is_ever_overruled() {
             git(&["commit", "-q", "-m", "the trunk moved again"]);
         }
         fn trunk(&self) -> String {
-            let out = std::process::Command::new("git").arg("-C").arg(&self.repo).args(["rev-parse", "master"]).output().unwrap();
+            let out = wsp_base::calls::Command::new("git").arg("-C").arg(&self.repo).args(["rev-parse", "master"]).output().unwrap();
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         }
         fn verdict(&self, flag: &str) {
@@ -5727,7 +5727,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(r.trunk(), moved);
         assert_eq!(r.latest().state, crate::verification::State::Blocks);
         assert!(r.latest().text.contains("does not apply"), "{}", r.latest().text);
-        let status = std::process::Command::new("git").arg("-C").arg(&r.tree).args(["status", "--porcelain"]).output().unwrap();
+        let status = wsp_base::calls::Command::new("git").arg("-C").arg(&r.tree).args(["status", "--porcelain"]).output().unwrap();
         assert!(status.stdout.is_empty(), "the tree is not left mid-rebase");
         let _ = spawned();
     }
@@ -5743,7 +5743,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(m.section("Log").unwrap().contains("does not apply"), "{}", m.section("Log").unwrap());
         assert!(passes_on(&store, "m-1").is_empty(), "no verifier pass");
         assert!(spawned().iter().all(|(label, _)| !label.contains("verifying")), "no verifier agent");
-        let st = String::from_utf8(std::process::Command::new("git").arg("-C").arg(&tree).args(["status", "--porcelain"]).output().unwrap().stdout).unwrap();
+        let st = String::from_utf8(wsp_base::calls::Command::new("git").arg("-C").arg(&tree).args(["status", "--porcelain"]).output().unwrap().stdout).unwrap();
         assert!(st.trim().is_empty(), "the rebase was aborted: {st}");
     }
 

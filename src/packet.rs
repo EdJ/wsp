@@ -716,7 +716,7 @@ mod tests {
                 "#!/bin/sh\ncat >/dev/null\ncase \"$*\" in\n*\"--depth meta\"*) echo '{{\"est_code_lines\":10,\"precedents\":[],\"likely\":[{likely}],\"recipe\":null}}';;\n*) printf 'CONTEXT PACK  compound@abc  built from 1 finished tasks  kind: x\\nlikely files  src/a.rs (identifier)\\n';;\nesac\n"
             );
             std::fs::write(&script, body).unwrap();
-            let _ = std::process::Command::new("chmod").arg("+x").arg(&script).status();
+            let _ = wsp_base::calls::Command::new("chmod").arg("+x").arg(&script).status();
             std::env::set_var("WSP_PACK_BIN", &script);
             FakePack(script)
         }
@@ -729,7 +729,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        let out = wsp_base::calls::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 

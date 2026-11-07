@@ -5663,7 +5663,7 @@ fn index_loss(staged: &str, disk: &str) -> u64 {
 /// listing and would count the whole file as loss.
 fn tree_index_loss(root: &std::path::Path) -> Option<u64> {
     let git = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git")
+        let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(root)
             .args(args)
@@ -5728,7 +5728,7 @@ fn uncommitted_warning(loose: &[String]) -> Option<String> {
 /// commit; now it waits, correctly, for the person who made it, and the only
 /// thing missing is anybody being told.
 fn store_uncommitted(root: &std::path::Path) -> Vec<String> {
-    let Ok(out) = std::process::Command::new("git")
+    let Ok(out) = wsp_base::calls::Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["status", "--porcelain"])
@@ -10465,7 +10465,7 @@ mod tests {
                 .as_u64()
                 .expect("a live pid") as u32,
         );
-        let mut child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut child = wsp_base::calls::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
         child.wait().unwrap();
         let mut rec: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();

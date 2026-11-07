@@ -218,7 +218,7 @@ fn seated(backends: &[&dyn Place]) -> Option<Vec<u32>> {
 /// What is running with `dir` as its working directory, other than this process
 /// and its parents, and other than a seat's of `backends`.
 fn running_among(dir: &Path, backends: &[&dyn Place]) -> Vec<u32> {
-    let Ok(out) = std::process::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output() else { return Vec::new() };
+    let Ok(out) = wsp_base::calls::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output() else { return Vec::new() };
     let Some(seats) = seated(backends) else { return Vec::new() };
     let dir = util::real(&dir.display().to_string());
     let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
@@ -256,7 +256,7 @@ pub fn live_seat_pids() -> Option<Vec<u32>> {
 /// outcome wanted.
 pub fn signal(sig: &str, pids: &[u32]) {
     if !pids.is_empty() {
-        let _ = std::process::Command::new("kill")
+        let _ = wsp_base::calls::Command::new("kill")
             .arg(sig)
             .args(pids.iter().map(|p| p.to_string()))
             .stdout(std::process::Stdio::null())
@@ -324,7 +324,7 @@ pub enum Verdict {
 
 /// Every process as `(pid, ppid, executable)`, from `ps -o comm=`.
 pub fn exes() -> Vec<(u32, u32, String)> {
-    let Ok(out) = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid=,comm="]).output() else { return Vec::new() };
+    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,comm="]).output() else { return Vec::new() };
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
@@ -504,7 +504,7 @@ pub fn left_in_finished(
                 matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done) && !staged(&t)
             })
     };
-    let out = std::process::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output().ok()?;
+    let out = wsp_base::calls::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output().ok()?;
     let lsof = String::from_utf8_lossy(&out.stdout);
     let found = finished_trees(&lsof, &finished, &keep);
     // The executables are read only for processes there are to sort (`wsp-480`).
@@ -517,7 +517,7 @@ pub fn left_in_finished(
 /// The resident memory of `pids` in kilobytes.
 pub fn rss_kb(pids: &[u32]) -> u64 {
     let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let Ok(out) = std::process::Command::new("ps").args(["-o", "rss=", "-p", &list]).output() else { return 0 };
+    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-o", "rss=", "-p", &list]).output() else { return 0 };
     String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<u64>().ok()).sum()
 }
 
@@ -689,7 +689,7 @@ pub fn tidy(store: &Store, ended: &[String]) {
 mod tests {
     use super::*;
     use crate::model::{Group, Project, Worklist};
-    use std::process::Command;
+    use wsp_base::calls::Command;
 
     fn run(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
@@ -947,7 +947,7 @@ mod tests {
         let place = Compound::at(root.join("seats"));
         let seat: Seat = place.open(&Order { label: "member".into(), ..Order::default() }).unwrap();
         let stood = |group: bool| {
-            let mut c = std::process::Command::new("sleep");
+            let mut c = wsp_base::calls::Command::new("sleep");
             c.arg("60").current_dir(&tree).stdin(std::process::Stdio::null());
             if group {
                 c.process_group(0);

@@ -352,7 +352,7 @@ impl Shells {
         if roots.is_empty() {
             return Shells::default();
         }
-        match std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,command="]).output() {
+        match wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,command="]).output() {
             Ok(out) => Shells::of(&String::from_utf8_lossy(&out.stdout), &roots),
             // Not "waiting": a `ps` that did not run is no evidence of a shell,
             // and the cost of reading none is a seat told, which is a sentence.

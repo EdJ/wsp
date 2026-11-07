@@ -495,7 +495,7 @@ fn tree_of(store: &Store, seat: &str) -> (Option<String>, Tree) {
         None => Tree::NotGit,
         Some(changed) if !changed.is_empty() => Tree::Dirty(changed.len()),
         Some(_) => {
-            let head = std::process::Command::new("git")
+            let head = wsp_base::calls::Command::new("git")
                 .args(["-C", &dir, "rev-parse", "--short", "HEAD"])
                 .output()
                 .ok()
@@ -853,7 +853,7 @@ mod tests {
         let tree = env.home().join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         for args in [vec!["init", "-q"], vec!["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c"]] {
-            let ok = std::process::Command::new("git").arg("-C").arg(&tree).args(&args).status().unwrap();
+            let ok = wsp_base::calls::Command::new("git").arg("-C").arg(&tree).args(&args).status().unwrap();
             assert!(ok.success());
         }
         store.set_binding("cpd-1", json!({ "task_id": "m-1", "pane_id": "cpd-1", "leg": "build", "cwd": tree.display().to_string() }));
@@ -941,7 +941,7 @@ mod tests {
         let (store, tree) = staged(&env);
         write_baton(&store, "pointers\n");
         std::fs::write(tree.join("f"), "x").unwrap();
-        std::process::Command::new("git").arg("-C").arg(&tree).args(["add", "f"]).status().unwrap();
+        wsp_base::calls::Command::new("git").arg("-C").arg(&tree).args(["add", "f"]).status().unwrap();
         let fake = Fake(RefCell::new(None), true);
         tick_at(&store, &fake, util::epoch_secs());
         assert!(running(&store), "a dirty tree is not closed over");
@@ -979,7 +979,7 @@ mod tests {
         let env = util::isolated("closing-refused");
         let (store, tree) = staged(&env);
         std::fs::write(tree.join("f"), "x").unwrap();
-        std::process::Command::new("git").arg("-C").arg(&tree).args(["add", "f"]).status().unwrap();
+        wsp_base::calls::Command::new("git").arg("-C").arg(&tree).args(["add", "f"]).status().unwrap();
         let args = crate::Args::synth("leg", &["done", "m-1"], &[("caption", "done")]);
         let rc = crate::leg_seat::cmd_done(&store, &args, Some("cpd-1"));
         assert_eq!(rc, 1, "a refused close exits non-zero");
@@ -1091,7 +1091,7 @@ mod tests {
         let tree = env.home().join(name);
         std::fs::create_dir_all(&tree).unwrap();
         for args in [vec!["init", "-q"], vec!["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c"]] {
-            assert!(std::process::Command::new("git").arg("-C").arg(&tree).args(&args).status().unwrap().success());
+            assert!(wsp_base::calls::Command::new("git").arg("-C").arg(&tree).args(&args).status().unwrap().success());
         }
         tree
     }
@@ -1209,7 +1209,7 @@ mod tests {
         let (store, tree2) = staged_member(&env, 3600);
         put(&store, "m-2", Kind::Member, "Done\n");
         std::fs::write(tree2.join("f"), "x").unwrap();
-        std::process::Command::new("git").arg("-C").arg(&tree2).args(["add", "f"]).status().unwrap();
+        wsp_base::calls::Command::new("git").arg("-C").arg(&tree2).args(["add", "f"]).status().unwrap();
         member_tick(&store, Some(State::Gone));
         assert_ne!(member_status(&store), Status::Review, "a dirty tree is not reviewed over");
         let raised = raised_texts(&store);

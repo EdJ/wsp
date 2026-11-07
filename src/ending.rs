@@ -963,11 +963,11 @@ mod tests {
             &["add", "-A"],
             &["commit", "-q", "-m", "store"],
         ] {
-            let ok = std::process::Command::new("git").arg("-C").arg(&store.root).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
+            let ok = wsp_base::calls::Command::new("git").arg("-C").arg(&store.root).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
             assert!(ok.success(), "git {args:?}");
         }
         let loose = || {
-            let out = std::process::Command::new("git")
+            let out = wsp_base::calls::Command::new("git")
                 .arg("-C")
                 .arg(&store.root)
                 .args(["status", "--porcelain"])
@@ -1567,14 +1567,14 @@ mod tests {
         let (a, b) = crate::place_super::one_ps(|| {
             let a = crate::place_super::tree_of(me);
             // A child started inside the scope is not in the table the scope holds.
-            let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+            let mut child = wsp_base::calls::Command::new("sleep").arg("5").spawn().unwrap();
             let b = crate::place_super::tree_of(me);
             let _ = child.kill();
             let _ = child.wait();
             (a, b)
         });
         assert_eq!(a, b, "the second look in the scope is the first one's table");
-        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let mut child = wsp_base::calls::Command::new("sleep").arg("5").spawn().unwrap();
         let after = crate::place_super::tree_of(me);
         let _ = child.kill();
         let _ = child.wait();
@@ -1593,7 +1593,7 @@ mod tests {
     #[test]
     fn a_child_that_outlives_its_root_is_still_named_and_still_running() {
         use std::os::unix::process::CommandExt;
-        let mut root = std::process::Command::new("sh")
+        let mut root = wsp_base::calls::Command::new("sh")
             .args(["-c", "sleep 30 & echo $!; wait"])
             .stdout(std::process::Stdio::piped())
             .process_group(0)
@@ -1610,7 +1610,7 @@ mod tests {
         let after = crate::place_super::tree_of(root.id());
         let running = crate::cycle::Fleet.running(&tree);
         // By pid, never by pattern — this test's own sleep and nothing else.
-        let _ = std::process::Command::new("kill").arg(child.to_string()).status();
+        let _ = wsp_base::calls::Command::new("kill").arg(child.to_string()).status();
         assert!(after.contains(&child), "still in the group with its parent gone: {after:?}");
         assert_eq!(running, vec![child], "the seat's root is gone and its agent is not");
     }
@@ -1650,11 +1650,11 @@ mod tests {
             let tree = root.join(crate::cmd_checkout::WORKTREES).join(id);
             std::fs::create_dir_all(&tree).unwrap();
             let mut cmd = if id == "f-4" {
-                let mut c = std::process::Command::new("sleep");
+                let mut c = wsp_base::calls::Command::new("sleep");
                 c.arg("60");
                 c
             } else {
-                let mut c = std::process::Command::new("sh");
+                let mut c = wsp_base::calls::Command::new("sh");
                 c.args(["-c", "sleep 60; true"]);
                 c
             };
@@ -1674,7 +1674,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             ended.push((*id, child.try_wait().unwrap().is_some()));
             // The group, for the `sleep` under the shell.
-            let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+            let _ = wsp_base::calls::Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
             let _ = child.kill();
             let _ = child.wait();
         }

@@ -2,6 +2,7 @@
 //! no state and depends on nothing in the workspace; see `MAP.md`.
 
 pub mod base;
+pub mod calls;
 pub mod choices;
 pub mod fm;
 pub mod input;

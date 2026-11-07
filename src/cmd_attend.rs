@@ -24,7 +24,8 @@
 //! unattended model that ran them would have its attempt judged by itself.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 
 use crate::agent_commands::{self};
 use crate::check;

@@ -1651,7 +1651,7 @@ mod tests {
     // ---- `wsp-341`: the hold lands the row ------------------------------------
 
     fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        let out = wsp_base::calls::Command::new("git")
             .arg("-C").arg(dir).args(args)
             .env_remove("GIT_INDEX_FILE")
             .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")

@@ -2708,7 +2708,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use wsp_base::calls::Command;
 
     #[test]
     fn a_land_on_a_row_still_being_worked_names_wsp_review_last() {

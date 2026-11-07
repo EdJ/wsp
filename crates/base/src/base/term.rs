@@ -1,7 +1,8 @@
 //! The terminal, asked through `stty`.
 
 use std::fs::File;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use crate::calls::Command;
 
 pub fn stty(args: &[&str]) {
     if let Ok(tty) = File::open("/dev/tty") {

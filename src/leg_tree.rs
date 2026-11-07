@@ -597,7 +597,7 @@ pub(crate) fn say(store: &Store, tree: Tree) {
 mod tests {
     use super::*;
     use crate::model::Project;
-    use std::process::Command;
+    use wsp_base::calls::Command;
 
     fn run(dir: &Path, args: &[&str]) {
         let out = Command::new("git")

@@ -141,7 +141,7 @@ impl Run {
 
 /// When process `pid` started, as `ps` says it, or `None` where there is none.
 fn start_of(pid: u32) -> Result<Option<String>, ()> {
-    let out = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
+    let out = wsp_base::calls::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
     ps_says(out.status.code(), &out.stdout)
 }
 

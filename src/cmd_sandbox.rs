@@ -85,7 +85,8 @@
 //! [`crate::daemon`]. See robustness-021.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};

@@ -142,7 +142,7 @@ pub(crate) fn read(state: &Path, agents: &[Seated], bindings: &BTreeMap<String, 
             backends.iter().find_map(|b| b.root(&seat)).map(|pid| (s.clone(), pid))
         })
         .collect();
-    match std::process::Command::new("ps").args(["-A", "-E", "-o", "pid=,ppid=,rss=,command="]).output() {
+    match wsp_base::calls::Command::new("ps").args(["-A", "-E", "-o", "pid=,ppid=,rss=,command="]).output() {
         Ok(out) if out.status.success() => of(&String::from_utf8_lossy(&out.stdout), &seats, &roots, warn_kb),
         _ => IdleMemory { warn_kb, unread: seats.len(), ..IdleMemory::default() },
     }

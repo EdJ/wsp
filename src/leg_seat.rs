@@ -191,7 +191,7 @@ pub(crate) fn order_line(task: &str, leg: &str, fetch: bool, last: bool) -> Stri
 
 /// Tracked changes in a tree, or `None` when it is not a git work tree.
 pub(crate) fn dirty(dir: &str) -> Option<Vec<String>> {
-    let out = std::process::Command::new("git")
+    let out = wsp_base::calls::Command::new("git")
         .args(["-C", dir, "status", "--porcelain", "--untracked-files=no"])
         .output()
         .ok()?;
@@ -742,7 +742,7 @@ mod tests {
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = wsp_base::calls::Command::new("git")
                 .args(["-C", dir.to_str().unwrap()])
                 .args(args)
                 .env_remove("GIT_INDEX_FILE")
@@ -791,7 +791,7 @@ mod tests {
         let repo = env.home().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
-            assert!(std::process::Command::new("git")
+            assert!(wsp_base::calls::Command::new("git")
                 .args(["-C", repo.to_str().unwrap()])
                 .args(args)
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")

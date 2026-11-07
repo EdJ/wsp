@@ -1,6 +1,6 @@
 //! The processes on this machine, as `ps` lists them.
 
-use std::process::Command;
+use crate::calls::Command;
 
 /// Every process this machine is running, as `(pid, ppid, the rest of the
 /// line)` — where "the rest" includes the environment.

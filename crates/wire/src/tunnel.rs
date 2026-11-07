@@ -20,7 +20,8 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crate::model::Machine;

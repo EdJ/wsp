@@ -64,7 +64,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -948,7 +949,7 @@ fn wait_for(ctx: &Ctx, what: &str, attempt: &mut dyn FnMut() -> Taken, lifted: O
 }
 
 fn finish(mut cmd: Command, nice: Option<i32>) -> i32 {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::os::unix::process::ExitStatusExt;
     extern "C" {
         fn setpriority(which: i32, who: u32, prio: i32) -> i32;
         fn signal(sig: i32, handler: usize) -> usize;

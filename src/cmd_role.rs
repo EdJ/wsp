@@ -345,7 +345,7 @@ pub(crate) fn parse_ps(line: &str) -> Option<Proc> {
 }
 
 fn processes() -> Vec<Proc> {
-    let Ok(out) = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,pcpu=,time=,command="]).output() else {
+    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,pcpu=,time=,command="]).output() else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout).lines().filter_map(parse_ps).collect()
@@ -571,7 +571,7 @@ fn observe(store: &Store, procs: &[Proc], now: i64) -> BTreeMap<u32, u64> {
 }
 
 fn signal(sig: &str, pid: u32) {
-    let _ = std::process::Command::new("kill").args([sig, &pid.to_string()]).status();
+    let _ = wsp_base::calls::Command::new("kill").args([sig, &pid.to_string()]).status();
 }
 
 /// Why `role` may not run `wsp reap` (`list` is the read-only form), if it may
@@ -613,7 +613,7 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
         return refuse(store, "reap", &role, "no backend answered, so whose processes are whose is not known — nothing stopped");
     };
     let procs = processes();
-    let cwds = std::process::Command::new("lsof")
+    let cwds = wsp_base::calls::Command::new("lsof")
         .args(["-d", "cwd", "-Fpn"])
         .output()
         .map(|o| parse_cwds(&String::from_utf8_lossy(&o.stdout)))

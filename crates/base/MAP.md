@@ -6,6 +6,7 @@ workspace; owns no state. Every other component may use it, and it uses none of 
 ## Holds
 
 - `src/util.rs` — paths, time, ids, `Paint`, `Clock`/`Dial`, env guards (`env_lock`, `isolated`), small string helpers
+- `src/calls.rs` — what a wsp call costs (`wsp-481`): the `Command` every spawn goes through, the `calls.jsonl` record and its reader (`docs/calls.md`)
 - `src/fm.rs` — the YAML-frontmatter subset
 - `src/input.rs` — key and line input parsing
 - `src/risk.rs` — command risk rules (`RULES`)

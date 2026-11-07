@@ -3339,7 +3339,8 @@ impl Store {
         if !hook.is_file() {
             return;
         }
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
+use wsp_base::calls::Command;
         if let Ok(mut child) = Command::new(&hook)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -3477,7 +3478,7 @@ impl Store {
     /// `Some` when git said yes. Output is captured rather than inherited so a
     /// commit never prints over whatever the command is saying.
     fn git(&self, args: &[&OsStr]) -> Option<std::process::Output> {
-        let out = std::process::Command::new("git")
+        let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(&self.root)
             // The commit procedure has agents working through a private index.
@@ -3494,7 +3495,8 @@ impl Store {
         if self.root.join(".git").exists() {
             return;
         }
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
+use wsp_base::calls::Command;
         let _ = Command::new("git")
             .arg("-C")
             .arg(&self.root)
@@ -4448,7 +4450,7 @@ mod tests {
     }
 
     fn git(store: &Store, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(&store.root)
             .args(args)

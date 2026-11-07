@@ -123,7 +123,7 @@ pub(crate) fn sentence(act: &Act) -> String {
 }
 
 fn signal(pid: u32, sig: &str) {
-    let _ = std::process::Command::new("kill")
+    let _ = wsp_base::calls::Command::new("kill")
         .arg(format!("-{sig}"))
         .arg(pid.to_string())
         .stdout(std::process::Stdio::null())

@@ -185,7 +185,7 @@ fn tree_of(cwd: &str) -> String {
     if cwd.is_empty() {
         return String::new();
     }
-    std::process::Command::new("git")
+    wsp_base::calls::Command::new("git")
         .args(["-C", cwd, "rev-parse", "--show-toplevel"])
         .output()
         .ok()

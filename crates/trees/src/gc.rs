@@ -18,7 +18,8 @@
 //! two-week grace — plain `git gc`, never `prune --expire=now`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::time::Duration;
 
 /// git's own `gc.auto` default: past this many loose objects it wants to pack.

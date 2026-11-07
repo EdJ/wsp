@@ -267,7 +267,7 @@ pub(crate) fn react_fixture(store: &Store) -> String {
     std::fs::create_dir_all(repo.join("web/src/pane")).unwrap();
     std::fs::create_dir_all(repo.join("web/scripts")).unwrap();
     let run = |a: &[&str]| {
-        let o = std::process::Command::new("git").arg("-C").arg(&repo).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap();
+        let o = wsp_base::calls::Command::new("git").arg("-C").arg(&repo).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap();
         assert!(o.status.success(), "{a:?}: {}", String::from_utf8_lossy(&o.stderr));
     };
     run(&["init", "-q", "-b", "master"]);
@@ -399,7 +399,7 @@ mod tests {
         std::fs::write(dir.join("web/src/a.ts"), "1").unwrap();
         std::fs::write(dir.join("b.rs"), "1").unwrap();
         let run = |a: &[&str]| {
-            std::process::Command::new("git").arg("-C").arg(&dir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap();
+            wsp_base::calls::Command::new("git").arg("-C").arg(&dir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap();
         };
         run(&["init", "-q"]);
         run(&["add", "."]);

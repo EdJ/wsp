@@ -135,7 +135,7 @@ pub(crate) fn tidy(store: &Store) {
 mod tests {
     use super::*;
     use crate::model::{Project, Task};
-    use std::process::Command;
+    use wsp_base::calls::Command;
 
     fn run(dir: &Path, args: &[&str]) {
         let out = Command::new("git")

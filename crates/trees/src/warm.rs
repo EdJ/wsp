@@ -170,7 +170,7 @@ where
 /// running in it has stopped. Best effort: a leftover is only disk.
 fn remove_when_gone(path: &Path) {
     let script = format!("while kill -0 {} 2>/dev/null; do sleep 1; done; rm -rf \"$1\"", std::process::id());
-    let _ = std::process::Command::new("sh")
+    let _ = wsp_base::calls::Command::new("sh")
         .args(["-c", &script, "sh"])
         .arg(path)
         .stdin(std::process::Stdio::null())

@@ -1358,7 +1358,7 @@ fn respawn(argv: &[String], json: bool) -> (String, i32) {
         return (String::new(), 0);
     }
     let Ok(exe) = std::env::current_exe() else { return ("no wsp binary to run".to_string(), 1) };
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = wsp_base::calls::Command::new(exe);
     cmd.args(argv).stdin(std::process::Stdio::null());
     if json {
         cmd.stdout(std::process::Stdio::null());
@@ -1437,7 +1437,7 @@ pub(crate) fn deliver(store: &Store, id: &str, line: &str) -> bool {
         return true;
     }
     let Ok(exe) = std::env::current_exe() else { return false };
-    let mut child = match std::process::Command::new(exe)
+    let mut child = match wsp_base::calls::Command::new(exe)
         .args(["tell", id, "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -3030,7 +3030,7 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
 
 fn launch_editor(path: &std::path::Path) -> i32 {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    match std::process::Command::new(&editor).arg(path).status() {
+    match wsp_base::calls::Command::new(&editor).arg(path).status() {
         Ok(s) => s.code().unwrap_or(0),
         Err(e) => {
             eprintln!("wsp: cannot launch {editor}: {e}");
@@ -3608,7 +3608,7 @@ pub(crate) mod tests {
     }
 
     fn git_at(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -4513,7 +4513,7 @@ pub(crate) mod tests {
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = wsp_base::calls::Command::new("git")
                 .arg("-C")
                 .arg(&repo)
                 .args(args)

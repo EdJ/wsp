@@ -7777,7 +7777,7 @@ mod tests {
     }
 
     fn git_run(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)

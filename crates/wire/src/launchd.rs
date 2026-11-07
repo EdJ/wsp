@@ -76,7 +76,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use wsp_base::calls::Command;
 use std::time::Duration;
 
 use crate::util;

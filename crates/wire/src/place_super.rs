@@ -185,9 +185,9 @@ use crate::util::alive;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use wsp_base::calls::Command;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -2217,7 +2217,7 @@ mod tests {
             .unwrap()
             .flatten()
             .any(|e| e.file_name().to_string_lossy().starts_with(".gone-"));
-        let root = std::process::Command::new("id").arg("-u").output().is_ok_and(|o| o.stdout == b"0\n");
+        let root = wsp_base::calls::Command::new("id").arg("-u").output().is_ok_and(|o| o.stdout == b"0\n");
         assert!(aside || root, "kept under a dot-name");
         let _ = fs::remove_dir_all(&base);
     }

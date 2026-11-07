@@ -95,7 +95,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use wsp_base::calls::Command;
 
 /// How many warm trees a repository gets.
 ///

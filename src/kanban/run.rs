@@ -57,8 +57,7 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     // pty and its place in the layout all survive.
     if code == RELOAD {
         if let Ok(exe) = std::env::current_exe() {
-            use std::os::unix::process::CommandExt;
-            let mut c = std::process::Command::new(exe);
+            let mut c = wsp_base::calls::Command::new(exe);
             c.arg("kanban");
             if let Some(name) = args.rest.first() {
                 c.arg(name);

@@ -1,7 +1,8 @@
 //! Git, asked from a directory, and the trunk and worktree names the rest hang from.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use crate::calls::Command;
 
 use crate::util;
 

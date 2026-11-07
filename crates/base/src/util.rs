@@ -748,7 +748,7 @@ pub fn hostname() -> String {
     static ASKED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ASKED
         .get_or_init(|| {
-            std::process::Command::new("hostname")
+            crate::calls::Command::new("hostname")
                 .output()
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -1162,7 +1162,7 @@ pub fn captures(glob: &str, path: &str) -> Option<Vec<String>> {
 }
 
 /// The environment a check's commands get: the caller's, less wsp's own.
-pub fn clean_env(cmd: &mut std::process::Command) {
+pub fn clean_env(cmd: &mut crate::calls::Command) {
     for (k, _) in std::env::vars() {
         if k.starts_with("WSP_") || k.starts_with("HERDR_") || k == "GIT_INDEX_FILE" {
             cmd.env_remove(k);
@@ -1375,7 +1375,7 @@ mod tests {
     /// exactly right in a test, which runs once and can afford the truth.
     #[test]
     fn the_offset_we_read_out_of_libc_is_the_one_the_system_reports() {
-        let out = match std::process::Command::new("date").arg("+%z").output() {
+        let out = match crate::calls::Command::new("date").arg("+%z").output() {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             // No `date` on the box is not a claim about this code.
             _ => return,
@@ -1447,7 +1447,7 @@ mod tests {
     #[test]
     fn a_test_that_hangs_fails_within_its_limit() {
         let started = Instant::now();
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
+        let out = crate::calls::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "util::tests::hangs_on_purpose", "--ignored", "--test-threads=1"])
             .env("WSP_TEST_LIMIT_SECS", "2")
             .stdin(std::process::Stdio::null())
@@ -1538,7 +1538,7 @@ pub fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
         return std::collections::BTreeSet::new();
     }
     let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
-    let out = match std::process::Command::new("ps").args(["-o", "pid=,state=", "-p", &list]).output() {
+    let out = match crate::calls::Command::new("ps").args(["-o", "pid=,state=", "-p", &list]).output() {
         Ok(o) => o,
         // Not an empty set: `ps` failing to run is not evidence that every agent
         // on this machine has stopped, and a caller that reaped on the strength

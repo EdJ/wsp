@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::process::Command;
+use wsp_base::calls::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -607,7 +607,6 @@ pub fn run(store: &Store, full: bool) -> i32 {
         // pty and its place in the layout all survive, and nothing has to
         // reattach.
         if let Ok(exe) = std::env::current_exe() {
-            use std::os::unix::process::CommandExt;
             let mut c = Command::new(exe);
             c.arg("panel");
             // The fullscreen panel comes back as itself. Without this a reload

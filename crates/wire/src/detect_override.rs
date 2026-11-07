@@ -184,7 +184,7 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
 /// and every field this module wants is about the manifest rather than the
 /// screen. ~130ms, and only ever run for an agent an override was found for.
 pub fn ask(agent: &str) -> Option<Live> {
-    let out = std::process::Command::new(crate::herdr::herdr_bin())
+    let out = wsp_base::calls::Command::new(crate::herdr::herdr_bin())
         .args(["agent", "explain", "--file", "/dev/null", "--agent", agent, "--json"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
