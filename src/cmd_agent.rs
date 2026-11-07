@@ -1515,13 +1515,24 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     }
 
     let how = crate::agent_commands::of(&row.agent.kind);
-    let sent = Sent::new(&what, &what, &seat, &needle, &text, args);
+    let sent = Sent::new(&addressee_id(store, &needle, &what), &what, &seat, &needle, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
             return twice(&sent, ago, &p);
         }
     }
     delivered(store, how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &text), &sent)
+}
+
+/// The addressee of a direct tell as an id — the task's id, or the seat or pane
+/// as the person named it — and not the display string [`target`] makes of it
+/// (`wsp-491 — <title>`), so the line the tell leaves in cycle.log names the
+/// same thing the wake path's does.
+fn addressee_id(store: &Store, needle: &str, what: &str) -> String {
+    if what.starts_with("pane ") {
+        return needle.to_string();
+    }
+    store.find_task(needle).map(|t| t.id).unwrap_or_else(|| needle.to_string())
 }
 
 /// One sentence on its way to one pane: everything both `tell` verbs need to
@@ -1736,6 +1747,11 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
             1
         }
         Err(e) => {
+            // The supervisor's own answer after its retries: the wake path's
+            // line for it, so a failed direct tell is not only on stderr.
+            if let Refusal::Failed(why) = &e {
+                crate::store::log_line(store, &format!("told {target}: delivery failed — {why}"));
+            }
             eprintln!("wsp: {what} was not told: {e}");
             1
         }
@@ -7091,14 +7107,16 @@ mod tests {
     #[test]
     fn an_acknowledged_direct_tell_is_told_in_cycle_log() {
         let (_env, store) = scratch("acked-tell");
-        let sent = |id: &str| Sent {
-            target: "wsp-491".into(),
-            what: "wsp-491".into(),
-            pane: "w1:p1".into(),
-            peek: String::new(),
-            chars: 2,
-            id: id.into(),
-            json: true,
+        // Built the way `tell` builds it: a task needle resolved through
+        // `target`, whose display string is `id — title`.
+        let task = crate::model::Task::new("wsp-490 probe: throwaway compound seat, reporting back", "wsp-491");
+        store.save_task(&task).unwrap();
+        let args = crate::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
+        let sent = |text: &str| {
+            let t = store.find_task("wsp-491").unwrap();
+            let what = format!("{} — {}", t.id, util::truncate(&t.title, 44));
+            assert!(what.len() > 10, "the display string carries the title: {what}");
+            Sent::new(&addressee_id(&store, "wsp-491", &what), &what, "cpd-1", "wsp-491", text, &args)
         };
         crate::store::SAID.with(|s| s.borrow_mut().clear());
         assert_eq!(delivered(&store, Ok(Delivery::Started), &sent("a")), 0);
@@ -7108,6 +7126,24 @@ mod tests {
         assert_eq!(said, vec!["told wsp-491: delivered, acknowledged by the seat".to_string()]);
         let file = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
         assert!(file.contains("told wsp-491: delivered, acknowledged by the seat"), "{file}");
+    }
+
+    /// A direct tell the seat's supervisor gave up on is in cycle.log as the
+    /// wake path words it, and one nobody took is not a supervisor failure.
+    #[test]
+    fn a_failed_direct_tell_is_told_in_cycle_log() {
+        let (_env, store) = scratch("failed-tell");
+        let args = crate::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
+        let sent = Sent::new("wsp-491", "wsp-491 — probe", "cpd-1", "wsp-491", "hi", &args);
+        crate::store::SAID.with(|s| s.borrow_mut().clear());
+        assert_eq!(delivered(&store, Err(Refusal::Failed("cpd-1: no turn after 4 tries".into())), &sent), 1);
+        let said = crate::store::SAID.with(|s| s.borrow().clone());
+        assert_eq!(said, vec!["told wsp-491: delivery failed — cpd-1: no turn after 4 tries".to_string()]);
+        let file = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
+        assert!(file.contains("told wsp-491: delivery failed — cpd-1: no turn after 4 tries"), "{file}");
+        crate::store::SAID.with(|s| s.borrow_mut().clear());
+        assert_eq!(delivered(&store, Err(Refusal::NotTaken), &sent), 1);
+        assert!(crate::store::SAID.with(|s| s.borrow().is_empty()));
     }
 
     /// The row's own line, `wsp add "-p" -p demo`: the first `-p` takes the
