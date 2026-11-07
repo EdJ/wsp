@@ -95,7 +95,7 @@ cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 
 | component | modules |
 |---|---|
 | `base` | `util`, `fm`, `input`, `risk`, `disk`, `memory`, `choices` |
-| `store` | `model`, `store`, `resolve`, `message`, `lapse`, `artefact`, `kind_data`, `sharing`, `scratch`, `cmd_project`, `cmd_migrate`, `cmd_mandate` |
+| `store` | `model`, `store`, `resolve`, `message`, `lapse`, `artefact`, `kind_data`, `sharing`, `scratch`, `cmd_project`, `cmd_migrate`, `cmd_mandate`, `testkit` |
 | `wire` | `herdr`, `place`, `place_herdr`, `place_compound`, `place_super`, `tunnel`, `far`, `sync`, `launchd`, `detect_override` |
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `build_output`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `cold`, `leg_tree`, `affected`, `at_stop`, `gc` |
 | `engine` | `caption`, `stage`, `history`, `after`, `worklist`, `cycle`, `barrier`, `barrier_run`, `barrier_replay`, `verification`, `check`, `did`, `closing`, `ending`, `repair`, `split`, `starts`, `stand_down`, `untaken`, `waiting`, `legs`, `leg_seat`, `cmd_worklist`, `cmd_task`, `packet`, `packet_gen`, `verifier_packet`, `attention`, `kind_attention`, `cmd_attend`, `cmd_message`, `hold`, `hold_close`, `pickup`, `waits`, `scope` |
