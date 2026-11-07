@@ -5480,6 +5480,14 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     fn run_ready(tag: &str, checks: &str, member_file: &str, trunk_file: &str) -> Run {
+        // The land a hold performs reruns checks through the engine's answers, which `main` installs.
+        crate::cmd_checkout::install_engine(crate::cmd_checkout::Engine {
+            passed: |_| Default::default(),
+            poke_task: |_, _, _| {},
+            runs: |_, _| false,
+            after_land: crate::check::after_land,
+            rerun: crate::check::rerun,
+        });
         let (env, store, tree, w) = ready_tree(tag, member_file, trunk_file);
         let ran = env.path("ran.log");
         let mut p = store.project("p").unwrap();
