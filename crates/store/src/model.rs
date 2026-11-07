@@ -2540,6 +2540,10 @@ pub fn crossed(groups: &[Group]) -> usize {
     groups.iter().rposition(|g| !g.verdict.trim().is_empty()).map_or(0, |i| i + 1)
 }
 
+pub fn project_of(t: &Task) -> Option<String> {
+    t.project.clone().filter(|p| !p.is_empty()).or_else(|| t.id.rsplit_once('-').map(|(p, _)| p.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

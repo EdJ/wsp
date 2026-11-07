@@ -76,7 +76,7 @@ pub(crate) fn run_command(dir: &Path, command: &str, limit: Duration) -> Ran {
     let Ok(err) = out.try_clone() else { return not_started("could not share the log".into()) };
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command).current_dir(dir).stdin(Stdio::null()).stdout(out).stderr(err).process_group(0);
-    crate::check::clean_env(&mut cmd);
+    crate::util::clean_env(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -150,7 +150,7 @@ fn command_for(store: &Store, repo: &Path) -> Option<String> {
 /// Whether the project of `t` declares an `at_stop:`, and so its seat may have
 /// servers of its own that only the teardown stops (`wsp-430`).
 pub(crate) fn declared(store: &Store, t: &crate::model::Task) -> bool {
-    let mut at = crate::check::project_of(t);
+    let mut at = crate::model::project_of(t);
     while let Some(id) = at.take() {
         let Some(p) = store.project(&id) else { return false };
         if !p.at_stop.trim().is_empty() {

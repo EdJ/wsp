@@ -1674,6 +1674,14 @@ mod tests {
     }
 
     fn ground(tag: &str, checks: &str, member: &[(&str, &str)], trunk: &[(&str, &str)]) -> Ground {
+        // The land a hold performs reruns checks through the engine's answers, which `main` installs.
+        crate::cmd_checkout::install_engine(crate::cmd_checkout::Engine {
+            passed: |_| Default::default(),
+            poke_task: |_, _, _| {},
+            runs: |_, _| false,
+            after_land: crate::check::after_land,
+            rerun: crate::check::rerun,
+        });
         let env = util::isolated(&format!("hold-{tag}"));
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -1855,11 +1863,11 @@ mod tests {
         let head = git_t(&g.tree, &["rev-parse", "HEAD"]);
         let pulled = vec!["src/a.txt".to_string()];
         let ours = vec!["m.txt".to_string()];
-        let rerun = |id: &str| crate::cmd_checkout::rerun_steps(&g.store, id, &head, &base, &pulled, &ours);
+        let rerun = |id: &str| crate::check::rerun_steps(&g.store, id, &head, &base, &pulled, &ours);
 
         let steps = rerun("m-1").expect("a plannable row");
         assert_eq!(steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["src"]);
-        let none = crate::cmd_checkout::rerun_steps(&g.store, "m-1", &head, &base, &["other.txt".to_string()], &ours);
+        let none = crate::check::rerun_steps(&g.store, "m-1", &head, &base, &["other.txt".to_string()], &ours);
         assert_eq!(none.expect("planned").len(), 0, "none affected is an empty answer");
 
         let mut t = g.member();

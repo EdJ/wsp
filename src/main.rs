@@ -483,6 +483,8 @@ fn main() {
         passed: worklist::passed_by_running,
         poke_task: cycle::poke_task,
         runs: |store, task| worklist::Running::read(store).of(task).is_some_and(|p| p.run),
+        after_land: check::after_land,
+        rerun: check::rerun,
     });
 
     place::install_above(place::Above {

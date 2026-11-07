@@ -1104,6 +1104,72 @@ pub fn row_of(name: &str) -> &str {
     name.split_once('.').map_or(name, |(row, _)| row)
 }
 
+/// What each `*` of `glob` stood for in `path`, or `None` when it does not name
+/// it. `*` and `?` stay inside a path segment, `**` is any number of whole
+/// segments, and a glob ending in `/` is everything under that directory. A
+/// rule's command names the captures `{1}`, `{2}`: `crates/*/**` with `cargo
+/// test -p {1}` is one crate's tests.
+pub fn captures(glob: &str, path: &str) -> Option<Vec<String>> {
+    fn seg(p: &[char], s: &[char], caps: &mut Vec<String>) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                for n in 0..=s.len() {
+                    caps.push(s[..n].iter().collect());
+                    if seg(&p[1..], &s[n..], caps) {
+                        return true;
+                    }
+                    caps.pop();
+                }
+                false
+            }
+            (Some('?'), Some(_)) => seg(&p[1..], &s[1..], caps),
+            (Some(a), Some(b)) if a == b => seg(&p[1..], &s[1..], caps),
+            _ => false,
+        }
+    }
+    fn segs(p: &[&str], s: &[&str], caps: &mut Vec<String>) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some(&"**") => {
+                for k in 0..=s.len() {
+                    let kept = caps.len();
+                    if segs(&p[1..], &s[k..], caps) {
+                        return true;
+                    }
+                    caps.truncate(kept);
+                }
+                false
+            }
+            Some(g) => {
+                let kept = caps.len();
+                let ok = !s.is_empty()
+                    && seg(&g.chars().collect::<Vec<_>>(), &s[0].chars().collect::<Vec<_>>(), caps)
+                    && segs(&p[1..], &s[1..], caps);
+                if !ok {
+                    caps.truncate(kept);
+                }
+                ok
+            }
+        }
+    }
+    let glob = glob.trim_start_matches("./");
+    let glob = if glob.ends_with('/') { format!("{glob}**") } else { glob.to_string() };
+    let p: Vec<&str> = glob.split('/').collect();
+    let s: Vec<&str> = path.split('/').collect();
+    let mut caps = Vec::new();
+    segs(&p, &s, &mut caps).then_some(caps)
+}
+
+/// The environment a check's commands get: the caller's, less wsp's own.
+pub fn clean_env(cmd: &mut std::process::Command) {
+    for (k, _) in std::env::vars() {
+        if k.starts_with("WSP_") || k.starts_with("HERDR_") || k == "GIT_INDEX_FILE" {
+            cmd.env_remove(k);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

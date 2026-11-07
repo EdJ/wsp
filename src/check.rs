@@ -71,6 +71,8 @@
 //! say, and a member returned to review at the same commit has been answered
 //! by a person. `wsp check <task>` by hand runs it again whenever asked.
 
+pub(crate) use crate::model::project_of;
+pub(crate) use crate::util::{captures, clean_env};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -309,63 +311,6 @@ fn matches(glob: &str, path: &str) -> bool {
     captures(glob, path).is_some()
 }
 
-/// What each `*` of `glob` stood for in `path`, or `None` when it does not name
-/// it. `*` and `?` stay inside a path segment, `**` is any number of whole
-/// segments, and a glob ending in `/` is everything under that directory. A
-/// rule's command names the captures `{1}`, `{2}`: `crates/*/**` with `cargo
-/// test -p {1}` is one crate's tests.
-pub(crate) fn captures(glob: &str, path: &str) -> Option<Vec<String>> {
-    fn seg(p: &[char], s: &[char], caps: &mut Vec<String>) -> bool {
-        match (p.first(), s.first()) {
-            (None, None) => true,
-            (Some('*'), _) => {
-                for n in 0..=s.len() {
-                    caps.push(s[..n].iter().collect());
-                    if seg(&p[1..], &s[n..], caps) {
-                        return true;
-                    }
-                    caps.pop();
-                }
-                false
-            }
-            (Some('?'), Some(_)) => seg(&p[1..], &s[1..], caps),
-            (Some(a), Some(b)) if a == b => seg(&p[1..], &s[1..], caps),
-            _ => false,
-        }
-    }
-    fn segs(p: &[&str], s: &[&str], caps: &mut Vec<String>) -> bool {
-        match p.first() {
-            None => s.is_empty(),
-            Some(&"**") => {
-                for k in 0..=s.len() {
-                    let kept = caps.len();
-                    if segs(&p[1..], &s[k..], caps) {
-                        return true;
-                    }
-                    caps.truncate(kept);
-                }
-                false
-            }
-            Some(g) => {
-                let kept = caps.len();
-                let ok = !s.is_empty()
-                    && seg(&g.chars().collect::<Vec<_>>(), &s[0].chars().collect::<Vec<_>>(), caps)
-                    && segs(&p[1..], &s[1..], caps);
-                if !ok {
-                    caps.truncate(kept);
-                }
-                ok
-            }
-        }
-    }
-    let glob = glob.trim_start_matches("./");
-    let glob = if glob.ends_with('/') { format!("{glob}**") } else { glob.to_string() };
-    let p: Vec<&str> = glob.split('/').collect();
-    let s: Vec<&str> = path.split('/').collect();
-    let mut caps = Vec::new();
-    segs(&p, &s, &mut caps).then_some(caps)
-}
-
 /// Whether a capture is safe to put in a shell command: a filename is
 /// somebody's text, and `$(…)` in one must not run.
 fn plain(c: &str) -> bool {
@@ -502,10 +447,6 @@ fn since_of(t: &Task) -> Option<String> {
     let after = line.split(" since ").nth(1)?;
     let sha = after.split_whitespace().next()?;
     (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
-}
-
-pub(crate) fn project_of(t: &Task) -> Option<String> {
-    t.project.clone().filter(|p| !p.is_empty()).or_else(|| t.id.rsplit_once('-').map(|(p, _)| p.to_string()))
 }
 
 // ---- where, and at what ----------------------------------------------------
@@ -704,15 +645,6 @@ pub(crate) struct Ran {
     pub first: Option<(String, String)>,
     /// The green this step was answered by, when it did not run.
     pub reused: Option<Green>,
-}
-
-/// The environment a check's commands get: the caller's, less wsp's own.
-pub(crate) fn clean_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars() {
-        if k.starts_with("WSP_") || k.starts_with("HERDR_") || k == "GIT_INDEX_FILE" {
-            cmd.env_remove(k);
-        }
-    }
 }
 
 /// Run one step in `dir`, its output to `log`, killed with its process group
@@ -1717,6 +1649,62 @@ pub(crate) fn review_hint(store: &Store, t: &Task) -> Option<String> {
             id = t.id
         )
     })
+}
+
+/// The checks a rebase onto a moved trunk can have affected. A rebase pulled the
+/// trunk in, so what it can have broken is owed a check: a check that cannot be
+/// planned is a land that checked nothing, and only an empty answer — planned,
+/// and none of it affected — may skip the run.
+pub(crate) fn rerun_steps(
+    store: &Store,
+    task: &str,
+    new_head: &str,
+    old_base: &str,
+    pulled_in: &[String],
+    ours: &[String],
+) -> Result<Vec<Step>, String> {
+    let t = store.find_task(task).ok_or_else(|| format!("{task} is not in the store"))?;
+    let tg = target(store, &t, Some(new_head))?;
+    let tg = Target { since: Some(old_base.to_string()), ..tg };
+    Ok(affected(&plan(store, &t, &tg, Some(new_head)).steps, pulled_in, ours))
+}
+
+/// The rerun a land performs in `dir` after its rebase onto a moved trunk: the
+/// checks [`rerun_steps`] names, under the tree lock, reusing greens.
+pub(crate) fn rerun(
+    store: &Store,
+    task: &str,
+    dir: &Path,
+    new_head: &str,
+    old_base: &str,
+    pulled_in: &[String],
+    ours: &[String],
+) -> crate::cmd_checkout::Rerun {
+    use crate::cmd_checkout::Rerun;
+    let steps = match rerun_steps(store, task, new_head, old_base, pulled_in, ours) {
+        Ok(steps) => steps,
+        Err(why) => return Rerun::Unplanned(why),
+    };
+    if steps.is_empty() {
+        return Rerun::Nothing;
+    }
+    let lockdir = store.state_file("checks").join(format!("{task}-tree"));
+    let _ = std::fs::create_dir_all(&lockdir);
+    let lock = match TreeLock::take(lockdir.join("lock"), TREE_WAIT) {
+        Ok(l) => l,
+        Err(why) => return Rerun::NoLock(why.to_string()),
+    };
+    let greens = store
+        .find_task(task)
+        .and_then(|t| target(store, &t, Some(new_head)).ok())
+        .map(|tg| crate::greens::Greens::open(store, &tg.project, &tg.repo));
+    let reuse = greens.as_ref().map(|g| crate::greens::Reuse { greens: g, sha: new_head, env: crate::greens::Env::Warm, who: task });
+    let ran = run_all(dir, &steps, &lockdir.join("land.log"), reuse.as_ref(), |_| {});
+    drop(lock);
+    if !passed(&ran) {
+        return Rerun::Failed(owed(&ran, new_head));
+    }
+    Rerun::Ran(steps.iter().map(|s| s.name.clone()).collect())
 }
 
 /// After `wsp land`: start the run for a row that no list will gate.

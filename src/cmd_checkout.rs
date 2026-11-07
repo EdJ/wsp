@@ -1094,7 +1094,7 @@ fn closed_members(trunks: &[(PathBuf, String)], id: &str) -> Vec<Passed> {
             .flatten()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != id && crate::leg_tree::row_of(n) == id);
+            .filter(|n| n != id && crate::util::row_of(n) == id);
         names.extend(legs);
         names.sort();
         out.extend(names.into_iter().map(|task| Passed { task, trunk: trunk.clone(), trunk_branch: branch.clone() }));
@@ -1750,6 +1750,26 @@ pub(crate) struct Engine {
     pub poke_task: fn(&Store, &str, &str),
     /// Whether a running list's group holds the row to a run of its own (`Running::of`'s `run`).
     pub runs: fn(&Store, &str) -> bool,
+    /// After a land: what a member reviewed before it landed is owed (`check::after_land`).
+    pub after_land: fn(&Store, &str),
+    /// The checks a rebase onto a moved trunk can have affected, rerun in `dir`
+    /// (`check::rerun`): the arguments are the task, the tree, the new head, the old
+    /// base, the paths the rebase pulled in and the paths the branch changed.
+    pub rerun: fn(&Store, &str, &Path, &str, &str, &[String], &[String]) -> Rerun,
+}
+
+/// How a rerun after a rebase onto a moved trunk ended.
+pub(crate) enum Rerun {
+    /// The checks it can affect could not be planned: why.
+    Unplanned(String),
+    /// Planned, and none of it affected.
+    Nothing,
+    /// The tree lock could not be taken: why.
+    NoLock(String),
+    /// A step failed: what is owed.
+    Failed(String),
+    /// Every step passed: their names.
+    Ran(Vec<String>),
 }
 
 static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
@@ -1760,7 +1780,7 @@ pub(crate) fn install_engine(e: Engine) {
 
 /// The installed answers; before any is installed (a unit test) nothing is passed and nothing is poked.
 fn engine() -> &'static Engine {
-    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {}, runs: |_, _| false };
+    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {}, runs: |_, _| false, after_land: |_, _| {}, rerun: |_, _, _, _, _, _, _| Rerun::Nothing };
     ENGINE.get().unwrap_or(&NONE)
 }
 
@@ -2093,7 +2113,7 @@ pub(crate) fn stranded_line(s: &Stray) -> String {
         // row's join merges it, and git can stand a tree on it again.
         _ if s.branch.contains('.') => format!(
             "{held} — a leg of {}; `git worktree add {WORKTREES}/{} {}` stands a tree on it again",
-            crate::leg_tree::row_of(&s.branch),
+            crate::util::row_of(&s.branch),
             s.branch,
             s.branch
         ),
@@ -2118,7 +2138,7 @@ pub(crate) fn finished(store: &Store) -> impl Fn(&str) -> bool {
     let archived = store.archived_ids();
     move |id: &str| {
         // A leg's tree is named `<task>.<leg>` and is finished when its row is.
-        let id = crate::leg_tree::row_of(id);
+        let id = crate::util::row_of(id);
         tasks
             .iter()
             .find(|t| t.id == id)
@@ -2145,7 +2165,7 @@ pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Who
     let renamed = store.renamed_ids();
     move |branch: &str| {
         // `<task>.<leg>` is a leg's branch (`leg_tree`), and the row's.
-        let branch = crate::leg_tree::row_of(branch);
+        let branch = crate::util::row_of(branch);
         if known.contains(branch) {
             return Whose::Task;
         }
@@ -2505,7 +2525,7 @@ pub fn land(store: &Store, args: &Args) -> i32 {
 
     // `wsp-134`: a member reviewed before it landed is verified once it has.
     (engine().poke_task)(store, &w.task, "land");
-    crate::check::after_land(store, &w.task);
+    (engine().after_land)(store, &w.task);
 
     if args.json() {
         println!(
@@ -2609,9 +2629,8 @@ pub(crate) fn land_verdict(store: &Store, task: &str) -> Verdict {
         };
         let pulled_in = paths(&old_base, &new_base);
         let ours = paths(&old_base, &old_head);
-        let steps = match rerun_steps(store, task, &new_head, &old_base, &pulled_in, &ours) {
-            Ok(steps) => steps,
-            Err(why) => {
+        match (engine().rerun)(store, task, &w.dir, &new_head, &old_base, &pulled_in, &ours) {
+            Rerun::Unplanned(why) => {
                 return Verdict::Blocked(format!(
                     "wsp: {} moved and the rebase pulled in {} path(s), but the checks it can affect could not be planned: {why} — nothing was landed; \
                      `wsp review` again once that is fixed",
@@ -2619,52 +2638,19 @@ pub(crate) fn land_verdict(store: &Store, task: &str) -> Verdict {
                     pulled_in.len()
                 ))
             }
-        };
-        if steps.is_empty() {
             // The one reason to run nothing: the plan was made and none of it is affected.
-            continue;
+            Rerun::Nothing => continue,
+            Rerun::NoLock(why) => return Verdict::Blocked(format!("wsp: the rerun after the trunk moved could not start: {why}")),
+            Rerun::Failed(owed) => {
+                return Verdict::Blocked(format!(
+                    "wsp: {} moved while you waited and the rebase pulled in {} path(s); rerunning the checks it can affect failed.\n{owed}",
+                    w.branch,
+                    pulled_in.len(),
+                ))
+            }
+            Rerun::Ran(names) => reran.extend(names),
         }
-        let dir = store.state_file("checks").join(format!("{task}-tree"));
-        let _ = std::fs::create_dir_all(&dir);
-        let lock = match crate::check::TreeLock::take(dir.join("lock"), crate::check::TREE_WAIT) {
-            Ok(l) => l,
-            Err(why) => return Verdict::Blocked(format!("wsp: the rerun after the trunk moved could not start: {why}")),
-        };
-        let greens = store
-            .find_task(task)
-            .and_then(|t| crate::check::target(store, &t, Some(&new_head)).ok())
-            .map(|tg| crate::greens::Greens::open(store, &tg.project, &tg.repo));
-        let reuse = greens.as_ref().map(|g| crate::greens::Reuse { greens: g, sha: &new_head, env: crate::greens::Env::Warm, who: task });
-        let ran = crate::check::run_all(&w.dir, &steps, &dir.join("land.log"), reuse.as_ref(), |_| {});
-        drop(lock);
-        if !crate::check::passed(&ran) {
-            return Verdict::Blocked(format!(
-                "wsp: {} moved while you waited and the rebase pulled in {} path(s); rerunning the checks it can affect failed.\n{}",
-                w.branch,
-                pulled_in.len(),
-                crate::check::owed(&ran, &new_head)
-            ));
-        }
-        reran.extend(steps.iter().map(|s| s.name.clone()));
     }
-}
-
-/// The checks a rebase onto a moved trunk can have affected. A rebase pulled the
-/// trunk in, so what it can have broken is owed a check: a check that cannot be
-/// planned is a land that checked nothing, and only an empty answer — planned,
-/// and none of it affected — may skip the run.
-pub(crate) fn rerun_steps(
-    store: &Store,
-    task: &str,
-    new_head: &str,
-    old_base: &str,
-    pulled_in: &[String],
-    ours: &[String],
-) -> Result<Vec<crate::check::Step>, String> {
-    let t = store.find_task(task).ok_or_else(|| format!("{task} is not in the store"))?;
-    let tg = crate::check::target(store, &t, Some(new_head))?;
-    let tg = crate::check::Target { since: Some(old_base.to_string()), ..tg };
-    Ok(crate::check::affected(&crate::check::plan(store, &t, &tg, Some(new_head)).steps, pulled_in, ours))
 }
 
 /// The verbs this module answers to, each with the help it carries. `main` and
