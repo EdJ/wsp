@@ -1007,7 +1007,15 @@ pub(crate) fn fold_pieces(store: &Store, member: &str) {
         if !crate::pieces::staged(&t) {
             return None;
         }
-        crate::pieces::fold_at_land(&mut t);
+        let ran: Vec<crate::pieces::PieceRan> = crate::cmd_attempts::attempts_of(&t)
+            .into_iter()
+            .filter(|a| !a.until.is_empty())
+            .filter_map(|a| {
+                let n = a.leg.as_deref()?.strip_prefix("piece ")?.parse().ok()?;
+                Some(crate::pieces::PieceRan { n, ran: a.ran, turns: a.turns })
+            })
+            .collect();
+        crate::pieces::fold_at_land(&mut t, &ran);
         store.save_task(&t).ok()
     });
 }

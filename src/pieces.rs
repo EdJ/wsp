@@ -764,9 +764,19 @@ pub(crate) fn rework_by(old: &Record, row: &str, verdict: &str, head: &str, stat
     add_all(old, news, &Actor::Person, status).map(Some)
 }
 
+/// What a piece's last finished seat ran as: the piece number, the agent
+/// (empty when unknown), the turns. The caller reads it off the attempts, so
+/// this module names nothing of the timeline.
+pub(crate) struct PieceRan {
+    pub n: usize,
+    pub ran: String,
+    pub turns: usize,
+}
+
 /// Fold a landed row's `## Pieces` into its log: one line a piece, and the
-/// section goes. Returns the lines written.
-pub(crate) fn fold_at_land(t: &mut Task) -> Vec<String> {
+/// section goes. `ran` is what each piece's seat ran as, the last one a piece
+/// wins. Returns the lines written.
+pub(crate) fn fold_at_land(t: &mut Task, ran: &[PieceRan]) -> Vec<String> {
     let rec = record(t);
     if rec.pieces.is_empty() {
         if staged(t) {
@@ -774,7 +784,6 @@ pub(crate) fn fold_at_land(t: &mut Task) -> Vec<String> {
         }
         return Vec::new();
     }
-    let ran = crate::cmd_attempts::attempts_of(t);
     let lines: Vec<String> = rec
         .pieces
         .iter()
@@ -788,8 +797,7 @@ pub(crate) fn fold_at_land(t: &mut Task) -> Vec<String> {
                     if let Some(c) = p.caption.as_deref().filter(|c| !c.is_empty()) {
                         line.push_str(&format!(" · {}", util::fold(c)));
                     }
-                    let mine = format!("piece {}", p.n);
-                    if let Some(a) = ran.iter().rev().find(|a| a.leg.as_deref() == Some(mine.as_str()) && !a.until.is_empty()) {
+                    if let Some(a) = ran.iter().rev().find(|a| a.n == p.n) {
                         let on = if a.ran.is_empty() { "?" } else { a.ran.as_str() };
                         line.push_str(&format!(" · ran {on} {} turns", a.turns));
                     }
@@ -1403,7 +1411,7 @@ mod tests {
         rec.pieces[0].done_when = "x".repeat(300);
         let mut t = row("");
         write(&mut t, &rec);
-        let lines = fold_at_land(&mut t);
+        let lines = fold_at_land(&mut t, &[]);
         assert_eq!(lines.len(), 3);
         assert!(!staged(&t) && t.section(SECTION).is_none(), "the section is gone");
         let log = t.section("Log").unwrap();
@@ -1415,6 +1423,20 @@ mod tests {
     }
 
     #[test]
+    fn a_folded_piece_line_shows_what_it_ran_as_and_its_turns() {
+        let mut t = row("");
+        write(&mut t, &three_done());
+        let ran = [
+            PieceRan { n: 1, ran: "sonnet/high".into(), turns: 12 },
+            PieceRan { n: 2, ran: String::new(), turns: 3 },
+        ];
+        let lines = fold_at_land(&mut t, &ran);
+        assert!(lines[0].contains(" · ran sonnet/high 12 turns · checks green"), "{}", lines[0]);
+        assert!(lines[1].contains(" · ran ? 3 turns"), "{}", lines[1]);
+        assert!(!lines[2].contains(" ran "), "{}", lines[2]);
+    }
+
+    #[test]
     fn a_dropped_piece_folds_with_its_reason_and_a_promoted_one_with_its_row() {
         let mut rec = three_done();
         rec.pieces[0].state = State::Dropped;
@@ -1423,7 +1445,7 @@ mod tests {
         rec.pieces[1].promoted = Some("m-9".into());
         let mut t = row("");
         write(&mut t, &rec);
-        let lines = fold_at_land(&mut t);
+        let lines = fold_at_land(&mut t, &[]);
         assert_eq!(lines[0], "piece 1 · types · dropped: not needed");
         assert_eq!(lines[1], "piece 2 · board · promoted to m-9");
     }
