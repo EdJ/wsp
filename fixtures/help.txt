@@ -66,6 +66,12 @@ TASKS
                                          from a piece's own seat: commit first; runs the
                                          piece's check: lines in its tree and is refused
                                          while one is red; the row does not move
+  wsp piece promote <task> <n>           a pending or blocked piece becomes a sub-task of the row
+                                         (its overview, done-when and checks); prints the
+                                         `wsp worklist add` line that would run it
+  wsp piece reset <task> <n> "why" [--force]
+                                         a blocked piece, or a running one whose seat is gone,
+                                         back to pending; --force ends a seat still there
   wsp verified <member> --holds|--blocks --from FILE --caption "…"
                                     a verifier's verdict, recorded on the member
                                     under ## Verification. --blocks sends it back
@@ -604,6 +610,13 @@ WORKLISTS
                                     run makes it executing, its end complete,
                                     `done` closed. cancelled puts the open rows
                                     back to todo, unclaimed. No word: say it
+  wsp worklist size-check [warn|refuse|off]
+                                    the size check run at `add` and at `planned`:
+                                    a row with a many-observation done-when, a
+                                    build over ~5 min before a drive, or an
+                                    exception-to-the-small-row wording needs
+                                    legs, pieces or sub-tasks, or `--whole --why
+                                    "…"` on the add. No word: the mode and hits
   wsp worklist after <slug> <other|none>
                                     start <slug> only once <other> is complete
   wsp worklist edit <slug> [--prio high|normal|low] [--alone|--no-alone] [--no-retro]
