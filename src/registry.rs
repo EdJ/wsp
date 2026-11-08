@@ -36,6 +36,7 @@ pub const ALL: &[&[crate::verbs::Verb]] = &[
     crate::kanban::VERBS,
     crate::legs::VERBS,
     crate::packet::VERBS,
+    crate::pieces::VERBS,
     crate::panel::VERBS,
     crate::place_super::VERBS,
     crate::retro::VERBS,

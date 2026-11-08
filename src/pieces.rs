@@ -1,0 +1,1498 @@
+//! A larger work in defined parts, inside one row: `docs/pieces.md`, wsp-501.
+//!
+//! A row carries its pieces under `## Pieces`, one entry each, in the order they
+//! were added, after a `cap:` line. Modelled on [`crate::legs`], and for the same
+//! reason: the record is the entry, and everything that asks about a piece asks
+//! the entry.
+//!
+//! ```text
+//! ## Pieces
+//! cap: 3
+//! - 1 · contract types · batch 1 · done · pane cpd-31 · tree wsp-501-1 · ended
+//!   overview: Types and a fixture each for runstate, worklists, taskpage …
+//!   done-when: each module's pass3 test green; the fixtures read back
+//!   check: tsc (2m): cd spikes/web-chrome && npx tsc --noEmit
+//!   checked: green at 52c768d
+//!   note: Done: 52c768d types+fixtures. Where: src/contract/*.ts. Left: …
+//!   caption: types and fixtures read back
+//! - 3 · rail places · batch 2 · claude opus high · pending
+//!   why: decides between the rail's two layouts the parity list leaves open
+//!   overview: …
+//! ```
+//!
+//! This module is the record: the parse and write, the rules every write is
+//! checked against, and `wsp piece add | show | drop | cap`. A piece's seat, its
+//! tree, the batch that opens and closes and the run are later rows
+//! (pieces-seat, pieces-close, pieces-run); the clauses they write are read and
+//! kept here so those rows have nowhere to put a second record.
+//!
+//! # What the doc left open (wsp-502)
+//!
+//! - **`by N` on an entry** records which seated piece added it. The doc lets a
+//!   seated piece edit "only pieces it added", and nothing else in the entry can
+//!   say so. It is written only for a piece added by a piece.
+//! - **A batch has opened** once any of its pieces is neither `pending` nor
+//!   `dropped`: a dropped piece was a pending one that never ran, so dropping
+//!   one does not close a batch to additions.
+//! - **`next`** is one new batch after the last, resolved once per call, so a
+//!   `--from FILE` of several `batch: next` pieces files them in the one batch.
+//! - **A dropped entry's `why:` is the reason it was dropped**, so the tier rule
+//!   (a `why:` only on a non-default tier) is not asked of it.
+//! - **The planner** is the seat that files rows: a governor or the primary.
+//!   There is no other planner seat to name.
+//! - **Every write is judged by what it changes**, as legs' are: a record that
+//!   was already wrong in the same way before the write does not make an
+//!   unrelated write refuse.
+
+use serde_json::{json, Value};
+
+use crate::model::{Policy, Status, Task};
+use crate::store::Store;
+use crate::util::{self, Paint};
+use crate::verification::Ending;
+use crate::Args;
+
+/// The heading the pieces sit under on the row.
+pub(crate) const SECTION: &str = "Pieces";
+
+/// Most pieces a row carries, dropped, promoted and rework counted.
+pub(crate) const MAX_PIECES: usize = 20;
+/// How many of a row's pieces run at once, when the row says nothing.
+pub(crate) const DEFAULT_CAP: usize = 3;
+/// A title, in characters.
+pub(crate) const TITLE_CAP: usize = 80;
+/// An overview.
+pub(crate) const OVERVIEW_CAP: usize = 3_000;
+/// A done-when.
+pub(crate) const DONE_WHEN_CAP: usize = 600;
+/// A note.
+pub(crate) const NOTE_CAP: usize = 1_500;
+/// A `why:`, as a leg's is.
+pub(crate) const WHY_CAP: usize = crate::legs::WHY_CAP;
+
+/// Where a piece is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum State {
+    Pending,
+    Running,
+    Done,
+    Blocked,
+    Dropped,
+    Promoted,
+}
+
+impl State {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            State::Pending => "pending",
+            State::Running => "running",
+            State::Done => "done",
+            State::Blocked => "blocked",
+            State::Dropped => "dropped",
+            State::Promoted => "promoted",
+        }
+    }
+
+    fn parse(s: &str) -> Option<State> {
+        Some(match s {
+            "pending" => State::Pending,
+            "running" => State::Running,
+            "done" => State::Done,
+            "blocked" => State::Blocked,
+            "dropped" => State::Dropped,
+            "promoted" => State::Promoted,
+            _ => return None,
+        })
+    }
+}
+
+/// One piece of a row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Piece {
+    /// Its number in the row, from 1, never reused.
+    pub n: usize,
+    pub title: String,
+    pub batch: usize,
+    /// What it runs on. Always a policy: an entry that names none reads as
+    /// [`crate::legs::default_policy`] and is written without it.
+    pub policy: Policy,
+    pub state: State,
+    /// The seat its agent was started in. Written by pieces-seat.
+    pub pane: Option<String>,
+    /// The tree it stands in. Written by pieces-seat.
+    pub tree: Option<String>,
+    pub ending: Ending,
+    /// The piece that added it, when a seated piece did.
+    pub by: Option<usize>,
+    pub overview: String,
+    pub done_when: String,
+    /// The `## Checks` line format, label first, one per `check:` line.
+    pub checks: Vec<String>,
+    pub checked: Option<String>,
+    pub note: String,
+    pub caption: Option<String>,
+    /// Why this tier for a piece that is not on the default, or why it was
+    /// dropped.
+    pub why: Option<String>,
+    /// The row a promoted piece became.
+    pub promoted: Option<String>,
+}
+
+impl Piece {
+    pub(crate) fn pending(n: usize, title: &str, batch: usize) -> Piece {
+        Piece {
+            n,
+            title: title.trim().to_string(),
+            batch,
+            policy: crate::legs::default_policy(),
+            state: State::Pending,
+            pane: None,
+            tree: None,
+            ending: Ending::Standing,
+            by: None,
+            overview: String::new(),
+            done_when: String::new(),
+            checks: Vec::new(),
+            checked: None,
+            note: String::new(),
+            caption: None,
+            why: None,
+            promoted: None,
+        }
+    }
+
+    /// The id a piece is addressed by once it is one word: `<row>-<n>`.
+    pub(crate) fn id(&self, row: &str) -> String {
+        format!("{row}-{}", self.n)
+    }
+
+    fn head(&self) -> String {
+        let mut out = format!("- {} · {} · batch {}", self.n, util::fold(&self.title), self.batch);
+        if !crate::legs::is_default(&self.policy) {
+            out.push_str(&format!(" · {}", crate::legs::policy_line(&self.policy)));
+        }
+        out.push_str(&format!(" · {}", self.state.as_str()));
+        let mut clause = |k: &str, v: &Option<String>| {
+            if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+                out.push_str(&format!(" · {k} {v}"));
+            }
+        };
+        clause("pane", &self.pane);
+        clause("tree", &self.tree);
+        clause("by", &self.by.map(|b| b.to_string()));
+        match &self.ending {
+            Ending::Standing => {}
+            Ending::Ended => out.push_str(" · ended"),
+            Ending::Failed(why) => out.push_str(&format!(" · end failed: {}", util::fold(why))),
+        }
+        out
+    }
+
+    /// The entry whole, as it is written.
+    pub(crate) fn lines(&self) -> String {
+        let mut out = self.head();
+        let mut field = |key: &str, text: &str| {
+            let text = text.trim();
+            if text.is_empty() {
+                return;
+            }
+            let mut lines = text.lines();
+            out.push_str(&format!("\n  {key}: {}", lines.next().unwrap_or_default().trim_end()));
+            for l in lines {
+                // Four spaces, so a line of somebody's text can never read as
+                // a key at two.
+                out.push('\n');
+                if !l.trim().is_empty() {
+                    out.push_str(&format!("    {}", l.trim_end()));
+                }
+            }
+        };
+        field("overview", &self.overview);
+        field("done-when", &self.done_when);
+        for c in &self.checks {
+            field("check", c);
+        }
+        field("checked", self.checked.as_deref().unwrap_or_default());
+        field("note", &self.note);
+        field("caption", self.caption.as_deref().unwrap_or_default());
+        field("why", self.why.as_deref().unwrap_or_default());
+        field("promoted", self.promoted.as_deref().unwrap_or_default());
+        out
+    }
+
+    fn parse_head(line: &str) -> Option<Piece> {
+        let rest = line.strip_prefix("- ")?;
+        let mut clauses = rest.split(" · ").map(str::trim);
+        let n: usize = clauses.next()?.parse().ok()?;
+        let title = clauses.next().filter(|t| !t.is_empty())?;
+        let mut p = Piece::pending(n, title, 0);
+        let mut batched = false;
+        let mut stated = false;
+        for c in clauses {
+            if let Some(b) = c.strip_prefix("batch ").and_then(|b| b.trim().parse().ok()) {
+                p.batch = b;
+                batched = true;
+            } else if let Some(s) = State::parse(c) {
+                p.state = s;
+                stated = true;
+            } else if c == "ended" {
+                p.ending = Ending::Ended;
+            } else if let Some(why) = c.strip_prefix("end failed:") {
+                p.ending = Ending::Failed(why.trim().to_string());
+            } else if let Some(v) = c.strip_prefix("pane ") {
+                p.pane = Some(v.trim().to_string());
+            } else if let Some(v) = c.strip_prefix("tree ") {
+                p.tree = Some(v.trim().to_string());
+            } else if let Some(v) = c.strip_prefix("by ") {
+                p.by = v.trim().parse().ok();
+            } else if let Some(policy) = Policy::of_label(c) {
+                p.policy = policy;
+            }
+        }
+        (batched && stated).then_some(p)
+    }
+}
+
+/// A row's pieces and how many run at once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Record {
+    pub cap: usize,
+    pub pieces: Vec<Piece>,
+}
+
+impl Default for Record {
+    fn default() -> Record {
+        Record { cap: DEFAULT_CAP, pieces: Vec::new() }
+    }
+}
+
+/// The pieces written on a row, in file order.
+pub(crate) fn record(t: &Task) -> Record {
+    let mut rec = Record::default();
+    let Some(text) = t.section(SECTION) else { return rec };
+    const KEYS: [&str; 8] = ["overview", "done-when", "check", "checked", "note", "caption", "why", "promoted"];
+    let mut out: Vec<(Piece, Vec<(String, String)>)> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("- ") {
+            if let Some(p) = Piece::parse_head(line) {
+                out.push((p, Vec::new()));
+            }
+            continue;
+        }
+        let Some((_, fields)) = out.last_mut() else {
+            if let Some(n) = line.trim().strip_prefix("cap:").and_then(|n| n.trim().parse().ok()) {
+                rec.cap = n;
+            }
+            continue;
+        };
+        let two = line.strip_prefix("  ").filter(|r| !r.starts_with(' '));
+        if let Some((k, v)) = two.and_then(|r| r.split_once(':')).filter(|(k, _)| KEYS.contains(k)) {
+            fields.push((k.to_string(), v.strip_prefix(' ').unwrap_or(v).to_string()));
+        } else if let Some((_, f)) = fields.last_mut() {
+            f.push('\n');
+            f.push_str(line.strip_prefix("    ").unwrap_or(line.trim_start()));
+        }
+    }
+    rec.pieces = out
+        .into_iter()
+        .map(|(mut p, f)| {
+            let one = |k: &str| f.iter().rev().find(|(fk, _)| fk == k).map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty());
+            p.overview = one("overview").unwrap_or_default();
+            p.done_when = one("done-when").unwrap_or_default();
+            p.checks = f.iter().filter(|(k, _)| k == "check").map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+            p.checked = one("checked");
+            p.note = one("note").unwrap_or_default();
+            p.caption = one("caption");
+            p.why = one("why");
+            p.promoted = one("promoted");
+            p
+        })
+        .collect();
+    rec
+}
+
+/// Write the pieces back under the heading, in the order given. Does not touch
+/// the row's `updated`, as legs' write does not.
+pub(crate) fn write(t: &mut Task, rec: &Record) {
+    let mut parts = Vec::new();
+    if !rec.pieces.is_empty() || rec.cap != DEFAULT_CAP {
+        parts.push(format!("cap: {}", rec.cap));
+    }
+    parts.extend(rec.pieces.iter().map(Piece::lines));
+    crate::model::set_section_in(&mut t.body, SECTION, &parts.join("\n"));
+}
+
+/// Whether the row carries pieces: a `## Pieces` with anything in it.
+pub(crate) fn staged(t: &Task) -> bool {
+    t.section(SECTION).is_some()
+}
+
+/// Why `wsp leg add` may not give this row legs, when it has pieces.
+pub(crate) fn refuses_legs(t: &Task) -> Option<String> {
+    staged(t).then(|| {
+        format!(
+            "{} has `## {SECTION}`, and a row has pieces or legs, not both — \
+             `wsp piece add` stages another piece, or the row is split into legs in a row of its own",
+            t.id
+        )
+    })
+}
+
+/// Why `wsp piece add` may not give this row pieces, when it has legs.
+fn refuses_pieces(t: &Task) -> Option<String> {
+    t.section(crate::legs::SECTION).is_some().then(|| {
+        format!(
+            "{} has `## {}`, and a row has pieces or legs, not both — \
+             the legs are its plan; a larger work in separable parts is a row with pieces and no legs",
+            t.id,
+            crate::legs::SECTION
+        )
+    })
+}
+
+// ---- the batches --------------------------------------------------------------
+
+/// The last batch any piece is in; 0 for none.
+pub(crate) fn last_batch(rec: &Record) -> usize {
+    rec.pieces.iter().map(|p| p.batch).max().unwrap_or(0)
+}
+
+/// Whether `batch` has opened: any piece of it is neither pending nor dropped.
+pub(crate) fn opened(rec: &Record, batch: usize) -> bool {
+    rec.pieces.iter().any(|p| p.batch == batch && !matches!(p.state, State::Pending | State::Dropped))
+}
+
+// ---- the rules ------------------------------------------------------------------
+
+/// What a record must satisfy, as the first thing that is wrong with it.
+pub(crate) fn check(rec: &Record) -> Result<(), String> {
+    if rec.pieces.len() > MAX_PIECES {
+        return Err(format!(
+            "{} pieces is over the {MAX_PIECES} a row carries, dropped, promoted and rework counted — a work wider than that is rows",
+            rec.pieces.len()
+        ));
+    }
+    if rec.cap == 0 || rec.cap > MAX_PIECES {
+        return Err(format!("cap: {} — how many pieces run at once is 1 to {MAX_PIECES}", rec.cap));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for p in &rec.pieces {
+        let at = format!("piece {}", p.n);
+        if !seen.insert(p.n) {
+            return Err(format!("two pieces are numbered {}", p.n));
+        }
+        if p.n == 0 || p.batch == 0 {
+            return Err(format!("{at}: numbers and batches count from 1"));
+        }
+        if p.title.trim().is_empty() || p.title.contains('\n') || p.title.contains(" · ") {
+            return Err(format!("{at}: a title is one line of words and no ` · `"));
+        }
+        let over = |what: &str, text: &str, cap: usize| {
+            let n = text.trim().chars().count();
+            (n > cap).then(|| format!("the {what} of {at} is {n} characters, over the {cap} cap"))
+        };
+        if let Some(e) = over("title", &p.title, TITLE_CAP)
+            .or_else(|| over("overview", &p.overview, OVERVIEW_CAP))
+            .or_else(|| over("done-when", &p.done_when, DONE_WHEN_CAP))
+            .or_else(|| over("note", &p.note, NOTE_CAP))
+            .or_else(|| over("why", p.why.as_deref().unwrap_or_default(), WHY_CAP))
+        {
+            return Err(e);
+        }
+        for c in &p.checks {
+            if !is_check_line(c) {
+                return Err(format!("{at}: `{c}` is not a check — `label (time): command`"));
+            }
+        }
+        if p.state == State::Dropped {
+            continue;
+        }
+        match (crate::legs::is_default(&p.policy), p.why.is_some()) {
+            (false, false) => {
+                return Err(format!(
+                    "{at} is on {}, not the default {}, and gives no reason — `--why \"…\"` says what \
+                     in that piece's own work needs it, or leave --agent off",
+                    crate::legs::policy_line(&p.policy),
+                    crate::legs::DEFAULT_AGENT
+                ))
+            }
+            (true, true) => {
+                return Err(format!(
+                    "{at} is on the default {} and has a `why:`, which would be a reason for nothing — \
+                     drop it, or give the piece the tier the reason is for",
+                    crate::legs::DEFAULT_AGENT
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether a `check:` line is the `## Checks` line format with its label first:
+/// `label (time): command`, the label being what the step is called.
+fn is_check_line(c: &str) -> bool {
+    let Some(step) = crate::check::step_of(c, crate::check::Of::Task) else { return false };
+    // A head that does not parse (`label (never)`) is left in the command whole.
+    step.command != c.trim()
+        && c.split_once(": ").is_some_and(|(head, _)| head.split_whitespace().next() == Some(step.name.as_str()))
+}
+
+/// [`check`] for a write: refused only if the record it leaves is wrong in a way
+/// the record it started from was not.
+fn judged(old: &Record, new: &Record) -> Result<(), String> {
+    match check(new) {
+        Ok(()) => Ok(()),
+        Err(e) if check(old).err().as_deref() == Some(e.as_str()) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- who may write -----------------------------------------------------------------
+
+/// Who is writing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Actor {
+    /// No seat: a person at a terminal.
+    Person,
+    /// The primary seat, which files rows.
+    Primary,
+    /// A governor, which files rows too.
+    Governor,
+    /// The seat holding the row's claim.
+    Claimant,
+    /// The seat of this piece of the row (binding `"piece"`).
+    Piece(usize),
+    /// Any other seat.
+    Other,
+}
+
+/// What may be written at all: the row must be open for it, and the writer one
+/// the doc names.
+fn gate(actor: &Actor, status: Status) -> Result<(), String> {
+    if !matches!(status, Status::Todo | Status::Doing) {
+        return Err(format!("pieces are written on a todo or doing row, and this one is {}", status.as_str()));
+    }
+    if *actor == Actor::Other {
+        return Err("only a person, the primary seat, a governor, the seat holding the row or one of its pieces may write its pieces".into());
+    }
+    Ok(())
+}
+
+/// A seated piece adds only to batches after its own.
+fn may_add(old: &Record, actor: &Actor, batch: usize) -> Result<(), String> {
+    let Actor::Piece(me) = actor else { return Ok(()) };
+    let Some(mine) = old.pieces.iter().find(|p| p.n == *me && p.state == State::Running) else {
+        return Err(format!("piece {me} is not running, and only a running piece may add pieces"));
+    };
+    if batch <= mine.batch {
+        return Err(format!("piece {me} is in batch {} and may add only to a later batch, not {batch}", mine.batch));
+    }
+    Ok(())
+}
+
+/// A seated piece changes only the pieces it added; anyone else, any pending one.
+fn may_change(actor: &Actor, p: &Piece) -> Result<(), String> {
+    if p.state != State::Pending {
+        return Err(format!("piece {} is {}, and only a pending piece can be changed", p.n, p.state.as_str()));
+    }
+    match actor {
+        Actor::Piece(me) if p.by != Some(*me) => {
+            Err(format!("piece {me} may change only the pieces it added, and piece {} is not one of them", p.n))
+        }
+        _ => Ok(()),
+    }
+}
+
+// ---- the writes -----------------------------------------------------------------------
+
+/// Where a new piece goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum At {
+    Batch(usize),
+    /// A new batch after the last.
+    Next,
+}
+
+/// A piece to add.
+#[derive(Clone, Debug)]
+pub(crate) struct New {
+    pub title: String,
+    pub at: At,
+    pub overview: String,
+    pub done_when: String,
+    pub checks: Vec<String>,
+    pub agent: Option<String>,
+    pub why: Option<String>,
+}
+
+/// The record `new` leaves when added, or why it may not be.
+pub(crate) fn add(old: &Record, new: New, actor: &Actor, status: Status) -> Result<Record, String> {
+    gate(actor, status)?;
+    let policy = match new.agent.as_deref() {
+        None => crate::legs::default_policy(),
+        Some(a) => Policy::parse(a)
+            .ok_or_else(|| format!("`{a}` is not a policy — a kind, then a model and an effort, as `claude opus high`"))?,
+    };
+    if new.title.trim().is_empty() {
+        return Err("a piece needs a title".into());
+    }
+    if new.overview.trim().is_empty() {
+        return Err("a piece needs an overview: what it is to do".into());
+    }
+    if new.done_when.trim().is_empty() {
+        return Err("a piece needs a done-when: how its seat knows it is finished".into());
+    }
+    let last = last_batch(old);
+    let batch = match new.at {
+        At::Next => last + 1,
+        At::Batch(0) => return Err("batches count from 1".into()),
+        At::Batch(b) if b > last + 1 => {
+            return Err(format!("batch {b} would leave a gap — the last batch is {last}, and `next` is {}", last + 1))
+        }
+        At::Batch(b) => b,
+    };
+    if opened(old, batch) {
+        return Err(format!("batch {batch} has opened, and a piece is added only to a batch that has not — `--batch next` is {}", last + 1));
+    }
+    may_add(old, actor, batch)?;
+    let mut rec = old.clone();
+    let n = old.pieces.iter().map(|p| p.n).max().unwrap_or(0) + 1;
+    let mut p = Piece::pending(n, &new.title, batch);
+    p.policy = policy;
+    p.why = new.why.map(|w| w.trim().to_string()).filter(|w| !w.is_empty());
+    p.overview = new.overview.trim().to_string();
+    p.done_when = new.done_when.trim().to_string();
+    p.checks = new.checks.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+    p.by = match actor {
+        Actor::Piece(me) => Some(*me),
+        _ => None,
+    };
+    rec.pieces.push(p);
+    judged(old, &rec)?;
+    Ok(rec)
+}
+
+/// [`add`] for several, in order, as one write. `next` is resolved once, so the
+/// pieces that say it share a batch.
+pub(crate) fn add_all(old: &Record, news: Vec<New>, actor: &Actor, status: Status) -> Result<Record, String> {
+    let next = last_batch(old) + 1;
+    let mut rec = old.clone();
+    let many = news.len() > 1;
+    for mut n in news {
+        if n.at == At::Next {
+            n.at = At::Batch(next);
+        }
+        let title = util::truncate(&util::fold(&n.title), 40);
+        rec = add(&rec, n, actor, status).map_err(|e| if many { format!("{title}: {e}") } else { e })?;
+    }
+    Ok(rec)
+}
+
+/// The record with piece `n` dropped, for a reason. A pending piece only.
+pub(crate) fn drop_piece(old: &Record, n: usize, why: &str, actor: &Actor, status: Status) -> Result<Record, String> {
+    gate(actor, status)?;
+    let why = why.trim();
+    if why.is_empty() {
+        return Err("a drop takes the reason, which stays on the entry".into());
+    }
+    let mut rec = old.clone();
+    let p = rec.pieces.iter_mut().find(|p| p.n == n).ok_or_else(|| format!("no piece {n}"))?;
+    may_change(actor, p)?;
+    p.state = State::Dropped;
+    p.why = Some(why.to_string());
+    judged(old, &rec)?;
+    Ok(rec)
+}
+
+/// The record with `cap:` set. Not a seated piece's to change.
+pub(crate) fn set_cap(old: &Record, cap: usize, actor: &Actor, status: Status) -> Result<Record, String> {
+    gate(actor, status)?;
+    if let Actor::Piece(me) = actor {
+        return Err(format!("piece {me} may add pieces to later batches, and the cap on how many run is not its to change"));
+    }
+    let mut rec = old.clone();
+    rec.cap = cap;
+    judged(old, &rec)?;
+    Ok(rec)
+}
+
+// ---- seen -------------------------------------------------------------------------------
+
+/// One line a piece, for `wsp show`: the number, the title, the batch, the
+/// state, and the caption once there is one.
+pub(crate) fn table(rec: &Record) -> String {
+    let mut out = vec![format!("cap: {}", rec.cap)];
+    for p in &rec.pieces {
+        let mut line = format!("- {} · {} · batch {}", p.n, util::truncate(&util::fold(&p.title), TITLE_CAP), p.batch);
+        if !crate::legs::is_default(&p.policy) {
+            line.push_str(&format!(" · {}", crate::legs::policy_line(&p.policy)));
+        }
+        line.push_str(&format!(" · {}", p.state.as_str()));
+        if let Some(c) = p.caption.as_deref().or(p.promoted.as_deref()).or(if p.state == State::Dropped { p.why.as_deref() } else { None }) {
+            line.push_str(&format!(" · {}", util::truncate(&util::fold(c), 80)));
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// The entries whole, for `wsp show --pieces`.
+pub(crate) fn whole(rec: &Record) -> String {
+    let mut out = vec![format!("cap: {}", rec.cap)];
+    out.extend(rec.pieces.iter().map(Piece::lines));
+    out.join("\n")
+}
+
+/// `wsp show`'s `## Pieces`: the table, or with `whole` every entry in full.
+pub(crate) fn section_for_show(t: &Task, whole_entries: bool) -> Option<String> {
+    let rec = record(t);
+    (!rec.pieces.is_empty()).then(|| if whole_entries { whole(&rec) } else { table(&rec) })
+}
+
+/// A row's pieces for `--json`: `[{n, id, title, batch, state, seat, tree,
+/// caption}]`.
+pub(crate) fn json(t: &Task) -> Value {
+    let rec = record(t);
+    Value::Array(
+        rec.pieces
+            .iter()
+            .map(|p| {
+                json!({
+                    "n": p.n, "id": p.id(&t.id), "title": p.title, "batch": p.batch,
+                    "state": p.state.as_str(), "seat": p.pane, "tree": p.tree, "caption": p.caption,
+                })
+            })
+            .collect(),
+    )
+}
+
+// ---- the verbs --------------------------------------------------------------------------
+
+/// The verbs this module answers to, each with the help it carries.
+pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
+    names: &["piece"],
+    run: dispatch,
+    help: &[
+        crate::verbs::Help {
+            section: crate::verbs::Section::Tasks,
+            order: 151,
+            text: r##"  wsp piece add <task> "title" --batch N|next --overview FILE|- --done-when "…" [--check "label (time): cmd"]… [--agent "claude opus high" --why "…"]
+                                    a piece of a row (docs/pieces.md): under
+                                    ## Pieces, in a batch not yet open. No --agent
+                                    is claude sonnet medium; another tier needs --why"##,
+        },
+        crate::verbs::Help {
+            section: crate::verbs::Section::Tasks,
+            order: 152,
+            text: r##"  wsp piece add <task> --from FILE       several at once, in one commit: a `### title` block
+                                         each, with batch:, done-when: and check: lines"##,
+        },
+        crate::verbs::Help {
+            section: crate::verbs::Section::Tasks,
+            order: 153,
+            text: r##"  wsp piece show <task> [<n>]            the pieces, or one piece whole"##,
+        },
+        crate::verbs::Help {
+            section: crate::verbs::Section::Tasks,
+            order: 154,
+            text: r##"  wsp piece drop <task> <n> "why"        a pending piece, never run"##,
+        },
+        crate::verbs::Help {
+            section: crate::verbs::Section::Tasks,
+            order: 155,
+            text: r##"  wsp piece cap <task> <N>               how many of the row's pieces run at once (default 3)"##,
+        },
+    ],
+}];
+
+const USAGE: &str = "usage:
+  wsp piece add <task> \"title\" --batch N|next --overview FILE|- --done-when \"…\" [--check \"label (time): cmd\"]… [--agent \"claude opus high\" --why \"…\"]
+  wsp piece add <task> --from FILE       several at once: a `### title` block each, with batch:, done-when:, check: lines
+  wsp piece show <task> [<n>]            the table, or one piece whole
+  wsp piece drop <task> <n> \"why\"        a pending piece, never run
+  wsp piece cap <task> <N>               how many of the row's pieces run at once";
+
+pub fn dispatch(store: &Store, args: &Args) -> i32 {
+    let me = crate::place::my_pane();
+    run(store, args, me.as_deref())
+}
+
+/// [`dispatch`] with the pane given, so a test is not asked where it is standing.
+pub(crate) fn run(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
+    match args.rest.first().map(String::as_str) {
+        Some("add") => cmd_add(store, args, pane),
+        Some("drop") => cmd_drop(store, args, pane),
+        Some("cap") => cmd_cap(store, args, pane),
+        Some("show") | Some("ls") | None => cmd_show(store, args),
+        Some(other) => {
+            eprintln!("wsp piece: unknown subcommand `{other}`\n{USAGE}");
+            2
+        }
+    }
+}
+
+/// Who `pane` is, for this row.
+fn actor_here(store: &Store, t: &Task, pane: Option<&str>) -> Actor {
+    let Some(p) = pane else { return Actor::Person };
+    if let Some(b) = store.bindings().get(p) {
+        if b.get("task_id").and_then(Value::as_str) == Some(t.id.as_str()) {
+            if let Some(n) = b.get("piece").and_then(Value::as_u64) {
+                return Actor::Piece(n as usize);
+            }
+            if b.get("leg").is_none() {
+                return Actor::Claimant;
+            }
+        }
+    }
+    if let Some(scope) = crate::place::governs(&store.governors(), &crate::place::Seat::new(p)) {
+        return if crate::governors::is_primary(&scope) { Actor::Primary } else { Actor::Governor };
+    }
+    if crate::cmd_role::bound_here(store, pane) {
+        Actor::Other
+    } else {
+        Actor::Person
+    }
+}
+
+/// Apply one edit to a row's pieces under the store lock, so two seats writing
+/// at once each see the other's result.
+fn edit(
+    store: &Store,
+    needle: &str,
+    pane: Option<&str>,
+    f: impl FnOnce(&Record, &Actor, Status) -> Result<Record, String>,
+) -> Result<(Task, Record), String> {
+    let id = store.task_or_why(needle)?.id;
+    store.locked(|| {
+        let mut t = store.find_task(&id).ok_or_else(|| format!("no task {id}"))?;
+        if let Some(why) = refuses_pieces(&t) {
+            return Err(why);
+        }
+        let old = record(&t);
+        let actor = actor_here(store, &t, pane);
+        let new = f(&old, &actor, t.status())?;
+        write(&mut t, &new);
+        store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
+        Ok((t, new))
+    })
+}
+
+fn refuse(why: String) -> i32 {
+    eprintln!("wsp: {}", why.trim_start_matches("wsp: "));
+    1
+}
+
+/// The overview: `--overview FILE`, or `-` for stdin. `-` after a long flag is a
+/// positional (a `-`-led word is never a value), so the flag reads as bare.
+fn overview_text(args: &Args) -> Result<String, String> {
+    let src = match args.get("overview") {
+        Some(v) if v == "true" && args.rest.iter().skip(3).any(|r| r == "-") => "-".to_string(),
+        Some(v) if v != "true" => v,
+        _ => return Err("a piece needs an overview: --overview FILE, or --overview - to read it from stdin".into()),
+    };
+    if src == "-" && util::stdin_is_tty() {
+        return Err("nothing is piped in — `--overview -` reads the overview from a stream".into());
+    }
+    util::read_source(&src).map_err(|e| format!("cannot read {src}: {e}"))
+}
+
+fn at_of(word: &str) -> Result<At, String> {
+    match word.trim() {
+        "next" => Ok(At::Next),
+        w => w.parse().map(At::Batch).map_err(|_| format!("batch `{w}` is a number from 1, or `next`")),
+    }
+}
+
+/// The pieces a `--from` file holds: one `### title` block each, with `batch:`,
+/// `done-when:`, `check:` (and optionally `agent:` and `why:`) lines, and what
+/// else is under the heading as the overview.
+pub(crate) fn parse_blocks(text: &str) -> Result<Vec<New>, String> {
+    let mut out: Vec<New> = Vec::new();
+    for line in text.lines() {
+        if let Some(title) = line.strip_prefix("### ") {
+            out.push(New {
+                title: title.trim().to_string(),
+                at: At::Next,
+                overview: String::new(),
+                done_when: String::new(),
+                checks: Vec::new(),
+                agent: None,
+                why: None,
+            });
+            continue;
+        }
+        let Some(cur) = out.last_mut() else {
+            if line.trim().is_empty() {
+                continue;
+            }
+            return Err(format!("`{}` comes before the first `### title`", util::truncate(line.trim(), 40)));
+        };
+        let keyed = |k: &str| line.strip_prefix(k).and_then(|r| r.strip_prefix(':')).map(|v| v.trim().to_string());
+        if let Some(v) = keyed("batch") {
+            cur.at = at_of(&v).map_err(|e| format!("{}: {e}", cur.title))?;
+        } else if let Some(v) = keyed("done-when") {
+            cur.done_when = v;
+        } else if let Some(v) = keyed("check") {
+            cur.checks.push(v);
+        } else if let Some(v) = keyed("agent") {
+            cur.agent = Some(v);
+        } else if let Some(v) = keyed("why") {
+            cur.why = Some(v);
+        } else {
+            cur.overview.push_str(line);
+            cur.overview.push('\n');
+        }
+    }
+    if out.is_empty() {
+        return Err("the file holds no `### title` block".into());
+    }
+    Ok(out)
+}
+
+fn cmd_add(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
+    let Some(task) = args.rest.get(1) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let news = if let Some(file) = args.get("from").filter(|f| f != "true") {
+        match util::read_source(&file).map_err(|e| format!("cannot read {file}: {e}")).and_then(|t| parse_blocks(&t)) {
+            Ok(n) => n,
+            Err(why) => return refuse(why),
+        }
+    } else {
+        let Some(title) = args.rest.get(2).filter(|t| t.as_str() != "-") else {
+            eprintln!("{USAGE}");
+            return 2;
+        };
+        let at = match args.get("batch") {
+            Some(b) if b != "true" => match at_of(&b) {
+                Ok(a) => a,
+                Err(why) => return refuse(why),
+            },
+            _ => return refuse("a piece needs a batch: `--batch N`, or `--batch next` for a new one after the last".into()),
+        };
+        let overview = match overview_text(args) {
+            Ok(o) => o,
+            Err(why) => return refuse(why),
+        };
+        let Some(done_when) = args.get("done-when").filter(|d| d != "true") else {
+            return refuse("a piece needs a done-when: `--done-when \"…\"`".into());
+        };
+        vec![New {
+            title: title.clone(),
+            at,
+            overview,
+            done_when,
+            checks: args.all("check"),
+            agent: args.get("agent"),
+            why: args.get("why"),
+        }]
+    };
+    let count = news.len();
+    let before = std::cell::Cell::new(0);
+    match edit(store, task, pane, |old, actor, status| {
+        before.set(old.pieces.len());
+        add_all(old, news, actor, status)
+    }) {
+        Ok((t, rec)) => {
+            let added: Vec<&Piece> = rec.pieces.iter().skip(before.get()).collect();
+            for p in &added {
+                store.log_event("piece-added", json!({ "id": t.id, "piece": p.n }));
+            }
+            let nums = added.iter().map(|p| p.n.to_string()).collect::<Vec<_>>().join(", ");
+            store.git_commit(&format!("wsp: {} piece{} {nums} added", t.id, if count == 1 { "" } else { "s" }));
+            for p in &added {
+                println!(
+                    "{} {}  piece {} · batch {} · {}  ({} of {MAX_PIECES})",
+                    Paint::new().green("✓"),
+                    t.id,
+                    p.n,
+                    p.batch,
+                    util::truncate(&util::fold(&p.title), 50),
+                    rec.pieces.len()
+                );
+            }
+            0
+        }
+        Err(why) => refuse(why),
+    }
+}
+
+fn cmd_drop(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
+    let (Some(task), Some(n)) = (args.rest.get(1), args.rest.get(2).and_then(|n| n.parse::<usize>().ok())) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let why = args.text(3);
+    match edit(store, task, pane, |old, actor, status| drop_piece(old, n, &why, actor, status)) {
+        Ok((t, _)) => {
+            store.git_commit(&format!("wsp: {} piece {n} dropped", t.id));
+            println!("{} {}  piece {n} dropped", Paint::new().green("✓"), t.id);
+            0
+        }
+        Err(why) => refuse(why),
+    }
+}
+
+fn cmd_cap(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
+    let (Some(task), Some(cap)) = (args.rest.get(1), args.rest.get(2).and_then(|n| n.parse::<usize>().ok())) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    match edit(store, task, pane, |old, actor, status| set_cap(old, cap, actor, status)) {
+        Ok((t, _)) => {
+            store.git_commit(&format!("wsp: {} pieces cap {cap}", t.id));
+            println!("{} {}  cap {cap}", Paint::new().green("✓"), t.id);
+            0
+        }
+        Err(why) => refuse(why),
+    }
+}
+
+fn cmd_show(store: &Store, args: &Args) -> i32 {
+    let Some(task) = args.rest.get(1) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let t = match store.task_or_why(task) {
+        Ok(t) => t,
+        Err(why) => return refuse(why),
+    };
+    let rec = record(&t);
+    if args.json() {
+        println!("{}", serde_json::to_string_pretty(&json(&t)).unwrap_or_default());
+        return 0;
+    }
+    if rec.pieces.is_empty() {
+        println!("{} has no pieces", t.id);
+        return 0;
+    }
+    let Some(n) = args.rest.get(2) else {
+        println!("{}", table(&rec));
+        return 0;
+    };
+    let Some(p) = n.parse::<usize>().ok().and_then(|n| rec.pieces.iter().find(|p| p.n == n)) else {
+        return refuse(format!("{} has no piece {n}", t.id));
+    };
+    println!("{} · {}\n{}", t.id, p.id(&t.id), p.lines());
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new(title: &str, at: At) -> New {
+        New {
+            title: title.into(),
+            at,
+            overview: format!("do {title}"),
+            done_when: format!("{title} is done"),
+            checks: Vec::new(),
+            agent: None,
+            why: None,
+        }
+    }
+
+    const TODO: Status = Status::Todo;
+
+    fn put(rec: &Record, n: New) -> Record {
+        add(rec, n, &Actor::Person, TODO).expect("the add is accepted")
+    }
+
+    fn with_state(mut rec: Record, n: usize, state: State) -> Record {
+        rec.pieces.iter_mut().find(|p| p.n == n).unwrap().state = state;
+        rec
+    }
+
+    fn row(body: &str) -> Task {
+        let mut t = Task::new("a row", "m-1");
+        t.body = format!("## Overview\nthe work\n\n{body}\n## Log\n- 2026-10-18 claimed\n");
+        t
+    }
+
+    #[test]
+    fn an_entry_reads_back_as_it_was_written() {
+        let mut rec = Record { cap: 2, ..Record::default() };
+        let mut p = Piece::pending(1, "contract types", 1);
+        p.state = State::Done;
+        p.pane = Some("cpd-31".into());
+        p.tree = Some("m-1-1".into());
+        p.ending = Ending::Ended;
+        p.overview = "Types and a fixture each.\n\nSecond paragraph.\n- not an entry\n  overview: not a key".into();
+        p.done_when = "each module's test green".into();
+        p.checks = vec!["tsc (2m): cd web && npx tsc --noEmit".into(), "contract (3m): cd web && npx vitest run".into()];
+        p.checked = Some("green at 52c768d".into());
+        p.note = "Done: 52c768d.\nLeft: nothing".into();
+        p.caption = Some("types and fixtures read back".into());
+        rec.pieces.push(p);
+        let mut q = Piece::pending(2, "rail places", 2);
+        q.policy = Policy::parse("claude opus high").unwrap();
+        q.why = Some("decides between two layouts".into());
+        q.by = Some(1);
+        q.overview = "pick".into();
+        q.done_when = "picked".into();
+        rec.pieces.push(q);
+        let mut r = Piece::pending(3, "old", 2);
+        r.state = State::Promoted;
+        r.promoted = Some("m-9".into());
+        rec.pieces.push(r);
+        let mut t = row("");
+        write(&mut t, &rec);
+        assert_eq!(record(&t), rec);
+        assert!(t.body.contains("## Pieces\ncap: 2\n- 1 · contract types · batch 1 · done · pane cpd-31 · tree m-1-1 · ended\n"), "{}", t.body);
+        assert!(t.body.contains("- 2 · rail places · batch 2 · claude opus high · pending · by 1\n"), "{}", t.body);
+        let again = record(&t);
+        write(&mut t, &again);
+        assert_eq!(record(&t), rec, "and again");
+    }
+
+    #[test]
+    fn a_row_with_no_pieces_reads_as_an_empty_record_with_the_default_cap() {
+        let rec = record(&row(""));
+        assert_eq!((rec.cap, rec.pieces.len()), (3, 0));
+        assert!(!staged(&row("")));
+    }
+
+    #[test]
+    fn numbers_are_never_reused_after_a_drop() {
+        let rec = put(&Record::default(), new("one", At::Next));
+        let rec = put(&rec, new("two", At::Batch(1)));
+        let rec = put(&rec, new("three", At::Batch(1)));
+        let rec = drop_piece(&rec, 3, "not needed", &Actor::Person, TODO).unwrap();
+        let rec = put(&rec, new("four", At::Batch(1)));
+        let ns: Vec<usize> = rec.pieces.iter().map(|p| p.n).collect();
+        assert_eq!(ns, vec![1, 2, 3, 4]);
+        assert_eq!(rec.pieces[2].state, State::Dropped);
+        assert_eq!(rec.pieces[2].why.as_deref(), Some("not needed"));
+        let rec = drop_piece(&rec, 4, "no", &Actor::Person, TODO).unwrap();
+        let rec = put(&rec, new("five", At::Batch(1)));
+        assert_eq!(rec.pieces.last().unwrap().n, 5, "the highest number was dropped and is still not reused");
+    }
+
+    #[test]
+    fn a_title_is_capped_at_eighty_and_is_one_line() {
+        let ok = "t".repeat(80);
+        assert!(add(&Record::default(), new(&ok, At::Next), &Actor::Person, TODO).is_ok());
+        let e = add(&Record::default(), new(&"t".repeat(81), At::Next), &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("title") && e.contains("81") && e.contains("80"), "{e}");
+        let e = add(&Record::default(), new("a · b", At::Next), &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("title"), "{e}");
+    }
+
+    #[test]
+    fn an_overview_is_capped_at_three_thousand_and_never_truncated() {
+        let mut n = new("x", At::Next);
+        n.overview = "o".repeat(3_000);
+        assert!(add(&Record::default(), n.clone(), &Actor::Person, TODO).is_ok());
+        n.overview = "o".repeat(3_001);
+        let e = add(&Record::default(), n, &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("overview") && e.contains("3001") && e.contains("3000"), "{e}");
+    }
+
+    #[test]
+    fn a_done_when_is_capped_at_six_hundred() {
+        let mut n = new("x", At::Next);
+        n.done_when = "d".repeat(600);
+        assert!(add(&Record::default(), n.clone(), &Actor::Person, TODO).is_ok());
+        n.done_when = "d".repeat(601);
+        let e = add(&Record::default(), n, &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("done-when") && e.contains("601") && e.contains("600"), "{e}");
+    }
+
+    #[test]
+    fn a_note_is_capped_at_fifteen_hundred() {
+        let rec = put(&Record::default(), new("x", At::Next));
+        let mut ok = rec.clone();
+        ok.pieces[0].note = "n".repeat(1_500);
+        assert!(check(&ok).is_ok());
+        let mut over = rec;
+        over.pieces[0].note = "n".repeat(1_501);
+        let e = check(&over).unwrap_err();
+        assert!(e.contains("note") && e.contains("1501") && e.contains("1500"), "{e}");
+    }
+
+    #[test]
+    fn a_twenty_first_piece_is_refused_and_a_twentieth_is_not_dropped_ones_counted() {
+        let mut rec = Record::default();
+        for i in 0..20 {
+            rec = put(&rec, new(&format!("p{i}"), At::Batch(1)));
+        }
+        let e = add(&rec, new("one more", At::Batch(1)), &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("21") && e.contains("20"), "{e}");
+        let rec = drop_piece(&rec, 20, "no", &Actor::Person, TODO).unwrap();
+        let rec = with_state(rec, 19, State::Promoted);
+        let e = add(&rec, new("still more", At::Next), &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("dropped, promoted and rework counted"), "a dropped and a promoted piece still count: {e}");
+    }
+
+    #[test]
+    fn a_check_line_that_is_not_a_check_is_refused() {
+        let mut n = new("x", At::Next);
+        n.checks = vec!["tsc (2m): npx tsc --noEmit".into(), "pieces: cargo test pieces::".into()];
+        let rec = add(&Record::default(), n, &Actor::Person, TODO).unwrap();
+        assert_eq!(rec.pieces[0].checks.len(), 2);
+        let mut bad = rec.clone();
+        bad.pieces[0].checks.push("   ".into());
+        bad.pieces[0].checks.push("label (never): cmd".into());
+        let e = check(&bad).unwrap_err();
+        assert!(e.contains("not a check"), "{e}");
+    }
+
+    #[test]
+    fn a_piece_with_no_policy_is_sonnet_medium() {
+        let mut t = row("");
+        let rec = put(&Record::default(), new("x", At::Next));
+        assert!(crate::legs::is_default(&rec.pieces[0].policy));
+        write(&mut t, &rec);
+        let back = record(&t);
+        assert_eq!(crate::legs::policy_line(&back.pieces[0].policy), crate::legs::DEFAULT_AGENT);
+        assert!(!t.body.contains("claude sonnet medium"), "the default is not written: {}", t.body);
+    }
+
+    #[test]
+    fn another_tier_needs_a_why_and_a_why_on_the_default_is_refused() {
+        let mut n = new("x", At::Next);
+        n.agent = Some("claude opus high".into());
+        let e = add(&Record::default(), n.clone(), &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("gives no reason"), "{e}");
+        n.why = Some("decides between two layouts".into());
+        let rec = add(&Record::default(), n, &Actor::Person, TODO).unwrap();
+        assert_eq!(crate::legs::policy_line(&rec.pieces[0].policy), "claude opus high");
+        // And the other way: the default tier with a why.
+        let mut d = new("y", At::Next);
+        d.why = Some("a reason for nothing".into());
+        let e = add(&Record::default(), d.clone(), &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("reason for nothing"), "{e}");
+        d.agent = Some(crate::legs::DEFAULT_AGENT.into());
+        assert!(add(&Record::default(), d, &Actor::Person, TODO).is_err(), "naming the default is still the default");
+        // `claude sonnet` is another policy than the default.
+        let mut s = new("z", At::Next);
+        s.agent = Some("claude sonnet".into());
+        assert!(add(&Record::default(), s, &Actor::Person, TODO).unwrap_err().contains("gives no reason"));
+    }
+
+    #[test]
+    fn a_dropped_piece_keeps_its_reason_and_the_tier_rule_is_not_asked_of_it() {
+        let mut n = new("x", At::Next);
+        n.agent = Some("claude opus high".into());
+        n.why = Some("hard".into());
+        let rec = add(&Record::default(), n, &Actor::Person, TODO).unwrap();
+        let rec = drop_piece(&rec, 1, "the plan changed", &Actor::Person, TODO).unwrap();
+        assert_eq!(rec.pieces[0].why.as_deref(), Some("the plan changed"));
+        let mut d = new("d", At::Next);
+        d.why = Some("x".into());
+        let rec = put(&Record::default(), new("d", At::Next));
+        let rec = drop_piece(&rec, 1, "no", &Actor::Person, TODO).unwrap();
+        assert!(check(&rec).is_ok(), "a default dropped piece carries a why: line");
+        assert!(drop_piece(&rec, 1, "again", &Actor::Person, TODO).is_err(), "only a pending piece is dropped");
+    }
+
+    #[test]
+    fn a_piece_goes_to_a_batch_that_has_not_opened_or_to_next_and_never_to_one_that_has() {
+        let rec = put(&Record::default(), new("a", At::Next));
+        let rec = put(&rec, new("b", At::Batch(1)));
+        let rec = put(&rec, new("c", At::Batch(2)));
+        assert_eq!(last_batch(&rec), 2);
+        assert_eq!(put(&rec, new("d", At::Next)).pieces.last().unwrap().batch, 3);
+        // A gap is refused.
+        assert!(add(&rec, new("e", At::Batch(4)), &Actor::Person, TODO).unwrap_err().contains("gap"));
+        // Batch 1 opens once one of its pieces is not pending.
+        let opened_by = |s: State| {
+            let rec = with_state(rec.clone(), 1, s);
+            add(&rec, new("late", At::Batch(1)), &Actor::Person, TODO)
+        };
+        for s in [State::Running, State::Done, State::Blocked, State::Promoted] {
+            let e = opened_by(s).unwrap_err();
+            assert!(e.contains("batch 1 has opened"), "{s:?}: {e}");
+        }
+        assert!(opened_by(State::Dropped).is_ok(), "a dropped piece never ran, so it opened nothing");
+        // Batch 2 is still open, and `next` is still 3.
+        let started = with_state(rec.clone(), 1, State::Running);
+        assert!(add(&started, new("in two", At::Batch(2)), &Actor::Person, TODO).is_ok());
+        assert_eq!(put(&started, new("n", At::Next)).pieces.last().unwrap().batch, 3);
+        assert!(add(&rec, new("zero", At::Batch(0)), &Actor::Person, TODO).is_err());
+    }
+
+    #[test]
+    fn a_row_with_legs_takes_no_piece_and_a_row_with_pieces_takes_no_leg() {
+        let (env, store) = scratch("both");
+        let mut other = Task::new("another row", "m-2");
+        other.set_status(Status::Doing);
+        other.body = "## Overview\nthe work\n\n## Log\n- 2026-10-18 claimed\n".into();
+        store.save_task(&other).unwrap();
+        let order = file(&env, "o.md", "do it");
+        let piece = |row: &str| run(&store, &parse(&["piece", "add", row, "p", "--batch", "next", "--overview", &order, "--done-when", "done"]), None);
+        let leg = |row: &str| crate::legs::run(&store, &parse(&["leg", "add", row, "scout", "--order", &order]), None);
+        // Legs first: a piece is refused, naming the legs.
+        assert_eq!(leg("m-1"), 0);
+        assert_eq!(piece("m-1"), 1);
+        assert!(record(&store.find_task("m-1").unwrap()).pieces.is_empty());
+        assert!(refuses_pieces(&store.find_task("m-1").unwrap()).unwrap().contains("## Legs"));
+        // Pieces first: a leg is refused, naming the pieces.
+        assert_eq!(piece("m-2"), 0);
+        assert_eq!(leg("m-2"), 1);
+        assert!(crate::legs::legs(&store.find_task("m-2").unwrap()).is_empty());
+        assert!(refuses_legs(&store.find_task("m-2").unwrap()).unwrap().contains("## Pieces"));
+        assert!(refuses_legs(&store.find_task("m-1").unwrap()).is_none());
+    }
+
+    // ---- who may write ----
+
+    fn two_batches() -> Record {
+        let rec = put(&Record::default(), new("a", At::Next));
+        let rec = put(&rec, new("b", At::Next));
+        with_state(rec, 1, State::Running)
+    }
+
+    #[test]
+    fn a_person_the_primary_a_governor_and_the_seat_holding_the_row_may_write_a_todo_or_doing_row() {
+        for actor in [Actor::Person, Actor::Primary, Actor::Governor, Actor::Claimant] {
+            for status in [Status::Todo, Status::Doing] {
+                let rec = add(&two_batches(), new("c", At::Batch(2)), &actor, status).unwrap_or_else(|e| panic!("{actor:?} {status:?}: {e}"));
+                assert_eq!(rec.pieces.len(), 3);
+                let rec = drop_piece(&rec, 2, "no", &actor, status).unwrap();
+                assert_eq!(rec.pieces[1].state, State::Dropped);
+                assert!(set_cap(&rec, 5, &actor, status).is_ok());
+            }
+            for status in [Status::Inbox, Status::Blocked, Status::Parked, Status::Review, Status::Done] {
+                let e = add(&two_batches(), new("c", At::Batch(2)), &actor, status).unwrap_err();
+                assert!(e.contains("todo or doing") && e.contains(status.as_str()), "{actor:?} {status:?}: {e}");
+                assert!(drop_piece(&two_batches(), 2, "no", &actor, status).is_err());
+                assert!(set_cap(&two_batches(), 5, &actor, status).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn any_other_seat_may_not_write() {
+        let e = add(&two_batches(), new("c", At::Batch(2)), &Actor::Other, TODO).unwrap_err();
+        assert!(e.contains("may write its pieces"), "{e}");
+        assert!(drop_piece(&two_batches(), 2, "no", &Actor::Other, TODO).is_err());
+        assert!(set_cap(&two_batches(), 5, &Actor::Other, TODO).is_err());
+    }
+
+    #[test]
+    fn a_seated_piece_adds_only_to_later_batches_and_changes_only_what_it_added() {
+        let me = Actor::Piece(1);
+        let rec = two_batches();
+        // Its own batch, and an earlier one, are refused; a later one is not.
+        assert!(add(&rec, new("same", At::Batch(1)), &me, TODO).is_err());
+        let e = add(&rec, new("same", At::Batch(2)), &me, TODO);
+        assert!(e.is_ok(), "{e:?}");
+        let rec = e.unwrap();
+        let added = rec.pieces.last().unwrap();
+        assert_eq!(added.by, Some(1), "it is recorded who added it");
+        // `next` is later than its own batch.
+        let rec = add(&rec, new("after", At::Next), &me, TODO).unwrap();
+        // It drops what it added, and not what it did not.
+        assert!(drop_piece(&rec, 3, "wrong", &me, TODO).is_ok());
+        let e = drop_piece(&rec, 2, "wrong", &me, TODO).unwrap_err();
+        assert!(e.contains("only the pieces it added"), "{e}");
+        // Nor the cap.
+        assert!(set_cap(&rec, 5, &me, TODO).unwrap_err().contains("cap"));
+        // A piece that is not running is no seat.
+        let idle = with_state(rec.clone(), 1, State::Done);
+        assert!(add(&idle, new("late", At::Next), &me, TODO).unwrap_err().contains("not running"));
+        // Another piece's number it is not.
+        assert!(add(&rec, new("x", At::Next), &Actor::Piece(9), TODO).is_err());
+    }
+
+    #[test]
+    fn nobody_changes_a_running_or_done_piece() {
+        let rec = two_batches();
+        let e = drop_piece(&rec, 1, "no", &Actor::Person, TODO).unwrap_err();
+        assert!(e.contains("only a pending piece"), "{e}");
+        assert!(drop_piece(&rec, 7, "no", &Actor::Person, TODO).unwrap_err().contains("no piece 7"));
+        assert!(drop_piece(&rec, 2, "  ", &Actor::Person, TODO).is_err());
+    }
+
+    #[test]
+    fn a_write_is_judged_by_what_it_changes() {
+        // A hand edit left a note over its cap; an unrelated add still goes in.
+        let mut rec = put(&Record::default(), new("a", At::Next));
+        rec.pieces[0].note = "n".repeat(1_600);
+        assert!(check(&rec).is_err());
+        assert!(add(&rec, new("b", At::Batch(1)), &Actor::Person, TODO).is_ok());
+    }
+
+    #[test]
+    fn the_cap_is_one_to_twenty() {
+        let rec = Record::default();
+        assert_eq!(set_cap(&rec, 5, &Actor::Person, TODO).unwrap().cap, 5);
+        assert!(set_cap(&rec, 0, &Actor::Person, TODO).is_err());
+        assert!(set_cap(&rec, 21, &Actor::Person, TODO).is_err());
+        let mut t = row("");
+        write(&mut t, &Record { cap: 5, pieces: Vec::new() });
+        assert_eq!(record(&t).cap, 5, "a cap with no pieces is kept");
+    }
+
+    // ---- the verbs, against a store ----
+
+    fn scratch(tag: &str) -> (util::Isolated, Store) {
+        let env = util::isolated(&format!("pieces-{tag}"));
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("a row", "m-1");
+        t.set_status(Status::Doing);
+        t.body = "## Overview\nthe work\n\n## Log\n- 2026-10-18 claimed\n".into();
+        store.save_task(&t).unwrap();
+        (env, store)
+    }
+
+    fn file(env: &util::Isolated, name: &str, text: &str) -> String {
+        let p = env.home().join(name);
+        std::fs::write(&p, text).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    fn parse(line: &[&str]) -> Args {
+        Args::parse(line.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    #[test]
+    fn the_verbs_add_show_drop_and_cap_and_refuse_what_the_rules_refuse() {
+        let (env, store) = scratch("verbs");
+        let overview = file(&env, "overview.md", "Read the call sites.");
+        let go = |line: &[&str]| run(&store, &parse(line), None);
+        assert_eq!(go(&["piece", "add", "m-1", "contract types", "--batch", "next", "--overview", &overview, "--done-when", "fixtures read back", "--check", "tsc (2m): npx tsc --noEmit", "--check", "unit: cargo test pieces::"]), 0);
+        assert_eq!(go(&["piece", "add", "m-1", "board", "--batch=2", "--overview", &overview, "--done-when", "renders"]), 0);
+        assert_eq!(go(&["piece", "add", "m-1", "rail", "--batch", "next", "--overview", &overview, "--done-when", "decided", "--agent", "claude opus high", "--why", "chooses between layouts"]), 0);
+        let rec = record(&store.find_task("m-1").unwrap());
+        assert_eq!(rec.pieces.iter().map(|p| (p.n, p.batch)).collect::<Vec<_>>(), vec![(1, 1), (2, 2), (3, 3)]);
+        assert_eq!(rec.pieces[0].checks, vec!["tsc (2m): npx tsc --noEmit", "unit: cargo test pieces::"]);
+        assert_eq!(crate::legs::policy_line(&rec.pieces[2].policy), "claude opus high");
+        // Refused: no why, no batch, no done-when, no overview, a gap, a bad check.
+        assert_eq!(go(&["piece", "add", "m-1", "x", "--batch", "next", "--overview", &overview, "--done-when", "d", "--agent", "claude opus high"]), 1);
+        assert_eq!(go(&["piece", "add", "m-1", "x", "--overview", &overview, "--done-when", "d"]), 1);
+        assert_eq!(go(&["piece", "add", "m-1", "x", "--batch", "next", "--overview", &overview]), 1);
+        assert_eq!(go(&["piece", "add", "m-1", "x", "--batch", "next", "--done-when", "d"]), 1);
+        assert_eq!(go(&["piece", "add", "m-1", "x", "--batch", "9", "--overview", &overview, "--done-when", "d"]), 1);
+        assert_eq!(go(&["piece", "add", "m-1", "x", "--batch", "soon", "--overview", &overview, "--done-when", "d"]), 1);
+        assert_eq!(go(&["piece", "add", "m-1", "x", "--batch", "next", "--overview", &overview, "--done-when", "d", "--check", "label (never): cmd"]), 1);
+        assert_eq!(go(&["piece", "add", "m-1"]), 2);
+        assert_eq!(go(&["piece", "show", "m-1"]), 0);
+        assert_eq!(go(&["piece", "show", "m-1", "2"]), 0);
+        assert_eq!(go(&["piece", "show", "m-1", "9"]), 1);
+        assert_eq!(go(&["piece", "drop", "m-1", "2", "the", "split", "was", "wrong"]), 0);
+        assert_eq!(go(&["piece", "drop", "m-1", "2", "again"]), 1);
+        assert_eq!(go(&["piece", "drop", "m-1", "3"]), 1, "a drop takes the reason");
+        assert_eq!(go(&["piece", "cap", "m-1", "2"]), 0);
+        assert_eq!(go(&["piece", "cap", "m-1", "0"]), 1);
+        assert_eq!(go(&["piece", "bogus"]), 2);
+        let rec = record(&store.find_task("m-1").unwrap());
+        assert_eq!(rec.cap, 2);
+        assert_eq!(rec.pieces[1].state, State::Dropped);
+        assert_eq!(rec.pieces[1].why.as_deref(), Some("the split was wrong"));
+    }
+
+    #[test]
+    fn a_from_file_adds_three_pieces_in_two_batches_in_one_commit() {
+        let (env, store) = scratch("from");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&store.root).args(args).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]);
+        let before: usize = git(&["rev-list", "--count", "HEAD"]).parse().unwrap();
+        let blocks = file(
+            &env,
+            "pieces.md",
+            "### contract types\nbatch: 1\ndone-when: fixtures read back\ncheck: tsc (2m): npx tsc --noEmit\nTypes and a fixture each.\nSecond line.\n\n\
+             ### board\nbatch: 2\ndone-when: renders\ncheck: board (1m): npx vitest run src/board\nThe board.\n\n\
+             ### rail\nbatch: 2\ndone-when: laid out\nagent: claude opus high\nwhy: chooses between layouts\nThe rail.\n",
+        );
+        let go = |line: &[&str]| run(&store, &parse(line), None);
+        assert_eq!(go(&["piece", "add", "m-1", "--from", &blocks]), 0);
+        let rec = record(&store.find_task("m-1").unwrap());
+        assert_eq!(rec.pieces.iter().map(|p| (p.n, p.batch, p.title.as_str())).collect::<Vec<_>>(), vec![(1, 1, "contract types"), (2, 2, "board"), (3, 2, "rail")]);
+        assert_eq!(rec.pieces[0].overview, "Types and a fixture each.\nSecond line.");
+        assert_eq!(rec.pieces[0].checks, vec!["tsc (2m): npx tsc --noEmit"]);
+        assert_eq!(rec.pieces[2].why.as_deref(), Some("chooses between layouts"));
+        let after: usize = git(&["rev-list", "--count", "HEAD"]).parse().unwrap();
+        assert_eq!(after - before, 1, "one store commit for the three pieces");
+        // A block that cannot go in leaves the others out too.
+        let bad = file(&env, "bad.md", "### ok\nbatch: next\ndone-when: d\nfine\n\n### no done-when\nbatch: next\nfine\n");
+        assert_eq!(go(&["piece", "add", "m-1", "--from", &bad]), 1);
+        assert_eq!(record(&store.find_task("m-1").unwrap()).pieces.len(), 3);
+        assert_eq!(git(&["rev-list", "--count", "HEAD"]).parse::<usize>().unwrap(), after);
+        // Pieces that say `next` share the one new batch.
+        let nexts = file(&env, "nexts.md", "### a\ndone-when: d\nthe a\n\n### b\ndone-when: d\nthe b\n");
+        assert_eq!(go(&["piece", "add", "m-1", "--from", &nexts]), 0);
+        let rec = record(&store.find_task("m-1").unwrap());
+        assert_eq!((rec.pieces[3].batch, rec.pieces[4].batch), (3, 3));
+        let junk = file(&env, "junk.md", "words before any heading\n");
+        assert_eq!(go(&["piece", "add", "m-1", "--from", &junk]), 1);
+        let empty = file(&env, "empty.md", "");
+        assert_eq!(go(&["piece", "add", "m-1", "--from", &empty]), 1);
+    }
+
+    #[test]
+    fn the_verbs_take_the_actor_from_the_seat_they_are_run_in() {
+        let (env, store) = scratch("actors");
+        let overview = file(&env, "overview.md", "do it");
+        let at = |pane: Option<&str>, line: &[&str]| run(&store, &parse(line), pane);
+        let add = |pane: Option<&str>, title: &str, batch: &str| {
+            at(pane, &["piece", "add", "m-1", title, "--batch", batch, "--overview", &overview, "--done-when", "d"])
+        };
+        // The seat holding the claim (a binding to the row) may write.
+        store.set_binding("cpd-1", json!({ "task_id": "m-1", "pane_id": "cpd-1" }));
+        assert_eq!(add(Some("cpd-1"), "one", "next"), 0);
+        // A seat bound to another row may not.
+        store.set_binding("cpd-2", json!({ "task_id": "z-9", "pane_id": "cpd-2" }));
+        assert_eq!(add(Some("cpd-2"), "nope", "next"), 1);
+        // A seat of a leg of this row is no claimant.
+        store.set_binding("cpd-3", json!({ "task_id": "m-1", "pane_id": "cpd-3", "leg": "scout" }));
+        assert_eq!(add(Some("cpd-3"), "nope", "next"), 1);
+        assert_eq!(add(None, "two", "next"), 0);
+        // A seated piece adds only to later batches.
+        let mut t = store.find_task("m-1").unwrap();
+        let mut rec = record(&t);
+        rec.pieces[0].state = State::Running;
+        write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-4", json!({ "task_id": "m-1", "pane_id": "cpd-4", "piece": 1 }));
+        assert_eq!(add(Some("cpd-4"), "same batch", "1"), 1);
+        assert_eq!(add(Some("cpd-4"), "later", "next"), 0);
+        let rec = record(&store.find_task("m-1").unwrap());
+        assert_eq!(rec.pieces.last().unwrap().by, Some(1));
+        assert_eq!(at(Some("cpd-4"), &["piece", "drop", "m-1", "2", "not mine"]), 1);
+        assert_eq!(at(Some("cpd-4"), &["piece", "drop", "m-1", "3", "mine"]), 0);
+        assert_eq!(at(Some("cpd-4"), &["piece", "cap", "m-1", "2"]), 1);
+    }
+
+    #[test]
+    fn show_renders_the_table_folded_and_the_pieces_whole_and_the_json_carries_them() {
+        let mut rec = Record::default();
+        let mut p = put(&rec, new("contract types", At::Next));
+        p.pieces[0].state = State::Done;
+        p.pieces[0].pane = Some("cpd-31".into());
+        p.pieces[0].caption = Some("types and fixtures read back".into());
+        p.pieces[0].tree = Some("m-1-1".into());
+        rec = put(&p, new("board", At::Batch(2)));
+        let t = {
+            let mut t = row("");
+            write(&mut t, &rec);
+            t
+        };
+        let folded = section_for_show(&t, false).unwrap();
+        assert_eq!(
+            folded,
+            "cap: 3\n- 1 · contract types · batch 1 · done · types and fixtures read back\n- 2 · board · batch 2 · pending"
+        );
+        let whole = section_for_show(&t, true).unwrap();
+        assert!(whole.contains("  overview: do contract types") && whole.contains("  done-when: board is done"), "{whole}");
+        assert_eq!(section_for_show(&row(""), false), None);
+        assert_eq!(
+            json(&t),
+            json!([
+                { "n": 1, "id": "m-1-1", "title": "contract types", "batch": 1, "state": "done", "seat": "cpd-31", "tree": "m-1-1", "caption": "types and fixtures read back" },
+                { "n": 2, "id": "m-1-2", "title": "board", "batch": 2, "state": "pending", "seat": null, "tree": null, "caption": null },
+            ])
+        );
+        assert_eq!(json(&row("")), json!([]));
+    }
+}

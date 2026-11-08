@@ -750,6 +750,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         // `wsp-241`: the passes, which were only ever inside `body`.
         v["verification"] = crate::verification::json(&t);
         v["legs"] = crate::legs::json(&t);
+        v["pieces"] = crate::pieces::json(&t);
         // `wsp-242`: where it is, as a word wsp derives and the tail the step
         // that put it there was given.
         // `wsp-255`: and when it entered each stage it has been in.
@@ -909,6 +910,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // entry on disk leaves both implicit (`docs/legs.md`, *The record*).
     if let Some(table) = crate::legs::section_for_show(&t) {
         crate::model::set_section_in(&mut rest, crate::legs::SECTION, &table);
+    }
+    // The pieces the same way: a table, or every entry whole with `--pieces`.
+    if let Some(table) = crate::pieces::section_for_show(&t, args.has("pieces")) {
+        crate::model::set_section_in(&mut rest, crate::pieces::SECTION, &table);
     }
     // Lifted out and printed below rather than with the body, because it is the
     // one section that is capped. It is last in a body whatever order the file
@@ -3248,7 +3253,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     the archive. It says when the answer is
                                     somewhere you did not look. Stops at 20
                                     hits and says how many more; --full for
-                                    all of them"##,
+                                    all of them; --pieces prints each piece whole"##,
             },
         ],
     },

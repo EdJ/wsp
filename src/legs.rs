@@ -161,7 +161,7 @@ pub(crate) fn is_default(p: &Policy) -> bool {
 
 /// A policy as an entry writes it: the words `claude opus high`, which is also
 /// what `wsp leg add --agent` takes.
-fn policy_line(p: &Policy) -> String {
+pub(crate) fn policy_line(p: &Policy) -> String {
     let mut out = p.kind.clone();
     for w in [&p.model, &p.effort].into_iter().flatten() {
         out.push(' ');
@@ -1157,6 +1157,10 @@ fn edit(
     let id = store.task_or_why(needle)?.id;
     store.locked(|| {
         let mut t = store.find_task(&id).ok_or_else(|| format!("no task {id}"))?;
+        // A row has legs or pieces, not both (`docs/pieces.md`, *The record*).
+        if let Some(why) = crate::pieces::refuses_legs(&t) {
+            return Err(why);
+        }
         let old = legs(&t);
         let actor = actor_of(&old, pane);
         let new = f(&old, actor.as_deref())?;

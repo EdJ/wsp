@@ -28,7 +28,7 @@ TASKS
                                     the archive. It says when the answer is
                                     somewhere you did not look. Stops at 20
                                     hits and says how many more; --full for
-                                    all of them
+                                    all of them; --pieces prints each piece whole
   wsp inbox                         tasks with no project
   wsp show <id> [--log]             full task, including notes. The log is
                                     the last few entries and says how many
@@ -52,6 +52,15 @@ TASKS
   wsp leg show <task> [<name>]           the legs, the tier and waits in full
   wsp leg done <task> [--from FILE|-] --caption "…"   a leg's seat ends it, at a clean
                                          commit: the baton, the caption, the run poked
+  wsp piece add <task> "title" --batch N|next --overview FILE|- --done-when "…" [--check "label (time): cmd"]… [--agent "claude opus high" --why "…"]
+                                    a piece of a row (docs/pieces.md): under
+                                    ## Pieces, in a batch not yet open. No --agent
+                                    is claude sonnet medium; another tier needs --why
+  wsp piece add <task> --from FILE       several at once, in one commit: a `### title` block
+                                         each, with batch:, done-when: and check: lines
+  wsp piece show <task> [<n>]            the pieces, or one piece whole
+  wsp piece drop <task> <n> "why"        a pending piece, never run
+  wsp piece cap <task> <N>               how many of the row's pieces run at once (default 3)
   wsp verified <member> --holds|--blocks --from FILE --caption "…"
                                     a verifier's verdict, recorded on the member
                                     under ## Verification. --blocks sends it back

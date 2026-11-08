@@ -253,6 +253,11 @@ pub const VALUED_ON: &[(&str, &str)] = &[
     // reason: `--agent "claude opus high"` is read as a value, not as a flag
     // that leaves its policy behind as a positional.
     ("leg", "agent"),
+    // `piece add`, the same way: the overview is a file, the tier a policy, and
+    // each `--check` a line (`docs/pieces.md`, *The record*).
+    ("piece", "overview"),
+    ("piece", "agent"),
+    ("piece", "check"),
     // `verify --check` stands alone; on `spawn` it names the group a barrier
     // check reads (`wsp-230`).
     ("spawn", "check"),
