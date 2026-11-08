@@ -472,7 +472,8 @@ are rows' landings at the barrier instead and would move, not appear.
 
 `wsp-510`, 2026-11-08, on master 507e5b0. Two runs: a sandbox run of the
 mechanics, then one real larger work (`wsp-495`) run as pieces on the list
-`pieces`, priced with `wsp attempts <row> --cost` and `wsp worklist cost`.
+`pieces-trial`, priced with `wsp attempts <row> --cost` and `wsp worklist
+cost`.
 
 ### The sandbox run
 
@@ -513,6 +514,94 @@ Found along the way:
 - `wsp attempts --cost` gives a start that never seated a clock that runs to
   the next start (8m and 6m for about a minute each). The fold says `ran ?`
   for a seat with no session.
+
+### The real run
+
+`wsp-495`, three gaps as three pieces, was the one member of `pieces-trial`.
+It could not join `pieces` group 6, because a running group takes no joins,
+and every later group would have waited on this row's barrier. Batch 1 was
+piece 1 (the run, in `src/cycle.rs` and `src/cmd_worklist.rs`, at sonnet
+high with a why) beside piece 2 (the seat, in `src/room.rs` and
+`src/waiting.rs`). Batch 2 was piece 3 (`docs/prerequisites.md`, written
+against what batch 1 built). The list waited 1h30m behind the thermal
+throttle before it started. That wait is the machine's, so it is not counted
+below. Times are UTC, 2026-11-08.
+
+| step | seat | clock | cost |
+|---|---|---|---|
+| piece 1, batch 1 | sonnet/high, 29 turns, peak 132k | 11m | $0.80 |
+| piece 2, batch 1 | sonnet/medium, 30 turns, peak 80k | 5m | $0.41 |
+| batch 1 close: merge, 3 checks on the merged tip | none | 22:28 to 22:31:49 | none |
+| piece 3, batch 2 | sonnet/medium, 7 turns | 51s | $0.12 |
+| landing check at d484d1e: sent back, `build` exit 137 | none | 165s | none |
+| piece 4, batch 3: rework, no change | sonnet/medium, 4 turns | 2m | $0.07 |
+| **verifier**, one seat, holds | sonnet/high, 7 turns | **185s** (spawn to verdict) | **$0.15** |
+| governor | 3 turns | 37m standing | $0.11 |
+| barrier: full suite 714s, then its reading seat | sonnet/high, 3 turns | 12m | $0.07 |
+| **list total** | 7 seats, 83 turns | 1h | **$1.73** |
+
+`wsp attempts wsp-495 --cost` prices the same seats at $1.25, against $1.40
+by `wsp worklist cost`. The difference is how each counts cache writes, and
+both are floors. The table uses the list's figures.
+
+- **The verifier against *Cost*.** It cost $0.15, inside the per-row median
+  ($0.13–0.16). Its clock was 185 s, about twice the per-row 80–97 s, on a
+  machine at load 11 and throttled to 60–64% of its clock, which slowed
+  every seat that hour. A row of three pieces did not need the breadth
+  allowance (the 150+ band's $0.31). As three rows, the same work would have
+  had three verifiers: $0.39–0.48 and three places for 80–97 s each. The
+  saving is $0.24–0.33 on verifiers. Less the fix piece's $0.07, the net is
+  $0.17–0.26, which is $0.06–0.09 a piece against the estimate's
+  $0.10–0.14. That is low, and both causes are below.
+- **Blocks.** The verifier did not block. No piece blocked. The landing
+  check sent the row back once, and no piece was at fault: when piece 3's
+  seat ended in the row's tree, the finished-row sweep stopped the check's
+  own `cargo build`. It spares a `wsp` but stops anything named `cargo`
+  before it asks what started it (`wsp-541`). Piece 4 found nothing to fix.
+  The run then opened a verifier on the unchanged commit without running
+  `build` again, so the land rested on the verifier and the barrier's full
+  suite (`wsp-543`). The send-back cost 6 minutes of wall time and $0.07.
+- **Wall time.** 26 minutes from piece 1 started to the land (22:16:03 to
+  22:42:10), against 19 minutes of piece seats summed and a 14-minute
+  critical path through them (11m, then 51s, then 2m). The rest is the
+  batch closes' checks (about 3½ minutes for batch 1, where `cargo test
+  prerequisite` took 95 s on the merged tip), the killed landing check, and
+  the verifier. The barrier's full suite (12 minutes) was the longest single
+  clock in the list, and pieces do not change it.
+- **Merges.** Batch 1's two branches merged clean. Their files did not
+  overlap, so a merge had nothing to collide on. No fix piece was for a
+  conflict.
+- **Legs.** No piece wanted legs or added a piece. The one coupling, the
+  doc written against the code, was batch 2, as *Departures* says.
+- **`cap: 3`** never bound. Batch 1 had two pieces. What held the row was
+  the room and the throttle, before it started.
+
+### The decision
+
+- **The cost estimate holds, with a narrower range at the small end.** For
+  a row of a few pieces, the one verifier costs a per-row verifier, not the
+  150+ band, so a piece saves a little under a whole verifier's $0.13–0.16.
+  Here it was $0.06–0.09 net, because the run lost a send-back to a sweep
+  defect. Without `wsp-541` it would have been $0.08–0.11. The estimate for
+  a wide row (react-pass-3 group 2, fifteen pieces, 23–27%) is unchanged:
+  this trial had no row that wide, so it neither confirms nor moves that
+  figure.
+- **Time is not saved**, as *Cost* said. Wall time was the critical path
+  plus the seatless closes and one verifier, and the barrier's suite was
+  larger than any of them.
+- **`cap: 3` stays.** It was not reached, and the machine's room bound
+  first. Nothing here argues for a higher default on this hardware.
+- **A piece's block blocks the piece: kept, untested.** No piece blocked. A
+  send-back at the landing check is the row's, and the run answered it as
+  it should: with a rework piece in a new batch, not by reseating the row.
+- **No legs inside pieces: confirmed** for this run. No piece wanted them.
+- **What the trial moved instead is the land gate.** A pieces row's review
+  is typed while its last piece's seat may still stand in the tree. A
+  sweep that fires when that seat ends must not reach the check that has
+  just started there (`wsp-541`). A rework piece that changes nothing must
+  not let the run's review skip the step that failed (`wsp-543`). Both are
+  filed. Until they land, a pieces row can be sent back for nothing, and
+  can then land without that step green.
 
 ## Not this
 
