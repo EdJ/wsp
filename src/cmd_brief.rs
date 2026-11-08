@@ -1239,6 +1239,10 @@ fn link_row(executor: bool) -> Option<&'static str> {
 }
 
 /// The brief as text, one line per element and nothing printed.
+/// The one line on waiting (`wsp-536`). A `pgrep -f` guard matches its own
+/// command line, so an `until … pgrep -f` loop never ends by itself.
+const WAIT_LINE: &str = "wait on a pid (`while kill -0 $pid; do sleep 5; done`) or a harness-tracked background command, never an `until … pgrep -f` loop: a loop that watches for itself holds nothing, and a quiet shell does not hold your seat";
+
 fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     let terse = depth == Depth::Terse;
     let session = depth.session();
@@ -1300,6 +1304,10 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             p.dim("`wsp sandbox` still spawns real processes, claude included: a test that spawns uses `wsp sandbox --fake`, and what you start you end (`wsp despawn`, `wsp sandbox rm`); the daemon names agents left for a store no daemon keeps in cycle.log and ends them after 30 min")
                 .to_string(),
         );
+        // How to wait on a command without holding the seat for nothing
+        // (`wsp-536`): the run reads a shell's process tree at the turn's end,
+        // and a loop that watches for itself never ends and holds nothing.
+        row("wait", p.dim(WAIT_LINE).to_string());
         // Whose the land is and what review follows it (`wsp-306`), said to
         // the agent holding a row and nobody else: a leg's work is landed by
         // its row's finish, and a seat with nothing claimed has no row to end.
@@ -1920,6 +1928,15 @@ mod tests {
     /// matters about the seat line is the one about it not being there. No
     /// governor anywhere is the normal state and it has to cost nothing —
     /// literally nothing, byte for byte.
+    #[test]
+    fn a_member_in_its_own_tree_is_told_to_wait_on_a_pid_and_never_on_a_pgrep_loop() {
+        let mut r = compose(&briefing());
+        r.own_tree = Some("t-001".into());
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("while kill -0 $pid"), "{text}");
+        assert!(text.contains("never an `until … pgrep -f` loop"), "{text}");
+    }
+
     #[test]
     fn a_brief_with_nobody_coordinating_says_nothing_about_a_seat() {
         let text = brief_lines(&compose(&briefing()), &plain(), Depth::Normal).join("\n");

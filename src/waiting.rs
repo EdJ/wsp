@@ -48,6 +48,7 @@ use std::collections::BTreeMap;
 
 use crate::place::State;
 use crate::store::Store;
+use crate::util;
 
 /// What the seat is waiting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +81,9 @@ pub(crate) enum On {
 pub(crate) struct Wait {
     pub(crate) why: Why,
     pub(crate) on: On,
+    /// What it is waiting on, when that is a shell of its own (`wsp-536`):
+    /// the work under it, how long, and how long it has been quiet.
+    pub(crate) own: Option<Own>,
 }
 
 impl Wait {
@@ -88,7 +92,27 @@ impl Wait {
         match &self.on {
             On::Person => "waiting · person".into(),
             On::Seat(scope) => format!("waiting · {scope}"),
-            On::Itself => "waiting · itself".into(),
+            On::Itself => match self.own.as_ref().filter(|o| o.quiet >= SHOWN) {
+                // Before the limit, so a person sees it going quiet (`wsp-536`).
+                Some(o) => format!("waiting · itself · quiet {}", util::duration_human(o.quiet)),
+                None => "waiting · itself".into(),
+            },
+        }
+    }
+
+    /// Why it is held and since when, in one line: `waiting on itself: cargo
+    /// test (4m, busy)`. What `wip --json` carries as `reason`.
+    pub(crate) fn reason(&self) -> String {
+        match (&self.why, &self.own) {
+            (Why::Shell(_), Some(o)) => {
+                let work = if o.work.is_empty() { "a shell" } else { o.work.as_str() };
+                let state = match o.quiet >= SHOWN {
+                    true => format!("quiet {}", util::duration_human(o.quiet)),
+                    false => "busy".to_string(),
+                };
+                format!("waiting on itself: {work} ({}, {state})", util::duration_human(o.age))
+            }
+            _ => self.sentence(),
         }
     }
 
@@ -140,6 +164,12 @@ impl Wait {
         if let Some(n) = shells {
             v["shells"] = n.into();
         }
+        if let Some(o) = &self.own {
+            v["work"] = o.work.as_str().into();
+            v["age"] = o.age.into();
+            v["quiet"] = o.quiet.into();
+        }
+        v["reason"] = self.reason().into();
         // §26.8 D9 names it `id`; `question` stays beside it as `answer`'s.
         if let (Why::Question(id), Some(o)) = (&self.why, v.as_object_mut()) {
             o.insert("id".into(), id.as_str().into());
@@ -244,20 +274,20 @@ impl Asks {
             return Some(w);
         }
         let hit = self.by_pane.get(seat).or_else(|| (!task.is_empty()).then(|| self.by_task.get(task)).flatten())?;
-        Some(Wait { why: Why::Answer(hit.0.clone()), on: hit.1.clone() })
+        Some(Wait { why: Why::Answer(hit.0.clone()), on: hit.1.clone(), own: None })
     }
 
     /// The person's question this seat is blocked on in `wsp ask --wait`.
     pub(crate) fn awaited(&self, seat: &str, task: &str) -> Option<Wait> {
         let id = self.awaited_pane.get(seat).or_else(|| (!task.is_empty()).then(|| self.awaited_task.get(task)).flatten())?;
-        Some(Wait { why: Why::Question(id.clone()), on: On::Person })
+        Some(Wait { why: Why::Question(id.clone()), on: On::Person, own: None })
     }
 
     /// The dialog a hook is holding for this seat, if one is: a person's to
     /// answer, and held whatever state the seat reads.
     pub(crate) fn held(&self, seat: &str, task: &str) -> Option<Wait> {
         let id = self.held_by_pane.get(seat).or_else(|| (!task.is_empty()).then(|| self.held_by_task.get(task)).flatten())?;
-        Some(Wait { why: Why::Question(id.clone()), on: On::Person })
+        Some(Wait { why: Why::Question(id.clone()), on: On::Person, own: None })
     }
 
     #[cfg(test)]
@@ -300,22 +330,47 @@ impl Asks {
 /// **What counts:** a shell running a command (`sh`, `bash`, `zsh`, `dash`,
 /// `ksh` or `fish`, with `-c`) under the seat's root ([`crate::place::Place::root`]),
 /// whose parent is not one — the subshells under it are the same command, not
-/// another one. Two bounds, both from what else looks like that:
+/// another one. Bounds, all from what else looks like that:
 ///
 /// - **At least [`SETTLED`] old.** A hook and the status line are shells under
 ///   the agent too, and live for a moment. A background command younger than
 ///   that is read on the next pass.
 /// - **Younger than [`LEFT_RUNNING`].** A shell the agent has not seen end in
-///   an hour is a dev server it left running, not a command it is waiting on,
-///   and holding the seat for it would hold it for good. Past that the seat
-///   reads idle again and the run tells it, which is a sentence and not an end:
-///   the end is a further threshold later.
+///   an hour is a dev server it left running, not a command it is waiting on.
+/// - **With work under it** (`wsp-536`, Ed 2026-11-08: *we're getting a lot of
+///   delays when agents finish their turn*). The shell's own tree is read at
+///   the turn's end: a compiler, a test binary, `cargo`, a server is work; a
+///   `sleep`, a `tail -f`, a `grep`, a `pgrep` is a watcher, and a shell with
+///   only watchers under it, or nothing, is a dead wait that wakes nobody
+///   (`wsp-530` sat on one with no process in its tree at all). One
+///   [`crate::stuck`] names as waiting on itself — an `until … pgrep -f` loop
+///   that matches its own line — never ends by itself and never counts.
+/// - **Not quiet for [`QUIET`].** Work that has used no CPU for a minute
+///   (blocked on a lock, a hung test) stops holding the seat, and the wait
+///   shows `quiet` from [`SHOWN`] on. CPU is read as the tree's total cputime
+///   against the last reading, kept in `shell-cpu.json` in the state dir.
+///
+/// The seat that stops counting reads idle on that tick, and the normal path
+/// applies: told to finish, then ended and reseated.
 ///
 /// A backend that cannot name a root, and a far machine whose process table
 /// is not this one, read as no shells: the seat is idle as before.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Shells {
-    by_seat: BTreeMap<String, usize>,
+    by_seat: BTreeMap<String, Own>,
+}
+
+/// What a seat's own shells are doing, from the process tree under them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Own {
+    /// How many shells.
+    pub(crate) n: usize,
+    /// The work under them, `cargo test`; empty when a test names none.
+    pub(crate) work: String,
+    /// How long the oldest has run, in seconds.
+    pub(crate) age: i64,
+    /// How long the tree has used no CPU, in seconds.
+    pub(crate) quiet: i64,
 }
 
 /// How long a shell has to have been running to be one the agent is waiting
@@ -325,8 +380,80 @@ const SETTLED: i64 = 5;
 /// How long a shell may run and still be waited on, in seconds. See [`Shells`].
 const LEFT_RUNNING: i64 = 60 * 60;
 
+/// How long the work under a shell may use no CPU and still hold the seat, in
+/// seconds. See [`Shells`].
+pub(crate) const QUIET: i64 = 60;
+
+/// From how quiet the wait says so, in seconds.
+const SHOWN: i64 = 10;
+
+/// A reading older than this is not a baseline: the tree is read afresh.
+const GAP: i64 = 120;
+
 /// The shells that run a command.
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
+
+/// Programs that wait or look and do no work: what a `while`/`until` loop is
+/// made of. A tree of only these holds nothing.
+const WATCHERS: [&str; 20] = [
+    "sleep", "tail", "grep", "egrep", "fgrep", "pgrep", "ps", "cat", "head", "wc", "awk", "sed", "stat", "ls", "date", "test", "[", "true",
+    "timeout", "tee",
+];
+
+/// The cputime each seat's tree showed at the last reading, so a later one can
+/// say how long it has been the same.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Memory {
+    /// seat → (cpu ms, when it last changed, when it was last read).
+    by_seat: BTreeMap<String, (i64, i64, i64)>,
+}
+
+impl Memory {
+    fn path() -> std::path::PathBuf {
+        let state = match std::env::var_os("WSP_STATE") {
+            Some(v) => std::path::PathBuf::from(v),
+            None => Store::default_state(),
+        };
+        state.join("shell-cpu.json")
+    }
+
+    fn load() -> Memory {
+        let read = std::fs::read_to_string(Memory::path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        let Some(serde_json::Value::Object(map)) = read else { return Memory::default() };
+        let by_seat = map
+            .into_iter()
+            .filter_map(|(seat, v)| {
+                let a = v.as_array()?;
+                Some((seat, (a.first()?.as_i64()?, a.get(1)?.as_i64()?, a.get(2)?.as_i64()?)))
+            })
+            .collect();
+        Memory { by_seat }
+    }
+
+    fn save(&mut self, now: i64) {
+        self.by_seat.retain(|_, (_, _, seen)| now - *seen < 600);
+        let map: serde_json::Map<String, serde_json::Value> =
+            self.by_seat.iter().map(|(k, (c, ch, seen))| (k.clone(), serde_json::json!([c, ch, seen]))).collect();
+        let path = Memory::path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension(format!("json.{}", std::process::id()));
+        if std::fs::write(&tmp, serde_json::Value::Object(map).to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// How long this seat's tree has shown `cpu`, and the reading kept.
+    fn quiet(&mut self, seat: &str, cpu: i64, now: i64) -> i64 {
+        let since = match self.by_seat.get(seat) {
+            Some((c, changed, seen)) if *c == cpu && now - *seen <= GAP => *changed,
+            _ => now,
+        };
+        self.by_seat.insert(seat.to_string(), (cpu, since, now));
+        now - since
+    }
+}
 
 impl Shells {
     /// These seats' shells, off the local backends' roots and one `ps`. No
@@ -352,21 +479,29 @@ impl Shells {
         if roots.is_empty() {
             return Shells::default();
         }
-        match wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,command="]).output() {
-            Ok(out) => Shells::of(&String::from_utf8_lossy(&out.stdout), &roots),
+        match wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,time=,command="]).output() {
+            Ok(out) => {
+                let now = util::epoch_secs();
+                let mut memory = Memory::load();
+                let shells = Shells::of(&String::from_utf8_lossy(&out.stdout), &roots, now, &mut memory);
+                memory.save(now);
+                shells
+            }
             // Not "waiting": a `ps` that did not run is no evidence of a shell,
             // and the cost of reading none is a seat told, which is a sentence.
             Err(_) => Shells::default(),
         }
     }
 
-    /// The reading over a `ps -o pid=,ppid=,etime=,command=` table.
-    fn of(ps: &str, roots: &[(String, u32)]) -> Shells {
+    /// The reading over a `ps -o pid=,ppid=,etime=,time=,command=` table.
+    fn of(ps: &str, roots: &[(String, u32)], now: i64, memory: &mut Memory) -> Shells {
         struct Row {
             pid: u32,
             ppid: u32,
             age: i64,
+            cpu: i64,
             shell: bool,
+            command: String,
         }
         let rows: Vec<Row> = ps
             .lines()
@@ -375,28 +510,53 @@ impl Shells {
                 let pid = it.next()?.parse().ok()?;
                 let ppid = it.next()?.parse().ok()?;
                 let age = elapsed(it.next()?)?;
+                let cpu = cpu_ms(it.next()?)?;
                 let command: Vec<&str> = it.collect();
-                Some(Row { pid, ppid, age, shell: runs_a_command(&command) })
+                Some(Row { pid, ppid, age, cpu, shell: runs_a_command(&command), command: command.join(" ") })
             })
             .collect();
         let shell: std::collections::BTreeSet<u32> = rows.iter().filter(|r| r.shell).map(|r| r.pid).collect();
-        let mut by_seat = BTreeMap::new();
-        for (seat, root) in roots {
-            let mut tree = vec![*root];
+        let below = |root: u32| -> Vec<u32> {
+            let mut tree = vec![root];
             let mut i = 0;
             while i < tree.len() {
                 let parent = tree[i];
                 tree.extend(rows.iter().filter(|r| r.ppid == parent && !tree.contains(&r.pid)).map(|r| r.pid).collect::<Vec<_>>());
                 i += 1;
             }
-            let n = rows
-                .iter()
-                .filter(|r| r.pid != *root && tree.contains(&r.pid))
-                .filter(|r| r.shell && !shell.contains(&r.ppid))
-                .filter(|r| (SETTLED..LEFT_RUNNING).contains(&r.age))
-                .count();
-            if n > 0 {
-                by_seat.insert(seat.clone(), n);
+            tree
+        };
+        let mut by_seat = BTreeMap::new();
+        for (seat, root) in roots {
+            let tree = below(*root);
+            let mine: Vec<&Row> = rows.iter().filter(|r| r.pid != *root && tree.contains(&r.pid)).collect();
+            let (mut n, mut age, mut cpu, mut work) = (0, 0, 0, String::new());
+            for sh in mine.iter().filter(|r| r.shell && !shell.contains(&r.ppid)).filter(|r| (SETTLED..LEFT_RUNNING).contains(&r.age)) {
+                // A pgrep guard that matches itself ends only when the tool's
+                // limit ends it: it holds nothing (`stuck::waits_on_itself`).
+                if crate::stuck::classify(&ran(&sh.command)) == Some(crate::stuck::Kind::SelfWait) {
+                    continue;
+                }
+                let under = below(sh.pid);
+                let doing: Vec<&&Row> = mine.iter().filter(|r| r.pid != sh.pid && under.contains(&r.pid) && !r.shell).collect();
+                let works: Vec<&&&Row> = doing.iter().filter(|r| !is_watcher(&r.command)).collect();
+                if works.is_empty() {
+                    continue;
+                }
+                n += 1;
+                age = age.max(sh.age);
+                cpu += doing.iter().map(|r| r.cpu).sum::<i64>();
+                if work.is_empty() {
+                    work = name_of_work(&works[0].command);
+                }
+            }
+            if n == 0 {
+                memory.by_seat.remove(seat);
+                continue;
+            }
+            let quiet = memory.quiet(seat, cpu, now);
+            if quiet < QUIET {
+                by_seat.insert(seat.clone(), Own { n, work, age, quiet });
             }
         }
         Shells { by_seat }
@@ -404,13 +564,81 @@ impl Shells {
 
     /// This seat's own shells, as a wait — `None` when it has none.
     pub(crate) fn of_seat(&self, seat: &str) -> Option<Wait> {
-        self.by_seat.get(seat).map(|n| Wait { why: Why::Shell(*n), on: On::Itself })
+        self.by_seat.get(seat).map(|o| Wait { why: Why::Shell(o.n), on: On::Itself, own: Some(o.clone()) })
     }
 
     #[cfg(test)]
     pub(crate) fn one(seat: &str, n: usize) -> Shells {
-        Shells { by_seat: BTreeMap::from([(seat.to_string(), n)]) }
+        Shells { by_seat: BTreeMap::from([(seat.to_string(), Own { n, ..Own::default() })]) }
     }
+}
+
+/// The command a `ps` line for Claude Code's shell actually runs: what is
+/// inside `eval '…'`, un-quoted, or the whole line when there is no `eval`.
+fn ran(command: &str) -> String {
+    let Some(i) = command.find("eval ") else { return command.to_string() };
+    let mut chars = command[i + 5..].chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    out.push(c);
+                }
+            }
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => out.extend(chars.next()),
+                        '"' => break,
+                        c => out.push(c),
+                    }
+                }
+            }
+            '\\' => out.extend(chars.next()),
+            c if c.is_whitespace() => break,
+            c => out.push(c),
+        }
+    }
+    match out.is_empty() {
+        true => command.to_string(),
+        false => out,
+    }
+}
+
+fn program(command: &str) -> &str {
+    let argv0 = command.split_whitespace().next().unwrap_or("");
+    argv0.rsplit('/').next().unwrap_or(argv0)
+}
+
+fn is_watcher(command: &str) -> bool {
+    WATCHERS.contains(&program(command))
+}
+
+/// `cargo test`, not `cargo test --release -p x`: the program and its verb.
+fn name_of_work(command: &str) -> String {
+    let mut it = command.split_whitespace().skip(1);
+    let verb = it.next().filter(|w| !w.starts_with('-') && !w.contains('/') && w.chars().count() <= 16);
+    match verb {
+        Some(v) => format!("{} {v}", program(command)),
+        None => program(command).to_string(),
+    }
+}
+
+/// `ps`'s `time`, `[[dd-]hh:]mm:ss[.cc]`, in milliseconds.
+fn cpu_ms(time: &str) -> Option<i64> {
+    let (days, rest) = match time.split_once('-') {
+        Some((d, r)) => (d.parse::<i64>().ok()?, r),
+        None => (0, time),
+    };
+    let mut secs = 0.0f64;
+    for part in rest.split(':') {
+        secs = secs * 60.0 + part.parse::<f64>().ok()?;
+    }
+    Some(days * 86_400_000 + (secs * 1000.0).round() as i64)
 }
 
 /// Whether a command line is a shell running a command: `/bin/zsh -c …`,
@@ -482,7 +710,7 @@ pub(crate) fn reading(state: Option<State>, asks: &Asks, shells: &Shells, seat: 
 /// refuses a prompt. It does *not* refuse a seat waiting on its own question,
 /// because that is how an answer arrives.
 pub(crate) fn on_screen(state: State) -> Option<Wait> {
-    (state == State::Blocked).then_some(Wait { why: Why::Prompt, on: On::Person })
+    (state == State::Blocked).then_some(Wait { why: Why::Prompt, on: On::Person, own: None })
 }
 
 #[cfg(test)]
@@ -553,21 +781,26 @@ mod tests {
     /// Claude Code's background `Bash` a `zsh -c` of its own with the command
     /// under that. Ages are `etime`.
     const TABLE: &str = "\
-    1     0 13-01:13:00 /sbin/launchd
-56312     1    02:03:00 /Users/ed/.local/bin/compound-sup
-56320 56312    02:02:58 claude --strict-mcp-config -n wsp-214-cpd-1025 --model opus
-56558 56320       00:04 caffeinate -i -t 300
-64546 56320    12:31 /bin/zsh -c source /Users/ed/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'wsp verify --release'
-64550 64546    12:30 /bin/zsh -c source /Users/ed/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'wsp verify --release'
-64551 64550    12:30 cargo test --release
-70001 56320       00:01 /bin/sh -c ~/.claude/statusline.sh
-80000     1    05:00 /usr/local/bin/compound-sup
-80001 80000    04:58 claude -n wsp-9-cpd-2
+    1     0 13-01:13:00     0:09.00 /sbin/launchd
+56312     1    02:03:00     0:01.00 /Users/ed/.local/bin/compound-sup
+56320 56312    02:02:58     1:00.00 claude --strict-mcp-config -n wsp-214-cpd-1025 --model opus
+56558 56320       00:04     0:00.01 caffeinate -i -t 300
+64546 56320       12:31     0:00.10 /bin/zsh -c source /Users/ed/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'wsp verify --release'
+64550 64546       12:30     0:00.05 /bin/zsh -c source /Users/ed/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'wsp verify --release'
+64551 64550       12:30     9:30.50 cargo test --release
+70001 56320       00:01     0:00.01 /bin/sh -c ~/.claude/statusline.sh
+80000     1       05:00     0:01.00 /usr/local/bin/compound-sup
+80001 80000       04:58     0:02.00 claude -n wsp-9-cpd-2
 ";
+
+    /// The reading at `now`, with nothing remembered.
+    fn read(table: &str, roots: &[(String, u32)]) -> Shells {
+        Shells::of(table, roots, 1000, &mut Memory::default())
+    }
 
     #[test]
     fn an_agent_idle_on_its_own_background_shell_is_waiting_on_itself_and_owed_nothing() {
-        let shells = Shells::of(TABLE, &[("cpd-1025".into(), 56312)]);
+        let shells = read(TABLE, &[("cpd-1025".into(), 56312)]);
         let w = reading(Some(State::Idle), &Asks::default(), &shells, "cpd-1025", "wsp-214").expect("its verify is running");
         assert_eq!(w.why, Why::Shell(1), "one shell, and not the subshell under it, the hook or caffeinate");
         assert_eq!(w.word(), "waiting · itself");
@@ -579,7 +812,7 @@ mod tests {
 
     #[test]
     fn another_seats_shell_is_not_this_seats() {
-        let shells = Shells::of(TABLE, &[("cpd-1025".into(), 56312), ("cpd-2".into(), 80000)]);
+        let shells = read(TABLE, &[("cpd-1025".into(), 56312), ("cpd-2".into(), 80000)]);
         assert!(shells.of_seat("cpd-2").is_none(), "cpd-2's agent has nothing running under it");
         assert!(shells.of_seat("cpd-9").is_none(), "nor has a seat nobody gave a root");
     }
@@ -587,14 +820,103 @@ mod tests {
     #[test]
     fn a_shell_of_a_moment_is_a_hook_and_one_of_hours_was_left_running() {
         let table = "\
-  100     1    01:00:00 compound-sup
-  101   100    59:00 claude
-  102   101       00:02 /bin/sh -c wsp hook stop
-  103   101    01:00:00 bash -lc npm run dev
+  100     1    01:00:00  0:01.00 compound-sup
+  101   100    59:00     0:30.00 claude
+  102   101       00:02  0:00.01 /bin/sh -c wsp hook stop
+  103   101    01:00:00  0:10.00 bash -lc npm run dev
+  104   103    01:00:00  5:00.00 npm run dev
 ";
-        let shells = Shells::of(table, &[("cpd-1".into(), 100)]);
-        assert!(shells.of_seat("cpd-1").is_none(), "a two-second hook and an hour-old server are not waited on");
-        assert!(Shells::of(&table.replace("01:00:00 bash", "59:59 bash"), &[("cpd-1".into(), 100)]).of_seat("cpd-1").is_some());
+        let roots = [("cpd-1".into(), 100)];
+        assert!(read(table, &roots).of_seat("cpd-1").is_none(), "a two-second hook and an hour-old server are not waited on");
+        assert!(read(&table.replace("01:00:00  0:10.00 bash", "59:59  0:10.00 bash").replace("01:00:00  5:00.00 npm", "59:59  5:00.00 npm"), &roots).of_seat("cpd-1").is_some());
+    }
+
+    /// The seat's tree as `wsp-536` reads it: `claude` (200) under the root
+    /// (100), a background shell (201) of `command`, and `kids` under it.
+    fn seat_with(command: &str, kids: &str) -> String {
+        format!(
+            "  100     1    01:00:00  0:01.00 compound-sup\n  200   100    59:00     0:30.00 claude\n  201   200    02:00  0:00.10 /bin/zsh -c source /s.sh && eval '{command}' < /dev/null\n{kids}"
+        )
+    }
+
+    fn held(table: &str, now: i64, memory: &mut Memory) -> Option<Wait> {
+        Shells::of(table, &[("cpd-1".into(), 100)], now, memory).of_seat("cpd-1")
+    }
+
+    #[test]
+    fn a_shell_with_no_child_holds_nothing_on_the_same_tick() {
+        // wsp-530: "1 shell still running" and no process in its tree.
+        let table = seat_with("wsp verify", "");
+        assert!(held(&table, 1000, &mut Memory::default()).is_none());
+    }
+
+    #[test]
+    fn a_shell_that_only_watches_holds_nothing() {
+        let table = seat_with("until [ -s /tmp/out ]; do sleep 5; done", "  202   201    00:01  0:00.00 sleep 5\n");
+        assert!(held(&table, 1000, &mut Memory::default()).is_none());
+        let tail = seat_with("tail -f /tmp/out", "  202   201    01:00  0:00.00 tail -f /tmp/out\n");
+        assert!(held(&tail, 1000, &mut Memory::default()).is_none());
+    }
+
+    #[test]
+    fn a_pgrep_guard_that_matches_its_own_line_is_never_held() {
+        // wsp-510: `pgrep -f` finds the shell that runs it, so it never ends.
+        let looped = "until [ -s /tmp/out ] && ! pgrep -f 'cargo test'; do sleep 5; done";
+        let table = seat_with(looped, "  202   201    00:01  0:00.00 sleep 5\n  203   201    01:00  3:00.00 pgrep-helper --work\n");
+        assert!(held(&table, 1000, &mut Memory::default()).is_none(), "named by stuck, whatever is under it");
+        // The same shell without the self-match is a wait on work.
+        let fine = seat_with("until [ -s /tmp/out ]; do sleep 5; done", "  203   201    01:00  3:00.00 pgrep-helper --work\n");
+        assert!(held(&fine, 1000, &mut Memory::default()).is_some());
+    }
+
+    #[test]
+    fn a_busy_test_run_holds_the_seat_and_the_tick_after_it_exits_it_reads_idle() {
+        let mut memory = Memory::default();
+        let running = seat_with("cargo nextest run", "  202   201    01:00  2:00.00 cargo nextest run\n");
+        let w = held(&running, 1000, &mut memory).expect("work under it");
+        assert_eq!((w.why.clone(), w.on.clone()), (Why::Shell(1), On::Itself));
+        let own = w.own.clone().expect("what it waits on");
+        assert_eq!((own.work.as_str(), own.age, own.quiet), ("cargo nextest", 120, 0));
+        assert_eq!(w.reason(), "waiting on itself: cargo nextest (2m, busy)");
+        assert_eq!(w.json()["reason"], "waiting on itself: cargo nextest (2m, busy)");
+        // The cputime moves between ticks: still held.
+        let busier = running.replace("2:00.00", "2:19.50");
+        assert!(held(&busier, 1020, &mut memory).is_some());
+        // It exits: the next tick reads idle, with the shell still there.
+        assert!(held(&seat_with("cargo nextest run", ""), 1040, &mut memory).is_none());
+    }
+
+    #[test]
+    fn work_that_has_used_no_cpu_for_a_minute_reads_idle_and_says_quiet_before_it() {
+        let mut memory = Memory::default();
+        let table = seat_with("cargo test", "  202   201    05:00  2:00.00 cargo test\n");
+        let first = held(&table, 1000, &mut memory).expect("just seen");
+        assert_eq!(first.word(), "waiting · itself", "nothing to say about 0s");
+        let w = held(&table, 1045, &mut memory).expect("quiet 45s, still held");
+        assert_eq!(w.word(), "waiting · itself · quiet 45s");
+        assert_eq!(w.reason(), "waiting on itself: cargo test (2m, quiet 45s)");
+        assert!(w.owed() == false);
+        assert!(held(&table, 1060, &mut memory).is_none(), "a minute with no CPU");
+        assert!(held(&table, 1080, &mut memory).is_none(), "and it stays idle while quiet");
+        // It wakes up: held again, and the clock starts over.
+        let woke = table.replace("2:00.00", "2:00.40");
+        let w = held(&woke, 1100, &mut memory).expect("CPU used");
+        assert_eq!(w.own.map(|o| o.quiet), Some(0));
+    }
+
+    #[test]
+    fn a_reading_from_long_ago_is_not_a_baseline() {
+        let mut memory = Memory::default();
+        let table = seat_with("cargo test", "  202   201    05:00  2:00.00 cargo test\n");
+        assert!(held(&table, 1000, &mut memory).is_some());
+        assert!(held(&table, 1000 + GAP + 1, &mut memory).is_some(), "not read since: read afresh, not quiet");
+    }
+
+    #[test]
+    fn the_command_a_shell_runs_is_what_is_inside_its_eval() {
+        assert_eq!(ran("/bin/zsh -c source /s.sh && eval 'wsp verify' < /dev/null && pwd -P"), "wsp verify");
+        assert_eq!(ran("zsh -c eval 'echo '\\''hi'\\''; sleep 1' x"), "echo 'hi'; sleep 1");
+        assert_eq!(ran("bash -c make"), "bash -c make", "no eval: the whole line");
     }
 
     #[test]
