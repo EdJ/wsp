@@ -282,7 +282,7 @@ AGENTS
                                     census. --print says how to do it by hand
   wsp reap <pid>… | --list          stop processes by pid, never by pattern: a dev
                                     or test tool over an hour old in the tree of a
-                                    row not at doing, a zsh busy loop, a test
+                                    row no seat or claim holds, a zsh busy loop, a test
                                     binary idle 15 min in a finished tree. Never
                                     a live seat's. The primary any such pid; a
                                     governor those in its list's trees
