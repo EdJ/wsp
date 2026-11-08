@@ -3253,7 +3253,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     the archive. It says when the answer is
                                     somewhere you did not look. Stops at 20
                                     hits and says how many more; --full for
-                                    all of them; --pieces prints each piece whole"##,
+                                    all of them"##,
             },
         ],
     },
@@ -3278,7 +3278,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 text: r##"  wsp show <id> [--log]             full task, including notes. The log is
                                     the last few entries and says how many
                                     earlier ones it did not print; --log for
-                                    all of them"##,
+                                    all of them; --pieces prints each piece
+                                    whole"##,
             },
         ],
     },
