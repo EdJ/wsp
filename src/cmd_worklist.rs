@@ -473,7 +473,20 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         },
         None => groups.len() + 1,
     };
-    if !win.allows(ordinal) {
+    // `wsp-530`: a held group is not being waited on by a running barrier, so
+    // a person or the primary may attach a row to it.
+    let to_held = !win.allows(ordinal)
+        && w.status() == WorklistStatus::Held
+        && win.at == Some(ordinal)
+        && ordinal <= groups.len()
+        && {
+            // Read lazily: the seat's own pane is only looked up for an edit
+            // that would otherwise be refused.
+            let mut here = rows_here(store);
+            here.extend(crate::place::my_pane());
+            may_edit_held(store, &here)
+        };
+    if !win.allows(ordinal) && !to_held {
         return win.refuse(ordinal, "will not add to");
     }
 
@@ -523,6 +536,14 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         if new_group { " (new)" } else { "" },
         crate::cmd_message::caller(store)
     ));
+    if to_held && !win.allows(ordinal) {
+        let why = args.get("why").filter(|v| !matches!(v.trim(), "-" | "true" | ""));
+        w.log(&format!(
+            "attached to held group {ordinal} · {}{}",
+            "the list is held, and no running barrier is waiting on its membership",
+            why.map(|v| format!(" · {v}")).unwrap_or_default()
+        ));
+    }
     if args.has("sub") {
         // Said out loud because `--sub` is a resolution and not a rule: what
         // went in is what was open when it was typed, and a sub-task added
@@ -3826,7 +3847,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         );
         return 0;
     }
-    report(&w, &pos, &st, &gone, seat, touched.as_ref());
+    report(store, &w, &pos, &st, &gone, seat, touched.as_ref());
     0
 }
 
@@ -3916,6 +3937,7 @@ fn front_lines(p: &Paint, w: &Worklist, pos: &Position, f: &Front, seat: bool) -
 /// and the verbs, because it is part of what the verdict rests on and not a
 /// hint about what to run.
 fn report(
+    store: &Store,
     w: &Worklist,
     pos: &Position,
     st: &State,
@@ -4003,6 +4025,12 @@ fn report(
                     println!("  {line}");
                 }
                 println!();
+            }
+            // `wsp-530`: a hold that leans on a row no list holds.
+            if matches!(gate, Gate::Held) {
+                for line in unattached_lines(store, w, pos, prose) {
+                    println!("{line}");
+                }
             }
             // The same block `go` prints once the barrier is behind it, read
             // while it stands shut — one walk, [`touched_lines`], both verbs.
@@ -4349,7 +4377,7 @@ fn go_with(
                 ))
             );
         }
-        report(&w, &pos, &st, &worklist::dangling(store, &w), seat, None);
+        report(store, &w, &pos, &st, &worklist::dangling(store, &w), seat, None);
         return 0;
     }
     let prose = shut.as_ref().map(|(_, prose)| prose.clone()).unwrap_or_default();
@@ -4724,7 +4752,7 @@ fn go_with(
     match &ahead {
         // Nothing left is what the pass is closing, and said above.
         Some(_) if closes => {}
-        Some((pos, st)) => report(&w, pos, st, &[], seat, None),
+        Some((pos, st)) => report(store, &w, pos, st, &[], seat, None),
         None => println!("{}", p.dim(&format!("{}  what may start now", how("next", &w, seat)))),
     }
     0
@@ -4914,6 +4942,53 @@ fn say_swept(p: &Paint, swept: Option<&worklist::Sweep>, kept: bool, dry: bool) 
 /// later, and a stop with no reason on it is the notification failure in its
 /// purest form — a run that will not go on and nothing anywhere saying why.
 pub fn hold(store: &Store, args: &Args) -> i32 {
+    hold_by(store, args, None)
+}
+
+/// Rows a hold's reason names that stand on no list and were filed at this
+/// barrier: made after its check opened, or sub-tasks of a member. `wsp-530`.
+///
+/// **A reason is prose, and nothing reads prose.** The check on pieces' group 5
+/// filed a fix and held with "wsp-527 has to land first": the row stood on no
+/// list, so nothing started or verified it and the barrier could never be
+/// checked again. The verb that makes a fix part of the held group is
+/// `followup --blocking`.
+fn unattached_named(store: &Store, w: &Worklist, at: usize, said: &str) -> Vec<String> {
+    let groups = w.groups();
+    let Some(g) = groups.get(at - 1) else { return Vec::new() };
+    let opened = g.checks.last().map(|c| c.at.clone());
+    let on_list: Vec<&String> = groups.iter().flat_map(|g| g.members.iter()).collect();
+    let words: Vec<&str> = said
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for t in store.tasks() {
+        if !words.contains(&t.id.as_str()) || on_list.contains(&&t.id) || out.contains(&t.id) {
+            continue;
+        }
+        if matches!(t.status(), crate::model::Status::Done) {
+            continue;
+        }
+        let since = opened.as_ref().is_some_and(|o| t.created.as_str() >= o.as_str());
+        let sub = t.parent.as_ref().is_some_and(|p| on_list.contains(&p));
+        if since || sub {
+            out.push(t.id.clone());
+        }
+    }
+    out
+}
+
+/// Whether the caller is somebody who may edit a *held* group: a person at a
+/// shell or the primary, and not a seat on a row or a barrier check. `here` is
+/// [`rows_here`] and the seat itself. `wsp-530`.
+fn may_edit_held(store: &Store, here: &[String]) -> bool {
+    here.iter().all(|h| store.task(h).is_none() && crate::barrier::seat_of(store, h).is_none())
+}
+
+/// [`hold`] with the caller's rows given, which makes "from a check seat"
+/// testable without one.
+pub(crate) fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i32 {
     let (mut w, said, seat) = match list_and_words(store, args) {
         Ok(v) => v,
         Err(code) => return code,
@@ -4922,7 +4997,7 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
     // (`wsp-374`), when it opens with `hold` and was written in this run.
     if said.trim().is_empty() {
         if let Some((from_file, written)) = crate::closing::check_args(store, args, "hold", &w) {
-            let code = hold(store, &from_file);
+            let code = hold_by(store, &from_file, here);
             if code == 0 {
                 crate::closing::note_close(store, &w.id, "hold", written, None);
             }
@@ -4950,6 +5025,41 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: `{}` is parked — no barrier is being decided while it is paused", w.id);
         eprintln!("     {}  first, and the barrier it stands at is owed again", how("resume", &w, seat));
         return 1;
+    }
+
+    // `wsp-530`: from the seat checking this barrier, a reason that leans on a
+    // row it filed and left off the list is refused.
+    if let Some(at) = worklist::position(store, &w, Reading::Landed).at {
+        // The seat is looked up only when the reason names such a row.
+        let mut loose = unattached_named(store, &w, at, &said);
+        if !loose.is_empty() {
+            let check = w.groups().get(at - 1).and_then(crate::barrier::running).and_then(|c| c.pane.clone());
+            let mine = check.is_some_and(|p| match here {
+                Some(h) => h.contains(&p),
+                None => {
+                    let mut h = rows_here(store);
+                    h.extend(crate::place::my_pane());
+                    h.contains(&p)
+                }
+            });
+            if !mine {
+                loose.clear();
+            }
+        }
+        if !loose.is_empty() {
+            eprintln!(
+                "wsp: this reason names {}, which {} on no list — a row named only in a hold is started by nothing",
+                loose.join(" "),
+                if loose.len() == 1 { "stands" } else { "stand" }
+            );
+            eprintln!(
+                "     attach {} to the group with `wsp worklist followup {} {} --blocking --from FILE --caption \"…\"`, which holds it pending the fix",
+                if loose.len() == 1 { "it" } else { "them" },
+                w.id,
+                loose.join(" ")
+            );
+            return 1;
+        }
     }
 
     let caption = match crate::caption::required(args, &said, "held") {
@@ -5017,6 +5127,20 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
 }
 
 // ---- followup ---------------------------------------------------------
+
+/// What `next` says of a held list whose reason names rows no list holds.
+fn unattached_lines(store: &Store, w: &Worklist, pos: &Position, prose: &str) -> Vec<String> {
+    let Some(at) = pos.at else { return Vec::new() };
+    unattached_named(store, w, at, prose)
+        .into_iter()
+        .map(|r| {
+            format!(
+                "  the hold names {r}, which no list holds — attach it with `wsp worklist followup {} {r} --blocking --from FILE --caption \"…\"` or `wsp worklist add {} {r} --group {at}`",
+                w.id, w.id
+            )
+        })
+        .collect()
+}
 
 /// The mark a follow-up is logged under, and the one [`followups`] reads back.
 const FOLLOWUP: &str = "follow-up by";
@@ -5145,13 +5269,23 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
                 crate::barrier::running(&g)?.pane.clone().filter(|p| here.contains(p))
             })
     });
-    let (Some(at), Some(row)) = (at, row) else {
-        match at {
+    // `wsp-530`: a person or the primary may attach to a list that is *held*,
+    // since no running barrier is waiting on that membership. The caller stands
+    // in the check's place on the record.
+    let held_at = pos
+        .at
+        .filter(|_| w.status() == WorklistStatus::Held && blocking && may_edit_held(store, here));
+    let (at, row, on_hold) = match (at, row, held_at) {
+        (Some(at), Some(row), _) => (at, row, false),
+        (_, _, Some(at)) => (at, crate::cmd_message::caller(store), true),
+        (at, _, _) => {
+            match at {
             Some(at) => eprintln!("wsp: only the agent checking group {at}'s barrier may add follow-ups to `{}`", w.id),
             None => eprintln!("wsp: `{}` is not standing at a barrier being checked, so there is no verdict to attach follow-ups to", w.id),
         }
         eprintln!("     a governor composes the list with `wsp worklist add` and `group`; anybody else files the row with `wsp add --parent` and says so");
         return 1;
+        }
     };
 
     if typed.len() > FOLLOWUP_MAX {
@@ -5205,12 +5339,16 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
     // One round. Refused, but not dropped: the check found work, and what it
     // found reaches the governor as a decision.
     let g = &groups[at - 1];
-    if let Some(prior) = spent_by(&w, &g.members) {
-        return refuse_round(store, w, at, &row, &prior, &members, &verdict);
+    if !on_hold {
+        if let Some(prior) = spent_by(&w, &g.members) {
+            return refuse_round(store, w, at, &row, &prior, &members, &verdict);
+        }
     }
 
     let said = Said { verdict: &verdict, caption: &caption };
-    if blocking {
+    if on_hold {
+        followup_held(store, args, &w.id, at, &row, &members, said)
+    } else if blocking {
         followup_blocking(store, args, &w.id, at, &row, &members, said)
     } else {
         followup_next(store, args, &w.id, at, &row, &members, said)
@@ -5222,6 +5360,59 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
 struct Said<'a> {
     verdict: &'a str,
     caption: &'a str,
+}
+
+/// A person's or the primary's `followup --blocking` on a list that is held:
+/// the rows join the group it is held at, on the record, and nothing else
+/// moves — the list stays held until `go`. `wsp-530`.
+fn followup_held(store: &Store, args: &Args, id: &str, at: usize, who: &str, members: &[String], said: Said) -> i32 {
+    let verdict = said.verdict;
+    let outcome = store.locked(|| -> Result<Worklist, i32> {
+        let mut w = store.worklist(id).ok_or(1)?;
+        if w.status() != WorklistStatus::Held {
+            eprintln!("wsp: `{}` was started again while this was being read — nothing was attached", w.id);
+            return Err(1);
+        }
+        let mut groups = w.groups();
+        if let Some(code) = already_in(&groups, members, &w.id) {
+            return Err(code);
+        }
+        groups[at - 1].members.extend(members.iter().cloned());
+        if let Some(code) = refuse_edges(store, &w, &groups) {
+            return Err(code);
+        }
+        w.log(&with_caption(
+            &format!(
+                "attached to held group {at} · {} · by {who} · the list is held, and no running barrier is waiting on its membership · {verdict}",
+                members.join(" ")
+            ),
+            Some(said.caption),
+        ));
+        w.set_groups(&groups);
+        if let Err(e) = store.save_worklist(&w) {
+            eprintln!("wsp: write failed: {e}");
+            return Err(1);
+        }
+        Ok(w)
+    });
+    let w = match outcome {
+        Ok(w) => w,
+        Err(code) => return code,
+    };
+    store.log_event(
+        "worklist-followup",
+        json!({ "id": w.id, "by": who, "blocking": true, "held": true, "members": members, "verdict": verdict, "caption": said.caption }),
+    );
+    store.git_commit(&format!("wsp: worklist {} group {at} (held) takes {}", w.id, members.join(" ")));
+    crate::cycle::poke_list(store, &w.id, "followup", None);
+    if args.json() {
+        println!("{}", worklist_json(store, &w));
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}", p.bold(&w.id), p.dim(&format!("held group {at} takes {}", members.join(" "))));
+    println!("  {}", p.dim(&format!("{} \"…\"  starts the list again, and wsp runs them", how("go", &w, false))));
+    0
 }
 
 /// The rows join the group being run, and the barrier is checked again once
@@ -5681,7 +5872,7 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
     }
     let p = Paint::new();
     println!("{} {}", p.bold(&w.id), p.dim(&format!("resumed — {}", resumes_to(&pos).trim_start_matches("returns it "))));
-    report(&w, &pos, &st, &gone, seat, None);
+    report(store, &w, &pos, &st, &gone, seat, None);
     0
 }
 
@@ -7447,6 +7638,101 @@ mod tests {
     }
 
     /// A verdict in a file, the way a check writes one.
+    fn hold_as(store: &Store, words: &[&str], here: &[&str]) -> i32 {
+        let here: Vec<String> = here.iter().map(|s| s.to_string()).collect();
+        let mut argv = vec!["hold", "run"];
+        argv.extend_from_slice(words);
+        hold_by(store, &Args::synth("worklist", &argv, &[]), Some(&here))
+    }
+
+    /// `wsp-530`: the check on pieces' group 5 filed a fix and held with its id
+    /// in the reason, so the fix stood on no list. From the seat checking the
+    /// barrier, that reason is refused and the verb is named; the same row
+    /// attached with `followup --blocking` is on the list and the hold goes
+    /// through; a row from before the check, or somebody else's hold, is not
+    /// the check's to attach.
+    #[test]
+    fn a_check_cannot_hold_on_a_row_it_filed_and_left_off_the_list() {
+        let _env = util::isolated("hold-unattached");
+        let store = at_barrier_one_seated("hold-unattached");
+        assert_eq!(hold_as(&store, &["wl-003", "has", "to", "land", "first"], &["cpd-9"]), 1);
+        assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Running, "nothing was held");
+
+        // The row is older than the check: not filed in it.
+        let mut t = store.task("wl-003").unwrap();
+        t.created = "2000-01-01T00:00:00Z".into();
+        store.save_task(&t).unwrap();
+        assert!(unattached_named(&store, &store.worklist("run").unwrap(), 1, "wl-003 first").is_empty());
+        // Unless it is a sub-task of a member.
+        t.parent = Some("wl-001".into());
+        store.save_task(&t).unwrap();
+        assert_eq!(unattached_named(&store, &store.worklist("run").unwrap(), 1, "wl-003 first"), ["wl-003"]);
+        t.parent = None;
+        t.created = util::now_iso();
+        store.save_task(&t).unwrap();
+
+        // Attached, it is on the list, and the reason may name it.
+        let from = verdict("hold-unattached", "not yet: one fix first");
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("blocking", "true"), ("from", &from)], &["cpd-9"]), 0);
+        assert!(unattached_named(&store, &store.worklist("run").unwrap(), 1, "wl-003 first").is_empty());
+    }
+
+    #[test]
+    fn a_hold_from_anyone_but_the_check_may_name_any_row() {
+        let _env = util::isolated("hold-named");
+        let store = at_barrier_one_seated("hold-named");
+        assert_eq!(hold_as(&store, &["wl-003", "waits", "on", "Ed"], &["cpd-other"]), 0);
+        assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Held);
+    }
+
+    /// A held group's membership is not being waited on, so a person or the
+    /// primary can attach to it — `add --group`, or `followup --blocking` —
+    /// and a seat on a row or a barrier cannot.
+    #[test]
+    fn a_person_attaches_to_a_held_group_and_a_running_one_still_refuses() {
+        let _env = util::isolated("hold-attach");
+        let store = at_barrier_one_seated("hold-attach");
+        // Running at the barrier: the group is being waited on.
+        assert_eq!(flagged(&store, &["add", "run", "wl-003"], &[("group", "1")]), 1);
+        assert_eq!(hold_as(&store, &["wl-003", "waits", "on", "Ed"], &["cpd-other"]), 0);
+        assert!(!may_edit_held(&store, &["cpd-9".to_string()]), "the check seat is not a hand");
+        assert!(!may_edit_held(&store, &["wl-001".to_string()]), "nor is a seat on a row");
+        assert!(may_edit_held(&store, &[]));
+
+        let from = verdict("hold-attach", "attached by hand");
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("next", "true"), ("from", &from)], &[]), 1, "only --blocking");
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("blocking", "true"), ("from", &from)], &["cpd-9"]), 1);
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("blocking", "true"), ("from", &from)], &[]), 0);
+        let w = store.worklist("run").unwrap();
+        assert_eq!(w.groups()[0].members, ["wl-001", "wl-003"]);
+        assert_eq!(w.status(), WorklistStatus::Held, "still held until go");
+        assert!(w.section("Log").unwrap_or_default().contains("attached to held group 1 · wl-003"));
+
+        task(&store, "wl-004", "todo");
+        assert_eq!(flagged(&store, &["add", "run", "wl-004"], &[("group", "1"), ("why", "found in the read")]), 0);
+        let w = store.worklist("run").unwrap();
+        assert_eq!(w.groups()[0].members, ["wl-001", "wl-003", "wl-004"]);
+        let log = w.section("Log").unwrap_or_default();
+        assert!(log.contains("attached to held group 1") && log.contains("found in the read"), "{log}");
+    }
+
+    #[test]
+    fn next_on_a_held_list_names_a_row_its_reason_leaves_off_every_list() {
+        let _env = util::isolated("hold-next");
+        let store = at_barrier_one_seated("hold-next");
+        assert_eq!(hold_as(&store, &["wl-003", "has", "to", "land", "first"], &["cpd-other"]), 0);
+        let w = store.worklist("run").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        let lines = unattached_lines(&store, &w, &pos, "wl-003 has to land first");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("names wl-003, which no list holds") && lines[0].contains("followup run wl-003 --blocking"),
+            "{lines:?}"
+        );
+        assert!(unattached_lines(&store, &w, &pos, "wl-001 landed").is_empty());
+        assert_eq!(run(&store, &["next", "run"]), 0);
+    }
+
     fn verdict(tag: &str, text: &str) -> String {
         let path = std::env::temp_dir().join(format!("wsp-wl-verdict-{tag}-{}", std::process::id()));
         std::fs::write(&path, text).unwrap();

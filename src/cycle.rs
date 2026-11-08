@@ -3051,7 +3051,8 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str) -> String {
          - it passes: `wsp worklist go {list} --from FILE --caption \"…\"`. wsp starts the next group and \
          rotates the governor;\n\
          - it does not: `wsp worklist hold {list} --from FILE --caption \"…\"`, saying what has to happen. \
-         The governor is told.{tail}\n\n\
+         The governor is told. A hold that owes work attaches it with `wsp worklist followup {list} <id>… --blocking`, \
+         and never leaves it in prose: a row named only in the reason stands on no list, and nothing starts it.{tail}\n\n\
          {caption}\n\n\
          A question for the governor before you decide is `wsp ask {list} -`; its answer comes back here.\n\n\
          There is no row of your own: the verb you finish with records this check on group {at}, \
@@ -4887,6 +4888,10 @@ pub(crate) mod tests {
         assert!(
             order.contains("wsp worklist followup run <id>… --next") && order.contains("--blocking"),
             "the check is told it can attach what it finds: {order}"
+        );
+        assert!(
+            order.contains("A hold that owes work attaches it with `wsp worklist followup run <id>… --blocking`, and never leaves it in prose"),
+            "the check is told a hold never leaves its owed work in prose: {order}"
         );
 
         let from = env.home().join("verdict");
