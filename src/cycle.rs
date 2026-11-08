@@ -651,9 +651,10 @@ fn told_about_task(store: &Store, id: &str, verb: &str) {
     } else {
         "A member is blocked"
     };
+    let cut = if what == "A member is blocked" { cut_line(&w.id, &t.id) } else { String::new() };
     tell(store, &w, &format!(
         "{what} in the {} run: {} ({}) is blocked. `wsp show {}` says on what. \
-         The run waits here until it is unblocked.",
+         The run waits here until it is unblocked.{cut}",
         w.id, t.id, util::truncate(&t.title, 60), t.id
     ));
 }
@@ -1409,6 +1410,17 @@ pub(crate) fn blocked_since(t: &Task) -> Option<i64> {
     })
 }
 
+/// The move for a member blocked with no answer in sight while the rest of its
+/// group has landed (`wsp-517`, wsp-513's last part): cut it, say why, tell the
+/// person. Waiting is for a block the person is about to answer.
+fn cut_line(list: &str, id: &str) -> String {
+    format!(
+        " If no answer is coming and the rest of the group has landed, cut it: \
+         `wsp worklist cut {list} {id} --why \"…\"` takes it and what rests on it out into a later group \
+         and the run goes on; say why in the reason and tell the person."
+    )
+}
+
 /// A member of the running group that has stood blocked for
 /// [`BLOCKED_ESCALATES_AFTER`]: a line on the row (so `wsp wip` and `wsp show`
 /// say it, and it is said once per block), a flag to the person, and the
@@ -1435,16 +1447,17 @@ fn escalate_the_blocked(store: &Store, w: &Worklist, at: usize, pos: &worklist::
         log_line(store, &format!("{} group {at}: {} blocked for {mins} min — flagged", w.id, t.id));
         let text = format!(
             "{}: blocked for {mins} min, and the {} run waits on it\n\n\
-             It asked: {question}\n\nAnswering it is what lets group {at} go on: tell the seat (`wsp tell {}`) or `wsp reopen {} \"what is owed\"`.",
-            t.id, w.id, t.id, t.id
+             It asked: {question}\n\nAnswering it is what lets group {at} go on: tell the seat (`wsp tell {}`) or `wsp reopen {} \"what is owed\"`.\n\n\
+             If no answer is coming, `wsp worklist cut {} {} --why \"…\"` takes it out and the group goes on without it.",
+            t.id, w.id, t.id, t.id, w.id, t.id
         );
         let m = crate::message::Message::new(crate::message::Party::wsp(), crate::message::Kind::Note, &text)
             .about(crate::message::About::Task(t.id.clone()));
         let _ = crate::message::raise(store, &m);
         tell(store, w, &format!(
             "{} ({}) has been blocked for {mins} min and the {} run waits on it; the person is flagged. \
-             It is waiting on: {question} — an answer to that (`wsp tell {}`) or `wsp reopen {} \"what is owed\"` is what unblocks it.",
-            t.id, util::truncate(&t.title, 60), w.id, t.id, t.id
+             It is waiting on: {question} — an answer to that (`wsp tell {}`) or `wsp reopen {} \"what is owed\"` is what unblocks it.{}",
+            t.id, util::truncate(&t.title, 60), w.id, t.id, t.id, cut_line(&w.id, &t.id)
         ));
     }
 }
@@ -7677,6 +7690,8 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(flags[0].text.contains("which one?"));
         let told = drained(&TOLD);
         assert!(told.len() == 1 && told[0].contains("which one?") && told[0].contains("25 min"), "{told:?}");
+        assert!(told[0].contains("wsp worklist cut run m-1 --why"), "the held line names the move: {told:?}");
+        assert!(flags[0].text.contains("wsp worklist cut run m-1 --why"), "{:?}", flags[0].text);
         assert!(store.find_task("m-1").unwrap().section("Log").unwrap().contains(ESCALATED));
         step(&store, &w, &Blind);
         assert_eq!(flags_on(&store, "m-1").len(), 1, "once per block");

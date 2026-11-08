@@ -1205,7 +1205,12 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
 /// to sequence, direct, review" from before `wsp-134`, beside a work order
 /// that says not to review, and the brief is the one of the two re-read on
 /// every request. Sequencing and review are wsp's and the verifier's now.
-const SEAT_JOB: &str = "yours to decide and direct; wsp runs the steps · wsp flag --seat is your inbox";
+///
+/// `wsp-517`: and the move for a block nobody is about to answer. A member
+/// blocked with no answer in sight while the rest of its group has landed is
+/// cut (`wsp worklist cut`), the reason given and the person told; waiting is
+/// for a block the person is about to answer.
+const SEAT_JOB: &str = "yours to decide and direct; wsp runs the steps · wsp flag --seat is your inbox · a member blocked with no answer in sight, the rest landed: `wsp worklist cut <list> <id> --why \"…\"`, and tell the person; wait only on a block they are about to answer";
 
 /// The same line for the primary interface (`wsp-279`), which holds a slot and
 /// governs nothing: where it reads the fleet, and that the person is who it
@@ -2054,6 +2059,18 @@ mod tests {
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("governor of batch"), "{text}");
         assert!(!text.contains("group"), "{text}");
+    }
+
+    /// `wsp-517`: a governor of a list is told the move for a member blocked
+    /// with no answer in sight — cut it, say why, tell the person — and that
+    /// waiting is for a block the person is about to answer.
+    #[test]
+    fn a_governor_of_a_list_is_told_to_cut_a_block_nobody_is_answering() {
+        let mut r = compose(&briefing());
+        r.custodian = Some("batch".into());
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("wsp worklist cut <list> <id> --why"), "{text}");
+        assert!(text.contains("tell the person") && text.contains("about to answer"), "{text}");
     }
 
     /// The primary interface holds a slot and governs nothing (`wsp-279`), so
