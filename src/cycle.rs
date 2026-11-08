@@ -6882,6 +6882,94 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(spawned(), vec![("run · barrier 1".to_string(), "claude".into())]);
     }
 
+    /// `wsp-516`, wsp-513's third part: after a cut the running group's barrier
+    /// reads the members the stored list names now. Group 1 is `m-1 m-2 m-3`
+    /// with `m-1` blocked and `m-2` resting on it; the verb cuts them into a new
+    /// group 2, the barrier of group 1 opens and passes on `m-3` alone, the run
+    /// goes on to the cut group, and the old group 2 is group 3.
+    #[test]
+    fn a_cut_leaves_the_barrier_to_read_the_members_that_remain_and_the_run_goes_on_to_the_cut_group() {
+        let (_env, store) = scratch("cutbarrier");
+        task(&store, "m-1", Status::Blocked);
+        task(&store, "m-2", Status::Todo);
+        task(&store, "m-3", Status::Review);
+        task(&store, "n-1", Status::Todo);
+        let mut t = store.find_task("m-2").unwrap();
+        t.after = vec!["m-1".into()];
+        t.tags = vec!["kept".into()];
+        store.save_task(&t).unwrap();
+        let w = list(&store, &[(&["m-1", "m-2", "m-3"], "claude"), (&["n-1"], "claude")]);
+
+        // The pass before the cut reads the whole group: the barrier is owed on
+        // three members and the blocked one holds it.
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        assert!(checks(&store, 1).is_empty(), "m-1 is blocked, so group 1's barrier is not owed");
+
+        let flags = [("why", "m-1 waits on a person")];
+        assert_eq!(
+            crate::cmd_worklist::cut_by(&store, &Args::synth("worklist", &["cut", "run", "m-1"], &flags), &[], None),
+            0
+        );
+        let after_cut = store.worklist("run").unwrap().groups();
+        let members: Vec<&[String]> = after_cut.iter().map(|g| g.members.as_slice()).collect();
+        assert_eq!(members, [&["m-3".to_string()][..], &["m-1".to_string(), "m-2".to_string()][..], &["n-1".to_string()][..]]);
+
+        // The same `w` the pass was handed before the cut: nothing is read from it.
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("run · barrier 1".to_string(), "claude".to_string())], "the barrier opens on what is left");
+        assert_eq!(checks(&store, 1).len(), 1);
+        let order = check_order(&store, "run", 1).expect("an order");
+        assert!(order.contains("m-3") && !order.contains("m-1") && !order.contains("m-2"), "the check reads m-3 alone: {order}");
+        assert_eq!(crate::barrier_run::owed(&store, &store.worklist("run").unwrap(), 1), crate::barrier_run::owed(&store, &w, 1));
+
+        // It passes, and the run stands at the cut group, which has nothing to start
+        // while its first row is blocked.
+        crate::barrier::settle(&store, "run", 1, crate::barrier::State::Passes);
+        let mut l = store.worklist("run").unwrap();
+        let mut g = l.groups();
+        g[0].verdict = "2026-08-20T09:00:00Z passed".into();
+        l.set_groups(&g);
+        store.save_worklist(&l).unwrap();
+        let l = store.worklist("run").unwrap();
+        assert_eq!(worklist::position(&store, &l, Reading::Settled).at, Some(2));
+        let _ = spawned();
+        step(&store, &l, &Blind);
+        assert!(spawned().is_empty(), "m-1 is blocked, m-2 rests on it, and n-1 is two groups on");
+        let (m1, m2) = (store.find_task("m-1").unwrap(), store.find_task("m-2").unwrap());
+        assert_eq!((m1.status(), m2.after.clone(), m2.tags.clone()), (Status::Blocked, vec!["m-1".to_string()], vec!["kept".to_string()]));
+
+        // The blocked row is answered: group 2 runs, is verified, and its barrier passes.
+        set(&store, "m-1", Status::Todo);
+        step(&store, &l, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "m-1 starts; m-2 still rests on it");
+        set(&store, "m-1", Status::Review);
+        step(&store, &l, &Blind);
+        assert!(spawned().iter().any(|(id, _)| id == "m-2"), "m-2 starts once m-1 has landed");
+        hold_all(&store);
+        step(&store, &l, &Blind);
+        let _ = spawned();
+        set(&store, "m-2", Status::Review);
+        step(&store, &l, &Blind);
+        let _ = spawned();
+        hold_all(&store);
+        step(&store, &l, &Blind);
+        assert_eq!(spawned(), vec![("run · barrier 2".to_string(), "claude".to_string())], "group 2's own barrier");
+        let order = check_order(&store, "run", 2).expect("an order");
+        assert!(order.contains("m-1") && order.contains("m-2") && !order.contains("m-3"), "{order}");
+        crate::barrier::settle(&store, "run", 2, crate::barrier::State::Passes);
+        let mut l2 = store.worklist("run").unwrap();
+        let mut g = l2.groups();
+        g[1].verdict = "2026-08-20T10:00:00Z passed".into();
+        l2.set_groups(&g);
+        store.save_worklist(&l2).unwrap();
+        assert_eq!(worklist::position(&store, &l2, Reading::Settled).at, Some(3), "and the run is on the old group 2");
+        step(&store, &l2, &Blind);
+        assert_eq!(spawned(), vec![("n-1".to_string(), "claude".to_string())]);
+    }
+
     /// The barrier of a one-member run, open and with its first start taken.
     fn barrier_open(tag: &str) -> (util::Isolated, Store, Worklist) {
         let (env, store) = scratch(tag);
