@@ -42,8 +42,8 @@ backlog uses sub-tasks.
 3. **The size check offers all three.** It names what tripped and accepts
    legs, pieces, sub-tasks or `--whole --why`. Its message says which fits
    which shape (*Choosing*).
-4. **A piece saves about $0.13–0.16 and a place for ~1.5 minutes against a
-   row**, nearly all of it the verifier seat. On react-pass-3 group 2 (15
+4. **A piece saves about $0.10–0.14 net and a place for ~1.5 minutes against
+   a row**, nearly all of it the verifier seat. On react-pass-3 group 2 (15
    rows) that is about a quarter of the group's spend. It does not save wall
    time (*Cost*).
 
@@ -299,7 +299,8 @@ legs' rework, one per named piece instead of one per row, because pieces are
 separable and the others stand.
 
 **The risk this takes.** The verifier reads more in one session. On
-react-pass-3, six of 35 members were sent back. With one verifier, a fault in
+react-pass-3, two of 35 members were sent back (compounding-189 four times,
+compounding-196 twice): six rework seats, $3.68, 13% of the list. With one verifier, a fault in
 piece 3 is found after the last batch rather than minutes after piece 3, and
 its rework runs at the end. The mitigations are already in the design: each
 piece's checks run at `piece done` and again at its batch's close, so the
@@ -423,7 +424,7 @@ pieces will mostly sit):
   barrier's per-member reading.
 - **Added:** a share of one larger verifier. The 150+ band's median is $0.31
   over 539 seconds; allow up to twice that for breadth, about $0.02–0.04 a
-  piece in a row of fifteen. The batch close is seatless and costs the
+  piece in a row of fifteen, so the net saving is about $0.10–0.14 a piece. The batch close is seatless and costs the
   check's seconds; a conflict or a red step costs one fix seat.
 - **Unchanged:** the piece's own seat (start, reading, work), its tree, and
   the planner's writing.
@@ -431,7 +432,7 @@ pieces will mostly sit):
 **On one real larger work: react-pass-3 group 2**, fifteen component rows
 (compounding-168 to 182), each its own directory with a done-when and check
 lines: the shape pieces are for. Measured: workers $4.64, seventeen verifier
-seats (180 and 182 were sent back once) $2.49, governor $0.71, barrier $0.17,
+seats (180 and 182 each had a second) $2.49, governor $0.71, barrier $0.17,
 total $8.01. The workers' turns summed to 246.
 
 | run as | verifiers | group total | saved |
@@ -477,10 +478,13 @@ test <module>::` lines with one-word labels.
 
 | group | rows | cap |
 |---|---|---|
-| 2: contract | **pieces-record** (`src/pieces.rs`: the section, its rules, `piece add | show | drop | cap`, `wsp show` rendering) · **pieces-ids** (the grammar, the slug refusal, the store audit) | x2 |
-| 3: parts | **pieces-seat** (`spawn --piece`, the binding, the brief, `piece done` with its checks, start and end lines, review and block from a piece) · **pieces-close** (`src/piece_close.rs`: a batch's merge and check on scratch repos, the fix piece it adds) | x2 |
-| 4: wiring | **pieces-run** (`cycle::step` opens batches under both caps, closes them, types review, `inner::run_inside`, the launch from `piece done`, repair) · **pieces-verdict** (the verifier's pieces block, rework pieces from a blocking verdict, the fold at land) | x2 |
-| 5: verbs | **pieces-address** (`show`, `tell`, `note`, `say`, `wip` on piece ids; strays and stale) · **pieces-promote** (`promote`, a seated piece adding to later batches, the handbook) · **wsp-499** (planner legs and the size check, which now names pieces) | x3 |
-| 6: proof | **pieces-proof** (a sandboxed run to verified with no hand step, then one real larger work run as pieces, measured against this table) | x1 |
+| 2: contract | **pieces-record** `wsp-502` (`src/pieces.rs`: the section, its rules, `wsp piece` add, show, drop and cap, `wsp show` rendering) · **pieces-ids** `wsp-503` (the grammar, the slug refusal, the store audit) | x2 |
+| 3: parts | **pieces-seat** `wsp-504` (`spawn --piece`, the binding, the brief, `piece done` with its checks, start and end lines, review and block from a piece) · **pieces-close** `wsp-505` (`src/piece_close.rs`: a batch's merge and check on scratch repos, the fix piece it adds) | x2 |
+| 4: wiring | **pieces-run** `wsp-506`, on Opus (`cycle::step` opens batches under both caps, closes them, types review, `inner::run_inside`, the launch from `piece done`, repair) · **pieces-verdict** `wsp-507` (the verifier's pieces block, rework pieces from a blocking verdict, the fold at land) | x2 |
+| 5: verbs | **pieces-address** `wsp-508` (`show`, `tell`, `note`, `say`, `wip` on piece ids; strays and stale) · **pieces-promote** `wsp-509` (`promote`, a seated piece adding to later batches, the docs) · **wsp-499** (planner legs and the size check, which now names pieces) | x3 |
+| 6: proof | **pieces-proof** `wsp-510`, on Opus (a sandboxed run to verified with no hand step, then one real larger work run as pieces, measured against this table) | x1 |
 
-The row ids, done-whens and checks are on each row and on the list.
+Each group's stop is on the list; each row's done-when and checks are on the
+row, and its `after` names the rows it needs. The two Opus rows say why in
+their logs: wsp-506 reorders the run's opening under the lock, and wsp-510
+records a decision from measurements.
