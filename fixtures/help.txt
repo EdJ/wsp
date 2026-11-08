@@ -208,7 +208,12 @@ AGENTS
                                     put that build at ~/.local/bin/wsp, one
                                     install at a time — the one file nothing can
                                     isolate; defaults to your verify tree's
-                                    release build, -n to look without touching it
+                                    release build, -n to look without touching it.
+                                    On macOS the copy is signed with the identity
+                                    in <state>/sign-identity (default Ed's Apple
+                                    Development one; `off` skips it), so a
+                                    Developer Tools exemption survives reinstalls;
+                                    a signing failure is reported, never fatal
   wsp install → ~/Library/LaunchAgents/com.wsp.daemon.plist
                                     …and writes and loads the launchd agent that
                                     keeps `wsp daemon` alive, so it comes back

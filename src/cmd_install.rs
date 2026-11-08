@@ -685,6 +685,87 @@ fn place(bytes: &[u8], dst: &Path) -> Result<(), String> {
     }
 }
 
+// ---- signing -----------------------------------------------------------
+
+/// The identity the installed binary is signed with unless the store says
+/// otherwise. An unsigned binary has a new identity on every install, so a
+/// Privacy & Security → Developer Tools exemption naming `~/.local/bin/wsp`
+/// would not survive one; a signed one keeps it.
+const SIGN_IDENTITY: &str = "Apple Development: Edward James (9NR3HR93Z7)";
+
+/// The file in the state directory that overrides [`SIGN_IDENTITY`]. `off`
+/// installs unsigned without trying.
+const SIGN_SETTING: &str = "sign-identity";
+
+/// How long `codesign` gets. A keychain prompt in a process nobody is looking
+/// at never returns, and an install must.
+const SIGN_PATIENCE: Duration = Duration::from_secs(30);
+
+/// The identity to sign with, or `None` when signing is switched off.
+fn sign_identity(state: &Path) -> Option<String> {
+    let set = fs::read_to_string(state.join(SIGN_SETTING)).ok();
+    let word = set.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match word {
+        Some(w) if w.eq_ignore_ascii_case("off") => None,
+        Some(w) => Some(w.to_string()),
+        None => Some(SIGN_IDENTITY.to_string()),
+    }
+}
+
+/// Run the real `codesign`, bounded by [`SIGN_PATIENCE`].
+fn codesign(bin: &Path, identity: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("codesign")
+        .args(["--force", "-s", identity])
+        .arg(bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run codesign: {e}"))?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let mut err = String::new();
+                if let Some(mut e) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = e.read_to_string(&mut err);
+                }
+                let err = err.trim();
+                return Err(if err.is_empty() {
+                    format!("codesign exited {status}")
+                } else {
+                    format!("codesign: {err}")
+                });
+            }
+            Ok(None) if start.elapsed() > SIGN_PATIENCE => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("codesign gave no answer in {}s", SIGN_PATIENCE.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("codesign: {e}")),
+        }
+    }
+}
+
+/// Sign what [`place`] put at `dst`, through `sign` so a test needs no
+/// keychain. **Never fails the install**: a refusal comes back as a sentence
+/// for the caller to report, and the binary stays as placed, unsigned.
+/// `None` is signed, or signing was off.
+fn sign_placed(
+    dst: &Path,
+    identity: Option<&str>,
+    sign: &dyn Fn(&Path, &str) -> Result<(), String>,
+) -> Option<String> {
+    let identity = identity?;
+    sign(dst, identity)
+        .err()
+        .map(|e| format!("{e} — installed unsigned, so a Developer Tools exemption will not hold"))
+}
+
 // ---- the command -------------------------------------------------------
 
 /// A binary to install, and the tree it came out of.
@@ -1243,6 +1324,11 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {e}");
         return 2;
     }
+    // After the copy was read back and compared (signing rewrites the file, so
+    // it could not be compared after), and before the record, so the size and
+    // mtime kept are the signed file's.
+    let signed_as = if cfg!(target_os = "macos") { sign_identity(&store.state) } else { None };
+    let sign_failed = sign_placed(&dst, signed_as.as_deref(), &codesign);
     let (size, mtime) = util::stamp(&dst).unwrap_or((bytes.len() as u64, util::epoch_secs() as u64));
     let rec = Record {
         at: util::now_iso(),
@@ -1271,6 +1357,8 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "dirty": ours.dirty,
                 "dirty_files": ours.dirty_files,
                 "bytes": size,
+                "signed": signed_as.is_some() && sign_failed.is_none(),
+                "sign_error": sign_failed,
                 "who": rec.who,
                 "why": why,
                 "daemon": agent,
@@ -1297,6 +1385,11 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         )),
         p.dim(&format!("{:.1} MB, read back and compared", size as f64 / 1_048_576.0))
     );
+    match (&signed_as, &sign_failed) {
+        (Some(id), None) => println!("{}", p.dim(&format!("signed as {id}"))),
+        (_, Some(e)) => eprintln!("{} {e}", p.yellow("unsigned")),
+        _ => {}
+    }
     println!(
         "{}",
         p.dim("panels, detail panes and the daemon re-exec into it within a tick — `wsp peek` to look at one")
@@ -1564,7 +1657,12 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     put that build at ~/.local/bin/wsp, one
                                     install at a time — the one file nothing can
                                     isolate; defaults to your verify tree's
-                                    release build, -n to look without touching it"##,
+                                    release build, -n to look without touching it.
+                                    On macOS the copy is signed with the identity
+                                    in <state>/sign-identity (default Ed's Apple
+                                    Development one; `off` skips it), so a
+                                    Developer Tools exemption survives reinstalls;
+                                    a signing failure is reported, never fatal"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
@@ -1892,6 +1990,51 @@ mod tests {
         // No record at all is the hand-installed case: something newer is there
         // and nothing can say what is in it, so it is not ours to overwrite.
         assert!(overtaken(clean.built, 1_500, None, &clean));
+    }
+
+    /// The sign step runs on the placed file, after the copy, and a failure of
+    /// it is a sentence rather than a failed install. `codesign` is a seam so no
+    /// keychain is needed.
+    #[test]
+    fn signing_runs_after_the_copy_and_its_failure_does_not_fail_the_install() {
+        use std::cell::RefCell;
+        let dir = scratch("sign");
+        let dst = dir.join("wsp");
+        place(b"new binary", &dst).expect("the install failed");
+
+        let seen = RefCell::new(Vec::new());
+        let ok = |bin: &Path, id: &str| -> Result<(), String> {
+            seen.borrow_mut().push((fs::read(bin).unwrap(), id.to_string()));
+            Ok(())
+        };
+        assert_eq!(sign_placed(&dst, Some("Some Identity"), &ok), None);
+        assert_eq!(
+            *seen.borrow(),
+            vec![(b"new binary".to_vec(), "Some Identity".to_string())],
+            "the signer did not see the placed file with the identity"
+        );
+
+        let refuse = |_: &Path, _: &str| -> Result<(), String> { Err("no identity".into()) };
+        let said = sign_placed(&dst, Some("Some Identity"), &refuse).expect("a failure was not reported");
+        assert!(said.contains("no identity") && said.contains("unsigned"), "{said}");
+        assert_eq!(fs::read(&dst).unwrap(), b"new binary", "a failed signing touched the install");
+
+        // Switched off: the signer is never called.
+        let boom = |_: &Path, _: &str| -> Result<(), String> { panic!("signed while off") };
+        assert_eq!(sign_placed(&dst, None, &boom), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The identity is the store's, else Ed's; `off` is no identity.
+    #[test]
+    fn the_identity_is_the_stores_else_the_default() {
+        let dir = scratch("sign-identity");
+        assert_eq!(sign_identity(&dir).as_deref(), Some(SIGN_IDENTITY));
+        fs::write(dir.join(SIGN_SETTING), "Apple Development: Someone Else (X)\n").unwrap();
+        assert_eq!(sign_identity(&dir).as_deref(), Some("Apple Development: Someone Else (X)"));
+        fs::write(dir.join(SIGN_SETTING), "off\n").unwrap();
+        assert_eq!(sign_identity(&dir), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The copy is a rename, and it is checked. Writing a binary in place is
