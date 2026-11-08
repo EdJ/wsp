@@ -31,8 +31,8 @@
 //! while the first settled). It is closing, and the tick ends it by its pane.
 //!
 //! **A seat that holds nothing is not counted unless it is seen working**
-//! (`wsp-353`): the seat of a row run as legs, which handed the row to them
-//! (the legs' own seats are counted as legs), and any seat of a member of a
+//! (`wsp-353`): the seat of a row run as legs or pieces, which handed the row to
+//! them (the legs' and pieces' own seats are counted as theirs), and any seat of a member of a
 //! parked list. Each sat in the cap for ten minutes at `compounding-048`
 //! while the starts it blocked waited.
 //!
@@ -263,6 +263,22 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
         }
     }
 
+    // A piece, the same: by the seat on its entry, a start not yet seated
+    // counted while it is fresh, and a done piece only while its seat is seen
+    // working (`docs/pieces.md`, *The run*, "Places").
+    for t in r.tasks.iter().filter(|t| t.body.contains("## Pieces")) {
+        let parked = in_parked_list(r, &t.id);
+        for p in crate::pieces::record(t).pieces {
+            let what = p.id(&t.id);
+            let running = p.state == crate::pieces::State::Running;
+            match &p.pane {
+                Some(seat) => take(&mut out, Some(seat), what, parked || !running || p.ending != crate::verification::Ending::Standing, false, p.started.as_deref()),
+                None if running && p.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false, false, None),
+                None => {}
+            }
+        }
+    }
+
     // A member or a helper: the seat its binding names, and the seat of the
     // agent its claim names — a binding is free to be lost and a claim is not.
     let status = |id: &str| r.tasks.iter().find(|t| t.id == id).map(|t| t.status());
@@ -275,7 +291,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     held.extend(r.claimed());
     for (seat, id) in held {
         let Some(s) = status(&id) else { continue };
-        let holds_nothing = in_parked_list(r, &id) || r.tasks.iter().any(|t| t.id == id && crate::legs::staged(t));
+        let holds_nothing = in_parked_list(r, &id) || r.tasks.iter().any(|t| t.id == id && crate::inner::run_inside(t));
         take(&mut out, Some(&seat), id, finished(s) || holds_nothing, false, None);
     }
 

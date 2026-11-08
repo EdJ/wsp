@@ -75,9 +75,31 @@
 //!   tier on a rework, which is the default unless that leg had a `why:`.
 //! - **A row at the 8-leg cap gets no rework leg**; the row's log says so and the
 //!   governor is told by the verdict's own message. It is not reseated as a whole.
-//! - **Outside a list**, `leg done` pokes, the poke runs [`start_legs`], and the
+//! - **Outside a list**, `leg done` pokes, the poke runs [`start_inside`], and the
 //!   repair tick runs [`legs_owed`] for rows that have begun. A row nothing has
 //!   begun is never started by a tick: staging it is not starting it.
+//!
+//! # Pieces: a larger work in batches, inside one row (`wsp-506`)
+//!
+//! A member with `## Pieces` is stepped the same way ([`run_pieces`]): in the
+//! same place in a step as legs, the batch that is owed a close is closed
+//! ([`crate::piece_close::close`]) and written `closed:` on the record, then the
+//! lowest open batch's pending pieces open in record order under the row's
+//! `cap:` and through the gate ([`take_pieces`]). A conflicting or red close
+//! files its `merge batch` or `fix batch` piece in the batch after, which opens
+//! next. Once every batch has closed the run types the row's review, the pieces
+//! table as the account ([`finish_pieces`]). Outside a list `piece done` pokes
+//! and [`start_inside`] runs; the repair tick runs [`pieces_owed`] and ends a
+//! done piece's seat ([`pieces_finished`]).
+//!
+//! - **A batch's close is recorded on the row** (`closed: 1 2` under `cap:`), so
+//!   a second advance does not merge it again and the next batch opens only
+//!   behind it. A close that is held is said in `cycle.log` and tried again.
+//! - **The review is marked before it is typed** ([`PIECES_REVIEWING`]), so a
+//!   second advance does not type it twice; a review refused is typed again
+//!   after [`REVIEW_TAKES`].
+//! - **The row's own cap counts its pieces running**, a start in flight among
+//!   them; a piece held by it says nothing, since the next piece to end opens it.
 //!
 //! # Levels, so a lost trigger costs a delay and nothing else
 //!
@@ -315,8 +337,8 @@ pub(crate) fn poke_task(store: &Store, id: &str, verb: &str) {
     let Some(t) = store.find_task(id) else { return };
     let ours = t.tags.iter().any(|g| g == VERIFY_TAG || g == BARRIER_TAG);
     let member = worklist::Running::read(store).list_of(&t.id).is_some();
-    // A row run as legs has its next legs to start, in a list or not.
-    if !ours && !member && !crate::legs::staged(&t) {
+    // A row run as legs or pieces has its next parts to start, in a list or not.
+    if !ours && !member && !crate::inner::run_inside(&t) {
         return;
     }
     launch(store, &["worklist", "advance", "--task", &t.id, "--verb", verb]);
@@ -454,10 +476,10 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
     if let (Some(id), Some(verb)) = (args.get("task"), args.get("verb")) {
         told_about_task(store, &id, &verb);
         // A row staged and spawned by hand has no list to step it: the legs it
-        // is owed start here, through the gate (`start_legs` leaves a list's
+        // is owed start here, through the gate (`start_inside` leaves a list's
         // member to the list).
-        if store.find_task(&id).is_some_and(|t| crate::legs::staged(&t)) {
-            let _ = start_legs(store, &id, &Fleet);
+        if store.find_task(&id).is_some_and(|t| crate::inner::run_inside(&t)) {
+            let _ = start_inside(store, &id, &Fleet);
         }
     }
     if let (Some(list), Some(event)) = (named.as_deref(), args.get("event")) {
@@ -917,8 +939,14 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // gate, in record order. After the verifiers and the barrier and before any
     // new member, so a leg is unfinished work on a row the run has begun and
     // finishing goes ahead of fanning out (`docs/legs.md`, *The run*).
+    // The pieces of a row already begun go in the same place: its batches close,
+    // and the lowest open one's pieces open (`docs/pieces.md`, *The run*).
     for s in pos.members.iter().filter(|s| !s.finished()) {
-        started.extend(run_legs(store, Some((&w, at)), &s.id, Rows::Started, None, &gate));
+        if store.find_task(&s.id).is_some_and(|t| crate::pieces::staged(&t)) {
+            started.extend(run_pieces(store, Some((&w, at)), &s.id, Rows::Started, None, &gate));
+        } else {
+            started.extend(run_legs(store, Some((&w, at)), &s.id, Rows::Started, None, &gate));
+        }
     }
 
     // 1. Members nobody has started, up to the group's cap — counted inside
@@ -954,8 +982,13 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 continue;
             }
             let Some(t) = store.find_task(&s.id) else { continue };
-            // A staged member starts with its first legs, which count as one
-            // member against the group's `xN` however many it runs.
+            // A staged member starts with its first legs, or its first batch's
+            // pieces, which count as one member against the group's `xN`
+            // however many it runs.
+            if crate::pieces::staged(&t) {
+                started.extend(run_pieces(store, Some((&w, at)), &s.id, Rows::New, Some((&g.members, cap)), &gate));
+                continue;
+            }
             if crate::legs::staged(&t) {
                 started.extend(run_legs(store, Some((&w, at)), &s.id, Rows::New, Some((&g.members, cap)), &gate));
                 continue;
@@ -1293,12 +1326,12 @@ const WEDGED_AFTER: i64 = 60;
 /// Unclaimed, and written long enough ago that a start in flight would have
 /// claimed it by now.
 ///
-/// **Never a row run as legs** (`docs/legs.md`, *The run*): it holds no claim by
-/// design, so "unclaimed for a minute" is its ordinary state, and starting a
+/// **Never a row run as legs or pieces** (`docs/legs.md`, *The run*;
+/// [`crate::inner::run_inside`]): it holds no claim by design, so "unclaimed for a minute" is its ordinary state, and starting a
 /// whole-row worker on it would put one beside the legs. Excluded by having the
 /// section and not by a leg running, since between two legs none does.
 fn wedged(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
-    !crate::legs::staged(t) && !claims.contains_key(&t.id) && util::epoch_secs() - util::epoch_of(&t.updated) > WEDGED_AFTER
+    !crate::inner::run_inside(t) && !claims.contains_key(&t.id) && util::epoch_secs() - util::epoch_of(&t.updated) > WEDGED_AFTER
 }
 
 /// How long a row at `doing` may have no seat and no line in `cycle.log` before
@@ -1319,7 +1352,7 @@ pub(crate) fn silent(store: &Store, ids: &[String]) -> Vec<(String, i64)> {
     let mut out = Vec::new();
     for id in ids {
         let Some(t) = store.find_task(id) else { continue };
-        if t.status() != Status::Doing || crate::legs::staged(&t) || claims.contains_key(id) || !store.panes_for_task(id).is_empty() {
+        if t.status() != Status::Doing || crate::inner::run_inside(&t) || claims.contains_key(id) || !store.panes_for_task(id).is_empty() {
             continue;
         }
         let said = log
@@ -1456,7 +1489,7 @@ fn take_member(
     let id = t.id.clone();
     let took = store.locked(|| {
         let t = store.find_task(&id)?;
-        if crate::legs::staged(&t) {
+        if crate::inner::run_inside(&t) {
             return None;
         }
         let claims = store.claims();
@@ -1513,9 +1546,10 @@ fn take_member(
 /// [`crate::repair`]'s, which tells it, ends it and puts the row back at `todo`.
 ///
 /// **A row run as legs is sent back to a leg**, the `rework` the verdict
-/// appended, and the step opens that; it is never reseated as a whole.
+/// appended, and the step opens that; it is never reseated as a whole. Nor is
+/// a row with pieces ([`crate::inner::run_inside`]).
 fn sent_back_unseated(store: &Store, t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
-    if crate::legs::staged(t) || claims.contains_key(&t.id) || !store.panes_for_task(&t.id).is_empty() {
+    if crate::inner::run_inside(t) || claims.contains_key(&t.id) || !store.panes_for_task(&t.id).is_empty() {
         return false;
     }
     let log = t.section("Log").unwrap_or_default();
@@ -1699,18 +1733,22 @@ fn start_leg(store: &Store, row: &str, leg: &str, owned: Option<(&str, &str)>) -
     }
 }
 
-/// The ready legs of a row nobody's list runs, started through the gate: what
-/// `wsp leg done` launches, detached, when it ends a leg of a row staged and
-/// spawned by hand (`docs/legs.md`, *The run*, "Outside a list"). A launch is
+/// The ready legs or pieces of a row nobody's list runs, started through the gate:
+/// what `wsp leg done` and `wsp piece done` launch, detached, when they end a part
+/// of a row staged and spawned by hand (`docs/legs.md`, *The run*, "Outside a
+/// list"; `docs/pieces.md`, *The run*). For pieces it closes what is owed a close
+/// and types the review first, as a list's step does. A launch is
 /// the run and not a person asking, so it waits for a place like any other start.
 /// A row in a list that has not ended is that list's, and is left to it: a
 /// running list's step starts it, and a held or parked one starts nothing until
 /// it is resumed (`wsp-356`), which is said once here.
-pub(crate) fn start_legs(store: &Store, row: &str, seats: &dyn Seats) -> Vec<String> {
+pub(crate) fn start_inside(store: &Store, row: &str, seats: &dyn Seats) -> Vec<String> {
+    let pieces = store.find_task(row).is_some_and(|t| crate::pieces::staged(&t));
+    let parts = if pieces { "pieces" } else { "legs" };
     if let Some(w) = worklist::open_list_of(&store.worklists(), row) {
         if !w.status().is_running() {
             log_line(store, &format!(
-                "{row}'s legs wait — its list {} is {}; they start when it is resumed",
+                "{row}'s {parts} wait — its list {} is {}; they start when it is resumed",
                 w.id,
                 w.status().as_str()
             ));
@@ -1718,7 +1756,7 @@ pub(crate) fn start_legs(store: &Store, row: &str, seats: &dyn Seats) -> Vec<Str
         return Vec::new();
     }
     let gate = crate::room::Gate::new(store, seats);
-    let started = run_legs(store, None, row, Rows::Started, None, &gate);
+    let started = if pieces { start_pieces(store, row, &gate) } else { run_legs(store, None, row, Rows::Started, None, &gate) };
     // Said once while it lasts, as a list's step does through `capped.json`
     // (`say_capped`), keyed on the row since there is no list: the repair tick
     // asks every minute and a held leg is the same sentence each time.
@@ -1755,7 +1793,7 @@ pub(crate) fn legs_owed(store: &Store, seats: &dyn Seats) -> Vec<String> {
         if !begun || worklist::open_list_of(&lists, &t.id).is_some() {
             continue;
         }
-        out.extend(start_legs(store, &t.id, seats));
+        out.extend(start_inside(store, &t.id, seats));
     }
     out
 }
@@ -1815,6 +1853,440 @@ pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
                             "wsp could not end leg {} of {} in {seat}: {}. It is not tried again — \
                              `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
                             l.name, t.id, util::truncate(&why, 200)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    ended
+}
+
+// ---- pieces -----------------------------------------------------------------------
+
+/// A piece opened by [`take_pieces`]: its number, and whether it is a start taken
+/// again because the last one never seated it.
+struct PieceOpening {
+    n: usize,
+    again: bool,
+}
+
+/// A piece opened with no seat so long ago that the start never arrived.
+fn piece_lost(p: &crate::pieces::Piece) -> bool {
+    p.state == crate::pieces::State::Running
+        && p.pane.is_none()
+        && p.started.as_deref().is_none_or(|at| util::epoch_secs() - util::epoch_of(at) > WEDGED_AFTER)
+}
+
+/// Open the pieces of `row` the run may start now: `docs/pieces.md`, *The run*.
+/// [`take_legs`]' rules, with the batch for the graph:
+///
+/// - **The lowest open batch only**, and only once every batch below it is
+///   closed ([`crate::pieces::close_owed`]), its pending pieces in record order.
+/// - **Under the row's `cap:`**, counting its pieces already running (a seat, or
+///   a start still in flight), and then **through the gate**.
+/// - **Each opening written under the store lock** with the count, so two
+///   advances racing find the record and start nothing twice.
+/// - **None while a seat holds the row's claim**: a seat that plans its own row
+///   adds the pieces and then releases.
+fn take_pieces(
+    store: &Store,
+    row: &str,
+    rows: Rows,
+    within: Option<(&[String], Option<usize>)>,
+    gate: &crate::room::Gate,
+) -> Vec<PieceOpening> {
+    let opened = store.locked(|| {
+        let mut opened = Vec::new();
+        let Some(t) = store.find_task(row) else { return opened };
+        if !crate::pieces::staged(&t) {
+            return opened;
+        }
+        let claims = store.claims();
+        match (t.status(), rows) {
+            (Status::Doing, Rows::Started) if !claims.contains_key(row) => {}
+            // A planned row starts with its first batch, and no seat.
+            (Status::Todo, Rows::New) if !claims.contains_key(row) => {
+                if let Some((members, Some(cap))) = within {
+                    if members_going(store, members, row, &claims) >= cap {
+                        return opened;
+                    }
+                }
+            }
+            _ => return opened,
+        }
+        let rec = crate::pieces::record(&t);
+        if crate::pieces::close_owed(&rec).is_some() {
+            return opened;
+        }
+        let Some(batch) = crate::piece_seat::lowest_open(&rec) else { return opened };
+        let ours: Vec<&crate::pieces::Piece> = rec.pieces.iter().filter(|p| p.batch == batch).collect();
+        let mut running = ours.iter().filter(|p| p.state == crate::pieces::State::Running && !piece_lost(p)).count();
+        let cap = rec.cap.max(1);
+        for p in ours {
+            let again = match p.state {
+                crate::pieces::State::Pending => false,
+                crate::pieces::State::Running if piece_lost(p) => true,
+                _ => continue,
+            };
+            if running >= cap {
+                // Held by the row's own cap, which says nothing: the next piece
+                // to end opens the next one.
+                if again {
+                    crate::piece_seat::unopen(store, row, p.n);
+                }
+                continue;
+            }
+            let label = p.id(row);
+            if crate::starts::held(store, &label) {
+                if again {
+                    crate::piece_seat::unopen(store, row, p.n);
+                }
+                continue;
+            }
+            if again && !retry_lost_start(store, row, &label, &format!("piece {} of {row}", p.n), &piece_remedy(row, p.n)) {
+                crate::piece_seat::unopen(store, row, p.n);
+                continue;
+            }
+            if !gate.admits(&label) {
+                continue;
+            }
+            if again {
+                crate::piece_seat::unopen(store, row, p.n);
+            }
+            if crate::piece_seat::open(store, row, p.n).is_ok() {
+                opened.push(PieceOpening { n: p.n, again });
+                running += 1;
+            }
+        }
+        opened
+    });
+    if !opened.is_empty() {
+        let ns: Vec<String> = opened.iter().map(|o| o.n.to_string()).collect();
+        store.git_commit(&format!("wsp: {row} opens piece {}", ns.join(", ")));
+    }
+    opened
+}
+
+/// What a person types to start a piece whose tries ran out.
+fn piece_remedy(row: &str, n: usize) -> String {
+    format!("`wsp spawn {row} --agent --piece {n}` starts it by hand once the cause is cleared")
+}
+
+/// The run's whole step on a row with pieces: close the batch that is owed a
+/// close, type the review once every batch is closed, then open what is ready and
+/// start a seat on each. `at` is the list and group these belong to, when there is
+/// one. Returns the labels started.
+fn run_pieces(
+    store: &Store,
+    at: Option<(&Worklist, usize)>,
+    row: &str,
+    rows: Rows,
+    within: Option<(&[String], Option<usize>)>,
+    gate: &crate::room::Gate,
+) -> Vec<String> {
+    if rows == Rows::Started {
+        close_batches(store, at, row);
+    }
+    let mut started = Vec::new();
+    for o in take_pieces(store, row, rows, within, gate) {
+        let label = crate::pieces::Piece::pending(o.n, "", 0).id(row);
+        let by = at.map(|(w, n)| format!("{} group {n}: ", w.id)).unwrap_or_default();
+        let again = if o.again { " again: the last start never seated it" } else { "" };
+        log_line(store, &format!("{by}starting piece {} of {row}{again}", o.n));
+        let owned = at.map(|(w, n)| (w.id.as_str(), n.to_string()));
+        match start_piece(store, row, o.n, owned.as_ref().map(|(l, n)| (*l, n.as_str()))) {
+            None => started.push(label),
+            Some(why) => {
+                log_line(store, &format!("FAILED spawn piece {} of {row}: {why}", o.n));
+                piece_start_failed(store, at.map(|(w, _)| w), row, o.n, &why);
+            }
+        }
+    }
+    started
+}
+
+/// `wsp spawn <row> --agent --piece <n>`, and its refusal if it refused. The tier
+/// is the entry's, which the spawn reads for itself.
+fn start_piece(store: &Store, row: &str, n: usize, owned: Option<(&str, &str)>) -> Option<String> {
+    if cfg!(test) {
+        #[cfg(test)]
+        return tests::SPAWNED.with(|s| {
+            let kind = store
+                .find_task(row)
+                .and_then(|t| crate::pieces::record(&t).pieces.into_iter().find(|p| p.n == n))
+                .map(|p| p.policy.kind)
+                .unwrap_or_default();
+            s.borrow_mut().push((crate::pieces::Piece::pending(n, "", 0).id(row), kind));
+            tests::FAIL.with(|f| f.borrow().clone())
+        });
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return Some(e.to_string()),
+    };
+    let n = n.to_string();
+    let argv = ["spawn", row, "--agent", "--piece", n.as_str()];
+    log_line(store, &format!("spawn {}", argv[1..].join(" ")));
+    let mut cmd = Command::new(exe);
+    cmd.args(argv).stdin(Stdio::null());
+    match owned {
+        Some((list, group)) => cmd.env(OWNED_LIST, list).env(OWNED_GROUP, group),
+        None => cmd.env(RUN_STEP, "1"),
+    };
+    match cmd.output() {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(why_not(&String::from_utf8_lossy(&o.stderr))),
+        Err(e) => Some(e.to_string()),
+    }
+}
+
+/// A piece's start failed, or its seat never came up: [`leg_start_failed`]'s rule
+/// for a piece. The seat is ended, the entry goes back to pending with no seat on
+/// it ([`crate::piece_seat::reset`]), and it is started again on the backoff, keyed
+/// by the piece's id in `starts.json` — or the person is flagged, on the last try.
+pub(crate) fn piece_start_failed(store: &Store, w: Option<&Worklist>, row: &str, n: usize, why: &str) {
+    let label = crate::pieces::Piece::pending(n, "", 0).id(row);
+    let seat = store
+        .find_task(row)
+        .and_then(|t| crate::pieces::record(&t).pieces.into_iter().find(|p| p.n == n))
+        .and_then(|p| p.pane);
+    let ended = match &seat {
+        Some(seat) => match despawn_seat(seat) {
+            Ok(()) => format!("{seat} was ended"),
+            Err(e) => format!("{seat} could not be ended ({e}): `wsp despawn --pane {seat}`"),
+        },
+        None => "it had no seat to end".to_string(),
+    };
+    crate::piece_seat::reset(store, row, n);
+    let m = crate::starts::missed(store, &label);
+    let why = util::truncate(why, 300);
+    let wait = m.again_in.map_or_else(|| "it is not tried again".to_string(), |s| format!("it starts again in {}", crate::barrier::span(s)));
+    store.locked(|| {
+        if let Some(mut t) = store.find_task(row) {
+            let _ = crate::log::note(store, &mut t, &format!("wsp could not spawn piece {n} (try {} of {}): {why}", m.tries, crate::barrier::TRIES));
+        }
+    });
+    log_line(store, &format!("{label}: its start did not take on try {} of {} — {ended}; {wait}", m.tries, crate::barrier::TRIES));
+    if m.last {
+        start_gave_up(store, w, row, &format!("piece {n} of {row}"), m.tries, &why, &piece_remedy(row, n));
+    } else if let Some(w) = w {
+        tell(store, w, &format!(
+            "piece {n} of {row} did not start in the {} run (try {} of {}): {why}. \
+             wsp ended the seat it left and {wait}.",
+            w.id, m.tries, crate::barrier::TRIES
+        ));
+    }
+}
+
+/// [`crate::piece_close::close`], which a test answers for itself.
+fn close_batch(store: &Store, row: &str, batch: usize) -> crate::piece_close::Closed {
+    #[cfg(test)]
+    {
+        let _ = store;
+        tests::CLOSED.with(|c| c.borrow_mut().push(format!("{row} batch {batch}")));
+        let answer = tests::CLOSE_AS.with(|f| f.get());
+        return match answer {
+            Some(f) => f(store, row, batch),
+            None => crate::piece_close::Closed::Clean { merged: Vec::new(), ran: 0, reused: 0, removed: Vec::new(), kept: Vec::new() },
+        };
+    }
+    #[cfg(not(test))]
+    crate::piece_close::close(store, row, batch)
+}
+
+/// What a close came to, as the line the row's log keeps; `None` for a close that
+/// did not happen (the batch is open, or the close was held), which is tried again.
+fn closed_line(batch: usize, c: &crate::piece_close::Closed) -> Option<String> {
+    use crate::piece_close::Closed;
+    let list = |ns: &[usize]| ns.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+    Some(match c {
+        Closed::Open(_) | Closed::Held(_) => return None,
+        Closed::Clean { merged, ran, reused, kept, .. } => format!(
+            "batch {batch} closed clean{} · {ran} check(s) run, {reused} reused{}",
+            if merged.is_empty() { String::new() } else { format!(" · merged piece {}", list(merged)) },
+            if kept.is_empty() { String::new() } else { format!(" · kept {}", kept.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(" ")) }
+        ),
+        Closed::Conflict { added: 0, .. } | Closed::Red { added: 0, .. } => return None,
+        Closed::Conflict { files, added, .. } => format!(
+            "batch {batch} did not merge ({}) — piece {added}, merge batch {batch}, is filed in batch {} and opens next",
+            util::truncate(&files.join(" "), 200),
+            batch + 1
+        ),
+        Closed::Red { step, piece, added } => format!(
+            "batch {batch} is red on its merged tip at {step} (piece {piece}'s line) — piece {added}, fix batch {batch}, is filed in batch {} and opens next",
+            batch + 1
+        ),
+    })
+}
+
+/// Close every batch of `row` that is owed a close, lowest first, each written
+/// `closed:` on the record with its line on the log, under the lock; then type the
+/// row's review when that was the last. A close that is held or did not happen is
+/// said and tried again at the next step. Nothing while a seat holds the row.
+fn close_batches(store: &Store, at: Option<(&Worklist, usize)>, row: &str) {
+    let by = at.map(|(w, n)| format!("{} group {n}: ", w.id)).unwrap_or_default();
+    // Bounded by the batches there are: each pass closes one or stops.
+    for _ in 0..=crate::pieces::MAX_PIECES {
+        let Some(t) = store.find_task(row) else { return };
+        if t.status() != Status::Doing || !crate::pieces::staged(&t) || store.claims().contains_key(row) {
+            return;
+        }
+        let Some(batch) = crate::pieces::close_owed(&crate::pieces::record(&t)) else { break };
+        let closed = close_batch(store, row, batch);
+        let Some(line) = closed_line(batch, &closed) else {
+            let why = match &closed {
+                crate::piece_close::Closed::Open(w) | crate::piece_close::Closed::Held(w) => w.clone(),
+                _ => "its merge or fix piece could not be filed".to_string(),
+            };
+            log_line(store, &format!("{by}{row}: batch {batch} waits to close — {why}"));
+            return;
+        };
+        let wrote = store.locked(|| {
+            let Some(mut t) = store.find_task(row) else { return false };
+            let mut rec = crate::pieces::record(&t);
+            if rec.closed.contains(&batch) {
+                return false;
+            }
+            rec.closed.push(batch);
+            crate::pieces::write(&mut t, &rec);
+            t.log(&line);
+            store.save_task(&t).is_ok()
+        });
+        if !wrote {
+            return;
+        }
+        store.git_commit(&format!("wsp: {row} batch {batch} closed"));
+        log_line(store, &format!("{by}{row}: {line}"));
+    }
+    finish_pieces(store, at, row);
+}
+
+/// The mark the run's review of a row with pieces leaves on its log before the
+/// verb runs, so a second advance does not type it again.
+const PIECES_REVIEWING: &str = "wsp: every batch of its pieces is closed — the run types the review";
+
+/// How long a review the run began is left to finish before it is typed again.
+const REVIEW_TAKES: i64 = 5 * 60;
+
+/// Every batch closed clean and nothing left to run: the run types the row's
+/// review, with the pieces table and captions as the account (`docs/pieces.md`,
+/// *The run*). Once: the mark is written under the lock first, and a second
+/// advance finds it. A row with no caption is given its title's.
+fn finish_pieces(store: &Store, at: Option<(&Worklist, usize)>, row: &str) {
+    let account = store.locked(|| {
+        let mut t = store.find_task(row)?;
+        if t.status() != Status::Doing || store.claims().contains_key(row) {
+            return None;
+        }
+        let rec = crate::pieces::record(&t);
+        if !crate::pieces::finished(&rec) {
+            return None;
+        }
+        let log = t.section("Log").unwrap_or_default();
+        let marked = log.lines().rev().find(|l| l.contains(PIECES_REVIEWING) || l.contains(SENT_BACK) || l.contains("→ doing"));
+        if let Some(l) = marked.filter(|l| l.contains(PIECES_REVIEWING)) {
+            let stamp = l.trim_start_matches("- ").split_whitespace().next().unwrap_or_default();
+            if util::epoch_secs() - util::epoch_of(stamp) < REVIEW_TAKES {
+                return None;
+            }
+        }
+        if t.caption.as_deref().is_none_or(|c| c.trim().is_empty()) {
+            t.caption = Some(util::truncate(&crate::caption::title(&t.title), crate::caption::LIMIT));
+        }
+        t.log(PIECES_REVIEWING);
+        store.save_task(&t).ok()?;
+        let done = rec.pieces.iter().filter(|p| p.state == crate::pieces::State::Done).count();
+        Some(format!(
+            "Every batch of {row}'s pieces closed clean: {done} piece(s) done in {} batch(es). The run typed this review; the pieces are the account.\n\n{}",
+            rec.closed.len(),
+            crate::pieces::table(&rec)
+        ))
+    });
+    let Some(account) = account else { return };
+    store.git_commit(&format!("wsp: {row}'s pieces are all closed"));
+    let by = at.map(|(w, n)| format!("{} group {n}: ", w.id)).unwrap_or_default();
+    let code = crate::cmd_task::review(store, &Args::synth("review", &[row, &account], &[]));
+    if code == 0 {
+        log_line(store, &format!("{by}{row}: every batch closed — the run typed its review"));
+    } else {
+        log_line(store, &format!("{by}{row}: every batch closed, and the review the run typed was refused (exit {code}); tried again in {}", crate::barrier::span(REVIEW_TAKES)));
+    }
+}
+
+/// The ready pieces of a row nobody's list runs, closed and started through the
+/// gate: what `wsp piece done` launches, detached, outside a list. [`start_inside`]'s
+/// half for pieces.
+fn start_pieces(store: &Store, row: &str, gate: &crate::room::Gate) -> Vec<String> {
+    run_pieces(store, None, row, Rows::Started, None, gate)
+}
+
+/// A row with pieces in no list that has not ended, that has begun, and has a
+/// close or a piece owed that nothing is starting: the repair tick's catch for a
+/// launch that was lost and a piece held at the cap. [`legs_owed`]'s rule.
+pub(crate) fn pieces_owed(store: &Store, seats: &dyn Seats) -> Vec<String> {
+    let lists = store.worklists();
+    let mut out = Vec::new();
+    for t in store.tasks_shared().iter().filter(|t| t.status() == Status::Doing && crate::pieces::staged(t)) {
+        let rec = crate::pieces::record(t);
+        let begun = !rec.closed.is_empty() || rec.pieces.iter().any(|p| matches!(p.state, crate::pieces::State::Done | crate::pieces::State::Running));
+        if !begun || worklist::open_list_of(&lists, &t.id).is_some() {
+            continue;
+        }
+        out.extend(start_inside(store, &t.id, seats));
+    }
+    out
+}
+
+/// Every piece that is done and still seated, ended — once each, never in a turn,
+/// from `/`: [`legs_finished`]' rule for a piece, the outcome on its entry.
+pub(crate) fn pieces_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
+    use crate::verification::Ending;
+    let mut ended = Vec::new();
+    for t in store.tasks_shared().iter().filter(|t| crate::pieces::staged(t)) {
+        for p in crate::pieces::record(t).pieces {
+            let Some(seat) = p.pane.clone() else { continue };
+            if p.state != crate::pieces::State::Done || p.ending != Ending::Standing {
+                continue;
+            }
+            if seats.state(&seat).is_some_and(|s| s.turn_in_flight()) {
+                continue;
+            }
+            let pids = match crate::ending::verifier_pids(seats, &seat) {
+                Ok(pids) => pids,
+                Err(why) => {
+                    crate::ending::say_part_left(store, &t.id, &format!("piece {}", p.n), &seat, &why);
+                    continue;
+                }
+            };
+            let outcome = despawn_seat(&seat).and_then(|()| crate::ending::confirm_gone(seats, &pids));
+            let ending = match &outcome {
+                Ok(()) => Ending::Ended,
+                Err(why) => Ending::Failed(why.clone()),
+            };
+            let wrote = store.locked(|| {
+                let Some(mut row) = store.find_task(&t.id) else { return false };
+                let mut rec = crate::pieces::record(&row);
+                let Some(q) = rec.pieces.iter_mut().find(|q| q.n == p.n && q.pane.as_deref() == Some(seat.as_str())) else { return false };
+                q.ending = ending.clone();
+                crate::pieces::write(&mut row, &rec);
+                store.save_task(&row).is_ok()
+            });
+            if wrote {
+                store.git_commit(&format!("wsp: {}'s piece {} in {seat} {}", t.id, p.n, if outcome.is_ok() { "ended" } else { "would not end" }));
+            }
+            match outcome {
+                Ok(()) => {
+                    log_line(store, &format!("ended {seat}, which ran piece {} of {}", p.n, t.id));
+                    ended.push(seat);
+                }
+                Err(why) => {
+                    log_line(store, &format!("could not end {seat}, which ran piece {} of {}: {why} — not tried again", p.n, t.id));
+                    if let Some(w) = list_of(store, t) {
+                        tell(store, &w, &format!(
+                            "wsp could not end piece {} of {} in {seat}: {}. It is not tried again — \
+                             `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
+                            p.n, t.id, util::truncate(&why, 200)
                         ));
                     }
                 }
@@ -2580,6 +3052,7 @@ fn forgive_spent_starts(store: &Store, list: &str) -> usize {
             labels.push(id.clone());
             if let Some(t) = store.find_task(id) {
                 labels.extend(crate::legs::legs(&t).iter().map(|l| crate::legs::label(id, &l.name)));
+                labels.extend(crate::pieces::record(&t).pieces.iter().map(|p| p.id(id)));
             }
         }
     }
@@ -3987,6 +4460,10 @@ pub(crate) mod tests {
         /// The barrier checks whose ending a verb arranged on this thread
         /// (`wsp-230`) — a launched process each, which a test cannot run.
         pub(crate) static CHECKS_ENDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// The batches the run asked to close on this thread, as `<row> batch <n>`.
+        pub(crate) static CLOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// Set, and a batch's close on this thread answers with it; else clean.
+        pub(crate) static CLOSE_AS: std::cell::Cell<Option<fn(&Store, &str, usize) -> crate::piece_close::Closed>> = const { std::cell::Cell::new(None) };
     }
 
     fn spawned() -> Vec<(String, String)> {
@@ -7388,6 +7865,288 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(ids(spawned()), ["m-1 · b".to_string()], "a is done, so b has the place");
     }
 
+    // ---- pieces (wsp-506) ------------------------------------------------------------
+
+    /// A row with pieces: `(n, batch)` each, pending, under `cap:`.
+    fn pieced(store: &Store, id: &str, status: Status, spec: &[(usize, usize)], cap: usize) {
+        task(store, id, status);
+        let mut t = store.find_task(id).unwrap();
+        let mut rec = crate::pieces::Record { cap, ..Default::default() };
+        for (n, batch) in spec {
+            let mut p = crate::pieces::Piece::pending(*n, &format!("part {n}"), *batch);
+            p.overview = format!("do part {n}");
+            p.done_when = format!("part {n} is done");
+            rec.pieces.push(p);
+        }
+        crate::pieces::write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+    }
+
+    fn piece_rec(store: &Store, id: &str) -> crate::pieces::Record {
+        crate::pieces::record(&store.find_task(id).unwrap())
+    }
+
+    fn piece_of(store: &Store, id: &str, n: usize) -> crate::pieces::Piece {
+        piece_rec(store, id).pieces.into_iter().find(|p| p.n == n).unwrap()
+    }
+
+    /// The seat a spawn gives a piece that opened, as `wsp spawn --piece` writes it.
+    fn seat_piece(store: &Store, id: &str, n: usize, seat: &str) {
+        let stand = crate::piece_seat::Standing { room: None, cwd: None, kind: "claude", spawned: "" };
+        assert!(crate::piece_seat::attach(store, id, n, seat, &stand), "piece {n} was not open to seat");
+    }
+
+    /// `wsp piece done` from the piece's seat, as the record has it after.
+    fn piece_done(store: &Store, id: &str, n: usize) {
+        let mut t = store.find_task(id).unwrap();
+        let mut rec = crate::pieces::record(&t);
+        let p = rec.pieces.iter_mut().find(|p| p.n == n).unwrap();
+        assert_eq!(p.state, crate::pieces::State::Running, "piece {n} is not running");
+        p.state = crate::pieces::State::Done;
+        p.caption = Some(format!("part {n} landed"));
+        crate::pieces::write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+    }
+
+    fn closes() -> Vec<String> {
+        drained(&CLOSED)
+    }
+
+    /// The packet's first done-when: one member, pieces in a batch of two and a
+    /// batch of one, run through both batches, both closes and the row's review
+    /// with no hand step, every piece opened once however often the step runs.
+    #[test]
+    fn a_member_with_pieces_runs_both_batches_the_closes_and_the_review_with_no_hand_step() {
+        let (_env, store) = scratch("pieces-run");
+        pieced(&store, "m-1", Status::Todo, &[(1, 1), (2, 1), (3, 2)], 3);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let _ = closes();
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1-1".to_string(), "m-1-2".to_string()], "batch 1, in record order, and no whole-row worker");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "a planned row is begun by its first batch");
+        assert!(store.claims().is_empty(), "a piece claims nothing");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "a second advance starts nothing twice");
+
+        seat_piece(&store, "m-1", 1, "cpd-1");
+        seat_piece(&store, "m-1", 2, "cpd-2");
+        piece_done(&store, "m-1", 1);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty() && closes().is_empty(), "batch 1 waits for both its pieces");
+
+        piece_done(&store, "m-1", 2);
+        step(&store, &w, &Blind);
+        assert_eq!(closes(), ["m-1 batch 1".to_string()], "the last piece's end closes its batch");
+        assert_eq!(ids(spawned()), ["m-1-3".to_string()], "and batch 2 opens in the same step");
+        assert_eq!(piece_rec(&store, "m-1").closed, [1]);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty() && closes().is_empty(), "a closed batch is not closed again");
+
+        seat_piece(&store, "m-1", 3, "cpd-3");
+        piece_done(&store, "m-1", 3);
+        step(&store, &w, &Blind);
+        assert_eq!(closes(), ["m-1 batch 2".to_string()]);
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Review, "the run typed the row's review");
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains(PIECES_REVIEWING), "{log}");
+        assert!(log.contains("part 3 landed") && log.contains("batch 2"), "the account is the pieces table and captions: {log}");
+        assert_eq!(piece_rec(&store, "m-1").closed, [1, 2]);
+        assert!(spawned().iter().all(|(id, _)| !id.starts_with("m-1-")), "no piece opens after the last batch");
+    }
+
+    /// With the room capped at 2 and a second member ready, the pieces of the row
+    /// begun take the places ahead of the new member.
+    #[test]
+    fn pieces_take_places_ahead_of_a_new_member_under_the_seats_cap() {
+        let (_env, store) = scratch("pieces-cap");
+        store.set_seat_cap(Some(2)).unwrap();
+        pieced(&store, "m-1", Status::Doing, &[(1, 1), (2, 1)], 3);
+        task(&store, "m-2", Status::Todo);
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1-1".to_string(), "m-1-2".to_string()], "the row begun goes before a new member");
+        assert_eq!(store.find_task("m-2").unwrap().status(), Status::Todo, "the new member waits");
+        let gate = crate::room::Gate::new(&store, &Blind);
+        let now: Vec<String> = gate.working().into_iter().map(|c| c.what).collect();
+        assert_eq!(now, ["m-1-1".to_string(), "m-1-2".to_string()], "each piece starting is one place");
+
+        seat_piece(&store, "m-1", 1, "cpd-1");
+        seat_piece(&store, "m-1", 2, "cpd-2");
+        let gate = crate::room::Gate::new(&store, &Blind);
+        let now: Vec<String> = gate.working().into_iter().map(|c| c.what).collect();
+        assert_eq!(now, ["m-1-1".to_string(), "m-1-2".to_string()], "counted off the entry's seat, once each, not as the row");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "the room is full");
+
+        piece_done(&store, "m-1", 1);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-2".to_string()], "a done piece's seat not seen working frees its place");
+    }
+
+    /// `cap: 1` runs batch 1 one piece at a time, and a held piece is written as
+    /// nothing: it stays pending.
+    #[test]
+    fn a_row_capped_at_one_runs_its_batch_one_piece_at_a_time() {
+        let (_env, store) = scratch("pieces-cap1");
+        pieced(&store, "m-1", Status::Todo, &[(1, 1), (2, 1)], 1);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let _ = closes();
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1-1".to_string()]);
+        assert_eq!(piece_of(&store, "m-1", 2).state, crate::pieces::State::Pending);
+        seat_piece(&store, "m-1", 1, "cpd-1");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "the row's own cap holds the second");
+        piece_done(&store, "m-1", 1);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1-2".to_string()], "the first ended, so the second runs");
+        assert!(closes().is_empty(), "and the batch is not closed with a piece still to run");
+    }
+
+    /// What a batch that did not merge does: files `merge batch N` in a batch of
+    /// its own right after, as `piece_close::close` would.
+    fn conflicted(store: &Store, row: &str, batch: usize) -> crate::piece_close::Closed {
+        let added = store.locked(|| {
+            let mut t = store.find_task(row).unwrap();
+            let rec = crate::pieces::record(&t);
+            if let Some(p) = rec.pieces.iter().find(|p| p.title == format!("merge batch {batch}")) {
+                return p.n;
+            }
+            let new = crate::pieces::New {
+                title: format!("merge batch {batch}"),
+                overview: "merge the branches by hand".into(),
+                done_when: "the row's tree is clean at a commit".into(),
+                at: crate::pieces::At::Next,
+                checks: Vec::new(),
+                agent: None,
+                why: None,
+            };
+            let (rec, n) = crate::pieces::insert_batch_after(&rec, batch, new, t.status()).unwrap();
+            crate::pieces::write(&mut t, &rec);
+            store.save_task(&t).unwrap();
+            n
+        });
+        crate::piece_close::Closed::Conflict { branches: vec![format!("{row}-2")], files: vec!["src/a.rs".into()], added }
+    }
+
+    /// A conflicting batch gets its `merge batch` piece, which opens next, and the
+    /// run goes on to the batch after it once that closes.
+    #[test]
+    fn a_conflicting_batch_gets_its_merge_piece_and_the_run_goes_on() {
+        let (_env, store) = scratch("pieces-conflict");
+        pieced(&store, "m-1", Status::Doing, &[(1, 1), (2, 1), (3, 2)], 3);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let _ = closes();
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1-1".to_string(), "m-1-2".to_string()]);
+        seat_piece(&store, "m-1", 1, "cpd-1");
+        seat_piece(&store, "m-1", 2, "cpd-2");
+        piece_done(&store, "m-1", 1);
+        piece_done(&store, "m-1", 2);
+
+        CLOSE_AS.with(|f| f.set(Some(conflicted)));
+        step(&store, &w, &Blind);
+        CLOSE_AS.with(|f| f.set(None));
+        assert_eq!(closes(), ["m-1 batch 1".to_string()]);
+        assert_eq!(ids(spawned()), ["m-1-4".to_string()], "the merge piece opens, ahead of the batch it was put before");
+        let merge = piece_of(&store, "m-1", 4);
+        assert_eq!((merge.title.as_str(), merge.batch), ("merge batch 1", 2));
+        assert_eq!(piece_of(&store, "m-1", 3).batch, 3, "the batch after moved up behind it");
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("batch 1 did not merge") && log.contains("piece 4"), "{log}");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty() && closes().is_empty(), "nothing twice");
+
+        seat_piece(&store, "m-1", 4, "cpd-4");
+        piece_done(&store, "m-1", 4);
+        step(&store, &w, &Blind);
+        assert_eq!(closes(), ["m-1 batch 2".to_string()]);
+        assert_eq!(ids(spawned()), ["m-1-3".to_string()], "and the run goes on");
+    }
+
+    /// A piece's start that never takes is put back and retried on the backoff,
+    /// keyed by the piece; a start written down and never seated is retaken.
+    #[test]
+    fn a_piece_start_that_never_takes_is_retried_on_the_backoff() {
+        let (_env, store) = scratch("pieces-retry");
+        pieced(&store, "m-1", Status::Doing, &[(1, 1)], 3);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        FAIL.with(|f| *f.borrow_mut() = Some("claude started but never became ready for input".into()));
+        step(&store, &w, &Blind);
+        FAIL.with(|f| *f.borrow_mut() = None);
+        assert_eq!(ids(spawned()), ["m-1-1".to_string()]);
+        assert_eq!(piece_of(&store, "m-1", 1).state, crate::pieces::State::Pending, "given back with no seat");
+        assert!(crate::starts::held(&store, "m-1-1"), "keyed by the piece");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "its wait is not over");
+        age_start(&store, "m-1-1", 31);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1-1".to_string()], "tried again on the backoff");
+
+        // Opened and never seated, past the minute: the start is taken again.
+        let mut t = store.find_task("m-1").unwrap();
+        let mut rec = crate::pieces::record(&t);
+        rec.pieces[0].started = Some(util::iso_at(util::epoch_secs() - 2 * WEDGED_AFTER));
+        crate::pieces::write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+        crate::starts::forgive(&store, "m-1-1");
+        let _ = drained(&SAID);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1-1".to_string()]);
+        assert!(drained(&SAID).iter().any(|l| l.contains("starting piece 1 of m-1 again")));
+    }
+
+    /// The tick ends a done piece's seat once, and records it on the entry.
+    #[test]
+    fn the_tick_ends_a_done_pieces_seat_once_and_records_it_on_the_entry() {
+        let (_env, store) = scratch("pieces-end");
+        pieced(&store, "m-1", Status::Todo, &[(1, 1)], 3);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        seat_piece(&store, "m-1", 1, "cpd-1");
+        assert!(pieces_finished(&store, &Exits).is_empty(), "a running piece's seat is not ended");
+        piece_done(&store, "m-1", 1);
+        let _ = drained(&ENDED);
+        assert_eq!(pieces_finished(&store, &Exits), ["cpd-1".to_string()]);
+        assert_eq!(drained(&ENDED), ["cpd-1".to_string()]);
+        assert_eq!(piece_of(&store, "m-1", 1).ending, crate::verification::Ending::Ended);
+        assert!(pieces_finished(&store, &Exits).is_empty(), "once");
+    }
+
+    /// Outside a list: `piece done`'s launch opens what is ready, and the tick
+    /// catches it for a begun row and never starts an unbegun one.
+    #[test]
+    fn outside_a_list_the_launch_and_the_tick_start_a_begun_rows_pieces() {
+        let (_env, store) = scratch("pieces-hand");
+        pieced(&store, "h-1", Status::Doing, &[(1, 1), (2, 2)], 3);
+        let _ = closes();
+        assert!(pieces_owed(&store, &Blind).is_empty(), "staging a row is not starting it");
+        assert_eq!(start_inside(&store, "h-1", &Blind), ["h-1-1".to_string()], "the launch opens batch 1");
+        let _ = spawned();
+        seat_piece(&store, "h-1", 1, "cpd-1");
+        piece_done(&store, "h-1", 1);
+        assert_eq!(pieces_owed(&store, &Blind), ["h-1-2".to_string()], "a lost launch: the tick closes batch 1 and opens batch 2");
+        assert_eq!(closes(), ["h-1 batch 1".to_string()]);
+        assert!(pieces_owed(&store, &Blind).is_empty(), "and once");
+    }
+
+    /// A seat holding the row's claim keeps every piece shut.
+    #[test]
+    fn no_piece_opens_while_a_seat_holds_the_rows_claim() {
+        let (_env, store) = scratch("pieces-claimed");
+        pieced(&store, "m-1", Status::Doing, &[(1, 1)], 3);
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        assert!(spawned().iter().all(|(id, _)| id != "m-1-1"), "the planner still holds it");
+        store.clear_claim("m-1");
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1-1".to_string()]);
+    }
+
     // ---- starts that did not take (wsp-335) --------------------------------------
 
     /// Make the misses of `label` as old as they would be `secs` after the last.
@@ -7957,9 +8716,9 @@ fn only_a_working_screen_is_ever_overruled() {
         let (_env, store) = scratch("legs-hand");
         store.set_seat_cap(Some(1)).unwrap();
         fanned_out(&store, "m-1");
-        assert_eq!(start_legs(&store, "m-1", &Blind), ["m-1 · a".to_string()], "one place");
+        assert_eq!(start_inside(&store, "m-1", &Blind), ["m-1 · a".to_string()], "one place");
         assert_eq!(ids(spawned()), ["m-1 · a".to_string()]);
-        assert!(start_legs(&store, "m-1", &Blind).is_empty(), "and once");
+        assert!(start_inside(&store, "m-1", &Blind).is_empty(), "and once");
         let held = |said: Vec<String>| said.iter().filter(|l| l.contains("m-1 · b waits")).count();
         assert_eq!(held(drained(&SAID)), 1, "the held leg is said once while it lasts, not on every tick");
     }
@@ -7969,7 +8728,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let (_env, store) = scratch("legs-hand-listed");
         fanned_out(&store, "m-1");
         let _ = list(&store, &[(&["m-1"], "claude")]);
-        assert!(start_legs(&store, "m-1", &Blind).is_empty(), "a member of a running list is that list's step's");
+        assert!(start_inside(&store, "m-1", &Blind).is_empty(), "a member of a running list is that list's step's");
         assert!(spawned().is_empty());
     }
 
@@ -7991,7 +8750,7 @@ fn only_a_working_screen_is_ever_overruled() {
             let _ = drained(&SAID);
             let _ = spawned();
 
-            assert!(start_legs(&store, "m-1", &Blind).is_empty(), "{stopped:?}: the launch from leg done starts nothing");
+            assert!(start_inside(&store, "m-1", &Blind).is_empty(), "{stopped:?}: the launch from leg done starts nothing");
             assert!(spawned().is_empty());
             let said = drained(&SAID);
             let why: Vec<_> = said.iter().filter(|l| l.contains("m-1's legs wait")).collect();

@@ -142,6 +142,33 @@ pub(crate) fn unopen(store: &Store, id: &str, n: usize) {
     });
 }
 
+/// A start that failed, or a seat that never came up: the piece goes back to
+/// `pending` **with its seat named or not**, which [`unopen`] will not do, and the
+/// seat's binding goes (wsp-506; `leg_seat::reset`'s rule, `compound-956`). The
+/// seat it had, if any. Nothing for a piece that is not `running`.
+pub(crate) fn reset(store: &Store, id: &str, n: usize) -> Option<Option<String>> {
+    let seat = store.locked(|| {
+        let mut t = store.find_task(id)?;
+        let mut rec = pieces::record(&t);
+        let p = rec.pieces.iter_mut().find(|p| p.n == n && p.state == State::Running)?;
+        let seat = p.pane.take();
+        p.state = State::Pending;
+        p.started = None;
+        p.tree = None;
+        p.ending = crate::verification::Ending::Standing;
+        pieces::write(&mut t, &rec);
+        store.save_task(&t).ok()?;
+        if let Some(s) = &seat {
+            store.clear_binding(s);
+        }
+        Some(seat)
+    });
+    if seat.is_some() {
+        store.git_commit(&format!("wsp: {id} piece {n} reset"));
+    }
+    seat
+}
+
 /// Where a piece's seat stands: the tree to open in when it is not the row's.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Prepared {
@@ -245,6 +272,8 @@ pub(crate) fn attach(store: &Store, id: &str, n: usize, seat: &str, stand: &Stan
         true
     });
     if wrote {
+        // A seat is a start that took: its misses in `starts.json` are forgotten.
+        crate::starts::forgive(store, &format!("{id}-{n}"));
         store.git_commit(&format!("wsp: {id} piece {n} started in {seat}"));
     }
     wrote

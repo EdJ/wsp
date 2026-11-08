@@ -461,7 +461,9 @@ fn due(store: &Store, lists: &[Worklist], tasks: &mut Option<Vec<Task>>, m: &Tas
     if m.status() != Status::Review || m.tags.iter().any(|g| g == crate::cycle::VERIFY_TAG || g == crate::cycle::BARRIER_TAG) {
         return None;
     }
-    if crate::legs::staged(m) {
+    // A row run as legs or pieces: its first seat is [`original_seats`]', and
+    // its parts' seats are ended by the tick, each from its entry.
+    if crate::inner::run_inside(m) {
         return None;
     }
     let owed = list_of_member(lists, &m.id)
@@ -608,8 +610,8 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     }
 }
 
-/// The first seat of every row run as legs, ended once the row has no leg left
-/// to run and has landed.
+/// The first seat of every row run as legs or pieces, ended once the row has no
+/// part left to run and has landed.
 ///
 /// **Its own record, because the seat has no other.** `wsp release <row>` drops
 /// the binding and the claim, so the pane stays open with nothing naming it but
@@ -619,12 +621,15 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
 fn original_seats(store: &Store, seats: &dyn Seats) {
     let mut asks = None;
     let bindings = store.bindings();
-    for row in store.tasks_shared().iter().filter(|t| crate::legs::staged(t)) {
+    for row in store.tasks_shared().iter().filter(|t| crate::inner::run_inside(t)) {
         if !matches!(row.status(), Status::Review | Status::Done) || crate::repair::landed(row).is_none() {
             continue;
         }
         let legs = crate::legs::legs(row);
         if legs.iter().any(|l| !matches!(l.state, crate::legs::State::Done | crate::legs::State::Skipped)) {
+            continue;
+        }
+        if !crate::pieces::record(row).pieces.iter().all(crate::pieces::settled) {
             continue;
         }
         for (seat, at) in handed_seats(row) {
@@ -690,7 +695,7 @@ pub(crate) fn handed_to_legs(store: &Store, row: &str, seat: &str, binding: &ser
         return;
     }
     let Some(t) = store.find_task(row) else { return };
-    if t.status() != Status::Doing || !crate::legs::staged(&t) {
+    if t.status() != Status::Doing || !crate::inner::run_inside(&t) {
         return;
     }
     once(store, row, &format!("{HANDED} {seat} {HANDED_TAIL}"));
@@ -758,10 +763,15 @@ pub(crate) fn say_verifier_left(store: &Store, w: Option<&Worklist>, member: &st
 /// A finished leg's seat left running for a reason that will not pass: said once on
 /// the row and in `cycle.log`, as [`say_verifier_left`] says a verifier's.
 pub(crate) fn say_leg_left(store: &Store, row: &str, leg: &str, seat: &str, why: &Left) {
+    say_part_left(store, row, &format!("leg {leg}"), seat, why)
+}
+
+/// [`say_leg_left`] for any part of a row run inside: `leg build`, `piece 2`.
+pub(crate) fn say_part_left(store: &Store, row: &str, part: &str, seat: &str, why: &Left) {
     if why.passes() {
         return;
     }
-    let line = format!("wsp: leg {leg}'s seat {seat} is left running: {}", why.sentence());
+    let line = format!("wsp: {part}'s seat {seat} is left running: {}", why.sentence());
     if once(store, row, &line) {
         crate::store::log_line(store, &format!("{row}: {}", line.trim_start_matches("wsp: ")));
     }

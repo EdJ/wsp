@@ -262,12 +262,17 @@ impl Piece {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Record {
     pub cap: usize,
+    /// The batches the run has closed, in the order it closed them: written
+    /// `closed: 1 2` under `cap:` by the run (wsp-506), so a second advance finds
+    /// a batch closed and does not merge it again, and the next batch opens only
+    /// behind it.
+    pub closed: Vec<usize>,
     pub pieces: Vec<Piece>,
 }
 
 impl Default for Record {
     fn default() -> Record {
-        Record { cap: DEFAULT_CAP, pieces: Vec::new() }
+        Record { cap: DEFAULT_CAP, closed: Vec::new(), pieces: Vec::new() }
     }
 }
 
@@ -287,6 +292,9 @@ pub(crate) fn record(t: &Task) -> Record {
         let Some((_, fields)) = out.last_mut() else {
             if let Some(n) = line.trim().strip_prefix("cap:").and_then(|n| n.trim().parse().ok()) {
                 rec.cap = n;
+            }
+            if let Some(ns) = line.trim().strip_prefix("closed:") {
+                rec.closed = ns.split_whitespace().filter_map(|n| n.parse().ok()).collect();
             }
             continue;
         };
@@ -322,6 +330,9 @@ pub(crate) fn write(t: &mut Task, rec: &Record) {
     let mut parts = Vec::new();
     if !rec.pieces.is_empty() || rec.cap != DEFAULT_CAP {
         parts.push(format!("cap: {}", rec.cap));
+    }
+    if !rec.closed.is_empty() {
+        parts.push(format!("closed: {}", rec.closed.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" ")));
     }
     parts.extend(rec.pieces.iter().map(Piece::lines));
     crate::model::set_section_in(&mut t.body, SECTION, &parts.join("\n"));
@@ -365,6 +376,33 @@ pub(crate) fn last_batch(rec: &Record) -> usize {
 /// Whether `batch` has opened: any piece of it is neither pending nor dropped.
 pub(crate) fn opened(rec: &Record, batch: usize) -> bool {
     rec.pieces.iter().any(|p| p.batch == batch && !matches!(p.state, State::Pending | State::Dropped))
+}
+
+/// Whether a piece is settled for its batch's close: done, dropped or promoted.
+pub(crate) fn settled(p: &Piece) -> bool {
+    matches!(p.state, State::Done | State::Dropped | State::Promoted)
+}
+
+/// The batch the run owes a close: the lowest one not yet closed whose pieces are
+/// all settled, with every batch below it closed. `None` while the lowest batch
+/// not closed still has a piece to end, or when every batch is closed.
+pub(crate) fn close_owed(rec: &Record) -> Option<usize> {
+    for b in 1..=last_batch(rec) {
+        let mut members = rec.pieces.iter().filter(|p| p.batch == b).peekable();
+        if members.peek().is_none() || rec.closed.contains(&b) {
+            continue;
+        }
+        return members.all(settled).then_some(b);
+    }
+    None
+}
+
+/// Every batch closed and nothing left to run: what the run types the row's
+/// review on. A record with no piece done is not finished; it was dropped whole.
+pub(crate) fn finished(rec: &Record) -> bool {
+    rec.pieces.iter().any(|p| p.state == State::Done)
+        && rec.pieces.iter().all(settled)
+        && (1..=last_batch(rec)).all(|b| rec.closed.contains(&b) || !rec.pieces.iter().any(|p| p.batch == b))
 }
 
 // ---- the rules ------------------------------------------------------------------
@@ -614,6 +652,9 @@ pub(crate) fn insert_batch_after(old: &Record, after: usize, new: New, status: S
     for p in shifted.pieces.iter_mut().filter(|p| p.batch > after) {
         p.batch += 1;
     }
+    for b in shifted.closed.iter_mut().filter(|b| **b > after) {
+        *b += 1;
+    }
     let rec = add(&shifted, New { at: At::Batch(after + 1), ..new }, &Actor::Person, status)?;
     let n = rec.pieces.last().map(|p| p.n).unwrap_or(0);
     Ok((rec, n))
@@ -783,6 +824,37 @@ mod tests {
         let mut t = Task::new("a row", "m-1");
         t.body = format!("## Overview\nthe work\n\n{body}\n## Log\n- 2026-10-18 claimed\n");
         t
+    }
+
+    /// wsp-506: the batches the run closed read back, a batch is owed its close
+    /// only once its pieces are settled and the ones below it are closed, and the
+    /// row is finished once every batch is closed.
+    #[test]
+    fn closed_batches_read_back_and_say_which_close_is_owed_and_when_the_row_is_finished() {
+        let piece = |n: usize, batch: usize, state: State| Piece { state, ..Piece::pending(n, &format!("p{n}"), batch) };
+        let mut rec = Record {
+            cap: 2,
+            closed: Vec::new(),
+            pieces: vec![piece(1, 1, State::Done), piece(2, 1, State::Running), piece(3, 2, State::Pending)],
+        };
+        assert_eq!(close_owed(&rec), None, "piece 2 still runs");
+        rec.pieces[1].state = State::Dropped;
+        assert_eq!(close_owed(&rec), Some(1));
+        rec.closed.push(1);
+        let mut t = row("");
+        write(&mut t, &rec);
+        assert!(t.body.contains("closed: 1\n"), "{}", t.body);
+        assert_eq!(record(&t), rec, "it reads back as written");
+        assert_eq!(close_owed(&rec), None, "batch 2 has its piece to run");
+        assert!(!finished(&rec));
+        rec.pieces[2].state = State::Done;
+        assert_eq!(close_owed(&rec), Some(2));
+        assert!(!finished(&rec), "not until batch 2 is closed");
+        rec.closed.push(2);
+        assert!(finished(&rec));
+        let before = Record { cap: 2, closed: vec![1], pieces: vec![piece(1, 1, State::Done), piece(2, 2, State::Pending)] };
+        let (moved, _) = insert_batch_after(&before, 1, new("fix", At::Next), Status::Doing).unwrap();
+        assert_eq!(moved.closed, [1], "a batch closed before the insert keeps its number");
     }
 
     #[test]
@@ -1092,7 +1164,7 @@ mod tests {
         assert!(set_cap(&rec, 0, &Actor::Person, TODO).is_err());
         assert!(set_cap(&rec, 21, &Actor::Person, TODO).is_err());
         let mut t = row("");
-        write(&mut t, &Record { cap: 5, pieces: Vec::new() });
+        write(&mut t, &Record { cap: 5, closed: Vec::new(), pieces: Vec::new() });
         assert_eq!(record(&t).cap, 5, "a cap with no pieces is kept");
     }
 

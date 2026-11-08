@@ -15,8 +15,8 @@
 //! 4. **A conflict or a red step** adds one piece in a new batch right after this
 //!    one ([`pieces::insert_batch_after`]): `merge batch N` or `fix batch N: <label>`.
 //!
-//! Not wired into the run: pieces-run calls [`close`] when a batch's last piece
-//! ends. The tests drive [`close_with`].
+//! The run calls [`close`] when a batch's last piece ends
+//! (`cycle::close_batches`, wsp-506). The tests drive [`close_with`].
 //!
 //! # The choices the doc left open (wsp-505)
 //!
@@ -30,9 +30,6 @@
 //!   again rather than filed a second time.
 //! - **Held is not an answer.** Someone standing in the row's tree, or
 //!   uncommitted changes in it, merges nothing and says so; the caller tries again.
-
-// Until pieces-run calls `close`, nothing outside the tests does.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -64,7 +61,9 @@ pub(crate) enum Closed {
     Red { step: String, piece: usize, added: usize },
 }
 
-/// [`close_with`], where "standing" is a live agent's working directory.
+/// [`close_with`], where "standing" is a live agent's working directory. The run's
+/// tests answer for it (`cycle::tests::CLOSE_AS`), so only the binary calls it.
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn close(store: &Store, row: &str, batch: usize) -> Closed {
     let seen = std::cell::OnceCell::new();
     let standing = |dir: &Path| -> Option<String> {
@@ -350,7 +349,7 @@ mod tests {
 
     fn put(store: &Store, ps: Vec<Piece>) {
         let mut t = store.task("p-001").unwrap();
-        pieces::write(&mut t, &pieces::Record { cap: pieces::DEFAULT_CAP, pieces: ps });
+        pieces::write(&mut t, &pieces::Record { cap: pieces::DEFAULT_CAP, closed: Vec::new(), pieces: ps });
         store.save_task(&t).unwrap();
     }
 

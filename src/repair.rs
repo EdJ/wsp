@@ -322,16 +322,20 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     }
     // And every leg that is done and still seated (wsp-293): the same, per leg,
     // with the outcome on its entry. Its tree goes with the sweep below.
-    let ended_legs = crate::cycle::legs_finished(store, seats);
+    let mut ended_legs = crate::cycle::legs_finished(store, seats);
+    // And a piece's, the same (`docs/pieces.md`, *The run*, "Ending").
+    ended_legs.extend(crate::cycle::pieces_finished(store, seats));
     let ended_legs_any = !ended_legs.is_empty();
     if !ended_legs.is_empty() {
-        stamp(store, &format!("leg seat(s) with nothing left to do, ended: {}", ended_legs.join(" ")));
+        stamp(store, &format!("leg or piece seat(s) with nothing left to do, ended: {}", ended_legs.join(" ")));
     }
-    // And a row run as legs, by hand, whose next legs nobody started: a launch
-    // that was lost, or a leg held at the cap until a place came free.
-    let owed = crate::cycle::legs_owed(store, seats);
+    // And a row run as legs or pieces, by hand, whose next parts nobody
+    // started: a launch that was lost, or a part held at the cap until a place
+    // came free. For pieces, a batch owed its close and the row its review too.
+    let mut owed = crate::cycle::legs_owed(store, seats);
+    owed.extend(crate::cycle::pieces_owed(store, seats));
     if !owed.is_empty() {
-        stamp(store, &format!("legs owed on rows no list runs, started: {}", owed.join(" ")));
+        stamp(store, &format!("legs or pieces owed on rows no list runs, started: {}", owed.join(" ")));
     }
     // And every barrier check whose verdict is in (`wsp-230`): it holds no
     // claim either, so the claim-keyed ending above never sees one.
@@ -348,9 +352,10 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // are stepped once more, now. `wsp-366`.
     if ended_verdicts || ended_passes_any || ended_legs_any || !ended.is_empty() {
         step_running(store, seats);
-        let owed = crate::cycle::legs_owed(store, seats);
+        let mut owed = crate::cycle::legs_owed(store, seats);
+        owed.extend(crate::cycle::pieces_owed(store, seats));
         if !owed.is_empty() {
-            stamp(store, &format!("legs owed on rows no list runs, started in the place a seat freed: {}", owed.join(" ")));
+            stamp(store, &format!("legs or pieces owed on rows no list runs, started in the place a seat freed: {}", owed.join(" ")));
         }
     }
     // And their trees, read off the disk rather than off the endings above, so

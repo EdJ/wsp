@@ -67,6 +67,7 @@ mod legs;
 mod cmd_piece;
 mod piece_close;
 mod pieces;
+mod inner;
 mod verification;
 mod cmd_watch;
 mod wake;

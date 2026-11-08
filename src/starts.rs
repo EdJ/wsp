@@ -10,8 +10,9 @@
 //!
 //! **The count lives in `starts.json` and not on the row.** A member's row is
 //! handed to every spawn and a leg's entry is the order its agent reads; how
-//! many times the run missed is the run's own business. Keyed by the member's id
-//! or the leg's label, and local to the machine as the seats are.
+//! many times the run missed is the run's own business. Keyed by the member's id,
+//! the leg's label, or the piece's id (`<row>-<n>`, wsp-506), and local to the
+//! machine as the seats are.
 //!
 //! **The backoff is the check's** ([`crate::barrier::wait_after`]): thirty
 //! seconds after the first miss, two minutes after the second, and the third is the

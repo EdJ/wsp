@@ -1263,6 +1263,12 @@ fn reseat(store: &Store, args: &Args, run: Option<String>) {
             println!("  {}", p.dim(s));
         }
     };
+    if crate::pieces::staged(&t) {
+        say(&format!(
+            "no agent holds {id}, and it is run as pieces: a reopen opens no piece — `wsp piece add {id} …` puts what is owed on one, and wsp starts it"
+        ));
+        return;
+    }
     if crate::legs::staged(&t) {
         say(&format!(
             "no agent holds {id}, and it is run as legs: a reopen opens no leg — `wsp leg add {id} …` puts what is owed on one, and wsp starts it"

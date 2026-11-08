@@ -82,6 +82,8 @@ enum Replace {
     /// The leg's seat is ended and the leg goes back to pending, to start
     /// again on the backoff (`wsp-335`): a row's name and the leg's.
     Leg(String, String),
+    /// A piece, the same, keyed by the row and the piece's number (`wsp-506`).
+    Piece(String, usize),
     /// A member: not here.
     Not,
 }
@@ -174,6 +176,11 @@ fn replace(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, o: &Owed, 
             cycle::leg_start_failed(store, Some(w), row, name, &format!("{} in {}: {why}", o.who, o.seat));
             return;
         }
+        Replace::Piece(row, n) => {
+            cycle::log_line(store, &format!("{head} — {} the piece is started again", replaced(&o.seat)));
+            cycle::piece_start_failed(store, Some(w), row, *n, &format!("{} in {}: {why}", o.who, o.seat));
+            return;
+        }
     };
     let how = if ended { "ended" } else { "could not be ended" };
     cycle::log_line(store, &format!("{head}: {why} — {} {how}, and the run opens another", replaced(&o.seat)));
@@ -215,6 +222,21 @@ fn owed(store: &Store, w: &Worklist, at: usize, g: &Group, pos: &Position) -> Ve
                     since: util::epoch_of(started),
                     order: None,
                     replace: Replace::Leg(t.id.clone(), l.name.clone()),
+                });
+            }
+        } else if crate::pieces::staged(&t) {
+            // A piece claims nothing either: its entry is the record of its seat.
+            for p in crate::pieces::record(&t).pieces.into_iter().filter(|p| p.state == crate::pieces::State::Running) {
+                let (Some(seat), Some(started)) = (p.pane.clone(), p.started.as_deref()) else { continue };
+                if p.ending != crate::verification::Ending::Standing {
+                    continue;
+                }
+                out.push(Owed {
+                    who: format!("piece {} of {}", p.n, t.id),
+                    seat,
+                    since: util::epoch_of(started),
+                    order: None,
+                    replace: Replace::Piece(t.id.clone(), p.n),
                 });
             }
         } else if t.status() == Status::Doing && claims.contains_key(&t.id) {
