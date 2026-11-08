@@ -62,6 +62,10 @@ TASKS
   wsp piece show <task> [<n>]            the pieces, or one piece whole
   wsp piece drop <task> <n> "why"        a pending piece, never run
   wsp piece cap <task> <N>               how many of the row's pieces run at once (default 3)
+  wsp piece done --note FILE|- --caption "…"
+                                         from a piece's own seat: commit first; runs the
+                                         piece's check: lines in its tree and is refused
+                                         while one is red; the row does not move
   wsp verified <member> --holds|--blocks --from FILE --caption "…"
                                     a verifier's verdict, recorded on the member
                                     under ## Verification. --blocks sends it back
@@ -271,6 +275,11 @@ AGENTS
                                     leg's entry and the pane bound to the row,
                                     at the leg's own tier (sonnet unless it
                                     says why)
+                                    --piece <n> is one piece of a row with
+                                    pieces (docs/pieces.md): no claim, the seat
+                                    on the piece's entry and the pane bound to
+                                    the row, the lowest open batch only, at the
+                                    entry's tier
   wsp spawn <list> --agent --check N  a run's barrier check on group N: no row
                                     and no claim, the seat written on the
                                     group's open check, the order the barrier's

@@ -119,6 +119,9 @@ pub(crate) struct Piece {
     pub pane: Option<String>,
     /// The tree it stands in. Written by pieces-seat.
     pub tree: Option<String>,
+    /// When it opened, written with `running` and kept: the end line's
+    /// "after 12m" reads it, as a leg's does.
+    pub started: Option<String>,
     pub ending: Ending,
     /// The piece that added it, when a seated piece did.
     pub by: Option<usize>,
@@ -146,6 +149,7 @@ impl Piece {
             state: State::Pending,
             pane: None,
             tree: None,
+            started: None,
             ending: Ending::Standing,
             by: None,
             overview: String::new(),
@@ -177,6 +181,7 @@ impl Piece {
         };
         clause("pane", &self.pane);
         clause("tree", &self.tree);
+        clause("since", &self.started);
         clause("by", &self.by.map(|b| b.to_string()));
         match &self.ending {
             Ending::Standing => {}
@@ -241,6 +246,8 @@ impl Piece {
                 p.pane = Some(v.trim().to_string());
             } else if let Some(v) = c.strip_prefix("tree ") {
                 p.tree = Some(v.trim().to_string());
+            } else if let Some(v) = c.strip_prefix("since ") {
+                p.started = Some(v.trim().to_string());
             } else if let Some(v) = c.strip_prefix("by ") {
                 p.by = v.trim().parse().ok();
             } else if let Some(policy) = Policy::of_label(c) {

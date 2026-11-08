@@ -304,7 +304,19 @@ pub fn attempts_of(t: &Task) -> Vec<Attempt> {
         // under the leg's name (`leg_seat`). **Paired by that name** and not
         // with the last open claim: two siblings are open at once and their
         // lines interleave, so the last one open is as likely the other's.
-        if let Some((name, said)) = head.strip_prefix("leg ").and_then(|h| h.split_once(' ')) {
+        // A piece's two lines are a leg's under the name `piece N` (`piece_seat`),
+        // paired by that number for the same reason.
+        let seat_line = head
+            .strip_prefix("leg ")
+            .and_then(|h| h.split_once(' '))
+            .map(|(name, said)| (name.to_string(), said))
+            .or_else(|| {
+                head.strip_prefix("piece ")
+                    .and_then(|h| h.split_once(' '))
+                    .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                    .map(|(n, said)| (format!("piece {n}"), said))
+            });
+        if let Some((name, said)) = seat_line.as_ref().map(|(n, s)| (n.as_str(), *s)) {
             if let Some(who) = said.strip_prefix("started by pane ") {
                 let mut a = Attempt {
                     task: t.id.clone(),
@@ -715,8 +727,10 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
         return 0;
     }
 
-    // A leg is the row's, named `<task>.<leg>` as its tree is (`leg_tree`).
+    // A leg is the row's, named `<task>.<leg>` as its tree is (`leg_tree`); a piece
+    // is `<task>-<n>`, as its id is.
     let named = |a: &Attempt| match &a.leg {
+        Some(l) if l.starts_with("piece ") => format!("{}-{}", a.task, &l["piece ".len()..]),
         Some(l) => format!("{}.{l}", a.task),
         None => a.task.clone(),
     };
@@ -884,6 +898,7 @@ pub struct CostLine {
 impl CostLine {
     fn what(&self) -> String {
         let name = match &self.leg {
+            Some(l) if l.starts_with("piece ") => l.clone(),
             Some(l) => format!("leg {l}"),
             None => self.kind.to_string(),
         };
@@ -944,7 +959,8 @@ pub fn row_cost(t: &Task) -> RowCost {
             Some(name) => {
                 let i = legs.iter().position(|l| &l.name == name);
                 let rework = i.is_some_and(|i| legs[i].rework.is_some());
-                (if rework { "rework" } else { "leg" }, i.is_some_and(|i| waits[i].len() > 1))
+                let kind = if name.starts_with("piece ") { "piece" } else if rework { "rework" } else { "leg" };
+                (kind, i.is_some_and(|i| waits[i].len() > 1))
             }
             None => {
                 claims += 1;
@@ -1561,6 +1577,30 @@ mod tests {
         let a = attempts_of(&t);
         assert_eq!(a.len(), 1);
         assert!(a[0].until.is_empty() && a[0].turns == 0, "{a:?}");
+    }
+
+    /// A piece's two lines are read as an attempt of its own, paired by its number
+    /// (`wsp-504`), and the row's cost lists each piece.
+    #[test]
+    fn a_piece_is_an_attempt_paired_by_its_number_and_listed_in_the_rows_cost() {
+        let t = task(&[
+            "- 2026-10-18T09:00:00Z piece 1 started by pane cpd-1 · spawned at sonnet/medium",
+            "- 2026-10-18T09:01:00Z piece 2 started by pane cpd-2 · spawned at opus/high · why the layout is subtle",
+            "- 2026-10-18T09:10:00Z piece 2 ended after 9m · ran opus-5-5/high · 20 turns · peak 90k · 10M cache 1M in 30k out",
+            "- 2026-10-18T09:12:00Z piece 2 blocked: which layout?",
+            "- 2026-10-18T09:30:00Z piece 1 ended after 30m · ran sonnet-5-5/medium · 40 turns · peak 120k · 30M cache 2M in 60k out",
+        ]);
+        let a = attempts_of(&t);
+        assert_eq!(a.len(), 2);
+        let one = a.iter().find(|x| x.leg.as_deref() == Some("piece 1")).unwrap();
+        let two = a.iter().find(|x| x.leg.as_deref() == Some("piece 2")).unwrap();
+        assert_eq!((one.turns, two.turns), (40, 20), "each end line closed its own piece's start");
+        assert_eq!((one.pane.as_str(), two.pane.as_str()), ("cpd-1", "cpd-2"));
+        assert_eq!(two.why.as_deref(), Some("the layout is subtle"));
+        let rc = row_cost(&t);
+        let what: Vec<String> = rc.lines.iter().map(CostLine::what).collect();
+        assert_eq!(what, ["piece 1", "piece 2"], "{:?}", rc.lines);
+        assert!(rc.lines.iter().all(|l| l.kind == "piece"));
     }
 
     /// A claim's lines are untouched by a leg's in between: the sequence rule that

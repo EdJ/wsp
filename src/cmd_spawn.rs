@@ -1112,8 +1112,8 @@ fn attention_gate(store: &Store, args: &Args, kind: &str, task: Option<&str>) ->
     if args.has("herdr") && !args.has("compound") {
         return Err(format!("--kind {kind} cannot run on herdr, whose agent catalogue is closed — drop `--herdr` (compound is the default) or use `--headless`"));
     }
-    if args.has("verify") || args.has("govern") || args.has("leg") {
-        return Err(format!("--kind {kind} runs a plain member's row, not a verifier, a leg or a governor"));
+    if args.has("verify") || args.has("govern") || args.has("leg") || args.has("piece") {
+        return Err(format!("--kind {kind} runs a plain member's row, not a verifier, a leg, a piece or a governor"));
     }
     let Some(t) = task.and_then(|t| store.find_task(t)) else {
         return Err(format!("--kind {kind} runs a row: `wsp spawn <task> --agent --kind {kind}`"));
@@ -2337,8 +2337,36 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             }
         }
     };
-    let kind = match &leg_rec {
-        Some(l) => leg_seat::tier_of(l).0,
+    // A piece (`docs/pieces.md`) is a seat the same way, at its own entry's tier.
+    let piece_rec = match args.get("piece") {
+        None => None,
+        Some(v) => {
+            let clean = !args.has("govern")
+                && !args.has("verify")
+                && args.get("check").is_none()
+                && args.has("agent")
+                && leg_name.is_none();
+            let n = v.parse::<usize>().ok().filter(|n| *n > 0);
+            let found = n
+                .zip(work.task.as_deref().filter(|_| clean))
+                .and_then(|(n, t)| store.find_task(t).and_then(|t| crate::pieces::record(&t).pieces.into_iter().find(|p| p.n == n)));
+            match (clean, n, found) {
+                (true, Some(_), Some(p)) => Some(p),
+                (true, Some(n), None) if work.task.is_some() => {
+                    let row = work.task.as_deref().unwrap_or_default();
+                    eprintln!("wsp: {row} has no piece {n} — `wsp piece show {row}` lists them");
+                    return 2;
+                }
+                _ => {
+                    eprintln!("wsp: --piece starts one piece of a row: `wsp spawn <row> --agent --piece <n>`, never with --govern, --verify, --check or --leg");
+                    return 2;
+                }
+            }
+        }
+    };
+    let entry_tier = leg_rec.as_ref().map(leg_seat::tier_of).or_else(|| piece_rec.as_ref().map(crate::piece_seat::tier_of));
+    let kind = match &entry_tier {
+        Some(t) => t.0.clone(),
         None => args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string()),
     };
     // A kind file that did not parse is an error, not a fall to `Plain`: the
@@ -2348,9 +2376,8 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         return 2;
     }
     let tier_args;
-    let tier_from = match &leg_rec {
-        Some(l) => {
-            let (_, m, e) = leg_seat::tier_of(l);
+    let tier_from = match &entry_tier {
+        Some((_, m, e)) => {
             let mut flags: Vec<(&str, &str)> = Vec::new();
             if let Some(m) = &m {
                 flags.push(("model", m));
@@ -2394,6 +2421,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
 
     let work = match &leg_name {
         Some(l) => Work { label: format!("{} · {l}", work.task.as_deref().unwrap_or_default()), ..work },
+        None => work,
+    };
+    let work = match &piece_rec {
+        Some(p) => Work { label: format!("{} · piece {}", work.task.as_deref().unwrap_or_default(), p.n), ..work },
         None => work,
     };
 
@@ -2532,6 +2563,26 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
         _ => cwd,
     };
+    // A piece of a wider batch stands in a tree of its own, cut from the row's tip
+    // (`piece_seat`, wsp-504); a batch of one stands in the row's.
+    let mut piece_prepared = crate::piece_seat::Prepared::default();
+    let cwd = match (&piece_rec, work.task.as_deref(), cwd.as_deref()) {
+        (Some(pc), Some(task), Some(row_cwd)) if !no_tree => {
+            let root = work.project.as_deref().and_then(|p| index.root_for(p, &named)).unwrap_or_else(|| row_cwd.to_string());
+            match crate::piece_seat::prepare(store, &root, row_cwd, task, pc.n) {
+                Ok(p) => {
+                    let here = p.cwd.clone().or(cwd.clone());
+                    piece_prepared = p;
+                    here
+                }
+                Err(why) => {
+                    eprintln!("wsp: {why}");
+                    return 1;
+                }
+            }
+        }
+        _ => cwd,
+    };
     // A bare terminal may stand anywhere; an agent may not, see [`grounded`].
     if args.has("agent") || args.has("govern") {
         if let Err(e) = grounded(&index, cwd.as_deref()) {
@@ -2610,7 +2661,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         crate::packet::at_spawn(
             store,
             work.task.as_deref(),
-            !verifying && leg_name.is_none() && checking.is_none(),
+            !verifying && leg_name.is_none() && piece_rec.is_none() && checking.is_none(),
             args.has("full"),
             args.has("no-packet"),
             agent_commands::of(&kind).short_start(),
@@ -2626,10 +2677,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let subject = work
         .task
         .clone()
-        .map(|t| match (&leg_name, verifying) {
-            (Some(l), _) => format!("{t}-{l}"),
-            (None, true) => format!("{t}-verify"),
-            (None, false) => t,
+        .map(|t| match (&leg_name, &piece_rec, verifying) {
+            (Some(l), _, _) => format!("{t}-{l}"),
+            (None, Some(p), _) => format!("{t}-{}", p.n),
+            (None, None, true) => format!("{t}-verify"),
+            (None, None, false) => t,
         })
         .or_else(|| checking.as_ref().map(|(l, at)| crate::barrier::subject(l, *at)))
         .or_else(|| work.list.clone())
@@ -2672,7 +2724,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // And so is the verdict of a member, a verifier and a check (`wsp-374`): the
     // closing verb reads it when it is given no `--from`, and a file left by an
     // earlier run of the same row is taken away as the new one starts.
-    if will_start && leg_name.is_none() {
+    if will_start && leg_name.is_none() && piece_rec.is_none() {
         let verdict = match (&checking, work.task.as_deref()) {
             (Some((list, at)), _) => Some((crate::barrier::subject(list, *at), crate::closing::Kind::Check)),
             (None, Some(task)) if verifying => Some((task.to_string(), crate::closing::Kind::Verifier)),
@@ -2709,11 +2761,23 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
         crate::leg_tree::record(store, task, name, &prepared);
     }
+    // And a piece, the same: `running` under the store lock before the seat exists
+    // (refused for a later batch, naming what is open), taken back if none comes.
+    if let (Some(pc), Some(task)) = (&piece_rec, work.task.as_deref()) {
+        if let Err(why) = crate::piece_seat::open(store, task, pc.n) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+        crate::piece_seat::record_tree(store, task, pc.n, &piece_prepared);
+    }
     let seat = match place.open(&order) {
         Ok(v) => v,
         Err(e) => {
             if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {
                 leg_seat::unopen(store, task, name);
+            }
+            if let (Some(pc), Some(task)) = (&piece_rec, work.task.as_deref()) {
+                crate::piece_seat::unopen(store, task, pc.n);
             }
             eprintln!("wsp: {e}");
             return 1;
@@ -2739,6 +2803,17 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             let room = place.room(&seat);
             let stand = leg_seat::Standing { room: room.as_deref(), cwd: cwd.as_deref(), kind: &kind };
             leg_seat::attach(store, t, leg_name.as_deref().unwrap_or_default(), seat.as_str(), &stand)
+        }
+        // A piece claims nothing: its entry gets the seat, the pane is bound to the
+        // row with `"piece": n`, and the log gets the start line.
+        Some(t) if piece_rec.is_some() => {
+            let room = place.room(&seat);
+            let spawned = crate::cmd_agent::spawned_at(
+                piece_rec.as_ref().and_then(|p| p.policy.model.as_deref()),
+                piece_rec.as_ref().and_then(|p| p.policy.effort.as_deref()),
+            );
+            let stand = crate::piece_seat::Standing { room: room.as_deref(), cwd: cwd.as_deref(), kind: &kind, spawned: &spawned };
+            crate::piece_seat::attach(store, t, piece_rec.as_ref().map_or(0, |p| p.n), seat.as_str(), &stand)
         }
         Some(t) => {
             // The seat, under the name the claim still calls it. `claim --pane`
@@ -2800,6 +2875,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {
             leg_seat::unopen(store, task, name);
             eprintln!("wsp: opened {seat} — but leg {name} of {task} could not be seated, so no agent was started");
+            return 1;
+        }
+        if let (Some(pc), Some(task)) = (&piece_rec, work.task.as_deref()) {
+            crate::piece_seat::unopen(store, task, pc.n);
+            eprintln!("wsp: opened {seat} — but piece {} of {task} could not be seated, so no agent was started", pc.n);
             return 1;
         }
         match verifying {
@@ -2870,13 +2950,18 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // Who is spawning it (`wsp-249`), before the agent starts for the claim's
     // reason: a reader that sees the seat should see who put it there.
     let by = spawner(&governors, cmd_agent::my_pane().as_deref());
-    record_spawner(store, &seat, work.task.as_deref().filter(|_| claimed && !verifying && leg_name.is_none()), by.as_ref());
+    record_spawner(
+        store,
+        &seat,
+        work.task.as_deref().filter(|_| claimed && !verifying && leg_name.is_none() && piece_rec.is_none()),
+        by.as_ref(),
+    );
     // And on the row, where it outlives the claim (`wsp-216`): a governor's
     // work order is whose the row's review and hands are, and the claim — the
     // other copy — is gone once the agent is ended, while the review it left
     // is still standing.
     if let (Some(task), Some(scope)) = (
-        work.task.as_deref().filter(|_| claimed && !verifying && leg_name.is_none()),
+        work.task.as_deref().filter(|_| claimed && !verifying && leg_name.is_none() && piece_rec.is_none()),
         by.as_ref().and_then(|b| b.get("scope")).and_then(Value::as_str),
     ) {
         if let Some(mut t) = store.task(task) {
@@ -2934,6 +3019,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 Some(l) => crate::packet::leg_order(t, l, leg_last),
                 None => crate::packet::order(t, crate::cmd_checkout::Flow::of_task(store, t)),
             }),
+            (Some(t), _) if piece_rec.is_some() => Some(crate::piece_seat::order_line(
+                t,
+                piece_rec.as_ref().map_or(0, |p| p.n),
+                route(how, laid) == Route::Fetch,
+            )),
             (Some(t), _) if leg_name.is_some() => Some(leg_seat::order_line(
                 t,
                 leg_name.as_deref().unwrap_or_default(),
@@ -4432,8 +4522,12 @@ fn swept_up(
     // the next leg's: ending one leg never takes it. The run ends a finished
     // leg's seat on a tick while the legs after it have yet to start, and a
     // scout that committed nothing would read as a tree with nothing to keep.
+    // A piece's seat is the same: a batch of one stands in the row's tree.
     let a_leg = task.is_some_and(|t| {
-        store.find_task(t).is_some_and(|t| crate::legs::legs(&t).iter().any(|l| l.pane.as_deref() == Some(seat.as_str())))
+        store.find_task(t).is_some_and(|t| {
+            crate::legs::legs(&t).iter().any(|l| l.pane.as_deref() == Some(seat.as_str()))
+                || crate::pieces::record(&t).pieces.iter().any(|p| p.pane.as_deref() == Some(seat.as_str()))
+        })
     });
     // A far row's copy goes first: what the agent made there comes home into
     // the seat's tree before that tree is judged below, and the far tree, the
@@ -4746,6 +4840,9 @@ fn end_work(
         if let Some(leg) = crate::legs::legs(&t).into_iter().find(|l| l.pane.as_deref() == Some(seat.as_str())) {
             let _ = std::fs::remove_file(brief_path(store, &format!("{}-{}", t.id, leg.name)));
         }
+        if let Some(p) = crate::pieces::record(&t).pieces.into_iter().find(|p| p.pane.as_deref() == Some(seat.as_str())) {
+            let _ = std::fs::remove_file(brief_path(store, &format!("{}-{}", t.id, p.n)));
+        }
     }
     // A barrier check's (`wsp-230`): no task either, so its brief and its tree
     // are named for the check — and its entry on the group says it was ended,
@@ -4882,7 +4979,12 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     no claim either, the seat written on the
                                     leg's entry and the pane bound to the row,
                                     at the leg's own tier (sonnet unless it
-                                    says why)"##,
+                                    says why)
+                                    --piece <n> is one piece of a row with
+                                    pieces (docs/pieces.md): no claim, the seat
+                                    on the piece's entry and the pane bound to
+                                    the row, the lowest open batch only, at the
+                                    entry's tier"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
@@ -7664,6 +7766,71 @@ mod tests {
         assert!(order.contains("leg plan of t-1") && order.contains("last leg: end with `wsp review t-1"), "{order}");
         assert!(order.contains("as a call of its own, `wsp review t-1"), "{order}");
         assert!(!order.contains('\n'), "{order:?}");
+    }
+
+    /// `wsp-504`. A piece is spawned with `--piece` and holds nothing, as a leg does:
+    /// no claim, its seat on its entry, the pane bound to the row with `"piece": n`, the
+    /// start line on the log, the entry's tier. A piece of a later batch is refused while
+    /// the batch before is open, and `block` from a piece's pane leaves the row `doing`.
+    #[test]
+    fn a_piece_spawn_claims_nothing_seats_the_entry_binds_the_row_and_refuses_a_later_batch() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("piece");
+        rooted(&store, "core");
+        let mut m = crate::model::Task::new("a row of pieces", "t-1");
+        m.project = Some("core".into());
+        m.status_raw = crate::model::Status::Doing.as_str().into();
+        m.body = "## Overview\nthe work\n\n## Log\n- 2026-10-18 started\n".to_string();
+        let mut rec = crate::pieces::Record::default();
+        rec.pieces = vec![
+            crate::pieces::Piece::pending(1, "types", 1),
+            crate::pieces::Piece::pending(2, "board", 1),
+            crate::pieces::Piece {
+                policy: crate::model::Policy::parse("claude opus high").unwrap(),
+                why: Some("decides the layout".into()),
+                ..crate::pieces::Piece::pending(3, "rail", 2)
+            },
+        ];
+        crate::pieces::write(&mut m, &rec);
+        store.save_task(&m).unwrap();
+
+        let place = Told(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = |n: &'static str| [("agent", "true"), ("piece", n), ("kind", "opencode"), ("no-tree", "true")];
+        // Batch 2 while batch 1 is open: refused, nothing opened, nothing seated.
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags("3"))), 1);
+        assert!(place.1.borrow().is_empty(), "no seat for a piece of a later batch");
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags("9"))), 2);
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &[("agent", "true"), ("piece", "1"), ("leg", "x")])), 2);
+
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags("1"))), 0);
+        assert!(store.claims().is_empty(), "a piece claims nothing");
+        let b = store.bindings()["w9:p1"].clone();
+        assert_eq!((b["task_id"].as_str(), b["piece"].as_u64()), (Some("t-1"), Some(1)), "the pane is bound to the row, as piece 1");
+        let r = crate::pieces::record(&store.find_task("t-1").unwrap());
+        assert_eq!(r.pieces[0].pane.as_deref(), Some("w9:p1"), "its seat is on its entry");
+        assert_eq!(r.pieces[0].state, crate::pieces::State::Running);
+        assert_eq!(r.pieces[1].state, crate::pieces::State::Pending);
+        let log = store.find_task("t-1").unwrap().section("Log").unwrap();
+        assert!(log.contains("piece 1 started by pane w9:p1 · spawned at sonnet/medium"), "{log}");
+        assert!(!log.contains("claimed by pane"), "{log}");
+        assert_eq!(place.1.borrow()[0].label, "t-1 · piece 1");
+        let argv = place.0.borrow()[0].args.clone();
+        assert_eq!(place.0.borrow()[0].kind, "claude", "the entry's kind, not the flag's");
+        let order = argv.last().cloned().expect("the order is the last argument");
+        assert!(order.contains("piece 1 of t-1") && order.contains("wsp piece done --note FILE"), "{order}");
+        assert!(order.contains("blocks your piece and not the row") && !order.contains('\n'), "{order:?}");
+        // Spawned again before its seat is anyone's? It is running with a seat: refused.
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags("1"))), 1);
+
+        // The second of the batch, beside it; the row is still `doing`.
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags("2"))), 0);
+        let r = crate::pieces::record(&store.find_task("t-1").unwrap());
+        assert!(r.pieces[..2].iter().all(|p| p.state == crate::pieces::State::Running));
+        let log = store.find_task("t-1").unwrap().section("Log").unwrap();
+        assert!(log.contains("piece 2 started by pane w9:p1"), "{log}");
+        assert_eq!(store.find_task("t-1").unwrap().status(), crate::model::Status::Doing);
     }
 
     /// `wsp-230`. A barrier check is started on the list with `--check N`, and

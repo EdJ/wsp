@@ -50,6 +50,14 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
             order: 155,
             text: r##"  wsp piece cap <task> <N>               how many of the row's pieces run at once (default 3)"##,
         },
+        crate::verbs::Help {
+            section: crate::verbs::Section::Tasks,
+            order: 156,
+            text: r##"  wsp piece done --note FILE|- --caption "…"
+                                         from a piece's own seat: commit first; runs the
+                                         piece's check: lines in its tree and is refused
+                                         while one is red; the row does not move"##,
+        },
     ],
 }];
 
@@ -58,7 +66,8 @@ const USAGE: &str = "usage:
   wsp piece add <task> --from FILE       several at once: a `### title` block each, with batch:, done-when:, check: lines
   wsp piece show <task> [<n>]            the table, or one piece whole
   wsp piece drop <task> <n> \"why\"        a pending piece, never run
-  wsp piece cap <task> <N>               how many of the row's pieces run at once";
+  wsp piece cap <task> <N>               how many of the row's pieces run at once
+  wsp piece done [<task>] --note FILE|- --caption \"…\"   from a piece's own seat: runs its check: lines, ends it";
 
 pub fn dispatch(store: &Store, args: &Args) -> i32 {
     let me = crate::place::my_pane();
@@ -71,6 +80,7 @@ pub(crate) fn run(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Some("add") => cmd_add(store, args, pane),
         Some("drop") => cmd_drop(store, args, pane),
         Some("cap") => cmd_cap(store, args, pane),
+        Some("done") => cmd_done(store, args, pane),
         Some("show") | Some("ls") | None => cmd_show(store, args),
         Some(other) => {
             eprintln!("wsp piece: unknown subcommand `{other}`\n{USAGE}");
@@ -242,6 +252,138 @@ fn cmd_cap(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         }
         Err(why) => refuse(why),
     }
+}
+
+/// The note: `--note FILE`, or `-` for stdin; with neither, empty.
+fn note_text(args: &Args) -> Result<String, String> {
+    let src = match args.get("note") {
+        Some(v) if v == "true" && args.rest.iter().skip(1).any(|r| r == "-") => "-".to_string(),
+        Some(v) if v != "true" => v,
+        _ => return Ok(String::new()),
+    };
+    if src == "-" && util::stdin_is_tty() {
+        return Err("nothing is piped in — `--note -` reads the note from a stream".into());
+    }
+    util::read_source(&src).map_err(|e| format!("cannot read {src}: {e}"))
+}
+
+/// `wsp piece done [<task>] --note FILE --caption "…"`: this seat's piece is finished.
+/// Found by the pane, so a person cannot end a piece they are not seated in. A refusal
+/// is one plain line on stderr, a non-zero exit and a line in `cycle.log`.
+pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
+    let row = args
+        .rest
+        .get(1)
+        .filter(|r| r.as_str() != "-")
+        .cloned()
+        .or_else(|| pane.and_then(|p| store.bindings().get(p).and_then(|b| b.get("task_id")?.as_str().map(str::to_string))));
+    let Some(row) = row else {
+        eprintln!("usage: wsp piece done [<task>] --note FILE|- --caption \"…\"   (from a piece's own seat)");
+        return 2;
+    };
+    let result = (|| {
+        let Some(pane) = pane else {
+            return Err("only a piece's own seat ends it — this process is in none".to_string());
+        };
+        let note = note_text(args)?;
+        let caption = args.get("caption").unwrap_or_default();
+        let dir = crate::leg_seat::standing_dir(store, pane);
+        crate::piece_seat::finish(store, &row, pane, dir.as_deref(), &note, &caption, &|seat, since| {
+            crate::cmd_agent::ran_in_seat(store, seat, since)
+        })
+    })();
+    match result {
+        Ok(done) => {
+            let p = Paint::new();
+            println!(
+                "{} {}  piece {} done · {} · checked green at {}{}",
+                p.green("✓"),
+                done.task.id,
+                done.piece.n,
+                done.piece.caption.as_deref().unwrap_or_default(),
+                if done.sha.is_empty() { "no commit" } else { done.sha.as_str() },
+                if done.checks == 0 { String::new() } else { format!(" ({} check(s))", done.checks) }
+            );
+            0
+        }
+        Err(why) => {
+            let why = why.trim_start_matches("wsp: ").to_string();
+            crate::store::log_line(
+                store,
+                &format!("piece done {row} refused for {}: {}", pane.unwrap_or("this process"), util::truncate(&util::fold(&why), 300)),
+            );
+            eprintln!("wsp: {} — the piece is still open", why.lines().next().unwrap_or_default().trim_end_matches(':'));
+            for rest in why.lines().skip(1) {
+                eprintln!("{rest}");
+            }
+            1
+        }
+    }
+}
+
+/// `wsp review` and `wsp block` typed in a piece's seat (`docs/pieces.md`, *A piece is a
+/// seat*), which `main` asks before it runs the verb. `None` for any other call, which
+/// goes on as it always did.
+///
+/// **`review` is `piece done` with the account as the note**, and the row does not move.
+/// **`block` blocks the piece, not the row**: its siblings carry on, and the row's
+/// governor is told once, with the piece's id. It is here and not in `cmd_task` because
+/// the words that read an account and the end line's clauses are above the engine.
+pub(crate) fn from_a_piece(store: &Store, args: &Args) -> Option<i32> {
+    from_a_piece_in(store, args, crate::place::my_pane())
+}
+
+/// [`from_a_piece`] with the pane given, so a test is not asked where it is standing.
+fn from_a_piece_in(store: &Store, args: &Args, pane: Option<String>) -> Option<i32> {
+    if !matches!(args.cmd.as_str(), "review" | "block") || args.rest.len() < 2 {
+        return None;
+    }
+    let needle = args.rest.first()?;
+    if !crate::piece_seat::is_seat(store, needle, pane.as_deref()) {
+        return None;
+    }
+    let account = match crate::cmd_agent::prose(args, 1) {
+        Ok(a) => a,
+        Err(code) => return Some(code),
+    };
+    let p = Paint::new();
+    if args.cmd == "review" {
+        let ran = |seat: &str, since: &str| crate::cmd_agent::ran_in_seat(store, seat, since);
+        return Some(match crate::piece_seat::on_review(store, needle, &account, pane.as_deref(), &ran) {
+            Ok(Some(done)) => {
+                println!(
+                    "{} {}  piece {} done · {}",
+                    p.green("✓"),
+                    done.task.id,
+                    done.piece.n,
+                    done.piece.caption.as_deref().unwrap_or_default()
+                );
+                0
+            }
+            Ok(None) => return None,
+            Err(why) => {
+                eprintln!("wsp: {} — the piece is still open", why.trim_start_matches("wsp: "));
+                1
+            }
+        });
+    }
+    Some(match crate::piece_seat::on_block(store, needle, &account, pane.as_deref()) {
+        Ok(Some(piece_id)) => {
+            let row = store.task(needle).map(|t| t.id).unwrap_or_else(|| needle.clone());
+            let told = format!("piece {piece_id} is blocked: {account}");
+            let code = crate::cmd_message::ask(store, &Args::synth("ask", &[&row, &told], &[]));
+            println!("{} {}  piece {piece_id} blocked — the row carries on", p.red("■"), p.bold(&row));
+            if code != 0 {
+                eprintln!("wsp: the piece is blocked, but its governor could not be asked — `wsp ask {row} \"…\"` says it");
+            }
+            0
+        }
+        Ok(None) => return None,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            1
+        }
+    })
 }
 
 fn cmd_show(store: &Store, args: &Args) -> i32 {
@@ -433,5 +575,61 @@ mod tests {
         assert!(crate::legs::legs(&store.find_task("m-2").unwrap()).is_empty());
         assert!(refuses_legs(&store.find_task("m-2").unwrap()).unwrap().contains("## Pieces"));
         assert!(refuses_legs(&store.find_task("m-1").unwrap()).is_none());
+    }
+    /// `wsp-504`: `piece done` from a piece's seat runs its checks and refuses red,
+    /// naming the step; `review` from another piece's pane ends that piece and leaves
+    /// the row `doing`; `block` blocks the piece and leaves its sibling running.
+    #[test]
+    fn piece_done_review_and_block_from_a_pieces_pane_leave_the_row_where_it_is() {
+        let (env, store) = scratch("seat");
+        let overview = file(&env, "overview.md", "Do it.");
+        let go = |line: &[&str]| run(&store, &parse(line), None);
+        assert_eq!(go(&["piece", "add", "m-1", "one", "--batch", "next", "--overview", &overview, "--done-when", "d", "--check", "gate (1m): test -f ok.txt"]), 0);
+        assert_eq!(go(&["piece", "add", "m-1", "two", "--batch", "1", "--overview", &overview, "--done-when", "d"]), 0);
+        assert_eq!(go(&["piece", "add", "m-1", "three", "--batch", "next", "--overview", &overview, "--done-when", "d"]), 0);
+        let dirs: Vec<std::path::PathBuf> = (1..=3)
+            .map(|n| {
+                let d = env.home().join(format!("tree-{n}"));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        let seat = |n: usize, pane: &str| {
+            crate::piece_seat::open(&store, "m-1", n).unwrap();
+            let cwd = dirs[n - 1].display().to_string();
+            let stand = crate::piece_seat::Standing { room: None, cwd: Some(&cwd), kind: "claude", spawned: "" };
+            assert!(crate::piece_seat::attach(&store, "m-1", n, pane, &stand));
+        };
+        seat(1, "cpd-1");
+        seat(2, "cpd-2");
+        let state = |n: usize| record(&store.find_task("m-1").unwrap()).pieces[n - 1].state;
+        // A later batch is refused while this one is open.
+        assert!(crate::piece_seat::open(&store, "m-1", 3).is_err());
+
+        let done = |pane: &str| cmd_done(&store, &parse(&["piece", "done", "--caption", "c"]), Some(pane));
+        assert_eq!(done("cpd-1"), 1, "the check is red");
+        assert_eq!(state(1), State::Running);
+        assert_eq!(done("cpd-9"), 2, "a pane bound to no row has none to end a piece of");
+        std::fs::write(dirs[0].join("ok.txt"), "x").unwrap();
+        assert_eq!(done("cpd-1"), 0);
+        assert_eq!(state(1), State::Done);
+        let p = &record(&store.find_task("m-1").unwrap()).pieces[0];
+        assert!(p.checked.as_deref().is_some_and(|c| c.starts_with("green at")), "{:?}", p.checked);
+
+        // `review` from piece 2's pane ends piece 2 only.
+        let review = parse(&["review", "m-1", "Did the two. Nothing left."]);
+        assert_eq!(from_a_piece_in(&store, &review, Some("cpd-9".into())), None, "a pane that is no piece's goes on to the verb");
+        assert_eq!(from_a_piece_in(&store, &review, Some("cpd-2".into())), Some(0));
+        assert_eq!(state(2), State::Done);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "review did not move the row");
+
+        // Batch 2 opens; a second piece beside it is the case for `block` leaving a sibling.
+        seat(3, "cpd-3");
+        let block = parse(&["block", "m-1", "which layout?"]);
+        assert_eq!(from_a_piece_in(&store, &block, Some("cpd-3".into())), Some(0));
+        assert_eq!(state(3), State::Blocked);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "block did not block the row");
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap();
+        assert!(log.contains("piece 3 blocked: which layout?"), "{log}");
     }
 }

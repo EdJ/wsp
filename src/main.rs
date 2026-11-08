@@ -61,6 +61,7 @@ mod cmd_stamp;
 mod cmd_task;
 mod cmd_verifications;
 mod leg_seat;
+mod piece_seat;
 mod leg_tree;
 mod legs;
 mod cmd_piece;
@@ -597,6 +598,10 @@ fn main() {
         None => {}
     }
 
+    // `review` and `block` typed in a piece's seat end or block the piece, never the row.
+    if let Some(code) = cmd_piece::from_a_piece(&store, &args) {
+        wsp_base::calls::exit(misheard(&args, code));
+    }
     let code = match registry::find(&args.cmd) {
         Some(verb) => (verb.run)(&store, &args),
         None => {

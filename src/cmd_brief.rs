@@ -879,7 +879,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     Brief {
         yours,
         verifying,
-        leg: b.pane.as_deref().and_then(|pane| crate::leg_seat::brief_lines(tasks, pane)),
+        leg: b.pane.as_deref().and_then(|pane| crate::leg_seat::brief_lines(tasks, pane).or_else(|| crate::piece_seat::brief_lines(tasks, pane))),
         leg_packet: b.pane.as_deref().is_some_and(|pane| crate::leg_seat::has_packet(tasks, pane)),
         checking: b.checking.clone().filter(|_| mine.is_none()),
         handbook,
@@ -1500,11 +1500,13 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             for (i, at) in r.mine.iter().flat_map(|t| t.refs.iter()).enumerate() {
                 row(if i == 0 { "files" } else { "" }, p.dim(at).to_string());
             }
-            // A leg's block: one line each, so it reads as the rest of the brief does.
+            // A leg's block (a piece's reads the same way): one line each, so it
+            // reads as the rest of the brief does.
             if let Some(lines) = &r.leg {
+                let seat_word = if lines.first().is_some_and(|l| l.starts_with("piece ")) { "piece" } else { "leg" };
                 for (i, block) in lines.iter().enumerate() {
                     for (j, line) in block.lines().enumerate() {
-                        row(if i == 0 && j == 0 { "leg" } else { "" }, line.to_string());
+                        row(if i == 0 && j == 0 { seat_word } else { "" }, line.to_string());
                     }
                 }
             }

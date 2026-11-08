@@ -111,15 +111,21 @@ pub(crate) struct Opened {
 /// no tip to say. An existing branch of the leg's name is reused, so a leg that
 /// is opened again finds the commits it made.
 pub(crate) fn open(root: &str, task: &str, leg: &str) -> Result<Opened, String> {
+    open_named(root, task, &tree_name(task, leg))
+}
+
+/// [`open`] by the tree's own name: a piece's tree is named by the piece id
+/// (`docs/pieces.md`, *Ids*), cut from the row's branch the same way.
+pub(crate) fn open_named(root: &str, task: &str, name: &str) -> Result<Opened, String> {
     let root = util::expand(root);
     let repo = crate::cmd_verify::toplevel(&root).ok_or_else(|| format!("{} is not in a git repository", root.display()))?;
     let trunk = cmd_checkout::trunk(&repo).ok_or("the repository has no main working tree")?;
     let row_dir = cmd_checkout::checkout_dir(&trunk, task);
     if !row_dir.join(".git").exists() {
-        return Err(format!("{task} has no tree to cut {} from — `wsp checkout {task}`", tree_name(task, leg)));
+        return Err(format!("{task} has no tree to cut {name} from — `wsp checkout {task}`"));
     }
     let row_branch = cmd_checkout::trunk_branch(&row_dir).ok_or_else(|| format!("{task}'s tree is on a detached HEAD"))?;
-    let name = tree_name(task, leg);
+    let name = name.to_string();
     let dir = trunk.join(WORKTREES).join(&name);
     let made = cmd_checkout::ensure(&repo, &dir, &name, &row_branch)?;
     // The leg starts warm from the row's tree: one install there serves every
@@ -211,7 +217,7 @@ pub(crate) fn prepare(store: &Store, root: &str, row_cwd: &str, task: &str, name
 
 /// `row_cwd` must be the row's own tree under the trunk's `.worktrees/`, not the
 /// trunk checkout itself or any other directory.
-fn require_row_tree(root: &str, row_cwd: &str, task: &str) -> Result<(), String> {
+pub(crate) fn require_row_tree(root: &str, row_cwd: &str, task: &str) -> Result<(), String> {
     let root = util::expand(root);
     let own = cmd_verify::toplevel(&root)
         .and_then(|repo| cmd_checkout::trunk(&repo))
@@ -232,7 +238,7 @@ fn require_row_tree(root: &str, row_cwd: &str, task: &str) -> Result<(), String>
 }
 
 /// A tree's path beside the row's: both are directories under `.worktrees/`.
-fn tree_path(row_cwd: &str, tree: &str) -> String {
+pub(crate) fn tree_path(row_cwd: &str, tree: &str) -> String {
     let row = util::expand(row_cwd);
     let path = row.parent().map(|p| p.join(tree)).unwrap_or_else(|| PathBuf::from(tree));
     util::contract(&path)
