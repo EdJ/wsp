@@ -673,10 +673,18 @@ is written:
   starts and re-reads cost more than they save, against the same row
   unstaged on the same tier. Which tier an unstaged row runs on is the list's
   choice, as it is today.
+- **Legs or pieces.** Legs are for coupled parts judged together, in one tree.
+  A work that divides into separable parts, each with its own done-when and
+  check lines, is a row with **pieces**, not legs; a part that needs its own
+  verdict or a life in the backlog is a sub-task. A row has one or the other
+  (`## Legs` or `## Pieces`), never both. `docs/pieces.md`, *Choosing: legs,
+  pieces or sub-tasks*, is the rule.
 
 **Staging a row already running** (`wsp-311`). A seat that finds its row
-bigger than one seat partway through hands the rest to legs. It does not
-split the row into sub-tasks. compound-758's seat filed four sub-tasks with
+bigger than one seat partway through hands the rest to legs, or, when the rest
+is separable parts each with its own done-when and checks, to pieces
+(`wsp piece add <row> … --batch next`; `docs/pieces.md`, *Choosing*). It does
+not split the row into sub-tasks. compound-758's seat filed four sub-tasks with
 `wsp add --parent`, titles only, built all four itself, and landed about 4,000
 lines in one commit. None was a member, so none was started, verified or seen
 at a barrier. The route, which a member's brief carries:

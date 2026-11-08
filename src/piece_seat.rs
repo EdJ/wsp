@@ -145,12 +145,13 @@ pub(crate) fn unopen(store: &Store, id: &str, n: usize) {
 /// A start that failed, or a seat that never came up: the piece goes back to
 /// `pending` **with its seat named or not**, which [`unopen`] will not do, and the
 /// seat's binding goes (wsp-506; `leg_seat::reset`'s rule, `compound-956`). The
-/// seat it had, if any. Nothing for a piece that is not `running`.
+/// seat it had, if any. Nothing for a piece that is neither `running` nor `blocked`
+/// (a blocked one is put back by `wsp piece reset`, wsp-509).
 pub(crate) fn reset(store: &Store, id: &str, n: usize) -> Option<Option<String>> {
     let seat = store.locked(|| {
         let mut t = store.find_task(id)?;
         let mut rec = pieces::record(&t);
-        let p = rec.pieces.iter_mut().find(|p| p.n == n && p.state == State::Running)?;
+        let p = rec.pieces.iter_mut().find(|p| p.n == n && matches!(p.state, State::Running | State::Blocked))?;
         let seat = p.pane.take();
         p.state = State::Pending;
         p.started = None;

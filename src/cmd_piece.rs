@@ -1,4 +1,4 @@
-//! `wsp piece add | show | drop | cap`: the verbs over the record in [`crate::pieces`].
+//! `wsp piece add | show | drop | cap | promote | reset | done`: the verbs over the record in [`crate::pieces`].
 //!
 //! The record, its rules and its writes are `pieces.rs` (engine). The words
 //! that read an `Args`, find the seat they are run in and print are here, in
@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use crate::model::{Status, Task};
 use crate::pieces::{
-    add_all, at_of, drop_piece, json, parse_blocks, record, refuses_pieces, set_cap, table, write, Actor, New, Piece,
-    Record, MAX_PIECES,
+    add_all, as_row, at_of, drop_piece, json, parse_blocks, promote, record, refuses_pieces, reset_piece, set_cap, table,
+    write, Actor, New, Piece, Record, MAX_PIECES,
 };
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -52,6 +52,20 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
         },
         crate::verbs::Help {
             section: crate::verbs::Section::Tasks,
+            order: 157,
+            text: r##"  wsp piece promote <task> <n>           a pending or blocked piece becomes a sub-task of the row
+                                         (its overview, done-when and checks); prints the
+                                         `wsp worklist add` line that would run it"##,
+        },
+        crate::verbs::Help {
+            section: crate::verbs::Section::Tasks,
+            order: 158,
+            text: r##"  wsp piece reset <task> <n> "why" [--force]
+                                         a blocked piece, or a running one whose seat is gone,
+                                         back to pending; --force ends a seat still there"##,
+        },
+        crate::verbs::Help {
+            section: crate::verbs::Section::Tasks,
             order: 156,
             text: r##"  wsp piece done --note FILE|- --caption "…"
                                          from a piece's own seat: commit first; runs the
@@ -67,6 +81,8 @@ const USAGE: &str = "usage:
   wsp piece show <task> [<n>]            the table, or one piece whole
   wsp piece drop <task> <n> \"why\"        a pending piece, never run
   wsp piece cap <task> <N>               how many of the row's pieces run at once
+  wsp piece promote <task> <n>           a pending or blocked piece becomes a sub-task of the row
+  wsp piece reset <task> <n> \"why\" [--force]   a blocked piece, or a running one whose seat is gone, back to pending
   wsp piece done [<task>] --note FILE|- --caption \"…\"   from a piece's own seat: runs its check: lines, ends it";
 
 pub fn dispatch(store: &Store, args: &Args) -> i32 {
@@ -80,6 +96,8 @@ pub(crate) fn run(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Some("add") => cmd_add(store, args, pane),
         Some("drop") => cmd_drop(store, args, pane),
         Some("cap") => cmd_cap(store, args, pane),
+        Some("promote") => cmd_promote(store, args, pane),
+        Some("reset") => cmd_reset(store, args, pane),
         Some("done") => cmd_done(store, args, pane),
         Some("show") | Some("ls") | None => cmd_show(store, args),
         Some(other) => {
@@ -252,6 +270,121 @@ fn cmd_cap(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         }
         Err(why) => refuse(why),
     }
+}
+
+/// `wsp piece promote <task> <n>`: a pending or blocked piece becomes a sub-task of
+/// the row (`docs/pieces.md`, *Transience*), so it can outlive the row. The entry
+/// becomes `promoted: <id>` and no longer holds its batch. Prints the `wsp worklist
+/// add` line that would run the new row; no list is edited.
+fn cmd_promote(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
+    let (Some(task), Some(n)) = (args.rest.get(1), args.rest.get(2).and_then(|n| n.parse::<usize>().ok())) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let result = store.locked(|| {
+        let mut t = store.find_task(&store.task_or_why(task)?.id).ok_or_else(|| format!("no task {task}"))?;
+        if let Some(why) = refuses_pieces(&t) {
+            return Err(why);
+        }
+        let old = record(&t);
+        let actor = actor_here(store, &t, pane);
+        // Judged before an id is taken, so a refusal leaves no row behind.
+        promote(&old, n, "-", &actor, t.status())?;
+        let piece = old.pieces.iter().find(|p| p.n == n).ok_or_else(|| format!("no piece {n}"))?.clone();
+        let (title, overview, checks) = as_row(&piece);
+        let id = store.alloc_task_id(t.project.as_deref()).map_err(|e| format!("cannot allocate id: {e}"))?;
+        let mut row = Task::new(title.trim(), &id);
+        row.project = t.project.clone();
+        row.parent = Some(t.id.clone());
+        if row.project.is_none() {
+            row.status_raw = "inbox".into();
+        }
+        crate::model::set_section_in(&mut row.body, "Overview", &overview);
+        if !checks.trim().is_empty() {
+            crate::model::set_section_in(&mut row.body, "Checks", &checks);
+        }
+        store.save_task(&row).map_err(|e| format!("write failed: {e}"))?;
+        let new = promote(&old, n, &id, &actor, t.status())?;
+        t.log(&format!("piece {n} promoted to {id}"));
+        write(&mut t, &new);
+        store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
+        Ok((t, row, piece))
+    });
+    match result {
+        Ok((t, row, piece)) => {
+            store.log_event("task-added", json!({ "id": row.id, "project": row.project, "title": row.title }));
+            store.log_event("piece-promoted", json!({ "id": t.id, "piece": n, "row": row.id }));
+            store.git_commit(&format!("wsp: {} piece {n} promoted to {}", t.id, row.id));
+            let p = Paint::new();
+            println!("{} {}  piece {n} promoted to {} — {}", p.green("✓"), t.id, p.bold(&row.id), row.title);
+            let list = crate::worklist::Running::read(store).list_of(&t.id).map(str::to_string);
+            let agent = if crate::legs::is_default(&piece.policy) {
+                String::new()
+            } else {
+                format!(" --agent \"{}\"", crate::legs::policy_line(&piece.policy))
+            };
+            println!(
+                "  to run it: wsp worklist add {} {}{agent}   (no list was edited)",
+                list.as_deref().unwrap_or("<list>"),
+                row.id
+            );
+            0
+        }
+        Err(why) => refuse(why),
+    }
+}
+
+/// `wsp piece reset <task> <n> "why" [--force]`: a blocked piece, or a running one
+/// whose seat is gone, goes back to `pending`, and the row's log says why. A seat
+/// still there is ended only with `--force`.
+fn cmd_reset(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
+    let (Some(task), Some(n)) = (args.rest.get(1), args.rest.get(2).and_then(|n| n.parse::<usize>().ok())) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let why = args.text(3);
+    let t = match store.task_or_why(task) {
+        Ok(t) => t,
+        Err(why) => return refuse(why),
+    };
+    if let Some(why) = refuses_pieces(&t) {
+        return refuse(why);
+    }
+    let old = record(&t);
+    if let Err(why) = reset_piece(&old, n, &why, &actor_here(store, &t, pane), t.status()) {
+        return refuse(why);
+    }
+    let seat = old.pieces.iter().find(|p| p.n == n).and_then(|p| p.pane.clone());
+    if let Some(seat) = &seat {
+        use crate::cycle::Seats;
+        let fleet = crate::cycle::Fleet;
+        let there = !fleet.absent(seat) && !matches!(fleet.state(seat), Some(crate::place::State::Gone | crate::place::State::Empty));
+        if there && !args.has("force") {
+            return refuse(format!(
+                "piece {n}'s seat {seat} is still there — an agent in it may be at work. \
+                 `wsp piece reset {} {n} \"why\" --force` ends it first",
+                t.id
+            ));
+        }
+        if there {
+            if let Err(e) = crate::cycle::despawn_seat(seat) {
+                return refuse(format!("{seat} could not be ended: {e}"));
+            }
+        }
+    }
+    if crate::piece_seat::reset(store, &t.id, n).is_none() {
+        return refuse(format!("piece {n} could not be reset: it is no longer blocked or running"));
+    }
+    crate::starts::forgive(store, &Piece::pending(n, "", 0).id(&t.id));
+    store.locked(|| {
+        if let Some(mut row) = store.find_task(&t.id) {
+            let _ = crate::log::note(store, &mut row, &format!("piece {n} reset by hand: {}", util::fold(&why)));
+        }
+    });
+    store.git_commit(&format!("wsp: {} piece {n} reset by hand", t.id));
+    crate::cycle::poke_task(store, &t.id, "piece-reset");
+    println!("{} {}  piece {n} is pending again", Paint::new().green("✓"), t.id);
+    0
 }
 
 /// The note: `--note FILE`, or `-` for stdin; with neither, empty.
@@ -576,6 +709,79 @@ mod tests {
         assert!(refuses_legs(&store.find_task("m-2").unwrap()).unwrap().contains("## Pieces"));
         assert!(refuses_legs(&store.find_task("m-1").unwrap()).is_none());
     }
+    /// `wsp-509`: promoting a blocked piece files a sub-task of the row that carries its
+    /// overview, done-when and checks, and the batch closes without it; `reset` puts a
+    /// blocked piece back to pending with a log line; a seated piece adds to the next batch.
+    #[test]
+    fn promote_files_a_sub_task_and_reset_puts_a_blocked_piece_back() {
+        let (env, store) = scratch("promote");
+        let overview = file(&env, "overview.md", "Read the call sites.");
+        let go = |line: &[&str]| run(&store, &parse(line), None);
+        assert_eq!(go(&["piece", "add", "m-1", "contract", "--batch", "1", "--overview", &overview, "--done-when", "fixtures read back", "--check", "tsc (2m): npx tsc --noEmit"]), 0);
+        assert_eq!(go(&["piece", "add", "m-1", "board", "--batch", "1", "--overview", &overview, "--done-when", "renders"]), 0);
+        assert_eq!(go(&["piece", "add", "m-1", "rail", "--batch", "2", "--overview", &overview, "--done-when", "laid out", "--agent", "claude opus high", "--why", "chooses"]), 0);
+        // Pending piece 3 promotes; a running or unknown piece does not.
+        let set = |n: usize, f: &dyn Fn(&mut Piece)| {
+            let mut t = store.find_task("m-1").unwrap();
+            let mut rec = record(&t);
+            f(rec.pieces.iter_mut().find(|p| p.n == n).unwrap());
+            write(&mut t, &rec);
+            store.save_task(&t).unwrap();
+        };
+        set(2, &|p| p.state = State::Done);
+        set(1, &|p| p.state = State::Blocked);
+        assert_eq!(go(&["piece", "promote", "m-1", "2"]), 1, "a done piece is not promoted");
+        assert_eq!(go(&["piece", "promote", "m-1", "9"]), 1);
+        assert_eq!(go(&["piece", "promote", "m-1"]), 2);
+        // The batch is held open by the blocked piece, and closes without it once promoted.
+        assert_eq!(crate::pieces::close_owed(&record(&store.find_task("m-1").unwrap())), None);
+        let before = store.tasks().len();
+        assert_eq!(go(&["piece", "promote", "m-1", "1"]), 0);
+        assert_eq!(store.tasks().len(), before + 1);
+        let t = store.find_task("m-1").unwrap();
+        let rec = record(&t);
+        let new_id = rec.pieces[0].promoted.clone().unwrap();
+        assert_eq!(rec.pieces[0].state, State::Promoted);
+        assert_eq!(crate::pieces::close_owed(&rec), Some(1));
+        let row = store.find_task(&new_id).unwrap();
+        assert_eq!(row.parent.as_deref(), Some("m-1"));
+        assert_eq!(row.title, "contract");
+        let ov = row.section("Overview").unwrap();
+        assert!(ov.contains("Read the call sites.") && ov.contains("Done when: fixtures read back"), "{ov}");
+        assert_eq!(row.section("Checks").unwrap().trim(), "tsc (2m): npx tsc --noEmit");
+        assert!(t.section("Log").unwrap().contains(&format!("piece 1 promoted to {new_id}")));
+        assert_eq!(go(&["piece", "promote", "m-1", "1"]), 1, "once only");
+        // Reset: a pending piece is refused, a blocked one goes back, the why goes on the log.
+        assert_eq!(go(&["piece", "reset", "m-1", "3", "no"]), 1);
+        set(3, &|p| p.state = State::Blocked);
+        assert_eq!(go(&["piece", "reset", "m-1", "3"]), 1, "a reset takes the reason");
+        assert_eq!(go(&["piece", "reset", "m-1", "3", "the", "answer", "came"]), 0);
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(record(&t).pieces[2].state, State::Pending);
+        assert!(t.section("Log").unwrap().contains("piece 3 reset by hand: the answer came"));
+        // A running piece with a seat that is not there goes back too.
+        set(3, &|p| {
+            p.state = State::Running;
+            p.pane = Some("cpd-gone-509".into());
+        });
+        assert_eq!(go(&["piece", "reset", "m-1", "3", "seat", "died"]), 0);
+        let p = record(&store.find_task("m-1").unwrap()).pieces[2].clone();
+        assert_eq!((p.state, p.pane), (State::Pending, None));
+        // A seated piece may add to the next batch and may not promote or reset a sibling's.
+        set(3, &|p| p.state = State::Running);
+        store.set_binding("cpd-7", json!({ "task_id": "m-1", "pane_id": "cpd-7", "piece": 3 }));
+        let seated = |line: &[&str]| run(&store, &parse(line), Some("cpd-7"));
+        assert_eq!(seated(&["piece", "add", "m-1", "more", "--batch", "next", "--overview", &overview, "--done-when", "d"]), 0);
+        let rec = record(&store.find_task("m-1").unwrap());
+        assert_eq!((rec.pieces.last().unwrap().batch, rec.pieces.last().unwrap().by), (3, Some(3)));
+        set(3, &|p| p.state = State::Blocked);
+        assert_eq!(seated(&["piece", "reset", "m-1", "3", "me"]), 1);
+        let sibling = rec.pieces.iter().find(|p| p.title == "rail").unwrap().n;
+        assert_eq!(sibling, 3);
+        assert_eq!(seated(&["piece", "promote", "m-1", "3"]), 1, "a sibling's piece is refused");
+        assert_eq!(seated(&["piece", "promote", "m-1", &rec.pieces.last().unwrap().n.to_string()]), 0, "its own is not");
+    }
+
     /// `wsp-504`: `piece done` from a piece's seat runs its checks and refuses red,
     /// naming the step; `review` from another piece's pane ends that piece and leaves
     /// the row `doing`; `block` blocks the piece and leaves its sibling running.

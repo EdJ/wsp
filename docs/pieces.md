@@ -321,8 +321,22 @@ row measures the block rate against the per-row baseline.
   the `wsp worklist add` line that would run it; it does not edit a list. This
   is how an undone piece outlives its row, and how a piece that turned out to
   need its own verdict gets one.
+  Spelled `wsp piece promote <row> <n>`. The new row is filed under the
+  piece's row in its project, at `todo`, with the piece's overview, then
+  `Done when:` and its done-when, as its `## Overview`, and the `check:`
+  lines as its `## Checks`. A piece on another tier prints its `--agent`
+  with the line. The row's log says `piece 2 promoted to <id>`, and the
+  batch closes without it. A seated piece promotes only a piece it added.
 - **`wsp piece drop <id> "why"`**: the work is not needed. It no longer holds
   its batch, and the fold says why.
+- **`wsp piece reset <id> "why"`** (`wsp piece reset <row> <n> "why"`): a
+  `blocked` piece, or a `running` one whose seat is gone, goes back to
+  `pending`; its seat, tree and start go from the entry, its binding is
+  cleared and its start misses forgiven, and the row's log says
+  `piece 2 reset by hand: <why>`. A seat still there is refused until
+  `--force`, which ends it first, as `wsp leg reset` does. A pending, done,
+  dropped or promoted piece is not reset, and a seated piece may not reset
+  another.
 
 ## Seen and told
 

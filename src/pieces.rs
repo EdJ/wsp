@@ -676,6 +676,73 @@ pub(crate) fn drop_piece(old: &Record, n: usize, why: &str, actor: &Actor, statu
     Ok(rec)
 }
 
+/// A seated piece moves out or back only a piece it added; anyone else, any
+/// piece that is `pending` or `blocked` (never one running, done, dropped or
+/// already promoted).
+fn may_move(actor: &Actor, p: &Piece) -> Result<(), String> {
+    if !matches!(p.state, State::Pending | State::Blocked) {
+        return Err(format!("piece {} is {}, and only a pending or blocked piece can be promoted", p.n, p.state.as_str()));
+    }
+    match actor {
+        Actor::Piece(me) if p.by != Some(*me) => {
+            Err(format!("piece {me} may change only the pieces it added, and piece {} is not one of them", p.n))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The record with piece `n` promoted to the row `new_id`: `promoted: <id>`, and
+/// the piece no longer holds its batch (a promoted piece is settled). A pending
+/// or blocked piece only. The row itself is the caller's to file, so this takes
+/// the id it was given.
+pub(crate) fn promote(old: &Record, n: usize, new_id: &str, actor: &Actor, status: Status) -> Result<Record, String> {
+    gate(actor, status)?;
+    let mut rec = old.clone();
+    let p = rec.pieces.iter_mut().find(|p| p.n == n).ok_or_else(|| format!("no piece {n}"))?;
+    may_move(actor, p)?;
+    p.state = State::Promoted;
+    p.promoted = Some(new_id.trim().to_string());
+    judged(old, &rec)?;
+    Ok(rec)
+}
+
+/// The sub-task a piece becomes: its title, its overview with the done-when
+/// under it as the row's overview, and its `check:` lines as `## Checks`.
+/// `(title, overview, checks)`.
+pub(crate) fn as_row(p: &Piece) -> (String, String, String) {
+    let mut overview = p.overview.trim().to_string();
+    if !p.done_when.trim().is_empty() {
+        overview.push_str(&format!("\n\nDone when: {}", p.done_when.trim()));
+    }
+    (p.title.clone(), overview, p.checks.join("\n"))
+}
+
+/// The record with piece `n` back to `pending`, for a reason the caller logs: a
+/// `blocked` piece, or a `running` one whose seat is gone (the caller has seen
+/// to the seat). The seat, tree and start go from the entry; its note, caption
+/// and checks stay for the seat that takes it next. Not a seated piece's to do.
+pub(crate) fn reset_piece(old: &Record, n: usize, why: &str, actor: &Actor, status: Status) -> Result<Record, String> {
+    gate(actor, status)?;
+    if let Actor::Piece(me) = actor {
+        return Err(format!("piece {me} may add pieces to later batches, and putting another piece back is not its to do"));
+    }
+    if why.trim().is_empty() {
+        return Err("a reset takes the reason, which goes on the row's log".into());
+    }
+    let mut rec = old.clone();
+    let p = rec.pieces.iter_mut().find(|p| p.n == n).ok_or_else(|| format!("no piece {n}"))?;
+    if !matches!(p.state, State::Blocked | State::Running) {
+        return Err(format!("piece {n} is {}, and only a blocked or running piece can be reset", p.state.as_str()));
+    }
+    p.state = State::Pending;
+    p.pane = None;
+    p.tree = None;
+    p.started = None;
+    p.ending = Ending::Standing;
+    judged(old, &rec)?;
+    Ok(rec)
+}
+
 /// The record with `cap:` set. Not a seated piece's to change.
 pub(crate) fn set_cap(old: &Record, cap: usize, actor: &Actor, status: Status) -> Result<Record, String> {
     gate(actor, status)?;
