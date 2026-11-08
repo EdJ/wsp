@@ -2683,7 +2683,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
          code rather than against the report: the commits, whether they \
          do what the overview asked, and the tests that cover them — `cargo test <module>::` in \
-         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{pieces}{split}\n\n\
+         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{pieces}{whole}{split}\n\n\
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
          - {holds};\n\
@@ -2699,6 +2699,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
         checked = CHECKED_ORDER,
         legs = legs_line(member),
         pieces = pieces_block(store, member),
+        whole = crate::size_check::whole_line(member),
         reuse = crate::check::greens_held(store, member).map(|(sha, held)| reuse_text(&sha, &held)).unwrap_or_default(),
         split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
     )
@@ -7752,6 +7753,39 @@ fn only_a_working_screen_is_ever_overruled() {
 
     fn leg_state(store: &Store, id: &str, name: &str) -> crate::legs::State {
         crate::legs::legs(&store.find_task(id).unwrap()).into_iter().find(|l| l.name == name).unwrap().state
+    }
+
+    /// `wsp-499`: legs a planner files on a todo row with `wsp leg add` — a build,
+    /// two drives that wait on it, a last leg — are started by the run when the
+    /// row starts, with no working seat to stage them: the build first, and the
+    /// drives together once it is done.
+    #[test]
+    fn legs_a_planner_filed_on_a_todo_row_start_when_the_row_starts() {
+        let (env, store) = scratch("legs-planner");
+        task(&store, "m-1", Status::Todo);
+        let file = env.home().join("order.md");
+        std::fs::write(&file, "Do it.").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let add = |name: &str, extra: &[&str]| {
+            let mut line = vec!["leg", "add", "m-1", name, "--order", path.as_str()];
+            line.extend_from_slice(extra);
+            let args = Args::parse(line.iter().map(|s| s.to_string()).collect());
+            assert_eq!(crate::legs::run(&store, &args, Some("cpd-planner")), 0, "{name}");
+        };
+        add("build", &[]);
+        add("finish", &["--after", "build"]);
+        add("drive-a", &["--after", "build", "--before", "finish"]);
+        add("drive-b", &["--after", "build", "--before", "finish"]);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo, "filed on a todo row, nothing started");
+        let w = list(&store, &[(&["m-1"], "claude")]);
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · build".to_string()], "the first leg, and no whole-row worker");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
+        seat_leg(&store, "m-1", "build", "cpd-1");
+        leg_done(&store, "m-1", "build");
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · drive-a".to_string(), "m-1 · drive-b".to_string()], "the drives side by side");
     }
 
     /// The row's legs, one staged member, run from the first start to a barrier

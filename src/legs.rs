@@ -1205,6 +1205,16 @@ fn packet_line(file: &str) -> Result<String, String> {
     Ok(format!("{} {}", crate::packet::LEG_KEY, rel.display()))
 }
 
+/// Why this pane may not give `row` legs: it is the seat of a different row. Legs
+/// are the row's own seat's, or a planner's or the primary seat's, which hold no
+/// row (`wsp-499`); a member working row X files no legs on row Y.
+fn another_rows_seat(store: &Store, row: &str, pane: Option<&str>) -> Option<String> {
+    let pane = pane?;
+    let target = store.task_or_why(row).ok()?.id;
+    let bound = store.bindings().get(pane)?.get("task_id")?.as_str()?.to_string();
+    (bound != target).then(|| format!("{pane} is the seat of {bound}, and legs are given by a row's own seat, a planner or the primary seat — not by another row's: `wsp ask` a planner to add them to {target}"))
+}
+
 fn cmd_add(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     let (Some(task), Some(name)) = (args.rest.get(1), args.rest.get(2)) else {
         eprintln!("{USAGE}");
@@ -1234,6 +1244,9 @@ fn cmd_add(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         new.after.as_ref().map(|a| format!(" · after {}", if a.is_empty() { "-".into() } else { a.join(", ") })).unwrap_or_default(),
         new.before.as_ref().map(|b| format!(" · before {b}")).unwrap_or_default()
     );
+    if let Some(why) = another_rows_seat(store, task, pane) {
+        return refuse(why);
+    }
     match edit(store, task, pane, |old, actor| add(old, new, actor)) {
         Ok((t, legs)) => {
             store.log_event("leg-added", serde_json::json!({ "id": t.id, "leg": name }));
@@ -1939,6 +1952,32 @@ mod tests {
         assert_eq!(ls[4].skipped.as_deref(), Some("the split was wrong"));
         assert_eq!(ls[3].after, Some(vec![]));
         assert_eq!(go(&["leg", "bogus"]), 2);
+    }
+
+    /// `wsp-499`: a planner, which holds no row, files legs on a row at todo, and
+    /// the seat of a row works it too; the seat of a different row may not.
+    #[test]
+    fn a_planner_files_legs_on_a_todo_row_and_a_member_seat_of_another_row_may_not() {
+        let (env, store) = scratch("planner");
+        let mut other = Task::new("another row", "m-2");
+        other.body = "## Overview\nelse\n\n## Log\n- 2026-10-18 claimed\n".into();
+        store.save_task(&other).unwrap();
+        assert_eq!(store.find_task("m-1").unwrap().status_raw, "todo", "the row is at todo");
+        let p = env.home().join("order.md");
+        std::fs::write(&p, "Build it.").unwrap();
+        let file = p.to_string_lossy().to_string();
+        let add = |name: &str, pane: Option<&str>| run(&store, &parse(&["leg", "add", "m-1", name, "--order", &file]), pane);
+
+        // An unbound pane is a planner's or the primary seat's.
+        assert_eq!(add("build", Some("cpd-planner")), 0);
+        // A member of m-2 is bound to m-2, and is refused on m-1.
+        store.set_binding("cpd-m2", serde_json::json!({ "task_id": "m-2" }));
+        assert_eq!(add("drive", Some("cpd-m2")), 1);
+        assert_eq!(legs(&store.find_task("m-1").unwrap()).len(), 1, "nothing was written");
+        // The row's own seat may.
+        store.set_binding("cpd-m1", serde_json::json!({ "task_id": "m-1" }));
+        assert_eq!(add("drive", Some("cpd-m1")), 0);
+        assert_eq!(legs(&store.find_task("m-1").unwrap()).len(), 2);
     }
 
     // ---- legs-seat (wsp-292) ----

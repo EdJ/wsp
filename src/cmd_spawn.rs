@@ -636,18 +636,25 @@ pub fn work_order(subject: &str, how: Handover) -> String {
     }
 }
 
-/// How the two seats that file rows split a big one: into sub-tasks, as it is
-/// planned, each made a member (`wsp-311`). Legs are the working seat's, for a
-/// row that turns out bigger once it is under way (Ed, 2026-10-22: "decompose
-/// using legs when working, but using add --parent when planning").
+/// How the two seats that file rows split a big one as it is planned. Pieces that
+/// are separate deliverables, each worth a verifier, are sub-tasks, each made a
+/// member (`wsp-311`); coupled work under one verdict (one tree, one built
+/// artefact: a build, then drives of it) is legs, filed on the todo row, which
+/// the run starts with the row (`wsp-499`, Ed 2026-11-08). The size check asks a
+/// row with a many-observation done-when, a build of over ~5 minutes before a
+/// drive, or its planner's own exception wording for one of these or `--whole`.
 /// compound-758 was filed "M-L. Split it if larger", which left the split to
 /// the seat that met it, and that seat reached for sub-tasks no run would
 /// start. One line, ASCII, for the reason the orders it goes into are.
 const STAGE_WHEN_FILED: &str = "A row you file or direct that will run past ~80 turns, or cross more than one \
-     layer, is decomposed when it is planned: `wsp add \"...\" --parent <id>` per piece, each with its own overview \
-     and done-when, and on a list `wsp worklist add <list> <id> --sub` makes the pieces members, since a sub-task \
-     no list holds is never started or verified. Never file one as \"split it if larger\": the seat that meets it \
-     can only stage legs inside its one row.";
+     layer, is decomposed when it is planned. Separate deliverables, each worth a verifier, are sub-tasks: \
+     `wsp add \"...\" --parent <id>` per piece, each with its own overview and done-when, and on a list \
+     `wsp worklist add <list> <id> --sub` makes the pieces members, since a sub-task no list holds is never \
+     started or verified. Coupled work under one verdict (one tree or built artefact: a build, then drives \
+     of it) is legs: `wsp leg add <id> <name> --order FILE` per leg, ending in one last leg, and the run \
+     starts them with the row. A done-when of three or more observations, or a build over ~5 minutes before \
+     a drive, needs one of these, or `--whole --why \"...\"` when one seat is right. Never file one as \
+     \"split it if larger\": the seat that meets it can only stage legs inside its one row.";
 
 /// What a task's work order adds when the tree it starts in already holds
 /// uncommitted work — empty otherwise. `wsp-171`'s second half.
@@ -9910,7 +9917,8 @@ mod tests {
         assert!(!primary.contains('\n'), "one line, for a kind that takes it in argv");
     }
 
-    /// `wsp-311`: the two seats that file rows stage a big one as they file it,
+    /// `wsp-311`: the two seats that file rows stage a big one as they file it
+    /// (sub-tasks for separate deliverables, legs for coupled work, `wsp-499`),
     /// and a member's order leaves the split to its brief.
     #[test]
     fn the_seats_that_file_rows_are_told_to_split_a_big_one_into_member_sub_tasks_when_planning_it() {
@@ -9922,7 +9930,8 @@ mod tests {
         for (who, order, told) in cases {
             assert_eq!(order.contains("--parent <id>` per piece"), told, "{who}: {order}");
             assert_eq!(order.contains("`wsp worklist add <list> <id> --sub`"), told, "{who}: {order}");
-            assert!(!order.contains("wsp leg add"), "{who}: legs are the working seat's, not the planner's: {order}");
+            assert_eq!(order.contains("`wsp leg add <id> <name> --order FILE` per leg"), told, "{who}: legs are the planner's too, wsp-499: {order}");
+            assert_eq!(order.contains("`--whole --why"), told, "{who}: {order}");
             assert_eq!(order.contains("split it if larger"), told, "{who}: {order}");
             assert!(!order.contains('\n') && order.is_ascii(), "{who}: one ASCII line");
         }

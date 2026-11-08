@@ -7,8 +7,10 @@ table (`wsp-290`), then trialled on three real rows (`wsp-295`, *The trial*).
 A seat that finds the row it is working too big stages the rest with
 `wsp leg add`, never sub-tasks (*Staging a row already running*, `wsp-311`).
 A row split while it is planned is split into sub-tasks with `wsp add
---parent`, each made a list member (Ed, 2026-10-22). The build rows are at
-the end.
+--parent`, each made a list member (Ed, 2026-10-22), when its pieces are
+separate deliverables; a planner files legs on a todo row when the pieces
+are coupled work under one verdict (`wsp-499`, *Legs at planning*). The
+build rows are at the end.
 
 ## The decision
 
@@ -641,6 +643,88 @@ has `cache_write_tokens`, `usd_micros` and `exact` as described above.
   with `after:` shown when it is not the line above, and order and baton
   folded to their first line. `--legs` prints them whole.
 
+## Legs at planning, and the size check (`wsp-499`)
+
+Ed, 2026-11-08, after compounding-196 (react-pass-3 group 4). Its planner
+called it "an exception to the small-row size: mostly the shell's build, 15 to
+20 minutes", then put a release build and five live drives into one seat with
+one done-when. Its first seat died five minutes in and the second could not
+start. Ed: "this is the kind of task that should be marked for or forced into
+legs", and "we should allow pre-planned legs also".
+
+**Why legs exist, and when not to use them.** Legs are transient pieces of
+one row for highly coupled work: pieces that share one tree, one built
+artefact or one line of reasoning, are judged by one verdict, and would cost
+more as separate rows than they save. They have no ticket and no done-when of
+their own, and they end when the row lands. They run in series or, where the
+pieces do not depend on each other, side by side (`wsp-296`'s graph). Legs are
+not preferred for a larger packet that benefits from defined pieces, each with
+its own done-when, run in parallel batches: that is a transient sub-task
+(`docs/pieces.md`, `wsp-501`) or, where a piece needs its own verdict, review
+or life in the backlog, a real sub-task on a list. In short:
+
+- coupled work under one verdict: **legs**;
+- a larger work in defined pieces, each with its own done-when: **pieces**;
+- separate deliverables, each worth a verifier: **sub-tasks**.
+
+**Planner-filed legs.** The 2026-10-22 rule, "decompose using legs when
+working, but using add --parent when planning", is kept for what it was about:
+pieces that are separate deliverables are sub-tasks, made members. Pieces that
+share one tree or one built artefact and are judged by one verdict (a build,
+then drives of it in parallel, then a report) are legs, added **at planning**:
+
+- `wsp leg add <id> <name> --order FILE [--after …]` is allowed on a row at
+  `todo` from a planner (a custodian or list governor) or the primary seat,
+  which hold no row, and from the row's own seat. It is refused from the
+  member seat of a different row: that seat has a row of its own, and a
+  split of another's is its planner's to make.
+- The run starts the first legs when the row starts (`cycle::take_legs`,
+  `Todo` and `Rows::New`), with no working seat needed to stage them. The
+  row goes to `doing` with its first leg, a leg claims nothing, and the drives
+  that wait on the build start together once it is done.
+- The record rules are the same as for a seat's legs: one last leg, Sonnet
+  unless a `why:` says otherwise, at most eight legs.
+
+**The size check.** It runs at `wsp worklist add` and at `wsp worklist status
+<list> planned`, for each member, before any seat is spent
+(`src/size_check.rs`). A row trips it when its overview shows:
+
+- **(a)** a done-when with three or more separate observations (clauses split
+  by `;`, bulleted or numbered items, `(1)` markers, whichever counts most);
+- **(b)** a build or setup step stated or estimated at over ~5 minutes (a
+  figure in minutes, or a `release build` or `cold build`) followed by a
+  drive, run or measure;
+- **(c)** the planner's own exception wording: "exception to the small-row
+  size", "mostly the build".
+
+Each hit names what tripped and points by shape: (b) is legs, (a) is pieces
+when the observations are of separate parts and legs when of one built thing,
+(c) is either. To pass, the row carries one of: `## Legs` (planner legs),
+`## Pieces`, open sub-tasks (`wsp add --parent`, `worklist add --sub`), or
+`--whole --why "…"`, which writes `## Whole` on the row and is shown to its
+verifier in the order.
+
+**Roll-out.** The mode is a setting, the file `size-check` in the state
+directory, set by `wsp worklist size-check [warn|refuse|off]` (no word says the
+mode and the hits so far, by signal). It starts as `warn`: a hit is printed and
+logged as a `size-check` event (`row`, `verb`, `signals`, `outcome`) and the
+verb goes on. About a week on, after Ed has read what it caught, it moves to
+`refuse`. **Measure:** for rows that tripped, seat deaths, reworks and wall
+time against rows that did not, from `wsp attempts` and the events.
+
+**The brief line** (a draft for Ed to place in `~/wsp/agents.md`, replacing
+"Decomposing while planning"):
+
+> - Decomposing while **planning**? Coupled work under one verdict (one tree
+>   or built artefact: a build, then drives of it) is **legs**: `wsp leg add
+>   <id> <name> --order FILE`, ending in one last leg; the run starts them
+>   with the row. A larger work in defined pieces, each with its own
+>   done-when, is **pieces** (`wsp piece add`). Separate deliverables, each
+>   worth a verifier, are **sub-tasks**: `wsp add "…" --parent <id>`, made
+>   members with `wsp worklist add <list> <id> --sub`. A done-when of three or
+>   more observations, or a build of over ~5 minutes before a drive, needs
+>   one of these; if one seat really is right, `--whole --why "…"`.
+
 ## When to stage
 
 This is the rule for the handbook, kept to what can be checked when the list
@@ -714,7 +798,7 @@ leg. Around the route:
   orders say to split a big row as it is filed, with `wsp add --parent` per
   piece, each with a done-when, made members with `wsp worklist add <list>
   <id> --sub`, and never to file one as "split it if larger" (Ed,
-  2026-10-22: "decompose using legs when working, but using add --parent
+  2026-10-22 (qualified by `wsp-499`: legs are also a planner's for coupled work): "decompose using legs when working, but using add --parent
   when planning").
 
 **When the builds run side by side.** Overlap does not change the token

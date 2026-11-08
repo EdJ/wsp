@@ -137,6 +137,8 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "done" | "finish" => done(store, args),
         // wsp-382: the status field, and the three words a hand may set.
         "status" => status(store, args),
+        // wsp-499: the size check's mode, and what it has caught.
+        "size-check" => size_check_verb(store, args),
         // wsp-383: what a planned list waits on.
         "after" => after(store, args),
         // wsp-384: the daemon's pickup of planned lists, once, by hand.
@@ -529,6 +531,9 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         w.log(&format!("--sub {} resolved to the {} open now, not live", typed[0], members.len()));
     }
     if let Some(code) = refuse_edges(store, &w, &groups) {
+        return code;
+    }
+    if let Some(code) = size_gate(store, args, &members, "add") {
         return code;
     }
     // Last of the refusals and first of the writes: another list's rows are
@@ -2430,6 +2435,17 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     run makes it executing, its end complete,
                                     `done` closed. cancelled puts the open rows
                                     back to todo, unclaimed. No word: say it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 185,
+                text: r##"  wsp worklist size-check [warn|refuse|off]
+                                    the size check run at `add` and at `planned`:
+                                    a row with a many-observation done-when, a
+                                    build over ~5 min before a drive, or an
+                                    exception-to-the-small-row wording needs
+                                    legs, pieces or sub-tasks, or `--whole --why
+                                    "…"` on the add. No word: the mode and hits"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
@@ -5992,6 +6008,117 @@ pub fn after(store: &Store, args: &Args) -> i32 {
     queue_report(args, &w, "after")
 }
 
+// ---- the size check -----------------------------------------------------
+
+/// The size check (`wsp-499`, `crate::size_check`) for each of `ids`, before any
+/// seat is spent: a row whose overview trips a signal and carries no legs,
+/// pieces, sub-tasks or `## Whole` is named, with what tripped, and each hit is
+/// logged as a `size-check` event. `--whole --why "…"` records the reason on the
+/// rows that tripped, and they pass. In `warn` the verb goes on; in `refuse` it
+/// stops with `Some(1)`, and in `off` nothing is read. `verb` is `add` or `planned`.
+fn size_gate(store: &Store, args: &Args, ids: &[String], verb: &str) -> Option<i32> {
+    use crate::size_check as sc;
+    let mode = sc::mode(&store.state);
+    if mode == sc::Mode::Off {
+        return None;
+    }
+    let tasks = store.tasks();
+    let mut tripped: Vec<(String, Vec<sc::Hit>)> = Vec::new();
+    for id in ids {
+        let Some(t) = tasks.iter().find(|t| &t.id == id) else { continue };
+        if !t.status().is_open() {
+            continue;
+        }
+        let hits = sc::trips(t, &tasks);
+        if !hits.is_empty() {
+            tripped.push((id.clone(), hits));
+        }
+    }
+    if tripped.is_empty() {
+        return None;
+    }
+    if args.has("whole") {
+        let why = match reason(args) {
+            Ok(Some(w)) => w,
+            Ok(None) => {
+                eprintln!("wsp: --whole says why one seat is right: `--whole --why \"…\"`");
+                return Some(2);
+            }
+            Err(code) => return Some(code),
+        };
+        let by = crate::cmd_message::caller(store);
+        for (id, hits) in &tripped {
+            let text = format!("{why} (size check: {}; by {by}, {})", hits.iter().map(|h| h.signal.key()).collect::<Vec<_>>().join(", "), util::now_iso());
+            let wrote = store.locked(|| {
+                let mut t = store.find_task(id)?;
+                crate::model::set_section_in(&mut t.body, sc::WHOLE, &text);
+                t.log(&format!("size check: kept whole — {why}"));
+                t.touch();
+                store.save_task(&t).ok()
+            });
+            if wrote.is_none() {
+                eprintln!("wsp: could not record --whole on {id}");
+                return Some(1);
+            }
+            store.log_event("size-check", json!({ "row": id, "verb": verb, "mode": mode.word(), "signals": hits.iter().map(|h| h.signal.key()).collect::<Vec<_>>(), "outcome": "whole" }));
+        }
+        store.git_commit(&format!("wsp: {} kept whole", tripped.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>().join(" ")));
+        return None;
+    }
+    for (id, hits) in &tripped {
+        store.log_event("size-check", json!({ "row": id, "verb": verb, "mode": mode.word(), "signals": hits.iter().map(|h| h.signal.key()).collect::<Vec<_>>(), "outcome": mode.word() }));
+        eprintln!("wsp: {id} looks bigger than one seat:");
+        for h in hits {
+            eprintln!("     {}", h.line());
+        }
+    }
+    eprintln!(
+        "     give each one legs (`wsp leg add <id> <name> --order FILE`), pieces (`wsp piece add <id> --from FILE`), \
+         or sub-tasks (`wsp add \"…\" --parent <id>`, `worklist add --sub`), or keep it whole: `--whole --why \"…\"`"
+    );
+    match mode {
+        sc::Mode::Refuse => Some(1),
+        _ => {
+            eprintln!("     (the size check only warns for now: `wsp worklist size-check` says how it is set)");
+            None
+        }
+    }
+}
+
+/// `wsp worklist size-check [warn|refuse|off]`: the mode the size check runs in,
+/// and with a word, sets it. With none, says the mode and how many rows each
+/// signal has caught, off the `size-check` events.
+fn size_check_verb(store: &Store, args: &Args) -> i32 {
+    use crate::size_check as sc;
+    if let Some(word) = args.rest.get(1) {
+        let Some(m) = sc::Mode::parse(word) else {
+            eprintln!("usage: wsp worklist size-check [warn|refuse|off]");
+            return 2;
+        };
+        let _ = std::fs::create_dir_all(&store.state);
+        if let Err(e) = std::fs::write(store.state.join(sc::SETTING), format!("{}\n", m.word())) {
+            eprintln!("wsp: cannot write the setting: {e}");
+            return 1;
+        }
+        println!("size check: {}", m.word());
+        return 0;
+    }
+    let events = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
+    let mut by: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for l in events.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else { continue };
+        if v["kind"] != "size-check" {
+            continue;
+        }
+        for s in v["data"]["signals"].as_array().into_iter().flatten().filter_map(|s| s.as_str()) {
+            *by.entry(s.to_string()).or_default() += 1;
+        }
+    }
+    let caught = ["a", "b", "c"].iter().map(|k| format!("({k}) {}", by.get(*k).copied().unwrap_or(0))).collect::<Vec<_>>().join("  ");
+    println!("size check: {} · hits by signal {caught}", sc::mode(&store.state).word());
+    0
+}
+
 // ---- status -----------------------------------------------------------
 
 /// `wsp worklist status <slug> [init|planned|cancelled] [--why …]` (`wsp-382`).
@@ -6055,6 +6182,10 @@ pub fn status(store: &Store, args: &Args) -> i32 {
                 return 1;
             }
             if word == "planned" {
+                let members: Vec<String> = w.groups().iter().flat_map(|g| g.members.iter().cloned()).collect();
+                if let Some(code) = size_gate(store, args, &members, "planned") {
+                    return code;
+                }
                 w.set_planned();
             } else {
                 w.set_status(WorklistStatus::Draft);
@@ -7652,6 +7783,126 @@ mod tests {
         later.parent = Some("wl-010".into());
         store.save_task(&later).unwrap();
         assert_eq!(groups_of(&store, "fork")[0].members.len(), 2, "resolved then, not live");
+    }
+
+    /// A row with this overview, at todo.
+    fn big_task(store: &Store, id: &str, overview: &str) {
+        let mut t = Task::new(id, id);
+        crate::model::set_section_in(&mut t.body, "Overview", overview);
+        store.save_task(&t).unwrap();
+    }
+
+    fn size_mode(store: &Store, word: &str) {
+        assert_eq!(run(store, &["size-check", word]), 0);
+    }
+
+    fn size_events(store: &Store) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(store.state_file("events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["kind"] == "size-check")
+            .collect()
+    }
+
+    /// `wsp-499`: each signal is warned at `add` while the check only warns, the
+    /// hit is logged with its signal and nothing is refused; in `refuse` the same
+    /// row is refused and nothing written, and in `off` it is not read.
+    #[test]
+    fn the_size_check_warns_then_refuses_on_each_signal_and_off_reads_nothing() {
+        let store = scratch("size-signals");
+        let fixtures = [
+            ("a", "Done when: the rail places; the task page opens; the Board drop lands."),
+            ("b", "Build the shell, 15 to 20 minutes, then drive the rail."),
+            ("c", "This is an exception to the small-row size."),
+        ];
+        run(&store, &["new", "batch", "b"]);
+        for (i, (signal, overview)) in fixtures.iter().enumerate() {
+            let id = format!("sz-{i}");
+            big_task(&store, &id, overview);
+            // The default is warn: the add goes through, and it is logged.
+            assert_eq!(run(&store, &["add", "batch", &id]), 0, "{signal}: warn goes on");
+            let last = size_events(&store).pop().expect("a hit is logged");
+            assert_eq!((last["data"]["row"].as_str(), last["data"]["signals"][0].as_str(), last["data"]["outcome"].as_str()), (Some(id.as_str()), Some(*signal), Some("warn")));
+        }
+        assert!(run(&store, &["size-check"]) == 0);
+
+        size_mode(&store, "refuse");
+        for (i, (signal, overview)) in fixtures.iter().enumerate() {
+            let id = format!("sz-r{i}");
+            big_task(&store, &id, overview);
+            assert_eq!(run(&store, &["add", "batch", &id]), 1, "{signal}: refuse stops");
+            assert!(!groups_of(&store, "batch").iter().any(|g| g.members.contains(&id)), "{signal}: nothing was written");
+        }
+        size_mode(&store, "off");
+        let before = size_events(&store).len();
+        big_task(&store, "sz-off", fixtures[0].1);
+        assert_eq!(run(&store, &["add", "batch", "sz-off"]), 0);
+        assert_eq!(size_events(&store).len(), before, "off reads nothing");
+        assert_eq!(run(&store, &["size-check", "sometimes"]), 2);
+    }
+
+    /// `wsp-499`: in `refuse`, a row passes with legs, with pieces, with open
+    /// sub-tasks, or with `--whole --why`, which writes `## Whole` for the
+    /// verifier; and a small row passes with none.
+    #[test]
+    fn a_big_row_passes_the_size_check_with_legs_sub_tasks_or_whole_and_a_small_one_with_nothing() {
+        let store = scratch("size-ways");
+        size_mode(&store, "refuse");
+        run(&store, &["new", "batch", "b"]);
+        let big = "Build the shell, 15 to 20 minutes, then drive the rail.";
+
+        big_task(&store, "sz-1", big);
+        assert_eq!(run(&store, &["add", "batch", "sz-1"]), 1);
+
+        big_task(&store, "sz-legs", big);
+        let mut t = store.find_task("sz-legs").unwrap();
+        crate::model::set_section_in(&mut t.body, "Legs", "- build · claude sonnet medium · pending\n  order: build it");
+        store.save_task(&t).unwrap();
+        assert_eq!(run(&store, &["add", "batch", "sz-legs"]), 0, "legs");
+
+        big_task(&store, "sz-pieces", big);
+        let mut t = store.find_task("sz-pieces").unwrap();
+        crate::model::set_section_in(&mut t.body, "Pieces", "- piece");
+        store.save_task(&t).unwrap();
+        assert_eq!(run(&store, &["add", "batch", "sz-pieces"]), 0, "pieces");
+
+        big_task(&store, "sz-parent", big);
+        let mut kid = Task::new("sz-kid", "sz-kid");
+        kid.parent = Some("sz-parent".into());
+        store.save_task(&kid).unwrap();
+        assert_eq!(run(&store, &["add", "batch", "sz-parent"]), 0, "a row with sub-tasks");
+
+        big_task(&store, "sz-whole", big);
+        assert_eq!(flagged(&store, &["add", "batch", "sz-whole"], &[("whole", "true")]), 2, "--whole wants its why");
+        assert!(store.find_task("sz-whole").unwrap().section("Whole").is_none());
+        assert_eq!(flagged(&store, &["add", "batch", "sz-whole"], &[("whole", "true"), ("why", "one tree, one reader")]), 0);
+        let kept = store.find_task("sz-whole").unwrap();
+        assert!(kept.section("Whole").unwrap().contains("one tree, one reader"));
+        assert!(crate::size_check::whole_line(&kept).contains("one tree, one reader"), "the verifier is told");
+        assert_eq!(size_events(&store).last().unwrap()["data"]["outcome"], "whole");
+
+        big_task(&store, "sz-small", "Fix the typo. Done when: it reads right.");
+        assert_eq!(run(&store, &["add", "batch", "sz-small"]), 0);
+        assert!(store.find_task("sz-small").unwrap().section("Whole").is_none(), "a small row records nothing");
+    }
+
+    /// `wsp-499`: the check runs again at `status <list> planned`, for each
+    /// member, and a row that took `--whole` there passes.
+    #[test]
+    fn the_size_check_runs_at_planned_for_each_member() {
+        let store = scratch("size-planned");
+        run(&store, &["new", "batch", "b"]);
+        big_task(&store, "sz-1", "Done when: a; b; c");
+        task(&store, "sz-2", "todo");
+        assert_eq!(run(&store, &["add", "batch", "sz-1", "sz-2"]), 0, "the default only warns");
+        size_mode(&store, "refuse");
+        assert_eq!(run(&store, &["status", "batch", "planned"]), 1, "refused at planned");
+        assert_ne!(status_of(&store, "batch").0, "planned");
+        assert_eq!(flagged(&store, &["status", "batch", "planned"], &[("whole", "true"), ("why", "one reader")]), 0);
+        assert_eq!(status_of(&store, "batch").0, "planned");
+        assert!(store.find_task("sz-1").unwrap().section("Whole").is_some());
+        assert!(store.find_task("sz-2").unwrap().section("Whole").is_none(), "only the row that tripped");
     }
 
     /// A task in two groups of one list holds two barriers, and the second

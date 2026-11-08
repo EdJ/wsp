@@ -92,6 +92,7 @@ mod retro_run;
 mod retro_series;
 mod retro_yours;
 mod room;
+mod size_check;
 mod split;
 mod stage;
 mod starts;
