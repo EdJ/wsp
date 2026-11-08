@@ -245,6 +245,13 @@ struct Record {
     /// that no longer matches is a binary somebody installed by hand.
     size: u64,
     mtime: u64,
+    /// Hash of the bytes as built, before any signing. Signing rewrites the
+    /// live file, so "is this build already live" cannot be asked of its bytes
+    /// once it is signed; it is asked of this instead. Absent in records made
+    /// before signing.
+    built: Option<String>,
+    /// The identity the live file was signed with, when the signing worked.
+    signed_as: Option<String>,
 }
 
 impl Record {
@@ -258,6 +265,8 @@ impl Record {
             dirty: v.get("dirty").and_then(|x| x.as_bool()).unwrap_or(false),
             size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
             mtime: v.get("mtime").and_then(|x| x.as_u64()).unwrap_or(0),
+            built: v.get("built").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            signed_as: v.get("signed_as").and_then(|x| x.as_str()).map(|s| s.to_string()),
         }
     }
 
@@ -270,6 +279,8 @@ impl Record {
             "dirty": self.dirty,
             "size": self.size,
             "mtime": self.mtime,
+            "built": self.built,
+            "signed_as": self.signed_as,
         })
     }
 
@@ -766,6 +777,38 @@ fn sign_placed(
         .map(|e| format!("{e} — installed unsigned, so a Developer Tools exemption will not hold"))
 }
 
+/// What the live file is, against the build about to be installed.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Live {
+    /// Nothing to do: this build is live, and signed as asked (or signing is off).
+    Same,
+    /// This build is live but not signed as asked — place it again and sign it.
+    Unsigned,
+    /// Something else is live, or nothing.
+    Other,
+}
+
+/// The `same` decision. Signing changes the live file's bytes, so a signed
+/// install is recognised by the record beside it — its stamp must still be the
+/// file's — holding the hash of the *unsigned* bytes it came from. Codesign's
+/// output is never compared and never assumed deterministic.
+fn standing_of(
+    live_bytes: Option<&[u8]>,
+    bytes: &[u8],
+    recorded: Option<&Record>,
+    identity: Option<&str>,
+) -> Live {
+    let built = crate::artefact::hash_of(bytes);
+    let by_record = recorded.map(|r| r.built.as_deref() == Some(built.as_str())).unwrap_or(false);
+    let by_bytes = live_bytes.map(|cur| cur == bytes).unwrap_or(false);
+    match identity {
+        None if by_record || by_bytes => Live::Same,
+        Some(id) if by_record && recorded.and_then(|r| r.signed_as.as_deref()) == Some(id) => Live::Same,
+        Some(_) if by_record || by_bytes => Live::Unsigned,
+        _ => Live::Other,
+    }
+}
+
 // ---- the command -------------------------------------------------------
 
 /// A binary to install, and the tree it came out of.
@@ -1012,6 +1055,12 @@ fn piped() -> Result<String, i32> {
 }
 
 pub fn install(store: &Store, args: &Args) -> i32 {
+    install_with(store, args, &codesign)
+}
+
+/// [`install`] with `sign` standing for `codesign`, so a test goes through the
+/// whole `same` decision with no keychain.
+fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result<(), String>) -> i32 {
     let p = util::Paint::new();
     let json_out = args.json();
     let dry = args.has("dry-run");
@@ -1100,7 +1149,18 @@ pub fn install(store: &Store, args: &Args) -> i32 {
             return 2;
         }
     };
-    let same = fs::read(&dst).map(|cur| cur == bytes).unwrap_or(false);
+    let identity = if cfg!(target_os = "macos") { sign_identity(&store.state) } else { None };
+    let built_hash = crate::artefact::hash_of(&bytes);
+    let standing = standing_of(
+        fs::read(&dst).ok().as_deref(),
+        &bytes,
+        recorded,
+        identity.as_deref(),
+    );
+    let same = standing == Live::Same;
+    // The live build is this one and unsigned: it is placed again and signed,
+    // once, and nothing about it is being reverted.
+    let sign_only = standing == Live::Unsigned;
 
     let describe = |p: &util::Paint| {
         println!(
@@ -1204,9 +1264,17 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         describe(&p);
     }
 
+    if sign_only && !json_out {
+        println!(
+            "{} {}",
+            p.yellow("unsigned"),
+            "an already-live build is being signed — it is placed again and signed once"
+        );
+    }
+
     if same {
         if !json_out {
-            println!("{} {}", p.green("✓"), "already live — byte for byte what you built");
+            println!("{} {}", p.green("✓"), "already live — the build you made");
         }
         let agent = launcher(store, &dst, dry, json_out, &p);
         let pi = pi_extension(&dst, &dst, dry, json_out, &p);
@@ -1229,7 +1297,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         return exit_for(&agent);
     }
 
-    let backwards = overtaken(ours.built, written(&dst), recorded, &ours);
+    let backwards = !sign_only && overtaken(ours.built, written(&dst), recorded, &ours);
     if backwards && !args.has("force") {
         let held = recorded.map(|r| r.line()).unwrap_or_else(|| match carried_by(&dst) {
             Some(c) => format!("{c} put there by hand — nothing beside it says who or why"),
@@ -1305,6 +1373,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         .as_ref()
         .filter(|r| live_now.map(|(size, mtime)| r.size == size && r.mtime == mtime).unwrap_or(false));
     if !args.has("force")
+        && !sign_only
         && overtaken(ours.built, written(&dst), recorded_now, &ours)
     {
         let held = recorded_now.map(|r| r.line()).unwrap_or_else(|| match carried_by(&dst) {
@@ -1327,8 +1396,8 @@ pub fn install(store: &Store, args: &Args) -> i32 {
     // After the copy was read back and compared (signing rewrites the file, so
     // it could not be compared after), and before the record, so the size and
     // mtime kept are the signed file's.
-    let signed_as = if cfg!(target_os = "macos") { sign_identity(&store.state) } else { None };
-    let sign_failed = sign_placed(&dst, signed_as.as_deref(), &codesign);
+    let signed_as = identity;
+    let sign_failed = sign_placed(&dst, signed_as.as_deref(), sign);
     let (size, mtime) = util::stamp(&dst).unwrap_or((bytes.len() as u64, util::epoch_secs() as u64));
     let rec = Record {
         at: util::now_iso(),
@@ -1338,6 +1407,8 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         dirty: ours.dirty,
         size,
         mtime,
+        built: Some(built_hash),
+        signed_as: signed_as.clone().filter(|_| sign_failed.is_none()),
     };
     remember(&dst, &rec);
     drop(lock);
@@ -1358,6 +1429,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "dirty_files": ours.dirty_files,
                 "bytes": size,
                 "signed": signed_as.is_some() && sign_failed.is_none(),
+                "signed_live_build": sign_only,
                 "sign_error": sign_failed,
                 "who": rec.who,
                 "why": why,
@@ -1733,6 +1805,8 @@ mod tests {
             dirty,
             size: 1,
             mtime: 0,
+            built: None,
+            signed_as: None,
         }
     }
 
@@ -2025,6 +2099,64 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Signing rewrites the live file, so "already live" is read off the record's
+    /// hash of the unsigned bytes. Through `install()` itself, `codesign` a seam:
+    /// the second install of one build, signing on, does nothing; an unsigned
+    /// live copy of the same build is signed once; a different build is placed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_second_install_of_a_signed_build_is_a_no_op_and_an_unsigned_one_is_signed() {
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = scratch("sign-same");
+        let store = Store::at(dir.join("home"), dir.join("state"));
+        fs::create_dir_all(&store.state).unwrap();
+        let dst = dir.join("bin/wsp");
+        let src = dir.join("built/wsp");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, b"build one").unwrap();
+
+        let calls = Cell::new(0);
+        // Signing rewrites the file, as the real one does.
+        let sign = |bin: &Path, _: &str| -> Result<(), String> {
+            calls.set(calls.get() + 1);
+            let mut b = fs::read(bin).unwrap();
+            b.extend_from_slice(b"<signature>");
+            fs::write(bin, b).map_err(|e| e.to_string())
+        };
+        let run = || {
+            let a = line(&["install", "--to", dst.to_str().unwrap(), src.to_str().unwrap(), "--why", "test"]);
+            install_with(&store, &a, &sign)
+        };
+
+        assert_eq!(run(), 0);
+        assert_eq!(calls.get(), 1, "the first install did not sign");
+        let signed = fs::read(&dst).unwrap();
+        assert_eq!(signed, b"build one<signature>");
+        let inode = fs::metadata(&dst).unwrap().ino();
+
+        assert_eq!(run(), 0);
+        assert_eq!(calls.get(), 1, "a second install of the same build signed again");
+        assert_eq!(fs::read(&dst).unwrap(), signed);
+        assert_eq!(fs::metadata(&dst).unwrap().ino(), inode, "a second install re-placed the live binary");
+
+        // Today's state: the same build live, unsigned, and a record that says nothing of signing.
+        fs::write(&dst, b"build one").unwrap();
+        let _ = fs::remove_file(record_path(&dst));
+        assert_eq!(run(), 0);
+        assert_eq!(calls.get(), 2, "an unsigned live copy of the build was not signed");
+        assert_eq!(fs::read(&dst).unwrap(), signed);
+        assert_eq!(run(), 0);
+        assert_eq!(calls.get(), 2, "it was signed twice");
+
+        // A different build is a real install.
+        fs::write(&src, b"build two").unwrap();
+        assert_eq!(run(), 0);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(fs::read(&dst).unwrap(), b"build two<signature>");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The identity is the store's, else Ed's; `off` is no identity.
     #[test]
     fn the_identity_is_the_stores_else_the_default() {
@@ -2090,6 +2222,8 @@ mod tests {
                 dirty: false,
                 size,
                 mtime,
+                built: None,
+                signed_as: None,
             },
         );
 
