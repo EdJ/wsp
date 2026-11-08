@@ -1619,6 +1619,133 @@ fn drop_group(store: &Store, args: &Args, id: &str, ordinal: usize, why: Option<
     0
 }
 
+/// What a cut is decided on besides the list: the facts the verb reads from
+/// the store, so [`cut`] itself reads nothing and writes nothing. `wsp-514`.
+// No caller until wsp-513's verb, its next part: only the tests read these yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CutReading {
+    /// Each member's `after:` list ([`crate::model::Task::after`]). A member
+    /// with no entry rests on nothing.
+    pub after: BTreeMap<String, Vec<String>>,
+    /// The members that have landed ([`crate::after::landed`]).
+    pub landed: BTreeSet<String>,
+    /// The running group's barrier, when its row has opened or its check is
+    /// running: what [`open_check`] names.
+    pub barrier: Option<String>,
+}
+
+/// What a cut takes out of the running group, and what it leaves.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Cut {
+    /// The group being cut from, 1-based.
+    pub group: usize,
+    /// The row asked for first, then every member of the same group resting
+    /// on it through `after:`, transitively, in the group's order.
+    pub takes: Vec<String>,
+    /// The members the group keeps, in its order. The group stays: a cut is
+    /// never the group dropped.
+    pub stays: Vec<String>,
+}
+
+/// Why a cut is refused. Each one says what to do instead, as
+/// [`Window::refuse`] does.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CutRefusal {
+    /// The row is not a member of the group being run (or nothing is run).
+    NotRunning { row: String, group: usize },
+    /// The running group's barrier has opened: a check is reading the group
+    /// the cut would change.
+    BarrierOpen { group: usize, barrier: String },
+    /// The row, or a member the cut would take with it, has landed.
+    Landed { group: usize, landed: Vec<String> },
+    /// The cut would take every member: that is the group dropped, `wsp-232`.
+    Whole { group: usize, takes: Vec<String> },
+}
+
+#[allow(dead_code)]
+impl CutRefusal {
+    /// The refusal in the two lines a verb prints: what, then what instead.
+    pub(crate) fn lines(&self, list: &str) -> [String; 2] {
+        match self {
+            CutRefusal::NotRunning { row, group } => [
+                format!("wsp: will not cut {row} — it is not a member of group {group} of `{list}`, the group being run"),
+                format!("     ahead of the run it is an edit: wsp worklist rm {list} {row}"),
+            ],
+            CutRefusal::BarrierOpen { group, barrier } => [
+                format!("wsp: will not cut from group {group} of `{list}` — its barrier is open on {barrier}, which is checking it"),
+                "     the barrier holds or passes it; a member that should not be there is a hold, then a follow-up".to_string(),
+            ],
+            CutRefusal::Landed { group, landed } => [
+                format!(
+                    "wsp: will not cut from group {group} of `{list}` — {} landed, and a cut takes back nothing on the trunk",
+                    landed.join(" ")
+                ),
+                "     the barrier reads what landed; what is wrong with it is a follow-up row, or a block at the barrier".to_string(),
+            ],
+            CutRefusal::Whole { group, takes } => [
+                format!(
+                    "wsp: will not cut {} — that is every member of group {group} of `{list}`, so it is the group dropped",
+                    takes.join(" ")
+                ),
+                format!("     wsp worklist group {list} {group} --drop --why -"),
+            ],
+        }
+    }
+}
+
+/// What cutting `row` out of group `at`, the group being run, takes: the row
+/// and every member of that group resting on it through `after:`,
+/// transitively. `wsp-514`, wsp-513's first part; the verb, the write and the
+/// barrier's account of it are the parts after.
+///
+/// Only a same-group edge counts, as only a same-group edge holds anything
+/// ([`crate::after`]). A member resting on the row from a later group is the
+/// barrier's to hold, and a sibling resting on nothing cut stays.
+///
+/// Refused, in this order: the row not in the running group; the group's
+/// barrier opened; the row or anything it would take landed; the cut taking
+/// every member, which is `group N --drop`.
+#[allow(dead_code)]
+pub(crate) fn cut(w: &Worklist, at: Option<usize>, row: &str, reading: &CutReading) -> Result<Cut, CutRefusal> {
+    let groups = w.groups();
+    let not_running = || CutRefusal::NotRunning { row: row.to_string(), group: at.unwrap_or(0) };
+    let at = at.ok_or_else(not_running)?;
+    let members = match at.checked_sub(1).and_then(|i| groups.get(i)) {
+        Some(g) if g.members.iter().any(|m| m == row) => &g.members,
+        _ => return Err(not_running()),
+    };
+    if let Some(b) = &reading.barrier {
+        return Err(CutRefusal::BarrierOpen { group: at, barrier: b.clone() });
+    }
+    let mut taken: BTreeSet<&str> = BTreeSet::from([row]);
+    loop {
+        let more: Vec<&str> = members
+            .iter()
+            .map(String::as_str)
+            .filter(|m| !taken.contains(m))
+            .filter(|m| reading.after.get(*m).is_some_and(|on| on.iter().any(|o| taken.contains(o.as_str()))))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        taken.extend(more);
+    }
+    let mut takes = vec![row.to_string()];
+    takes.extend(members.iter().filter(|m| m.as_str() != row && taken.contains(m.as_str())).cloned());
+    let landed: Vec<String> = takes.iter().filter(|m| reading.landed.contains(*m)).cloned().collect();
+    if !landed.is_empty() {
+        return Err(CutRefusal::Landed { group: at, landed });
+    }
+    let stays: Vec<String> = members.iter().filter(|m| !taken.contains(m.as_str())).cloned().collect();
+    if stays.is_empty() {
+        return Err(CutRefusal::Whole { group: at, takes });
+    }
+    Ok(Cut { group: at, takes, stays })
+}
+
 /// `--why`, the reason an edit is logged with. Optional ahead of the run, and
 /// required by [`amend_running_stop`].
 ///
@@ -6685,6 +6812,92 @@ mod tests {
     /// reads the ambient store, so the tests can run beside each other.
     fn scratch(tag: &str) -> Store {
         crate::testkit::store(&format!("wl-{tag}"))
+    }
+
+    /// A list of two groups for the cut: group 2 is the one being run.
+    fn cut_list(running: &[&str]) -> Worklist {
+        let mut w = Worklist::new("cl", "Cut");
+        w.set_groups(&[
+            Group { members: vec!["c-1".into()], ..Group::default() },
+            Group { members: running.iter().map(|s| s.to_string()).collect(), ..Group::default() },
+        ]);
+        w
+    }
+
+    fn rests(edges: &[(&str, &[&str])]) -> CutReading {
+        CutReading {
+            after: edges.iter().map(|(m, on)| (m.to_string(), on.iter().map(|s| s.to_string()).collect())).collect(),
+            ..CutReading::default()
+        }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_lone_blocked_row_is_cut_alone_and_the_group_keeps_the_rest() {
+        let w = cut_list(&["c-2", "c-3"]);
+        let got = cut(&w, Some(2), "c-2", &CutReading::default()).unwrap();
+        assert_eq!(got, Cut { group: 2, takes: ids(&["c-2"]), stays: ids(&["c-3"]) });
+    }
+
+    #[test]
+    fn a_cut_takes_the_members_resting_on_the_row_through_a_chain_of_two() {
+        // c-5 rests on c-4, which rests on c-2: both go with c-2.
+        let w = cut_list(&["c-5", "c-2", "c-4", "c-3"]);
+        let r = rests(&[("c-4", &["c-2"]), ("c-5", &["c-4"])]);
+        let got = cut(&w, Some(2), "c-2", &r).unwrap();
+        assert_eq!(got, Cut { group: 2, takes: ids(&["c-2", "c-5", "c-4"]), stays: ids(&["c-3"]) });
+    }
+
+    #[test]
+    fn a_sibling_not_chained_to_the_row_stays_even_resting_on_something_else() {
+        // c-3 rests on c-6, a member that stays, and on c-1 in the group
+        // before: neither edge reaches the row.
+        let w = cut_list(&["c-2", "c-3", "c-6"]);
+        let r = rests(&[("c-3", &["c-6", "c-1"]), ("c-2", &["c-1"])]);
+        let got = cut(&w, Some(2), "c-2", &r).unwrap();
+        assert_eq!(got, Cut { group: 2, takes: ids(&["c-2"]), stays: ids(&["c-3", "c-6"]) });
+    }
+
+    #[test]
+    fn a_row_outside_the_running_group_is_refused_and_pointed_at_rm() {
+        let w = cut_list(&["c-2", "c-3"]);
+        let r = CutReading::default();
+        assert_eq!(cut(&w, Some(2), "c-1", &r), Err(CutRefusal::NotRunning { row: "c-1".into(), group: 2 }));
+        assert_eq!(cut(&w, Some(2), "c-9", &r), Err(CutRefusal::NotRunning { row: "c-9".into(), group: 2 }));
+        assert_eq!(cut(&w, None, "c-2", &r), Err(CutRefusal::NotRunning { row: "c-2".into(), group: 0 }));
+        let said = cut(&w, Some(2), "c-1", &r).unwrap_err().lines("cl");
+        assert!(said[1].contains("wsp worklist rm cl c-1"), "{said:?}");
+    }
+
+    #[test]
+    fn a_cut_is_refused_once_the_groups_barrier_has_opened() {
+        let w = cut_list(&["c-2", "c-3"]);
+        let r = CutReading { barrier: Some("c-b (doing)".into()), ..CutReading::default() };
+        let got = cut(&w, Some(2), "c-2", &r);
+        assert_eq!(got, Err(CutRefusal::BarrierOpen { group: 2, barrier: "c-b (doing)".into() }));
+        assert!(got.unwrap_err().lines("cl")[0].contains("c-b (doing)"));
+    }
+
+    #[test]
+    fn a_cut_is_refused_when_the_row_or_what_rests_on_it_has_landed() {
+        let w = cut_list(&["c-2", "c-4", "c-3"]);
+        let mut r = rests(&[("c-4", &["c-2"])]);
+        r.landed = BTreeSet::from(["c-4".to_string()]);
+        assert_eq!(cut(&w, Some(2), "c-2", &r), Err(CutRefusal::Landed { group: 2, landed: ids(&["c-4"]) }));
+        r.landed = BTreeSet::from(["c-2".to_string(), "c-3".to_string()]);
+        assert_eq!(cut(&w, Some(2), "c-2", &r), Err(CutRefusal::Landed { group: 2, landed: ids(&["c-2"]) }));
+    }
+
+    #[test]
+    fn a_cut_taking_every_member_is_refused_as_the_group_dropped() {
+        let w = cut_list(&["c-2", "c-4"]);
+        let r = rests(&[("c-4", &["c-2"])]);
+        let got = cut(&w, Some(2), "c-2", &r);
+        assert_eq!(got, Err(CutRefusal::Whole { group: 2, takes: ids(&["c-2", "c-4"]) }));
+        assert_eq!(got.unwrap_err().lines("cl")[1], "     wsp worklist group cl 2 --drop --why -");
     }
 
     #[test]
