@@ -687,6 +687,12 @@ fn inherited(task: &str, cwd: Option<&str>) -> String {
     }
 }
 
+/// What a seat started on a sent-back row is told about why, in its own order
+/// (`wsp-529`). Empty for a row that was not sent back.
+fn sent_back_note(store: &Store, task: &str) -> String {
+    store.find_task(task).and_then(|t| crate::cycle::sent_back_order(&t)).unwrap_or_default()
+}
+
 /// The sentence an agent is handed, and it is one sentence per job rather than
 /// one per kind.
 ///
@@ -3026,7 +3032,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             }
             (Some(t), _) if packet_start => Some(match leg_name.as_deref() {
                 Some(l) => crate::packet::leg_order(t, l, leg_last),
-                None => crate::packet::order(t, crate::cmd_checkout::Flow::of_task(store, t)),
+                None => format!(
+                    "{}{}",
+                    crate::packet::order(t, crate::cmd_checkout::Flow::of_task(store, t)),
+                    sent_back_note(store, t)
+                ),
             }),
             (Some(t), _) if piece_rec.is_some() => Some(crate::piece_seat::order_line(
                 t,
@@ -3040,9 +3050,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 leg_last,
             )),
             (Some(t), _) => Some(format!(
-                "{}{}",
+                "{}{}{}",
                 handover(t, Handover::Spawned, route(how, laid)),
-                inherited(t, cwd.as_deref())
+                inherited(t, cwd.as_deref()),
+                sent_back_note(store, t)
             )),
             (None, Some(p)) => Some(handover(p, Handover::of_seat(p), route(how, laid))),
             (None, None) => None,

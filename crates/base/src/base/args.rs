@@ -200,6 +200,8 @@ pub fn literal(cmd: &str) -> Option<&'static Literal> {
 /// `--supersedes` — and `--` still ends flag parsing everywhere.
 pub const OWNED_AFTER: &[(&str, &str)] = &[
     ("decide", "supersedes"),
+    // A review of a commit a verifier already blocked, put up as it is (`wsp-529`).
+    ("review", "anyway"),
     // The verdict's own two words, which come after the member as often as not.
     ("verified", "holds"),
     ("verified", "blocks"),
@@ -246,6 +248,9 @@ pub const VALUED_ON: &[(&str, &str)] = &[
     ("list", "status"),
     ("find", "status"),
     ("add", "status"),
+    // `wsp review <id> --anyway "why"` carries its reason (`wsp-529`); elsewhere
+    // `anyway` stands alone.
+    ("review", "anyway"),
     ("project", "status"),
     // `spawn --agent` stands alone; on a worklist it names who runs a group.
     ("worklist", "agent"),

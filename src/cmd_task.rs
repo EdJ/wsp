@@ -1596,6 +1596,10 @@ pub fn review(store: &Store, args: &Args) -> i32 {
     // Given no account: the one written at the place wsp keeps for it (`wsp-374`,
     // `$WSP_VERDICT`), when it was written in this run of the row.
     if let Some((from_file, written)) = crate::closing::member_args(store, args) {
+        let mut from_file = from_file;
+        if let Some(why) = args.get("anyway") {
+            from_file.flags.insert("anyway".into(), vec![why]);
+        }
         let code = review(store, &from_file);
         if code == 0 {
             crate::closing::note_close(store, &args.rest[0], "review", written, None);
@@ -1666,6 +1670,35 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         }
         _ => None,
     };
+    // The commit a verifier has already blocked, put up again unchanged, is
+    // refused: a second verifier would spend a turn reaching the same verdict
+    // (`wsp-529`). `--anyway "why"` is for a seat that disagrees, logged.
+    let mut anyway_line = None;
+    let _ = args.has("anyway");
+    if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+        let tip = match crate::cmd_checkout::ready_at(store, &t.id) {
+            Ok(Some((sha, _))) => Some(sha),
+            _ => None,
+        };
+        if let Some(pass) = tip.as_deref().and_then(|tip| blocked_at(&t, tip)) {
+            match args.get("anyway").filter(|w| w != "true" && !w.trim().is_empty()) {
+                Some(why) => {
+                    anyway_line = Some(format!(
+                        "anyway: reviewed again at {} over the verifier's block ({}): {}",
+                        pass.read.as_deref().unwrap_or_default(),
+                        pass.decided.as_deref().unwrap_or(pass.at.as_str()),
+                        fold(&why)
+                    ));
+                }
+                None => {
+                    for line in blocked_refusal(&t.id, &pass) {
+                        eprintln!("{line}");
+                    }
+                    return 1;
+                }
+            }
+        }
+    }
     // A `## Checks` line that cannot start would be replayed at the landing and
     // fail there; it is refused here, where its author is.
     if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
@@ -1699,6 +1732,9 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         if let Some(line) = &ready_line {
             t.log(line);
         }
+        if let Some(line) = &anyway_line {
+            t.log(line);
+        }
     });
     if code != 0 {
         return code;
@@ -1718,6 +1754,30 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         }
     }
     0
+}
+
+/// The newest pass on the row when it is a block read at `tip`: the commit a
+/// seat is putting up again, unchanged (`wsp-529`).
+fn blocked_at(t: &Task, tip: &str) -> Option<crate::verification::Pass> {
+    let p = crate::verification::passes(t).pop()?;
+    let read = p.read.as_deref()?;
+    (p.state == crate::verification::State::Blocks && crate::verification::same_commit(read, tip)).then_some(p)
+}
+
+/// What `wsp review` says to a seat putting up a commit a verifier blocked: the
+/// verdict's first lines, where the whole of it is, and the two ways on.
+fn blocked_refusal(id: &str, pass: &crate::verification::Pass) -> Vec<String> {
+    let mut out = vec![format!(
+        "wsp: {id} is at {}, which a verifier already blocked, and nothing has changed since — a second verifier would read the same commit",
+        pass.read.as_deref().unwrap_or_default()
+    )];
+    out.extend(crate::cycle::verdict_head(&pass.text).lines().map(|l| format!("  | {l}")));
+    out.push(format!("  the whole verdict is under ## Verification (`wsp show {id}`)"));
+    out.push("  fix what it found and commit (`wsp commit-help`), then `wsp review` again".into());
+    out.push(format!(
+        "  if you disagree with it: `wsp review {id} --anyway \"why\" \"account\"` puts it up as it is, logged, and the governor hears of it"
+    ));
+    out
 }
 
 /// Deliberately not yet — the other half of what `block` used to mean.
@@ -3734,6 +3794,46 @@ pub(crate) mod tests {
         assert!(log.contains(&format!("{} {tip} on wsp-101", crate::repair::READY)), "{log}");
         let repo = tree.parent().unwrap().parent().unwrap();
         assert_ne!(git_at(repo, &["rev-parse", "master"]), tip, "nothing reached the trunk");
+    }
+
+    /// `wsp-529`: a commit a verifier blocked is not put up again unchanged —
+    /// refused with the verdict's head, the row does not move; a new commit is
+    /// allowed; `--anyway "why"` puts it up as it is and the log says so.
+    #[test]
+    fn review_is_refused_at_an_unchanged_blocked_commit_and_allowed_after_a_new_one_or_anyway() {
+        let (_env, store, tree) = a_member_with_a_commit("review-blocked");
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done"])), 0);
+        let tip = git_at(&tree, &["rev-parse", "HEAD"]);
+        let mut t = store.task("wsp-101").unwrap();
+        let mut ps = vec![crate::verification::Pass::opened(Some(tip.clone()), None)];
+        ps[0].state = crate::verification::State::Blocks;
+        ps[0].text = "signing breaks the already-live no-op\nsecond line".into();
+        crate::verification::write(&mut t, &ps);
+        crate::verification::send_back(&mut t, crate::util::now_iso(), "a verifier", Some(&tip), "signing breaks the no-op", None);
+        store.save_task(&t).unwrap();
+
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "fixed it"])), 1, "same commit, clean tree: refused");
+        let t = store.task("wsp-101").unwrap();
+        assert_eq!(t.status_raw, "doing", "and the row did not move");
+        let lines = blocked_refusal("wsp-101", &crate::verification::passes(&t)[0]).join("\n");
+        assert!(lines.contains("signing breaks") && lines.contains("## Verification") && lines.contains("--anyway"), "{lines}");
+
+        let anyway = parse(&["review", "wsp-101", "--anyway", "the verdict reads the wrong file", "I disagree"]);
+        assert_eq!(review(&store, &anyway), 0, "--anyway overrides");
+        let t = store.task("wsp-101").unwrap();
+        assert_eq!(t.status_raw, "review");
+        let log = t.section("Log").unwrap();
+        assert!(log.contains("anyway:") && log.contains("the verdict reads the wrong file") && log.contains(&tip[..12]), "{log}");
+
+        // Back to doing, a new commit, and review goes through.
+        let mut t = store.task("wsp-101").unwrap();
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        std::fs::write(tree.join("more.txt"), "fix\n").unwrap();
+        git_at(&tree, &["add", "."]);
+        git_at(&tree, &["commit", "--quiet", "-m", "the fix"]);
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "fixed it for real"])), 0, "a new commit is reviewed");
+        assert!(!store.task("wsp-101").unwrap().section("Log").unwrap().lines().last().unwrap_or_default().contains("anyway:"));
     }
 
     /// A tree holding uncommitted work cannot be ready: refused, named, and the

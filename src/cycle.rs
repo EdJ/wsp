@@ -2560,7 +2560,13 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) 
                 }
             }
             Some(p) if p.state == State::Blocks => {
-                if !moved_since(&now_landing, &member.updated, p) && !reviewed_since_sent_back(&m) {
+                // **Never at a commit it has already seen blocked (`wsp-529`).**
+                // A second verifier on the same commit spends a turn to say it
+                // has not changed (wsp-526). A seat that disagrees says so with
+                // `wsp review --anyway`, and the governor is told the block is
+                // unanswered ([`answered_block`]).
+                let at_blocked = matches!((&now_landing, &p.read), (Some(n), Some(r)) if v::same_commit(n, r));
+                if at_blocked || (!moved_since(&now_landing, &member.updated, p) && !reviewed_since_sent_back(&m)) {
                     return None;
                 }
             }
@@ -2668,7 +2674,81 @@ pub(crate) fn answered_block(t: &Task) -> bool {
         (Some(now), Some(then)) => !crate::verification::same_commit(&now, &then),
         _ => false,
     };
-    landed_again || reviewed_since_sent_back(t)
+    landed_again || (reviewed_since_sent_back(t) && blocked_at_tip(t).is_none())
+}
+
+/// The newest pass on the member when it is a block read at the commit the
+/// member is at now: nothing has changed since (`wsp-529`). A return to review
+/// there owes no verifier — the run has seen this commit blocked — and the
+/// block stays unanswered, which is what the governor is told.
+///
+/// `None` when either side has no commit (design-only work), which falls back
+/// to the older reading of a return to review.
+pub(crate) fn blocked_at_tip(t: &Task) -> Option<crate::verification::Pass> {
+    let now = crate::repair::commit_of(t)?;
+    let pass = crate::verification::passes(t).pop()?;
+    let read = pass.read.as_deref()?;
+    (pass.state == crate::verification::State::Blocks && crate::verification::same_commit(&now, read)).then_some(pass)
+}
+
+/// A verdict's first lines: what a seat is shown of it where the whole is not
+/// wanted, the blocking sentence and what follows it.
+pub(crate) fn verdict_head(text: &str) -> String {
+    let head: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).take(6).collect();
+    util::truncate(&head.join("\n"), 700)
+}
+
+/// What a seat started on a sent-back row is told in its first message (`wsp-529`):
+/// the reason, the verdict's head, and that a review of an unchanged blocked
+/// commit is refused. Read off the row, so it needs no tell that can fail
+/// (`wsp-526`: every tell of the reason failed while the seat sat idle).
+///
+/// The newest `sent back:` with no `review:` below it, and not "the newest log
+/// line", because the claim that seats the agent writes its own line first.
+/// `None` for a row that was not sent back, or has gone back to review since.
+/// One ASCII line, as every work order is.
+pub(crate) fn sent_back_order(t: &Task) -> Option<String> {
+    if t.status() != Status::Doing {
+        return None;
+    }
+    let log = t.section("Log").unwrap_or_default();
+    let heads: Vec<&str> = log
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(|l| match l.split_once(' ') {
+            Some((stamp, said)) if util::is_stamp(stamp) => said,
+            _ => l,
+        })
+        .collect();
+    let back = heads.iter().rposition(|h| h.starts_with(SENT_BACK))?;
+    if heads[back + 1..].iter().any(|h| h.starts_with("review:") || *h == "→ review") {
+        return None;
+    }
+    let reason = heads[back].trim_start_matches(SENT_BACK).trim();
+    let verdict = crate::verification::passes(t)
+        .pop()
+        .filter(|p| p.state == crate::verification::State::Blocks && !p.text.trim().is_empty())
+        .map(|p| format!(" The verdict begins: {}", util::fold(&verdict_head(&p.text))))
+        .unwrap_or_default();
+    let text = format!(
+        " {id} was sent back to doing, so it is yours to fix: {reason}.{verdict} The whole verdict is under ## Verification (`wsp show {id}`). \
+         Fix what it found and commit; `wsp review {id}` is refused at a commit a verifier already blocked, unchanged.",
+        id = t.id,
+    );
+    Some(ascii_line(&text))
+}
+
+fn ascii_line(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{2014}' | '\u{2013}' => "-".to_string(),
+            '\u{2018}' | '\u{2019}' => "'".to_string(),
+            '\u{201c}' | '\u{201d}' => "\"".to_string(),
+            '\u{2192}' => "->".to_string(),
+            c if c.is_ascii() && c != '\n' => c.to_string(),
+            _ => " ".to_string(),
+        })
+        .collect()
 }
 
 /// How a barrier row's title starts; the list's slug follows it.
@@ -4893,10 +4973,12 @@ pub(crate) mod tests {
     /// fix, and it is read again by a fresh agent.
     /// **`wsp-212`: what a block owed was not a commit.** wsp-217 was blocked
     /// for one `wsp install`, did it, and went back to review at the commit
-    /// its verifier had read. Keyed on the landing alone, nothing came, and the
-    /// barrier waited for ever on a verdict about a row that had since moved.
+    /// its verifier had read. **`wsp-529` reverses the run's half of that:** a
+    /// second verifier at a commit already seen blocked spent a turn saying it
+    /// had not changed (wsp-526), so the run opens none, and the block stays
+    /// unanswered, which is what the governor is told. A new commit is verified.
     #[test]
-    fn a_member_back_at_review_at_the_same_commit_gets_a_fresh_verifier_once() {
+    fn the_run_opens_no_verifier_at_a_commit_it_has_seen_blocked_and_one_at_a_new_commit() {
         let (_env, store) = scratch("samecommit");
         task(&store, "m-1", Status::Review);
         let mut t = store.find_task("m-1").unwrap();
@@ -4919,16 +5001,55 @@ pub(crate) mod tests {
         t.set_status(Status::Review);
         store.save_task(&t).unwrap();
         step(&store, &w, &Blind);
-        let ps = passes_on(&store, "m-1");
-        assert_eq!(ps.len(), 2, "back at review after the block, at the same commit: verified again");
-        assert_eq!(ps[1].read, ps[0].read, "on the commit it was already blocked at");
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 1, "back at review at the commit it was blocked at: no verifier");
+        assert!(blocked_at_tip(&store.find_task("m-1").unwrap()).is_some());
+        assert!(!answered_block(&store.find_task("m-1").unwrap()), "and the block is not answered: the governor hears of it");
 
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{} c9a5c581639b54db01dbb88ff344c8892baca5e7", crate::repair::LANDED));
+        t.log("review: a real fix");
+        store.save_task(&t).unwrap();
+        assert!(blocked_at_tip(&store.find_task("m-1").unwrap()).is_none());
+        assert!(answered_block(&store.find_task("m-1").unwrap()));
+        step(&store, &w, &Blind);
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.len(), 2, "a new commit is verified");
+        assert_eq!(ps[1].read.as_deref(), Some("c9a5c581639b"));
         step(&store, &w, &Blind);
         assert_eq!(passes_on(&store, "m-1").len(), 2, "one verifier per return to review, not one per tick");
-        verdict_all(&store, crate::verification::State::Blocks);
-        set(&store, "m-1", Status::Review);
+        let _ = spawned();
+    }
+
+    /// `wsp-529`: a seat started on a sent-back row finds the reason and the
+    /// verdict's head in its order; a row not sent back, or back at review,
+    /// finds nothing added. Checked through the builder, not a pane.
+    #[test]
+    fn the_order_of_a_seat_started_after_a_send_back_carries_the_reason_and_the_verdict_head() {
+        let (_env, store) = scratch("sentbackorder");
+        task(&store, "m-1", Status::Review);
+        let mut t = store.find_task("m-1").unwrap();
+        assert!(sent_back_order(&t).is_none(), "not sent back");
+        crate::log::note(&store, &mut t, &format!("{} 323faba83e4ce0ea6ae7253674a1e919cee27f78", crate::repair::LANDED)).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        assert_eq!(passes_on(&store, "m-1").len(), 2, "blocked again: the return it answered is above the new send-back");
+        verdict_all(&store, crate::verification::State::Blocks);
+        let mut t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Doing);
+        // The claim that seats the new agent writes its own line after the send-back.
+        t.log("claimed by pane cpd-9");
+        store.save_task(&t).unwrap();
+        let said = sent_back_order(&store.find_task("m-1").unwrap()).expect("a sent-back row gives its seat the reason");
+        assert!(said.contains("sent back") && said.contains("## Verification") && said.contains("wsp review m-1"), "{said}");
+        assert!(said.is_ascii() && !said.contains('\n'), "{said:?}");
+        let head = passes_on(&store, "m-1")[0].text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim().to_string();
+        assert!(head.is_empty() || said.contains(&head), "the verdict's head is in it: {said}");
+
+        let mut t = store.find_task("m-1").unwrap();
+        t.log("review: fixed");
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        assert!(sent_back_order(&store.find_task("m-1").unwrap()).is_none(), "back at review: nothing to say");
         let _ = spawned();
     }
 
