@@ -308,6 +308,14 @@ impl Window {
             None => eprintln!("     every one of its {} groups has finished", self.of),
         }
 
+        // The one row the running group takes without a hand (`wsp-495`), said
+        // where somebody is refused for trying to add another.
+        if !behind {
+            eprintln!(
+                "     a row one of its members rests on (`wsp after <member> <row>`) is added by the run itself when no list holds it — nothing else joins a group being run"
+            );
+        }
+
         let first = self.first_open();
         if first < self.of {
             eprintln!(
@@ -10472,5 +10480,28 @@ mod tests {
         assert_eq!(run(&store, &["add", "second", "r-3"]), 0);
         assert_eq!(flagged(&store, &["mv", "second", "r-3"], &[("group", "1")]), 0);
         assert_eq!(groups_of(&store, "second")[0].members, vec!["r-1", "r-3"]);
+    }
+
+    /// `wsp-495`: the run takes in a row a member rests on, and a hand still
+    /// takes in nothing else — the same `add --group` that is refused on the
+    /// group being run leaves its members as they were.
+    #[test]
+    fn only_the_run_adds_a_prerequisite_and_a_hand_adding_to_the_running_group_is_still_refused() {
+        let (_env, store) = running("prerequisite-refusal");
+        for id in ["pr-1", "pr-2", "pr-3"] {
+            task(&store, id, "todo");
+        }
+        run(&store, &["new", "pre", "p"]);
+        assert_eq!(run(&store, &["add", "pre", "pr-1"]), 0);
+        started(&store, "pre");
+
+        assert_eq!(flagged(&store, &["add", "pre", "pr-2"], &[("group", "1")]), 1, "the running group takes no row by hand");
+        assert_eq!(groups_of(&store, "pre")[0].members, vec!["pr-1"], "and nothing was written");
+        // Even one a member rests on: that is for the run to take in, not a hand.
+        let mut m = store.find_task("pr-1").unwrap();
+        m.after = vec!["pr-3".into()];
+        store.save_task(&m).unwrap();
+        assert_eq!(flagged(&store, &["add", "pre", "pr-3"], &[("group", "1")]), 1);
+        assert_eq!(groups_of(&store, "pre")[0].members, vec!["pr-1"]);
     }
 }

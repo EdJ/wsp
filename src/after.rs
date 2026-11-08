@@ -412,7 +412,7 @@ pub fn chains(store: &Store, w: &Worklist, only: Option<&str>) -> Vec<String> {
 /// with no repository at all (design-only work) or whose branch holds nothing
 /// the trunk has not got is as landed as it will ever be. One git reading per
 /// such member, and only for one at `review` or `done` without the line.
-fn landed(store: &Store, repos: &mut Option<Repos>, id: &str) -> bool {
+pub(crate) fn landed(store: &Store, repos: &mut Option<Repos>, id: &str) -> bool {
     let Some(t) = store.find_task(id) else { return true };
     if crate::repair::landed(&t).is_some() {
         return true;

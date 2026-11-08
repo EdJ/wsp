@@ -780,6 +780,11 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     let Some(g) = groups.get(at - 1) else { return started };
     let Some(policy) = g.policy() else { return started };
     let all = starts == Starts::All;
+    // A prerequisite a member names with `after` and no list holds joins the
+    // group first (`wsp-495`), and the pass reads the group as it now stands.
+    if all && pull_prerequisites(store, &w, at) {
+        return step_in(store, &w, seats, starts);
+    }
     // The seat's cap (`wsp-231`), asked by each of the three starts below
     // inside the lock its record is written under. With no cap it reads
     // nothing and admits everything.
@@ -1356,6 +1361,10 @@ pub(crate) fn silent(store: &Store, ids: &[String]) -> Vec<(String, i64)> {
         if t.status() != Status::Doing || crate::inner::run_inside(&t) || claims.contains_key(id) || !store.panes_for_task(id).is_empty() {
             continue;
         }
+        // Not silent: waiting, by its own choice, on a row the run is running.
+        if awaiting_prerequisite(store, &t, &claims).is_some_and(|on| !on.is_empty()) {
+            continue;
+        }
         let said = log
             .lines()
             .rev()
@@ -1494,6 +1503,14 @@ fn take_member(
             return None;
         }
         let claims = store.claims();
+        // A member that released its seat to wait on a prerequisite the run
+        // pulled into the group stays unstarted until that row has landed, and
+        // is then seated again on its tree (`wsp-495`). Neither the silence nor
+        // the cap below may start it first.
+        let prerequisite = (t.status() == Status::Doing).then(|| awaiting_prerequisite(store, &t, &claims)).flatten();
+        if prerequisite.as_ref().is_some_and(|on| !on.is_empty()) {
+            return None;
+        }
         // What the run reseats a `doing` member for when no start of its own
         // is under way (`wsp-524`): nothing said of it and nobody on it for
         // [`SILENT_AFTER`], or a governor ended its seat to have it reseated.
@@ -1519,6 +1536,7 @@ fn take_member(
         let mut reseat = None;
         let why = match t.status() {
             Status::Todo if !claims.contains_key(&id) => "new",
+            Status::Doing if prerequisite.is_some() && !spent => "again: its prerequisite landed",
             Status::Doing if ours && wedged(&t, &claims) && !spent => {
                 if !retry_lost_start(store, &id, &id, &id, &format!("`wsp worklist advance {list}`")) {
                     return None;
@@ -1550,6 +1568,10 @@ fn take_member(
         }
         let policy = store.worklist(list)?.groups().get(at - 1)?.policy_for(&id)?;
         let mut t = t;
+        if prerequisite.is_some() {
+            t.log(&format!("{PREREQUISITE_LANDED}: {}", prerequisites_named(&t).join(" ")));
+            log_line(store, &format!("{list}: {id} started again: its prerequisite landed"));
+        }
         if let Some((reason, n)) = reseat {
             if spent {
                 crate::starts::forgive(store, &id);
@@ -1565,6 +1587,152 @@ fn take_member(
     })?;
     store.git_commit(&format!("wsp: {list} group {at} starts {id}"));
     Some(took)
+}
+
+// ---- a member's prerequisite (wsp-495) ---------------------------------------------
+
+/// The line the run writes on a member when it adds a row the member names with
+/// `after` to the member's running group: `wsp: prerequisite <row> added to
+/// <list> group <n> …`. It is also what [`awaiting_prerequisite`] reads.
+pub(crate) const PREREQUISITE: &str = "wsp: prerequisite";
+
+/// What the run writes when the rows a released member waited on have landed
+/// and it starts the member again.
+const PREREQUISITE_LANDED: &str = "wsp: prerequisite landed, starting again";
+
+/// What the run writes on a member whose `after` names a row it will not pull
+/// in, once per row.
+const NOT_PULLED: &str = "wsp: not adding";
+
+/// The rows the run has pulled in on this member's account, in the order it
+/// wrote them.
+fn prerequisites_named(t: &Task) -> Vec<String> {
+    t.section("Log")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (_, rest) = l.trim().strip_prefix("- ")?.split_once(' ')?;
+            let rest = rest.strip_prefix(PREREQUISITE)?;
+            rest.split_whitespace().next().map(str::to_string)
+        })
+        .collect()
+}
+
+/// A member that released its seat to wait on a prerequisite the run pulled in:
+/// `None` for any other row. Otherwise the rows still owed, and **empty once
+/// every one has landed, which is when the member is due its seat again**.
+///
+/// The member is at `doing` with no claim and no pane, and the run's
+/// [`PREREQUISITE`] line is newer than the last start or claim on its row — read
+/// as [`sent_back_unseated`] reads its own mark, so a member that took its seat
+/// again is no longer one that waits.
+fn awaiting_prerequisite(store: &Store, t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> Option<Vec<String>> {
+    if t.status() != Status::Doing || !unseated_since(store, t, claims, PREREQUISITE) {
+        return None;
+    }
+    let mut repos = None;
+    let mut on = prerequisites_named(t);
+    on.retain(|o| !crate::after::landed(store, &mut repos, o));
+    Some(on)
+}
+
+/// Add to the running group `at` of `w` each row that one of its members names
+/// with `after` and that **no list holds**, so a prerequisite a member finds
+/// mid-run is scheduled without a person. Returns whether it added any.
+///
+/// Safe where an arbitrary late member is not: the row exists only to unblock a
+/// member, and the barrier already waits on that member. The row goes in just
+/// ahead of the member, [`crate::after::waiting`] holds the member until it has
+/// landed, and the group's `xN` and the seat's cap govern its start like any
+/// member's. What is **not** added, and says so on the member's row: a row some
+/// other list holds. A row that is done owes nothing; a row named by a task that
+/// is not a member of the group is nobody's prerequisite here.
+fn pull_prerequisites(store: &Store, w: &Worklist, at: usize) -> bool {
+    let wanted = |store: &Store, w: &Worklist, groups: &[Group], held: &[(String, String)]| -> Vec<(String, String)> {
+        let Some(g) = groups.get(at - 1) else { return Vec::new() };
+        let mut out: Vec<(String, String)> = Vec::new();
+        for m in &g.members {
+            let Some(t) = store.find_task(m) else { continue };
+            if Settlement::of(&t).settled() || t.status() == Status::Done {
+                continue;
+            }
+            for o in &t.after {
+                if g.members.contains(o) || out.iter().any(|(_, x)| x == o) {
+                    continue;
+                }
+                let Some(row) = store.find_task(o) else { continue };
+                if row.status() == Status::Done {
+                    continue;
+                }
+                match held.iter().find(|(r, _)| r == o) {
+                    None => out.push((m.clone(), o.clone())),
+                    Some((_, list)) if *list != w.id => {
+                        let said = format!("{NOT_PULLED} {o} to {} group {at}: {list} holds it", w.id);
+                        let mut t = t.clone();
+                        if !t.section("Log").unwrap_or_default().lines().any(|l| l.contains(&said)) {
+                            t.log(&said);
+                            let _ = store.save_task(&t);
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        out
+    };
+    let held_by = |store: &Store| -> Vec<(String, String)> {
+        store
+            .worklists()
+            .iter()
+            .flat_map(|l| l.groups().into_iter().flat_map(|g| g.members).map(|m| (m, l.id.clone())).collect::<Vec<_>>())
+            .collect()
+    };
+    // Read once without the lock, so a pass with nothing to add costs no write.
+    if wanted(store, w, &w.groups(), &held_by(store)).is_empty() {
+        return false;
+    }
+    let pulled = store.locked(|| {
+        let mut w = store.worklist(&w.id)?;
+        if w.status() != WorklistStatus::Running || worklist::position(store, &w, Reading::Settled).at != Some(at) {
+            return None;
+        }
+        let mut groups = w.groups();
+        let rows = wanted(store, &w, &groups, &held_by(store));
+        if rows.is_empty() {
+            return None;
+        }
+        for (m, o) in &rows {
+            let members = &mut groups[at - 1].members;
+            let place = members.iter().position(|x| x == m).unwrap_or(members.len());
+            members.insert(place, o.clone());
+        }
+        let said = rows.iter().map(|(m, o)| format!("{o} for {m}")).collect::<Vec<_>>().join(", ");
+        w.log(&format!("wsp: group {at} takes in {said} — a member names it with after: and no list holds it"));
+        w.set_groups(&groups);
+        store.save_worklist(&w).ok()?;
+        for (m, o) in &rows {
+            if let Some(mut t) = store.find_task(m) {
+                t.log(&format!(
+                    "{PREREQUISITE} {o} added to {} group {at}: the run starts it first, and this row again once it has landed",
+                    w.id
+                ));
+                t.touch();
+                let _ = store.save_task(&t);
+            }
+            if let Some(mut r) = store.find_task(o) {
+                r.log(&format!("added to {} group {at} by the run: {m} names it with after: and no list held it", w.id));
+                r.touch();
+                let _ = store.save_task(&r);
+            }
+        }
+        Some(rows)
+    });
+    let Some(rows) = pulled else { return false };
+    for (m, o) in &rows {
+        log_line(store, &format!("{} group {at}: {o} added — {m} names it with after: and no list holds it", w.id));
+    }
+    store.git_commit(&format!("wsp: {} group {at} takes in {}", w.id, rows.iter().map(|(_, o)| o.as_str()).collect::<Vec<_>>().join(" ")));
+    true
 }
 
 /// Sent back since anybody last started on it, and nobody on it now: a member
@@ -1689,6 +1857,10 @@ fn members_going(store: &Store, members: &[String], id: &str, claims: &std::coll
         .filter_map(|m| store.find_task(m))
         .filter(|m| !Settlement::of(m).settled())
         .filter(|m| m.status() == Status::Doing || claims.contains_key(&m.id))
+        // A member that released its seat to wait on a prerequisite is not in
+        // flight: counting it would hold the prerequisite out of an `x1` group,
+        // which is the member waiting on the row it is holding the place of.
+        .filter(|m| !awaiting_prerequisite(store, m, claims).is_some_and(|on| !on.is_empty()))
         .count()
 }
 
@@ -9252,5 +9424,123 @@ fn only_a_working_screen_is_ever_overruled() {
         let owed = legs_owed(&store, &Blind);
         assert_eq!(owed, ["begun · a".to_string(), "begun · b".to_string()]);
         assert_eq!(ids(spawned()), ["begun · a".to_string(), "begun · b".to_string()]);
+    }
+
+    // ---- a member's prerequisite (wsp-495) ---------------------------------------
+
+    /// `m-1` of a group run at `x1` is going when it files a row and rests on it
+    /// (`wsp after`), and then releases its seat to wait.
+    fn waiting_on_its_prerequisite(tag: &str) -> (util::Isolated, Store, Worklist) {
+        let (env, store) = scratch(tag);
+        task(&store, "m-1", Status::Todo);
+        let mut w = list(&store, &[(&["m-1"], "claude")]);
+        let mut g = w.groups();
+        g[0].cap = Some(1);
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".into(), "claude".into())]);
+        store.set_claim("m-1", serde_json::json!({ "workspace_id": "cpd-9" }));
+        task(&store, "pre", Status::Todo);
+        let mut m = store.find_task("m-1").unwrap();
+        m.after = vec!["pre".into()];
+        store.save_task(&m).unwrap();
+        (env, store, w)
+    }
+
+    /// The whole route (`wsp-495`): a running member files a row nobody lists and
+    /// sets `after`; the run adds it to the member's group, starts it ahead of
+    /// the member under the group's `x1` once the member has let its seat go,
+    /// holds the member (silent as it is) while it runs, seats it again when it
+    /// has landed, and the barrier waits on both.
+    #[test]
+    fn a_prerequisite_a_running_member_names_is_added_started_ahead_and_the_member_is_seated_again_once_it_lands() {
+        let (_env, store, w) = waiting_on_its_prerequisite("prerequisite-route");
+
+        // Still seated: the row joins the group, but the member holds the one place.
+        step(&store, &w, &Blind);
+        let members = store.worklist("run").unwrap().groups()[0].members.clone();
+        assert_eq!(members, vec!["pre", "m-1"], "the row joins the group being run, ahead of the member");
+        assert!(spawned().is_empty(), "x1 is held by the member while it has its seat");
+        let m = store.find_task("m-1").unwrap();
+        assert!(m.section("Log").unwrap_or_default().contains("wsp: prerequisite pre added to run group 1"), "the member's row says who and why");
+        let p = store.find_task("pre").unwrap();
+        assert!(p.section("Log").unwrap_or_default().contains("m-1 names it with after:"), "and so does the row");
+        assert!(
+            store.worklist("run").unwrap().section("Log").unwrap_or_default().contains("takes in pre for m-1"),
+            "and the list"
+        );
+
+        // It lets the seat go: the member is no longer in flight, so the row starts.
+        store.clear_claim("m-1");
+        left_unseated(&store, "m-1", &[], 900);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("pre".into(), "claude".into())], "started with no person, under x1");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "nothing starts twice, and the quiet member is not reseated while it waits");
+        assert!(!said(&store).contains("m-1 started again"), "{}", said(&store));
+
+        // The row lands: the member is seated again, on the same row.
+        let mut p = store.find_task("pre").unwrap();
+        p.set_status(Status::Review);
+        p.log(&format!("{} 1234567abc on master", crate::repair::LANDED));
+        store.save_task(&p).unwrap();
+        step(&store, &w, &Blind);
+        let started = spawned();
+        assert!(started.contains(&("m-1".into(), "claude".into())), "seated again once the prerequisite landed: {started:?}");
+        let m = store.find_task("m-1").unwrap();
+        assert_eq!(m.status(), Status::Doing);
+        assert!(m.section("Log").unwrap_or_default().contains("wsp: prerequisite landed, starting again"));
+        step(&store, &w, &Blind);
+        assert!(!spawned().iter().any(|(id, _)| id == "m-1"), "and only once");
+
+        // The barrier is owed on both.
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        assert!(checks(&store, 1).is_empty(), "the prerequisite is verified and the member is not: no barrier");
+        let mut m = store.find_task("m-1").unwrap();
+        m.set_status(Status::Review);
+        m.log(&format!("{} 7654321cba on master", crate::repair::LANDED));
+        store.save_task(&m).unwrap();
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        assert_eq!(checks(&store, 1).len(), 1, "both landed and verified: the barrier opens");
+    }
+
+    /// A row another list holds is not pulled in, a done row owes nothing, and a
+    /// row named by a task outside the group is nobody's prerequisite there. The
+    /// member's row says which, once.
+    #[test]
+    fn a_prerequisite_another_list_holds_or_a_non_member_names_is_not_added_and_the_row_says_so() {
+        let (_env, store) = scratch("prerequisite-refused");
+        task(&store, "m-1", Status::Todo);
+        task(&store, "held", Status::Todo);
+        task(&store, "fin", Status::Done);
+        task(&store, "outside", Status::Todo);
+        task(&store, "free", Status::Todo);
+        let mut m = store.find_task("m-1").unwrap();
+        m.after = vec!["held".into(), "fin".into()];
+        store.save_task(&m).unwrap();
+        let mut o = store.find_task("outside").unwrap();
+        o.after = vec!["free".into()];
+        store.save_task(&o).unwrap();
+        let other = {
+            let mut e = Worklist::new("elsewhere", "elsewhere");
+            e.set_status(WorklistStatus::Draft);
+            e.set_groups(&[Group { members: vec!["held".into()], agent: "claude".into(), ..Group::default() }]);
+            store.save_worklist(&e).unwrap();
+            e
+        };
+        let w = list(&store, &[(&["m-1"], "claude")]);
+
+        step(&store, &w, &Blind);
+        step(&store, &w, &Blind);
+        assert_eq!(store.worklist("run").unwrap().groups()[0].members, vec!["m-1"], "nothing joined");
+        assert_eq!(store.worklist(&other.id).unwrap().groups()[0].members, vec!["held"], "and the other list is as it was");
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default().to_string();
+        assert_eq!(log.matches("wsp: not adding held to run group 1: elsewhere holds it").count(), 1, "said once: {log}");
+        assert!(!log.contains("fin"), "a done row owes nothing, so nothing is said: {log}");
+        assert!(!log.contains("wsp: prerequisite"), "{log}");
     }
 }
