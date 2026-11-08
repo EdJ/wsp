@@ -688,6 +688,141 @@ pub(crate) fn set_cap(old: &Record, cap: usize, actor: &Actor, status: Status) -
     Ok(rec)
 }
 
+// ---- the verdict ---------------------------------------------------------------------------
+
+/// The `check:` lines of every done piece as steps, labelled `<n>.<label>`:
+/// what `wsp check <row>` runs after the row's own.
+pub(crate) fn check_steps(t: &Task) -> Vec<(usize, crate::check::Step)> {
+    let mut out = Vec::new();
+    for p in record(t).pieces.iter().filter(|p| p.state == State::Done) {
+        for c in &p.checks {
+            if let Some(mut s) = crate::check::step_of(c, crate::check::Of::Task) {
+                s.name = format!("{}.{}", p.n, s.name);
+                out.push((p.n, s));
+            }
+        }
+    }
+    out
+}
+
+/// What opens a rework piece's overview when a verifier sent the row back.
+const VERIFIER_HEAD: &str = "The verifier blocked this row. Its verdict, which is what is owed:\n\n";
+
+/// Whether a rework piece is still owed in the last batch, so a verdict
+/// recorded twice is one send-back and not two.
+fn rework_open(rec: &Record) -> bool {
+    let last = last_batch(rec);
+    rec.pieces.iter().any(|p| {
+        p.batch == last && (p.title == "rework" || p.title.starts_with("rework of ")) && matches!(p.state, State::Pending | State::Running | State::Blocked)
+    })
+}
+
+/// The pieces a verdict names, by id (`<row>-<n>`): done pieces only, since
+/// there is nothing to rework in one that was dropped or never ran.
+pub(crate) fn named_in(rec: &Record, row: &str, verdict: &str) -> Vec<usize> {
+    rec.pieces.iter().filter(|p| p.state == State::Done && crate::legs::names(verdict, &p.id(row))).map(|p| p.n).collect()
+}
+
+/// The record a blocking verdict leaves: one rework piece per piece it names,
+/// in a new batch after the last, on the named piece's tier and `why:` prefixed
+/// `rework of N:`, with the verdict as its overview and the named piece's
+/// done-when and checks. A verdict that names none gets one over the row, on
+/// the default tier. `Ok(None)` when a rework is already owed in the last batch.
+pub(crate) fn rework_by(old: &Record, row: &str, verdict: &str, head: &str, status: Status) -> Result<Option<Record>, String> {
+    if old.pieces.is_empty() || rework_open(old) {
+        return Ok(None);
+    }
+    let verdict = verdict.trim();
+    let overview = format!("{head}{}", util::truncate(verdict, OVERVIEW_CAP - head.chars().count()));
+    let named = named_in(old, row, verdict);
+    let news: Vec<New> = if named.is_empty() {
+        vec![New {
+            title: "rework".into(),
+            at: At::Next,
+            overview,
+            done_when: "each item the verdict says is owed is done, and the row's own check is green".into(),
+            checks: Vec::new(),
+            agent: None,
+            why: None,
+        }]
+    } else {
+        named
+            .iter()
+            .filter_map(|n| old.pieces.iter().find(|p| p.n == *n))
+            .map(|p| New {
+                title: format!("rework of {}", p.n),
+                at: At::Next,
+                overview: overview.clone(),
+                done_when: p.done_when.clone(),
+                checks: p.checks.clone(),
+                agent: (!crate::legs::is_default(&p.policy)).then(|| crate::legs::policy_line(&p.policy)),
+                why: (!crate::legs::is_default(&p.policy))
+                    .then(|| util::truncate(&format!("rework of {}: {}", p.n, p.why.as_deref().unwrap_or_default()), WHY_CAP)),
+            })
+            .collect()
+    };
+    add_all(old, news, &Actor::Person, status).map(Some)
+}
+
+/// Fold a landed row's `## Pieces` into its log: one line a piece, and the
+/// section goes. Returns the lines written.
+pub(crate) fn fold_at_land(t: &mut Task) -> Vec<String> {
+    let rec = record(t);
+    if rec.pieces.is_empty() {
+        if staged(t) {
+            crate::model::set_section_in(&mut t.body, SECTION, "");
+        }
+        return Vec::new();
+    }
+    let ran = crate::cmd_attempts::attempts_of(t);
+    let lines: Vec<String> = rec
+        .pieces
+        .iter()
+        .map(|p| {
+            let head = format!("piece {} · {}", p.n, util::fold(&p.title));
+            match p.state {
+                State::Dropped => format!("{head} · dropped: {}", util::fold(p.why.as_deref().unwrap_or("no reason given"))),
+                State::Promoted => format!("{head} · promoted to {}", p.promoted.as_deref().unwrap_or("a row")),
+                _ => {
+                    let mut line = format!("{head} · {}", p.state.as_str());
+                    if let Some(c) = p.caption.as_deref().filter(|c| !c.is_empty()) {
+                        line.push_str(&format!(" · {}", util::fold(c)));
+                    }
+                    let mine = format!("piece {}", p.n);
+                    if let Some(a) = ran.iter().rev().find(|a| a.leg.as_deref() == Some(mine.as_str()) && !a.until.is_empty()) {
+                        let on = if a.ran.is_empty() { "?" } else { a.ran.as_str() };
+                        line.push_str(&format!(" · ran {on} {} turns", a.turns));
+                    }
+                    line.push_str(match (p.checks.is_empty(), p.checked.as_deref()) {
+                        (true, _) => " · no checks",
+                        (false, Some(c)) if c.starts_with("green") => " · checks green",
+                        (false, _) => " · checks not green",
+                    });
+                    if !p.done_when.is_empty() {
+                        line.push_str(&format!(" · done-when: {}", util::truncate(&util::fold(&p.done_when), 200)));
+                    }
+                    line
+                }
+            }
+        })
+        .collect();
+    for l in &lines {
+        t.log(l);
+    }
+    crate::model::set_section_in(&mut t.body, SECTION, "");
+    lines
+}
+
+/// The folded line of piece `n` in a landed row's log, if it was folded.
+pub(crate) fn folded_line(t: &Task, n: usize) -> Option<String> {
+    let want = format!("piece {n} · ");
+    t.section("Log")?.lines().find_map(|l| {
+        let at = l.find(&want)?;
+        (l[..at].split_whitespace().count() <= 2)
+            .then(|| l[at..].to_string())
+    })
+}
+
 // ---- seen -------------------------------------------------------------------------------
 
 /// One line a piece, for `wsp show`: the number, the title, the batch, the
@@ -1198,5 +1333,98 @@ mod tests {
             ])
         );
         assert_eq!(json(&row("")), json!([]));
+    }
+
+    /// Three done pieces in two batches; piece 2 on opus with a reason.
+    fn three_done() -> Record {
+        let mut rec = Record::default();
+        for (title, at) in [("types", At::Next), ("board", At::Next), ("rail", At::Batch(2))] {
+            let mut n = new(title, at);
+            n.checks = vec![format!("{title} (1m): true {title}")];
+            if title == "board" {
+                n.agent = Some("claude opus high".into());
+                n.why = Some("the layout is subtle".into());
+            }
+            rec = put(&rec, n);
+        }
+        for p in rec.pieces.iter_mut() {
+            p.state = State::Done;
+            p.caption = Some(format!("{} read back", p.title));
+            p.checked = Some("green at abc".into());
+        }
+        rec
+    }
+
+    #[test]
+    fn a_done_pieces_check_lines_are_steps_labelled_by_number_and_a_pending_ones_are_not() {
+        let mut rec = three_done();
+        rec.pieces[2].state = State::Pending;
+        let mut t = row("");
+        write(&mut t, &rec);
+        let names: Vec<String> = check_steps(&t).into_iter().map(|(_, s)| s.name).collect();
+        assert_eq!(names, ["1.types", "2.board"]);
+    }
+
+    #[test]
+    fn a_blocking_verdict_naming_a_piece_adds_one_rework_piece_in_a_new_batch_on_its_tier() {
+        let rec = three_done();
+        let after = rework_by(&rec, "m-1", "m-1-2 does not hold: the rail overlaps.", "Blocked:\n\n", Status::Doing).unwrap().unwrap();
+        assert_eq!(after.pieces.len(), 4, "exactly one");
+        let r = after.pieces.last().unwrap();
+        assert_eq!((r.title.as_str(), r.batch, r.state), ("rework of 2", 3, State::Pending));
+        assert_eq!(r.policy, rec.pieces[1].policy);
+        assert_eq!(r.why.as_deref(), Some("rework of 2: the layout is subtle"));
+        assert!(r.overview.starts_with("Blocked:") && r.overview.contains("the rail overlaps"), "{}", r.overview);
+        assert_eq!(r.done_when, rec.pieces[1].done_when);
+        assert_eq!(r.checks, rec.pieces[1].checks);
+        // M-1-20 is not m-1-2.
+        let after = rework_by(&rec, "m-1", "m-1-20 is wrong", "", Status::Doing).unwrap().unwrap();
+        assert_eq!(after.pieces.last().unwrap().title, "rework");
+        // A second verdict recorded is not a second send-back.
+        assert_eq!(rework_by(&after, "m-1", "m-1-2 is wrong", "", Status::Doing).unwrap(), None);
+    }
+
+    #[test]
+    fn a_verdict_naming_no_piece_adds_one_over_the_row_and_two_named_add_two() {
+        let rec = three_done();
+        let after = rework_by(&rec, "m-1", "the whole does not add up", "", Status::Doing).unwrap().unwrap();
+        assert_eq!(after.pieces.len(), 4);
+        let r = after.pieces.last().unwrap();
+        assert_eq!((r.title.as_str(), r.batch), ("rework", 3));
+        assert!(crate::legs::is_default(&r.policy) && r.why.is_none());
+        let after = rework_by(&rec, "m-1", "m-1-1 and m-1-3 fail", "", Status::Doing).unwrap().unwrap();
+        let new: Vec<_> = after.pieces[3..].iter().map(|p| (p.title.as_str(), p.batch)).collect();
+        assert_eq!(new, [("rework of 1", 3), ("rework of 3", 3)], "one batch for both");
+    }
+
+    #[test]
+    fn landing_folds_each_piece_into_a_log_line_and_the_section_goes() {
+        let mut rec = three_done();
+        rec.pieces[0].done_when = "x".repeat(300);
+        let mut t = row("");
+        write(&mut t, &rec);
+        let lines = fold_at_land(&mut t);
+        assert_eq!(lines.len(), 3);
+        assert!(!staged(&t) && t.section(SECTION).is_none(), "the section is gone");
+        let log = t.section("Log").unwrap();
+        assert_eq!(log.matches("piece ").count(), 3, "{log}");
+        assert!(lines[0].starts_with("piece 1 · types · done · types read back · checks green · done-when: xxx"), "{}", lines[0]);
+        assert!(lines[0].contains(&"x".repeat(150)) && !lines[0].contains(&"x".repeat(250)) && lines[0].ends_with('…'), "{}", lines[0]);
+        assert_eq!(folded_line(&t, 2).as_deref(), Some(lines[1].as_str()));
+        assert_eq!(folded_line(&t, 4), None);
+    }
+
+    #[test]
+    fn a_dropped_piece_folds_with_its_reason_and_a_promoted_one_with_its_row() {
+        let mut rec = three_done();
+        rec.pieces[0].state = State::Dropped;
+        rec.pieces[0].why = Some("not needed".into());
+        rec.pieces[1].state = State::Promoted;
+        rec.pieces[1].promoted = Some("m-9".into());
+        let mut t = row("");
+        write(&mut t, &rec);
+        let lines = fold_at_land(&mut t);
+        assert_eq!(lines[0], "piece 1 · types · dropped: not needed");
+        assert_eq!(lines[1], "piece 2 · board · promoted to m-9");
     }
 }

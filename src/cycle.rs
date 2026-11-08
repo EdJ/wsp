@@ -2683,7 +2683,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
          code rather than against the report: the commits, whether they \
          do what the overview asked, and the tests that cover them — `cargo test <module>::` in \
-         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{split}\n\n\
+         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{pieces}{split}\n\n\
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
          - {holds};\n\
@@ -2698,6 +2698,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
         caption = CAPTION_ORDER,
         checked = CHECKED_ORDER,
         legs = legs_line(member),
+        pieces = pieces_block(store, member),
         reuse = crate::check::greens_held(store, member).map(|(sha, held)| reuse_text(&sha, &held)).unwrap_or_default(),
         split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
     )
@@ -2740,6 +2741,42 @@ fn legs_line(member: &Task) -> String {
          leg's tier. A verdict that names no leg sends it back on the default.",
         crate::legs::table(&all)
     )
+}
+
+/// The block a verifier's order gains on a row that ran as pieces: per piece its
+/// id, title, done-when and the result of its check lines on the row's tip, and
+/// that a blocking verdict names the pieces (`<row>-<n>`) it is about, since wsp
+/// adds one rework piece for each. Empty for a row with no pieces.
+fn pieces_block(store: &Store, member: &Task) -> String {
+    let rec = crate::pieces::record(member);
+    if rec.pieces.is_empty() {
+        return String::new();
+    }
+    let results = crate::check::pieces_results(store, member);
+    let mut out = String::from("\n\n**This row ran as pieces**, parts of one work, each its own agent and judged here, by you, once:\n");
+    for p in &rec.pieces {
+        let id = p.id(&member.id);
+        match p.state {
+            crate::pieces::State::Dropped => out.push_str(&format!("\n- `{id}` · {} · dropped: {}", util::fold(&p.title), util::fold(p.why.as_deref().unwrap_or_default()))),
+            crate::pieces::State::Promoted => out.push_str(&format!("\n- `{id}` · {} · promoted to {}", util::fold(&p.title), p.promoted.as_deref().unwrap_or_default())),
+            _ => {
+                out.push_str(&format!("\n- `{id}` · {} · {}", util::fold(&p.title), p.state.as_str()));
+                out.push_str(&format!("\n  done-when: {}", util::fold(&p.done_when)));
+                match results.iter().find(|(n, _)| *n == p.n) {
+                    Some((_, said)) => out.push_str(&format!("\n  checks on the row's tip: {}", said.join("; "))),
+                    None if p.checks.is_empty() => out.push_str("\n  checks: none"),
+                    None => out.push_str("\n  checks: not run"),
+                }
+            }
+        }
+    }
+    out.push_str(
+        "\n\n**Judge each piece's done-when item by item**, as you judge the row's. If it does not hold, \
+         **name the pieces whose work fails** in your verdict, by id from the list. wsp appends one `rework` \
+         piece for each in a new batch, on that piece's tier, with your verdict as its order. A verdict that \
+         names no piece gets one rework piece over the row.",
+    );
+    out
 }
 
 /// How to write a verdict's caption, in both work orders that end in one
@@ -7770,6 +7807,37 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(ids(spawned()), ["run · barrier 1".to_string()], "and the barrier follows");
         step(&store, &w, &Blind);
         assert!(spawned().is_empty());
+    }
+
+    /// The verifier's order carries each piece's done-when and the result of its
+    /// check lines, and asks for the pieces a block is about to be named.
+    #[test]
+    fn the_verifiers_order_carries_each_pieces_done_when_and_check_result() {
+        let (_env, store) = scratch("piecesorder");
+        task(&store, "m-1", Status::Review);
+        let mut t = store.find_task("m-1").unwrap();
+        let mut rec = crate::pieces::Record::default();
+        for (n, label) in [(1, "types"), (2, "board")] {
+            let mut p = crate::pieces::Piece::pending(n, label, 1);
+            p.state = crate::pieces::State::Done;
+            p.done_when = format!("the {label} read back");
+            p.checks = vec![format!("{label} (1m): true {label}")];
+            rec.pieces.push(p);
+        }
+        let mut p = crate::pieces::Piece::pending(3, "extra", 2);
+        p.state = crate::pieces::State::Dropped;
+        p.why = Some("not needed".into());
+        rec.pieces.push(p);
+        crate::pieces::write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+        let order = verifier_order(&store, &store.find_task("m-1").unwrap());
+        assert!(order.contains("ran as pieces") && order.contains("name the pieces whose work fails"), "{order}");
+        for want in ["`m-1-1` · types", "done-when: the types read back", "1.types · not green", "`m-1-2` · board", "done-when: the board read back", "2.board · not green", "`m-1-3` · extra · dropped: not needed"] {
+            assert!(order.contains(want), "{want}: {order}");
+        }
+        let plain = Task::new("plain", "m-2");
+        store.save_task(&plain).unwrap();
+        assert!(!verifier_order(&store, &store.find_task("m-2").unwrap()).contains("ran as pieces"));
     }
 
     /// The tick ends a done leg's seat once, from `/`, and records it on the entry.

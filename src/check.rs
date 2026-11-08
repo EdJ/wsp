@@ -388,6 +388,12 @@ pub(crate) struct Plan {
 /// step is not a row's.
 pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Plan {
     let mut steps = task_steps(t);
+    // The done pieces' own lines follow the row's, labelled `<n>.<label>`.
+    for (_, s) in crate::pieces::check_steps(t) {
+        if !steps.iter().any(|x| x.command == s.command) {
+            steps.push(s);
+        }
+    }
     let rules = project_steps(store, t);
     let changed = if rules.iter().any(|s| s.of == Of::Rule && !s.barrier && !s.end) { changed_paths(tg, t, at.is_none()) } else { Vec::new() };
     for r in rules.into_iter().filter(|r| !r.barrier && !r.end) {
@@ -1215,6 +1221,34 @@ pub(crate) fn greens_held(store: &Store, t: &Task) -> Option<(String, Vec<(Strin
         held.push((s.command.clone(), g));
     }
     Some((tg.sha, held))
+}
+
+/// What a verifier is told about each done piece's `check:` lines: the result
+/// of each on the row's tip, from the greens ledger. `None` for a row with no
+/// pieces' lines.
+pub(crate) fn pieces_results(store: &Store, t: &Task) -> Vec<(usize, Vec<String>)> {
+    let steps = crate::pieces::check_steps(t);
+    if steps.is_empty() {
+        return Vec::new();
+    }
+    let tg = target(store, t, None).ok();
+    let ledger = tg.as_ref().map(|tg| greens::Greens::open(store, &tg.project, &tg.repo));
+    let mut out: Vec<(usize, Vec<String>)> = Vec::new();
+    for (n, s) in steps {
+        let green = tg.as_ref().zip(ledger.as_ref()).and_then(|(tg, l)| {
+            let inputs = crate::affected::key(&tg.repo, &tg.sha, &s.command);
+            l.lookup_by(&tg.sha, inputs.as_deref(), &s.command, greens::Env::Warm)
+        });
+        let said = match green {
+            Some(g) => format!("{} · green · {}s", s.name, g.took),
+            None => format!("{} · not green at this commit (no green in the ledger)", s.name),
+        };
+        match out.iter_mut().find(|(m, _)| *m == n) {
+            Some((_, v)) => v.push(said),
+            None => out.push((n, vec![said])),
+        }
+    }
+    out
 }
 
 fn plan_line(s: &Step, green: Option<&Green>) -> String {
@@ -2139,6 +2173,28 @@ mod tests {
         // the barrier step is nobody's per row, and `true` named twice runs once.
         assert_eq!(names, [("test", Of::Task), ("always-too", Of::Task)], "{names:?}");
         assert_eq!(got.changed, Vec::<String>::new().into_iter().chain(["check.sh".to_string()]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_rows_plan_lists_every_done_pieces_check_lines_after_its_own_labelled_by_number() {
+        let (_env, store, _) = world("pieces", "", "exit 0\n");
+        let mut t = store.find_task("pj-001").unwrap();
+        t.body.push_str("\n## Checks\n- own: true own\n");
+        let mut rec = crate::pieces::Record::default();
+        for (n, label) in [(1, "types"), (2, "board"), (3, "rail")] {
+            let mut p = crate::pieces::Piece::pending(n, label, 1);
+            p.state = if n == 3 { crate::pieces::State::Pending } else { crate::pieces::State::Done };
+            p.checks = vec![format!("{label} (1m): true {label}")];
+            rec.pieces.push(p);
+        }
+        let mut p = crate::pieces::Piece::pending(4, "again", 2);
+        p.state = crate::pieces::State::Done;
+        p.checks = vec!["again: true own".into()];
+        rec.pieces.push(p);
+        crate::pieces::write(&mut t, &rec);
+        let tg = target(&store, &t, None).unwrap();
+        let names: Vec<_> = plan(&store, &t, &tg, None).steps.into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["own", "1.types", "2.board"], "a pending piece's lines and a command the row ran already are not added");
     }
 
     #[test]

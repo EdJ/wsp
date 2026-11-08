@@ -961,7 +961,7 @@ pub(crate) fn startable(legs: &[Leg], lost: &dyn Fn(&str) -> bool) -> Vec<(Strin
 
 /// Whether a word of a verdict is the leg's name: the name with nothing that
 /// could continue it on either side.
-fn names(text: &str, name: &str) -> bool {
+pub(crate) fn names(text: &str, name: &str) -> bool {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     text.match_indices(name).any(|(i, m)| {
         !text[..i].chars().next_back().is_some_and(word) && !text[i + m.len()..].chars().next().is_some_and(word)
@@ -970,7 +970,7 @@ fn names(text: &str, name: &str) -> bool {
 
 /// How dear a policy is, to take the dearest of several: the model by name, then
 /// the effort. A model the table does not know is not cheap.
-fn dearness(p: &Policy) -> (u8, u8) {
+pub(crate) fn dearness(p: &Policy) -> (u8, u8) {
     let m = p.model.as_deref().unwrap_or_default();
     let model = match () {
         _ if m.contains("opus") => 3,

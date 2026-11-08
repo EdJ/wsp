@@ -964,6 +964,9 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
         Some(l) => note_landing(store, &member.id, l, &reran).unwrap_or(pass),
         None => pass,
     };
+    if state == State::Holds {
+        fold_pieces(store, &member.id);
+    }
     store.log_event(
         "task-verified",
         serde_json::json!({
@@ -994,6 +997,19 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
         println!("  {}", p.dim("no `checked:` lines — one per done-when item you looked at, ending in held or not held, is what `wsp verifications` counts"));
     }
     0
+}
+
+/// A hold is the end of a row's pieces: `## Pieces` folds into the log, one line
+/// a piece, and the section goes (`docs/pieces.md`, *Transience*).
+pub(crate) fn fold_pieces(store: &Store, member: &str) {
+    store.locked(|| {
+        let mut t = store.find_task(member)?;
+        if !crate::pieces::staged(&t) {
+            return None;
+        }
+        crate::pieces::fold_at_land(&mut t);
+        store.save_task(&t).ok()
+    });
 }
 
 /// After a hold landed the row: the newest pass gets the `landed` clause when
@@ -1136,6 +1152,25 @@ pub(crate) fn send_back(t: &mut Task, now: String, by: &str, read: Option<&str>,
     // A row run as legs is sent back to a leg of its own: one `rework`
     // leg after the last, whose order is the verdict (`docs/legs.md`,
     // *The run*). The step starts it; nobody is told to go back to work.
+    let rec = crate::pieces::record(t);
+    if !rec.pieces.is_empty() {
+        let head = rework_head.unwrap_or("The verifier blocked this row. Its verdict, which is what is owed:\n\n");
+        match crate::pieces::rework_by(&rec, &t.id.clone(), text, head, Status::Doing) {
+            Ok(Some(after)) => {
+                for p in after.pieces.iter().skip(rec.pieces.len()) {
+                    t.log(&format!(
+                        "wsp: appended piece {} in batch {}{}",
+                        p.n,
+                        p.batch,
+                        if crate::legs::is_default(&p.policy) { String::new() } else { format!(" · on {}", p.policy.label()) },
+                    ));
+                }
+                crate::pieces::write(t, &after);
+            }
+            Ok(None) => {}
+            Err(why) => t.log(&format!("wsp: {why}")),
+        }
+    }
     let before = crate::legs::legs(t);
     if !before.is_empty() {
         let reworked = match rework_head {
@@ -1535,6 +1570,39 @@ mod tests {
         write(&mut m, &[p]);
         store.save_task(&m).unwrap();
         assert!(!verified(&store.tasks(), "m-1"), "a pass still reading is not a verdict");
+    }
+
+    /// A blocking verdict that names a piece adds one rework piece and moves the
+    /// row to doing; a hold folds the pieces into the log.
+    #[test]
+    fn a_block_adds_a_rework_piece_for_the_piece_it_names_and_a_hold_folds_the_pieces() {
+        let (_env, store) = scratch("pieces");
+        let mut m = Task::new("a member", "m-1");
+        m.set_status(Status::Review);
+        let mut rec = crate::pieces::Record::default();
+        for (n, label) in [(1, "types"), (2, "board"), (3, "rail")] {
+            let mut p = crate::pieces::Piece::pending(n, label, 1);
+            p.state = crate::pieces::State::Done;
+            p.done_when = format!("{label} works");
+            p.caption = Some(format!("{label} read back"));
+            rec.pieces.push(p);
+        }
+        crate::pieces::write(&mut m, &rec);
+        store.save_task(&m).unwrap();
+        record(&store, "m-1", State::Blocks, "m-1-2 does not hold: the board is empty", None, Some("the board is empty")).unwrap();
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Doing);
+        let after = crate::pieces::record(&t);
+        assert_eq!(after.pieces.len(), 4, "exactly one rework piece");
+        let r = &after.pieces[3];
+        assert_eq!((r.title.as_str(), r.batch, r.done_when.as_str()), ("rework of 2", 2, "board works"));
+        assert!(r.overview.contains("the board is empty"), "{}", r.overview);
+
+        fold_pieces(&store, "m-1");
+        let t = store.find_task("m-1").unwrap();
+        assert!(!crate::pieces::staged(&t));
+        assert_eq!(t.section("Log").unwrap().matches(" · ").count() >= 4 && (1..=4).all(|n| crate::pieces::folded_line(&t, n).is_some()), true, "one line a piece");
+        assert!(crate::pieces::folded_line(&t, 2).unwrap().starts_with("piece 2 · board · done · board read back"));
     }
 
     /// `wsp verified` from a governor's seat, with no pass of its own open, is
