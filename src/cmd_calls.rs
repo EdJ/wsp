@@ -11,6 +11,10 @@
 //! `tell`, with no sub-verb because `cpd-3` is no documented word, and no flag
 //! values at all.
 //!
+//! **Two logs** (`wsp-488`): actions and the daemon's ticks in `calls.jsonl`,
+//! polls in `polls.jsonl` (`docs/calls.md` says which calls are polls); the
+//! default view is the actions, `--polls` the polls, `--all` both.
+//!
 //! The report is sorted by total CPU, so its top line is the next thing to cut.
 
 use serde_json::{json, Value};
@@ -83,22 +87,50 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
         },
     };
     let since = util::epoch_secs() - span;
-    let lines = calls::read_all(&store.state);
+    let (polls, all) = (args.has("polls"), args.has("all"));
+    if polls && all {
+        eprintln!("wsp: --polls and --all are two ways to choose the log; give one");
+        return 2;
+    }
+    let logs: &[calls::Log] = if all {
+        &[calls::Log::Actions, calls::Log::Polls]
+    } else if polls {
+        &[calls::Log::Polls]
+    } else {
+        &[calls::Log::Actions]
+    };
+    let mut lines = Vec::new();
+    let mut covers = Vec::new();
+    for log in logs {
+        let mine = calls::read_log(&store.state, *log);
+        covers.push(calls::Coverage::of_log(&mine, &store.state, *log));
+        lines.extend(mine);
+    }
     if lines.is_empty() {
-        println!("wsp calls: nothing recorded in {} yet (WSP_NO_CALLS={})", util::contract(&store.state.join(calls::FILE)), if calls::off() { "set" } else { "unset" });
+        let files: Vec<String> = logs.iter().map(|l| util::contract(&store.state.join(l.file()))).collect();
+        println!("wsp calls: nothing recorded in {} yet (WSP_NO_CALLS={})", files.join(" or "), if calls::off() { "set" } else { "unset" });
         return 0;
     }
-    let cov = calls::Coverage::of(&lines, &store.state);
+    let covers_json = if covers.len() == 1 { covers[0].json(since) } else { Value::Array(covers.iter().map(|c| c.json(since)).collect()) };
+    let say = |covers: &[calls::Coverage]| {
+        for c in covers {
+            println!("  {}", coverage_text(c, span, since));
+        }
+    };
+    let which_log = if all { "actions and polls" } else if polls { "polls" } else { "actions" };
     let (ticks, n_ticks) = calls::summarize_ticks(&lines, since);
     let tick_json = |rows: &[Row]| -> Vec<Value> {
         rows.iter().map(|r| json!({"phase": r.name, "ticks": r.count, "p50_ms": r.p(0.5), "p95_ms": r.p(0.95), "total_ms": (r.walls.iter().sum::<f64>() * 10.0).round() / 10.0})).collect()
     };
     if by == "phase" {
         if args.json() {
-            println!("{}", json!({"since": span, "covers": cov.json(since), "ticks": n_ticks, "phases": tick_json(&ticks)}));
+            println!("{}", json!({"since": span, "log": which_log, "covers": covers_json, "ticks": n_ticks, "phases": tick_json(&ticks)}));
             return 0;
         }
-        println!("  {}", coverage_text(&cov, span, since));
+        say(&covers);
+        if polls {
+            println!("  (the daemon's ticks are in calls.jsonl; `wsp calls --by phase` without --polls)");
+        }
         print_phases(&ticks, n_ticks, span);
         return 0;
     }
@@ -116,7 +148,8 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
             "{}",
             json!({
                 "since": span,
-                "covers": cov.json(since),
+                "log": which_log,
+                "covers": covers_json,
                 "by": by,
                 "calls": n_calls,
                 "cpu_s": (total / 100.0).round() / 10.0,
@@ -136,8 +169,8 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let span_text = util::duration_human(span);
     if which == By::Child {
-        println!("{}", p.bold(&format!("wsp calls by child — last {span_text}: {:.1} s of child wall", child_wall / 1000.0)));
-        println!("  {}", coverage_text(&cov, span, since));
+        println!("{}", p.bold(&format!("wsp calls by child ({which_log}) — last {span_text}: {:.1} s of child wall", child_wall / 1000.0)));
+        say(&covers);
         println!("  {:<22} {:>7} {:>8} {:>8} {:>9} {:>6}", "child", "runs", "p50 ms", "p95 ms", "wall s", "share");
         for r in rows.iter().take(25) {
             let w: f64 = r.walls.iter().sum();
@@ -154,8 +187,8 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
         println!("  (child CPU is not split by program — getrusage has only the total; see `--by verb`)");
         return 0;
     }
-    println!("{}", p.bold(&format!("wsp calls by {by} — last {span_text}: {n_calls} calls, {:.1} CPU-s", total / 1000.0)));
-    println!("  {}", coverage_text(&cov, span, since));
+    println!("{}", p.bold(&format!("wsp calls by {by} ({which_log}) — last {span_text}: {n_calls} calls, {:.1} CPU-s", total / 1000.0)));
+    say(&covers);
     println!("  {:<34} {:>7} {:>8} {:>8} {:>9} {:>6}", by, "count", "p50 ms", "p95 ms", "CPU-s", "share");
     for (i, r) in rows.iter().take(25).enumerate() {
         println!(
@@ -200,10 +233,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
     help: &[crate::verbs::Help {
         section: crate::verbs::Section::Plumbing,
         order: 111,
-        text: r##"  wsp calls [--since 1h] [--by verb|caller|child|phase] [--json]
+        text: r##"  wsp calls [--since 1h] [--by verb|caller|child|phase] [--polls|--all] [--json]
                                     what wsp's own calls cost: count, p50/p95 wall,
-                                    CPU-s and share, dearest first (calls.jsonl;
-                                    WSP_NO_CALLS=1 stops the recording)"##,
+                                    CPU-s and share, dearest first. Actions and
+                                    ticks (calls.jsonl) by default, --polls the
+                                    polls (polls.jsonl), --all both; each view
+                                    says the time its file covers
+                                    (WSP_NO_CALLS=1 stops the recording)"##,
     }],
 }];
 
@@ -251,5 +287,32 @@ mod tests {
         assert_eq!(n, 1);
         assert!(ticks.iter().any(|r| r.name == "sync"));
         assert_eq!(calls(&store, &args("calls", &[], &[("by", "bogus")])), 2);
+    }
+
+    /// Each view reads its own file and says what that file covers; `--all`
+    /// reads both and says it twice; asking for both ways at once is refused.
+    #[test]
+    fn polls_and_actions_are_read_apart_and_each_says_its_span() {
+        let env = crate::util::isolated("calls-two");
+        let store = Store::open();
+        let now = util::now_iso();
+        let line = |verb: &str| {
+            json!({"k":"call","t":now,"verb":verb,"sub":"","flags":["json"],"role":"none","parent":"compound-host","wall_ms":10.0,
+                   "user_ms":5.0,"sys_ms":0.0,"kids_user_ms":0.0,"kids_sys_ms":0.0,"children":{}})
+        };
+        calls::append_to(&env.state(), calls::Log::Polls, &line("wip"), calls::POLL_CAP);
+        calls::append_to(&env.state(), calls::Log::Actions, &line("tell"), calls::CAP);
+        let a = calls::read_log(&env.state(), calls::Log::Actions);
+        let p = calls::read_log(&env.state(), calls::Log::Polls);
+        assert_eq!((a.len(), p.len()), (1, 1));
+        assert_eq!(a[0]["verb"], "tell");
+        assert_eq!(p[0]["verb"], "wip");
+        let say = |log| calls::Coverage::of_log(&calls::read_log(&env.state(), log), &env.state(), log).line(3600, 0);
+        assert!(say(calls::Log::Actions).starts_with("calls.jsonl covers "), "{}", say(calls::Log::Actions));
+        assert!(say(calls::Log::Polls).starts_with("polls.jsonl covers "), "{}", say(calls::Log::Polls));
+        assert_eq!(calls(&store, &args("calls", &[], &[])), 0);
+        assert_eq!(calls(&store, &args("calls", &[], &[("polls", "1")])), 0);
+        assert_eq!(calls(&store, &args("calls", &[], &[("all", "1"), ("json", "1")])), 0);
+        assert_eq!(calls(&store, &args("calls", &[], &[("all", "1"), ("polls", "1")])), 2);
     }
 }

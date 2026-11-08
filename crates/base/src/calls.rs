@@ -5,7 +5,13 @@
 //! those". Nothing recorded it before; wsp-480 was found with `/usr/bin/time`
 //! and `sample` against a binary with no symbols.
 //!
-//! **Two kinds of line, one file** — `$WSP_STATE/calls.jsonl`, appended with
+//! **Two files, polls apart from actions** (`wsp-488`) — see [`Log`]: a poll
+//! (a caller that says `WSP_POLL=1`, or a read-only verb run by no seat) goes to
+//! `polls.jsonl`, everything else and the daemon's ticks to `calls.jsonl`, each
+//! with its own cap and one rotation, so a poll storm cannot push the actions
+//! out of the window.
+//!
+//! **Two kinds of line** — `$WSP_STATE/calls.jsonl`, appended with
 //! `O_APPEND` and one `write`, so no lock is taken and two processes cannot
 //! interleave inside a line (a line is far under `PIPE_BUF`-sized atomic
 //! appends in practice, and a torn line is skipped by the reader):
@@ -28,7 +34,8 @@
 //! **Cheap.** The cost on a call is one `getrusage` pair, one `proc_name`, one
 //! small file read when run inside a seat (the governors record, to say
 //! primary or governor), one `stat` and one `write`. `WSP_NO_CALLS=1` turns all
-//! of it off. The file rotates to `calls.1.jsonl` past [`CAP`].
+//! of it off. Each file rotates to `<name>.1.jsonl` past its cap ([`CAP`],
+//! [`POLL_CAP`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -40,10 +47,67 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-/// Rotate to `calls.1.jsonl` when the file is past this.
+/// Rotate `calls.jsonl` to `calls.1.jsonl` when it is past this.
 pub const CAP: u64 = 20 * 1024 * 1024;
+/// The same for `polls.jsonl`. A line per poll, unfolded: see `docs/calls.md`.
+pub const POLL_CAP: u64 = 20 * 1024 * 1024;
 pub const FILE: &str = "calls.jsonl";
 pub const OLD: &str = "calls.1.jsonl";
+pub const POLL_FILE: &str = "polls.jsonl";
+pub const POLL_OLD: &str = "polls.1.jsonl";
+
+/// Which of the two logs a line belongs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Log {
+    /// Calls that are acts, and the daemon's ticks: read one by one.
+    Actions,
+    /// Calls that are polls: read as a rate and a total per caller.
+    Polls,
+}
+
+impl Log {
+    pub fn file(self) -> &'static str {
+        match self {
+            Log::Actions => FILE,
+            Log::Polls => POLL_FILE,
+        }
+    }
+    pub fn old(self) -> &'static str {
+        match self {
+            Log::Actions => OLD,
+            Log::Polls => POLL_OLD,
+        }
+    }
+    pub fn cap(self) -> u64 {
+        match self {
+            Log::Actions => CAP,
+            Log::Polls => POLL_CAP,
+        }
+    }
+}
+
+/// Which log a finished call goes to. A poll is a call whose caller says so
+/// (`WSP_POLL=1`), or a read-only verb (`readonly` — the table is in
+/// `src/readonly.rs`) run by no seat (`role == "none"`).
+pub fn log_for(poll_env: bool, readonly: bool, role: &str) -> Log {
+    if poll_env || (readonly && role == "none") {
+        Log::Polls
+    } else {
+        Log::Actions
+    }
+}
+
+fn poll_env() -> bool {
+    std::env::var_os("WSP_POLL").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Say that this process's verb writes no store state (decided in `main` from
+/// the table in `src/readonly.rs`); with no seat around it, its call is a poll.
+pub fn set_read_only(yes: bool) {
+    READ_ONLY.store(yes, Ordering::SeqCst);
+}
 
 // ---------------------------------------------------------------------------
 // The system calls. Declared here, as `util` does for `localtime_r`, so the
@@ -373,11 +437,16 @@ pub fn off() -> bool {
 /// Append one line to `dir/calls.jsonl`, rotating first if the file is past
 /// `cap`. One `write` on an `O_APPEND` descriptor.
 pub fn append(dir: &Path, line: &Value, cap: u64) {
+    append_to(dir, Log::Actions, line, cap)
+}
+
+/// [`append`] to the named log.
+pub fn append_to(dir: &Path, log: Log, line: &Value, cap: u64) {
     let mut s = line.to_string();
     s.push('\n');
-    let path = dir.join(FILE);
+    let path = dir.join(log.file());
     if std::fs::metadata(&path).is_ok_and(|m| m.len() >= cap) {
-        let _ = std::fs::rename(&path, dir.join(OLD));
+        let _ = std::fs::rename(&path, dir.join(log.old()));
     }
     let f = std::fs::OpenOptions::new().create(true).append(true).open(&path);
     if let Ok(mut f) = f {
@@ -385,13 +454,13 @@ pub fn append(dir: &Path, line: &Value, cap: u64) {
     }
 }
 
-fn write(line: Value) {
+fn write(log: Log, line: Value) {
     if off() {
         return;
     }
     if let Some(dir) = state_dir() {
         if dir.is_dir() {
-            append(&dir, &line, CAP);
+            append_to(&dir, log, &line, log.cap());
         }
     }
 }
@@ -566,7 +635,7 @@ fn finish_now() {
         &drain_children(),
         (code != i32::MIN).then_some(code),
     );
-    write(line);
+    write(log_for(poll_env(), READ_ONLY.load(Ordering::SeqCst), r), line);
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +726,7 @@ pub fn tick_end() {
         &t.phases,
         &drain_children(),
     );
-    write(line);
+    write(Log::Actions, line);
 }
 
 /// Drop a tick that did nothing worth a line (the loop's early `continue`).
@@ -821,8 +890,13 @@ pub fn summarize_ticks(lines: &[Value], since: i64) -> (Vec<Row>, u64) {
 /// Read every line of `calls.1.jsonl` then `calls.jsonl` under `dir`, skipping
 /// anything that does not parse (a torn line).
 pub fn read_all(dir: &Path) -> Vec<Value> {
+    read_log(dir, Log::Actions)
+}
+
+/// [`read_all`] for the named log.
+pub fn read_log(dir: &Path, log: Log) -> Vec<Value> {
     let mut out = Vec::new();
-    for name in [OLD, FILE] {
+    for name in [log.old(), log.file()] {
         if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
             out.extend(text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()));
         }
@@ -836,6 +910,7 @@ pub fn read_all(dir: &Path) -> Vec<Value> {
 /// over a file that starts three hours ago would otherwise read as two days.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Coverage {
+    pub log: Log,
     /// Epoch seconds of the oldest and newest record read, if any.
     pub first: Option<i64>,
     pub last: Option<i64>,
@@ -845,13 +920,18 @@ pub struct Coverage {
 
 impl Coverage {
     pub fn of(lines: &[Value], dir: &Path) -> Coverage {
+        Coverage::of_log(lines, dir, Log::Actions)
+    }
+
+    pub fn of_log(lines: &[Value], dir: &Path, log: Log) -> Coverage {
         let times = lines.iter().map(|v| crate::util::epoch_of(s(v, "t"))).filter(|t| *t > 0);
         let size = |n: &str| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0);
         Coverage {
+            log,
             first: times.clone().min(),
             last: times.max(),
-            live_bytes: size(FILE),
-            old_bytes: size(OLD),
+            live_bytes: size(log.file()),
+            old_bytes: size(log.old()),
         }
     }
 
@@ -872,15 +952,18 @@ impl Coverage {
     /// The line that says so. `asked` is the window in seconds, `since` its start.
     pub fn line(&self, asked: i64, since: i64) -> String {
         let (Some(a), Some(b)) = (self.first, self.last) else {
-            return "the file has no records".to_string();
+            return format!("{} has no records", self.log.file());
         };
         let size = |n: u64| format!("{:.1} MB", n as f64 / 1_048_576.0);
         let mut out = format!(
-            "file covers {} ({} to {}); calls.jsonl {} + calls.1.jsonl {}",
+            "{} covers {} ({} to {}); {} {} + {} {}",
+            self.log.file(),
             crate::util::duration_human(self.span()),
             crate::util::iso_at(a),
             crate::util::iso_at(b),
+            self.log.file(),
             size(self.live_bytes),
+            self.log.old(),
             size(self.old_bytes)
         );
         if self.short(since) {
@@ -895,6 +978,7 @@ impl Coverage {
 
     pub fn json(&self, since: i64) -> Value {
         json!({
+            "log": self.log.file(),
             "first": self.first.map(crate::util::iso_at),
             "last": self.last.map(crate::util::iso_at),
             "span_s": self.span(),
@@ -1021,10 +1105,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The log a call goes to: the caller's word, or a read-only verb run by no
+    /// seat; nothing else.
+    #[test]
+    fn a_poll_is_the_callers_word_or_a_read_only_verb_run_by_no_seat() {
+        assert_eq!(log_for(true, false, "member"), Log::Polls, "WSP_POLL=1 is a poll whoever says it");
+        assert_eq!(log_for(false, true, "none"), Log::Polls, "wip --json from compound's host");
+        assert_eq!(log_for(false, true, "member"), Log::Actions, "an agent reading is an agent working");
+        assert_eq!(log_for(false, true, "seat"), Log::Actions);
+        assert_eq!(log_for(false, false, "none"), Log::Actions, "a verb that writes is an act, seat or none");
+        assert_eq!(log_for(false, false, "daemon"), Log::Actions);
+    }
+
+    /// Both logs rotate at their own cap, independently: a poll storm turns
+    /// `polls.jsonl` over and leaves every action line in `calls.jsonl`.
+    #[test]
+    fn polls_and_actions_rotate_at_their_own_caps() {
+        let dir = std::env::temp_dir().join(format!("wsp-calls-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pad = "x".repeat(200);
+        let size = |f: &str| std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0);
+        append_to(&dir, Log::Actions, &json!({"k":"call","m":"action-0","pad":pad}), 4096);
+        let mut line_len = 0;
+        for i in 0..120 {
+            let line = json!({"k":"call","m":format!("poll-{i:04}"),"pad":pad});
+            line_len = line.to_string().len() as u64 + 1;
+            append_to(&dir, Log::Polls, &line, 4096);
+            assert!(size(POLL_FILE) < 4096 + line_len);
+            assert!(size(POLL_FILE) + size(POLL_OLD) <= 2 * (4096 + line_len));
+        }
+        assert!(size(POLL_OLD) > 0, "polls.jsonl rotated to polls.1.jsonl");
+        assert!(!dir.join(OLD).exists(), "a poll storm rotates nothing in calls.jsonl");
+        let actions = read_log(&dir, Log::Actions);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["m"], "action-0", "the action is still there");
+        let polls = read_log(&dir, Log::Polls);
+        assert!(polls.iter().any(|v| v["m"] == "poll-0119"));
+        assert!(!polls.iter().any(|v| v["m"] == "poll-0000"), "the oldest polls are gone");
+        // And the actions rotate on their own cap.
+        for i in 0..60 {
+            append_to(&dir, Log::Actions, &json!({"k":"call","m":format!("act-{i}"),"pad":pad}), 4096);
+        }
+        assert!(size(OLD) > 0 && size(FILE) < 4096 + line_len);
+        let cov = Coverage::of_log(&read_log(&dir, Log::Polls), &dir, Log::Polls);
+        assert_eq!(cov.live_bytes, size(POLL_FILE));
+        assert!(cov.line(3600, 0).contains("polls.jsonl"), "{}", cov.line(3600, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A poll line is about this long, which is what the per-poll-line choice
+    /// in `docs/calls.md` is worked out from.
+    #[test]
+    fn a_poll_line_is_a_few_hundred_bytes() {
+        let mut k = Kids::default();
+        k.0.insert("ps".into(), (2, 300.0));
+        k.0.insert("git".into(), (4, 40.0));
+        let v = call_line(0, "worklist", "show", &["all".to_string(), "json".to_string()], None, "none", "compound-host", Duration::from_millis(900), (400_000, 60_000), (300_000, 80_000), &k, Some(0));
+        let n = v.to_string().len();
+        assert!((250..700).contains(&n), "{n} bytes: {v}");
+    }
+
     /// The bound Ed asked for is in the constant, not just in the test's cap.
     #[test]
     fn the_real_cap_is_twenty_mebibytes_so_both_files_stay_under_forty() {
         assert_eq!(CAP, 20 * 1024 * 1024);
+        assert_eq!(POLL_CAP, 20 * 1024 * 1024);
     }
 
     /// The file's coverage is read off its records, not off the window asked
@@ -1044,7 +1190,7 @@ mod tests {
         let two_days = 2 * 86_400;
         assert!(cov.short(now - two_days));
         let said = cov.line(two_days, now - two_days);
-        assert!(said.contains("file covers 3h"), "{said}");
+        assert!(said.contains("calls.jsonl covers 3h"), "{said}");
         assert!(said.contains("SHORT: asked for 2d"), "{said}");
         assert!(!cov.short(now - 3 * 3600), "a window the file spans is not short");
         assert!(!cov.line(3 * 3600, now - 3 * 3600).contains("SHORT"));

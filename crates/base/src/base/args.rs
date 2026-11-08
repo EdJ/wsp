@@ -10,6 +10,8 @@ pub const BOOL_FLAGS: &[&str] = &[
     "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full", "no-packet", "regen",
     // `worklist show --all --json --include-closed`.
     "include-closed",
+    // `calls --polls` (wsp-488); `calls --all` is the existing "all".
+    "polls",
     // `attempts --cost <row>`, whose positional is a task id.
     "cost",
     // `spawn --no-focus` is what focus not being asked for is now called, and it

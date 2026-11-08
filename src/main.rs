@@ -15,6 +15,7 @@ pub(crate) use wsp_store::{agent_kind, caption, checks, decisions, governors, la
 pub(crate) use wsp_wire::{detect_override, fake, far, herdr, launchd, place, place_compound, place_herdr, place_super, tunnel};
 mod artefact;
 mod registry;
+mod readonly;
 mod after;
 mod closing;
 mod packet;
@@ -466,7 +467,9 @@ fn record_call(args: &Args) {
     let mut flags: Vec<String> = args.flag_names().into_iter().map(str::to_string).collect();
     flags.sort();
     let verb = if args.cmd.is_empty() && args.has("version") { "version" } else { args.cmd.as_str() };
-    wsp_base::calls::begin(verb, &sub_of(args), flags);
+    let sub = sub_of(args);
+    wsp_base::calls::set_read_only(readonly::is_read_only(verb, &sub));
+    wsp_base::calls::begin(verb, &sub, flags);
 }
 
 /// The first word after the verb, if the help documents `wsp <verb> <word>`.

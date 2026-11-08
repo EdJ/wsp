@@ -102,7 +102,7 @@ cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 
 | `seats` | `agent_commands`, `kind_data`, `cmd_project`, `cmd_spawn`, `cmd_agent`, `cmd_resume`, `wake`, `room`, `cmd_govern`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_role`, `cmd_stamp`, `stuck`, `sync` |
 | `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `cmd_calls`, `cmd_report`, `wallbuckets`, `cmd_attempts`, `cmd_verifications`, `retro`, `retro_run`, `retro_series` |
 | `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |
-| `top` | `main`, `registry`, `daemon`, `leaked_agents` |
+| `top` | `main`, `registry`, `readonly`, `daemon`, `leaked_agents` |
 
 **499 distinct symbols cross a component boundary today, and 49 of the 72 possible component pairs have an edge.**
 Those two figures are the seam count to ratchet down, in the sense of `compounding-004` (95 seams to 70).

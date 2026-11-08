@@ -647,10 +647,13 @@ PLUMBING
   wsp burn [--json]                 tokens by seat, dearest first — input,
                                     output and cache, tallied per hook from
                                     the transcript; where core-049's cuts land
-  wsp calls [--since 1h] [--by verb|caller|child|phase] [--json]
+  wsp calls [--since 1h] [--by verb|caller|child|phase] [--polls|--all] [--json]
                                     what wsp's own calls cost: count, p50/p95 wall,
-                                    CPU-s and share, dearest first (calls.jsonl;
-                                    WSP_NO_CALLS=1 stops the recording)
+                                    CPU-s and share, dearest first. Actions and
+                                    ticks (calls.jsonl) by default, --polls the
+                                    polls (polls.jsonl), --all both; each view
+                                    says the time its file covers
+                                    (WSP_NO_CALLS=1 stops the recording)
   wsp throttle [off|on|auto] [--json]
                                     how builds are held back for the person at
                                     the machine: niced, capped in jobs, and a
