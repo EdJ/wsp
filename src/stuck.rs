@@ -256,6 +256,12 @@ fn one_line(command: &str) -> String {
 
 // ---- the shapes -------------------------------------------------------------
 
+/// Whether a command line is a loop whose search finds the loop: the one
+/// [`Kind`] a seat's shell is read for without holding the seat.
+pub(crate) fn waits_on_itself_line(command: &str) -> bool {
+    classify(command) == Some(Kind::SelfWait)
+}
+
 /// Which of the shapes a command is, when it is one.
 pub(crate) fn classify(command: &str) -> Option<Kind> {
     let simple = simple_commands(command);

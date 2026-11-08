@@ -4639,6 +4639,7 @@ fn runs(
 pub(crate) fn idle_members_shells(agents: &[crate::place::Seated], bindings: &BTreeMap<String, Value>) -> crate::waiting::Shells {
     crate::waiting::Shells::read(
         agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),
+        &crate::stuck::waits_on_itself_line,
     )
 }
 

@@ -462,7 +462,7 @@ impl Shells {
     /// Asked only about seats that read `Idle`, by every caller: a seat in a
     /// turn is working whatever it has running, and the reading is a process
     /// table that `wsp wip` would otherwise pay for on every poll.
-    pub(crate) fn read<'a>(seats: impl IntoIterator<Item = &'a str>) -> Shells {
+    pub(crate) fn read<'a>(seats: impl IntoIterator<Item = &'a str>, self_wait: &dyn Fn(&str) -> bool) -> Shells {
         // A test's seat ids are not this machine's, and a fake backend's are
         // not anybody's: a test hands the index in with [`Shells::one`].
         if cfg!(test) {
@@ -483,7 +483,7 @@ impl Shells {
             Ok(out) => {
                 let now = util::epoch_secs();
                 let mut memory = Memory::load();
-                let shells = Shells::of(&String::from_utf8_lossy(&out.stdout), &roots, now, &mut memory);
+                let shells = Shells::of(&String::from_utf8_lossy(&out.stdout), &roots, now, &mut memory, self_wait);
                 memory.save(now);
                 shells
             }
@@ -494,7 +494,7 @@ impl Shells {
     }
 
     /// The reading over a `ps -o pid=,ppid=,etime=,time=,command=` table.
-    fn of(ps: &str, roots: &[(String, u32)], now: i64, memory: &mut Memory) -> Shells {
+    fn of(ps: &str, roots: &[(String, u32)], now: i64, memory: &mut Memory, self_wait: &dyn Fn(&str) -> bool) -> Shells {
         struct Row {
             pid: u32,
             ppid: u32,
@@ -533,8 +533,8 @@ impl Shells {
             let (mut n, mut age, mut cpu, mut work) = (0, 0, 0, String::new());
             for sh in mine.iter().filter(|r| r.shell && !shell.contains(&r.ppid)).filter(|r| (SETTLED..LEFT_RUNNING).contains(&r.age)) {
                 // A pgrep guard that matches itself ends only when the tool's
-                // limit ends it: it holds nothing (`stuck::waits_on_itself`).
-                if crate::stuck::classify(&ran(&sh.command)) == Some(crate::stuck::Kind::SelfWait) {
+                // limit ends it: it holds nothing (`stuck::waits_on_itself_line`, passed in: `waiting` sits below `stuck`).
+                if self_wait(&ran(&sh.command)) {
                     continue;
                 }
                 let under = below(sh.pid);
@@ -795,7 +795,7 @@ mod tests {
 
     /// The reading at `now`, with nothing remembered.
     fn read(table: &str, roots: &[(String, u32)]) -> Shells {
-        Shells::of(table, roots, 1000, &mut Memory::default())
+        Shells::of(table, roots, 1000, &mut Memory::default(), &crate::stuck::waits_on_itself_line)
     }
 
     #[test]
@@ -840,7 +840,7 @@ mod tests {
     }
 
     fn held(table: &str, now: i64, memory: &mut Memory) -> Option<Wait> {
-        Shells::of(table, &[("cpd-1".into(), 100)], now, memory).of_seat("cpd-1")
+        Shells::of(table, &[("cpd-1".into(), 100)], now, memory, &crate::stuck::waits_on_itself_line).of_seat("cpd-1")
     }
 
     #[test]

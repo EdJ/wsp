@@ -5119,7 +5119,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     }
 
     fn shells(&self, seats: &[&str]) -> crate::waiting::Shells {
-        crate::waiting::Shells::read(seats.iter().copied())
+        crate::waiting::Shells::read(seats.iter().copied(), &crate::stuck::waits_on_itself_line)
     }
 
     /// Pressed by the backend that holds the seat, and no other: a press is a
