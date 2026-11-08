@@ -587,6 +587,31 @@ pub(crate) fn add_all(old: &Record, news: Vec<New>, actor: &Actor, status: Statu
     Ok(rec)
 }
 
+/// The record with `new` written as a batch of its own right after batch
+/// `after`, and the number it was given. **The only write that inserts a
+/// batch**: every batch after `after` moves up by one. It is the run's (a closing
+/// batch adds its merge or fix piece), so it takes no actor, and it is allowed
+/// because nothing after `after` has opened; if something has, it refuses and
+/// the record is as it was.
+pub(crate) fn insert_batch_after(old: &Record, after: usize, new: New, status: Status) -> Result<(Record, usize), String> {
+    gate(&Actor::Person, status)?;
+    if !old.pieces.iter().any(|p| p.batch == after) {
+        return Err(format!("no piece is in batch {after}, so nothing can be inserted after it"));
+    }
+    if let Some(b) = (after + 1..=last_batch(old)).find(|b| opened(old, *b)) {
+        return Err(format!("batch {b} has opened, and a batch is inserted only before batches that have not"));
+    }
+    // Adding to the batch after the last is the ordinary write, so it carries
+    // the piece's own rules; the batches that follow are then moved up behind it.
+    let mut shifted = old.clone();
+    for p in shifted.pieces.iter_mut().filter(|p| p.batch > after) {
+        p.batch += 1;
+    }
+    let rec = add(&shifted, New { at: At::Batch(after + 1), ..new }, &Actor::Person, status)?;
+    let n = rec.pieces.last().map(|p| p.n).unwrap_or(0);
+    Ok((rec, n))
+}
+
 /// The record with piece `n` dropped, for a reason. A pending piece only.
 pub(crate) fn drop_piece(old: &Record, n: usize, why: &str, actor: &Actor, status: Status) -> Result<Record, String> {
     gate(actor, status)?;
@@ -751,6 +776,24 @@ mod tests {
         let mut t = Task::new("a row", "m-1");
         t.body = format!("## Overview\nthe work\n\n{body}\n## Log\n- 2026-10-18 claimed\n");
         t
+    }
+
+    #[test]
+    fn a_batch_is_inserted_right_after_one_and_the_later_batches_move_up_unless_one_has_opened() {
+        let rec = put(&put(&put(&Record::default(), new("a", At::Next)), new("b", At::Next)), new("c", At::Next));
+        let rec = with_state(rec, 1, State::Done);
+        let (got, n) = insert_batch_after(&rec, 1, new("merge batch 1", At::Next), TODO).unwrap();
+        assert_eq!(n, 4);
+        let batches: Vec<(usize, usize)> = got.pieces.iter().map(|p| (p.n, p.batch)).collect();
+        assert_eq!(batches, [(1, 1), (2, 3), (3, 4), (4, 2)]);
+        assert!(check(&got).is_ok());
+
+        // Batch 2 running: nothing is inserted before it, and the record is as it was.
+        let open = with_state(rec.clone(), 2, State::Running);
+        let err = insert_batch_after(&open, 1, new("merge batch 1", At::Next), TODO).unwrap_err();
+        assert!(err.contains("batch 2 has opened"), "{err}");
+        assert!(insert_batch_after(&rec, 9, new("x", At::Next), TODO).is_err());
+        assert!(insert_batch_after(&rec, 1, new("x", At::Next), Status::Done).is_err());
     }
 
     #[test]

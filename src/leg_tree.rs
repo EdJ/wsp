@@ -462,7 +462,7 @@ pub(crate) fn overlap_line(leg: &str, found: &[(String, Vec<String>)]) -> Option
 
 /// Take the tree of a finished leg, on `check_tree`'s rule and one more: its
 /// branch is in the row's.
-fn take(repo: &Path, dir: &Path, name: &str, row_dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
+pub(crate) fn take(repo: &Path, dir: &Path, name: &str, row_dir: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Tree {
     let path = util::contract(dir);
     if let Some(why) = standing(dir) {
         return Tree::Kept { path, why };
