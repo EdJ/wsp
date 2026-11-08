@@ -7655,11 +7655,15 @@ mod tests {
     fn a_check_cannot_hold_on_a_row_it_filed_and_left_off_the_list() {
         let _env = util::isolated("hold-unattached");
         let store = at_barrier_one_seated("hold-unattached");
+        // Filed during the check: stamped after it opened, not left to the clock
+        // happening to tick past the second it opened in.
+        let mut t = store.task("wl-003").unwrap();
+        t.created = "2999-01-01T00:00:00Z".into();
+        store.save_task(&t).unwrap();
         assert_eq!(hold_as(&store, &["wl-003", "has", "to", "land", "first"], &["cpd-9"]), 1);
         assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Running, "nothing was held");
 
         // The row is older than the check: not filed in it.
-        let mut t = store.task("wl-003").unwrap();
         t.created = "2000-01-01T00:00:00Z".into();
         store.save_task(&t).unwrap();
         assert!(unattached_named(&store, &store.worklist("run").unwrap(), 1, "wl-003 first").is_empty());
@@ -7668,7 +7672,7 @@ mod tests {
         store.save_task(&t).unwrap();
         assert_eq!(unattached_named(&store, &store.worklist("run").unwrap(), 1, "wl-003 first"), ["wl-003"]);
         t.parent = None;
-        t.created = util::now_iso();
+        t.created = "2999-01-01T00:00:00Z".into();
         store.save_task(&t).unwrap();
 
         // Attached, it is on the list, and the reason may name it.
@@ -7720,6 +7724,9 @@ mod tests {
     fn next_on_a_held_list_names_a_row_its_reason_leaves_off_every_list() {
         let _env = util::isolated("hold-next");
         let store = at_barrier_one_seated("hold-next");
+        let mut t = store.task("wl-003").unwrap();
+        t.created = "2999-01-01T00:00:00Z".into();
+        store.save_task(&t).unwrap();
         assert_eq!(hold_as(&store, &["wl-003", "has", "to", "land", "first"], &["cpd-other"]), 0);
         let w = store.worklist("run").unwrap();
         let pos = worklist::position(&store, &w, Reading::Landed);
