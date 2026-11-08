@@ -65,6 +65,13 @@ use crate::util;
 /// run's own [`crate::cycle`] ten minutes, after which it is taken again.
 const WEDGED_AFTER: i64 = 10 * 60;
 
+/// How long a seat may sit in its own open `wsp ask --person` before it holds no
+/// place under the cap (`wsp-495`): a question that may wait all night is the
+/// person's, and the seat holding it open in a tool call was costing a start.
+/// The ask stays open, the seat stays waiting and is never nudged or ended; it
+/// only stops counting as an agent working.
+pub(crate) const HELD_ASK_AFTER: i64 = 10 * 60;
+
 /// How a seat reads, for this count and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Look {
@@ -134,11 +141,31 @@ pub(crate) struct Records {
     pub claims: BTreeMap<String, Value>,
     pub agents: BTreeMap<String, Value>,
     pub governors: BTreeMap<String, Value>,
+    /// The panes and tasks of seats standing in an open ask to the person older
+    /// than [`HELD_ASK_AFTER`].
+    pub held_asks: BTreeSet<String>,
+}
+
+/// The panes and tasks waiting on a person's answer for longer than `after`
+/// seconds, off the open questions.
+fn held_asks(store: &Store, after: i64) -> BTreeSet<String> {
+    let now = util::epoch_secs();
+    let mut out = BTreeSet::new();
+    for m in store.messages().into_values() {
+        if !(m.wants_answering() && !m.is_reply() && m.for_person) || now - util::epoch_of(&m.at) < after {
+            continue;
+        }
+        if let Some(w) = &m.waiting {
+            out.extend([w.pane.clone(), w.task.clone()].into_iter().filter(|x| !x.is_empty()));
+        }
+    }
+    out
 }
 
 impl Records {
     pub(crate) fn read(store: &Store) -> Records {
         Records {
+            held_asks: held_asks(store, HELD_ASK_AFTER),
             tasks: store.tasks(),
             lists: store.worklists(),
             bindings: store.bindings(),
@@ -203,7 +230,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     // no place whatever its screen shows; the tick ends it by its pane.
     let mut take = |out: &mut Vec<Counted>, seat: Option<&str>, what: String, finished: bool, settled: bool, since: Option<&str>| {
         if let Some(s) = seat {
-            if !here(s) || governor(s) || !seen.insert(s.to_string()) || settled || !look(s).counts(finished) {
+            if !here(s) || governor(s) || r.held_asks.contains(s) || !seen.insert(s.to_string()) || settled || !look(s).counts(finished) {
                 return;
             }
             let never_up = look(s) == Look::Starting && since.is_some_and(|at| now - util::epoch_of(at) > crate::barrier::NOT_UP_AFTER);
@@ -437,6 +464,7 @@ mod tests {
             claims: BTreeMap::new(),
             agents: BTreeMap::new(),
             governors: BTreeMap::new(),
+            held_asks: BTreeSet::new(),
         }
     }
 
@@ -628,5 +656,34 @@ mod tests {
         store.set_seat_cap(Some(1)).unwrap();
         let (cap, now) = full(&store, &AllWorking).expect("one of one");
         assert_eq!((cap, names(&now)), (1, "h-1 in w2:p1".to_string()));
+    }
+    /// `wsp-495`: a seat standing in its own `wsp ask --person` holds a place
+    /// until the ask is old, holds none after, and holds one again once answered
+    /// is moot (the ask is closed and the seat is working on).
+    #[test]
+    fn held_ask_older_than_the_threshold_holds_no_place_and_an_answered_one_never_did() {
+        use crate::message::{self, About, Kind, Message, Party, Waiting};
+        let env = util::isolated("room-held-ask");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_task(&task("h-1", Status::Doing)).unwrap();
+        store.set_binding("w2:p1", json!({ "task_id": "h-1" }));
+        store.set_seat_cap(Some(1)).unwrap();
+
+        let mut q = Message::question(Party::pane("w2:p1", ""), Kind::Note, "Land now?", Waiting::new("w2:p1", "h-1"))
+            .about(About::Task("h-1".into()))
+            .for_the_person();
+        q.at = util::iso_at(util::epoch_secs() - (HELD_ASK_AFTER - 60));
+        message::raise(&store, &q).unwrap();
+        assert!(full(&store, &AllWorking).is_some(), "a young ask holds the place");
+
+        let mut old = store.message(&q.id).unwrap();
+        old.at = util::iso_at(util::epoch_secs() - (HELD_ASK_AFTER + 60));
+        store.save_message(&old).unwrap();
+        assert!(full(&store, &AllWorking).is_none(), "an old ask holds none");
+        assert!(store.message(&q.id).unwrap().wants_answering(), "and it is still open");
+
+        message::answer(&store, &q.id, &Party::Human, "yes").unwrap();
+        assert!(full(&store, &AllWorking).is_some(), "answered, the seat is an agent working again");
     }
 }

@@ -971,4 +971,11 @@ mod tests {
         assert_eq!((j["why"].as_str(), j["on"].as_str(), j["id"].as_str()), (Some("question"), Some("person"), Some("m-1")));
         assert!(w.owed() && w.word() == "waiting · person");
     }
+
+    #[test]
+    fn held_ask_seat_still_reads_waiting_on_the_person_never_idle() {
+        let asks = Asks::waiter("w1:p1", "m-1", "q-1");
+        let w = reading(Some(State::Working), &asks, &Shells::one("w9:p9", 0), "w1:p1", "m-1").expect("waiting");
+        assert_eq!((w.why, w.on), (Why::Question("q-1".into()), On::Person));
+    }
 }
