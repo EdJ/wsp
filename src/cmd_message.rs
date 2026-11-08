@@ -982,7 +982,7 @@ pub(crate) fn asked_of_the_person(store: &Store, q: &Message, subject: &str) {
 
 /// What answering this unblocks, derived from what it is about. Never stored:
 /// a member moved between groups would leave a stored one lying.
-fn unblocks(store: &Store, q: &Message) -> Option<String> {
+pub(crate) fn unblocks(store: &Store, q: &Message) -> Option<String> {
     match &q.about {
         About::Group { scope, group } => Some(format!("{scope} group {group}")),
         About::Scope(s) => Some(s.clone()),

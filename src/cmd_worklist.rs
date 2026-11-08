@@ -105,6 +105,7 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "rm" | "remove" => rm(store, args),
         "mv" | "move" => mv(store, args),
         "group" => group(store, args),
+        "cut" => cut_verb(store, args),
         "stop-checks" => stop_checks(store, args),
         // What an automatic pass would have done to the barriers on record.
         "replay" => crate::barrier_replay::run(store, args),
@@ -1621,8 +1622,6 @@ fn drop_group(store: &Store, args: &Args, id: &str, ordinal: usize, why: Option<
 
 /// What a cut is decided on besides the list: the facts the verb reads from
 /// the store, so [`cut`] itself reads nothing and writes nothing. `wsp-514`.
-// No caller until wsp-513's verb, its next part: only the tests read these yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CutReading {
     /// Each member's `after:` list ([`crate::model::Task::after`]). A member
@@ -1636,7 +1635,6 @@ pub(crate) struct CutReading {
 }
 
 /// What a cut takes out of the running group, and what it leaves.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Cut {
     /// The group being cut from, 1-based.
@@ -1651,7 +1649,6 @@ pub(crate) struct Cut {
 
 /// Why a cut is refused. Each one says what to do instead, as
 /// [`Window::refuse`] does.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CutRefusal {
     /// The row is not a member of the group being run (or nothing is run).
@@ -1665,7 +1662,6 @@ pub(crate) enum CutRefusal {
     Whole { group: usize, takes: Vec<String> },
 }
 
-#[allow(dead_code)]
 impl CutRefusal {
     /// The refusal in the two lines a verb prints: what, then what instead.
     pub(crate) fn lines(&self, list: &str) -> [String; 2] {
@@ -1708,7 +1704,6 @@ impl CutRefusal {
 /// Refused, in this order: the row not in the running group; the group's
 /// barrier opened; the row or anything it would take landed; the cut taking
 /// every member, which is `group N --drop`.
-#[allow(dead_code)]
 pub(crate) fn cut(w: &Worklist, at: Option<usize>, row: &str, reading: &CutReading) -> Result<Cut, CutRefusal> {
     let groups = w.groups();
     let not_running = || CutRefusal::NotRunning { row: row.to_string(), group: at.unwrap_or(0) };
@@ -1744,6 +1739,161 @@ pub(crate) fn cut(w: &Worklist, at: Option<usize>, row: &str, reading: &CutReadi
         return Err(CutRefusal::Whole { group: at, takes });
     }
     Ok(Cut { group: at, takes, stays })
+}
+
+/// `wsp worklist cut <slug> <task> --why "…"|-`: apply [`cut`]. `wsp-515`,
+/// wsp-513's second part; the barrier passing on what is left and the
+/// governor's brief are the parts after.
+///
+/// **One store commit, and nothing despawned.** The cut rows go into a new
+/// group straight after the running one, on its agent line, cap and stop (the
+/// new group has not started, so all three can still be edited), and the
+/// later groups renumber. The rows are still the same rows: their claim, seat,
+/// attempts, verdicts and branch are on the task and are not touched. A person
+/// item about one follows without being written, because where it unblocks is
+/// derived from the group the row is in ([`crate::cmd_message`]).
+///
+/// The reason is required and logged. A person, the primary or the list's
+/// governor may cut; a seat on a row or on a barrier may not, since a member
+/// that edits the plan it is judged by is the thing the window exists to
+/// stop.
+///
+/// [`crate::after::refuse_membership`] is not asked: it refuses any change to
+/// a started group's same-group holds, and a cut moves exactly those, together,
+/// to a group that has not started.
+fn cut_verb(store: &Store, args: &Args) -> i32 {
+    let mut here = rows_here(store);
+    here.extend(crate::place::my_pane());
+    let governs = crate::place::my_pane().and_then(|p| crate::place::governs(&store.governors(), &crate::place::Seat::new(&p)));
+    cut_by(store, args, &here, governs)
+}
+
+/// [`cut_verb`] with the caller given — the rows and seat it holds, and the
+/// scope it governs — which is what makes "a member seat may not" testable.
+pub(crate) fn cut_by(store: &Store, args: &Args, here: &[String], governs: Option<String>) -> i32 {
+    const USAGE: &str = "usage: wsp worklist cut <slug> <task> --why \"…\"|-   (-n says what would move)";
+    let (Some(needle), Some(row)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    if args.rest.len() > 3 {
+        eprintln!("{USAGE}");
+        eprintln!("       one row: what rests on it goes with it, and `cut` says which");
+        return 2;
+    }
+    let why = match reason(args) {
+        Ok(Some(why)) => why,
+        Ok(None) => {
+            eprintln!("wsp: a cut is a decision about the run, so it is made with a reason, which is logged");
+            eprintln!("     `wsp worklist cut {needle} {row} --why -` — the reason on stdin");
+            return 2;
+        }
+        Err(code) => return code,
+    };
+    let w0 = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    if !may_edit_held(store, here) {
+        eprintln!("wsp: a seat on a row or a barrier does not cut — it is the plan that seat is judged by");
+        eprintln!("     the person, the primary or `{}`'s governor cuts: `wsp ask {} -`", w0.id, w0.id);
+        return 1;
+    }
+    if let Some(scope) = &governs {
+        let home = worklist::home(store, &w0).map(|h| h.project);
+        if *scope != w0.id && home.as_deref() != Some(scope.as_str()) {
+            eprintln!("wsp: this seat governs `{scope}`, not `{}`, and does not cut from it", w0.id);
+            return 1;
+        }
+    }
+    let row = store.find_task(&row).map(|t| t.id).unwrap_or(row);
+    let dry = args.has("dry-run");
+
+    let outcome = store.locked(|| -> Result<(Worklist, Cut, usize), i32> {
+        // Read again inside the lock: a `go` in another process may have
+        // passed this barrier since.
+        let mut w = store.worklist(&w0.id).ok_or(1)?;
+        let mut groups = w.groups();
+        let win = window(store, &w);
+        let at = win.at.filter(|_| win.started);
+        let mut reading = CutReading::default();
+        if let Some(g) = at.and_then(|a| groups.get(a - 1)) {
+            let tasks = store.tasks();
+            for m in &g.members {
+                if let Some(t) = tasks.iter().find(|t| &t.id == m) {
+                    reading.after.insert(m.clone(), t.after.clone());
+                }
+            }
+            let mut repos = None;
+            for m in &g.members {
+                if crate::after::landed(store, &mut repos, m) {
+                    reading.landed.insert(m.clone());
+                }
+            }
+            reading.barrier = open_check(store, &w, at.unwrap_or(1));
+        }
+        let got = match cut(&w, at, &row, &reading) {
+            Ok(c) => c,
+            Err(refusal) => {
+                for line in refusal.lines(&w.id) {
+                    eprintln!("{line}");
+                }
+                return Err(1);
+            }
+        };
+        let running = &mut groups[got.group - 1];
+        let (agent, cap, stop) = (running.agent.clone(), running.cap, running.stop.clone());
+        running.members.retain(|m| !got.takes.contains(m));
+        let lines: BTreeMap<String, String> = got.takes.iter().filter_map(|m| running.member_agents.remove(m).map(|l| (m.clone(), l))).collect();
+        groups.insert(
+            got.group,
+            Group { members: got.takes.clone(), agent, cap, stop, member_agents: lines, ..Group::default() },
+        );
+        w.log(&format!(
+            "cut {} from group {} into group {} (new), ahead of {} planned — why: {why}",
+            got.takes.join(" "),
+            got.group,
+            got.group + 1,
+            groups.len() - got.group - 1
+        ));
+        let count = groups.len();
+        if !dry {
+            w.set_groups(&groups);
+            if let Err(e) = store.save_worklist(&w) {
+                eprintln!("wsp: write failed: {e}");
+                return Err(1);
+            }
+            store.log_event("worklist-edited", json!({ "id": w.id, "what": "cut", "group": got.group, "rows": got.takes, "why": why }));
+            store.git_commit(&format!("wsp: worklist {} cut {} from group {} into group {}", w.id, got.takes.join(" "), got.group, got.group + 1));
+        }
+        Ok((w, got, count))
+    });
+    let (w, got, count) = match outcome {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    if args.json() {
+        let mut out = worklist_json(store, &w);
+        if let Some(o) = out.as_object_mut() {
+            o.insert("cut".into(), json!({ "from": got.group, "into": got.group + 1, "rows": got.takes, "stays": got.stays, "why": why }));
+            o.insert("dry_run".into(), json!(dry));
+        }
+        println!("{}", out);
+    } else {
+        let verb = if dry { "would cut" } else { "cut" };
+        println!(
+            "{} {verb} {} from group {} into group {} (new) · {count} groups · {} stay",
+            w.id,
+            got.takes.join(" "),
+            got.group,
+            got.group + 1,
+            got.stays.join(" ")
+        );
+    }
+    0
 }
 
 /// `--why`, the reason an edit is logged with. Optional ahead of the run, and
@@ -2464,6 +2614,19 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     the group out whole: the running one too,
                                     with --why, until its barrier opens.
                                     --caption "…"|none renames it, run or not"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Worklists,
+                order: 65,
+                text: r##"  wsp worklist cut <slug> <task> --why "…"|-
+                                    take a blocked row, and the members of its
+                                    group resting on it (after:), out of the
+                                    group being run into a new group straight
+                                    after it, on the same agent line, cap and
+                                    stop; later groups renumber. Until its
+                                    barrier opens, and not a row that landed;
+                                    -n says what moves first. Nothing is
+                                    despawned and the rows keep their history"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
@@ -10716,5 +10879,133 @@ mod tests {
         store.save_task(&m).unwrap();
         assert_eq!(flagged(&store, &["add", "pre", "pr-3"], &[("group", "1")]), 1);
         assert_eq!(groups_of(&store, "pre")[0].members, vec!["pr-1"]);
+    }
+
+    // ---- cut, the verb (`wsp-515`) ----
+
+    /// A running list `cl` standing at group 2 of three, whose group 2 has the
+    /// agent line, cap and stop a cut copies: c-1 | c-2 c-3 c-4 | c-5, with
+    /// c-3 resting on c-2 and c-4 on nothing.
+    fn cut_store(tag: &str) -> (util::Isolated, Store) {
+        let (env, store) = running(tag);
+        for id in ["c-1", "c-2", "c-3", "c-4", "c-5"] {
+            task(&store, id, "todo");
+        }
+        let mut t = store.find_task("c-3").unwrap();
+        t.after = vec!["c-2".into()];
+        store.save_task(&t).unwrap();
+        let mut w = Worklist::new("cl", "Cut");
+        w.set_groups(&[
+            Group { members: vec!["c-1".into()], ..Group::default() },
+            Group {
+                members: vec!["c-2".into(), "c-3".into(), "c-4".into()],
+                agent: "claude opus high".into(),
+                cap: Some(2),
+                stop: "no row waits on a lock".into(),
+                member_agents: BTreeMap::from([("c-3".to_string(), "claude sonnet low".to_string())]),
+                caption: "The middle".into(),
+                ..Group::default()
+            },
+            Group { members: vec!["c-5".into()], ..Group::default() },
+        ]);
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        crossed(&store, "cl", 1);
+        (env, store)
+    }
+
+    fn cut_as(store: &Store, row: &str, why: Option<&str>, here: &[&str], governs: Option<&str>) -> i32 {
+        let here: Vec<String> = here.iter().map(|s| s.to_string()).collect();
+        let flags: Vec<(&str, &str)> = why.map(|w| ("why", w)).into_iter().collect();
+        cut_by(store, &Args::synth("worklist", &["cut", "cl", row], &flags), &here, governs.map(String::from))
+    }
+
+    #[test]
+    fn a_cut_writes_a_new_group_straight_after_the_running_one_with_its_line_cap_and_stop() {
+        let (_env, store) = cut_store("cut-write");
+        assert_eq!(cut_as(&store, "c-2", Some("c-2 waits on a lock nobody holds"), &[], None), 0);
+        let g = groups_of(&store, "cl");
+        assert_eq!(g.len(), 4, "one group more");
+        assert_eq!(g[1].members, ["c-4"], "the running group keeps what did not rest on the row");
+        assert_eq!(g[1].caption, "The middle");
+        assert_eq!(g[2].members, ["c-2", "c-3"], "the row and what rests on it, in the group's order");
+        assert_eq!((g[2].agent.as_str(), g[2].cap, g[2].stop.as_str()), ("claude opus high", Some(2), "no row waits on a lock"));
+        assert_eq!(g[2].member_agents.get("c-3").map(String::as_str), Some("claude sonnet low"), "a member's own line goes with it");
+        assert!(g[1].member_agents.is_empty());
+        assert!(g[2].verdict.is_empty() && g[2].checks.is_empty() && g[2].caption.is_empty());
+        assert_eq!(g[3].members, ["c-5"], "the planned group renumbers to 4");
+        assert_eq!(g[0].members, ["c-1"]);
+        assert!(g[2].id.is_some() && g[2].id != g[1].id && g[2].id != g[3].id, "a group of its own, by name");
+    }
+
+    #[test]
+    fn a_cut_is_logged_with_its_reason_and_show_log_says_so() {
+        let (_env, store) = cut_store("cut-log");
+        assert_eq!(cut_as(&store, "c-2", Some("waits on a lock nobody holds"), &[], None), 0);
+        let w = store.worklist("cl").unwrap();
+        let log = crate::model::section_of(&crate::model::localise_dates(&w.body), "Log").unwrap_or_default();
+        assert!(
+            log.contains("cut c-2 c-3 from group 2 into group 3 (new), ahead of 1 planned — why: waits on a lock nobody holds"),
+            "{log}"
+        );
+        assert_eq!(run(&store, &["show", "cl", "--log"]), 0);
+        assert_eq!(flagged(&store, &["show", "cl"], &[("log", "true")]), 0);
+    }
+
+    #[test]
+    fn a_cut_keeps_the_cut_rows_history_and_does_not_despawn() {
+        let (_env, store) = cut_store("cut-history");
+        let mut t = store.find_task("c-2").unwrap();
+        t.status_raw = "blocked".into();
+        t.tags = vec!["lock".into()];
+        store.save_task(&t).unwrap();
+        let claimed = t.clone();
+        assert_eq!(cut_as(&store, "c-2", Some("blocked on a lock"), &[], None), 0);
+        let after = store.find_task("c-2").unwrap();
+        assert_eq!(after.status_raw, claimed.status_raw);
+        assert_eq!(after.tags, claimed.tags);
+        assert_eq!(after.after, claimed.after);
+        assert_eq!(store.find_task("c-3").unwrap().after, ["c-2"], "the edge between the cut rows stands");
+    }
+
+    #[test]
+    fn a_person_item_about_a_cut_row_points_at_the_new_group() {
+        use crate::message::{self, About, Kind, Message, Party, Waiting};
+        let (_env, store) = cut_store("cut-item");
+        let q = Message::question(Party::seat("cl"), Kind::Note, "c-2 is blocked on a lock: wait, or cut?", Waiting::new("w3R:p1", ""))
+            .about(About::Task("c-2".into()))
+            .for_the_person();
+        message::raise(&store, &q).unwrap();
+        assert_eq!(crate::cmd_message::unblocks(&store, &q).as_deref(), Some("cl group 2"));
+        assert_eq!(cut_as(&store, "c-2", Some("blocked on a lock"), &[], None), 0);
+        assert_eq!(crate::cmd_message::unblocks(&store, &q).as_deref(), Some("cl group 3"));
+    }
+
+    #[test]
+    fn a_member_seat_does_not_cut_and_the_governor_does() {
+        let (_env, store) = cut_store("cut-who");
+        assert_eq!(cut_as(&store, "c-2", Some("blocked"), &["c-4"], None), 1, "a seat on a row");
+        assert_eq!(cut_as(&store, "c-2", Some("blocked"), &["cpd-9"], Some("other")), 1, "a governor of another list");
+        assert_eq!(groups_of(&store, "cl").len(), 3, "nothing was written");
+        assert_eq!(cut_as(&store, "c-2", Some("blocked"), &[], Some("cl")), 0, "its governor");
+    }
+
+    #[test]
+    fn the_primary_bound_to_no_row_cuts() {
+        let (_env, store) = cut_store("cut-who-2");
+        assert_eq!(cut_as(&store, "c-2", Some("blocked"), &["w1:p1"], None), 0, "the primary, bound to no row");
+    }
+
+    #[test]
+    fn a_cut_needs_its_reason_and_a_refusal_writes_nothing() {
+        let (_env, store) = cut_store("cut-refused");
+        assert_eq!(cut_as(&store, "c-2", None, &[], None), 2);
+        assert_eq!(cut_as(&store, "c-1", Some("x"), &[], None), 1, "a row behind the run is `rm`, ahead of it");
+        assert_eq!(cut_as(&store, "c-5", Some("x"), &[], None), 1);
+        assert_eq!(groups_of(&store, "cl").len(), 3);
+        // The dry run says and writes nothing.
+        let flags = [("why", "x"), ("dry-run", "true")];
+        assert_eq!(cut_by(&store, &Args::synth("worklist", &["cut", "cl", "c-2"], &flags), &[], None), 0);
+        assert_eq!(groups_of(&store, "cl").len(), 3);
     }
 }
