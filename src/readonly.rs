@@ -44,7 +44,7 @@ pub const ACTIONS: &[&str] = &[
 ];
 
 /// Verbs that write except for the listed sub-verbs.
-pub const MIXED: &[(&str, &[&str])] = &[("worklist", &["ls", "show"])];
+pub const MIXED: &[(&str, &[&str])] = &[("worklist", &["ls", "show"]), ("piece", &["show"])];
 
 /// The name the registry lists first for a word (`wl` → `worklist`).
 fn canonical(word: &str) -> &str {
