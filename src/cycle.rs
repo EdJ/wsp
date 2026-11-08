@@ -2814,6 +2814,28 @@ pub(crate) fn verifier_order_line(store: &Store, member: &Task) -> String {
     }
 }
 
+/// The reasons a member gave for running the full suite in its seat
+/// (`wsp-538`), from its log, so that an unneeded run is visible to the one
+/// reading the work and can be challenged. Empty when there were none.
+pub(crate) fn full_suite_line(member: &Task) -> String {
+    let log = member.section("Log").unwrap_or_default();
+    let why: Vec<String> = log
+        .lines()
+        .filter_map(|l| l.split_once(crate::throttle::FULL_SUITE_LOGGED).map(|(_, w)| w.trim().to_string()))
+        .collect();
+    if why.is_empty() {
+        return String::new();
+    }
+    let said = why.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join("; ");
+    format!(
+        "\n\nThe member ran the full suite in its seat ({}), saying: {said}. The barrier runs the full suite once per group: if this change did not need the whole suite, say so in your verdict.",
+        match why.len() {
+            1 => "once".to_string(),
+            n => format!("{n} times"),
+        }
+    )
+}
+
 /// The order without the packet.
 fn verifier_base(store: &Store, member: &Task) -> String {
     let running = worklist::Running::read(store);
@@ -2861,7 +2883,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
          code rather than against the report: the commits, whether they \
          do what the overview asked, and the tests that cover them — `cargo test <module>::` in \
-         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{pieces}{whole}{split}\n\n\
+         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{pieces}{whole}{ran_full}{split}\n\n\
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
          - {holds};\n\
@@ -2878,6 +2900,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
         legs = legs_line(member),
         pieces = pieces_block(store, member),
         whole = crate::size_check::whole_line(member),
+        ran_full = full_suite_line(member),
         reuse = crate::check::greens_held(store, member).map(|(sha, held)| reuse_text(&sha, &held)).unwrap_or_default(),
         split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
     )
@@ -4599,6 +4622,17 @@ pub(crate) use crate::store::log_line;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// `wsp-538`: the reason a member gave for a full suite is in its verifier's
+    /// order, so an unneeded run can be challenged.
+    #[test]
+    fn a_verifiers_order_shows_the_reason_for_a_full_suite_run_in_the_members_seat() {
+        let mut m = Task::new("a member", "m-1");
+        assert_eq!(full_suite_line(&m), "");
+        m.log(&format!("{} the fixture every test reads", crate::throttle::FULL_SUITE_LOGGED));
+        let line = full_suite_line(&m);
+        assert!(line.contains("\"the fixture every test reads\"") && line.contains("once") && line.contains("say so in your verdict"), "{line}");
+    }
+
     use super::*;
     use crate::store::a_reader;
     pub(crate) use crate::store::SAID;

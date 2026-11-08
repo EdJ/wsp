@@ -741,6 +741,114 @@ pub struct Ctx<'a> {
     pub held: bool,
     /// The variable already in the build's environment, by name.
     pub env: &'a dyn Fn(&str) -> Option<String>,
+    /// A line for the row's log, by row (`wsp-538`: the reason a member gave for
+    /// a full suite).
+    pub log: &'a dyn Fn(&str, &str),
+    /// The row's body, by row: its `## Checks` and the barrier's failing tests,
+    /// named in the refusal so the narrow path is the obvious one.
+    pub body: &'a dyn Fn(&str) -> String,
+}
+
+/// What a member says to run a full suite anyway (`wsp-538`).
+pub const FULL_SUITE_WHY: &str = "WSP_FULL_SUITE";
+
+/// What the seat is, in `WSP_SEAT_KIND`: `member`, `verifier` or `check`.
+/// Only a member is held to its row's own checks.
+pub const SEAT_KIND: &str = "WSP_SEAT_KIND";
+
+/// The row's log line for a full suite a member ran with a reason.
+pub const FULL_SUITE_LOGGED: &str = "full suite run in this seat:";
+
+/// Whether a command is a full-workspace run a member is asked to confirm:
+/// `cargo test` / `cargo nextest run` with no filter (see [`is_full_suite`]), or
+/// the full `npm run check` of a React tree.
+pub fn is_gated_suite(tool: &str, args: &[String]) -> bool {
+    if tool == "npm" {
+        return args.len() == 2 && args[0] == "run" && args[1] == "check";
+    }
+    is_full_suite(tool, args)
+}
+
+/// The full-workspace command a piece of row text requires, if it does: a
+/// backticked span (or a line) that is `cargo test` / `cargo nextest run` with no
+/// filter, or the full `npm run check` (`wsp-538`). A done-when that says so
+/// sends the member to the one run the barrier owns.
+pub fn asks_full_suite(text: &str) -> Option<String> {
+    let mut cands: Vec<&str> = text.split('`').skip(1).step_by(2).collect();
+    cands.extend(text.lines().map(|l| l.trim().trim_start_matches("$ ").trim_start_matches("verify").trim()));
+    cands.into_iter().find_map(|c| {
+        let words: Vec<String> = c.split_whitespace().map(|w| w.trim_end_matches(['.', ',', ';']).to_string()).collect();
+        let (tool, rest) = words.split_first()?;
+        let tool = tool.as_str();
+        // A sentence that starts with a command's name is not a command: it
+        // has to read as the command, whole (`cargo test` and its flags).
+        let rest: Vec<String> = rest.iter().take_while(|w| w.starts_with('-') || matches!(w.as_str(), "run" | "nextest" | "test" | "t" | "check") || w.starts_with('+')).cloned().collect();
+        let full = rest.len() + 1 == words.len() && is_gated_suite(tool, &rest);
+        full.then(|| c.to_string())
+    })
+}
+
+/// Why a row may not require a full-workspace run of its member.
+pub fn full_suite_ask_refusal(found: &str) -> String {
+    format!(
+        "wsp: this asks the member to run `{found}`, the whole suite. The barrier runs it once per group; a row's done-when names the failing test and the scoped check instead (`cargo nextest run -E 'test(=<test>)'` or `wsp check <row>`). A person may still write one."
+    )
+}
+
+/// The `## Checks` lines of a row, as written.
+fn checks_of(body: &str) -> Vec<String> {
+    let mut in_checks = false;
+    let mut out = Vec::new();
+    for l in body.lines() {
+        if let Some(h) = l.strip_prefix("## ") {
+            in_checks = h.trim() == "Checks";
+            continue;
+        }
+        if in_checks && !l.trim().is_empty() {
+            out.push(l.trim().to_string());
+        }
+    }
+    out
+}
+
+/// The tests a nextest run in the row's body reports failing: `FAIL [ 0.2s] crate path::name`.
+fn failing_tests(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in body.lines() {
+        let l = l.trim().trim_start_matches("- ").trim();
+        let Some(at) = l.find("FAIL [") else { continue };
+        let Some(close) = l[at..].find(']') else { continue };
+        let words: Vec<&str> = l[at + close + 1..].split_whitespace().collect();
+        if let Some(name) = words.last().filter(|n| n.contains("::") || words.len() == 1) {
+            let name = name.to_string();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// What a member is told when it asks for the whole suite without a reason.
+pub fn full_suite_refusal(body: &str) -> String {
+    let mut m = format!(
+        "wsp: refused. The barrier runs the full suite once per group; run your row's checks (`wsp check <row>`). If this change needs the whole suite (a shared module, a fixture every test reads, a build-wide setting), run it again with `{FULL_SUITE_WHY}=\"<why>\"`."
+    );
+    let checks = checks_of(body);
+    if !checks.is_empty() {
+        m.push_str("\nYour row's checks:");
+        for c in checks.iter().take(8) {
+            m.push_str(&format!("\n  {c}"));
+        }
+    }
+    let failing = failing_tests(body);
+    if !failing.is_empty() {
+        m.push_str("\nA test the barrier saw fail, run alone:");
+        for t in failing.iter().take(5) {
+            m.push_str(&format!("\n  cargo nextest run -E 'test(={t})'"));
+        }
+    }
+    m
 }
 
 fn shim_dir(state: &Path) -> PathBuf {
@@ -853,8 +961,21 @@ pub fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
         eprintln!("wsp: no `{tool}` on PATH past wsp's own shim");
         return 127;
     };
-    if !ctx.held && !ctx.task.is_empty() && is_full_suite(tool, args) {
-        note_full_suite(ctx);
+    if !ctx.held && !ctx.task.is_empty() && is_gated_suite(tool, args) {
+        // A member confirms, with a reason, before the whole suite (`wsp-538`);
+        // a verifier is noted as before, and a check or the barrier has no task.
+        if (ctx.env)(SEAT_KIND).as_deref() == Some("member") {
+            match (ctx.env)(FULL_SUITE_WHY).map(|w| w.trim().to_string()).filter(|w| !w.is_empty()) {
+                Some(why) => (ctx.log)(&ctx.task, &format!("{FULL_SUITE_LOGGED} {why}")),
+                None => {
+                    (ctx.say)(&full_suite_refusal(&(ctx.body)(&ctx.task)));
+                    return 2;
+                }
+            }
+        }
+        if tool == "cargo" {
+            note_full_suite(ctx);
+        }
     }
     let mut cmd = Command::new(&real);
     cmd.args(args);
@@ -1007,6 +1128,14 @@ pub fn run_raw(argv: &[String]) -> i32 {
         poll: Duration::from_secs(1),
         held: std::env::var_os(HELD).is_some_and(|v| !v.is_empty()),
         env: &env,
+        log: &|task, line| {
+            if let Some(mut t) = store.find_task(task) {
+                t.log(line);
+                t.touch();
+                let _ = store.save_task(&t);
+            }
+        },
+        body: &|task| store.find_task(task).map(|t| t.body).unwrap_or_default(),
     };
     run_in(&ctx, tool, args)
 }
@@ -1744,6 +1873,8 @@ mod tests {
             poll: Duration::from_millis(20),
             held: false,
             env,
+            log: &|_, _| {},
+            body: &|_| String::new(),
         }
     }
 
@@ -2083,6 +2214,81 @@ mod tests {
         seatless.task = String::new();
         run_in(&seatless, "cargo", &["test".into()]);
         assert_eq!(full_suite_runs(&rig.state, ""), 0, "no row, no note");
+    }
+
+    /// `wsp-538`: a member confirms with a reason before the whole suite; the
+    /// reason is the row's log; a verifier and a check are not asked.
+    #[test]
+    fn a_members_full_nextest_is_refused_and_allowed_with_a_reason_that_lands_in_the_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = rig("throttle-member-suite");
+        mode(&rig, Mode::Off, 1);
+        fs::write(rig.bin.join("cargo"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(rig.bin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+        let idle = || None;
+        let said = std::cell::RefCell::new(Vec::<String>::new());
+        let say = |m: &str| said.borrow_mut().push(m.to_string());
+        let logged = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let log = |t: &str, l: &str| logged.borrow_mut().push((t.to_string(), l.to_string()));
+        let body = |_: &str| "## Checks\n\ntests: cargo test cmd_spawn::\n\n## Log\n\n- 1 barrier: FAIL [   0.2s] wsp cmd_spawn::a_seat_starts\n".to_string();
+        let why = std::cell::RefCell::new(None::<String>);
+        let kind = std::cell::RefCell::new("member".to_string());
+        let env = |k: &str| match k {
+            SEAT_KIND => Some(kind.borrow().clone()),
+            FULL_SUITE_WHY => why.borrow().clone(),
+            _ => None,
+        };
+        let mut c = ctx(&rig, &idle, &say, &env);
+        c.log = &log;
+        c.body = &body;
+        let full = s(&["nextest", "run", "--workspace"]);
+
+        assert_eq!(run_in(&c, "cargo", &full), 2, "refused");
+        let text = said.borrow().join("\n");
+        assert!(text.contains("barrier runs the full suite once per group") && text.contains("wsp check <row>") && text.contains("WSP_FULL_SUITE"), "{text}");
+        assert!(text.contains("tests: cargo test cmd_spawn::"), "the row's own checks: {text}");
+        assert!(text.contains("cargo nextest run -E 'test(=cmd_spawn::a_seat_starts)'"), "the failing test, alone: {text}");
+        assert_eq!(full_suite_runs(&rig.state, "wsp-9"), 0, "a refused run is not a run");
+        assert!(logged.borrow().is_empty());
+
+        assert_eq!(run_in(&c, "cargo", &s(&["nextest", "run", "cmd_spawn::"])), 0, "a filtered run is the member's own");
+        assert_eq!(run_in(&c, "cargo", &s(&["test", "--workspace"])), 2, "plain cargo test too");
+
+        *why.borrow_mut() = Some("the fixture every test reads".into());
+        assert_eq!(run_in(&c, "cargo", &full), 0, "allowed with a reason");
+        assert_eq!(*logged.borrow(), vec![("wsp-9".to_string(), format!("{FULL_SUITE_LOGGED} the fixture every test reads"))]);
+        assert_eq!(full_suite_runs(&rig.state, "wsp-9"), 1, "and still counted");
+
+        *kind.borrow_mut() = "verifier".into();
+        *why.borrow_mut() = None;
+        assert_eq!(run_in(&c, "cargo", &full), 0, "a verifier is not gated");
+        *kind.borrow_mut() = "check".into();
+        assert_eq!(run_in(&c, "cargo", &full), 0, "a check is not gated");
+        let mut person = ctx(&rig, &idle, &say, &env);
+        person.task = String::new();
+        *kind.borrow_mut() = "member".into();
+        assert_eq!(run_in(&person, "cargo", &full), 0, "a person at a shell has no row");
+    }
+
+    #[test]
+    fn a_done_when_requiring_the_full_workspace_run_is_found_and_a_scoped_one_is_not() {
+        for yes in [
+            "`cargo nextest run --workspace` runs to its end",
+            "Done when: `cargo test` is green.",
+            "verify  cargo test",
+            "the full `npm run check` passes",
+        ] {
+            assert!(asks_full_suite(yes).is_some(), "{yes}");
+        }
+        for no in [
+            "`cargo nextest run -E 'test(=a::b)'` passes",
+            "verify  cargo test cmd_worklist::",
+            "cargo test is slow, so run the one test",
+            "`cargo nextest run -p wsp a::`",
+            "Save prints ok.",
+        ] {
+            assert!(asks_full_suite(no).is_none(), "{no}: {:?}", asks_full_suite(no));
+        }
     }
 
     #[test]

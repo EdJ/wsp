@@ -5298,6 +5298,17 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
+    // The barrier runs the full suite once per group, so a follow-up does not
+    // ask its member for it (`wsp-538`): it names the failing test and the
+    // scoped check. A person may still write such a row, but not file it here.
+    for m in &members {
+        let Some(t) = tasks.iter().find(|t| &t.id == m) else { continue };
+        let asks = [t.section("Overview"), t.section("Checks")].into_iter().flatten().find_map(|s| crate::throttle::asks_full_suite(&s));
+        if let Some(found) = asks {
+            eprintln!("{m}: {}", crate::throttle::full_suite_ask_refusal(&found));
+            return 1;
+        }
+    }
     let groups = w.groups();
     if let Some(code) = already_in(&groups, &members, &w.id) {
         return code;
@@ -7555,6 +7566,23 @@ mod tests {
         assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("blocking", "true"), ("from", &from)], &["cpd-9"]), 0);
         assert_eq!(checks_on(&store, 1)[0].state, crate::barrier::State::Blocking);
         assert_eq!(checks_ending(), vec!["cpd-9"]);
+    }
+
+    /// `wsp-538`: the barrier owns the full suite, so a follow-up whose
+    /// done-when requires it of the member is refused, naming the scoped check.
+    #[test]
+    fn a_follow_up_whose_done_when_requires_the_full_workspace_run_is_refused() {
+        let _env = util::isolated("followup-full");
+        let store = at_barrier_one_seated("followup-full");
+        let from = verdict("followup-full", "holds, with a tail");
+        let mut t = store.task("wl-003").unwrap();
+        t.body = format!("{}\n\n## Overview\nFix it. Done when: `cargo nextest run --workspace` runs to its end.\n", t.body);
+        store.save_task(&t).unwrap();
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("next", "true"), ("from", &from)], &["cpd-9"]), 1, "refused");
+        assert!(checks_ending().is_empty(), "and the check is not ended by it");
+        t.body = "## Overview\nFix it. Done when: `cargo nextest run -E 'test(=a::b)'` passes.\n".into();
+        store.save_task(&t).unwrap();
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("next", "true"), ("from", &from)], &["cpd-9"]), 0);
     }
 
     /// `wsp-254`: a follow-up group goes in ahead of a planned one, which is

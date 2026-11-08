@@ -13,7 +13,9 @@ use crate::Args;
 
 pub fn add(store: &Store, args: &Args) -> i32 {
     // Asked only of a sub-task: the seat matters to nothing else `add` does.
-    let pane = args.get("parent").and_then(|_| crate::place::my_pane());
+    // And of a row that asks for the whole suite (`wsp-538`), which only a seat is refused.
+    let asks = || std::iter::once(args.text(0)).chain(args.get("caption")).any(|t| crate::throttle::asks_full_suite(&t).is_some());
+    let pane = (args.has("parent") || asks()).then(crate::place::my_pane).flatten();
     add_from(store, args, pane.as_deref())
 }
 
@@ -48,6 +50,16 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Ok(c) => c.filter(|c| !c.is_empty()),
         Err(code) => return code,
     };
+
+    // From a seat, a row does not require the whole suite of its member
+    // (`wsp-538`): the barrier owns that run. A person at a shell may write one.
+    if pane.is_some() {
+        let asks = std::iter::once(title.as_str()).chain(args.get("caption").iter().map(String::as_str)).find_map(crate::throttle::asks_full_suite);
+        if let Some(found) = asks {
+            eprintln!("{}", crate::throttle::full_suite_ask_refusal(&found));
+            return 1;
+        }
+    }
 
     let index = Index::new(store.projects());
 
@@ -5010,6 +5022,18 @@ pub(crate) mod tests {
     /// a sub-task under it. Refused, nothing filed, and the refusal names legs;
     /// `--anyway` files it. The same from a seat not bound to the member, and
     /// under the member once it is at review, files it with nothing said.
+    /// `wsp-538`: from a seat, `add` does not file a row requiring the full suite.
+    #[test]
+    fn add_from_a_seat_refuses_a_row_that_requires_the_full_workspace_run() {
+        let store = scratch("add-full-suite");
+        let ask = Args::synth("add", &["Fix it; done when `cargo nextest run --workspace` runs to its end"], &[("inbox", "true")]);
+        assert_eq!(add_from(&store, &ask, Some("cpd-1")), 1, "refused from a seat");
+        assert!(store.tasks().is_empty(), "and nothing was filed");
+        let scoped = Args::synth("add", &["Fix it; done when `cargo nextest run -E 'test(=a::b)'` passes"], &[("inbox", "true")]);
+        assert_eq!(add_from(&store, &scoped, Some("cpd-1")), 0);
+        assert_eq!(add_from(&store, &ask, None), 0, "a person may write one");
+    }
+
     #[test]
     fn add_parent_from_the_seat_working_a_member_is_refused_without_anyway() {
         let store = scratch("add-parent-member");

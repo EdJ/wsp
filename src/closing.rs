@@ -149,6 +149,16 @@ impl Kind {
         }
     }
 
+    /// What the seat says it is in `$WSP_SEAT_KIND` (`wsp-538`): the build shim
+    /// holds only a member to its row's own checks.
+    pub(crate) fn seat_word(self) -> &'static str {
+        match self {
+            Kind::Member => "member",
+            Kind::Verifier => "verifier",
+            Kind::Check => "check",
+        }
+    }
+
     /// The words a verdict file may open with.
     fn words(self) -> &'static [&'static str] {
         match self {

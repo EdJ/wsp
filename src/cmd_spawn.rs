@@ -2749,6 +2749,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         if let Some((key, kind)) = verdict {
             crate::closing::clear_verdict(store, &key, kind);
             order.env.insert("WSP_VERDICT".into(), crate::closing::verdict_path(store, &key, kind).display().to_string());
+            order.env.insert(crate::throttle::SEAT_KIND.into(), kind.seat_word().into());
         }
     }
     // `--on`: the row's tree goes up first and nothing starts on a half copy

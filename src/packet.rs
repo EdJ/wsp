@@ -340,7 +340,7 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
 
 /// What a packet that names a `cargo test` says of how much to run (`wsp-389`):
 /// the narrow filter is the member's, the full suite the barrier's.
-pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrower filter of it, for what you changed — never the full `cargo test`. The full suite runs once per group, at the barrier and (where the project declares it) in the verifier's tier; a full-suite run in your seat is noted in `wsp wip`. If the full suite matters for your change, name it in your review summary and leave it to the barrier.";
+pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrower filter of it, for what you changed — never the full `cargo test`. The full suite runs once per group, at the barrier and (where the project declares it) in the verifier's tier; in your seat the full `cargo nextest run --workspace` is refused until you give a reason (`WSP_FULL_SUITE=\"<why>\"`, for a shared module, a fixture every test reads or a build-wide setting); the reason goes in the row's log and the verifier sees it, and a run is noted in `wsp wip`. Otherwise run your row's checks (`wsp check <row>`), name the full suite in your review summary and leave it to the barrier.";
 
 /// The print: a heading, the author's words, each named file inline, and a tail
 /// (a leg's finish line), refused over [`CAP`].

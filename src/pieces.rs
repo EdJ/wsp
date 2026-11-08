@@ -586,6 +586,12 @@ pub(crate) fn add(old: &Record, new: New, actor: &Actor, status: Status) -> Resu
     if new.done_when.trim().is_empty() {
         return Err("a piece needs a done-when: how its seat knows it is finished".into());
     }
+    // The full suite is the barrier's (`wsp-538`); a person may still write one.
+    if !matches!(actor, Actor::Person) {
+        if let Some(found) = crate::throttle::asks_full_suite(&new.done_when) {
+            return Err(crate::throttle::full_suite_ask_refusal(&found));
+        }
+    }
     let last = last_batch(old);
     let batch = match new.at {
         At::Next => last + 1,
@@ -1122,6 +1128,19 @@ mod tests {
     }
 
     const TODO: Status = Status::Todo;
+
+    /// `wsp-538`: the barrier owns the full suite; a planner's piece does not
+    /// require it of the member, and a person may still write one.
+    #[test]
+    fn a_planners_piece_may_not_require_the_full_workspace_run_and_a_person_may() {
+        let ask = |at| New { done_when: "`cargo nextest run --workspace` runs to its end".into(), ..new("fix", at) };
+        let why = add(&Record::default(), ask(At::Next), &Actor::Governor, TODO).unwrap_err();
+        assert!(why.contains("barrier runs it once per group") && why.contains("test(="), "{why}");
+        assert!(add(&Record::default(), ask(At::Next), &Actor::Primary, TODO).is_err());
+        assert!(add(&Record::default(), ask(At::Next), &Actor::Person, TODO).is_ok(), "a person may");
+        let scoped = New { done_when: "`cargo nextest run -E 'test(=a::b)'` passes".into(), ..new("fix", At::Next) };
+        assert!(add(&Record::default(), scoped, &Actor::Governor, TODO).is_ok());
+    }
 
     fn put(rec: &Record, n: New) -> Record {
         add(rec, n, &Actor::Person, TODO).expect("the add is accepted")
