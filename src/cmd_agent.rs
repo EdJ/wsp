@@ -6205,6 +6205,11 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // A piece id reads `<row>-<n>`, so a project named `<x>-<digits>` would be
+    // read as a row. Refused at `project add` and `code`; named here for one
+    // that was made before.
+    problems.extend(crate::store::piece_ambiguous_projects(&index.projects));
+
     // A loaded index in a tree agents share.
     //
     // `git add` writes to one `.git/index` for everybody standing in a tree,

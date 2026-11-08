@@ -1368,6 +1368,53 @@ fn looks_like_id(needle: &str) -> bool {
     })
 }
 
+/// `<a>-<n>-<m>` with `n` and `m` all digits: piece `m` of row `<a>-<n>`.
+///
+/// Shape only. Whether the row exists, and whether it has that piece, is the
+/// resolver's. What keeps the shape unambiguous is [`piece_reading`]: no
+/// project id or code ends in `-<digits>`, so the row half never reads as a
+/// piece.
+pub fn split_piece_id(id: &str) -> Option<(&str, u32)> {
+    let (row, m) = id.rsplit_once('-')?;
+    if m.is_empty() || !m.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (code, n) = row.rsplit_once('-')?;
+    if code.is_empty() || n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((row, m.parse().ok()?))
+}
+
+/// Why a project slug or code may not end in `-<digits>`, or `None` if it does not.
+///
+/// `foo-2` as a slug would number its tasks `foo-2-001`, and a piece id would
+/// read that as piece 1 of row `foo-2`.
+pub fn piece_reading(name: &str) -> Option<String> {
+    let ends = name.rsplit_once('-').is_some_and(|(head, n)| {
+        !head.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    });
+    ends.then(|| {
+        format!("`{name}` ends in `-<digits>`, and a piece id (`<row>-<n>`) would read it as a row")
+    })
+}
+
+/// One line per project whose id or code ends in `-<digits>`, for `wsp doctor`.
+pub fn piece_ambiguous_projects(projects: &[Project]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in projects {
+        if let Some(why) = piece_reading(&p.id) {
+            out.push(format!("project {}: id {why}", p.id));
+        }
+        if let Some(why) = piece_reading(p.code()) {
+            if p.code() != p.id {
+                out.push(format!("project {}: code {why}", p.id));
+            }
+        }
+    }
+    out
+}
+
 impl Store {
     /// The task a needle names, or the message saying why it named none.
     ///
@@ -3954,6 +4001,40 @@ mod tests {
             store.scope_taken("batch", Some("batch")).is_none(),
             "a scope keeping the name it already has is not colliding with itself",
         );
+    }
+
+    // ---- piece ids --------------------------------------------------------
+
+    #[test]
+    fn a_piece_id_is_a_row_id_and_a_number() {
+        assert_eq!(split_piece_id("compounding-199-2"), Some(("compounding-199", 2)));
+        assert_eq!(split_piece_id("jolt-app-77-2"), Some(("jolt-app-77", 2)));
+        assert_eq!(split_piece_id("wsp-501"), None);
+        assert_eq!(split_piece_id("wsp-501-x"), None);
+        assert_eq!(split_piece_id("wsp-x-2"), None, "the row half has to be a row id");
+        assert_eq!(split_piece_id("wsp-501-"), None);
+    }
+
+    #[test]
+    fn a_name_ending_in_digits_reads_as_a_row() {
+        assert!(piece_reading("foo-2").is_some());
+        assert!(piece_reading("bar-12").is_some());
+        assert!(piece_reading("foo-2a").is_none());
+        assert!(piece_reading("foo").is_none());
+    }
+
+    #[test]
+    fn doctor_names_a_project_whose_id_or_code_ends_in_digits() {
+        let store = scratch("piece-ambiguous");
+        proj(&store, "wsp", "");
+        proj(&store, "fine", "ok");
+        assert!(piece_ambiguous_projects(&store.projects()).is_empty());
+        proj(&store, "foo-2", "");
+        proj(&store, "other", "bar-12");
+        let found = piece_ambiguous_projects(&store.projects());
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().any(|l| l.contains("foo-2")), "{found:?}");
+        assert!(found.iter().any(|l| l.contains("other") && l.contains("bar-12")), "{found:?}");
     }
 
     // ---- per-project ids --------------------------------------------------

@@ -80,6 +80,10 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: `{slug_raw}` does not reduce to a usable slug");
         return 2;
     }
+    if let Some(why) = crate::store::piece_reading(&slug) {
+        eprintln!("wsp: {why}");
+        return 2;
+    }
     if store.project(&slug).is_some() {
         eprintln!("wsp: project `{slug}` already exists");
         return 1;
@@ -978,6 +982,15 @@ mod tests {
         let mut p = Project::new(id);
         p.parent = parent.map(|s| s.to_string());
         store.save_project(&p).unwrap();
+    }
+
+    #[test]
+    fn a_slug_ending_in_digits_is_refused_and_one_ending_in_a_letter_is_not() {
+        let store = scratch("project-add-digits");
+        assert_eq!(add(&store, &Args::synth("project", &["add", "foo-2"], &[])), 2);
+        assert!(store.project("foo-2").is_none());
+        assert_eq!(add(&store, &Args::synth("project", &["add", "foo-2a"], &[])), 0);
+        assert!(store.project("foo-2a").is_some());
     }
 
     /// The bug this file exists to have fixed: `wsp project rm batch` deleted

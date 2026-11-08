@@ -599,6 +599,10 @@ pub fn code(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: a code cannot begin with a digit");
         return 2;
     }
+    if let Some(why) = crate::store::piece_reading(&new) {
+        eprintln!("wsp: {why}");
+        return 2;
+    }
     if crate::cmd_migrate::is_dated(&format!("{new}-001")) {
         eprintln!("wsp: `{new}` would produce ids indistinguishable from the dated scheme");
         return 2;
@@ -692,6 +696,16 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_code_ending_in_digits_is_refused() {
+        let store = crate::testkit::store("code-digits");
+        store.save_project(&crate::model::Project::new("bar")).unwrap();
+        assert_eq!(code(&store, &Args::synth("code", &["bar", "bar-12"], &[])), 2);
+        assert_eq!(store.project("bar").unwrap().code_raw, "");
+        assert_eq!(code(&store, &Args::synth("code", &["bar", "br"], &[])), 0);
+        assert_eq!(store.project("bar").unwrap().code_raw, "br");
+    }
 
     fn renaming() -> BTreeMap<String, String> {
         [("t-260815-001", "core-001"), ("t-260815-002", "core-002")]
