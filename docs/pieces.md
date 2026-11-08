@@ -468,6 +468,52 @@ than per-row verifiers had (a late rework batch costs a seat and the end of
 the critical path); or merge conflicts between pieces of a batch, which today
 are rows' landings at the barrier instead and would move, not appear.
 
+## The trial
+
+`wsp-510`, 2026-11-08, on master 507e5b0. Two runs: a sandbox run of the
+mechanics, then one real larger work (`wsp-495`) run as pieces on the list
+`pieces`, priced with `wsp attempts <row> --cost` and `wsp worklist cost`.
+
+### The sandbox run
+
+`wsp sandbox --fake`, with a stub `compound-sup` standing in for the real one
+(the run spawns on compound by default, and a fake herdr does not catch that:
+without the stub every seat would have been a real agent). Each stub seat
+reported `SessionStart` and a turn as Claude's hooks do. The list `proof` had one
+member, `demo-001`, on a scratch repo: pieces 1 and 2 in batch 1, piece 3 in
+batch 2, each with one `check:` line.
+
+With no person's verb, the run:
+
+- opened batch 1, with a tree for each piece cut from the row's branch;
+- closed it: merged both branches into the row's tree and ran the two checks
+  on the merged tip;
+- opened piece 3 in the row's tree;
+- closed batch 2 and typed the row's review, with the pieces table as the
+  account;
+- opened one verifier, whose order carried the pieces block (each piece's id,
+  done-when and checks on the row's tip);
+- landed on the hold, folded the three pieces into the row's log, ran the
+  barrier and closed the list.
+
+Only the seats were played: three `piece done`, one `verified --holds` and
+the barrier's `go`, each from its own seat. Piece 1's start to the land took
+about 3 minutes.
+
+Found along the way:
+
+- **Piece trees outlive their batch** (`wsp-532`). `piece done` pokes the run
+  while the piece's agent is still in its turn. So the batch closes with each
+  piece's seat standing in its tree, and the trees are kept. Nothing discards
+  them once the tick ends those seats, and `leg_tree::sweep` reads only
+  `<row>.<leg>` names. The trees and branches were still there after the list
+  closed.
+- **A sandbox's list outputs reach the real `~/.compound/artefacts`**
+  (`wsp-533`): `wsp sandbox` leaves `WSP_ARTEFACTS` unset.
+- `wsp attempts --cost` gives a start that never seated a clock that runs to
+  the next start (8m and 6m for about a minute each). The fold says `ran ?`
+  for a seat with no session.
+
 ## Not this
 
 - **Pieces as sub-tasks with a flag.** A sub-task is a store row, an id that
