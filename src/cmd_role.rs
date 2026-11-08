@@ -456,7 +456,9 @@ pub(crate) fn prove(p: &Proc, cwd: Option<&str>, f: &Facts) -> Result<Proof, Str
         return Err(format!("{name} is held by a live seat or a claim"));
     }
     let done_with = match (f.status_of)(&name) {
-        Some(Status::Doing) => return Err(format!("{name} is at doing")),
+        // `held` was refused above, so a doing row here has no seat and no claim:
+        // nobody may be using what stands in its tree.
+        Some(Status::Doing) => format!("{name} is at doing with no seat and no claim"),
         Some(s) => format!("{name} is at {}", s.as_str()),
         None => match (f.check_in_use)(&name) {
             Some(false) => format!("{name} is a barrier check's tree, no longer in use"),
@@ -499,7 +501,8 @@ pub(crate) fn session_label(command: &str) -> Option<String> {
 
 /// A leaked compound-sup test session: its label is no live seat (no binding, no
 /// governor slot, none of the live seats' processes), it is older than an hour,
-/// and the row whose tree it stands in, if any, is not held and not at doing.
+/// and the row whose tree it stands in, if any, is not held (a doing row with no
+/// seat and no claim is not held).
 fn prove_session(p: &Proc, label: &str, cwd: Option<&str>, f: &Facts) -> Result<Proof, String> {
     if (f.seat_live)(label) {
         return Err(format!("{label} is a live seat — bound to a row or holding a governor's slot"));
@@ -511,9 +514,6 @@ fn prove_session(p: &Proc, label: &str, cwd: Option<&str>, f: &Facts) -> Result<
     if let Some((name, _)) = cwd.and_then(tree_named) {
         if (f.held)(&name) {
             return Err(format!("{name} is held by a live seat or a claim"));
-        }
-        if (f.status_of)(&name) == Some(Status::Doing) {
-            return Err(format!("{name} is at doing"));
         }
         tree = Some(name);
     }
@@ -543,6 +543,49 @@ pub(crate) fn in_scope(
             }
         }
     }
+}
+
+/// Of the pids standing in a tree by working directory (`in_tree`, less every live
+/// seat's), those a despawn ends with the seat: what the tree started
+/// ([`crate::check_tree::verdict`]: a dev tool, or a child of something that stood
+/// there), and a `compound-sup spawn --label cpd-N` test session, which a seat's
+/// own test run leaves behind and which `verdict` spares as an installed server.
+/// Never a host or a login shell, and never by a pattern on a name alone: each
+/// pid is in the tree by its working directory.
+pub(crate) fn left_by_a_seat(in_tree: &[u32], table: &[(u32, u32, String)], procs: &[Proc], tree: &std::path::Path) -> Vec<u32> {
+    let session = |pid: u32| procs.iter().find(|p| p.pid == pid).is_some_and(|p| session_label(&p.command).is_some());
+    in_tree
+        .iter()
+        .copied()
+        .filter(|&pid| match crate::check_tree::verdict(pid, tree, in_tree, table) {
+            crate::check_tree::Verdict::Stop => true,
+            crate::check_tree::Verdict::Spare(_) => session(pid),
+        })
+        .collect()
+}
+
+/// The pids a seat started that stand in `dir`, to be ended with the tree.
+/// Read before the tree is removed: a removed directory is not reliably a
+/// working directory `lsof` can name.
+pub(crate) fn left_in(dir: &std::path::Path) -> Vec<u32> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let in_tree = crate::check_tree::running_in(dir);
+    left_by_a_seat(&in_tree, &crate::check_tree::exes(), &processes(), dir)
+}
+
+/// `TERM`, a moment, then `KILL` for what is left. Returns what it signalled,
+/// TERM first, then KILL.
+pub(crate) fn end_pids(pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    if cfg!(test) || pids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    crate::check_tree::signal("-TERM", pids);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let still: Vec<u32> = util::alive(pids).into_iter().collect();
+    crate::check_tree::signal("-KILL", &still);
+    (pids.to_vec(), still)
 }
 
 const SEEN: &str = "reap-seen.json";
@@ -857,7 +900,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
         order: 310,
         text: r##"  wsp reap <pid>… | --list          stop processes by pid, never by pattern: a dev
                                     or test tool over an hour old in the tree of a
-                                    row not at doing, a zsh busy loop, a test
+                                    row no seat or claim holds, a zsh busy loop, a test
                                     binary idle 15 min in a finished tree. Never
                                     a live seat's. The primary any such pid; a
                                     governor those in its list's trees"##,
@@ -893,9 +936,14 @@ mod tests {
     const VITE: &str = "node /r/.worktrees/x/node_modules/.bin/vite --port 5173";
 
     #[test]
-    fn reap_refuses_a_pid_in_the_tree_of_a_doing_row() {
-        let why = judge(&world(), &proc(10, 9000, 0.0, VITE), "/r/.worktrees/wsp-1/web", 0).unwrap_err();
-        assert!(why.contains("wsp-1 is at doing"), "{why}");
+    fn reap_allows_a_pid_in_the_tree_of_a_doing_row_with_no_seat_and_refuses_one_a_seat_holds() {
+        let ok = judge(&world(), &proc(10, 9000, 0.0, VITE), "/r/.worktrees/wsp-1/web", 0).unwrap();
+        assert_eq!(ok.tree.as_deref(), Some("wsp-1"));
+        assert!(ok.text.contains("no seat"), "{}", ok.text);
+        let mut w = world();
+        w.held.push("wsp-1");
+        let why = judge(&w, &proc(10, 9000, 0.0, VITE), "/r/.worktrees/wsp-1/web", 0).unwrap_err();
+        assert!(why.contains("held"), "{why}");
     }
 
     #[test]
@@ -921,10 +969,34 @@ mod tests {
         assert!(ok.text.contains("cpd-5"), "{}", ok.text);
         assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-9")), "/r/.worktrees/wsp-2", 0).is_err(), "live seat");
         assert!(judge(&world(), &proc(10, 100, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-2", 0).is_err(), "young");
-        assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-1", 0).is_err(), "doing");
+        assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-1", 0).is_ok(), "doing, no seat");
         assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-3", 0).is_err(), "held");
         assert_eq!(session_label("compound-sup spawn --socket /x -- /bin/zsh"), None, "no label, no pattern");
         assert_eq!(session_label("vim --label cpd-5"), None);
+    }
+
+    #[test]
+    fn a_despawn_ends_the_dev_tools_and_test_sessions_in_the_tree_and_no_host() {
+        let t = std::path::Path::new("/r/.worktrees/wsp-1");
+        let ex = |pid: u32, ppid: u32, exe: &str| (pid, ppid, exe.to_string());
+        let table = vec![
+            ex(100, 1, "/usr/local/bin/node"),
+            ex(101, 1, "/Users/u/.local/bin/compound-sup"),
+            ex(102, 101, "/bin/zsh"),
+            ex(103, 1, "/Users/u/.local/bin/compound-sup"),
+            ex(104, 1, "/opt/herdr"),
+            ex(105, 1, "/Users/u/.local/bin/compound-sup"),
+        ];
+        let procs = vec![
+            proc(100, 9000, 0.0, "node /r/.worktrees/wsp-1/node_modules/.bin/vite"),
+            proc(101, 9000, 0.0, "/Users/u/.local/bin/compound-sup spawn --label cpd-7 -- /bin/zsh"),
+            proc(102, 9000, 0.0, "/bin/zsh"),
+            proc(103, 9000, 0.0, "/Users/u/.local/bin/compound-sup serve"),
+            proc(104, 9000, 0.0, "/opt/herdr"),
+            proc(105, 9000, 0.0, "/Users/u/.local/bin/compound-sup spawn --socket /x -- /bin/zsh"),
+        ];
+        let got = left_by_a_seat(&[100, 101, 102, 103, 104, 105], &table, &procs, t);
+        assert_eq!(got, vec![100, 101, 102], "vite, the labelled session and its zsh; not the server, the host or an unlabelled one");
     }
 
     #[test]
@@ -963,7 +1035,7 @@ mod tests {
         let bin = proc(11, 9000, 0.0, "/r/target/debug/deps/wsp-abc123 --test-threads 4");
         assert!(judge(&world(), &bin, "/r/.worktrees/wsp-2", 14 * 60).is_err());
         assert!(judge(&world(), &bin, "/r/.worktrees/wsp-2", 15 * 60).is_ok());
-        assert!(judge(&world(), &bin, "/r/.worktrees/wsp-1", 15 * 60).is_err(), "not in a doing row's tree");
+        assert!(judge(&world(), &bin, "/r/.worktrees/wsp-1", 15 * 60).is_ok(), "a doing row with no seat");
         assert!(judge(&world(), &bin, "/r/.worktrees/L-check-1", 15 * 60).is_ok(), "a barrier check's tree no longer in use");
         let busy = proc(11, 9000, 3.0, "/r/target/debug/deps/wsp-abc123");
         assert!(judge(&world(), &busy, "/r/.worktrees/wsp-2", 99_999).is_err());

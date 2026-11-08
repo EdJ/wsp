@@ -4447,7 +4447,30 @@ fn swept_up(
         // A barrier check's tree is taken on its own rule (`wsp-289`): nothing
         // in it beyond `target/`, and its check no longer anybody's.
         Some(t) if crate::check_tree::named(store, t).is_some() => crate::check_tree::discard(store, t, &standing),
-        Some(t) => cmd_checkout::discard(cmd_checkout::candidates(store, &cwd, t), t, &standing),
+        Some(t) => {
+            // What the seat started and left standing in its tree is read before
+            // the tree goes and ended once it has: a vite or a compound-sup
+            // session kept running there rewrote the tree after the removal and
+            // left the next seat a half-made one (`wsp-498`).
+            let dir = cmd_checkout::tree_of(cmd_checkout::candidates(store, &cwd, t), t);
+            let left = dir.as_deref().map(crate::cmd_role::left_in).unwrap_or_default();
+            let tree = cmd_checkout::discard(cmd_checkout::candidates(store, &cwd, t), t, &standing);
+            if let (Tree::Removed { path, .. }, Some(dir)) = (&tree, &dir) {
+                let (term, kill) = crate::cmd_role::end_pids(&left);
+                if !term.is_empty() {
+                    let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+                    crate::store::log_line(
+                        store,
+                        &format!("despawn {seat} ({t}): ended what stood in the removed tree {path}: TERM {}{}", list(&term), if kill.is_empty() { String::new() } else { format!(", KILL {}", list(&kill)) }),
+                    );
+                    // Whatever it wrote between the removal and its end is not a tree.
+                    if dir.exists() && !dir.join(".git").exists() {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
+            }
+            tree
+        }
         // A seat holding nothing names no tree. There is no path from a seat to
         // a checkout except through the task, and guessing one from the pane's
         // cwd would remove a tree on the strength of where somebody stood.

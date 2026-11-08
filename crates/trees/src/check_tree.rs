@@ -227,7 +227,7 @@ fn running_among(dir: &Path, backends: &[&dyn Place]) -> Vec<u32> {
 }
 
 /// [`running_among`] the backends wsp can spawn onto here.
-fn running_in(dir: &Path) -> Vec<u32> {
+pub fn running_in(dir: &Path) -> Vec<u32> {
     let all = crate::place::local_backends();
     running_among(dir, &here_of(&all))
 }
