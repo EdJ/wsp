@@ -322,7 +322,7 @@ pub(crate) fn write(t: &mut Task, rec: &Record) {
     crate::model::set_section_in(&mut t.body, SECTION, &parts.join("\n"));
 }
 
-/// Whether the row carries pieces: a `## Pieces` with anything in it.
+/// Whether the row carries pieces: it has a `## Pieces` section.
 pub(crate) fn staged(t: &Task) -> bool {
     t.section(SECTION).is_some()
 }
