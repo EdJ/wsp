@@ -63,6 +63,7 @@ mod cmd_verifications;
 mod leg_seat;
 mod leg_tree;
 mod legs;
+mod cmd_piece;
 mod pieces;
 mod verification;
 mod cmd_watch;
