@@ -138,7 +138,12 @@ fn edit(
     pane: Option<&str>,
     f: impl FnOnce(&Record, &Actor, Status) -> Result<Record, String>,
 ) -> Result<(Task, Record), String> {
-    let id = store.task_or_why(needle)?.id;
+    // A piece id names its row: `add` and `cap` take no number, and one given is
+    // the row's all the same.
+    let id = match crate::pieces::addressed(store, needle)? {
+        Some(a) => a.task.id,
+        None => store.task_or_why(needle)?.id,
+    };
     store.locked(|| {
         let mut t = store.find_task(&id).ok_or_else(|| format!("no task {id}"))?;
         if let Some(why) = refuses_pieces(&t) {
@@ -151,6 +156,18 @@ fn edit(
         store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
         Ok((t, new))
     })
+}
+
+/// The row and piece number a verb's first words name, as `<row>-<n>` or as
+/// `<row> <n>`, and the index of the first word after them (`docs/pieces.md`,
+/// *Ids*). The number is `None` when the verb was given the row alone, and an
+/// `Err` when the row has no such piece.
+fn row_and_n(store: &Store, args: &Args) -> Result<Option<(String, Option<usize>, usize)>, String> {
+    let Some(first) = args.rest.get(1) else { return Ok(None) };
+    if let Some(a) = crate::pieces::addressed(store, first)? {
+        return Ok(Some((a.task.id, Some(a.n), 2)));
+    }
+    Ok(Some((first.clone(), args.rest.get(2).and_then(|n| n.parse::<usize>().ok()), 3)))
 }
 
 fn refuse(why: String) -> i32 {
@@ -242,12 +259,16 @@ fn cmd_add(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
 }
 
 fn cmd_drop(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
-    let (Some(task), Some(n)) = (args.rest.get(1), args.rest.get(2).and_then(|n| n.parse::<usize>().ok())) else {
-        eprintln!("{USAGE}");
-        return 2;
+    let (task, n, at) = match row_and_n(store, args) {
+        Ok(Some((task, Some(n), at))) => (task, n, at),
+        Ok(_) => {
+            eprintln!("{USAGE}");
+            return 2;
+        }
+        Err(why) => return refuse(why),
     };
-    let why = args.text(3);
-    match edit(store, task, pane, |old, actor, status| drop_piece(old, n, &why, actor, status)) {
+    let why = args.text(at);
+    match edit(store, &task, pane, |old, actor, status| drop_piece(old, n, &why, actor, status)) {
         Ok((t, _)) => {
             store.git_commit(&format!("wsp: {} piece {n} dropped", t.id));
             println!("{} {}  piece {n} dropped", Paint::new().green("✓"), t.id);
@@ -408,7 +429,12 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         .rest
         .get(1)
         .filter(|r| r.as_str() != "-")
-        .cloned()
+        // `piece done wsp-501-2` is the row's piece 2: the row, as the seat's
+        // own binding says which piece it is.
+        .map(|r| match crate::pieces::addressed(store, r) {
+            Ok(Some(a)) => a.task.id,
+            _ => r.clone(),
+        })
         .or_else(|| pane.and_then(|p| store.bindings().get(p).and_then(|b| b.get("task_id")?.as_str().map(str::to_string))));
     let Some(row) = row else {
         eprintln!("usage: wsp piece done [<task>] --note FILE|- --caption \"…\"   (from a piece's own seat)");
@@ -524,9 +550,26 @@ fn cmd_show(store: &Store, args: &Args) -> i32 {
         eprintln!("{USAGE}");
         return 2;
     };
-    let t = match store.task_or_why(task) {
-        Ok(t) => t,
+    // `wsp piece show wsp-501-2` is `wsp piece show wsp-501 2`; on a landed row
+    // it is the line the piece folded into.
+    let named = match crate::pieces::addressed(store, task) {
+        Ok(a) => a,
         Err(why) => return refuse(why),
+    };
+    if let Some(a) = named.as_ref().filter(|a| a.piece.is_none()) {
+        if args.json() {
+            println!("{}", json!({ "row": a.task.id, "n": a.n, "id": a.id(), "folded": a.folded }));
+        } else {
+            println!("{} · {}\n{}", a.task.id, a.id(), a.folded.as_deref().unwrap_or_default());
+        }
+        return 0;
+    }
+    let t = match &named {
+        Some(a) => a.task.clone(),
+        None => match store.task_or_why(task) {
+            Ok(t) => t,
+            Err(why) => return refuse(why),
+        },
     };
     let rec = record(&t);
     if args.json() {
@@ -537,10 +580,15 @@ fn cmd_show(store: &Store, args: &Args) -> i32 {
         println!("{} has no pieces", t.id);
         return 0;
     }
-    let Some(n) = args.rest.get(2) else {
-        println!("{}", table(&rec));
-        return 0;
+    let n = match (&named, args.rest.get(2)) {
+        (Some(a), _) => a.n.to_string(),
+        (None, Some(n)) => n.clone(),
+        (None, None) => {
+            println!("{}", table(&rec));
+            return 0;
+        }
     };
+    let n = &n;
     let Some(p) = n.parse::<usize>().ok().and_then(|n| rec.pieces.iter().find(|p| p.n == n)) else {
         return refuse(format!("{} has no piece {n}", t.id));
     };
@@ -837,5 +885,75 @@ mod tests {
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "block did not block the row");
         let log = store.find_task("m-1").unwrap().section("Log").unwrap();
         assert!(log.contains("piece 3 blocked: which layout?"), "{log}");
+    }
+
+    /// `docs/pieces.md`, *Ids* and *Seen and told* (wsp-508): a piece id works in
+    /// `show` and `note`, and every `wsp piece` verb takes `<row>-<n>` as well as
+    /// `<row> <n>` — on a row with a running piece, and on a landed row whose
+    /// pieces folded into its log.
+    #[test]
+    fn a_piece_id_works_in_show_note_and_every_piece_verb_and_on_a_landed_row() {
+        use crate::pieces::addressed;
+        let (env, store) = scratch("ids");
+        let overview = file(&env, "overview.md", "Do it.");
+        let go = |line: &[&str]| run(&store, &parse(line), None);
+        assert_eq!(go(&["piece", "add", "m-1", "one", "--batch", "next", "--overview", &overview, "--done-when", "d"]), 0);
+        assert_eq!(go(&["piece", "add", "m-1", "two", "--batch", "next", "--overview", &overview, "--done-when", "d"]), 0);
+        let mut t = store.find_task("m-1").unwrap();
+        let mut rec = record(&t);
+        rec.pieces[0].state = State::Running;
+        rec.pieces[0].pane = Some("cpd-1".into());
+        write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+
+        // The resolver: the row and the piece; a row with no such piece is a refusal;
+        // a word that is no piece id, or names no row, is not its business.
+        let a = addressed(&store, "m-1-1").unwrap().unwrap();
+        assert_eq!((a.task.id.as_str(), a.n, a.id().as_str()), ("m-1", 1, "m-1-1"));
+        assert_eq!(a.piece.as_ref().map(|p| p.state), Some(State::Running));
+        assert!(addressed(&store, "m-1-9").unwrap_err().contains("no piece 9"));
+        assert!(addressed(&store, "m-1").unwrap().is_none());
+        assert!(addressed(&store, "zz-1-1").unwrap().is_none());
+
+        // show
+        let show = |id: &str| crate::cmd_task::show(&store, &parse(&["show", id]));
+        assert_eq!(show("m-1-1"), 0);
+        assert_eq!(show("m-1-9"), 1);
+        assert_eq!(crate::cmd_task::show(&store, &parse(&["show", "m-1-2", "--json"])), 0);
+        // note: the row's log, prefixed with the piece
+        assert_eq!(crate::cmd_task::note(&store, &parse(&["note", "m-1-1", "the", "board", "is", "wide"])), 0);
+        assert_eq!(crate::cmd_task::note(&store, &parse(&["note", "m-1-9", "nobody"])), 1);
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap();
+        assert!(log.contains("piece 1: the board is wide"), "{log}");
+        assert!(!log.contains("nobody"), "{log}");
+
+        // every piece verb takes the one word as well as the two
+        assert_eq!(go(&["piece", "show", "m-1-1"]), 0);
+        assert_eq!(go(&["piece", "show", "m-1", "1"]), 0);
+        assert_eq!(go(&["piece", "show", "m-1-9"]), 1);
+        assert_eq!(go(&["piece", "cap", "m-1-1", "2"]), 0);
+        assert_eq!(record(&store.find_task("m-1").unwrap()).cap, 2);
+        assert_eq!(go(&["piece", "drop", "m-1-1", "too", "late"]), 1, "a running piece is not dropped");
+        assert_eq!(go(&["piece", "drop", "m-1-2", "the", "split", "was", "wrong"]), 0);
+        assert_eq!(record(&store.find_task("m-1").unwrap()).pieces[1].state, State::Dropped);
+        assert_eq!(go(&["piece", "drop", "m-1-3", "nothing"]), 1);
+        assert_eq!(go(&["piece", "drop", "m-1-1"]), 1, "a drop takes the reason");
+
+        // A landed row: the pieces folded into its log, and the id reads them back.
+        let mut t = store.find_task("m-1").unwrap();
+        let mut rec = record(&t);
+        rec.pieces[0].state = State::Done;
+        rec.pieces[0].caption = Some("board renders".into());
+        write(&mut t, &rec);
+        crate::pieces::fold_at_land(&mut t, &[]);
+        store.save_task(&t).unwrap();
+        let a = addressed(&store, "m-1-1").unwrap().unwrap();
+        assert!(a.piece.is_none() && a.folded.as_deref().unwrap().starts_with("piece 1 · one · done"), "{:?}", a.folded);
+        assert_eq!(show("m-1-1"), 0);
+        assert_eq!(show("m-1-7"), 1);
+        assert_eq!(go(&["piece", "show", "m-1-2"]), 0, "the dropped one folded too");
+        assert_eq!(crate::cmd_task::note(&store, &parse(&["note", "m-1-1", "after", "the", "fact"])), 0);
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap();
+        assert!(log.contains("piece 1: after the fact"), "{log}");
     }
 }

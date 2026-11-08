@@ -1094,7 +1094,7 @@ fn closed_members(trunks: &[(PathBuf, String)], id: &str) -> Vec<Passed> {
             .flatten()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != id && crate::util::row_of(n) == id);
+            .filter(|n| n != id && tree_row(n) == id);
         names.extend(legs);
         names.sort();
         out.extend(names.into_iter().map(|task| Passed { task, trunk: trunk.clone(), trunk_branch: branch.clone() }));
@@ -2106,6 +2106,13 @@ pub fn n_branches(n: usize) -> String {
 pub fn stranded_line(s: &Stray) -> String {
     let held = format!("branch {} holds {} and has no tree", s.branch, n_commits(s.commits));
     match &s.whose {
+        // A piece's branch (`pieces`, *Batches and trees*) is named by its id.
+        Whose::Task if tree_row(&s.branch) != s.branch && !s.branch.contains('.') => format!(
+            "{held} — a piece of {}; `git worktree add {WORKTREES}/{} {}` stands a tree on it again",
+            tree_row(&s.branch),
+            s.branch,
+            s.branch
+        ),
         Whose::Former(now) => format!(
             "{held} — it is {now} now, and `wsp checkout {now}` cuts a fresh branch rather than finding this one; `git switch {}` does",
             s.branch
@@ -2120,6 +2127,15 @@ pub fn stranded_line(s: &Stray) -> String {
         ),
         _ => format!("{held} — `wsp checkout {}` builds it again", s.branch),
     }
+}
+
+/// The row a tree or branch name belongs to: a leg's `<row>.<leg>` and a piece's
+/// `<row>-<n>` (`docs/pieces.md`, *Ids*) are both the row's, never an orphan.
+/// Shape only, as [`crate::util::row_of`] is: the caller asks the store whether
+/// the row it gets back is one.
+fn tree_row(name: &str) -> &str {
+    let name = crate::util::row_of(name);
+    crate::store::split_piece_id(name).map_or(name, |(row, _)| row)
 }
 
 /// Whether the store considers a task finished — done, or archived out of the
@@ -2139,7 +2155,7 @@ pub fn finished(store: &Store) -> impl Fn(&str) -> bool {
     let archived = store.archived_ids();
     move |id: &str| {
         // A leg's tree is named `<task>.<leg>` and is finished when its row is.
-        let id = crate::util::row_of(id);
+        let id = tree_row(id);
         tasks
             .iter()
             .find(|t| t.id == id)
@@ -2166,7 +2182,7 @@ pub fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Whose {
     let renamed = store.renamed_ids();
     move |branch: &str| {
         // `<task>.<leg>` is a leg's branch (`leg_tree`), and the row's.
-        let branch = crate::util::row_of(branch);
+        let branch = tree_row(branch);
         if known.contains(branch) {
             return Whose::Task;
         }
@@ -4026,5 +4042,41 @@ mod tests {
         let out = sweep_closed(&store, &["p-001".to_string()], false);
         assert!(out.removed.is_empty());
         assert!(out.kept[0].1.contains("wsp despawn p-001"), "{:?}", out.kept);
+    }
+
+    /// `wsp-508`: a piece's tree and branch are named by its id (`p-001-2`) and are
+    /// its row's — finished when the row is, known to the store, and a branch left
+    /// without a tree is a stray of that row rather than a name nobody owns.
+    #[test]
+    fn a_pieces_tree_and_branch_are_its_rows_never_an_orphan() {
+        let env = util::isolated("co-piece");
+        let dir = lane(&env, "p", "p-001");
+        let store = Store::open();
+        let tree = checkout_dir(&dir, "p-001-2");
+        ensure(&dir, &tree, "p-001-2", "master").unwrap();
+        std::fs::write(tree.join("board.txt"), "board\n").unwrap();
+        run(&tree, &["add", "."]);
+        run(&tree, &["commit", "--quiet", "-m", "the board"]);
+
+        assert!(!finished(&store)("p-001-2"), "the row is open");
+        assert_eq!(naming(&store)("p-001-2"), Whose::Task, "the row's, not a stranger's");
+        assert_eq!(naming(&store)("q-009-2"), Whose::Stranger, "a row nothing knows is still nobody's");
+        assert!(
+            stale(&dir, &finished(&store), &|_| false).iter().all(|s| s.task != "p-001-2"),
+            "a piece tree holding work its row's trunk has not got is not stale"
+        );
+
+        // The tree goes, the branch stays with its commits: a stray of the row.
+        remove(&dir, &tree);
+        let strays = strays(&dir, &naming(&store));
+        let s = strays.iter().find(|s| s.branch == "p-001-2").expect("the branch is reported");
+        assert_eq!((s.whose.clone(), s.commits), (Whose::Task, 1));
+        assert!(stranded_line(s).contains("a piece of p-001"), "{}", stranded_line(s));
+
+        // And it is finished with the row.
+        let mut t = store.find_task("p-001").unwrap();
+        t.set_status(crate::model::Status::Done);
+        store.save_task(&t).unwrap();
+        assert!(finished(&store)("p-001-2"));
     }
 }

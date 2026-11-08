@@ -125,10 +125,11 @@ pub(crate) fn of_member(m: &Member) -> Told {
         return told("landed", Some(format!("{n} file{}", if n == 1 { "" } else { "s" })), &t.updated, "stage");
     }
     // A staged row's tail is the newest leg caption written (`docs/legs.md`,
-    // *Seen*): `scout: three layers, plan next`. Written by the leg's seat at
+    // *Seen*), or the newest piece's (`docs/pieces.md`, *Seen and told*): `scout: three layers, plan next`. Written by the leg's seat at
     // `leg done`, so it is never one wsp made up, and it comes before what the
     // seat last said because it is the later and the plainer record of progress.
     let said = crate::legs::newest_caption(t)
+        .or_else(|| crate::pieces::newest_caption(t))
         .or_else(|| m.said.map(|s| caption::say(s, Some(&t.id))))
         .filter(|s| !s.is_empty());
     match (t.status(), m.agent) {
@@ -1134,5 +1135,22 @@ mod tests {
         crate::legs::write(&mut bare, &[Leg::pending("scout", "x")]);
         let now = of_member(&Member { said: Some("reading"), agent: Agent::Working, ..member(&bare, &[]) });
         assert_eq!(now.tail.as_deref(), Some("Reading"), "no caption written: the seat's own say stands");
+    }
+
+    /// `docs/pieces.md`, *Seen and told*: the tail is the newest piece caption,
+    /// as it is for legs.
+    #[test]
+    fn a_rows_tail_is_the_newest_piece_caption() {
+        use crate::pieces::{Piece, Record, State};
+        let mut t = task("doing", &[]);
+        let done = |n: usize, caption: &str| Piece {
+            state: State::Done,
+            caption: Some(caption.into()),
+            ..Piece::pending(n, "x", 1)
+        };
+        let rec = Record { pieces: vec![done(1, "types read back"), done(2, "board renders"), Piece::pending(3, "rail", 2)], ..Default::default() };
+        crate::pieces::write(&mut t, &rec);
+        let now = of_member(&Member { said: Some("reading"), agent: Agent::Working, ..member(&t, &[]) });
+        assert_eq!((now.word, now.tail.as_deref()), ("working", Some("m-1-2: board renders")), "{now:?}");
     }
 }

@@ -1532,6 +1532,9 @@ fn addressee_id(store: &Store, needle: &str, what: &str) -> String {
     if what.starts_with("pane ") {
         return needle.to_string();
     }
+    if let Ok(Some(a)) = crate::pieces::addressed(store, needle) {
+        return a.id();
+    }
     store.find_task(needle).map(|t| t.id).unwrap_or_else(|| needle.to_string())
 }
 
@@ -1797,6 +1800,11 @@ fn target(store: &Store, needle: &str, seated: &dyn Fn(&str) -> bool) -> Option<
     if needle.contains(':') || seated(needle) {
         return Some((needle.to_string(), format!("pane {needle}")));
     }
+    // A piece id reaches the piece's seat, from its entry on the row.
+    if let Ok(Some(a)) = crate::pieces::addressed(store, needle) {
+        let piece = a.piece.as_ref()?;
+        return Some((piece.pane.clone()?, format!("{} — {}", a.id(), util::truncate(&piece.title, 44))));
+    }
     let t = store.find_task(needle)?;
     let pane = store.panes_for_task(&t.id).into_iter().next()?;
     Some((pane, format!("{} — {}", t.id, util::truncate(&t.title, 44))))
@@ -1981,10 +1989,22 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     // typed, which is the string this verb exists to publish and the only one
     // in the system with no other home — the task's title is in the store and
     // this is not.
+    //
+    // From a piece's pane the scope is the piece's id, `wsp-501-2`
+    // (`docs/pieces.md`, *Seen and told*): the pane is bound to the row, and the
+    // binding's `piece` says which of the row's seats it is.
+    let piece_id = held.as_ref().and_then(|t| {
+        let n = store.bindings().get(&pane)?.get("piece")?.as_u64()?;
+        Some(format!("{}-{n}", t.id))
+    });
+    let scoped = |t: &Task, said: &str| match &piece_id {
+        Some(id) => Some(format!("{id} · {}", said.trim())).filter(|_| !said.trim().is_empty()),
+        None => said_full(t, said),
+    };
     let full = match (said.is_empty() || args.has("clear"), &held) {
-        (true, Some(t)) => task_full(t),
+        (true, Some(t)) => scoped(t, &t.title),
         (true, None) => None,
-        (false, Some(t)) => said_full(t, said),
+        (false, Some(t)) => scoped(t, said),
         (false, None) => plain_full(said),
     };
     let label = full.as_deref().map(on_the_wire);
@@ -4288,6 +4308,7 @@ fn wip_tasks(store: &Store) -> Vec<Task> {
         h.status().is_open()
             || h.has_section(crate::verification::SECTION)
             || h.has_section(crate::legs::SECTION)
+            || h.has_section(crate::pieces::SECTION)
             || h.tags.iter().any(|t| t == crate::verification::VERIFY_TAG || t == crate::cycle::BARRIER_TAG)
     })
 }
@@ -4490,6 +4511,9 @@ pub(crate) enum Role {
     /// It is `leg` of the staged row `task` (`docs/legs.md`): it holds no
     /// claim, and the row's `## Legs` is what names it.
     Leg { task: String, leg: String },
+    /// It is piece `piece` of the staged row `task` (`docs/pieces.md`): it holds
+    /// no claim either, and the row's `## Pieces` names it.
+    Piece { task: String, piece: usize },
     /// The governor of `scope` spawned it, and it holds `task` if it holds
     /// work — compound draws it at that row, or under that governor with none
     /// (`docs/ux-design.md` §18 rule 6).
@@ -4513,6 +4537,7 @@ impl Role {
             Role::Verifier { member, pass } => json!({ "is": "verifier", "member": member, "pass": pass }),
             Role::Check { list, group } => json!({ "is": "check", "list": list, "group": group }),
             Role::Leg { task, leg } => json!({ "is": "leg", "task": task, "leg": leg }),
+            Role::Piece { task, piece } => json!({ "is": "piece", "task": task, "piece": piece }),
             Role::Helper { scope, task: None } => json!({ "is": "helper", "scope": scope }),
             Role::Helper { scope, task: Some(t) } => json!({ "is": "helper", "scope": scope, "task": t }),
             Role::Agent => json!({ "is": "agent" }),
@@ -4576,6 +4601,7 @@ fn runs(
     held: Option<&Task>,
     ran_on: &BTreeMap<String, Option<String>>,
     legged: &BTreeMap<String, crate::legs::Standing>,
+    pieced: &BTreeMap<String, crate::pieces::Standing>,
 ) -> Runs {
     let text = |v: Option<&Value>, k: &str| {
         v.and_then(|v| v.get(k)).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
@@ -4589,6 +4615,10 @@ fn runs(
     // A leg holds no claim, so its entry's policy is the record that started it.
     if let Some(s) = legged.get(seat) {
         let p = &s.leg.policy;
+        return Runs { kind: Some(p.kind.clone()), model: p.model.clone(), effort: p.effort.clone() };
+    }
+    if let Some(s) = pieced.get(seat) {
+        let p = &s.piece.policy;
         return Runs { kind: Some(p.kind.clone()), model: p.model.clone(), effort: p.effort.clone() };
     }
     let Some(t) = held else { return Runs::default() };
@@ -4621,6 +4651,8 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     // A leg holds none either (`docs/legs.md`, *Seen*): its entry on the row's
     // `## Legs` names the seat, running or done and not yet ended.
     let legged = crate::legs::seated(&w.tasks);
+    // So does a piece (`docs/pieces.md`, *Seen and told*): one line each.
+    let pieced = crate::pieces::seated(&w.tasks);
     let ran_on = crate::verification::ran_on_by_seat(&w.tasks);
     let running = crate::worklist::Running::over(&w.lists);
     let homes = crate::worklist::homes(w.lists.iter().filter(|l| w.governors.contains_key(&l.id)), &w.tasks, &w.index);
@@ -4686,7 +4718,8 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
                 && waiting.as_ref().is_none_or(|w| w.owed())
                 // A leg that has written its baton is finished: its seat stands
                 // until the tick ends it, and nobody is owed anything from it.
-                && legged.get(seat).is_none_or(|s| s.leg.state != crate::legs::State::Done);
+                && legged.get(seat).is_none_or(|s| s.leg.state != crate::legs::State::Done)
+                && pieced.get(seat).is_none_or(|s| s.piece.state != crate::pieces::State::Done);
         // The task whose claim started this seat: its binding's, or — once the
         // binding has gone with a reseat — the open one its agent claimed.
         let held = bound.or_else(|| {
@@ -4714,6 +4747,10 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             (Role::Member { .. } | Role::Agent, Some(s)) => Role::Leg { task: s.task.clone(), leg: s.leg.name.clone() },
             (role, _) => role,
         };
+        let role = match (role, pieced.get(seat)) {
+            (Role::Member { .. } | Role::Agent, Some(s)) => Role::Piece { task: s.task.clone(), piece: s.piece.n },
+            (role, _) => role,
+        };
         let spawned_by = w.spawned.get(seat).filter(|v| v.is_object()).cloned();
         let role = match (role, spawned_by.as_ref().and_then(|b| b.get("scope")).and_then(Value::as_str)) {
             (Role::Agent, Some(scope)) => Role::Helper { scope: scope.to_string(), task: None },
@@ -4727,6 +4764,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             task: legged
                 .get(seat)
                 .map(|s| crate::legs::seat_label(&s.task, &s.leg.name))
+                .or_else(|| pieced.get(seat).map(|s| crate::pieces::seat_label(&s.task, &s.piece)))
                 .or_else(|| bound.map(|t| t.title.clone()))
                 .or_else(|| verifying.get(seat).map(|(m, _)| crate::verification::seat_label(m)))
                 .or_else(|| w.checking.get(seat).map(|(list, at, _)| crate::barrier::seat_label(list, *at)))
@@ -4743,9 +4781,10 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             waiting,
             members_waiting: 0,
             // A leg's is when it opened: the row's claim, if any, is not its.
-            held: (match legged.get(seat) {
-                Some(s) => s.leg.started.as_deref(),
-                None => bound
+            held: (match (legged.get(seat), pieced.get(seat)) {
+                (Some(s), _) => s.leg.started.as_deref(),
+                (None, Some(s)) => s.piece.started.as_deref(),
+                (None, None) => bound
                     .and_then(|t| w.claims.get(&t.id))
                     .and_then(|c| c.get("claimed_at"))
                     .and_then(|c| c.as_str()),
@@ -4759,7 +4798,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             // mandate on one that has since been removed points nowhere.
             direction: crate::cmd_mandate::from_map(&w.mandates, agent.as_deref(), Some(workspace_id))
                 .filter(|p| w.index.get(p).is_some()),
-            runs: runs(w, seat, seat_of_project.as_deref(), held, &ran_on, &legged),
+            runs: runs(w, seat, seat_of_project.as_deref(), held, &ran_on, &legged, &pieced),
             answers_to,
             answers_to_empty,
             role,
@@ -4850,6 +4889,7 @@ fn answers_to(
         Role::Member { task, .. }
         | Role::Verifier { member: task, .. }
         | Role::Leg { task, .. }
+        | Role::Piece { task, .. }
         | Role::Helper { task: Some(task), .. } => {
             task_walk(task)
         }
@@ -5047,6 +5087,11 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
                 // The row's own line (`docs/legs.md`, *Seen*): a leg holds no
                 // claim, so the count of its row's legs is said here.
                 (None, false) if r.leg.is_some() => r.leg.as_ref().map(|s| p.dim(&crate::legs::tally(s))).unwrap_or_default(),
+                // And a piece's: the count of its row's pieces, and the batch.
+                (None, false) if matches!(r.role, Role::Piece { .. }) => crate::pieces::seated(&w.tasks)
+                    .get(&r.pane)
+                    .map(|s| p.dim(&crate::pieces::tally(s)))
+                    .unwrap_or_default(),
                 // A gone seat that is still drawn is drawn because it holds
                 // something, and says what: the reconciler's to repair, not a
                 // row nobody swept (`wsp-169`).
@@ -9228,6 +9273,104 @@ mod tests {
         assert!(text.contains("t-001 · build-store"), "{text}");
         assert!(text.contains("t-001 · build-spawn"), "{text}");
         assert!(text.contains("legs 2 running, 1 done of 4"), "{text}");
+    }
+
+    /// `docs/pieces.md`, *Seen and told* (wsp-508). A piece holds no claim, so
+    /// `wip` reads it off the row's `## Pieces`: two running pieces of one row
+    /// are two rows, each `role: {is: piece, task, piece}`, labelled
+    /// `<row>-<n> <title>`, the row's count and batch said on the line, and a
+    /// done piece whose seat the tick has yet to end needs nobody.
+    #[test]
+    fn wip_shows_two_running_pieces_of_one_row_each_on_its_own_line() {
+        use crate::pieces::{Piece, Record, State};
+        let mut w = wip_world();
+        let m = std::rc::Rc::make_mut(&mut w.tasks).iter_mut().find(|t| t.id == "t-001").unwrap();
+        let piece = |n: usize, title: &str, batch: usize, state: State, pane: Option<&str>| Piece {
+            state,
+            pane: pane.map(str::to_string),
+            ..Piece::pending(n, title, batch)
+        };
+        let rec = Record {
+            cap: 3,
+            closed: Vec::new(),
+            pieces: vec![
+                piece(1, "types", 1, State::Done, Some("cpd-40")),
+                piece(2, "board component", 2, State::Running, Some("cpd-41")),
+                piece(3, "rail component", 2, State::Running, Some("cpd-42")),
+                piece(4, "docs", 3, State::Pending, None),
+            ],
+        };
+        crate::pieces::write(m, &rec);
+        for seat in ["cpd-40", "cpd-41", "cpd-42"] {
+            w.bindings.insert(seat.into(), json!({ "task_id": "t-001" }));
+            w.agents.push(seated_agent(seat, if seat == "cpd-40" { "idle" } else { "working" }, seat));
+        }
+
+        let j = wip_json(&w);
+        let row = |pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap().clone();
+        assert_eq!(row("cpd-41")["role"], json!({ "is": "piece", "task": "t-001", "piece": 2 }));
+        assert_eq!(row("cpd-42")["role"], json!({ "is": "piece", "task": "t-001", "piece": 3 }), "the sibling is a row of its own");
+        assert_eq!(row("cpd-41")["task"], "t-001-2 board component");
+        assert_eq!(row("cpd-41")["task_id"], "t-001", "still the row's");
+        assert_eq!(row("cpd-41")["model"], "sonnet", "the entry's policy, with no claim to read it from");
+        assert_eq!(row("cpd-40")["needs_you"], false, "a done piece's seat waits on the tick");
+        assert_eq!(row("w2:p1")["needs_you"], true, "and a member still does");
+
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("t-001-2 board component"), "{text}");
+        assert!(text.contains("t-001-3 rail component"), "{text}");
+        assert!(text.contains("pieces 2 running, 1 done of 4 · batch 2 of 3"), "{text}");
+    }
+
+    /// `wsp tell <piece-id>` reaches the entry's seat, and the addressee is the
+    /// piece's id; a piece with no seat, or a row with no such piece, reaches none.
+    #[test]
+    fn tell_resolves_a_piece_id_to_its_entrys_seat() {
+        let iso = util::isolated("tell-piece");
+        let store = Store::at(iso.home(), iso.state());
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("a row", "m-1");
+        t.set_status(Status::Doing);
+        let rec = crate::pieces::Record {
+            pieces: vec![
+                crate::pieces::Piece {
+                    state: crate::pieces::State::Running,
+                    pane: Some("cpd-7".into()),
+                    ..crate::pieces::Piece::pending(1, "board", 1)
+                },
+                crate::pieces::Piece::pending(2, "rail", 1),
+            ],
+            ..Default::default()
+        };
+        crate::pieces::write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+        let got = target(&store, "m-1-1", &|_| false);
+        assert_eq!(got, Some(("cpd-7".to_string(), "m-1-1 — board".to_string())));
+        assert_eq!(addressee_id(&store, "m-1-1", "m-1-1 — board"), "m-1-1");
+        assert_eq!(target(&store, "m-1-2", &|_| false), None, "a piece with no seat");
+        assert_eq!(target(&store, "m-1-9", &|_| false), None, "a row with no such piece");
+        drop(iso);
+    }
+
+    /// `wsp say` from a piece's pane speaks as `<row>-<n>`.
+    #[test]
+    fn say_from_a_pieces_pane_speaks_as_the_piece() {
+        let iso = util::isolated("say-piece");
+        let store = Store::at(iso.home(), iso.state());
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("a row", "wsp-901");
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-8", json!({ "task_id": "wsp-901", "pane_id": "cpd-8", "piece": 2 }));
+        store.set_binding("cpd-9", json!({ "task_id": "wsp-901", "pane_id": "cpd-9" }));
+        let said = |pane: &str| {
+            let code = say(&store, &Args::synth("say", &["running the whole suite over every crate once more"], &[("pane", pane)]));
+            assert_eq!(code, 0);
+            store.said()[pane]["full"].as_str().unwrap_or_default().to_string()
+        };
+        assert_eq!(said("cpd-8"), "wsp-901-2 · running the whole suite over every crate once more");
+        assert_eq!(said("cpd-9"), "wsp-901 · running the whole suite over every crate once more", "a member says it as the row");
+        drop(iso);
     }
 
     /// `wsp-246`. Every row says what its seat is, typed, so a reader placing

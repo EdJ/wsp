@@ -2767,6 +2767,19 @@ fn show_all(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Each member's pieces, folded, under the member's id: `wsp-501  2 pieces · …`
+/// would say less than the table does, so it is the table, one line a piece.
+fn piece_lines(p: &Paint, tasks: &[crate::model::Task], g: &Group) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in &g.members {
+        let Some(t) = tasks.iter().find(|t| &t.id == m) else { continue };
+        let Some(table) = crate::pieces::section_for_show(t, false) else { continue };
+        out.push(p.dim(&format!("{m}  pieces")));
+        out.extend(table.lines().filter(|l| l.starts_with("- ")).map(|l| format!("  {}", p.dim(l))));
+    }
+    out
+}
+
 pub fn show(store: &Store, args: &Args) -> i32 {
     if args.has("all") {
         return show_all(store, args);
@@ -2932,6 +2945,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                 }
             }
             for line in landed_lines(&p, g) {
+                println!("{indent}{line}");
+            }
+            // A member's pieces under it, folded: one line a piece, as `wsp show`
+            // draws them (`docs/pieces.md`, *Seen and told*).
+            for line in piece_lines(&p, &tasks, g) {
                 println!("{indent}{line}");
             }
         }
@@ -6348,6 +6366,39 @@ mod tests {
     /// `done` waits on the reports every list now hands back.
     fn no_outputs(store: &Store, slug: &str) {
         assert_eq!(dispatch(store, &Args::synth("worklist", &["output", slug], &[("none", "true")])), 0);
+    }
+
+    /// `docs/pieces.md`, *Seen and told* (wsp-508): `worklist show` draws a member's
+    /// pieces under the group, folded to a line a piece; a member with none adds
+    /// nothing.
+    #[test]
+    fn worklist_show_draws_a_members_pieces_under_it_folded() {
+        use crate::pieces::{Piece, Record, State};
+        let (_env, store) = running("show-pieces");
+        task(&store, "a-1", "doing");
+        task(&store, "a-2", "todo");
+        assert_eq!(run(&store, &["new", "one", "One"]), 0);
+        assert_eq!(run(&store, &["add", "one", "a-1"]), 0);
+        assert_eq!(run(&store, &["add", "one", "a-2"]), 0);
+        let mut t = store.find_task("a-1").unwrap();
+        let rec = Record {
+            pieces: vec![
+                Piece { state: State::Running, ..Piece::pending(1, "board", 1) },
+                Piece::pending(2, "rail", 2),
+            ],
+            ..Default::default()
+        };
+        crate::pieces::write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+
+        let w = store.worklist("one").unwrap();
+        let tasks = store.tasks();
+        let lines: Vec<String> = w.groups().iter().flat_map(|g| piece_lines(&Paint::new(), &tasks, g)).collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("a-1"), "{lines:?}");
+        assert!(lines[1].contains("1 · board · batch 1 · running"), "{lines:?}");
+        assert!(lines[2].contains("2 · rail · batch 2 · pending"), "{lines:?}");
+        assert_eq!(run(&store, &["show", "one"]), 0);
     }
 
     /// `wsp-315`: the window reads every open list in one process, and each

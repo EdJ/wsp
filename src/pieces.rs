@@ -931,21 +931,123 @@ pub(crate) fn section_for_show(t: &Task, whole_entries: bool) -> Option<String> 
     (!rec.pieces.is_empty()).then(|| if whole_entries { whole(&rec) } else { table(&rec) })
 }
 
+/// One piece for `--json`: `{n, id, title, batch, state, seat, tree, caption}`.
+pub(crate) fn piece_json(row: &str, p: &Piece) -> Value {
+    json!({
+        "n": p.n, "id": p.id(row), "title": p.title, "batch": p.batch,
+        "state": p.state.as_str(), "seat": p.pane, "tree": p.tree, "caption": p.caption,
+    })
+}
+
 /// A row's pieces for `--json`: `[{n, id, title, batch, state, seat, tree,
 /// caption}]`.
 pub(crate) fn json(t: &Task) -> Value {
     let rec = record(t);
-    Value::Array(
-        rec.pieces
-            .iter()
-            .map(|p| {
-                json!({
-                    "n": p.n, "id": p.id(&t.id), "title": p.title, "batch": p.batch,
-                    "state": p.state.as_str(), "seat": p.pane, "tree": p.tree, "caption": p.caption,
-                })
-            })
-            .collect(),
-    )
+    Value::Array(rec.pieces.iter().map(|p| piece_json(&t.id, p)).collect())
+}
+
+// ---- addressed ----------------------------------------------------------------------
+
+/// What a piece id names (`docs/pieces.md`, *Ids*): the row, and the piece
+/// itself while the row carries it, or the log line it folded into once the row
+/// has landed.
+#[derive(Clone, Debug)]
+pub(crate) struct Addressed {
+    pub task: Task,
+    /// The row is filed away, not live.
+    pub archived: Option<std::path::PathBuf>,
+    pub n: usize,
+    pub piece: Option<Piece>,
+    /// The folded line (`piece 2 · …`) in a landed row's log.
+    pub folded: Option<String>,
+}
+
+impl Addressed {
+    /// `<row>-<n>`.
+    pub(crate) fn id(&self) -> String {
+        format!("{}-{}", self.task.id, self.n)
+    }
+}
+
+/// Whether `needle` is a piece id: `Ok(None)` when it is not shaped like one or
+/// names no row (so the caller goes on as it always did), `Err` when it names a
+/// row that has no such piece, and the row with its piece, or its folded line,
+/// when it does.
+pub(crate) fn addressed(store: &crate::store::Store, needle: &str) -> Result<Option<Addressed>, String> {
+    let Some((row, n)) = crate::store::split_piece_id(needle) else { return Ok(None) };
+    let (task, archived) = match store.resolve_task(row) {
+        crate::store::Found::One(t) => (*t, None),
+        crate::store::Found::Archived(t, path) => (*t, Some(path)),
+        _ => return Ok(None),
+    };
+    let n = n as usize;
+    let piece = record(&task).pieces.into_iter().find(|p| p.n == n);
+    let folded = if piece.is_none() { folded_line(&task, n) } else { None };
+    if piece.is_none() && folded.is_none() {
+        return Err(format!("{} has no piece {n}", task.id));
+    }
+    Ok(Some(Addressed { task, archived, n, piece, folded }))
+}
+
+// ---- seen in wip ---------------------------------------------------------------------
+
+/// What `wip` reads of a piece standing in a seat (`docs/pieces.md`, *Seen and told*).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Standing {
+    pub task: String,
+    pub piece: Piece,
+    pub running: usize,
+    pub done: usize,
+    pub of: usize,
+    /// The batch the row is in: the lowest still open, else the last.
+    pub batch: usize,
+    pub batches: usize,
+}
+
+/// The pieces whose seat is still up, by seat: `running`, or `done` and not yet
+/// ended by the tick. A piece holds no claim, so this is where `wip` finds it.
+pub(crate) fn seated(tasks: &[Task]) -> std::collections::BTreeMap<String, Standing> {
+    let mut out = std::collections::BTreeMap::new();
+    for t in tasks.iter().filter(|t| t.body.contains(&format!("## {SECTION}"))) {
+        let rec = record(t);
+        let running = rec.pieces.iter().filter(|p| p.state == State::Running).count();
+        let done = rec.pieces.iter().filter(|p| p.state == State::Done).count();
+        let batches = last_batch(&rec);
+        let open = rec.pieces.iter().filter(|p| matches!(p.state, State::Pending | State::Running | State::Blocked));
+        let batch = open.map(|p| p.batch).min().unwrap_or(batches);
+        for p in &rec.pieces {
+            let up = matches!(p.state, State::Running | State::Done) && p.ending == Ending::Standing;
+            if let Some(pane) = p.pane.clone().filter(|_| up) {
+                out.insert(
+                    pane,
+                    Standing { task: t.id.clone(), piece: p.clone(), running, done, of: rec.pieces.len(), batch, batches },
+                );
+            }
+        }
+    }
+    out
+}
+
+/// The seat's label: `wsp-501-2 board component`.
+pub(crate) fn seat_label(row: &str, p: &Piece) -> String {
+    format!("{} {}", p.id(row), util::fold(&p.title))
+}
+
+/// `pieces 2 running, 5 done of 9 · batch 2 of 4`: the row's own line.
+pub(crate) fn tally(s: &Standing) -> String {
+    format!("pieces {} running, {} done of {} · batch {} of {}", s.running, s.done, s.of, s.batch, s.batches)
+}
+
+/// The newest piece caption, as `wsp-501-2: board renders`: the highest-numbered
+/// done piece that has one. Nothing is derived.
+pub(crate) fn newest_caption(t: &Task) -> Option<String> {
+    let rec = record(t);
+    let p = rec
+        .pieces
+        .iter()
+        .filter(|p| p.state == State::Done && p.caption.as_deref().is_some_and(|c| !c.trim().is_empty()))
+        .max_by_key(|p| p.n)?;
+    Some(format!("{}: {}", p.id(&t.id), util::fold(p.caption.as_deref()?)))
 }
 
 

@@ -701,6 +701,31 @@ fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Ve
     out
 }
 
+/// `wsp show <piece-id>`: the parent's header line, then the entry whole.
+fn show_piece(a: &crate::pieces::Addressed, args: &Args) -> i32 {
+    if args.json() {
+        let v = match &a.piece {
+            Some(p) => crate::pieces::piece_json(&a.task.id, p),
+            None => json!({ "n": a.n, "id": a.id(), "folded": a.folded }),
+        };
+        let mut v = v;
+        v["row"] = json!(a.task.id);
+        if let Some(path) = &a.archived {
+            v["archived"] = json!(util::contract(path));
+        }
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{}  {}", p.bold(&a.task.id), a.task.title);
+    match (&a.piece, &a.folded) {
+        (Some(piece), _) => println!("{}", piece.lines()),
+        (None, Some(line)) => println!("{} (folded at land)", line.trim_end()),
+        (None, None) => {}
+    }
+    0
+}
+
 pub fn show(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp show <id> [--log]");
@@ -713,6 +738,16 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // has left the live store. `show` does: displaying the record *is* the
     // verb, and a reader who followed `render-026`'s citation of `render-018`
     // wants the prose it points at, not the path it is filed under.
+    // A piece id (`docs/pieces.md`, *Seen and told*): the row's header line and
+    // the entry whole, or the line it folded into once the row has landed.
+    match crate::pieces::addressed(store, &needle) {
+        Ok(Some(a)) => return show_piece(&a, args),
+        Ok(None) => {}
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    }
     let (t, archived) = match store.resolve_task(&needle) {
         crate::store::Found::One(t) => (*t, None),
         crate::store::Found::Archived(t, path) => (*t, Some(path)),
@@ -1071,7 +1106,16 @@ fn mutate_saying<F>(store: &Store, args: &Args, verb: &str, said: Option<&str>, 
 where
     F: FnOnce(&mut Task),
 {
-    let Some(needle) = args.rest.first().cloned() else {
+    mutate_saying_at(store, args, verb, said, None, f)
+}
+
+/// [`mutate_saying`] on a row the caller has already named: `row` is the id to
+/// write to in place of the first word, for a verb that took a piece id.
+fn mutate_saying_at<F>(store: &Store, args: &Args, verb: &str, said: Option<&str>, row: Option<String>, f: F) -> i32
+where
+    F: FnOnce(&mut Task),
+{
+    let Some(needle) = row.or_else(|| args.rest.first().cloned()) else {
         eprintln!("usage: wsp {verb} <id>");
         return 2;
     };
@@ -1820,7 +1864,17 @@ pub fn note(store: &Store, args: &Args) -> i32 {
     // typed form is the text itself, on the terminal above; for this one it is
     // this line or nothing at all.
     let said = from.map(|src| format!("{} characters from {src} — {}", text.len(), util::truncate(&text, 48)));
-    mutate_saying(store, args, "note", said.as_deref(), |t| t.log(&text))
+    // A piece id writes to the row's log, prefixed `piece 2:` (`docs/pieces.md`,
+    // *Seen and told*).
+    let (row, prefix) = match args.rest.first().map(|n| crate::pieces::addressed(store, n)) {
+        Some(Ok(Some(a))) => (Some(a.task.id.clone()), format!("piece {}: ", a.n)),
+        Some(Err(why)) => {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+        _ => (None, String::new()),
+    };
+    mutate_saying_at(store, args, "note", said.as_deref(), row, |t| t.log(&format!("{prefix}{text}")))
 }
 
 /// Refuse a `--supersedes` that names nothing on this body.
