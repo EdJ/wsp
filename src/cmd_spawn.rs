@@ -582,7 +582,9 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              decisions and corrections on the rows rather than in this conversation. {stage} Do not \
              review, rebase, test or land yourself, and never spawn, verify, nudge or relay a \
              step of the run: wsp verifies each member as it lands, and an agent you `wsp spawn` \
-             is for work no row owns yet. Sending work back is `wsp reopen <id> \"what is owed\"`, which moves the row, \
+             is for work no row owns yet. A member left with no seat (a start that failed, a block, a \
+             seat you despawned) is reseated by the run within minutes: you do not start one, and \
+             `wsp despawn <row>` is how you free its seat so the run does. Sending work back is `wsp reopen <id> \"what is owed\"`, which moves the row, \
              tells that agent's pane and stops the run reading the group as finished; a plain \
              `wsp tell <id>` is a conversation and moves nothing, so use it for a question or a \
              correction and `wsp reopen` when the answer is more work. \
@@ -4811,6 +4813,17 @@ fn end_work(
     // which it will not, and if it ever does, the release is the later reading.
     let task = ended.or(task);
 
+    // A governor's (or the primary seat's) despawn of a member is "free the seat
+    // so the run reseats", and this is the word the run reads for it
+    // (`wsp-524`). Only a row at `doing`, which is the one the run reseats.
+    if me.governs.is_some() {
+        if let Some(mut t) = task.as_deref().and_then(|id| store.task(id)) {
+            if t.status() == crate::model::Status::Doing {
+                let _ = crate::log::note(store, &mut t, crate::cycle::RESEAT_ASKED);
+            }
+        }
+    }
+
     // An inherited ending is consumed by being done. A rotation leaves a record
     // telling the successor to end exactly this pane; once it has — or once the
     // pane was already gone, which is the same fact to this verb — the record
@@ -6332,6 +6345,8 @@ mod tests {
         // verifier wsp already started. A spawn is for work outside the run.
         assert!(text.contains("never spawn, verify, nudge or relay a step of the run"), "{text}");
         assert!(text.contains("you are told when it does"), "and that it may stop: {text}");
+        // `wsp-524`: a member left with no seat is the run's to reseat, not the governor's.
+        assert!(text.contains("is reseated by the run within minutes"), "the run reseats: {text}");
         // No fetch. `--govern` records the slot before the agent starts, so its
         // `SessionStart` hook has already run `wsp brief` with the slot in
         // place — asking again at request 1 is a whole context re-read.
@@ -9384,6 +9399,30 @@ mod tests {
 
         assert_eq!(code, 0, "the compound seat answered for itself");
         assert!(compound.state(&cpd_seat).is_err(), "the seat this ended must actually be gone");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-524`: a governor's (or the primary seat's) despawn of a member that
+    /// is at `doing` leaves the word the run reads as "reseat this"; a person's
+    /// despawn from outside any seat leaves nothing.
+    #[test]
+    fn a_governors_despawn_of_a_member_writes_the_word_the_run_reseats_on() {
+        let _env = no_backend();
+        let store = seat("despawn-reseat");
+        working(&store, "t-260816-095", "w1:p1");
+        working(&store, "t-260816-096", "w1:p2");
+        let place = Ends::ok();
+        let tidied = Tidied::default();
+        let by_a_person = Args::synth("despawn", &[], &[("pane", "w1:p2")]);
+        assert_eq!(end_work(&place, &store, &by_a_person, Caller::default(), &tidied.f()), 0);
+        let log = |id: &str| store.find_task(id).unwrap().section("Log").unwrap_or_default().to_string();
+        assert!(!log("t-260816-096").contains(crate::cycle::RESEAT_ASKED), "{}", log("t-260816-096"));
+
+        let primary = Caller { pane: Some("w9:p9"), governs: Some(crate::governors::PRIMARY), bound: false };
+        let by_the_primary = Args::synth("despawn", &[], &[("pane", "w1:p1"), ("why", "so the run reseats")]);
+        assert_eq!(end_work(&place, &store, &by_the_primary, primary, &tidied.f()), 0);
+        assert!(log("t-260816-095").contains(crate::cycle::RESEAT_ASKED), "{}", log("t-260816-095"));
 
         let _ = std::fs::remove_dir_all(&store.root);
     }

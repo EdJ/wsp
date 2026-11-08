@@ -780,9 +780,6 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     let Some(g) = groups.get(at - 1) else { return started };
     let Some(policy) = g.policy() else { return started };
     let all = starts == Starts::All;
-    if all {
-        name_silent(store, &w);
-    }
     // The seat's cap (`wsp-231`), asked by each of the three starts below
     // inside the lock its record is written under. With no cap it reads
     // nothing and admits everything.
@@ -1017,6 +1014,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
 
     say_capped(store, &w.id, at, gate.cap, gate.take_held(), all);
     if all {
+        // After the starts, so a silent row the step just reseated is not named
+        // first: the naming is a line said of the row, and the reseat reads the
+        // row's silence (wsp-524).
+        name_silent(store, &w);
         escalate_the_blocked(store, &w, at, &pos);
     }
 
@@ -1493,21 +1494,49 @@ fn take_member(
             return None;
         }
         let claims = store.claims();
+        // What the run reseats a `doing` member for when no start of its own
+        // is under way (`wsp-524`): nothing said of it and nobody on it for
+        // [`SILENT_AFTER`], or a governor ended its seat to have it reseated.
+        let reseating = (t.status() == Status::Doing).then(|| {
+            if silent(store, std::slice::from_ref(&id)).first().is_some() {
+                Some("again: no seat")
+            } else if despawned_unseated(store, &t, &claims) {
+                Some("again: a governor ended its seat")
+            } else {
+                None
+            }
+        });
+        let reseating = reseating.flatten();
         // After a start that did not take: its wait is not over, or its tries
-        // are spent and a person is to say (`wsp-335`).
-        if crate::starts::held(store, &id) {
+        // are spent and a person is to say (`wsp-335`). A spent start is the
+        // one thing a reseat takes again, once the seat has room.
+        let held = crate::starts::held(store, &id);
+        let spent = held && crate::starts::spent(store, &id) && reseating.is_some();
+        if held && !spent {
             return None;
         }
         let ours = t.section("Log").and_then(|l| l.lines().last().map(|x| x.contains(STARTED_BY))).unwrap_or(false);
+        let mut reseat = None;
         let why = match t.status() {
             Status::Todo if !claims.contains_key(&id) => "new",
-            Status::Doing if ours && wedged(&t, &claims) => {
+            Status::Doing if ours && wedged(&t, &claims) && !spent => {
                 if !retry_lost_start(store, &id, &id, &id, &format!("`wsp worklist advance {list}`")) {
                     return None;
                 }
                 "again: the last start never claimed it"
             }
-            Status::Doing if sent_back_unseated(store, &t, &claims) => "again: it was sent back and nobody is on it",
+            Status::Doing if !spent && sent_back_unseated(store, &t, &claims) => "again: it was sent back and nobody is on it",
+            Status::Doing if reseating.is_some() => {
+                let (done, stopped) = reseats_lately(&t);
+                if done >= RESEATS {
+                    if !stopped {
+                        stop_reseating(store, &t, list, done);
+                    }
+                    return None;
+                }
+                reseat = reseating.map(|r| (r, done + 1));
+                reseating.unwrap_or_default()
+            }
             _ => return None,
         };
         let going = members_going(store, members, &id, &claims);
@@ -1521,6 +1550,13 @@ fn take_member(
         }
         let policy = store.worklist(list)?.groups().get(at - 1)?.policy_for(&id)?;
         let mut t = t;
+        if let Some((reason, n)) = reseat {
+            if spent {
+                crate::starts::forgive(store, &id);
+            }
+            t.log(&format!("{RESEATED} (reseat {n} of {RESEATS}): {reason}"));
+            log_line(store, &format!("{list}: {id} started again: no seat — {reason}, reseat {n} of {RESEATS}"));
+        }
         t.set_status(Status::Doing);
         t.log(&format!("{STARTED_BY} {list} group {at}"));
         t.touch();
@@ -1549,13 +1585,75 @@ fn take_member(
 /// appended, and the step opens that; it is never reseated as a whole. Nor is
 /// a row with pieces ([`crate::inner::run_inside`]).
 fn sent_back_unseated(store: &Store, t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    unseated_since(store, t, claims, SENT_BACK)
+}
+
+/// A governor ended the member's seat and nobody has started on it since
+/// (`wsp-524`): [`RESEAT_ASKED`] is what `wsp despawn` writes for it, and it is
+/// read exactly as [`sent_back_unseated`] reads the sent-back line.
+fn despawned_unseated(store: &Store, t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    unseated_since(store, t, claims, RESEAT_ASKED)
+}
+
+fn unseated_since(store: &Store, t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>, mark: &str) -> bool {
     if crate::inner::run_inside(t) || claims.contains_key(&t.id) || !store.panes_for_task(&t.id).is_empty() {
         return false;
     }
     let log = t.section("Log").unwrap_or_default();
     let lines: Vec<&str> = log.lines().collect();
-    let Some(back) = lines.iter().rposition(|l| l.contains(SENT_BACK)) else { return false };
+    let Some(back) = lines.iter().rposition(|l| l.contains(mark)) else { return false };
     !lines[back + 1..].iter().any(|l| l.contains(STARTED_BY) || l.contains("claimed by pane "))
+}
+
+/// What `wsp despawn` writes on a member's row when a governor ends its seat:
+/// the step reads it as "reseat this", so freeing the seat so the run reseats
+/// does what it says (`wsp-524`).
+pub(crate) const RESEAT_ASKED: &str = "despawned by a governor: the run reseats it";
+
+/// The line a reseat writes on the row, and what the cap counts.
+const RESEATED: &str = "wsp: no seat, starting again";
+
+/// The line the run writes when it stops reseating, so the person is raised once.
+const RESEAT_STOPPED: &str = "wsp: reseated twice with no first turn, not again";
+
+/// How many times in [`RESEAT_WINDOW`] the run reseats one member before it
+/// stops and raises the person.
+const RESEATS: usize = 2;
+const RESEAT_WINDOW: i64 = 60 * 60;
+
+/// The reseats written on the row within [`RESEAT_WINDOW`], and whether the run
+/// has already stopped and said so.
+fn reseats_lately(t: &Task) -> (usize, bool) {
+    let now = util::epoch_secs();
+    let mut done = 0;
+    let mut stopped = false;
+    for l in t.section("Log").unwrap_or_default().lines() {
+        let Some((stamp, rest)) = l.trim().strip_prefix("- ").and_then(|x| x.split_once(' ')) else { continue };
+        if now - util::epoch_of(stamp) > RESEAT_WINDOW {
+            continue;
+        }
+        done += rest.starts_with(RESEATED) as usize;
+        stopped |= rest.starts_with(RESEAT_STOPPED);
+    }
+    (done, stopped)
+}
+
+/// A member reseated [`RESEATS`] times that is silent again: the third is not
+/// started, the row says so, and the person is raised once (`wsp-524`). Called
+/// under the store lock.
+fn stop_reseating(store: &Store, t: &Task, list: &str, done: usize) {
+    use crate::message::{self, About, Kind, Message, Party};
+    let mut m = t.clone();
+    m.log(&format!("{RESEAT_STOPPED} ({done} reseats)"));
+    m.touch();
+    let _ = store.save_task(&m);
+    let text = format!(
+        "{} has had no seat after {done} reseats in the {list} run, and the run has stopped starting one\n\n\
+         Start it by hand (`wsp spawn {} --agent`) once the cause is cleared.",
+        t.id, t.id
+    );
+    let _ = message::raise(store, &Message::new(Party::wsp(), Kind::Note, &text).about(About::Task(t.id.clone())));
+    log_line(store, &format!("{list}: {} flagged the person — no seat after {done} reseats, not started again", t.id));
 }
 
 // ---- legs -----------------------------------------------------------------------
@@ -8477,6 +8575,103 @@ fn only_a_working_screen_is_ever_overruled() {
         let err = "wsp: spikes/canvas/target not cloned: this tree has no spikes/canvas/Cargo.lock — install as usual\nwsp: claude started but never became ready\n";
         assert_eq!(why_not(err), "wsp: claude started but never became ready");
         assert_eq!(why_not("wsp: no room"), "wsp: no room");
+    }
+
+    /// A `doing` row with no seat, left quiet for `secs`, with `lines` on its log
+    /// and nothing said of it in `cycle.log`.
+    fn left_unseated(store: &Store, id: &str, lines: &[&str], secs: i64) {
+        let mut t = store.find_task(id).unwrap();
+        for l in lines {
+            t.log(l);
+        }
+        t.updated = util::iso_at(util::epoch_secs() - secs);
+        store.save_task(&t).unwrap();
+        std::fs::write(store.state_file("cycle.log"), "").unwrap();
+    }
+
+    fn said(store: &Store) -> String {
+        std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default()
+    }
+
+    /// wsp-524, the first case: a start that failed its three tries while the
+    /// seat was at its cap is taken again once there is room, at the member's
+    /// own agent line, and once.
+    #[test]
+    fn a_start_given_up_at_the_cap_is_reseated_once_there_is_room() {
+        let (_env, store) = scratch("reseat-spent");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        left_unseated(&store, "m-1", &[&format!("{STARTED_BY} run group 1")], 400);
+        store.update_starts(|m| {
+            m.insert("m-1".into(), serde_json::json!({ "tries": 3, "at": util::epoch_secs() - 400, "spent": true }));
+        });
+        assert!(crate::starts::held(&store, "m-1"), "given up, and held until a person says");
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "reseated at its own agent line");
+        assert!(said(&store).contains("started again: no seat"), "{}", said(&store));
+        assert!(!crate::starts::spent(&store, "m-1"), "and its spent count is forgiven");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "once per silence");
+    }
+
+    /// The second case: the verifier blocked it, the run's start did not take,
+    /// the governor answered that starting one is the run's job and wrote
+    /// nothing else. The run starts it.
+    #[test]
+    fn a_blocked_member_the_governor_declined_to_start_is_reseated() {
+        let (_env, store) = scratch("reseat-block");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        left_unseated(
+            &store,
+            "m-1",
+            &[
+                &format!("{SENT_BACK} the verifier blocked: something"),
+                &format!("{STARTED_BY} run group 1"),
+                "governor: starting one is the run's job",
+            ],
+            400,
+        );
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())]);
+        assert!(said(&store).contains("started again: no seat"), "{}", said(&store));
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "once");
+    }
+
+    /// The third case: a governor's despawn writes the word the step reads, and
+    /// the seat is reseated at once and not after five quiet minutes.
+    #[test]
+    fn a_member_a_governor_despawned_is_reseated_by_the_next_step() {
+        let (_env, store) = scratch("reseat-despawn");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(RESEAT_ASKED);
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())]);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "once");
+    }
+
+    /// Two reseats that never reached a first turn are the most: the third silence
+    /// starts nothing and raises one item, and a fourth raises no second.
+    #[test]
+    fn a_third_failed_reseat_raises_one_item_and_starts_nothing() {
+        let (_env, store) = scratch("reseat-cap");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        for round in 1..=4 {
+            left_unseated(&store, "m-1", &["governor: nothing to add"], 400);
+            step(&store, &w, &Blind);
+            let started = spawned().len();
+            assert_eq!(started, usize::from(round <= 2), "round {round}");
+        }
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default().to_string();
+        assert_eq!(log.matches(RESEAT_STOPPED).count(), 1, "one stop, said once: {log}");
+        assert_eq!(log.matches(super::RESEATED).count(), 2, "{log}");
+        assert!(!said(&store).contains("started again"), "the last rounds started nothing: {}", said(&store));
     }
 
     /// A start that has not claimed within a minute is taken again, and a

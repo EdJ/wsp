@@ -78,6 +78,11 @@ pub(crate) fn held(store: &Store, label: &str) -> bool {
     util::epoch_secs() - e["at"].as_i64().unwrap_or(0) <= wait
 }
 
+/// Whether `label`'s tries are spent: it is given up, and a person is to say.
+pub(crate) fn spent(store: &Store, label: &str) -> bool {
+    store.starts().get(label).is_some_and(|e| e["spent"].as_bool() == Some(true))
+}
+
 /// Forget `label`'s misses, so its next start is the first. Whether it had any.
 pub(crate) fn forgive(store: &Store, label: &str) -> bool {
     let mut had = false;
