@@ -4637,6 +4637,29 @@ fn pickup(store: &Store) -> i32 {
     0
 }
 
+/// The ordinals of the groups a start leaves with no kind, past the `already`
+/// finished ones. The last group is left out: it runs the full suite whatever
+/// its kind (`docs/scoped-barriers.md`), so a kind would change nothing there.
+fn unkinded_groups(groups: &[Group], already: usize) -> Vec<usize> {
+    let last = groups.len();
+    groups
+        .iter()
+        .enumerate()
+        .filter(|(i, g)| *i >= already && i + 1 < last && g.kind.trim().is_empty() && !g.members.is_empty())
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// What the start says of [`unkinded_groups`]: which groups, what it costs and
+/// the command that sets one.
+fn unkinded_line(id: &str, ordinals: &[usize]) -> String {
+    let which = ordinals.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+    format!(
+        "group {which} of `{id}` has no kind, so its barrier runs the full suite — \
+         `wsp worklist group {id} N --kind contract|components|wiring|insitu` narrows it (docs/scoped-barriers.md)"
+    )
+}
+
 /// Start a `planned` list on the daemon's say-so (`wsp-384`): `go`, with the
 /// reason as its sentence and `--if-planned` so the write itself refuses a
 /// list that is no longer planned. 0 started; 3 it was not planned any more;
@@ -4962,6 +4985,15 @@ fn go_with(
     }
     w.log(&entry);
 
+    // `wsp-560`: a group with no kind runs its barrier on the full suite, and
+    // a plan that writes none (fleet-fixes) pays for it in every group: 101m
+    // of a 514m wall. The start is the moment a governor can still set them,
+    // so the log names the groups whose barrier would be narrowed by one.
+    let unkinded = if starting { unkinded_groups(&groups, already) } else { Vec::new() };
+    if !unkinded.is_empty() {
+        w.log(&unkinded_line(&w.id, &unkinded));
+    }
+
     // Written here rather than by `next`, which a governor polls: once per
     // barrier is a record and once per poll is a log made of its own polling.
     let gone = worklist::dangling(store, &w);
@@ -5013,6 +5045,10 @@ fn go_with(
     // stdout is a log, and the report below is for a person at a terminal.
     if args.has("quiet") && !dry {
         return 0;
+    }
+
+    if !unkinded.is_empty() && !args.json() {
+        eprintln!("wsp: {}", unkinded_line(&w.id, &unkinded));
     }
 
     // Read here rather than at the top, because `go` is what puts the list
@@ -7463,6 +7499,19 @@ mod tests {
 
     fn groups_of(store: &Store, id: &str) -> Vec<Group> {
         store.worklist(id).expect("the list").groups()
+    }
+
+    /// `wsp-560`: the start names the groups a kind would narrow: not the last
+    /// (always a full run), not one already finished, not one with a kind.
+    #[test]
+    fn the_start_names_the_groups_with_no_kind_that_a_kind_would_narrow() {
+        let g = |kind: &str| Group { members: vec!["a-1".into()], kind: kind.into(), ..Default::default() };
+        let groups = vec![g(""), g("components"), g(""), g(""), g("")];
+        assert_eq!(unkinded_groups(&groups, 0), vec![1, 3, 4]);
+        assert_eq!(unkinded_groups(&groups, 3), vec![4], "groups already finished are not asked about");
+        assert!(unkinded_groups(&groups[..1], 0).is_empty(), "a lone group is the last one");
+        let line = unkinded_line("fleet", &[1, 3]);
+        assert!(line.contains("group 1, 3 of `fleet` has no kind") && line.contains("worklist group fleet N --kind"), "{line}");
     }
 
     /// `wsp-240`: a caption on the list at `new`, on a group where `add`
