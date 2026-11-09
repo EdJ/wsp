@@ -531,15 +531,17 @@ WORKLISTS
                                     the group out whole: the running one too,
                                     with --why, until its barrier opens.
                                     --caption "…"|none renames it, run or not
-  wsp worklist cut <slug> <task> --why "…"|-
+  wsp worklist cut <slug> <task> --why "…"|-|--from FILE
                                     take a blocked row, and the members of its
                                     group resting on it (after:), out of the
                                     group being run into a new group straight
                                     after it, on the same agent line, cap and
                                     stop; later groups renumber. Until its
                                     barrier opens, and not a row that landed;
-                                    -n says what moves first. Nothing is
-                                    despawned and the rows keep their history
+                                    -n says what moves first. By the person,
+                                    the primary or the list's governor, logged
+                                    with who. Nothing is despawned and the
+                                    rows keep their history
   wsp worklist member <slug> <task> --agent "kind [model] [effort]"|none
                                     one member on its own line beside the
                                     group's — its spawn and its verifier run

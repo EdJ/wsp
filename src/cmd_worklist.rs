@@ -1755,7 +1755,7 @@ pub(crate) fn cut(w: &Worklist, at: Option<usize>, row: &str, reading: &CutReadi
     Ok(Cut { group: at, takes, stays })
 }
 
-/// `wsp worklist cut <slug> <task> --why "…"|-`: apply [`cut`]. `wsp-515`,
+/// `wsp worklist cut <slug> <task> --why "…"|-|--from FILE`: apply [`cut`]. `wsp-515`,
 /// wsp-513's second part; the barrier passing on what is left and the
 /// governor's brief are the parts after.
 ///
@@ -1785,21 +1785,46 @@ fn cut_verb(store: &Store, args: &Args) -> i32 {
 /// [`cut_verb`] with the caller given — the rows and seat it holds, and the
 /// scope it governs — which is what makes "a member seat may not" testable.
 pub(crate) fn cut_by(store: &Store, args: &Args, here: &[String], governs: Option<String>) -> i32 {
-    const USAGE: &str = "usage: wsp worklist cut <slug> <task> --why \"…\"|-   (-n says what would move)";
+    cut_by_reading(store, args, here, governs, &piped_stdin)
+}
+
+/// The stream, refused before it is read when there is nobody on the other
+/// end: reading a terminal is a command that stops and swallows the keys.
+fn piped_stdin() -> Result<String, String> {
+    if util::stdin_is_tty() {
+        return Err("nothing is piped in — `--why -` reads the reason from a stream".into());
+    }
+    crate::util::read_source("-").map_err(|e| format!("cannot read stdin: {e}"))
+}
+
+/// [`cut_by`] with stdin given, which is what makes `--why -` testable.
+fn cut_by_reading(store: &Store, args: &Args, here: &[String], governs: Option<String>, stdin: &dyn Fn() -> Result<String, String>) -> i32 {
+    const USAGE: &str = "usage: wsp worklist cut <slug> <task> --why \"…\"|-|--from FILE   (-n says what would move)";
+    // `--why -` reaches here as `--why` standing for itself and a bare `-`
+    // among the positionals — the parser gives a dash to a flag only on
+    // `STREAM_VALUED` — so the dash is the reason's, not a fourth word. The
+    // reading `cmd_install::reason_given` gives the same two tokens. wsp-553.
+    let took_dash = args.get("why").as_deref() == Some("true") && args.rest.get(3).is_some_and(|a| a == "-");
+    let words = args.rest.len() - usize::from(took_dash);
     let (Some(needle), Some(row)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
     };
-    if args.rest.len() > 3 {
+    if words > 3 {
         eprintln!("{USAGE}");
         eprintln!("       one row: what rests on it goes with it, and `cut` says which");
         return 2;
     }
-    let why = match reason(args) {
+    let dry = args.has("dry-run");
+    // A dry run decides nothing, so it is not made to give the reason a cut
+    // is logged with; given one, it reads it, so a refusal of the reason
+    // arrives before the real cut rather than at it.
+    let why = match cut_reason(args, stdin) {
         Ok(Some(why)) => why,
+        Ok(None) if dry => String::new(),
         Ok(None) => {
             eprintln!("wsp: a cut is a decision about the run, so it is made with a reason, which is logged");
-            eprintln!("     `wsp worklist cut {needle} {row} --why -` — the reason on stdin");
+            eprintln!("     `wsp worklist cut {needle} {row} --why -` — the reason on stdin, or `--why --from FILE`");
             return 2;
         }
         Err(code) => return code,
@@ -1816,15 +1841,24 @@ pub(crate) fn cut_by(store: &Store, args: &Args, here: &[String], governs: Optio
         eprintln!("     the person, the primary or `{}`'s governor cuts: `wsp ask {} -`", w0.id, w0.id);
         return 1;
     }
-    if let Some(scope) = &governs {
-        let home = worklist::home(store, &w0).map(|h| h.project);
-        if *scope != w0.id && home.as_deref() != Some(scope.as_str()) {
-            eprintln!("wsp: this seat governs `{scope}`, not `{}`, and does not cut from it", w0.id);
-            return 1;
+    // Who may cut is the person, the primary and the list's governor
+    // (wsp-513). The primary is a seat in the governors' record under the
+    // reserved scope, so it arrives here as a governor of `primary`, and was
+    // refused as one of another list until wsp-553.
+    let by = match &governs {
+        Some(scope) if crate::governors::is_primary(scope) => "the primary".to_string(),
+        Some(scope) => {
+            let home = worklist::home(store, &w0).map(|h| h.project);
+            if *scope != w0.id && home.as_deref() != Some(scope.as_str()) {
+                eprintln!("wsp: this seat governs `{scope}`, not `{}`, and does not cut from it", w0.id);
+                eprintln!("     the person, the primary or `{}`'s governor cuts: `wsp ask {} -`", w0.id, w0.id);
+                return 1;
+            }
+            format!("`{scope}`'s governor")
         }
-    }
+        None => "the person".to_string(),
+    };
     let row = store.find_task(&row).map(|t| t.id).unwrap_or(row);
-    let dry = args.has("dry-run");
 
     let outcome = store.locked(|| -> Result<(Worklist, Cut, usize), i32> {
         // Read again inside the lock: a `go` in another process may have
@@ -1867,7 +1901,7 @@ pub(crate) fn cut_by(store: &Store, args: &Args, here: &[String], governs: Optio
             Group { members: got.takes.clone(), agent, cap, stop, member_agents: lines, ..Group::default() },
         );
         w.log(&format!(
-            "cut {} from group {} into group {} (new), ahead of {} planned — why: {why}",
+            "cut {} from group {} into group {} (new), ahead of {} planned, by {by} — why: {why}",
             got.takes.join(" "),
             got.group,
             got.group + 1,
@@ -1880,7 +1914,7 @@ pub(crate) fn cut_by(store: &Store, args: &Args, here: &[String], governs: Optio
                 eprintln!("wsp: write failed: {e}");
                 return Err(1);
             }
-            store.log_event("worklist-edited", json!({ "id": w.id, "what": "cut", "group": got.group, "rows": got.takes, "why": why }));
+            store.log_event("worklist-edited", json!({ "id": w.id, "what": "cut", "group": got.group, "rows": got.takes, "why": why, "by": by }));
             store.git_commit(&format!("wsp: worklist {} cut {} from group {} into group {}", w.id, got.takes.join(" "), got.group, got.group + 1));
         }
         Ok((w, got, count))
@@ -1892,22 +1926,35 @@ pub(crate) fn cut_by(store: &Store, args: &Args, here: &[String], governs: Optio
     if args.json() {
         let mut out = worklist_json(store, &w);
         if let Some(o) = out.as_object_mut() {
-            o.insert("cut".into(), json!({ "from": got.group, "into": got.group + 1, "rows": got.takes, "stays": got.stays, "why": why }));
+            o.insert("cut".into(), json!({ "from": got.group, "into": got.group + 1, "rows": got.takes, "stays": got.stays, "why": why, "by": by }));
             o.insert("dry_run".into(), json!(dry));
         }
         println!("{}", out);
     } else {
-        let verb = if dry { "would cut" } else { "cut" };
-        println!(
-            "{} {verb} {} from group {} into group {} (new) · {count} groups · {} stay",
-            w.id,
-            got.takes.join(" "),
-            got.group,
-            got.group + 1,
-            got.stays.join(" ")
-        );
+        for line in cut_lines(&w.id, &got, count, dry) {
+            println!("{line}");
+        }
     }
     0
+}
+
+/// What [`cut_by`] prints, held apart so "`-n` names what would move" is a
+/// test of sentences rather than of stdout. The row is named first and what
+/// rests on it after, because the second half is the part nobody typed.
+fn cut_lines(list: &str, got: &Cut, count: usize, dry: bool) -> Vec<String> {
+    let verb = if dry { "would cut" } else { "cut" };
+    let (row, rest) = got.takes.split_first().map(|(r, rest)| (r.as_str(), rest)).unwrap_or(("", &[]));
+    let resting = if rest.is_empty() { String::new() } else { format!(", and {} resting on it,", rest.join(" ")) };
+    let stays = if got.stays.is_empty() { "none stay".to_string() } else { format!("{} stay", got.stays.join(" ")) };
+    let mut out = vec![format!(
+        "{list} {verb} {row}{resting} from group {} into group {} (new) · {count} groups · {stays}",
+        got.group,
+        got.group + 1,
+    )];
+    if dry {
+        out.push(format!("  nothing was written — `wsp worklist cut {list} {row} --why -` makes it"));
+    }
+    out
 }
 
 /// `--why`, the reason an edit is logged with. Optional ahead of the run, and
@@ -1918,6 +1965,54 @@ pub(crate) fn cut_by(store: &Store, args: &Args, here: &[String], governs: Optio
 /// the reason from stdin, or one of them is typed, and both on stdin is refused
 /// before either is read. The typed sentence gets the check [`typed_stop`] makes,
 /// since a reason for a corrected stop is written in the same vocabulary.
+/// The reason a [`cut_by`] is logged with: `--why "…"`, `--why -` off stdin,
+/// or `--why --from FILE`. wsp-553.
+///
+/// Not [`reason`], because that one refuses `--from`, which on the verbs it
+/// serves is the stop's source. A cut has no stop to read, so `--from` is free
+/// to be where the reason is — the spelling `wsp install --why --from FILE`
+/// already has, and the one the memory *prose goes through a file* asks for.
+fn cut_reason(args: &Args, stdin: &dyn Fn() -> Result<String, String>) -> Result<Option<String>, i32> {
+    let typed = args.get("why");
+    let asked_for_prose = matches!(typed.as_deref().map(str::trim), Some("true" | "-"));
+    let source = match (args.get("from"), typed) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(t)) if !asked_for_prose && !t.trim().is_empty() => {
+            eprintln!("wsp: a sentence and --from are two reasons — give one");
+            return Err(2);
+        }
+        (Some(_), None) => {
+            eprintln!("wsp: --from is where a --why is read from — `wsp worklist cut <slug> <task> --why --from FILE`");
+            return Err(2);
+        }
+        (Some(path), Some(_)) if !matches!(path.trim(), "true" | "-") => path,
+        (_, Some(t)) if !asked_for_prose => {
+            if let Some(bad) = util::terminal_output(&t) {
+                eprintln!("wsp: {bad}");
+                eprintln!("     a backtick inside double quotes runs a command. `--why -` reads the reason from stdin, where a shell never sees it");
+                return Err(2);
+            }
+            return Ok(Some(fold(&t)).filter(|s| !s.is_empty()));
+        }
+        _ => "-".to_string(),
+    };
+    let read = if source == "-" { stdin() } else { crate::util::read_source(&source).map_err(|e| format!("cannot read {source}: {e}")) };
+    match read {
+        Ok(text) => match fold(&text) {
+            t if t.is_empty() => {
+                let place = if source == "-" { "stdin".to_string() } else { util::contract(&util::expand(&source)) };
+                eprintln!("wsp: nothing in {place} — the reason for a cut goes there");
+                Err(2)
+            }
+            t => Ok(Some(t)),
+        },
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            Err(2)
+        }
+    }
+}
+
 fn reason(args: &Args) -> Result<Option<String>, i32> {
     let Some(raw) = args.get("why") else { return Ok(None) };
     if !matches!(raw.trim(), "-" | "true") {
@@ -2632,15 +2727,17 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
                 order: 65,
-                text: r##"  wsp worklist cut <slug> <task> --why "…"|-
+                text: r##"  wsp worklist cut <slug> <task> --why "…"|-|--from FILE
                                     take a blocked row, and the members of its
                                     group resting on it (after:), out of the
                                     group being run into a new group straight
                                     after it, on the same agent line, cap and
                                     stop; later groups renumber. Until its
                                     barrier opens, and not a row that landed;
-                                    -n says what moves first. Nothing is
-                                    despawned and the rows keep their history"##,
+                                    -n says what moves first. By the person,
+                                    the primary or the list's governor, logged
+                                    with who. Nothing is despawned and the
+                                    rows keep their history"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
@@ -10966,7 +11063,7 @@ mod tests {
         let w = store.worklist("cl").unwrap();
         let log = crate::model::section_of(&crate::model::localise_dates(&w.body), "Log").unwrap_or_default();
         assert!(
-            log.contains("cut c-2 c-3 from group 2 into group 3 (new), ahead of 1 planned — why: waits on a lock nobody holds"),
+            log.contains("cut c-2 c-3 from group 2 into group 3 (new), ahead of 1 planned, by the person — why: waits on a lock nobody holds"),
             "{log}"
         );
         assert_eq!(run(&store, &["show", "cl", "--log"]), 0);
@@ -11011,10 +11108,101 @@ mod tests {
         assert_eq!(cut_as(&store, "c-2", Some("blocked"), &[], Some("cl")), 0, "its governor");
     }
 
+    /// wsp-553: the primary is a seat in the governors' record under the
+    /// reserved scope, so it reaches the verb as `governs == "primary"` — the
+    /// shape that was refused as a governor of another list on first use.
     #[test]
-    fn the_primary_bound_to_no_row_cuts() {
+    fn the_primary_cuts_and_the_log_says_it_was_the_primary() {
         let (_env, store) = cut_store("cut-who-2");
-        assert_eq!(cut_as(&store, "c-2", Some("blocked"), &["w1:p1"], None), 0, "the primary, bound to no row");
+        let primary = Some(crate::governors::PRIMARY);
+        assert_eq!(cut_as(&store, "c-2", Some("blocked on a missing field"), &["w1:p1"], primary), 0, "the primary, bound to no row");
+        assert_eq!(groups_of(&store, "cl").len(), 4, "and the cut was written");
+        let w = store.worklist("cl").unwrap();
+        let log = crate::model::section_of(&crate::model::localise_dates(&w.body), "Log").unwrap_or_default();
+        assert!(log.contains("ahead of 1 planned, by the primary — why: blocked on a missing field"), "{log}");
+    }
+
+    #[test]
+    fn a_member_seat_is_refused_even_when_it_is_the_primary_s_pane() {
+        // A row bound here outranks the governors' record: the window exists to
+        // stop a member editing the plan it is judged by.
+        let (_env, store) = cut_store("cut-who-3");
+        assert_eq!(cut_as(&store, "c-2", Some("blocked"), &["c-4", "w1:p1"], Some(crate::governors::PRIMARY)), 1);
+        assert_eq!(groups_of(&store, "cl").len(), 3, "nothing was written");
+    }
+
+    #[test]
+    fn the_governor_s_cut_is_logged_with_its_scope() {
+        let (_env, store) = cut_store("cut-who-4");
+        assert_eq!(cut_as(&store, "c-2", Some("blocked"), &[], Some("cl")), 0);
+        let w = store.worklist("cl").unwrap();
+        assert!(w.body.contains("by `cl`'s governor — why: blocked"), "{}", w.body);
+    }
+
+    fn argv(words: &[&str]) -> Args {
+        Args::parse(std::iter::once("worklist").chain(words.iter().copied()).map(String::from).collect())
+    }
+
+    /// The fault on first use: `--why -` printed the usage, because the parser
+    /// leaves the dash a positional and the verb counted it as a fourth word.
+    #[test]
+    fn why_dash_reads_the_reason_from_stdin() {
+        let (_env, store) = cut_store("cut-stdin");
+        let a = argv(&["cut", "cl", "c-2", "--why", "-"]);
+        assert_eq!(a.rest.last().map(String::as_str), Some("-"), "the shape the verb has to read");
+        let stdin = || Ok("waits on a lock\nnobody holds\n".to_string());
+        assert_eq!(cut_by_reading(&store, &a, &[], None, &stdin), 0);
+        let w = store.worklist("cl").unwrap();
+        assert!(w.body.contains("why: waits on a lock nobody holds"), "{}", w.body);
+        assert_eq!(groups_of(&store, "cl").len(), 4);
+    }
+
+    #[test]
+    fn why_dash_with_nothing_piped_or_empty_is_refused_and_writes_nothing() {
+        let (_env, store) = cut_store("cut-stdin-2");
+        let a = argv(&["cut", "cl", "c-2", "--why", "-"]);
+        assert_eq!(cut_by_reading(&store, &a, &[], None, &|| Err("nothing is piped in".into())), 2);
+        assert_eq!(cut_by_reading(&store, &a, &[], None, &|| Ok("  \n".into())), 2);
+        assert_eq!(groups_of(&store, "cl").len(), 3);
+        // A second dash is still a stray word, not the reason's.
+        let two = argv(&["cut", "cl", "c-2", "c-3", "--why", "-"]);
+        assert_eq!(cut_by_reading(&store, &two, &[], None, &|| Ok("x".into())), 2);
+        assert_eq!(groups_of(&store, "cl").len(), 3);
+    }
+
+    #[test]
+    fn why_from_file_reads_the_reason_out_of_the_file() {
+        let (env, store) = cut_store("cut-file");
+        let file = env.path("why.txt");
+        std::fs::write(&file, "the field `x` is missing\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let stdin = || -> Result<String, String> { panic!("a file reason reads no stdin") };
+        // A sentence and a file are two reasons, refused before either is used.
+        let both = argv(&["cut", "cl", "c-2", "--why", "typed", "--from", &path]);
+        assert_eq!(cut_by_reading(&store, &both, &[], None, &stdin), 2);
+        assert_eq!(groups_of(&store, "cl").len(), 3);
+        let a = argv(&["cut", "cl", "c-2", "--why", "--from", &path]);
+        assert_eq!(cut_by_reading(&store, &a, &[], None, &stdin), 0);
+        assert!(store.worklist("cl").unwrap().body.contains("why: the field `x` is missing"));
+    }
+
+    /// `-n` names the row and what rests on it, says nothing was written, and
+    /// changes nothing — and it needs no reason, since it decides nothing.
+    #[test]
+    fn dry_run_names_what_would_move_and_changes_nothing() {
+        let (_env, store) = cut_store("cut-dry");
+        let before = store.worklist("cl").unwrap().body;
+        let a = argv(&["cut", "cl", "c-2", "-n"]);
+        assert!(a.has("dry-run"));
+        assert_eq!(cut_by_reading(&store, &a, &[], None, &|| panic!("no reason is read")), 0);
+        assert_eq!(store.worklist("cl").unwrap().body, before, "nothing was written, not even the log");
+        let got = Cut { group: 2, takes: vec!["c-2".into(), "c-3".into()], stays: vec!["c-4".into()] };
+        let lines = cut_lines("cl", &got, 4, true);
+        assert_eq!(lines[0], "cl would cut c-2, and c-3 resting on it, from group 2 into group 3 (new) · 4 groups · c-4 stay");
+        assert!(lines[1].contains("nothing was written"), "{lines:?}");
+        assert_eq!(cut_lines("cl", &got, 4, false).len(), 1, "a real cut has no dry-run line");
+        // Through main's gate too: `worklist cut` is one of the verbs that look first.
+        assert!(crate::dry_run(&a).0);
     }
 
     #[test]

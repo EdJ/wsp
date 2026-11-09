@@ -167,7 +167,7 @@ fn die_on_broken_pipe() {
 /// need. It is short because the property it describes is rare, and it going
 /// stale is the one failure here that costs nothing but a wrong signpost.
 const LOOKS_FIRST: &str =
-    "archive, checkout, install, migrate, project rm, sandbox rm, scratch, verify --rm, worklist go, worklist group --drop, worklist rm";
+    "archive, checkout, install, migrate, project rm, sandbox rm, scratch, verify --rm, worklist cut, worklist go, worklist group --drop, worklist rm";
 
 /// Whether this invocation reads `-n`, and what to call it if it does not.
 ///
@@ -259,9 +259,11 @@ fn dry_run(args: &Args) -> (bool, String) {
         "sandbox" => named(matches!(sub, "rm" | "remove" | "stop")),
         "scratch" => (true, args.cmd.clone()),
         // `group` the way `verify` is: only its removing branch, `--drop`,
-        // has anything to look at first.
+        // has anything to look at first. `cut` is the cascade shape: the row
+        // is named and what rests on it is computed, so `-n` is the only
+        // place that set is said before it moves (wsp-553).
         "worklist" | "wl" => {
-            named(matches!(sub, "go" | "start" | "rm" | "remove") || (sub == "group" && args.given("drop")))
+            named(matches!(sub, "go" | "start" | "rm" | "remove" | "cut") || (sub == "group" && args.given("drop")))
         }
         // The one arm that turns on a flag rather than a word, because that is
         // where `verify` keeps the difference: `wsp verify` is a build and has
