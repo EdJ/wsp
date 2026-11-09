@@ -84,7 +84,8 @@ does not know it waited.
 daemon, the lease is short, and the far side is `compound-remote` in compound;
 there is no shell loop and no `executor/` script.
 
-- **The beat.** Every 30 s (`far::BEAT_SECS`) the daemon sends each far seat on
+- **The beat.** Every 30 s, or a third of the lease where that is shorter
+  (`far::beat_every`; `far::BEAT_SECS` is the cap), the daemon sends each far seat on
   each reachable machine `lease <seat> ok` through the seat's forwarded
   controller socket (the `.sock` of section 2), or `lease <seat> stop` once
   nothing holds the seat any more (its claim is released; a seat opened less than
@@ -97,7 +98,9 @@ there is no shell loop and no `executor/` script.
   `machines.json`; one that fails changes nothing, so `heard` is the last time
   the far supervisor really answered, which the probe's `last_seen` is not. The
   first beat on a new master is at once, so a held seat is let go as soon as the
-  link is back.
+  link is back. A machine is silent when `heard` is older than the lease plus one
+  beat (a late tick is not a dead link), and a machine with no far seat to beat
+  has its `heard` cleared, so it reads off the probe (wsp-588).
 - **The lease.** A machine field, in seconds, default 180 (`wsp machine set mb2
   lease=240`): how long a far seat may go unheard before its agent is held. Two to
   three minutes, because a beat every 30 s makes a dead link visible in about one

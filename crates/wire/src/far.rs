@@ -829,11 +829,21 @@ pub trait Wire {
 pub const LINK_PROBE: Duration = Duration::from_secs(8);
 
 /// Whether a far machine is silent: its link is down, or its seats' beat has gone
-/// unanswered for longer than its lease (`docs/remote-agents.md` section 3).
-/// A machine never beaten (`heard` empty) while the link is up is not silent: it
-/// has simply had no far seat to beat.
+/// unanswered for longer than its lease and one beat more
+/// (`docs/remote-agents.md` section 3). A machine never beaten (`heard` empty)
+/// while the link is up is not silent: it has simply had no far seat to beat.
+/// The daemon empties `heard` when the machine's last far seat ends
+/// ([`beat_idle`]), so an idle machine reads off the probe, not off the last
+/// beat of a seat that is gone (wsp-588).
 pub fn is_silent(m: &Machine, l: &MachineLive) -> bool {
-    !l.reachable || (!l.heard.is_empty() && crate::util::since(&l.heard) > i64::from(m.lease_secs()))
+    !l.reachable || (!l.heard.is_empty() && heard_is_stale(m, crate::util::since(&l.heard)))
+}
+
+/// The silence rule with no clock in it: a beat last answered `age` seconds ago
+/// is stale once older than the lease plus one beat. The beat is the allowance
+/// for a late tick, which is a slow daemon and not a dead link (wsp-588).
+pub fn heard_is_stale(m: &Machine, age: i64) -> bool {
+    age > i64::from(m.lease_secs()) + beat_every(m).as_secs() as i64
 }
 
 /// When a silent machine was last heard: the last answered beat, else the
@@ -909,6 +919,35 @@ pub fn loud(machines: &[Machine], live: &std::collections::BTreeMap<String, Mach
 
 /// How often the daemon beats each far seat (`docs/remote-agents.md` section 3).
 pub const BEAT_SECS: u64 = 30;
+
+/// How often a machine's seats are beaten: [`BEAT_SECS`], or a third of the
+/// machine's lease where that is shorter, so a beat that is late once or twice
+/// still lands inside the lease. At a 60 s lease that is 20 s, which is the
+/// daemon's tick: a beat at the lease's own interval put `heard` past the lease
+/// on any late tick (wsp-588).
+pub fn beat_every(m: &Machine) -> Duration {
+    Duration::from_secs((u64::from(m.lease_secs()) / 3).clamp(1, BEAT_SECS))
+}
+
+/// How early before it is due a tick still beats. The daemon ticks every 20 s
+/// and a beat is stamped when it is sent, so a beat due in 19.9 s would wait for
+/// the tick after (40 s apart, and 60 s under load); one due within this is sent
+/// now. The cost is a beat a few seconds early, which nothing minds.
+pub const BEAT_SLACK: Duration = Duration::from_secs(5);
+
+/// How long after a beat the next is due: [`beat_every`] less [`BEAT_SLACK`].
+pub fn beat_wait(m: &Machine) -> Duration {
+    beat_every(m).saturating_sub(BEAT_SLACK)
+}
+
+/// What the daemon does when a machine has no far seat to beat: forget that it
+/// ever heard one. `heard` and `leases` are the beats of seats; with none there
+/// is nothing to be silent about, and `heard` would only age until the machine
+/// read `unreachable` over a working link (wsp-588).
+pub fn beat_idle(live: &mut MachineLive) {
+    live.heard.clear();
+    live.leases.clear();
+}
 
 /// How long one beat waits for the far side's answer. Short, because beats are
 /// sent from the tick, one seat after another.
@@ -2001,6 +2040,51 @@ mod tests {
     /// unanswered past its lease; one never beaten with the link up is not. The
     /// sentence and the seat word say how long, and a machine that is heard says
     /// nothing at all (`docs/remote-agents.md` section 3).
+    /// wsp-588: a 60 s lease never reads silent while beats answer on time, with
+    /// no real clock: the daemon's 20 s tick (with a late one now and then) drives
+    /// the beat's schedule, and the silence rule is asked every second.
+    #[test]
+    fn a_sixty_second_lease_never_reads_silent_while_beats_answer() {
+        let mut m = Machine::new("mb2", "mb2");
+        m.lease = Some(60);
+        assert_eq!(beat_every(&m), Duration::from_secs(20), "a third of the lease");
+        assert!(beat_wait(&m) < beat_every(&m));
+        // The default lease keeps the 30 s beat.
+        assert_eq!(beat_every(&Machine::new("mb2", "mb2")), Duration::from_secs(BEAT_SECS));
+
+        // Ticks 20 s apart, a late one of 35 s (a loaded machine) among them.
+        let gaps = [20, 20, 20, 35, 20, 20, 35, 35, 20, 20, 20, 20];
+        let (mut now, mut next, mut heard) = (0i64, 0i64, 0i64);
+        for gap in gaps.iter().cycle().take(200) {
+            now += gap;
+            if now >= next {
+                heard = now;
+                next = now + beat_wait(&m).as_secs() as i64;
+            }
+            // The next tick is `gap` away at worst; ask at every second up to it.
+            for t in now..now + gap {
+                assert!(!heard_is_stale(&m, t - heard), "silent {}s after a beat at tick {now}", t - heard);
+            }
+        }
+        // And the rule still means something: a beat a lease and a beat old.
+        assert!(!heard_is_stale(&m, 60 + 20));
+        assert!(heard_is_stale(&m, 60 + 21));
+    }
+
+    /// wsp-588: with no far seat left to beat, the last beat is forgotten, so the
+    /// machine reads off the probe and not off a seat that is gone.
+    #[test]
+    fn a_machine_with_no_far_seat_left_is_not_silent_off_an_old_beat() {
+        let m = Machine::new("mb2", "mb2");
+        let ago = |secs: i64| crate::util::iso_at(crate::util::epoch_secs() - secs);
+        let mut l = MachineLive { reachable: true, last_seen: ago(5), heard: ago(4000), ..Default::default() };
+        l.leases.insert("cpd-7".into(), ago(4000));
+        assert!(is_silent(&m, &l), "an old beat with a seat to answer it is silence");
+        beat_idle(&mut l);
+        assert!(l.heard.is_empty() && l.leases.is_empty());
+        assert!(!is_silent(&m, &l), "idle: the probe says reachable");
+    }
+
     #[test]
     fn a_machine_is_silent_on_a_down_link_or_a_stale_beat_and_says_how_long() {
         let m = Machine::new("mb2", "mb2");

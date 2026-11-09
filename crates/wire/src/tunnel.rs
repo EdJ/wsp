@@ -155,16 +155,18 @@ impl Tunnel {
         self.next_try = None;
     }
 
-    /// Beat the machine's far seats when [`crate::far::BEAT_SECS`] have passed.
+    /// Beat the machine's far seats when [`crate::far::beat_every`] has passed.
     /// The first beat after the master answers is at once, so a seat that was
     /// waiting on the link is let go the moment it is back.
     fn beat_if_due(&mut self, store: &Store, m: &Machine, wire: &dyn crate::far::Wire) -> Vec<(String, String)> {
         if self.next_beat.is_some_and(|t| Instant::now() < t) {
             return Vec::new();
         }
-        self.next_beat = Some(Instant::now() + Duration::from_secs(crate::far::BEAT_SECS));
+        self.next_beat = Some(Instant::now() + crate::far::beat_wait(m));
         let seats = crate::place_compound::beat_seats(store, &m.name);
         if seats.is_empty() {
+            // No far seat to beat: the last beat belongs to a seat that is gone.
+            crate::far::beat_idle(&mut self.live);
             return Vec::new();
         }
         // The controller's forward is dialled before it is used: one that is not
@@ -1297,6 +1299,27 @@ mod tests {
         assert_eq!(wire.leases.borrow().len(), 2);
         assert_eq!(t.live.leases.len(), 2, "the last answer per seat is kept");
         t.stop();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// wsp-588: the last far seat ends, and the next beat forgets the old one, so
+    /// the machine does not read `unreachable` off a beat nothing renews.
+    #[test]
+    fn a_beat_with_no_far_seat_left_forgets_the_last_one() {
+        let (store, root) = store_with_seats("idle", &[("cpd-7", "mb2")]);
+        let m = far_machine();
+        let wire = script();
+        let mut t = Tunnel::new();
+        t.live.reachable = true;
+        t.beat_if_due(&store, &m, &wire);
+        assert!(!t.live.heard.is_empty() && t.live.leases.contains_key("cpd-7"));
+        // The seat ends: its record goes.
+        std::fs::remove_dir_all(store.state.join("compound-seats").join("cpd-7")).unwrap();
+        t.live.heard = crate::util::iso_at(crate::util::epoch_secs() - 4000);
+        t.next_beat = Some(Instant::now() - Duration::from_secs(1));
+        t.beat_if_due(&store, &m, &wire);
+        assert!(t.live.heard.is_empty() && t.live.leases.is_empty(), "{:?}", t.live);
+        assert!(!crate::far::is_silent(&m, &t.live));
         let _ = std::fs::remove_dir_all(&root);
     }
 

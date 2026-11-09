@@ -1384,7 +1384,7 @@ pub struct Machine {
     /// How long a far seat may go unheard before its agent is held, in seconds
     /// (`docs/remote-agents.md` section 3). `None` is [`DEFAULT_LEASE`]; read it
     /// through [`Machine::lease_secs`]. Short, because the daemon's beat keeps it
-    /// alive every [`crate::far::BEAT_SECS`]: a lease is how long a dead link is
+    /// alive every [`crate::far::beat_every`]: a lease is how long a dead link is
     /// tolerated, not how long the agent may work.
     pub lease: Option<u32>,
     /// What a far seat does when the link is gone. Only `required` exists: the
