@@ -692,6 +692,32 @@ pub fn trust_command(m: &Machine, op: &str, dir: &str) -> String {
     )
 }
 
+/// The far command that reads whether the display is on: macOS's display
+/// wrangler power state, 4 awake and below that dimmed or asleep. Prints
+/// `display 4`, say; prints nothing on a machine that has no such thing.
+pub const DISPLAY_PROBE: &str =
+    "ioreg -r -n IODisplayWrangler -w0 2>/dev/null | grep -o '\"CurrentPowerState\"=[0-9]*' | head -1 | sed 's/.*=/display /'";
+
+/// Whether the probe's output says the far display is asleep (compound-1012:
+/// libghostty's display link needs an active display, so a far renderer never
+/// comes up while it sleeps). `None` when it cannot say.
+pub fn display_asleep(out: &str) -> Option<bool> {
+    let n: u32 = out.lines().find_map(|l| l.trim().strip_prefix("display "))?.trim().parse().ok()?;
+    Some(n < 4)
+}
+
+/// The sentence a far start that never became ready is given when the far display
+/// is asleep, else `None`: the cause, in place of "never became ready".
+pub fn asleep_words(m: &Machine, wire: &dyn Wire) -> Option<String> {
+    let out = wire.run(m, DISPLAY_PROBE, Duration::from_secs(10)).ok()?;
+    display_asleep(&out)?.then(|| {
+        format!(
+            "the far display of {} is asleep, so its renderer cannot start (the seat's agent may still be working): wake it, or keep it awake (`caffeinate -d` there)",
+            m.name
+        )
+    })
+}
+
 /// A word quoted for the far shell with no `~/` expansion: an environment value or
 /// an argument is data, even when it starts with `~/`.
 fn quote_plain(word: &str) -> String {
@@ -1098,6 +1124,15 @@ pub fn record(live: &mut MachineLive, c: &Check, now: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_display_probe_reads_asleep_awake_and_unknown() {
+        assert_eq!(display_asleep("display 4\n"), Some(false));
+        assert_eq!(display_asleep("display 0\n"), Some(true));
+        assert_eq!(display_asleep("display 3"), Some(true));
+        assert_eq!(display_asleep(""), None);
+        assert_eq!(display_asleep("something else"), None);
+    }
     use std::cell::RefCell;
 
     fn machine() -> Machine {

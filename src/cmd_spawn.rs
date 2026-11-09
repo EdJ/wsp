@@ -3147,6 +3147,17 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 }
             }
             Err(e) => {
+                // A far start that never became ready is, on a machine whose
+                // display sleeps, a renderer that cannot start (wsp-583):
+                // say that, not the symptom.
+                let e = match (args.get("on"), e.contains("never became ready")) {
+                    (Some(on), true) => store
+                        .machine(&on)
+                        .and_then(|m| crate::far::asleep_words(&m, &crate::far::Ssh))
+                        .map(|why| format!("{e}: {why}"))
+                        .unwrap_or(e),
+                    _ => e,
+                };
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
                 // The order was never sent. If the agent draws its prompt
                 // after this gives up (cpd-3135, 2026-11-05), the repair tick
