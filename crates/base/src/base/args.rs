@@ -33,7 +33,7 @@ pub const BOOL_FLAGS: &[&str] = &[
     // And `resume`, whose positional is a task or a project.
     "print",
     // And `checkout`, whose positional is a task id.
-    "sweep",
+    "sweep", "all-roots",
     // And for `install`, whose positional is the binary to install.
     "dry-run",
     // `worklist output <slug> --none`, and the source of one it adds.

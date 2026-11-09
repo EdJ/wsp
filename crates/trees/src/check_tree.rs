@@ -617,6 +617,12 @@ pub fn discard(store: &Store, name: &str, standing: &dyn Fn(&Path) -> Option<Str
 /// Every check tree on disk whose check is nobody's, taken on the rule.
 /// `standing` is asked only once there is a tree to ask it about.
 pub fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -> Vec<Tree> {
+    sweep_of(store, None, standing)
+}
+
+/// [`sweep`], of the check trees of one list when `only` names it: what a list
+/// that has completed takes (`wsp-548`).
+pub fn sweep_of(store: &Store, only: Option<&str>, standing: &dyn Fn(&Path) -> Option<String>) -> Vec<Tree> {
     let mut out = Vec::new();
     for repo in repos(store) {
         let Ok(entries) = std::fs::read_dir(repo.join(WORKTREES)) else { continue };
@@ -629,7 +635,7 @@ pub fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -> Vec<T
                 continue;
             }
             let Some((list, at)) = named(store, &name) else { continue };
-            if in_use(store, &list, at) {
+            if only.is_some_and(|o| o != list) || in_use(store, &list, at) {
                 continue;
             }
             out.push(take(store, &repo, &dir, &residue, standing));

@@ -35,6 +35,7 @@ mod hold_close;
 mod testkit;
 mod check;
 mod build_output;
+mod list_sweep;
 mod scope;
 mod scratch;
 mod leaked_agents;

@@ -1123,6 +1123,12 @@ fn closed_members(trunks: &[(PathBuf, String)], id: &str) -> Vec<Passed> {
 /// Every root the row's project names, not where the caller stands: `done` is
 /// typed from anywhere, and most often by somebody who was never in the tree.
 pub fn sweep_closed(store: &Store, ids: &[String], dry: bool) -> Swept {
+    sweep_closed_with(store, ids, None, dry)
+}
+
+/// [`sweep_closed`] with who is standing where answered by `busy` when given,
+/// and by a census of the live backends when not (`wsp-548`).
+pub fn sweep_closed_with(store: &Store, ids: &[String], busy: Option<&dyn Fn(&str, &Path) -> Option<String>>, dry: bool) -> Swept {
     let index = crate::resolve::Index::new(store.projects());
     let mut members = Vec::new();
     for id in ids {
@@ -1145,8 +1151,13 @@ pub fn sweep_closed(store: &Store, ids: &[String], dry: bool) -> Swept {
     if members.is_empty() {
         return Swept::default();
     }
-    let occupied = Occupied::now(store);
-    sweep_passed(&members, &|_| false, &|t, d| occupied.of(t, d), dry)
+    match busy {
+        Some(busy) => sweep_passed(&members, &|_| false, busy, dry),
+        None => {
+            let occupied = Occupied::now(store);
+            sweep_passed(&members, &|_| false, &|t, d| occupied.of(t, d), dry)
+        }
+    }
 }
 
 /// What [`sweep_closed`] did, in lines: nothing for a row that had no tree.
@@ -2005,19 +2016,24 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
 fn swept(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let dry = args.has("dry-run");
-    let Ok(cwd) = std::env::current_dir() else {
-        eprintln!("wsp: cannot read the current directory");
-        return 2;
+    // `--all-roots` (`wsp-548`): every repository any project names, so the
+    // trees of rows whose project has two roots go from wherever it is typed,
+    // and a sweep outside the repository is not refused for being outside it.
+    let repos = match args.has("all-roots") {
+        true => crate::check_tree::repos(store),
+        false => {
+            let Ok(cwd) = std::env::current_dir() else {
+                eprintln!("wsp: cannot read the current directory");
+                return 2;
+            };
+            let Some(repo) = toplevel(&cwd) else {
+                eprintln!("wsp: {} is not in a git repository", util::contract(&cwd));
+                return 2;
+            };
+            vec![repo]
+        }
     };
-    let Some(repo) = toplevel(&cwd) else {
-        eprintln!("wsp: {} is not in a git repository", util::contract(&cwd));
-        return 2;
-    };
-    let Some(trunk) = trunk(&repo) else {
-        eprintln!("wsp: cannot find the repository's main working tree");
-        return 2;
-    };
-
+    let all = args.has("all-roots");
     let closed = finished(store);
     // The same evidence the barrier stands on, asked of the store here rather
     // than recomputed: a tree whose group a running worklist has passed is one
@@ -2027,15 +2043,35 @@ fn swept(store: &Store, args: &Args) -> i32 {
     // time — see [`crate::worklist::passed_by_running`].
     let passed = (engine().passed)(store);
     let occupied = Occupied::now(store);
-    let busy = |task: &str| -> Option<String> { occupied.of(task, &checkout_dir(&trunk, task)) };
-
     let whose = naming(store);
-    let out = sweep(&repo, &closed, &|t| passed.contains(t), &whose, &busy, dry);
+    let mut seen = BTreeSet::new();
+    for repo in repos {
+        let Some(trunk) = trunk(&repo) else {
+            eprintln!("wsp: cannot find the main working tree of {}", util::contract(&repo));
+            if all {
+                continue;
+            }
+            return 2;
+        };
+        if !seen.insert(util::real(&trunk.display().to_string())) {
+            continue;
+        }
+        let busy = |task: &str| -> Option<String> { occupied.of(task, &checkout_dir(&trunk, task)) };
+        let out = sweep(&repo, &closed, &|t| passed.contains(t), &whose, &busy, dry);
+        report(&p, args, &trunk, &out, dry, all);
+    }
+    0
+}
 
+/// One repository's sweep, said: a line each, or one json object. With
+/// `--all-roots` each repository is headed by its path, and one that had
+/// nothing says nothing.
+fn report(p: &util::Paint, args: &Args, trunk: &Path, out: &Swept, dry: bool, all: bool) {
     if args.json() {
         println!(
             "{}",
             json!({
+                "repo": util::contract(trunk),
                 "removed": out.removed,
                 "branches_kept": out.branches,
                 "branches_pruned": out.pruned,
@@ -2048,11 +2084,17 @@ fn swept(store: &Store, args: &Args) -> i32 {
                 "dry_run": dry,
             })
         );
-        return 0;
+        return;
     }
-
+    let nothing = out.removed.is_empty() && out.kept.is_empty() && out.pruned.is_empty() && out.stranded.is_empty();
+    if all && nothing {
+        return;
+    }
+    if all {
+        println!("{}", p.bold(&util::contract(trunk)));
+    }
     for task in &out.removed {
-        let path = util::contract(&checkout_dir(&trunk, task));
+        let path = util::contract(&checkout_dir(trunk, task));
         println!("{} {path}", if dry { p.dim("would remove") } else { p.dim("removed") });
     }
     for task in &out.branches {
@@ -2075,10 +2117,9 @@ fn swept(store: &Store, args: &Args) -> i32 {
     for s in &out.stranded {
         println!("{}", p.yellow(&stranded_line(s)));
     }
-    if out.removed.is_empty() && out.kept.is_empty() && out.pruned.is_empty() && out.stranded.is_empty() {
+    if nothing {
         println!("{}", p.dim("no tree or branch here belongs to a finished task"));
     }
-    0
 }
 
 /// `n branches`, singular at one — [`n_commits`]'s neighbour and there for the
@@ -2697,9 +2738,11 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
                 order: 90,
-                text: r##"  wsp checkout --sweep [-n]         …or every tree here whose task is closed and
+                text: r##"  wsp checkout --sweep [-n] [--all-roots]
+                                    …or every tree here whose task is closed and
                                     nobody removed; skips any tree somebody is
-                                    standing in or has work in, -n to look first"##,
+                                    standing in or has work in, -n to look first;
+                                    --all-roots does every project's roots"##,
             },
         ],
     },
@@ -3001,6 +3044,45 @@ mod tests {
             "the tree was found but the repository it lives in was not"
         );
         assert_eq!(w.looked.len(), 2, "the seat was not searched first");
+    }
+
+    /// `--sweep --all-roots` (`wsp-548`): typed from a directory that is no
+    /// repository, it takes the closed rows' trees in every project root and
+    /// leaves the open row's; without it the same command is refused there.
+    #[test]
+    fn sweep_all_roots_takes_the_closed_trees_of_every_root() {
+        let (env, _seat) = scratch("all-roots");
+        let one = lane(&env, "one", "one-1");
+        let two = lane(&env, "two", "two-1");
+        let store = Store::open();
+        let mut open = store.task("two-1").unwrap();
+        open.set_status(crate::model::Status::Doing);
+        store.save_task(&open).unwrap();
+        let mut closed = store.task("one-1").unwrap();
+        closed.set_status(crate::model::Status::Done);
+        store.save_task(&closed).unwrap();
+        let mut also = crate::model::Task::new("another", "two-2");
+        also.project = Some("two".into());
+        also.set_status(crate::model::Status::Done);
+        store.save_task(&also).unwrap();
+        for (root, t) in [(&one, "one-1"), (&two, "two-1"), (&two, "two-2")] {
+            ensure(root, &checkout_dir(root, t), t, "master").unwrap();
+        }
+        let elsewhere = env.path("not-a-repo");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&elsewhere).unwrap();
+
+        let refused = swept(&store, &Args::synth("checkout", &[], &[("sweep", "true")]));
+        let kept = checkout_dir(&one, "one-1").join(".git").exists();
+        let code = swept(&store, &Args::synth("checkout", &[], &[("sweep", "true"), ("all-roots", "true")]));
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(refused, 2, "refused outside a repository");
+        assert!(kept);
+        assert_eq!(code, 0);
+        assert!(!checkout_dir(&one, "one-1").exists(), "a closed row's tree is still in the first root");
+        assert!(!checkout_dir(&two, "two-2").exists(), "a closed row's tree is still in the second root");
+        assert!(checkout_dir(&two, "two-1").join(".git").exists(), "an open row's tree was swept");
     }
 
     /// Widening the search must not move where a tree is made, because a task

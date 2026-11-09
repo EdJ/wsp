@@ -167,9 +167,11 @@ AGENTS
                                     --force is needed to lose uncommitted work.
                                     -n on any of the three says what it would do
                                     and does none of it
-  wsp checkout --sweep [-n]         …or every tree here whose task is closed and
+  wsp checkout --sweep [-n] [--all-roots]
+                                    …or every tree here whose task is closed and
                                     nobody removed; skips any tree somebody is
-                                    standing in or has work in, -n to look first
+                                    standing in or has work in, -n to look first;
+                                    --all-roots does every project's roots
   wsp land [<id>]                   rebase it onto the trunk and fast-forward the
                                     trunk onto it; prints what actually moved.
                                     The tree stays — landing is not finishing.

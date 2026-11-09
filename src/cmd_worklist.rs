@@ -6339,6 +6339,17 @@ fn at_clear_argv(list: &str) -> Vec<String> {
     vec!["retro".into(), list.into(), "--at-clear".into()]
 }
 
+/// [`crate::list_sweep::finish`], and the list saved with what it said. The
+/// trees taken, as lines for the caller to print.
+fn sweep_completed(store: &Store, w: &mut Worklist, groups: &[Group]) -> Vec<String> {
+    let out = crate::list_sweep::finish(store, w);
+    if !out.nothing() {
+        let msg = format!("swept {}", w.id);
+        save(store, w, groups, "swept", &msg);
+    }
+    out.trees
+}
+
 /// [`done`] once the list is found, and the whole of it: the record, and
 /// everything the run opened ended with it.
 ///
@@ -6422,13 +6433,10 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     // And the trees of its members that are closed, where their work is on the
     // trunk (`wsp-305`): no barrier will sweep them now. After the run's seats
     // are ended, so a claim that just went does not keep one.
-    let closed: Vec<String> = groups
-        .iter()
-        .flat_map(|g| g.members.iter())
-        .filter(|m| store.task(m).is_some_and(|t| t.status() == crate::model::Status::Done))
-        .cloned()
-        .collect();
-    let swept = crate::cmd_checkout::closed_lines(&crate::cmd_checkout::sweep_closed(store, &closed, false));
+    // And the rest of what the list left (`wsp-548`): its check trees, the warm
+    // trees of a project nothing else is on, and the trees and scratch of its
+    // closed members in every root of their project.
+    let swept = sweep_completed(store, &mut w, &groups);
     crate::cycle::tell_above(
         store,
         &w,
@@ -6874,6 +6882,11 @@ pub fn status(store: &Store, args: &Args) -> i32 {
         if !put_back.is_empty() {
             store.git_commit(&format!("wsp: worklist {} cancelled, rows put back", w.id));
         }
+    }
+    if cancelling {
+        // The list is over as `done` leaves it: what it made goes, and what it
+        // cannot take is named on its log (`wsp-548`).
+        sweep_completed(store, &mut w, &groups);
     }
     store.log_event("worklist-status", json!({ "id": w.id, "from": was.word(), "to": if cancelling { "cancelled" } else { word.as_str() }, "why": why, "put_back": put_back }));
     let now = if cancelling { "cancelled" } else { word.as_str() };
