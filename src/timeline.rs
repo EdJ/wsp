@@ -323,10 +323,10 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         if let Some(s) = spawned {
             // `wsp review` runs the row's own check before it spawns the verifier;
             // the last `task-checked` between the two ends it.
-            let checked = i.kind("task-checked", id).into_iter().map(|(t, _)| t).filter(|t| *t >= r && *t <= s).max();
+            let checked = i.kind("task-checked", id).into_iter().filter(|(t, _)| *t >= r && *t <= s).max_by_key(|(t, _)| *t);
             match checked {
-                Some(c) => {
-                    out.push(Phase::work("the row's own check (wsp check, run by review)", r, c));
+                Some((c, event)) => {
+                    out.push(Phase::work(format!("the row's own check (wsp check, run by review){}", check_start_note(event)), r, c));
                     if s > c {
                         out.push(Phase::gap("row's check ended → verifier spawn requested", c, s, wait_name(i, c, s, id)));
                     }
@@ -423,6 +423,23 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     out
 }
 
+/// What a `task-checked` event says of how the check began (`wsp-566`): the
+/// state of its `target/` and the load, and each step that ran with its seconds.
+fn check_start_note(event: &Value) -> String {
+    let Some(start) = event.get("start") else { return String::new() };
+    let target = start["target"].as_str().unwrap_or("?");
+    let load = match (start["load"].as_f64(), start["cores"].as_u64()) {
+        (Some(l), Some(c)) => format!(", load {l:.1} of {c} cores"),
+        _ => String::new(),
+    };
+    let steps: Vec<String> = event["step_secs"]
+        .as_array()
+        .map(|a| a.iter().filter(|s| s["reused"] != true).filter_map(|s| Some(format!("{} {}s", s["name"].as_str()?, s["secs"].as_u64()?))).collect())
+        .unwrap_or_default();
+    let steps = if steps.is_empty() { String::new() } else { format!(" — per step: {}", steps.join("; ")) };
+    format!(" — started on target {target}{load}{steps}")
+}
+
 /// The seconds a `barrier run —` segment reports: the run's elapsed time.
 fn run_seconds(seg: &str) -> Option<i64> {
     let after = seg.split(" failed, ").nth(1)?;
@@ -437,7 +454,8 @@ fn run_label(at: usize, seg: &str) -> String {
         _ => seg.split(" · ").next().unwrap_or("").to_string(),
     };
     let steps = seg.split(" · per step: ").nth(1).map(|s| s.split(" · ").next().unwrap_or(s).trim_end()).map(|s| format!(" — per step: {s}")).unwrap_or_default();
-    format!("barrier {at} run ({counts}){steps}")
+    let start = seg.split(" · start: ").nth(1).map(|s| s.split(" · ").next().unwrap_or(s).trim_end()).map(|s| format!(" — start: {s}")).unwrap_or_default();
+    format!("barrier {at} run ({counts}){steps}{start}")
 }
 
 fn clock(t: i64) -> String {
@@ -1526,6 +1544,15 @@ mod tests {
         let ph = build(&i);
         let gap = ph.iter().find(|p| p.label.starts_with("gap before leg a")).unwrap();
         assert!(!gap.waiting_for.as_deref().unwrap().contains("cap"), "{gap:?}");
+    }
+
+    #[test]
+    fn a_check_that_began_cold_says_so_in_its_phase_and_one_without_a_start_reads_as_before() {
+        let cold = json!({"id": "r-1", "took": 95, "start": {"target": "cold", "load": 3.24, "cores": 8}, "step_secs": [{"name": "build", "secs": 768, "reused": false}, {"name": "fmt", "secs": 0, "reused": true}]});
+        assert_eq!(check_start_note(&cold), " — started on target cold, load 3.2 of 8 cores — per step: build 768s");
+        assert_eq!(check_start_note(&json!({"id": "r-1", "took": 95})), "");
+        let line = "list group 1: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 300s · per step: build 300s · start: pj: target cloned, load 1.0 of 8 cores · scope: full";
+        assert_eq!(run_label(1, line.split("barrier run — ").nth(1).unwrap()), "barrier 1 run (1 step(s), 0 reused, 1 ran, 0 failed, 300s) — per step: build 300s — start: pj: target cloned, load 1.0 of 8 cores");
     }
 
     #[test]

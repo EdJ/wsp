@@ -418,9 +418,12 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     let mut applied = scope.clone();
     let mut targets: Vec<String> = Vec::new();
     let mut any_narrowed = false;
+    // How each unit's tree stood when its steps began (`wsp-566`).
+    let mut starts: Vec<String> = Vec::new();
     for unit in &plan.units {
-        let (r, w, narrowed) = run_unit_scoped(store, unit, &format!("barrier {list} {at}"), Some((&scope, &changed)));
+        let (r, w, narrowed, start) = run_unit_scoped(store, unit, &format!("barrier {list} {at}"), Some((&scope, &changed)));
         waited += w;
+        starts.extend(start.map(|s| format!("{}: {}", unit.project, s.line())));
         ranged.push(r);
         match narrowed {
             Some(n) => {
@@ -499,12 +502,14 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     log_line(
         store,
         &format!(
-            "{list} group {at}: barrier run — {count} step(s), {reused} reused, {ran_n} ran, {} failed, {}s{}{}{}",
+            "{list} group {at}: barrier run — {count} step(s), {reused} reused, {ran_n} ran, {} failed, {}s{}{}{}{}",
             failed.len(),
             secs,
             // Per-step seconds of the steps that ran: `wsp timeline` reads them (`wsp-390`).
             if per_step.is_empty() { String::new() } else { format!(" · per step: {}", per_step.join("; ")) },
-            // Scoped against full (`wsp-431`), after the per-step figures so the timeline's reading of them is whole.
+            // Whether the trees began cold or warm and how busy the machine was (`wsp-566`), after the per-step figures so the timeline's reading of them is whole.
+            if starts.is_empty() { String::new() } else { format!(" · start: {}", starts.join("; ")) },
+            // Scoped against full (`wsp-431`).
             format!(" · scope: {}", note.line()),
             if decision.would_pass && !on { " · would pass without an agent (auto-pass is off for a project)" } else { "" }
         ),
@@ -550,9 +555,9 @@ type Scoping<'a> = Option<(&'a scope::Scope, &'a [String])>;
 /// [`run_unit`], and how long it waited for the tree lock, and what scoping did
 /// to the unit's steps (so the caller reads results against the steps that ran).
 /// A wait is said in the log, with whose lock it was.
-fn run_unit_scoped(store: &Store, unit: &Unit, who: &str, scoping: Scoping) -> (Ranged, std::time::Duration, Option<scope::Narrowed>) {
+fn run_unit_scoped(store: &Store, unit: &Unit, who: &str, scoping: Scoping) -> (Ranged, std::time::Duration, Option<scope::Narrowed>, Option<check::Start>) {
     if unit.items.is_empty() {
-        return (Ranged::Ran(Vec::new()), std::time::Duration::ZERO, None);
+        return (Ranged::Ran(Vec::new()), std::time::Duration::ZERO, None, None);
     }
     let dir = check::barrier_dir(store, &unit.project, &unit.repo);
     let before = Instant::now();
@@ -565,8 +570,8 @@ fn run_unit_scoped(store: &Store, unit: &Unit, who: &str, scoping: Scoping) -> (
     });
     // Everything up to the lock is waiting; the checkout and the steps are not.
     let waited = if lock.is_ok() { before.elapsed() } else { std::time::Duration::ZERO };
-    let (ranged, narrowed) = run_unit_locked(store, unit, who, &dir, lock, scoping);
-    (ranged, waited, narrowed)
+    let (ranged, narrowed, start) = run_unit_locked(store, unit, who, &dir, lock, scoping);
+    (ranged, waited, narrowed, start)
 }
 
 fn run_unit_locked(
@@ -576,16 +581,19 @@ fn run_unit_locked(
     dir: &std::path::Path,
     lock: Result<check::TreeLock, String>,
     scoping: Scoping,
-) -> (Ranged, Option<scope::Narrowed>) {
+) -> (Ranged, Option<scope::Narrowed>, Option<check::Start>) {
     let tree = dir.join("tree");
     let lock = match lock {
         Ok(l) => l,
-        Err(why) => return (Ranged::Could(why), None),
+        Err(why) => return (Ranged::Could(why), None, None),
     };
-    if let Err(why) = check::checkout(&unit.repo, &tree, &unit.sha) {
-        drop(lock);
-        return (Ranged::Could(format!("could not put {} in {}: {why}", &unit.sha[..12], util::contract(&tree))), None);
-    }
+    let start = match check::checkout_started(&unit.repo, &tree, &unit.sha) {
+        Ok(start) => start,
+        Err(why) => {
+            drop(lock);
+            return (Ranged::Could(format!("could not put {} in {}: {why}", &unit.sha[..12], util::contract(&tree))), None, None);
+        }
+    };
     // The steps as scoped, in the tree at the commit: the targets a diff reaches
     // are read from the crate graph and the module graph there.
     let narrowed = scoping.map(|(scope, changed)| scope::narrow(&tree, &unit.items, scope, changed));
@@ -595,7 +603,7 @@ fn run_unit_locked(
     let reuse = crate::greens::Reuse { greens: &greens, sha: &unit.sha, env: crate::greens::Env::Warm, who };
     let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), Some(&reuse), |_| {});
     drop(lock);
-    (Ranged::Ran(ran), narrowed)
+    (Ranged::Ran(ran), narrowed, Some(start))
 }
 
 fn could_not_any(ranged: &[Ranged]) -> bool {

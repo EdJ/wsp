@@ -47,6 +47,19 @@
 //! it at a time — a lock beside it — because two builds in one tree is how a
 //! linker segfaults and a green run is bought for the wrong tree.
 //!
+//! **A new tree starts warm, and the record says how it started** (`wsp-566`).
+//! The first check of a list built for 768s against 20-95s for the later ones,
+//! and nothing said whether its `target/` had started cold or the machine was
+//! busy. [`checkout_started`] clones the trunk's `target/` into a tree that is
+//! new or has lost its own (`warm::clone_from`, one `clonefile(2)`, bounded at
+//! 90s, as a row's tree is), and returns a [`Start`]: `cloned`, `warm`, `cold`
+//! (no built target and nothing to clone) or `none` (no cargo), with the
+//! one-minute load and the cores. It is written on the `task-checked` event
+//! (`start`, `load_end`, `step_secs`), on the barrier's `barrier run —` log
+//! line (` · start:`), and from both into the timeline phase labels that reach
+//! `effort.json`, so a retro can tell a cold start from a slow machine. The
+//! cold build (`cold.rs`) is cold by design and takes no seed.
+//!
 //! The commands run with every `WSP_*` and `herdr` variable removed. A test
 //! suite that finds `WSP_HOME` set fails four store tests and reads as the
 //! change under check being wrong.
@@ -547,6 +560,64 @@ pub(crate) fn checkout(repo: &Path, tree: &Path, sha: &str) -> Result<(), String
     git_ok(repo, &["worktree", "add", "--detach", "--quiet", &tree.display().to_string(), sha])
 }
 
+/// How a check tree stood when its steps began (`wsp-566`): was there a built
+/// `target/` to start from, and how busy was the machine. A first check that
+/// builds for twelve minutes against twenty seconds for the later ones is a cold
+/// target or a loaded machine, and the record said neither; this is what says.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Start {
+    /// `cold` (no built `target/`), `warm` (one was there), `cloned` (made warm
+    /// from the trunk's just now), or `none` (a tree with no cargo target to be
+    /// warm or cold).
+    pub target: &'static str,
+    /// What seeding said, one line each, when it was tried.
+    pub seed: Vec<String>,
+    /// The one-minute load average at the start, and the cores to read it against.
+    pub load: Option<f64>,
+    pub cores: usize,
+}
+
+impl Start {
+    /// The tree as it stands now; `cloned` says a seed was just made into it.
+    pub(crate) fn of(tree: &Path, seed: Vec<String>) -> Start {
+        let cloned = seed.iter().any(|l| l.contains("cloned from the parent tree"));
+        let built = std::fs::read_dir(tree.join("target")).is_ok_and(|mut d| d.next().is_some());
+        let target = match (built, cloned) {
+            (true, true) => "cloned",
+            (true, false) => "warm",
+            (false, _) if tree.join("Cargo.lock").is_file() => "cold",
+            (false, _) => "none",
+        };
+        Start { target, seed, load: crate::throttle::load1(), cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) }
+    }
+
+    /// `target cold, load 3.2 of 8 cores`, for a line of the log.
+    pub(crate) fn line(&self) -> String {
+        let load = self.load.map(|l| format!(", load {l:.1} of {} cores", self.cores)).unwrap_or_default();
+        format!("target {}{load}", self.target)
+    }
+
+    /// The same as the figures an event carries.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "target": self.target, "load": self.load, "cores": self.cores, "seed": self.seed })
+    }
+}
+
+/// [`checkout`], then — for a tree that is new or has lost its `target/` —
+/// seed it from the trunk's by clone, as a row's tree is (`wsp-566`), and say
+/// how it stands. Only the row-check and barrier trees come through here: the
+/// cold build is cold by design and calls [`checkout`] alone.
+pub(crate) fn checkout_started(repo: &Path, tree: &Path, sha: &str) -> Result<Start, String> {
+    let made = !tree.join(".git").exists();
+    checkout(repo, tree, sha)?;
+    let seed = if made || !tree.join("target").exists() {
+        crate::cmd_checkout::trunk(repo).filter(|t| t != tree).map(|t| crate::warm::clone_from(&t, tree)).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Ok(Start::of(tree, seed))
+}
+
 /// One check at a time in a tree: a file beside it holding the pid that has it.
 pub(crate) struct TreeLock(PathBuf);
 
@@ -953,6 +1024,12 @@ pub(crate) enum Settled {
 /// review, send the row back in the same write, so no reader ever sees a failed
 /// landing as finished.
 pub(crate) fn settle(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration) -> Settled {
+    settle_started(store, id, at, ran, took, None)
+}
+
+/// [`settle`], with how the tree stood when the steps began, so the event says
+/// whether a long step began on a cold `target/` or a busy machine.
+pub(crate) fn settle_started(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration, start: Option<&Start>) -> Settled {
     let state = if passed(ran) { RunState::Passed } else { RunState::Failed };
     let settled = store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return Settled::Lost };
@@ -976,7 +1053,13 @@ pub(crate) fn settle(store: &Store, id: &str, at: &str, ran: &[Ran], took: Durat
         out
     });
     let word = state.as_str();
-    store.log_event("task-checked", serde_json::json!({ "id": id, "state": word, "steps": ran.len(), "took": took.as_secs() }));
+    let steps: Vec<_> = ran.iter().map(|r| serde_json::json!({ "name": r.step.name, "secs": secs(r.took), "reused": r.reused.is_some() })).collect();
+    let mut event = serde_json::json!({ "id": id, "state": word, "steps": ran.len(), "took": took.as_secs(), "step_secs": steps });
+    if let Some(start) = start {
+        event["start"] = start.json();
+        event["load_end"] = serde_json::json!(crate::throttle::load1());
+    }
+    store.log_event("task-checked", event);
     store.git_commit(&format!("wsp: checked {id} {word}"));
     settled
 }
@@ -1092,14 +1175,19 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         Ok(l) => l,
         Err(why) => return gave_up(store, &t.id, entry.as_deref(), &why),
     };
-    if own.is_none() {
-        if let Err(why) = checkout(&tg.repo, &tree, &tg.sha) {
-            drop(lock);
-            return gave_up(store, &t.id, entry.as_deref(), &format!("could not put {} in {}: {why}", &tg.sha[..12], util::contract(&tree)));
+    let start = if own.is_none() {
+        match checkout_started(&tg.repo, &tree, &tg.sha) {
+            Ok(start) => start,
+            Err(why) => {
+                drop(lock);
+                return gave_up(store, &t.id, entry.as_deref(), &format!("could not put {} in {}: {why}", &tg.sha[..12], util::contract(&tree)));
+            }
         }
-    }
+    } else {
+        Start::of(&tree, Vec::new())
+    };
     if !auto && !args.json() {
-        println!("{} {} at {} in {}", p.dim("checking"), p.bold(&t.id), &tg.sha[..12], util::contract(&tree));
+        println!("{} {} at {} in {} · {}", p.dim("checking"), p.bold(&t.id), &tg.sha[..12], util::contract(&tree), start.line());
     }
     let greens = greens::Greens::open(store, &tg.project, &tg.repo);
     let ledger = (at.is_none() && !args.has("again") && !args.has("force"))
@@ -1120,7 +1208,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     let ok = passed(&ran);
 
     let settled = match &entry {
-        Some(at) => settle(store, &t.id, at, &ran, took),
+        Some(at) => settle_started(store, &t.id, at, &ran, took, Some(&start)),
         None => Settled::Lost,
     };
     if args.json() {
@@ -1503,11 +1591,14 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
         Ok(l) => l,
         Err(why) => return gave_up(store, &found.id, None, &why),
     };
-    if let Err(why) = checkout(&tg.repo, &tree, &tg.sha) {
-        drop(lock);
-        return gave_up(store, &found.id, None, &format!("could not put {} in {}: {why}", &tg.sha[..12], util::contract(&tree)));
-    }
-    println!("{} {} barrier at {}", p.dim("checking"), p.bold(&found.id), &tg.sha[..12]);
+    let start = match checkout_started(&tg.repo, &tree, &tg.sha) {
+        Ok(start) => start,
+        Err(why) => {
+            drop(lock);
+            return gave_up(store, &found.id, None, &format!("could not put {} in {}: {why}", &tg.sha[..12], util::contract(&tree)));
+        }
+    };
+    println!("{} {} barrier at {} · {}", p.dim("checking"), p.bold(&found.id), &tg.sha[..12], start.line());
     let ran = run_all(&tree, &steps, &dir.join("last.log"), None, |r| {
         let (mark, tail) = match &r.done {
             Done::Passed => (p.green("✓"), String::new()),
@@ -2385,6 +2476,68 @@ mod tests {
         run_all(&dir, &[counting(&dir, "b")], &log, Some(&warm), |_| {});
         run_all(&dir, &[counting(&dir, "b")], &log, Some(&cold), |_| {});
         assert_eq!(runs_of(&dir, "b"), 2, "the warm green did not answer the cold ask");
+    }
+
+    /// A trunk with a lockfile, an ignored built `target/`, and one commit.
+    fn trunk_with_target(name: &str, built: bool) -> (PathBuf, PathBuf, String) {
+        let (dir, tree, _) = {
+            let (dir, log) = scratch_log(name);
+            (dir.clone(), dir.with_file_name(format!("{}-tree", dir.file_name().unwrap().to_string_lossy())), log)
+        };
+        crate::testkit::repo(&dir);
+        std::fs::write(dir.join("Cargo.lock"), "lock").unwrap();
+        std::fs::write(dir.join(".gitignore"), "target\n").unwrap();
+        git_run(&dir, &["add", "Cargo.lock", ".gitignore"]);
+        git_run(&dir, &["commit", "--quiet", "-m", "one"]);
+        if built {
+            std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+            std::fs::write(dir.join("target/debug/x"), "bin").unwrap();
+        }
+        let sha = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let _ = std::fs::remove_dir_all(&tree);
+        (dir, tree, sha)
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_new_check_tree_starts_from_the_trunks_target_and_the_record_says_cloned() {
+        let (repo, tree, sha) = trunk_with_target("seed", true);
+        let first = checkout_started(&repo, &tree, &sha).unwrap();
+        assert_eq!(first.target, "cloned", "{:?}", first.seed);
+        assert_eq!(std::fs::read_to_string(tree.join("target/debug/x")).unwrap(), "bin");
+        // The same tree at the next check began warm, and nothing was cloned again.
+        let again = checkout_started(&repo, &tree, &sha).unwrap();
+        assert_eq!((again.target, again.seed.is_empty()), ("warm", true));
+        assert!(again.line().starts_with("target warm"), "{}", again.line());
+    }
+
+    #[test]
+    fn a_new_check_tree_with_no_target_to_clone_says_cold_and_a_tree_with_no_cargo_says_none() {
+        let (repo, tree, sha) = trunk_with_target("cold", false);
+        let start = checkout_started(&repo, &tree, &sha).unwrap();
+        assert_eq!(start.target, "cold", "{:?}", start.seed);
+        assert!(!tree.join("target").exists());
+        let json = start.json();
+        assert_eq!((json["target"].as_str(), json["cores"].as_u64().is_some_and(|c| c >= 1)), (Some("cold"), true));
+        let bare = scratch_log("bare").0;
+        assert_eq!(Start::of(&bare, Vec::new()).target, "none");
+    }
+
+    #[test]
+    fn a_tree_whose_target_was_removed_is_seeded_again() {
+        let (repo, tree, sha) = trunk_with_target("reseed", true);
+        checkout_started(&repo, &tree, &sha).unwrap();
+        std::fs::remove_dir_all(tree.join("target")).unwrap();
+        let start = checkout_started(&repo, &tree, &sha).unwrap();
+        // macOS clones it; elsewhere the seed says why not and the tree is honestly cold.
+        assert_eq!(start.target, if cfg!(target_os = "macos") { "cloned" } else { "cold" }, "{:?}", start.seed);
+    }
+
+    #[test]
+    fn the_cold_build_still_starts_without_a_target() {
+        let (repo, tree, sha) = trunk_with_target("coldbuild", true);
+        checkout(&repo, &tree, &sha).unwrap();
+        assert!(!tree.join("target").exists(), "only the row-check and barrier trees are seeded");
     }
 
     #[test]
