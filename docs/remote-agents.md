@@ -154,8 +154,17 @@ delivered on reconnect rather than dropped (built: `wake::hold_tell` keeps it un
 read for seats that do not exist, so the build must prove it tells an
 unreachable seat from a non-existent one.*
 
-**On reconnect.** The daemon's backoff tops out at 60 s, so the master is back
-within a minute of the link. Then, in order: re-add the per-seat forwards; probe
+**On reconnect.** The master is back within seconds of the link (wsp-561; it
+took 5 m 55 s on the i5 before). While a machine is not answering, the daemon
+looks at it again every 5 s between its 20 s ticks: a tunnel waiting out its
+backoff (which tops out at 15 s) asks a fresh `ssh -o ControlPath=none <m>
+true` and dials at once when it answers, and a master that has been `starting`
+for 15 s without making its control socket is killed and dialled again, with no
+backoff. The probe rides the master or nothing, so a master still connecting is
+never probed past by a direct ssh. A slow far side is not a dead link: a
+machine that answered in the last 3 min stays reachable (tunnel `slow`)
+through failures that reached it, and only a failed connect (`connect to host
+…`, no route, refused, unresolved) makes it unreachable at once. Then, in order: re-add the per-seat forwards; probe
 the wire version again (a far machine that rebooted may have lost its
 supervisors, in which case its census is `heard` and empty, and *that* is when a
 claim is reaped, with the rule unchanged); take a census; the seat's state

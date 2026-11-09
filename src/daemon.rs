@@ -678,7 +678,30 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     let mut first = true;
     loop {
         if !std::mem::take(&mut first) {
-            std::thread::sleep(TICK);
+            // The wait between ticks, in slices while a far machine is not
+            // answering: each slice looks at those machines again, so a link
+            // that comes back is redialled within seconds and not on the next
+            // tick after a backoff (wsp-561). With every machine up — or none —
+            // this is the one sleep it always was.
+            let until = std::time::Instant::now() + TICK;
+            loop {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                if !tunnels.recovering() {
+                    std::thread::sleep(left);
+                    break;
+                }
+                std::thread::sleep(left.min(crate::tunnel::RECOVER_EVERY));
+                if std::time::Instant::now() < until {
+                    for name in tunnels.recover(store) {
+                        if verbose {
+                            eprintln!("wsp daemon: {name} {}", store.machine_live(&name).map(|l| l.tunnel).unwrap_or_default());
+                        }
+                    }
+                }
+            }
         }
 
         // `wsp-481`: one line in `calls.jsonl` per pass of this loop, with ms

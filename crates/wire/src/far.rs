@@ -123,7 +123,12 @@ pub const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
 /// killed and reported as [`Failed::Ran`] (the link answered; the command did
 /// not finish).
 pub fn ssh_run(m: &Machine, control: Option<&Path>, cmd: &str, timeout: Duration) -> Result<String, Failed> {
-    let mut c = Command::new("ssh");
+    ssh_run_with("ssh", m, control, cmd, timeout)
+}
+
+/// [`ssh_run`] with the ssh program named, so a test can pass a script.
+pub fn ssh_run_with(ssh: &str, m: &Machine, control: Option<&Path>, cmd: &str, timeout: Duration) -> Result<String, Failed> {
+    let mut c = Command::new(ssh);
     c.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
     c.args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]);
     if let Some(p) = control {
@@ -145,6 +150,27 @@ pub fn ssh_run(m: &Machine, control: Option<&Path>, cmd: &str, timeout: Duration
         Some(127) => Err(Failed::Ran(format!("{} not found on {}", sup_of(m), m.ssh))),
         Some(n) => Err(Failed::Ran(if last.is_empty() { format!("exited {n}") } else { last })),
     }
+}
+
+/// Whether ssh's words say the far machine was never reached: the TCP connect
+/// itself failed (`connect to host … : Operation timed out`, `No route to host`,
+/// `Connection refused`, `Network is unreachable`) or the name did not resolve.
+/// That is a dead link. Anything else — a banner that came late, a server that
+/// stopped answering keepalives, a master still connecting, a command that did
+/// not finish — means a far side that a packet reached, which on a loaded
+/// machine (load 34 on the i5, wsp-561) is a slow answer and not a lost one.
+pub fn dead_link(why: &str) -> bool {
+    let w = why.to_ascii_lowercase();
+    [
+        "connect to host",
+        "could not resolve hostname",
+        "no route to host",
+        "network is unreachable",
+        "network is down",
+        "connection refused",
+    ]
+        .iter()
+        .any(|k| w.contains(k))
 }
 
 /// `Command::output` with a deadline: `None` when it was still running at the
@@ -1230,6 +1256,32 @@ mod tests {
         fold_probe(&mut l, Err(Failed::Link("Connection refused".into())), "later");
         assert!(!l.reachable);
         assert_eq!(l.last_seen, "later", "last seen is when it last answered, not when it last failed");
+    }
+
+    /// A connect that failed is a dead link; a far side a packet reached and that
+    /// was slow to answer is not (wsp-561: load 34 on the i5 read `unreachable`
+    /// for 2.5 min while ssh worked). The words are ssh's own, macOS and Linux.
+    #[test]
+    fn a_connect_that_failed_is_a_dead_far_link_and_a_slow_answer_is_not() {
+        for dead in [
+            "ssh: connect to host 100.64.0.7 port 22: Operation timed out",
+            "ssh: connect to host mb2 port 22: Connection timed out",
+            "ssh: connect to host mb2 port 22: No route to host",
+            "ssh: connect to host mb2 port 22: Connection refused",
+            "ssh: Could not resolve hostname eds-macbook-i5: nodename nor servname provided, or not known",
+        ] {
+            assert!(dead_link(dead), "{dead}");
+        }
+        for slow in [
+            "Connection timed out during banner exchange",
+            "Timeout, server eds-macbook-i5 not responding.",
+            "kex_exchange_identification: read: Connection reset by peer",
+            "no answer in 15s",
+            "the ssh master has not connected yet",
+            "ssh exited 255",
+        ] {
+            assert!(!dead_link(slow), "{slow}");
+        }
     }
 
     /// The defect the first verifier found: the real `compound-sup spawn` prints

@@ -28,11 +28,32 @@ use crate::model::Machine;
 use crate::store::{MachineLive, Store};
 use crate::util;
 
-/// The backoff, in seconds, by consecutive failure. A machine that is switched
-/// off should not be dialled every twenty seconds for a week; a machine that
-/// has just come back should not wait five minutes to be noticed. The tail is
-/// flat at a minute for that second reason.
-const BACKOFF: [u64; 5] = [2, 5, 15, 30, 60];
+/// The backoff, in seconds, by consecutive failure. The tail is flat at 15 s:
+/// a machine that has just come back must be redialled within seconds of
+/// answering (wsp-561, where the link was back at 12:47:54 and the tunnel read
+/// `starting` until 12:53:11). What it costs a machine that stays off is one
+/// ssh that fails at connect every 15 s; between ticks, [`Supervisor::recover`]
+/// asks a cheaper question every [`RECOVER_EVERY`] and cuts the wait short
+/// when the link answers.
+const BACKOFF: [u64; 3] = [2, 5, 15];
+
+/// How long a master may sit in `starting` — alive, and never answered — before
+/// it is killed and dialled again at once. An ssh started during an outage can
+/// stay up and never connect (stuck before kex, or on a route that has since
+/// changed); without this it was held for as long as it lived (wsp-561).
+const STARTING_WITHIN: Duration = Duration::from_secs(15);
+
+/// How long a machine that answered is held reachable through failures that
+/// reached the far side ([`crate::far::dead_link`] says no): a loaded machine
+/// is slow, not gone. A failed connect ends the hold at once.
+const SLOW_HOLD: Duration = Duration::from_secs(180);
+
+/// How often, between the daemon's ticks, a machine that is not answering is
+/// looked at again.
+pub const RECOVER_EVERY: Duration = Duration::from_secs(5);
+
+/// How long the cheap "is the link back" ssh may take.
+const LINK_TEST_WITHIN: Duration = Duration::from_secs(8);
 
 /// How long to wait after this many consecutive failures — the curve, on its
 /// own, with no clock in it.
@@ -70,6 +91,14 @@ struct Tunnel {
     /// [`Tunnel::stop`] can ask it to exit rather than only kill the ssh that
     /// was started.
     master: Option<(Machine, PathBuf)>,
+    /// When the running master was started, and whether it has answered since:
+    /// a master past [`STARTING_WITHIN`] that never has is replaced.
+    started_at: Option<Instant>,
+    master_answered: bool,
+    /// When the machine last answered a probe, for [`SLOW_HOLD`].
+    answered_at: Option<Instant>,
+    /// The ssh program: `ssh`, or a script in a test.
+    ssh: String,
 }
 
 impl Tunnel {
@@ -84,7 +113,46 @@ impl Tunnel {
             next_beat: None,
             beat_said: BTreeMap::new(),
             master: None,
+            started_at: None,
+            master_answered: false,
+            answered_at: None,
+            ssh: "ssh".into(),
         }
+    }
+
+    /// Whether a failure that reached the far side keeps the machine reachable:
+    /// it answered within [`SLOW_HOLD`].
+    fn holds(&self) -> bool {
+        self.live.reachable && self.answered_at.is_some_and(|a| a.elapsed() < SLOW_HOLD)
+    }
+
+    /// The link failed, for `why`. A dead link (a connect that failed) is
+    /// unreachable; one that reached a slow far side is held reachable while
+    /// [`Tunnel::holds`], and reads `slow`.
+    fn link_failed(&mut self, why: String, word: &str) {
+        let held = !crate::far::dead_link(&why) && self.holds();
+        self.live.error = why;
+        match held {
+            true => self.live.tunnel = "slow".into(),
+            false => {
+                self.live.reachable = false;
+                self.live.tunnel = word.into();
+            }
+        }
+    }
+
+    /// Kill the master that is running and forget it, without a backoff: the
+    /// next step dials again.
+    fn drop_master(&mut self) {
+        if let Some((m, control)) = self.master.take() {
+            clear_master_with(&self.ssh, &m, &control, MASTER_EXIT_WITHIN);
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.started_at = None;
+        self.next_try = None;
     }
 
     /// Beat the machine's far seats when [`crate::far::BEAT_SECS`] have passed.
@@ -185,12 +253,20 @@ impl Tunnel {
         // A new master means the seats have been waiting on the link: the first
         // beat on it is at once.
         self.next_beat = None;
-        self.live.tunnel = "starting".into();
+        self.started_at = Some(Instant::now());
+        self.master_answered = false;
         // Not reachable yet: ssh has been started, not connected.
         // Saying otherwise here is how a machine reads as up for
         // the twenty seconds before anyone asks it anything — and
         // "up" is the word the reap guard is not allowed to be
-        // wrong about.
+        // wrong about. The one exception is a machine that answered
+        // within the hold and whose master was lost to a slow far
+        // side, not a failed connect: that is an answer, not a guess.
+        if self.holds() {
+            self.live.tunnel = "slow".into();
+            return;
+        }
+        self.live.tunnel = "starting".into();
         self.live.reachable = false;
         self.live.error.clear();
     }
@@ -227,7 +303,7 @@ impl Tunnel {
         // next tunnel would attach to it and exit 0.
         if let Some((m, control)) = self.master.take() {
             if self.child.is_some() {
-                clear_master(&m, &control);
+                clear_master_with(&self.ssh, &m, &control, MASTER_EXIT_WITHIN);
             }
         }
         if let Some(mut child) = self.child.take() {
@@ -268,14 +344,62 @@ fn carry_check(live: &mut MachineLive, on_disk: Option<MachineLive>) {
     }
 }
 
-#[derive(Default)]
 pub struct Supervisor {
     tunnels: BTreeMap<String, Tunnel>,
+    /// The ssh program each tunnel runs: `ssh`, or a script in a test.
+    ssh: String,
+}
+
+impl Default for Supervisor {
+    fn default() -> Supervisor {
+        Supervisor { tunnels: BTreeMap::new(), ssh: "ssh".into() }
+    }
 }
 
 impl Supervisor {
     pub fn new() -> Supervisor {
         Supervisor::default()
+    }
+
+    /// Whether any machine is not answering, so the daemon looks again between
+    /// its ticks ([`Supervisor::recover`]).
+    pub fn recovering(&self) -> bool {
+        self.tunnels.values().any(|t| !t.live.reachable)
+    }
+
+    /// Between ticks, every [`RECOVER_EVERY`]: step each machine that is not
+    /// answering, and only those. A master that is starting is probed again (so
+    /// [`STARTING_WITHIN`] is kept to the second, not to the next 20 s tick); a
+    /// tunnel waiting out its backoff is asked a cheap fresh `ssh … true` with no
+    /// master, and is dialled now when it answers. That is what makes the redial
+    /// within seconds of the link coming back, after an outage of any length.
+    pub fn recover(&mut self, store: &Store) -> Vec<String> {
+        let mut changed = Vec::new();
+        for m in store.machines().into_iter().filter(|m| m.is_active()) {
+            let Some(t) = self.tunnels.get_mut(&m.name) else { continue };
+            if t.live.reachable {
+                continue;
+            }
+            if t.child.is_none() && !t.may_try() {
+                if link_answers(&t.ssh, &m).is_err() {
+                    continue;
+                }
+                t.next_try = None;
+            }
+            let before = (t.live.reachable, t.live.tunnel.clone());
+            let sock = store.machine_socket(&m.name);
+            self.step(store, &m, &sock);
+            if let Some(t) = self.tunnels.get_mut(&m.name) {
+                if t.checking.is_none() {
+                    carry_check(&mut t.live, store.machine_live(&m.name));
+                }
+                store.set_machine_live(&m.name, &t.live);
+                if before != (t.live.reachable, t.live.tunnel.clone()) {
+                    changed.push(m.name.clone());
+                }
+            }
+        }
+        changed
     }
 
     /// One pass: start what should be up, notice what has fallen over, and
@@ -327,7 +451,8 @@ impl Supervisor {
     }
 
     fn step(&mut self, store: &Store, m: &Machine, sock: &std::path::Path) {
-        let t = self.tunnels.entry(m.name.clone()).or_insert_with(Tunnel::new);
+        let ssh = self.ssh.clone();
+        let t = self.tunnels.entry(m.name.clone()).or_insert_with(|| Tunnel { ssh, ..Tunnel::new() });
         t.live.socket = sock.to_string_lossy().into_owned();
 
         // Has the ssh we started fallen over since last time?
@@ -335,9 +460,8 @@ impl Supervisor {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     t.child = None;
-                    t.live.reachable = false;
-                    t.live.tunnel = "retrying".into();
-                    t.live.error = why_it_died(store, &m.name, status.code());
+                    t.started_at = None;
+                    t.link_failed(why_it_died(store, &m.name, status.code()), "retrying");
                     t.backoff();
                     return;
                 }
@@ -353,7 +477,7 @@ impl Supervisor {
             if !t.may_try() {
                 return;
             }
-            match spawn(store, m, sock) {
+            match spawn_with(&t.ssh, store, m, sock) {
                 Ok(child) => {
                     let dir = sock.parent().unwrap_or(&store.state);
                     t.master = Some((m.clone(), dir.join(format!("cm-{}", m.name))));
@@ -376,14 +500,46 @@ impl Supervisor {
         // (`docs/remote-agents.md` section 2). A link that is down is
         // unreachable; a link that is up whose command failed is connected and
         // not ready — `far::fold_probe` keeps those two apart.
-        let probed = crate::far::ssh_run(
-            m,
-            Some(&control_path(store, &m.name)),
-            &crate::far::probe_command(m),
-            crate::far::PROBE_TIMEOUT,
-        );
-        crate::far::fold_probe(&mut t.live, probed, &util::now_iso());
-        if t.live.reachable {
+        //
+        // The probe rides the master or nothing. ssh falls back to a connection
+        // of its own when the ControlPath is not there, so a master still
+        // connecting used to be probed past — answered by a direct ssh — or,
+        // with the link down, read as `starting` for as long as it lived. The
+        // master makes its socket once it is connected; until then it has not
+        // answered.
+        let control = control_path(store, &m.name);
+        let probed = match control.exists() {
+            true => crate::far::ssh_run_with(
+                &t.ssh,
+                m,
+                Some(&control),
+                &crate::far::probe_command(m),
+                crate::far::PROBE_TIMEOUT,
+            ),
+            false => Err(crate::far::Failed::Link("the ssh master has not connected yet".into())),
+        };
+        let answered = !matches!(probed, Err(crate::far::Failed::Link(_)));
+        match probed {
+            Err(crate::far::Failed::Link(why)) => {
+                // A master that has never answered, past its deadline, is
+                // replaced now — the backoff is for a dial that failed, and this
+                // one has not failed, it has stalled (wsp-561). A master that has
+                // answered is left to its own keepalives: killing it for a slow
+                // probe would drop every seat's forward on a loaded machine.
+                if !t.master_answered && t.started_at.is_some_and(|s| s.elapsed() >= STARTING_WITHIN) {
+                    t.drop_master();
+                    t.link_failed(format!("no answer {}s after the master started: {why}", STARTING_WITHIN.as_secs()), "retrying");
+                    return;
+                }
+                t.link_failed(why, "starting");
+            }
+            probed => {
+                crate::far::fold_probe(&mut t.live, probed, &util::now_iso());
+                t.master_answered = true;
+                t.answered_at = Some(Instant::now());
+            }
+        }
+        if answered {
             t.failures = 0;
             t.next_try = None;
             t.readd_if_due(store, m, &crate::far::Ssh);
@@ -437,7 +593,13 @@ fn err_log(store: &Store, name: &str) -> PathBuf {
 pub const SUN_PATH_MAX: usize = 103;
 
 /// The `ssh` we hold open, and why each flag is on it.
+#[cfg(test)]
 fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<Child> {
+    spawn_with("ssh", store, m, sock)
+}
+
+/// [`spawn`] with the ssh program named.
+fn spawn_with(ssh: &str, store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<Child> {
     let path = sock.to_string_lossy();
     if path.len() > SUN_PATH_MAX {
         return Err(std::io::Error::new(
@@ -457,15 +619,35 @@ fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<
     let _ = std::fs::remove_file(sock);
 
     let control = dir.join(format!("cm-{}", m.name));
-    clear_master(m, &control);
+    clear_master_with(ssh, m, &control, MASTER_EXIT_WITHIN);
 
     let log = std::fs::File::create(err_log(store, &m.name))?;
 
-    let mut c = Command::new("ssh");
+    let mut c = Command::new(ssh);
     c.args(ssh_args(m, &control));
     c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(log));
     c.spawn()
 }
+
+/// The cheap question asked while a machine is not answering: a fresh ssh, with
+/// no master (`ControlPath=none`), that runs `true`. It is the same path every
+/// other ssh to the machine takes, `~/.ssh/config` and proxies included, so its
+/// answer is the one a person typing `ssh <machine>` would get.
+fn link_answers(ssh: &str, m: &Machine) -> Result<(), String> {
+    let mut c = Command::new(ssh);
+    c.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ControlPath=none"]);
+    c.arg(&m.ssh).args(["--", "true"]);
+    match crate::far::run_bounded(c, LINK_TEST_WITHIN) {
+        Ok(Some(o)) if o.status.success() => Ok(()),
+        Ok(Some(o)) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Ok(None) => Err(format!("no answer in {}s", LINK_TEST_WITHIN.as_secs())),
+        Err(e) => Err(format!("cannot start ssh: {e}")),
+    }
+}
+
+/// How long a master gets to answer `-O exit` over its own socket. A live one
+/// answers in milliseconds; this is the patience for one that is wedged.
+const MASTER_EXIT_WITHIN: Duration = Duration::from_secs(5);
 
 /// Close whatever master is still holding `control`, and sweep its path.
 ///
@@ -477,16 +659,10 @@ fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<
 /// "ssh exited 0" for ever while the check passes. It is asked to exit over its
 /// own control socket, by name and not by pattern; a path nothing answers on is
 /// a plain headstone and is removed.
-fn clear_master(m: &Machine, control: &std::path::Path) {
-    clear_master_with("ssh", m, control, MASTER_EXIT_WITHIN);
-}
-
-/// How long a master gets to answer `-O exit` over its own socket. A live one
-/// answers in milliseconds; this is the patience for one that is wedged.
-const MASTER_EXIT_WITHIN: Duration = Duration::from_secs(5);
-
-/// [`clear_master`] with the ssh program and the deadline named, so a test can
-/// pass a script and the time it needs to start on a loaded machine.
+///
+/// The ssh program and the deadline are named, so a test can pass a script and
+/// the time it needs to start on a loaded machine; the tunnel passes its own
+/// program and [`MASTER_EXIT_WITHIN`].
 fn clear_master_with(ssh: &str, m: &Machine, control: &std::path::Path, within: Duration) {
     let _ = exit_master(ssh, m, control, within);
     let _ = std::fs::remove_file(control);
@@ -645,19 +821,19 @@ fn why_it_died(store: &Store, name: &str, code: Option<i32>) -> String {
 mod tests {
     use super::*;
 
-    /// The curve, and the flat tail. A machine that is switched off must not be
-    /// dialled every tick for a week, and one that has just come back must not
-    /// wait five minutes to be noticed — so the wait grows and then stops
-    /// growing.
+    /// The curve, and the flat tail. A machine that has just come back must not
+    /// wait five minutes to be noticed (wsp-561: it waited 5 m 55 s), so the
+    /// wait grows to 15 s and stops there.
     ///
     /// Asked of [`wait_after`] rather than of a `next_try` measured against a
     /// clock read a moment earlier: the curve is what is being asserted, and
     /// the reading only ever added a way for the answer to be wrong on a busy
     /// machine.
     #[test]
-    fn the_backoff_grows_and_then_holds_at_a_minute() {
+    fn the_backoff_grows_and_then_holds_at_fifteen_seconds() {
         let waits: Vec<u64> = (0..8).map(|n| wait_after(n).as_secs()).collect();
-        assert_eq!(waits, [2, 5, 15, 30, 60, 60, 60, 60]);
+        assert_eq!(waits, [2, 5, 15, 15, 15, 15, 15, 15]);
+        assert_eq!(wait_after(100_000), Duration::from_secs(15), "an outage of any length waits no longer (wsp-561)");
 
         // And that the tunnel spends it: nothing is tried until the wait it was
         // just given has passed.
@@ -1169,5 +1345,190 @@ mod tests {
         assert_eq!(log.matches("answers again").count(), 1, "{log}");
         assert_eq!(log.matches("lease beat to cpd-7 failed").count(), 1, "{log}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fake ssh for the supervisor: `down` in its directory makes every dial
+    /// fail at connect, as a cut link does; `stall` makes a master that stays up
+    /// and never connects (no control socket), as one started mid-outage can.
+    /// Otherwise a master makes its control socket and stays up, the link test
+    /// answers, and the probe prints a wire range. Each master and link test is
+    /// a line in `said`.
+    fn fake_ssh(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir.display();
+        let script = format!(
+            r#"#!/bin/sh
+case " $* " in *" -O "*) exit 0 ;; esac
+if [ -e {d}/down ]; then echo "ssh: connect to host mb2 port 22: Operation timed out" >&2; exit 255; fi
+case " $* " in
+  *" -N "*)
+    echo master >> {d}/said
+    if [ ! -e {d}/stall ]; then
+      for a in "$@"; do case "$a" in ControlPath=*) : > "${{a#ControlPath=}}" ;; esac; done
+    fi
+    exec sleep 300 ;;
+  *" true "*) echo link >> {d}/said; exit 0 ;;
+  *) echo "1 99" ;;
+esac
+"#
+        );
+        let fake = dir.join("ssh");
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake.display().to_string()
+    }
+
+    fn said(dir: &std::path::Path, what: &str) -> usize {
+        std::fs::read_to_string(dir.join("said")).unwrap_or_default().lines().filter(|l| *l == what).count()
+    }
+
+    /// A store with one machine, `mb2`, and a supervisor that dials it with the
+    /// fake ssh.
+    fn far_rig(name: &str) -> (Store, PathBuf, Supervisor) {
+        let (store, root) = store_with_seats(name, &[]);
+        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
+        let mut sup = Supervisor::new();
+        sup.ssh = fake_ssh(&root);
+        (store, root, sup)
+    }
+
+    /// Step until `done` holds, by the recover path the daemon takes between
+    /// ticks. The patience is for a fake `/bin/sh` to start on a loaded machine,
+    /// not a wait the product makes: each pass is one slice.
+    fn recover_until(sup: &mut Supervisor, store: &Store, done: impl Fn(&Tunnel) -> bool) {
+        let give_up = Instant::now() + Duration::from_secs(120);
+        while !done(&sup.tunnels["mb2"]) {
+            assert!(Instant::now() < give_up, "never: {:?}", sup.tunnels["mb2"].live);
+            sup.recover(store);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The link comes back after an outage of any length, and the machine is
+    /// redialled on the next slice between ticks — not when a backoff runs out
+    /// (wsp-561: link back at 12:47:54, tunnel `starting` until 12:53:11). While
+    /// the link is down, the slices ask the cheap question and dial nothing.
+    #[test]
+    fn a_far_link_that_comes_back_is_redialled_at_once_after_an_outage_of_any_length() {
+        let (store, root, mut sup) = far_rig("back");
+        std::fs::write(root.join("down"), "").unwrap();
+
+        // The cut: the master fails at connect and the machine reads unreachable.
+        sup.tick(&store);
+        let give_up = Instant::now() + Duration::from_secs(120);
+        while sup.tunnels["mb2"].live.tunnel != "retrying" {
+            assert!(Instant::now() < give_up, "{:?}", sup.tunnels["mb2"].live);
+            std::thread::sleep(Duration::from_millis(50));
+            sup.tick(&store);
+        }
+        assert!(!sup.tunnels["mb2"].live.reachable);
+        assert!(crate::far::dead_link(&sup.tunnels["mb2"].live.error), "{:?}", sup.tunnels["mb2"].live);
+        assert!(sup.recovering());
+
+        // An outage of any length: a week of failures, and a backoff not yet
+        // spent. The cap holds the wait to 15 s however long it was down …
+        let t = sup.tunnels.get_mut("mb2").unwrap();
+        t.failures = 100_000;
+        t.backoff();
+        assert!(t.next_try.unwrap() <= Instant::now() + Duration::from_secs(15), "the backoff is capped");
+        // … and the redial does not wait for even that.
+        t.next_try = Some(Instant::now() + Duration::from_secs(3600));
+
+        // Still down: the slice asks, and dials nothing.
+        let masters = said(&root, "master");
+        sup.recover(&store);
+        assert_eq!(said(&root, "master"), masters, "no master is dialled into a dead link");
+        assert!(!sup.tunnels["mb2"].live.reachable);
+
+        // The link answers: the very next slice dials, with the backoff unspent.
+        std::fs::remove_file(root.join("down")).unwrap();
+        sup.recover(&store);
+        assert_eq!(said(&root, "link"), 1, "the cheap question was asked");
+        assert_eq!(said(&root, "master"), masters + 1, "and the master dialled in the same slice");
+        assert!(sup.tunnels["mb2"].child.is_some());
+
+        // And once its socket is there, the next slice finds it up.
+        recover_until(&mut sup, &store, |t| t.live.reachable);
+        let t = &sup.tunnels["mb2"];
+        assert_eq!(t.live.tunnel, "up");
+        assert_eq!(t.live.wire, Some(99));
+        assert_eq!((t.failures, t.next_try), (0, None), "an answer clears the debt");
+        assert!(!sup.recovering(), "and the daemon goes back to its one sleep");
+        assert_eq!(store.machine_live("mb2").map(|l| l.reachable), Some(true), "written where `machine show` reads it");
+
+        sup.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A master that stays up and never connects is replaced once it has been
+    /// `starting` for [`STARTING_WITHIN`], and the replacement is dialled at once:
+    /// it stalled, it did not fail, so the backoff does not grow.
+    #[test]
+    fn a_far_master_that_never_connects_is_replaced_after_its_deadline_without_a_backoff() {
+        let (store, root, mut sup) = far_rig("stall");
+        std::fs::write(root.join("stall"), "").unwrap();
+        sup.tick(&store);
+        let give_up = Instant::now() + Duration::from_secs(120);
+        while said(&root, "master") == 0 {
+            assert!(Instant::now() < give_up);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Inside its deadline it is left alone, and reads as starting.
+        sup.recover(&store);
+        let t = &sup.tunnels["mb2"];
+        assert!(t.child.is_some() && t.live.tunnel == "starting" && !t.live.reachable, "{:?}", t.live);
+        assert!(t.live.error.contains("not connected"), "{:?}", t.live);
+
+        // Past it, it is killed, and nothing waits.
+        let failures = t.failures;
+        sup.tunnels.get_mut("mb2").unwrap().started_at = Some(Instant::now() - STARTING_WITHIN);
+        sup.recover(&store);
+        let t = &sup.tunnels["mb2"];
+        assert!(t.child.is_none(), "the stalled master is gone");
+        assert_eq!((t.failures, t.next_try), (failures, None), "redialled now, the backoff not grown");
+
+        // The link is fine now: the next slice dials and the new master answers.
+        std::fs::remove_file(root.join("stall")).unwrap();
+        recover_until(&mut sup, &store, |t| t.live.reachable);
+        assert_eq!(said(&root, "master"), 2);
+
+        sup.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A slow far side is not a dead link. A machine that answered within
+    /// [`SLOW_HOLD`] stays reachable through a keepalive timeout, a late banner,
+    /// and the master it loses to them being started again (wsp-561: load 34 on
+    /// the i5 read `unreachable` for 2.5 min while ssh worked). A connect that
+    /// fails ends the hold at once, and so does the hold running out.
+    #[test]
+    fn a_slow_far_probe_under_load_stays_reachable_and_a_failed_connect_does_not() {
+        let mut t = Tunnel::new();
+        t.live.reachable = true;
+        t.live.tunnel = "up".into();
+        t.answered_at = Some(Instant::now());
+
+        t.link_failed("Timeout, server mb2 not responding.".into(), "retrying");
+        assert!(t.live.reachable, "{:?}", t.live);
+        assert_eq!(t.live.tunnel, "slow");
+        t.started(sleeper());
+        assert!(t.live.reachable && t.live.tunnel == "slow", "a new master on a slow machine: {:?}", t.live);
+        t.link_failed("Connection timed out during banner exchange".into(), "starting");
+        assert!(t.live.reachable, "{:?}", t.live);
+
+        t.link_failed("ssh: connect to host mb2 port 22: Operation timed out".into(), "retrying");
+        assert!(!t.live.reachable && t.live.tunnel == "retrying", "a failed connect is a dead link: {:?}", t.live);
+
+        // A hold that has run out is no hold.
+        t.live.reachable = true;
+        t.answered_at = Some(Instant::now() - SLOW_HOLD);
+        t.link_failed("Timeout, server mb2 not responding.".into(), "retrying");
+        assert!(!t.live.reachable);
+        // And a machine that never answered has nothing to hold.
+        let mut fresh = Tunnel::new();
+        fresh.link_failed("Timeout, server mb2 not responding.".into(), "retrying");
+        assert!(!fresh.live.reachable);
+        t.stop();
     }
 }
