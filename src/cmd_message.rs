@@ -1812,6 +1812,44 @@ pub(crate) fn caller(store: &Store) -> String {
     }
 }
 
+/// Who is speaking, as an address a reply can be sent to (`wsp-521`): the same
+/// words [`crate::address`] reads, so the footer on a tell is itself something
+/// `wsp tell` accepts.
+///
+/// `primary` and `governor:<scope>` for a governor's seat, `seat:<row>` for a
+/// pane bound to a row, the pane id bare for one that holds neither (which
+/// `tell` also takes), and `person` for a caller outside any pane. Pure over
+/// the records and the pane, so the three callers — a seat, the primary and a
+/// shell — are proved without an environment.
+pub(crate) fn sender_of(
+    governors: &std::collections::BTreeMap<String, serde_json::Value>,
+    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+    pane: Option<&str>,
+) -> String {
+    let Some(pane) = pane.filter(|p| !p.is_empty()) else {
+        return "person".into();
+    };
+    if let Some(scope) = crate::place::governs(governors, &crate::place::Seat::new(pane)) {
+        return match crate::governors::is_primary(&scope) {
+            true => crate::governors::PRIMARY.into(),
+            false => format!("governor:{scope}"),
+        };
+    }
+    match bindings.get(pane).and_then(|b| b.get("task_id")).and_then(|t| t.as_str()).filter(|t| !t.is_empty()) {
+        Some(row) => format!("seat:{row}"),
+        None => pane.to_string(),
+    }
+}
+
+/// [`sender_of`] for this process: the pane it is in, read the way [`caller`]
+/// reads it.
+pub(crate) fn sender(store: &Store) -> String {
+    let pane = crate::place::seat_from_env()
+        .map(|s| s.to_string())
+        .or_else(|| herdr::Env::read().pane_id.filter(|p| !p.is_empty()));
+    sender_of(&store.governors(), &store.bindings(), pane.as_deref())
+}
+
 /// The record a needle names: an id, or an unambiguous prefix of one.
 ///
 /// A message id is minted from a clock and a pid and nobody types one whole.

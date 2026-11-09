@@ -70,7 +70,9 @@ pub const BOOL_FLAGS: &[&str] = &[
     // cannot vouch for a seat (`compound-097`), and it sits beside `--again`
     // for the same reason: both are a person overriding a refusal that is
     // right in general.
-    "abandon", "again", "anyway",
+    // `--no-reply` (`wsp-521`) leaves the reply footer off a tell, and sits
+    // before the sentence it must not eat.
+    "abandon", "again", "anyway", "no-reply",
     // `wsp verified <member> --holds|--blocks`, `wsp spawn <member> --verify`
     // and `wsp migrate --verify-rows -n`: none takes a value, and each is
     // followed by a positional or a stream it must not eat.

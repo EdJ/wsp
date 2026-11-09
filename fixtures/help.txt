@@ -481,6 +481,17 @@ AGENTS
                                     dialog is holding the keyboard; look with
                                     `wsp peek`, then `--anyway` takes the
                                     decision yourself
+                                    <id> may be an address: primary,
+                                    governor:<list|project>, seat:<row>,
+                                    verifier:<row>, check:<list>, list:<name>;
+                                    `person` puts it on the person's list.
+                                    The seat reads who spoke, and ends with a
+                                    one-line footer naming the reply, `wsp tell
+                                    <sender> --re <id> -`; `--no-reply` leaves
+                                    it off, for direction that is owed nothing
+                                    back. `--re <id>` marks this as the reply to
+                                    that message and is refused for an unknown
+                                    one
 
 MACHINES
   wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is

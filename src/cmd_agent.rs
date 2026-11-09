@@ -1441,6 +1441,29 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
         Ok(t) => t,
         Err(code) => return code,
     };
+    // `--re <id>` says which message this answers, and an id nothing here sent
+    // or raised is refused before anything is typed (`wsp-521`).
+    let re = match args.get("re").filter(|r| r != "true") {
+        Some(r) => match known_message(store, &r) {
+            Ok(id) => Some(id),
+            Err(why) => {
+                eprintln!("wsp: --re `{r}`: {why}");
+                return 1;
+            }
+        },
+        None => match args.has("re") {
+            true => {
+                eprintln!("wsp: --re takes the id of the message this answers");
+                return 2;
+            }
+            false => None,
+        },
+    };
+    let from = crate::cmd_message::sender(store);
+    // A reply to the person is an item on their list, not keystrokes in a pane.
+    if needle.trim() == "person" {
+        return tell_the_person(store, args, &text, re.as_deref());
+    }
 
     // Not `peek_target`, and the difference is worth a line rather than the
     // reuse. That resolver's whole value is that it also finds the panel, the
@@ -1495,8 +1518,9 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // it waits in the wake spool for the link: `docs/remote-agents.md` section 3.
     // Only a seat that was found gets here; one nothing answers for was refused
     // above and nothing was kept for it.
+    let said = dressed(&from, &message_id(&seat, &text), &text, !args.has("no-reply"));
     if row.state == State::Unreachable {
-        let n = crate::wake::hold_tell(store, &seat, &text);
+        let n = crate::wake::hold_tell(store, &seat, &said);
         let word = format!("{what} is unreachable — held ({n} waiting), delivered when the link returns");
         match args.json() {
             true => println!("{}", json!({ "held": true, "pane": seat, "waiting": n })),
@@ -1542,13 +1566,120 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
         Some(_) => needle.clone(),
         None => addressee_id(store, &needle, &what),
     };
-    let sent = Sent::new(&addressee, &what, &seat, &peek, &text, args);
+    let sent = Sent::new(&addressee, &what, &seat, &peek, &text, args).by(&from, re.as_deref(), !args.has("no-reply"));
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
             return twice(&sent, ago, &p);
         }
     }
-    delivered(store, how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &text), &sent)
+    delivered(store, how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &said), &sent)
+}
+
+/// The sentence as the seat reads it (`wsp-521`): it opens by saying who
+/// speaks, and — unless `--no-reply` — ends with a footer naming the reply.
+///
+/// **One line, and on the same line as the sentence's last word.** A seat's
+/// argv refuses control characters, so the footer is the one part that is never
+/// split, and it is appended after a space rather than a break. The id is the
+/// one [`message_id`] makes of the sentence as typed, so the footer, the
+/// `agent-told` event and `--re` all name the same thing.
+pub(crate) fn dressed(from: &str, id: &str, text: &str, reply: bool) -> String {
+    let opened = format!("{from} says: {}", text.trim_end());
+    match reply {
+        true => format!("{opened} [from {from} · reply: wsp tell {from} --re {id} -]"),
+        false => opened,
+    }
+}
+
+/// The id a `--re` names, if this store knows the message: one a tell left on
+/// the event log, or a record the message store holds. An unambiguous prefix is
+/// enough, as it is for `wsp answer`.
+fn known_message(store: &Store, needle: &str) -> Result<String, String> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Err("no id given".into());
+    }
+    let mut ids: Vec<String> = store
+        .events_of("agent-told")
+        .iter()
+        .filter_map(|d| d.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    ids.extend(message::all(store).into_iter().map(|m| m.id));
+    ids.sort();
+    ids.dedup();
+    if ids.iter().any(|i| i == needle) {
+        return Ok(needle.to_string());
+    }
+    let hits: Vec<&String> = ids.iter().filter(|i| i.starts_with(needle)).collect();
+    match hits.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err("no message by that id — a footer carries it, and `wsp ask` lists what is open".into()),
+        many => Err(format!("names {} messages — give more of it", many.len())),
+    }
+}
+
+/// `wsp tell person "…"`: what a seat says back to the person lands on their
+/// list, by [`crate::cmd_message`]'s road for a question only they answer
+/// (`wsp-233`), and is not typed into any pane.
+///
+/// A shell is the person, so telling the person from one is refused rather
+/// than raised: nobody is waiting, and the record would be an item whose
+/// author is its reader.
+fn tell_the_person(store: &Store, args: &Args, text: &str, re: Option<&str>) -> i32 {
+    let (me, pane) = crate::cmd_message::whoami(store);
+    let from = crate::cmd_message::sender(store);
+    tell_the_person_as(store, args, text, re, me, pane, &from)
+}
+
+/// [`tell_the_person`] with the caller read already, so the item is proved
+/// without exporting a pane into the process every other test shares.
+fn tell_the_person_as(
+    store: &Store,
+    args: &Args,
+    text: &str,
+    re: Option<&str>,
+    me: Party,
+    pane: Option<String>,
+    from: &str,
+) -> i32 {
+    let Some(pane) = pane else {
+        eprintln!("wsp: that is the person, and this is a shell — there is nobody here to tell them from");
+        return 1;
+    };
+    let held = store
+        .bindings()
+        .get(&pane)
+        .and_then(|b| b.get("task_id").and_then(Value::as_str).map(str::to_string))
+        .filter(|id| store.task(id).is_some())
+        .unwrap_or_default();
+    let about = match held.is_empty() {
+        true => About::Nothing,
+        false => About::Task(held.clone()),
+    };
+    let q = Message::question(me, Kind::Note, text, Waiting::new(&pane, &held)).about(about).for_the_person();
+    if let Err(e) = message::raise(store, &q) {
+        eprintln!("wsp: {e}");
+        return 1;
+    }
+    if !held.is_empty() {
+        crate::cmd_message::asked_of_the_person(store, &q, &held);
+    }
+    let id = message_id("person", text);
+    store.log_event(
+        "agent-told",
+        json!({
+            "target": "person", "pane": "", "chars": text.len(), "id": id, "from": from,
+            "re": re, "item": q.id, "at": util::epoch_secs(), "turn": false,
+        }),
+    );
+    match args.json() {
+        true => println!("{}", json!({ "target": "person", "id": id, "item": q.id, "from": from, "re": re, "told": true })),
+        false => {
+            let p = Paint::new();
+            println!("{}", p.dim(&format!("→ the person · item {} · `wsp yours` lists it", q.id)));
+        }
+    }
+    0
 }
 
 /// The one seat an address names, as `target` answers: the pane and the post.
@@ -1610,6 +1741,12 @@ pub struct Sent {
     /// output. An id from a counter would be unique per attempt and would
     /// answer a question nobody asked.
     pub id: String,
+    /// Who spoke, as an address, and which message this answers (`wsp-521`).
+    /// Empty and `None` for the paths that do not say, which write the event as
+    /// they always did.
+    pub from: String,
+    pub re: Option<String>,
+    pub reply: bool,
     pub json: bool,
 }
 
@@ -1633,8 +1770,19 @@ impl Sent {
             peek: peek.into(),
             chars: text.len(),
             id: message_id(pane, text),
+            from: String::new(),
+            re: None,
+            reply: false,
             json: args.json(),
         }
+    }
+
+    /// Who said it, what it answers, and whether it carried a reply footer.
+    pub fn by(mut self, from: &str, re: Option<&str>, reply: bool) -> Sent {
+        self.from = from.into();
+        self.re = re.map(str::to_string);
+        self.reply = reply;
+        self
     }
 
     /// This same sentence, to this same pane, within the last [`SAME_BREATH`].
@@ -1725,7 +1873,7 @@ pub fn twice(sent: &Sent, ago: i64, p: &Paint) -> i32 {
 /// recognisable at all.
 pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &Sent) -> i32 {
     let p = Paint::new();
-    let Sent { target, what, pane, peek, chars, id, json } = sent;
+    let Sent { target, what, pane, peek, chars, id, from, re, reply, json } = sent;
     match outcome {
         Ok(how) => {
             // Recorded as an event and not on the task's log, deliberately. The
@@ -1737,6 +1885,7 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
                 "agent-told",
                 json!({
                     "target": target, "pane": pane, "chars": chars, "id": id,
+                    "from": from, "re": re, "reply": reply,
                     "at": util::epoch_secs(),
                     "turn": matches!(how, Delivery::Started | Delivery::Acked),
                 }),
@@ -1750,7 +1899,7 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
             if *json {
                 println!(
                     "{}",
-                    json!({ "target": target, "pane": pane, "id": id, "told": true,
+                    json!({ "target": target, "pane": pane, "id": id, "told": true, "from": from, "re": re,
                             "turn": matches!(how, Delivery::Started | Delivery::Acked) })
                 );
             } else {
@@ -7180,7 +7329,18 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     at, because the text would land in whatever
                                     dialog is holding the keyboard; look with
                                     `wsp peek`, then `--anyway` takes the
-                                    decision yourself"##,
+                                    decision yourself
+                                    <id> may be an address: primary,
+                                    governor:<list|project>, seat:<row>,
+                                    verifier:<row>, check:<list>, list:<name>;
+                                    `person` puts it on the person's list.
+                                    The seat reads who spoke, and ends with a
+                                    one-line footer naming the reply, `wsp tell
+                                    <sender> --re <id> -`; `--no-reply` leaves
+                                    it off, for direction that is owed nothing
+                                    back. `--re <id>` marks this as the reply to
+                                    that message and is refused for an unknown
+                                    one"##,
             },
         ],
     },
@@ -7248,6 +7408,89 @@ mod tests {
         let store = Store::open();
         store.ensure_dirs().unwrap();
         (env, store)
+    }
+
+    /// `wsp-521`: the footer is on by default, off with `--no-reply`, and one
+    /// line either way — the seat's argv refuses a control character.
+    #[test]
+    fn a_tell_ends_with_a_one_line_reply_footer_unless_told_not_to() {
+        let said = dressed("governor:pieces", "m-1a2b", "run the check", true);
+        assert_eq!(
+            said,
+            "governor:pieces says: run the check [from governor:pieces · reply: wsp tell governor:pieces --re m-1a2b -]"
+        );
+        assert!(!said.contains('\n') && !said.chars().any(char::is_control), "{said:?}");
+        let bare = dressed("governor:pieces", "m-1a2b", "stop", false);
+        assert_eq!(bare, "governor:pieces says: stop");
+        assert!(!bare.contains("reply:"));
+        // A sentence that ends in a newline does not leave the footer on its own line.
+        assert!(!dressed("primary", "m-1", "go on\n", true).contains('\n'));
+    }
+
+    /// The sender is right from a governor's seat, from the primary, from a
+    /// seat on a row, and from a shell.
+    #[test]
+    fn the_sender_is_an_address_from_a_seat_the_primary_and_a_shell() {
+        let gov = |pane: &str| json!({ "workspace": "w1", "pane": pane });
+        let governors: BTreeMap<String, Value> = [
+            ("pieces".to_string(), gov("w1:p2")),
+            (crate::governors::PRIMARY.to_string(), gov("w1:p1")),
+        ]
+        .into();
+        let bindings: BTreeMap<String, Value> = [("cpd-9".to_string(), json!({ "task_id": "wsp-521" }))].into();
+        let of = |pane: Option<&str>| crate::cmd_message::sender_of(&governors, &bindings, pane);
+        assert_eq!(of(Some("w1:p2")), "governor:pieces");
+        assert_eq!(of(Some("w1:p1")), "primary");
+        assert_eq!(of(Some("cpd-9")), "seat:wsp-521");
+        assert_eq!(of(Some("cpd-77")), "cpd-77", "a pane that holds nothing is named as it is");
+        assert_eq!(of(None), "person");
+        // And the footer's reply is an address `tell` itself reads.
+        assert!(crate::address::parse(&of(Some("w1:p2"))).is_some());
+        assert!(crate::address::parse(&of(Some("cpd-9"))).is_some());
+    }
+
+    /// `--re` is recorded on the `agent-told` event, and refused for an id nothing
+    /// sent or raised — before anything is typed.
+    #[test]
+    fn re_is_recorded_and_an_unknown_id_is_refused() {
+        let (_env, store) = scratch("tell-re");
+        let args = crate::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
+        let first = Sent::new("wsp-491", "wsp-491", "cpd-1", "wsp-491", "first", &args).by("primary", None, true);
+        assert_eq!(delivered(&store, Ok(Delivery::Started), &first), 0);
+        let reply = Sent::new("primary", "primary", "cpd-2", "primary", "second", &args)
+            .by("seat:wsp-491", Some(first.id.as_str()), false);
+        assert_eq!(delivered(&store, Ok(Delivery::Started), &reply), 0);
+
+        let told = store.events_of("agent-told");
+        let last = told.last().unwrap();
+        assert_eq!(last["re"], json!(first.id));
+        assert_eq!(last["from"], json!("seat:wsp-491"));
+        assert_eq!(last["reply"], json!(false));
+        assert_eq!(told[0]["from"], json!("primary"));
+        assert_eq!(told[0]["reply"], json!(true));
+
+        assert_eq!(known_message(&store, &first.id), Ok(first.id.clone()));
+        assert!(known_message(&store, "m-nothing").is_err());
+        let args = Args::synth("tell", &["seat:wsp-491", "hello"], &[("re", "m-nothing")]);
+        assert_eq!(tell(&store, &args), 1, "an unknown id is refused before the seat is looked for");
+    }
+
+    /// A reply to `person` is an item on their list and is typed into no pane.
+    #[test]
+    fn a_reply_to_the_person_becomes_an_item() {
+        let (_env, store) = scratch("tell-person");
+        let args = Args::synth("tell", &["person", "done, and it holds"], &[]);
+        let me = Party::seat("pieces");
+        let code = tell_the_person_as(&store, &args, "done, and it holds", None, me.clone(), Some("w1:p2".into()), "governor:pieces");
+        assert_eq!(code, 0);
+        let items = message::for_the_person(&store);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].text.contains("done, and it holds"));
+        assert!(items[0].for_person);
+        assert_eq!(store.events_of("agent-told").last().unwrap()["target"], json!("person"));
+        // From a shell there is nobody to tell the person *from*.
+        assert_eq!(tell_the_person_as(&store, &args, "hello", None, Party::Human, None, "person"), 1);
+        assert_eq!(message::for_the_person(&store).len(), 1);
     }
 
     /// A direct `wsp tell` that the seat's supervisor acknowledged leaves the
