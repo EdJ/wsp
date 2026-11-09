@@ -3150,13 +3150,9 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 // A far start that never became ready is, on a machine whose
                 // display sleeps, a renderer that cannot start (wsp-583):
                 // say that, not the symptom.
-                let e = match (args.get("on"), e.contains("never became ready")) {
-                    (Some(on), true) => store
-                        .machine(&on)
-                        .and_then(|m| crate::far::asleep_words(&m, &crate::far::Ssh))
-                        .map(|why| format!("{e}: {why}"))
-                        .unwrap_or(e),
-                    _ => e,
+                let e = match args.get("on").and_then(|on| store.machine(&on)) {
+                    Some(m) => crate::far::with_far_cause(e, &m, &crate::far::Ssh),
+                    None => e,
                 };
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
                 // The order was never sent. If the agent draws its prompt

@@ -712,10 +712,23 @@ pub fn asleep_words(m: &Machine, wire: &dyn Wire) -> Option<String> {
     let out = wire.run(m, DISPLAY_PROBE, Duration::from_secs(10)).ok()?;
     display_asleep(&out)?.then(|| {
         format!(
-            "the far display of {} is asleep, so its renderer cannot start (the seat's agent may still be working): wake it, or keep it awake (`caffeinate -d` there)",
+            "the far display of {} is asleep or dimmed, so its renderer cannot start (the seat's agent may still be working): wake it, or keep it awake (`caffeinate -d` there)",
             m.name
         )
     })
+}
+
+/// A far start's error, with the cause appended when it is the far display: only
+/// a start that "never became ready" is looked into, and a probe that cannot
+/// say leaves the error as it was.
+pub fn with_far_cause(e: String, m: &Machine, wire: &dyn Wire) -> String {
+    if !e.contains("never became ready") {
+        return e;
+    }
+    match asleep_words(m, wire) {
+        Some(why) => format!("{e}: {why}"),
+        None => e,
+    }
 }
 
 /// A word quoted for the far shell with no `~/` expansion: an environment value or
@@ -1125,6 +1138,37 @@ pub fn record(live: &mut MachineLive, c: &Check, now: &str) {
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
+
+    /// A far side that answers the display probe from a script and remembers the commands.
+    struct Display {
+        says: Result<&'static str, Failed>,
+        asked: RefCell<Vec<String>>,
+    }
+
+    impl Wire for Display {
+        fn machine(&self, _: &str) -> Option<Machine> {
+            None
+        }
+        fn run(&self, _: &Machine, cmd: &str, _: Duration) -> Result<String, Failed> {
+            self.asked.borrow_mut().push(cmd.to_string());
+            self.says.clone().map(String::from)
+        }
+        fn forward(&self, _: &Machine, _: &str, _: &Path, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn dir(&self, _: &Machine) -> PathBuf {
+            PathBuf::new()
+        }
+        fn lease(&self, _: &Machine, _: &Path, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn display(says: Result<&'static str, Failed>) -> Display {
+        Display { says, asked: RefCell::new(Vec::new()) }
+    }
+
     #[test]
     fn the_display_probe_reads_asleep_awake_and_unknown() {
         assert_eq!(display_asleep("display 4\n"), Some(false));
@@ -1133,7 +1177,32 @@ mod tests {
         assert_eq!(display_asleep(""), None);
         assert_eq!(display_asleep("something else"), None);
     }
-    use std::cell::RefCell;
+
+    #[test]
+    fn an_asleep_far_display_is_named_and_any_other_reading_is_not() {
+        let m = machine();
+        let w = display(Ok("display 0\n"));
+        let why = asleep_words(&m, &w).expect("asleep is named");
+        assert!(why.contains("mb2") && why.contains("asleep"), "{why}");
+        assert_eq!(*w.asked.borrow(), vec![DISPLAY_PROBE.to_string()], "the probe is the one command asked");
+        assert_eq!(asleep_words(&m, &display(Ok("display 4\n"))), None);
+        assert_eq!(asleep_words(&m, &display(Ok(""))), None);
+        assert_eq!(asleep_words(&m, &display(Err(Failed::Ran("boom".into())))), None);
+        assert_eq!(asleep_words(&m, &display(Err(Failed::Link("down".into())))), None);
+    }
+
+    #[test]
+    fn a_far_start_that_never_became_ready_gets_the_cause_and_no_other_error_does() {
+        let m = machine();
+        let e = "claude started but never became ready for input".to_string();
+        let asleep = with_far_cause(e.clone(), &m, &display(Ok("display 0")));
+        assert!(asleep.starts_with(&format!("{e}: ")) && asleep.contains("asleep"), "{asleep}");
+        assert_eq!(with_far_cause(e.clone(), &m, &display(Ok("display 4"))), e);
+        assert_eq!(with_far_cause(e.clone(), &m, &display(Err(Failed::Link("down".into())))), e);
+        let other = display(Ok("display 0"));
+        assert_eq!(with_far_cause("no such pane".into(), &m, &other), "no such pane");
+        assert!(other.asked.borrow().is_empty(), "another error is not probed for");
+    }
 
     fn machine() -> Machine {
         let mut m = Machine::new("mb2", "mb2");
