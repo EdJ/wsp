@@ -1,3 +1,13 @@
 # Every rustc goes through `.cargo/rustc-wrap`: sccache if installed, bare rustc if not.
 [build]
 rustc-wrapper = ".cargo/rustc-wrap"
+
+# wsp-539: on an Intel Mac `ld` does not ad-hoc sign what it links (Apple Silicon's does), and
+# `taskgated` then checks each unsigned test process as nextest starts it, about 2,900 per full
+# run. `-adhoc_codesign` signs at link: a full `cargo nextest run --workspace` costs `taskgated`
+# 11.5 CPU-seconds instead of 50.6 (4.4x), and runs a little faster. `wsp install` signs a release
+# build again with `codesign --force`, which replaces this signature. Measured in the row's note.
+# Not for `aarch64-apple-darwin`, which signs already. An explicit RUSTFLAGS in the environment
+# replaces this (cargo takes one source of rustflags), so nothing here sets one.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-adhoc_codesign"]
