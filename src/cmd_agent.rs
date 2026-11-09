@@ -8137,7 +8137,9 @@ mod tests {
                     "id": first.id, "at": util::epoch_secs() }),
         );
 
-        assert_eq!(first.already_sent(&store), Some(0), "the retry after a lie");
+        // Whole seconds: a tick between the log and the read makes it 1.
+        let n = first.already_sent(&store).expect("the retry after a lie");
+        assert!((0..=1).contains(&n), "the retry after a lie, {n} s on");
         assert_eq!(
             sent("w1:p6", "worklist-005 touches panel/rows.rs").id,
             first.id,

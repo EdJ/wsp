@@ -1258,10 +1258,12 @@ mod tests {
     }
 
     /// The whole of what an exit does — role, parent name, both `getrusage`s,
-    /// the line, the append — costs under a millisecond. The best of several
-    /// batches, because a loaded machine (four agents build here by design)
-    /// slows a batch and never speeds one. Run with `--release` for the
-    /// number a shipped binary has; the bound holds in a debug build too.
+    /// the line, the append — costs under a millisecond. Measured in the CPU
+    /// this process spends, not the wall clock: a loaded machine (four agents
+    /// build here by design) stretches the wall time of a batch by however long
+    /// the process waited for a core, and that is not what an exit costs. Still
+    /// the best of several batches. Run with `--release` for the number a
+    /// shipped binary has; the bound holds in a debug build too.
     #[test]
     fn the_record_an_exit_writes_costs_under_a_millisecond() {
         let dir = std::env::temp_dir().join(format!("wsp-calls-cost-{}", std::process::id()));
@@ -1272,9 +1274,13 @@ mod tests {
         let mut kids = Kids::default();
         kids.0.insert("ps".into(), (3, 41.0));
         kids.0.insert("lsof".into(), (1, 160.0));
+        let spent = || {
+            let (u, s) = own_cpu();
+            Duration::from_micros(u + s)
+        };
         let mut best = Duration::MAX;
         for _ in 0..5 {
-            let t = Instant::now();
+            let t = spent();
             for _ in 0..50 {
                 let r = role(Some("cpd-1"), "wip", Some(&dir));
                 let parent = process_name(unsafe { getppid() });
@@ -1284,7 +1290,7 @@ mod tests {
                 );
                 append(&dir, &line, CAP);
             }
-            best = best.min(t.elapsed() / 50);
+            best = best.min((spent() - t) / 50);
         }
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("a call record costs {best:?}");
