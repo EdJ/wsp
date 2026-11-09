@@ -1,56 +1,31 @@
-//! The only long-lived piece: herdr events + store polling -> token refresh.
+//! The only long-lived piece: a timer that drives the run, the repairs, the
+//! attention pass and the far machines' tunnels.
 //!
 //! "The only" is now enforced rather than assumed — one daemon per store, and
 //! the argument for how a second one is turned away is under *one daemon per
 //! store* below.
 //!
-//! Deliberately dependency-free. One thread blocks on the event stream and
-//! feeds a channel; the main loop coalesces bursts (herdr emits
-//! `workspace_focused` on every sidebar hover) and refreshes TTLs on a timer.
+//! **It speaks to compound and to nothing of herdr's** (`wsp-544`). It used to
+//! subscribe to herdr's events, sync herdr's sidebar tokens every tick and
+//! subscribe to every far machine's herdr; none of those had a socket at the
+//! far end since `compound-112`, and the sync's failure was a `daemon.log` line
+//! every tick — 11,020 of them. The inventory is on `wsp-544`. Nothing wakes it
+//! early now: every pass below runs on its own interval, off a [`TICK`].
 //!
 //! It carries one passenger, and being the only long-lived process is the whole
 //! qualification for it: [`crate::attention`] derives what is wrong on this
 //! machine once a minute and puts the changes where a hook can see them. That
 //! is the one thing in wsp that happens at nobody's request — every other
-//! surface states the same facts to whoever is looking. It rides above the
-//! fingerprint gate below rather than beside the sync, because a stopped agent
-//! changes nothing in the store and raises no event this daemon can subscribe
-//! to, so a pass that ran only when something woke us would never run on the
-//! one condition it is for.
+//! surface states the same facts to whoever is looking.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::attention;
-use crate::herdr;
 use crate::store::Store;
-use crate::sync::{self, Cache};
 use crate::tunnel::Supervisor;
 
-const DEBOUNCE: Duration = Duration::from_millis(400);
 const TICK: Duration = Duration::from_secs(20);
-const REFRESH: Duration = Duration::from_secs(15 * 60);
-
-/// What is worth a re-sync. `pane.agent_status_changed` is not here and must
-/// not be: it is per-pane and its request requires a `pane_id`, so one entry
-/// asking for it globally refuses the entire list — see [`crate::herdr`]. The
-/// daemon has a 20s tick to fall back on, which is why this went unnoticed for
-/// as long as it did. `pane.agent_detected` is what a new agent raises.
-const EVENTS: &[&str] = &[
-    "workspace.created",
-    "workspace.closed",
-    "workspace.renamed",
-    "workspace.focused",
-    "tab.created",
-    "tab.closed",
-    "pane.created",
-    "pane.closed",
-    "pane.exited",
-    "pane.agent_detected",
-    "worktree.created",
-    "worktree.opened",
-];
 
 /// The stamp we are now running under, if it is not the one we started with.
 ///
@@ -80,12 +55,9 @@ fn changed(started_as: Option<(u64, u64)>, now: Option<(u64, u64)>) -> Option<(u
 /// live in the panels and absent from the process that polls hardest.
 ///
 /// `exec` rather than spawn-and-exit, for the reason the panel does it: the
-/// process id, and so herdr's idea of what it started, survives. What does not
-/// survive is the event-reader thread and its socket — which costs nothing,
-/// because the new image resubscribes on the way up, and a dropped stream is
-/// the case that code already handles on every herdr restart. Nothing is owed
-/// to the sync either: this is called at the top of the loop, where the last
-/// one has finished and the next has not begun.
+/// process id, and so launchd's idea of what it started, survives. Nothing is
+/// owed to the passes either: this is called at the top of the loop, where the
+/// last one has finished and the next has not begun.
 fn reload(verbose: bool) -> std::io::Error {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -102,62 +74,6 @@ fn reload(verbose: bool) -> std::io::Error {
 }
 
 
-/// Machines we already have an event reader thread for. Each thread puts its
-/// own name in and takes it out again on the way past, so the tick can tell
-/// "already watching" from "needs watching" without keeping a handle.
-type Readers = std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>;
-
-/// Start an event reader for every reachable machine that has not got one.
-///
-/// Started here rather than by the supervisor because the supervisor holds
-/// connections and this holds a subscription to the far end of one: it is only
-/// worth starting once the tunnel is up and answering, which is precisely what
-/// the supervisor has just decided.
-///
-/// The thread owns its own lifetime. It re-subscribes when a stream ends — a
-/// far herdr restarting, or a tunnel dropping — and gives up only when the
-/// machine has gone from the store or been retired, which is the one condition
-/// under which nobody wants it back.
-fn watch_machines(
-    tunnels: &Supervisor,
-    readers: &Readers,
-    tx: &mpsc::Sender<()>,
-    verbose: bool,
-) {
-    for name in tunnels.reachable() {
-        {
-            let mut held = readers.lock().unwrap_or_else(|e| e.into_inner());
-            if !held.insert(name.clone()) {
-                continue;
-            }
-        }
-        if verbose {
-            eprintln!("wsp daemon: watching {name}");
-        }
-        let readers = readers.clone();
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                // Retired or removed is the only way out. Unreachable is not:
-                // the machine is expected back, and giving up on it here would
-                // leave it silent until something else happened to restart us.
-                let store = Store::open();
-                if !store.machine(&name).map(|m| m.is_active()).unwrap_or(false) {
-                    break;
-                }
-                let tx2 = tx.clone();
-                let res =
-                    herdr::subscribe_on(Some(&name), EVENTS, move |_e, _d| tx2.send(()).is_ok());
-                std::thread::sleep(match res {
-                    Err(_) => Duration::from_secs(5),
-                    Ok(()) => Duration::from_millis(500),
-                });
-            }
-            readers.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
-        });
-    }
-}
-
 /// Is there nothing at all for the daemon to run for?
 ///
 /// Read this before touching the herdr-only gate it replaces: the gate used
@@ -172,18 +88,10 @@ fn watch_machines(
 /// the process list or the compound state directory itself could not be
 /// read, not "no herdr socket".
 ///
-/// **This does not mean the daemon then sees everything.** `sync::sync` and
-/// `cmd_agent::reconcile` still read `herdr::panes()`/`herdr::workspaces()`
-/// directly, the way this predicate no longer does, so on a compound-only
-/// machine they fail every tick and the sidebar-token push, the herdr pane
-/// reap and the restart-time resume offer all go on seeing nothing — quietly,
-/// because that failure is swallowed rather than fatal. What does run for
-/// real is `attention::tick`, the daemon's actual reason for being (see the
-/// module docs): it reads the store, not herdr, so it is exactly as good on
-/// a compound-only machine as anywhere else. Folding `sync`'s two herdr calls
-/// onto `local_backends()` the same way is `compound-123`, filed as its own
-/// row rather than done here, because it is a read-first question about what
-/// `sync` is even for and not a one-line gate.
+///
+/// The daemon no longer asks herdr anything else either (`wsp-544`): the
+/// herdr sync, its event subscriptions and the start-up reconcile were all
+/// taken out, so a compound-only machine is the whole of what it runs on.
 fn nothing_answered(backend_ok: &[bool]) -> bool {
     backend_ok.iter().all(|ok| !ok)
 }
@@ -250,7 +158,7 @@ fn misdirected(
     };
     Some(format!(
         "refusing to run against {}: it is not this machine's herdr, and no WSP_HOME/WSP_STATE says which store it is for.\n\
-         wsp: a daemon on another herdr and the live store reaps every binding in it on its first sync.\n\
+         wsp: a daemon started by another herdr would run the cycle and the repairs on the live store.\n\
          wsp: set both, or start the session with `wsp sandbox`, which does.",
         which
     ))
@@ -600,7 +508,7 @@ pub(crate) fn health(
         },
         many => {
             problems.push(format!(
-                "{} wsp daemons are running against this store (pids {}) — they push tokens, refresh TTLs and reap bindings twice against one herdr, and the loser of any race is silent",
+                "{} wsp daemons are running against this store (pids {}) — they run the cycle and the repairs twice against one store, and the loser of any race is silent",
                 many.len(),
                 list(many)
             ));
@@ -692,17 +600,8 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     let backend_ok: Vec<bool> =
         crate::place::local_backends().iter().map(|b| b.census().is_ok()).collect();
     if nothing_answered(&backend_ok) {
-        eprintln!(
-            "wsp: no backend answered — no herdr socket at {} and compound has nothing to run for either",
-            herdr::socket_path().display()
-        );
+        eprintln!("wsp: no backend answered — compound has nothing to run for");
         return 1;
-    }
-    if verbose && !herdr::available() {
-        eprintln!(
-            "wsp daemon: no herdr socket at {} — sidebar sync and herdr's pane reap stay idle; the attention pass still runs, compound seats included",
-            herdr::socket_path().display()
-        );
     }
 
     // Third gate, and after the other two on purpose: a daemon that is going to
@@ -721,12 +620,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             };
             eprintln!("wsp: a wsp daemon for this store is already running as pid {pid}{up}");
             eprintln!(
-                "wsp: two of them reap and refresh twice against one herdr — `kill {pid}` first if this one is meant to replace it"
+                "wsp: two of them run the cycle and the repairs twice against one store — `kill {pid}` first if this one is meant to replace it"
             );
             // Not a failure. What the caller wanted — a daemon on this store —
-            // is what is running, and herdr's `[[startup]]` hook gets a plugin
-            // that did its job on every restart rather than one that looks
-            // broken on all but the first.
+            // is what is running, and whatever started this one gets a
+            // process that did its job rather than one that looks broken.
             return 0;
         }
         Claim::Take(displaced) => {
@@ -751,33 +649,10 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // So the signal is caught, and the masters are asked to exit before we do.
     reap_on_term(store);
 
-    let (tx, rx) = mpsc::channel::<()>();
-    let far = tx.clone();
-
-    // Event reader. If the server restarts the stream ends; we retry rather
-    // than exiting, because herdr restarts this daemon only on its own restart.
-    std::thread::spawn(move || loop {
-        let tx2 = tx.clone();
-        let res = herdr::subscribe(EVENTS, move |_event, _data| tx2.send(()).is_ok());
-        if res.is_err() {
-            std::thread::sleep(Duration::from_secs(2));
-        } else {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    });
-
-    // One more reader per executor, feeding the same channel. Which machine
-    // woke us does not matter — only that something did — so the join is the
-    // channel, exactly where it already was.
-    let readers: Readers = Default::default();
-
-    let mut cache = Cache::default();
-    // Every executor's herdr socket, held open on this machine. Inert until
+    // Every executor's ssh master, held open on this machine. Inert until
     // somebody runs `wsp machine add`; see `crate::tunnel`.
     let mut tunnels = Supervisor::new();
-    let mut last_refresh = Instant::now();
-    let mut last_fingerprint = store.fingerprint();
-    // The half of this process that looks rather than syncs. Its ledger lives
+    // The half of this process that looks. Its ledger lives
     // in the store and not in this variable, so the `exec` below costs it
     // nothing; see `attention::load`.
     let mut pass = attention::Pass::new();
@@ -787,72 +662,34 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // would tie "somebody woke us" to "a member's agent exited".
     let mut repair_pass = crate::repair::Pass::new();
     // What we are executing, so we can notice an `install` landing underneath
-    // us. See `reload` at the top of the loop for why the daemon needs this at
-    // all when herdr restarts it.
+    // us. See `reload` at the top of the loop.
     let mut started_as = crate::util::exe_stamp();
 
-    // Before the first sync: herdr has just come back with its workspaces and
-    // agent sessions restored, but pane ids are new and no binding survived.
-    // Claims did, so rebuild from those.
-    // Never reaping: a session being restored is a world that is briefly
-    // missing workspaces, and this runs at exactly that moment.
-    let r = crate::cmd_agent::reconcile(store, false);
+    // Claims and worked records for tasks that no longer exist. Store-only:
+    // the herdr reconcile that used to run beside this was dead on a machine
+    // with no herdr (`wsp-544`).
     let live: Vec<String> = store.tasks().into_iter().map(|t| t.id).collect();
     let dropped = store.reap_claims(&live) + store.reap_worked(&live);
-    if verbose && (r.bound > 0 || r.named > 0 || dropped > 0) {
-        eprintln!(
-            "wsp daemon: reconciled {} binding(s), named {} pane(s), dropped {dropped} stale claim(s)",
-            r.bound, r.named
-        );
+    if verbose && dropped > 0 {
+        eprintln!("wsp daemon: dropped {dropped} stale claim(s)");
     }
 
-    // The agents that were running before the restart, offered back to whoever
-    // is at the machine.
-    //
-    // **Before the first sync, and that ordering is the whole of it.** `sync`
-    // rewrites the roster from what is running now — which, one second after
-    // herdr came up, is nothing. Reading it afterwards would find an empty
-    // census every time and offer nothing, on the one path this exists for.
-    // So the copy is taken here, while the file on disk is still the census
-    // from before the restart, and `cmd_resume::offered` reads that copy from
-    // then on.
-    //
-    // Nothing is started. It opens one terminal with the question in it, and a
-    // person answers. Ed, 2026-08-18: "it is not automatic: on load, ask the
-    // user."
-    crate::cmd_resume::ask_on_startup(store);
-
-    match sync::sync(store, &mut cache, true) {
-        Ok(r) => {
-            if verbose {
-                eprintln!("wsp daemon: initial sync — {} workspaces, {} panes", r.workspaces, r.panes);
-            }
-        }
-        Err(e) => eprintln!("wsp daemon: initial sync failed: {e}"),
-    }
-
+    // The first pass runs at once; every later one a `TICK` after the last.
+    let mut first = true;
     loop {
-        let woken = match rx.recv_timeout(TICK) {
-            Ok(()) => true,
-            Err(RecvTimeoutError::Timeout) => false,
-            Err(RecvTimeoutError::Disconnected) => return 0,
-        };
-
-        if woken {
-            // Coalesce the burst.
-            std::thread::sleep(DEBOUNCE);
-            while rx.try_recv().is_ok() {}
+        if !std::mem::take(&mut first) {
+            std::thread::sleep(TICK);
         }
 
         // `wsp-481`: one line in `calls.jsonl` per pass of this loop, with ms
-        // per phase, so a slow phase shows up by name. The debounce above is a
-        // sleep, not work, and is left out of it.
+        // per phase, so a slow phase shows up by name. The sleep above is not
+        // work, and is left out of it.
         wsp_base::calls::tick_begin();
         wsp_base::calls::phase("standing");
 
         // Both of the next two checks are here, at the top, because it is the
-        // one point in the loop where nothing is half-done: no sync in flight,
-        // no store lock held, the debounce already drained. Everything below
+        // one point in the loop where nothing is half-done: no pass in flight,
+        // no store lock held. Everything below
         // this line either finishes or is not started.
         //
         // Standing down comes before reloading: a daemon that is no longer the
@@ -902,13 +739,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             started_as = Some(stamp);
         }
 
-        // Every tick, not only when something woke us: a machine going away is
-        // not an event herdr has any way to tell us about, and a tunnel that
-        // fell over five minutes ago must not wait for a sidebar hover to be
-        // noticed.
+        // Every tick: a tunnel that fell over five minutes ago is noticed on
+        // the next one. Far seats are reached through compound-sup's per-seat
+        // forwards on these masters, which `tunnels.tick` puts back.
         wsp_base::calls::phase("tunnels");
         let moved = tunnels.tick(store);
-        watch_machines(&tunnels, &readers, &far, verbose);
         if verbose && !moved.is_empty() {
             for name in &moved {
                 match store.machine_live(name) {
@@ -923,17 +758,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             }
         }
 
-        // Above the gate below, and that placement is the whole point of this
-        // task. A stopped agent changes nothing in the store and raises no
-        // event this daemon subscribes to — `pane.agent_status_changed` is
-        // per-pane and cannot be asked for globally, see `EVENTS` — so a pass
-        // that ran only when something woke us would be a pass that never ran
-        // on the one condition it exists to notice. It has its own interval and
-        // it is a passenger on this loop, never a reason to sync.
+        // On its own interval, every tick: a stopped agent changes nothing in
+        // the store and raises no event, so a pass that ran only when something
+        // woke us would never run on the one condition it exists to notice.
         // One reading of the clock for both, so a tick can never be recorded
         // at a time the due check did not make it due for.
         let now = crate::util::epoch_secs();
-        let mut attention_moved = false;
         wsp_base::calls::phase("attention");
         if pass.due(now) {
             // One walk of the store for the whole pass (`wsp-320`): it reads
@@ -943,13 +773,6 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
                 let mut source = attention::machine_source(store);
                 attention::tick(store, &mut pass, &mut source, now)
             });
-            // An edge is exactly the moment the sidebar's `needs` token
-            // changes, and nothing else below would notice: `store.fingerprint`
-            // walks the store's committed records, and a level going up moves
-            // none of them. Without this the token is correct and up to `REFRESH`
-            // late, which on the one signal that is *somebody is waiting on
-            // you* is the fault being fixed with a smaller number on it.
-            attention_moved = !emits.is_empty();
             if verbose {
                 for e in &emits {
                     eprintln!(
@@ -965,11 +788,8 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
 
         // **The run's own steps, and the repairs, on the same timer** — `wsp-147`.
         //
-        // Above the gate below for the reason the attention pass is: a member
-        // whose agent exited raises no event this daemon subscribes to and
-        // writes no record, so a pass that ran only when something woke us would
-        // be a pass that never ran on the one condition it exists to notice. It
-        // runs in this process rather than as a `wsp worklist advance` per list
+        // On a timer for the reason the attention pass is: a member whose
+        // agent exited raises no event and writes no record. It runs in this process rather than as a `wsp worklist advance` per list
         // because that would be a process per running list every minute, and
         // because `cycle::step` is idempotent: a tick racing a verb's own
         // advance finds the records and starts nothing twice.
@@ -985,40 +805,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             store.steady(|| crate::retro_series::sweep(store));
         }
 
-        wsp_base::calls::phase("fingerprint");
-        let fingerprint = store.fingerprint();
-        let store_changed = fingerprint != last_fingerprint;
-        last_fingerprint = fingerprint;
-
-        let force = last_refresh.elapsed() >= REFRESH;
-        if !woken && !store_changed && !force && !attention_moved {
-            wsp_base::calls::tick_end();
-            continue;
-        }
-        if force {
-            last_refresh = Instant::now();
-        }
-
-        wsp_base::calls::phase("sync");
-        let synced = sync::sync(store, &mut cache, force);
         wsp_base::calls::tick_end();
-        match synced {
-            Ok(r) => {
-                if verbose && (r.workspaces > 0 || r.panes > 0 || r.reaped > 0) {
-                    eprintln!(
-                        "wsp daemon: {} workspaces, {} panes, {} bindings reaped{}",
-                        r.workspaces,
-                        r.panes,
-                        r.reaped,
-                        if force { " (refresh)" } else { "" }
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("wsp daemon: sync failed: {e}");
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        }
     }
 }
 
@@ -1035,7 +822,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
                 order: 80,
-                text: r##"  wsp daemon [-v]                   events + refresh loop (herdr [[startup]])"##,
+                text: r##"  wsp daemon [-v]                   cycle, repair and attention loop (launchd)"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
