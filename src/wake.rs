@@ -577,6 +577,9 @@ pub(crate) fn flush_held_tells(
         match read(&seat) {
             Seen::Missing => {
                 settle_key(store, &key, &held.iter().map(|(q, _)| *q).collect::<Vec<_>>());
+                for _ in &held {
+                    store.log_event("agent-told-settled", json!({ "pane": seat, "how": "dropped", "at": util::epoch_secs() }));
+                }
                 dropped += held.len();
             }
             Seen::Is(state) if state.will_take_a_prompt() => {
@@ -585,6 +588,7 @@ pub(crate) fn flush_held_tells(
                         break;
                     }
                     settle_key(store, &key, &[*seq]);
+                    store.log_event("agent-told-settled", json!({ "pane": seat, "how": "delivered", "at": util::epoch_secs() }));
                     sent += 1;
                 }
             }

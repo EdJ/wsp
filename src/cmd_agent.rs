@@ -1432,6 +1432,15 @@ fn run_owner() -> Option<String> {
 /// in the brief's seat line and in the work order.
 pub fn tell(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
+    if args.has("log") {
+        return match args.get("log").filter(|a| a != "true").or_else(|| args.rest.first().cloned()) {
+            Some(address) => crate::tell_log::show(store, &address, args.has("full"), args.json()),
+            None => {
+                eprintln!("usage: wsp tell --log <address|id> [--full] [--json]");
+                2
+            }
+        };
+    }
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp tell <id|address> \"…\"   (or `-` to read it from stdin)");
         eprintln!("       an address: primary, governor:<list|project>, seat:<row>, verifier:<row>, check:<list>, list:<name>");
@@ -1521,6 +1530,16 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     let said = dressed(&from, &message_id(&seat, &text), &text, !args.has("no-reply"));
     if row.state == State::Unreachable {
         let n = crate::wake::hold_tell(store, &seat, &said);
+        // Written as held, so the log shows it before the link returns and
+        // `flush_held_tells` settles it after (`wsp-522`).
+        store.log_event(
+            "agent-told",
+            json!({
+                "target": addressee_id(store, &needle, &what), "pane": seat, "chars": text.len(),
+                "id": message_id(&seat, &text), "from": from, "re": re, "text": text, "held": true,
+                "at": util::epoch_secs(), "turn": false,
+            }),
+        );
         let word = format!("{what} is unreachable — held ({n} waiting), delivered when the link returns");
         match args.json() {
             true => println!("{}", json!({ "held": true, "pane": seat, "waiting": n })),
@@ -1669,7 +1688,7 @@ fn tell_the_person_as(
         "agent-told",
         json!({
             "target": "person", "pane": "", "chars": text.len(), "id": id, "from": from,
-            "re": re, "item": q.id, "at": util::epoch_secs(), "turn": false,
+            "re": re, "item": q.id, "text": text, "at": util::epoch_secs(), "turn": false,
         }),
     );
     match args.json() {
@@ -1732,6 +1751,8 @@ pub struct Sent {
     /// What to type after `wsp peek` when the sentence needs rescuing.
     pub peek: String,
     pub chars: usize,
+    /// The sentence itself, for the event `wsp tell --log --full` reads.
+    pub text: String,
     /// This exact sentence to this exact pane, as a short handle.
     ///
     /// **Derived from the message and not minted**, which is the whole of its
@@ -1769,6 +1790,7 @@ impl Sent {
             pane: pane.into(),
             peek: peek.into(),
             chars: text.len(),
+            text: text.to_string(),
             id: message_id(pane, text),
             from: String::new(),
             re: None,
@@ -1873,7 +1895,7 @@ pub fn twice(sent: &Sent, ago: i64, p: &Paint) -> i32 {
 /// recognisable at all.
 pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &Sent) -> i32 {
     let p = Paint::new();
-    let Sent { target, what, pane, peek, chars, id, from, re, reply, json } = sent;
+    let Sent { target, what, pane, peek, chars, text, id, from, re, reply, json } = sent;
     match outcome {
         Ok(how) => {
             // Recorded as an event and not on the task's log, deliberately. The
@@ -1885,7 +1907,7 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
                 "agent-told",
                 json!({
                     "target": target, "pane": pane, "chars": chars, "id": id,
-                    "from": from, "re": re, "reply": reply,
+                    "from": from, "re": re, "reply": reply, "text": text,
                     "at": util::epoch_secs(),
                     "turn": matches!(how, Delivery::Started | Delivery::Acked),
                 }),
@@ -7340,7 +7362,12 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     it off, for direction that is owed nothing
                                     back. `--re <id>` marks this as the reply to
                                     that message and is refused for an unknown
-                                    one"##,
+                                    one
+                                    `--log <address|id>` reads the tells to and
+                                    from that post off the event log, replies
+                                    under what they answer, a held tell shown
+                                    held and then delivered; `--full` adds the
+                                    text"##,
             },
         ],
     },

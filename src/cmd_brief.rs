@@ -1402,7 +1402,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                 "{}  {}{}",
                 p.bold(&s.scope),
                 match mine {
-                    true => p.dim("yours — wsp flag --seat is your inbox"),
+                    true => p.dim("yours — wsp flag --seat is your inbox · wsp tell --log <address> reads what was told"),
                     false if s.vacant => p.dim(
                         "being seated · wsp ask <id> \"…\" waits there for it — later, never lost",
                     ),
@@ -1415,7 +1415,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                     // and not a paragraph; the work order says the same thing
                     // once, at spawn.
                     false => p.dim(
-                        "coordinating here · wsp ask <id> \"…\" reaches it — busy is later, never lost",
+                        "coordinating here · wsp ask <id> \"…\" reaches it — busy is later, never lost · wsp tell --log <address> reads what was told",
                     ),
                 },
                 awake.unwrap_or_default(),

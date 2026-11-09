@@ -492,6 +492,11 @@ AGENTS
                                     back. `--re <id>` marks this as the reply to
                                     that message and is refused for an unknown
                                     one
+                                    `--log <address|id>` reads the tells to and
+                                    from that post off the event log, replies
+                                    under what they answer, a held tell shown
+                                    held and then delivered; `--full` adds the
+                                    text
 
 MACHINES
   wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is
