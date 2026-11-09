@@ -118,7 +118,10 @@ there is no shell loop and no `executor/` script.
   seat's first tool call is not refused before the first beat can reach it (the
   beat goes through a forward made minutes after the spawn, wsp-562), `spawn --on`
   writes a first lease, `ok`, to `<exec_dir>/lease/<seat>` in the same command as
-  the gate, before the agent starts. Its
+  the gate, before the agent starts. That lease is fresh to the gate for 75 s
+  (compound-remote's `lease::FRESH`; wsp passes no `--fresh`): a first call in
+  that time passes at once, a later one before the first beat is held, the gate
+  polling up to the lease for the beat, and refused only if none comes. Its
   semantics live in the compound-remote row; wsp's half is the beat, the two
   machine fields and the installation.
 - **`link`.** A machine field that takes one word, `required`, and refuses

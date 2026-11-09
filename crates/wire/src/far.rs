@@ -928,6 +928,12 @@ pub fn remote_of(m: &Machine) -> String {
     }
 }
 
+/// How long the gate counts a lease file fresh, in seconds: compound-remote's
+/// `lease::FRESH` (two 30 s beats and slack), which the gate uses because
+/// [`gate_command`] passes no `--fresh`. Mirrored here; a test pins that the
+/// command still leaves it alone.
+pub const GATE_FRESH_SECS: u64 = 75;
+
 /// The PreToolUse hook command of a far seat (`docs/remote-agents.md` section 3).
 pub fn gate_command(m: &Machine, seat: &str) -> String {
     format!(
@@ -946,6 +952,12 @@ pub fn gate_command(m: &Machine, seat: &str) -> String {
 /// controller socket, which is up minutes after the spawn, and a gate that finds
 /// no lease file waits out the whole lease and then refuses the seat's first
 /// tool call (agent-029 run 3, wsp-562). Ends in ` && ` so it chains.
+///
+/// What it buys is bounded: the gate counts a lease fresh for [`GATE_FRESH_SECS`]
+/// (compound-remote's own `lease::FRESH`; [`gate_command`] passes no `--fresh`),
+/// so a first call within that long of the spawn passes at once. A later one,
+/// before the first beat, finds the lease stale and the gate polls for the beat
+/// up to the lease (`m.lease_secs()`) before it refuses.
 pub fn first_lease_command(m: &Machine, seat: &str) -> String {
     let dir = format!("{}/lease", m.exec_dir.trim_end_matches('/'));
     let tmp = format!("{dir}/.{seat}.wsp.tmp");
@@ -1498,6 +1510,94 @@ mod tests {
         let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names, vec![std::ffi::OsString::from("cpd-7")], "no temp file left behind");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The real `compound-remote`, when this machine has one built: `$COMPOUND_REMOTE_BIN`,
+    /// else the sibling compound checkout's release build.
+    fn real_remote() -> Option<std::path::PathBuf> {
+        let from_env = std::env::var_os("COMPOUND_REMOTE_BIN").map(std::path::PathBuf::from);
+        let sibling = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("claude/compound/target/release/compound-remote"));
+        from_env.into_iter().chain(sibling).find(|p| p.is_file())
+    }
+
+    /// Run the real gate on `seat` under `root` with a short lease; returns (exit code, how long it took).
+    fn run_gate(bin: &std::path::Path, root: &std::path::Path, seat: &str, lease: &str) -> (i32, Duration) {
+        let t = std::time::Instant::now();
+        let out = std::process::Command::new(bin)
+            .args(["gate", "--exec-dir"])
+            .arg(root)
+            .args(["--seat", seat, "--lease", lease, "--poll", "0.2"])
+            .output()
+            .unwrap();
+        (out.status.code().unwrap_or(-1), t.elapsed())
+    }
+
+    /// The whole contract, against the real gate binary (skipped, saying so, where none
+    /// is built): a seat spawned with its first lease passes its first tool call at
+    /// once; a seat with no lease yet is **held** while the beat is delayed and passes
+    /// when the beat lands; a lease that has really expired, a `stop`, and a seat that
+    /// never beats are refused (exit 2) after the lease (wsp-562).
+    #[test]
+    fn the_gate_holds_a_first_call_for_a_delayed_beat_and_still_refuses_an_expired_lease() {
+        let Some(bin) = real_remote() else {
+            eprintln!("skipped: no compound-remote built (set COMPOUND_REMOTE_BIN)");
+            return;
+        };
+        let root = std::path::PathBuf::from("/tmp").join(format!("wf-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut m = Machine::new("mb2", "mb2");
+        m.exec_dir = root.display().to_string();
+        let sh = |cmd: &str| assert!(std::process::Command::new("sh").arg("-c").arg(cmd).status().unwrap().success(), "{cmd}");
+        let lease = root.join("lease");
+
+        // Spawned with its first lease: the first call passes without waiting.
+        sh(&format!("{}true", first_lease_command(&m, "cpd-1")));
+        let (code, took) = run_gate(&bin, &root, "cpd-1", "3");
+        assert_eq!((code, took < Duration::from_secs(1)), (0, true), "fresh first lease passes at once ({took:?})");
+
+        // No lease yet, the beat delayed ~1s: held, then passing.
+        std::fs::create_dir_all(&lease).unwrap();
+        let late = lease.join("cpd-2");
+        let writer = std::thread::spawn({
+            let late = late.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(1200));
+                std::fs::write(late, "ok").unwrap();
+            }
+        });
+        let (code, took) = run_gate(&bin, &root, "cpd-2", "5");
+        writer.join().unwrap();
+        assert_eq!(code, 0, "the call passes once the beat lands");
+        assert!(took >= Duration::from_millis(1000), "and was held for it, not passed on nothing ({took:?})");
+
+        // A lease that has really expired (older than the gate's window), no beat since: refused after the lease.
+        sh(&format!("{}true", first_lease_command(&m, "cpd-3")));
+        let old = GATE_FRESH_SECS + 60;
+        sh(&format!("touch -t $(date -r $(( $(date +%s) - {old} )) +%Y%m%d%H%M.%S) '{}'", lease.join("cpd-3").display()));
+        let (code, took) = run_gate(&bin, &root, "cpd-3", "1");
+        assert_eq!(code, 2, "an expired lease is refused");
+        assert!(took >= Duration::from_millis(900), "after waiting out the lease ({took:?})");
+
+        // `stop` is refused at once, and a seat that never beats after the lease.
+        std::fs::write(lease.join("cpd-4"), "stop").unwrap();
+        assert_eq!(run_gate(&bin, &root, "cpd-4", "3").0, 2);
+        let (code, took) = run_gate(&bin, &root, "cpd-5", "1");
+        assert_eq!(code, 2, "no lease and no beat: refused");
+        assert!(took >= Duration::from_millis(900), "after the lease ({took:?})");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The first lease covers only the gate's freshness window, and the command must
+    /// not quietly change that window: no `--fresh`, so `GATE_FRESH_SECS` (75 s) holds
+    /// and a stale or missing lease is polled for up to the machine's lease.
+    #[test]
+    fn the_first_lease_covers_the_gates_fresh_window_and_the_command_leaves_it_alone() {
+        let m = Machine::new("mb2", "mb2");
+        let g = gate_command(&m, "cpd-7");
+        assert!(!g.contains("--fresh"), "{g}");
+        assert!(g.contains(&format!("--lease {}", m.lease_secs())), "{g}");
+        assert_eq!(GATE_FRESH_SECS, 75, "compound-remote's lease::FRESH");
+        assert!(u64::from(m.lease_secs()) > GATE_FRESH_SECS, "the poll outlasts the fresh window");
     }
 
     /// The hook carries the machine's lease, outlives it, replaces an earlier
