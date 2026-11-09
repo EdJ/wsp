@@ -628,6 +628,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         live.wire_oldest = c.wire_oldest;
     }
     far::record(&mut live, &c, &now);
+    live.shim_warning = far::shim_check(&m, &|cmd, t| far::ssh_run(&m, Some(&control), cmd, t)).unwrap_or_default();
     store.set_machine_live(&m.name, &live);
     store.log_event("machine-checked", json!({ "name": m.name, "ready": c.passed(), "why": c.why() }));
 
@@ -640,6 +641,9 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         for s in &c.steps {
             let mark = if s.ok { p.green("✓") } else { p.red("✗") };
             println!("{mark} {:<8} {}", s.name, s.said);
+        }
+        if !live.shim_warning.is_empty() {
+            println!("{} {:<8} {}", p.yellow("!"), "shim", live.shim_warning);
         }
         match c.passed() {
             true => println!("{} {} is ready", p.green("✓"), m.name),
@@ -665,7 +669,12 @@ pub fn health(store: &Store, problems: &mut Vec<String>, notes: &mut Vec<String>
             continue;
         };
         match readiness(l, seat) {
-            Readiness::Ready => notes.push(format!("machine {name}: ready (wire {seat})")),
+            Readiness::Ready => {
+                notes.push(format!("machine {name}: ready (wire {seat})"));
+                if !l.shim_warning.is_empty() {
+                    problems.push(format!("machine {name}: another wsp shadows the shim — {}", l.shim_warning));
+                }
+            }
             Readiness::Unreachable => {
                 let seen = match l.last_seen.as_str() {
                     "" => "never seen".to_string(),

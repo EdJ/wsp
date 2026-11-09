@@ -236,6 +236,11 @@ pub struct MachineLive {
     /// Which step of the last check failed, and what it said. Empty when it
     /// passed or never ran.
     pub check_error: String,
+    /// What the last check found shadowing the shim: a `wsp` on the far default
+    /// PATH that is not `<exec_dir>/bin/wsp` (`wsp-563`). Empty: none, or not
+    /// looked. A warning, never a reason the machine is not ready: a seat's own
+    /// PATH puts the shim first.
+    pub shim_warning: String,
     /// Why it is not reachable, in the words of whatever failed. Empty when it
     /// is. This is the whole diagnostic surface for "why is mb2 grey", so it
     /// keeps the message rather than a code.
@@ -261,6 +266,7 @@ impl MachineLive {
             ready: v.get("ready").and_then(|x| x.as_bool()).unwrap_or(false),
             checked: s("checked"),
             check_error: s("check_error"),
+            shim_warning: s("shim_warning"),
             error: s("error"),
         }
     }
@@ -278,6 +284,7 @@ impl MachineLive {
             "ready": self.ready,
             "checked": self.checked,
             "check_error": self.check_error,
+            "shim_warning": self.shim_warning,
             "error": self.error,
         })
     }

@@ -264,6 +264,7 @@ fn carry_check(live: &mut MachineLive, on_disk: Option<MachineLive>) {
         live.ready = d.ready;
         live.checked = d.checked;
         live.check_error = d.check_error;
+        live.shim_warning = d.shim_warning;
     }
 }
 
@@ -991,10 +992,11 @@ mod tests {
             ready: true,
             checked: "2026-11-05T11:50:00Z".into(),
             check_error: "x".into(),
+            shim_warning: "w".into(),
             ..Default::default()
         };
         carry_check(&mut live, Some(on_disk));
-        assert!(live.ready && live.checked == "2026-11-05T11:50:00Z" && live.check_error == "x");
+        assert!(live.ready && live.checked == "2026-11-05T11:50:00Z" && live.check_error == "x" && live.shim_warning == "w");
         assert!(live.reachable && live.wire == Some(9) && live.last_seen == "now", "the probe's facts are the tick's");
 
         carry_check(&mut live, None);

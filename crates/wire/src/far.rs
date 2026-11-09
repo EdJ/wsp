@@ -493,6 +493,11 @@ pub fn seat_command(m: &Machine, label: &str, cwd: &str, env: &BTreeMap<String, 
     let token = token_path(m);
     let msg = format!("no Claude token at {token} on {} (claude setup-token there)", m.name);
     let before = format!("t=$(cat {} 2>/dev/null) && [ -n \"$t\" ] || {{ echo {} >&2; exit 1; }}; ", quote(&token), quote(&msg));
+    // The executor's `bin` (the `wsp` shim and `wsp-trust`) first on the agent's
+    // PATH, whatever else the machine has installed (`wsp-563`). Set in the far
+    // shell, where an assignment expands a leading `~/`; a PATH in `env` below
+    // is the caller's own and still wins.
+    let before = format!("{before}{}; ", path_with_shim(m));
     let mut pre = String::from("CLAUDE_CODE_OAUTH_TOKEN=\"$t\" env ");
     // `env` stops reading options at the first NAME=value (POSIX, and macOS's), so
     // every `-u K` goes before any `K=V`.
@@ -515,6 +520,51 @@ pub fn seat_command(m: &Machine, label: &str, cwd: &str, env: &BTreeMap<String, 
         tail.push_str(&quote_plain(a));
     }
     launch(m, label, cwd, &before, &pre, "", &tail)
+}
+
+/// The far shell assignment that puts `<exec_dir>/bin` first on PATH.
+pub fn path_with_shim(m: &Machine) -> String {
+    format!("PATH={}:\"$PATH\"; export PATH", quote(&shim_dir(m)))
+}
+
+/// `<exec_dir>/bin`: where the `wsp` shim and `wsp-trust` live on the machine.
+pub fn shim_dir(m: &Machine) -> String {
+    format!("{}/bin", m.exec_dir.trim_end_matches('/'))
+}
+
+/// The far command that says which `wsp` the machine's default PATH finds:
+/// `ok` (the shim, or none at all), or `shadow <path>`.
+pub fn shim_probe_command(m: &Machine) -> String {
+    format!(
+        "s={shim}; w=$(command -v wsp 2>/dev/null); \
+         if [ -z \"$w\" ] || [ \"$w\" = \"$s\" ]; then echo ok; else echo \"shadow $w\"; fi",
+        shim = quote(&format!("{}/wsp", shim_dir(m))),
+    )
+}
+
+/// What the probe's answer means: `Some(words)` when another `wsp` is first on
+/// the far default PATH. A warning, not a failed step: a seat's own PATH puts
+/// the shim first. `None` for the shim, for none, and for an answer that is not
+/// understood.
+pub fn shim_shadow(m: &Machine, out: &str) -> Option<String> {
+    let path = out.lines().find_map(|l| l.trim().strip_prefix("shadow "))?.trim();
+    (!path.is_empty()).then(|| {
+        format!(
+            "{path} is first on {}'s default PATH, ahead of {}/wsp — a seat is started with {} first, but a shell there runs {path}; move it aside",
+            m.name,
+            shim_dir(m),
+            shim_dir(m),
+        )
+    })
+}
+
+/// Ask the machine which `wsp` it finds, and say what shadows the shim, if
+/// anything. A machine that cannot be asked says nothing.
+pub fn shim_check(m: &Machine, run: &dyn Fn(&str, Duration) -> Result<String, Failed>) -> Option<String> {
+    if m.exec_dir.is_empty() {
+        return None;
+    }
+    run(&shim_probe_command(m), PROBE_TIMEOUT).ok().and_then(|out| shim_shadow(m, &out))
 }
 
 /// The helper that sets or clears Claude Code's folder trust for one directory
@@ -1230,6 +1280,70 @@ mod tests {
         assert!(!cmd.contains("bad name"), "a name the shell cannot take is dropped: {cmd}");
         assert!(cmd.contains("spawn --label 'cpd-7' --cwd ~/'wsp-exec/trees/t-1' -- 'claude' '--model' 'a b'"), "{cmd}");
         assert!(!cmd.contains("--no-renderer"), "the seat gets its renderer: {cmd}");
+    }
+
+    /// A far agent started with another `wsp` first on the machine's PATH still
+    /// runs the shim (`wsp-563`): the seat command is run by a real shell with a
+    /// stale `wsp` ahead on its PATH and a `compound-sup` that runs the agent.
+    #[test]
+    fn a_far_agent_has_the_executors_bin_first_on_its_path_so_wsp_is_the_shim() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wsp-far-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (exec, stale) = (dir.join("exec"), dir.join("stale"));
+        std::fs::create_dir_all(exec.join("bin")).unwrap();
+        std::fs::create_dir_all(&stale).unwrap();
+        let exe = |p: std::path::PathBuf, body: &str| {
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        exe(exec.join("bin/wsp"), "#!/bin/sh\n");
+        exe(stale.join("wsp"), "#!/bin/sh\n");
+        std::fs::write(exec.join("claude-token"), "tok\n").unwrap();
+        // The supervisor: the handshake, then the agent (everything after `--`) in
+        // the environment it was started with.
+        let sup = dir.join("compound-sup");
+        exe(sup.clone(), "#!/bin/sh\necho 'socket /run/x.sock'\nwhile [ \"$1\" != -- ]; do shift; done; shift\nexec \"$@\"\n");
+        let mut m = Machine::new("mb2", "mb2");
+        m.sup_at = sup.display().to_string();
+        m.exec_dir = exec.display().to_string();
+
+        let seen = dir.join("seen");
+        let probe = format!("echo \"$(command -v wsp)\" > {}; echo \"${{PATH%%:*}}\" >> {}", seen.display(), seen.display());
+        let cmd = seat_command(&m, "cpd-1", &dir.display().to_string(), &BTreeMap::new(), "sh", &["-c".into(), probe]);
+        let default_path = format!("{}:/usr/bin:/bin", stale.display());
+        let out = Command::new("/bin/sh").arg("-c").arg(&cmd).env("PATH", &default_path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for _ in 0..50 {
+            if seen.exists() && std::fs::read_to_string(&seen).map(|t| t.lines().count() == 2).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let got = std::fs::read_to_string(&seen).unwrap();
+        let bin = exec.join("bin");
+        assert_eq!(got.lines().next(), Some(bin.join("wsp").to_str().unwrap()), "which wsp names the shim: {got}");
+        assert_eq!(got.lines().nth(1), Some(bin.to_str().unwrap()), "{got}");
+
+        // The same machine's default PATH, asked without the seat's: the stale
+        // binary is named, and the shim alone is not a warning.
+        let ask = |path: &str| {
+            let o = Command::new("/bin/sh").arg("-c").arg(shim_probe_command(&m)).env("PATH", path).output().unwrap();
+            shim_shadow(&m, &String::from_utf8_lossy(&o.stdout))
+        };
+        let warned = ask(&default_path).expect("a stale wsp ahead of the shim is named");
+        assert!(warned.contains(&stale.join("wsp").display().to_string()), "{warned}");
+        assert_eq!(ask(&format!("{}:{default_path}", bin.display())), None, "the shim first is no warning");
+        assert_eq!(ask("/usr/bin:/bin"), None, "no wsp at all is not a shadow");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_seat_command_sets_the_path_in_the_far_shell_with_a_tilde_exec_dir() {
+        let cmd = seat_command(&machine(), "cpd-7", "~/wsp-exec/trees/t-1", &BTreeMap::new(), "claude", &[]);
+        assert!(cmd.contains("PATH=~/'wsp-exec/bin':\"$PATH\"; export PATH"), "{cmd}");
+        assert_eq!(shim_shadow(&machine(), "ok\n"), None);
+        assert_eq!(shim_shadow(&machine(), "shadow \n"), None);
     }
 
     /// The row's own tree is trusted by name in the far `~/.claude.json`, kept
