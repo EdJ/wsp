@@ -118,6 +118,10 @@ struct Sandbox {
     home: PathBuf,
     /// The machine state: `WSP_STATE`.
     state: PathBuf,
+    /// Where worklist outputs and artefacts are written: `WSP_ARTEFACTS`.
+    /// Without it `artefact::root()` falls back to the real
+    /// `~/.compound/artefacts`, and a sandbox list writes over a real one.
+    artefacts: PathBuf,
     /// The binary under test — whichever one is running right now.
     bin: PathBuf,
     /// The directory holding the `wsp` symlink, which goes first on `PATH`.
@@ -133,6 +137,7 @@ impl Sandbox {
             name: name.to_string(),
             home: dir.join("wsp"),
             state: dir.join("state"),
+            artefacts: dir.join("artefacts"),
             shim: dir.join("bin"),
             socket: PathBuf::new(),
             bin,
@@ -154,6 +159,7 @@ impl Sandbox {
         vec![
             ("WSP_HOME".into(), self.home.display().to_string()),
             ("WSP_STATE".into(), self.state.display().to_string()),
+            ("WSP_ARTEFACTS".into(), self.artefacts.display().to_string()),
             ("WSP_BIN".into(), self.bin.display().to_string()),
             ("PATH".into(), path_with(&self.shim, std::env::var("PATH").ok().as_deref())),
         ]
@@ -595,6 +601,8 @@ fn lay_out(sb: &Sandbox, seed: Option<&Store>) -> Result<(), String> {
     std::os::unix::fs::symlink(&sb.bin, &link)
         .map_err(|e| format!("cannot link {} at {}: {e}", util::contract(&sb.bin), util::contract(&link)))?;
 
+    std::fs::create_dir_all(&sb.artefacts)
+        .map_err(|e| format!("cannot make {}: {e}", util::contract(&sb.artefacts)))?;
     let store = Store::at(sb.home.clone(), sb.state.clone());
     if let Some(live) = seed {
         std::fs::create_dir_all(&sb.home).map_err(|e| e.to_string())?;
@@ -862,6 +870,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     println!("export HERDR_SOCKET_PATH={}", sb.socket.display());
     println!("export WSP_HOME={}", sb.home.display());
     println!("export WSP_STATE={}", sb.state.display());
+    println!("export WSP_ARTEFACTS={}", sb.artefacts.display());
     println!("export WSP_BIN={}", sb.bin.display());
     println!("export PATH={}:$PATH", sb.shim.display());
     let forget = forget_keys();
@@ -1260,10 +1269,10 @@ mod tests {
         sb.socket = sb.dir.join("herdr.sock");
         let env: std::collections::HashMap<String, String> = sb.env().into_iter().collect();
 
-        for key in ["HERDR_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_BIN"] {
+        for key in ["HERDR_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS", "WSP_BIN"] {
             assert!(env.contains_key(key), "{key} is not in the sandbox environment");
         }
-        for key in ["HERDR_SOCKET_PATH", "WSP_HOME", "WSP_STATE"] {
+        for key in ["HERDR_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS"] {
             let v = &env[key];
             assert!(
                 v.starts_with(&sb.dir.display().to_string()),
@@ -1547,6 +1556,36 @@ mod tests {
         let sb = Store::at(dir.join("state/sandbox/wsp-p1/wsp"), dir.join("state/sandbox/wsp-p1/state"));
         assert_eq!(outside_only(&sb, "rm"), Some(2));
         assert_eq!(outside_only(&sb, "ls"), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `WSP_ARTEFACTS` unset sends `artefact::root()` to the real
+    /// `~/.compound/artefacts`, where a sandbox list called `pieces` writes
+    /// over the real `pieces`. The sandbox names a root of its own, laid out
+    /// with the rest, and `sandbox rm` takes it away with the rest.
+    #[test]
+    fn the_sandbox_has_an_artefacts_root_of_its_own_and_rm_removes_it() {
+        let dir = scratch("artefacts");
+        let sb = sandbox_at(&dir, "wsp-w1");
+        for env in [sb.store_env(), sb.env()] {
+            let env: std::collections::HashMap<String, String> = env.into_iter().collect();
+            let v = env.get("WSP_ARTEFACTS").expect("WSP_ARTEFACTS is not in the sandbox environment");
+            assert!(
+                Path::new(v).starts_with(&sb.dir) && Path::new(v) != sb.dir,
+                "WSP_ARTEFACTS={v} is not under the sandbox at {}",
+                sb.dir.display()
+            );
+        }
+        lay_out(&sb, None).unwrap();
+        assert!(sb.artefacts.is_dir(), "the artefacts root was not laid out");
+        std::fs::write(sb.artefacts.join("proof.html"), "x").unwrap();
+
+        // `rm` removes `<state>/sandbox/<name>` whole (its dry half is below, the
+        // real half shells out to herdr), so what is inside that directory goes
+        // with it.
+        assert_eq!(sb.dir, dir.join("state").join("sandbox").join("wsp-w1"));
+        std::fs::remove_dir_all(&sb.dir).unwrap();
+        assert!(!sb.artefacts.exists(), "removing the sandbox directory left the artefacts root behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
