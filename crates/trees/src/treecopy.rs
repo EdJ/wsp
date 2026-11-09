@@ -771,7 +771,7 @@ impl Copy {
         let (far, seat) = (self.far_tree(), self.tree.display().to_string());
         let out = if self.remote.rsync_usable() {
             sh(&format!(
-                "rsync -a --files-from={} -e {} {}:{}/ {}/ 2>&1",
+                "rsync -aI --files-from={} -e {} {}:{}/ {}/ 2>&1",
                 shq(&list.display().to_string()),
                 shq(&self.remote.rsync_e()),
                 shq(&self.remote.host),
@@ -1513,6 +1513,28 @@ mod tests {
         assert_eq!(code, 0, "a conflict does not fail the turn");
         assert!(said.starts_with("checkpoint: 1 copied, 0 deleted, 1 refused") && said.contains("sub/deep/c.txt"), "{said}");
         assert_eq!(fs::read_to_string(r.seat.join("sub/deep/c.txt")).unwrap(), "person\n");
+    }
+
+    /// rsync's quick check is size + mtime at one-second grain, so a same-size
+    /// rewrite within the second of the last copy used to be skipped (`-I` fixes
+    /// it; tar always overwrites).
+    #[test]
+    fn a_same_size_rewrite_within_the_same_second_still_arrives() {
+        for tar in [false, true] {
+            let r = rig(if tar { "samesec-tar" } else { "samesec-rsync" }, tar);
+            r.copy.copy_up("trunk").unwrap();
+            for i in 0..20 {
+                let (a, b) = if i % 2 == 0 { ("agent", "again") } else { ("again", "agent") };
+                run(&r.far(), &format!("echo {a} > src/a.rs"));
+                let (code, said) = checkpoint(&r.copy);
+                assert_eq!(code, 0, "{said}");
+                assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), format!("{a}\n"), "round {i} tar={tar}: {said}");
+                run(&r.far(), &format!("echo {b} > src/a.rs"));
+                let (code, said) = checkpoint(&r.copy);
+                assert_eq!(code, 0, "{said}");
+                assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), format!("{b}\n"), "round {i} tar={tar}: {said}");
+            }
+        }
     }
 
     #[test]
