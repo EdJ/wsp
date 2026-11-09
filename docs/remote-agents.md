@@ -406,3 +406,196 @@ The groups run in order, and group 2 is manual, so nothing starts without Ed.
 3. The lease: decided 2026-11-06 (agent-028) as 180 s with a 30 s beat (section 3),
    per machine.
 4. Retire wsp-071 as the duplicate of wsp-070.
+
+## 11. Heavy rows go to the i5 (agent-040, 2026-11-10)
+
+Status: a plan. Nothing in this section is built. It answers Ed's 2026-11-09
+request, made after a night at load 900 and 8.4 GB of swap on the seat: plan how
+the run hands work to eds-macbook-i5, and do the first setup by hand. It changes
+one rule of section 1: the run now places some rows on a far machine itself, and
+the verifier of a far row reads the far tree. Placement is still never guessed.
+The project declares what is heavy, and the run only reads that declaration.
+
+**Decided by Ed (2026-11-09).** Only load-heavy rows go to the i5. It is not an
+overflow machine, and the rest of the work stays here. The verifier runs on the
+i5 in the member's far tree. The barrier runs here, on the trunk, after
+copy-back and land. What counts as heavy belongs to each project, not to core
+wsp.
+
+### 11.1 "Heavy", declared by the project
+
+A project key, `heavy:`, read the same way as `at_stop:` and `at_review:`:
+
+```
+heavy:
+  paths:  spikes/web-chrome/
+  checks: vitest playwright check:box
+  on:     eds-macbook-i5
+  setup:  scripts/far-setup.sh
+  wait:   10m
+```
+
+- **A row is heavy when both matchers match.** `paths` matches a path the row
+  names in its overview, its refs or its `check:` lines. `checks` is a word in
+  one of its `check:` lines. For compounding that means "files under
+  `spikes/web-chrome/` and a box check that runs vitest or Playwright". wsp does
+  not read the context pack's *likely files*, because those are inferred and
+  placement must not be.
+- **`on`** names the machine heavy rows go to. A project with no `heavy:` key has
+  no heavy rows. wsp's own project (`agent`) declares none: cargo is warm here,
+  and its rows are light. A cargo row on the i5 would start from a cold
+  `target/`, so it would cost more than it saves.
+- **`setup`** is the project's far-toolchain script (11.4). `wait` is the fallback
+  time (11.2).
+- **Override, in the list rather than on the row.** Placement is something the
+  run decides, so the override lives where the run reads it:
+  `wsp worklist member <slug> <task> --place heavy|light --why "…"` and
+  `wsp worklist group <slug> N --place heavy|light --why "…"`. The member
+  setting beats the group setting, and the group setting beats the
+  declaration. A row's own `--heavy` tag is not offered: one row in two lists
+  would then have one setting for two runs.
+- **Shown.** `worklist show` and `worklist next` print `heavy (spikes/web-chrome/
+  + vitest)` or `heavy (member override: …)` beside the member, so a person can
+  see why the run placed it there.
+
+### 11.2 Placement in the run
+
+When `worklist advance` spawns a heavy member, it spawns it `--on <heavy.on>`
+if the machine is **ready** (section 7's `machine check`, plus the heavy setup
+check of 11.4) and has a free place. It runs the same `spawn --on` that a person
+would type, so section 1's machinery is unchanged. Only the choice moves.
+
+- **One count per machine.** Each machine has a ceiling: the seat's `agents` (4)
+  and the i5's `agents` (2). A seat on the i5 counts against the i5's ceiling,
+  not against this Mac's. This changes the cap bullet of wsp-422 ("one count
+  across machines"). That bullet also names a per-machine ceiling, so the two
+  differ only in whether the fleet has a total as well; that is raised as a
+  block on the count row. A list's own `--parallel` still counts all of its
+  members on every machine, because it limits work in flight, not load.
+- **When the i5 cannot take it.** The member waits up to `heavy.wait` (10 min
+  recommended) for the i5 to be ready with a place free. The wait is named as its
+  own cause (`waits on eds-macbook-i5: full 2/2` or `… unreachable 3m`). After
+  that it **falls back here**, logged on the row as `placed here: <machine>
+  <reason> for 10m`. A fallback heavy row counts against this Mac like any
+  other. N is an open choice (block).
+- **A light row is never placed far.** The i5 is not overflow.
+
+### 11.3 The verifier on the i5
+
+For a far member the run spawns its verifier `--verify --on <the member's
+machine>`, in the member's far tree, with no second copy-up:
+
+1. The member's `wsp review` already copies back and records the commit
+   (wsp-586). The seat records that commit's tree hash, and the far tree must
+   hash the same (section 6, check 3). The verifier refuses to start on a far tree
+   that differs, and reads nothing else.
+2. The verifier runs the row's checks there, on the i5's toolchain. Its
+   `wsp verified` goes back through the shim with the checks' output, the way any
+   far verb does (section 3).
+3. A held verdict lands on the seat from the seat's copy, which already exists
+   because of step 1. **The land reads the seat's tree**, as before. What moves
+   is only where the checks ran. Section 5's "verify builds and tests the copy on
+   the seat" stays true for light rows and for a person's `wsp verify`.
+4. "Checks rerun where the trunk moved" needs a place to run. The rebase happens
+   on the seat. The recommendation is to copy the rebased tree up to the same
+   far tree and rerun the checks on the i5, since that is the load being moved.
+   The alternative is to rerun them here. This is a block on the verifier row.
+5. If the i5 goes unreachable during a verify, nothing is lost: the verifier has
+   no work of its own, and the seat already has the member's copy. After
+   `heavy.wait` the run despawns the far verifier `--lost` and starts a local
+   one on the seat's copy.
+
+**The barrier stays here**, on the trunk after copy-back and land, as Ed decided.
+A heavy list's barrier still runs its full vitest/Playwright suite on this Mac.
+That run is one suite per group instead of one per row, and it is the price of
+the trunk being checked where the trunk is.
+
+### 11.4 The far toolchain for heavy rows (the hands-on part)
+
+This part is written as the project's script, `heavy.setup`. For compounding it
+is `scripts/far-setup.sh`. It is run first by hand with Ed (group 1) and later by
+`wsp machine check` with `--check`:
+
+- **node_modules, one install.** `npm ci` once into
+  `<exec_dir>/deps/<project>/web-chrome/node_modules`, keyed by the lockfile's
+  hash. At copy-up wsp clones it into the far tree with `cp -c -R` (APFS
+  clonefile: no bytes copied, no space used until written). It is never copied up
+  from the seat. Section 6 already leaves `node_modules/` out of the copy and out
+  of `--delete`. A row whose lockfile differs from the install's hash runs
+  `npm ci` in its own far tree, and the cost is logged.
+- **Playwright's WebKit.** It is installed once with `npx playwright install
+  webkit`, at the revision the lockfile's Playwright pins, in the i5's
+  `~/Library/Caches/ms-playwright`.
+- **Rust `target/`.** It stays warm per project under `CARGO_TARGET_DIR=<exec_dir>/
+  target/<project>` (section 6) if a heavy row builds Rust. The web-chrome box
+  checks do not, so this is warmed only if the trial shows a need.
+- **The claude token.** This is section 8's token, already in place for agent-029.
+  The check is a headless `claude -p` that answers.
+- **Goldens and screenshot baselines (react-goldens).** C7 said the baselines are
+  this Mac's WebKit. The i5 runs a different GPU and maybe a different macOS, so
+  a pixel compare there may fail on rendering alone. The recommendation, until
+  the trial compares one golden on both machines: a row whose checks compare
+  screenshots against goldens is **not heavy**. Its `checks` matcher excludes
+  `goldens`, and the golden compare runs here. Whether the i5 gets its own
+  baselines is a block.
+- **`--check`** prints one line per item: node version, the install's lockfile
+  hash against the trunk's, WebKit revision, token, free disk. It exits non-zero
+  on any miss. `machine check` runs it over ssh and marks the machine **connected
+  but not ready (heavy: <first miss>)**, which is section 7's state with a reason.
+
+### 11.5 A hands-on trial before automation
+
+Group 1 of the build is manual, for Ed and the primary seat. First, the setup of
+11.4 is done by hand and written down as the script. Then one heavy row (a
+components-split group-4 member, or a react-pass-4 member) is placed by hand
+with `wsp spawn <row> --on eds-macbook-i5`. Its verifier is placed there too, by
+`spawn --verify --on` if that works today, and otherwise by running its checks
+by hand in the far tree. The trial measures:
+
+- spawn to review, and review to verdict;
+- copy-up and copy-back seconds and bytes, with and without the `cp -c` clone;
+- the i5's load and memory during the row (`vm_stat`, swap, load every 30 s);
+- this Mac's load with and without the row here (a local twin, wsp-422's
+  pairing);
+- one golden compared on both machines (11.4).
+
+Only after that is the run's placement turned on, for one list (the last
+group).
+
+### 11.6 What it must not break
+
+- A far row's work lands only after copy-back **and** a held verifier. The land
+  reads the seat's tree, and the tree hash binds the far verdict to it.
+- An unreachable i5 **holds** its far seats. It does not lose them (section 3).
+  The run does not wait forever on it. New heavy members fall back after
+  `heavy.wait`, and a verifier is replaced (11.3, step 5). A held *member* is
+  never released automatically, because releasing it loses work. After `heavy.wait`
+  the run tells the list's governor, and through it the person, that the member
+  is held, with the two verbs (`despawn --lost`, `machine retire`). The list's
+  other members go on, and only its barrier waits.
+- Light rows, barriers and a person's `spawn --on` behave as they do today.
+
+### 11.7 The build, as the `i5-heavy` list
+
+The list waits after `remote-agents`. Kinds, caps and stops are on the list
+itself (`wsp worklist show i5-heavy`).
+
+| group | kind | rows | what |
+|---|---|---|---|
+| 1 | **manual**, Ed and the primary seat | far setup by hand; the trial | 11.4 by hand and written as the script; one heavy row by hand with its verifier; the measurements of 11.5 |
+| 2 | agent | heavy declaration; one count per machine | the `heavy:` key, the matchers, the `--place` overrides and the display; per-machine ceilings and waits named for a machine |
+| 3 | agent | placement in the run; the far verifier | advance spawns heavy members `--on` with the fallback; verifier `--verify --on` in the far tree, the hash bind, the rerun, the verifier fallback, the held-member tell |
+| 4 | agent | compounding's declaration and setup check | `heavy:` set on compounding; `scripts/far-setup.sh --check` read by `machine check` |
+| 5 | **manual** | placement on for one list | one real list run with placement on, watched; the cost table against the trial |
+
+### 11.8 Open choices, raised as blocks
+
+1. The fallback time N (recommendation: 10 min). This blocks the placement row.
+2. Whether the fleet has a total cap beside the per-machine ceilings (wsp-422's
+   "one count across machines"). Recommendation: no total, only per-machine
+   ceilings plus each list's own `--parallel`. This blocks the count row.
+3. Where "checks rerun where the trunk moved" runs for a far member
+   (recommendation: the i5). This blocks the far-verifier row.
+4. Goldens: whether a goldens row is light (recommendation, until the trial
+   measures it) or the i5 gets its own baselines. This blocks compounding's
+   declaration row.
