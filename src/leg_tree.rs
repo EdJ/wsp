@@ -538,6 +538,32 @@ pub(crate) fn sweep(store: &Store, standing: &dyn Fn(&Path) -> Option<String>) -
                 out.push(take(&repo, &dir, &name, &row_dir, &residue, standing));
             }
         }
+        out.extend(sweep_pieces(store, &repo, &residue, standing));
+    }
+    out
+}
+
+/// The trees of pieces whose batch is closed (`closed:` on the row's record),
+/// taken on the rule: what a close kept because the piece's seat was standing
+/// (wsp-532), once that seat has ended. Read off the records, not the names, since
+/// a `<row>-<n>` name does not say where the row's id stops. A tree whose branch
+/// is not in the row's yet, or that holds more than build output, is kept as ever.
+fn sweep_pieces(store: &Store, repo: &Path, residue: &Residue, standing: &dyn Fn(&Path) -> Option<String>) -> Vec<Tree> {
+    let mut out = Vec::new();
+    let Some(trunk) = cmd_checkout::trunk(repo) else { return out };
+    for t in store.tasks_shared().iter().filter(|t| crate::pieces::staged(t)) {
+        let rec = crate::pieces::record(t);
+        let row_dir = cmd_checkout::checkout_dir(&trunk, &t.id);
+        if !row_dir.join(".git").exists() {
+            continue;
+        }
+        for p in rec.pieces.iter().filter(|p| p.state == crate::pieces::State::Done && rec.closed.contains(&p.batch)) {
+            let Some(name) = p.tree.as_deref() else { continue };
+            let dir = repo.join(WORKTREES).join(name);
+            if dir.join(".git").exists() {
+                out.push(take(repo, &dir, name, &row_dir, residue, standing));
+            }
+        }
     }
     out
 }

@@ -477,6 +477,43 @@ mod tests {
         assert!(row.join("b.txt").exists());
     }
 
+    /// wsp-532: `piece done` closes the batch while the piece's seat is still in its
+    /// tree, so the close keeps the tree; once the seat ends the sweep takes it, by
+    /// the same rule, and a tree with residue is still kept.
+    #[test]
+    fn a_tree_kept_for_a_standing_seat_goes_once_the_seat_ends() {
+        let (_env, store, repo, row) = scratch("seat");
+        let a = piece_tree(&repo, 1, "a.txt", "from a\n");
+        let b = piece_tree(&repo, 2, "b.txt", "from b\n");
+        std::fs::write(repo.join(WORKTREES).join(&b).join("notes.md"), "mine\n").unwrap();
+        put(&store, vec![done(1, 1, Some(&a), &[]), done(2, 1, Some(&b), &[])]);
+
+        let seated = |dir: &Path| dir.display().to_string().contains("p-001-").then(|| "cpd-4 is standing in it".to_string());
+        let out = close_with(&store, "p-001", 1, &seated);
+        let Closed::Clean { removed, kept, .. } = out else { panic!("{out:?}") };
+        assert!(removed.is_empty() && kept.len() == 2, "{removed:?} {kept:?}");
+
+        // The run writes the batch closed; the seat is still there, so nothing goes.
+        let mut t = store.task("p-001").unwrap();
+        let mut rec = pieces::record(&t);
+        rec.closed.push(1);
+        pieces::write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+        let held = crate::leg_tree::sweep(&store, &seated);
+        assert!(held.iter().all(|t| matches!(t, Tree::Kept { .. })), "a tree went with its seat standing");
+        assert!(repo.join(WORKTREES).join(&a).exists());
+
+        // The tick ends the seat: the clean tree and its branch go, the one with residue is kept and named.
+        let out = crate::leg_tree::sweep(&store, &nobody);
+        assert_eq!(out.len(), 2, "{} trees", out.len());
+        assert!(out.iter().any(|t| matches!(t, Tree::Removed { path, .. } if path.ends_with("p-001-1"))), "p-001-1 did not go");
+        assert!(out.iter().any(|t| matches!(t, Tree::Kept { path, why } if path.ends_with("p-001-2") && why.contains("notes.md"))), "p-001-2 was not kept and named");
+        assert!(!repo.join(WORKTREES).join(&a).exists());
+        assert!(git(&repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{a}")]).is_none(), "the branch stayed");
+        assert!(repo.join(WORKTREES).join(&b).join("notes.md").exists());
+        assert!(row.join("a.txt").exists() && row.join("b.txt").exists());
+    }
+
     #[test]
     fn a_batch_with_a_piece_still_to_end_does_not_close_and_somebody_in_the_tree_holds_it() {
         let (_env, store, repo, _row) = scratch("held");
