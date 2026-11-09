@@ -114,7 +114,11 @@ there is no shell loop and no `executor/` script.
   lease and passes if the beat returns, so the agent resumes in the same turn;
   past the lease, or told `stop`, it exits 2 with `seat unreachable beyond the
   lease — stop work and end your turn`, and so does every later call until a
-  beat returns. No beat at all is stale: the gate **fails closed**. Its
+  beat returns. No beat at all is stale: the gate **fails closed**. So that a
+  seat's first tool call is not refused before the first beat can reach it (the
+  beat goes through a forward made minutes after the spawn, wsp-562), `spawn --on`
+  writes a first lease, `ok`, to `<exec_dir>/lease/<seat>` in the same command as
+  the gate, before the agent starts. Its
   semantics live in the compound-remote row; wsp's half is the beat, the two
   machine fields and the installation.
 - **`link`.** A machine field that takes one word, `required`, and refuses

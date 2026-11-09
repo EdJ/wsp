@@ -1495,8 +1495,10 @@ impl Compound<'_> {
     /// Write the PreToolUse gate into the far tree's `.claude/settings.json`
     /// (`docs/remote-agents.md` section 3): `compound-remote gate --exec-dir <d>
     /// --seat <s> --lease <machine lease>`, merged into whatever the tree
-    /// already has there, with a hook timeout above the lease. Refuses rather
-    /// than start an agent that nothing gates.
+    /// already has there, with a hook timeout above the lease. The seat's first
+    /// lease goes down in the same command (wsp-562), so its first tool call
+    /// finds a fresh one rather than waiting for a beat that is minutes off.
+    /// Refuses rather than start an agent that nothing gates.
     fn install_gate(&self, m: &crate::model::Machine, seat: &Seat, cwd: &str) -> Result<()> {
         let bad = |why: String| Refusal::Backend(why);
         let file = format!("{}/.claude/settings.json", cwd.trim_end_matches('/'));
@@ -1506,7 +1508,8 @@ impl Compound<'_> {
             .map_err(|f| bad(format!("reading {file} on {}: {}", m.name, f.why())))?;
         let text = crate::far::settings_with_gate(&there, m, seat.as_str()).map_err(|why| bad(format!("{}: {why}", m.name)))?;
         let write = format!(
-            "mkdir -p {} && cat > {} <<'WSP_GATE_EOF'\n{text}\nWSP_GATE_EOF",
+            "{}mkdir -p {} && cat > {} <<'WSP_GATE_EOF'\n{text}\nWSP_GATE_EOF",
+            crate::far::first_lease_command(m, seat.as_str()),
             crate::far::quote(&format!("{}/.claude", cwd.trim_end_matches('/'))),
             crate::far::quote(&file),
         );
@@ -2536,6 +2539,12 @@ mod tests {
         );
         let (asked_gate, asked) = (asked[..2].to_vec(), asked[3..].to_vec());
         assert!(asked_gate[1].contains(&format!("--seat '{seat}' --lease 180")), "{}", asked_gate[1]);
+        assert!(
+            asked_gate[1].starts_with("run mkdir -p '/far/exec/lease' && printf ok > '/far/exec/lease/.")
+                && asked_gate[1].contains(&format!("mv '/far/exec/lease/.{seat}.wsp.tmp' '/far/exec/lease/{seat}' && mkdir -p ")),
+            "the seat's first lease is written with the gate, before the agent: {}",
+            asked_gate[1]
+        );
         assert!(asked[0].contains(&format!("spawn --label '{seat}' --cwd '/far/exec/trees/t-1'")), "{}", asked[0]);
         assert!(asked[0].contains("WSP_SEAT_ID='") && asked[0].contains("claude-token"), "{}", asked[0]);
         assert_eq!(asked[1], format!("forward {seat}.sock:/far/run/s.sock"));

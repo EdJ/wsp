@@ -939,6 +939,24 @@ pub fn gate_command(m: &Machine, seat: &str) -> String {
     )
 }
 
+/// The far shell that writes a seat's **first lease**, `ok`, to
+/// `<exec_dir>/lease/<seat>` (temp, then rename, as compound-remote's own `lease`
+/// verb writes it; the file's mtime is the beat). `spawn --on` runs it with the
+/// gate, before the agent starts: the first beat goes through the forwarded
+/// controller socket, which is up minutes after the spawn, and a gate that finds
+/// no lease file waits out the whole lease and then refuses the seat's first
+/// tool call (agent-029 run 3, wsp-562). Ends in ` && ` so it chains.
+pub fn first_lease_command(m: &Machine, seat: &str) -> String {
+    let dir = format!("{}/lease", m.exec_dir.trim_end_matches('/'));
+    let tmp = format!("{dir}/.{seat}.wsp.tmp");
+    format!(
+        "mkdir -p {d} && printf ok > {t} && mv {t} {f} && ",
+        d = quote(&dir),
+        t = quote(&tmp),
+        f = quote(&format!("{dir}/{seat}")),
+    )
+}
+
 /// What the hook may take, in seconds: the gate waits up to the lease, so the
 /// hook's own timeout is above it.
 pub fn gate_timeout(m: &Machine) -> u32 {
@@ -1453,6 +1471,33 @@ mod tests {
         assert!(got[0].contains("\"word\":\"ok\"") && got[1].contains("\"word\":\"stop\""), "{got:?}");
         assert!(Ssh.lease(&m, &dir.join("none.sock"), "cpd-7", "ok").is_err(), "nobody listening");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A far seat's first lease is on disk from spawn, before any beat: run for
+    /// real, the command leaves `ok` at `<exec_dir>/lease/<seat>` and no temp
+    /// file, and a second run replaces it. The gate then finds a fresh lease on
+    /// the seat's first tool call instead of waiting out the whole lease for a
+    /// beat that goes through a forward made minutes later (wsp-562).
+    #[test]
+    fn the_first_lease_is_written_at_spawn_before_any_beat() {
+        let root = std::path::PathBuf::from("/tmp").join(format!("wf-firstlease-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut m = Machine::new("mb2", "mb2");
+        m.exec_dir = format!("{}/it's exec/", root.display());
+        let run = || {
+            let cmd = format!("{}true", first_lease_command(&m, "cpd-7"));
+            let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        run();
+        let dir = root.join("it's exec/lease");
+        assert_eq!(std::fs::read_to_string(dir.join("cpd-7")).unwrap(), "ok");
+        let age = std::fs::metadata(dir.join("cpd-7")).unwrap().modified().unwrap().elapsed().unwrap_or_default();
+        assert!(age < Duration::from_secs(60), "fresh, not stale: {age:?}");
+        run();
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("cpd-7")], "no temp file left behind");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The hook carries the machine's lease, outlives it, replaces an earlier
