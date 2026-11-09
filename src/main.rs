@@ -531,6 +531,8 @@ fn main() {
         hold_secs: hold::SECS,
     });
 
+    cmd_worklist::install_cap_waits(|store, list| room::waiting_lines_of(store, &[], Some(list)));
+
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Before parsing: what follows `run` is the build tool's own command line,
     // flags and all, and `Args` would take `--release` for one of ours.

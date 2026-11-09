@@ -94,6 +94,20 @@ use crate::util::{self, Paint};
 use crate::worklist::{self, Landing, Position, Reading, Segment, Standing};
 use crate::Args;
 
+/// What `next` says of the starts its list has waiting at the seat cap (`wsp-550`):
+/// `room::waiting_lines_of`, which `main` installs ([`install_cap_waits`]) because
+/// room is above this module and it may not name it.
+static CAP_WAITS: std::sync::OnceLock<fn(&Store, &str) -> Vec<String>> = std::sync::OnceLock::new();
+
+pub fn install_cap_waits(f: fn(&Store, &str) -> Vec<String>) {
+    let _ = CAP_WAITS.set(f);
+}
+
+/// The lines for one list, or none in a process that installed no reader.
+fn cap_waits_of(store: &Store, list: &str) -> Vec<String> {
+    CAP_WAITS.get().map(|f| f(store, list)).unwrap_or_default()
+}
+
 pub fn dispatch(store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(|s| s.as_str()).unwrap_or("ls") {
         // `new` and `add` are two verbs here where `project` has one, because a
@@ -4139,7 +4153,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
 
     if args.json() {
         let mut v = next_json(&w, &pos, &st, &gone, touched.as_ref());
-        let cap_waits = crate::room::waiting_lines_of(store, &[], Some(&w.id));
+        let cap_waits = cap_waits_of(store, &w.id);
         if let (Some(o), false) = (v.as_object_mut(), cap_waits.is_empty()) {
             o.insert("waiting_at_cap".into(), json!(cap_waits));
         }
@@ -4276,7 +4290,7 @@ fn report(
             // Starts the run holds at the seat's cap, said as `wip` says them
             // (`wsp-550`): without it a governor reads "waiting" and goes
             // looking for what is wrong.
-            for line in crate::room::waiting_lines_of(store, &[], Some(&w.id)) {
+            for line in cap_waits_of(store, &w.id) {
                 println!("{}", p.dim(&line));
             }
         }
