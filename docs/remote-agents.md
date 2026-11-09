@@ -582,20 +582,21 @@ itself (`wsp worklist show i5-heavy`).
 
 | group | kind | rows | what |
 |---|---|---|---|
-| 1 | **manual**, Ed and the primary seat | far setup by hand; the trial | 11.4 by hand and written as the script; one heavy row by hand with its verifier; the measurements of 11.5 |
-| 2 | agent | heavy declaration; one count per machine | the `heavy:` key, the matchers, the `--place` overrides and the display; per-machine ceilings and waits named for a machine |
-| 3 | agent | placement in the run; the far verifier | advance spawns heavy members `--on` with the fallback; verifier `--verify --on` in the far tree, the hash bind, the rerun, the verifier fallback, the held-member tell |
-| 4 | agent | compounding's declaration and setup check | `heavy:` set on compounding; `scripts/far-setup.sh --check` read by `machine check` |
-| 5 | **manual** | placement on for one list | one real list run with placement on, watched; the cost table against the trial |
+| 1 | **manual**, Ed and the primary seat | compounding-337 far setup by hand; agent-042 the trial (after 337) | 11.4 by hand and written as `scripts/far-setup.sh --check`; one heavy row by hand with its verifier; the measurements of 11.5 |
+| 2 | agent, x2 | agent-043 heavy declaration; agent-044 one count per machine | the `heavy:` key, the matchers, the `--place` overrides and the display; per-machine ceilings and waits named for a machine |
+| 3 | agent, x1 | agent-045 placement in the run; agent-046 the far verifier (after 045) | advance spawns heavy members `--on` with the fallback, and `machine check` reads the setup check; verifier `--verify --on` in the far tree, the hash bind, the rerun, the verifier fallback, the held-member tell |
+| 4 | agent | compounding-338 compounding's declaration | `heavy:` set on compounding, with goldens rows light |
+| 5 | **manual** | agent-047 placement on for one list | one real list run with placement on, watched; the cost table against the trial |
+
+The list is left at `init`: Ed sets it `planned` when the trial can start.
 
 ### 11.8 Open choices, raised as blocks
 
-1. The fallback time N (recommendation: 10 min). This blocks the placement row.
+1. The fallback time N (recommendation: 10 min). This blocks agent-045.
 2. Whether the fleet has a total cap beside the per-machine ceilings (wsp-422's
    "one count across machines"). Recommendation: no total, only per-machine
-   ceilings plus each list's own `--parallel`. This blocks the count row.
+   ceilings plus each list's own `--parallel`. This blocks agent-044.
 3. Where "checks rerun where the trunk moved" runs for a far member
-   (recommendation: the i5). This blocks the far-verifier row.
+   (recommendation: the i5). This blocks agent-046.
 4. Goldens: whether a goldens row is light (recommendation, until the trial
-   measures it) or the i5 gets its own baselines. This blocks compounding's
-   declaration row.
+   measures it) or the i5 gets its own baselines. This blocks compounding-338.
