@@ -353,10 +353,36 @@ pub fn load_high(one: f64, five: f64, cores: usize) -> bool {
 const HOLD_LOAD: f64 = LOAD_FACTOR;
 const RELEASE_LOAD: f64 = 1.0;
 
-/// Free memory, percent (`memory_pressure`): held under the first, let go at
-/// or over the second.
-const HOLD_MEM_FREE: u32 = 10;
-const RELEASE_MEM_FREE: u32 = 20;
+// Memory (wsp-591). `memory_pressure`'s "free percentage" counts compressed and
+// purgeable memory as free: it read 32% at 20:37 on 2026-11-09 while swap was
+// 6.4 of 8 GB, 5,271 pages (20 MB) were free and the load was 734, so a gate on
+// it never held anything. What says "out of memory" on macOS is paging: swap
+// that is *growing*, and pages going out to it. The percentage is still read
+// and shown, and gates nothing.
+//
+// Swap's level alone cannot gate: macOS leaves swap at 60-90% of its (growing)
+// total long after the pressure has passed. This machine, on a calm evening
+// (load 35), read swap 4.1 of 5.1 GB and ~1,500 pageouts a minute; the heavy
+// day read swap 6.4/8 then 8.4/9.2 GB and a swap total that kept growing. So:
+//
+// - swap holds when it is over 60% of its total *and* grew by 100 MB a minute or
+//   more; it lets go once growth is under 25 MB a minute. A full but flat swap
+//   with nothing paging out is a machine that has settled, and it releases.
+// - pageouts hold at 20,000 pages (4 KB) a minute, 80 MB a minute, 13 times the
+//   calm figure; they let go under 5,000.
+//
+// Growth and the pageout rate need two samples, so the last one is kept in
+// `mem.json` in the state directory (the CLI and the daemon are separate
+// processes) and a rate is taken over at least [`MEM_WINDOW_SECS`] seconds.
+const HOLD_SWAP_PERCENT: u32 = 60;
+const HOLD_SWAP_GROWTH_MB: i64 = 100;
+const RELEASE_SWAP_GROWTH_MB: i64 = 25;
+const HOLD_PAGEOUTS: u32 = 20_000;
+const RELEASE_PAGEOUTS: u32 = 5_000;
+/// A rate is taken over at least this long; a closer call reuses the last rate.
+const MEM_WINDOW_SECS: u64 = 10;
+/// A sample older than this is history, not a baseline.
+const MEM_STALE_SECS: u64 = 900;
 
 /// The clock limit is let go this many points above where it held.
 const RELEASE_THERMAL_ABOVE: u32 = 5;
@@ -388,6 +414,49 @@ pub struct Pause {
     pub kind: PauseKind,
     pub reading: u32,
     pub release: u32,
+    /// What held, for a memory hold; `None` for the others.
+    pub mem: Option<MemHold>,
+}
+
+/// The memory reading that held, in the words `wsp wip` prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemHold {
+    pub swap_used_mb: u32,
+    pub swap_total_mb: u32,
+    /// Swap is over its line and growing.
+    pub swap_growing: bool,
+    pub pageouts_min: Option<u32>,
+    /// The pageout rate alone holds.
+    pub paging: bool,
+}
+
+fn gb(mb: u32) -> String {
+    format!("{:.1}", mb as f64 / 1024.0)
+}
+
+fn thousands(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl MemHold {
+    fn text(&self) -> String {
+        let mut s = format!("swap {}/{} GB", gb(self.swap_used_mb), gb(self.swap_total_mb));
+        if self.swap_growing {
+            s.push_str(" and growing");
+        }
+        if let Some(p) = self.pageouts_min {
+            s.push_str(&format!(", {} pageouts/min", thousands(p)));
+        }
+        s
+    }
 }
 
 impl Pause {
@@ -401,10 +470,14 @@ impl Pause {
                 tenths(self.reading),
                 tenths(self.release)
             ),
-            PauseKind::Memory => format!(
-                "throttle: memory is short, {}% free, held until {}% is free",
-                self.reading, self.release
-            ),
+            PauseKind::Memory => match self.mem {
+                Some(m) => format!(
+                    "throttle: memory ({}), held until swap stops growing and pageouts are under {}/min",
+                    m.text(),
+                    thousands(self.release)
+                ),
+                None => "throttle: memory".into(),
+            },
             PauseKind::Thermal => format!(
                 "throttle: the CPU is limited to {}% of its clock, held until it is at {}%",
                 self.reading, self.release
@@ -418,10 +491,36 @@ impl Pause {
 pub struct Reading {
     pub one: f64,
     pub cores: usize,
-    /// Percent of memory free; `None` where it cannot be read.
+    /// Percent of memory free (`memory_pressure`); shown, gates nothing.
     pub mem_free: Option<u32>,
+    /// Swap, used and total in MB; `None` where it cannot be read.
+    pub swap: Option<(u32, u32)>,
+    /// MB of swap gained a minute since the last sample; negative when it fell.
+    pub swap_growth_mb_min: Option<i64>,
+    /// Pages (4 KB) paged out a minute since the last sample.
+    pub pageouts_min: Option<u32>,
     /// `CPU_Speed_Limit`; `None` where there is no `pmset`.
     pub thermal: Option<u32>,
+}
+
+/// Whether memory holds: swap over its line and growing, or pageouts over
+/// theirs; once held, until growth is under the lower line and pageouts under
+/// theirs. A gauge that cannot be read (no swap, no earlier sample) does not
+/// hold.
+fn mem_hold(was_held: bool, r: &Reading) -> Option<MemHold> {
+    let (used, total) = r.swap?;
+    let over = total > 0 && used as u64 * 100 >= total as u64 * HOLD_SWAP_PERCENT as u64;
+    let growth_line = if was_held { RELEASE_SWAP_GROWTH_MB } else { HOLD_SWAP_GROWTH_MB };
+    let swap_growing = over && r.swap_growth_mb_min.is_some_and(|g| g >= growth_line);
+    let page_line = if was_held { RELEASE_PAGEOUTS } else { HOLD_PAGEOUTS };
+    let paging = r.pageouts_min.is_some_and(|p| p >= page_line);
+    (swap_growing || paging).then_some(MemHold {
+        swap_used_mb: used,
+        swap_total_mb: total,
+        swap_growing,
+        pageouts_min: r.pageouts_min,
+        paging,
+    })
 }
 
 /// Every reading that holds new work back, given the kinds that held it last
@@ -434,19 +533,16 @@ pub fn decide_hold(was: &[PauseKind], r: &Reading, s: &Settings) -> Vec<Pause> {
     let mut out = Vec::new();
     let load_line = if held(PauseKind::Load) { RELEASE_LOAD } else { HOLD_LOAD } * cores;
     if r.one > load_line {
-        out.push(Pause { kind: PauseKind::Load, reading: tenths(r.one), release: tenths(RELEASE_LOAD * cores) });
+        out.push(Pause { kind: PauseKind::Load, reading: tenths(r.one), release: tenths(RELEASE_LOAD * cores), mem: None });
     }
-    if let Some(free) = r.mem_free {
-        let line = if held(PauseKind::Memory) { RELEASE_MEM_FREE } else { HOLD_MEM_FREE };
-        if free < line {
-            out.push(Pause { kind: PauseKind::Memory, reading: free, release: RELEASE_MEM_FREE });
-        }
+    if let Some(m) = mem_hold(held(PauseKind::Memory), r) {
+        out.push(Pause { kind: PauseKind::Memory, reading: m.swap_used_mb, release: RELEASE_PAGEOUTS, mem: Some(m) });
     }
     if let Some(limit) = r.thermal {
         let release = (s.thermal_below + RELEASE_THERMAL_ABOVE).min(100);
         let line = if held(PauseKind::Thermal) { release } else { s.thermal_below };
         if limit < line {
-            out.push(Pause { kind: PauseKind::Thermal, reading: limit, release });
+            out.push(Pause { kind: PauseKind::Thermal, reading: limit, release, mem: None });
         }
     }
     out
@@ -492,7 +588,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn sample_pause() -> Pause {
-    Pause { kind: PauseKind::Load, reading: 142, release: 80 }
+    Pause { kind: PauseKind::Load, reading: 142, release: 80, mem: None }
 }
 
 fn hold_path(state: &Path) -> PathBuf {
@@ -536,9 +632,135 @@ fn mem_free() -> Option<u32> {
     out.status.success().then(|| parse_mem_free(&String::from_utf8_lossy(&out.stdout))).flatten()
 }
 
+/// Swap in MB, `(used, total)`, out of `sysctl vm.swapusage`:
+/// `vm.swapusage: total = 8192.00M  used = 6553.50M  free = 1638.50M  (encrypted)`.
+pub fn parse_swapusage(out: &str) -> Option<(u32, u32)> {
+    let after = |key: &str| -> Option<u32> {
+        let rest = out.split(key).nth(1)?.trim_start().strip_prefix('=')?.trim_start();
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let unit = rest[num.len()..].chars().next()?;
+        let v: f64 = num.parse().ok()?;
+        let mb = match unit {
+            'K' => v / 1024.0,
+            'M' => v,
+            'G' => v * 1024.0,
+            _ => return None,
+        };
+        Some(mb.round() as u32)
+    };
+    Some((after("used")?, after("total")?))
+}
+
+/// Pages paged out since boot, in 4 KB units, out of `vm_stat`:
+/// `Mach Virtual Memory Statistics: (page size of 16384 bytes)` … `Pageouts:   12205611.`
+pub fn parse_pageouts(out: &str) -> Option<u64> {
+    let size: u64 = out
+        .lines()
+        .next()
+        .and_then(|l| l.split("page size of").nth(1))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(4096);
+    let line = out.lines().find(|l| l.starts_with("Pageouts:"))?;
+    let n: u64 = line.split(':').nth(1)?.trim().trim_end_matches('.').parse().ok()?;
+    Some(n * size / 4096)
+}
+
+fn swap_now() -> Option<(u32, u32)> {
+    if cfg!(test) {
+        return None;
+    }
+    let out = Command::new("sysctl").args(["-n", "vm.swapusage"]).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| parse_swapusage(&String::from_utf8_lossy(&out.stdout))).flatten()
+}
+
+fn pageouts_now() -> Option<u64> {
+    if cfg!(test) {
+        return None;
+    }
+    let out = Command::new("vm_stat").stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| parse_pageouts(&String::from_utf8_lossy(&out.stdout))).flatten()
+}
+
+/// The last memory sample and the rates taken from it, in `mem.json`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MemMark {
+    at: u64,
+    swap_used_mb: u32,
+    pageouts: u64,
+    growth_mb_min: Option<i64>,
+    pageouts_min: Option<u32>,
+}
+
+fn mem_path(state: &Path) -> PathBuf {
+    state.join("mem.json")
+}
+
+fn mem_mark_before(state: &Path) -> Option<MemMark> {
+    let v: Value = serde_json::from_str(&fs::read_to_string(mem_path(state)).ok()?).ok()?;
+    Some(MemMark {
+        at: v.get("at")?.as_u64()?,
+        swap_used_mb: v.get("swap_used_mb")?.as_u64()? as u32,
+        pageouts: v.get("pageouts")?.as_u64()?,
+        growth_mb_min: v.get("growth_mb_min").and_then(Value::as_i64),
+        pageouts_min: v.get("pageouts_min").and_then(Value::as_u64).map(|n| n as u32),
+    })
+}
+
+/// Take the rates for a sample at `now` (seconds) against the last mark, and
+/// remember it. Closer than [`MEM_WINDOW_SECS`] to the last, the last rates
+/// stand and the baseline stays, so a caller that asks every second reads the
+/// rate over a window, not the noise of one tick. A mark older than
+/// [`MEM_STALE_SECS`], or counters that went backwards (a reboot), give no rate.
+/// Returns `(swap growth MB/min, pageouts/min)`.
+fn mem_rates(state: &Path, now: u64, swap_used_mb: u32, pageouts: u64) -> (Option<i64>, Option<u32>) {
+    let prev = mem_mark_before(state);
+    if let Some(p) = prev {
+        let dt = now.saturating_sub(p.at);
+        if now >= p.at && dt < MEM_WINDOW_SECS {
+            return (p.growth_mb_min, p.pageouts_min);
+        }
+    }
+    let rates = prev
+        .filter(|p| now > p.at && now - p.at <= MEM_STALE_SECS && pageouts >= p.pageouts)
+        .map(|p| {
+            let dt = (now - p.at) as f64;
+            let growth = ((swap_used_mb as f64 - p.swap_used_mb as f64) * 60.0 / dt).round() as i64;
+            let paged = ((pageouts - p.pageouts) as f64 * 60.0 / dt).round().min(u32::MAX as f64) as u32;
+            (Some(growth), Some(paged))
+        })
+        .unwrap_or((None, None));
+    let mark = json!({
+        "at": now,
+        "swap_used_mb": swap_used_mb,
+        "pageouts": pageouts,
+        "growth_mb_min": rates.0,
+        "pageouts_min": rates.1,
+    });
+    let _ = crate::store::write_atomic(&mem_path(state), &mark.to_string());
+    rates
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 /// An unreadable load reads as none, so the memory and the clock still count.
-fn reading_now() -> Reading {
-    Reading { one: load_average().map_or(0.0, |l| l.0), cores: cores(), mem_free: mem_free(), thermal: speed_limit() }
+fn reading_now(state: &Path) -> Reading {
+    let swap = swap_now();
+    let (growth, paged) = match (swap, pageouts_now()) {
+        (Some((used, _)), Some(po)) => mem_rates(state, unix_now(), used, po),
+        _ => (None, None),
+    };
+    Reading {
+        one: load_average().map_or(0.0, |l| l.0),
+        cores: cores(),
+        mem_free: mem_free(),
+        swap,
+        swap_growth_mb_min: growth,
+        pageouts_min: paged,
+        thermal: speed_limit(),
+    }
 }
 
 /// How many times the readiness wait of a spawn is stretched at this load
@@ -1416,7 +1638,31 @@ pub fn holding_back(store: &Store) -> Option<Pause> {
         return None;
     }
     let s = Settings::load(&store.state);
-    hold_step(&store.state, &reading_now(), &s).into_iter().next()
+    hold_step(&store.state, &reading_now(&store.state), &s).into_iter().next()
+}
+
+/// The memory readings as `wsp throttle --json` carries them, and which, if
+/// any, is holding. Blank under test, like [`holding_back`].
+pub fn memory_json(store: &Store) -> Value {
+    if cfg!(test) {
+        return Value::Null;
+    }
+    let s = Settings::load(&store.state);
+    let r = reading_now(&store.state);
+    let held = hold_step(&store.state, &r, &s).into_iter().find(|h| h.kind == PauseKind::Memory);
+    memory_json_of(&r, held)
+}
+
+fn memory_json_of(r: &Reading, held: Option<Pause>) -> Value {
+    json!({
+        "free_percent": r.mem_free,
+        "swap_used_mb": r.swap.map(|s| s.0),
+        "swap_total_mb": r.swap.map(|s| s.1),
+        "swap_growth_mb_per_min": r.swap_growth_mb_min,
+        "pageouts_per_min": r.pageouts_min,
+        "held": held.is_some(),
+        "held_text": held.map(|h| h.text()),
+    })
 }
 
 /// [`View::status_line`], for the surfaces that are not `wsp throttle`.
@@ -1550,6 +1796,7 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
                 "jobs": v.settings.job_cap(v.cores),
                 "load": v.load.map(|(a, b, c)| json!([a, b, c])),
                 "load_warning": v.load_warning(),
+                "memory": memory_json(store),
                 "cpu_speed_limit": v.thermal,
                 "thermal_below": v.settings.thermal_below,
                 "thermally_limited": v.hot(),
@@ -1601,7 +1848,7 @@ mod tests {
         // as the 1-minute load is under the release line.
         let t = crate::util::isolated("throttle-hold-series");
         let st = Settings::default();
-        let at = |one: f64| Reading { one, cores: 8, mem_free: Some(57), thermal: Some(100) };
+        let at = |one: f64| Reading { one, ..calm() };
         // (seconds since the spike, 1-minute load, held?)
         let series: [(u32, f64, bool); 9] = [
             (0, 4.0, false),
@@ -1624,24 +1871,121 @@ mod tests {
         assert_eq!(h[0].text(), "throttle: the 1-minute load is 14.2, held until it is under 8.0");
     }
 
+    /// A machine with nothing wrong: load 1 on 8 cores, a full clock, swap
+    /// 80% used but flat, nothing paging, and `memory_pressure` happy.
+    fn calm() -> Reading {
+        Reading {
+            one: 1.0,
+            cores: 8,
+            mem_free: Some(57),
+            swap: Some((4096, 5120)),
+            swap_growth_mb_min: Some(0),
+            pageouts_min: Some(1_500),
+            thermal: Some(100),
+        }
+    }
+
     #[test]
-    fn memory_and_the_clock_hold_with_their_own_release_lines() {
-        let t = crate::util::isolated("throttle-hold-mem-heat");
+    fn swap_over_the_line_and_growing_holds_and_flat_with_no_paging_releases() {
+        let t = crate::util::isolated("throttle-hold-swap");
         let st = Settings::default();
-        let r = |mem: u32, therm: u32| Reading { one: 1.0, cores: 8, mem_free: Some(mem), thermal: Some(therm) };
-        assert!(hold_step(&t.state(), &r(40, 100), &st).is_empty());
-        let m = hold_step(&t.state(), &r(6, 100), &st);
-        assert_eq!(m[0].kind, PauseKind::Memory);
-        assert!(m[0].text().contains("memory is short, 6% free"), "{}", m[0].text());
-        assert_eq!(hold_step(&t.state(), &r(15, 100), &st).len(), 1, "15% is over the line it held at, under the one it lets go at");
-        assert!(hold_step(&t.state(), &r(21, 100), &st).is_empty());
-        let h = hold_step(&t.state(), &r(40, 31), &st);
+        let r = |used: u32, growth: Option<i64>, po: Option<u32>| Reading {
+            swap: Some((used, 9216)),
+            swap_growth_mb_min: growth,
+            pageouts_min: po,
+            ..calm()
+        };
+        // The heavy day: 8.4 of 9.2 GB and 1,200 pageouts a minute, growing.
+        let h = hold_step(&t.state(), &r(8602, Some(300), Some(1_200)), &st);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].kind, PauseKind::Memory);
+        assert!(h[0].text().contains("memory (swap 8.4/9.0 GB and growing, 1,200 pageouts/min)"), "{}", h[0].text());
+        // Still growing a little (over the release line): still held.
+        assert_eq!(hold_step(&t.state(), &r(8700, Some(40), Some(1_200)), &st).len(), 1);
+        // High but flat, nothing paging: released.
+        assert!(hold_step(&t.state(), &r(8700, Some(5), Some(300)), &st).is_empty());
+        // Between the lines: growing 50 MB/min does not hold afresh.
+        assert!(hold_step(&t.state(), &r(8700, Some(50), Some(300)), &st).is_empty());
+        // Growing fast but swap is mostly empty: the level is not the problem.
+        assert!(hold_step(&t.state(), &r(2000, Some(500), Some(300)), &st).is_empty());
+        // No earlier sample, no growth, no hold: a gauge not read does not hold.
+        assert!(hold_step(&t.state(), &r(8700, None, None), &st).is_empty());
+    }
+
+    #[test]
+    fn a_high_pageout_rate_holds_alone_and_lets_go_under_its_lower_line() {
+        let t = crate::util::isolated("throttle-hold-pageouts");
+        let st = Settings::default();
+        let r = |po: u32| Reading { pageouts_min: Some(po), ..calm() };
+        assert!(hold_step(&t.state(), &r(19_000), &st).is_empty());
+        let h = hold_step(&t.state(), &r(25_000), &st);
+        assert_eq!(h[0].kind, PauseKind::Memory);
+        assert!(h[0].text().contains("swap 4.0/5.0 GB, 25,000 pageouts/min"), "{}", h[0].text());
+        assert!(!h[0].text().contains("and growing"));
+        assert_eq!(hold_step(&t.state(), &r(8_000), &st).len(), 1, "under the hold line, over the release line");
+        assert!(hold_step(&t.state(), &r(4_000), &st).is_empty());
+    }
+
+    #[test]
+    fn the_free_percentage_is_shown_and_gates_nothing() {
+        let t = crate::util::isolated("throttle-hold-free-pct");
+        let st = Settings::default();
+        // Free percentage at 2% with nothing paging and swap flat: not held.
+        assert!(hold_step(&t.state(), &Reading { mem_free: Some(2), ..calm() }, &st).is_empty());
+        let j = memory_json_of(&Reading { mem_free: Some(32), swap_growth_mb_min: Some(120), ..calm() }, None);
+        assert_eq!(j["free_percent"], 32);
+        assert_eq!(j["swap_used_mb"], 4096);
+        assert_eq!(j["swap_total_mb"], 5120);
+        assert_eq!(j["swap_growth_mb_per_min"], 120);
+        assert_eq!(j["pageouts_per_min"], 1_500);
+        assert_eq!(j["held"], false);
+    }
+
+    #[test]
+    fn the_clock_holds_with_its_own_release_line_and_no_gauge_no_hold() {
+        let t = crate::util::isolated("throttle-hold-heat");
+        let st = Settings::default();
+        let r = |therm: u32| Reading { thermal: Some(therm), ..calm() };
+        assert!(hold_step(&t.state(), &r(100), &st).is_empty());
+        let h = hold_step(&t.state(), &r(31), &st);
         assert_eq!(h[0].kind, PauseKind::Thermal);
-        assert_eq!(hold_step(&t.state(), &r(40, 72), &st).len(), 1, "still under 75");
-        assert!(hold_step(&t.state(), &r(40, 75), &st).is_empty());
-        // No gauge, no hold.
-        let blind = Reading { one: 0.0, cores: 8, mem_free: None, thermal: None };
+        assert_eq!(hold_step(&t.state(), &r(72), &st).len(), 1, "still under 75");
+        assert!(hold_step(&t.state(), &r(75), &st).is_empty());
+        let blind = Reading { one: 0.0, cores: 8, mem_free: None, swap: None, swap_growth_mb_min: None, pageouts_min: None, thermal: None };
         assert!(hold_step(&t.state(), &blind, &st).is_empty());
+    }
+
+    #[test]
+    fn rates_are_taken_over_a_window_against_the_last_sample() {
+        let t = crate::util::isolated("throttle-mem-rates");
+        let state = t.state();
+        // The first sample has nothing to compare with.
+        assert_eq!(mem_rates(&state, 1000, 4000, 1_000_000), (None, None));
+        // A call two seconds later reuses the rates (none) and keeps the baseline.
+        assert_eq!(mem_rates(&state, 1002, 4010, 1_000_100), (None, None));
+        // 30 s on: +200 MB of swap and 20,000 pages out in half a minute.
+        assert_eq!(mem_rates(&state, 1030, 4200, 1_020_000), (Some(400), Some(40_000)));
+        // Soon after, the same rates stand.
+        assert_eq!(mem_rates(&state, 1035, 4300, 1_020_100), (Some(400), Some(40_000)));
+        // Against the 1030 baseline, a minute on: swap falling is a negative growth.
+        assert_eq!(mem_rates(&state, 1090, 3900, 1_020_100), (Some(-300), Some(100)));
+        // A counter that went back (reboot) gives no rate; so does a stale mark.
+        assert_eq!(mem_rates(&state, 1150, 100, 5), (None, None));
+        assert_eq!(mem_rates(&state, 1150 + MEM_STALE_SECS + 1, 100, 50), (None, None));
+    }
+
+    #[test]
+    fn swap_and_pageouts_are_read_out_of_their_tools() {
+        assert_eq!(
+            parse_swapusage("vm.swapusage: total = 9216.00M  used = 8602.50M  free = 613.50M  (encrypted)"),
+            Some((8603, 9216))
+        );
+        assert_eq!(parse_swapusage("total = 8.00G  used = 6.25G  free = 1.75G"), Some((6400, 8192)));
+        assert_eq!(parse_swapusage("nothing"), None);
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:  2919.\nPageouts:   1000.\n";
+        assert_eq!(parse_pageouts(vm), Some(4000), "in 4 KB pages");
+        assert_eq!(parse_pageouts("Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPageouts:  12205611.\n"), Some(12205611));
+        assert_eq!(parse_pageouts("nothing"), None);
     }
 
     #[test]
