@@ -1235,7 +1235,7 @@ pub fn stop_checks(store: &Store, args: &Args) -> i32 {
 
 pub fn group(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
-        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--caption \"…\"|none] [--kind contract|components|wiring|insitu|none] [--drop] [--why \"…\"|-]";
+        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--caption \"…\"|none] [--kind contract|components|wiring|insitu|none] [--together|--no-together] [--drop] [--why \"…\"|-]";
     let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
@@ -1271,14 +1271,23 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         return 2;
     }
     let drop = args.has("drop");
-    if !drop && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") && !args.has("kind") {
+    let set_together = args.has("together") || args.has("no-together");
+    if args.has("together") && args.has("no-together") {
+        eprintln!("wsp: --together and --no-together say opposite things — give one");
+        return 2;
+    }
+    if !drop && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") && !args.has("kind") {
         eprintln!("{USAGE}");
         eprintln!("       --parallel caps the work; --agent says who runs it; --stop is the prose read at the barrier after it");
         eprintln!("       --caption is the line a glance reads for it; --drop takes the group out whole");
         eprintln!("       --kind says what the group is for, which scopes its barrier's run (docs/scoped-barriers.md)");
+        eprintln!("       --together keeps the list from starting until the group's whole width and a verifier are free, so its");
+        eprintln!("       members are seated at once: for work that must be compared like for like (a trial's twins, remote and");
+        eprintln!("       local twins). Without it a planned list starts when one place is free and its members start as places");
+        eprintln!("       free, up to the xN; --no-together takes it off");
         return 2;
     }
-    if drop && (args.has("parallel") || args.has("stop") || args.has("agent") || args.has("caption") || args.has("kind")) {
+    if drop && (set_together || args.has("parallel") || args.has("stop") || args.has("agent") || args.has("caption") || args.has("kind")) {
         eprintln!("wsp: --drop takes the group out whole, so there is nothing of it left to set");
         return 2;
     }
@@ -1290,10 +1299,10 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     // A caption alone is the one edit any group takes, run or not: it is
     // what the group is called, and nothing a member, a verifier or the
     // barrier reads. The window guards what is in flight.
-    let caption_only = args.has("caption") && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("kind");
+    let caption_only = args.has("caption") && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("kind");
     // A kind alone is read at the barrier and by nothing in flight, so it is
     // the other edit a group takes while it runs.
-    let kind_only = args.has("kind") && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption");
+    let kind_only = args.has("kind") && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption");
     let kind = match args.get("kind").map(|k| k.trim().to_string()) {
         None => None,
         Some(k) if matches!(k.as_str(), "" | "none" | "-" | "true") => Some(String::new()),
@@ -1324,7 +1333,7 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     if !caption_only && !kind_only && !win.allows(ordinal) {
         // The one edit the group being run still takes: its stop, which
         // nothing has read as a barrier yet. See [`amend_running_stop`].
-        let only_stop = args.has("stop") && !args.has("parallel") && !args.has("agent");
+        let only_stop = args.has("stop") && !set_together && !args.has("parallel") && !args.has("agent");
         let live = win.started && win.at == Some(ordinal);
         if live && only_stop {
             let Some(why) = why else {
@@ -1395,6 +1404,10 @@ pub fn group(store: &Store, args: &Args) -> i32 {
             }
             Err(code) => return code,
         }
+    }
+    if set_together {
+        groups[ordinal - 1].together = args.has("together");
+        said.push(if args.has("together") { "together".into() } else { "not together".into() });
     }
     if let Some(k) = kind {
         said.push(if k.is_empty() { "no kind".into() } else { format!("kind: {k}") });

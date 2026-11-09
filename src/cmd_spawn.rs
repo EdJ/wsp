@@ -6138,6 +6138,7 @@ mod tests {
             checks: Vec::new(),
             stop_checks: Vec::new(),
             kind: String::new(),
+            together: false,
             id: None,
             caption: String::new(),
         }]);
@@ -9230,6 +9231,7 @@ mod tests {
                 checks: Vec::new(),
                 stop_checks: Vec::new(),
                 kind: String::new(),
+                together: false,
                 id: None,
                 caption: String::new(),
             }]);
@@ -9291,6 +9293,7 @@ mod tests {
                 checks: Vec::new(),
                 stop_checks: Vec::new(),
                 kind: String::new(),
+                together: false,
                 id: None,
                 caption: String::new(),
             },
@@ -9306,6 +9309,7 @@ mod tests {
                 checks: Vec::new(),
                 stop_checks: Vec::new(),
                 kind: String::new(),
+                together: false,
                 id: None,
                 caption: String::new(),
             },

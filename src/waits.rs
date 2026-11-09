@@ -124,9 +124,15 @@ pub struct Entry {
     /// anything under it. `None` for a list with no home, which conflicts with
     /// nothing.
     pub scope: Option<String>,
-    /// Agents its first group would take at once: members (up to its cap) and
-    /// a verifier.
+    /// What the list needs free to start. One, unless its first group is
+    /// marked `together` (`wsp-584`): then the members (up to its cap) at once
+    /// and a verifier. A group not marked starts its members as places free.
     pub need: usize,
+    /// How many members the first group runs at once as places free: its
+    /// members up to its cap.
+    pub width: usize,
+    /// The first group asked to be seated all at once.
+    pub together: bool,
     pub empty: bool,
     pub manual: bool,
 }
@@ -226,10 +232,13 @@ fn entry_of(store: &Store, l: &Listed, seat_cap: Option<usize>) -> Entry {
     let w = &l.list;
     let groups = w.groups();
     let scope = scope_of(store, w);
-    let need = groups.first().map_or(0, |g| {
+    let width = groups.first().map_or(0, |g| {
         let members = g.members.len();
-        let running = g.cap.map_or(members, |c| c.min(members));
-        let want = running + 1;
+        g.cap.map_or(members, |c| c.min(members))
+    });
+    let together = groups.first().is_some_and(|g| g.together);
+    let need = groups.first().map_or(0, |g| {
+        let want = if g.together { width + 1 } else { 1 };
         seat_cap.map_or(want, |c| want.min(c))
     });
     let next = groups.get(l.at.at.unwrap_or(1).saturating_sub(1)).or(groups.first());
@@ -241,6 +250,8 @@ fn entry_of(store: &Store, l: &Listed, seat_cap: Option<usize>) -> Entry {
         alone: w.alone.unwrap_or(scope.as_deref() == Some(OWN_SOURCE)),
         scope,
         need,
+        width,
+        together,
         empty: groups.is_empty(),
         manual: next.is_some_and(|g| g.policy().is_none()),
     }
@@ -283,6 +294,10 @@ pub struct Row {
     pub id: String,
     pub wait: Option<Wait>,
     pub need: usize,
+    /// Members of the first group that run at once as places free.
+    pub width: usize,
+    /// The first group is marked `together`, so `need` is all of it at once.
+    pub together: bool,
 }
 
 /// The planned lists among `listed`, in queue order, each with what it waits
@@ -313,10 +328,14 @@ pub fn read_on(store: &Store, listed: &[Listed], machine: Option<Machine>) -> Ve
         }
     }
     world.waiting_on_ed = idle_on_ed(store, listed);
-    let need: std::collections::BTreeMap<String, usize> = entries.iter().map(|e| (e.id.clone(), e.need)).collect();
+    let need: std::collections::BTreeMap<String, (usize, usize, bool)> =
+        entries.iter().map(|e| (e.id.clone(), (e.need, e.width, e.together))).collect();
     queue(entries, &world)
         .into_iter()
-        .map(|(id, wait)| Row { need: need.get(&id).copied().unwrap_or(0), id, wait })
+        .map(|(id, wait)| {
+            let (need, width, together) = need.get(&id).copied().unwrap_or((0, 0, false));
+            Row { need, width, together, id, wait }
+        })
         .collect()
 }
 
@@ -385,6 +404,8 @@ mod tests {
             alone: false,
             scope: Some("proj".into()),
             need: 3,
+            width: 2,
+            together: true,
             empty: false,
             manual: false,
         }
@@ -414,6 +435,23 @@ mod tests {
         w.free = Some(3);
         assert_eq!(only(entry("a"), &w), None);
         assert_eq!(Wait::Room { short: 1 }.text(), "room: 1 slot short");
+    }
+
+    /// A first group not marked together needs one place to start (`wsp-584`);
+    /// a together group still needs its whole width and a verifier.
+    #[test]
+    fn a_group_not_marked_together_needs_one_place_and_a_together_one_all_of_them() {
+        let mut e = entry("a");
+        e.need = 1;
+        e.together = false;
+        let mut w = world();
+        w.free = Some(1);
+        assert_eq!(only(e.clone(), &w), None, "one place of four is enough for an x2 group");
+        assert_eq!(line(&only(e.clone(), &w)), "may start");
+        w.free = Some(0);
+        assert_eq!(only(e, &w), Some(Wait::Room { short: 1 }));
+        w.free = Some(1);
+        assert_eq!(only(entry("t"), &w).unwrap().text(), "room: 2 slots short", "together keeps its full need");
     }
 
     #[test]

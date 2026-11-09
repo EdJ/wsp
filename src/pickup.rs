@@ -215,7 +215,11 @@ fn why_started(w: &Worklist, row: &Row, machine: &Machine, seen: &Seen) -> Strin
     }
     match (machine.free, machine.cap) {
         (Some(free), Some(cap)) => {
-            s.push_str(&format!("; {free} of {cap} places free, its first group takes {}", row.need))
+            if row.together {
+                s.push_str(&format!("; {free} of {cap} places free, its first group takes {}", row.need))
+            } else {
+                s.push_str(&format!("; {free} of {cap} places free, its first group takes 1 to start (x{} as places free)", row.width))
+            }
         }
         _ => s.push_str("; this seat has no cap on agents"),
     }
@@ -376,8 +380,8 @@ mod tests {
         assert_eq!(word(&store, "first"), "executing");
         assert_eq!(word(&store, "second"), "planned", "one per tick");
 
-        // The first has taken its places; one free is a place short.
-        assert_eq!(tick_on(&store, room(1)), None);
+        // The first has taken its places; none free is a place short.
+        assert_eq!(tick_on(&store, room(0)), None);
         assert_eq!(word(&store, "second"), "planned");
         let seen = seen_of(&store, "second");
         assert_eq!(seen.kinds, ["room"]);
@@ -389,7 +393,7 @@ mod tests {
         let log = store.worklist("second").unwrap().section("Log").unwrap_or_default();
         assert!(log.contains("started · started by wsp, the first planned list that may start"), "{log}");
         assert!(log.contains("held by room (last: room: 1 slot short)"), "{log}");
-        assert!(log.contains("6 of 8 places free, its first group takes 2"), "{log}");
+        assert!(log.contains("6 of 8 places free, its first group takes 1 to start (x1 as places free)"), "{log}");
         assert!(log.contains("planned, and room came free"), "the caption: {log}");
 
         // Told in wip, and nothing is left to start.
@@ -398,6 +402,54 @@ mod tests {
         assert!(lines[1].contains("planned list second") && lines[1].contains("held by room"), "{lines:?}");
         assert_eq!(tick_on(&store, room(8)), None);
         assert!(seen_of(&store, "second").kinds.is_empty(), "the record of a started list goes");
+    }
+
+    /// A list of three members in one x3 group, `together` or not.
+    fn x3_list(store: &Store, slug: &str, together: bool) {
+        planned(store, slug, &format!("{slug}-1"), "2026-11-05T09:00:00Z");
+        for i in 2..=3 {
+            let id = format!("{slug}-{i}");
+            member(store, &id);
+            assert_eq!(flagged(store, &["add", slug, &id], &[("group", "1")]), 0);
+        }
+        assert_eq!(flagged(store, &["group", slug, "1"], &[("parallel", "3")]), 0);
+        if together {
+            assert_eq!(flagged(store, &["group", slug, "1"], &[("together", "true")]), 0);
+        }
+        assert_eq!(store.worklist(slug).unwrap().groups()[0].together, together);
+    }
+
+    /// `wsp-584`: with one place of four free, an x3 first group not marked
+    /// together starts its list, and the sentence says what it took.
+    #[test]
+    fn one_free_place_starts_an_x3_list() {
+        let (_env, store) = setup("loose");
+        store.set_seat_cap(Some(4)).unwrap();
+        x3_list(&store, "loose", false);
+        let one = Some(Machine { free: Some(1), cap: Some(4), throttled: None });
+        assert_eq!(tick_on(&store, one).as_deref(), Some("loose"));
+        assert_eq!(word(&store, "loose"), "executing");
+        let log = store.worklist("loose").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("1 of 4 places free, its first group takes 1 to start (x3 as places free)"), "{log}");
+    }
+
+    /// The same list marked together is three short for the group and its
+    /// verifier, and nothing starts.
+    #[test]
+    fn one_free_place_does_not_start_an_x3_list_marked_together() {
+        let (_env, store) = setup("tied");
+        store.set_seat_cap(Some(4)).unwrap();
+        x3_list(&store, "tied", true);
+        let one = Some(Machine { free: Some(1), cap: Some(4), throttled: None });
+        assert_eq!(tick_on(&store, one), None);
+        assert_eq!(word(&store, "tied"), "planned");
+        let rows = waits::read_on(&store, &worklist::listing(&store, store.worklists()), one);
+        assert_eq!((rows[0].need, rows[0].together), (4, true));
+        assert_eq!(waits::line(&rows[0].wait), "room: 3 slots short");
+        let all = Some(Machine { free: Some(4), cap: Some(4), throttled: None });
+        assert_eq!(tick_on(&store, all).as_deref(), Some("tied"));
+        let log = store.worklist("tied").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("4 of 4 places free, its first group takes 4"), "{log}");
     }
 
     #[test]
@@ -597,7 +649,7 @@ mod tests {
     fn the_sentence_and_the_caption_say_what_the_list_waited_on() {
         let mut w = Worklist::new("l", "L");
         w.planned = Some(util::now_iso());
-        let row = Row { id: "l".into(), wait: None, need: 3 };
+        let row = Row { id: "l".into(), wait: None, need: 3, width: 2, together: true };
         let m = Machine { free: Some(5), cap: Some(8), throttled: None };
         let none = why_started(&w, &row, &m, &Seen::default());
         assert!(none.contains("nothing was in its way") && none.contains("5 of 8 places free"), "{none}");

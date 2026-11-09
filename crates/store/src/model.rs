@@ -1794,6 +1794,14 @@ pub struct Group {
     /// [`Self::member_agents`] documents: `wsp install` before a list carrying
     /// one is run by an older binary.
     pub kind: String,
+    /// `together:` — the group's members must be seated at once, so the list
+    /// does not start until the group's whole width and one more are free
+    /// (`wsp-584`). Absent is the default: a planned list starts when one place
+    /// is free and the members start as places free, up to `xN`.
+    ///
+    /// **A wsp from before this reads the line as more members**, the hazard
+    /// [`Self::member_agents`] documents.
+    pub together: bool,
 }
 
 /// Who a group runs on: the kind, and optionally the model and the effort,
@@ -2099,6 +2107,9 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         } else if let Some(rest) = trimmed.strip_prefix("kind:") {
             last.kind = rest.trim().to_string();
             cont = Cont::Members;
+        } else if trimmed == "together:" || trimmed.strip_prefix("together:").is_some_and(|r| r.trim() == "yes") {
+            last.together = true;
+            cont = Cont::Members;
         } else if let Some(rest) = trimmed.strip_prefix("agent:") {
             // One line, never wrapped: a policy is three words.
             last.agent = rest.trim().to_string();
@@ -2254,6 +2265,9 @@ pub fn render_groups(groups: &[Group]) -> String {
         }
         if !g.kind.trim().is_empty() {
             out.push_str(&format!("  kind: {}\n", g.kind.trim()));
+        }
+        if g.together {
+            out.push_str("  together: yes\n");
         }
         block(&mut out, "agent", &g.agent);
         // In member order, and only for members still in the group: a line
@@ -3112,6 +3126,15 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         w.set_groups(&gs);
         assert_eq!(w.groups()[0].kind, "components");
         assert!(w.groups()[1].kind.is_empty());
+    }
+
+    /// `together:` is a line of the group's own and round-trips.
+    #[test]
+    fn a_groups_together_is_its_own_line_and_round_trips() {
+        let gs = parse_groups("- 1  x3  a-1  a-2\n  together: yes\n- 2  a-3\n");
+        assert!(gs[0].together && !gs[1].together);
+        assert_eq!(gs[0].members, vec!["a-1", "a-2"]);
+        assert_eq!(parse_groups(&render_groups(&gs)), gs);
     }
 
     /// `stop-checks:` is one item to a line, beside the stop and not in it, and
