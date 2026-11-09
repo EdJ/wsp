@@ -1769,6 +1769,11 @@ pub fn review(store: &Store, args: &Args) -> i32 {
     if code != 0 {
         return code;
     }
+    // The project's `at_review:` (`wsp-592`), now the review is recorded:
+    // bounded, said in the logs, and never a reason to fail the review.
+    if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+        let _ = crate::at_stop::after_review(store, &t.id);
+    }
     // A warning and never a refusal, because this is exactly where `ui-007`
     // sits: nothing ahead of the trunk and right to be here. So it names what
     // it saw and leaves the judgement — and says nothing at all when the tree

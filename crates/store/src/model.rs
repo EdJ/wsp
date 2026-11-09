@@ -174,6 +174,10 @@ pub struct Project {
     /// removes that tree (see [`crate::at_stop`]); empty when the project has
     /// none, and then nothing runs.
     pub at_stop: String,
+    /// A shell command run in a member's tree when `wsp review` records its
+    /// review (`wsp-592`), to stop the servers and watchers it started; empty
+    /// when the project has none, and then nothing runs.
+    pub at_review: String,
     /// How long a row sits at `review` before the run closes it, once it is
     /// landed, verified and owed nothing: hours as a number, or `off`. Empty
     /// is the default, 24 hours. `wsp review --auto-close off|<hours>`.
@@ -227,6 +231,7 @@ impl Project {
             brief: doc.str("brief"),
             code_raw: doc.opt("code").unwrap_or_default(),
             at_stop: doc.opt("at_stop").unwrap_or_default(),
+            at_review: doc.opt("at_review").unwrap_or_default(),
             auto_close: doc.opt("auto_close").unwrap_or_default(),
             seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
             body: doc.body.clone(),
@@ -246,6 +251,9 @@ impl Project {
         // Only where there is one: nearly every project has none.
         if !self.at_stop.trim().is_empty() {
             d.set_str("at_stop", &self.at_stop);
+        }
+        if !self.at_review.trim().is_empty() {
+            d.set_str("at_review", &self.at_review);
         }
         if !self.auto_close.trim().is_empty() {
             d.set_str("auto_close", &self.auto_close);

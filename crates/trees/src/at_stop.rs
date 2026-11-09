@@ -18,6 +18,10 @@
 //! and not the trunk's, so it cannot go through `remove`). It runs while the
 //! tree is still there, because the command is *in* it.
 //!
+//! `at_review:` (`wsp-592`) is the same command under another key, run in the
+//! member's tree by [`after_review`] when `wsp review` records the review, so a
+//! project can stop what its member started once the work is handed over.
+//!
 //! # What it may not do
 //!
 //! It is bounded by [`LIMIT`], and one still running at the limit has its whole
@@ -117,6 +121,10 @@ fn tail_of(text: &str) -> String {
 /// The line that says what happened, for the logs. `None` for a clean exit
 /// with nothing to say, which is what a teardown that worked looks like.
 fn said(path: &str, ran: &Ran) -> String {
+    said_of("at_stop", path, ran)
+}
+
+fn said_of(key: &str, path: &str, ran: &Ran) -> String {
     let how = match &ran.ended {
         Ended::Exited(0) => "exit 0".to_string(),
         Ended::Exited(n) => format!("FAILED, exit {n}"),
@@ -125,26 +133,27 @@ fn said(path: &str, ran: &Ran) -> String {
         Ended::NotStarted(why) => format!("FAILED, did not start: {why}"),
     };
     match ran.tail.is_empty() {
-        true => format!("at_stop in {path}: {how}"),
-        false => format!("at_stop in {path}: {how}; output ends: {}", ran.tail),
+        true => format!("{key} in {path}: {how}"),
+        false => format!("{key} in {path}: {how}; output ends: {}", ran.tail),
     }
 }
 
-/// The `at_stop:` of the project whose repository `repo` is (or is a tree of).
-fn command_for(store: &Store, repo: &Path) -> Option<String> {
+/// The command a project keeps under `pick` (`at_stop` or `at_review`), for the
+/// project whose repository `repo` is (or is a tree of).
+fn command_of(store: &Store, repo: &Path, pick: fn(&crate::model::Project) -> &String) -> Option<String> {
     let trunk = crate::cmd_checkout::trunk(repo).unwrap_or_else(|| repo.to_path_buf());
     let trunk = util::real(&trunk.display().to_string());
     store
         .projects()
         .into_iter()
-        .filter(|p| !p.at_stop.trim().is_empty())
+        .filter(|p| !pick(p).trim().is_empty())
         .find(|p| {
             p.roots
                 .iter()
                 .filter_map(|r| crate::check_tree::repo_of(r))
                 .any(|r| util::real(&r.display().to_string()) == trunk)
         })
-        .map(|p| p.at_stop)
+        .map(|p| pick(&p).clone())
 }
 
 /// Whether the project of `t` declares an `at_stop:`, and so its seat may have
@@ -166,13 +175,33 @@ pub fn declared(store: &Store, t: &crate::model::Task) -> bool {
 /// nothing in the store says `repo` is a project's, or when that project has no
 /// `at_stop:`.
 pub fn run_for(store: &Store, repo: &Path, dir: &Path, limit: Duration) -> Option<Ran> {
+    run_key(store, repo, dir, limit, "at_stop", |p| &p.at_stop)
+}
+
+/// The project's `at_review:` (`wsp-592`), run in the member's tree when
+/// `wsp review` records the review: so a project can stop the servers and
+/// watchers its member started once the work is handed over. Same runner as
+/// `at_stop:` — bounded, said in `cycle.log` and the row, never blocking.
+pub fn after_review(store: &Store, row: &str) -> Option<Ran> {
+    let dir = crate::cmd_checkout::member_tree(store, row)?;
+    run_key(store, &dir.clone(), &dir, limit(), "at_review", |p| &p.at_review)
+}
+
+fn run_key(
+    store: &Store,
+    repo: &Path,
+    dir: &Path,
+    limit: Duration,
+    key: &str,
+    pick: fn(&crate::model::Project) -> &String,
+) -> Option<Ran> {
     if !dir.join(".git").exists() {
         return None;
     }
-    let command = command_for(store, repo)?;
+    let command = command_of(store, repo, pick)?;
     let ran = run_command(dir, &command, limit);
     let path = util::contract(dir);
-    let line = said(&path, &ran);
+    let line = said_of(key, &path, &ran);
     crate::store::log_line(store, &line);
     // A seat's tree is named for its row; a check's or a leg's is not, and has
     // no row of its own to write to.
@@ -300,6 +329,40 @@ mod tests {
         assert!(out.iter().any(|t| matches!(t, crate::cmd_checkout::Tree::Removed { .. })), "no tree was taken");
         assert!(!check.exists());
         assert!(env.path("check-marker").exists(), "the check tree's teardown did not run");
+    }
+
+    /// `wsp-592`: the review's hook runs in the member's tree, and only where
+    /// the project has the key.
+    #[test]
+    fn a_review_runs_the_projects_at_review_in_the_members_tree() {
+        let (env, store, repo, dir) = scratch("review", "");
+        std::env::set_var("MARKER_DIR", env.path(""));
+        let mut p = store.project("p").unwrap();
+        p.at_review = "pwd > \"$MARKER_DIR/review-marker\"".into();
+        store.save_project(&p).unwrap();
+        let mut t = crate::model::Task::new("a row", "p-001");
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+        let _ = repo;
+
+        let ran = after_review(&store, "p-001").expect("it did not run");
+        assert_eq!(ran.ended, Ended::Exited(0));
+        let marker = std::fs::read_to_string(env.path("review-marker")).unwrap();
+        assert!(marker.trim().ends_with("p-001"), "{marker}");
+        assert!(dir.exists(), "the tree went");
+        let row = store.task("p-001").unwrap();
+        assert!(row.body.contains("at_review in"), "the row's log: {}", row.body);
+    }
+
+    #[test]
+    fn a_review_in_a_project_without_the_key_runs_nothing() {
+        let (env, store, _repo, _dir) = scratch("review-none", "touch \"$MARKER_DIR/stop-ran\"");
+        std::env::set_var("MARKER_DIR", env.path(""));
+        let mut t = crate::model::Task::new("a row", "p-001");
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+        assert!(after_review(&store, "p-001").is_none());
+        assert!(!env.path("stop-ran").exists(), "at_stop ran at review");
     }
 
     #[test]
