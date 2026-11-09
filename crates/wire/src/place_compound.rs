@@ -315,6 +315,11 @@ fn compound_sup_binary() -> Option<PathBuf> {
 /// only ever had to point wsp at `$COMPOUND_SUP` keeps working without
 /// learning a second variable.
 fn compound_render_binary() -> Option<PathBuf> {
+    // A test's stand-in, per thread so no other test meets it.
+    #[cfg(test)]
+    if let Some(p) = tests::RENDER.with(|r| r.borrow().clone()) {
+        return Some(p);
+    }
     if let Some(p) = std::env::var_os("COMPOUND_RENDER") {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
@@ -371,6 +376,22 @@ fn trust_prompt(seat: &Seat, screen: &str) -> Option<String> {
 /// answers again, so a Claude Code whose hooks never fire is late rather than
 /// never told.
 const STARTING_WINDOW: i64 = 120;
+
+/// Whether the hooks log shows a turn begun at or after `since`, newest line
+/// first and out as soon as a line is older than the question.
+fn turn_in_log(log: &str, since: i64) -> bool {
+    for line in log.lines().rev() {
+        let Ok(h) = serde_json::from_str::<Value>(line) else { continue };
+        if util::epoch_of(&str_of(&h, "at")) < since {
+            return false;
+        }
+        // A nested session's prompt is not the seat's turn (`wsp-364`).
+        if str_of(&h, "hook") == "UserPromptSubmit" && h.get("child").is_none() {
+            return true;
+        }
+    }
+    false
+}
 
 /// Whether Claude Code's prompt is holding typed text, read off its screen —
 /// [`Place::typed`] for a `claude` seat. `None` when the screen holds no
@@ -620,6 +641,14 @@ impl Compound<'_> {
         // Claude-only: the start window is a fact about Claude Code's hooks; a
         // data kind has none and must not be taken for it.
         if kind == "claude" && started > 0 && at < started && util::epoch_secs() - started < STARTING_WINDOW {
+            // A far seat's hooks fire on the far machine and never write this
+            // seat's `said.json`, so the window would hold it `Starting` for its
+            // whole two minutes while its renderer served a drawn screen and its
+            // agent worked (wsp-589). The screen is the signal `wsp peek` reads;
+            // take it when it answers, and stay `Starting` when it does not.
+            if !str_of(rec, "machine").is_empty() {
+                return self.detected_state(seat, rec).filter(|s| *s != State::Unknown).unwrap_or(State::Starting);
+            }
             return State::Starting;
         }
         if at == 0 || util::epoch_secs().saturating_sub(at) > VOUCH_SECS {
@@ -1921,19 +1950,18 @@ impl Place for Compound<'_> {
     fn turn_began_since(&self, seat: &Seat, since: i64) -> Option<bool> {
         let dir = self.dir_of(seat).ok()?;
         // No log is *cannot say*, not *no turn*: a seat that predates the file.
-        let log = fs::read_to_string(dir.join(HOOKS_FILE)).ok()?;
-        // Newest first, and out as soon as a line is older than the question.
-        for line in log.lines().rev() {
-            let Ok(h) = serde_json::from_str::<Value>(line) else { continue };
-            if util::epoch_of(&str_of(&h, "at")) < since {
-                return Some(false);
-            }
-            // A nested session's prompt is not the seat's turn (`wsp-364`).
-            if str_of(&h, "hook") == "UserPromptSubmit" && h.get("child").is_none() {
-                return Some(true);
-            }
+        let log = fs::read_to_string(dir.join(HOOKS_FILE)).ok();
+        // A far seat's hooks fire over there and write nothing here, so a log
+        // that shows no turn is *cannot say* for it, not *no turn*: the caller
+        // then reads the seat's live state, which a far screen answers
+        // (wsp-589). Only a turn actually seen is a turn.
+        let far = self.record(seat).ok().is_some_and(|r| !str_of(&r, "machine").is_empty());
+        let began = log.as_deref().map(|log| turn_in_log(log, since));
+        match (far, began) {
+            (true, Some(true)) => Some(true),
+            (true, _) => None,
+            (false, began) => began,
         }
-        Some(false)
     }
 
     fn census(&self) -> Result<Census> {
@@ -2918,6 +2946,69 @@ mod tests {
 
         let _ = write_atomic(&dir.join(SEAT_FILE), &started(now, "opencode"));
         assert_ne!(place.state(&seat).unwrap(), State::Starting, "opencode fires no hooks to wait for");
+    }
+
+    thread_local! {
+        /// A stand-in `compound-render` for this thread's calls to
+        /// [`compound_render_binary`].
+        pub(super) static RENDER: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// **A far seat's screen is its readiness, and its turn is read off its
+    /// state** (wsp-589). The far agent's hooks fire over there and write
+    /// nothing here, so the start window held a far seat `Starting` while its
+    /// renderer served a working screen (`wsp spawn --on`: *never became ready*;
+    /// `wsp tell`: *delivered, no turn seen*, both on a seat that worked).
+    #[test]
+    fn a_far_seat_reads_ready_off_its_screen_and_its_silent_hooks_are_not_no_turn() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        let (far, root) = far_script("ready", false, false);
+        let place = Compound { far: &far, ..Compound::at(root.join("seats")) };
+        let seat = Seat::new("cpd-f1");
+        let dir = place.dir_of(&seat).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let sock = root.join("s.sock");
+        // Accepts and drops, so the supervisor-side fallback read fails at once
+        // instead of waiting on a socket that never answers.
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || for _ in listener.incoming() {});
+        let now = util::epoch_secs();
+        let _ = write_atomic(
+            &dir.join(SEAT_FILE),
+            &json!({
+                "machine": "mb2", "socket": sock, "render_socket": root.join("s.rsock"),
+                "started_at": util::iso_at(now),
+                "agent": { "kind": "claude", "name": "a", "args": [] },
+            })
+            .to_string(),
+        );
+
+        // No renderer to ask: still starting, which is the honest word.
+        assert_eq!(place.state(&seat).unwrap(), State::Starting, "no screen, no hook");
+
+        let render = root.join("compound-render");
+        fs::write(&render, "#!/bin/sh\ncase \"$1\" in state) echo working;; *) echo '001|hi';; esac\n").unwrap();
+        fs::set_permissions(&render, fs::Permissions::from_mode(0o755)).unwrap();
+        RENDER.with(|r| *r.borrow_mut() = Some(render.clone()));
+        assert_eq!(place.state(&seat).unwrap(), State::Working, "the renderer serves a working screen: no hook is needed");
+        fs::write(&render, "#!/bin/sh\ncase \"$1\" in state) echo idle;; *) echo '001|hi';; esac\n").unwrap();
+        assert!(place.state(&seat).unwrap().will_take_a_prompt(), "an idle screen takes a prompt");
+        fs::write(&render, "#!/bin/sh\ncase \"$1\" in state) echo unknown;; *) echo '001|hi';; esac\n").unwrap();
+        assert_eq!(place.state(&seat).unwrap(), State::Starting, "a screen that says nothing keeps it starting");
+
+        // The hooks log is local and a far agent never writes it.
+        assert_eq!(place.turn_began_since(&seat, now), None, "no log: cannot say");
+        let _ = fs::write(dir.join(HOOKS_FILE), format!("{}\n", json!({ "at": util::iso_at(now - 5), "hook": "SessionStart" })));
+        assert_eq!(place.turn_began_since(&seat, now), None, "a far log showing no turn is cannot-say, not no-turn");
+        let _ = fs::write(
+            dir.join(HOOKS_FILE),
+            format!("{}\n", json!({ "at": util::iso_at(now + 1), "hook": "UserPromptSubmit" })),
+        );
+        assert_eq!(place.turn_began_since(&seat, now), Some(true), "a turn seen is a turn");
+
+        RENDER.with(|r| *r.borrow_mut() = None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Claude Code's prompt is the box under the last rule, and a sentence

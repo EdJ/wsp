@@ -3151,7 +3151,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 // display sleeps, a renderer that cannot start (wsp-583):
                 // say that, not the symptom.
                 let e = match args.get("on").and_then(|on| store.machine(&on)) {
-                    Some(m) => crate::far::with_far_cause(e, &m, &crate::far::Ssh),
+                    Some(m) => {
+                        // Ready by the screen means the display is no cause (wsp-589).
+                        let seen = place.state(&seat).is_ok_and(|s| s.will_take_a_prompt() || s.turn_in_flight());
+                        crate::far::with_far_cause(e, &m, &crate::far::Ssh, seen)
+                    }
                     None => e,
                 };
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");

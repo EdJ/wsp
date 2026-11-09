@@ -720,9 +720,11 @@ pub fn asleep_words(m: &Machine, wire: &dyn Wire) -> Option<String> {
 
 /// A far start's error, with the cause appended when it is the far display: only
 /// a start that "never became ready" is looked into, and a probe that cannot
-/// say leaves the error as it was.
-pub fn with_far_cause(e: String, m: &Machine, wire: &dyn Wire) -> String {
-    if !e.contains("never became ready") {
+/// say leaves the error as it was. `seen` is whether the seat's screen reads
+/// now (the signal `wsp peek` uses): a renderer that serves a screen is not
+/// stopped by the display, whatever its power state (wsp-589).
+pub fn with_far_cause(e: String, m: &Machine, wire: &dyn Wire, seen: bool) -> String {
+    if seen || !e.contains("never became ready") {
         return e;
     }
     match asleep_words(m, wire) {
@@ -1347,13 +1349,17 @@ mod tests {
     fn a_far_start_that_never_became_ready_gets_the_cause_and_no_other_error_does() {
         let m = machine();
         let e = "claude started but never became ready for input".to_string();
-        let asleep = with_far_cause(e.clone(), &m, &display(Ok("display 0")));
+        let asleep = with_far_cause(e.clone(), &m, &display(Ok("display 0")), false);
         assert!(asleep.starts_with(&format!("{e}: ")) && asleep.contains("asleep"), "{asleep}");
-        assert_eq!(with_far_cause(e.clone(), &m, &display(Ok("display 4"))), e);
-        assert_eq!(with_far_cause(e.clone(), &m, &display(Err(Failed::Link("down".into())))), e);
+        assert_eq!(with_far_cause(e.clone(), &m, &display(Ok("display 4")), false), e);
+        assert_eq!(with_far_cause(e.clone(), &m, &display(Err(Failed::Link("down".into()))), false), e);
         let other = display(Ok("display 0"));
-        assert_eq!(with_far_cause("no such pane".into(), &m, &other), "no such pane");
+        assert_eq!(with_far_cause("no such pane".into(), &m, &other, false), "no such pane");
         assert!(other.asked.borrow().is_empty(), "another error is not probed for");
+        // A seat whose screen reads is not held back by the display: no words, no probe.
+        let up = display(Ok("display 0"));
+        assert_eq!(with_far_cause(e.clone(), &m, &up, true), e);
+        assert!(up.asked.borrow().is_empty(), "a readable screen is not probed past");
     }
 
     fn machine() -> Machine {
