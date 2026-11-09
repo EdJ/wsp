@@ -381,6 +381,20 @@ impl<'a> Gate<'a> {
         false
     }
 
+    /// [`Gate::admits`] for a start that replaces one of the same name which
+    /// was launched and has made no claim (`wsp-549`): that start holds a place
+    /// of its own in the count until [`WEDGED_AFTER`], and the one that
+    /// replaces it takes that place over, so it is not counted against itself.
+    pub(crate) fn admits_again(&self, what: &str) -> bool {
+        let Some(cap) = self.cap else { return true };
+        let now: Vec<Counted> = self.working().into_iter().filter(|c| c.seat.is_some() || c.what != what).collect();
+        if now.len() < cap {
+            return true;
+        }
+        self.held.borrow_mut().push((what.to_string(), now));
+        false
+    }
+
     pub(crate) fn take_held(&self) -> Vec<(String, Vec<Counted>)> {
         self.held.borrow_mut().drain(..).collect()
     }
@@ -423,7 +437,7 @@ pub(crate) fn waiting_lines(store: &Store, seen: &[crate::place::Seated]) -> Vec
     }
     let states: BTreeMap<&str, State> = seen.iter().map(|s| (s.seat.as_str(), s.state)).collect();
     let holders = working(&Records::read(store), &|seat| Look::of_state(states.get(seat).copied()));
-    let mut out = vec![format!("waiting at the cap of {cap}, held by {}:", names(&holders))];
+    let mut out = vec![format!("waiting for a seat slot ({} of {cap}: {}):", holders.len(), names(&holders))];
     for (what, owner, since) in waits {
         let age = match since.is_empty() {
             true => String::new(),
@@ -636,7 +650,7 @@ mod tests {
         assert!(waiting_lines(&store, &seen).is_empty(), "nothing waits");
         store.set_capped("run", Some(json!({ "m-2": util::now_iso() })));
         let lines = waiting_lines(&store, &seen);
-        assert_eq!(lines[0], "waiting at the cap of 1, held by h-1 in w2:p1:");
+        assert_eq!(lines[0], "waiting for a seat slot (1 of 1: h-1 in w2:p1):");
         assert!(lines[1].starts_with("  m-2 (run)"), "{lines:?}");
     }
 

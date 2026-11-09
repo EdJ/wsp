@@ -1547,10 +1547,20 @@ fn take_member(
         }
         let ours = t.section("Log").and_then(|l| l.lines().last().map(|x| x.contains(STARTED_BY))).unwrap_or(false);
         let mut reseat = None;
+        let mut gated = false;
         let why = match t.status() {
             Status::Todo if !claims.contains_key(&id) => "new",
             Status::Doing if prerequisite.is_some() && !spent => "again: its prerequisite landed",
             Status::Doing if ours && wedged(&t, &claims) && !spent => {
+                // A start the room holds is queued and is not a miss (wsp-549):
+                // the group's cap and the seat's are asked *before* a try is
+                // counted, so a row waiting for a slot loses none, however
+                // many passes it waits. Only a start that was launched and
+                // made no claim is counted.
+                if cap.is_some_and(|c| members_going(store, members, &id, &claims) >= c) || !gate.admits_again(&id) {
+                    return None;
+                }
+                gated = true;
                 if !retry_lost_start(store, &id, &id, &id, &format!("`wsp worklist advance {list}`")) {
                     return None;
                 }
@@ -1576,7 +1586,7 @@ fn take_member(
         }
         // The seat's cap, after the group's: a group under its own `xN` may
         // still find the machine full, and what is said is the machine.
-        if !gate.admits(&id) {
+        if !gated && !gate.admits(&id) {
             return None;
         }
         let policy = store.worklist(list)?.groups().get(at - 1)?.policy_for(&id)?;
@@ -9026,6 +9036,39 @@ fn only_a_working_screen_is_ever_overruled() {
 
     fn said(store: &Store) -> String {
         std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default()
+    }
+
+    /// wsp-549 (compounding-200, wsp-502): a start the seat's cap holds is queued
+    /// and uses no try. A row whose last start went quiet, passed over for many
+    /// passes at the cap, is not given up on; when a slot frees it starts, and
+    /// that start is the first miss and not the third.
+    #[test]
+    fn a_start_held_at_the_cap_uses_no_try_and_starts_when_a_slot_frees() {
+        let (_env, store) = scratch("queued-at-cap");
+        task(&store, "m-1", Status::Doing);
+        task(&store, "h-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        store.set_seat_cap(Some(1)).unwrap();
+        left_unseated(&store, "m-1", &[&format!("{STARTED_BY} run group 1")], 100);
+        // Another start in flight holds the one place.
+        let mut h = store.find_task("h-1").unwrap();
+        h.log(&format!("{STARTED_BY} other group 1"));
+        store.save_task(&h).unwrap();
+
+        for _ in 0..6 {
+            step(&store, &w, &Blind);
+            assert!(spawned().is_empty(), "the seat is full");
+            assert!(!crate::starts::held(&store, "m-1"), "and the wait is not a miss");
+            assert!(store.starts().get("m-1").is_none(), "no try used");
+        }
+        assert!(!said(&store).contains("giving up"), "{}", said(&store));
+        assert!(!said(&store).contains("starting again, try"), "{}", said(&store));
+        assert!(store.capped().get("run").is_some(), "queued, for wip to read");
+
+        set(&store, "h-1", Status::Done);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "started as soon as a slot freed");
+        assert_eq!(store.starts().get("m-1").and_then(|e| e["tries"].as_u64()), Some(1), "one try, the launched one");
     }
 
     /// wsp-524, the first case: a start that failed its three tries while the
