@@ -36,6 +36,11 @@ TASKS
                                     all of them; --pieces prints each piece
                                     whole
   wsp start|review <id>           move through the workflow
+  wsp review --auto-close off|<hours> -p <proj>
+                                a row at review closes itself (`done`) once
+                                landed, verified, owed nothing and quiet that
+                                long (24 by default); `wsp review <id> "…"
+                                --hold-review` keeps one for the person
   wsp reopen|todo <id> "what is owed" [--no-seat]
                                 send work back: moves the row, tells
                                 its pane, and stops the run reading it as
@@ -800,7 +805,9 @@ PLUMBING
                                     group it names, and a seat or an agent may
                                     raise one and never close one
   wsp yours [-p <proj>] [--json]    what waits on the person, and how many rows
-                                    wait at review (a count, not items)
+                                    wait at review (a count, not items), and how
+                                    many the run closed since you looked;
+                                    --closed lists those and counts as looking
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
                                     --reap ends claims whose workspace is gone
   wsp adopt [--yes]                 turn live workspaces into tasks
