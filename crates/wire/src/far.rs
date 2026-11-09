@@ -488,15 +488,18 @@ pub fn token_path(m: &Machine) -> String {
 ///
 /// `env` rides in front of `compound-sup` as `env K=V`, and an empty value is
 /// `env -u K` — the same "override, never replace" contract the local backend
-/// keeps. Names that are not shell identifiers are dropped.
+/// keeps. Names that are not shell identifiers are dropped, and so is `PATH`: the
+/// far agent's is the far machine's own with `<exec_dir>/bin` in front.
 pub fn seat_command(m: &Machine, label: &str, cwd: &str, env: &BTreeMap<String, String>, program: &str, args: &[String]) -> String {
     let token = token_path(m);
     let msg = format!("no Claude token at {token} on {} (claude setup-token there)", m.name);
     let before = format!("t=$(cat {} 2>/dev/null) && [ -n \"$t\" ] || {{ echo {} >&2; exit 1; }}; ", quote(&token), quote(&msg));
     // The executor's `bin` (the `wsp` shim and `wsp-trust`) first on the agent's
     // PATH, whatever else the machine has installed (`wsp-563`). Set in the far
-    // shell, where an assignment expands a leading `~/`; a PATH in `env` below
-    // is the caller's own and still wins.
+    // shell, where an assignment expands a leading `~/`. A PATH in `env` below
+    // is the controller's own (`throttle::seat_env` sends `<shims>:<its PATH>`),
+    // meaningless on this machine and able to override the shim, so it is never
+    // sent: the far seat loses the cargo throttle shim, deliberately.
     let before = format!("{before}{}; ", path_with_shim(m));
     let mut pre = String::from("CLAUDE_CODE_OAUTH_TOKEN=\"$t\" env ");
     // `env` stops reading options at the first NAME=value (POSIX, and macOS's), so
@@ -505,7 +508,7 @@ pub fn seat_command(m: &Machine, label: &str, cwd: &str, env: &BTreeMap<String, 
         .iter()
         .filter(|(k, _)| {
             let ident = !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !k.starts_with(|c: char| c.is_ascii_digit());
-            ident && k.as_str() != "CLAUDE_CODE_OAUTH_TOKEN"
+            ident && k.as_str() != "CLAUDE_CODE_OAUTH_TOKEN" && k.as_str() != "PATH"
         })
         .collect();
     for (k, _) in named.iter().filter(|(_, v)| v.is_empty()) {
@@ -1310,7 +1313,14 @@ mod tests {
 
         let seen = dir.join("seen");
         let probe = format!("echo \"$(command -v wsp)\" > {}; echo \"${{PATH%%:*}}\" >> {}", seen.display(), seen.display());
-        let cmd = seat_command(&m, "cpd-1", &dir.display().to_string(), &BTreeMap::new(), "sh", &["-c".into(), probe]);
+        // The env `spawn --on` really produces: `throttle::seat_env`'s PATH, the
+        // controller's shims ahead of the controller's own PATH.
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "/ctl/state/wsp/shims:/ctl/bin:/usr/bin:/bin".to_string());
+        env.insert("WSP_ROW".to_string(), "wsp-1".to_string());
+        let cmd = seat_command(&m, "cpd-1", &dir.display().to_string(), &env, "sh", &["-c".into(), probe]);
+        assert!(!cmd.contains("/ctl/"), "the controller's PATH is never sent: {cmd}");
+        assert!(cmd.contains("WSP_ROW=") , "{cmd}");
         let default_path = format!("{}:/usr/bin:/bin", stale.display());
         let out = Command::new("/bin/sh").arg("-c").arg(&cmd).env("PATH", &default_path).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
