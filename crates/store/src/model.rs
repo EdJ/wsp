@@ -174,6 +174,10 @@ pub struct Project {
     /// removes that tree (see [`crate::at_stop`]); empty when the project has
     /// none, and then nothing runs.
     pub at_stop: String,
+    /// How long a row sits at `review` before the run closes it, once it is
+    /// landed, verified and owed nothing: hours as a number, or `off`. Empty
+    /// is the default, 24 hours. `wsp review --auto-close off|<hours>`.
+    pub auto_close: String,
     /// Highest number this project has handed out — a hint, not the truth.
     ///
     /// [`crate::store::Store::alloc_task_id`] reads it to skip the directory
@@ -223,6 +227,7 @@ impl Project {
             brief: doc.str("brief"),
             code_raw: doc.opt("code").unwrap_or_default(),
             at_stop: doc.opt("at_stop").unwrap_or_default(),
+            auto_close: doc.opt("auto_close").unwrap_or_default(),
             seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
             body: doc.body.clone(),
         }
@@ -241,6 +246,9 @@ impl Project {
         // Only where there is one: nearly every project has none.
         if !self.at_stop.trim().is_empty() {
             d.set_str("at_stop", &self.at_stop);
+        }
+        if !self.auto_close.trim().is_empty() {
+            d.set_str("auto_close", &self.auto_close);
         }
         d.set_str("seq", &self.seq.to_string());
         d.set_str("schema", SCHEMA);

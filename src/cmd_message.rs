@@ -1183,6 +1183,25 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
         },
         None => None,
     };
+    if args.has("closed") {
+        // The listing is the look: what the run closed is no longer unseen.
+        let rows = crate::auto_close::closed_rows(store);
+        let unseen = crate::auto_close::unseen(store);
+        if args.json() {
+            let out: Vec<_> = rows.iter().map(|(at, id)| json!({ "at": at, "id": id, "unseen": unseen.iter().any(|u| u.1 == *id && u.0 == *at) })).collect();
+            println!("{}", serde_json::to_string_pretty(&json!({ "closed_by_the_run": out })).unwrap_or_default());
+        } else if rows.is_empty() {
+            println!("{}", Paint::new().dim("the run has closed no rows"));
+        }
+        if !args.json() {
+            for (at, id) in &rows {
+                let new = if unseen.iter().any(|u| u.1 == *id && u.0 == *at) { "*" } else { " " };
+                println!("{new} {at}  {id}  {}", store.task(id).map(|t| t.title).unwrap_or_default());
+            }
+        }
+        crate::auto_close::looked(store);
+        return 0;
+    }
     let items = yours_in(store, project.as_deref());
     let review = store
         .tasks()
@@ -1201,6 +1220,7 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
                 "project": project,
                 "items": items.iter().map(|q| item_json(store, q)).collect::<Vec<_>>(),
                 "review": review,
+                "closed_by_the_run": crate::auto_close::unseen(store).len(),
                 "retro": crate::retro_yours::yours_lines(store),
                 // The person's questions closed in the last ten minutes, so a
                 // reader can tell *answered in the pane* from *gone*.
@@ -1247,6 +1267,10 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
     }
     if review > 0 {
         println!("{}", p.dim(&format!("{review} at review, waiting on `wsp done` — not items")));
+    }
+    let closed = crate::auto_close::unseen(store).len();
+    if closed > 0 {
+        println!("{}", p.dim(&format!("{closed} row(s) closed by the run since you last looked — `wsp yours --closed` lists them")));
     }
     0
 }
@@ -1995,7 +2019,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Plumbing,
                 order: 350,
                 text: r##"  wsp yours [-p <proj>] [--json]    what waits on the person, and how many rows
-                                    wait at review (a count, not items)"##,
+                                    wait at review (a count, not items), and how
+                                    many the run closed since you looked;
+                                    --closed lists those and counts as looking"##,
             },
         ],
     },

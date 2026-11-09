@@ -1605,6 +1605,20 @@ pub fn block(store: &Store, args: &Args) -> i32 {
 pub fn review(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
         "wsp review <id> \"what you did, and what you left\"   (or `-` to read it from stdin)";
+    // `wsp review --auto-close off|<hours> -p <project>`: a project's setting, no row.
+    if let Some(word) = args.get("auto-close") {
+        let project = args.get("project").or_else(|| args.get("p"));
+        return match crate::auto_close::set_setting(store, &word, project.as_deref()) {
+            Ok(said) => {
+                println!("{said}");
+                0
+            }
+            Err(why) => {
+                eprintln!("wsp: {why}");
+                2
+            }
+        };
+    }
     // Given no account: the one written at the place wsp keeps for it (`wsp-374`,
     // `$WSP_VERDICT`), when it was written in this run of the row.
     if let Some((from_file, written)) = crate::closing::member_args(store, args) {
@@ -1733,8 +1747,12 @@ pub fn review(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     }
+    let hold = args.has("hold-review");
     let code = mutate_saying(store, args, "review", said.as_deref(), |t| {
         t.set_status(Status::Review);
+        if hold && !t.tags.iter().any(|g| g == crate::auto_close::HOLD) {
+            t.tags.push(crate::auto_close::HOLD.into());
+        }
 
         // `review: …`, the shape `blocked:` and `parked:` already have — the
         // transition is implied by the prefix and the sentence is the entry.
@@ -3492,7 +3510,17 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     crate::verbs::Verb {
         names: &["review"],
         run: review,
-        help: &[],
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 99,
+                text: r##"  wsp review --auto-close off|<hours> -p <proj>
+                                a row at review closes itself (`done`) once
+                                landed, verified, owed nothing and quiet that
+                                long (24 by default); `wsp review <id> "…"
+                                --hold-review` keeps one for the person"##,
+            },
+        ],
     },
     crate::verbs::Verb {
         names: &["reopen"],

@@ -44,6 +44,8 @@ pub const BOOL_FLAGS: &[&str] = &[
     "keep-tree",
     // And `reopen`, whose positionals are the id and the reason.
     "no-seat",
+    // `wsp review <id> "…" --hold-review` and `wsp yours --closed` (`wsp-547`).
+    "hold-review", "closed",
     // And `govern`, whose positional is a project: `wsp spawn -p wsp --govern`
     // and `wsp govern wsp --remove` both put the flag last, where anything not
     // known here swallows the argument after it. `--rotate` is the same shape:

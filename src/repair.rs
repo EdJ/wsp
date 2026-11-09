@@ -369,6 +369,10 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // (`wsp-327`): `wsp done` takes the tree, and rows wait at review for days.
     wsp_base::calls::phase("sweep:build-output");
     crate::build_output::tidy(store);
+    // And the rows at review nothing is owed on, closed in one commit
+    // (`wsp-547`), before the scratch sweep so a closed row's is read as closed.
+    wsp_base::calls::phase("sweep:auto-close");
+    crate::auto_close::tidy(store);
     // And whether the disk those trees are on is running out.
     // And the scratch of rows that have closed (`wsp-373`).
     wsp_base::calls::phase("sweep:scratch");
