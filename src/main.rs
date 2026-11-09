@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+mod address;
 mod affected;
 pub(crate) use wsp_trees::{at_stop, check_tree, cmd_checkout, cmd_verify, gc, greens, guard, overlap, throttle, treecopy, warm};
 mod base;

@@ -1433,7 +1433,8 @@ fn run_owner() -> Option<String> {
 pub fn tell(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let Some(needle) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp tell <id> \"…\"   (or `-` to read it from stdin)");
+        eprintln!("usage: wsp tell <id|address> \"…\"   (or `-` to read it from stdin)");
+        eprintln!("       an address: primary, governor:<list|project>, seat:<row>, verifier:<row>, check:<list>, list:<name>");
         return 2;
     };
     let text = match message(args) {
@@ -1447,12 +1448,31 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // right answer for "show me what this looks like" and a hazard for a verb
     // that types prose into whatever it lands on. This resolves the two things
     // that can hold an agent and nothing else.
-    let (seat, what) = match target(store, &needle, &compound_holds) {
-        Some(v) => v,
-        None => {
-            eprintln!("wsp: nothing holds `{needle}` — `wsp wip` says who holds what");
-            return 1;
-        }
+    // An address (`primary`, `governor:<scope>`, `seat:<row>`, …) names a
+    // post rather than a row, and resolves first; a bare word is a row or a
+    // seat id, as it always was. See [`crate::address`].
+    let addressed = crate::address::parse(&needle);
+    let (seat, what) = match &addressed {
+        Some(addr) => match addressed_seat(store, addr) {
+            Ok(v) => v,
+            Err(why) => {
+                eprintln!("wsp: `{needle}`: {why}");
+                return 1;
+            }
+        },
+        None => match target(store, &needle, &compound_holds) {
+            Some(v) => v,
+            None => {
+                eprintln!("wsp: nothing holds `{needle}` — `wsp wip` says who holds what");
+                return 1;
+            }
+        },
+    };
+    // What `wsp peek` and `--anyway` are told to name: the seat, for an
+    // address, since neither verb reads one.
+    let peek = match addressed {
+        Some(_) => seat.clone(),
+        None => needle.clone(),
     };
 
     // Asked of every backend wsp can spawn onto (`compound-077`), not herdr
@@ -1485,7 +1505,10 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     if row.agent.kind.is_empty() {
-        eprintln!("wsp: no agent in {seat} — the pane is alive and empty. `wsp spawn {needle}` puts one in it");
+        match addressed {
+            Some(_) => eprintln!("wsp: no agent in {seat} — the pane is alive and empty"),
+            None => eprintln!("wsp: no agent in {seat} — the pane is alive and empty. `wsp spawn {needle}` puts one in it"),
+        }
         return 1;
     }
     // The one state a message must not be sent into, and the reason it is
@@ -1497,7 +1520,7 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // whichever backend answered.
     if let Some(wait) = crate::waiting::on_screen(row.state) {
         eprintln!("wsp: {what} is {} — answer that first", wait.sentence());
-        eprintln!("     `wsp peek {needle}` shows what it is asking");
+        eprintln!("     `wsp peek {peek}` shows what it is asking");
         return 1;
     }
 
@@ -1510,18 +1533,37 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
             "wsp: {what} cannot say whether it is at a prompt — it reads {}",
             row.state.as_str()
         );
-        eprintln!("     look first, then `wsp tell {needle} --anyway -` if it is waiting");
+        eprintln!("     look first, then `wsp tell {peek} --anyway -` if it is waiting");
         return 1;
     }
 
     let how = crate::agent_commands::of(&row.agent.kind);
-    let sent = Sent::new(&addressee_id(store, &needle, &what), &what, &seat, &needle, &text, args);
+    let addressee = match addressed {
+        Some(_) => needle.clone(),
+        None => addressee_id(store, &needle, &what),
+    };
+    let sent = Sent::new(&addressee, &what, &seat, &peek, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
             return twice(&sent, ago, &p);
         }
     }
     delivered(store, how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &text), &sent)
+}
+
+/// The one seat an address names, as `target` answers: the pane and the post.
+///
+/// `list:` names every seat on a list, and delivering to more than one is not
+/// built yet; a list with one seat on it is that seat, and one with more is
+/// refused with the seats named, so the person can tell each.
+fn addressed_seat(store: &Store, addr: &crate::address::Address) -> Result<(String, String), String> {
+    let mut found = crate::address::resolve(addr, &crate::address::Book::read(store))?;
+    if found.len() > 1 {
+        let seats: Vec<String> = found.iter().map(|n| format!("{} ({})", n.pane, n.what)).collect();
+        return Err(format!("names {} seats and a tell goes to one — tell each: {}", found.len(), seats.join(", ")));
+    }
+    let n = found.remove(0);
+    Ok((n.pane, n.what))
 }
 
 /// The addressee of a direct tell as an id — the task's id, or the seat or pane
