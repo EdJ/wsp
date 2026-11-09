@@ -592,6 +592,11 @@ fn main() {
         wsp_base::calls::exit(2);
     }
 
+    // The far tree's `Stop` hook: copy the changed files back, run nothing.
+    if let Some(code) = treecopy::checkpoint_from_executor(&store, &args.cmd) {
+        wsp_base::calls::exit(code);
+    }
+
     // A call the executor's shim forwarded: its tree verbs sync the agent's work
     // back first and run on the seat's tree; checkout and land are refused.
     match treecopy::from_executor(&store, &args.cmd) {

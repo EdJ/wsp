@@ -1106,8 +1106,22 @@ pub fn gate_timeout(m: &Machine) -> u32 {
     m.lease_secs() + 60
 }
 
+/// The `Stop` hook command of a far seat (`docs/remote-agents.md` section 6,
+/// "Checkpoint"): the shim's `checkpoint`, which has the seat copy the files that
+/// changed back at the end of every turn. Absolute, because the hook does not
+/// get the agent's `PATH`; silent and always successful, because a `Stop` hook
+/// that exits 2 keeps the agent working, and a checkpoint missed on a down link
+/// is caught by the next turn's, or by `review`.
+pub fn checkpoint_command(m: &Machine) -> String {
+    format!("{} checkpoint >/dev/null 2>&1 || true", quote(&format!("{}/wsp", shim_dir(m))))
+}
+
+/// How long a checkpoint may take: a copy-back is a manifest on each side and
+/// the files that differ.
+pub const CHECKPOINT_TIMEOUT_SECS: u32 = 300;
+
 /// `existing` (the far tree's `.claude/settings.json`, empty when there is none)
-/// with the gate under `hooks.PreToolUse`. An earlier gate entry is replaced and
+/// with the gate under `hooks.PreToolUse` and the checkpoint under `hooks.Stop`. An earlier gate entry is replaced and
 /// everything else is kept. An existing file that is not a JSON object is an
 /// error: it is somebody's configuration and is not overwritten.
 pub fn settings_with_gate(existing: &str, m: &Machine, seat: &str) -> Result<String, String> {
@@ -1128,6 +1142,14 @@ pub fn settings_with_gate(existing: &str, m: &Machine, seat: &str) -> Result<Str
     pre.push(serde_json::json!({
         "matcher": "",
         "hooks": [{ "type": "command", "command": gate_command(m, seat), "timeout": gate_timeout(m) }],
+    }));
+    let stop = hooks.entry("Stop").or_insert_with(|| serde_json::json!([]));
+    let Some(stop) = stop.as_array_mut() else { return Err("`hooks.Stop` in the far .claude/settings.json is not a list".into()) };
+    stop.retain(|entry| {
+        !entry["hooks"].as_array().into_iter().flatten().any(|h| h["command"].as_str().is_some_and(|c| c.contains("/wsp' checkpoint") || c.contains("/wsp checkpoint")))
+    });
+    stop.push(serde_json::json!({
+        "hooks": [{ "type": "command", "command": checkpoint_command(m), "timeout": CHECKPOINT_TIMEOUT_SECS }],
     }));
     serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())
 }
@@ -1953,6 +1975,26 @@ mod tests {
         assert!(h["timeout"].as_u64().unwrap() > 300);
         assert!(settings_with_gate("not json", &m, "cpd-7").unwrap_err().contains("not overwriting"));
         assert!(settings_with_gate("[]", &m, "cpd-7").is_err());
+    }
+
+    /// The far tree gets the turn-end checkpoint with the gate: the shim's
+    /// `checkpoint`, by absolute path, written once, beside any other `Stop` hook
+    /// the tree already has, and never able to fail the turn.
+    #[test]
+    fn the_far_tree_gets_a_stop_checkpoint_beside_the_gate_and_written_once() {
+        let mut m = machine();
+        m.exec_dir = "/far/exec".into();
+        let theirs = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]},"model":"x"}"#;
+        let once = settings_with_gate(theirs, &m, "cpd-7").unwrap();
+        assert_eq!(once, settings_with_gate(&once, &m, "cpd-7").unwrap(), "idempotent");
+        let v: serde_json::Value = serde_json::from_str(&once).unwrap();
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "theirs is kept, ours is added once");
+        assert_eq!(stop[0]["hooks"][0]["command"], "echo mine");
+        assert_eq!(stop[1]["hooks"][0]["command"], "'/far/exec/bin/wsp' checkpoint >/dev/null 2>&1 || true");
+        assert_eq!(v["model"], "x");
+        assert!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap().contains(" gate --exec-dir "));
+        assert!(settings_with_gate(r#"{"hooks":{"Stop":{}}}"#, &m, "cpd-7").is_err());
     }
 
     /// A machine is silent when its link is down, or when its beat has gone

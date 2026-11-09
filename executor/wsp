@@ -33,7 +33,9 @@
 #   4. Tree verbs (docs/remote-agents.md section 5). `verify`, `review` and
 #      `commit-help` are run with WSP_EXECUTOR_TREE=1, which makes the seat copy
 #      the agent's work back first (refusing on a stale conflict) and run on the
-#      seat's tree. `checkout` and `land` are refused here, with a sentence and
+#      seat's tree. `checkpoint` is the far tree's `Stop` hook (spawn writes it):
+#      the seat copies back the files that changed, and nothing else runs.
+#      `checkout` and `land` are refused here, with a sentence and
 #      without asking the seat: the row's worktree was made by the seat, and a
 #      verifier lands it.
 #
@@ -72,7 +74,7 @@ env="WSP_SEAT_ID=$(q "${WSP_SEAT_ID:-}")"
 env="$env WSP_PROJECT=$(q "${WSP_PROJECT:-}") WSP_TASK=$(q "${WSP_TASK:-}")"
 env="$env WSP_TERSE=$(q "${WSP_TERSE:-}") WSP_EXECUTOR=1"
 case "${1:-}" in
-    verify | review | commit-help) env="$env WSP_EXECUTOR_TREE=1" ;;
+    verify | review | commit-help | checkpoint) env="$env WSP_EXECUTOR_TREE=1" ;;
 esac
 
 # Not `exec`: the status is read here. Anything but 255 is the seat's own.

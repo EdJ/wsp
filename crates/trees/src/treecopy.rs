@@ -961,6 +961,34 @@ pub fn sync_before(copy: &Copy) -> Result<(), String> {
     ))
 }
 
+/// The verbs that run on the seat's tree, and so need the agent's work copied
+/// back first. The seat knows this list as well as the shim does: a call from an
+/// executor is synced whether or not the shim that forwarded it marked it, so a
+/// shim a release behind cannot leave a `review` unsynced.
+pub const TREE_VERBS: [&str; 3] = ["verify", "review", "commit-help"];
+
+/// Does a call from an executor run on the seat's tree, and so need the agent's
+/// work copied back first? The shim says so with [`TREE_ENV`]; the verb's own
+/// name says so too, and either is enough.
+pub fn needs_sync(verb: &str, marked_by_the_shim: bool) -> bool {
+    marked_by_the_shim || TREE_VERBS.contains(&verb)
+}
+
+/// The executor row a call is for, with its tree and its copy: `WSP_TASK`, the
+/// seat's worktree for it, and the machine it was copied to.
+fn executor_copy(store: &Store) -> Result<(PathBuf, Copy), String> {
+    let row = std::env::var("WSP_TASK").ok().filter(|s| !s.is_empty()).ok_or("`wsp` from an executor needs WSP_TASK to find the row's tree")?;
+    let tree = crate::cmd_checkout::member_tree(store, &row).ok_or_else(|| format!("{row} has no worktree on the seat"))?;
+    let rec = record_of(store, &row).ok_or_else(|| format!("{row} has not been copied to an executor"))?;
+    let m = store
+        .machines()
+        .into_iter()
+        .find(|m| m.ssh == rec.host)
+        .ok_or_else(|| format!("no machine is reached as `{}`, where {row} was copied", rec.host))?;
+    let remote = Remote::of_machine(store, &m, &m.exec_dir);
+    Ok((tree.clone(), Copy::new(store, remote, &row, &tree)))
+}
+
 /// What the seat does with a verb the shim marked as an executor's: refuse
 /// `checkout` and `land`; for the tree verbs, sync back and return the seat's
 /// tree, which the verb then runs in. `None` for every other call.
@@ -971,22 +999,53 @@ pub fn from_executor(store: &Store, verb: &str) -> Option<Result<PathBuf, String
     if let Some(why) = executor_refusal(verb) {
         return Some(Err(why));
     }
-    if std::env::var_os(TREE_ENV).is_none() {
+    if !needs_sync(verb, std::env::var_os(TREE_ENV).is_some()) {
         return None;
     }
     Some((|| {
-        let row = std::env::var("WSP_TASK").ok().filter(|s| !s.is_empty()).ok_or("`wsp` from an executor needs WSP_TASK to find the row's tree")?;
-        let tree = crate::cmd_checkout::member_tree(store, &row).ok_or_else(|| format!("{row} has no worktree on the seat"))?;
-        let rec = record_of(store, &row).ok_or_else(|| format!("{row} has not been copied to an executor"))?;
-        let m = store
-            .machines()
-            .into_iter()
-            .find(|m| m.ssh == rec.host)
-            .ok_or_else(|| format!("no machine is reached as `{}`, where {row} was copied", rec.host))?;
-        let remote = Remote::of_machine(store, &m, &m.exec_dir);
-        sync_before(&Copy::new(store, remote, &row, &tree))?;
+        let (tree, copy) = executor_copy(store)?;
+        sync_before(&copy)?;
         Ok(tree)
     })())
+}
+
+/// `wsp checkpoint` from an executor, the far tree's `Stop` hook: copy back the
+/// files whose far hash differs from what the two sides last agreed on, and say
+/// what came. Files only: the agent's commits come with `verify` and `review`,
+/// because a patch applied on every turn would move the seat's HEAD under the
+/// agent. A path the seat changed too is named and left alone. The exit is 1
+/// when the copy could not be made; the hook ignores it, because a turn does not
+/// end on a missed checkpoint. `None` for every other call.
+pub fn checkpoint_from_executor(store: &Store, verb: &str) -> Option<i32> {
+    if verb != "checkpoint" || std::env::var_os(EXECUTOR_ENV).is_none() {
+        return None;
+    }
+    let (code, said) = match executor_copy(store) {
+        Ok((_, copy)) => checkpoint(&copy),
+        Err(why) => (1, format!("wsp: checkpoint: {why}")),
+    };
+    if code == 0 {
+        println!("{said}");
+    } else {
+        eprintln!("{said}");
+    }
+    Some(code)
+}
+
+/// The checkpoint itself: the files that changed, copied back, and a line saying
+/// how many (with every refused path under it). The code is 1 when the copy
+/// could not be made.
+pub fn checkpoint(copy: &Copy) -> (i32, String) {
+    match copy.copy_back() {
+        Err(why) => (1, format!("wsp: checkpoint: {why}")),
+        Ok(b) => {
+            let mut said = format!("checkpoint: {} copied, {} deleted, {} refused", b.copied.len(), b.deleted.len(), b.refused.len());
+            for s in &b.refused {
+                said.push_str(&format!("\n  {}", s.words()));
+            }
+            (0, said)
+        }
+    }
 }
 
 fn prune_empty_parents(root: &Path, file: &Path) {
@@ -1400,6 +1459,62 @@ mod tests {
         assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "person\n");
     }
 
+    /// A `review` the shim did not mark still syncs: the seat knows its tree
+    /// verbs as well as the shim does.
+    #[test]
+    fn a_tree_verb_syncs_whether_or_not_the_shim_marked_it() {
+        for v in TREE_VERBS {
+            assert!(needs_sync(v, false), "{v}");
+        }
+        assert!(needs_sync("anything", true), "the shim's mark is still enough");
+        for v in ["say", "note", "lease", "ls"] {
+            assert!(!needs_sync(v, false), "{v}");
+        }
+    }
+
+    /// `review` after the agent committed in the far tree: the commit's files are
+    /// in the seat's tree, and so is the commit, before the verb runs.
+    #[test]
+    fn a_review_after_a_far_commit_leaves_its_files_and_commit_in_the_seats_tree() {
+        let r = rig("review-commit", false);
+        r.copy.copy_up("trunk").unwrap();
+        let head = run(&r.seat, "git rev-parse HEAD");
+        run(&r.far(), "git config user.name Agent && git config user.email a@far && echo c1 > src/a.rs && echo made > src/new.rs && git add -A && git commit -qm 'the far change'");
+        assert!(!r.seat.join("src/new.rs").exists());
+        sync_before(&r.copy).unwrap();
+        assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "c1\n");
+        assert_eq!(fs::read_to_string(r.seat.join("src/new.rs")).unwrap(), "made\n");
+        assert_eq!(run(&r.seat, "git log -1 --format=%s").trim(), "the far change");
+        assert_ne!(run(&r.seat, "git rev-parse HEAD"), head);
+        assert_eq!(Manifest::of_dir(&r.seat).unwrap(), r.copy.remote.manifest(&r.far().display().to_string()).unwrap());
+    }
+
+    /// A turn end: the changed files come back, the seat's HEAD does not move
+    /// under the agent, a second one has nothing to send, and a path the seat
+    /// changed too is named and left alone without failing the turn.
+    #[test]
+    fn a_turn_end_checkpoint_copies_changed_files_and_names_a_stale_one() {
+        let r = rig("checkpoint", false);
+        r.copy.copy_up("trunk").unwrap();
+        let head = run(&r.seat, "git rev-parse HEAD");
+        run(&r.far(), "echo agent > src/a.rs && echo made > src/new.rs && rm src/b.rs");
+        let (code, said) = checkpoint(&r.copy);
+        assert_eq!(code, 0, "{said}");
+        assert_eq!(said, "checkpoint: 2 copied, 1 deleted, 0 refused");
+        assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "agent\n");
+        assert_eq!(fs::read_to_string(r.seat.join("src/new.rs")).unwrap(), "made\n");
+        assert!(!r.seat.join("src/b.rs").exists());
+        assert_eq!(run(&r.seat, "git rev-parse HEAD"), head, "files only; commits come with verify and review");
+        assert_eq!(checkpoint(&r.copy).1, "checkpoint: 0 copied, 0 deleted, 0 refused");
+
+        run(&r.far(), "echo again > src/a.rs && echo far > sub/deep/c.txt");
+        run(&r.seat, "echo person > sub/deep/c.txt");
+        let (code, said) = checkpoint(&r.copy);
+        assert_eq!(code, 0, "a conflict does not fail the turn");
+        assert!(said.starts_with("checkpoint: 1 copied, 0 deleted, 1 refused") && said.contains("sub/deep/c.txt"), "{said}");
+        assert_eq!(fs::read_to_string(r.seat.join("sub/deep/c.txt")).unwrap(), "person\n");
+    }
+
     #[test]
     fn checkout_and_land_are_refused_from_an_executor_and_the_rest_are_not() {
         for v in ["checkout", "land"] {
@@ -1508,7 +1623,7 @@ mod tests {
     #[test]
     fn the_shim_marks_tree_verbs_and_only_those_and_refuses_checkout_and_land() {
         let record = "printf '%s\\n' \"$*\" > \"$ARGS_OUT\"";
-        for v in ["verify", "review", "commit-help"] {
+        for v in ["verify", "review", "commit-help", "checkpoint"] {
             let (code, _, err, _, d) = shim(&format!("shim-tree-{v}"), record, &[v, "--json"]);
             assert_eq!(code, 0, "{err}");
             let sent = fs::read_to_string(d.0.join("args")).unwrap();

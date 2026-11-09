@@ -247,9 +247,12 @@ match anything on the seat.
 1. **At spawn** (`spawn --on`): copy up, then start the agent. Nothing starts on a
    half copy.
 2. **Checkpoint**, on `Stop` while connected: copy back the files whose hash differs
-   from the base. Cheap by construction.
-3. **Before `verify` and before `review`**: a full sync-back, through the shim's
-   tree verbs. The row's recorded commit is made on the seat from the copied-back
+   from the base. Cheap by construction. `spawn --on` writes the hook into the far
+   tree's `.claude/settings.json` with the gate: `<exec_dir>/bin/wsp checkpoint`,
+   which the seat answers with a files-only copy-back (never a failed turn).
+3. **Before `verify`, `review` and `commit-help`**: a full sync-back, through the
+   shim's tree verbs (the seat syncs any such verb that arrives from an executor,
+   marked by the shim or not). The row's recorded commit is made on the seat from the copied-back
    tree, so a verifier reads the seat's tree and nothing else.
 4. On reconnect after a drop, as a checkpoint.
 
