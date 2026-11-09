@@ -5173,8 +5173,14 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             ));
             // The seat's wait in one line, under it (`wsp-552`): which delay
             // it is and since when, without opening the pane. A turn in
-            // flight already says `working`, so it gets none.
-            if let Some(sw) = r.wait.as_ref().filter(|sw| sw.kind != crate::waiting::Kind::Working && !terse) {
+            // flight already says `working`, so it gets none; nor does a seat
+            // whose wait is its stuck call, which the flag above already says.
+            let said_above = |sw: &crate::waiting::SeatWait| match sw.kind {
+                crate::waiting::Kind::Working => true,
+                crate::waiting::Kind::CannotBeTold => r.stuck.is_some(),
+                _ => false,
+            };
+            if let Some(sw) = r.wait.as_ref().filter(|sw| !said_above(sw) && !terse) {
                 out.push(format!("{}  {}", " ".repeat(pw), p.dim(&format!("↳ {}", sw.line))));
             }
         }
