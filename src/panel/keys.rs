@@ -111,6 +111,7 @@ impl View {
             Mode::Card(_) => "a card",
             Mode::Confirm { .. } => "a confirmation",
             Mode::Menu(_) => "the menu",
+            Mode::Where(_) => "where to start",
         }
     }
 }
@@ -140,6 +141,11 @@ pub(crate) struct View {
     /// is; this answers who is on it and which of them has stopped — the
     /// question herdr's own sidebar exists for, asked without leaving the panel.
     pub(super) agents: bool,
+    /// Put the machines in place of the tree: ready, connected but not ready
+    /// and why, unreachable since, retired — the agents under each
+    /// (`docs/remote-agents.md` section 7). A view and not a column: the tree
+    /// is projects and a machine is not one.
+    pub(super) machines: bool,
     /// Narrow the tree to the tasks a phrase is in — the title, the id or the
     /// prose. Empty is off.
     ///
@@ -347,6 +353,86 @@ pub(crate) enum Mode {
     },
     /// A list of things to do that are not about any row.
     Menu(Menu),
+    /// `S` asking where: this machine, then each machine that reads `ready`
+    /// (`docs/remote-agents.md` section 7) — and no other, because a machine
+    /// that is connected but not ready is the one that failed five starts.
+    Where(Where),
+}
+
+/// The "where?" an agent is started: the `wsp spawn` that waits on the answer
+/// and the places to put it.
+///
+/// `↵` is the confirmation as well as the choice — the y/n `S` used to put in
+/// front of itself would be a second question about the same keypress — so a
+/// pick that is not `↵` starts nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Where {
+    /// The spawn without its `--on`.
+    pub(super) argv: Vec<String>,
+    /// What it is for, in the words of the question.
+    pub(super) what: String,
+    /// Machine names; index 0 is `""`, this machine, always on offer and
+    /// always first so the common case is `S` then `↵`.
+    pub(super) places: Vec<String>,
+    pub(super) sel: usize,
+}
+
+impl Where {
+    pub(super) fn new(argv: Vec<String>, what: String, ready: &[String]) -> Where {
+        let mut places = vec![String::new()];
+        places.extend(ready.iter().cloned());
+        Where { argv, what, places, sel: 0 }
+    }
+
+    /// The place as the footer says it.
+    pub(super) fn name(&self, i: usize) -> &str {
+        match self.places.get(i).map(String::as_str) {
+            Some("") | None => "this machine",
+            Some(m) => m,
+        }
+    }
+}
+
+/// What the keys mean while the "where?" is up: move along the places, `↵`
+/// starts there, `esc` starts nothing. Everything else is swallowed, for the
+/// reason the menu swallows it — this is a question in front of something
+/// expensive.
+pub(super) fn where_key(k: Key, ui: &mut Ui, view: &mut View, mut w: Where) -> Effect {
+    let n = w.places.len();
+    match k {
+        Key::Esc | Key::Char('q') | Key::Interrupt => {
+            view.mode = Mode::Browse;
+            say(ui, "cancelled");
+            Effect::None
+        }
+        Key::Right | Key::Down | Key::Char('l') | Key::Char('j') if n > 0 => {
+            w.sel = (w.sel + 1) % n;
+            view.mode = Mode::Where(w);
+            Effect::None
+        }
+        Key::Left | Key::Up | Key::Char('h') | Key::Char('k') if n > 0 => {
+            w.sel = (w.sel + n - 1) % n;
+            view.mode = Mode::Where(w);
+            Effect::None
+        }
+        Key::Enter => {
+            view.mode = Mode::Browse;
+            let mut argv = w.argv.clone();
+            let note = match w.places.get(w.sel).map(String::as_str) {
+                Some(m) if !m.is_empty() => {
+                    argv.push("--on".into());
+                    argv.push(m.to_string());
+                    format!("starting an agent on {} at {m}…", w.what)
+                }
+                _ => format!("starting an agent on {}…", w.what),
+            };
+            Effect::Spawn { argv, note }
+        }
+        _ => {
+            view.mode = Mode::Where(w);
+            Effect::None
+        }
+    }
 }
 
 /// The list a menu is holding while it is up.
@@ -865,7 +951,7 @@ pub(crate) fn keymap(target: &Target, flagged: bool) -> Vec<(&'static str, Vec<(
                 ("u", "take the work back · y/n", Scope::TaskOrPane),
                 ("U", "empty its window, keep the work · y/n", Scope::Pane),
                 ("O", "a terminal here", Scope::TaskOrProject),
-                ("S", "an agent on it · y/n", Scope::TaskOrProject),
+                ("S", "an agent on it · where, y/n", Scope::TaskOrProject),
                 ("T", "say it to a project's governor", Scope::Seat),
                 ("x", "lower a raised flag", Scope::Flagged),
                 ("↵", "on a flag: the card again", Scope::Flagged),
@@ -884,6 +970,7 @@ pub(crate) fn keymap(target: &Target, flagged: bool) -> Vec<(&'static str, Vec<(
                 ("A i r", "show done, ids, sync", Scope::Always),
                 ("R", "only what needs review", Scope::Always),
                 ("w", "the agents, not the work", Scope::Always),
+                ("M", "the machines, and back", Scope::Always),
                 ("W", "its task, in the tree", Scope::Agent),
                 ("q", "close it · then the menu", Scope::Always),
             ],
@@ -1904,6 +1991,10 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Mode::Menu(menu) => {
                 view.mode = Mode::Menu(menu.clone());
                 menu_key(k, ui, view, menu)
+            }
+            Mode::Where(w) => {
+                view.mode = Mode::Where(w.clone());
+                where_key(k, ui, view, w)
             }
         }
     };

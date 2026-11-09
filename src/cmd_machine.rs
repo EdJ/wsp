@@ -928,44 +928,103 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
 /// Everything in this design that can go badly wrong goes wrong by collapsing
 /// those two, so they do not share a rendering here either.
 fn state_of(p: &Paint, m: &Machine, live: Option<&MachineLive>) -> (String, String) {
+    match machine_state(m, live) {
+        MachineState::Retired => (p.dim("retired"), String::new()),
+        MachineState::Unreachable { seen } => (p.red("unreachable"), seen),
+        MachineState::Ready { wire } => (p.green("ready"), wire.map(|w| format!("wire {w}")).unwrap_or_default()),
+        MachineState::NotReady { why } => (p.green("connected"), format!("not ready — {why}")),
+        // No record at all is not the same as a failed dial, and saying
+        // "offline" here would blame the machine for the daemon not running.
+        MachineState::NoReport => (p.dim("—"), "no daemon report yet".into()),
+    }
+}
+
+/// Where a machine stands, in the four words of `docs/remote-agents.md`
+/// section 7 — plus the one that is no word at all, a machine the daemon has
+/// not reported on.
+///
+/// The one classification the machines list, the panel's machines view and the
+/// panel's `S` picker all read, so none of them can call a machine ready that
+/// another calls not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MachineState {
+    /// Retired: a decision, and the agents that ran there are still in the log.
+    Retired,
+    /// The link is down or the far seats' beat has gone unanswered past the
+    /// lease. `seen` is already a phrase: `(last seen 2h)` or `(never seen)`.
+    Unreachable { seen: String },
+    /// Connected and `wsp machine check` passed: an agent can start there.
+    Ready { wire: Option<u32> },
+    /// Connected, and an agent cannot start there yet — `why` says what.
+    NotReady { why: String },
+    /// No daemon report at all.
+    NoReport,
+}
+
+impl MachineState {
+    /// The word the view heads the machine with.
+    pub(crate) fn word(&self) -> &'static str {
+        match self {
+            MachineState::Retired => "retired",
+            MachineState::Unreachable { .. } => "unreachable",
+            MachineState::Ready { .. } => "ready",
+            MachineState::NotReady { .. } => "connected",
+            MachineState::NoReport => "—",
+        }
+    }
+
+    /// What follows the word: the wire it speaks, why it is not ready, or when
+    /// it was last seen.
+    pub(crate) fn note(&self) -> String {
+        match self {
+            MachineState::Retired => String::new(),
+            MachineState::Unreachable { seen } => seen.clone(),
+            MachineState::Ready { wire } => wire.map(|w| format!("wire {w}")).unwrap_or_default(),
+            MachineState::NotReady { why } => format!("not ready — {why}"),
+            MachineState::NoReport => "no daemon report yet".into(),
+        }
+    }
+
+    /// Only a passed check earns a place in `S`'s picker.
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, MachineState::Ready { .. })
+    }
+}
+
+pub(crate) fn machine_state(m: &Machine, live: Option<&MachineLive>) -> MachineState {
     if !m.is_active() {
-        return (p.dim("retired"), String::new());
+        return MachineState::Retired;
     }
     match live {
         // Silent is not offline: the link is down, or the far seats' beat has
         // gone unanswered past the lease. Their seats read `unreachable` too
         // (`docs/remote-agents.md` section 3), and say it with this word.
-        Some(l) if crate::far::is_silent(m, l) => {
-            let seen = match crate::far::last_heard(l) {
+        Some(l) if crate::far::is_silent(m, l) => MachineState::Unreachable {
+            seen: match crate::far::last_heard(l) {
                 "" => "(never seen)".to_string(),
                 at => format!("(last seen {})", crate::far::heard_ago(at)),
-            };
-            (p.red("unreachable"), seen)
-        }
+            },
+        },
         Some(l) if l.reachable => match readiness(l, crate::place_compound::wire_version()) {
-            Readiness::Ready => (p.green("ready"), l.wire.map(|w| format!("wire {w}")).unwrap_or_default()),
-            Readiness::Unchecked => (
-                p.green("connected"),
-                format!("not ready — not checked yet (wsp machine check {})", m.name),
-            ),
-            Readiness::NotReady(why) => (p.green("connected"), format!("not ready — {why}")),
+            Readiness::Ready => MachineState::Ready { wire: l.wire },
+            Readiness::Unchecked => MachineState::NotReady {
+                why: format!("not checked yet (wsp machine check {})", m.name),
+            },
+            Readiness::NotReady(why) => MachineState::NotReady { why },
             Readiness::Mismatch { seat, oldest, far } => {
                 let range = if oldest == far { far.to_string() } else { format!("{oldest}-{far}") };
-                (p.green("connected"), format!("not ready — wire mismatch v{seat}/v{range}"))
+                MachineState::NotReady { why: format!("wire mismatch v{seat}/v{range}") }
             }
-            Readiness::NoWire(why) => (
-                p.green("connected"),
-                match why.is_empty() {
-                    true => "not ready — no wire version yet".to_string(),
-                    false => format!("not ready — {why}"),
+            Readiness::NoWire(why) => MachineState::NotReady {
+                why: match why.is_empty() {
+                    true => "no wire version yet".to_string(),
+                    false => why,
                 },
-            ),
+            },
             Readiness::Unreachable => unreachable!("the arm is reachable"),
         },
         Some(_) => unreachable!("a machine whose link is down is silent, above"),
-        // No record at all is not the same as a failed dial, and saying
-        // "offline" here would blame the machine for the daemon not running.
-        None => (p.dim("—"), "no daemon report yet".into()),
+        None => MachineState::NoReport,
     }
 }
 

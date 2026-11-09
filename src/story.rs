@@ -316,6 +316,8 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // nothing here pays for it or has it moving under it.
         worklists: Vec::new(),
         panes: agents,
+        machines: Vec::new(),
+        machines_live: BTreeMap::new(),
     }
 }
 

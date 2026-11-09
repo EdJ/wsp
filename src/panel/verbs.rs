@@ -26,7 +26,7 @@ use crate::store::Store;
 
 use super::install::{list_panes, widest, PaneInfo};
 use crate::util::shell_quote;
-use super::keys::{move_or_fold, say, Effect, Mode, Tags, View};
+use super::keys::{move_or_fold, say, Effect, Mode, Tags, View, Where};
 use super::render::WHOLE_SCREEN;
 use super::rows::{hotkeys, Target, Ui};
 use super::run::Screen;
@@ -316,8 +316,9 @@ impl Pick {
 /// are looking at, and asking which task is a question about the tree.
 fn begin(view: &mut View, verb: Pick) -> Effect {
     view.mode = Mode::Pick { verb };
-    if view.agents {
+    if view.agents || view.machines {
         view.agents = false;
+        view.machines = false;
         return Effect::Refetch;
     }
     Effect::None
@@ -1448,7 +1449,26 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         }
     };
 
+    // The machines are in place of the tree, and what asks about work gives
+    // the tree back first — the same switch `R`, `w` and `/` make on the agents.
+    if view.machines && matches!(k, Key::Char('w') | Key::Char('R') | Key::Char('A')) {
+        view.machines = false;
+    }
+
     match k {
+        // The machines view is the nearest thing in front of you when it is
+        // up, and `M` is the way in and out.
+        Key::Char('q') | Key::Esc | Key::Char('M') if view.machines => {
+            view.machines = false;
+            say(ui, "the work");
+            Effect::Refetch
+        }
+        Key::Char('M') => {
+            view.machines = true;
+            view.agents = false;
+            say(ui, "the machines");
+            Effect::Refetch
+        }
         // `q` and Esc both mean "put away what is in front of me", and the
         // panel itself is never that. It is installed furniture in every
         // workspace, so quitting it by a stray keystroke costs a reinstall and
@@ -1661,7 +1681,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         Key::Char('/') => {
             // Asked in the agents view it means the tree, the same way `R`
             // does: this is a question about work, and that view holds none.
-            let back = std::mem::take(&mut view.agents);
+            let back = std::mem::take(&mut view.agents) | std::mem::take(&mut view.machines);
             view.mode = Mode::Find { buffer: view.filter.clone() };
             match back {
                 true => Effect::Refetch,
@@ -2143,6 +2163,15 @@ fn spawn(target: &Target, ui: &mut Ui, view: &mut View, agent: bool) -> Effect {
         true => format!("starting an agent on {what}…"),
         false => format!("opening {what}…"),
     };
+    // `S` asks *where* when there is somewhere else to ask about
+    // (`docs/remote-agents.md` section 7): this machine and every machine that
+    // reads `ready`, and nothing else on offer. With no ready machine there is
+    // no question, and it is the y/n it always was. `↵` on the choice is the
+    // confirmation, so it is not followed by a second one.
+    if agent && !ui.ready.is_empty() {
+        view.mode = Mode::Where(Where::new(argv, what, &ui.ready));
+        return Effect::None;
+    }
     let deed = Effect::Spawn { argv, note };
     // Only the expensive half asks. A workspace is a directory and a pane; an
     // agent is a model, a context window and a colleague who will start
@@ -2215,6 +2244,125 @@ mod tests {
 
     fn said(ui: &Ui) -> String {
         ui.message.clone().expect("the footer says why").0
+    }
+
+    // ---- the machines view, and S asking where ----
+
+    /// A world with four machines — ready, connected but not ready, silent and
+    /// retired — and an agent standing on the silent one.
+    fn four_machines() -> Snapshot {
+        use crate::model::Machine;
+        use crate::store::MachineLive;
+        let up = MachineLive {
+            reachable: true,
+            wire: Some(crate::place_compound::wire_version()),
+            wire_oldest: Some(crate::place_compound::wire_version()),
+            checked: crate::util::now_iso(),
+            ..Default::default()
+        };
+        let mut retired = Machine::new("old", "old");
+        retired.status = "retired".into();
+        let mut snap = Snapshot {
+            machines: vec![
+                Machine::new("good", "good"),
+                Machine::new("noauth", "noauth"),
+                Machine::new("gone", "gone"),
+                retired,
+            ],
+            ..Default::default()
+        };
+        snap.machines_live.insert("good".into(), MachineLive { ready: true, ..up.clone() });
+        snap.machines_live.insert(
+            "noauth".into(),
+            MachineLive { ready: false, check_error: "no auth".into(), ..up.clone() },
+        );
+        snap.machines_live.insert("gone".into(), MachineLive { error: "no route".into(), ..Default::default() });
+        snap.panes.push(AgentRef { pane: "w1:p2@gone".into(), state: "idle".into(), kind: "claude".into(), agent: true, ..Default::default() });
+        snap
+    }
+
+    /// The view has four states, the reason a connected machine is not ready,
+    /// and the agents under the machine they stand on.
+    #[test]
+    fn the_machines_view_draws_the_four_states_and_the_agents_under_each() {
+        let snap = four_machines();
+        let mut view = View::default();
+        let mut ui = collect(&snap, &view);
+        assert!(!ui.machines);
+        let _ = apply_key(Key::Char('M'), &mut ui, &mut view);
+        assert!(view.machines);
+        let ui = collect(&snap, &view);
+        assert!(ui.rows.is_empty(), "the machines are in place of the tree");
+        let text: Vec<String> = super::super::render::machine_lines(&ui, 80)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect();
+        let all = text.join("\n");
+        let at = |n: &str| text.iter().position(|l| l.contains(n)).unwrap_or_else(|| panic!("no {n}:\n{all}"));
+        assert!(text[at("good")].contains("ready"), "{all}");
+        assert!(text[at("noauth")].contains("connected") && text[at("noauth")].contains("no auth"), "{all}");
+        assert!(text[at("gone")].contains("unreachable"), "{all}");
+        assert!(text[at("old")].contains("retired"), "{all}");
+        assert!(at("w1:p2@gone") > at("gone") && at("w1:p2@gone") < at("old"), "the agent sits under its machine:\n{all}");
+        assert!(!all.contains("nobody\n   can't"), "{all}");
+
+        // And `M` puts the tree back.
+        let mut ui = ui;
+        let _ = apply_key(Key::Char('M'), &mut ui, &mut view);
+        assert!(!view.machines);
+    }
+
+    /// `S` offers this machine and the machines that read ready, and nothing
+    /// that is merely connected, silent or retired; `↵` on the first is the
+    /// spawn it always was.
+    #[test]
+    fn s_asks_where_and_offers_only_ready_machines_plus_this_one() {
+        let mut snap = four_machines();
+        snap.projects = vec![crate::model::Project::new("wsp")];
+        let mut view = View::default();
+        let mut ui = collect(&snap, &view);
+        assert_eq!(ui.ready, vec!["good".to_string()]);
+        let at = ui.rows_for_target(&Target::Project("wsp".into()))[0];
+        ui.select_for_test(at);
+
+        let _ = apply_key(Key::Char('S'), &mut ui, &mut view);
+        let Mode::Where(w) = &view.mode else { panic!("S did not ask where: {:?}", view.mode) };
+        assert_eq!(w.places, vec![String::new(), "good".to_string()]);
+
+        // The default is this machine: no --on.
+        let mut here = view.clone();
+        let eff = apply_key(Key::Enter, &mut ui, &mut here);
+        match eff {
+            Effect::Spawn { argv, .. } => assert!(!argv.contains(&"--on".to_string()), "{argv:?}"),
+            other => panic!("not a spawn: {other:?}"),
+        }
+
+        // The ready machine becomes --on.
+        let _ = apply_key(Key::Right, &mut ui, &mut view);
+        match apply_key(Key::Enter, &mut ui, &mut view) {
+            Effect::Spawn { argv, .. } => {
+                let i = argv.iter().position(|a| a == "--on").expect("--on");
+                assert_eq!(argv[i + 1], "good");
+                assert!(argv.contains(&"--agent".to_string()));
+            }
+            other => panic!("not a spawn: {other:?}"),
+        }
+    }
+
+    /// With no machine that is ready there is nothing to ask, and `S` is the
+    /// y/n it always was.
+    #[test]
+    fn s_with_no_ready_machine_is_the_plain_confirmation() {
+        let mut snap = four_machines();
+        snap.machines_live.remove("good");
+        snap.projects = vec![crate::model::Project::new("wsp")];
+        let mut view = View::default();
+        let mut ui = collect(&snap, &view);
+        assert!(ui.ready.is_empty());
+        let at = ui.rows_for_target(&Target::Project("wsp".into()))[0];
+        ui.select_for_test(at);
+        let _ = apply_key(Key::Char('S'), &mut ui, &mut view);
+        assert!(matches!(view.mode, Mode::Confirm { .. }), "{:?}", view.mode);
     }
 
     // ---- refusals, as the question they become ----

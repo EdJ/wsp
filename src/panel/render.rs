@@ -996,6 +996,64 @@ impl Anchor {
     }
 }
 
+/// The machines view, one block to a machine and this seat last: the name and
+/// its state in one of four words (`docs/remote-agents.md` section 7) — ready,
+/// connected with the reason it is not ready, unreachable with since when, or
+/// retired — and the agents standing on it underneath.
+///
+/// Unreachable is drawn as a warning and never as an empty machine: a machine
+/// nobody can reach has agents on it that nobody can see, which is the thing
+/// the view exists not to mistake for none.
+pub(super) fn machine_lines(ui: &Ui, w: usize) -> Vec<Line> {
+    let mut out = Vec::new();
+    for b in &ui.fleet {
+        // The seat is last, has no record, and is always where you are. A seat
+        // with nothing on it and nothing else to compare to is not worth a block.
+        if b.name.is_empty() && b.agents.is_empty() && ui.fleet.len() == 1 {
+            out.push(line(Style::Dim, " no machines — this seat only"));
+            out.push(line(Style::Dim, " wsp machine add <name> <ssh-target>"));
+            continue;
+        }
+        let mut head = Line::default();
+        head.push(Style::Plain, " ");
+        match b.name.is_empty() {
+            true => head.push(Style::Accent, "this machine"),
+            false => {
+                head.push(Style::Accent, b.name.clone());
+                head.push(Style::Plain, "  ");
+                let st = match b.word {
+                    "ready" => Style::Plain,
+                    "unreachable" => Style::Warn,
+                    "connected" => Style::Warn,
+                    _ => Style::Dim,
+                };
+                head.push(st, b.word);
+                if !b.note.is_empty() {
+                    head.push(Style::Dim, format!("  {}", b.note));
+                }
+            }
+        }
+        head.fit(w);
+        out.push(head);
+        if b.agents.is_empty() {
+            // Not "nobody": an unreachable machine has agents nobody can see,
+            // and the view must not read them as none.
+            let say = match b.word {
+                "unreachable" => "   can't see its agents",
+                _ => "   nobody",
+            };
+            out.push(line(Style::Dim, say));
+        }
+        for (pane, what) in &b.agents {
+            let mut l = Line::default();
+            l.push(Style::Dim, format!("   {pane}  {what}"));
+            l.fit(w);
+            out.push(l);
+        }
+    }
+    out
+}
+
 pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
     const HEAD: usize = 2;
     const FOOTER: usize = 3;
@@ -1306,6 +1364,11 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
     for i in scroll..tree_len.min(scroll + g.tree_rows) {
         lines.push(cell(ui, i, w, &keys));
     }
+    // The machines, in place of the tree: they have no rows, so the loop above
+    // drew nothing and this takes the pane.
+    if ui.machines {
+        lines.extend(machine_lines(ui, w).into_iter().take(g.tree_rows));
+    }
     while lines.len()
         < h.saturating_sub(footer_rows + g.focus_rows + g.tags_rows + map_rows + dock_rows)
     {
@@ -1427,6 +1490,10 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Accent, "agents");
     }
+    if ui.machines {
+        foot.push(Style::Plain, "  ");
+        foot.push(Style::Accent, "machines");
+    }
     // And the door, at the right-hand edge, where herdr keeps its own. Fitted
     // rather than appended: the counts are what give way if a pane is narrow
     // enough for the two to meet, because a count that is one column short is
@@ -1482,6 +1549,30 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         // put the list away — and `q` is said because `q` is very likely what
         // opened it.
         Mode::Menu(_) => line(Style::Dim, "↵ takes it · q or esc closes"),
+        // One line, the places side by side with the cursor's in brackets:
+        // there are never many, and a list drawn over the tree for two names
+        // would hide the row the agent is being started on.
+        Mode::Where(wh) => {
+            let mut l = Line::default();
+            l.push(Style::Accent, util::truncate(&format!("an agent on {} — where?", wh.what), w.saturating_sub(4)));
+            let mut tail = Line::default();
+            for i in 0..wh.places.len() {
+                tail.push(Style::Plain, " ");
+                match i == wh.sel {
+                    true => tail.push(Style::Accent, format!("[{}]", wh.name(i))),
+                    false => tail.push(Style::Dim, wh.name(i).to_string()),
+                }
+            }
+            tail.push(Style::Dim, "  ←→ ↵");
+            if l.width() + tail.width() <= w {
+                l.spans.extend(tail.spans);
+                l
+            } else {
+                // Too narrow for the question and the places: the places win,
+                // because the question is what was just pressed.
+                tail
+            }
+        }
         Mode::Confirm { question, .. } => {
             let mut l = Line::default();
             l.push(Style::Warn, util::truncate(question, w.saturating_sub(6)));

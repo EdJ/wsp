@@ -825,6 +825,64 @@ pub(crate) struct Ui {
     pub(super) filter: String,
     /// The agents are in place of the tree.
     pub(super) agents: bool,
+    /// The machines are in place of the tree: one block per machine, in the
+    /// four states of `docs/remote-agents.md` section 7, the agents under each.
+    pub(super) machines: bool,
+    /// The blocks that view draws, built whether or not it is up so the frame
+    /// and the test read the same thing.
+    pub(super) fleet: Vec<MachineBlock>,
+    /// The machines `S` may offer: ready, and nothing else. This seat is not in
+    /// it, because it is always on offer and has no state to be in.
+    pub(super) ready: Vec<String>,
+}
+
+/// One machine in the machines view: what it is, how it stands, who is on it.
+/// `name` is empty for this seat, which has no record and no state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MachineBlock {
+    pub(super) name: String,
+    pub(super) word: &'static str,
+    pub(super) note: String,
+    /// `(pane, what it is · its state)`, one per agent standing on it.
+    pub(super) agents: Vec<(String, String)>,
+}
+
+/// The blocks of the machines view: every machine, then this seat last. The
+/// partition is of the panes the panel already holds — `@machine`-qualified, so
+/// where each stands is written on it — and not a second query.
+pub(super) fn fleet_of(snap: &Snapshot) -> Vec<MachineBlock> {
+    let on = |name: &str| -> Vec<(String, String)> {
+        snap.panes
+            .iter()
+            .filter(|a| crate::herdr::host_of(&a.pane).unwrap_or("") == name)
+            .map(|a| {
+                let kind = match a.kind.is_empty() {
+                    true => "a shell",
+                    false => a.kind.as_str(),
+                };
+                (a.pane.clone(), format!("{kind} · {}", a.state))
+            })
+            .collect()
+    };
+    let mut out: Vec<MachineBlock> = snap
+        .machines
+        .iter()
+        .map(|m| {
+            let st = crate::cmd_machine::machine_state(m, snap.machines_live.get(&m.name));
+            MachineBlock { name: m.name.clone(), word: st.word(), note: st.note(), agents: on(&m.name) }
+        })
+        .collect();
+    out.push(MachineBlock { name: String::new(), word: "", note: String::new(), agents: on("") });
+    out
+}
+
+/// The machines `S` offers: active, answering, and with a passed check.
+pub(super) fn ready_machines(snap: &Snapshot) -> Vec<String> {
+    snap.machines
+        .iter()
+        .filter(|m| crate::cmd_machine::machine_state(m, snap.machines_live.get(&m.name)).is_ready())
+        .map(|m| m.name.clone())
+        .collect()
 }
 
 /// What the cursor is sitting on, in the store's own terms rather than the
@@ -1237,6 +1295,11 @@ pub struct Snapshot {
     /// anything drawn: it belongs to the event loop and is now taken there,
     /// from [`crate::live::Live`].
     pub panes: Vec<AgentRef>,
+    /// The machines there are, and what the daemon last saw of each — the two
+    /// halves `wsp machine ls` joins, read here for the machines view and for
+    /// `S`'s picker (`docs/remote-agents.md` section 7).
+    pub machines: Vec<crate::model::Machine>,
+    pub machines_live: std::collections::BTreeMap<String, crate::store::MachineLive>,
 }
 
 impl Snapshot {
@@ -1265,6 +1328,8 @@ impl Snapshot {
             governors: store.governors(),
             worklists: crate::worklist::listing(store, store.worklists()),
             panes,
+            machines: store.machines(),
+            machines_live: store.machines_live(),
         }
     }
 }
@@ -2394,6 +2459,14 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         }
     }
 
+    // The machines are in place of the tree: no rows to aim a key at, so the
+    // keys that act on a row say there is nothing there instead of acting on
+    // one the pane is not drawing.
+    let (rows, dock) = match view.machines {
+        true => (Vec::new(), 0),
+        false => (rows, dock),
+    };
+
     Ui {
         rows,
         dock,
@@ -2410,6 +2483,9 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         show_done: view.show_done,
         review_only: view.review_only,
         filter: view.filter.clone(),
+        machines: view.machines,
+        fleet: fleet_of(snap),
+        ready: ready_machines(snap),
     }
 }
 
@@ -3749,6 +3825,8 @@ mod tests {
             governors: Default::default(),
             worklists: Vec::new(),
             panes: vec![],
+            machines: Vec::new(),
+            machines_live: Default::default(),
         }
     }
 
