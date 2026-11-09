@@ -29,7 +29,51 @@ fn open_in(store: &Store, series: &str) -> Option<Worklist> {
         .filter(|w| number_of(series, &w.id).is_some())
         .filter(|w| w.status() == WorklistStatus::Draft && !w.is_cancelled())
         .filter(|w| series == DEFECTS || !w.is_planned())
+        .filter(|w| series != DEFECTS || !is_retros_list(w))
         .max_by_key(|w| number_of(series, &w.id))
+}
+
+/// The agent line of a retros list's first group (`wsp-558`).
+pub const RETRO_AGENT: &str = "claude sonnet high";
+const RETRO_STOP: &str = "Pass when each timing retro in this group is at review with its verifier holding: the list's effort report is read, its waits named by cause with seconds, and every defect it finds is filed as a row (on the next retro-defects list, as wsp-472 says), with no fix made here. Analysis only, no full suite.";
+
+/// A retros list: a `retro-N` whose first group is the retro group — on the
+/// retro agent line, its barrier not yet passed — and which has not finished.
+/// Defects never go on one, so a manual defects group cannot block a retro.
+pub fn is_retros_list(w: &Worklist) -> bool {
+    if number_of(DEFECTS, &w.id).is_none() || w.is_cancelled() || w.status() == WorklistStatus::Done {
+        return false;
+    }
+    w.groups().first().is_some_and(|g| g.agent.trim() == RETRO_AGENT && g.verdict.trim().is_empty())
+}
+
+/// Put a timing-retro row on the open retros list, filing the next `retro-N`
+/// (planned, not alone, one group on the retro agent line at x2) when none is
+/// open. Returns the list's id. The run starts the row like any member; nothing
+/// is spawned here.
+pub fn place_retro(store: &Store, row: &str, project: Option<&str>) -> Result<String, String> {
+    let open = store.worklists().into_iter().filter(is_retros_list).max_by_key(|w| number_of(DEFECTS, &w.id));
+    if let Some(mut w) = open {
+        let mut groups = w.groups();
+        if !groups[0].members.iter().any(|m| m == row) {
+            groups[0].members.push(row.to_string());
+        }
+        w.log(&format!("{row} → group 1 · the timing retro"));
+        w.set_groups(&groups);
+        store.save_worklist(&w).map_err(|e| format!("write failed: {e}"))?;
+        return Ok(w.id);
+    }
+    let next = store.worklists().iter().filter_map(|w| number_of(DEFECTS, &w.id)).max().unwrap_or(0) + 1;
+    let id = format!("{DEFECTS}-{next}");
+    let mut w = Worklist::new(&id, &format!("Timing retros {next}"));
+    w.set_planned();
+    w.alone = Some(false);
+    w.project = project.map(str::to_string);
+    w.set_groups(&[Group { members: vec![row.to_string()], cap: Some(2), agent: RETRO_AGENT.into(), stop: RETRO_STOP.into(), ..Group::default() }]);
+    w.log(&format!("{row} → group 1 · the timing retro"));
+    store.save_worklist(&w).map_err(|e| format!("cannot write {id}: {e}"))?;
+    store.log_event("worklist-added", serde_json::json!({ "id": id }));
+    Ok(id)
 }
 
 /// The newest list of `series` that has not started, or the next number's.

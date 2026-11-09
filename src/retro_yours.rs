@@ -30,6 +30,12 @@ pub fn yours_lines(store: &Store) -> Vec<String> {
             continue;
         }
         let s = state(&w.id);
+        if s["done"] == false && util::since(s["started"].as_str().unwrap_or("")) <= 2 * 86400 {
+            if let (Some(row), Some(on)) = (s["row"].as_str(), s["retros"].as_str()) {
+                out.push(format!("{} cleared; its retro {row} is on {on}", w.id));
+            }
+            continue;
+        }
         if s["done"] != true || util::since(s["finished"].as_str().unwrap_or("")) > 2 * 86400 {
             continue;
         }

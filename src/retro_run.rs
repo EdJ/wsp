@@ -104,16 +104,18 @@ fn seat_row(store: &Store, w: &Worklist) -> Result<Task, String> {
 }
 
 /// Start a retro seat over `w`: a row carrying the packet, a record on the
-/// list so a clear has one, the evidence file, and the spawn. `by_hand` skips
+/// list so a clear has one, the evidence file, and the row placed on the retros
+/// list — which the run starts; nothing is spawned here (`wsp-558`). `by_hand` skips
 /// the guards (and the one-per-clear record) but not the evidence.
 pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, String> {
     if !by_hand {
         retro::eligible(store, w)?;
     }
     let t = seat_row(store, w)?;
+    let on = crate::retro_series::place_retro(store, &t.id, t.project.as_deref())?;
     let mut w = store.worklist(&w.id).unwrap_or_else(|| w.clone());
     w.retro = Some((util::now_iso(), t.id.clone()));
-    w.log(&format!("timing retro — {} {}", t.id, if by_hand { "by hand" } else { "at the clear" }));
+    w.log(&format!("timing retro — {} on {on} {}", t.id, if by_hand { "by hand" } else { "at the clear" }));
     store.save_worklist(&w).map_err(|e| format!("write failed: {e}"))?;
     let f = Figures::of(&crate::cmd_report::effort(store, &w, None));
     let mut s = match state(&w.id) {
@@ -122,6 +124,7 @@ pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, Strin
     };
     s["list"] = json!(w.id);
     s["row"] = json!(t.id);
+    s["retros"] = json!(on);
     s["started"] = json!(util::now_iso());
     s["wall"] = json!(f.wall);
     s["rows"] = json!(f.rows);
@@ -130,8 +133,7 @@ pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, Strin
     s["done"] = json!(false);
     s["summary"] = Value::Null;
     save(store, &w, &s, "timing retro started")?;
-    store.log_event("retro-started", json!({ "list": w.id, "row": t.id, "by_hand": by_hand }));
-    crate::cycle::launch_out(store, &["spawn", &t.id, "--agent", "--kind", "claude", "--model", "sonnet", "--effort", "high"]);
+    store.log_event("retro-started", json!({ "list": w.id, "row": t.id, "retros": on, "by_hand": by_hand }));
     Ok(t.id)
 }
 
@@ -337,6 +339,8 @@ mod tests {
         assert!(store.task(&seat).is_some());
         assert!(store.worklist("l").unwrap().retro.is_some());
         assert!(dir("l").join("retro.html").is_file());
+        let pending = crate::retro_yours::yours_lines(&store);
+        assert_eq!(pending, vec![format!("l cleared; its retro {seat} is on retro-1")]);
 
         let tmp = env.home().join("scratch");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -346,7 +350,7 @@ mod tests {
         let dw = put(&tmp, "dw", "start under 2m");
         let code = file(&store, &args(&["file", "l"], &[("defect", ""), ("title", "Unclaimed start waits twenty minutes"), ("evidence", &ev), ("fix", &fx), ("done-when", &dw)]));
         assert_eq!(code, 0);
-        assert!(store.worklist("retro-1").is_some());
+        assert!(store.worklist("retro-2").is_some(), "the defects go on a list of their own, not the retros list");
         let dup = file(&store, &args(&["file", "l"], &[("defect", ""), ("title", "Unclaimed start waits twenty minutes"), ("evidence", &ev), ("fix", &fx), ("done-when", &dw)]));
         assert_eq!(dup, 1, "a near title is refused");
         let sum = put(&tmp, "sum", "one defect filed");
@@ -355,7 +359,38 @@ mod tests {
         assert!(html.contains("Defects") && html.contains("Unclaimed start"));
         let lines = crate::retro_yours::yours_lines(&store);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("l cleared in") && lines[0].contains("1 defects on retro-1") && lines[0].contains("0 questions"), "{}", lines[0]);
+        assert!(lines[0].starts_with("l cleared in") && lines[0].contains("1 defects on retro-2") && lines[0].contains("0 questions"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_clear_places_the_retro_on_the_open_retros_list_or_files_one_and_spawns_nothing() {
+        let (_env, store) = crate::testkit::isolated_store("retro-placed");
+        for id in ["p", "q"] {
+            let mut w = Worklist::new(id, "A list");
+            w.body = "## Groups\n\n1. a-1\n".into();
+            store.save_worklist(&w).unwrap();
+        }
+        let first = start(&store, &store.worklist("p").unwrap(), true).unwrap();
+        let r = store.worklist("retro-1").expect("no retros list open: retro-1 is filed");
+        assert!(r.is_planned() && r.alone == Some(false));
+        let g = &r.groups()[0];
+        assert_eq!((g.members.clone(), g.cap, g.agent.as_str()), (vec![first.clone()], Some(2), "claude sonnet high"));
+        assert!(g.stop.contains("verifier holding") && g.stop.contains("no fix"), "{}", g.stop);
+        assert!(store.worklist("p").unwrap().retro.is_some());
+        let second = start(&store, &store.worklist("q").unwrap(), true).unwrap();
+        assert!(store.worklist("retro-2").is_none(), "the open retros list takes the next retro");
+        assert_eq!(store.worklist("retro-1").unwrap().groups()[0].members, vec![first.clone(), second]);
+        // a retros list whose retro group has passed its barrier is not reused
+        let mut r = store.worklist("retro-1").unwrap();
+        let mut gs = r.groups();
+        gs[0].verdict = "passed".into();
+        r.set_groups(&gs);
+        store.save_worklist(&r).unwrap();
+        let mut w = Worklist::new("s", "A list");
+        w.body = "## Groups\n\n1. a-1\n".into();
+        store.save_worklist(&w).unwrap();
+        let third = start(&store, &w, true).unwrap();
+        assert_eq!(store.worklist("retro-2").unwrap().groups()[0].members, vec![third]);
     }
 
     #[test]
@@ -390,12 +425,12 @@ mod tests {
         assert_eq!(file(&store, &args(&["file", "n"], &flags)), 0);
         // the same finding again is refused, and a note goes on the open row instead
         assert_eq!(file(&store, &args(&["file", "n"], &flags)), 1);
-        let rows = store.worklist("retro-1").unwrap().groups()[0].members.clone();
+        let rows = store.worklist("retro-2").unwrap().groups()[0].members.clone();
         assert_eq!(rows.len(), 1, "no duplicate");
         let nt = put(&tmp, "nt", "seen again: 18m unclaimed");
         assert_eq!(note(&store, &args(&["note", "n", &rows[0], &nt], &[])), 0);
         assert!(store.task(&rows[0]).unwrap().body.contains("seen again: 18m unclaimed"));
-        assert_eq!(store.worklist("retro-1").unwrap().groups()[0].members.len(), 1);
+        assert_eq!(store.worklist("retro-2").unwrap().groups()[0].members.len(), 1);
         assert!(store.worklist("retro-ask-1").is_none());
     }
 
