@@ -174,6 +174,15 @@ impl Claimed {
 }
 
 impl AgentRef {
+    /// The machine the pane stands on, or the empty string for this seat.
+    ///
+    /// Read here for the same reason as [`AgentRef::stopped`]: the pane id
+    /// spells the machine as an `@machine` suffix, and only the herdr adapter
+    /// knows that spelling.
+    pub(crate) fn machine(&self) -> &str {
+        crate::herdr::host_of(&self.pane).unwrap_or("")
+    }
+
     /// There is an agent in this pane and no turn is running in it.
     ///
     /// Read here rather than at the call sites, and the guard in

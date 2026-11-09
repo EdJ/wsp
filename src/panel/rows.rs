@@ -854,7 +854,7 @@ pub(super) fn fleet_of(snap: &Snapshot) -> Vec<MachineBlock> {
     let on = |name: &str| -> Vec<(String, String)> {
         snap.panes
             .iter()
-            .filter(|a| crate::herdr::host_of(&a.pane).unwrap_or("") == name)
+            .filter(|a| a.machine() == name)
             .map(|a| {
                 let kind = match a.kind.is_empty() {
                     true => "a shell",
