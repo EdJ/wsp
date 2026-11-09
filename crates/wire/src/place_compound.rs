@@ -566,6 +566,12 @@ impl Compound<'_> {
                 return State::Unreachable;
             }
             if UnixStream::connect(&socket).is_err() {
+                // The forward answers no more, which is what a tunnel that has
+                // dropped looks like for the first lease of a link cut, while the
+                // machine still reads ready. Ask the link before calling it a death.
+                if self.far.link_down(&str_of(rec, "machine")) {
+                    return State::Unreachable;
+                }
                 return State::Gone;
             }
         } else {
@@ -1903,8 +1909,16 @@ impl Place for Compound<'_> {
         // absence (`docs/remote-agents.md` section 3).
         let mut silent: BTreeSet<String> = BTreeSet::new();
         for id in self.ids() {
-            let machine = str_of(&self.record(&Seat::new(id)).unwrap_or(json!({})), "machine");
-            if !machine.is_empty() && self.far.silent_for(&machine).is_some() {
+            let rec = self.record(&Seat::new(id)).unwrap_or(json!({}));
+            let machine = str_of(&rec, "machine");
+            if machine.is_empty() || silent.contains(&machine) {
+                continue;
+            }
+            // Silent by its lease, or its forward refusing behind a link that is
+            // down: either way a reap has no empty answer to believe.
+            let socket = str_of(&rec, "socket");
+            let cut = !socket.is_empty() && UnixStream::connect(&socket).is_err() && self.far.link_down(&machine);
+            if cut || self.far.silent_for(&machine).is_some() {
                 silent.insert(machine);
             }
         }
@@ -2503,6 +2517,37 @@ mod tests {
 
         far.silent.set(false);
         assert_eq!(place.state(&seat).unwrap(), State::Gone, "back to the ordinary reading when the machine is heard");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The first lease of a link cut: the forward refuses at once, the machine
+    /// still reads ready (not silent by its lease), and the seat must read
+    /// `unreachable` and the census file the machine silent — never `gone`.
+    #[test]
+    fn a_far_seat_behind_a_dropped_link_reads_unreachable_before_the_lease_runs_out() {
+        let (far, root) = far_script("cut", false, false);
+        let place = Compound { far: &far, ..Compound::at(root.join("seats")) };
+        let order = Order {
+            label: "t-1".into(),
+            cwd: Some("/far/exec/trees/t-1".into()),
+            on: Some("mb2".into()),
+            ..Order::default()
+        };
+        let seat = place.open(&order).unwrap();
+        let mut rec = place.record(&seat).unwrap();
+        rec["socket"] = json!(root.join("fwd").join("dead.sock").display().to_string());
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
+        write_atomic(&place.dir_of(&seat).unwrap().join(SEAT_FILE), &rec.to_string()).unwrap();
+
+        far.link_down.set(true);
+        assert!(!far.silent.get(), "the machine is not silent by its lease");
+        assert_eq!(place.state(&seat).unwrap(), State::Unreachable, "a dropped link is not a death");
+        let census = place.census().unwrap();
+        assert_eq!(census.seats().find(|r| r.seat == seat).expect("still drawn").state, State::Unreachable);
+        assert!(!census.answered("mb2"), "and a reap may not believe an absence from it");
+
+        far.link_down.set(false);
+        assert_eq!(place.state(&seat).unwrap(), State::Gone, "a link that answers and no session is a session gone");
         let _ = fs::remove_dir_all(&root);
     }
 

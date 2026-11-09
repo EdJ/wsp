@@ -813,7 +813,20 @@ pub trait Wire {
     fn silent_for(&self, _name: &str) -> Option<String> {
         None
     }
+    /// Whether the link to machine `name` is down right now: a short command over
+    /// ssh fails as a link (ssh exited 255, or never started). Asked of a seat whose
+    /// forwarded socket does not answer and whose machine is not yet silent by its
+    /// lease: the tunnel dropping makes that socket refuse at once, and a seat
+    /// behind a down link is `unreachable`, never `gone` (`docs/remote-agents.md`
+    /// section 3). A command that ran and failed is a link that answered.
+    fn link_down(&self, name: &str) -> bool {
+        let Some(m) = self.machine(name) else { return false };
+        matches!(self.run(&m, "true", LINK_PROBE), Err(Failed::Link(_)))
+    }
 }
+
+/// How long [`Wire::link_down`] waits: ssh's own connect timeout is 5 s.
+pub const LINK_PROBE: Duration = Duration::from_secs(8);
 
 /// Whether a far machine is silent: its link is down, or its seats' beat has gone
 /// unanswered for longer than its lease (`docs/remote-agents.md` section 3).
@@ -1386,6 +1399,48 @@ mod tests {
         ] {
             assert!(!dead_link(slow), "{slow}");
         }
+    }
+
+    /// `Wire::link_down` over a fake ssh: one that drops (exit 255, "connect to
+    /// host … timed out") is a down link; one that answers, and one whose command
+    /// ran and failed, are not.
+    #[test]
+    fn a_fake_ssh_that_drops_is_a_down_link_and_one_that_answers_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Fake(String);
+        impl Wire for Fake {
+            fn machine(&self, name: &str) -> Option<Machine> {
+                Some(Machine::new(name, name))
+            }
+            fn run(&self, m: &Machine, cmd: &str, timeout: Duration) -> Result<String, Failed> {
+                ssh_run_with(&self.0, m, None, cmd, timeout)
+            }
+            fn forward(&self, _: &Machine, _: &str, _: &Path, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn dir(&self, _: &Machine) -> PathBuf {
+                PathBuf::new()
+            }
+            fn lease(&self, _: &Machine, _: &Path, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wsp-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Fake(p.to_string_lossy().into_owned())
+        };
+        let drops = script("drops", "echo 'ssh: connect to host mb2 port 22: Operation timed out' >&2; exit 255");
+        let answers = script("answers", "exit 0");
+        let ran = script("ran", "echo 'boom' >&2; exit 1");
+        assert!(drops.link_down("mb2"), "a drop is a down link");
+        assert!(!answers.link_down("mb2"), "an answer is a link");
+        assert!(!ran.link_down("mb2"), "a command that ran and failed went over a link");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The defect the first verifier found: the real `compound-sup spawn` prints
