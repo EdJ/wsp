@@ -55,6 +55,9 @@ pub const RECOVER_EVERY: Duration = Duration::from_secs(5);
 /// How long the cheap "is the link back" ssh may take.
 const LINK_TEST_WITHIN: Duration = Duration::from_secs(8);
 
+/// How often a reachable machine is asked what it holds for seats this store lacks.
+const SWEEP_SECS: u64 = 600;
+
 /// How long to wait after this many consecutive failures — the curve, on its
 /// own, with no clock in it.
 ///
@@ -87,6 +90,11 @@ struct Tunnel {
     /// Per seat, what the last beat said — the failure's words, or empty for an
     /// answer — so `cycle.log` hears of a change and not of every beat.
     beat_said: BTreeMap<String, String>,
+    /// When the machine is next asked what it holds for seats this store does not
+    /// have (wsp-590). `None` is at once: a new master asks first thing.
+    next_sweep: Option<Instant>,
+    /// The strays already named in `cycle.log`, so each is said once while it stays.
+    strays_said: std::collections::BTreeSet<String>,
     /// The machine and control path of the master this tunnel started, so
     /// [`Tunnel::stop`] can ask it to exit rather than only kill the ssh that
     /// was started.
@@ -112,6 +120,8 @@ impl Tunnel {
             readd: false,
             next_beat: None,
             beat_said: BTreeMap::new(),
+            next_sweep: None,
+            strays_said: Default::default(),
             master: None,
             started_at: None,
             master_answered: false,
@@ -215,6 +225,27 @@ impl Tunnel {
         self.beat_said.retain(|id, _| seats.iter().any(|s| &s.id == id));
     }
 
+    /// Name, in `cycle.log`, what the machine holds for a seat this store does not
+    /// have: a `compound-sup` session still running or a lease file left, after a
+    /// seat was ended on this side and not there (wsp-590). Asked when the master
+    /// is new and every [`SWEEP_SECS`] after; said once per stray while it stays.
+    /// Named only: ending another seat's session is a person's to do.
+    fn sweep_tick(&mut self, store: &Store, m: &Machine, wire: &dyn crate::far::Wire) {
+        if self.next_sweep.is_some_and(|t| Instant::now() < t) || m.exec_dir.is_empty() {
+            return;
+        }
+        self.next_sweep = Some(Instant::now() + Duration::from_secs(SWEEP_SECS));
+        // A failed ask is the link's to say; the next sweep asks again.
+        let Ok(out) = wire.run(m, &crate::far::holdings_command(m), crate::far::SESSION_TIMEOUT) else { return };
+        let strays = crate::far::strays(&out, &crate::place_compound::seats_on(store, &m.name));
+        for s in &strays {
+            if self.strays_said.insert(s.label.clone()) {
+                crate::store::log_line(store, &s.words(&m.name));
+            }
+        }
+        self.strays_said.retain(|l| strays.iter().any(|s| &s.label == l));
+    }
+
     /// Ask for a readiness check when there has been none, or the last one is
     /// old (`docs/remote-agents.md` section 7: "on a timer and on `machine add`"
     /// — a new machine has no check, so its first reachable tick is the one on
@@ -255,6 +286,7 @@ impl Tunnel {
         // A new master means the seats have been waiting on the link: the first
         // beat on it is at once.
         self.next_beat = None;
+        self.next_sweep = None;
         self.started_at = Some(Instant::now());
         self.master_answered = false;
         // Not reachable yet: ssh has been started, not connected.
@@ -548,6 +580,7 @@ impl Supervisor {
             // After the re-add: a seat's socket is only there to dial once its
             // forward is back.
             t.beat_tick(store, m, &crate::far::Ssh);
+            t.sweep_tick(store, m, &crate::far::Ssh);
         }
         t.recheck(store, m);
     }
@@ -1269,6 +1302,49 @@ mod tests {
         assert!(wire.leases.borrow().is_empty() && t.live.heard.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
+    /// A far session or lease file no seat here owns is named once in `cycle.log`
+    /// and not ended; a seat's own, a check session and a lease temp are not
+    /// named (wsp-590).
+    #[test]
+    fn a_far_session_and_lease_with_no_seat_are_named_once_and_left_alone() {
+        struct Holds(std::cell::RefCell<Vec<String>>);
+        impl crate::far::Wire for Holds {
+            fn machine(&self, _: &str) -> Option<Machine> {
+                None
+            }
+            fn run(&self, _: &Machine, cmd: &str, _: Duration) -> Result<String, crate::far::Failed> {
+                self.0.borrow_mut().push(cmd.to_string());
+                Ok("lease cpd-4070\nlease cpd-7\nlease .cpd-9.wsp.tmp\n\
+                    /Users/e/bin/compound-sup spawn --label cpd-4070 --cwd /Users/e/wsp-exec/trees/demos-002 -- claude\n\
+                    compound-sup spawn --label cpd-7 --cwd /x -- claude\n\
+                    compound-sup spawn --label wsp-check-123 --cwd /x -- sleep 5\n"
+                    .into())
+            }
+            fn forward(&self, _: &Machine, _: &str, _: &std::path::Path, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn dir(&self, _: &Machine) -> PathBuf {
+                PathBuf::new()
+            }
+            fn lease(&self, _: &Machine, _: &std::path::Path, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let (store, root) = store_with_seats("strays", &[("cpd-7", "mb2")]);
+        let wire = Holds(Default::default());
+        let m = far_machine();
+        let mut t = Tunnel::new();
+        t.sweep_tick(&store, &m, &wire);
+        t.next_sweep = Some(Instant::now() - Duration::from_secs(1));
+        t.sweep_tick(&store, &m, &wire);
+        let log = cycle_log(&store);
+        assert_eq!(log.matches("cpd-4070 holds a compound-sup session and a lease file").count(), 1, "{log}");
+        assert!(!log.contains("cpd-7 holds") && !log.contains("wsp-check") && !log.contains(".cpd-9"), "{log}");
+        let asked = wire.0.borrow().clone();
+        assert!(asked.iter().all(|c| !c.contains("close") && !c.contains("rm ") && !c.contains("kill")), "named, not ended: {asked:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn cycle_log(store: &Store) -> String {
         std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default()
     }

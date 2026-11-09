@@ -1526,17 +1526,40 @@ impl Compound<'_> {
     }
 
     /// End a far seat's session: `compound-sup close <far socket>` on the
-    /// machine, then drop both forwards and sweep the local sockets. A link that
-    /// is down refuses (the session would be left running unseen); a command
-    /// that ran and failed means the session is already gone.
-    fn stop_far(&self, rec: &Value) -> Result<()> {
+    /// machine, its lease file removed, then both forwards dropped and the local
+    /// sockets swept. A link that is down refuses (the session would be left
+    /// running unseen) and says what it left: the seat is kept, so ending it
+    /// again once the link is back finishes the job. A command that ran and
+    /// failed means the session is already gone.
+    fn stop_far(&self, seat: &Seat, rec: &Value) -> Result<()> {
         let name = str_of(rec, "machine");
         let m = self.far.machine(&name);
         let far_sock = str_of(rec, "far_socket");
-        if let (Some(m), false) = (&m, far_sock.is_empty()) {
-            let cmd = format!("{} close {}", crate::far::quote(&crate::far::sup_of(m)), crate::far::quote(&far_sock));
-            if let Err(crate::far::Failed::Link(why)) = self.far.run(m, &cmd, crate::far::SESSION_TIMEOUT) {
-                return Err(Refusal::Backend(format!("cannot reach {name} to close its session: {why}")));
+        let id = seat.as_str().to_string();
+        if let Some(m) = &m {
+            let left = |why: &str| {
+                let mut left = Vec::new();
+                if !far_sock.is_empty() {
+                    left.push(format!("its session {far_sock}"));
+                }
+                if !id.is_empty() {
+                    left.push(format!("its lease file {}/lease/{id}", m.exec_dir.trim_end_matches('/')));
+                }
+                Refusal::Backend(format!(
+                    "cannot reach {name} to close its session: {why} — left on {name}: {}; the seat is kept, so ending it again once {name} answers closes them",
+                    if left.is_empty() { "nothing recorded".to_string() } else { left.join(" and ") }
+                ))
+            };
+            if !far_sock.is_empty() {
+                let cmd = format!("{} close {}", crate::far::quote(&crate::far::sup_of(m)), crate::far::quote(&far_sock));
+                if let Err(crate::far::Failed::Link(why)) = self.far.run(m, &cmd, crate::far::SESSION_TIMEOUT) {
+                    return Err(left(&why));
+                }
+            }
+            if !id.is_empty() && !m.exec_dir.is_empty() {
+                if let Err(crate::far::Failed::Link(why)) = self.far.run(m, &crate::far::drop_lease_command(m, &id), crate::far::SESSION_TIMEOUT) {
+                    return Err(left(&why));
+                }
             }
         }
         for (local, far) in [("socket", "far_socket"), ("render_socket", "far_render_socket")] {
@@ -1619,6 +1642,20 @@ pub fn forwards_for(store: &Store, machine: &str) -> Vec<(PathBuf, String)> {
 /// wsp has no record of.
 pub fn seat_machine(store: &Store, seat: &str) -> String {
     str_of(&read_json(&store.state.join(SEATS).join(seat).join(SEAT_FILE)), "machine")
+}
+
+/// Every seat of this store that names `machine`, started or not: what owns a
+/// session or a lease file on that machine.
+pub fn seats_on(store: &Store, machine: &str) -> Vec<String> {
+    let root = store.state.join(SEATS);
+    let mut out = Vec::new();
+    for e in fs::read_dir(&root).into_iter().flatten().flatten() {
+        if str_of(&read_json(&e.path().join(SEAT_FILE)), "machine") == machine {
+            out.push(e.file_name().to_string_lossy().into_owned());
+        }
+    }
+    out.sort();
+    out
 }
 
 /// The far seats on `machine`, as the beat sends to them: every seat record that
@@ -1847,7 +1884,7 @@ impl Place for Compound<'_> {
         let rec = self.record(seat)?;
         let dir = self.dir_of(seat)?;
         if !str_of(&rec, "machine").is_empty() {
-            self.stop_far(&rec)?;
+            self.stop_far(seat, &rec)?;
             fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
             return Ok(());
         }
@@ -2611,6 +2648,10 @@ mod tests {
         assert!(asked[0].contains("close '/far/run/s.sock'"), "closed by its socket: {asked:?}");
         assert!(asked.contains(&format!("cancel {seat}.sock:/far/run/s.sock")) && asked.contains(&format!("cancel {seat}.rsock:/far/run/s.rsock")), "{asked:?}");
         assert!(place.record(&seat).is_err(), "the seat is gone");
+        assert!(
+            asked.iter().any(|c| c == &format!("run rm -f '/far/exec/lease/{seat}' '/far/exec/lease/.{seat}.wsp.tmp'")),
+            "and its lease file with it (wsp-590): {asked:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2633,6 +2674,10 @@ mod tests {
         far.link_down.set(true);
         let err = place.stop(&seat).unwrap_err();
         assert!(err.to_string().contains("cannot reach mb2"), "{err}");
+        assert!(
+            err.to_string().contains("its session /far/run/s.sock") && err.to_string().contains(&format!("its lease file /far/exec/lease/{seat}")),
+            "what it left is said: {err}"
+        );
         assert!(place.record(&seat).is_ok(), "the seat is kept, so the session is not lost track of");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&root2);

@@ -1139,6 +1139,84 @@ pub fn first_lease_command(m: &Machine, seat: &str) -> String {
     )
 }
 
+/// The far shell that removes a seat's lease file, `<exec_dir>/lease/<seat>`
+/// (and a first-lease temp the spawn left), when its session is ended. A lease
+/// file nobody beats is read as stale, but it stays on the machine and keeps its
+/// name in `leases` until something removes it (wsp-590).
+pub fn drop_lease_command(m: &Machine, seat: &str) -> String {
+    let dir = format!("{}/lease", m.exec_dir.trim_end_matches('/'));
+    format!(
+        "rm -f {} {}",
+        quote(&format!("{dir}/{seat}")),
+        quote(&format!("{dir}/.{seat}.wsp.tmp")),
+    )
+}
+
+/// The far command that lists what the machine holds for seats: one
+/// `lease <name>` line per file in `<exec_dir>/lease`, and one line per running
+/// `compound-sup spawn --label …` (the process's own command line). Read by
+/// [`strays`].
+pub fn holdings_command(m: &Machine) -> String {
+    let dir = format!("{}/lease", m.exec_dir.trim_end_matches('/'));
+    format!(
+        "for f in {d}/*; do [ -e \"$f\" ] && echo \"lease ${{f##*/}}\"; done; ps -axo command= | grep -F 'spawn --label' | grep -v 'grep -F' | grep -F -- 'compound-sup'; true",
+        d = quote(&dir),
+    )
+}
+
+/// What the far machine holds for a seat that no seat of this store owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stray {
+    pub label: String,
+    /// A `compound-sup` session is running under that label.
+    pub session: bool,
+    /// A lease file is there under that name.
+    pub lease: bool,
+}
+
+impl Stray {
+    /// One line for `cycle.log`.
+    pub fn words(&self, machine: &str) -> String {
+        let what = match (self.session, self.lease) {
+            (true, true) => "a compound-sup session and a lease file",
+            (true, false) => "a compound-sup session",
+            _ => "a lease file",
+        };
+        format!(
+            "wsp: {machine}: {} holds {what} on {machine} but no seat here has it — a seat ended on this side and not there; end it on the machine (`compound-sup close <socket>`, `rm <exec_dir>/lease/{}`)",
+            self.label, self.label
+        )
+    }
+}
+
+/// [`holdings_command`]'s output → the labels held that none of `seats` owns.
+/// A throwaway check session (`wsp-check-*`) and a lease temp are not seats'.
+pub fn strays(out: &str, seats: &[String]) -> Vec<Stray> {
+    let mut by: std::collections::BTreeMap<String, Stray> = std::collections::BTreeMap::new();
+    for line in out.lines() {
+        let line = line.trim();
+        let (label, session) = match line.strip_prefix("lease ") {
+            Some(name) => (name.trim().to_string(), false),
+            None => {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                match words.iter().position(|w| *w == "--label").and_then(|i| words.get(i + 1)) {
+                    Some(l) if words.iter().any(|w| w.rsplit('/').next() == Some(SUP)) => (l.trim_matches('\'').to_string(), true),
+                    _ => continue,
+                }
+            }
+        };
+        if label.is_empty() || label.starts_with('.') || label.starts_with("wsp-check-") || seats.contains(&label) {
+            continue;
+        }
+        let e = by.entry(label.clone()).or_insert(Stray { label, session: false, lease: false });
+        match session {
+            true => e.session = true,
+            false => e.lease = true,
+        }
+    }
+    by.into_values().collect()
+}
+
 /// What the hook may take, in seconds: the gate waits up to the lease, so the
 /// hook's own timeout is above it.
 pub fn gate_timeout(m: &Machine) -> u32 {
@@ -1831,6 +1909,18 @@ mod tests {
 
     /// `ok` while something holds the seat, `stop` once nothing does — except in
     /// the moments after it opened, before its claim has landed.
+    #[test]
+    fn strays_are_the_sessions_and_leases_no_seat_owns() {
+        let out = "lease cpd-4070\nlease cpd-7\nlease .cpd-9.wsp.tmp\n\
+                   /Users/e/bin/compound-sup spawn --label cpd-4070 --cwd /t -- claude\n\
+                   compound-sup spawn --label cpd-7 --cwd /t -- claude\n\
+                   compound-sup spawn --label wsp-check-5 --cwd /t -- sleep 9\n\
+                   vim spawn --label foo\n";
+        let got = strays(out, &["cpd-7".to_string()]);
+        assert_eq!(got, vec![Stray { label: "cpd-4070".into(), session: true, lease: true }]);
+        assert_eq!(drop_lease_command(&machine(), "cpd-1"), "rm -f ~/'wsp-exec/lease/cpd-1' ~/'wsp-exec/lease/.cpd-1.wsp.tmp'");
+    }
+
     #[test]
     fn a_held_seat_is_told_ok_and_a_released_one_stop_but_not_before_its_claim_lands() {
         assert_eq!(seat(true, Some(3600)).state(), "ok");
