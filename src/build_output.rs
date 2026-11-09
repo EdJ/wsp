@@ -21,6 +21,16 @@
 //! fails any of it keeps its build output and `cycle.log` says why, once per
 //! daemon process.
 //!
+//! **The tree itself, once settled** (`wsp-546`). A row at `review` that is
+//! landed *and* settled in the sense above and whose newest verification holds
+//! is over: the verifier's `--holds` landed it, and nobody builds there unless
+//! it is sent back, which `wsp checkout <id>` answers with a tree rebuilt from
+//! the commits on the trunk. `done` is the person's bookkeeping and lags by
+//! days, and 116 trees (67 GB by `du`) sat at review on 2026-11-09. So
+//! [`settled_trees`] hands them to `cmd_checkout::sweep_closed`, which keeps
+//! every refusal `wsp done` makes: uncommitted work, a branch the trunk lacks,
+//! a claim held, a pane standing in it.
+//!
 //! Idempotent for the reason `check_tree` is: a dropped `target/` is not there
 //! to find again.
 
@@ -106,10 +116,33 @@ fn unsettled(store: &Store, row: &str) -> Option<String> {
     None
 }
 
+/// The rows at `review` with a tree under some project root that are landed,
+/// settled and verified — the ones whose tree has nothing left to do. Read off
+/// the directories, as [`sweep`] is, so a row whose agent went some other way is
+/// found too.
+pub(crate) fn settled_trees(store: &Store) -> Vec<String> {
+    let mut rows = BTreeSet::new();
+    for repo in check_tree::repos(store) {
+        let Ok(entries) = std::fs::read_dir(repo.join(WORKTREES)) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let row = crate::leg_tree::row_of(&name);
+            if e.path().join(".git").exists() && store.task(row).is_some_and(|t| t.status() == Status::Review) {
+                rows.insert(row.to_string());
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let tasks = store.tasks();
+    rows.into_iter().filter(|r| unsettled(store, r).is_none() && crate::scratch::landed_and_verified(store, &tasks, r)).collect()
+}
+
 static SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// The tick's half: [`sweep`] with the live panes and claims as `busy`, and what
-/// it did in `cycle.log`.
+/// The tick's half: [`sweep`] with the live panes and claims as `busy`, then
+/// the trees of [`settled_trees`], and what it did in `cycle.log`.
 ///
 /// Not under test, for `check_tree::tidy`'s reason; the tests drive [`sweep`].
 pub(crate) fn tidy(store: &Store) {
@@ -126,6 +159,14 @@ pub(crate) fn tidy(store: &Store) {
                 if SAID.lock().map(|mut s| s.insert(line.clone())).unwrap_or(true) {
                     crate::store::log_line(store, &line);
                 }
+            }
+        }
+    }
+    let rows = settled_trees(store);
+    if !rows.is_empty() {
+        for line in cmd_checkout::closed_lines(&cmd_checkout::sweep_closed(store, &rows, false)) {
+            if SAID.lock().map(|mut s| s.insert(line.clone())).unwrap_or(true) {
+                crate::store::log_line(store, &format!("{line}: landed and verified"));
             }
         }
     }
@@ -279,5 +320,38 @@ mod tests {
         store.save_worklist(&w).unwrap();
         assert!(matches!(sweep(&store, &free).as_slice(), [Build::Dropped { .. }]));
         assert!(!row.join("target").exists());
+    }
+
+    /// A row at review whose work is on the trunk and whose verification holds
+    /// loses its tree and its legs' trees, not at `done`; before the
+    /// verification, with work the trunk lacks, or sent back, it keeps them.
+    #[test]
+    fn a_landed_and_verified_row_at_review_loses_its_tree() {
+        use crate::verification::{self, Pass, State};
+        let (_env, store, repo) = scratch("trees", Status::Review);
+        let row = tree_with_build(&repo, "p-001");
+        let leg = tree_with_build(&repo, "p-001.scout");
+        assert!(settled_trees(&store).is_empty(), "an unverified row's tree was offered");
+
+        let mut t = store.task("p-001").unwrap();
+        let mut pass = Pass::opened(None, None);
+        pass.state = State::Holds;
+        verification::write(&mut t, &[pass]);
+        store.save_task(&t).unwrap();
+        assert_eq!(settled_trees(&store), ["p-001"]);
+
+        std::fs::write(row.join("work.txt"), "committed, not landed\n").unwrap();
+        run(&row, &["add", "work.txt"]);
+        run(&row, &["commit", "--quiet", "-m", "work"]);
+        assert!(settled_trees(&store).is_empty(), "a row with commits the trunk lacks was offered");
+        run(&repo, &["merge", "--quiet", "--ff-only", "p-001"]);
+        assert_eq!(settled_trees(&store), ["p-001"]);
+
+        let out = cmd_checkout::sweep_closed(&store, &["p-001".to_string()], false);
+        assert_eq!(out.removed.len(), 2, "the row's tree and its leg's");
+        assert!(!row.exists() && !leg.exists(), "a tree is still there");
+        assert!(settled_trees(&store).is_empty(), "the second look found a tree");
+        // The work is on the trunk, and `wsp checkout` makes a tree of it again.
+        assert!(repo.join("work.txt").exists());
     }
 }

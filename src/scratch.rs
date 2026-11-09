@@ -9,8 +9,17 @@
 //! under the state directory keyed by the row ([`path`]), and the orders say to
 //! put build dirs and copies that live outside the tree there. When the row is
 //! closed ([`closed`]: `done`, or at `review` with every list holding it
-//! finished) the tick removes it ([`tidy`]), keeping what the row cites or
-//! declares ([`keeps`]).
+//! finished, or landed and verified: [`closed`]) the tick removes it
+//! ([`tidy`]), keeping what the row cites or declares ([`keeps`]) and any
+//! top-level entry small enough to be a result ([`SMALL`]).
+//!
+//! **Landed and verified is the point the work is over** (`wsp-546`). A list
+//! only finishes when its last group has, and a row in no list never; `done` is
+//! the person's bookkeeping and lags by days. 49 rows' scratch, 246 GB of it one
+//! benchmark's four copies, sat there on 2026-11-09 with their rows at review
+//! and landed. The verifier's `--holds` lands the row, so a row at `review`
+//! whose work is on the trunk and whose newest verification holds is over; one
+//! sent back is at `doing` and keeps its scratch.
 //!
 //! **A sweep** for what predates this: `wsp scratch [-n]` finds
 //! `~/.cache/<row-id>` directories whose row is closed, lists them with sizes,
@@ -21,12 +30,12 @@
 //! **What is kept.** Logs, packets and results are small; the cost is build
 //! output. A row keeps a file or directory by naming it, one path per line, in
 //! `.keep` at the top of its scratch (relative to it, or absolute), or by citing
-//! its path in the row's own text. Whatever is kept keeps its parents; the rest
-//! goes.
+//! its path in the row's own text; a top-level entry that is under [`SMALL`]
+//! without its build output is a result and stays too. Whatever is kept keeps
+//! its parents; the rest goes.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use wsp_base::calls::Command;
 use std::sync::Mutex;
 
 use crate::model::WorklistStatus;
@@ -40,15 +49,26 @@ pub(crate) const KEEP_FILE: &str = ".keep";
 /// cost, not the record.
 const BUILD: &[&str] = &["target", "node_modules"];
 
+/// A top-level entry of a scratch directory smaller than this, not counting
+/// build output, is a result and is kept (`res/`, a log directory); a copy of a
+/// tree is not.
+pub(crate) const SMALL: u64 = 10 * 1024 * 1024;
+
 /// `$WSP_SCRATCH` for `row`.
 pub(crate) fn path(store: &Store, row: &str) -> PathBuf {
     store.state.join("scratch").join(row)
 }
 
-/// Whether a row's work is over: `done`, or at `review` with every list holding
-/// it finished. A row at review in no list, or in a list still running, may be
-/// sent back and keeps its scratch.
+/// Whether a row's work is over: `done`; at `review` with every list holding
+/// it finished; or at `review` landed with its newest verification holding. A
+/// row at review in no list and unverified, or in a list still running and not
+/// yet landed and verified, may be sent back and keeps its scratch.
 pub(crate) fn closed(store: &Store, row: &str) -> bool {
+    closed_in(store, &std::cell::OnceCell::new(), row)
+}
+
+/// [`closed`], reading the tasks once for however many rows are asked.
+fn closed_in(store: &Store, tasks: &std::cell::OnceCell<Vec<crate::model::Task>>, row: &str) -> bool {
     let Some(task) = store.task(row) else { return false };
     match task.status() {
         crate::model::Status::Done => true,
@@ -58,10 +78,18 @@ pub(crate) fn closed(store: &Store, row: &str) -> bool {
                 .into_iter()
                 .filter(|w| w.groups().iter().any(|g| g.members.iter().any(|m| m == row)))
                 .collect();
-            !lists.is_empty() && lists.iter().all(|w| w.status() == WorklistStatus::Done)
+            (!lists.is_empty() && lists.iter().all(|w| w.status() == WorklistStatus::Done))
+                || landed_and_verified(store, tasks.get_or_init(|| store.tasks()), row)
         }
         _ => false,
     }
+}
+
+/// Whether a row's work is on the trunk and its newest verification holds: the
+/// point at which a verifier's `--holds` has landed it and nobody will build in
+/// its tree or write to its scratch again unless it is sent back.
+pub(crate) fn landed_and_verified(store: &Store, tasks: &[crate::model::Task], row: &str) -> bool {
+    crate::verification::verified(tasks, row) && crate::after::landed(store, &mut None, row)
 }
 
 /// Paths under `dir`, to a depth that finds a cited result and no further,
@@ -106,6 +134,11 @@ pub(crate) fn cites(text: &str, path: &str) -> bool {
 /// row's text cites whole (in full, or contracted with `~`). A file cited keeps
 /// that file and its parents as parents, not its siblings.
 pub(crate) fn keeps(dir: &Path, text: &str) -> Vec<Keep> {
+    keeps_under(dir, text, SMALL)
+}
+
+/// [`keeps`] with the size under which a top-level entry is a result.
+pub(crate) fn keeps_under(dir: &Path, text: &str, limit: u64) -> Vec<Keep> {
     let mut keep: Vec<Keep> = std::fs::read_to_string(dir.join(KEEP_FILE))
         .unwrap_or_default()
         .lines()
@@ -119,6 +152,12 @@ pub(crate) fn keeps(dir: &Path, text: &str) -> Vec<Keep> {
         .map(|path| Keep { path, declared: true })
         .collect();
     keep.push(Keep { path: dir.join(KEEP_FILE), declared: true });
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if !keep.iter().any(|k| k.path == p) && small(&p, limit) {
+            keep.push(Keep { path: p, declared: false });
+        }
+    }
     let mut all = Vec::new();
     walk(dir, 4, &mut all);
     for p in all {
@@ -127,6 +166,32 @@ pub(crate) fn keeps(dir: &Path, text: &str) -> Vec<Keep> {
         }
     }
     keep
+}
+
+/// Whether `p` holds under `limit` bytes once build output is left out: a
+/// result, not a copy of a tree. Stops counting at the limit, so a 60 GB copy
+/// costs a few thousand entries and not the walk.
+fn small(p: &Path, limit: u64) -> bool {
+    fn add(p: &Path, limit: u64, seen: &mut u64, entries: &mut usize) -> bool {
+        let Ok(meta) = std::fs::symlink_metadata(p) else { return true };
+        *entries += 1;
+        if is_build(p) && meta.is_dir() {
+            return true;
+        }
+        *seen += meta.len();
+        if *seen >= limit || *entries > 20_000 {
+            return false;
+        }
+        if meta.is_dir() {
+            for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+                if !add(&e.path(), limit, seen, entries) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    limit > 0 && add(p, limit, &mut 0, &mut 0)
 }
 
 fn is_build(p: &Path) -> bool {
@@ -178,20 +243,14 @@ fn prune(dir: &Path, keep: &[Keep]) -> bool {
 pub(crate) struct Found {
     pub row: String,
     pub dir: PathBuf,
-    /// `du`'s figure: an upper bound on a clone-built tree.
+    /// What removing it frees, clones counted once ([`crate::disk::size_of`]);
+    /// `du`'s upper bound when the filesystem would not say (`exact` false).
     pub bytes: u64,
+    pub exact: bool,
+    /// [`crate::disk::Sized::upto`].
+    pub upto: u64,
     /// Paths that stay.
     pub kept: Vec<Keep>,
-}
-
-fn du(path: &Path) -> u64 {
-    Command::new("du")
-        .args(["-sk"])
-        .arg(path)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next()?.parse::<u64>().ok())
-        .map_or(0, |kb| kb * 1024)
 }
 
 /// The cache directory experiment rows have used: `~/.cache/<row-id>`.
@@ -204,17 +263,18 @@ fn cache_dir() -> PathBuf {
 pub(crate) fn find(store: &Store) -> Vec<Found> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
+    let tasks = std::cell::OnceCell::new();
     let owned = std::fs::read_dir(store.state.join("scratch")).into_iter().flatten().flatten().map(|e| e.path());
     let cached = std::fs::read_dir(cache_dir()).into_iter().flatten().flatten().map(|e| e.path());
     for dir in owned.chain(cached) {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
         let row = crate::util::row_of(name.strip_suffix("-verify").unwrap_or(&name)).to_string();
-        if !dir.is_dir() || !seen.insert(dir.clone()) || !closed(store, &row) {
+        if !dir.is_dir() || !seen.insert(dir.clone()) || !closed_in(store, &tasks, &row) {
             continue;
         }
         let text = store.task(&row).map(|t| format!("{}\n{}", t.title, t.body)).unwrap_or_default();
-        let kept = keeps(&dir, &text);
-        out.push(Found { row, dir, bytes: 0, kept });
+        let kept = keeps_under(&dir, &text, 0);
+        out.push(Found { row, dir, bytes: 0, exact: false, upto: 0, kept });
     }
     out.sort_by(|a, b| a.dir.cmp(&b.dir));
     out
@@ -224,7 +284,9 @@ pub(crate) fn find(store: &Store) -> Vec<Found> {
 pub(crate) fn sized(store: &Store) -> Vec<Found> {
     let mut found = find(store);
     for f in &mut found {
-        f.bytes = du(&f.dir);
+        if let Some(s) = crate::disk::size_of(&f.dir) {
+            (f.bytes, f.exact, f.upto) = (s.bytes, s.exact, s.upto);
+        }
     }
     found
 }
@@ -284,7 +346,7 @@ pub(crate) fn scratch(store: &Store, args: &crate::base::args::Args) -> i32 {
     if args.json() {
         let rows: Vec<_> = found
             .iter()
-            .map(|f| serde_json::json!({ "row": f.row, "path": f.dir.display().to_string(), "du_bytes": f.bytes,
+            .map(|f| serde_json::json!({ "row": f.row, "path": f.dir.display().to_string(), "bytes": f.bytes, "exact": f.exact, "upto": f.upto,
                                          "kept": f.kept.iter().map(|k| k.path.display().to_string()).collect::<Vec<_>>() }))
             .collect();
         println!("{}", serde_json::json!({ "scratch": rows, "dry_run": dry, "freed_bytes": gained }));
@@ -301,12 +363,19 @@ pub(crate) fn scratch(store: &Store, args: &crate::base::args::Args) -> i32 {
             true => String::new(),
             false => format!("; keeping {}", stays.join(", ")),
         };
-        println!("{verb} the rest of {}  {} by du  (row {}){keeping}", util::contract(&f.dir), crate::disk::gb(f.bytes), f.row);
+        let size = crate::disk::text(f.bytes, f.exact, f.upto);
+        println!("{verb} the rest of {}  {size}  (row {}){keeping}", util::contract(&f.dir), f.row);
     }
     let total: u64 = found.iter().map(|f| f.bytes).sum();
+    let upto: u64 = found.iter().map(|f| f.upto.max(f.bytes)).sum();
     match gained {
-        Some(g) => println!("freed {} on the volume (du counted {}; clones are counted once per copy)", crate::disk::gb(g), crate::disk::gb(total)),
-        None => println!("du counts {} at most — clones are counted once per copy; the real gain shows without -n", crate::disk::gb(total)),
+        Some(g) => println!("freed {} on the volume by df (sized at {})", crate::disk::gb(g), crate::disk::gb(total)),
+        None if found.iter().all(|f| f.exact) => println!(
+            "{} on the volume at least, up to {} with the clones they share; the gain read off df shows without -n",
+            crate::disk::gb(total),
+            crate::disk::gb(upto)
+        ),
+        None => println!("{} at most — du counts clones once per copy; the gain read off df shows without -n", crate::disk::gb(total)),
     }
     0
 }
@@ -333,6 +402,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 mod tests {
     use super::*;
     use crate::model::{Task, Worklist};
+    use wsp_base::calls::Command;
 
     fn put(p: &Path) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -349,9 +419,9 @@ mod tests {
         put(&dir.join("cited/notes.md"));
         std::fs::write(dir.join(KEEP_FILE), "logs\n../escape\n").unwrap();
         let text = format!("see {}", dir.join("cited/notes.md").display());
-        let keep = keeps(&dir, &text);
+        let keep = keeps_under(&dir, &text, 0);
         assert!(!keep.iter().any(|k| k.path.to_string_lossy().contains("..")), "a keep list left the directory");
-        remove(&Found { row: "row-1".into(), dir: dir.clone(), bytes: 0, kept: keep });
+        remove(&Found { row: "row-1".into(), dir: dir.clone(), bytes: 0, exact: false, upto: 0, kept: keep });
         assert!(dir.join("logs/run.log").exists() && dir.join("cited/notes.md").exists());
         assert!(!dir.join("r1").exists(), "build dirs and results nobody kept stayed");
     }
@@ -367,7 +437,7 @@ mod tests {
         put(&dir.join("r1/results/other.json"));
         put(&dir.join("r1/notes.md"));
         let text = format!("Results at {}. Done.", dir.join("r1/results/out.json").display());
-        remove(&Found { row: "row-3".into(), dir: dir.clone(), bytes: 0, kept: keeps(&dir, &text) });
+        remove(&Found { row: "row-3".into(), dir: dir.clone(), bytes: 0, exact: false, upto: 0, kept: keeps_under(&dir, &text, 0) });
         assert!(dir.join("r1/results/out.json").exists(), "the cited file went");
         assert!(!dir.join("r1/target").exists(), "a cited file kept its run's target");
         assert!(!dir.join("r1/results/other.json").exists() && !dir.join("r1/notes.md").exists(), "a cited file kept its siblings");
@@ -376,14 +446,14 @@ mod tests {
         let dir = env.path("s/row-4");
         put(&dir.join("r2/target/big"));
         put(&dir.join("r2/results/a.json"));
-        remove(&Found { row: "row-4".into(), dir: dir.clone(), bytes: 0, kept: keeps(&dir, &format!("in {}", dir.join("r2").display())) });
+        remove(&Found { row: "row-4".into(), dir: dir.clone(), bytes: 0, exact: false, upto: 0, kept: keeps_under(&dir, &format!("in {}", dir.join("r2").display()), 0) });
         assert!(dir.join("r2/results/a.json").exists() && !dir.join("r2/target").exists());
 
         // A directory listed in `.keep` is the row's own word: kept whole.
         let dir = env.path("s/row-5");
         put(&dir.join("r3/target/big"));
         std::fs::write(dir.join(KEEP_FILE), "r3\n").unwrap();
-        remove(&Found { row: "row-5".into(), dir: dir.clone(), bytes: 0, kept: keeps(&dir, "") });
+        remove(&Found { row: "row-5".into(), dir: dir.clone(), bytes: 0, exact: false, upto: 0, kept: keeps_under(&dir, "", 0) });
         assert!(dir.join("r3/target/big").exists());
     }
 
@@ -401,7 +471,7 @@ mod tests {
         put(&dir.join("r1/results/a.json"));
         put(&dir.join("r1v2/results/b.json"));
         let text = format!("{}", dir.join("r1v2/results/b.json").display());
-        remove(&Found { row: "row-6".into(), dir: dir.clone(), bytes: 0, kept: keeps(&dir, &text) });
+        remove(&Found { row: "row-6".into(), dir: dir.clone(), bytes: 0, exact: false, upto: 0, kept: keeps_under(&dir, &text, 0) });
         assert!(dir.join("r1v2/results/b.json").exists());
         assert!(!dir.join("r1").exists(), "r1 was kept by r1v2's citation");
     }
@@ -411,7 +481,7 @@ mod tests {
         let env = util::isolated("scratch-gone");
         let dir = env.path("s/row-2");
         put(&dir.join("r1/target/obj"));
-        remove(&Found { row: "row-2".into(), dir: dir.clone(), bytes: 0, kept: Vec::new() });
+        remove(&Found { row: "row-2".into(), dir: dir.clone(), bytes: 0, exact: false, upto: 0, kept: Vec::new() });
         assert!(!dir.exists());
     }
 
@@ -443,5 +513,86 @@ mod tests {
         assert!(!closed(&store, "p-003"), "review in no list");
         assert!(!closed(&store, "p-004"));
         assert!(!closed(&store, "p-999"));
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The case of 2026-11-09: a row at review in no list, or in one still
+    /// running, whose verifier held and whose work is on the trunk. Its scratch
+    /// goes then and not when somebody marks it done; before the verifier, or
+    /// with commits the trunk lacks, it stays.
+    #[test]
+    fn a_row_at_review_is_closed_once_landed_and_its_verification_holds() {
+        use crate::verification::{self, Pass, State};
+        let env = util::isolated("scratch-landed");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::testkit::repo(&repo);
+        git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        git(&repo, &["checkout", "--quiet", "-b", "p-001"]);
+        git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "the row's work"]);
+        git(&repo, &["checkout", "--quiet", "master"]);
+        let store = Store::open();
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut t = Task::new("t", "p-001");
+        t.project = Some("p".into());
+        t.status_raw = "review".into();
+        store.save_task(&t).unwrap();
+        let mut w = Worklist::new("run", "p");
+        let mut g = crate::model::Group::default();
+        g.members = vec!["p-001".into()];
+        w.set_groups(&[g]);
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+
+        let hold = |store: &Store| {
+            let mut t = store.task("p-001").unwrap();
+            let mut pass = Pass::opened(None, None);
+            pass.state = State::Holds;
+            verification::write(&mut t, &[pass]);
+            store.save_task(&t).unwrap();
+        };
+        assert!(!closed(&store, "p-001"), "unverified");
+        hold(&store);
+        assert!(!closed(&store, "p-001"), "verified, with its commit not on the trunk");
+        git(&repo, &["merge", "--ff-only", "--quiet", "p-001"]);
+        assert!(closed(&store, "p-001"), "landed and verified, in a list still running");
+        let mut t = store.task("p-001").unwrap();
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        assert!(!closed(&store, "p-001"), "sent back");
+    }
+
+    /// A benchmark's result directory is small and stays; its four copies of a
+    /// tree are not and go, beside it, with the build output of any kept entry.
+    #[test]
+    fn a_small_result_stays_and_a_big_copy_beside_it_goes() {
+        let env = util::isolated("scratch-small");
+        let dir = env.path("s/row-7");
+        put(&dir.join("res/t1.json"));
+        put(&dir.join("res/target/obj"));
+        std::fs::create_dir_all(dir.join("t1/src")).unwrap();
+        std::fs::write(dir.join("t1/src/lib.rs"), vec![b'x'; 4096]).unwrap();
+        put(&dir.join("t1/target/obj"));
+        remove(&Found { row: "row-7".into(), dir: dir.clone(), bytes: 0, exact: false, upto: 0, kept: keeps_under(&dir, "", 1024) });
+        assert!(dir.join("res/t1.json").exists(), "a small result went");
+        assert!(!dir.join("res/target").exists(), "a kept result kept its build output");
+        assert!(!dir.join("t1").exists(), "a big copy stayed");
+        assert!(small(&dir.join("res"), SMALL) && !small(&dir.join("res"), 0));
     }
 }

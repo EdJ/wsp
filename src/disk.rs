@@ -41,8 +41,12 @@ const FRESH: i64 = 10 * 60;
 
 pub(crate) struct Removable {
     pub path: String,
-    /// `du`'s figure, which counts every `cp -cR` clone in full: an upper bound.
+    /// What removing it frees, clones counted once ([`size_of`]); `du`'s upper
+    /// bound where the filesystem would not say (`exact` false).
     pub bytes: u64,
+    pub exact: bool,
+    /// [`Sized::upto`].
+    pub upto: u64,
     /// What it is: `build output`, `scratch of a closed row`, …
     pub kind: String,
 }
@@ -72,9 +76,13 @@ impl Disk {
                 let names: Vec<String> = self
                     .items
                     .iter()
-                    .map(|r| format!("{} {} ({})", r.kind, util::contract(Path::new(&r.path)), gb(r.bytes)))
+                    .map(|r| format!("{} {} ({})", r.kind, util::contract(Path::new(&r.path)), text(r.bytes, r.exact, r.upto)))
                     .collect();
-                format!("it can be reclaimed from: {} — sizes by du, which counts clones in full", names.join("; "))
+                let how = match self.items.iter().all(|r| r.exact) {
+                    true => "what removing each frees on the volume, clones counted once",
+                    false => "sizes by du where marked ≤, which counts clones in full",
+                };
+                format!("it can be reclaimed from: {} — {how}", names.join("; "))
             }
             true => "no reclaimable item measured yet — `wsp doctor` measures them".into(),
         };
@@ -151,14 +159,129 @@ pub(crate) fn reclaimable(store: &Store) -> Vec<(PathBuf, &'static str)> {
             }
         }
     }
+    let settled = crate::build_output::settled_trees(store);
+    for repo in crate::check_tree::repos(store) {
+        for dir in children(&repo.join(WORKTREES)) {
+            let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if settled.iter().any(|r| r == crate::leg_tree::row_of(name)) && !out.iter().any(|(p, _)| *p == dir) {
+                out.push((dir, "tree of a landed and verified row"));
+            }
+        }
+    }
     out.extend(crate::cmd_sandbox::strays(store).into_iter().map(|p| (p, "sandbox tree")));
     out
 }
 
-fn size_of(path: &Path) -> Option<u64> {
+/// What removing `path` gives back: its **private** size, the bytes no other
+/// file shares an extent with. `du` counts every `cp -cR` clone in full — 545 GB
+/// by `du` freed 43 GB (`wsp-373`), and a 61.6 GB copy made four times is 246 GB
+/// by `du` — so a figure that names what to delete is the volume's own: APFS
+/// answers it per file (`ATTR_CMNEXT_PRIVATESIZE`) and a tree is the sum. A
+/// tree and its clone each read as their own changes, and the sum is therefore
+/// a floor on what both going would free, never more than one going frees.
+/// Where the filesystem does not answer, `du` stands in and the caller is told
+/// ([`Sized::exact`]).
+pub(crate) struct Sized {
+    pub bytes: u64,
+    /// Whether `bytes` is the volume's figure and not `du`'s upper bound.
+    pub exact: bool,
+    /// What it would free if every clone sharing its extents went too (`du`'s
+    /// figure): four copies made with `cp -cR` each read nearly nothing alone
+    /// and the whole between them. At least `bytes`.
+    pub upto: u64,
+}
+
+impl Sized {
+    /// `4.2 GB`, or `0 MB (up to 61 GB with the clones it shares with)`, with a
+    /// `≤` where the filesystem would not say.
+    pub(crate) fn show(&self) -> String {
+        text(self.bytes, self.exact, self.upto)
+    }
+}
+
+pub(crate) fn text(bytes: u64, exact: bool, upto: u64) -> String {
+    let own = format!("{}{}", if exact { "" } else { "≤" }, gb(bytes));
+    match exact && upto > bytes + bytes / 2 + (64 << 20) {
+        true => format!("{own}, up to {} with the clones it shares extents with", gb(upto)),
+        false => own,
+    }
+}
+
+pub(crate) fn size_of(path: &Path) -> Option<Sized> {
+    if let Some((bytes, upto)) = private_tree(path) {
+        return Some(Sized { bytes, exact: true, upto });
+    }
     let out = Command::new("du").args(["-sk"]).arg(path).output().ok()?;
     let kb: u64 = String::from_utf8_lossy(&out.stdout).split_whitespace().next()?.parse().ok()?;
-    Some(kb * 1024)
+    Some(Sized { bytes: kb * 1024, exact: false, upto: kb * 1024 })
+}
+
+/// The private size and the allocated size of every file under `path`,
+/// symlinks not followed. `None`
+/// when the first file will not say, which is a filesystem without the
+/// attribute.
+fn private_tree(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let (mut total, mut upto) = (0u64, 0u64);
+    let mut stack = vec![path.to_path_buf()];
+    let mut asked = false;
+    while let Some(p) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+        if meta.is_dir() {
+            stack.extend(std::fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
+        } else if meta.is_file() {
+            upto += meta.blocks() * 512;
+            match private_size(&p) {
+                Some(b) => {
+                    asked = true;
+                    total += b;
+                }
+                None if !asked => return None,
+                None => total += meta.len(),
+            }
+        }
+    }
+    asked.then_some((total, upto)).or_else(|| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()).then_some((0, 0)))
+}
+
+#[cfg(target_os = "macos")]
+fn private_size(path: &Path) -> Option<u64> {
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    #[repr(C)]
+    struct AttrList {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+    extern "C" {
+        fn getattrlist(path: *const c_char, list: *mut AttrList, buf: *mut c_void, size: usize, options: u32) -> c_int;
+    }
+    const ATTR_BIT_MAP_COUNT: u16 = 5;
+    const ATTR_CMNEXT_PRIVATESIZE: u32 = 0x0000_0008;
+    const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
+    const FSOPT_ATTR_CMN_EXTENDED: u32 = 0x0000_0020;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut list = AttrList { bitmapcount: ATTR_BIT_MAP_COUNT, reserved: 0, commonattr: 0, volattr: 0, dirattr: 0, fileattr: 0, forkattr: ATTR_CMNEXT_PRIVATESIZE };
+    let mut buf = [0u8; 16];
+    // SAFETY: `c` is NUL-terminated, `list` and `buf` outlive the call, and the
+    // size passed is the buffer's.
+    let rc = unsafe { getattrlist(c.as_ptr(), &mut list, buf.as_mut_ptr().cast(), buf.len(), FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED) };
+    if rc != 0 {
+        return None;
+    }
+    // A u32 length, then the off_t. Extended common attributes are asked in
+    // `forkattr` when FSOPT_ATTR_CMN_EXTENDED is set.
+    Some(u64::from_ne_bytes(buf[4..12].try_into().ok()?))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn private_size(_: &Path) -> Option<u64> {
+    None
 }
 
 /// The biggest of `items` that are on the volume mounted at `volume`, at most
@@ -167,9 +290,9 @@ pub(crate) fn biggest(items: &[(PathBuf, &str)], volume: &str) -> Vec<Removable>
     let mut found: Vec<Removable> = items
         .iter()
         .filter(|(p, _)| free_of(p).is_some_and(|(v, _)| v == volume))
-        .filter_map(|(p, kind)| size_of(p).map(|bytes| Removable { path: p.display().to_string(), bytes, kind: kind.to_string() }))
+        .filter_map(|(p, kind)| size_of(p).map(|s| Removable { path: p.display().to_string(), bytes: s.bytes, exact: s.exact, upto: s.upto, kind: kind.to_string() }))
         .collect();
-    found.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    found.sort_by(|a, b| b.upto.max(b.bytes).cmp(&a.upto.max(a.bytes)));
     found.truncate(NAMED);
     found
 }
@@ -194,7 +317,7 @@ fn recorded(state: &Path, volume: &str) -> Vec<Removable> {
                     // The directory may have been removed since it was measured; a
                     // record naming one is a pointer to nothing.
                     Path::new(&path).is_dir().then_some(())?;
-                    Some(Removable { path, bytes: i.get("bytes")?.as_u64()?, kind: i.get("kind")?.as_str()?.to_string() })
+                    Some(Removable { path, bytes: i.get("bytes")?.as_u64()?, exact: i.get("exact").and_then(|e| e.as_bool()).unwrap_or(false), upto: i.get("upto").and_then(|e| e.as_u64()).unwrap_or(0), kind: i.get("kind")?.as_str()?.to_string() })
                 })
                 .collect(),
         )
@@ -208,7 +331,7 @@ fn record(state: &Path, volume: &str, found: &[Removable]) {
         .and_then(|s| serde_json::from_str(&s).ok())
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| json!({}));
-    let items: Vec<_> = found.iter().map(|f| json!({ "path": f.path, "bytes": f.bytes, "kind": f.kind })).collect();
+    let items: Vec<_> = found.iter().map(|f| json!({ "path": f.path, "bytes": f.bytes, "exact": f.exact, "upto": f.upto, "kind": f.kind })).collect();
     all[volume] = json!({ "at": util::epoch_secs(), "items": items });
     let _ = std::fs::write(record_path(state), all.to_string());
 }
@@ -277,7 +400,7 @@ fn hold_reason(volume: &str, free: u64, items: &[Removable]) -> Option<String> {
     if free >= HOLD {
         return None;
     }
-    let disk = Disk { volume: volume.into(), free, limit: HOLD, items: items.iter().map(|r| Removable { path: r.path.clone(), bytes: r.bytes, kind: r.kind.clone() }).collect() };
+    let disk = Disk { volume: volume.into(), free, limit: HOLD, items: items.iter().map(|r| Removable { path: r.path.clone(), bytes: r.bytes, exact: r.exact, upto: r.upto, kind: r.kind.clone() }).collect() };
     Some(format!("{} — a build would fail partway; free space first (`wsp scratch -n`, `wsp checkout --sweep -n`, `wsp sandbox rm --all -n`) and it goes ahead", disk.line()))
 }
 
@@ -333,7 +456,7 @@ mod tests {
         assert!(!ok.low());
         assert_eq!(ok.line(), "50 GB free on /v");
 
-        let item = |p: &str, gib: u64, kind: &str| Removable { path: p.into(), bytes: gib << 30, kind: kind.into() };
+        let item = |p: &str, gib: u64, kind: &str| Removable { path: p.into(), bytes: gib << 30, exact: true, upto: gib << 30, kind: kind.into() };
         let tight = Disk {
             volume: "/v".into(),
             free: LOW - 1,
@@ -355,7 +478,7 @@ mod tests {
     #[test]
     fn under_twenty_gb_the_hold_says_why_and_over_it_does_not() {
         assert!(hold_reason("/v", HOLD, &[]).is_none());
-        let why = hold_reason("/v", HOLD - 1, &[Removable { path: "/s/scratch/c-1".into(), bytes: 9 << 30, kind: "scratch of a closed row".into() }]).unwrap();
+        let why = hold_reason("/v", HOLD - 1, &[Removable { path: "/s/scratch/c-1".into(), bytes: 9 << 30, exact: true, upto: 9 << 30, kind: "scratch of a closed row".into() }]).unwrap();
         assert!(why.contains("free on /v") && why.contains("scratch of a closed row") && why.contains("wsp scratch"), "{why}");
     }
 
@@ -386,6 +509,29 @@ mod tests {
         std::fs::remove_dir_all(&big).unwrap();
         let after = recorded(&state, &volume);
         assert_eq!(after.len(), 2, "a record named a directory that is gone");
+    }
+
+    /// `du` reads a `cp -cR` clone in full; the volume gives back only what
+    /// nothing else shares. A copy of a tree made with clones is near nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_clone_of_a_tree_is_sized_by_what_removing_it_frees() {
+        let env = util::isolated("disk-clone");
+        let (orig, copy) = (env.path("orig"), env.path("copy"));
+        fill(&orig, 4096);
+        let out = Command::new("cp").args(["-cR"]).arg(&orig).arg(&copy).output().unwrap();
+        assert!(out.status.success());
+        let (a, b) = (size_of(&orig).unwrap(), size_of(&copy).unwrap());
+        assert!(a.exact && b.exact);
+        assert!(a.upto >= 4096 * 1024 && b.upto >= 4096 * 1024, "{} {}", a.upto, b.upto);
+        // Each still shares its extent with the other, so neither reads as the 4 MB `du` says.
+        assert!(a.bytes < 1024 * 1024 && b.bytes < 1024 * 1024, "{} {}", a.bytes, b.bytes);
+
+        // A file written afresh is private.
+        let fresh = env.path("fresh");
+        fill(&fresh, 2048);
+        std::fs::write(fresh.join("big"), (0..2048 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>()).unwrap();
+        assert!(size_of(&fresh).unwrap().bytes >= 2048 * 1024);
     }
 
     /// A store whose one project is rooted at a scratch repository holding two

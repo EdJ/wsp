@@ -56,13 +56,7 @@ cycle -> main: Args  # engine -> top
 cycle -> room: Counted, Gate, names  # engine -> seats
 cycle -> wake: messages_held, say, settle_held  # engine -> seats
 detail -> main: Args  # surface -> top
-disk -> check_tree: in_use, named, repos  # base -> trees
-disk -> cmd_checkout: WORKTREES  # base -> trees
-disk -> cmd_sandbox: strays  # base -> seats
-disk -> cycle: log_line  # base -> engine
-disk -> model: Status  # base -> store
-disk -> scratch: find  # base -> store
-disk -> store: Store  # base -> store
+disk -> cmd_sandbox: strays  # engine -> seats
 ending -> cmd_attempts: attempts_of  # engine -> timeline
 kanban -> main: Args  # surface -> top
 kind_attention -> agent_commands: Kind, Spawn  # engine -> seats
