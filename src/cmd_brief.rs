@@ -1218,6 +1218,21 @@ const SEAT_JOB: &str = "yours to decide and direct; wsp runs the steps · wsp fl
 const PRIMARY_JOB: &str =
     "the person's side of the fleet; governs nothing · wsp wip, wsp yours, wsp govern · your asks wait on the person";
 
+/// What the primary and a governor are told about the channel (`wsp-523`): the
+/// addresses `wsp tell` reads, that `list:` fans out, and the footer's reply
+/// form. One line, because the brief is re-read on every request.
+pub(crate) const GOVERNOR_COMMS: &str = "wsp tell <address> \"…\": primary, governor:<list|project>, seat:<row>, verifier:<row>, check:<list>, list:<name> (every live seat, one id each) · a message ends `[from X · reply: wsp tell X --re <id> -]`: answer with that exact command, not in prose on your screen; `--no-reply` leaves the footer off";
+
+/// The member's half (`wsp-523`): a footer is answered by its command, and the
+/// closing report goes to the governor rather than staying on the seat's screen.
+pub(crate) fn member_comms(on_a_list: bool) -> String {
+    let governor = match on_a_list {
+        true => "`wsp tell governor:<list>` (or `governor:<project>`)",
+        false => "`wsp tell governor:<project>`",
+    };
+    format!("a message ending `[from X · reply: wsp tell X --re <id> -]` is answered with that exact command, not in prose on your screen · your closing report (what you found, what you filed, what is left) goes to your governor with {governor}, not left on your own screen")
+}
+
 /// What an agent holding `id` is told about asking the person (`wsp-303`).
 ///
 /// Two lines, because the brief is re-read on every request. The example is the
@@ -1423,6 +1438,10 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         );
     }
 
+    if r.custodian.is_some() {
+        row("tell", p.dim(GOVERNOR_COMMS).to_string());
+    }
+
     // The pane this one replaced, and what is becoming of it. Beside the seat
     // line because it is the same fact read from the incoming end; drawn only
     // while a handover record names this pane, which is one pane on the
@@ -1532,6 +1551,8 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             for (i, l) in asking(&t.id).iter().enumerate() {
                 row(if i == 0 { "ask" } else { "" }, p.dim(l).to_string());
             }
+            // The channel between seats (`wsp-523`).
+            row("tell", p.dim(&member_comms(r.list.is_some())).to_string());
             // Writing an asset (`wsp-376`): in place, as a version, never under a
             // new name and never over the file by hand.
             row("assets", p.dim(crate::artefact::BRIEF_LINE).to_string());
@@ -2002,6 +2023,31 @@ mod tests {
                 assert_eq!(text.contains("wsp release t-001"), told, "{what}: {text}");
                 assert_eq!(text.contains("never `wsp add --parent`"), told, "{what}: {text}");
             }
+        }
+    }
+
+    /// `wsp-523`: the briefs name the channel. The primary and a governor get the
+    /// addresses and the footer's reply form; a member gets that a footer is
+    /// answered by its command, and that its closing report goes to its governor.
+    #[test]
+    fn the_briefs_name_the_addresses_and_the_reply_footer() {
+        let mut r = compose(&briefing());
+        for custodian in [crate::governors::PRIMARY, "batch"] {
+            r.custodian = Some(custodian.into());
+            let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+            for want in ["list:<name> (every live seat, one id each)", "governor:<list|project>", "wsp tell X --re <id> -", "not in prose on your screen"] {
+                assert!(text.contains(want), "{custodian}: {want}: {text}");
+            }
+        }
+        let mut r = compose(&briefing());
+        r.custodian = None;
+        for depth in [Depth::Normal, Depth::Session] {
+            let text = brief_lines(&r, &plain(), depth).join("\n");
+            assert!(text.contains("answered with that exact command, not in prose on your screen"), "{text}");
+            assert!(text.contains("wsp tell governor:<project>"), "{text}");
+            assert!(!text.contains("governor:<list>"), "a row on no list is not told of a list: {text}");
+            assert!(text.contains("closing report"), "{text}");
+            assert!(!text.contains("every live seat, one id each"), "a member is not handed the governor's line");
         }
     }
 

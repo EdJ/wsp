@@ -492,6 +492,9 @@ AGENTS
                                     back. `--re <id>` marks this as the reply to
                                     that message and is refused for an unknown
                                     one
+                                    `list:<name>` tells every live seat on the
+                                    list once, each with its own id; `--log`
+                                    shows it as one fan-out with its count
                                     `--log <address|id>` reads the tells to and
                                     from that post off the event log, replies
                                     under what they answer, a held tell shown

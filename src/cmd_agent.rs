@@ -1484,6 +1484,9 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // post rather than a row, and resolves first; a bare word is a row or a
     // seat id, as it always was. See [`crate::address`].
     let addressed = crate::address::parse(&needle);
+    if let Some(crate::address::Address::List(name)) = &addressed {
+        return tell_list(store, args, &from, re.as_deref(), &text, &needle, name);
+    }
     let (seat, what) = match &addressed {
         Some(addr) => match addressed_seat(store, addr) {
             Ok(v) => v,
@@ -1500,11 +1503,73 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
             }
         },
     };
+    tell_seat(store, args, &p, &from, re.as_deref(), &text, &needle, addressed.is_some(), seat, what)
+}
+
+/// `wsp tell list:<name> "…"` — the sentence to every live seat on the list,
+/// each as its own message with its own id (the id is of the pane and the
+/// text), and the sender's `cycle.log` gets one line for the lot with its count
+/// (`wsp-523`). The sender's own seat is not told its own sentence.
+fn tell_list(store: &Store, args: &Args, from: &str, re: Option<&str>, text: &str, needle: &str, name: &str) -> i32 {
+    let p = Paint::new();
+    let seats = match crate::address::resolve(&crate::address::Address::List(name.into()), &crate::address::Book::read(store)) {
+        Ok(v) => v,
+        Err(why) => {
+            eprintln!("wsp: `{needle}`: {why}");
+            return 1;
+        }
+    };
+    let own = crate::place::seat_from_env().map(|s| s.to_string());
+    let seats: Vec<_> = seats.into_iter().filter(|n| own.as_deref() != Some(n.pane.as_str())).collect();
+    if seats.is_empty() {
+        eprintln!("wsp: `{needle}`: nobody else is seated on {name}");
+        return 1;
+    }
+    let (mut told, mut failed) = (0usize, 0usize);
+    for n in &seats {
+        match tell_seat(store, args, &p, from, re, text, needle, true, n.pane.clone(), n.what.clone()) {
+            0 => told += 1,
+            _ => failed += 1,
+        }
+    }
+    crate::store::log_line(
+        store,
+        &format!("told {needle}: fan-out to {} seats ({told} told, {failed} not) from {from}", seats.len()),
+    );
+    store.log_event(
+        "agent-told-list",
+        json!({ "list": name, "from": from, "seats": seats.len(), "told": told, "at": util::epoch_secs() }),
+    );
+    if !args.json() {
+        println!("{}", p.dim(&format!("{needle}: {} seats, {told} told", seats.len())));
+    }
+    match failed {
+        0 => 0,
+        _ => 1,
+    }
+}
+
+/// The rest of a tell once its seat is known: the checks on the seat, the
+/// footer, the repeat guard and the delivery. One seat, whichever address or
+/// fan-out found it.
+#[allow(clippy::too_many_arguments)]
+fn tell_seat(
+    store: &Store,
+    args: &Args,
+    p: &Paint,
+    from: &str,
+    re: Option<&str>,
+    text: &str,
+    needle: &str,
+    addressed: bool,
+    seat: String,
+    what: String,
+) -> i32 {
     // What `wsp peek` and `--anyway` are told to name: the seat, for an
     // address, since neither verb reads one.
     let peek = match addressed {
-        Some(_) => seat.clone(),
-        None => needle.clone(),
+        true => seat.clone(),
+        false => needle.to_string(),
     };
 
     // Asked of every backend wsp can spawn onto (`compound-077`), not herdr
@@ -1527,7 +1592,7 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // it waits in the wake spool for the link: `docs/remote-agents.md` section 3.
     // Only a seat that was found gets here; one nothing answers for was refused
     // above and nothing was kept for it.
-    let said = dressed(&from, &message_id(&seat, &text), &text, !args.has("no-reply"));
+    let said = dressed(from, &message_id(&seat, text), text, !args.has("no-reply"));
     if row.state == State::Unreachable {
         let n = crate::wake::hold_tell(store, &seat, &said);
         // Written as held, so the log shows it before the link returns and
@@ -1549,8 +1614,8 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     }
     if row.agent.kind.is_empty() {
         match addressed {
-            Some(_) => eprintln!("wsp: no agent in {seat} — the pane is alive and empty"),
-            None => eprintln!("wsp: no agent in {seat} — the pane is alive and empty. `wsp spawn {needle}` puts one in it"),
+            true => eprintln!("wsp: no agent in {seat} — the pane is alive and empty"),
+            false => eprintln!("wsp: no agent in {seat} — the pane is alive and empty. `wsp spawn {needle}` puts one in it"),
         }
         return 1;
     }
@@ -1582,13 +1647,13 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
 
     let how = crate::agent_commands::of(&row.agent.kind);
     let addressee = match addressed {
-        Some(_) => needle.clone(),
-        None => addressee_id(store, &needle, &what),
+        true => needle.to_string(),
+        false => addressee_id(store, &needle, &what),
     };
-    let sent = Sent::new(&addressee, &what, &seat, &peek, &text, args).by(&from, re.as_deref(), !args.has("no-reply"));
+    let sent = Sent::new(&addressee, &what, &seat, &peek, text, args).by(from, re, !args.has("no-reply"));
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
-            return twice(&sent, ago, &p);
+            return twice(&sent, ago, p);
         }
     }
     delivered(store, how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &said), &sent)
@@ -7363,6 +7428,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     back. `--re <id>` marks this as the reply to
                                     that message and is refused for an unknown
                                     one
+                                    `list:<name>` tells every live seat on the
+                                    list once, each with its own id; `--log`
+                                    shows it as one fan-out with its count
                                     `--log <address|id>` reads the tells to and
                                     from that post off the event log, replies
                                     under what they answer, a held tell shown
@@ -7435,6 +7503,17 @@ mod tests {
         let store = Store::open();
         store.ensure_dirs().unwrap();
         (env, store)
+    }
+
+    /// `wsp-523`: a fan-out to a list nobody knows is refused before anything is
+    /// typed or logged.
+    #[test]
+    fn a_tell_to_an_unknown_list_is_refused_and_leaves_no_fan_out() {
+        let (_env, store) = scratch("tell-list");
+        let args = Args::synth("tell", &["list:nope", "hello"], &[]);
+        assert_eq!(tell(&store, &args), 1);
+        assert!(store.events_of("agent-told-list").is_empty());
+        assert!(store.events_of("agent-told").is_empty());
     }
 
     /// `wsp-521`: the footer is on by default, off with `--no-reply`, and one
