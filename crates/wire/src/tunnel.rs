@@ -1382,6 +1382,18 @@ esac
         std::fs::read_to_string(dir.join("said")).unwrap_or_default().lines().filter(|l| *l == what).count()
     }
 
+    /// Wait until `said` holds `n` lines of `what`. A master is a spawned child
+    /// and writes its line when it gets the CPU, not when `spawn` returns; the
+    /// patience is for that, as [`recover_until`]'s is.
+    fn said_until(dir: &std::path::Path, what: &str, n: usize) {
+        let give_up = Instant::now() + Duration::from_secs(120);
+        while said(dir, what) < n {
+            assert!(Instant::now() < give_up, "never {n} {what}: {}", said(dir, what));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(said(dir, what), n, "{what}");
+    }
+
     /// A store with one machine, `mb2`, and a supervisor that dials it with the
     /// fake ssh.
     fn far_rig(name: &str) -> (Store, PathBuf, Supervisor) {
@@ -1437,15 +1449,18 @@ esac
         // Still down: the slice asks, and dials nothing.
         let masters = said(&root, "master");
         sup.recover(&store);
-        assert_eq!(said(&root, "master"), masters, "no master is dialled into a dead link");
+        assert!(sup.tunnels["mb2"].child.is_none(), "no master is dialled into a dead link");
+        assert_eq!(said(&root, "master"), masters);
         assert!(!sup.tunnels["mb2"].live.reachable);
 
         // The link answers: the very next slice dials, with the backoff unspent.
         std::fs::remove_file(root.join("down")).unwrap();
         sup.recover(&store);
         assert_eq!(said(&root, "link"), 1, "the cheap question was asked");
-        assert_eq!(said(&root, "master"), masters + 1, "and the master dialled in the same slice");
-        assert!(sup.tunnels["mb2"].child.is_some());
+        assert!(sup.tunnels["mb2"].child.is_some(), "and the master dialled in the same slice");
+        // The master is a spawned child: its line in `said` comes when the fake
+        // `/bin/sh` gets the CPU, which on a loaded machine is after `recover`.
+        said_until(&root, "master", masters + 1);
 
         // And once its socket is there, the next slice finds it up.
         recover_until(&mut sup, &store, |t| t.live.reachable);
@@ -1468,11 +1483,7 @@ esac
         let (store, root, mut sup) = far_rig("stall");
         std::fs::write(root.join("stall"), "").unwrap();
         sup.tick(&store);
-        let give_up = Instant::now() + Duration::from_secs(120);
-        while said(&root, "master") == 0 {
-            assert!(Instant::now() < give_up);
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        said_until(&root, "master", 1);
 
         // Inside its deadline it is left alone, and reads as starting.
         sup.recover(&store);
@@ -1490,6 +1501,8 @@ esac
 
         // The link is fine now: the next slice dials and the new master answers.
         std::fs::remove_file(root.join("stall")).unwrap();
+        // The fake writes its line before its socket, so a master that reads
+        // reachable has already said so.
         recover_until(&mut sup, &store, |t| t.live.reachable);
         assert_eq!(said(&root, "master"), 2);
 
