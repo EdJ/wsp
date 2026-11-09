@@ -38,6 +38,9 @@ pub const BOOL_FLAGS: &[&str] = &[
     "dry-run",
     // `worklist output <slug> --none`, and the source of one it adds.
     "none", "wsp",
+    // `worklist group <slug> N --together <more>`: a group's all-at-once mark
+    // takes no value, or the word after it would be eaten (wsp-584).
+    "together", "no-together",
     // Same for `sandbox`, whose positional is a sandbox name.
     "keep", "seed", "fake",
     // And `despawn`, whose positional is a task id.

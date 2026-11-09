@@ -7151,6 +7151,18 @@ mod tests {
     use super::*;
     use crate::model::Task;
 
+    /// wsp-584: `--together` and `--no-together` take no value, so a bare word
+    /// after either is still a positional and is not swallowed as its value.
+    #[test]
+    fn together_takes_no_value_and_leaves_the_word_after_it() {
+        for flag in ["--together", "--no-together"] {
+            let args = Args::parse(["worklist", "group", "run", flag, "2"].iter().map(|s| s.to_string()).collect());
+            assert!(args.has(&flag[2..]), "{flag} is read");
+            assert_eq!(args.get(&flag[2..]), None, "{flag} took no value");
+            assert!(args.rest.iter().any(|r| r == "2"), "the word after {flag} stays a positional: {:?}", args.rest);
+        }
+    }
+
     /// A store of its own, with no environment touched: nothing in these verbs
     /// reads the ambient store, so the tests can run beside each other.
     fn scratch(tag: &str) -> Store {

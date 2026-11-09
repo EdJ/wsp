@@ -9071,6 +9071,37 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(store.starts().get("m-1").and_then(|e| e["tries"].as_u64()), Some(1), "one try, the launched one");
     }
 
+    /// wsp-584: an x3 first group that is not together, with one of four places
+    /// free, starts exactly one member; the next starts when a place frees.
+    #[test]
+    fn an_x3_group_not_together_starts_one_member_with_one_place_free_and_the_next_as_places_free() {
+        let (_env, store) = scratch("x3-one-free");
+        for id in ["m-1", "m-2", "m-3"] {
+            task(&store, id, Status::Todo);
+        }
+        for id in ["h-1", "h-2", "h-3"] {
+            task(&store, id, Status::Doing);
+            let mut h = store.find_task(id).unwrap();
+            h.log(&format!("{STARTED_BY} other group 1"));
+            store.save_task(&h).unwrap();
+        }
+        let w = list(&store, &[(&["m-1", "m-2", "m-3"], "claude")]);
+        let mut w2 = store.worklist("run").unwrap();
+        let mut groups = w2.groups();
+        groups[0].cap = Some(3);
+        groups[0].together = false;
+        w2.set_groups(&groups);
+        store.save_worklist(&w2).unwrap();
+        store.set_seat_cap(Some(4)).unwrap();
+
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().len(), 1, "one place free: exactly one member starts");
+
+        set(&store, "h-1", Status::Done);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().len(), 1, "a place freed: the next member starts");
+    }
+
     /// wsp-524, the first case: a start that failed its three tries while the
     /// seat was at its cap is taken again once there is room, at the member's
     /// own agent line, and once.
