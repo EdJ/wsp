@@ -92,7 +92,7 @@ const STALLED_AFTER: i64 = 10 * 60;
 /// daemon restart can. It is written under the store lock and re-read inside
 /// the same lock that decides whether to write it, so two ticks racing cannot
 /// both tell.
-const NOTICED: &str = "wsp: this member's seat reads";
+pub(crate) const NOTICED: &str = "wsp: this member's seat reads";
 
 /// The marker in a member's `## Log` saying its seat is waiting on somebody,
 /// and on whom — [`crate::waiting`]'s sentence after it.
@@ -1325,6 +1325,36 @@ fn noticed(t: &Task) -> Option<i64> {
         }
     }
     since
+}
+
+/// What the run has said to this row's seat since its newest start, off the
+/// row's own `## Log` (`wsp-552`): `wip`'s `wait` reads it so a person sees
+/// `told to finish`, `sent back 20s ago: reseating` or a send-back that never
+/// reached the pane without opening the row.
+///
+/// The same marks this module and [`crate::cycle`] write and act on, read the
+/// way [`noticed`] reads its own: a fresh start clears every one, and a spell
+/// of waiting clears the told-mark.
+pub(crate) fn run_said(t: &Task) -> crate::waiting::Said {
+    let mut said = crate::waiting::Said::default();
+    let Some(log) = t.section("Log") else { return said };
+    for l in log.lines() {
+        if fresh_start(l) {
+            said = crate::waiting::Said::default();
+        } else if l.contains(WAITING) {
+            said.told = None;
+        } else if l.contains(NOTICED) {
+            said.told = stamp_of(l);
+        } else if l.contains(crate::cycle::SENT_BACK) || l.contains(crate::cycle::RESEAT_ASKED) {
+            said.sent_back = stamp_of(l);
+            said.undelivered = None;
+        } else if l.contains(TELL_PENDING) {
+            said.undelivered = stamp_of(l);
+        } else if l.contains(TELL_DELIVERED) {
+            said.undelivered = None;
+        }
+    }
+    said
 }
 
 /// When this member last had a new agent put on it, off the line that says so.

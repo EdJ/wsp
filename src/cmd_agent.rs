@@ -4421,6 +4421,10 @@ pub(crate) struct WipRow {
     /// Published as `waiting`, and drawn in the STATE column in place of the
     /// bare word, because `idle` is exactly what a waiting seat must not read.
     pub(crate) waiting: Option<crate::waiting::Wait>,
+    /// The seat's whole wait in one reading (`wsp-552`): its kind, target,
+    /// since, quiet seconds and line — [`crate::waiting::seat_wait`].
+    /// Published as `wait`; `wip` prints the line under the row.
+    pub(crate) wait: Option<crate::waiting::SeatWait>,
     /// For a governor's row, how many seats under it are waiting: the rows
     /// whose `answers_to` is its scope, whatever they are waiting on.
     pub(crate) members_waiting: usize,
@@ -4759,6 +4763,21 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             (role, _) => role,
         };
         let (answers_to, answers_to_empty) = answers_to(w, &role, seat, r.project.as_deref(), &running, &homes);
+        let unsent = !a.state.turn_in_flight() && w.unsent.contains(seat);
+        let dropped = !a.state.turn_in_flight() && w.dropped.contains(seat);
+        let stuck = w.stuck.get(seat).copied();
+        let wait = crate::waiting::seat_wait(&crate::waiting::Facts {
+            state: a.state,
+            waiting: waiting.as_ref(),
+            in_state_since: w.since.get(seat).map(|s| util::epoch_of(s)).filter(|&e| e > 0),
+            stuck: stuck.map(|(k, secs)| (k.key(), k.word(), secs)),
+            said: held.map(crate::repair::run_said).unwrap_or_default(),
+            unreachable: w.silent.seats.get(seat).cloned(),
+            unsent,
+            dropped,
+            rests_on: held.and_then(|t| rests_on(w, t)),
+            now: util::epoch_secs(),
+        });
 
         rows.push(WipRow {
             project: r.project.unwrap_or_else(|| "—".into()),
@@ -4780,6 +4799,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             seat: seat_of_project.clone(),
             said: sentence(&w.said, seat, bound.map(|t| t.id.as_str())),
             waiting,
+            wait,
             members_waiting: 0,
             // A leg's is when it opened: the row's claim, if any, is not its.
             held: (match (legged.get(seat), pieced.get(seat)) {
@@ -4805,10 +4825,10 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             role,
             spawned_by,
             leg: leg.cloned(),
-            unsent: !a.state.turn_in_flight() && w.unsent.contains(seat),
-            dropped: !a.state.turn_in_flight() && w.dropped.contains(seat),
+            unsent,
+            dropped,
             full_suite: w.full_suite.contains(seat),
-            stuck: w.stuck.get(seat).copied(),
+            stuck,
             was_governor,
         });
     }
@@ -4828,6 +4848,29 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     }
     rows.sort_by(|a, b| a.project.cmp(&b.project).then(a.pane.cmp(&b.pane)));
     rows
+}
+
+/// The first row or list `t` rests on (`after:`) that has not finished, and
+/// its standing — `("pieces-trial", "planned: alone")` — for the `other_work`
+/// wait (`wsp-552`). A row at review has landed its part; a list is finished
+/// when it is done or cancelled. A name that is neither is not read as a wait.
+fn rests_on(w: &Wip, t: &Task) -> Option<(String, String)> {
+    t.after.iter().find_map(|o| {
+        if let Some(row) = w.tasks.iter().find(|r| &r.id == o) {
+            let s = crate::worklist::Settlement::of(row);
+            return (!s.settled()).then(|| (o.clone(), s.word().to_string()));
+        }
+        let l = w.lists.iter().find(|l| &l.id == o)?;
+        if l.is_cancelled() || l.status() == crate::model::WorklistStatus::Done {
+            return None;
+        }
+        let word = if l.is_planned() { "planned" } else { l.status().as_str() };
+        let standing = match l.alone == Some(true) {
+            true => format!("{word}: alone"),
+            false => word.to_string(),
+        };
+        Some((o.clone(), standing))
+    })
 }
 
 /// The three lists under the agents: work waiting on a person, in the order it
@@ -4926,6 +4969,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "since": r.since,
             "direction": r.direction,
             "waiting": r.waiting.as_ref().map(|w| w.json()),
+            "wait": r.wait.as_ref().map(|w| w.json()),
             "members_waiting": r.seat.as_ref().map(|_| r.members_waiting),
             "kind": r.runs.kind, "model": r.runs.model, "effort": r.runs.effort,
             "role": r.role.json(),
@@ -5127,6 +5171,12 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
                 state,
                 flag
             ));
+            // The seat's wait in one line, under it (`wsp-552`): which delay
+            // it is and since when, without opening the pane. A turn in
+            // flight already says `working`, so it gets none.
+            if let Some(sw) = r.wait.as_ref().filter(|sw| sw.kind != crate::waiting::Kind::Working && !terse) {
+                out.push(format!("{}  {}", " ".repeat(pw), p.dim(&format!("↳ {}", sw.line))));
+            }
         }
     }
 
@@ -11205,5 +11255,189 @@ mod tests {
         assert_eq!(ran_text(&ran), " · ran sonnet-5-5/high · 63 turns · peak 180k · 4.1M cache 100k in 5.0k out");
         ran.peak = 0;
         assert_eq!(ran_text(&ran), " · ran sonnet-5-5/high · 63 turns · 4.1M cache 100k in 5.0k out");
+    }
+
+    // ---- `wait` (`wsp-552`) ----------------------------------------------
+
+    /// A row whose `## Log` holds `lines`, each dated `ago` seconds back.
+    fn logged(id: &str, status: &str, lines: &[(&str, i64)]) -> Task {
+        let mut t = wip_task(id, id, Some("wsp"), status);
+        let now = util::epoch_secs();
+        let log: String = lines.iter().map(|(l, ago)| format!("- {} {l}\n", util::iso_at(now - ago))).collect();
+        t.body = format!("## Log\n{log}");
+        t
+    }
+
+    /// One seat in each kind of wait, bound to a row of its own, with `since`
+    /// a minute back for each.
+    fn waits_world() -> Wip {
+        let mut w = wip_world();
+        let now = util::epoch_secs();
+        let start = (crate::cycle::STARTED_BY, 600);
+        let rows = [
+            ("w4:p1", logged("t-010", "doing", &[start]), State::Idle),
+            ("w5:p1", logged("t-011", "doing", &[start]), State::Blocked),
+            ("w6:p1", logged("t-012", "doing", &[start]), State::Idle),
+            ("w7:p1", logged("t-013", "doing", &[start]), State::Idle),
+            ("w8:p1", logged("t-014", "doing", &[start, (&format!("{} idle with this row still at doing", crate::repair::NOTICED), 30)]), State::Idle),
+            ("w9:p1", logged("t-015", "doing", &[start, (&format!("{} the verifier blocked: x", crate::cycle::SENT_BACK), 20)]), State::Gone),
+            ("w10:p1", logged("t-016", "doing", &[start]), State::Idle),
+            ("w11:p1", logged("t-017", "doing", &[start]), State::Working),
+        ];
+        for (seat, mut t, state) in rows {
+            if t.id == "t-013" {
+                t.after = vec!["pieces-trial".into()];
+            }
+            w.bindings.insert(seat.into(), json!({ "task_id": t.id }));
+            std::rc::Rc::make_mut(&mut w.tasks).push(t);
+            let mut a = seated_agent(seat, "idle", seat);
+            a.state = state;
+            w.agents.push(a);
+        }
+        for a in &w.agents {
+            w.since.insert(a.seat.as_str().to_string(), util::iso_at(now - 60));
+        }
+        let mut list = crate::model::Worklist::new("pieces-trial", "the trial");
+        list.set_planned();
+        list.alone = Some(true);
+        w.lists = vec![list];
+        w.shells = crate::waiting::Shells::own(
+            "w4:p1",
+            crate::waiting::Own { n: 1, work: "cargo nextest".into(), age: 240, quiet: 0 },
+        );
+        w.asks = crate::waiting::Asks::one("w6:p1", "t-012", "q-7", crate::waiting::On::Seat("wsp".into()));
+        w.unsent.insert("w10:p1".into());
+        w.stuck.insert("w11:p1".into(), (crate::stuck::Kind::SelfWait, 300));
+        w
+    }
+
+    fn wait_of(j: &Value, pane: &str) -> Value {
+        j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap()["wait"].clone()
+    }
+
+    #[test]
+    fn wip_json_carries_a_working_seats_wait_with_its_age() {
+        let j = wip_json(&waits_world());
+        let wait = wait_of(&j, "w1:p1");
+        assert_eq!(wait["kind"], "working", "{wait}");
+        assert_eq!(wait["line"], "working 1m", "{wait}");
+        assert!(wait["since"].is_string() && wait["quiet_secs"].is_null(), "{wait}");
+    }
+
+    #[test]
+    fn wip_json_carries_a_seat_waiting_on_its_own_shell_with_the_work_its_age_and_quiet() {
+        let wait = wait_of(&wip_json(&waits_world()), "w4:p1");
+        assert_eq!(wait["kind"], "itself", "{wait}");
+        assert_eq!(wait["target"], "cargo nextest", "{wait}");
+        assert_eq!(wait["quiet_secs"], 0, "{wait}");
+        assert_eq!(wait["line"], "waiting on itself: cargo nextest (4m, busy)", "{wait}");
+    }
+
+    #[test]
+    fn wip_json_carries_a_seat_on_a_prompt_as_waiting_on_a_person() {
+        let wait = wait_of(&wip_json(&waits_world()), "w5:p1");
+        assert_eq!(wait["kind"], "person", "{wait}");
+        assert_eq!(wait["line"], "waiting on a person 1m: a prompt on its screen", "{wait}");
+    }
+
+    #[test]
+    fn wip_json_carries_a_seat_behind_its_ask_as_waiting_on_the_governor_it_went_to() {
+        let wait = wait_of(&wip_json(&waits_world()), "w6:p1");
+        assert_eq!(wait["kind"], "governor", "{wait}");
+        assert_eq!(wait["target"], "wsp", "{wait}");
+        assert_eq!(wait["line"], "waiting on the wsp governor 1m: its question q-7", "{wait}");
+    }
+
+    #[test]
+    fn wip_json_carries_a_seat_whose_row_rests_on_an_unfinished_list_as_on_other_work() {
+        let wait = wait_of(&wip_json(&waits_world()), "w7:p1");
+        assert_eq!(wait["kind"], "other_work", "{wait}");
+        assert_eq!(wait["target"], "pieces-trial", "{wait}");
+        assert_eq!(wait["line"], "waiting on pieces-trial (planned: alone, 1m)", "{wait}");
+    }
+
+    #[test]
+    fn wip_json_carries_a_stopped_seat_nothing_was_said_to_as_idle() {
+        let wait = wait_of(&wip_json(&waits_world()), "w2:p1");
+        assert_eq!(wait["kind"], "idle", "{wait}");
+        assert_eq!(wait["line"], "idle since turn end 1m", "{wait}");
+    }
+
+    #[test]
+    fn wip_json_carries_a_seat_the_run_told_to_finish_as_told_since_the_telling() {
+        let wait = wait_of(&wip_json(&waits_world()), "w8:p1");
+        assert_eq!(wait["kind"], "told", "{wait}");
+        assert_eq!(wait["line"], "idle since turn end 1m: told to finish", "{wait}");
+        let since = util::epoch_of(wait["since"].as_str().unwrap());
+        assert!((util::epoch_secs() - since - 30).abs() <= 2, "since is the telling: {wait}");
+    }
+
+    #[test]
+    fn wip_json_carries_an_ended_seat_whose_row_was_sent_back_as_reseating() {
+        let wait = wait_of(&wip_json(&waits_world()), "w9:p1");
+        assert_eq!(wait["kind"], "reseating", "{wait}");
+        assert!(wait["line"].as_str().unwrap().starts_with("sent back 2"), "{wait}");
+        assert!(wait["line"].as_str().unwrap().ends_with("s ago: reseating"), "{wait}");
+    }
+
+    #[test]
+    fn wip_json_carries_a_seat_nothing_typed_reaches_as_cannot_be_told() {
+        let j = wip_json(&waits_world());
+        let unsent = wait_of(&j, "w10:p1");
+        assert_eq!(unsent["kind"], "cannot_be_told", "{unsent}");
+        assert_eq!(unsent["target"], "unsent", "{unsent}");
+        assert_eq!(unsent["line"], "cannot be told: typed, not sent", "{unsent}");
+        // A shell call `stuck.rs` named never ends, so a tell queues behind it.
+        let stuck = wait_of(&j, "w11:p1");
+        assert_eq!(stuck["kind"], "cannot_be_told", "{stuck}");
+        assert_eq!(stuck["target"], "self", "{stuck}");
+        assert_eq!(stuck["line"], "cannot be told: waiting on itself 5m", "{stuck}");
+    }
+
+    #[test]
+    fn a_send_back_that_did_not_reach_the_pane_is_cannot_be_told_and_a_fresh_start_clears_every_mark() {
+        let t = logged(
+            "t-1",
+            "doing",
+            &[
+                (crate::cycle::STARTED_BY, 600),
+                (&format!("{} x", crate::cycle::SENT_BACK), 60),
+                ("wsp: the sent-back reason did not reach its pane — typed when the seat reads idle", 50),
+            ],
+        );
+        let said = crate::repair::run_said(&t);
+        assert!(said.undelivered.is_some() && said.sent_back.is_some(), "{said:?}");
+        let f = crate::waiting::Facts {
+            state: State::Idle,
+            waiting: None,
+            in_state_since: None,
+            stuck: None,
+            said,
+            unreachable: None,
+            unsent: false,
+            dropped: false,
+            rests_on: None,
+            now: util::epoch_secs(),
+        };
+        let sw = crate::waiting::seat_wait(&f).unwrap();
+        assert_eq!(sw.kind, crate::waiting::Kind::CannotBeTold);
+        assert_eq!(sw.target.as_deref(), Some("send-back"));
+        let mut t = t;
+        t.log(&format!("{} again", crate::cycle::STARTED_BY));
+        assert_eq!(crate::repair::run_said(&t), crate::waiting::Said::default(), "a new agent has been told nothing");
+    }
+
+    #[test]
+    fn wip_text_prints_each_held_or_stopped_seats_wait_line_under_it() {
+        let text = wip_lines(&waits_world(), &Paint::new(), false).join("\n");
+        for line in [
+            "↳ waiting on itself: cargo nextest (4m, busy)",
+            "↳ idle since turn end 1m: told to finish",
+            "↳ waiting on pieces-trial (planned: alone, 1m)",
+            "↳ cannot be told: typed, not sent",
+        ] {
+            assert!(text.contains(line), "{line} in:\n{text}");
+        }
+        assert!(!text.contains("↳ working"), "a turn in flight already says working:\n{text}");
     }
 }

@@ -568,6 +568,11 @@ impl Shells {
     }
 
     #[cfg(test)]
+    pub(crate) fn own(seat: &str, own: Own) -> Shells {
+        Shells { by_seat: BTreeMap::from([(seat.to_string(), own)]) }
+    }
+
+    #[cfg(test)]
     pub(crate) fn one(seat: &str, n: usize) -> Shells {
         Shells { by_seat: BTreeMap::from([(seat.to_string(), Own { n, ..Own::default() })]) }
     }
@@ -711,6 +716,240 @@ pub(crate) fn reading(state: Option<State>, asks: &Asks, shells: &Shells, seat: 
 /// because that is how an answer arrives.
 pub(crate) fn on_screen(state: State) -> Option<Wait> {
     (state == State::Blocked).then_some(Wait { why: Why::Prompt, on: On::Person, own: None })
+}
+
+// ---- the seat's whole wait, in one field (`wsp-552`) ----------------------
+
+/// What the run has said to a member's seat since its newest start, read off
+/// the row's log by [`crate::repair::run_said`]: each the epoch it was said.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Said {
+    /// Told to finish, land and review, or say what is left.
+    pub(crate) told: Option<i64>,
+    /// Sent back, or its seat ended by a governor for the run to reseat.
+    pub(crate) sent_back: Option<i64>,
+    /// A send-back whose reason did not reach the pane.
+    pub(crate) undelivered: Option<i64>,
+}
+
+/// Which wait a seat is in: the `kind` of `wip --json`'s `wait`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A turn in flight.
+    Working,
+    /// Its own shell, which wakes it.
+    Itself,
+    /// A prompt or a question only a person answers.
+    Person,
+    /// A question routed to a governor.
+    Governor,
+    /// A row or list its own row rests on (`after:`) that has not finished.
+    OtherWork,
+    /// Stopped, and nothing said to it yet.
+    Idle,
+    /// Stopped, and told to finish by the run.
+    Told,
+    /// Ended after a send-back or a governor's despawn; the run starts it again.
+    Reseating,
+    /// Nothing typed reaches it: a send-back that did not land, a prompt with
+    /// text nobody sent, a first order not received, a far machine gone
+    /// silent, or a shell call that never ends ([`crate::stuck`]).
+    CannotBeTold,
+}
+
+impl Kind {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Kind::Working => "working",
+            Kind::Itself => "itself",
+            Kind::Person => "person",
+            Kind::Governor => "governor",
+            Kind::OtherWork => "other_work",
+            Kind::Idle => "idle",
+            Kind::Told => "told",
+            Kind::Reseating => "reseating",
+            Kind::CannotBeTold => "cannot_be_told",
+        }
+    }
+}
+
+/// A seat's wait as `wip --json` publishes it, and the line `wip` prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeatWait {
+    pub(crate) kind: Kind,
+    /// What it waits on: a question id, a governor's scope, a row or list, the
+    /// work under its shell, the stuck call's key. `None` where it is nobody.
+    pub(crate) target: Option<String>,
+    /// Since when, as an epoch; published as ISO.
+    pub(crate) since: Option<i64>,
+    /// How long the work under its own shell has used no CPU — set only on
+    /// `itself`.
+    pub(crate) quiet_secs: Option<i64>,
+    /// One line, with its age: `waiting on itself: cargo nextest (4m, busy)`.
+    pub(crate) line: String,
+}
+
+impl SeatWait {
+    /// `{kind, target, since, quiet_secs, line}`, the field names compound's
+    /// census reads (compounding-208).
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind.key(),
+            "target": self.target,
+            "since": self.since.map(util::iso_at),
+            "quiet_secs": self.quiet_secs,
+            "line": self.line,
+        })
+    }
+}
+
+/// What one row of `wip` knows about its seat, for [`seat_wait`].
+#[derive(Debug, Clone)]
+pub(crate) struct Facts<'a> {
+    pub(crate) state: State,
+    /// [`reading`]'s answer for the seat.
+    pub(crate) waiting: Option<&'a Wait>,
+    /// When the seat came into its state, as an epoch.
+    pub(crate) in_state_since: Option<i64>,
+    /// A shell call [`crate::stuck`] named: its key, its word, how long held.
+    pub(crate) stuck: Option<(&'static str, &'static str, i64)>,
+    pub(crate) said: Said,
+    /// `unreachable 4m`, for a seat on a far machine gone silent.
+    pub(crate) unreachable: Option<String>,
+    pub(crate) unsent: bool,
+    pub(crate) dropped: bool,
+    /// The first row or list its own row rests on that has not finished, and
+    /// that one's standing: `("pieces-trial", "planned: alone")`.
+    pub(crate) rests_on: Option<(String, String)>,
+    pub(crate) now: i64,
+}
+
+/// ` 4m`, or nothing where the age is unknown or not yet a second.
+fn aged(now: i64, since: Option<i64>) -> String {
+    match since.map(|s| now - s) {
+        Some(secs) if secs > 0 => format!(" {}", util::duration_human(secs)),
+        _ => String::new(),
+    }
+}
+
+/// **The one line per seat** (`wsp-552`, wsp-536's item 5): which wait a seat
+/// is in, on what, since when — from [`reading`], the stuck reading, the run's
+/// own marks on the row, and what its row rests on.
+///
+/// In this order, because each one earlier is the truer story: a wait somebody
+/// owes or its own shell; then whether anything typed can reach it at all; a
+/// turn in flight; and only then the stopped seat's words — ended for a
+/// reseat, resting on other work, told to finish, or plain idle. `None` for a
+/// seat starting up, or gone with nothing the run is doing about it.
+pub(crate) fn seat_wait(f: &Facts) -> Option<SeatWait> {
+    let now = f.now;
+    if let Some(w) = f.waiting {
+        let since = match &w.own {
+            Some(o) => Some(now - o.age),
+            None => f.in_state_since,
+        };
+        let age = aged(now, since);
+        let what = match &w.why {
+            Why::Prompt => "a prompt on its screen".to_string(),
+            Why::Answer(id) => format!("its question {id}"),
+            Why::Question(id) => format!("held in a tool call for {id}"),
+            Why::Shell(_) => String::new(),
+        };
+        let question = match &w.why {
+            Why::Answer(id) | Why::Question(id) => Some(id.clone()),
+            _ => None,
+        };
+        return Some(match &w.on {
+            On::Itself => SeatWait {
+                kind: Kind::Itself,
+                target: w.own.as_ref().map(|o| o.work.clone()).filter(|s| !s.is_empty()),
+                since,
+                quiet_secs: w.own.as_ref().map(|o| o.quiet),
+                line: w.reason(),
+            },
+            On::Person => SeatWait {
+                kind: Kind::Person,
+                target: question,
+                since,
+                quiet_secs: None,
+                line: format!("waiting on a person{age}: {what}"),
+            },
+            On::Seat(scope) => SeatWait {
+                kind: Kind::Governor,
+                target: Some(scope.clone()),
+                since,
+                quiet_secs: None,
+                line: format!("waiting on the {scope} governor{age}: {what}"),
+            },
+        });
+    }
+    let cannot = |target: &str, since: Option<i64>, why: String| SeatWait {
+        kind: Kind::CannotBeTold,
+        target: Some(target.to_string()),
+        since,
+        quiet_secs: None,
+        line: format!("cannot be told: {why}"),
+    };
+    if let Some((key, word, secs)) = f.stuck {
+        return Some(cannot(key, Some(now - secs), format!("{word} {}", util::duration_human(secs))));
+    }
+    if f.state == State::Unreachable {
+        let word = f.unreachable.clone().unwrap_or_else(|| "unreachable".to_string());
+        return Some(cannot("unreachable", f.in_state_since, word));
+    }
+    if let Some(when) = f.said.undelivered.filter(|_| f.state != State::Working) {
+        return Some(cannot("send-back", Some(when), format!("the send-back {} ago did not reach its pane", util::duration_human(now - when))));
+    }
+    if f.state == State::Working {
+        return Some(SeatWait {
+            kind: Kind::Working,
+            target: None,
+            since: f.in_state_since,
+            quiet_secs: None,
+            line: format!("working{}", aged(now, f.in_state_since)),
+        });
+    }
+    if f.unsent {
+        return Some(cannot("unsent", f.in_state_since, "typed, not sent".to_string()));
+    }
+    if f.dropped {
+        return Some(cannot("first-order", f.in_state_since, "its first order was not received".to_string()));
+    }
+    if let (Some(when), State::Gone) = (f.said.sent_back, f.state) {
+        return Some(SeatWait {
+            kind: Kind::Reseating,
+            target: None,
+            since: Some(when),
+            quiet_secs: None,
+            line: format!("sent back {} ago: reseating", util::duration_human((now - when).max(0))),
+        });
+    }
+    if f.state != State::Idle {
+        return None;
+    }
+    if let Some((target, standing)) = &f.rests_on {
+        return Some(SeatWait {
+            kind: Kind::OtherWork,
+            target: Some(target.clone()),
+            since: f.in_state_since,
+            quiet_secs: None,
+            line: match aged(now, f.in_state_since) {
+                a if a.is_empty() => format!("waiting on {target} ({standing})"),
+                a => format!("waiting on {target} ({standing},{a})"),
+            },
+        });
+    }
+    let idle = format!("idle since turn end{}", aged(now, f.in_state_since));
+    Some(match f.said.told {
+        Some(when) => SeatWait {
+            kind: Kind::Told,
+            target: None,
+            since: Some(when),
+            quiet_secs: None,
+            line: format!("{idle}: told to finish"),
+        },
+        None => SeatWait { kind: Kind::Idle, target: None, since: f.in_state_since, quiet_secs: None, line: idle },
+    })
 }
 
 #[cfg(test)]
