@@ -4138,11 +4138,12 @@ pub fn next(store: &Store, args: &Args) -> i32 {
     let touched = barrier_evidence(store, &w, &pos, &st);
 
     if args.json() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&next_json(&w, &pos, &st, &gone, touched.as_ref()))
-                .unwrap_or_default()
-        );
+        let mut v = next_json(&w, &pos, &st, &gone, touched.as_ref());
+        let cap_waits = crate::room::waiting_lines_of(store, &[], Some(&w.id));
+        if let (Some(o), false) = (v.as_object_mut(), cap_waits.is_empty()) {
+            o.insert("waiting_at_cap".into(), json!(cap_waits));
+        }
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;
     }
     report(store, &w, &pos, &st, &gone, seat, touched.as_ref());
@@ -4271,6 +4272,12 @@ fn report(
         State::Ready(f) | State::Waiting(f) => {
             for line in front_lines(&p, w, pos, f, seat) {
                 println!("{line}");
+            }
+            // Starts the run holds at the seat's cap, said as `wip` says them
+            // (`wsp-550`): without it a governor reads "waiting" and goes
+            // looking for what is wrong.
+            for line in crate::room::waiting_lines_of(store, &[], Some(&w.id)) {
+                println!("{}", p.dim(&line));
             }
         }
         State::Shut { gate, prose, flight } => {

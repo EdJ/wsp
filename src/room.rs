@@ -422,10 +422,19 @@ pub(crate) fn full(store: &Store, seats: &dyn Seats) -> Option<(usize, Vec<Count
 /// start, since when, and the seats holding the places. `seen` is the census
 /// `wip` already took, so this asks no backend.
 pub(crate) fn waiting_lines(store: &Store, seen: &[crate::place::Seated]) -> Vec<String> {
+    waiting_lines_of(store, seen, None)
+}
+
+/// [`waiting_lines`] for the starts of one list (`wsp worklist next`, `wsp-550`):
+/// the same sentence `wip` says, off the same file. `next` reads and asks no
+/// backend, so it passes no census and a holder's seat reads as it does when
+/// the screen is not known.
+pub(crate) fn waiting_lines_of(store: &Store, seen: &[crate::place::Seated], only: Option<&str>) -> Vec<String> {
     let Some(cap) = store.seat_cap() else { return Vec::new() };
     let waits: Vec<(String, String, String)> = store
         .capped()
         .into_iter()
+        .filter(|(owner, _)| only.is_none_or(|o| o == owner))
         .flat_map(|(owner, starts)| {
             starts.as_object().cloned().unwrap_or_default().into_iter().map(move |(what, since)| {
                 (what, owner.clone(), since.as_str().unwrap_or_default().to_string())
@@ -436,7 +445,13 @@ pub(crate) fn waiting_lines(store: &Store, seen: &[crate::place::Seated]) -> Vec
         return Vec::new();
     }
     let states: BTreeMap<&str, State> = seen.iter().map(|s| (s.seat.as_str(), s.state)).collect();
-    let holders = working(&Records::read(store), &|seat| Look::of_state(states.get(seat).copied()));
+    // A start waiting here is launched and unseated, so the count reads it as a
+    // place of its own; it holds none against itself (`admits_again`), and the
+    // line `cycle.log` says of it leaves it out, so this does too (`wsp-550`).
+    let holders: Vec<Counted> = working(&Records::read(store), &|seat| Look::of_state(states.get(seat).copied()))
+        .into_iter()
+        .filter(|c| c.seat.is_some() || !waits.iter().any(|(what, _, _)| *what == c.what))
+        .collect();
     let mut out = vec![format!("waiting for a seat slot ({} of {cap}: {}):", holders.len(), names(&holders))];
     for (what, owner, since) in waits {
         let age = match since.is_empty() {
@@ -652,6 +667,31 @@ mod tests {
         let lines = waiting_lines(&store, &seen);
         assert_eq!(lines[0], "waiting for a seat slot (1 of 1: h-1 in w2:p1):");
         assert!(lines[1].starts_with("  m-2 (run)"), "{lines:?}");
+    }
+
+    /// wsp-550: `next` reads the same sentence for its own list only.
+    #[test]
+    fn next_reads_the_waiting_of_its_own_list_in_wips_words() {
+        let env = util::isolated("room-waiting-next");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_task(&task("h-1", Status::Doing)).unwrap();
+        store.set_binding("w2:p1", json!({ "task_id": "h-1" }));
+        store.set_seat_cap(Some(1)).unwrap();
+        store.set_capped("run", Some(json!({ "m-2": util::now_iso() })));
+        store.set_capped("other", Some(json!({ "o-1": util::now_iso() })));
+        let lines = waiting_lines_of(&store, &[], Some("run"));
+        assert!(lines[0].starts_with("waiting for a seat slot (1 of 1: h-1"), "{lines:?}");
+        assert_eq!(lines.len(), 2, "only this list's start: {lines:?}");
+        assert!(lines[1].starts_with("  m-2 (run)"), "{lines:?}");
+        assert!(waiting_lines_of(&store, &[], Some("none")).is_empty());
+        // The start that waits is launched and unseated, and is not a holder
+        // of the places it waits for.
+        let mut m = task("m-2", Status::Doing);
+        m.log(&format!("{} run group 1", crate::cycle::STARTED_BY));
+        store.save_task(&m).unwrap();
+        let lines = waiting_lines_of(&store, &[], Some("run"));
+        assert!(lines[0].starts_with("waiting for a seat slot (1 of 1: h-1"), "{lines:?}");
     }
 
     /// What `wsp spawn` by hand reads before it starts anyway: nothing on a

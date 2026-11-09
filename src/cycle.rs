@@ -9092,6 +9092,54 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(spawned().is_empty(), "once per silence");
     }
 
+    /// wsp-550: a member already flagged (its tries spent, wsp-524's reseat) while
+    /// the seat is at its cap waits for room and uses no try: nothing started,
+    /// no "starting again" said, no second flag, its spent count kept until the
+    /// reseat. Once a slot frees it is reseated, once.
+    #[test]
+    fn a_flagged_member_at_the_cap_waits_for_room_uses_no_try_and_is_reseated_once() {
+        let (_env, store) = scratch("reseat-flagged-cap");
+        task(&store, "m-1", Status::Doing);
+        task(&store, "h-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        store.set_seat_cap(Some(1)).unwrap();
+        // Quiet past the room's own window, so its old start holds no place.
+        left_unseated(&store, "m-1", &[&format!("{STARTED_BY} run group 1")], 700);
+        store.update_starts(|m| {
+            m.insert("m-1".into(), serde_json::json!({ "tries": 3, "at": util::epoch_secs() - 700, "spent": true }));
+        });
+        let mut h = store.find_task("h-1").unwrap();
+        h.log(&format!("{STARTED_BY} other group 1"));
+        store.save_task(&h).unwrap();
+
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "the seat is full");
+        assert!(store.capped().get("run").is_some(), "queued, for wip and next to read: {}", said(&store));
+        assert!(said(&store).contains("m-1 waits — the seat is at its cap of 1"), "{}", said(&store));
+        // The wait is said once (it is a line said of the row, so the next
+        // silence is five minutes on); every pass after reads the same.
+        for _ in 0..5 {
+            step(&store, &w, &Blind);
+            assert!(spawned().is_empty(), "still full");
+            assert!(crate::starts::spent(&store, "m-1"), "still flagged, and not forgiven while it waits");
+            assert_eq!(store.starts().get("m-1").and_then(|e| e["tries"].as_u64()), Some(3), "no try used");
+        }
+        assert!(!said(&store).contains("starting again"), "{}", said(&store));
+        assert!(!said(&store).contains("started again"), "{}", said(&store));
+        assert!(!said(&store).contains("flagged the person"), "{}", said(&store));
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default().to_string();
+        assert_eq!(log.matches(super::RESEATED).count(), 0, "no reseat written while it waits: {log}");
+
+        // A slot frees and the row has been silent again for the window.
+        set(&store, "h-1", Status::Done);
+        std::fs::write(store.state_file("cycle.log"), "").unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "reseated once there is room");
+        assert!(!crate::starts::spent(&store, "m-1"), "and its spent count is forgiven then");
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "once");
+    }
+
     /// The second case: the verifier blocked it, the run's start did not take,
     /// the governor answered that starting one is the run's job and wrote
     /// nothing else. The run starts it.
