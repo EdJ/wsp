@@ -47,6 +47,8 @@ pub struct Entry {
     pub fate: Fate,
     /// The item a tell to the person landed as.
     pub item: Option<String>,
+    /// Set on each seat of a `list:` fan-out (`wsp-523`): its key and size.
+    pub fan: Option<(String, usize)>,
 }
 
 impl Entry {
@@ -83,6 +85,10 @@ pub fn entries(told: &[Value], settled: &[Value]) -> Vec<Entry> {
                 _ => Fate::Delivered,
             },
             item: d.get("item").and_then(Value::as_str).map(str::to_string),
+            fan: d
+                .get("fan")
+                .and_then(Value::as_str)
+                .map(|k| (k.to_string(), d.get("fan_of").and_then(Value::as_u64).unwrap_or(0) as usize)),
         })
         .collect();
     out.sort_by_key(|e| e.at);
@@ -184,7 +190,16 @@ fn fate_word(f: &Fate) -> String {
 /// The log as lines: one per tell, indented under what it answers.
 pub fn lines(rows: &[(usize, &Entry)], full: bool) -> Vec<String> {
     let mut out = Vec::new();
+    // A fan-out is one line: the first seat's entry stands for the lot, and the
+    // others of the same key are folded into its count.
+    let mut seen: Vec<&str> = Vec::new();
     for (depth, e) in rows {
+        if let Some((key, _)) = &e.fan {
+            if seen.contains(&key.as_str()) {
+                continue;
+            }
+            seen.push(key);
+        }
         let pad = "  ".repeat(*depth);
         let arrow = if *depth > 0 { "↳ " } else { "" };
         let re = match (&e.re, depth) {
@@ -195,14 +210,22 @@ pub fn lines(rows: &[(usize, &Entry)], full: bool) -> Vec<String> {
             Some(i) => format!("{} (item {i})", e.to),
             None => e.to.clone(),
         };
+        let state = match &e.fan {
+            Some((_, n)) => format!("fan-out to {n} seats"),
+            None => fate_word(&e.fate),
+        };
+        let id = match &e.fan {
+            Some(_) => String::new(),
+            None => e.id.clone(),
+        };
         out.push(format!(
             "{pad}{arrow}{}  {} → {}  {}  [{}] {}{re}",
             util::local_hm(e.at),
             if e.from.is_empty() { "?" } else { &e.from },
             to,
             e.caption(),
-            fate_word(&e.fate),
-            e.id,
+            state,
+            id,
         ));
         if full && !e.text.is_empty() {
             for l in e.text.lines() {
@@ -224,7 +247,7 @@ pub fn show(store: &Store, address: &str, full: bool, json: bool) -> i32 {
             .map(|(depth, e)| {
                 json!({
                     "at": e.at, "from": e.from, "to": e.to, "pane": e.pane, "id": e.id, "re": e.re,
-                    "depth": depth, "fate": fate_word(&e.fate), "caption": e.caption(),
+                    "fan": e.fan.as_ref().map(|f| f.1), "depth": depth, "fate": fate_word(&e.fate), "caption": e.caption(),
                     "text": if full { Some(&e.text) } else { None },
                 })
             })
@@ -331,5 +354,27 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 0);
         assert!(lines(&rows, false)[0].contains("(re m-gone)"));
+    }
+
+    /// `wsp-523`: the seats of one `list:` fan-out are one line with the count.
+    #[test]
+    fn a_fan_out_is_one_line_with_its_count() {
+        let mut evs: Vec<Value> = (1..=3)
+            .map(|i| {
+                let mut d = told(100, "governor:pieces", "list:run", &format!("cpd-{i}"), &format!("m-{i}"), None, "stand by");
+                d["fan"] = json!("k1");
+                d["fan_of"] = json!(3);
+                d
+            })
+            .collect();
+        evs.push(told(200, "governor:pieces", "list:run", "cpd-1", "m-9", None, "one more"));
+        let all = entries(&evs, &[]);
+        let rd = reading("list:run", &Book::default());
+        let rows = thread(&all, &rd);
+        assert_eq!(rows.len(), 4);
+        let out = lines(&rows, false);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].contains("fan-out to 3 seats"), "{out:?}");
+        assert!(out[1].contains("m-9"), "{out:?}");
     }
 }

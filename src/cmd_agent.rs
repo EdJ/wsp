@@ -1503,7 +1503,7 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
             }
         },
     };
-    tell_seat(store, args, &p, &from, re.as_deref(), &text, &needle, addressed.is_some(), seat, what)
+    tell_seat(store, args, &p, &from, re.as_deref(), &text, &needle, addressed.is_some(), None, seat, what)
 }
 
 /// `wsp tell list:<name> "…"` — the sentence to every live seat on the list,
@@ -1526,8 +1526,11 @@ fn tell_list(store: &Store, args: &Args, from: &str, re: Option<&str>, text: &st
         return 1;
     }
     let (mut told, mut failed) = (0usize, 0usize);
+    // One key for the lot, so `wsp tell --log` can draw the seats' events as one
+    // fan-out: the list, the sentence and the moment it went.
+    let fan = format!("{}@{}", message_id(needle, text), util::epoch_secs());
     for n in &seats {
-        match tell_seat(store, args, &p, from, re, text, needle, true, n.pane.clone(), n.what.clone()) {
+        match tell_seat(store, args, &p, from, re, text, needle, true, Some((fan.as_str(), seats.len())), n.pane.clone(), n.what.clone()) {
             0 => told += 1,
             _ => failed += 1,
         }
@@ -1562,6 +1565,7 @@ fn tell_seat(
     text: &str,
     needle: &str,
     addressed: bool,
+    fan: Option<(&str, usize)>,
     seat: String,
     what: String,
 ) -> i32 {
@@ -1650,7 +1654,7 @@ fn tell_seat(
         true => needle.to_string(),
         false => addressee_id(store, &needle, &what),
     };
-    let sent = Sent::new(&addressee, &what, &seat, &peek, text, args).by(from, re, !args.has("no-reply"));
+    let sent = Sent::new(&addressee, &what, &seat, &peek, text, args).by(from, re, !args.has("no-reply")).in_fan(fan);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
             return twice(&sent, ago, p);
@@ -1833,6 +1837,9 @@ pub struct Sent {
     pub from: String,
     pub re: Option<String>,
     pub reply: bool,
+    /// Set when this is one seat of a `list:` fan-out (`wsp-523`): the fan-out's
+    /// key and how many seats it went to, which the event carries.
+    pub fan: Option<(String, usize)>,
     pub json: bool,
 }
 
@@ -1860,8 +1867,14 @@ impl Sent {
             from: String::new(),
             re: None,
             reply: false,
+            fan: None,
             json: args.json(),
         }
+    }
+
+    pub fn in_fan(mut self, fan: Option<(&str, usize)>) -> Sent {
+        self.fan = fan.map(|(k, n)| (k.to_string(), n));
+        self
     }
 
     /// Who said it, what it answers, and whether it carried a reply footer.
@@ -1960,7 +1973,7 @@ pub fn twice(sent: &Sent, ago: i64, p: &Paint) -> i32 {
 /// recognisable at all.
 pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &Sent) -> i32 {
     let p = Paint::new();
-    let Sent { target, what, pane, peek, chars, text, id, from, re, reply, json } = sent;
+    let Sent { target, what, pane, peek, chars, text, id, from, re, reply, fan, json } = sent;
     match outcome {
         Ok(how) => {
             // Recorded as an event and not on the task's log, deliberately. The
@@ -1973,6 +1986,7 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
                 json!({
                     "target": target, "pane": pane, "chars": chars, "id": id,
                     "from": from, "re": re, "reply": reply, "text": text,
+                    "fan": fan.as_ref().map(|f| f.0.as_str()), "fan_of": fan.as_ref().map(|f| f.1),
                     "at": util::epoch_secs(),
                     "turn": matches!(how, Delivery::Started | Delivery::Acked),
                 }),
