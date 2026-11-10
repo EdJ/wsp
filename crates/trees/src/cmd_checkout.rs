@@ -2369,7 +2369,7 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
 
 /// How many times a rebase is tried when git refuses it for a lock held by
 /// something else for a moment (`wsp-571`).
-const REBASE_TRIES: u32 = 5;
+const REBASE_TRIES: u32 = 8;
 
 /// Whether git's refusal is a lock another process held for a moment — an
 /// `index.lock` a status or a commit in the same tree was inside of — and not
@@ -2388,6 +2388,19 @@ fn rebase_in_progress(dir: &Path) -> bool {
     })
 }
 
+/// git's refusal with the files the rebase stopped on added: git says them on
+/// stdout, which `git_ok` does not return, so they are read from the index
+/// while the stopped rebase is still there (before any abort).
+fn with_conflicts(dir: &Path, why: String) -> String {
+    let files = git(dir, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+    let files: Vec<&str> = files.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if files.is_empty() {
+        why
+    } else {
+        format!("{why}\nconflicting files: {}", files.join(", "))
+    }
+}
+
 /// `git rebase <onto>` in `dir`, retried when the refusal is a transient lock
 /// (`wsp-571`): a rebase that git stopped on `index.lock` can leave its
 /// `rebase-merge` directory behind, and the next try then fails on *that*
@@ -2400,7 +2413,7 @@ fn rebase_onto(dir: &Path, onto: &str) -> Result<(), String> {
         tries += 1;
         let Err(e) = git_ok(dir, &["rebase", onto]) else { return Ok(()) };
         if tries >= REBASE_TRIES || !transient_lock(&e) {
-            return Err(e);
+            return Err(with_conflicts(dir, e));
         }
         if rebase_in_progress(dir) {
             let _ = git_ok(dir, &["rebase", "--abort"]);
@@ -2906,6 +2919,7 @@ mod tests {
     /// refusal; a conflict is still returned at once.
     #[test]
     fn a_rebase_waits_out_a_transient_index_lock() {
+        // a lock held for 2s, as the row's Done-when has it
         let (_env, dir) = scratch("lockretry");
         repo(&dir);
         let wt = checkout_dir(&dir, "t-8");
@@ -2921,7 +2935,7 @@ mod tests {
         std::fs::write(&lock, "").unwrap();
         let held = lock.clone();
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::thread::sleep(std::time::Duration::from_millis(2000));
             let _ = std::fs::remove_file(held);
         });
         let r = rebase_onto(&wt, "master");
@@ -2930,6 +2944,26 @@ mod tests {
         assert!(!rebase_in_progress(&wt), "a rebase-merge dir was left behind");
         assert_eq!(ahead(&dir, "master", "t-8").len(), 1);
         assert!(git_ok(&wt, &["merge-base", "--is-ancestor", "master", "HEAD"]).is_ok(), "not on the trunk's tip");
+    }
+
+    /// `wsp-571`: a conflict is not retried, and the refusal names the files.
+    #[test]
+    fn a_rebase_conflict_is_sent_back_once_naming_the_files() {
+        let (_env, dir) = scratch("conflictnames");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-9");
+        ensure(&dir, &wt, "t-9", "master").unwrap();
+        std::fs::write(wt.join("kept.txt"), "mine\n").unwrap();
+        run(&wt, &["commit", "--quiet", "-am", "mine"]);
+        std::fs::write(dir.join("kept.txt"), "theirs\n").unwrap();
+        run(&dir, &["commit", "--quiet", "-am", "theirs"]);
+
+        let e = rebase_onto(&wt, "master").unwrap_err();
+        assert!(!transient_lock(&e), "a conflict would be retried: {e}");
+        assert!(e.contains("conflicting files: kept.txt"), "{e}");
+        let said = abort_rebase(&wt, "master", &e);
+        assert!(said.contains("kept.txt"), "{said}");
+        assert!(!rebase_in_progress(&wt), "left mid-rebase");
     }
 
     /// The whole point, asserted end to end: work committed in one agent's tree
