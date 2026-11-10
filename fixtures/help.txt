@@ -157,7 +157,9 @@ AGENTS
                                     with one and the short start unless `--no-packet`;
                                     `--leg NAME` prints that leg's packet (an order line
                                     `packet: FILE`, or `wsp leg add … --packet FILE`), which
-                                    also starts the leg short
+                                    also starts the leg short; a row sent back (`wsp reopen`) has
+                                    its `sent back:` reasons printed first, newest first, under
+                                    "What is owed now"
   wsp attend <id>                   one attention-harness attempt on a row, to its checks'
                                     result: what `spawn --kind attention` runs; nobody types it
   wsp cold <list|project> [--plan] [--at COMMIT] [--keep]
