@@ -234,6 +234,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let mut tools: BTreeMap<String, i64> = BTreeMap::new();
     let (mut model, mut idle, mut gap, mut calls) = (0i64, 0i64, 0i64, 0u64);
     let mut legs_total = 0i64;
+    let mut between = 0i64;
     let (mut start, mut end) = (i64::MAX, 0i64);
     let mut missing_sessions = 0usize;
     let mut group_json: Vec<Value> = Vec::new();
@@ -257,7 +258,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         // member's figures hold it (their own timeline shows it); the sums take
         // it out of the members and put it back once per group (`wsp-390`).
         let mut shared: Option<crate::timeline::RowFigures> = None;
-        let (mut gstart, mut glast) = (0i64, 0i64);
+        let (mut gstart, mut glast, mut gend) = (0i64, 0i64, 0i64);
         for m in &g.members {
             let mut f = figures(m);
             let seat_filled = fill_from_seat(&mut f, cost["groups"].get(gi).and_then(|c| c["members"].as_array()).and_then(|ms| ms.iter().find(|x| x["task"] == m.as_str())).map(|x| &x["total"]));
@@ -267,6 +268,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             }
             if f.end > 0 {
                 glast = glast.max(f.start);
+                gend = gend.max(f.end);
             }
             if shared.as_ref().is_none_or(|s| f.shared > s.shared) {
                 shared = Some(crate::timeline::RowFigures { shared: f.shared, shared_gap: f.shared_gap, shared_waits: f.shared_waits.clone(), ..Default::default() });
@@ -284,7 +286,11 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             // A leg running is the row's work, not its seat idle (`wsp-218`).
             let legs_only = crate::wallbuckets::legs_only_seconds(&f.spans, &f.active);
             legs_total += legs_only;
-            idle += (f.wall - f.shared - f.model_secs - tool - legs_only).max(0);
+            // The stretch between a row's attempts is named for what it was
+            // (parked, waiting to be restarted, sent back and reopened), not the
+            // seat idle (`compounding-217`).
+            between += f.between_attempts;
+            idle += (f.wall - f.shared - f.model_secs - tool - legs_only - f.between_attempts).max(0);
             missing_sessions += f.missing;
             if f.end > 0 {
                 start = start.min(f.start);
@@ -332,6 +338,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
                 "tool_seconds": f.tools, "gap_seconds": f.gap, "calls": f.calls,
                 "tokens_in": f.tokens_in, "tokens_cache_read": f.cache_read, "tokens_out": f.tokens_out,
                 "transcripts_missing": f.missing, "full_suite_runs": suites,
+                "between_attempts_seconds": f.between_attempts,
                 "spawn_to_first_line_seconds": f.spawn_to_first,
                 "verifier_spawn_to_first_line_seconds": f.verifier_spawn_to_first,
                 "verifier_test_seconds": f.verifier_test_secs,
@@ -353,7 +360,12 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         }
         group_starts.push((gstart, glast));
         let open = if gi == 0 { None } else { passes.get(&(gi as u64)).copied() };
-        let mut gw = crate::wallbuckets::group_wall(&sweep, open, passes.get(&(gi as u64 + 1)).copied());
+        // The last group has no window after it to take the seconds between
+        // its pass and its barrier's last stretch, which the pass line is
+        // written a moment before (`compounding-217`: 4 s unattributed).
+        let pass = passes.get(&(gi as u64 + 1)).copied();
+        let pass = if gi + 1 == groups.len() { pass.map(|p| p.max(gend)) } else { pass };
+        let mut gw = crate::wallbuckets::group_wall(&sweep, open, pass);
         // The wait for the pass is named by its group, so that two groups' waits
         // are two lines, and says whether a barrier ran or the group is manual.
         if let Some(g) = gw.as_mut() {
@@ -421,7 +433,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "full_suite": "full_suite_runs: full-suite `cargo test` runs started in a member's or verifier's seat (the shim's note, wsp-389), by row and group. The barrier's own run is one per group and is not counted here; the aim is zero in seats.",
             "barrier_scope": "groups[].barrier_scope: the barrier's run scoped to what the group touched (wsp-431) — scoped or full and why, the targets it ran, shared paths that widened it, its seconds against the last full run's, and net_red: scoped barriers a red full run stood behind, which is what scoping let through",
             "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start. null where no group follows or no pass is found; the governor figures are null where its transcript is not found; its transcript is the one the seat's burn.json names, for each pane `governor-set` seated, clipped to the stretch it held the slot; burn.json holds only a seat's latest session and goes when the seat stops, so the figures are a floor",
-            "wall_buckets": "totals.wall_buckets and groups[].wall_buckets (wsp-470): every second of the list's wall in one bucket, by what the run as a whole was doing at that second — working (some member's seat in a model call or a tool, or one of its legs running, or a check or a verifier running; legs_running_seconds is the part of working where only legs were — a member whose legs run has no call of its own then, and wsp-218 stopped calling that its seat idle), waiting (nobody working, some member started and not moving: blocked from the moment it blocks, an unclaimed or slow start, a named gap, a seat idle), serialised (nobody started, a member behind the cap or an `after`), barrier_run, check_seat, between_groups (a pass to the group's first start). A group's window runs from the previous group's pass to its own, so they tile the wall. gap_seconds and idle_seconds above are member-seconds read per row, kept beside it: a stall inside a seat is not a gap there. seat_idle_seconds and seat_idle_by_reason (wsp-559), beside waiting_by in each group's wall_buckets and in the totals: the waiting that was a seat idle, split by what the row's log says it waited on from the moment it was written — sent back (the verdict given, the tell not delivered or delivered, the verdict with the governor), reopened, a rebase refused, a hand-off to another row, owed to another (an after), a block, the seat's own shells, the check and the verifier's hand-off, the verdict read — and 'none recorded' where no line precedes the second",
+            "wall_buckets": "totals.wall_buckets and groups[].wall_buckets (wsp-470): every second of the list's wall in one bucket, by what the run as a whole was doing at that second — working (some member's seat in a model call or a tool, or one of its legs running, or a check or a verifier running; legs_running_seconds is the part of working where only legs were — a member whose legs run has no call of its own then, and wsp-218 stopped calling that its seat idle), waiting (nobody working, some member started and not moving: blocked from the moment it blocks, an unclaimed or slow start, a named gap, a seat idle), serialised (nobody started, a member behind the cap or an `after`), barrier_run, check_seat, between_groups (a pass to the group's first start). A group's window runs from the previous group's pass to its own, so they tile the wall: a member that started before its window opened (a row cut from the previous group and started again) is read from the pass on, and attributed_seconds equals wall_seconds. between_attempts_seconds (totals, and per member) is the stretch between a row's attempts (compounding-217): a row released and started again is two seats, each with its own spawn → release or review span, and what lay between them is named for what it was — the row parked or waiting to be restarted (with the row it waited on when its `after` names one), or reviewed, sent back and reopened (rework; the row's attempt is booked in rework.attempts) — and is neither the seat finishing nor the seat idle, nor in idle_seconds. gap_seconds and idle_seconds above are member-seconds read per row, kept beside it: a stall inside a seat is not a gap there. seat_idle_seconds and seat_idle_by_reason (wsp-559), beside waiting_by in each group's wall_buckets and in the totals: the waiting that was a seat idle, split by what the row's log says it waited on from the moment it was written — sent back (the verdict given, the tell not delivered or delivered, the verdict with the governor), reopened, a rebase refused, a hand-off to another row, owed to another (an after), a block, the seat's own shells, the check and the verifier's hand-off, the verdict read — and 'none recorded' where no line precedes the second",
             "time": "per member row, spawn to verdict (wall, gaps); the seat's model and tool time are its own transcript calls inside those phases, legs only where run-leg timings exist",
         },
         "totals": {
@@ -472,6 +484,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     });
     v["totals"]["last_verdict_wall_seconds"] = json!(wall);
     v["totals"]["legs_running_seconds"] = json!(legs_total);
+    v["totals"]["between_attempts_seconds"] = json!(between);
     if let Some(b) = baseline {
         v["baseline"] = against(&v, b);
     }
@@ -1447,6 +1460,40 @@ mod tests {
         assert_eq!(v["totals"]["legs_running_seconds"], 780);
         assert_eq!(v["totals"]["idle_seconds"], 100, "wall 1000 less model 120 and the legs' 780: the check's 100 is left, as before, and no leg second: {}", v["totals"]);
         assert!(wb["named"].as_array().unwrap().is_empty(), "no leg run in the biggest stalls: {wb}");
+    }
+
+    #[test]
+    fn the_stretch_between_a_rows_attempts_is_named_and_in_neither_the_seat_idle_nor_idle_seconds() {
+        use crate::timeline::RowFigures;
+        use crate::wallbuckets::{Class, Span};
+        let (_e, store, w) = list("attempts", &["r-1"]);
+        let why = format!("{} \u{2014} parked, waiting on wsp-552", crate::timeline::PARKED_CAUSE);
+        let f = RowFigures {
+            start: 0,
+            end: 1000,
+            wall: 1000,
+            gap: 800,
+            waits: [(why.clone(), 800)].into(),
+            between_attempts: 800,
+            spans: vec![
+                Span { start: 0, end: 100, class: Class::Seat },
+                Span { start: 100, end: 900, class: Class::Gap(why.clone()) },
+                Span { start: 900, end: 1000, class: Class::Seat },
+            ],
+            active: vec![(0, 100), (900, 1000)],
+            measured: true,
+            model_secs: 200,
+            ..Default::default()
+        };
+        let v = effort_with(&store, &w, None, &|_| f.clone());
+        let wb = &v["totals"]["wall_buckets"];
+        assert_eq!(wb["seat_idle_seconds"], 0, "{wb}");
+        assert_eq!(v["totals"]["idle_seconds"], 0, "{}", v["totals"]);
+        assert_eq!(v["totals"]["between_attempts_seconds"], 800);
+        assert_eq!(v["groups"][0]["members"][0]["between_attempts_seconds"], 800);
+        assert_eq!(wb["waiting_seconds"], 800);
+        assert_eq!(wb["unattributed_seconds"], 0, "{wb}");
+        assert!(wb["waiting_by_cause"].as_array().unwrap().iter().any(|c| c["cause"].as_str().unwrap().contains("parked, waiting on wsp-552")), "{wb}");
     }
 
     #[test]

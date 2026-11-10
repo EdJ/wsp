@@ -213,6 +213,106 @@ const VERIFIER_START: &str = "verifier seat start (spawn → its first transcrip
 const VERIFIER_START_LINE: &str = "verifier seat start (spawn → wsp's started line; the seat's first line unread, so this lags it)";
 const VERIFIER_HELD: &str = "verdict → verifier seat ended (clean-up, alongside what follows)";
 
+/// One seating of a row's seat (`compounding-217`): the claim, and the release
+/// that let the row be claimed again. A row released and started again is two of
+/// these, and what lies between them is neither the first seat finishing nor the
+/// second one idle.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Attempt {
+    /// The spawn request that made this seat, where the cycle log has it.
+    pub spawn: Option<i64>,
+    pub claim: i64,
+    /// The release that ended it; `None` for the last.
+    pub end: Option<i64>,
+    /// Its first review, when it got that far.
+    pub review: Option<i64>,
+}
+
+impl Attempt {
+    /// Where the seat's own span begins: its spawn request, else its claim.
+    pub(crate) fn begin(&self) -> i64 {
+        self.spawn.unwrap_or(self.claim)
+    }
+}
+
+/// The cause of the stretch between an attempt that was released before it
+/// reached review and the next one.
+pub(crate) const PARKED_CAUSE: &str = "the row parked or released between attempts";
+/// The cause of the stretch from an attempt's review to the next attempt: the
+/// row was sent back and reopened. The row's `rework` block books the attempt.
+pub(crate) const REWORK_CAUSE: &str = "rework: the row sent back after review and reopened";
+
+/// The attempts of a row's seat, in order. A release counts as the end of one
+/// only when the row was claimed again afterwards and before its last passing
+/// verdict (a claim after that is a reopen of a landed row, which is not this
+/// run's wall). A row with legs started is one attempt: its release is the seat
+/// handing the row to them.
+pub(crate) fn attempts(i: &Inputs) -> Vec<Attempt> {
+    let id = i.id.as_str();
+    let mut claims: Vec<i64> = i.kind("task-claimed", id).into_iter().map(|(t, _)| t).collect();
+    claims.sort_unstable();
+    let Some(&first) = claims.first() else { return Vec::new() };
+    let spawn_pred = |l: &str| {
+        l.contains(&format!("starting {id} on ")) || (l.starts_with(&format!("spawn {id} --agent")) && !l.contains("--leg") && !l.contains("--verify"))
+    };
+    let reviews: Vec<i64> = i.kind("task-review", id).into_iter().map(|(t, _)| t).collect();
+    let single = |claim: i64| Attempt { spawn: spawn_line(i), claim, end: None, review: reviews.iter().copied().find(|r| *r >= claim) };
+    if i.legs.iter().any(|l| !l.skipped) {
+        return vec![single(first)];
+    }
+    let cut = i.kind("task-verified", id).into_iter().filter(|(_, d)| d["verdict"] == "holds").map(|(t, _)| t).max().unwrap_or(i64::MAX);
+    let mut releases: Vec<i64> = i.kind("task-released", id).into_iter().map(|(t, _)| t).collect();
+    releases.sort_unstable();
+    let mut out: Vec<Attempt> = Vec::new();
+    let mut claim = first;
+    let mut from = 0i64;
+    loop {
+        let next = releases.iter().copied().filter(|r| *r >= claim).find_map(|r| claims.iter().copied().find(|c| *c > r && *c < cut).map(|c| (r, c)));
+        let spawn = if out.is_empty() { spawn_line(i) } else { i.first_line(from, spawn_pred).filter(|s| *s <= claim) };
+        let review = reviews.iter().copied().find(|r| *r >= claim && next.is_none_or(|(e, _)| *r <= e));
+        match next {
+            Some((end, again)) => {
+                out.push(Attempt { spawn, claim, end: Some(end), review });
+                claim = again;
+                from = end;
+            }
+            None => {
+                out.push(Attempt { spawn, claim, end: None, review });
+                return out;
+            }
+        }
+    }
+}
+
+/// What the stretch from `prev`'s end to the next attempt was, for the row.
+fn between_attempts(i: &Inputs, prev: &Attempt, to: i64) -> (String, String) {
+    let id = i.id.as_str();
+    let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
+    if let Some(rv) = prev.review {
+        return (
+            format!("reviewed at {} → sent back → seat started again", at(rv)),
+            format!("{REWORK_CAUSE} (the next seat was claimed at {})", at(to)),
+        );
+    }
+    let end = prev.end.unwrap_or(prev.claim);
+    // What the row rested on: the latest `after` set in the stretch that names a
+    // row; the park, where the log wrote one.
+    let waits: Option<String> = i
+        .kind("task-after", id)
+        .into_iter()
+        .filter(|(t, _)| *t >= prev.claim && *t <= to)
+        .max_by_key(|(t, _)| *t)
+        .and_then(|(_, d)| d["after"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")))
+        .filter(|s| !s.is_empty());
+    let parked = i.kind("task-parked", id).into_iter().any(|(t, _)| t >= prev.claim && t <= end);
+    let head = if parked { "parked" } else { "released" };
+    let why = match waits {
+        Some(w) => format!("{head}, waiting on {w}, until it was started again at {}", at(to)),
+        None => format!("{head}, waiting to be restarted, until {}", at(to)),
+    };
+    (format!("{head} at {} → seat started again", at(end)), format!("{PARKED_CAUSE} — {why}"))
+}
+
 /// The phases of a row, in time order.
 pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let id = i.id.as_str();
@@ -244,13 +344,40 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         (l, _) => l.or(claimed),
     };
     let seat_end = released.or(reviews.first().copied());
+    let seated = attempts(i);
+    let of = |n: usize| if seated.len() > 1 { format!(", attempt {n} of {}", seated.len()) } else { String::new() };
     if let (Some(a), Some(b)) = (work_from, seat_end) {
-        out.push(Phase::work(if released.is_some() { "the seat's work until release" } else { "the seat's work until review" }, a, b));
+        out.push(Phase::work(format!("{}{}", if released.is_some() { "the seat's work until release" } else { "the seat's work until review" }, of(1)), a, b));
+    }
+    // A row released and started again (`compounding-217`): each seat gets its
+    // own spawn → release or review, and the stretch between them is named for
+    // what it was — the row parked or waiting to be restarted, or sent back after
+    // a review — not the first seat finishing, nor the second one idle.
+    let mut attempts_end: Option<i64> = None;
+    for (k, a) in seated.iter().enumerate().skip(1) {
+        let prev = &seated[k - 1];
+        let Some(from) = prev.review.or(prev.end) else { continue };
+        let (label, why) = between_attempts(i, prev, a.claim);
+        if a.begin() > from {
+            out.push(Phase::gap(label, from, a.begin(), why));
+        }
+        if let Some(s) = a.spawn {
+            out.push(Phase::work(format!("spawn requested → seat claimed{}", of(k + 1)), s, a.claim));
+        }
+        let up = i.first_learned_after(a.claim).filter(|u| a.end.is_none_or(|e| *u <= e));
+        if let Some(u) = up {
+            out.push(Phase::work(format!("seat up (session started){}", of(k + 1)), a.claim, u));
+        }
+        let end = a.end.or(a.review);
+        if let Some(e) = end {
+            out.push(Phase::work(format!("the seat's work until {}{}", if a.end.is_some() { "release" } else { "review" }, of(k + 1)), up.unwrap_or(a.claim), e));
+            attempts_end = Some(e);
+        }
     }
 
     // Legs.
     let mut done: Vec<(String, i64)> = Vec::new();
-    let mut last_end = released;
+    let mut last_end = attempts_end.or(released);
     for (n, leg) in i.legs.iter().enumerate() {
         if leg.skipped {
             continue;
@@ -996,7 +1123,11 @@ fn seat_sessions(i: &Inputs, windows: &[(i64, i64)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (t, d) in i.kind("session-learned", &i.id) {
         let Some(s) = d["session"].as_str() else { continue };
-        if windows.iter().any(|(a, b)| t >= *a && t <= *b) || review.is_some_and(|r| t > r) || d.get("leg").is_some() {
+        // A session learned after the first review is the row's own seat only
+        // where the row was claimed again by that pane in between (a seat started
+        // again, `compounding-217`); otherwise it is something else's.
+        let reseated = review.is_some_and(|r| i.kind("task-claimed", &i.id).into_iter().any(|(c, cd)| c > r && c <= t && cd["pane"] == d["pane"] && !d["pane"].is_null()));
+        if windows.iter().any(|(a, b)| t >= *a && t <= *b) || review.is_some_and(|r| t > r && !reseated) || d.get("leg").is_some() {
             continue;
         }
         if !out.iter().any(|x| x == s) {
@@ -1080,6 +1211,20 @@ fn seat_bounds(i: &Inputs, phases: &[Phase], legs: &[Span]) -> Vec<(String, i64,
     let (Some(begin), Some(end)) = (begin, end) else { return Vec::new() };
     let end = end.max(last_leg.unwrap_or(0));
     if legs.is_empty() {
+        // A row released and started again: one span per seat (`compounding-217`).
+        let seated = attempts(i);
+        if seated.len() > 1 {
+            let n = seated.len();
+            let out: Vec<(String, i64, i64)> = seated
+                .iter()
+                .enumerate()
+                .map(|(k, a)| {
+                    let (stop, to) = if a.end.is_some() { ("release", a.end) } else { ("review", a.review) };
+                    (format!("the seat, attempt {} of {n}, spawn to {stop}", k + 1), a.begin(), to.unwrap_or(end).max(a.begin()))
+                })
+                .collect();
+            return out;
+        }
         return vec![("the seat, spawn to review".into(), begin, end)];
     }
     let mut out = vec![(format!("before leg {}", legs[0].0), begin.min(legs[0].1), legs[0].1)];
@@ -1279,6 +1424,10 @@ pub(crate) struct RowFigures {
     /// What the row's log says it was waiting on, from each moment (`wsp-559`):
     /// the seat idle is named by the latest one.
     pub markers: Vec<(i64, String)>,
+    /// Seconds between a row's attempts (`compounding-217`): parked or waiting
+    /// to be restarted, or sent back after a review and reopened. Named gaps
+    /// of their own, so neither the seat finishing nor the seat idle.
+    pub between_attempts: i64,
 }
 
 /// What the lines the log already writes for a row say it was waiting on, from
@@ -1411,6 +1560,9 @@ pub(crate) fn figures_of(phases: &[Phase], seat: &SeatReport) -> RowFigures {
             f.shared_gap += p.seconds();
             *f.shared_waits.entry(why.clone()).or_insert(0) += p.seconds();
         }
+        if !p.shared && (why.starts_with(PARKED_CAUSE) || why.starts_with(REWORK_CAUSE)) {
+            f.between_attempts += p.seconds();
+        }
         *f.waits.entry(why).or_insert(0) += p.seconds();
     }
     f.sessions = seat.sessions.len();
@@ -1518,6 +1670,79 @@ mod tests {
             holder_events: Vec::new(),
             ..Default::default()
         }
+    }
+
+    fn two_seatings(parked: bool) -> Inputs {
+        let id = "r-1";
+        let mut events = vec![
+            ev(110, "task-claimed", json!({"id": id, "pane": "p1"})),
+            ev(112, "session-learned", json!({"id": id, "pane": "p1", "session": "s1"})),
+        ];
+        let mut cycle = vec![(100, "starting r-1 on claude (new)".to_string())];
+        if parked {
+            events.push(ev(130, "task-after", json!({"id": id, "after": ["r-9"]})));
+            events.push(ev(140, "task-parked", json!({"id": id})));
+            events.push(ev(150, "task-released", json!({"id": id})));
+        } else {
+            events.push(ev(200, "task-review", json!({"id": id})));
+            events.push(ev(260, "task-verified", json!({"id": id, "verdict": "blocks"})));
+            events.push(ev(400, "task-released", json!({"id": id})));
+        }
+        cycle.push((1990, "starting r-1 on claude (new)".to_string()));
+        events.push(ev(2000, "task-claimed", json!({"id": id, "pane": "p2"})));
+        events.push(ev(2002, "session-learned", json!({"id": id, "pane": "p2", "session": "s2"})));
+        events.push(ev(2300, "task-review", json!({"id": id})));
+        events.push(ev(2400, "task-verified", json!({"id": id, "verdict": "holds"})));
+        Inputs { id: id.into(), events, cycle, ..Default::default() }
+    }
+
+    /// A row released before its review and started again is two seats, and the
+    /// stretch between them is the row parked, not its seat finishing (`compounding-217`).
+    #[test]
+    fn a_parked_row_started_again_is_two_attempts_and_a_named_wait_between() {
+        let i = two_seatings(true);
+        let a = attempts(&i);
+        assert_eq!(a.len(), 2);
+        assert_eq!((a[0].claim, a[0].end, a[0].review), (110, Some(150), None));
+        assert_eq!((a[1].spawn, a[1].claim, a[1].end, a[1].review), (Some(1990), 2000, None, Some(2300)));
+        let ph = build(&i);
+        let work: Vec<&str> = ph.iter().filter(|p| p.label.starts_with("the seat's work")).map(|p| p.label.as_str()).collect();
+        assert_eq!(work, ["the seat's work until release, attempt 1 of 2", "the seat's work until review, attempt 2 of 2"]);
+        let gap = ph.iter().find(|p| p.gap && p.label.starts_with("parked at")).expect("the stretch between is named");
+        assert_eq!((gap.start, gap.end), (150, 1990));
+        let why = gap.waiting_for.as_deref().unwrap();
+        assert!(why.starts_with(PARKED_CAUSE) && why.contains("waiting on r-9"), "{why}");
+        assert!(!ph.iter().any(|p| p.waiting_for.as_deref().is_some_and(|w| w.contains("seat finishing"))), "{ph:?}");
+        let f = figures_of(&ph, &SeatReport::default());
+        assert_eq!(f.between_attempts, 1840);
+        let bounds = seat_bounds(&i, &ph, &[]);
+        assert_eq!(bounds.iter().map(|b| (b.1, b.2)).collect::<Vec<_>>(), [(100, 150), (1990, 2300)], "{bounds:?}");
+        assert!(bounds[0].0.contains("attempt 1 of 2") && bounds[1].0.contains("spawn to review"));
+    }
+
+    /// A row reviewed, sent back and reseated is rework between the review and
+    /// the next seat, and the second seat's session is the row's own.
+    #[test]
+    fn a_row_sent_back_after_review_and_reseated_has_a_rework_stretch_not_a_seat_idle() {
+        let i = two_seatings(false);
+        let ph = build(&i);
+        let gap = ph.iter().find(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with(REWORK_CAUSE))).expect("rework named");
+        assert_eq!((gap.start, gap.end), (200, 1990));
+        let work = ph.iter().find(|p| p.label == "the seat's work until review, attempt 2 of 2").unwrap();
+        assert_eq!((work.start, work.end), (2002, 2300));
+        assert_eq!(seat_sessions(&i, &[]), ["s1", "s2"], "a session learned after the first review by a pane that claimed the row since is the row's seat");
+    }
+
+    #[test]
+    fn a_claim_after_the_last_passing_verdict_is_a_reopen_of_a_landed_row_not_an_attempt() {
+        let mut i = two_seatings(true);
+        assert_eq!(attempts(&i).len(), 2, "the claim at 2000 is before the verdict at 2400");
+        // A later reopen, after the row had landed.
+        i.events.push(ev(5000, "task-released", json!({"id": "r-1"})));
+        i.events.push(ev(6000, "task-claimed", json!({"id": "r-1", "pane": "p3"})));
+        assert_eq!(attempts(&i).len(), 2, "the claim at 6000 follows the passing verdict at 2400");
+        i.events.retain(|(t, k, _)| !(*t == 2000 && k == "task-claimed"));
+        assert_eq!(attempts(&i).len(), 1, "with no claim before the verdict there is one seat");
     }
 
     /// A sent-back row's idle is named by the lines the log already writes (`wsp-559`).

@@ -224,12 +224,18 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
             Some((m, own.iter().map(|s| s.start).min()?, own.iter().map(|s| s.end).max()?))
         })
         .collect();
-    let first = started.iter().map(|x| x.1).min()?;
+    let first_start = started.iter().map(|x| x.1).min()?;
     let shared: Vec<&Span> = members.iter().flat_map(|m| m.spans.iter()).filter(|s| matches!(s.class, Class::Barrier | Class::Check)).collect();
     let last_member = started.iter().map(|x| x.2).max()?;
+    // The window opens at the previous group's pass, whether or not a member
+    // started before it (a row cut from the previous group and started again, a
+    // seat claimed ahead): what a member did before the window opened is the
+    // previous window's, so the windows tile and no second is in two
+    // (`compounding-217`: the buckets summed 1531 s past the wall).
+    let open = open.unwrap_or(first_start);
+    let first = first_start.max(open);
     let barrier_from = shared.iter().map(|s| s.start).min().unwrap_or(last_member).max(first);
     let close = pass.unwrap_or_else(|| shared.iter().map(|s| s.end).max().unwrap_or(last_member)).max(barrier_from);
-    let open = open.unwrap_or(first).min(first);
     let mut g = GroupWall { open, close, ..Default::default() };
     let add = |g: &mut GroupWall, k: &'static str, secs: i64| *g.by.entry(k).or_insert(0) += secs;
 
@@ -484,6 +490,29 @@ mod tests {
         assert_eq!(g.seconds("barrier_run"), 0);
         assert_eq!(g.seconds("waiting"), 10 + 400);
         assert_eq!(g.by.values().sum::<i64>(), 500);
+    }
+
+    #[test]
+    fn a_member_started_before_its_windows_pass_opened_is_read_from_the_pass_on_and_the_windows_tile() {
+        // Group 1 passes at 600. r-2 was in group 1, cut, started again for group
+        // 2: its first stretch (50-120) lies in group 1's window, its second (700-800)
+        // in group 2's, and the days between are a named gap. Group 2's window
+        // opens at 600, not at r-2's first start of 50.
+        let mut m = seat("r-2", 50, 800, &[(60, 120), (710, 800)], &[]);
+        m.spans = vec![
+            Span { start: 50, end: 60, class: Class::Start },
+            Span { start: 60, end: 120, class: Class::Seat },
+            Span { start: 120, end: 700, class: Class::Gap("parked between attempts".into()) },
+            Span { start: 700, end: 710, class: Class::Start },
+            Span { start: 710, end: 800, class: Class::Seat },
+            Span { start: 800, end: 900, class: Class::Barrier },
+        ];
+        let g = group_wall(&[m], Some(600), Some(900)).unwrap();
+        assert_eq!((g.open, g.close), (600, 900));
+        assert_eq!(g.by.values().sum::<i64>(), 300, "the window and no more: nothing before the pass");
+        assert_eq!(g.seconds("between_groups"), 0);
+        assert_eq!(g.seconds("working"), 90);
+        assert_eq!(g.waits.get(&("r-2".to_string(), "a gap — parked between attempts".to_string())), Some(&100), "120-700 clipped to 600-700");
     }
 
     #[test]
