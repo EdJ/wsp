@@ -338,6 +338,17 @@ pub fn load1() -> Option<f64> {
     load_average().map(|l| l.0)
 }
 
+/// Is the one-minute load over the line at which new work is held (`wsp-595`:
+/// a check that timed out while it was is not a verdict on the change)?
+pub fn load_over_hold(one: f64, cores: usize) -> bool {
+    one > HOLD_LOAD * cores as f64
+}
+
+/// Has the one-minute load fallen under the line that lets held work go?
+pub fn load_released(one: f64, cores: usize) -> bool {
+    one < RELEASE_LOAD * cores as f64
+}
+
 pub fn load_high(one: f64, five: f64, cores: usize) -> bool {
     one.min(five) > LOAD_FACTOR * cores as f64
 }

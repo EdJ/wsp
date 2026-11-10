@@ -424,6 +424,9 @@ pub(crate) enum RunState {
     Running,
     Passed,
     Failed,
+    /// Timed out while the machine was over its load line: no verdict on the
+    /// change, and a rerun is owed once the load falls (`wsp-595`).
+    Waiting,
 }
 
 impl RunState {
@@ -432,6 +435,7 @@ impl RunState {
             RunState::Running => "running",
             RunState::Passed => "passed",
             RunState::Failed => "failed",
+            RunState::Waiting => "waiting",
         }
     }
 }
@@ -464,6 +468,7 @@ impl Run {
             "running" => RunState::Running,
             "passed" => RunState::Passed,
             "failed" => RunState::Failed,
+            "waiting" => RunState::Waiting,
             _ => return None,
         };
         let mut run = Run { at: at.to_string(), state, read: None, took: None, text: String::new() };

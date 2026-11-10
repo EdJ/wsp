@@ -1136,6 +1136,7 @@ pub(crate) fn begin(store: &Store, id: &str, sha: &str, stale: i64, again: bool)
                 RunState::Running => {
                     runs.remove(i);
                 }
+                RunState::Waiting => {}
                 _ if !again => return None,
                 _ => {}
             }
@@ -1175,6 +1176,9 @@ pub(crate) enum Settled {
     /// A step could not start: the line is wrong, not the work, so the row is
     /// recorded and left where it is, and its owner is asked to fix the line.
     Malformed,
+    /// Timed out while the machine was over its load line: not a verdict, the
+    /// row stays at review, and the gate runs the check again once the load falls.
+    Waiting,
     /// The row or its entry is gone.
     Lost,
 }
@@ -1189,20 +1193,55 @@ pub(crate) fn settle(store: &Store, id: &str, at: &str, ran: &[Ran], took: Durat
 /// [`settle`], with how the tree stood when the steps began, so the event says
 /// whether a long step began on a cold `target/` or a busy machine.
 pub(crate) fn settle_started(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration, start: Option<&Start>) -> Settled {
-    let state = if passed(ran) { RunState::Passed } else { RunState::Failed };
+    settle_loaded(store, id, at, ran, took, start, crate::throttle::load1())
+}
+
+/// [`settle_started`], with the load at the end given.
+fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration, start: Option<&Start>, load_end: Option<f64>) -> Settled {
+    let busy = start.and_then(|s| timed_out_under_load(ran, s, load_end));
+    let state = if passed(ran) {
+        RunState::Passed
+    } else if busy.is_some() {
+        RunState::Waiting
+    } else {
+        RunState::Failed
+    };
     let settled = store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return Settled::Lost };
         let mut runs = v::runs(&t);
-        let Some(run) = runs.iter_mut().find(|r| r.at == at) else { return Settled::Lost };
+        let Some(i) = runs.iter().position(|r| r.at == at) else { return Settled::Lost };
+        let read = runs[i].read.clone();
+        // An earlier attempt at this commit that timed out under load: if this one
+        // timed out at normal load, the reason carries both loads.
+        let earlier: Vec<String> = runs[..i]
+            .iter()
+            .filter(|r| r.state == RunState::Waiting && r.read == read)
+            .filter_map(|r| r.text.lines().find_map(|l| l.strip_prefix(WAITING)))
+            .map(|l| l.trim_end_matches(", rerunning once the load falls").to_string())
+            .collect();
+        let run = &mut runs[i];
         run.state = state;
         run.took = Some(secs(took));
         run.text = account(ran);
-        let read = run.read.clone();
-        let mut out = if state == RunState::Passed { Settled::Passed } else { Settled::Failed };
+        if let Some(why) = &busy {
+            run.text.push_str(&format!("\n{WAITING}{why}, rerunning once the load falls"));
+        }
+        let mut out = match state {
+            RunState::Passed => Settled::Passed,
+            RunState::Waiting => Settled::Waiting,
+            _ => Settled::Failed,
+        };
         if ran.iter().any(|r| matches!(r.done, Done::Malformed(_))) {
             out = Settled::Malformed;
+        } else if state == RunState::Waiting {
+            t.updated = util::now_iso();
+            t.log(&format!("wsp: check {WAITING}{} — the row stays where it is", busy.as_deref().unwrap_or_default()));
         } else if state == RunState::Failed && t.status() == Status::Review {
-            let owes = owed(ran, read.as_deref().unwrap_or_default());
+            let mut owes = owed(ran, read.as_deref().unwrap_or_default());
+            if !earlier.is_empty() && ran.iter().any(|r| matches!(r.done, Done::Failed { timed_out: true, .. })) {
+                let now = start.map(|s| format!(", then at normal {}", s.line())).unwrap_or_default();
+                owes = format!("Timed out twice: under load ({}){now}.\n\n{owes}", earlier.join("; "));
+            }
             v::send_back(&mut t, util::now_iso(), "wsp check failed", read.as_deref(), &owes, Some(CHECK_HEAD));
             out = Settled::SentBack;
         }
@@ -1216,11 +1255,26 @@ pub(crate) fn settle_started(store: &Store, id: &str, at: &str, ran: &[Ran], too
     let mut event = serde_json::json!({ "id": id, "state": word, "steps": ran.len(), "took": took.as_secs(), "step_secs": steps });
     if let Some(start) = start {
         event["start"] = start.json();
-        event["load_end"] = serde_json::json!(crate::throttle::load1());
+        event["load_end"] = serde_json::json!(load_end);
     }
     store.log_event("task-checked", event);
     store.git_commit(&format!("wsp: checked {id} {word}"));
     settled
+}
+
+/// What an entry's line says when it timed out under load.
+pub(crate) const WAITING: &str = "timed out under load, ";
+
+/// The run timed out (a step stopped by its limit) while the one-minute load,
+/// at the start or at the end, stood over the line at which new work is held
+/// (`wsp-595`): a timeout on a machine nobody can work on is not a verdict on
+/// the change. Says which loads, for the line on the row.
+pub(crate) fn timed_out_under_load(ran: &[Ran], start: &Start, load_end: Option<f64>) -> Option<String> {
+    ran.iter().find(|r| matches!(r.done, Done::Failed { timed_out: true, .. }))?;
+    let over = |l: Option<f64>| l.filter(|l| crate::throttle::load_over_hold(*l, start.cores));
+    over(start.load).or(over(load_end))?;
+    let f = |l: Option<f64>| l.map(|l| format!("{l:.1}")).unwrap_or_else(|| "?".into());
+    Some(format!("load {} at the start, {} at the end, of {} cores", f(start.load), f(load_end), start.cores))
 }
 
 const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed:\n\n";
@@ -1384,6 +1438,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         }
         let tail = match (&settled, record) {
             (Settled::SentBack, _) => format!(" · {} is back at doing with this as what is owed", t.id),
+            (Settled::Waiting, _) => format!(" · timed out under load, rerunning once the load falls; {} stays where it is", t.id),
             (_, false) => " · nothing written on the row".to_string(),
             _ => String::new(),
         };
@@ -1901,7 +1956,13 @@ pub(crate) fn gate(store: &Store, member: &Task) -> Gate {
     let Some(sha) = crate::repair::commit_of(member) else { return Gate::Clear };
     let same = |read: &Option<String>| read.as_deref().is_some_and(|x| v::same_commit(x, &sha));
     let mine = v::runs(member).into_iter().rev().find(|r| same(&r.read));
-    if mine.as_ref().is_some_and(|r| r.state != RunState::Running) {
+    if mine.as_ref().is_some_and(|r| r.state == RunState::Waiting) {
+        // Timed out under load: owed a rerun, and the rerun waits for the load.
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        if !crate::throttle::load1().is_none_or(|l| crate::throttle::load_released(l, cores)) {
+            return Gate::Wait;
+        }
+    } else if mine.as_ref().is_some_and(|r| r.state != RunState::Running) {
         return Gate::Clear;
     }
     // A verifier already reading this landing was opened with nothing to wait
@@ -2325,6 +2386,55 @@ mod tests {
         let run = &v::runs(&t)[0];
         assert_eq!(run.state, RunState::Failed);
         assert!(run.text.contains("✗ tests · sh check.sh · 2s · exit 7") && run.text.contains("  | boom"), "{}", run.text);
+    }
+
+    fn timed_out() -> Vec<Ran> {
+        vec![Ran {
+            step: Step { name: "build".into(), command: "cargo build".into(), limit: Duration::from_secs(900), of: Of::Project, on: Vec::new(), barrier: false, end: false },
+            done: Done::Failed { exit: None, timed_out: true },
+            took: Duration::from_secs(900),
+            tail: String::new(),
+            first: None,
+            reused: None,
+        }]
+    }
+
+    fn at_load(load: f64) -> Start {
+        Start { target: "warm", seed: Vec::new(), load: Some(load), cores: 8 }
+    }
+
+    #[test]
+    fn a_timeout_under_load_leaves_the_row_at_review_and_is_run_again_not_sent_back() {
+        let (_env, store, sha) = world("busy", "- build: cargo build", "exit 0\n");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        let ran = timed_out();
+        assert_eq!(settle_loaded(&store, "pj-001", &at, &ran, Duration::from_secs(900), Some(&at_load(19.0)), Some(19.0)), Settled::Waiting);
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(t.status(), Status::Review, "not sent back");
+        let run = &v::runs(&t)[0];
+        assert_eq!(run.state, RunState::Waiting);
+        assert!(run.text.contains("timed out under load, load 19.0 at the start") && run.text.contains("rerunning"), "{}", run.text);
+        assert!(!t.section("Log").unwrap().contains("sent back"));
+        assert!(begin(&store, "pj-001", &sha, 3600, false).is_some(), "the rerun may start");
+        assert_eq!(v::runs(&store.find_task("pj-001").unwrap()).len(), 2, "the first attempt stays on the row");
+    }
+
+    #[test]
+    fn a_timeout_at_normal_load_is_a_red_check() {
+        let (_env, store, sha) = world("calm", "- build: cargo build", "exit 0\n");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        assert_eq!(settle_loaded(&store, "pj-001", &at, &timed_out(), Duration::from_secs(900), Some(&at_load(2.0)), Some(2.0)), Settled::SentBack);
+    }
+
+    #[test]
+    fn a_second_timeout_at_normal_load_is_sent_back_with_both_loads_in_the_reason() {
+        let (_env, store, sha) = world("twice", "- build: cargo build", "exit 0\n");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        settle_loaded(&store, "pj-001", &at, &timed_out(), Duration::from_secs(900), Some(&at_load(30.0)), Some(30.0));
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        assert_eq!(settle_loaded(&store, "pj-001", &at, &timed_out(), Duration::from_secs(900), Some(&at_load(2.0)), Some(2.0)), Settled::SentBack);
+        let log = store.find_task("pj-001").unwrap().section("Log").unwrap();
+        assert!(log.contains("Timed out twice") && log.contains("load 30.0") && log.contains("load 2.0"), "{log}");
     }
 
     #[test]
