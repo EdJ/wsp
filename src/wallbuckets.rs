@@ -102,6 +102,33 @@ pub(crate) struct MemberIn {
     pub active: Vec<(i64, i64)>,
     pub blocked: Vec<(i64, i64)>,
     pub measured: bool,
+    /// `(epoch, reason)`, sorted: what the row's log says it was waiting on from
+    /// that moment (`wsp-559`). The seat idle is named by the latest one.
+    pub markers: Vec<(i64, String)>,
+}
+
+/// The cause a seat idle is booked under, before the reason after ` — `.
+pub(crate) const SEAT_IDLE: &str = "the seat idle (in neither a model call nor a tool)";
+/// The reason where the log says nothing at that moment.
+pub(crate) const NONE_RECORDED: &str = "none recorded";
+
+/// The reason the row's log gives for the seat idle at `t`: the latest marker
+/// at or before it.
+fn idle_reason(m: &MemberIn, t: i64) -> &str {
+    let n = m.markers.partition_point(|(a, _)| *a <= t);
+    if n == 0 { NONE_RECORDED } else { &m.markers[n - 1].1 }
+}
+
+/// Seat-idle seconds by reason, from a group's `waits`.
+pub(crate) fn seat_idle_reasons<'a>(waits: impl Iterator<Item = (&'a str, i64)>) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    for (cause, s) in waits {
+        if let Some(rest) = cause.strip_prefix(SEAT_IDLE) {
+            let why = rest.strip_prefix(" — ").unwrap_or(NONE_RECORDED);
+            *out.entry(why.to_string()).or_insert(0) += s;
+        }
+    }
+    out
 }
 
 pub(crate) const BUCKETS: [&str; 6] = ["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups"];
@@ -151,7 +178,7 @@ fn state(m: &MemberIn, t: i64, first: i64, last: i64) -> State {
         Some(Class::Seat) if !m.measured => State::Working,
         Some(Class::Start) => State::Waiting(1, "an unclaimed or slow start (spawn requested → the seat's first work)".into()),
         Some(Class::Gap(why)) => State::Waiting(2, format!("a gap — {why}")),
-        _ => State::Waiting(3, "the seat idle (in neither a model call nor a tool)".into()),
+        _ => State::Waiting(3, format!("{SEAT_IDLE} — {}", idle_reason(m, t))),
     }
 }
 
@@ -186,6 +213,7 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
         for (a, b) in m.active.iter().chain(m.blocked.iter()) {
             cuts.extend([*a, *b]);
         }
+        cuts.extend(m.markers.iter().map(|(t, _)| *t));
     }
     cuts.retain(|t| *t >= first && *t <= barrier_from);
     cuts.sort_unstable();
@@ -254,6 +282,7 @@ mod tests {
             active: active.to_vec(),
             blocked: blocked.to_vec(),
             measured: true,
+            markers: Vec::new(),
         }
     }
 
@@ -321,6 +350,23 @@ mod tests {
         let g = group_wall(&ms, None, Some(160)).unwrap();
         assert_eq!(g.seconds("working"), 90);
         assert_eq!(g.seconds("waiting"), 10, "the start only");
+    }
+
+    #[test]
+    fn a_seat_idle_is_named_by_the_latest_line_the_log_wrote_before_it() {
+        // r-1 works 10-100, then sits idle to 990 with no phase: sent back at 200, told at 500, reopened at 600.
+        let mut m = seat("r-1", 0, 100, &[(10, 100)], &[]);
+        m.spans[1].end = 100;
+        m.spans.push(Span { start: 990, end: 1000, class: Class::Verify });
+        m.spans.push(Span { start: 1000, end: 1100, class: Class::Barrier });
+        m.markers = vec![(200, "sent back: the verdict given".into()), (500, "told: the seat has the sentence".into()), (600, "reopened: the seat is on the send-back".into())];
+        let g = group_wall(&[m], None, Some(1100)).unwrap();
+        let by = seat_idle_reasons(g.waits.iter().map(|((_, c), s)| (c.as_str(), *s)));
+        assert_eq!(by.get(NONE_RECORDED), Some(&100), "100-200, before any line");
+        assert_eq!(by.get("sent back: the verdict given"), Some(&300));
+        assert_eq!(by.get("told: the seat has the sentence"), Some(&100));
+        assert_eq!(by.get("reopened: the seat is on the send-back"), Some(&390));
+        assert_eq!(by.values().sum::<i64>(), 890, "every idle second of 100-990 carries a reason");
     }
 
     #[test]

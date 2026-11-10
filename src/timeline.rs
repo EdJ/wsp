@@ -1220,6 +1220,68 @@ pub(crate) struct RowFigures {
     /// Every transcript the seat's calls come from was found: where one was
     /// not, its seat time cannot be told from idle and is not called waiting.
     pub measured: bool,
+    /// What the row's log says it was waiting on, from each moment (`wsp-559`):
+    /// the seat idle is named by the latest one.
+    pub markers: Vec<(i64, String)>,
+}
+
+/// What the lines the log already writes for a row say it was waiting on, from
+/// the moment each is written: a verdict sent back, the tell reaching the seat
+/// or not, a reopen, a rebase refused, a hand-off to another row, a block, an
+/// `after` it is owed. Sorted by time; a moment with none before it is "none
+/// recorded".
+pub(crate) fn idle_markers(i: &Inputs) -> Vec<(i64, String)> {
+    let id = i.id.as_str();
+    let mut out: Vec<(i64, String)> = Vec::new();
+    for (t, k, d) in i.events.iter().filter(|(_, _, d)| d["id"] == id) {
+        let why = match k.as_str() {
+            "task-claimed" | "session-learned" => crate::wallbuckets::NONE_RECORDED.to_string(),
+            "task-review" => "review typed: the check and the verifier's hand-off".into(),
+            "task-checked" => "the check done: the verifier's hand-off".into(),
+            "task-verified" if d["verdict"] == "blocks" => "sent back: the verdict given, the seat not yet told or moving".into(),
+            "task-verified" => "the verdict holds: the seat left standing, nothing owed".into(),
+            "task-reopen" | "task-doing" => "reopened: the seat is on the send-back".into(),
+            "task-blocked" => "blocked on a person or a fix".into(),
+            "task-parked" => "parked".into(),
+            "task-released" => "the seat released".into(),
+            "task-handoff" => match d["to"].as_str() {
+                Some(to) => format!("handed to another row ({to}): the remainder is owed there"),
+                None => "handed to another row".into(),
+            },
+            _ => continue,
+        };
+        out.push((*t, why));
+    }
+    for (t, l) in &i.cycle {
+        let why = if l.contains("of its own still running") && l.contains(" is waiting on ") {
+            "the seat waiting on shells of its own (wakes when they end)".to_string()
+        } else if l.contains("A verifier found a problem") && l.starts_with("tell ") {
+            "sent back: the verdict with the governor".into()
+        } else if l.starts_with(&format!("tell {id}: not delivered")) {
+            "sent back: the tell not delivered, the seat busy".into()
+        } else if l.starts_with(&format!("tell {id}: it has the sentence")) || l.contains("was typed to it, now it reads idle") {
+            "told: the seat has the sentence".into()
+        } else if l.starts_with("told ") && l.contains("typed at the seat") {
+            "told: typed at the seat, no turn seen yet".into()
+        } else if l.contains("sent back — wsp: the rebase") || (l.contains("sent back —") && l.contains("rebase")) {
+            "rebase refused: sent back to the seat".into()
+        } else if l.contains("again: it was sent back") {
+            "sent back: the seat started again".into()
+        } else if l.contains(&format!("{id} sent back")) {
+            "sent back by wsp".into()
+        } else if l.contains("its verifier blocked") && l.contains("sent back or answered") {
+            "sent back or answered? the barrier waits on it".into()
+        } else if l.contains(&format!("{id} waits on ")) && l.contains("it has not landed") {
+            "owed to another row (an after that has not landed)".into()
+        } else if l.contains("verification holds and the agent is left running") {
+            "the verdict read: the seat left running".into()
+        } else {
+            continue;
+        };
+        out.push((*t, why));
+    }
+    out.sort_by_key(|m| m.0);
+    out
 }
 
 /// When the row stood blocked: from each `task-blocked` to the next event that
@@ -1269,6 +1331,7 @@ pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
     let seat = seat_report(&i, &phases, &run, &transcript);
     let mut f = figures_of(&phases, &seat);
     f.blocked = blocked_spans(&i, f.end);
+    f.markers = idle_markers(&i);
     (f.spawn_to_first, f.verifier_spawn_to_first, f.verifier_test_secs, f.verdict_to_despawn) = fixed_of(&i, &phases);
     f
 }
@@ -1399,6 +1462,35 @@ mod tests {
             holder_events: Vec::new(),
             ..Default::default()
         }
+    }
+
+    /// A sent-back row's idle is named by the lines the log already writes (`wsp-559`).
+    #[test]
+    fn the_logs_lines_name_what_a_sent_back_row_waited_on() {
+        let mut i = row();
+        i.events.push(ev(390, "task-verified", json!({"id": "r-1", "verdict": "blocks"})));
+        i.events.push(ev(520, "task-reopen", json!({"id": "r-1"})));
+        i.events.push(ev(700, "task-handoff", json!({"id": "r-1", "to": "r-9"})));
+        i.cycle.push((391, "tell g: A verifier found a problem in the g run: r-1 (x)".into()));
+        i.cycle.push((395, "tell r-1: not delivered — wsp: cannot say whether it is at a prompt".into()));
+        i.cycle.push((500, "tell r-1: it has the sentence".into()));
+        i.cycle.push((600, "g group 1: r-1 sent back — wsp: the rebase onto master does not apply cleanly".into()));
+        i.cycle.push((650, "g group 1: r-1 (cpd-1) is waiting on 2 shells of its own still running, which wakes it".into()));
+        i.cycle.push((660, "g group 2: r-7 waits on r-1 — after: it has not landed".into()));
+        let m = idle_markers(&i);
+        let at = |t: i64| m.iter().filter(|x| x.0 <= t).last().map(|x| x.1.as_str()).unwrap_or("-");
+        assert!(at(390).starts_with("sent back: the verdict given"), "{m:?}");
+        assert!(at(391).contains("with the governor"));
+        assert!(at(395).contains("not delivered"));
+        assert!(at(510).contains("has the sentence"));
+        assert!(at(520).starts_with("reopened"));
+        assert!(at(600).starts_with("rebase refused"));
+        assert!(at(655).contains("shells of its own"));
+        assert!(at(700).contains("r-9"), "the hand-off names the row the remainder went to");
+        assert_eq!(at(100), "-", "nothing before the claim: the sweep reads it as none recorded");
+        assert_eq!(at(115), crate::wallbuckets::NONE_RECORDED);
+        assert!(m.windows(2).all(|w| w[0].0 <= w[1].0), "sorted");
+        assert!(!m.iter().any(|x| x.1.contains("r-7")), "another row's line is not this row's reason");
     }
 
     /// The verifier's seat is up long before wsp says `started` (`wsp-429`): the
