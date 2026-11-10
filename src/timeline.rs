@@ -1778,7 +1778,6 @@ mod tests {
         };
         let r1 = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), ..Default::default() };
         let g = crate::wallbuckets::group_wall(&[r1, r2], None, Some(at(20, 25, 20))).unwrap();
-        eprintln!("AFTER {g:?}");
         assert_eq!(g.seconds("barrier_run"), 30 + 1242 + 6 + 9, "wait to the run, the failed run, the wait to the run again, the run again: {g:?}");
         assert_eq!(g.seconds("check_seat"), 1 + 120 + 125, "the failed run's seat (and the second before it was up), the last run's seat: {g:?}");
         assert_eq!(g.seconds("serialised"), 0, "wsp-531 had started inside the failed run's check seat; nothing was held: {g:?}");
