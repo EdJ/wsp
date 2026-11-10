@@ -204,8 +204,16 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
 
     add(&mut g, "between_groups", first - open);
 
-    // The members' stretch, instant by instant.
-    let mut cuts: Vec<i64> = vec![first, barrier_from];
+    // The window instant by instant: where a barrier span lies it is the
+    // barrier's (its run, or its check seat); after the last it is the barrier's
+    // up to the pass; elsewhere the members', which includes the stretch
+    // between a failed run and the next, a follow-up row's own time (`wsp-568`).
+    let barrier = merge(&shared.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>());
+    let last_barrier = barrier.last().map_or(barrier_from, |b| b.1);
+    let mut cuts: Vec<i64> = vec![first, barrier_from, close, last_barrier];
+    for s in &shared {
+        cuts.extend([s.start, s.end]);
+    }
     for (m, ..) in &started {
         for s in &m.spans {
             cuts.extend([s.start, s.end]);
@@ -215,11 +223,23 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
         }
         cuts.extend(m.markers.iter().map(|(t, _)| *t));
     }
-    cuts.retain(|t| *t >= first && *t <= barrier_from);
+    cuts.retain(|t| *t >= first && *t <= close);
     cuts.sort_unstable();
     cuts.dedup();
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
+        if a >= last_barrier || within(&barrier, a) {
+            let at = |s: &&&Span| a >= s.start && a < s.end;
+            if shared.iter().filter(at).any(|s| s.class == Class::Check) {
+                add(&mut g, "check_seat", b - a);
+            } else {
+                add(&mut g, "barrier_run", b - a);
+                if shared.iter().filter(at).any(|s| s.class == Class::Barrier) {
+                    g.barrier_run += b - a;
+                }
+            }
+            continue;
+        }
         let mut working = false;
         let mut waiting: Option<(u8, &str, String)> = None;
         let mut not_started = false;
@@ -245,27 +265,6 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
         } else {
             add(&mut g, "waiting", b - a);
             *g.waits.entry((String::new(), "every member done, the barrier not yet started".into())).or_insert(0) += b - a;
-        }
-    }
-
-    // The barrier: from the last verdict to the pass.
-    let mut cuts: Vec<i64> = vec![barrier_from, close];
-    for s in &shared {
-        cuts.extend([s.start, s.end]);
-    }
-    cuts.retain(|t| *t >= barrier_from && *t <= close);
-    cuts.sort_unstable();
-    cuts.dedup();
-    for w in cuts.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let at = |s: &&&Span| a >= s.start && a < s.end;
-        if shared.iter().filter(at).any(|s| s.class == Class::Check) {
-            add(&mut g, "check_seat", b - a);
-        } else {
-            add(&mut g, "barrier_run", b - a);
-            if shared.iter().filter(at).any(|s| s.class == Class::Barrier) {
-                g.barrier_run += b - a;
-            }
         }
     }
     Some(g)
@@ -307,6 +306,29 @@ mod tests {
         assert_eq!(g.barrier_run, 600);
         assert_eq!(g.waits.iter().find(|((r, c), _)| r == "r-2" && c.starts_with("blocked")).map(|(_, s)| *s), Some(800));
         assert_eq!(g.by.values().sum::<i64>(), 1700, "every second of 0-1700 is in a bucket");
+    }
+
+    #[test]
+    fn a_failed_barrier_run_then_a_follow_up_row_then_the_run_again_reads_as_the_barrier_and_tiles_the_wall() {
+        // r-1 works 0-100; r-2 is held to 300 and works to 400. The barrier's
+        // first run fails (400-1000); the follow-up r-3 starts at 1010 and works
+        // to 1100, and nothing runs to 1500; the run again is 1500-1515, its
+        // check seat to 1600. The stretch between the runs is the members', not
+        // the barrier's.
+        let mut ms = vec![seat("r-1", 0, 100, &[(10, 100)], &[]), seat("r-2", 300, 400, &[(310, 400)], &[]), seat("r-3", 1010, 1100, &[(1020, 1100)], &[])];
+        for m in ms.iter_mut() {
+            m.spans.push(Span { start: 400, end: 1000, class: Class::Barrier });
+            m.spans.push(Span { start: 1500, end: 1515, class: Class::Barrier });
+            m.spans.push(Span { start: 1515, end: 1600, class: Class::Check });
+        }
+        let g = group_wall(&ms, None, Some(1600)).unwrap();
+        assert_eq!(g.seconds("barrier_run"), 600 + 15, "the failed run and the run again, not the stretch between");
+        assert_eq!(g.barrier_run, 615);
+        assert_eq!(g.seconds("check_seat"), 85);
+        assert_eq!(g.seconds("serialised"), 200 + 10, "100-300 r-2 held, and 1000-1010 before the follow-up starts");
+        assert_eq!(g.seconds("working"), 90 + 90 + 80, "r-1, r-2 and the follow-up r-3");
+        assert_eq!(g.seconds("waiting"), 20 + 10 + 400, "the starts, r-3's, and 1100-1500 with every member done");
+        assert_eq!(g.by.values().sum::<i64>(), 1600, "the buckets sum to the wall");
     }
 
     #[test]

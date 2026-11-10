@@ -415,13 +415,11 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             for (n, (e, line)) in found.iter().enumerate() {
                 let secs = run_seconds(line).unwrap_or(0);
                 let start = (e - secs).max(prev);
-                if start > prev {
-                    let label = if n == 0 {
-                        format!("last verdict → barrier {at} run started{others}")
-                    } else {
-                        format!("barrier {at} run failed → run again started")
-                    };
-                    out.push(Phase::gap(label, prev, start, wait_name(i, prev, start, &who)).shared());
+                // The wait before the first run is the barrier's; what lies
+                // between a failed run and the next is the follow-up's own
+                // time, in no barrier phase (`wsp-568`).
+                if n == 0 && start > prev {
+                    out.push(Phase::gap(format!("last verdict → barrier {at} run started{others}"), prev, start, wait_name(i, prev, start, &who)).shared());
                 }
                 out.push(Phase::work(run_label(*at, line), start, *e).shared());
                 prev = *e;
@@ -1719,7 +1717,32 @@ mod tests {
         let ph = build(&i);
         let runs: Vec<(i64, i64)> = ph.iter().filter(|p| p.shared && p.label.starts_with("barrier 1 run (")).map(|p| (p.start, p.end)).collect();
         assert_eq!(runs, vec![(400, 1000), (1585, 1600)], "{ph:?}");
-        assert!(ph.iter().any(|p| p.gap && p.shared && p.start == 1000 && p.end == 1585), "{ph:?}");
+        assert!(!ph.iter().any(|p| p.shared && p.start >= 1000 && p.end <= 1585), "the stretch between the runs is in no barrier phase: {ph:?}");
+    }
+
+    /// Signing's group 1 (`cycle.log`, 2026-11-08): the first barrier run failed
+    /// after 1242s (the run line at 19:53:12), a follow-up row was added and its
+    /// verdict came at 20:23:00, the second run was 9s (20:23:15). The offsets
+    /// are the log's, from the first verdict (19:32:00 = 380 here).
+    #[test]
+    fn signings_group_one_reads_the_failed_run_and_the_run_again_as_the_barrier() {
+        let mut i = row();
+        i.group = Some(("list".into(), 1, vec!["r-1".into(), "r-2".into()]));
+        let at = |h: i64, m: i64, sec: i64| 380 + (h * 3600 + m * 60 + sec) - (19 * 3600 + 32 * 60);
+        i.events.push(ev(at(20, 23, 0), "task-verified", json!({"id": "r-2"})));
+        i.cycle.push((at(19, 53, 12), "list group 1: barrier run — 1 step(s), 0 reused, 1 ran, 1 failed, 1242s · per step: full 1241s · scope: full".into()));
+        i.cycle.push((at(20, 23, 15), "list group 1: barrier run — 2 step(s), 1 reused, 1 ran, 0 failed, 9s · per step: help 8s · scope: full".into()));
+        i.cycle.push((at(20, 25, 20), "tell list: Barrier 1 of list passed".into()));
+        let ph = build(&i);
+        let runs: Vec<i64> = ph.iter().filter(|p| p.shared && p.label.starts_with("barrier 1 run (")).map(|p| p.seconds()).collect();
+        assert_eq!(runs, vec![1242, 9], "{ph:?}");
+        let m = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), measured: false, ..Default::default() };
+        let g = crate::wallbuckets::group_wall(&[m], None, Some(at(20, 25, 20))).unwrap();
+        let shared: i64 = ph.iter().filter(|p| p.shared).map(|p| p.seconds()).sum();
+        assert_eq!(g.seconds("barrier_run"), shared, "the barrier's phases are the barrier's wall, the fix stretch between the runs is not: {g:?}");
+        assert!(g.seconds("barrier_run") >= 1242 + 9, "{g:?}");
+        assert!(g.seconds("working") + g.seconds("waiting") + g.seconds("serialised") >= at(20, 23, 0) - at(19, 53, 12), "the follow-up's stretch is the members': {g:?}");
+        assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets sum to the wall");
     }
 
     #[test]

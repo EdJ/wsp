@@ -197,12 +197,38 @@ fn median(v: &mut [i64]) -> i64 {
     }
 }
 
+/// A member whose own record is empty (no calls, tokens or tool seconds read:
+/// its transcript was not found, or the row has none) but whose seat the cost
+/// table measured (`wsp-568`). Its calls and tokens come from the seat, and it
+/// reads as measured, so its span is the seat idle and not "working" for the
+/// whole of it; the member row says so. `true` where it did.
+fn fill_from_seat(f: &mut crate::timeline::RowFigures, total: Option<&Value>) -> bool {
+    let empty = f.calls == 0 && f.tokens_in == 0 && f.tokens_out == 0 && f.cache_read == 0 && f.model_secs == 0 && f.tools.is_empty();
+    let Some(t) = total.filter(|_| empty && !f.measured) else { return false };
+    let (seats, unmeasured) = (n(t, "seats"), n(t, "unmeasured"));
+    if seats == 0 || unmeasured >= seats || (n(t, "turns") == 0 && n(t, "output_tokens") == 0) {
+        return false;
+    }
+    f.calls = n(t, "turns");
+    f.tokens_in = n(t, "input_tokens");
+    f.cache_read = n(t, "cache_tokens");
+    f.tokens_out = n(t, "output_tokens");
+    f.measured = true;
+    true
+}
+
 /// [`effort`] with the timeline figures of a row handed in, so that a test can
 /// hold the sums to what it hands.
 pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, figures: &dyn Fn(&str) -> crate::timeline::RowFigures) -> Value {
-    let groups = w.groups();
     let es = crate::cmd_cost::entries(store, &w.id).unwrap_or_default();
-    let cost = crate::cmd_cost::cost_json(&w.id, &es, groups.len());
+    let cost = crate::cmd_cost::cost_json(&w.id, &es, w.groups().len());
+    effort_over(store, w, baseline, figures, cost)
+}
+
+/// [`effort_with`] over a cost block handed in, so that a test can hold a
+/// member's seat to what the cost table says of it.
+pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, figures: &dyn Fn(&str) -> crate::timeline::RowFigures, cost: Value) -> Value {
+    let groups = w.groups();
 
     let mut waits: BTreeMap<String, i64> = BTreeMap::new();
     let mut tools: BTreeMap<String, i64> = BTreeMap::new();
@@ -232,7 +258,8 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
         let mut shared: Option<crate::timeline::RowFigures> = None;
         let (mut gstart, mut glast) = (0i64, 0i64);
         for m in &g.members {
-            let f = figures(m);
+            let mut f = figures(m);
+            let seat_filled = fill_from_seat(&mut f, cost["groups"].get(gi).and_then(|c| c["members"].as_array()).and_then(|ms| ms.iter().find(|x| x["task"] == m.as_str())).map(|x| &x["total"]));
             sweep.push(crate::wallbuckets::MemberIn { id: m.clone(), spans: f.spans.clone(), active: f.active.clone(), blocked: f.blocked.clone(), measured: f.measured, markers: f.markers.clone() });
             if f.end > 0 && f.start > 0 && (gstart == 0 || f.start < gstart) {
                 gstart = f.start;
@@ -305,6 +332,7 @@ pub(crate) fn effort_with(store: &Store, w: &Worklist, baseline: Option<&str>, f
                 "verifier_spawn_to_first_line_seconds": f.verifier_spawn_to_first,
                 "verifier_test_seconds": f.verifier_test_secs,
                 "verdict_to_despawn_seconds": f.verdict_to_despawn,
+                "record_empty_seat_measured": seat_filled,
             }));
             fixed_first.extend(f.spawn_to_first);
             fixed_vfirst.extend(f.verifier_spawn_to_first);
@@ -1307,6 +1335,37 @@ mod tests {
         assert_eq!(members.iter().map(|m| m["model_seconds"].as_i64().unwrap()).sum::<i64>(), 200);
         assert_eq!(members.iter().map(|m| m["gap_seconds"].as_i64().unwrap()).sum::<i64>(), t["gap_seconds"].as_i64().unwrap());
         assert_eq!(members[0]["wall_seconds"], 300);
+    }
+
+    #[test]
+    fn a_member_with_an_empty_record_but_a_measured_seat_is_filled_from_the_seat_and_not_working_its_span() {
+        use crate::timeline::RowFigures;
+        use crate::wallbuckets::{Class, Span};
+        let (_e, store, w) = list("empty", &["r-1", "r-2"]);
+        let spans = |a: i64, b: i64| vec![Span { start: a, end: b, class: Class::Seat }];
+        // r-1 read whole; r-2 (the follow-up) has no calls, tokens or tools, and no transcript.
+        let fig = |id: &str| match id {
+            "r-1" => RowFigures { start: 0, end: 1000, wall: 1000, spans: spans(0, 1000), active: vec![(0, 1000)], measured: true, calls: 4, model_secs: 800, tokens_in: 5, tokens_out: 6, ..Default::default() },
+            _ => RowFigures { start: 0, end: 1000, wall: 1000, spans: spans(0, 1000), ..Default::default() },
+        };
+        let seat = |turns: u64| json!({"seats": 1, "unmeasured": 0, "turns": turns, "input_tokens": 90, "output_tokens": 30, "cache_tokens": 70, "seconds": 900});
+        let cost = |turns: u64| json!({"groups": [{"group": 1, "members": [
+            {"task": "r-1", "total": seat(4)},
+            {"task": "r-2", "total": seat(turns)},
+        ]}]});
+        let v = effort_over(&store, &w, None, &fig, cost(7));
+        let ms = v["groups"][0]["members"].as_array().unwrap();
+        let r2 = ms.iter().find(|m| m["task"] == "r-2").unwrap();
+        assert_eq!((r2["calls"].as_u64(), r2["tokens_in"].as_u64(), r2["tokens_out"].as_u64()), (Some(7), Some(90), Some(30)), "{r2}");
+        assert_eq!(r2["record_empty_seat_measured"], true);
+        assert_eq!(ms.iter().find(|m| m["task"] == "r-1").unwrap()["record_empty_seat_measured"], false);
+        // r-1 works the whole span; r-2 alone would have been called working for it.
+        let alone = effort_over(&store, &w, None, &|id| if id == "r-2" { fig("r-2") } else { RowFigures::default() }, cost(7));
+        assert_eq!(alone["groups"][0]["wall_buckets"]["working_seconds"], 0, "{}", alone["groups"][0]["wall_buckets"]);
+        // A seat the cost table did not measure fills nothing.
+        let un = effort_over(&store, &w, None, &fig, json!({"groups": [{"group": 1, "members": [{"task": "r-2", "total": {"seats": 1, "unmeasured": 1, "turns": 0, "output_tokens": 0}}]}]}));
+        let r2 = un["groups"][0]["members"].as_array().unwrap().iter().find(|m| m["task"] == "r-2").unwrap().clone();
+        assert_eq!((r2["record_empty_seat_measured"].clone(), r2["calls"].clone()), (json!(false), json!(0)));
     }
 
     #[test]
