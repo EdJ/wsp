@@ -557,6 +557,12 @@ fn main() {
         wsp_base::calls::set_code(0);
         return;
     }
+    if args.cmd == "help" && args.has("fixture") {
+        // What `fixtures/help.txt` holds, for `wsp help --fixture > fixtures/help.txt`.
+        println!("{}", help_fixture());
+        wsp_base::calls::set_code(0);
+        return;
+    }
     if args.cmd.is_empty() || args.cmd == "help" || args.has("help") {
         help();
         wsp_base::calls::set_code(0);
@@ -948,6 +954,17 @@ fn help() {
     println!("{}", help_text());
 }
 
+/// The help after its version line, which names the build: the bytes of
+/// `fixtures/help.txt`.
+fn help_fixture() -> String {
+    let help = help_text();
+    help.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default()
+}
+
+/// What the help test says when the snapshot is stale: the test, the file and
+/// the verb that rewrites it (`wsp-564`).
+const STALE_HELP: &str = "wsp help changed and fixtures/help.txt did not. If the change is meant, regenerate the snapshot and commit it with the help text: `cargo run -q -- help --fixture > fixtures/help.txt` (or `wsp help --fixture > fixtures/help.txt` from a build that has the change), then `cargo test the_help_is_what_it_was_before_the_registry`";
+
 /// The help as one string, so that the check on flag names can read it.
 ///
 /// The argument for building it rather than printing it is in [`vocabulary`]:
@@ -1086,7 +1103,18 @@ mod tests {
     fn the_help_is_what_it_was_before_the_registry() {
         let help = super::help_text();
         let (_, rest) = help.split_once('\n').expect("a first line");
-        assert_eq!(rest, include_str!("../fixtures/help.txt").trim_end_matches('\n'));
+        assert_eq!(rest, include_str!("../fixtures/help.txt").trim_end_matches('\n'), "{}", super::STALE_HELP);
+    }
+
+    #[test]
+    fn a_stale_snapshot_failure_names_the_test_and_the_verb_that_regenerates_it() {
+        assert!(super::STALE_HELP.contains("wsp help --fixture > fixtures/help.txt"));
+        assert!(super::STALE_HELP.contains("the_help_is_what_it_was_before_the_registry"));
+    }
+
+    #[test]
+    fn help_fixture_is_the_snapshot_bytes() {
+        assert_eq!(super::help_fixture(), include_str!("../fixtures/help.txt").trim_end_matches('\n'));
     }
 
     #[test]

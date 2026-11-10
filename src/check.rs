@@ -408,7 +408,11 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
         }
     }
     let rules = project_steps(store, t);
-    let changed = if rules.iter().any(|s| s.of == Of::Rule && !s.barrier && !s.end) { changed_paths(tg, t, at.is_none()) } else { Vec::new() };
+    // The changed paths are read for the help snapshot too (`wsp-564`), so a
+    // repository that carries `fixtures/help.txt` always has them.
+    let at_sha = |path: &str| git(&tg.repo, &["show", &format!("{}:{path}", tg.sha)]);
+    let wants_paths = rules.iter().any(|s| s.of == Of::Rule && !s.barrier && !s.end) || at_sha(HELP_FIXTURE).is_some();
+    let changed = if wants_paths { changed_paths(tg, t, at.is_none()) } else { Vec::new() };
     for r in rules.into_iter().filter(|r| !r.barrier && !r.end) {
         let made = match r.of {
             Of::Rule => expand(&r, &changed),
@@ -420,7 +424,52 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
             }
         }
     }
+    if let Some(h) = help_step(&at_sha, &changed) {
+        if !steps.iter().any(|s| s.command == h.command) {
+            steps.push(h);
+        }
+    }
     Plan { steps, changed }
+}
+
+/// The help snapshot a repository keeps: everything `wsp help` prints after
+/// its version line.
+pub(crate) const HELP_FIXTURE: &str = "fixtures/help.txt";
+
+/// The test that compares the help to [`HELP_FIXTURE`].
+pub(crate) const HELP_TEST: &str = "the_help_is_what_it_was_before_the_registry";
+
+/// Whether a changed file feeds `wsp help`: the verb registry and its entries,
+/// or a module that declares a `VERBS` table or the closing notes.
+fn feeds_help(path: &str, content: &str) -> bool {
+    path.ends_with(".rs")
+        && (matches!(path, "src/main.rs" | "src/registry.rs" | "src/verbs.rs") || content.contains("const VERBS") || content.contains("HELP_NOTES"))
+}
+
+/// The help-snapshot test, when a path the landing changed feeds the help and
+/// the repository keeps a snapshot (`wsp-564`). A help line changed without
+/// `fixtures/help.txt` reached the trunk red and was found by the group's
+/// barrier twenty minutes later, three times in a day; this finds it in the
+/// member's own check, for the cost of one test and only on a row that touches
+/// a help source. The failure message of the test names the verb that
+/// regenerates the snapshot (`wsp help --fixture`).
+///
+/// `read` gives a path's content at the commit under check.
+pub(crate) fn help_step(read: &dyn Fn(&str) -> Option<String>, changed: &[String]) -> Option<Step> {
+    read(HELP_FIXTURE)?;
+    let on: Vec<String> = changed.iter().filter(|p| feeds_help(p, &read(p).unwrap_or_default())).cloned().collect();
+    if on.is_empty() {
+        return None;
+    }
+    Some(Step {
+        name: "help".into(),
+        command: format!("cargo test {HELP_TEST}"),
+        limit: Duration::from_secs(20 * 60),
+        of: Of::Rule,
+        on,
+        barrier: false,
+        end: false,
+    })
 }
 
 /// The steps of a re-plan after the trunk moved that the rebase can have
@@ -1456,7 +1505,13 @@ fn inner(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: cannot read what {} changed against the trunk", util::contract(&tree));
         return 1;
     };
-    let steps = if wide { affected_steps(store, &t, &tree, &changed) } else { inner_steps(store, &t, &changed) };
+    let mut steps = if wide { affected_steps(store, &t, &tree, &changed) } else { inner_steps(store, &t, &changed) };
+    let in_tree = |path: &str| std::fs::read_to_string(tree.join(path)).ok();
+    if let Some(h) = help_step(&in_tree, &changed) {
+        if !steps.iter().any(|s| s.command == h.command) {
+            steps.push(h);
+        }
+    }
     if steps.is_empty() {
         println!("{} {}", p.dim("nothing to run —"), p.dim(&format!("{} changed path(s) call for no check of {}", changed.len(), t.id)));
         return 0;
@@ -2286,6 +2341,65 @@ mod tests {
         let tg = target(&store, &t, None).unwrap();
         let names: Vec<_> = plan(&store, &t, &tg, None).steps.into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["own", "1.types", "2.board"], "a pending piece's lines and a command the row ran already are not added");
+    }
+
+    /// A commit on the test repo that writes `files` and returns its sha.
+    fn commit_files(repo: &Path, files: &[(&str, &str)]) -> String {
+        for (path, text) in files {
+            let full = repo.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, text).unwrap();
+            git_run(repo, &["add", path]);
+        }
+        git_run(repo, &["commit", "--quiet", "-m", "pj-001: more"]);
+        git(repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn a_help_source_in_the_diff_adds_the_help_test_and_a_row_that_touches_none_does_not() {
+        let (env, store, base) = world("help-step", "- ok: true", "exit 0\n");
+        let repo = env.path("repo");
+        let t = store.find_task("pj-001").unwrap();
+        let names = |tg: &Target| plan(&store, &t, tg, Some(&tg.sha)).steps;
+        let at = |sha: &str| Target { since: Some(base.clone()), ..target(&store, &t, Some(sha)).unwrap() };
+
+        // A repository with a snapshot, and a change that leaves help alone.
+        let with_fixture = commit_files(&repo, &[(HELP_FIXTURE, "help\n")]);
+        let docs = commit_files(&repo, &[("docs/x.md", "x\n")]);
+        let steps = names(&at(&docs));
+        assert!(steps.iter().all(|s| s.name != "help"), "{steps:?}");
+        let _ = with_fixture;
+
+        // A help line added to a module's VERBS, and the snapshot not touched.
+        let help_line = commit_files(&repo, &[("src/cmd_new.rs", "pub const VERBS: &[crate::verbs::Verb] = &[];\n")]);
+        let steps = names(&at(&help_line));
+        let help = steps.iter().find(|s| s.name == "help").unwrap_or_else(|| panic!("no help step in {steps:?}"));
+        assert_eq!(help.command, format!("cargo test {HELP_TEST}"));
+        assert_eq!(help.on, ["src/cmd_new.rs"]);
+        assert_eq!(help.of, Of::Rule);
+
+        // The snapshot updated beside it: the step still runs, and its test passes.
+        let both = commit_files(&repo, &[("src/cmd_new.rs", "pub const VERBS: &[crate::verbs::Verb] = &[];\n// more\n"), (HELP_FIXTURE, "help 2\n")]);
+        assert!(names(&at(&both)).iter().any(|s| s.name == "help"));
+    }
+
+    #[test]
+    fn the_help_step_needs_a_snapshot_in_the_repository_and_a_source_that_feeds_the_help() {
+        let reads = |files: &'static [(&'static str, &'static str)]| {
+            move |p: &str| files.iter().find(|(n, _)| *n == p).map(|(_, c)| c.to_string())
+        };
+        let changed = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // No snapshot: not this repository's business.
+        let none = reads(&[("src/main.rs", "fn main() {}")]);
+        assert!(help_step(&none, &changed(&["src/main.rs"])).is_none());
+        // A snapshot, and the entry point, the registry or a table of verbs changed.
+        let kept = reads(&[(HELP_FIXTURE, "h"), ("src/main.rs", "fn main() {}"), ("src/x.rs", "pub const VERBS: &[V] = &[];"), ("src/y.rs", "fn y() {}"), ("docs/z.md", "const VERBS")]);
+        for p in [&["src/main.rs"][..], &["src/x.rs"], &["src/y.rs", "src/x.rs"]] {
+            assert!(help_step(&kept, &changed(p)).is_some(), "{p:?}");
+        }
+        for p in [&["src/y.rs"][..], &["docs/z.md"], &[]] {
+            assert!(help_step(&kept, &changed(p)).is_none(), "{p:?}");
+        }
     }
 
     #[test]
