@@ -36,6 +36,9 @@ pub(crate) enum Class {
     /// The seat's own work (or a leg): working where it is in a call or a tool,
     /// idle otherwise.
     Seat,
+    /// A leg of the row running (`wsp-218`): the member's seat has no call or
+    /// tool of its own then, but the row's work is going on in the leg's seat.
+    Leg,
     /// The row's own check, the verifier's start and read: working.
     Verify,
     /// Nothing was running; what was being waited for.
@@ -66,6 +69,8 @@ impl Span {
             Class::Alongside
         } else if l.starts_with("spawn requested") || l.starts_with("seat up") || l.starts_with("warm-up") {
             Class::Start
+        } else if l.starts_with("leg ") {
+            Class::Leg
         } else if l.starts_with("the row's own check") || l.starts_with("verifier") {
             Class::Verify
         } else {
@@ -87,6 +92,15 @@ pub(crate) fn merge(v: &[(i64, i64)]) -> Vec<(i64, i64)> {
         }
     }
     out
+}
+
+/// Seconds a row's legs ran in which its own seat had no call or tool in
+/// flight (`wsp-218`): the legs' union less the seat's active stretches.
+pub(crate) fn legs_only_seconds(spans: &[Span], active: &[(i64, i64)]) -> i64 {
+    let legs = merge(&spans.iter().filter(|s| s.class == Class::Leg).map(|s| (s.start, s.end)).collect::<Vec<_>>());
+    let total: i64 = legs.iter().map(|(a, b)| b - a).sum();
+    let covered: i64 = legs.iter().map(|(a, b)| active.iter().map(|(x, y)| ((*y).min(*b) - (*x).max(*a)).max(0)).sum::<i64>()).sum();
+    total - covered
 }
 
 fn within(v: &[(i64, i64)], t: i64) -> bool {
@@ -150,6 +164,9 @@ pub(crate) struct GroupWall {
     pub waits: BTreeMap<(String, String), i64>,
     /// Seconds of the barrier's run alone (not the wait before it).
     pub barrier_run: i64,
+    /// Of `working`, the seconds where only a member's legs were running: no
+    /// seat was in a call or a tool (`wsp-218`).
+    pub legs: i64,
 }
 
 impl GroupWall {
@@ -162,6 +179,8 @@ enum State {
     NotStarted,
     Done,
     Working,
+    /// Only a leg of the row is running.
+    Legs,
     Waiting(u8, String),
 }
 
@@ -179,6 +198,11 @@ fn state(m: &MemberIn, t: i64, first: i64, last: i64) -> State {
     }
     if within(&m.active, t) {
         return State::Working;
+    }
+    // A leg running is the row's work even while the member's own seat has
+    // nothing in flight; any other span a leg overlaps is read as it was.
+    if m.spans.iter().any(|s| s.class == Class::Leg && t >= s.start && t < s.end) {
+        return State::Legs;
     }
     match m.spans.iter().filter(|s| t >= s.start && t < s.end && s.class != Class::Alongside).map(|s| &s.class).next() {
         Some(Class::Verify) => State::Working,
@@ -257,12 +281,13 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
             }
             continue;
         }
-        let mut working = false;
+        let (mut working, mut legs) = (false, false);
         let mut waiting: Option<(u8, &str, String)> = None;
         let mut not_started = false;
         for (m, f, l) in &started {
             match state(m, a, *f, *l) {
                 State::Working => working = true,
+                State::Legs => legs = true,
                 State::Waiting(rank, cause) => {
                     if waiting.as_ref().is_none_or(|w| rank < w.0) {
                         waiting = Some((rank, &m.id, cause));
@@ -272,8 +297,11 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
                 State::Done => {}
             }
         }
-        if working {
+        if working || legs {
             add(&mut g, "working", b - a);
+            if !working {
+                g.legs += b - a;
+            }
         } else if let Some((_, row, cause)) = waiting {
             add(&mut g, "waiting", b - a);
             *g.waits.entry((row.to_string(), cause)).or_insert(0) += b - a;
@@ -378,6 +406,32 @@ mod tests {
         assert_eq!(g.seconds("between_groups"), 100);
         assert_eq!((g.open, g.close), (400, 720));
         assert_eq!(g.by.values().sum::<i64>(), 320);
+    }
+
+    #[test]
+    fn a_members_legs_running_are_working_not_the_seat_idle() {
+        // r-1's seat works 10-100, then runs legs 100-900 (its own calls: none),
+        // then reviews 900-1000. Two legs overlap in the middle.
+        let mut m = seat("r-1", 0, 100, &[(10, 100)], &[]);
+        m.spans.push(Span { start: 100, end: 600, class: Class::Leg });
+        m.spans.push(Span { start: 400, end: 900, class: Class::Leg });
+        m.spans.push(Span { start: 900, end: 1000, class: Class::Verify });
+        m.spans.push(Span { start: 1000, end: 1100, class: Class::Barrier });
+        let g = group_wall(&[m], None, Some(1100)).unwrap();
+        assert_eq!(g.seconds("working"), 90 + 800 + 100, "the seat's call, the legs, the check");
+        assert_eq!(g.legs, 800, "the legs alone, overlap counted once");
+        assert_eq!(g.seconds("waiting"), 10, "the start only");
+        assert!(seat_idle_reasons(g.waits.iter().map(|((_, c), s)| (c.as_str(), *s))).is_empty(), "{:?}", g.waits);
+    }
+
+    #[test]
+    fn a_blocked_row_is_waiting_even_with_a_leg_span_over_it() {
+        let mut m = seat("r-1", 0, 100, &[(10, 100)], &[(200, 300)]);
+        m.spans.push(Span { start: 100, end: 400, class: Class::Leg });
+        m.spans.push(Span { start: 400, end: 500, class: Class::Barrier });
+        let g = group_wall(&[m], None, Some(500)).unwrap();
+        assert_eq!(g.seconds("waiting"), 10 + 100);
+        assert_eq!(g.legs, 200);
     }
 
     #[test]

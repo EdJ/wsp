@@ -389,6 +389,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             .min()
             .unwrap_or(from)
             .min(from);
+        let verdicts_of_group: Vec<i64> = members.iter().flat_map(|m| i.kind("task-verified", m).into_iter().map(|(t, _)| t)).collect();
         let mut runs: Vec<(i64, &str)> = Vec::new();
         for (t, l) in i.cycle.iter().filter(|(t, l)| *t >= first_from && l.contains(&head)) {
             runs.extend(l.split(&head).skip(1).map(|seg| (*t, seg)));
@@ -428,7 +429,12 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                 // The wait before a run, from the last verdict, is the barrier's;
                 // what lies between a failed run and that wait is the follow-up's
                 // own time, in no barrier phase (`wsp-568`).
-                let waited_from = if n == 0 { prev } else { from.max(prev) };
+                // The first run's wait begins at the last verdict before it
+                // started, not the first: until then a member is still at work,
+                // its legs running (`wsp-218`: group 4's 2051s were
+                // compounding-204's legs). A verdict after the run is the
+                // follow-up's own time.
+                let waited_from = if n == 0 { verdicts_of_group.iter().copied().filter(|v| *v <= start).max().unwrap_or(prev).max(prev) } else { from.max(prev) };
                 if waited_from < start && (n == 0 || from < start) {
                     out.push(Phase::gap(format!("last verdict → barrier {at} run started{others}"), waited_from, start, wait_name(i, waited_from, start, &who)).shared());
                 }
@@ -1729,6 +1735,18 @@ mod tests {
         assert!(ph.iter().any(|p| p.label.starts_with("barrier 1 run ended → passed") && p.seconds() == 10), "{ph:?}");
         let unnamed: i64 = ph.iter().filter(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with("nothing the logs"))).map(|p| p.seconds()).sum();
         assert_eq!(unnamed, 0);
+    }
+
+    #[test]
+    fn the_first_barrier_run_waits_from_the_last_verdict_not_the_first_while_another_member_is_still_at_work() {
+        let mut i = row();
+        i.group = Some(("list".into(), 1, vec!["r-1".into(), "r-2".into()]));
+        i.events.push(ev(900, "task-verified", json!({"id": "r-2"})));
+        i.cycle.push((1000, "list group 1: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 60s".into()));
+        i.cycle.push((1010, "tell list: Barrier 1 of list passed".into()));
+        let ph = build(&i);
+        let wait = ph.iter().find(|p| p.label.starts_with("last verdict → barrier 1 run started")).unwrap();
+        assert_eq!((wait.start, wait.end), (900, 940), "r-1 was verified at 380; r-2's legs ran to 900, and that is not the barrier's wait: {ph:?}");
     }
 
     #[test]
