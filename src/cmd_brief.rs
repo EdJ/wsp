@@ -1233,13 +1233,18 @@ pub(crate) fn member_comms(on_a_list: bool) -> String {
     format!("a message ending `[from X · reply: wsp tell X --re <id> -]` is answered with that exact command, not in prose on your screen · your closing report (what you found, what you filed, what is left) goes to your governor with {governor}, not left on your own screen")
 }
 
+/// The line beside the block rule (`wsp-581`): a turn that ends on a question
+/// while its own background command runs is held as waiting on itself, so the
+/// question at the prompt reaches nobody unless it is raised.
+pub(crate) const UNREAD_LINE: &str = "a question at your prompt is read by nobody: raise it with `wsp block` or `wsp ask` even while a background command is running, then wait on that command";
+
 /// What an agent holding `id` is told about asking the person (`wsp-303`).
 ///
 /// Two lines, because the brief is re-read on every request. The example is the
 /// smallest `--choices` that `wsp ask` accepts, so an agent has the shape
 /// without a trip to the README. Claude is told its own tool still works
 /// (`wsp-301`'s hook catches it), so it is steered and not forbidden.
-fn asking(id: &str) -> [String; 2] {
+fn asking(id: &str) -> [String; 3] {
     [
         format!(
             "need the person to decide? `wsp ask {id} --person --wait --choices -` with \
@@ -1247,6 +1252,7 @@ fn asking(id: &str) -> [String; 2] {
              on stdin; the pick is printed to you"
         ),
         "use it rather than your own question tool or a question in your reply (AskUserQuestion still works)".into(),
+        UNREAD_LINE.into(),
     ]
 }
 
@@ -2597,6 +2603,7 @@ mod tests {
         let text = brief_lines(&compose(&b), &plain(), Depth::Normal).join("\n");
         assert!(text.contains("wsp ask t-001 --person --wait --choices -"), "{text}");
         assert!(text.contains("AskUserQuestion still works"), "{text}");
+        assert!(text.contains(UNREAD_LINE), "the question at a prompt is read by nobody: {text}");
 
         let shown = &asking("t-001")[0];
         let json = &shown[shown.find('{').unwrap()..shown.rfind('}').unwrap() + 1];

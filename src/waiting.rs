@@ -178,6 +178,92 @@ impl Wait {
     }
 }
 
+/// What a turn's last message said, read off the seat's screen (`wsp-581`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Words {
+    /// The final paragraph, on one line and trimmed.
+    pub(crate) text: String,
+    /// Whether it carries a request: a line beginning "What I need", "Need" or
+    /// "Either … or", or a question. A prompt for a judge, never a block.
+    pub(crate) asks: bool,
+}
+
+/// The most of the last paragraph a tell carries, in characters.
+const WORDS_SHOWN: usize = 360;
+
+/// The final paragraph of a seat's screen, with the agent's own chrome left
+/// out: the prompt box, its borders, the status footer, tool-result lines.
+/// `None` where nothing readable is on it.
+///
+/// **No judgement over the wording** beyond [`Words::asks`]: the governor
+/// reads the paragraph and decides (`wsp-581`).
+pub(crate) fn last_words(screen: &str) -> Option<Words> {
+    let mut block: Vec<String> = Vec::new();
+    let mut last: Vec<String> = Vec::new();
+    for raw in screen.lines() {
+        let l = raw.trim();
+        let l = l.trim_matches(|c| c == '│' || c == '┃').trim();
+        if l.is_empty() || is_chrome(l) {
+            if !block.is_empty() {
+                last = std::mem::take(&mut block);
+            }
+            continue;
+        }
+        block.push(l.trim_start_matches(['⏺', '●']).trim().to_string());
+    }
+    if !block.is_empty() {
+        last = block;
+    }
+    last.retain(|l| !l.is_empty());
+    if last.is_empty() {
+        return None;
+    }
+    let bare = |l: &str| l.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '?').to_lowercase();
+    let joined = last.join(" ");
+    let asks = last.iter().any(|l| {
+        let b = bare(l);
+        let word = |w: &str| b.strip_prefix(w).is_some_and(|r| r.chars().next().is_none_or(|c| !c.is_alphanumeric()));
+        word("what i need") || word("need") || (word("either") && joined.to_lowercase().contains(" or "))
+    }) || joined.contains('?');
+    Some(Words { text: util::truncate(&joined, WORDS_SHOWN), asks })
+}
+
+/// A screen line that is the agent's frame and not its words.
+fn is_chrome(l: &str) -> bool {
+    l.chars().all(|c| "─━│┃╭╮╰╯┌┐└┘├┤ -=_".contains(c))
+        || l.starts_with(['>', '❯', '⏵', '✻', '✽', '✢', '·', '⎿'])
+        || ["shell still running", "shells still running", "for shortcuts", "to interrupt", "bypass permissions", "auto-accept", "ctrl+"]
+            .iter()
+            .any(|f| l.to_lowercase().contains(f))
+}
+
+impl Wait {
+    /// The one line a governor gets when a held member's turn ends
+    /// (`wsp-581`): what the seat waits on and the last paragraph it wrote,
+    /// and whether that paragraph is a request nothing raised. Only for a seat
+    /// waiting on itself: every other wait already has its ask or prompt.
+    pub(crate) fn turn_over(&self, id: &str, seat: &str, words: Option<&Words>) -> String {
+        let (work, age) = match &self.own {
+            Some(o) => (
+                if o.work.is_empty() { "a shell".to_string() } else { o.work.clone() },
+                util::duration_human(o.age),
+            ),
+            None => ("a shell".to_string(), "just now".to_string()),
+        };
+        let said = match words {
+            Some(w) => format!("\"{}\"", w.text),
+            None => "(nothing readable on its screen)".to_string(),
+        };
+        let mut line = format!("{id} ({seat}): turn over, waiting on its own `{work}` (`{age}`); its last words: {said}");
+        if words.is_some_and(|w| w.asks) {
+            line.push_str(&format!(
+                " — that reads as a request and no ask is raised (an unraised ask, for you to judge; not blocked). `wsp peek {id}` shows its screen."
+            ));
+        }
+        line
+    }
+}
+
 /// The open questions, read once, indexed by who is sitting still behind each.
 ///
 /// **Read once per pass and asked per seat**, because every reader here walks
@@ -1216,5 +1302,42 @@ mod tests {
         let asks = Asks::waiter("w1:p1", "m-1", "q-1");
         let w = reading(Some(State::Working), &asks, &Shells::one("w9:p9", 0), "w1:p1", "m-1").expect("waiting");
         assert_eq!((w.why, w.on), (Why::Question("q-1".into()), On::Person));
+    }
+
+    /// `wsp-581`: the last paragraph of a screen, less the agent's frame.
+    #[test]
+    fn the_last_words_are_the_final_paragraph_less_the_frame() {
+        let screen = "⏺ First thing.\n\n⏺ Ran the build.\n  ⎿  ok\n\n⏺ All green; waiting on the\n  full suite now.\n\n╭────╮\n│ >  │\n╰────╯\n  ? for shortcuts · 1 shell still running\n";
+        let w = last_words(screen).unwrap();
+        assert_eq!(w.text, "All green; waiting on the full suite now.");
+        assert!(!w.asks);
+        assert_eq!(last_words("╭──╮\n│ > │\n╰──╯\n"), None);
+    }
+
+    #[test]
+    fn a_request_is_a_need_an_either_or_or_a_question() {
+        for text in [
+            "What I need: a permission rule.",
+            "**Need** a decision on the branch.",
+            "Either you despawn them,\nor tell me to.",
+            "Should I go ahead and rebase?",
+        ] {
+            assert!(last_words(text).unwrap().asks, "{text}");
+        }
+        for text in ["Needed nothing; done.", "Either way it is green.", "Shipped step 1."] {
+            assert!(!last_words(text).unwrap().asks, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_turn_over_line_names_the_work_and_quotes_the_words() {
+        let w = Wait { why: Why::Shell(1), on: On::Itself, own: Some(Own { n: 1, work: "cargo test".into(), age: 180, quiet: 0 }) };
+        let said = last_words("What I need: a yes.").unwrap();
+        let line = w.turn_over("m-1", "cpd-1", Some(&said));
+        assert!(line.contains("turn over, waiting on its own `cargo test` (`3m`); its last words: \"What I need: a yes.\""), "{line}");
+        assert!(line.contains("an unraised ask"), "{line}");
+        let calm = w.turn_over("m-1", "cpd-1", last_words("Done.").as_ref());
+        assert!(!calm.contains("unraised"), "{calm}");
+        assert!(w.turn_over("m-1", "cpd-1", None).contains("nothing readable"));
     }
 }

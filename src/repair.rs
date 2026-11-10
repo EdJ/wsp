@@ -1191,6 +1191,14 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
                          to finish and it is not ended. `wsp peek {}` shows its screen.",
                         t.id, w.id, wait.sentence(), wait.word(), t.id
                     ));
+                } else if matches!(wait.why, crate::waiting::Why::Shell(_)) {
+                    // **The turn's end says what the turn said, even while held**
+                    // (`wsp-581`). Nobody owes the seat anything, but its last
+                    // paragraph may be a question no ask carries, and a prompt is
+                    // read by nobody. One line, once per spell; the governor
+                    // judges it, and a list with none lands it on the panel.
+                    let words = seats.last_words(&seat);
+                    crate::cycle::tell(store, w, &wait.turn_over(&t.id, &seat, words.as_ref()));
                 }
             }
             continue;
@@ -3532,7 +3540,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     }
 
     /// A [`Fake`] whose agent at `.1` has a shell of its own running.
-    struct Shelled(Fake, &'static str);
+    struct Shelled(Fake, &'static str, &'static str);
 
     impl Seats for Shelled {
         fn state(&self, seat: &str) -> Option<State> {
@@ -3543,6 +3551,9 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
                 true => crate::waiting::Shells::one(self.1, 1),
                 false => Default::default(),
             }
+        }
+        fn last_words(&self, _seat: &str) -> Option<crate::waiting::Words> {
+            crate::waiting::last_words(self.2)
         }
     }
 
@@ -3555,12 +3566,16 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     #[test]
     fn a_member_idle_on_its_own_background_shell_is_held_and_nobody_is_told() {
         let (_env, store) = in_flight("shelled");
-        let verifying = Shelled(Fake::new(&[("cpd-1", Some(State::Idle))]), "cpd-1");
+        let verifying = Shelled(Fake::new(&[("cpd-1", Some(State::Idle))]), "cpd-1", "⏺ Started the verify in the background; it wakes me when it ends.\n\n╭──────╮\n│ >    │\n╰──────╯\n  1 shell still running");
         for _ in 0..3 {
             tick(&store, &verifying, &mut Pass::new());
         }
         assert!(member_told().is_empty(), "the shell wakes it; a sentence would start a turn it did not need");
-        assert!(governed().is_empty(), "and nobody is owed a person");
+        let heard = governed();
+        assert_eq!(heard.len(), 1, "the turn's end is said once, and only as a line: {heard:?}");
+        assert!(heard[0].contains("turn over, waiting on its own"), "{}", heard[0]);
+        assert!(heard[0].contains("its last words: \"Started the verify in the background; it wakes me when it ends.\""), "{}", heard[0]);
+        assert!(!heard[0].contains("no ask is raised"), "nothing to ask, no ask shown: {}", heard[0]);
         assert!(ended().is_empty());
         let said: Vec<String> = stamped().into_iter().filter(|l| l.contains("not told and not ended")).collect();
         assert_eq!(said.len(), 1, "said once: {said:?}");
@@ -3572,6 +3587,30 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
         assert_eq!(member_told().len(), 1, "now it is told, and not ended on any earlier mark");
         assert!(ended().is_empty());
+    }
+
+    /// `wsp-581`: agent-029 started its release verify, ended its turn on "What
+    /// I need: either despawn both seats yourself … or tell me to", and raised
+    /// nothing. **The line the governor gets says the turn is over, quotes the
+    /// last paragraph, and says it is a request nobody raised.**
+    #[test]
+    fn a_held_member_whose_last_words_ask_for_something_has_that_said_as_an_unraised_ask() {
+        let (_env, store) = in_flight("unraised");
+        let seat = Shelled(
+            Fake::new(&[("cpd-1", Some(State::Idle))]),
+            "cpd-1",
+            "⏺ Step 1 is shipped.\n\n⏺ What I need: either despawn both seats yourself (wsp despawn demos-003), or tell me to.\n\n╭──╮\n│ > │\n╰──╯\n  ⏵⏵ bypass permissions on · 1 shell still running",
+        );
+        tick(&store, &seat, &mut Pass::new());
+        tick(&store, &seat, &mut Pass::new());
+        let heard = governed();
+        assert_eq!(heard.len(), 1, "once: {heard:?}");
+        assert!(heard[0].contains("turn over, waiting on its own"), "{}", heard[0]);
+        assert!(heard[0].contains("What I need: either despawn both seats yourself"), "the final paragraph only: {}", heard[0]);
+        assert!(!heard[0].contains("Step 1 is shipped"), "{}", heard[0]);
+        assert!(heard[0].contains("an unraised ask"), "{}", heard[0]);
+        assert!(member_told().is_empty() && ended().is_empty(), "a prompt for a judge, not a block or a tell");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
     }
 
     /// A seat that *was* waiting and is idle again — the prompt answered — is

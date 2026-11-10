@@ -5634,6 +5634,16 @@ fn read_body(r: &serde_json::Value) -> &serde_json::Value {
     r.get("read").unwrap_or(r)
 }
 
+/// What herdr shows on a pane now, as text; `None` where herdr is not there
+/// or would not read it.
+pub(crate) fn read_pane_text(pane: &str) -> Option<String> {
+    if !herdr::available() {
+        return None;
+    }
+    let r = herdr::call("pane.read", json!({ "pane_id": pane, "source": "visible", "format": "text" })).ok()?;
+    read_body(&r).get("text").and_then(|t| t.as_str()).map(str::to_string)
+}
+
 /// `wsp peek [<target>]` — read what is actually on a pane.
 ///
 /// Every interface bug on 2026-08-15 cost a round trip through a person's eyes:

@@ -248,6 +248,14 @@ pub(crate) trait Seats {
         crate::waiting::Shells::default()
     }
 
+    /// The last paragraph on the seat's screen — what its turn ended on
+    /// (`wsp-581`). `None` where nobody can read it, and the default, for
+    /// [`Seats::absent`]'s reason: a fake that read a real screen would be
+    /// reading whatever this machine happens to be running.
+    fn last_words(&self, _seat: &str) -> Option<crate::waiting::Words> {
+        None
+    }
+
     /// Which of these are still running. A parameter for the same reason
     /// [`Seats::state`] is: a test names pids that were never processes.
     fn running(&self, pids: &[u32]) -> Vec<u32> {

@@ -5134,6 +5134,17 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
         crate::waiting::Shells::read(seats.iter().copied(), &crate::stuck::waits_on_itself_line)
     }
 
+    fn last_words(&self, seat: &str) -> Option<crate::waiting::Words> {
+        let compound = crate::place_compound::Compound::new();
+        let seat_id = Seat::new(seat);
+        let screen = if compound.socket_of(&seat_id).is_some() {
+            compound.read_screen(&seat_id).ok()?
+        } else {
+            crate::cmd_agent::read_pane_text(seat)?
+        };
+        crate::waiting::last_words(&screen)
+    }
+
     /// Pressed by the backend that holds the seat, and no other: a press is a
     /// keystroke, and every backend that is not this seat's answers `NoSeat`.
     fn press(&self, seat: &str) -> bool {
