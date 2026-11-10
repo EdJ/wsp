@@ -43,8 +43,20 @@ pub(crate) struct Missed {
     pub again_in: Option<i64>,
 }
 
-/// A start of `label` did not take. Counts it under the lock.
+/// A start of `label` did not take. Counts it under the lock, and notes whether
+/// the machine was holding new work back when it missed ([`missed_under`]).
 pub(crate) fn missed(store: &Store, label: &str) -> Missed {
+    // Never under test, where the reading is the machine running the suite.
+    let hold = (!cfg!(test)).then(|| crate::throttle::holding_back(store)).flatten().map(|p| p.text());
+    missed_under(store, label, hold.as_deref())
+}
+
+/// [`missed`] with the hold that was on, if one was, handed in. A miss under a
+/// throttle or memory hold is the machine's and not the start's: the entry
+/// remembers it, so [`forgive_after_hold`] starts the row again when the hold
+/// lets go and nobody has to ask (`wsp-600`: compounding-316's start gave up
+/// under the memory hold and only a hand `advance` restarted it).
+pub(crate) fn missed_under(store: &Store, label: &str, hold: Option<&str>) -> Missed {
     let now = util::epoch_secs();
     let mut out = Missed { tries: 1, last: false, again_in: None };
     store.update_starts(|m| {
@@ -59,7 +71,11 @@ pub(crate) fn missed(store: &Store, label: &str) -> Missed {
             last: spent && before < crate::barrier::TRIES,
             again_in: crate::barrier::wait_after(tries),
         };
-        m.insert(label.to_string(), json!({ "tries": tries, "at": now, "spent": spent }));
+        let mut e = json!({ "tries": tries, "at": now, "spent": spent });
+        if let Some(h) = hold {
+            e["hold"] = json!(h);
+        }
+        m.insert(label.to_string(), e);
         m.retain(|_, e| e["spent"].as_bool() == Some(true) || now - e["at"].as_i64().unwrap_or(0) <= 24 * FORGOTTEN_AFTER);
     });
     out
@@ -103,6 +119,32 @@ pub(crate) fn forgive_spent(store: &Store, labels: &[String]) -> usize {
         }
     });
     n
+}
+
+/// Forget the misses of those of `labels` whose tries are spent and whose last
+/// miss was made under a hold, once nothing is holding any more: the labels
+/// forgiven, for the line that says so. While `holding` they stay as they are.
+pub(crate) fn forgive_after_hold(store: &Store, labels: &[String], holding: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if holding {
+        return out;
+    }
+    let starts = store.starts();
+    let due: Vec<&String> = labels
+        .iter()
+        .filter(|l| starts.get(l.as_str()).is_some_and(|e| e["spent"].as_bool() == Some(true) && e["hold"].is_string()))
+        .collect();
+    if due.is_empty() {
+        return out;
+    }
+    store.update_starts(|m| {
+        for l in due {
+            if m.remove(l.as_str()).is_some() {
+                out.push(l.clone());
+            }
+        }
+    });
+    out
 }
 
 #[cfg(test)]

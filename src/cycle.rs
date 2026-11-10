@@ -798,6 +798,9 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // inside the lock its record is written under. With no cap it reads
     // nothing and admits everything.
     let gate = crate::room::Gate::new(store, seats);
+    if all {
+        retry_after_hold(store, &w.id);
+    }
 
     // 1a. Every seat the group is waiting on a first turn from, whose order
     // went in and started nothing (`wsp-252`). Before the verifiers and the
@@ -1394,10 +1397,45 @@ pub(crate) fn silent(store: &Store, ids: &[String]) -> Vec<(String, i64)> {
 /// reading waits on).
 fn name_silent(store: &Store, w: &Worklist) {
     let ids: Vec<String> = w.groups().iter().flat_map(|g| g.members.iter().cloned()).collect();
-    for (id, quiet) in silent(store, &ids) {
-        log_line(store, &format!("{}: {id} {SILENT_SAID} {} — its start may not have arrived", w.id, util::duration_human(quiet)));
+    let quiet_now = silent(store, &ids);
+    // A row that has a seat again, or has said something, starts its count over.
+    for id in ids.iter().filter(|i| !quiet_now.iter().any(|(q, _)| q == *i)) {
+        let label = format!("{SILENT_LABEL}{id}");
+        if store.starts().contains_key(&label) {
+            crate::starts::forgive(store, &label);
+        }
+    }
+    for (id, quiet) in quiet_now {
+        // **Counted, as a check's tries are** (`wsp-600`): the line used to
+        // repeat every five minutes with nothing done and nobody told, and
+        // retro-2's wsp-565 stood there 45 minutes. The step reseats a silent
+        // row in the same pass, so a notice is one that did not take; the third
+        // raises the row to its governor and the person's panel.
+        let m = crate::starts::missed_under(store, &format!("{SILENT_LABEL}{id}"), None);
+        log_line(store, &format!(
+            "{}: {id} {SILENT_SAID} {} — its start may not have arrived (notice {} of {})",
+            w.id,
+            util::duration_human(quiet),
+            m.tries,
+            crate::barrier::TRIES
+        ));
+        if m.last {
+            let remedy = format!("`wsp spawn {id} --agent` seats one once the cause is cleared, or `wsp worklist advance {}` tries the run's start again", w.id);
+            start_gave_up(
+                store,
+                Some(w),
+                &id,
+                &format!("{id} has had no seat for {}, and the run's starts did not seat it; it", util::duration_human(quiet)),
+                m.tries,
+                "no seat and no log line",
+                &remedy,
+            );
+        }
     }
 }
+
+/// What a silent row's notices are counted under in `starts.json`.
+const SILENT_LABEL: &str = "silent:";
 
 /// How long a member may stand blocked, or on a question only a person can
 /// answer, before the run escalates it (`wsp-471`). compounding-125 held its
@@ -1548,8 +1586,16 @@ fn take_member(
         // After a start that did not take: its wait is not over, or its tries
         // are spent and a person is to say (`wsp-335`). A spent start is the
         // one thing a reseat takes again, once the seat has room.
+        //
+        // **A sent-back line newer than every start is a fresh ask, and the
+        // tries a spent start used belong to an earlier one** (`wsp-600`): a
+        // start since the reopen would have written [`STARTED_BY`] over it, so
+        // a spent count beside it is stale. retro-2's wsp-565 sat 45 minutes
+        // at `doing` because a spent count made the sent-back branch below
+        // step aside, and the reseat it fell to had used its budget.
+        let sent_back = t.status() == Status::Doing && sent_back_unseated(store, &t, &claims);
         let held = crate::starts::held(store, &id);
-        let spent = held && crate::starts::spent(store, &id) && reseating.is_some();
+        let spent = held && crate::starts::spent(store, &id) && (reseating.is_some() || sent_back);
         if held && !spent {
             return None;
         }
@@ -1574,7 +1620,12 @@ fn take_member(
                 }
                 "again: the last start never claimed it"
             }
-            Status::Doing if !spent && sent_back_unseated(store, &t, &claims) => "again: it was sent back and nobody is on it",
+            Status::Doing if sent_back => {
+                if spent {
+                    crate::starts::forgive(store, &id);
+                }
+                "again: it was sent back and nobody is on it"
+            }
             Status::Doing if reseating.is_some() => {
                 let (done, stopped) = reseats_lately(&t);
                 if done >= RESEATS {
@@ -3467,28 +3518,85 @@ pub(crate) fn check_start_failed(store: &Store, w: &Worklist, at: usize, why: &s
 /// [`crate::barrier::give_up`] each answer it once.
 pub(crate) fn check_gave_up(store: &Store, w: &Worklist, at: usize, tries: u32, last: &str) {
     use crate::message::{self, About, Kind, Message, Party};
+    let (evidence, passable) = barrier_evidence(store, w, at);
+    let verdict = if passable {
+        format!(
+            "Everything the stop reads mechanically is met: {evidence}. \
+             `wsp worklist go {list}` passes it in one step.",
+            list = w.id
+        )
+    } else {
+        format!("What the check would have read: {evidence}. That does not meet the stop, so `wsp worklist go {list}` is not yet the answer.", list = w.id)
+    };
     let text = format!(
         "{list} group {at}: the barrier check never started, after {tries} tries\n\n\
          Last error: {last}\n\n\
-         Every member has landed and been verified, and the run is waiting at the barrier with no check. \
+         {verdict}\n\n\
          `wsp worklist advance {list}` starts the check again once the cause is cleared, \
          and `wsp worklist go {list}` passes the barrier without one.",
         list = w.id,
     );
     let m = Message::new(Party::wsp(), Kind::Note, &text).about(About::Group { scope: w.id.clone(), group: at });
     let _ = message::raise(store, &m);
-    log_line(store, &format!("{} group {at}: flagged the person — the check never started in {tries} tries: {last}", w.id));
+    log_line(store, &format!("{} group {at}: flagged the person — the check never started in {tries} tries: {last}; {evidence}", w.id));
     tell(store, w, &format!(
-        "The {} run's barrier check on group {at} did not start in {tries} tries, and the person is flagged. \
+        "The {} run's barrier check on group {at} did not start in {tries} tries, and the person is flagged. {verdict} \
          `wsp worklist advance {}` starts it again once the cause is cleared.",
         w.id, w.id
     ));
 }
 
+/// What a barrier check that never started would have read, and whether that
+/// already meets the stop's mechanical parts (`wsp-600`): the barrier run's
+/// result, and each member's landing and verdict. retro-2's group 4 waited
+/// for a person who found it all green by hand.
+pub(crate) fn barrier_evidence(store: &Store, w: &Worklist, at: usize) -> (String, bool) {
+    let run = crate::barrier::suite_of(store, &w.id, at);
+    let tasks = store.tasks_shared();
+    let pos = worklist::position(store, w, Reading::Landed);
+    let mut held = Vec::new();
+    let mut all = true;
+    for m in &pos.members {
+        let verified = crate::verification::verified(&tasks, &m.id);
+        let landed = m.finished();
+        if !(landed && verified) {
+            all = false;
+            held.push(format!("{} ({})", m.id, if !landed { "not landed" } else { "verifier not holding" }));
+        }
+    }
+    let run_said = match run {
+        Some(crate::barrier::Suite::Green) => "the barrier run is green",
+        Some(crate::barrier::Suite::Red) => "the barrier run is red",
+        Some(crate::barrier::Suite::Running) => "the barrier run is still going",
+        None => "no barrier run is recorded",
+    };
+    let members = if held.is_empty() {
+        format!("all {} members landed with their verifiers holding", pos.members.len())
+    } else {
+        format!("held: {}", held.join(", "))
+    };
+    (format!("{run_said}; {members}"), all && run == Some(crate::barrier::Suite::Green))
+}
+
 /// The members of `list`, and the legs of those run as legs, whose starts ran
 /// out of tries: forgiven, so the step that follows starts them again.
 fn forgive_spent_starts(store: &Store, list: &str) -> usize {
-    let Some(w) = store.worklist(list) else { return 0 };
+    crate::starts::forgive_spent(store, &start_labels(store, list))
+}
+
+/// The starts that gave up under a throttle or memory hold are tried again once
+/// the hold lets go, without a hand `advance` (`wsp-600`). Says which, once.
+fn retry_after_hold(store: &Store, list: &str) {
+    let spent = crate::starts::forgive_after_hold(store, &start_labels(store, list), !cfg!(test) && crate::throttle::holding_back(store).is_some());
+    if !spent.is_empty() {
+        log_line(store, &format!("{list}: the hold has let go — {} tried again, its start having given up under it", spent.join(", ")));
+    }
+}
+
+/// The labels the run keeps start counts under for `list`: each member, its
+/// legs and its pieces.
+fn start_labels(store: &Store, list: &str) -> Vec<String> {
+    let Some(w) = store.worklist(list) else { return Vec::new() };
     let mut labels = Vec::new();
     for g in w.groups() {
         for id in &g.members {
@@ -3499,7 +3607,7 @@ fn forgive_spent_starts(store: &Store, list: &str) -> usize {
             }
         }
     }
-    crate::starts::forgive_spent(store, &labels)
+    labels
 }
 
 /// A member's start failed, in the step: its agent and claim are ended so the
@@ -7080,6 +7188,105 @@ fn only_a_working_screen_is_ever_overruled() {
         let c = checks(&store, 1);
         assert_eq!((c.len(), c[0].state, c[1].tries), (2, crate::barrier::State::Abandoned, 1), "{c:?}");
         assert_eq!(spawned().len(), 1);
+    }
+
+    /// wsp-600 (retro-2 group 4): the check never started, the barrier run was
+    /// green and every member landed with its verifier holding, and the list
+    /// waited for a person to find that out. The notice names the evidence and
+    /// says the stop's mechanical parts are met.
+    #[test]
+    fn a_check_that_gave_up_names_the_green_run_and_the_held_members() {
+        let (_env, store, w) = barrier_open("checkevidence");
+        crate::barrier::note_run(&store, "run", 1, crate::barrier::Suite::Green, None);
+        let _ = drained(&TOLD);
+        check_gave_up(&store, &w, 1, 3, "claude did not start in cpd-1: cpd-1 is gone");
+        let flags = crate::message::raised(&store);
+        assert_eq!(flags.len(), 1, "one notice to the person");
+        let text = &flags[0].text;
+        assert!(text.contains("the barrier run is green") && text.contains("all 1 members landed with their verifiers holding"), "{text}");
+        assert!(text.contains("passes it in one step"), "{text}");
+        let told = drained(&TOLD).join("\n");
+        assert!(told.contains("the barrier run is green") && told.contains("passes it in one step"), "the governor hears the same: {told}");
+
+        // A member whose verifier does not hold is named, and `go` is not offered as the answer.
+        let mut t = store.find_task("m-1").unwrap();
+        t.log("sent back: something");
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        let (said_, passable) = barrier_evidence(&store, &store.worklist("run").unwrap(), 1);
+        assert!(!passable && said_.contains("held: m-1 (not landed)"), "{said_}");
+    }
+
+    /// wsp-600 (retro-2's wsp-565): a member reopened while its group runs sat
+    /// at `doing` with no seat because a start that had spent its tries before
+    /// the reopen made the run step aside. The sent-back line is a fresh ask.
+    #[test]
+    fn a_member_reopened_in_a_running_group_is_seated_in_one_step_whatever_an_earlier_start_spent() {
+        let (_env, store) = scratch("reopened-seat");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        for _ in 0..crate::barrier::TRIES {
+            crate::starts::missed_under(&store, "m-1", None);
+        }
+        assert!(crate::starts::spent(&store, "m-1"));
+        left_unseated(&store, "m-1", &[&format!("{SENT_BACK} the layering check is red on master")], 60);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "seated within one tick");
+        assert!(!crate::starts::spent(&store, "m-1"), "the earlier tries were not this ask's");
+    }
+
+    /// wsp-600: a start that gave up under a throttle or memory hold is tried
+    /// again when the hold lets go, with nobody running `advance`.
+    #[test]
+    fn a_start_that_gave_up_under_a_hold_is_retried_when_the_hold_lets_go() {
+        let (_env, store) = scratch("retry-after-hold");
+        task(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        for _ in 0..crate::barrier::TRIES {
+            crate::starts::missed_under(&store, "m-1", Some("throttle: memory"));
+        }
+        assert!(crate::starts::spent(&store, "m-1"));
+        // Still held: left alone.
+        assert!(crate::starts::forgive_after_hold(&store, &["m-1".to_string()], true).is_empty());
+        assert!(crate::starts::spent(&store, "m-1"));
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "the hold is not on, so the step starts it");
+        assert!(said(&store).contains("the hold has let go"), "{}", said(&store));
+    }
+
+    /// wsp-600: and a start that gave up with no hold on is a person's, as before.
+    #[test]
+    fn a_start_that_gave_up_with_no_hold_on_waits_for_a_person() {
+        let (_env, store) = scratch("no-retry-without-hold");
+        task(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        for _ in 0..crate::barrier::TRIES {
+            crate::starts::missed_under(&store, "m-1", None);
+        }
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty());
+    }
+
+    /// wsp-600: "its start may not have arrived" is counted, not repeated: the
+    /// third notice raises the row to the governor and the person's panel.
+    #[test]
+    fn a_silent_member_is_named_three_times_and_then_raised() {
+        let (_env, store) = scratch("silent-raises");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let _ = drained(&TOLD);
+        let raised = || crate::message::raised(&store);
+        for n in 1..=3 {
+            left_unseated(&store, "m-1", &[], 400);
+            name_silent(&store, &w);
+            assert!(said(&store).contains(&format!("notice {n} of 3")), "{}", said(&store));
+            assert_eq!(raised().len(), usize::from(n == 3), "raised on the last notice only (after {n})");
+        }
+        assert!(drained(&TOLD).iter().any(|t| t.contains("m-1") && t.contains("person is flagged")));
+        // Once: a fourth notice says nothing more.
+        left_unseated(&store, "m-1", &[], 400);
+        name_silent(&store, &w);
+        assert_eq!(raised().len(), 1);
     }
 
     /// The spawn killed before it could say it failed: no seat, no report, and
