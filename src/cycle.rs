@@ -1412,8 +1412,21 @@ fn name_silent(store: &Store, w: &Worklist) {
         // row in the same pass, so a notice is one that did not take; the third
         // raises the row to its governor and the person's panel.
         let m = crate::starts::missed_under(store, &format!("{SILENT_LABEL}{id}"), None);
+        // Whether the group's own `xN` is what holds it: the step says nothing
+        // when the cap is full, so a row waiting for a place reads the same as
+        // one whose start was lost. Say which (`wsp-600`).
+        let held_at = w
+            .groups()
+            .iter()
+            .find(|g| g.members.contains(&id))
+            .and_then(|g| g.parallelism(None).map(|c| (c, members_going(store, &g.members, &id, &store.claims()))))
+            .filter(|(c, going)| going >= c);
+        let cause = match held_at {
+            Some((c, going)) => format!("it waits for a place in its group's x{c} ({going} of {c} in flight)"),
+            None => "its start may not have arrived".to_string(),
+        };
         log_line(store, &format!(
-            "{}: {id} {SILENT_SAID} {} — its start may not have arrived (notice {} of {})",
+            "{}: {id} {SILENT_SAID} {} — {cause} (notice {} of {})",
             w.id,
             util::duration_human(quiet),
             m.tries,
@@ -1421,13 +1434,17 @@ fn name_silent(store: &Store, w: &Worklist) {
         ));
         if m.last {
             let remedy = format!("`wsp spawn {id} --agent` seats one once the cause is cleared, or `wsp worklist advance {}` tries the run's start again", w.id);
+            let last = match held_at {
+                Some((c, _)) => format!("no seat and no log line; the group's x{c} is full of members in flight"),
+                None => "no seat and no log line".to_string(),
+            };
             start_gave_up(
                 store,
                 Some(w),
                 &id,
                 &format!("{id} has had no seat for {}, and the run's starts did not seat it; it", util::duration_human(quiet)),
                 m.tries,
-                "no seat and no log line",
+                &last,
                 &remedy,
             );
         }
@@ -1590,9 +1607,11 @@ fn take_member(
         // **A sent-back line newer than every start is a fresh ask, and the
         // tries a spent start used belong to an earlier one** (`wsp-600`): a
         // start since the reopen would have written [`STARTED_BY`] over it, so
-        // a spent count beside it is stale. retro-2's wsp-565 sat 45 minutes
-        // at `doing` because a spent count made the sent-back branch below
-        // step aside, and the reseat it fell to had used its budget.
+        // a spent count beside it is stale. This is a hardening and **not the
+        // cause of retro-2's wsp-565 standing seatless**: the record shows no
+        // spent start there (the 07:35 `advance` forgave none). That was the
+        // group's `x2` counting seatless sent-back members against each other
+        // in [`members_going`], which now leaves them out.
         let sent_back = t.status() == Status::Doing && sent_back_unseated(store, &t, &claims);
         let held = crate::starts::held(store, &id);
         let spent = held && crate::starts::spent(store, &id) && (reseating.is_some() || sent_back);
@@ -1943,7 +1962,27 @@ fn members_going(store: &Store, members: &[String], id: &str, claims: &std::coll
         // flight: counting it would hold the prerequisite out of an `x1` group,
         // which is the member waiting on the row it is holding the place of.
         .filter(|m| !awaiting_prerequisite(store, m, claims).is_some_and(|on| !on.is_empty()))
+        // **Nor is a member that is itself waiting for a seat** (`wsp-600`).
+        // retro-2 group 1 is `x2`; wsp-565, wsp-572 and compounding-284 were
+        // all sent back at `doing` with no seat. Each counted the other two as
+        // in flight, `2 >= 2`, and `take_member` returned without a line: the
+        // three starved each other for 2.5 hours, until wsp-565's hand-made
+        // seat reached review and freed a count. A row with no claim and no
+        // pane that is waiting to be reseated runs nothing; it takes its place
+        // when it is started, and the count taken under the lock then holds the
+        // cap. A start the run has made and that has not claimed yet is not
+        // among these (its last word is [`STARTED_BY`]), so it still counts.
+        .filter(|m| !waits_for_a_seat(store, m, claims))
         .count()
+}
+
+/// A member at `doing` with no claim and no seat that the run is to seat: sent
+/// back and not started since, ended by a governor and not started since, or
+/// silent for [`SILENT_AFTER`]. It holds no place of the group's `xN`.
+fn waits_for_a_seat(store: &Store, m: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    m.status() == Status::Doing
+        && !claims.contains_key(&m.id)
+        && (sent_back_unseated(store, m, claims) || despawned_unseated(store, m, claims) || !silent(store, std::slice::from_ref(&m.id)).is_empty())
 }
 
 /// Open every leg of `row` the run may start now, each through the seat's gate,
@@ -7233,6 +7272,48 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "seated within one tick");
         assert!(!crate::starts::spent(&store, "m-1"), "the earlier tries were not this ask's");
+    }
+
+    /// wsp-600, the real shape of retro-2's wsp-565 (cycle test fake, not the
+    /// sandbox): an `x2` group with three members sent back at `doing`, none
+    /// seated. Each used to count the other two as in flight (`2 >= 2`), so
+    /// none started and nothing was said. Two are seated in one step, the
+    /// third as a place frees, and a third that waits says it is the cap.
+    #[test]
+    fn three_sent_back_members_of_an_x2_group_are_seated_two_at_a_time_and_the_third_as_a_place_frees() {
+        let (_env, store) = scratch("x2-sent-back");
+        for m in ["m-1", "m-2", "m-3"] {
+            task(&store, m, Status::Doing);
+            left_unseated(&store, m, &[&format!("{SENT_BACK} the layering check is red on master")], 60);
+        }
+        let mut w = list(&store, &[(&["m-1", "m-2", "m-3"], "claude")]);
+        let mut g = w.groups();
+        g[0].cap = Some(2);
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        let _ = spawned();
+
+        step(&store, &w, &Blind);
+        let started = spawned();
+        assert_eq!(started.len(), 2, "two places, two seated in one step: {started:?}");
+        assert_eq!(started.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(), ["m-1", "m-2"]);
+
+        // The third is held by the group's cap, and its notice says so.
+        let mut t = store.find_task("m-3").unwrap();
+        t.updated = util::iso_at(util::epoch_secs() - 400);
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "the group is full");
+        name_silent(&store, &w);
+        let line = said(&store);
+        assert!(line.contains("m-3") && line.contains("waits for a place in its group's x2"), "{line}");
+        assert!(!line.contains("may not have arrived"), "{line}");
+
+        // A place frees: the third is seated.
+        set(&store, "m-1", Status::Review);
+        step(&store, &w, &Blind);
+        let after = spawned();
+        assert!(after.iter().any(|(m, _)| m == "m-3"), "the third is seated: {after:?}");
     }
 
     /// wsp-600: a start that gave up under a throttle or memory hold is tried
