@@ -137,6 +137,86 @@ pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, Strin
     Ok(t.id)
 }
 
+/// The retro of record on a list, as text: row, seat, state, the `done` text and
+/// the outputs. Reads only.
+pub fn show_text(store: &Store, w: &Worklist) -> String {
+    let s = state(&w.id);
+    let Some((_, row)) = w.retro.clone() else {
+        return format!("{}: no retro has run — `wsp retro start {}` starts one\n", w.id, w.id);
+    };
+    let t = store.task(&row);
+    let seat = store
+        .claims()
+        .get(&row)
+        .and_then(|c| c["pane"].as_str().or_else(|| c["seat"].as_str()).map(str::to_string))
+        .unwrap_or_else(|| "—".into());
+    let mut o = format!(
+        "{} retro: {row} · seat {seat} · {} · on {}\n",
+        w.id,
+        t.as_ref().map(|t| t.status_raw.clone()).unwrap_or_else(|| "no row".into()),
+        s["retros"].as_str().unwrap_or("—")
+    );
+    if s["done"] == true {
+        o.push_str(&format!("done {}\n\n{}\n", s["finished"].as_str().unwrap_or(""), s["summary"].as_str().unwrap_or("").trim()));
+    } else {
+        o.push_str("not done: the retro seat has not recorded its `done`\n");
+    }
+    for f in arr(&s, "filed") {
+        o.push_str(&format!("filed {} on {}\n", f["row"].as_str().unwrap_or("—"), f["list"].as_str().unwrap_or("—")));
+    }
+    let d = crate::cmd_report::dir(&w.id);
+    for name in [FILE, "retro.html"] {
+        if d.join(name).is_file() {
+            o.push_str(&format!("output {}\n", d.join(name).display()));
+        }
+    }
+    o
+}
+
+/// `wsp retro <list>` and `wsp retro show <list>`: print the retro, start nothing.
+pub fn show(store: &Store, slug: &str) -> i32 {
+    let Some(w) = store.worklist(slug) else { return fail(&format!("no list `{slug}`")) };
+    print!("{}", show_text(store, &w));
+    0
+}
+
+/// Why a hand start is refused, if it is: from a verifier seat, or while the
+/// list's retro row is still open or at review and not named as replaced.
+pub fn start_refusal(store: &Store, w: &Worklist, replaces: Option<&str>, seat: Option<&str>) -> Option<String> {
+    if let Some(seat) = seat {
+        if let Some(member) = crate::verification::seats(&store.tasks()).get(seat) {
+            return Some(format!("a verifier seat is read-only (it verifies {member}); `wsp retro {}` shows the retro without starting one", w.id));
+        }
+    }
+    let (_, row) = w.retro.clone()?;
+    let t = store.task(&row)?;
+    if t.status() != Status::Done && replaces != Some(row.as_str()) {
+        return Some(format!(
+            "{}'s retro {row} is still {} — `wsp retro {}` shows it; to start another over it, `wsp retro start {} --replaces {row}`",
+            w.id, t.status_raw, w.id, w.id
+        ));
+    }
+    None
+}
+
+/// `wsp retro start <list> [--replaces ROW]`.
+pub fn start_by_hand(store: &Store, args: &Args) -> i32 {
+    let Some(w) = args.rest.get(1).and_then(|s| store.worklist(s)) else {
+        return fail(&format!("no list `{}`", args.rest.get(1).map(String::as_str).unwrap_or("")));
+    };
+    let replaces = args.get("replaces");
+    if let Some(why) = start_refusal(store, &w, replaces.as_deref(), crate::place::my_pane().as_deref()) {
+        return fail(&why);
+    }
+    match start(store, &w, true) {
+        Ok(row) => {
+            println!("{} retro started on {row}", w.id);
+            0
+        }
+        Err(e) => fail(&e),
+    }
+}
+
 /// When a list clears: a retro if the guards pass. Quiet when they do not.
 pub fn at_clear(store: &Store, w: &Worklist) {
     let Some(w) = store.worklist(&w.id) else { return };
@@ -190,7 +270,7 @@ fn list_of(store: &Store, args: &Args) -> Result<(Worklist, Value), i32> {
     let Some(w) = store.worklist(slug) else { return Err(fail(&format!("no list `{slug}`"))) };
     let s = state(&w.id);
     if s.is_null() || s["done"] == true {
-        return Err(fail(&format!("{} has no retro running — `wsp retro {}` starts one", w.id, w.id)));
+        return Err(fail(&format!("{} has no retro running — `wsp retro show {}` reads the one that ran, `wsp retro start {}` starts one", w.id, w.id, w.id)));
     }
     Ok((w, s))
 }
@@ -277,10 +357,28 @@ pub fn note(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Whether the list's retro of record has `done` recorded but its row is open
+/// again: the verifier sent it back.
+fn sent_back(store: &Store, args: &Args) -> bool {
+    let Some(w) = args.rest.get(1).and_then(|s| store.worklist(s)) else { return false };
+    let s = state(&w.id);
+    s["done"] == true
+        && s["row"].as_str().and_then(|r| store.task(r)).is_some_and(|t| !matches!(t.status(), Status::Review | Status::Done))
+}
+
 pub fn done(store: &Store, args: &Args) -> i32 {
-    let (w, mut s) = match list_of(store, args) {
-        Ok(x) => x,
-        Err(c) => return c,
+    // A retro row sent back after its `done` (open again, not at review or
+    // done) records `done` again.
+    let again = sent_back(store, args);
+    let (w, mut s) = if again {
+        let w = store.worklist(&args.rest[1]).unwrap();
+        let s = state(&w.id);
+        (w, s)
+    } else {
+        match list_of(store, args) {
+            Ok(x) => x,
+            Err(c) => return c,
+        }
     };
     let Some(path) = args.rest.get(2) else {
         eprintln!("usage: wsp retro done <list> FILE");
@@ -391,6 +489,74 @@ mod tests {
         store.save_worklist(&w).unwrap();
         let third = start(&store, &w, true).unwrap();
         assert_eq!(store.worklist("retro-2").unwrap().groups()[0].members, vec![third]);
+    }
+
+    fn snapshot(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(d: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let mut es: Vec<_> = std::fs::read_dir(d).into_iter().flatten().flatten().collect();
+            es.sort_by_key(|e| e.path());
+            for e in es {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.push((p.display().to_string(), std::fs::read(&p).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_bare_retro_prints_the_retro_and_starts_nothing() {
+        let (env, store) = crate::testkit::isolated_store("retro-bare");
+        let mut w = Worklist::new("c", "A list");
+        w.body = "## Groups\n\n1. a-1\n".into();
+        store.save_worklist(&w).unwrap();
+        let seat = start(&store, &w, true).unwrap();
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ok = put(&tmp, "ok", "nothing to file: the wall was inside the baseline");
+        assert_eq!(done(&store, &Args::synth("retro", &["done", "c", &ok], &[])), 0);
+        assert_eq!(store.task(&seat).unwrap().status_raw, "review");
+        let before = (snapshot(&env.home()), snapshot(&env.state()), snapshot(&crate::artefact::root()));
+        let w = store.worklist("c").unwrap();
+        let text = show_text(&store, &w);
+        assert!(text.contains(&seat) && text.contains("nothing to file: the wall was inside the baseline"), "{text}");
+        assert_eq!(crate::retro::retro(&store, &Args::synth("retro", &["c"], &[])), 0);
+        assert_eq!(crate::retro::retro(&store, &Args::synth("retro", &["show", "c"], &[])), 0);
+        let after = (snapshot(&env.home()), snapshot(&env.state()), snapshot(&crate::artefact::root()));
+        assert!(before == after, "the store and the artefacts are byte-identical");
+        // starting takes its own verb, and is refused over a retro still at review
+        assert_eq!(crate::retro::retro(&store, &Args::synth("retro", &["start", "c"], &[])), 1);
+        assert!(snapshot(&env.home()) == before.0);
+        let why = start_refusal(&store, &w, None, None).unwrap();
+        assert!(why.contains("--replaces"), "{why}");
+        assert!(start_refusal(&store, &w, Some(&seat), None).is_none());
+    }
+
+    #[test]
+    fn the_retro_row_of_record_can_record_done_again_after_it_is_sent_back() {
+        let (env, store) = crate::testkit::isolated_store("retro-sent-back");
+        let mut w = Worklist::new("d", "A list");
+        w.body = "## Groups\n\n1. a-1\n".into();
+        store.save_worklist(&w).unwrap();
+        let seat = start(&store, &w, true).unwrap();
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let one = put(&tmp, "one", "nothing to file: first reading");
+        let two = put(&tmp, "two", "nothing to file: corrected reading");
+        let a = |f: &str| Args::synth("retro", &["done", "d", f], &[]);
+        assert_eq!(done(&store, &a(&one)), 0);
+        assert_eq!(done(&store, &a(&two)), 1, "at review, the record stands");
+        let mut t = store.task(&seat).unwrap();
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        assert_eq!(done(&store, &a(&two)), 0);
+        assert!(show_text(&store, &store.worklist("d").unwrap()).contains("corrected reading"));
+        assert_eq!(store.task(&seat).unwrap().status_raw, "review");
     }
 
     #[test]

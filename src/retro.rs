@@ -24,7 +24,9 @@ pub const BASELINE: usize = 3;
 pub const SYNTAX: &str = "\
 wsp retro file <list> --defect|--strategic --title T --evidence FILE --fix FILE --done-when FILE [--ask FILE]
 wsp retro note <list> <row> FILE
-wsp retro done <list> FILE";
+wsp retro done <list> FILE
+wsp retro show <list>
+wsp retro start <list> [--replaces ROW]";
 
 /// The bucket names of the wall, as `effort.json` spells them under
 /// `totals.wall_buckets` (`<name>_seconds`).
@@ -267,8 +269,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
     help: &[crate::verbs::Help {
         section: crate::verbs::Section::Worklists,
         order: 290,
-        text: r##"  wsp retro <list> --packet|--check   the timing retro of a cleared list: its
-                                    packet, or whether it gets one and why not"##,
+        text: r##"  wsp retro <list> | show <list>      the retro that ran on a cleared list: row, seat, the
+                                    `done` text, outputs; starts nothing
+  wsp retro <list> --packet|--check   its packet, or whether it gets a retro and why not
+  wsp retro start <list> [--replaces ROW]
+                                    start a retro by hand; refused while the list's retro
+                                    row is open or at review unless ROW names it, and
+                                    from a verifier seat"##,
     }],
 }];
 
@@ -278,6 +285,8 @@ pub fn retro(store: &Store, args: &Args) -> i32 {
         Some("file") if args.rest.len() > 1 => return crate::retro_run::file(store, args),
         Some("note") if args.rest.len() > 1 => return crate::retro_run::note(store, args),
         Some("done") if args.rest.len() > 1 => return crate::retro_run::done(store, args),
+        Some("show") if args.rest.len() > 1 => return crate::retro_run::show(store, &args.rest[1]),
+        Some("start") if args.rest.len() > 1 => return crate::retro_run::start_by_hand(store, args),
         _ => {}
     }
     let Some(slug) = args.rest.first().cloned() else {
@@ -305,17 +314,8 @@ pub fn retro(store: &Store, args: &Args) -> i32 {
         }
         return 0;
     }
-    // By hand: a seat over the evidence there is, whatever ran before.
-    match crate::retro_run::start(store, &w, true) {
-        Ok(row) => {
-            println!("{} retro started on {row}", w.id);
-            0
-        }
-        Err(e) => {
-            eprintln!("wsp: {e}");
-            1
-        }
-    }
+    // Bare: read, never start. Starting takes `wsp retro start <list>`.
+    crate::retro_run::show(store, &slug)
 }
 
 #[cfg(test)]
