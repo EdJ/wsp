@@ -318,6 +318,9 @@ pub fn attempts_of(t: &Task) -> Vec<Attempt> {
             });
         if let Some((name, said)) = seat_line.as_ref().map(|(n, s)| (n.as_str(), *s)) {
             if let Some(who) = said.strip_prefix("started by pane ") {
+                // A start that never took left no end line, and the leg's next
+                // start finds it still open: it ended where the next began.
+                close_unfinished(&mut out, name, stamp);
                 let mut a = Attempt {
                     task: t.id.clone(),
                     title: t.title.clone(),
@@ -347,6 +350,16 @@ pub fn attempts_of(t: &Task) -> Vec<Attempt> {
                 }
                 continue;
             }
+        }
+        // `leg_start_failed`'s note: the seat the start named was ended and the
+        // leg put back to pending, with no end line. The attempt ran until here.
+        if let Some(name) = head
+            .strip_prefix("wsp could not spawn leg ")
+            .and_then(|h| h.rsplit_once(" (try "))
+            .map(|(n, _)| n)
+        {
+            close_unfinished(&mut out, name, stamp);
+            continue;
         }
         if let Some(who) = head.strip_prefix("claimed by pane ") {
             let mut a = Attempt {
@@ -406,6 +419,16 @@ pub fn attempts_of(t: &Task) -> Vec<Attempt> {
         }
     }
     out
+}
+
+/// Close the leg's open attempt at `stamp` as dropped: a start that never took
+/// is not a seat that is still running, and must not be read to the clock's now
+/// (`compounding-222`: a window of 3053 s read 24737 s).
+fn close_unfinished(out: &mut [Attempt], name: &str, stamp: &str) {
+    if let Some(a) = out.iter_mut().rev().find(|a| a.leg.as_deref() == Some(name) && a.until.is_empty()) {
+        a.until = stamp.to_string();
+        a.outcome = Outcome::Dropped;
+    }
 }
 
 /// The clauses a release line and a leg's end line share: the tier that ran, the
@@ -1564,6 +1587,29 @@ mod tests {
         assert_eq!(by("build-b").until, "2026-10-18T09:30:00Z");
         assert_eq!(by("scout").outcome, Outcome::Done);
         assert_eq!(by("build-a").seconds(), 39 * 60);
+    }
+
+    /// compounding-222: a leg start that never took logs a start and then the
+    /// "could not spawn" note, and no end line. Its clock stops at the note and
+    /// does not run to now; the start that did take is read on its own.
+    #[test]
+    fn a_leg_start_that_never_took_stops_its_clock_at_the_note_that_says_so() {
+        let t = task(&[
+            "- 2026-10-18T09:00:00Z leg plan started by pane cpd-1 · spawned at sonnet/high",
+            "- 2026-10-18T09:00:50Z wsp could not spawn leg plan (try 1 of 3): never became ready",
+            "- 2026-10-18T09:05:00Z leg plan started by pane cpd-2 · spawned at sonnet/high",
+            "- 2026-10-18T09:20:00Z leg plan ended after 15m · ran sonnet-5-5/high · 9 turns",
+        ]);
+        let a = attempts_of(&t);
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!((a[0].seconds(), a[0].outcome), (50, Outcome::Dropped), "{a:?}");
+        assert_eq!((a[1].seconds(), a[1].turns, a[1].outcome), (15 * 60, 9, Outcome::Done), "{a:?}");
+        let open = task(&[
+            "- 2026-10-18T09:00:00Z leg plan started by pane cpd-1",
+            "- 2026-10-18T09:10:00Z leg plan started by pane cpd-2",
+        ]);
+        let a = attempts_of(&open);
+        assert_eq!(a[0].seconds(), 600, "a restart with no note closes the earlier start where it began: {a:?}");
     }
 
     /// An end line with no start of its name opens nothing and closes nothing: it
