@@ -241,7 +241,7 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
     }
     for (gi, t) in &tasks {
         let mut claims = 0;
-        for a in attempts_of(t) {
+        for a in attempts_of(t).into_iter().filter(|a| !a.never_took()) {
             let role = match &a.leg {
                 Some(_) => "leg",
                 None => {
@@ -606,6 +606,28 @@ mod tests {
         let readings: u64 = ["cpd-5", "cpd-6"].iter().map(|s| crate::cmd_burn::reading(s).unwrap()["cost"].as_u64().unwrap()).sum();
         assert_eq!(Sum::of(es.iter()).usd, readings, "the list total is the sum of reading over its seats");
         assert_eq!(es.iter().map(|e| (e.role, e.dropped)).collect::<Vec<_>>(), vec![("worker", true), ("rework", false)]);
+    }
+
+    /// compounding-222: a leg start that never took has no transcript, and is not
+    /// a seat with a transcript missing: it is not counted as unmeasured, a seat,
+    /// or seconds.
+    #[test]
+    fn a_leg_start_that_never_took_is_not_an_unmeasured_seat() {
+        let (env, store) = fixture("cost-ghost");
+        seat(&env.state(), "cpd-2", 2, 50);
+        let mut t = store.find_task("m-1").unwrap();
+        t.body = "## Log\n\
+- 2026-10-18T09:00:00Z leg plan started by pane cpd-1 · spawned at sonnet/high\n\
+- 2026-10-18T09:00:50Z wsp could not spawn leg plan (try 1 of 3): never became ready\n\
+- 2026-10-18T09:05:00Z leg plan started by pane cpd-2 · spawned at sonnet/high\n\
+- 2026-10-18T09:20:00Z leg plan ended after 15m · ran sonnet-5-5/high · 9 turns · 1M cache 1k in 1k out\n"
+            .into();
+        store.save_task(&t).unwrap();
+        let es = entries(&store, "run").unwrap();
+        let legs: Vec<&Entry> = es.iter().filter(|e| e.role == "leg").collect();
+        assert_eq!(legs.len(), 1, "{legs:?}");
+        let sum = Sum::of(es.iter());
+        assert_eq!((sum.seats, sum.unmeasured, sum.seconds), (1, 0, 15 * 60), "{es:?}");
     }
 
     #[test]

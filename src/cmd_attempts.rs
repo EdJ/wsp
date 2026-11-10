@@ -181,6 +181,13 @@ impl Attempt {
         };
         (end - util::epoch_of(&self.at)).max(0)
     }
+
+    /// A leg start that never took (`compounding-222`): closed as dropped with no
+    /// turn and no tier that ran. It is a try, not a seat; the cost table and the
+    /// effort census do not count it as one.
+    pub fn never_took(&self) -> bool {
+        self.leg.is_some() && self.outcome == Outcome::Dropped && self.turns == 0 && self.ran.is_empty()
+    }
 }
 
 /// The tier column: one label when intent and fact agree, both when they do
@@ -977,7 +984,7 @@ pub fn row_cost(t: &Task) -> RowCost {
     let waits = crate::legs::waits(&legs);
     let mut out = RowCost { task: t.id.clone(), title: t.title.clone(), ..RowCost::default() };
     let mut claims = 0;
-    for a in attempts_of(t) {
+    for a in attempts_of(t).into_iter().filter(|a| !a.never_took()) {
         let (kind, join) = match &a.leg {
             Some(name) => {
                 let i = legs.iter().position(|l| &l.name == name);
@@ -1018,7 +1025,7 @@ pub fn row_cost(t: &Task) -> RowCost {
         });
     }
     out.lines.sort_by(|a, b| a.at.cmp(&b.at));
-    let ran: Vec<Attempt> = attempts_of(t).into_iter().filter(|a| a.leg.is_some() && !a.until.is_empty()).collect();
+    let ran: Vec<Attempt> = attempts_of(t).into_iter().filter(|a| a.leg.is_some() && !a.until.is_empty() && !a.never_took()).collect();
     out.legs_sum = ran.iter().map(Attempt::seconds).sum();
     let first = ran.iter().map(|a| util::epoch_of(&a.at)).min();
     let last = ran.iter().map(|a| util::epoch_of(&a.until)).max();
@@ -1610,6 +1617,23 @@ mod tests {
         ]);
         let a = attempts_of(&open);
         assert_eq!(a[0].seconds(), 600, "a restart with no note closes the earlier start where it began: {a:?}");
+    }
+
+    /// compounding-222: the start that never took is a try, not a seat. The cost
+    /// table lists the leg once, with the seat that ran, and its unmeasured count
+    /// and clocks carry nothing of the ghost.
+    #[test]
+    fn a_leg_start_that_never_took_is_not_a_line_of_the_cost_table() {
+        let t = task(&[
+            "- 2026-10-18T09:00:00Z leg plan started by pane cpd-1 · spawned at sonnet/high",
+            "- 2026-10-18T09:00:50Z wsp could not spawn leg plan (try 1 of 3): never became ready",
+            "- 2026-10-18T09:05:00Z leg plan started by pane cpd-2 · spawned at sonnet/high",
+            "- 2026-10-18T09:20:00Z leg plan ended after 15m · ran sonnet-5-5/high · 9 turns · 1M cache 1k in 1k out",
+        ]);
+        let rc = row_cost(&t);
+        assert_eq!(rc.lines.iter().filter(|l| l.leg.as_deref() == Some("plan")).count(), 1, "{:?}", rc.lines);
+        assert_eq!(rc.unmeasured(), 0, "{:?}", rc.lines);
+        assert_eq!((rc.legs_sum, rc.wall), (15 * 60, Some(15 * 60)));
     }
 
     /// An end line with no start of its name opens nothing and closes nothing: it
