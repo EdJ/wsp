@@ -411,7 +411,7 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
     // The changed paths are read for the help snapshot too (`wsp-564`), so a
     // repository that carries `fixtures/help.txt` always has them.
     let at_sha = |path: &str| git(&tg.repo, &["show", &format!("{}:{path}", tg.sha)]);
-    let wants_paths = rules.iter().any(|s| s.of == Of::Rule && !s.barrier && !s.end) || at_sha(HELP_FIXTURE).is_some();
+    let wants_paths = rules.iter().any(|s| s.of == Of::Rule && !s.barrier && !s.end) || [HELP_FIXTURE, LAYERING_FILE, READONLY_FILE].iter().any(|f| at_sha(f).is_some());
     let changed = if wants_paths { changed_paths(tg, t, at.is_none()) } else { Vec::new() };
     for r in rules.into_iter().filter(|r| !r.barrier && !r.end) {
         let made = match r.of {
@@ -424,7 +424,7 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
             }
         }
     }
-    if let Some(h) = help_step(&at_sha, &changed) {
+    for h in structure_steps(&at_sha, &changed) {
         if !steps.iter().any(|s| s.command == h.command) {
             steps.push(h);
         }
@@ -470,6 +470,48 @@ pub(crate) fn help_step(read: &dyn Fn(&str) -> Option<String>, changed: &[String
         barrier: false,
         end: false,
     })
+}
+
+/// The layering test a repository keeps, and the readonly classification.
+pub(crate) const LAYERING_FILE: &str = "tests/layering.rs";
+pub(crate) const LAYERING_COMMAND: &str = "cargo test --test layering";
+pub(crate) const READONLY_FILE: &str = "src/readonly.rs";
+pub(crate) const READONLY_COMMAND: &str = "cargo test readonly::tests";
+
+/// Whether a changed file can add a module or a verb: the module list, the
+/// registry, or a file that declares a `VERBS` table.
+fn adds_module_or_verb(path: &str, content: &str) -> bool {
+    path.ends_with(".rs") && (matches!(path, "src/main.rs" | "src/registry.rs" | "src/verbs.rs") || content.contains("const VERBS"))
+}
+
+/// The layering and readonly tests, when a path the landing changed can add a
+/// module or a verb (`wsp-569`). Both ran only at the group's barrier, which
+/// stops at the first failure and holds the whole group; a row that adds a
+/// module (an upward `use`) or a verb (unclassified in `src/readonly.rs`) finds
+/// out in its own check, for the cost of two small tests, and only when it
+/// touches those sources. Each needs its file in the repository.
+///
+/// `read` gives a path's content at the commit under check.
+pub(crate) fn structure_steps(read: &dyn Fn(&str) -> Option<String>, changed: &[String]) -> Vec<Step> {
+    let mut out: Vec<Step> = help_step(read, changed).into_iter().collect();
+    let on: Vec<String> = changed.iter().filter(|p| adds_module_or_verb(p, &read(p).unwrap_or_default())).cloned().collect();
+    if on.is_empty() {
+        return out;
+    }
+    for (file, name, command) in [(LAYERING_FILE, "layering", LAYERING_COMMAND), (READONLY_FILE, "readonly", READONLY_COMMAND)] {
+        if read(file).is_some() {
+            out.push(Step {
+                name: name.into(),
+                command: command.into(),
+                limit: Duration::from_secs(20 * 60),
+                of: Of::Rule,
+                on: on.clone(),
+                barrier: false,
+                end: false,
+            });
+        }
+    }
+    out
 }
 
 /// The steps of a re-plan after the trunk moved that the rebase can have
@@ -1507,7 +1549,7 @@ fn inner(store: &Store, args: &Args) -> i32 {
     };
     let mut steps = if wide { affected_steps(store, &t, &tree, &changed) } else { inner_steps(store, &t, &changed) };
     let in_tree = |path: &str| std::fs::read_to_string(tree.join(path)).ok();
-    if let Some(h) = help_step(&in_tree, &changed) {
+    for h in structure_steps(&in_tree, &changed) {
         if !steps.iter().any(|s| s.command == h.command) {
             steps.push(h);
         }
@@ -2381,6 +2423,17 @@ mod tests {
         // The snapshot updated beside it: the step still runs, and its test passes.
         let both = commit_files(&repo, &[("src/cmd_new.rs", "pub const VERBS: &[crate::verbs::Verb] = &[];\n// more\n"), (HELP_FIXTURE, "help 2\n")]);
         assert!(names(&at(&both)).iter().any(|s| s.name == "help"));
+    }
+
+    #[test]
+    fn a_module_or_verb_in_the_diff_adds_the_layering_and_readonly_tests() {
+        let kept = |p: &str| matches!(p, LAYERING_FILE | READONLY_FILE).then(|| "x".to_string());
+        let changed = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cmds = |p: &[&str]| structure_steps(&kept, &changed(p)).into_iter().map(|s| s.command).collect::<Vec<_>>();
+        assert_eq!(cmds(&["src/main.rs"]), [LAYERING_COMMAND, READONLY_COMMAND]);
+        assert!(cmds(&["src/util.rs", "README.md"]).is_empty());
+        let none = |_: &str| None;
+        assert!(structure_steps(&none, &changed(&["src/main.rs"])).is_empty());
     }
 
     #[test]
