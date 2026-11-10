@@ -1029,7 +1029,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         }
     }
 
-    say_capped(store, &w.id, at, gate.cap, gate.take_held(), all);
+    say_capped(store, &w.id, at, &gate, all);
     if all {
         // After the starts, so a silent row the step just reseated is not named
         // first: the naming is a line said of the row, and the reseat reads the
@@ -1064,8 +1064,9 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
 /// `capped.json`, one entry per list: a step that takes every start replaces
 /// its list's entry with what it held now, so a start that went ahead and was
 /// held again later is said again; a [`Starts::Finishing`] pass only adds.
-fn say_capped(store: &Store, list: &str, at: usize, cap: Option<usize>, held: Vec<(String, Vec<crate::room::Counted>)>, all: bool) {
-    let Some(cap) = cap else {
+fn say_capped(store: &Store, list: &str, at: usize, gate: &crate::room::Gate, all: bool) {
+    let held = gate.take_held();
+    let Some(cap) = gate.cap else {
         if all && store.capped().contains_key(list) {
             store.set_capped(list, None);
         }
@@ -1086,8 +1087,8 @@ fn say_capped(store: &Store, list: &str, at: usize, cap: Option<usize>, held: Ve
             }
             None => {
                 log_line(store, &format!(
-                    "{list} group {at}: {what} waits — the seat is at its cap of {cap}: {}",
-                    crate::room::names(&room)
+                    "{list} group {at}: {what} waits — the seat is at its cap of {cap}{}",
+                    gate.cap_said(&what, &room)
                 ));
                 now.insert(what, serde_json::Value::String(util::now_iso()));
             }
@@ -2160,7 +2161,7 @@ pub(crate) fn start_inside(store: &Store, row: &str, seats: &dyn Seats) -> Vec<S
             }
             None => {
                 let cap = gate.cap.unwrap_or_default();
-                log_line(store, &format!("{what} waits — the seat is at its cap of {cap}: {}", crate::room::names(&room)));
+                log_line(store, &format!("{what} waits — the seat is at its cap of {cap}{}", gate.cap_said(&what, &room)));
                 now.insert(what, serde_json::Value::String(util::now_iso()));
             }
         }
@@ -7827,6 +7828,157 @@ fn only_a_working_screen_is_ever_overruled() {
         hold_all(&store);
         step(&store, &w, &Blind);
         assert_eq!(ids(spawned()), ["m-5"], "and the verdict frees the place for the next member");
+    }
+
+    // ---- light rows count half a place (`wsp-601`) ------------------------
+
+    /// A row of project `docs`, carrying `tag`.
+    fn docs_row(store: &Store, id: &str, tag: &str) {
+        let mut t = Task::new(id, id);
+        t.status_raw = Status::Todo.as_str().into();
+        t.project = Some("docs".into());
+        t.tags = vec![tag.into()];
+        store.save_task(&t).unwrap();
+    }
+
+    /// Project `docs`, declaring `light` as its light tags.
+    fn declare_light(store: &Store, light: &str) {
+        let mut p = crate::model::Project::new("docs");
+        p.light = light.into();
+        store.save_project(&p).unwrap();
+    }
+
+    /// One group of `members` run on claude, carrying `weight` and `own` (member, word).
+    fn weighed_list(store: &Store, members: &[&str], weight: &str, own: &[(&str, &str)]) -> Worklist {
+        let w = list(store, &[(members, "claude")]);
+        let mut g = w.groups();
+        g[0].weight = weight.into();
+        g[0].member_weights = own.iter().map(|(m, x)| (m.to_string(), x.to_string())).collect();
+        let mut w = w;
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        w
+    }
+
+    /// Done when: a cap of 4 admits eight light rows and refuses the ninth, and
+    /// the cap line says the weights in use.
+    #[test]
+    fn a_cap_of_four_admits_eight_light_rows_and_refuses_the_ninth() {
+        let (_env, store) = scratch("light-eight");
+        let members: Vec<String> = (1..=9).map(|n| format!("r-{n}")).collect();
+        for m in &members {
+            task(&store, m, Status::Todo);
+        }
+        store.set_seat_cap(Some(4)).unwrap();
+        let refs: Vec<&str> = members.iter().map(String::as_str).collect();
+        let w = weighed_list(&store, &refs, "light", &[]);
+        let _ = drained(&SAID);
+
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()).len(), 8, "eight halves are four places");
+        let said = said_capped();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("r-9 waits — the seat is at its cap of 4 (4 in use — 0 whole, 8 light at ½; the start waiting counts ½): r-1 starting"), "{said:?}");
+    }
+
+    /// Four build rows fill four places; two build and four light do the same.
+    #[test]
+    fn four_build_rows_or_two_build_and_four_light_fill_a_cap_of_four() {
+        let (_env, store) = scratch("light-mix");
+        let members = ["b-1", "b-2", "b-3", "b-4", "b-5"];
+        for m in members {
+            task(&store, m, Status::Todo);
+        }
+        store.set_seat_cap(Some(4)).unwrap();
+        let w = weighed_list(&store, &members, "", &[]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()).len(), 4, "four build rows, the fifth refused");
+
+        drop(_env);
+        let (_env, store) = scratch("light-mix-2");
+        let members = ["b-1", "b-2", "l-1", "l-2", "l-3", "l-4", "l-5"];
+        for m in members {
+            task(&store, m, Status::Todo);
+        }
+        store.set_seat_cap(Some(4)).unwrap();
+        let own: Vec<(&str, &str)> = ["l-1", "l-2", "l-3", "l-4", "l-5"].iter().map(|m| (*m, "light")).collect();
+        let w = weighed_list(&store, &members, "", &own);
+        let _ = drained(&SAID);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["b-1", "b-2", "l-1", "l-2", "l-3", "l-4"], "2 + 4 at those weights, then the next is refused");
+        let said = said_capped();
+        assert!(said[0].contains("l-5 waits — the seat is at its cap of 4 (4 in use — 2 whole, 4 light at ½;"), "{said:?}");
+    }
+
+    /// A project's `light:` tags make its rows light; a row without one is whole.
+    #[test]
+    fn a_projects_declaration_is_honoured() {
+        let (_env, store) = scratch("light-project");
+        declare_light(&store, "retro plan");
+        for n in 1..=4 {
+            docs_row(&store, &format!("r-{n}"), "retro");
+        }
+        docs_row(&store, "r-5", "build");
+        store.set_seat_cap(Some(1)).unwrap();
+        let w = weighed_list(&store, &["r-1", "r-2", "r-3", "r-4", "r-5"], "", &[]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["r-1", "r-2"], "two retros fill a place; the third is refused, and r-5 behind it");
+
+        drop(_env);
+        let (_env, store) = scratch("light-project-none");
+        docs_row(&store, "r-1", "retro");
+        docs_row(&store, "r-2", "retro");
+        store.set_seat_cap(Some(1)).unwrap();
+        let w = weighed_list(&store, &["r-1", "r-2"], "", &[]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["r-1"], "a project that declares nothing has no light rows");
+    }
+
+    /// A member's line beats its group's, and the group's beats the project's,
+    /// either way.
+    #[test]
+    fn a_row_override_and_a_group_override_beat_the_projects_declaration() {
+        // The group says heavy over a project that says light: one place, one row.
+        let (_env, store) = scratch("light-group-heavy");
+        declare_light(&store, "retro");
+        docs_row(&store, "r-1", "retro");
+        docs_row(&store, "r-2", "retro");
+        store.set_seat_cap(Some(1)).unwrap();
+        let w = weighed_list(&store, &["r-1", "r-2"], "heavy", &[]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["r-1"], "the group's heavy beats the project's light");
+
+        // The group says light over a project that declares nothing.
+        drop(_env);
+        let (_env, store) = scratch("light-group-light");
+        docs_row(&store, "r-1", "build");
+        docs_row(&store, "r-2", "build");
+        store.set_seat_cap(Some(1)).unwrap();
+        let w = weighed_list(&store, &["r-1", "r-2"], "light", &[]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["r-1", "r-2"], "the group's light beats the project's silence");
+
+        // A member heavy in a light group takes a whole place; one light in a
+        // heavy group takes half.
+        drop(_env);
+        let (_env, store) = scratch("light-member-heavy");
+        for m in ["r-1", "r-2"] {
+            docs_row(&store, m, "build");
+        }
+        store.set_seat_cap(Some(1)).unwrap();
+        let w = weighed_list(&store, &["r-1", "r-2"], "light", &[("r-1", "heavy")]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["r-1"], "the member's heavy beats the group's light");
+
+        drop(_env);
+        let (_env, store) = scratch("light-member-light");
+        for m in ["r-1", "r-2", "r-3"] {
+            docs_row(&store, m, "build");
+        }
+        store.set_seat_cap(Some(1)).unwrap();
+        let w = weighed_list(&store, &["r-1", "r-2", "r-3"], "heavy", &[("r-1", "light"), ("r-2", "light")]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["r-1", "r-2"], "the member's light beats the group's heavy");
     }
 
     /// The seat's number and a group's `xN` are both caps, and the smaller

@@ -210,7 +210,7 @@ impl Fleet {
 fn seat_working(store: &Store) -> Vec<String> {
     match store.seat_cap() {
         None => Vec::new(),
-        Some(_) => crate::room::Gate::new(store, &crate::cycle::Fleet).working().iter().map(|c| c.said()).collect(),
+        Some(_) => crate::room::Gate::new(store, &crate::cycle::Fleet).working().iter().map(|c| if c.weight < crate::room::WHOLE { format!("{} (light)", c.said()) } else { c.said() }).collect(),
     }
 }
 
@@ -221,9 +221,16 @@ fn names_seat(needle: &str) -> bool {
 
 /// The seat's cap as one cell: the number and how many it holds now, or how
 /// to set one.
-fn seat_cap_line(cap: Option<usize>, working: usize) -> String {
+fn seat_cap_line(cap: Option<usize>, working: &[String]) -> String {
+    // A light row counts half a place (`wsp-601`): the places in use, said only
+    // where one is light.
+    let light = working.iter().filter(|w| w.ends_with(" (light)")).count();
+    let held = match light {
+        0 => String::new(),
+        _ => format!(" ({} places, {light} light)", crate::room::places((working.len() - light) * crate::room::WHOLE + light * crate::room::LIGHT)),
+    };
     match cap {
-        Some(n) => format!("{n} agents at once · {working} working"),
+        Some(n) => format!("{n} agents at once · {} working{held}", working.len()),
         None => "no cap — wsp machine set seat agents=4".into(),
     }
 }
@@ -362,7 +369,7 @@ fn list_lines(f: &Fleet, p: &Paint) -> Vec<String> {
         out.push(format!(
             "{}  {}",
             p.bold(&format!("seat  {}", f.seat)),
-            p.dim(&seat_cap_line(f.seat_cap, f.seat_working.len()))
+            p.dim(&seat_cap_line(f.seat_cap, &f.seat_working))
         ))
     };
 
@@ -763,7 +770,7 @@ fn set_seat(store: &Store, args: &Args) -> i32 {
     if args.json() {
         println!("{}", json!({ "seat": util::hostname(), "agents": cap }));
     } else {
-        println!("seat {}", Paint::new().dim(&seat_cap_line(cap, seat_working(store).len())));
+        println!("seat {}", Paint::new().dim(&seat_cap_line(cap, &seat_working(store))));
     }
     0
 }

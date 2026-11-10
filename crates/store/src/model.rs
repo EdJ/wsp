@@ -182,6 +182,12 @@ pub struct Project {
     /// landed, verified and owed nothing: hours as a number, or `off`. Empty
     /// is the default, 24 hours. `wsp review --auto-close off|<hours>`.
     pub auto_close: String,
+    /// `light:` — the tags that mark this project's light rows (a retro, a plan,
+    /// docs), space or comma separated (`wsp-601`). A row carrying one counts
+    /// half a place under the seat's cap; a row carrying none counts a whole
+    /// one. Empty is no light rows, which is every project before this. A
+    /// group's `weight:` and a member's `weight <member>:` override it.
+    pub light: String,
     /// Highest number this project has handed out — a hint, not the truth.
     ///
     /// [`crate::store::Store::alloc_task_id`] reads it to skip the directory
@@ -233,6 +239,7 @@ impl Project {
             at_stop: doc.opt("at_stop").unwrap_or_default(),
             at_review: doc.opt("at_review").unwrap_or_default(),
             auto_close: doc.opt("auto_close").unwrap_or_default(),
+            light: doc.opt("light").unwrap_or_default(),
             seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
             body: doc.body.clone(),
         }
@@ -258,10 +265,18 @@ impl Project {
         if !self.auto_close.trim().is_empty() {
             d.set_str("auto_close", &self.auto_close);
         }
+        if !self.light.trim().is_empty() {
+            d.set_str("light", &self.light);
+        }
         d.set_str("seq", &self.seq.to_string());
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
+    }
+
+    /// The tags `light:` declares.
+    pub fn light_tags(&self) -> Vec<String> {
+        self.light.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).map(str::to_string).collect()
     }
 
     pub fn section(&self, name: &str) -> Option<String> {
@@ -1810,6 +1825,35 @@ pub struct Group {
     /// **A wsp from before this reads the line as more members**, the hazard
     /// [`Self::member_agents`] documents.
     pub together: bool,
+    /// `weight:` — `light` or `heavy`, what every member of the group counts as
+    /// under the seat's cap (`wsp-601`), beating the project's `light:`. Empty
+    /// is the project's say. A light row counts half a place.
+    ///
+    /// **A wsp from before this reads the line as more members**, the hazard
+    /// [`Self::member_agents`] documents.
+    pub weight: String,
+    /// `weight <member>: light|heavy` — one member's own, beating the group's.
+    /// The same hazard.
+    pub member_weights: BTreeMap<String, String>,
+}
+
+/// Whether a `weight:` word says light (`Some(true)`), heavy (`Some(false)`),
+/// or nothing a cap can use.
+pub fn weight_word(word: &str) -> Option<bool> {
+    match word.trim() {
+        "light" => Some(true),
+        "heavy" => Some(false),
+        _ => None,
+    }
+}
+
+impl Group {
+    /// What the list says of `member`'s weight: its own line, else the group's.
+    /// `Some(true)` is light, `Some(false)` is heavy, `None` leaves it to the
+    /// project's declaration.
+    pub fn light_for(&self, member: &str) -> Option<bool> {
+        self.member_weights.get(member).and_then(|w| weight_word(w)).or_else(|| weight_word(&self.weight))
+    }
 }
 
 /// Who a group runs on: the kind, and optionally the model and the effort,
@@ -2118,6 +2162,12 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         } else if trimmed == "together:" || trimmed.strip_prefix("together:").is_some_and(|r| r.trim() == "yes") {
             last.together = true;
             cont = Cont::Members;
+        } else if let Some(rest) = trimmed.strip_prefix("weight:") {
+            last.weight = rest.trim().to_string();
+            cont = Cont::Members;
+        } else if let Some((member, word)) = member_weight(trimmed, &last.members) {
+            last.member_weights.insert(member, word);
+            cont = Cont::Members;
         } else if let Some(rest) = trimmed.strip_prefix("agent:") {
             // One line, never wrapped: a policy is three words.
             last.agent = rest.trim().to_string();
@@ -2167,6 +2217,13 @@ fn member_agent(line: &str, members: &[String]) -> Option<(String, String)> {
     let (member, policy) = line.strip_prefix("agent ")?.split_once(':')?;
     let member = member.trim();
     members.iter().any(|m| m == member).then(|| (member.to_string(), policy.trim().to_string()))
+}
+
+/// `weight <member>: light|heavy`, for a member of the group.
+fn member_weight(line: &str, members: &[String]) -> Option<(String, String)> {
+    let (member, word) = line.strip_prefix("weight ")?.split_once(':')?;
+    let member = member.trim();
+    members.iter().any(|m| m == member).then(|| (member.to_string(), word.trim().to_string()))
 }
 
 /// One token stream of a `landed:` block, folded into entries already read.
@@ -2276,6 +2333,14 @@ pub fn render_groups(groups: &[Group]) -> String {
         }
         if g.together {
             out.push_str("  together: yes\n");
+        }
+        if !g.weight.trim().is_empty() {
+            out.push_str(&format!("  weight: {}\n", g.weight.trim()));
+        }
+        for m in &g.members {
+            if let Some(w) = g.member_weights.get(m).filter(|w| !w.trim().is_empty()) {
+                out.push_str(&format!("  weight {m}: {}\n", w.trim()));
+            }
         }
         block(&mut out, "agent", &g.agent);
         // In member order, and only for members still in the group: a line
@@ -3134,6 +3199,20 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         w.set_groups(&gs);
         assert_eq!(w.groups()[0].kind, "components");
         assert!(w.groups()[1].kind.is_empty());
+    }
+
+    /// `weight:` and `weight <member>:` are lines of the group's own and round-trip.
+    #[test]
+    fn a_groups_weights_are_their_own_lines_and_round_trip() {
+        let gs = parse_groups("- 1  a-1  a-2\n  weight: light\n  weight a-2: heavy\n- 2  a-3\n");
+        assert_eq!(gs[0].weight, "light");
+        assert_eq!(gs[0].light_for("a-1"), Some(true));
+        assert_eq!(gs[0].light_for("a-2"), Some(false), "the member's line beats the group's");
+        assert_eq!(gs[1].light_for("a-3"), None);
+        let again = parse_groups(&render_groups(&gs));
+        assert_eq!(again[0].member_weights.get("a-2").map(String::as_str), Some("heavy"));
+        assert_eq!(again[0].weight, "light");
+        assert_eq!(again[0].members, vec!["a-1", "a-2"], "no weight line is read as a member");
     }
 
     /// `together:` is a line of the group's own and round-trips.

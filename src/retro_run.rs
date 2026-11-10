@@ -94,6 +94,8 @@ fn seat_row(store: &Store, w: &Worklist) -> Result<Task, String> {
     let id = store.alloc_task_id(project.as_deref()).map_err(|e| format!("cannot allocate id: {e}"))?;
     let mut t = Task::new(&format!("Timing retro of {}", w.id), &id);
     t.project = project.clone();
+    // The tag a project's `light:` can name: a retro builds nothing (`wsp-601`).
+    t.tags = vec!["retro".into()];
     if project.is_none() {
         t.status_raw = "inbox".into();
     }

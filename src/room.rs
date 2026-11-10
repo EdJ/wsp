@@ -45,6 +45,20 @@
 //! answer is the moment the machine is least visible, and the direction to be
 //! wrong in there is starting one agent fewer.
 //!
+//! # Light rows count half (`wsp-601`)
+//!
+//! Ed, 2026-11-10: a retro, a plan or a docs row builds nothing, and seven of
+//! them held whole places at retro-ask-2 while 2206s of 3478s passed. **A light
+//! row counts half a place and any other row a whole one**, so a cap of 4 admits
+//! eight light rows, or four others, or two and four. Places are counted in
+//! halves ([`WHOLE`], [`LIGHT`]) so nothing is a fraction.
+//!
+//! A row is light by, in order: its member line in the list (`wsp worklist
+//! member … --weight light|heavy`), its group's line (`wsp worklist group N
+//! --weight …`), and its project's `light:` tags (`wsp project set <p> light
+//! "retro plan docs"`; a row is light when it carries one). A verifier weighs what
+//! the row it checks does; a barrier check, a leg and a piece are whole.
+//!
 //! # Under the lock
 //!
 //! The run's three starts each write their record under the store lock — the
@@ -127,6 +141,44 @@ impl Look {
 pub(crate) struct Counted {
     pub seat: Option<String>,
     pub what: String,
+    /// In halves of a place: [`WHOLE`] or [`LIGHT`].
+    pub weight: usize,
+}
+
+/// A place, in the halves the count is kept in.
+pub(crate) const WHOLE: usize = 2;
+/// A light row's share of one.
+pub(crate) const LIGHT: usize = 1;
+
+/// What the agents counted take of the cap, in halves.
+pub(crate) fn load(counted: &[Counted]) -> usize {
+    counted.iter().map(|c| c.weight).sum()
+}
+
+/// Halves of a place, said as places: `3`, `2½`, `½`.
+pub(crate) fn places(halves: usize) -> String {
+    match (halves / WHOLE, halves % WHOLE) {
+        (0, 0) => "0".into(),
+        (0, _) => "½".into(),
+        (n, 0) => n.to_string(),
+        (n, _) => format!("{n}½"),
+    }
+}
+
+/// The cap line's own account of the weights in use, empty where every agent
+/// counted is whole — the line reads as it always did. `waiting` is the start
+/// that is turned away.
+pub(crate) fn weights_said(counted: &[Counted], waiting: usize) -> String {
+    let light = counted.iter().filter(|c| c.weight < WHOLE).count();
+    if light == 0 && waiting >= WHOLE {
+        return String::new();
+    }
+    let whole = counted.len() - light;
+    format!(
+        " ({} in use — {whole} whole, {light} light at ½; the start waiting counts {})",
+        places(load(counted)),
+        places(waiting)
+    )
 }
 
 impl Counted {
@@ -149,6 +201,8 @@ pub(crate) struct Records {
     /// The panes and tasks of seats standing in an open ask to the person older
     /// than [`HELD_ASK_AFTER`].
     pub held_asks: BTreeSet<String>,
+    /// Each project's `light:` tags, its nearest parent's where it has none.
+    pub lights: BTreeMap<String, Vec<String>>,
 }
 
 /// The panes and tasks waiting on a person's answer for longer than `after`
@@ -177,7 +231,22 @@ impl Records {
             claims: store.claims(),
             agents: store.agents_held(),
             governors: store.governors(),
+            lights: lights_of(&store.projects()),
         }
+    }
+
+    /// What `id` counts as under the cap: the list's line for it, its group's,
+    /// then its project's `light:` tags; a row with none of these is whole.
+    pub(crate) fn weight_of(&self, id: &str) -> usize {
+        let said = crate::worklist::open_list_of(&self.lists, id)
+            .and_then(|w| w.groups().into_iter().find(|g| g.members.iter().any(|m| m == id)))
+            .and_then(|g| g.light_for(id));
+        let light = said.unwrap_or_else(|| {
+            self.tasks.iter().find(|t| t.id == id).is_some_and(|t| {
+                t.project.as_ref().and_then(|p| self.lights.get(p)).is_some_and(|tags| t.tags.iter().any(|x| tags.contains(x)))
+            })
+        });
+        if light { LIGHT } else { WHOLE }
     }
 
     /// Every seat on this machine the count might ask about: the ones whose
@@ -194,6 +263,25 @@ impl Records {
         out.retain(|s| here(s));
         out
     }
+}
+
+/// The `light:` tags each project goes by: its own, else its nearest parent's.
+fn lights_of(projects: &[crate::model::Project]) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for p in projects {
+        let mut at = Some(p);
+        let mut hops = 0;
+        while let Some(q) = at {
+            let tags = q.light_tags();
+            if !tags.is_empty() {
+                out.insert(p.id.clone(), tags);
+                break;
+            }
+            hops += 1;
+            at = q.parent.as_ref().filter(|_| hops < 32).and_then(|id| projects.iter().find(|x| &x.id == id));
+        }
+    }
+    out
 }
 
 impl Records {
@@ -233,7 +321,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     // **`settled`: a verdict is recorded** (`wsp-385`) — a verifier's, or a check's
     // (its own, or its barrier's having passed). Such a seat is closing and holds
     // no place whatever its screen shows; the tick ends it by its pane.
-    let mut take = |out: &mut Vec<Counted>, seat: Option<&str>, what: String, finished: bool, settled: bool, since: Option<&str>| {
+    let mut take = |out: &mut Vec<Counted>, seat: Option<&str>, what: String, weight: usize, finished: bool, settled: bool, since: Option<&str>| {
         if let Some(s) = seat {
             if !here(s) || governor(s) || r.held_asks.contains(s) || !seen.insert(s.to_string()) || settled || !look(s).counts(finished) {
                 return;
@@ -243,19 +331,20 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
                 return;
             }
         }
-        out.push(Counted { seat: seat.map(str::to_string), what });
+        out.push(Counted { seat: seat.map(str::to_string), what, weight });
     };
 
     // A verifier, by its pass on the member.
     for t in r.tasks.iter().filter(|t| t.body.contains("## Verification")) {
         for p in crate::verification::passes(t) {
             let what = crate::verification::seat_label(&t.id);
+            let weight = r.weight_of(&t.id);
             let running = p.state == crate::verification::State::Running;
             match &p.pane {
                 Some(_) if !p.standing() => {}
-                Some(seat) => take(&mut out, Some(seat), what, !running, !running, Some(&p.at)),
+                Some(seat) => take(&mut out, Some(seat), what, weight, !running, !running, Some(&p.at)),
                 None if running && p.ending == crate::verification::Ending::Standing && fresh(&p.at) => {
-                    take(&mut out, None, what, false, false, None)
+                    take(&mut out, None, what, weight, false, false, None)
                 }
                 None => {}
             }
@@ -270,8 +359,8 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             for c in &g.checks {
                 let what = crate::barrier::seat_label(&w.id, i + 1);
                 match (c.standing(), &c.pane) {
-                    (Some(seat), _) => take(&mut out, Some(seat), what, !c.open() || moot, !c.open() || moot, Some(&c.at)),
-                    (None, None) if c.open() && fresh(&c.at) => take(&mut out, None, what, false, false, None),
+                    (Some(seat), _) => take(&mut out, Some(seat), what, WHOLE, !c.open() || moot, !c.open() || moot, Some(&c.at)),
+                    (None, None) if c.open() && fresh(&c.at) => take(&mut out, None, what, WHOLE, false, false, None),
                     _ => {}
                 }
             }
@@ -288,8 +377,8 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             let what = crate::legs::label(&t.id, &l.name);
             let running = l.state == crate::legs::State::Running;
             match &l.pane {
-                Some(seat) => take(&mut out, Some(seat), what, parked || !running || l.ending != crate::verification::Ending::Standing, false, l.started.as_deref()),
-                None if running && l.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false, false, None),
+                Some(seat) => take(&mut out, Some(seat), what, WHOLE, parked || !running || l.ending != crate::verification::Ending::Standing, false, l.started.as_deref()),
+                None if running && l.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, WHOLE, false, false, None),
                 None => {}
             }
         }
@@ -304,8 +393,8 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             let what = p.id(&t.id);
             let running = p.state == crate::pieces::State::Running;
             match &p.pane {
-                Some(seat) => take(&mut out, Some(seat), what, parked || !running || p.ending != crate::verification::Ending::Standing, false, p.started.as_deref()),
-                None if running && p.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, false, false, None),
+                Some(seat) => take(&mut out, Some(seat), what, WHOLE, parked || !running || p.ending != crate::verification::Ending::Standing, false, p.started.as_deref()),
+                None if running && p.started.as_deref().is_some_and(fresh) => take(&mut out, None, what, WHOLE, false, false, None),
                 None => {}
             }
         }
@@ -328,7 +417,8 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
         // on a fresh one, and until it does the seat counts only if seen working.
         let holds_nothing = in_parked_list(r, &id)
             || r.tasks.iter().any(|t| t.id == id && (crate::inner::run_inside(t) || crate::repair::undelivered_reason(t).is_some()));
-        take(&mut out, Some(&seat), id, finished(s) || holds_nothing, false, None);
+        let weight = r.weight_of(&id);
+        take(&mut out, Some(&seat), id, weight, finished(s) || holds_nothing, false, None);
     }
 
     // A member the run moved to `doing` whose agent has not claimed it yet:
@@ -339,7 +429,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
             .and_then(|l| l.lines().last().map(|x| x.contains(crate::cycle::STARTED_BY)))
             .unwrap_or(false);
         if t.status() == Status::Doing && ours && !r.claims.contains_key(&t.id) && fresh(&t.updated) {
-            take(&mut out, None, t.id.clone(), false, false, None);
+            take(&mut out, None, t.id.clone(), r.weight_of(&t.id), false, false, None);
         }
     }
     out
@@ -383,11 +473,27 @@ impl<'a> Gate<'a> {
     pub(crate) fn admits(&self, what: &str) -> bool {
         let Some(cap) = self.cap else { return true };
         let now = self.working();
-        if now.len() < cap {
+        if load(&now) + self.weight_of(what) <= cap * WHOLE {
             return true;
         }
         self.held.borrow_mut().push((what.to_string(), now));
         false
+    }
+
+    /// What a start named `what` would count as: a row, or a verifier of one
+    /// (`r-1 · verifying`), by the row's weight; anything else is whole.
+    fn weight_of(&self, what: &str) -> usize {
+        let row = what.split(" · ").next().unwrap_or(what).trim();
+        // A row's own start, or its verifier; a leg, a piece and a barrier check
+        // carry a label of their own and are whole, as they are in the count.
+        if what != row && what != crate::verification::seat_label(row) {
+            return WHOLE;
+        }
+        let r = Records::read(self.store);
+        match r.tasks.iter().any(|t| t.id == row) {
+            true => r.weight_of(row),
+            false => WHOLE,
+        }
     }
 
     /// [`Gate::admits`] for a start that replaces one of the same name which
@@ -397,11 +503,18 @@ impl<'a> Gate<'a> {
     pub(crate) fn admits_again(&self, what: &str) -> bool {
         let Some(cap) = self.cap else { return true };
         let now: Vec<Counted> = self.working().into_iter().filter(|c| c.seat.is_some() || c.what != what).collect();
-        if now.len() < cap {
+        if load(&now) + self.weight_of(what) <= cap * WHOLE {
             return true;
         }
         self.held.borrow_mut().push((what.to_string(), now));
         false
+    }
+
+    /// The cap line's words after `of {cap}` for a start named `what` turned
+    /// away with `room` in the way: the weights in use, where any are light or
+    /// the start is (`wsp-601`), then the colon and the holders.
+    pub(crate) fn cap_said(&self, what: &str, room: &[Counted]) -> String {
+        format!("{}: {}", weights_said(room, self.weight_of(what)), names(room))
     }
 
     pub(crate) fn take_held(&self) -> Vec<(String, Vec<Counted>)> {
@@ -424,7 +537,8 @@ pub(crate) fn full(store: &Store, seats: &dyn Seats) -> Option<(usize, Vec<Count
     let gate = Gate::new(store, seats);
     let cap = gate.cap?;
     let now = gate.working();
-    (now.len() >= cap).then_some((cap, now))
+    // A hand spawn is a whole row: full is when a whole place is not left.
+    (load(&now) + WHOLE > cap * WHOLE).then_some((cap, now))
 }
 
 /// What `wsp wip` says of the starts waiting at the cap, off `capped.json`: each
@@ -461,7 +575,7 @@ pub(crate) fn waiting_lines_of(store: &Store, seen: &[crate::place::Seated], onl
         .into_iter()
         .filter(|c| c.seat.is_some() || !waits.iter().any(|(what, _, _)| *what == c.what))
         .collect();
-    let mut out = vec![format!("waiting for a seat slot ({} of {cap}: {}):", holders.len(), names(&holders))];
+    let mut out = vec![format!("waiting for a seat slot ({} of {cap}: {}):", places(load(&holders)), names(&holders))];
     for (what, owner, since) in waits {
         let age = match since.is_empty() {
             true => String::new(),
@@ -503,6 +617,7 @@ mod tests {
             agents: BTreeMap::new(),
             governors: BTreeMap::new(),
             held_asks: BTreeSet::new(),
+            lights: BTreeMap::new(),
         }
     }
 

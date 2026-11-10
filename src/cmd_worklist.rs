@@ -1235,7 +1235,7 @@ pub fn stop_checks(store: &Store, args: &Args) -> i32 {
 
 pub fn group(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
-        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--caption \"…\"|none] [--kind contract|components|wiring|insitu|none] [--together|--no-together] [--drop] [--why \"…\"|-]";
+        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--caption \"…\"|none] [--kind contract|components|wiring|insitu|none] [--together|--no-together] [--weight light|heavy|none] [--drop] [--why \"…\"|-]";
     let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
@@ -1276,8 +1276,9 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: --together and --no-together say opposite things — give one");
         return 2;
     }
-    if !drop && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") && !args.has("kind") {
+    if !drop && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") && !args.has("kind") && !args.has("weight") {
         eprintln!("{USAGE}");
+        eprintln!("       --weight light|heavy says what each member counts as under the seat's cap, over the project's `light:` (a light row is half a place)");
         eprintln!("       --parallel caps the work; --agent says who runs it; --stop is the prose read at the barrier after it");
         eprintln!("       --caption is the line a glance reads for it; --drop takes the group out whole");
         eprintln!("       --kind says what the group is for, which scopes its barrier's run (docs/scoped-barriers.md)");
@@ -1287,7 +1288,7 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         eprintln!("       free, up to the xN; --no-together takes it off");
         return 2;
     }
-    if drop && (set_together || args.has("parallel") || args.has("stop") || args.has("agent") || args.has("caption") || args.has("kind")) {
+    if drop && (set_together || args.has("parallel") || args.has("stop") || args.has("agent") || args.has("caption") || args.has("kind") || args.has("weight")) {
         eprintln!("wsp: --drop takes the group out whole, so there is nothing of it left to set");
         return 2;
     }
@@ -1299,10 +1300,17 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     // A caption alone is the one edit any group takes, run or not: it is
     // what the group is called, and nothing a member, a verifier or the
     // barrier reads. The window guards what is in flight.
-    let caption_only = args.has("caption") && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("kind");
+    let caption_only = args.has("caption") && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("kind") && !args.has("weight");
     // A kind alone is read at the barrier and by nothing in flight, so it is
     // the other edit a group takes while it runs.
-    let kind_only = args.has("kind") && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption");
+    let kind_only = args.has("kind") && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") && !args.has("weight");
+    // A weight alone is read by the seat's count and by nothing in flight, so
+    // it is the third edit a group takes while it runs (`wsp-601`).
+    let weight_only = args.has("weight") && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("agent") && !args.has("caption") && !args.has("kind");
+    let weight = match weight_arg(args) {
+        Ok(w) => w,
+        Err(code) => return code,
+    };
     let kind = match args.get("kind").map(|k| k.trim().to_string()) {
         None => None,
         Some(k) if matches!(k.as_str(), "" | "none" | "-" | "true") => Some(String::new()),
@@ -1330,7 +1338,7 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     };
 
     let win = window(store, &w);
-    if !caption_only && !kind_only && !win.allows(ordinal) {
+    if !caption_only && !kind_only && !weight_only && !win.allows(ordinal) {
         // The one edit the group being run still takes: its stop, which
         // nothing has read as a barrier yet. See [`amend_running_stop`].
         let only_stop = args.has("stop") && !set_together && !args.has("parallel") && !args.has("agent");
@@ -1412,6 +1420,10 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     if let Some(k) = kind {
         said.push(if k.is_empty() { "no kind".into() } else { format!("kind: {k}") });
         groups[ordinal - 1].kind = k;
+    }
+    if let Some(wt) = weight {
+        said.push(if wt.is_empty() { "the project's weight".into() } else { format!("weight: {wt}") });
+        groups[ordinal - 1].weight = wt;
     }
     if let Some(c) = caption {
         said.push(if c.is_empty() { "no caption".into() } else { format!("caption: {c}") });
@@ -2086,7 +2098,79 @@ fn reason(args: &Args) -> Result<Option<String>, i32> {
 /// `none` takes the member's line away, and it runs on the group's again.
 /// `manual` is refused: whether wsp runs a group is the group's line, and a
 /// member wsp skipped would be a barrier waiting on something nobody starts.
+/// `--weight light|heavy|none`: what a row counts as under the seat's cap
+/// (`wsp-601`). `Some("")` is `none`, the override taken off.
+fn weight_arg(args: &Args) -> Result<Option<String>, i32> {
+    match args.get("weight").map(|v| v.trim().to_string()) {
+        None => Ok(None),
+        Some(v) if matches!(v.as_str(), "none" | "-" | "") => Ok(Some(String::new())),
+        Some(v) if crate::model::weight_word(&v).is_some() => Ok(Some(v)),
+        Some(v) => {
+            eprintln!("wsp: a weight is light or heavy — `none` takes the override off, not `{v}`");
+            Err(2)
+        }
+    }
+}
+
+/// `wsp worklist member <slug> <task> --weight light|heavy|none`: one member's
+/// own weight under the seat's cap, over its group's and its project's. Read by
+/// the count and by nothing in flight, so a started member may change it too.
+fn member_weight(store: &Store, args: &Args) -> i32 {
+    let (Some(needle), Some(who)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
+        eprintln!("usage: wsp worklist member <slug> <task> --weight light|heavy|none");
+        return 2;
+    };
+    let word = match weight_arg(args) {
+        Ok(Some(w)) => w,
+        _ => return 2,
+    };
+    let w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let Some((_, id)) = member_named(&w.groups(), &who, store) else {
+        eprintln!("wsp: `{who}` is not in `{}` — wsp worklist show {}", w.id, w.id);
+        return 1;
+    };
+    let outcome = store.locked(|| -> Result<Worklist, i32> {
+        let mut w = store.worklist(&w.id).ok_or(1)?;
+        let mut groups = w.groups();
+        let Some(gi) = groups.iter().position(|g| g.members.contains(&id)) else { return Err(1) };
+        match word.is_empty() {
+            true => groups[gi].member_weights.remove(&id),
+            false => groups[gi].member_weights.insert(id.clone(), word.clone()),
+        };
+        w.log(&format!("{id} counts as {} under the seat's cap", if word.is_empty() { "its group's or its project's" } else { &word }));
+        w.set_groups(&groups);
+        if let Err(e) = store.save_worklist(&w) {
+            eprintln!("wsp: write failed: {e}");
+            return Err(1);
+        }
+        Ok(w)
+    });
+    let w = match outcome {
+        Ok(w) => w,
+        Err(code) => return code,
+    };
+    store.log_event("worklist-edited", json!({ "id": w.id, "what": "member" }));
+    store.git_commit(&format!("wsp: worklist {} member {id} weight {}", w.id, if word.is_empty() { "none" } else { &word }));
+    if args.json() {
+        println!("{}", worklist_json(store, &w));
+    } else if word.is_empty() {
+        println!("{id} in {}: the weight of its group, else its project", w.id);
+    } else {
+        println!("{id} in {}: {word} under the seat's cap", w.id);
+    }
+    0
+}
+
 pub fn member(store: &Store, args: &Args) -> i32 {
+    if args.has("weight") && !args.has("agent") {
+        return member_weight(store, args);
+    }
     const USAGE: &str = "usage: wsp worklist member <slug> <task> --agent \"kind [model] [effort]\"|none";
     let (Some(needle), Some(who), Some(raw)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned(), args.get("agent"))
     else {

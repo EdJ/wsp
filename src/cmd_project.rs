@@ -432,6 +432,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     if !proj.at_review.is_empty() {
         println!("{}  {}", p.dim(util::pad("at_review", 8).as_str()), proj.at_review);
     }
+    if !proj.light.is_empty() {
+        println!("{}  {}", p.dim(util::pad("light", 8).as_str()), proj.light);
+    }
     println!("{}  {}", p.dim(util::pad("status", 8).as_str()), proj.status);
 
     let kids = index.children(Some(&proj.id));
@@ -861,8 +864,11 @@ pub fn set(store: &Store, args: &Args) -> i32 {
             }
             "at_stop" => proj.at_stop = v.trim().to_string(),
             "at_review" => proj.at_review = v.trim().to_string(),
+            // The tags that mark a light row (a retro, a plan, docs): half a
+            // place under the seat's cap (`wsp-601`). Empty takes them off.
+            "light" => proj.light = v.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" "),
             other => {
-                eprintln!("wsp: cannot set `{other}` (name|brief|status|parent|tags|roots|at_stop|at_review)");
+                eprintln!("wsp: cannot set `{other}` (name|brief|status|parent|tags|roots|at_stop|at_review|light)");
                 return 2;
             }
         }
@@ -896,6 +902,7 @@ pub fn project_json(p: &Project, index: &Index) -> serde_json::Value {
         "roots": p.roots,
         "at_stop": p.at_stop,
         "at_review": p.at_review,
+        "light": p.light,
         "status": p.status,
         "brief": p.brief,
         "handbook": crate::model::section_of(&p.body, "Handbook"),
