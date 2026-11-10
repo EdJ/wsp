@@ -4804,9 +4804,9 @@ pub(crate) mod tests {
             trees.push(dir);
         }
 
-        assert_eq!(done(&store, &parse(&["done", "p-001"])), 0);
+        assert_eq!(done(&store, &parse(&["done", "p-001"]), &|_| false), 0);
         assert!(!trees[0].exists(), "a done row whose work is on the trunk kept its tree");
-        assert_eq!(done(&store, &parse(&["done", "p-002", "--keep-tree"])), 0);
+        assert_eq!(done(&store, &parse(&["done", "p-002", "--keep-tree"]), &|_| false), 0);
         assert!(trees[1].join(".git").exists(), "--keep-tree did not keep it");
         assert_eq!(store.task("p-002").unwrap().status(), Status::Done);
     }
