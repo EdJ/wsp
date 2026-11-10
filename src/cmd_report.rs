@@ -373,7 +373,15 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         }));
     }
     let wall = if end > start { end - start } else { 0 };
-    let wall_buckets = wall_buckets_json(&walls, &group_json, wall);
+    // The buckets tile the windows from the first group's open to the last
+    // pass, which runs past the last member's verdict where a pass is given
+    // late (a manual group's, by a person), so the wall they are held to
+    // reaches it too.
+    let reach = {
+        let (lo, hi) = walls.iter().flatten().fold((i64::MAX, 0i64), |(lo, hi), g| (lo.min(g.open), hi.max(g.close)));
+        if hi > lo { hi - lo } else { 0 }
+    };
+    let wall_buckets = wall_buckets_json(&walls, &group_json, wall.max(reach));
     let gov = governor_wall(store, &w.id, &group_starts);
     for (gi, gj) in group_json.iter_mut().enumerate() {
         gj["governor_wall"] = gov.get(gi).and_then(|x| x.as_ref()).map_or(Value::Null, GovWall::json);

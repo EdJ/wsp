@@ -131,7 +131,11 @@ pub(crate) fn seat_idle_reasons<'a>(waits: impl Iterator<Item = (&'a str, i64)>)
     out
 }
 
-pub(crate) const BUCKETS: [&str; 6] = ["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups"];
+/// The waiting cause for the stretch from a group's last barrier run (or, where
+/// it has none, its last member) to its pass.
+pub(crate) const PASS_WAIT: &str = "the barrier done, the pass not yet given";
+
+pub(crate) const BUCKETS:[&str; 6] = ["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups"];
 
 /// One group's wall by bucket, and what the waiting and the barrier were.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -228,7 +232,16 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
     cuts.dedup();
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        if a >= last_barrier || within(&barrier, a) {
+        if a >= last_barrier {
+            // After the barrier's last run and its check seat, up to the pass:
+            // nobody is running the barrier, the group is waiting for its pass
+            // (a manual group's is given by a person), so it is not the
+            // barrier's run (`wsp-568` booked it there).
+            add(&mut g, "waiting", b - a);
+            *g.waits.entry((String::new(), PASS_WAIT.into())).or_insert(0) += b - a;
+            continue;
+        }
+        if within(&barrier, a) {
             let at = |s: &&&Span| a >= s.start && a < s.end;
             if shared.iter().filter(at).any(|s| s.class == Class::Check) {
                 add(&mut g, "check_seat", b - a);
@@ -389,6 +402,30 @@ mod tests {
         assert_eq!(by.get("told: the seat has the sentence"), Some(&100));
         assert_eq!(by.get("reopened: the seat is on the send-back"), Some(&390));
         assert_eq!(by.values().sum::<i64>(), 890, "every idle second of 100-990 carries a reason");
+    }
+
+    #[test]
+    fn a_manual_groups_wait_for_its_pass_is_waiting_not_the_barriers_run() {
+        // The barrier runs 100-107 and its check seat to 110; the person gives
+        // the pass at 2600.
+        let mut ms = vec![seat("r-1", 0, 100, &[(10, 100)], &[])];
+        barrier(&mut ms, (100, 107), (107, 110));
+        let g = group_wall(&ms, None, Some(2600)).unwrap();
+        assert_eq!(g.seconds("barrier_run"), 7);
+        assert_eq!(g.barrier_run, 7);
+        assert_eq!(g.seconds("check_seat"), 3);
+        assert_eq!(g.seconds("waiting"), 10 + 2490, "the start, then 110-2600 for the pass");
+        assert_eq!(g.waits.get(&(String::new(), PASS_WAIT.to_string())), Some(&2490));
+        assert_eq!(g.by.values().sum::<i64>(), 2600);
+    }
+
+    #[test]
+    fn a_group_with_no_barrier_run_waits_for_its_pass_from_its_last_member() {
+        let ms = vec![seat("r-1", 0, 100, &[(10, 100)], &[])];
+        let g = group_wall(&ms, None, Some(500)).unwrap();
+        assert_eq!(g.seconds("barrier_run"), 0);
+        assert_eq!(g.seconds("waiting"), 10 + 400);
+        assert_eq!(g.by.values().sum::<i64>(), 500);
     }
 
     #[test]
