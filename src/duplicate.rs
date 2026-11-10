@@ -266,6 +266,75 @@ mod tests {
         assert!(said.is_ascii() && !said.contains('\n'), "{said:?}");
     }
 
+    /// The `wsp-527` case itself: a row that *landed* after the check's tree
+    /// was cut, touching a file the follow-up names, is refused and named with
+    /// the commit it landed at. One that landed before the check opened is in
+    /// that tree already and is not.
+    #[test]
+    fn a_row_landed_since_the_checks_tree_was_cut_is_named_and_one_landed_before_is_not() {
+        let env = crate::util::isolated("dup-landed");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::testkit::repo(&repo);
+        let git = |dir: &Path, args: &[&str]| {
+            let out = wsp_base::calls::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        std::fs::write(repo.join("kept.txt"), "one\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "--quiet", "-m", "first"]);
+        let mut p = crate::model::Project::new("wsp");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+
+        // Two rows that landed a change to `help.txt`; they differ in when.
+        let mut tip = String::new();
+        for id in ["wsp-910", "wsp-911"] {
+            let dir = repo.join(crate::cmd_checkout::WORKTREES).join(id);
+            git(&repo, &["worktree", "add", "--quiet", "-b", id, &dir.display().to_string(), "master"]);
+            std::fs::write(dir.join("help.txt"), format!("{id}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "--quiet", "-m", id]);
+            git(&dir, &["rebase", "--quiet", "master"]);
+            git(&repo, &["merge", "--ff-only", "--quiet", id]);
+            tip = git(&repo, &["rev-parse", "master"]);
+        }
+        let landed = |id: &str, updated: &str| {
+            let mut t = row(id, &format!("{id} unrelated"), "done", "Did it.");
+            t.project = Some("wsp".into());
+            t.updated = updated.into();
+            store.save_task(&t).unwrap();
+            t
+        };
+        landed("wsp-910", "2026-11-10T01:00:00Z");
+        landed("wsp-911", "2026-11-10T03:00:00Z");
+        let mut mine = row("wsp-912", "fix the fixture", "todo", "Fix help.txt, the retro block is missing.");
+        mine.project = Some("wsp".into());
+        store.save_task(&mine).unwrap();
+        let tasks = store.tasks();
+
+        let since = "2026-11-10T02:00:00Z";
+        let found = of(&store, &mine, &tasks, Some(since), &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].row, "wsp-911", "the one that landed after the tree was cut");
+        assert_eq!(found[0].status, format!("landed at {}", &tip[..7]), "{found:?}");
+        assert!(found[0].why.contains("touches help.txt"), "{found:?}");
+        assert!(of(&store, &mine, &tasks, None, &[]).is_empty(), "no check open looks at open rows only");
+    }
+
     #[test]
     fn titles_with_most_words_shared_are_close_and_short_ones_never() {
         let a = names(&row("a-1", "fixtures help text carries reap old help lines", "todo", ""));

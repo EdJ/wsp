@@ -2850,7 +2850,11 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     rows attached: --blocking holds, and they
                                     join the group; --next passes, and they are
                                     the next group. One round, and only the
-                                    check's own seat may run it"##,
+                                    check's own seat may run it. A row an open
+                                    one, or one landed since the check's tree
+                                    was cut, already covers is refused and the
+                                    other named; `--anyway "why"` goes ahead
+                                    and logs the why"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
@@ -5659,7 +5663,8 @@ const FOLLOWUP_MAX: usize = 4;
 ///   since this check's tree was cut, already covers — the same failing test, a
 ///   file the other's diff touched, a close title — is refused with that row
 ///   named. `--anyway "why"` goes ahead, and the why is logged. See
-///   [`crate::duplicate`].
+///   [`crate::duplicate`]. Only `followup` looks: `wsp add` has no barrier
+///   check's seat to file from, so it is not a way a check attaches a row.
 /// - **Logged**, naming the check row that added them.
 pub fn followup(store: &Store, args: &Args) -> i32 {
     let mut here = rows_here(store);
@@ -5692,7 +5697,7 @@ fn rows_here(store: &Store) -> Vec<String> {
 /// [`followup`] with the caller's rows given, which is what makes the "only
 /// the barrier check" rule testable without a seat.
 pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
-    const USAGE: &str = "usage: wsp worklist followup <slug> <task>… --blocking|--next --from FILE   (`--from -` reads stdin)";
+    const USAGE: &str = "usage: wsp worklist followup <slug> <task>… --blocking|--next --from FILE [--anyway \"why\"]   (`--from -` reads stdin)";
     let Some(needle) = args.rest.get(1).cloned() else {
         eprintln!("{USAGE}");
         return 2;
@@ -8238,11 +8243,13 @@ mod tests {
             let mut t = store.task("wl-003").unwrap();
             crate::model::set_section_in(&mut t.body, "Overview", mine);
             store.save_task(&t).unwrap();
-            let mut flags = vec![("blocking", "true"), ("from", from.as_str())];
+            // Through `Args::parse`, as the command line goes: `anyway` is a
+            // global boolean, and only `VALUED_ON` makes it carry its reason.
+            let mut line: Vec<String> = ["worklist", "followup", "run", "wl-003", "--blocking", "--from", from.as_str()].map(String::from).to_vec();
             if let Some(why) = anyway {
-                flags.push(("anyway", why));
+                line.extend(["--anyway".to_string(), why.to_string()]);
             }
-            let code = follow(&store, &["followup", "run", "wl-003"], &flags, &["cpd-9"]);
+            let code = followup_by(&store, &Args::parse(line), &["cpd-9".to_string()]);
             let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
             match tag {
                 "refused" => {
@@ -8257,6 +8264,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `wsp-565`: `--anyway "why"` is read off the command line with its reason
+    /// as its value, wherever it sits among the flags, and the reason is not
+    /// left behind as a row or a stray word. A bare `--anyway` still parses and
+    /// carries no reason (so the refusal stands).
+    #[test]
+    fn anyway_on_a_worklist_line_carries_its_reason_and_leaves_the_rows_alone() {
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| s.to_string()).collect());
+        for line in [
+            &["worklist", "followup", "run", "wl-003", "--blocking", "--anyway", "a different block", "--caption", "x"][..],
+            &["worklist", "followup", "run", "wl-003", "--anyway", "a different block", "--blocking", "--caption", "x"][..],
+        ] {
+            let a = parse(line);
+            assert_eq!(a.get("anyway").as_deref(), Some("a different block"), "{line:?}");
+            assert_eq!(a.rest, ["followup", "run", "wl-003"], "{line:?}");
+            assert!(a.has("blocking") && a.get("caption").as_deref() == Some("x"), "{line:?}");
+        }
+        let bare = parse(&["worklist", "followup", "run", "wl-003", "--blocking", "--anyway"]);
+        assert_eq!(bare.rest, ["followup", "run", "wl-003"]);
+        assert_eq!(bare.get("anyway").as_deref(), Some("true"), "no reason given");
     }
 
     /// `wsp-538`: the barrier owns the full suite, so a follow-up whose

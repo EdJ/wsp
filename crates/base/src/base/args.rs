@@ -261,6 +261,10 @@ pub const VALUED_ON: &[(&str, &str)] = &[
     ("project", "status"),
     // `spawn --agent` stands alone; on a worklist it names who runs a group.
     ("worklist", "agent"),
+    // `worklist followup … --anyway "why"` carries the reason it goes ahead of a
+    // row already covering the work (`wsp-565`). Without this the reason lands
+    // in `rest` as a stray positional and the override reads as a bare `true`.
+    ("worklist", "anyway"),
     // And on `leg add`, where it is the policy the leg runs on and `--why` the
     // reason: `--agent "claude opus high"` is read as a value, not as a flag
     // that leaves its policy behind as a positional.

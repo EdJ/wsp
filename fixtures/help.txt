@@ -631,7 +631,11 @@ WORKLISTS
                                     rows attached: --blocking holds, and they
                                     join the group; --next passes, and they are
                                     the next group. One round, and only the
-                                    check's own seat may run it
+                                    check's own seat may run it. A row an open
+                                    one, or one landed since the check's tree
+                                    was cut, already covers is refused and the
+                                    other named; `--anyway "why"` goes ahead
+                                    and logs the why
   wsp worklist park [<slug>] "why"|-|--from FILE   a person's pause: nothing
                                     starts, no barrier is checked, its seat is
                                     not refilled, nothing is ended. `go` and
