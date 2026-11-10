@@ -976,6 +976,11 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // back to it. Waiting two ticks on it left remote-agents unseated for three
     // hours between two groups, with the only repair a person's `advance`.
     let gone = word == "gone";
+    if gone && !never_filled {
+        if let Some(seat) = cmd_govern::seat_held(&scope, &governors) {
+            note_gone(store, seats, &seat.pane, &format!("the {scope} governor"));
+        }
+    }
     if !never_filled && !gone && !here.overdue(EMPTY_TICKS) {
         // Said once, on the way out — the pass that noticed is the interesting
         // one, and the next one is already counting.
@@ -1107,6 +1112,9 @@ fn how_it_reads(store: &Store, seats: &dyn Seats, scope: &str) -> Option<&'stati
 /// has exited, or it has sat at a prompt past [`STALLED_AFTER`] with the row
 /// still at `doing`.
 ///
+/// **A seat that reads `Gone` is put back at once and not told** (`wsp-597`);
+/// the rest of this paragraph is about `Idle`.
+///
 /// **Tell first, then respawn, and only after the threshold.** The order is the
 /// whole of it: an agent that exited mid-turn takes its uncommitted thinking
 /// with it, and a respawn hands the next one a fresh context rather than the
@@ -1207,6 +1215,9 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         }
 
         let word = state.as_str();
+        if state == State::Gone {
+            note_gone(store, seats, &seat, &t.id);
+        }
         let already = noticed(&t);
         // **Closing for the seat** (`wsp-374`): a session that ended with its
         // row at `doing`, or a seat still idle a window after it was told, has a
@@ -1222,6 +1233,23 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
                 stamp(store, &format!("{} group {at}: {} ({seat}) was closed by wsp from its verdict — {}", w.id, t.id, why_words(ended, idle)));
                 continue;
             }
+        }
+        if ended {
+            // **A seat that reads `Gone` is not told** (`wsp-597`). Its session has
+            // ended and a tell to it is refused as undeliverable, so telling first
+            // and waiting [`STALLED_AFTER`] was ten minutes of nothing:
+            // `compound-985` stood 10m46s on it while `wsp-385`, sent back in
+            // the same burst, was started again in three. The verdict, if there
+            // is one, was asked for above; what is left is ending the seat,
+            // putting the row back, and the run starting it on its next step.
+            // The tell-then-wait stays for `Idle`, a seat that can hear.
+            stamp(store, &format!(
+                "{} group {at}: {} ({seat}) reads gone — its session has ended and cannot be told; putting the row back, and the run starts it again",
+                w.id, t.id
+            ));
+            put_back(store, &t.id);
+            crate::cycle::despawn(store, &t.id);
+            continue;
         }
         if already.is_some_and(|since| since + STALLED_AFTER <= util::epoch_secs()) {
             // Told once, still not working. End it, put the row back where a
@@ -1274,6 +1302,82 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             "{} in the {} run is at doing with nothing working on it — its seat reads {word} and it \
              has been told to finish, land and review, or say what is left. `wsp show {}` has its row.",
             id, w.id, id
+        ));
+    }
+}
+
+const GONE_FILE: &str = "gone-seats.json";
+
+/// Two gone seats this close together are one event, not two (`wsp-597`).
+const BURST_WITHIN: i64 = 5 * 60;
+
+/// How long a first sighting is remembered, so a seat read gone on every tick
+/// is said once.
+const GONE_KEEP: i64 = 30 * 60;
+
+/// The host's side of a seat's death, as far as the host keeps it: the load
+/// and the free memory now, which is the nearest reading to the moment.
+fn host_words() -> String {
+    if cfg!(test) {
+        return "host readings not taken".to_string();
+    }
+    let load = crate::throttle::load_avgs()
+        .map_or("load unread".to_string(), |(a, b, c)| format!("load {a:.1} {b:.1} {c:.1}"));
+    let mem = crate::throttle::mem_free_now().map_or("free memory unread".to_string(), |p| format!("{p}% memory free"));
+    format!("{load}, {mem}")
+}
+
+/// **A seat's first reading of `gone` goes in `cycle.log` with what the host
+/// knows of how it ended, and a second inside five minutes is a burst**
+/// (`wsp-597`). Four claude sessions ended inside two and a half minutes on
+/// 2026-11-05 and nothing kept said whether it was a crash, a memory kill or a
+/// restart of the terminal server; a burst across lists points at the machine.
+///
+/// **Exit status and signal are not known to this process.** The agent is a
+/// child of the terminal server, not of the daemon, and a pane that reads `gone`
+/// has already lost the status; the line says so rather than leaving it out, and
+/// says whether the pane itself is still on a backend, which tells an agent that
+/// exited in a pane that stayed from a pane that was closed.
+fn note_gone(store: &Store, seats: &dyn Seats, seat: &str, who: &str) {
+    let now = util::epoch_secs();
+    let path = store.state.join(GONE_FILE);
+    let mut all: std::collections::BTreeMap<String, (i64, String)> =
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.as_object().cloned())
+            .map(|m| m.into_iter().filter_map(|(k, v)| Some((k, (v["at"].as_i64()?, v["who"].as_str()?.to_string())))).collect())
+            .unwrap_or_default();
+    all.retain(|_, (at, _)| *at + GONE_KEEP > now);
+    if all.contains_key(seat) {
+        return;
+    }
+    let others: Vec<String> = all
+        .iter()
+        .filter(|(_, (at, _))| *at + BURST_WITHIN > now)
+        .map(|(s, (_, w))| format!("{w} ({s})"))
+        .collect();
+    all.insert(seat.to_string(), (now, who.to_string()));
+    let _ = std::fs::create_dir_all(&store.state);
+    let out: serde_json::Map<String, serde_json::Value> =
+        all.iter().map(|(s, (at, w))| (s.clone(), serde_json::json!({ "at": at, "who": w }))).collect();
+    let _ = std::fs::write(&path, serde_json::Value::Object(out).to_string());
+
+    let pane = if seats.absent(seat) {
+        "the pane is on no backend any more"
+    } else {
+        "the pane is still there with its agent exited"
+    };
+    stamp(store, &format!(
+        "{who} ({seat}) reads gone — how it ended: exit status and signal are not kept by the host; {pane}; {}",
+        host_words()
+    ));
+    if !others.is_empty() {
+        stamp(store, &format!(
+            "burst: {} seats gone inside {} minutes — {}, {who} ({seat}) — a burst across seats points at the machine, not the rows",
+            others.len() + 1,
+            BURST_WITHIN / 60,
+            others.join(", ")
         ));
     }
 }
@@ -3271,51 +3375,57 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 // ---- 1. a member that is gone ----------------------------------------
 
     /// A member whose agent has exited: the claim is held, the row is at
-    /// `doing`, and nothing in the run would ever say so again. **No verb runs
-    /// and one tick repairs it** — the member's own seat is told, the governing
-    /// seat is told, and both say which.
+    /// `doing`. **One tick puts it back and ends the seat, with no tell**
+    /// (`wsp-597`): a session that has ended cannot hear one, and the ten minutes
+    /// waited on it were the whole of `compound-985`'s idle.
     #[test]
-    fn a_member_whose_agent_exited_is_told_and_the_run_is_told_with_no_verb_and_one_tick() {
+    fn a_member_whose_agent_exited_is_put_back_in_one_tick_with_no_tell_and_no_wait() {
         let (_env, store) = in_flight("gone");
 
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]), &mut Pass::new());
 
-        let told = member_told();
-        assert_eq!(told.len(), 1, "{told:?}");
-        assert_eq!(told[0].0, "m-1", "the member's own seat, not the governor's");
-        assert!(told[0].1.contains("wsp review m-1"), "{} — it is told how to finish", told[0].1);
-        let gov = governed();
-        assert_eq!(gov.len(), 1, "and the governing seat: {gov:?}");
-        assert!(gov[0].contains("m-1") && gov[0].contains("reads gone"), "{}", gov[0]);
-        assert!(
-            stamped().iter().any(|l| l.contains("nothing working on it")),
-            "and `cycle.log` says it, since the log is where the run's history is read"
-        );
+        assert!(member_told().is_empty(), "a gone seat cannot be told");
+        assert!(governed().is_empty(), "and nothing is told about a tell that was never sent");
+        assert_eq!(ended(), vec!["m-1".to_string()], "the seat is ended on the first tick");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo, "and the row is where a start can take it");
+        let said = stamped();
+        assert!(said.iter().any(|l| l.contains("m-1") && l.contains("cannot be told")), "{said:?}");
+        assert!(!said.iter().any(|l| l.contains("nothing working on it")), "no tell, so no line about one: {said:?}");
     }
 
-    /// A tick that finds it still gone does not tell twice, and does not end it
-    /// on the first sighting: the record on the member stops the second tell,
-    /// and the threshold is what ends it.
+    /// A seat gone is logged once, with what the host knows of how it ended, and
+    /// a second one inside five minutes is a burst that names both.
     #[test]
-    fn a_member_told_once_is_not_told_again_and_is_ended_only_past_the_threshold() {
-        let (_env, store) = in_flight("once");
-        let seats = Fake::new(&[("cpd-1", Some(State::Gone))]);
+    fn a_gone_seat_is_logged_once_and_a_second_inside_five_minutes_is_a_burst() {
+        let (_env, store) = scratch("gone-burst");
+        member(&store, "m-1", Status::Doing);
+        member(&store, "m-2", Status::Doing);
+        list(&store, &["m-1", "m-2"], "claude");
+        claim(&store, "m-1", "cpd-1");
+        claim(&store, "m-2", "cpd-2");
 
-        tick(&store, &seats, &mut Pass::new());
-        assert_eq!(member_told().len(), 1);
-        assert!(ended().is_empty(), "an agent that has just gone is told first, not ended");
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Gone)), ("cpd-2", Some(State::Working))]), &mut Pass::new());
+        let first = stamped();
+        assert_eq!(first.iter().filter(|l| l.contains("m-1 (cpd-1) reads gone — how it ended")).count(), 1, "{first:?}");
+        assert!(first.iter().any(|l| l.contains("exit status and signal")), "{first:?}");
+        assert!(!first.iter().any(|l| l.starts_with("burst:")), "one seat is not a burst: {first:?}");
 
-        tick(&store, &seats, &mut Pass::new());
-        assert!(member_told().is_empty(), "the marker on the member is what stops a second tell");
-        assert!(ended().is_empty());
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Gone)), ("cpd-2", Some(State::Gone))]), &mut Pass::new());
+        let second = stamped();
+        assert_eq!(second.iter().filter(|l| l.contains("m-1 (cpd-1) reads gone — how it ended")).count(), 0, "once per seat: {second:?}");
+        let burst: Vec<_> = second.iter().filter(|l| l.starts_with("burst:")).collect();
+        assert_eq!(burst.len(), 1, "{second:?}");
+        assert!(burst[0].contains("m-1 (cpd-1)") && burst[0].contains("m-2 (cpd-2)"), "both seats named: {}", burst[0]);
+    }
 
-        age_the_notice(&store, "m-1");
-        tick(&store, &seats, &mut Pass::new());
-        assert_eq!(
-            ended(),
-            vec!["m-1".to_string()],
-            "told once and still gone: the agent is ended and the run starts the member again"
-        );
+    /// A tick that finds a member idle still tells it first; only a gone seat
+    /// skips the tell.
+    #[test]
+    fn an_idle_member_still_gets_the_tell_first() {
+        let (_env, store) = in_flight("idle-first");
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "an idle seat can hear, and is told first");
+        assert!(ended().is_empty(), "told, not ended");
     }
 
     /// An agent sitting at a prompt with its row at `doing` is not gone — it is
@@ -4085,7 +4195,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
         let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
         assert!(
-            log.contains("nothing working on it"),
+            log.contains("reads gone"),
             "the file a governor reads for a run's history has to carry it: {log:?}"
         );
     }
@@ -4187,17 +4297,12 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         // still says `doing`, and every reading of the run agrees it is going.
         let going = Fake::new(&[("cpd-1", Some(State::Gone)), ("cpd-2", Some(State::Working))]);
         tick(&store, &going, &mut Pass::new());
-        assert_eq!(member_told().len(), 1, "the dead member is told first, once");
+        assert!(member_told().is_empty(), "a gone seat cannot hear a tell");
         assert!(barriers(&store).is_empty(), "and nothing is passed over it");
-
-        // Told once and still gone: the agent is ended and the claim released,
-        // and the run takes the member again on the same branch and tree.
-        age_the_notice(&store, "m-1");
-        tick(&store, &going, &mut Pass::new());
         assert_eq!(
             crate::cycle::tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()),
             vec!["m-1".to_string()],
-            "the agent that exited is ended"
+            "the agent that exited is ended on the first tick, and the run takes the member again on the same branch and tree"
         );
         store.clear_claim("m-1");
         store.clear_binding("cpd-1");

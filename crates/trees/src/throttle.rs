@@ -323,6 +323,16 @@ fn load_average() -> Option<(f64, f64, f64)> {
     parse_loadavg(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// The three load averages now (`wsp-597`: a seat's death is logged with them).
+pub fn load_avgs() -> Option<(f64, f64, f64)> {
+    load_average()
+}
+
+/// Percent of memory free now, as `memory_pressure` gives it.
+pub fn mem_free_now() -> Option<u32> {
+    mem_free()
+}
+
 /// The one-minute load average now.
 pub fn load1() -> Option<f64> {
     load_average().map(|l| l.0)
