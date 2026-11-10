@@ -412,16 +412,41 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         let others = if last > verdict.unwrap_or(0) { " (other members' verdicts came later)" } else { "" };
         if let Some(&(end, _)) = found.last() {
             let mut prev = first_from.max(0).min(from);
+            let begins: Vec<i64> = {
+                let mut at_least = prev;
+                found
+                    .iter()
+                    .map(|(e, line)| {
+                        let st = (e - run_seconds(line).unwrap_or(0)).max(at_least);
+                        at_least = *e;
+                        st
+                    })
+                    .collect()
+            };
             for (n, (e, line)) in found.iter().enumerate() {
-                let secs = run_seconds(line).unwrap_or(0);
-                let start = (e - secs).max(prev);
-                // The wait before the first run is the barrier's; what lies
-                // between a failed run and the next is the follow-up's own
-                // time, in no barrier phase (`wsp-568`).
-                if n == 0 && start > prev {
-                    out.push(Phase::gap(format!("last verdict → barrier {at} run started{others}"), prev, start, wait_name(i, prev, start, &who)).shared());
+                let start = begins[n];
+                // The wait before a run, from the last verdict, is the barrier's;
+                // what lies between a failed run and that wait is the follow-up's
+                // own time, in no barrier phase (`wsp-568`).
+                let waited_from = if n == 0 { prev } else { from.max(prev) };
+                if waited_from < start && (n == 0 || from < start) {
+                    out.push(Phase::gap(format!("last verdict → barrier {at} run started{others}"), waited_from, start, wait_name(i, waited_from, start, &who)).shared());
                 }
                 out.push(Phase::work(run_label(*at, line), start, *e).shared());
+                // A run that failed had its own check seat, before the next
+                // run: from its start to the line that settles the barrier
+                // (the follow-ups added), whether or not a row joined after.
+                if let Some(next) = begins.get(n + 1) {
+                    let is_seat = |l: &str| l.starts_with(&format!("spawn {list} --agent --check {at}")) || l.contains(&format!("barrier-run {at}")) || l.contains(&format!("started {list} · barrier {at}"));
+                    let up = i.first_line(*e, is_seat).filter(|b| b < next);
+                    let settled = up.and_then(|u| i.first_line(u, |l| l.contains(&format!("{list}: the check in ")) && l.contains("settled its barrier"))).filter(|d| d <= next);
+                    if let (Some(u), Some(d)) = (up, settled) {
+                        if u > *e {
+                            out.push(Phase::gap(format!("barrier {at} run ended → check seat started"), *e, u, wait_name(i, *e, u, &who)).shared());
+                        }
+                        out.push(Phase::work(format!("barrier {at} check seat → settled (follow-ups added)"), u, d).shared());
+                    }
+                }
                 prev = *e;
             }
             // A check seat after the run: its own wait, then its work.
@@ -1717,31 +1742,47 @@ mod tests {
         let ph = build(&i);
         let runs: Vec<(i64, i64)> = ph.iter().filter(|p| p.shared && p.label.starts_with("barrier 1 run (")).map(|p| (p.start, p.end)).collect();
         assert_eq!(runs, vec![(400, 1000), (1585, 1600)], "{ph:?}");
-        assert!(!ph.iter().any(|p| p.shared && p.start >= 1000 && p.end <= 1585), "the stretch between the runs is in no barrier phase: {ph:?}");
+        assert!(!ph.iter().any(|p| p.shared && p.start >= 1000 && p.start < 1500), "the stretch to the last verdict is in no barrier phase: {ph:?}");
     }
 
-    /// Signing's group 1 (`cycle.log`, 2026-11-08): the first barrier run failed
-    /// after 1242s (the run line at 19:53:12), a follow-up row was added and its
-    /// verdict came at 20:23:00, the second run was 9s (20:23:15). The offsets
-    /// are the log's, from the first verdict (19:32:00 = 380 here).
+    /// Signing's group 1 (`cycle.log`, 2026-11-08), line for line: the first
+    /// barrier run failed after 1242s (the run line at 19:53:12), its check seat
+    /// was spawned at 19:53:13 and settled the barrier at 19:55:13 (follow-up
+    /// wsp-531 added, started 19:55:06), wsp-531's verdict came at 20:23:00, the
+    /// second run was 9s (20:23:15), its check seat passed at 20:25:20. The
+    /// offsets are the log's, the first verdict (19:32:00) at 380 here.
     #[test]
-    fn signings_group_one_reads_the_failed_run_and_the_run_again_as_the_barrier() {
+    fn signings_group_one_reads_the_failed_run_and_its_check_seat_and_the_run_again_as_the_barrier() {
         let mut i = row();
         i.group = Some(("list".into(), 1, vec!["r-1".into(), "r-2".into()]));
         let at = |h: i64, m: i64, sec: i64| 380 + (h * 3600 + m * 60 + sec) - (19 * 3600 + 32 * 60);
         i.events.push(ev(at(20, 23, 0), "task-verified", json!({"id": "r-2"})));
         i.cycle.push((at(19, 53, 12), "list group 1: barrier run — 1 step(s), 0 reused, 1 ran, 1 failed, 1242s · per step: full 1241s · scope: full".into()));
+        i.cycle.push((at(19, 53, 13), "spawn list --agent --check 1 --kind claude --model sonnet --effort high".into()));
+        i.cycle.push((at(19, 54, 31), "tell list: Group 1's barrier in the list run holds, pending follow-ups: r-2. cpd-3834 added them to the group".into()));
+        i.cycle.push((at(19, 55, 13), "list: the check in cpd-3834 settled its barrier and its turn is over — ending it".into()));
         i.cycle.push((at(20, 23, 15), "list group 1: barrier run — 2 step(s), 1 reused, 1 ran, 0 failed, 9s · per step: help 8s · scope: full".into()));
+        i.cycle.push((at(20, 23, 15), "spawn list --agent --check 1 --kind claude --model sonnet --effort high".into()));
         i.cycle.push((at(20, 25, 20), "tell list: Barrier 1 of list passed".into()));
         let ph = build(&i);
         let runs: Vec<i64> = ph.iter().filter(|p| p.shared && p.label.starts_with("barrier 1 run (")).map(|p| p.seconds()).collect();
         assert_eq!(runs, vec![1242, 9], "{ph:?}");
-        let m = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), measured: false, ..Default::default() };
-        let g = crate::wallbuckets::group_wall(&[m], None, Some(at(20, 25, 20))).unwrap();
-        let shared: i64 = ph.iter().filter(|p| p.shared).map(|p| p.seconds()).sum();
-        assert_eq!(g.seconds("barrier_run"), shared, "the barrier's phases are the barrier's wall, the fix stretch between the runs is not: {g:?}");
-        assert!(g.seconds("barrier_run") >= 1242 + 9, "{g:?}");
-        assert!(g.seconds("working") + g.seconds("waiting") + g.seconds("serialised") >= at(20, 23, 0) - at(19, 53, 12), "the follow-up's stretch is the members': {g:?}");
+        let seats: Vec<i64> = ph.iter().filter(|p| p.shared && !p.gap && p.label.contains("check seat")).map(|p| p.seconds()).collect();
+        assert_eq!(seats, vec![120, 125], "the failed run's check seat as well as the last: {ph:?}");
+        // wsp-531 starts at 19:55:06 and works to its verdict.
+        let (s2, v2) = (at(19, 55, 6), at(20, 23, 0));
+        let r2 = crate::wallbuckets::MemberIn {
+            id: "r-2".into(),
+            spans: vec![crate::wallbuckets::Span { start: s2, end: s2 + 10, class: crate::wallbuckets::Class::Start }, crate::wallbuckets::Span { start: s2 + 10, end: v2, class: crate::wallbuckets::Class::Seat }],
+            ..Default::default()
+        };
+        let r1 = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), ..Default::default() };
+        let g = crate::wallbuckets::group_wall(&[r1, r2], None, Some(at(20, 25, 20))).unwrap();
+        eprintln!("AFTER {g:?}");
+        assert_eq!(g.seconds("barrier_run"), 30 + 1242 + 6 + 9, "wait to the run, the failed run, the wait to the run again, the run again: {g:?}");
+        assert_eq!(g.seconds("check_seat"), 1 + 120 + 125, "the failed run's seat (and the second before it was up), the last run's seat: {g:?}");
+        assert_eq!(g.seconds("serialised"), 0, "wsp-531 had started inside the failed run's check seat; nothing was held: {g:?}");
+        assert!(g.seconds("working") >= v2 - (s2 + 120) - 10, "the follow-up's stretch is the members': {g:?}");
         assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets sum to the wall");
     }
 
