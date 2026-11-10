@@ -5655,6 +5655,11 @@ const FOLLOWUP_MAX: usize = 4;
 ///   hold the open check row of the group being run. A member, a verifier and a
 ///   person at the CLI hold none. The governor still edits the list with the
 ///   composing verbs.
+/// - **Not a duplicate** (`wsp-565`). A row that an open one, or one landed
+///   since this check's tree was cut, already covers — the same failing test, a
+///   file the other's diff touched, a close title — is refused with that row
+///   named. `--anyway "why"` goes ahead, and the why is logged. See
+///   [`crate::duplicate`].
 /// - **Logged**, naming the check row that added them.
 pub fn followup(store: &Store, args: &Args) -> i32 {
     let mut here = rows_here(store);
@@ -5797,6 +5802,14 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
         }
     }
 
+    // `wsp-565`: a row that an open one, or one landed since this check's tree
+    // was cut, already covers is somebody's — `wsp-531` re-did `wsp-527`'s fix
+    // for 28 minutes of the list's wall. Refused unless `--anyway "why"`.
+    let anyway = match duplicates_of(store, &w, at, &row, &members, &tasks, args) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+
     let verdict = match words(args, args.rest.len()) {
         Ok(v) if !v.trim().is_empty() => v,
         Ok(_) => {
@@ -5822,12 +5835,62 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
     }
 
     let said = Said { verdict: &verdict, caption: &caption };
-    if on_hold {
+    let list = w.id.clone();
+    let code = if on_hold {
         followup_held(store, args, &w.id, at, &row, &members, said)
     } else if blocking {
         followup_blocking(store, args, &w.id, at, &row, &members, said)
     } else {
         followup_next(store, args, &w.id, at, &row, &members, said)
+    };
+    if let (0, Some(line)) = (code, anyway) {
+        log_anyway(store, &list, &row, &line);
+    }
+    code
+}
+
+/// `wsp-565`: the rows each of `members` duplicates, refused with the rows
+/// named unless `--anyway "why"`; then the line to log, naming what was
+/// overridden. `Ok(None)` is nothing found.
+fn duplicates_of(store: &Store, w: &Worklist, at: usize, row: &str, members: &[String], tasks: &[crate::model::Task], args: &Args) -> Result<Option<String>, i32> {
+    // The tree this check read, and the rows it is itself an answer to.
+    let since = w.groups().get(at - 1).and_then(crate::barrier::running).map(|c| c.at.clone());
+    let mut skip: Vec<String> = vec![row.to_string()];
+    skip.extend(members.iter().cloned());
+    let mut found: Vec<(String, crate::duplicate::Found)> = Vec::new();
+    for m in members {
+        let Some(t) = tasks.iter().find(|t| &t.id == m) else { continue };
+        let mut skip = skip.clone();
+        skip.extend(t.parent.clone());
+        for f in crate::duplicate::of(store, t, tasks, since.as_deref(), &skip) {
+            found.push((m.clone(), f));
+        }
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let named: Vec<String> = found.iter().map(|(m, f)| format!("{m} ~ {}", f.line())).collect();
+    match args.get("anyway").filter(|a| a != "true" && !a.trim().is_empty()) {
+        Some(why) => Ok(Some(format!("anyway: {} · {}", named.join("; "), why.split_whitespace().collect::<Vec<_>>().join(" ")))),
+        None => {
+            eprintln!("wsp: a follow-up already covered by a row in flight, or landed since this check's tree was cut:");
+            for n in &named {
+                eprintln!("     {n}");
+            }
+            eprintln!("     let that row finish, or `--anyway \"why\"` if this is a different piece of work (it is logged)");
+            Err(1)
+        }
+    }
+}
+
+/// The `--anyway` line, in the list's log, after the follow-up went through.
+fn log_anyway(store: &Store, list: &str, row: &str, line: &str) {
+    let saved = store.locked(|| -> Result<(), i32> {
+        let mut fresh = store.worklist(list).ok_or(1)?;
+        crate::log::note_to_list(store, &mut fresh, &format!("{FOLLOWUP} {row}: {line}")).map_err(|_| 1)
+    });
+    if saved.is_ok() {
+        store.git_commit(&format!("wsp: worklist {list} follow-up by {row} went ahead of a duplicate"));
     }
 }
 
@@ -8155,6 +8218,45 @@ mod tests {
         assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("blocking", "true"), ("from", &from)], &["cpd-9"]), 0);
         assert_eq!(checks_on(&store, 1)[0].state, crate::barrier::State::Blocking);
         assert_eq!(checks_ending(), vec!["cpd-9"]);
+    }
+
+    /// `wsp-565`: `wsp-531` re-did `wsp-527`'s fix because nothing at `followup`
+    /// looked for a row already on it. A follow-up that names a file or test an
+    /// open row covers is refused with that row named; a different file, or
+    /// `--anyway "why"`, goes through, and the why is logged.
+    #[test]
+    fn a_follow_up_for_work_an_open_row_already_covers_is_refused_unless_said_anyway() {
+        let _env = util::isolated("followup-dup");
+        let from = verdict("followup-dup", "holds, with a tail");
+        let cover = "Fix fixtures/help.txt so a_help_fixture_carries_the_new_retro_block passes.";
+        for (tag, mine, anyway) in [("refused", cover, None), ("other", "Fix fixtures/other.txt, which is another matter.", None), ("anyway", cover, Some("a different block"))] {
+            let store = at_barrier_one_seated(&format!("followup-dup-{tag}"));
+            row_with(&store, "wl-009", cover);
+            let mut open = store.task("wl-009").unwrap();
+            open.status_raw = "doing".into();
+            store.save_task(&open).unwrap();
+            let mut t = store.task("wl-003").unwrap();
+            crate::model::set_section_in(&mut t.body, "Overview", mine);
+            store.save_task(&t).unwrap();
+            let mut flags = vec![("blocking", "true"), ("from", from.as_str())];
+            if let Some(why) = anyway {
+                flags.push(("anyway", why));
+            }
+            let code = follow(&store, &["followup", "run", "wl-003"], &flags, &["cpd-9"]);
+            let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+            match tag {
+                "refused" => {
+                    assert_eq!(code, 1);
+                    assert!(!groups_of(&store, "run")[0].members.contains(&"wl-003".to_string()), "nothing attached");
+                    assert!(checks_ending().is_empty(), "and the check is still open");
+                }
+                "other" => assert_eq!(code, 0, "{log}"),
+                _ => {
+                    assert_eq!(code, 0, "{log}");
+                    assert!(log.contains("anyway: wl-003 ~ wl-009 (doing)") && log.contains("a different block"), "{log}");
+                }
+            }
+        }
     }
 
     /// `wsp-538`: the barrier owns the full suite, so a follow-up whose

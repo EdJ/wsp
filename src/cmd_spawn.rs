@@ -3037,7 +3037,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                     "{}{}",
                     crate::packet::order(t, crate::cmd_checkout::Flow::of_task(store, t)),
                     sent_back_note(store, t)
-                ),
+                ) + &crate::duplicate::moved_note(store, t, cwd.as_deref()),
             }),
             (Some(t), _) if piece_rec.is_some() => Some(crate::piece_seat::order_line(
                 t,
@@ -3055,7 +3055,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 handover(t, Handover::Spawned, route(how, laid)),
                 inherited(t, cwd.as_deref()),
                 sent_back_note(store, t)
-            )),
+            ) + &crate::duplicate::moved_note(store, t, cwd.as_deref())),
             (None, Some(p)) => Some(handover(p, Handover::of_seat(p), route(how, laid))),
             (None, None) => None,
         };
