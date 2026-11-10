@@ -6,7 +6,7 @@ in buckets, the biggest stalls, per-row spawn and idle figures) and attributes t
 wall to causes within 10 %.
 
 - `wsp retro <list> --packet` prints what the seat reads; `--check` says whether the list
-  is eligible. `wsp retro <list>` by hand starts one.
+  is eligible. `wsp retro <list>` (or `show`) reads the retro that ran and starts nothing; `wsp retro start <list> [--replaces ROW]` starts one by hand, and is refused over a retro row still open or at review unless named, and from a verifier seat.
 - `--no-retro` on a list (or `retro=off`) turns it off. One retro per clear, and only for lists big enough.
 - The seat files only through `wsp retro file|note|done`, at most 5 rows a run.
   A **defect** goes on the planned list `retro-N`; a **strategic** question goes on

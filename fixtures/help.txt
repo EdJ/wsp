@@ -693,8 +693,13 @@ WORKLISTS
   Every sentence here — a stop condition, a verdict, a reason to hold — takes
   `-` for a stream and `--from FILE` for a file, because a shell runs every
   backtick inside the double quotes a paragraph needs.
-  wsp retro <list> --packet|--check   the timing retro of a cleared list: its
-                                    packet, or whether it gets one and why not
+  wsp retro <list> | show <list>      the retro that ran on a cleared list: row, seat, the
+                                    `done` text, outputs; starts nothing
+  wsp retro <list> --packet|--check   its packet, or whether it gets a retro and why not
+  wsp retro start <list> [--replaces ROW]
+                                    start a retro by hand; refused while the list's retro
+                                    row is open or at review unless ROW names it, and
+                                    from a verifier seat
 
 PLUMBING
   wsp panel [--full]                the sidebar replacement (runs in a pane);
