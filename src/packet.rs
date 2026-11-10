@@ -335,7 +335,78 @@ fn inside(path: &str) -> bool {
 
 pub fn build(t: &Task, root: &Path) -> Result<String, String> {
     let Some(p) = of(t) else { return Err(format!("{} has no ## {SECTION} section", t.id)) };
-    render(&format!("# Packet · {} · {}\n", t.id, t.title), &p, root, &t.id, "")
+    let head = match owed(t) {
+        Some(owed) => format!("# Packet · {} · {}\n\n{owed}\n## The original brief\nWhat the row first asked, for what it names. Whatever of it already landed is done.\n", t.id, t.title),
+        None => format!("# Packet · {} · {}\n", t.id, t.title),
+    };
+    render(&head, &p, root, &t.id, "")
+}
+
+/// Bytes of the owed block: the newest reason is always in (cut to this if it
+/// has to be), older ones follow while they fit.
+const OWED_CAP: usize = 4_000;
+
+/// What a reopened row is owed, to open its packet (`compounding-220`).
+///
+/// **The packet is saved once and the row's story moves on.** A packet is the
+/// overview and the files it names, generated at the row's first spawn and kept;
+/// `wsp reopen <id> "what is owed"` writes its reason to the row's log and to a
+/// pane, and a seat that is re-seated afterwards (`wsp-304`) is told to read the
+/// packet and nothing else. So the second seat of compounding-189 read the first
+/// brief, re-reported a commit that had landed, and the verifier blocked it
+/// again — the reason sat in the log, one verb away, unread. Read from the log
+/// at every print, then, so no one rewrites an overview by hand for it.
+///
+/// The `sent back:` lines of the row's log, newest first — a reopen's, a
+/// verifier's block, a failed check's — under a heading that says this is what is
+/// owed and that an earlier landed commit is not it. Only while the row is at
+/// `doing`: a row nobody sent back, or one that has gone back to review, is
+/// printed as it always was.
+pub fn owed(t: &Task) -> Option<String> {
+    if t.status() != crate::model::Status::Doing {
+        return None;
+    }
+    let log = t.section("Log").unwrap_or_default();
+    let mut reasons: Vec<(String, String)> = log
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .filter_map(|l| {
+            let (stamp, said) = match l.split_once(' ') {
+                Some((stamp, said)) if util::is_stamp(stamp) => (stamp.get(..10).unwrap_or(stamp).to_string(), said),
+                _ => (String::new(), l),
+            };
+            let why = said.strip_prefix(crate::cycle::SENT_BACK)?.trim();
+            (!why.is_empty()).then(|| (stamp, why.to_string()))
+        })
+        .collect();
+    if reasons.is_empty() {
+        return None;
+    }
+    reasons.reverse();
+    let mut out = String::from(
+        "## What is owed now\n\
+         This row was reopened. What follows is what is owed, newest first, and it is the work: \
+         a commit already on this row is not it, so do not redo or re-report one — \
+         read `git log` and do only what is named here.\n\n",
+    );
+    let mut used = 0;
+    for (n, (stamp, why)) in reasons.iter().enumerate() {
+        let line = match stamp.is_empty() {
+            true => format!("{}. {why}\n", n + 1),
+            false => format!("{}. ({stamp}) {why}\n", n + 1),
+        };
+        if n > 0 && used + line.len() > OWED_CAP {
+            out.push_str(&format!("({} older send-back(s) are in `wsp show {} --log`)\n", reasons.len() - n, t.id));
+            break;
+        }
+        let line = match line.len() > OWED_CAP {
+            true => format!("{}\n", util::truncate(line.trim_end(), OWED_CAP)),
+            false => line,
+        };
+        used += line.len();
+        out.push_str(&line);
+    }
+    Some(out)
 }
 
 /// What a packet that names a `cargo test` says of how much to run (`wsp-389`):
@@ -521,7 +592,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     with one and the short start unless `--no-packet`;
                                     `--leg NAME` prints that leg's packet (an order line
                                     `packet: FILE`, or `wsp leg add … --packet FILE`), which
-                                    also starts the leg short"##,
+                                    also starts the leg short; a row sent back (`wsp reopen`) has
+                                    its `sent back:` reasons printed first, newest first, under
+                                    "What is owed now""##,
             },
         ],
     },
@@ -613,6 +686,53 @@ mod tests {
         assert!(out.contains("## src/a.rs\n```\nfn a() {}\n```"));
         assert!(out.find("Save prints ok").unwrap() < out.find("## src/a.rs").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `compounding-220`: the second seat of a reopened row read the first
+    /// brief and re-reported a commit that had landed. The packet opens with
+    /// what is owed, newest first, read from the log, before the original brief.
+    #[test]
+    fn a_reopened_rows_packet_opens_with_what_is_owed_newest_first_before_the_original_brief() {
+        let dir = std::env::temp_dir();
+        let mut t = row("Add the flag.");
+        t.set_status(crate::model::Status::Doing);
+        t.body.push_str("\n## Log\n- 2026-11-08 sent back: the first gap\n- 2026-11-08 review: fixed it\n- 2026-11-09T07:48:00Z sent back: the verifier blocked at 53f9831: wire the second half\n- 2026-11-09 claimed by pane cpd-9\n");
+        let out = build(&t, &dir).unwrap();
+        let (owed_at, brief_at) = (out.find("## What is owed now").expect(&out), out.find("Add the flag.").unwrap());
+        assert!(owed_at < brief_at && out.starts_with("# Packet · t-1 · Add a flag\n"), "{out}");
+        assert!(out.contains("not it"), "it says an earlier landed commit is not the work: {out}");
+        let (new, old) = (out.find("wire the second half").unwrap(), out.find("the first gap").unwrap());
+        assert!(new < old && new < brief_at, "newest first: {out}");
+        assert!(out.contains("(2026-11-09) the verifier blocked"), "{out}");
+    }
+
+    #[test]
+    fn a_row_not_sent_back_or_back_at_review_prints_as_it_always_did() {
+        let dir = std::env::temp_dir();
+        let plain = build(&row("Add the flag."), &dir).unwrap();
+        assert_eq!(plain, "# Packet · t-1 · Add a flag\n\nAdd the flag.\n");
+        let mut t = row("Add the flag.");
+        t.body.push_str("\n## Log\n- 2026-11-08 sent back: the first gap\n");
+        t.set_status(crate::model::Status::Review);
+        assert_eq!(build(&t, &dir).unwrap(), plain, "answered: at review");
+        t.set_status(crate::model::Status::Doing);
+        t.body = t.body.replace("sent back: the first gap", "claimed by pane x");
+        assert_eq!(build(&t, &dir).unwrap(), plain, "doing, never sent back");
+    }
+
+    #[test]
+    fn the_owed_block_is_bounded_and_the_newest_reason_always_survives() {
+        let mut t = row("x");
+        t.set_status(crate::model::Status::Doing);
+        let mut log = String::from("\n## Log\n");
+        for i in 0..20 {
+            log.push_str(&format!("- 2026-11-09 sent back: reason number {i} {}\n", "y".repeat(800)));
+        }
+        t.body.push_str(&log);
+        let out = owed(&t).unwrap();
+        assert!(out.len() < OWED_CAP + 1_000, "{}", out.len());
+        assert!(out.contains("reason number 19") && !out.contains("reason number 0 "), "{out}");
+        assert!(out.contains("older send-back(s) are in `wsp show t-1 --log`"), "{out}");
     }
 
     #[test]

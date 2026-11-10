@@ -5253,6 +5253,29 @@ pub(crate) mod tests {
         );
     }
 
+    /// `compounding-220`: the packet generated for the second seat of a
+    /// reopened row starts with the reopen's reason, before the original
+    /// overview. compounding-189's second seat re-reported a landed commit
+    /// because its packet carried only the first brief.
+    #[test]
+    fn the_packet_of_a_reopened_rows_second_seat_opens_with_the_reopen_reason() {
+        let store = scratch("reopenpacket");
+        released(&store, "m-1", "claimed by pane cpd-1306 · spawned at sonnet/high");
+        let mut t = store.find_task("m-1").unwrap();
+        crate::model::set_section_in(&mut t.body, "Overview", "Wire the first half.");
+        crate::model::set_section_in(&mut t.body, crate::packet::SECTION, "Wire the first half.");
+        store.save_task(&t).unwrap();
+
+        assert_eq!(reopen(&store, &Args::synth("reopen", &["m-1", "the second half is what is owed"], &[])), 0);
+        assert_eq!(reseated().len(), 1, "a second seat is started");
+
+        let t = store.find_task("m-1").unwrap();
+        let out = crate::packet::build(&t, &std::env::temp_dir()).unwrap();
+        let (owed, original) = (out.find("the second half is what is owed").expect(&out), out.find("Wire the first half.").unwrap());
+        assert!(owed < original, "the reason comes first: {out}");
+        assert!(crate::packet::at_spawn(&store, Some("m-1"), true, false, false, true).is_some_and(|n| n as usize == out.len()));
+    }
+
     /// An opencode model has a `/` of its own, and an unstated half stays
     /// unstated; with no session learned the kind is the default.
     #[test]
