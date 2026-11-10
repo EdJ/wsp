@@ -380,25 +380,52 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         // longest of those that end together began first, and is the run.
         let who = format!("{list} · barrier {at}");
         let head = format!("{list} group {at}: barrier run — ");
+        // Every run of the group, not only the one after the last verdict: a
+        // run that failed, a fix row's verdict, and the run after it are all
+        // the barrier's wall (`wsp-568`). No run precedes the first verdict.
+        let first_from = members
+            .iter()
+            .filter_map(|m| i.kind("task-verified", m).into_iter().map(|(t, _)| t).min())
+            .min()
+            .unwrap_or(from)
+            .min(from);
         let mut runs: Vec<(i64, &str)> = Vec::new();
-        for (t, l) in i.cycle.iter().filter(|(t, l)| *t >= from && l.contains(&head)) {
+        for (t, l) in i.cycle.iter().filter(|(t, l)| *t >= first_from && l.contains(&head)) {
             runs.extend(l.split(&head).skip(1).map(|seg| (*t, seg)));
         }
-        let first_end = runs.first().map(|(t, _)| *t);
-        let run = runs
-            .iter()
-            .filter(|(t, _)| first_end.is_some_and(|f| *t <= f + 120))
-            .max_by_key(|(_, seg)| run_seconds(seg).unwrap_or(0))
-            .copied();
+        // Copies of a run share one line of the log, or follow one another; the
+        // longest of those that end together began first, and is the run.
+        let mut found: Vec<(i64, &str)> = Vec::new();
+        let mut k = 0;
+        while k < runs.len() {
+            let f = runs[k].0;
+            let mut n = k;
+            while n < runs.len() && runs[n].0 <= f + 120 {
+                n += 1;
+            }
+            if let Some(r) = runs[k..n].iter().max_by_key(|(_, seg)| run_seconds(seg).unwrap_or(0)).copied() {
+                found.push(r);
+            }
+            k = n;
+        }
         let pass = i.first_line(from, |l| l.starts_with(&format!("tell {list}: Barrier {at} of {list}")));
         let others = if last > verdict.unwrap_or(0) { " (other members' verdicts came later)" } else { "" };
-        if let Some((end, line)) = run {
-            let secs = run_seconds(line).unwrap_or(0);
-            let start = (end - secs).max(from);
-            if start > from {
-                out.push(Phase::gap(format!("last verdict → barrier {at} run started{others}"), from, start, wait_name(i, from, start, &who)).shared());
+        if let Some(&(end, _)) = found.last() {
+            let mut prev = first_from.max(0).min(from);
+            for (n, (e, line)) in found.iter().enumerate() {
+                let secs = run_seconds(line).unwrap_or(0);
+                let start = (e - secs).max(prev);
+                if start > prev {
+                    let label = if n == 0 {
+                        format!("last verdict → barrier {at} run started{others}")
+                    } else {
+                        format!("barrier {at} run failed → run again started")
+                    };
+                    out.push(Phase::gap(label, prev, start, wait_name(i, prev, start, &who)).shared());
+                }
+                out.push(Phase::work(run_label(*at, line), start, *e).shared());
+                prev = *e;
             }
-            out.push(Phase::work(run_label(*at, line), start, end).shared());
             // A check seat after the run: its own wait, then its work.
             let seat = req.or(seat_up).filter(|b| *b >= end);
             if let Some(b) = seat {
@@ -1679,6 +1706,20 @@ mod tests {
         assert!(ph.iter().any(|p| p.label.starts_with("barrier 1 run ended → passed") && p.seconds() == 10), "{ph:?}");
         let unnamed: i64 = ph.iter().filter(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with("nothing the logs"))).map(|p| p.seconds()).sum();
         assert_eq!(unnamed, 0);
+    }
+
+    #[test]
+    fn a_failed_barrier_run_before_a_follow_up_members_verdict_is_still_the_barriers_wall() {
+        let mut i = row();
+        i.group = Some(("list".into(), 1, vec!["r-1".into(), "r-2".into()]));
+        i.events.push(ev(1500, "task-verified", json!({"id": "r-2"})));
+        i.cycle.push((1000, "list group 1: barrier run — 2 step(s), 0 reused, 1 ran, 1 failed, 600s · per step: test 600s".into()));
+        i.cycle.push((1600, "list group 1: barrier run — 2 step(s), 2 reused, 0 ran, 0 failed, 15s".into()));
+        i.cycle.push((1610, "tell list: Barrier 1 of list passed".into()));
+        let ph = build(&i);
+        let runs: Vec<(i64, i64)> = ph.iter().filter(|p| p.shared && p.label.starts_with("barrier 1 run (")).map(|p| (p.start, p.end)).collect();
+        assert_eq!(runs, vec![(400, 1000), (1585, 1600)], "{ph:?}");
+        assert!(ph.iter().any(|p| p.gap && p.shared && p.start == 1000 && p.end == 1585), "{ph:?}");
     }
 
     #[test]
