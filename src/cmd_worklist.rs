@@ -6550,8 +6550,8 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
     // And the trees of its members that are closed, where their work is on the
     // trunk (`wsp-305`): no barrier will sweep them now. After the run's seats
     // are ended, so a claim that just went does not keep one.
-    // And the rest of what the list left (`wsp-548`): its check trees, the warm
-    // trees of a project nothing else is on, and the trees and scratch of its
+    // And the rest of what the list left (`wsp-548`): its check trees
+    // (the warm trees stay, `wsp-576`), and the trees and scratch of its
     // closed members in every root of their project.
     let swept = sweep_completed(store, &mut w, &groups);
     crate::cycle::tell_above(

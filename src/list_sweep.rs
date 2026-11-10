@@ -13,15 +13,17 @@
 //! 1. the list's check trees, `<root>/.worktrees/<list>-check-<N>`, on
 //!    [`check_tree`]'s rule (nobody standing in one, nothing in one beyond
 //!    build output);
-//! 2. the warm trees under `checks/` and `barrier/` of each project the list
-//!    touched, when no other list that has not ended names that project, nobody
-//!    holds the tree's lock and nobody stands in it: the next check pays one
-//!    cold build for it;
-//! 3. the trees of its members that are closed (`done`, or landed and verified),
+//! 2. the trees of its members that are closed (`done`, or landed and verified),
 //!    in **every root of the member's project**, on `sweep_closed`'s rule: the
 //!    branch stays, and a tree somebody stands in, one with uncommitted work
 //!    and one whose branch the trunk lacks is named and not touched;
-//! 4. the scratch of those members (`wsp-546`).
+//! 3. the scratch of those members (`wsp-546`).
+//!
+//! The shared warm trees, `checks/<project>-<repo>/tree` and
+//! `barrier/<project>-<repo>/tree`, are left standing (`wsp-576`): they make the
+//! next list's first check and first barrier incremental, and a cold first
+//! check cost 768s against 20 to 95s warm. Only a check holding nothing beyond
+//! build output is ever taken, and only per-row.
 //!
 //! and says `swept: N trees, M GB by df` on the list, with the volume's free
 //! space read before and after, and each tree it spared with why.
@@ -30,7 +32,6 @@
 //! across every project root.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use crate::check_tree;
 use crate::cmd_checkout::{self, Tree};
@@ -98,16 +99,7 @@ pub(crate) fn complete(
     projects.sort();
     projects.dedup();
 
-    // 2. the warm trees of projects no other list is on.
-    for project in &projects {
-        if let Some(other) = other_list_on(store, &w.id, project) {
-            out.kept.push(format!("kept the warm check trees of {project}: {other} is still on it"));
-            continue;
-        }
-        warm_trees(store, project, standing, &mut out);
-    }
-
-    // 3. the closed members' trees, in each root of their project.
+    // 2. the closed members' trees, in each root of their project.
     let tasks = store.tasks();
     let closed: Vec<String> = members
         .iter()
@@ -128,7 +120,7 @@ pub(crate) fn complete(
         out.kept.push(format!("branch {b} kept — it has commits the trunk has not"));
     }
 
-    // 4. their scratch.
+    // 3. their scratch.
     let owned = store.state.join("scratch");
     for f in crate::scratch::find(store).into_iter().filter(|f| f.dir.starts_with(&owned) && closed.contains(&f.row)) {
         crate::scratch::remove(&f);
@@ -137,56 +129,6 @@ pub(crate) fn complete(
 
     out.free = before.zip(crate::disk::free_at(&store.state));
     out
-}
-
-/// A list other than `list` that has not ended and has a member in `project`.
-fn other_list_on(store: &Store, list: &str, project: &str) -> Option<String> {
-    store
-        .worklists()
-        .into_iter()
-        .filter(|o| o.id != list && matches!(o.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked))
-        .find(|o| {
-            o.groups().iter().flat_map(|g| g.members.iter()).any(|m| store.task(m).and_then(|t| t.project).as_deref() == Some(project))
-        })
-        .map(|o| o.id)
-}
-
-/// The warm `tree` of `checks/<project>-<repo>` and `barrier/<project>-<repo>`
-/// for each repository the project names, taken unless its lock is held or
-/// somebody stands in it.
-fn warm_trees(store: &Store, project: &str, standing: &dyn Fn(&Path) -> Option<String>, out: &mut Swept) {
-    let Some(p) = store.projects().into_iter().find(|p| p.name == project) else { return };
-    let mut seen = std::collections::BTreeSet::new();
-    for repo in p.roots.iter().filter_map(|r| check_tree::repo_of(r)) {
-        let Some(name) = repo.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
-        for area in ["checks", "barrier"] {
-            let dir = store.state_file(area).join(format!("{project}-{name}"));
-            if !seen.insert(dir.clone()) || !dir.join("tree/.git").exists() {
-                continue;
-            }
-            take_warm(&repo, &dir, standing, out);
-        }
-    }
-}
-
-fn take_warm(repo: &Path, dir: &Path, standing: &dyn Fn(&Path) -> Option<String>, out: &mut Swept) {
-    let tree: PathBuf = dir.join("tree");
-    let path = util::contract(&tree);
-    if let Some(why) = standing(&tree) {
-        out.kept.push(format!("kept warm tree {path}: {why}"));
-        return;
-    }
-    // Held across the removal, so a check that starts now waits and then finds
-    // no tree and makes one.
-    let Ok(_lock) = crate::check::TreeLock::take(dir.join("lock"), Duration::ZERO) else {
-        out.kept.push(format!("kept warm tree {path}: a check holds its lock"));
-        return;
-    };
-    cmd_checkout::remove(repo, &tree);
-    match tree.exists() {
-        true => out.kept.push(format!("kept warm tree {path}: it would not go")),
-        false => out.trees.push(path),
-    }
 }
 
 /// [`complete`] with the live backends, said on the list's log and in
@@ -302,6 +244,33 @@ mod tests {
         assert!(out.line().starts_with("swept: 4 trees, "), "{}", out.line());
         assert!(out.line().ends_with(" by df"), "{}", out.line());
         assert!(complete(&store, &w, &free, &nobody).nothing(), "the second sweep found something");
+    }
+
+    /// `wsp-576`: the shared warm trees of `checks/` and `barrier/` outlive the
+    /// list, with their `target/`; its check tree and members' trees go.
+    #[test]
+    fn a_completed_list_leaves_the_warm_check_and_barrier_trees() {
+        let (_env, store, roots) = world();
+        let check = tree(&roots[0], "run-check-1");
+        let member = tree(&roots[0], "p-001");
+        let mut warm = Vec::new();
+        for area in ["checks", "barrier"] {
+            let dir = store.state_file(area).join("p-a");
+            std::fs::create_dir_all(&dir).unwrap();
+            let t = dir.join("tree");
+            run(&roots[0], &["worktree", "add", "--quiet", "--detach", &t.display().to_string(), "master"]);
+            std::fs::create_dir_all(t.join("target/debug")).unwrap();
+            std::fs::write(t.join("target/debug/artefact"), "built\n").unwrap();
+            warm.push(t);
+        }
+        let w = store.worklist("run").unwrap();
+        let out = complete(&store, &w, &free, &nobody);
+        for t in &warm {
+            assert!(t.join(".git").exists() && t.join("target/debug/artefact").exists(), "{} was taken", t.display());
+        }
+        assert!(!check.exists() && !member.exists(), "a finished tree is still there");
+        assert!(out.trees.iter().all(|p| !p.contains("/tree")), "{:?}", out.trees);
+        assert!(out.line().ends_with(" by df"), "{}", out.line());
     }
 
     /// A dirty tree and an occupied one are named and not touched, and the rest
