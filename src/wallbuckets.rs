@@ -131,11 +131,14 @@ pub(crate) fn seat_idle_reasons<'a>(waits: impl Iterator<Item = (&'a str, i64)>)
     out
 }
 
-/// The waiting cause for the stretch from a group's last barrier run (or, where
-/// it has none, its last member) to its pass.
-pub(crate) const PASS_WAIT: &str = "the barrier done, the pass not yet given";
+/// The waiting cause for the stretch from a group's last barrier run and check
+/// seat to its pass, where a barrier ran.
+pub(crate) const PASS_WAIT: &str = "waiting for the pass (the barrier done, the pass not yet given)";
+/// The same where the group has no barrier span (a manual group): none ran, the
+/// pass is given by a person.
+pub(crate) const PASS_WAIT_MANUAL: &str = "waiting for the pass (manual group: no barrier ran, the pass not yet given)";
 
-pub(crate) const BUCKETS:[&str; 6] = ["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups"];
+pub(crate) const BUCKETS: [&str; 6] = ["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups"];
 
 /// One group's wall by bucket, and what the waiting and the barrier were.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -213,6 +216,7 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
     // up to the pass; elsewhere the members', which includes the stretch
     // between a failed run and the next, a follow-up row's own time (`wsp-568`).
     let barrier = merge(&shared.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>());
+    let pass_wait = if shared.iter().any(|s| s.class == Class::Barrier) { PASS_WAIT } else { PASS_WAIT_MANUAL };
     let last_barrier = barrier.last().map_or(barrier_from, |b| b.1);
     let mut cuts: Vec<i64> = vec![first, barrier_from, close, last_barrier];
     for s in &shared {
@@ -238,7 +242,7 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
             // (a manual group's is given by a person), so it is not the
             // barrier's run (`wsp-568` booked it there).
             add(&mut g, "waiting", b - a);
-            *g.waits.entry((String::new(), PASS_WAIT.into())).or_insert(0) += b - a;
+            *g.waits.entry((String::new(), pass_wait.into())).or_insert(0) += b - a;
             continue;
         }
         if within(&barrier, a) {

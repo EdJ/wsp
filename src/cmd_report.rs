@@ -349,7 +349,17 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         }
         group_starts.push((gstart, glast));
         let open = if gi == 0 { None } else { passes.get(&(gi as u64)).copied() };
-        walls.push(crate::wallbuckets::group_wall(&sweep, open, passes.get(&(gi as u64 + 1)).copied()));
+        let mut gw = crate::wallbuckets::group_wall(&sweep, open, passes.get(&(gi as u64 + 1)).copied());
+        // The wait for the pass is named by its group, so that two groups' waits
+        // are two lines, and says whether a barrier ran or the group is manual.
+        if let Some(g) = gw.as_mut() {
+            let waits = std::mem::take(&mut g.waits);
+            for ((row, cause), s) in waits {
+                let cause = if cause == crate::wallbuckets::PASS_WAIT || cause == crate::wallbuckets::PASS_WAIT_MANUAL { format!("group {}: {cause}", gi + 1) } else { cause };
+                *g.waits.entry((row, cause)).or_insert(0) += s;
+            }
+        }
+        walls.push(gw);
         let gcost = cost["groups"].get(gi).and_then(|c| c.get("total")).cloned().unwrap_or(Value::Null);
         // How the group's barrier was scoped, against a full run (`wsp-431`).
         let note = crate::scope::Note::read(store, &w.id, gi + 1);
@@ -375,13 +385,15 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let wall = if end > start { end - start } else { 0 };
     // The buckets tile the windows from the first group's open to the last
     // pass, which runs past the last member's verdict where a pass is given
-    // late (a manual group's, by a person), so the wall they are held to
-    // reaches it too.
+    // late (a manual group's, by a person). The list's wall is that stretch:
+    // `wall_seconds` here and in the buckets is one figure, first spawn to the
+    // last pass; `last_verdict_wall_seconds` is the stretch to the last verdict.
     let reach = {
         let (lo, hi) = walls.iter().flatten().fold((i64::MAX, 0i64), |(lo, hi), g| (lo.min(g.open), hi.max(g.close)));
         if hi > lo { hi - lo } else { 0 }
     };
-    let wall_buckets = wall_buckets_json(&walls, &group_json, wall.max(reach));
+    let list_wall = wall.max(reach);
+    let wall_buckets = wall_buckets_json(&walls, &group_json, list_wall);
     let gov = governor_wall(store, &w.id, &group_starts);
     for (gi, gj) in group_json.iter_mut().enumerate() {
         gj["governor_wall"] = gov.get(gi).and_then(|x| x.as_ref()).map_or(Value::Null, GovWall::json);
@@ -409,7 +421,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "time": "per member row, spawn to verdict (wall, gaps); the seat's model and tool time are its own transcript calls inside those phases, legs only where run-leg timings exist",
         },
         "totals": {
-            "wall_seconds": wall,
+            "wall_seconds": list_wall,
             "model_seconds": model,
             "tool_seconds": tools,
             "tool_seconds_total": tool_total,
@@ -454,6 +466,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         "conditions": { "load": "missing: the record carries no load figure", "thermals": "missing: the record carries no thermal figure" },
         "cost": cost,
     });
+    v["totals"]["last_verdict_wall_seconds"] = json!(wall);
     if let Some(b) = baseline {
         v["baseline"] = against(&v, b);
     }
@@ -733,7 +746,8 @@ pub fn effort_html(v: &Value) -> String {
     b.push_str(&table(
         &["figure", "value"],
         &[
-            vec!["wall (first spawn to last verdict)".into(), hms(n(t, "wall_seconds") as i64)],
+            vec!["wall (first spawn to last pass)".into(), hms(n(t, "wall_seconds") as i64)],
+            vec!["of it, first spawn to last verdict".into(), hms(n(t, "last_verdict_wall_seconds") as i64)],
             vec!["model time".into(), hms(n(t, "model_seconds") as i64)],
             vec!["tool time".into(), format!("{} ({})", hms(n(t, "tool_seconds_total") as i64), if tool_kinds.is_empty() { "none read".into() } else { tool_kinds.join(", ") })],
             vec!["idle (wall under neither model nor tool, per row)".into(), hms(n(t, "idle_seconds") as i64)],
@@ -1482,5 +1496,62 @@ mod tests {
         assert!(named.iter().any(|x| x["bucket"] == "barrier_run" && x["seconds"] == 900), "{b}");
         let html = effort_html(&v);
         assert!(html.contains("Where the wall went") && html.contains("r-2"), "the report prints the buckets and names the stall");
+    }
+
+    #[test]
+    fn a_manual_groups_wait_for_its_pass_is_named_and_the_list_has_one_wall_to_that_pass() {
+        use crate::timeline::RowFigures;
+        use crate::wallbuckets::{Class, Span};
+        let (_e, store, _w) = list("passwait", &["r-1"]);
+        store.save_task(&Task::new("r-2", "r-2")).unwrap();
+        assert_eq!(run(&store, &["add", "passwait", "r-2"], &[]), 0);
+        assert_eq!(run(&store, &["group", "passwait", "2"], &[("agent", "manual")]), 0);
+        let w = store.worklist("passwait").unwrap();
+        assert_eq!(w.groups().len(), 2);
+        let t0: i64 = 1_000_000_000;
+        // Group 1 passes at 110; the last member (group 2, manual) lands at 300
+        // and the person gives the pass 37 minutes later, at 2520.
+        let ev = |at: i64, n: u64| json!({ "ts": util::iso_at(t0 + at), "kind": "worklist-go", "data": { "id": "passwait", "passed": n, "started": false } }).to_string();
+        std::fs::write(store.state_file("events.jsonl"), format!("{}\n{}\n", ev(110, 1), ev(2520, 2))).unwrap();
+        let sp = |a: i64, b: i64, class| Span { start: t0 + a, end: t0 + b, class };
+        let fig = |id: &str| {
+            if id == "r-1" {
+                RowFigures {
+                    start: t0,
+                    end: t0 + 110,
+                    wall: 110,
+                    spans: vec![sp(0, 10, Class::Start), sp(10, 100, Class::Seat), sp(100, 107, Class::Barrier), sp(107, 110, Class::Check)],
+                    active: vec![(t0 + 10, t0 + 100)],
+                    measured: true,
+                    ..Default::default()
+                }
+            } else {
+                RowFigures {
+                    start: t0 + 120,
+                    end: t0 + 300,
+                    wall: 180,
+                    spans: vec![sp(120, 130, Class::Start), sp(130, 300, Class::Seat)],
+                    active: vec![(t0 + 130, t0 + 300)],
+                    measured: true,
+                    ..Default::default()
+                }
+            }
+        };
+        let v = effort_with(&store, &w, None, &fig);
+        let t = &v["totals"];
+        let b = &t["wall_buckets"];
+        assert_eq!(t["wall_seconds"], 2520, "first spawn to the last pass: {t}");
+        assert_eq!(t["last_verdict_wall_seconds"], 300);
+        assert_eq!(b["wall_seconds"], t["wall_seconds"], "one wall for the list");
+        assert_eq!(b["attributed_seconds"], b["wall_seconds"], "{b}");
+        assert_eq!(b["unattributed_seconds"], 0);
+        assert_eq!(v["groups"][1]["wall_buckets"]["barrier_run_seconds"], 0, "a manual group ran no barrier");
+        assert_eq!(b["barrier_run_seconds"], 7, "group 1's one barrier run");
+        let cause = "group 2: waiting for the pass (manual group: no barrier ran, the pass not yet given)";
+        let wait = b["waiting_by_cause"].as_array().unwrap().iter().find(|x| x["cause"] == cause).unwrap_or_else(|| panic!("{b}"));
+        assert_eq!(wait["seconds"], 2220);
+        assert!(b["named"].as_array().unwrap().iter().any(|x| x["group"] == 2 && x["seconds"] == 2220 && x["what"].as_str().unwrap().contains("manual group")), "{b}");
+        let html = effort_html(&v);
+        assert!(html.contains("first spawn to last pass") && html.contains("42m"), "the report prints the one wall");
     }
 }
