@@ -528,13 +528,13 @@ is `scripts/far-setup.sh`. It is run first by hand with Ed (group 1) and later b
   `~/Library/Caches/ms-playwright`.
 - **Rust `target/`.** It stays warm per project under `CARGO_TARGET_DIR=<exec_dir>/
   target/<project>` (section 6) if a heavy row builds Rust. The web-chrome box
-  checks do not, so this is warmed only if the trial shows a need.
+  checks do not, so this is warmed only if the early proof shows a need.
 - **The claude token.** This is section 8's token, already in place for agent-029.
   The check is a headless `claude -p` that answers.
 - **Goldens and screenshot baselines (react-goldens).** C7 said the baselines are
   this Mac's WebKit. The i5 runs a different GPU and maybe a different macOS, so
   a pixel compare there may fail on rendering alone. The recommendation, until
-  the trial compares one golden on both machines: a row whose checks compare
+  the early proof compares one golden on both machines: a row whose checks compare
   screenshots against goldens is **not heavy**. Its `checks` matcher excludes
   `goldens`, and the golden compare runs here. Whether the i5 gets its own
   baselines is a block.
@@ -543,24 +543,34 @@ is `scripts/far-setup.sh`. It is run first by hand with Ed (group 1) and later b
   on any miss. `machine check` runs it over ssh and marks the machine **connected
   but not ready (heavy: <first miss>)**, which is section 7's state with a reason.
 
-### 11.5 A hands-on trial before automation
+### 11.5 A scripted early proof, and a scripted full one
 
-Group 1 of the build is manual, for Ed and the primary seat. First, the setup of
-11.4 is done by hand and written down as the script. Then one heavy row (a
-components-split group-4 member, or a react-pass-4 member) is placed by hand
-with `wsp spawn <row> --on eds-macbook-i5`. Its verifier is placed there too, by
-`spawn --verify --on` if that works today, and otherwise by running its checks
-by hand in the far tree. The trial measures:
+Remote-agents' live proof came last and needed a person at the far machine. It
+ran five times over 3.5 days, and each run found a defect that became a fix row
+(17 in all); the days between runs were 80 % of that list's wall. The rule for
+any plan that touches a far machine (Ed, 2026-11-10): **the live proof is
+scripted from the start, and a small one runs early.** The one thing that stays
+hands-on is the one-time setup.
 
-- spawn to review, and review to verdict;
-- copy-up and copy-back seconds and bytes, with and without the `cp -c` clone;
-- the i5's load and memory during the row (`vm_stat`, swap, load every 30 s);
-- this Mac's load with and without the row here (a local twin, wsp-422's
-  pairing);
-- one golden compared on both machines (11.4).
-
-Only after that is the run's placement turned on, for one list (the last
-group).
+- **Setup, by hand (group 1).** 11.4 is done once with Ed and written down as
+  `scripts/far-setup.sh --check`. Nothing else in the list needs a person at
+  the i5.
+- **The early proof (group 2, agent-042).** Right after the setup, before the
+  build groups, a script places one heavy row (a components-split group-4
+  member, or a react-pass-4 member) with `wsp spawn <row> --on eds-macbook-i5`,
+  places its verifier there by `spawn --verify --on` (or runs its checks by
+  hand in the far tree, filing what was missing), cuts the link once during the
+  verify, and measures:
+  - spawn to review, and review to verdict;
+  - copy-up and copy-back seconds and bytes, with and without the `cp -c` clone;
+  - the i5's load and memory during the row (`vm_stat`, swap, load every 30 s);
+  - this Mac's load with and without the row here (a local twin, wsp-422's
+    pairing);
+  - one golden compared on both machines (11.4).
+  A failure is a row and the rerun is one command.
+- **The full proof (group 6, agent-047).** The run's placement is turned on for
+  one list, and a script runs it, cuts the link once, and reads back the cost
+  table against the early proof.
 
 ### 11.6 What it must not break
 
@@ -582,13 +592,14 @@ itself (`wsp worklist show i5-heavy`).
 
 | group | kind | rows | what |
 |---|---|---|---|
-| 1 | **manual**, Ed and the primary seat | compounding-337 far setup by hand; agent-042 the trial (after 337) | 11.4 by hand and written as `scripts/far-setup.sh --check`; one heavy row by hand with its verifier; the measurements of 11.5 |
-| 2 | agent, x2 | agent-043 heavy declaration; agent-044 one count per machine | the `heavy:` key, the matchers, the `--place` overrides and the display; per-machine ceilings and waits named for a machine |
-| 3 | agent, x1 | agent-045 placement in the run; agent-046 the far verifier (after 045) | advance spawns heavy members `--on` with the fallback, and `machine check` reads the setup check; verifier `--verify --on` in the far tree, the hash bind, the rerun, the verifier fallback, the held-member tell |
-| 4 | agent | compounding-338 compounding's declaration | `heavy:` set on compounding, with goldens rows light |
-| 5 | **manual** | agent-047 placement on for one list | one real list run with placement on, watched; the cost table against the trial |
+| 1 | **manual**, Ed and the primary seat | compounding-337 far setup by hand | 11.4 by hand and written as `scripts/far-setup.sh --check`; the only hands-on group |
+| 2 | agent, x1 | agent-042 the scripted early proof | one heavy row placed by script with its verifier there and the link cut once; the measurements of 11.5 |
+| 3 | agent, x2 | agent-043 heavy declaration; agent-044 one count per machine | the `heavy:` key, the matchers, the `--place` overrides and the display; per-machine ceilings and waits named for a machine |
+| 4 | agent, x1 | agent-045 placement in the run; agent-046 the far verifier (after 045) | advance spawns heavy members `--on` with the fallback, and `machine check` reads the setup check; verifier `--verify --on` in the far tree, the hash bind, the rerun, the verifier fallback, the held-member tell |
+| 5 | agent | compounding-338 compounding's declaration | `heavy:` set on compounding, with goldens rows light |
+| 6 | agent | agent-047 the scripted full proof | one real list run with placement on by script, link cut once; the cost table against the early proof |
 
-The list is left at `init`: Ed sets it `planned` when the trial can start.
+The list is left at `init`: Ed sets it `planned` when the setup can start.
 
 ### 11.8 Open choices, raised as blocks
 
@@ -598,5 +609,5 @@ The list is left at `init`: Ed sets it `planned` when the trial can start.
    ceilings plus each list's own `--parallel`. This blocks agent-044.
 3. Where "checks rerun where the trunk moved" runs for a far member
    (recommendation: the i5). This blocks agent-046.
-4. Goldens: whether a goldens row is light (recommendation, until the trial
+4. Goldens: whether a goldens row is light (recommendation, until the early proof
    measures it) or the i5 gets its own baselines. This blocks compounding-338.
