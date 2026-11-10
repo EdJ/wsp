@@ -1132,7 +1132,7 @@ mod tests {
         let _ = store;
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
-        let mut m = Task::new("m", "m-1");
+        let mut m = crate::model::Task::new("m", "m-1");
         crate::verification::write(&mut m, &[crate::verification::Pass { pane: Some("w3:p1".into()), ..crate::verification::Pass::opened(None, None) }]);
         store.save_task(&m).unwrap();
         assert_eq!(crate::verification::seats(&store.tasks()).get("w3:p1").map(String::as_str), Some("m-1"));
