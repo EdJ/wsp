@@ -53,7 +53,7 @@ cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
 cycle -> cmd_agent: did_of_seat, fixed_of_seat, notice, ran_of_seat, secs_of_seat  # engine -> seats
 cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
 cycle -> main: Args  # engine -> top
-cycle -> room: Counted, Gate, names  # engine -> seats
+cycle -> room: Gate  # engine -> seats
 cycle -> wake: messages_held, say, settle_held  # engine -> seats
 detail -> main: Args  # surface -> top
 disk -> cmd_sandbox: strays  # engine -> seats

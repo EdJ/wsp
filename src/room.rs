@@ -182,6 +182,12 @@ pub(crate) fn weights_said(counted: &[Counted], waiting: usize) -> String {
 }
 
 impl Counted {
+    /// A whole-place agent with no seat yet.
+    #[cfg(test)]
+    pub(crate) fn whole(what: &str) -> Counted {
+        Counted { seat: None, what: what.to_string(), weight: WHOLE }
+    }
+
     pub(crate) fn said(&self) -> String {
         match &self.seat {
             Some(s) => format!("{} in {s}", self.what),
@@ -515,6 +521,13 @@ impl<'a> Gate<'a> {
     /// the start is (`wsp-601`), then the colon and the holders.
     pub(crate) fn cap_said(&self, what: &str, room: &[Counted]) -> String {
         format!("{}: {}", weights_said(room, self.weight_of(what)), names(room))
+    }
+
+    /// Whole places free under the cap, `None` where there is no cap. A half
+    /// place left is not one a list's start is judged on.
+    pub(crate) fn free_places(&self) -> Option<usize> {
+        let cap = self.cap?;
+        Some((cap * WHOLE).saturating_sub(load(&self.working())) / WHOLE)
     }
 
     pub(crate) fn take_held(&self) -> Vec<(String, Vec<Counted>)> {

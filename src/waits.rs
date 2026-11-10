@@ -260,9 +260,7 @@ fn entry_of(store: &Store, l: &Listed, seat_cap: Option<usize>) -> Entry {
 /// Places free under the seat's cap, counted as the run counts them.
 fn free_places(store: &Store) -> Option<usize> {
     let gate = crate::room::Gate::new(store, &crate::cycle::Fleet);
-    let cap = gate.cap?;
-    // Whole places left; a half left is not one a list's start is judged on.
-    Some((cap * crate::room::WHOLE).saturating_sub(crate::room::load(&gate.working())) / crate::room::WHOLE)
+    gate.free_places()
 }
 
 /// What the machine says right now, the two readings [`queue`] cannot get from
@@ -508,7 +506,7 @@ mod tests {
         let mut g = crate::model::Group::default();
         g.members = vec!["m-1".into()];
         w.set_groups(&[g]);
-        let at = |what: &str| vec![crate::room::Counted { seat: None, what: what.into(), weight: crate::room::WHOLE }];
+        let at = |what: &str| vec![crate::room::Counted::whole(what)];
         assert!(has_a_seat_working(&w, &at("m-1")));
         assert!(has_a_seat_working(&w, &at("m-1 · verifying")));
         assert!(has_a_seat_working(&w, &at("l · barrier 1")));
