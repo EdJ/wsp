@@ -2357,13 +2357,55 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
     if git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_ok() {
         return Prepared::Unchanged;
     }
-    if let Err(e) = git_ok(&w.dir, &["rebase", &w.branch]) {
+    if let Err(e) = rebase_onto(&w.dir, &w.branch) {
         let said = abort_rebase(&w.dir, &w.branch, &e);
         return Prepared::Refused(format!("wsp: {said}\nresolve it in {tree}, then `wsp review` again"));
     }
     match git(&w.dir, &["rev-parse", "HEAD"]) {
         Some(head) => Prepared::Rebased { head: head.trim().to_string(), branch },
         None => Prepared::Unchanged,
+    }
+}
+
+/// How many times a rebase is tried when git refuses it for a lock held by
+/// something else for a moment (`wsp-571`).
+const REBASE_TRIES: u32 = 5;
+
+/// Whether git's refusal is a lock another process held for a moment — an
+/// `index.lock` a status or a commit in the same tree was inside of — and not
+/// a conflict: the same rebase, a moment later, is likely to apply.
+fn transient_lock(why: &str) -> bool {
+    why.contains("index.lock") || (why.contains("Unable to create") && why.contains(".lock"))
+}
+
+/// Whether a rebase is stopped in `dir`, whatever stopped it.
+fn rebase_in_progress(dir: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"].iter().any(|d| {
+        git(dir, &["rev-parse", "--git-path", d]).is_some_and(|p| {
+            let p = PathBuf::from(p.trim());
+            (if p.is_absolute() { p } else { dir.join(p) }).exists()
+        })
+    })
+}
+
+/// `git rebase <onto>` in `dir`, retried when the refusal is a transient lock
+/// (`wsp-571`): a rebase that git stopped on `index.lock` can leave its
+/// `rebase-merge` directory behind, and the next try then fails on *that*
+/// ("It seems that there is already a rebase-merge directory"), so each retry
+/// first puts such a stop back with `rebase --abort`. A conflict is returned
+/// at once, as git said it, with the rebase left stopped for the caller.
+fn rebase_onto(dir: &Path, onto: &str) -> Result<(), String> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let Err(e) = git_ok(dir, &["rebase", onto]) else { return Ok(()) };
+        if tries >= REBASE_TRIES || !transient_lock(&e) {
+            return Err(e);
+        }
+        if rebase_in_progress(dir) {
+            let _ = git_ok(dir, &["rebase", "--abort"]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150 * u64::from(tries)));
     }
 }
 
@@ -2468,7 +2510,7 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
         // agents who edited one file meet, which is the arrangement working
         // rather than failing.
         if mode != Mode::FastForward {
-            if let Err(e) = git_ok(&w.dir, &["rebase", &w.branch]) {
+            if let Err(e) = rebase_onto(&w.dir, &w.branch) {
                 let said = if mode == Mode::ForRun {
                     abort_rebase(&w.dir, &w.branch, &e)
                 } else {
@@ -2673,7 +2715,7 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
         }
         let old_head = git(&w.dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
         let old_base = git(&w.dir, &["merge-base", &w.branch, "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
-        if let Err(e) = git_ok(&w.dir, &["rebase", &w.branch]) {
+        if let Err(e) = rebase_onto(&w.dir, &w.branch) {
             let said = abort_rebase(&w.dir, &w.branch, &e);
             return Verdict::Blocked(format!(
                 "wsp: {} moved since the rebase and the rebase does not apply: {said}\nresolve it in {tree}, then `wsp review` again",
@@ -2858,6 +2900,36 @@ mod tests {
         assert!(!git(&wt, &["status"]).unwrap().contains("rebase in progress"), "left mid-rebase");
         assert!(!dirty(&wt), "the tree is clean again");
         assert_eq!(ahead(&dir, "master", "t-7").len(), 1, "and its commit is still its own");
+    }
+
+    /// `wsp-571`: an `index.lock` held for a moment is waited out, not a
+    /// refusal; a conflict is still returned at once.
+    #[test]
+    fn a_rebase_waits_out_a_transient_index_lock() {
+        let (_env, dir) = scratch("lockretry");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-8");
+        ensure(&dir, &wt, "t-8", "master").unwrap();
+        std::fs::write(wt.join("mine.txt"), "mine\n").unwrap();
+        run(&wt, &["add", "mine.txt"]);
+        run(&wt, &["commit", "--quiet", "-m", "mine"]);
+        std::fs::write(dir.join("theirs.txt"), "theirs\n").unwrap();
+        run(&dir, &["add", "theirs.txt"]);
+        run(&dir, &["commit", "--quiet", "-m", "theirs"]);
+
+        let lock = PathBuf::from(git(&wt, &["rev-parse", "--absolute-git-dir"]).unwrap().trim()).join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let held = lock.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let _ = std::fs::remove_file(held);
+        });
+        let r = rebase_onto(&wt, "master");
+        releaser.join().unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        assert!(!rebase_in_progress(&wt), "a rebase-merge dir was left behind");
+        assert_eq!(ahead(&dir, "master", "t-8").len(), 1);
+        assert!(git_ok(&wt, &["merge-base", "--is-ancestor", "master", "HEAD"]).is_ok(), "not on the trunk's tip");
     }
 
     /// The whole point, asserted end to end: work committed in one agent's tree
