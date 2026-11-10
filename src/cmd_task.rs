@@ -1181,8 +1181,8 @@ pub fn set_status(store: &Store, args: &Args, status: Status) -> i32 {
     })
 }
 
-pub fn done(store: &Store, args: &Args) -> i32 {
-    done_with(store, args, &crate::cmd_spawn::seat_is_live)
+pub fn done(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool) -> i32 {
+    done_with(store, args, live)
 }
 
 /// The seats still standing on `id`, named: a row's bindings, leaving out a

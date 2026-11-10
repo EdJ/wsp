@@ -267,7 +267,7 @@ pub fn done(store: &Store, args: &Args) -> i32 {
         }
         crate::store::log_line(store, &format!("done {} by {}", row.map(|t| t.id).unwrap_or_default(), role.name()));
     }
-    crate::cmd_task::done(store, args)
+    crate::cmd_task::done(store, args, &crate::cmd_spawn::seat_is_live)
 }
 
 // ---- daemon reload ------------------------------------------------------------
