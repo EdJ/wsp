@@ -1500,7 +1500,12 @@ pub(crate) fn deliver(store: &Store, id: &str, line: &str) -> bool {
     }
     if cfg!(test) {
         #[cfg(test)]
-        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), line.to_string())));
+        {
+            if crate::cycle::tests::TELL_REFUSED.with(|r| r.get()) {
+                return false;
+            }
+            crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), line.to_string())));
+        }
         return true;
     }
     let Ok(exe) = std::env::current_exe() else { return false };

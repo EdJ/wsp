@@ -167,6 +167,16 @@ pub(crate) fn despawn_allowed(
     }
 }
 
+/// The list a verifier's or a barrier check's seat belongs to, for a seat that
+/// is on no row of its own (`compounding-285`): a verifier stands on the member
+/// it reads, a check on its list's group, and a governor ends both on its list.
+fn list_of_seat(store: &Store, seat: &str) -> Option<String> {
+    if let Some(member) = crate::verification::seats(&store.tasks()).get(seat) {
+        return list_of_row(store, member);
+    }
+    crate::barrier::seats(&store.worklists()).remove(seat).map(|(list, _)| list)
+}
+
 /// The gate `despawn` runs once it knows which seat it is about. `Err` carries
 /// the exit code, after the refusal has been said and logged.
 pub(crate) fn gate_despawn(
@@ -185,7 +195,7 @@ pub(crate) fn gate_despawn(
     if crate::cmd_govern::incoming(&store.handovers(), caller.0).is_some_and(|(_, from)| from == seat) {
         return Ok(());
     }
-    let list = task.and_then(|t| list_of_row(store, t));
+    let list = task.and_then(|t| list_of_row(store, t)).or_else(|| list_of_seat(store, seat));
     let mid_turn = role == Role::Primary && seat_mid_turn(seat);
     let why = args.get("why");
     match despawn_allowed(&role, why.as_deref(), list.as_deref(), mid_turn, args.has("now")) {
@@ -1114,6 +1124,19 @@ mod tests {
         assert!(despawn_allowed(&Role::Primary, Some("dropped"), None, true, false).is_err(), "mid-turn");
         assert!(despawn_allowed(&Role::Primary, Some("dropped"), None, true, true).is_ok(), "--now");
         assert!(despawn_allowed(&Role::Outside, None, None, true, false).is_ok());
+    }
+
+    #[test]
+    fn a_verifiers_seat_is_on_the_list_of_the_row_it_reads() {
+        let (env, store) = (crate::util::isolated("role-verifier-seat"), ());
+        let _ = store;
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let mut m = Task::new("m", "m-1");
+        crate::verification::write(&mut m, &[crate::verification::Pass { pane: Some("w3:p1".into()), ..crate::verification::Pass::opened(None, None) }]);
+        store.save_task(&m).unwrap();
+        assert_eq!(crate::verification::seats(&store.tasks()).get("w3:p1").map(String::as_str), Some("m-1"));
+        assert_eq!(list_of_seat(&store, "w3:p9"), None, "a seat on nothing is on no list");
     }
 
     #[test]

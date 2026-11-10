@@ -1478,7 +1478,7 @@ fn landed_since_sent_back(t: &Task) -> Option<String> {
 
 // ---- a reason that did not reach its pane ----------------------------------
 
-const TELL_PENDING: &str = "wsp: the sent-back reason did not reach its pane — typed when the seat reads idle";
+pub(crate) const TELL_PENDING: &str = "wsp: the sent-back reason did not reach its pane — typed when the seat reads idle";
 const TELL_DELIVERED: &str = "wsp: the sent-back reason reached its pane";
 
 /// Records that the newest send-back could not be typed to the member's pane.
@@ -1490,7 +1490,7 @@ pub(crate) fn note_tell_pending(store: &Store, id: &str) {
 }
 
 /// What the newest send-back said, when no delivery has been recorded since.
-fn undelivered_reason(t: &Task) -> Option<String> {
+pub(crate) fn undelivered_reason(t: &Task) -> Option<String> {
     let log = t.section("Log")?;
     let mut owed = None;
     let mut pending = false;
@@ -1527,6 +1527,19 @@ fn retry_undelivered_tells(store: &Store, seats: &dyn Seats) {
                 let _ = crate::log::note(store, &mut t, TELL_DELIVERED);
             });
             stamp(store, &format!("{}: the send-back that did not reach {seat} was typed to it, now it reads idle", t.id));
+        } else {
+            // **An idle seat that has now refused the send-back twice is not
+            // retried a third time** (`compounding-285`): retro-1's 207 and 215
+            // sat idle at review, refused six tells over 42 minutes, and held
+            // a place in the seat cap the whole while. The row is owed work, so
+            // the seat is ended and the run starts it on a fresh one, whose
+            // first order carries the reason ([`crate::cycle::sent_back_order`]):
+            // the same move as a row "sent back and nobody is on it".
+            stamp(store, &format!(
+                "{}: the send-back did not reach {seat} after a retry and it reads idle — ending it, and the run starts the row again on a fresh seat",
+                t.id
+            ));
+            crate::cycle::despawn(store, &t.id);
         }
     }
 }
@@ -3866,6 +3879,22 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
         assert!(member_told().iter().all(|(_, t)| !t.contains("sent m-1 back")), "delivered once, not every tick");
+    }
+
+    #[test]
+    fn a_send_back_an_idle_seat_still_refuses_ends_the_seat_so_the_run_starts_the_row_afresh() {
+        let (_env, store) = in_flight("refusedtell");
+        let mut t = store.find_task("m-1").unwrap();
+        crate::log::note(&store, &mut t, "sent back: the verifier blocked: not held").unwrap();
+        note_tell_pending(&store, "m-1");
+        let _ = ended();
+        crate::cycle::tests::TELL_REFUSED.with(|r| r.set(true));
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Working))]), &mut Pass::new());
+        assert!(ended().is_empty(), "a working seat is left alone");
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        crate::cycle::tests::TELL_REFUSED.with(|r| r.set(false));
+        assert_eq!(ended(), ["m-1"], "refused on an idle seat: ended in one tick");
+        assert!(stamped().iter().any(|l| l.contains("m-1") && l.contains("ending it")));
     }
 
     /// What each state of a row's log answers, in one place.

@@ -36,6 +36,11 @@
 //! parked list. Each sat in the cap for ten minutes at `compounding-048`
 //! while the starts it blocked waited.
 //!
+//! **A seat whose send-back it did not take is not counted unless it is seen
+//! working** (`compounding-285`): the row is owed work, but the seat cannot take
+//! it and the run ends it and starts the row afresh, so it holds no place a queued
+//! start is waiting for. 207's idle seat held one for 42 minutes at retro-1.
+//!
 //! **Unfinished work nobody can read is counted.** A backend that does not
 //! answer is the moment the machine is least visible, and the direction to be
 //! wrong in there is starting one agent fewer.
@@ -318,7 +323,11 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     held.extend(r.claimed());
     for (seat, id) in held {
         let Some(s) = status(&id) else { continue };
-        let holds_nothing = in_parked_list(r, &id) || r.tasks.iter().any(|t| t.id == id && crate::inner::run_inside(t));
+        // **A sent-back row whose seat took no tell holds nothing owed to the cap**
+        // (`compounding-285`): the run is about to end that seat and start the row
+        // on a fresh one, and until it does the seat counts only if seen working.
+        let holds_nothing = in_parked_list(r, &id)
+            || r.tasks.iter().any(|t| t.id == id && (crate::inner::run_inside(t) || crate::repair::undelivered_reason(t).is_some()));
         take(&mut out, Some(&seat), id, finished(s) || holds_nothing, false, None);
     }
 
@@ -580,6 +589,20 @@ mod tests {
         assert_eq!(counted(&r, &idle), ["plain"]);
         let busy = [("w1:p1", Look::Working), ("w1:p2", Look::Working), ("w1:p3", Look::Working)];
         assert_eq!(counted(&r, &busy), ["legged", "parked", "plain"]);
+    }
+
+    /// `compounding-285`: a sent-back row whose seat took no tell holds no place
+    /// unless the seat is seen working; one that took it still does.
+    #[test]
+    fn an_idle_seat_that_did_not_take_its_send_back_holds_no_place() {
+        let mut refused = task("m-1", Status::Doing);
+        refused.log("sent back: the verifier blocked: x");
+        refused.log(crate::repair::TELL_PENDING);
+        let mut taken = task("m-2", Status::Doing);
+        taken.log("sent back: the verifier blocked: x");
+        let r = records(vec![refused, taken], &[("w1:p1", "m-1"), ("w1:p2", "m-2")]);
+        assert_eq!(counted(&r, &[("w1:p1", Look::Quiet), ("w1:p2", Look::Quiet)]), ["m-2"]);
+        assert_eq!(counted(&r, &[("w1:p1", Look::Working), ("w1:p2", Look::Quiet)]), ["m-1", "m-2"]);
     }
 
     /// A governor is not counted, by its pane, even holding a row.
