@@ -4392,7 +4392,7 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
     let governs =
         pane.as_deref().and_then(|p| crate::place::governs(&governors, &crate::place::Seat::new(p)));
     let bound = crate::cmd_role::bound_here(store, pane.as_deref());
-    let me = Caller { pane: pane.as_deref(), governs: governs.as_deref(), bound };
+    let me = Caller { pane: pane.as_deref(), governs: governs.as_deref(), bound, live: Some(seat_is_live) };
     end_work(backend(args).as_ref(), store, args, me, &tidy)
 }
 
@@ -4411,7 +4411,7 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
 fn despawn_lost(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
-    let (seat, task) = match seat_of(store, args, &index) {
+    let (seat, task) = match seat_of(store, args, &index, None) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("wsp: {e}");
@@ -4486,6 +4486,10 @@ struct Caller<'a> {
     governs: Option<&'a str>,
     /// Whether the pane is a member, verifier or check seat's (`wsp-473`).
     bound: bool,
+    /// Whether a seat is still standing, for a closed row's last seat
+    /// ([`closed_row_seat`], `wsp-582`). A function and not a census read here
+    /// for the reason on [`end_work`]; `None` finds no such seat.
+    live: Option<fn(&str) -> bool>,
 }
 
 /// What the ending took away after the seat itself.
@@ -4655,7 +4659,7 @@ fn far_cleared(store: &Store, seat: &str, row: &str, tree: Option<std::path::Pat
 /// been lost, which is what a herdr restart leaves behind, is refused with the
 /// command that rebuilds it rather than a guess: `wsp reconcile` binds a claim
 /// back to a pane by label, and despawn works again afterwards.
-fn seat_of(store: &Store, args: &Args, index: &Index) -> Result<(Seat, Option<String>), String> {
+fn seat_of(store: &Store, args: &Args, index: &Index, live: Option<fn(&str) -> bool>) -> Result<(Seat, Option<String>), String> {
     let task_of = |seat: &str| {
         store
             .bindings()
@@ -4677,16 +4681,55 @@ fn seat_of(store: &Store, args: &Args, index: &Index) -> Result<(Seat, Option<St
     };
     match store.panes_for_task(&task).first() {
         Some(seat) => Ok((Seat::new(seat.clone()), Some(task))),
-        None => Err(match store.claims().contains_key(&task) {
-            // The claim outlived the pane it was made in, which is what a herdr
-            // restart does. Nothing here can say which seat holds it.
-            true => format!(
-                "{task} is claimed but no seat is bound to it — `wsp reconcile` to bind it again, \
-                 or `wsp release --pane <seat>` if the agent is already gone"
-            ),
-            false => format!("nothing is working {task}"),
-        }),
+        None => {
+            // A row that was closed with its seat still up (`wsp-582`): the claim
+            // and the binding went with `wsp done`, and the seat is named only
+            // by the row's last `worked` record.
+            let last = closed_row_seat(store, &task);
+            if let Some(seat) = last.clone().filter(|s| live.is_some_and(|f| f(s))) {
+                return Ok((Seat::new(seat), Some(task)));
+            }
+            Err(match (store.claims().contains_key(&task), store.task(&task).is_some_and(|t| t.status() == crate::model::Status::Done)) {
+                // The claim outlived the pane it was made in, which is what a herdr
+                // restart does. Nothing here can say which seat holds it.
+                (true, _) => format!(
+                    "{task} is claimed but no seat is bound to it — `wsp reconcile` to bind it again, \
+                     or `wsp release --pane <seat>` if the agent is already gone"
+                ),
+                (false, true) => match last {
+                    Some(seat) => format!(
+                        "{task} is done and was last worked in {seat}, which wsp cannot find standing — \
+                         nothing was ended, so it is NOT despawned. If that seat is still up, \
+                         `wsp despawn --pane {seat}` ends it by name"
+                    ),
+                    None => format!(
+                        "{task} is done and wsp has no record of the seat that worked it — nothing was ended. \
+                         If an agent is still up on it, `wsp wip` lists the seats and \
+                         `wsp despawn --pane <seat>` ends one by name"
+                    ),
+                },
+                (false, false) => format!("nothing is working {task}"),
+            })
+        }
     }
+}
+
+/// The seat a closed row was last worked in, off its `worked` record, when the
+/// row is `done` and nothing holds that seat now (`wsp-582`).
+fn closed_row_seat(store: &Store, task: &str) -> Option<String> {
+    let t = store.task(task)?;
+    if t.status() != crate::model::Status::Done || store.claims().contains_key(task) {
+        return None;
+    }
+    let seat = store.worked().get(task)?.get("workspace_id")?.as_str()?.to_string();
+    (!seat.is_empty() && !store.bindings().contains_key(&seat)).then_some(seat)
+}
+
+/// Whether `seat` is still standing: a far seat is taken to be (its stop is
+/// the question, and a seat already gone says so), a local one is looked for
+/// in the backends' census.
+pub(crate) fn seat_is_live(seat: &str) -> bool {
+    crate::herdr::host_of(seat).is_some() || cmd_agent::locate_seat(&crate::place::local_backends(), seat).is_some()
 }
 
 /// `me` is which seat this process is standing in, passed in rather than read
@@ -4704,7 +4747,7 @@ fn end_work(
 ) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
-    let (seat, task) = match seat_of(store, args, &index) {
+    let (seat, task) = match seat_of(store, args, &index, me.live) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("wsp: {e}");
@@ -4835,6 +4878,11 @@ fn end_work(
     // What the binding said, unless the release found something else there —
     // which it will not, and if it ever does, the release is the later reading.
     let task = ended.or(task);
+
+    // A seat ended after its row closed: the row's log names it (`wsp-582`).
+    if let Some(mut t) = task.as_deref().and_then(|id| store.task(id)).filter(|t| t.status() == crate::model::Status::Done) {
+        let _ = crate::log::note(store, &mut t, &format!("ended {seat}, which was still running after the row closed"));
+    }
 
     // A governor's (or the primary seat's) despawn of a member is "free the seat
     // so the run reseats", and this is the word the run reads for it
@@ -8190,6 +8238,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
+    /// `wsp-582`: a row closed with its seat up has no binding and no claim, and
+    /// `wsp despawn <row>` used to exit 2 on "nothing is working". It ends the seat
+    /// `worked` names — a far one too — and the row's log says so; a seat that is
+    /// not standing is refused in words that say it is not done.
+    #[test]
+    fn despawn_of_a_done_row_ends_its_last_seat_and_names_it_in_the_log() {
+        let _env = no_backend();
+        let store = seat("closed-row");
+        working(&store, "t-260816-095", "w1:p1");
+        // What `wsp done` leaves: the claim and the binding gone, the worked record kept.
+        let (_, ended) = cmd_agent::release_pane(&store, "w1:p1");
+        assert_eq!(ended.as_deref(), Some("t-260816-095"));
+        store.set_worked("t-260816-095", json!({ "workspace_id": "cpd-3986@eds", "reason": "done" }));
+        let mut t = store.task("t-260816-095").unwrap();
+        t.set_status(crate::model::Status::Done);
+        store.save_task(&t).unwrap();
+
+        let args = Args::synth("despawn", &["t-260816-095"], &[]);
+        // Not standing: refused, and the refusal says nothing was ended and gives the --pane form.
+        let place = Ends::ok();
+        let tidied = Tidied::default();
+        let none = Caller { live: Some(|_| false), ..Caller::default() };
+        assert_eq!(end_work(&place, &store, &args, none, &tidied.f()), 2);
+        assert!(place.asked.borrow().is_empty());
+        let index = Index::new(store.projects());
+        let why = seat_of(&store, &args, &index, Some(|_| false)).unwrap_err();
+        assert!(why.contains("NOT despawned") && why.contains("--pane cpd-3986@eds"), "{why}");
+
+        // Standing: ended, tidied, and logged on the row.
+        let up = Caller { live: Some(|s| s == "cpd-3986@eds"), ..Caller::default() };
+        assert_eq!(end_work(&place, &store, &args, up, &tidied.f()), 0);
+        assert_eq!(place.asked.borrow().iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>(), vec!["cpd-3986@eds"]);
+        assert_eq!(tidied.0.borrow()[0], ("cpd-3986@eds".to_string(), Some("t-260816-095".to_string())));
+        let log = store.task("t-260816-095").unwrap().body;
+        assert!(log.contains("ended cpd-3986@eds, which was still running after the row closed"), "{log}");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
     /// The other half of the direction's question: ending a seat ends the
     /// **claim**, not only the binding.
     ///
@@ -8271,7 +8358,7 @@ mod tests {
         let index = Index::new(store.projects());
         working(&store, "t-260816-095", "w1:p1");
 
-        let of = |a: &Args| seat_of(&store, a, &index);
+        let of = |a: &Args| seat_of(&store, a, &index, None);
         assert_eq!(
             of(&Args::synth("despawn", &["095"], &[])).unwrap(),
             (Seat::new("w1:p1"), Some("t-260816-095".into()))
@@ -9457,7 +9544,7 @@ mod tests {
         let log = |id: &str| store.find_task(id).unwrap().section("Log").unwrap_or_default().to_string();
         assert!(!log("t-260816-096").contains(crate::cycle::RESEAT_ASKED), "{}", log("t-260816-096"));
 
-        let primary = Caller { pane: Some("w9:p9"), governs: Some(crate::governors::PRIMARY), bound: false };
+        let primary = Caller { pane: Some("w9:p9"), governs: Some(crate::governors::PRIMARY), bound: false, ..Caller::default() };
         let by_the_primary = Args::synth("despawn", &[], &[("pane", "w1:p1"), ("why", "so the run reseats")]);
         assert_eq!(end_work(&place, &store, &by_the_primary, primary, &tidied.f()), 0);
         assert!(log("t-260816-095").contains(crate::cycle::RESEAT_ASKED), "{}", log("t-260816-095"));
@@ -9635,6 +9722,7 @@ mod tests {
             load: None,
             throttle: None,
             idle_memory: Default::default(),
+            worked: Default::default(),
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),

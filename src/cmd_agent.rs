@@ -4404,6 +4404,8 @@ pub(crate) struct Wip {
     /// What the idle panes' processes hold in resident memory, and the
     /// threshold it warns past (`wsp-338`).
     pub idle_memory: crate::memory::IdleMemory,
+    /// `worked.json`: who last held each row, for [`closed_row_of`] (`wsp-582`).
+    pub worked: BTreeMap<String, Value>,
     /// The open questions, read once — the store half of [`crate::waiting`]'s
     /// reading, asked for every row.
     pub asks: crate::waiting::Asks,
@@ -4569,6 +4571,7 @@ impl Wip {
             load: crate::throttle::loud(store),
             throttle: Some(crate::throttle::status_line(store)),
             idle_memory,
+            worked: store.worked(),
             asks: crate::waiting::Asks::read(store),
             shells,
             mandates: store.mandates(),
@@ -4775,6 +4778,30 @@ pub(crate) struct WipRow {
     /// scope is kept here so the row still says whose it was. Published as
     /// `was_governor`.
     pub(crate) was_governor: Option<String>,
+    /// The finished row this seat last held and is still up on, when the row was
+    /// closed (`wsp done`) with the seat running: `on a closed row` (`wsp-582`).
+    /// Published as `closed_row`.
+    pub(crate) closed_row: Option<String>,
+}
+
+/// The row, closed, that `seat` last held and was never ended from: the seat
+/// `worked` says a done row's claim was let go of, when nothing holds the seat now.
+/// `wsp despawn <row>` ends it.
+pub(crate) fn closed_row_of(
+    tasks: &[Task],
+    bindings: &BTreeMap<String, Value>,
+    worked: &BTreeMap<String, Value>,
+    seat: &str,
+) -> Option<String> {
+    if bindings.contains_key(seat) {
+        return None;
+    }
+    worked
+        .iter()
+        .filter(|(_, w)| w.get("workspace_id").and_then(Value::as_str) == Some(seat))
+        .map(|(id, _)| id)
+        .find(|id| tasks.iter().any(|t| &t.id == *id && t.status() == Status::Done))
+        .cloned()
 }
 
 /// What a seat is, typed, for a reader that places it (`wsp-246`): compound's
@@ -5122,6 +5149,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             full_suite: w.full_suite.contains(seat),
             stuck,
             was_governor,
+            closed_row: closed_row_of(&w.tasks, &w.bindings, &w.worked, seat),
         });
     }
     // A governor's count, once every row has its own reading — off the same
@@ -5267,7 +5295,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "role": r.role.json(),
             "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
             "spawned_by": r.spawned_by,
-            "unsent": r.unsent, "dropped": r.dropped, "full_suite": r.full_suite, "stuck": r.stuck.map(|(k, secs)| json!({ "kind": k.key(), "word": k.word(), "secs": secs })), "was_governor": r.was_governor,
+            "unsent": r.unsent, "dropped": r.dropped, "full_suite": r.full_suite, "stuck": r.stuck.map(|(k, secs)| json!({ "kind": k.key(), "word": k.word(), "secs": secs })), "was_governor": r.was_governor, "closed_row": r.closed_row,
             "leg": r.leg.as_ref().map(|s| json!({
                 "name": s.leg.name, "after": s.after, "index": s.index, "of": s.of,
             })),
@@ -5439,6 +5467,12 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
                     },
                     false => String::new(),
                 },
+            };
+            // A seat still up on a row that was closed under it: stands out, and
+            // names the verb that ends it (`wsp-582`).
+            let flag = match &r.closed_row {
+                Some(row) => format!("{flag} {}", p.yellow(&format!("· on a closed row {row} — wsp despawn {row}"))).trim_start().to_string(),
+                None => flag,
             };
             // What the agent said it is doing, in place of what the work is
             // called, when it has said something about this work — the trade a
@@ -9283,6 +9317,7 @@ mod tests {
             load: None,
             throttle: None,
             idle_memory: Default::default(),
+            worked: Default::default(),
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),
@@ -9410,6 +9445,30 @@ mod tests {
     /// `wsp-119`: `bound_state` used to read the status off such a row anyway,
     /// which is how `doctor` and `wip` came to hold opposite facts about one
     /// agent.
+    /// `wsp-582`: a seat still up on a row that was closed under it is marked in
+    /// `wip` as such; a seat that something holds, or whose row is open, is not.
+    #[test]
+    fn wip_marks_a_seat_on_a_closed_row() {
+        let mut w = wip_world();
+        let mut done = wip_task("closed-1", "finished", Some("wsp"), "done");
+        done.status_raw = "done".into();
+        let open = wip_task("open-1", "still going", Some("wsp"), "doing");
+        let mut all: Vec<Task> = w.tasks.iter().cloned().collect();
+        all.extend([done, open]);
+        w.tasks = all.into();
+        w.worked.insert("closed-1".into(), json!({ "workspace_id": "w8:p1" }));
+        w.worked.insert("open-1".into(), json!({ "workspace_id": "w3:p1" }));
+        assert_eq!(closed_row_of(&w.tasks, &w.bindings, &w.worked, "w8:p1").as_deref(), Some("closed-1"));
+        assert_eq!(closed_row_of(&w.tasks, &w.bindings, &w.worked, "w3:p1"), None, "an open row's seat is not on a closed one");
+        w.bindings.insert("w8:p1".into(), json!({ "task_id": "open-1" }));
+        assert_eq!(closed_row_of(&w.tasks, &w.bindings, &w.worked, "w8:p1"), None, "a seat something holds now is not");
+        w.bindings.remove("w8:p1");
+        w.agents.push(seated_agent("w8:p1", "idle", "wsp"));
+        let rows = wip_rows(&w);
+        assert_eq!(rows.iter().find(|r| r.pane == "w8:p1").unwrap().closed_row.as_deref(), Some("closed-1"));
+        assert!(wip_json(&w)["agents"].to_string().contains("closed_row") || wip_json(&w).to_string().contains("closed_row"));
+    }
+
     fn wip_agent(pane: &str, ws: &str, state: &str, title: &str) -> herdr::Pane {
         herdr::Pane {
             pane_id: pane.to_string(),
@@ -9483,6 +9542,7 @@ mod tests {
             load: None,
             throttle: None,
             idle_memory: Default::default(),
+            worked: Default::default(),
             asks: Default::default(),
             shells: Default::default(),
             mandates: Default::default(),

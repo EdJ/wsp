@@ -2473,6 +2473,7 @@ impl Source for Poll<'_> {
             load: None,
             throttle: None,
             idle_memory: Default::default(),
+            worked: Default::default(),
             // (c) asks every row whether it is waiting — the one reading the
             // reconciler and the barrier ask too.
             asks: crate::waiting::Asks::read(self.store),
@@ -4728,6 +4729,7 @@ mod tests {
             full_suite: false,
             stuck: None,
             was_governor: None,
+            closed_row: None,
         }
     }
 
@@ -5796,6 +5798,7 @@ mod tests {
             full_suite: false,
             stuck: None,
             was_governor: None,
+            closed_row: None,
         }
     }
 

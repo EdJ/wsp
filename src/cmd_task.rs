@@ -1182,6 +1182,48 @@ pub fn set_status(store: &Store, args: &Args, status: Status) -> i32 {
 }
 
 pub fn done(store: &Store, args: &Args) -> i32 {
+    done_with(store, args, &crate::cmd_spawn::seat_is_live)
+}
+
+/// The seats still standing on `id`, named: a row's bindings, leaving out a
+/// leg's (the run ends those on a tick) and a seat `live` cannot find.
+fn standing_on(store: &Store, id: &str, live: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let bindings = store.bindings();
+    store
+        .panes_for_task(id)
+        .into_iter()
+        .filter(|pane| bindings.get(pane).is_some_and(|b| b.get("leg").is_none()))
+        .filter(|pane| live(pane))
+        .collect()
+}
+
+/// [`done`], with the question "is this seat standing" passed in.
+///
+/// **`wsp done` refuses a row whose seat is still up (`wsp-582`), and ends nothing.**
+/// It used to release the claim and clear the binding and leave the seat running:
+/// two hours on, `wsp despawn <row>` found nothing bound and exited 2, the idle
+/// seat sat in `wip` and held the cap, and a far one went on holding its lease.
+/// Refusing, not ending it, because ending a seat is `despawn`'s and carries its
+/// gate (the primary seat gives a why and not mid-turn; a governor ends its own
+/// list's) — a close that ended seats would be a way round that. The refusal
+/// names the seat and the command; the row is untouched.
+fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool) -> i32 {
+    if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
+        let seats = standing_on(store, &t.id, live);
+        if !seats.is_empty() {
+            eprintln!(
+                "wsp: {} still has a seat running — {} — so it is NOT done and nothing was closed. \
+                 `wsp despawn {}` ends the seat (and says if it kept the tree), then `wsp done {}` again; \
+                 a far seat on a machine that is gone is `wsp despawn {} --lost`",
+                t.id,
+                seats.join(", "),
+                t.id,
+                t.id,
+                t.id
+            );
+            return 1;
+        }
+    }
     // Let go of the work before finishing it: the log then reads in the order
     // it happened — the claim ended, then the task did — and the whole thing
     // lands in the one commit `mutate` makes on its way out.
@@ -4767,6 +4809,35 @@ pub(crate) mod tests {
         assert_eq!(done(&store, &parse(&["done", "p-002", "--keep-tree"])), 0);
         assert!(trees[1].join(".git").exists(), "--keep-tree did not keep it");
         assert_eq!(store.task("p-002").unwrap().status(), Status::Done);
+    }
+
+    /// `wsp-582`: `done` on a row whose seat is up refuses, names the seat and the
+    /// verb, and leaves the claim and binding exactly as they were; a seat that
+    /// is gone, or a leg's, does not stop it.
+    #[test]
+    fn done_refuses_a_row_whose_seat_is_up_and_names_it() {
+        let _env = util::isolated("done-live-seat");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("a row", "p-001");
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-9", json!({ "task_id": "p-001", "pane_id": "cpd-9", "workspace_id": "cpd-9" }));
+        store.set_binding("cpd-8@mb", json!({ "task_id": "p-001", "pane_id": "cpd-8@mb", "workspace_id": "cpd-8@mb" }));
+        store.set_binding("cpd-7", json!({ "task_id": "p-001", "leg": "a", "pane_id": "cpd-7", "workspace_id": "cpd-7" }));
+        store.set_claim("p-001", json!({ "workspace_id": "cpd-9", "workspace_label": "p-001", "cwd": "/tmp" }));
+
+        let alive = |s: &str| s != "cpd-gone";
+        assert_eq!(standing_on(&store, "p-001", &alive), vec!["cpd-8@mb".to_string(), "cpd-9".to_string()], "a far seat is named too, a leg's is not");
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &alive), 1);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Doing, "a refused close closes nothing");
+        assert!(store.claims().contains_key("p-001"), "and releases nothing");
+        assert!(store.bindings().contains_key("cpd-9") && store.bindings().contains_key("cpd-8@mb"));
+
+        // The seats gone: the close goes through as it always did.
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false), 0);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"));
     }
 
     fn scratch_file(name: &str, text: &str) -> String {
