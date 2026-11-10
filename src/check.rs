@@ -429,7 +429,75 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
             steps.push(h);
         }
     }
+    // The base the diff was read against; a landing found by its commit
+    // messages has none, and then a module's being new cannot be told.
+    if let Some(base) = tg.since.clone().or_else(|| at.is_none().then(|| since_of(t)).flatten()) {
+        let in_base = |path: &str| git(&tg.repo, &["cat-file", "-e", &format!("{base}:{path}")]).is_some();
+        if let Some(l) = layering_step(&|p| at_sha(p).is_some(), &in_base, &changed) {
+            if !steps.iter().any(|s| s.command == l.command) {
+                steps.push(l);
+            }
+        }
+    }
     Plan { steps, changed }
+}
+
+/// The module a source path belongs to, as `tests/layering.rs` counts them:
+/// `src/<m>.rs` or `src/<m>/…` of the package or of a crate. Returns the path
+/// of the module (`src/m` or `crates/c/src/m`), without the `.rs`.
+fn module_of(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let at = match parts.as_slice() {
+        ["src", ..] => 0,
+        ["crates", _, "src", ..] => 2,
+        _ => return None,
+    };
+    let rest = &parts[at + 1..];
+    let first = rest.first()?;
+    let name = match rest.len() {
+        1 => first.strip_suffix(".rs")?,
+        _ => first,
+    };
+    // The crate's root files are not modules of the map.
+    if rest.len() == 1 && matches!(name, "main" | "lib") {
+        return None;
+    }
+    Some(format!("{}/{name}", parts[..=at].join("/")))
+}
+
+/// The layering test, when the diff adds a module (`wsp-572`): a file under
+/// `src/` or a crate's `src/` whose module the base does not have. A module
+/// added without its row in `docs/components.md` reached the trunk red five
+/// times and was found by the group's barrier each time, minutes later; this
+/// finds it in the member's own check for about a second, and only on a row
+/// that adds a module. The test's own message names the modules with no
+/// component.
+///
+/// `has` says whether the checked tree keeps a path, `in_base` whether the
+/// base the diff is read against does (a file or a directory).
+pub(crate) fn layering_step(has: &dyn Fn(&str) -> bool, in_base: &dyn Fn(&str) -> bool, changed: &[String]) -> Option<Step> {
+    if !has(LAYERING_FILE) {
+        return None;
+    }
+    let mut on: Vec<String> = Vec::new();
+    for p in changed.iter().filter(|p| p.ends_with(".rs") && has(p)) {
+        let Some(m) = module_of(p) else { continue };
+        if !in_base(&format!("{m}.rs")) && !in_base(&m) {
+            on.push(p.clone());
+        }
+    }
+    if on.is_empty() {
+        return None;
+    }
+    Some(Step {
+        name: "layering".into(),
+        command: LAYERING_COMMAND.into(),
+        limit: Duration::from_secs(20 * 60),
+        of: Of::Rule,
+        on,
+        barrier: false,
+        end: false,
+    })
 }
 
 /// The help snapshot a repository keeps: everything `wsp help` prints after
@@ -1554,6 +1622,18 @@ fn inner(store: &Store, args: &Args) -> i32 {
             steps.push(h);
         }
     }
+    let base = crate::cmd_checkout::trunk(&tree)
+        .and_then(|trunk| crate::cmd_checkout::trunk_branch(&trunk))
+        .and_then(|branch| git(&tree, &["merge-base", "HEAD", &branch]));
+    if let Some(base) = base {
+        let base = base.trim().to_string();
+        let in_base = |path: &str| git(&tree, &["cat-file", "-e", &format!("{base}:{path}")]).is_some();
+        if let Some(l) = layering_step(&|p| tree.join(p).exists(), &in_base, &changed) {
+            if !steps.iter().any(|s| s.command == l.command) {
+                steps.push(l);
+            }
+        }
+    }
     if steps.is_empty() {
         println!("{} {}", p.dim("nothing to run —"), p.dim(&format!("{} changed path(s) call for no check of {}", changed.len(), t.id)));
         return 0;
@@ -2453,6 +2533,44 @@ mod tests {
         for p in [&["src/y.rs"][..], &["docs/z.md"], &[]] {
             assert!(help_step(&kept, &changed(p)).is_none(), "{p:?}");
         }
+    }
+
+    #[test]
+    fn the_layering_step_runs_for_a_row_that_adds_a_module_and_for_no_other() {
+        let tree = ["tests/layering.rs", "src/old.rs", "src/dir/a.rs", "src/new.rs", "src/dir/b.rs", "src/fresh/mod.rs", "crates/store/src/more.rs", "crates/store/src/lib.rs", "docs/x.rs"];
+        let has = |p: &str| tree.contains(&p);
+        let base = |p: &str| ["src/old.rs", "src/dir", "src/dir/a.rs", "crates/store/src/lib.rs"].contains(&p);
+        let changed = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A file of a module the base has, or a root file, adds no module.
+        for p in [&["src/old.rs"][..], &["src/dir/b.rs"], &["crates/store/src/lib.rs"], &["docs/x.rs"], &[]] {
+            assert!(layering_step(&has, &base, &changed(p)).is_none(), "{p:?}");
+        }
+        // A new file, a new directory, a new file of a crate.
+        for (p, on) in [("src/new.rs", "src/new.rs"), ("src/fresh/mod.rs", "src/fresh/mod.rs"), ("crates/store/src/more.rs", "crates/store/src/more.rs")] {
+            let s = layering_step(&has, &base, &changed(&["src/old.rs", p])).unwrap_or_else(|| panic!("no step for {p}"));
+            assert_eq!((s.command.as_str(), s.on.as_slice()), (LAYERING_COMMAND, &[on.to_string()][..]));
+        }
+        // A repository with no layering test has nothing to run.
+        assert!(layering_step(&|p| p != LAYERING_FILE && has(p), &base, &changed(&["src/new.rs"])).is_none());
+    }
+
+    #[test]
+    fn a_new_module_in_the_diff_adds_the_layering_test_to_the_plan() {
+        let (env, store, _base) = world("layering-step", "- ok: true", "exit 0\n");
+        let repo = env.path("repo");
+        let t = store.find_task("pj-001").unwrap();
+        commit_files(&repo, &[(LAYERING_FILE, "// test\n"), ("src/old.rs", "pub fn f() {}\n")]);
+        let since = git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let steps = |sha: &str| {
+            let tg = Target { since: Some(since.clone()), ..target(&store, &t, Some(sha)).unwrap() };
+            plan(&store, &t, &tg, Some(&tg.sha)).steps
+        };
+        let edit = commit_files(&repo, &[("src/old.rs", "pub fn f() { }\n")]);
+        assert!(steps(&edit).iter().all(|s| s.name != "layering"));
+        let add = commit_files(&repo, &[("src/brand_new.rs", "pub fn g() {}\n")]);
+        let got = steps(&add);
+        let l = got.iter().find(|s| s.name == "layering").unwrap_or_else(|| panic!("no layering step in {got:?}"));
+        assert_eq!(l.command, LAYERING_COMMAND);
     }
 
     #[test]
