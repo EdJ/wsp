@@ -10473,6 +10473,29 @@ mod tests {
         assert!(!store.claims().contains_key("t-001"));
     }
 
+    /// `wsp-603`: `wsp tell <row>` goes to the seat that holds the claim, and
+    /// says so, when the row has two seats and the unclaimed one is bound first.
+    #[test]
+    fn a_tell_to_a_row_with_two_seats_reaches_the_one_holding_the_claim() {
+        let _env = util::isolated("tell-the-holder");
+        let store = Store::open();
+        store.save_task(&wip_task("t-001", "doubled", Some("wsp"), "doing")).unwrap();
+        store.set_agent("a-1", json!({ "seat": "cpd-1", "started": "2026-10-01T00:00:00Z" }));
+        store.set_agent("a-2", json!({ "seat": "cpd-2", "started": "2026-10-01T00:00:01Z" }));
+        store.set_binding("cpd-1", json!({ "task_id": "t-001", "pane_id": "cpd-1" }));
+        store.set_binding("cpd-2", json!({ "task_id": "t-001", "pane_id": "cpd-2" }));
+        store.set_claim("t-001", json!({ "agent_id": "a-2", "claimed_at": "2026-10-01T00:00:02Z" }));
+
+        let (pane, what) = target(&store, "t-001", &|_| false).expect("the row has a seat");
+        assert_eq!(pane, "cpd-2", "the claim's seat, not the first one bound");
+        assert!(what.contains("cpd-2 holds the claim"), "and it is named: {what}");
+
+        // With no claim there is no holder to name, and the row still reaches a seat.
+        store.clear_claim("t-001");
+        let (_, what) = target(&store, "t-001", &|_| false).expect("a seat still");
+        assert!(!what.contains("holds the claim"), "{what}");
+    }
+
     /// A compound seat directory whose pid is dead, last written `ago` seconds
     /// before now: the shape `wip` calls `gone`, dated by the only clock a dead
     /// agent leaves.

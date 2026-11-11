@@ -504,19 +504,31 @@ fn lay_brief(
     }
 }
 
-/// What an agent is told about work it has just been handed.
-///
 /// The seat already holding `task`'s claim, bound and standing, when it is not
-/// `seat` (`wsp-603`).
-fn standing_twin(store: &Store, task: &str, seat: &str) -> Option<String> {
+/// `seat` (`wsp-603`). `standing` is how a seat is read: whether it is there
+/// still, passed in so a test need not stand a backend up.
+fn standing_twin(store: &Store, task: &str, seat: &str, standing: &dyn Fn(&str) -> bool) -> Option<String> {
     let claim = store.claims().get(task).cloned()?;
     let panes: Vec<String> = store.panes_for_task(task).into_iter().filter(|p| p != seat).collect();
     let holder = crate::address::claim_holder(&claim, &panes, &store.agents_held())?;
-    let backends = crate::place::local_backends();
-    let (_, row) = cmd_agent::locate_seat(&backends, &holder)?;
-    (!matches!(row.state, State::Gone | State::Empty)).then_some(holder)
+    standing(&holder).then_some(holder)
 }
 
+/// Whether `seat` is there and not gone: the backend that just opened the new
+/// seat answers for its own, and any other is found through the census.
+fn seat_stands(place: &dyn Place, seat: &str) -> bool {
+    let state = match place.state(&Seat::new(seat)) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            let backends = crate::place::local_backends();
+            cmd_agent::locate_seat(&backends, seat).map(|(_, row)| row.state)
+        }
+    };
+    state.is_some_and(|s| !matches!(s, State::Gone | State::Empty))
+}
+
+/// What an agent is told about work it has just been handed.
+///
 /// One definition, three cases: the panel says this to an agent it claims a
 /// task onto, `spawn` says it to the agent it just started, and `spawn
 /// --govern` says the custodial one to an agent it has just put in a project's
@@ -2849,7 +2861,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             // wrote into one tree for sixteen minutes before anyone saw it.
             // `--force` is a person taking the row off whoever has it.
             if !args.has("force") {
-                if let Some(twin) = standing_twin(store, t, seat.as_str()) {
+                if let Some(twin) = standing_twin(store, t, seat.as_str(), &|h| seat_stands(place, h)) {
                     let _ = place.stop(&seat);
                     if let Some(mut row) = store.task(t) {
                         let _ = crate::log::note(
@@ -8112,6 +8124,96 @@ mod tests {
         );
         assert_eq!(code, 2, "--govern on a task was accepted");
         assert!(place.0.borrow().is_empty(), "it opened a workspace before refusing");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A backend with one standing seat, `w1:p1`, that opens `w9:p2` and
+    /// remembers which seats it was told to stop.
+    struct Twinned(std::cell::RefCell<Vec<String>>);
+
+    impl Place for Twinned {
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            Ok(Seat::new("w9:p2"))
+        }
+        fn stop(&self, seat: &Seat) -> crate::place::Result<()> {
+            self.0.borrow_mut().push(seat.as_str().to_string());
+            Ok(())
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("the second seat is not started")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("the second seat is not told")
+        }
+        fn state(&self, seat: &Seat) -> crate::place::Result<State> {
+            Ok(if seat.as_str() == "w1:p1" { State::Working } else { State::Empty })
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("spawn is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("spawn does not wait for anything")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// `wsp-603`, the first done-when: a spawn whose readiness retry brings up a
+    /// second pane for a row that has a bound, claimed, standing seat ends the
+    /// second at once, logs it, and leaves the one seat bound and the claim with
+    /// its holder. A holder that is gone does not count, and `--force` is a
+    /// person taking the row.
+    #[test]
+    fn a_second_seat_for_a_row_with_a_standing_claim_is_ended_and_logged() {
+        let _guard = no_backend();
+        let store = seat("twin");
+        let root = store.root.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        for argv in [
+            vec!["init", "--quiet", "-b", "master"],
+            vec!["commit", "--quiet", "--allow-empty", "-m", "first"],
+        ] {
+            let out = wsp_base::calls::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(&argv)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let mut proj = Project::new("robustness");
+        proj.roots = vec![root.display().to_string()];
+        store.save_project(&proj).unwrap();
+        let mut task = crate::model::Task::new("started once", "t-1");
+        task.project = Some("robustness".into());
+        task.status_raw = "doing".into();
+        store.save_task(&task).unwrap();
+        store.set_agent("a-1", json!({ "seat": "w1:p1", "started": "2026-10-01T00:00:00Z" }));
+        store.set_binding("w1:p1", json!({ "task_id": "t-1", "pane_id": "w1:p1" }));
+        store.set_claim("t-1", json!({ "agent_id": "a-1", "claimed_at": "2026-10-01T00:00:01Z" }));
+
+        let place = Twinned(Default::default());
+        let code = place_work(&place, &store, &Args::synth("spawn", &["t-1"], &[]));
+        assert_eq!(code, 1, "the second start is refused");
+        assert_eq!(*place.0.borrow(), vec!["w9:p2".to_string()], "the second seat, and only it, was ended");
+        assert_eq!(store.panes_for_task("t-1"), vec!["w1:p1".to_string()], "one seat stays bound");
+        assert!(store.claims().contains_key("t-1"), "the claim is its holder's still");
+        let log = std::fs::read_to_string(store.root.join("tasks").join("t-1.md")).unwrap_or_default();
+        assert!(log.contains("a second start came up as w9:p2 while w1:p1 held the claim"), "{log}");
+
+        // The holder is not standing: nothing to double, so the guard stands aside.
+        let gone = |_: &str| false;
+        assert_eq!(standing_twin(&store, "t-1", "w9:p2", &gone), None);
+        let there = |s: &str| s == "w1:p1";
+        assert_eq!(standing_twin(&store, "t-1", "w9:p2", &there).as_deref(), Some("w1:p1"));
+        assert_eq!(standing_twin(&store, "t-1", "w1:p1", &there), None, "a seat is not its own twin");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
