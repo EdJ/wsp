@@ -511,7 +511,7 @@ fn lay_brief(
 fn standing_twin(store: &Store, task: &str, seat: &str) -> Option<String> {
     let claim = store.claims().get(task).cloned()?;
     let panes: Vec<String> = store.panes_for_task(task).into_iter().filter(|p| p != seat).collect();
-    let holder = cmd_agent::claim_holder(&claim, &panes, &store.agents_held())?;
+    let holder = crate::address::claim_holder(&claim, &panes, &store.agents_held())?;
     let backends = crate::place::local_backends();
     let (_, row) = cmd_agent::locate_seat(&backends, &holder)?;
     (!matches!(row.state, State::Gone | State::Empty)).then_some(holder)

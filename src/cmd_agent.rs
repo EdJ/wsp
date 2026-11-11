@@ -2102,7 +2102,7 @@ fn target(store: &Store, needle: &str, seated: &dyn Fn(&str) -> bool) -> Option<
     // in one tree has two, and a tell to the other reaches nobody who owns it
     // (`wsp-603`).
     let panes = store.panes_for_task(&t.id);
-    let held = store.claims().get(&t.id).and_then(|c| claim_holder(c, &panes, &store.agents_held()));
+    let held = store.claims().get(&t.id).and_then(|c| crate::address::claim_holder(c, &panes, &store.agents_held()));
     let title = util::truncate(&t.title, 44);
     match held {
         Some(pane) => Some((pane.clone(), format!("{} — {title} · {pane} holds the claim", t.id))),
@@ -3951,21 +3951,6 @@ fn end_claim(store: &Store, task_id: &str) {
     store.git_commit(&format!("wsp: release {task_id}"));
 }
 
-/// The seat that holds a row's claim, of the seats bound to the row: the one
-/// whose agent is the claim's. One bound seat is the holder whatever the claim
-/// says; with several and no agent matching, nobody can say (`wsp-603`).
-pub(crate) fn claim_holder(
-    claim: &Value,
-    panes: &[String],
-    agents: &BTreeMap<String, Value>,
-) -> Option<String> {
-    if let [only] = panes {
-        return Some(only.clone());
-    }
-    let agent = claim.get("agent_id")?.as_str()?;
-    panes.iter().find(|p| Store::agent_in_seat_from_map(agents, p).as_deref() == Some(agent)).cloned()
-}
-
 /// `Some((row, holder))` when `pane` is bound to a claimed row whose claim is
 /// another seat's.
 pub(crate) fn claim_elsewhere(store: &Store, row: &str, pane: &str) -> Option<(String, String)> {
@@ -3974,7 +3959,7 @@ pub(crate) fn claim_elsewhere(store: &Store, row: &str, pane: &str) -> Option<(S
     if !panes.iter().any(|p| p == pane) {
         return None;
     }
-    let holder = claim_holder(&claim, &panes, &store.agents_held())?;
+    let holder = crate::address::claim_holder(&claim, &panes, &store.agents_held())?;
     (holder != pane).then(|| (row.to_string(), holder))
 }
 
@@ -10480,7 +10465,7 @@ mod tests {
         assert!(store.bindings().contains_key("cpd-2"), "with its holder");
 
         let panes = store.panes_for_task("t-001");
-        let held = claim_holder(&store.claims()["t-001"], &panes, &store.agents_held());
+        let held = crate::address::claim_holder(&store.claims()["t-001"], &panes, &store.agents_held());
         assert_eq!(held.as_deref(), Some("cpd-2"));
 
         let (_, released) = release_pane(&store, "cpd-2");

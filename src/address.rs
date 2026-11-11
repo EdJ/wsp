@@ -190,6 +190,21 @@ fn governor(book: &Book, scope: &str, what: impl Into<String>) -> Result<Vec<Nam
     }
 }
 
+/// The seat that holds a row's claim, of the seats bound to the row: the one
+/// whose agent is the claim's. One bound seat is the holder whatever the claim
+/// says; with several and no agent matching, nobody can say (`wsp-603`).
+pub(crate) fn claim_holder(
+    claim: &Value,
+    panes: &[String],
+    agents: &BTreeMap<String, Value>,
+) -> Option<String> {
+    if let [only] = panes {
+        return Some(only.clone());
+    }
+    let agent = claim.get("agent_id")?.as_str()?;
+    panes.iter().find(|p| Store::agent_in_seat_from_map(agents, p).as_deref() == Some(agent)).cloned()
+}
+
 fn seat(book: &Book, row: &str) -> Result<Vec<Named>, String> {
     if !book.tasks.iter().any(|t| t.id == row) {
         return Err(format!("no row `{row}` — `wsp ls` lists them"));
@@ -202,7 +217,7 @@ fn seat(book: &Book, row: &str) -> Result<Vec<Named>, String> {
         return Err(format!("{row} is claimed and nobody is in its seat — `wsp wip` says who holds what"));
     }
     // Of two seats on one row, the one that holds the claim (`wsp-603`).
-    let holder = book.claims.get(row).filter(|_| panes.len() > 1).and_then(|c| crate::cmd_agent::claim_holder(c, &panes, &book.agents));
+    let holder = book.claims.get(row).filter(|_| panes.len() > 1).and_then(|c| claim_holder(c, &panes, &book.agents));
     if let Some(holder) = holder {
         return Ok(vec![named(&holder, format!("the seat on {row}, which holds its claim"))]);
     }
