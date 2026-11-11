@@ -1728,6 +1728,29 @@ pub fn review(store: &Store, args: &Args) -> i32 {
             }
         }
     }
+    // A hold that owes its land (`wsp-605`): reviewed again at the commit it
+    // read, the land is tried with the recorded hold and no new verifier.
+    // Landed, the review goes on as for any landed row; refused, it is said
+    // here, on the row, and to the governor.
+    if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+        match crate::verification::retry_owed(store, &t.id, "reviewed again") {
+            Some(crate::verification::Owed::Landed(sha)) => {
+                let at = sha.map(|s| format!(" at {}", &s[..s.len().min(12)])).unwrap_or_default();
+                println!("✓ {}: the verifier's hold was owed its land, and it landed{at} — no new verifier", t.id);
+            }
+            Some(crate::verification::Owed::Still(why)) => {
+                eprintln!("{why}");
+                eprintln!("wsp: {} stays at review with its land owed; its governor is told", t.id);
+                return 1;
+            }
+            Some(crate::verification::Owed::Blocked(why)) => {
+                eprintln!("{why}");
+                eprintln!("wsp: {}'s owed land was refused, so the hold is recorded as a block and the row is sent back", t.id);
+                return 1;
+            }
+            None => {}
+        }
+    }
     // A member of a group wsp runs is not landed by its agent: it is marked
     // ready at its tree's commit, and the verifier that reads that tree lands
     // it. Refused before the row moves when the tree holds uncommitted work.

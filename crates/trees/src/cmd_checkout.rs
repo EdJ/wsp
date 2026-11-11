@@ -2689,6 +2689,46 @@ pub enum Verdict {
     },
     /// The trunk is untouched; this is what is owed.
     Blocked(String),
+    /// The trunk is untouched because the tree holds uncommitted files
+    /// (`wsp-605`). Not a block of the work: the hold stands and the land is
+    /// owed, retried when the tree is clean. The text names the files.
+    Dirty(String),
+}
+
+/// The uncommitted paths in a tree, each with its two-letter `git status`
+/// code (` M`, `??`): what a dirty-tree refusal names (`wsp-605`).
+pub fn dirty_files(dir: &Path) -> Vec<(String, String)> {
+    git(dir, &["status", "--porcelain", "--untracked-files=all"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.len() > 3)
+        .map(|l| (l[..2].to_string(), l[3..].trim().to_string()))
+        .collect()
+}
+
+/// A hold's land refused on a dirty tree, said so a seat can tell "my checks
+/// dirtied it" from "work I forgot" (`wsp-605`). The row was put up for review
+/// at a clean tree (`ready_at` refuses a dirty one), so this is `git status`
+/// after the checks run in it against before: a tracked file changed since is
+/// one the checks write, and a new file is either their output or work nobody
+/// committed.
+pub fn dirty_refusal(tree: &str, files: &[(String, String)]) -> String {
+    let (written, added): (Vec<_>, Vec<_>) = files.iter().partition(|(code, _)| code != "??");
+    let names = |v: &[&(String, String)]| v.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>().join(", ");
+    let mut out = format!("wsp: {tree} has uncommitted work, so the hold's land is owed and nothing was landed");
+    if !written.is_empty() {
+        out.push_str(&format!(
+            "\n  changed since the row was put up clean, so written by the checks run in it (a check that rewrites tracked files): {}",
+            names(&written)
+        ));
+    }
+    if !added.is_empty() {
+        out.push_str(&format!("\n  new since the row was put up clean — a check's output, or work nobody committed: {}", names(&added)));
+    }
+    out.push_str(&format!(
+        "\n  revert what the checks wrote (`git -C {tree} checkout -- <file>`) or commit what is work; the run lands the hold once the tree is clean, with no new verifier"
+    ));
+    out
 }
 
 const ROUNDS: usize = 3;
@@ -2712,6 +2752,9 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
                 Ok(landed) => Verdict::Landed { landed, reran },
                 Err(Refusal::Nothing(_)) => Verdict::Nothing,
                 Err(Refusal::NotFastForward(_)) if moved(&w) => continue,
+                // Only the index disagrees: `git reset` is the whole fix, and the land is owed as for any dirty tree.
+                Err(Refusal::Dirty(t)) if t.contains("nothing uncommitted") => Verdict::Dirty(format!("wsp: the hold could not land {task}: {t}")),
+                Err(Refusal::Dirty(_)) => Verdict::Dirty(dirty_refusal(&tree, &dirty_files(&w.dir))),
                 Err(r) => Verdict::Blocked(format!("wsp: the hold could not land {task}: {}", r.text())),
             };
         }
@@ -2724,7 +2767,7 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
         }
         rebases += 1;
         if dirty(&w.dir) {
-            return Verdict::Blocked(format!("wsp: {tree} has uncommitted work — commit it (`wsp commit-help`), then `wsp review` again"));
+            return Verdict::Dirty(dirty_refusal(&tree, &dirty_files(&w.dir)));
         }
         let old_head = git(&w.dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
         let old_base = git(&w.dir, &["merge-base", &w.branch, "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();

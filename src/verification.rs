@@ -142,6 +142,10 @@ pub(crate) struct Pass {
     pub did: Option<crate::did::Did>,
     /// The done-when items the verifier says it checked, each held or not.
     pub checked: Vec<crate::did::Checked>,
+    /// On a hold: the land it owes, and why it could not happen yet
+    /// (`wsp-605`) — a dirty tree, which is no block of the work. Cleared when
+    /// the run lands it. One line.
+    pub owed: Option<String>,
 }
 
 /// A pass's spend: the clauses a leg's end line carries, as clauses of the
@@ -217,6 +221,7 @@ impl Pass {
             spent: None,
             did: None,
             checked: Vec::new(),
+            owed: None,
         }
     }
 
@@ -238,6 +243,8 @@ impl Pass {
         clause("on", &self.on);
         clause("was", &self.was);
         clause("decided", &self.decided);
+        // One clause: a ` · ` inside the reason would end it.
+        clause("owed", &self.owed.as_deref().map(|o| crate::util::fold(o).replace(" · ", " — ")));
         if let Some(s) = &self.spent {
             clause("ran", &Some(s.ran.clone()));
             clause("turns", &Some(s.turns.to_string()));
@@ -338,6 +345,7 @@ impl Pass {
             spent: None,
             did: None,
             checked: Vec::new(),
+            owed: None,
         };
         for c in clauses {
             let c = c.trim();
@@ -354,6 +362,7 @@ impl Pass {
                     "on" => p.on = v,
                     "was" => p.was = v,
                     "decided" => p.decided = v,
+                    "owed" => p.owed = v,
                     "ran" => p.spent.get_or_insert_with(Spent::default).ran = v.unwrap_or_default(),
                     "turns" => p.spent.get_or_insert_with(Spent::default).turns = v.and_then(|v| v.parse().ok()).unwrap_or(0),
                     "peak" => p.spent.get_or_insert_with(Spent::default).peak = v.and_then(|v| util::count_of(&v)).unwrap_or(0),
@@ -674,6 +683,7 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         spent: None,
         did: None,
         checked: Vec::new(),
+        owed: None,
     }
 }
 
@@ -942,12 +952,19 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
     let mut caption = caption;
     let mut landing = None;
     let mut reran = Vec::new();
+    let mut land_owes = None;
     if state == State::Holds && crate::repair::ready(&member).is_some() {
         match crate::cmd_checkout::land_verdict(store, &member.id) {
             crate::cmd_checkout::Verdict::Nothing => {}
             crate::cmd_checkout::Verdict::Landed { landed, reran: r } => {
                 landing = Some(landed);
                 reran = r;
+            }
+            // Not a block of the work (`wsp-605`): the verdict holds and the
+            // land is owed, retried once the tree is clean.
+            crate::cmd_checkout::Verdict::Dirty(why) => {
+                land_owes = Some(why);
+                println!("{}", Paint::new().yellow("■ the hold stands, but the tree is dirty, so its land is owed; the run lands it once the tree is clean"));
             }
             crate::cmd_checkout::Verdict::Blocked(why) => {
                 state = State::Blocks;
@@ -969,6 +986,15 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
         Some(l) => note_landing(store, &member.id, l, &reran).unwrap_or(pass),
         None => pass,
     };
+    if let Some(why) = &land_owes {
+        set_owed(store, &member.id, Some(why), "the verifier's hold");
+        let said = format!(
+            "{}: the verifier held it, but its land is owed — the tree is dirty, and nothing reached the trunk.\n{why}",
+            member.id
+        );
+        crate::repair::tell_member(store, &member.id, &said);
+        tell_governor(store, &member.id, &said);
+    }
     if state == State::Holds {
         fold_pieces(store, &member.id);
     }
@@ -977,6 +1003,7 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
         serde_json::json!({
             "id": member.id, "verdict": state.as_str(), "caption": caption, "read": pass.read, "pane": pass.pane,
             "landed": landing.as_ref().map(|l| l.sha.clone()),
+            "owed": land_owes,
         }),
     );
     store.git_commit(&format!("wsp: verified {} {} — {}", member.id, state.as_str(), member.title));
@@ -1002,6 +1029,112 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
         println!("  {}", p.dim("no `checked:` lines — one per done-when item you looked at, ending in held or not held, is what `wsp verifications` counts"));
     }
     0
+}
+
+/// The newest pass on a row when it is a hold that owes its land (`wsp-605`):
+/// the verdict stands, the tree was dirty when it tried, and the row is still
+/// ready and unlanded. No verifier is owed for it — only the land.
+pub(crate) fn land_owed(t: &Task) -> Option<Pass> {
+    let p = passes(t).pop()?;
+    (p.state == State::Holds && p.owed.is_some() && crate::repair::ready(t).is_some()).then_some(p)
+}
+
+/// The newest pass's `owed` clause set or cleared, and the row's log told why.
+fn set_owed(store: &Store, member: &str, owed: Option<&str>, by: &str) {
+    store.locked(|| {
+        let mut t = store.find_task(member)?;
+        let mut ps = passes(&t);
+        let last = ps.last_mut()?;
+        last.owed = owed.map(str::to_string);
+        write(&mut t, &ps);
+        let line = match owed {
+            Some(why) => format!("wsp: the hold's land is owed ({by}): {}", util::truncate(&crate::util::fold(why), 400)),
+            None => format!("wsp: the hold's owed land is settled ({by})"),
+        };
+        crate::log::note(store, &mut t, &line).ok()
+    });
+}
+
+/// Tell whoever governs the list a row is on; nothing for a row on no list.
+fn tell_governor(store: &Store, member: &str, text: &str) {
+    if let Some(w) = store.find_task(member).and_then(|t| crate::cycle::list_of(store, &t)) {
+        crate::cycle::tell(store, &w, text);
+    }
+}
+
+/// What a retry of an owed land came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Owed {
+    /// It reached the trunk at this commit, or `None` when nothing was left to land.
+    Landed(Option<String>),
+    /// Refused again on a dirty tree: still owed, said on the row and to the governor.
+    Still(String),
+    /// Refused for a reason the member owes work for (a conflict, a red
+    /// rerun): recorded as the block it now is, and the row sent back.
+    Blocked(String),
+}
+
+/// The land a hold owes, tried again with the recorded hold and no new
+/// verifier (`wsp-605`) — `by` is what brought it ("reviewed again", "the tree
+/// is clean"). It reruns only what a land reruns after a rebase.
+///
+/// `None` when nothing is owed, or the tree is no longer at the commit the
+/// hold read: new commits are work no verifier has read, and their review
+/// opens a pass as any landing does.
+pub(crate) fn retry_owed(store: &Store, member: &str, by: &str) -> Option<Owed> {
+    let t = store.find_task(member)?;
+    let pass = land_owed(&t)?;
+    let ready = crate::repair::ready(&t)?;
+    let tree = crate::cmd_checkout::member_tree(store, member)?;
+    let head = wsp_base::calls::Command::new("git").arg("-C").arg(&tree).args(["rev-parse", "HEAD"]).output().ok()?;
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    if !same_commit(&head, &ready) {
+        return None;
+    }
+    let out = match crate::cmd_checkout::land_verdict(store, member) {
+        crate::cmd_checkout::Verdict::Nothing => {
+            set_owed(store, member, None, by);
+            Owed::Landed(None)
+        }
+        crate::cmd_checkout::Verdict::Landed { landed, reran } => {
+            set_owed(store, member, None, by);
+            note_landing(store, member, &landed, &reran);
+            fold_pieces(store, member);
+            store.log_event("task-verified", serde_json::json!({ "id": member, "verdict": "holds", "landed": landed.sha, "owed": "landed", "by": by }));
+            Owed::Landed(Some(landed.sha))
+        }
+        crate::cmd_checkout::Verdict::Dirty(why) => {
+            set_owed(store, member, Some(&why), &format!("{by}, and refused again"));
+            tell_governor(
+                store,
+                member,
+                &format!("{member}: its hold is still owed a land — {by}, and the tree is still dirty, so nothing reached the trunk.\n{why}"),
+            );
+            Owed::Still(why)
+        }
+        crate::cmd_checkout::Verdict::Blocked(why) => {
+            store.locked(|| {
+                let mut t = store.find_task(member)?;
+                let mut ps = passes(&t);
+                let last = ps.last_mut()?;
+                let now = util::now_iso();
+                last.state = State::Blocks;
+                last.owed = None;
+                last.decided = Some(now.clone());
+                last.caption = Some("the hold could not land the row".into());
+                last.text = format!("{}\n\n{why}", last.text.trim());
+                write(&mut t, &ps);
+                send_back(&mut t, now, "the hold's owed land was refused", pass.read.as_deref(), &why, None);
+                store.save_task(&t).ok()
+            });
+            deliver_unless_reworked(store, member, &why);
+            tell_governor(store, member, &format!("{member}: its owed land was refused ({by}), so the hold is recorded as a block and it is sent back.\n{why}"));
+            Owed::Blocked(why)
+        }
+    };
+    store.git_commit(&format!("wsp: {member} owed land — {by}"));
+    crate::cycle::poke_task(store, member, "verified");
+    Some(out)
 }
 
 /// A hold is the end of a row's pieces: `## Pieces` folds into the log, one line
@@ -1374,6 +1507,7 @@ mod tests {
             }),
             did: None,
             checked: Vec::new(),
+            owed: None,
         };
         let bare = Pass { at: "2026-10-06T11:00:00Z".into(), ..Pass::opened(None, None) };
         write(&mut t, &[bare.clone(), full.clone()]);
@@ -1823,6 +1957,136 @@ mod tests {
         fn reran(&self) -> String {
             std::fs::read_to_string(&self.ran).unwrap_or_default()
         }
+    }
+
+    // ---- `wsp-605`: a hold that cannot land on a dirty tree owes its land ------
+
+    /// The tree as `npm run check` left compounding-366's: a tracked file the
+    /// checks rewrite, and a new one.
+    fn dirty_it(g: &Ground) {
+        std::fs::write(g.tree.join("f"), "rewritten by the checks\n").unwrap();
+        std::fs::write(g.tree.join("shot.png"), "new\n").unwrap();
+    }
+
+    fn clean_it(g: &Ground) {
+        git_t(&g.tree, &["checkout", "--", "f"]);
+        std::fs::remove_file(g.tree.join("shot.png")).unwrap();
+    }
+
+    /// The run's list, so the governor has somebody to be told.
+    fn on_a_list(g: &Ground) {
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], agent: "claude".into(), ..Default::default() }]);
+        g.store.save_worklist(&w).unwrap();
+    }
+
+    fn told() -> Vec<String> {
+        crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).collect())
+    }
+
+    #[test]
+    fn a_hold_whose_land_meets_a_dirty_tree_is_owed_its_land_not_a_block() {
+        for (tag, trunk) in [("owed-ff", &[][..]), ("owed-moved", &[("t.txt", "theirs\n")][..])] {
+            let g = ground(tag, "", &[("m.txt", "mine\n")], trunk);
+            let before = g.trunk();
+            dirty_it(&g);
+            assert_eq!(g.verdict("holds"), 0);
+            assert_eq!(g.trunk(), before, "{tag}: nothing reached the trunk");
+            let t = g.member();
+            let p = passes(&t).pop().unwrap();
+            assert_eq!(p.state, State::Holds, "{tag}: the verdict holds");
+            let owed = p.owed.clone().expect("the land is owed");
+            assert!(owed.contains("written by the checks run in it") && owed.contains(": f"), "{tag}: the tracked file is named as the checks': {owed}");
+            assert!(owed.contains("work nobody committed: shot.png"), "{tag}: the new file is named: {owed}");
+            assert_eq!(t.status_raw, "review", "{tag}: not sent back");
+            assert!(!t.section("Log").unwrap().contains(crate::cycle::SENT_BACK), "{tag}");
+            assert!(land_owed(&t).is_some(), "{tag}");
+            assert!(crate::cycle::blocked_at_tip(&t).is_none(), "{tag}: no block for wsp-529 to refuse");
+            let again = Pass::parse(p.line().lines().next().unwrap()).unwrap();
+            assert_eq!(again.owed.as_deref(), Some(crate::util::fold(&owed).replace(" · ", " — ").as_str()), "{tag}: the clause reads back");
+        }
+    }
+
+    #[test]
+    fn a_review_again_at_the_same_commit_with_a_clean_tree_lands_the_owed_hold_with_no_verifier() {
+        let g = ground("owed-clean", "", &[("m.txt", "mine\n")], &[("t.txt", "theirs\n")]);
+        dirty_it(&g);
+        assert_eq!(g.verdict("holds"), 0);
+        clean_it(&g);
+        let Some(Owed::Landed(Some(sha))) = retry_owed(&g.store, "m-1", "reviewed again") else { panic!("landed") };
+        let t = g.member();
+        assert_eq!(g.trunk(), sha, "the trunk is at the landed commit");
+        assert_eq!(crate::repair::landed(&t).as_deref(), Some(sha.as_str()));
+        let ps = passes(&t);
+        assert_eq!(ps.len(), 1, "no new pass, so no verifier");
+        assert_eq!(ps[0].state, State::Holds);
+        assert!(ps[0].owed.is_none(), "the owed land is settled");
+        assert!(land_owed(&t).is_none());
+        assert_eq!(retry_owed(&g.store, "m-1", "reviewed again"), None, "nothing is owed twice");
+    }
+
+    #[test]
+    fn the_run_lands_an_owed_hold_once_the_tree_turns_clean() {
+        let g = ground("owed-turns", "", &[("m.txt", "mine\n")], &[]);
+        dirty_it(&g);
+        assert_eq!(g.verdict("holds"), 0);
+        let before = g.trunk();
+        crate::cycle::retry_owed_land(&g.store, "run", 1, &g.member());
+        assert_eq!(g.trunk(), before, "a dirty tree waits");
+        assert!(land_owed(&g.member()).is_some());
+        clean_it(&g);
+        crate::cycle::retry_owed_land(&g.store, "run", 1, &g.member());
+        assert_eq!(g.trunk(), g.ready, "landed once clean");
+        assert!(land_owed(&g.member()).is_none());
+        assert_eq!(passes(&g.member()).len(), 1, "with no verifier");
+    }
+
+    #[test]
+    fn a_still_dirty_tree_stays_owed_and_tells_the_governor() {
+        let g = ground("owed-still", "", &[("m.txt", "mine\n")], &[]);
+        on_a_list(&g);
+        dirty_it(&g);
+        assert_eq!(g.verdict("holds"), 0);
+        assert!(told().iter().any(|t| t.contains("its land is owed")), "the governor hears of the owed land");
+        let before = g.trunk();
+        let Some(Owed::Still(why)) = retry_owed(&g.store, "m-1", "reviewed again") else { panic!("still owed") };
+        assert!(why.contains("shot.png"), "{why}");
+        assert_eq!(g.trunk(), before);
+        let t = g.member();
+        assert!(land_owed(&t).is_some(), "still owed");
+        assert_eq!(t.status_raw, "review");
+        assert!(t.section("Log").unwrap().contains("the hold's land is owed (reviewed again, and refused again)"), "said on the row");
+        let heard = told();
+        assert!(heard.iter().any(|t| t.contains("m-1: its hold is still owed a land") && t.contains("shot.png")), "{heard:?}");
+    }
+
+    #[test]
+    fn new_commits_over_an_owed_hold_are_not_landed_unread() {
+        let g = ground("owed-moved-on", "", &[("m.txt", "mine\n")], &[]);
+        dirty_it(&g);
+        assert_eq!(g.verdict("holds"), 0);
+        clean_it(&g);
+        std::fs::write(g.tree.join("more.txt"), "more\n").unwrap();
+        git_t(&g.tree, &["add", "more.txt"]);
+        git_t(&g.tree, &["commit", "-q", "-m", "more work"]);
+        let before = g.trunk();
+        assert_eq!(retry_owed(&g.store, "m-1", "reviewed again"), None);
+        assert_eq!(g.trunk(), before, "a commit no verifier read stays off the trunk");
+    }
+
+    /// `wsp-529` stands for a real block: at an unchanged commit it is still
+    /// one, and nothing is owed to land.
+    #[test]
+    fn a_real_block_at_an_unchanged_commit_is_still_refused() {
+        let g = ground("owed-real-block", "", &[("m.txt", "mine\n")], &[]);
+        assert_eq!(g.verdict("blocks"), 0);
+        let t = g.member();
+        assert!(land_owed(&t).is_none());
+        assert_eq!(retry_owed(&g.store, "m-1", "reviewed again"), None);
+        let blocked = crate::cycle::blocked_at_tip(&t).expect("the block at the tip");
+        assert!(same_commit(blocked.read.as_deref().unwrap(), &g.ready));
+        assert!(!crate::cycle::answered_block(&t), "unanswered, so no verifier is owed");
     }
 
     #[test]

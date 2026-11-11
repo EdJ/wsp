@@ -825,6 +825,12 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         // mixed group is the member's own line and not the group's.
         let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
         let label = crate::verification::seat_label(&member.id);
+        // A hold that owes its land (`wsp-605`) owes no verifier: the land is
+        // retried once the tree is clean, and until then nothing here starts.
+        if crate::verification::land_owed(&member).is_some() {
+            retry_owed_land(store, &w.id, at, &member);
+            continue;
+        }
         if !prepare_ready(store, &w.id, at, &member) {
             continue;
         }
@@ -2805,6 +2811,24 @@ fn prepare_ready(store: &Store, list: &str, at: usize, member: &Task) -> bool {
             false
         }
     }
+}
+
+/// The land a hold owes (`wsp-605`), tried again when the member's tree has
+/// turned clean. A dirty tree waits silently: the member and the governor were
+/// told when the land was refused, and `wsp review` tries it again on demand.
+pub(crate) fn retry_owed_land(store: &Store, list: &str, at: usize, member: &Task) {
+    let Some(tree) = crate::cmd_checkout::member_tree(store, &member.id) else { return };
+    if crate::cmd_checkout::uncommitted(&tree) > 0 {
+        return;
+    }
+    let said = match crate::verification::retry_owed(store, &member.id, "the tree is clean") {
+        Some(crate::verification::Owed::Landed(Some(sha))) => format!("the hold's owed land landed at {}", &sha[..sha.len().min(12)]),
+        Some(crate::verification::Owed::Landed(None)) => "the hold's owed land had nothing left to land".into(),
+        Some(crate::verification::Owed::Still(why)) => format!("the hold's land is still owed: {}", util::fold(&why)),
+        Some(crate::verification::Owed::Blocked(why)) => format!("the hold's owed land was refused, sent back: {}", util::fold(&why)),
+        None => return,
+    };
+    log_line(store, &format!("{list} group {at}: {} {said}", member.id));
 }
 
 fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
