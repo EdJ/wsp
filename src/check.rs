@@ -1965,17 +1965,20 @@ pub(crate) fn gate(store: &Store, member: &Task) -> Gate {
     } else if mine.as_ref().is_some_and(|r| r.state != RunState::Running) {
         return Gate::Clear;
     }
-    // A verifier already reading this landing was opened with nothing to wait
-    // for, and nothing here is asked again on every tick.
-    if mine.is_none() && v::passes(member).last().is_some_and(|p| same(&p.read)) {
-        return Gate::Clear;
-    }
+    // A pass already opened at this landing is no answer for a commit with no
+    // run: its spawn may have failed (`compound-sup` not found, `wsp-602`) and
+    // the verifier gate then owed nothing for ever. The run is owed, and the
+    // entry `begin` writes is what keeps it from being asked again.
     let Ok(tg) = target(store, member, None) else { return Gate::Clear };
     let steps = plan(store, member, &tg, None).steps;
     if steps.is_empty() {
         return Gate::Clear;
     }
     if let Some(at) = begin(store, &member.id, &sha, stale_after(&steps), false) {
+        if mine.is_none() {
+            let short: String = sha.chars().take(12).collect();
+            crate::store::log_line(store, &format!("check {}: check owed at {short}, starting it", member.id));
+        }
         crate::cycle::launch_out(store, &["check", &member.id, "--auto", "--run", &at]);
     }
     Gate::Wait
@@ -2522,6 +2525,27 @@ mod tests {
         settle(&store, "pj-001", &runs[0].at, &ran, Duration::ZERO);
         let t = store.find_task("pj-001").unwrap();
         assert_eq!(gate(&store, &t), Gate::Clear, "passed for {sha}");
+    }
+
+    /// `wsp-602`: a pass opened at the landing whose spawn failed is no run of
+    /// the check; the gate still owes one, and says so.
+    #[test]
+    fn a_pass_with_no_run_at_its_commit_does_not_clear_the_gate() {
+        let (_env, store, sha) = world("owed", "- ok: true", "exit 0\n");
+        let mut t = store.find_task("pj-001").unwrap();
+        let mut passes = v::passes(&t);
+        passes.push(v::Pass::opened(Some(sha.clone()), None));
+        v::write(&mut t, &passes);
+        store.save_task(&t).unwrap();
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(gate(&store, &t), Gate::Wait, "the check is owed at {sha}");
+        let t = store.find_task("pj-001").unwrap();
+        let runs = v::runs(&t);
+        assert_eq!(runs.len(), 1, "and its entry is written");
+        assert_eq!(runs[0].state, RunState::Running);
+        let short: String = sha.chars().take(12).collect();
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(log.contains(&format!("check owed at {short}, starting it")), "{log}");
     }
 
     #[test]

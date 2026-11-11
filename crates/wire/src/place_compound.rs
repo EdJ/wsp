@@ -287,21 +287,38 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// session under load, not an expected wait.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Where `compound-sup` lives: `$COMPOUND_SUP`, or found on `PATH`.
+/// Where `compound-sup` lives: `$COMPOUND_SUP` when it names a file, else
+/// `PATH`, else `~/.local/bin/compound-sup`, else beside the running `wsp`.
 ///
-/// There is no relative-path fallback the way `crates/host/src/sessions.rs`
-/// has one, and cannot be: that fallback is "beside this binary", which
-/// means something for the compound host built from its own workspace and
-/// means nothing for `wsp`, a separate binary in a separate repository. An
-/// operator who wants `wsp` to place compound work sets the variable once,
-/// the same shape as `HERDR_SOCKET_PATH` already is for the other backend.
+/// A set-but-missing `$COMPOUND_SUP` falls through rather than failing, and a
+/// caller whose `PATH` lacks `~/.local/bin` (a seat's shell running `advance`)
+/// still finds the binary the daemon's own `PATH` has (`wsp-602`).
 fn compound_sup_binary() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("COMPOUND_SUP") {
-        let p = PathBuf::from(p);
-        return p.is_file().then_some(p);
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from));
+    find_sup(
+        std::env::var_os("COMPOUND_SUP"),
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME").map(PathBuf::from),
+        exe_dir,
+    )
+}
+
+fn find_sup(
+    var: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+    exe_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(p) = var.map(PathBuf::from).filter(|p| p.is_file()) {
+        return Some(p);
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join("compound-sup")).find(|p| p.is_file())
+    if let Some(path) = path {
+        if let Some(p) = std::env::split_paths(&path).map(|d| d.join("compound-sup")).find(|p| p.is_file()) {
+            return Some(p);
+        }
+    }
+    let local = home.filter(|h| !h.as_os_str().is_empty()).map(|h| h.join(".local/bin/compound-sup"));
+    local.into_iter().chain(exe_dir.map(|d| d.join("compound-sup"))).find(|p| p.is_file())
 }
 
 /// Where `compound-render` lives: `$COMPOUND_RENDER`, `PATH`, or beside
@@ -2247,6 +2264,41 @@ pub mod test_sups {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wsp-602`: a caller whose `PATH` lacks `~/.local/bin` still finds the
+    /// supervisor there, and a set-but-missing `$COMPOUND_SUP` falls through.
+    #[test]
+    fn compound_sup_is_found_off_path_and_a_missing_variable_falls_through() {
+        let d = std::env::temp_dir().join(format!("wsp602-sup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let home = d.join("home");
+        let beside = d.join("beside");
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(&beside).unwrap();
+        let on_path = d.join("onpath");
+        std::fs::create_dir_all(&on_path).unwrap();
+        let none = || Some(d.join("empty").into_os_string());
+        let missing = Some(d.join("nope").into_os_string());
+
+        assert_eq!(find_sup(None, none(), Some(home.clone()), Some(beside.clone())), None);
+
+        std::fs::write(beside.join("compound-sup"), "").unwrap();
+        assert_eq!(find_sup(None, none(), Some(home.clone()), Some(beside.clone())), Some(beside.join("compound-sup")));
+
+        std::fs::write(home.join(".local/bin/compound-sup"), "").unwrap();
+        assert_eq!(
+            find_sup(missing.clone(), none(), Some(home.clone()), Some(beside.clone())),
+            Some(home.join(".local/bin/compound-sup")),
+            "a set-but-missing variable falls through, and ~/.local/bin comes before beside wsp"
+        );
+
+        std::fs::write(on_path.join("compound-sup"), "").unwrap();
+        assert_eq!(
+            find_sup(missing, Some(on_path.clone().into_os_string()), Some(home), Some(beside)),
+            Some(on_path.join("compound-sup"))
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     /// Wait for something a real process does in its own time. Same shape
     /// as `place_super::tests::until`, its own copy for the same reason that
