@@ -82,6 +82,8 @@ pub struct Book {
     pub claims: BTreeMap<String, Value>,
     /// pane -> binding record
     pub bindings: BTreeMap<String, Value>,
+    /// agent id -> agent record, which says which seat an agent is in
+    pub agents: BTreeMap<String, Value>,
     pub lists: Vec<Worklist>,
     pub tasks: Vec<Task>,
     pub projects: Vec<String>,
@@ -93,6 +95,7 @@ impl Book {
             governors: store.governors(),
             claims: store.claims(),
             bindings: store.bindings(),
+            agents: store.agents_held(),
             lists: store.worklists(),
             tasks: store.tasks(),
             projects: store.projects().into_iter().map(|p| p.id).collect(),
@@ -197,6 +200,11 @@ fn seat(book: &Book, row: &str) -> Result<Vec<Named>, String> {
     let panes = book.panes_for(row);
     if panes.is_empty() {
         return Err(format!("{row} is claimed and nobody is in its seat — `wsp wip` says who holds what"));
+    }
+    // Of two seats on one row, the one that holds the claim (`wsp-603`).
+    let holder = book.claims.get(row).filter(|_| panes.len() > 1).and_then(|c| crate::cmd_agent::claim_holder(c, &panes, &book.agents));
+    if let Some(holder) = holder {
+        return Ok(vec![named(&holder, format!("the seat on {row}, which holds its claim"))]);
     }
     Ok(panes.iter().map(|p| named(p, format!("the seat on {row}"))).collect())
 }
@@ -336,6 +344,20 @@ mod tests {
     #[test]
     fn seat_is_whoever_holds_the_rows_claim() {
         assert_eq!(panes(at("seat:m-1", &book())), vec!["cpd-1"]);
+    }
+
+    /// `wsp-603`: a member started twice has two seats on one row, and a tell
+    /// goes to the one the claim is on, and says so.
+    #[test]
+    fn of_two_seats_on_a_row_the_one_holding_the_claim_is_named() {
+        let mut b = book();
+        bind(&mut b, "cpd-2", "m-1");
+        b.claims.insert("m-1".into(), json!({ "agent_id": "a-2" }));
+        b.agents.insert("a-1".into(), json!({ "seat": "cpd-1" }));
+        b.agents.insert("a-2".into(), json!({ "seat": "cpd-2" }));
+        let found = at("seat:m-1", &b).unwrap();
+        assert_eq!(panes(Ok(found.clone())), vec!["cpd-2"]);
+        assert!(found[0].what.contains("holds its claim"), "{}", found[0].what);
     }
 
     #[test]

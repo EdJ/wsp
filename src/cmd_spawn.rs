@@ -506,6 +506,17 @@ fn lay_brief(
 
 /// What an agent is told about work it has just been handed.
 ///
+/// The seat already holding `task`'s claim, bound and standing, when it is not
+/// `seat` (`wsp-603`).
+fn standing_twin(store: &Store, task: &str, seat: &str) -> Option<String> {
+    let claim = store.claims().get(task).cloned()?;
+    let panes: Vec<String> = store.panes_for_task(task).into_iter().filter(|p| p != seat).collect();
+    let holder = cmd_agent::claim_holder(&claim, &panes, &store.agents_held())?;
+    let backends = crate::place::local_backends();
+    let (_, row) = cmd_agent::locate_seat(&backends, &holder)?;
+    (!matches!(row.state, State::Gone | State::Empty)).then_some(holder)
+}
+
 /// One definition, three cases: the panel says this to an agent it claims a
 /// task onto, `spawn` says it to the agent it just started, and `spawn
 /// --govern` says the custodial one to an agent it has just put in a project's
@@ -2832,6 +2843,25 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             crate::piece_seat::attach(store, t, piece_rec.as_ref().map_or(0, |p| p.n), seat.as_str(), &stand)
         }
         Some(t) => {
+            // **A member is started once** (`wsp-603`): one spawn opens one seat.
+            // If the row already has a bound, claimed seat that is standing, this
+            // one is the second, and it is ended at once and logged — two agents
+            // wrote into one tree for sixteen minutes before anyone saw it.
+            // `--force` is a person taking the row off whoever has it.
+            if !args.has("force") {
+                if let Some(twin) = standing_twin(store, t, seat.as_str()) {
+                    let _ = place.stop(&seat);
+                    if let Some(mut row) = store.task(t) {
+                        let _ = crate::log::note(
+                            store,
+                            &mut row,
+                            &format!("a second start came up as {seat} while {twin} held the claim; ended {seat} at once"),
+                        );
+                    }
+                    eprintln!("wsp: {t} is already started in {twin}, so the second seat {seat} was ended and nothing was started in it");
+                    return 1;
+                }
+            }
             // The seat, under the name the claim still calls it. `claim --pane`
             // is `cmd_agent`'s vocabulary and migrating it is its own task; the
             // string is the same string either way.
@@ -4869,6 +4899,16 @@ fn end_work(
     // The claim, through the one implementation of ending one. `release` writes
     // the `worked` record, the line in the task's log and the commit; a second
     // copy of that here would be a second contract.
+    //
+    // **Unless the claim is another seat's** (`wsp-603`): a member started twice
+    // in one tree has two seats on one row, and ending the one without the claim
+    // puts down only itself. Read before the release, which clears the binding.
+    let claim_is = store
+        .bindings()
+        .get(seat.as_str())
+        .and_then(|b| b.get("task_id"))
+        .and_then(|t| t.as_str())
+        .and_then(|t| cmd_agent::claim_elsewhere(store, t, seat.as_str()));
     let (released, ended) = cmd_agent::release_pane(store, seat.as_str());
     // A seat with no binding — a verifier, a leg, a barrier check, a governor —
     // is let go of with nothing for `release_pane` to clear, so what it asked
@@ -4887,7 +4927,7 @@ fn end_work(
     // A governor's (or the primary seat's) despawn of a member is "free the seat
     // so the run reseats", and this is the word the run reads for it
     // (`wsp-524`). Only a row at `doing`, which is the one the run reseats.
-    if me.governs.is_some() {
+    if me.governs.is_some() && claim_is.is_none() {
         if let Some(mut t) = task.as_deref().and_then(|id| store.task(id)) {
             if t.status() == crate::model::Status::Doing {
                 let _ = crate::log::note(store, &mut t, crate::cycle::RESEAT_ASKED);
@@ -4917,7 +4957,9 @@ fn end_work(
     // absent file is the ordinary answer for every kind that never had one, and
     // a line here would be printed on every despawn in the fleet for the
     // benefit of none.
-    for subject in task.iter().map(String::as_str).chain(held.iter().map(String::as_str)) {
+    // The row's own tree and brief are the claim holder's, and stay when it is.
+    let own_task = task.clone().filter(|_| claim_is.is_none());
+    for subject in own_task.iter().map(String::as_str).chain(held.iter().map(String::as_str)) {
         let _ = std::fs::remove_file(brief_path(store, subject));
     }
     // A verifier's, named after the member it verified (`wsp-188`): the seat
@@ -4947,7 +4989,7 @@ fn end_work(
     // Last, and only now: the tree is the one step a person can still do by
     // hand afterwards, so it must not be the step that stops the claim being
     // released. Everything before this line is what `despawn` has always done.
-    let Leftovers { tree, legs, builds, far } = tidy(&seat, task.as_deref().or(check.as_deref()), workspace.as_deref());
+    let Leftovers { tree, legs, builds, far } = tidy(&seat, own_task.as_deref().or(check.as_deref()), workspace.as_deref());
 
     if args.json() {
         println!(
@@ -4979,6 +5021,10 @@ fn end_work(
             false => format!("{seat} was already gone"),
         }));
         match (&task, released) {
+            (Some(t), _) if claim_is.is_some() => println!(
+                "  {}",
+                p.dim(&format!("{t} stays claimed: {} holds it", claim_is.as_ref().map_or("", |(_, h)| h.as_str()))),
+            ),
             (Some(t), true) => println!("  {}", p.dim(&format!("released {t}"))),
             (Some(t), false) => println!("  {}", p.dim(&format!("{t} was not bound to it"))),
             (None, _) => println!("  {}", p.dim("it was holding nothing")),

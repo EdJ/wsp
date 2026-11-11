@@ -2098,8 +2098,16 @@ fn target(store: &Store, needle: &str, seated: &dyn Fn(&str) -> bool) -> Option<
         return Some((piece.pane.clone()?, format!("{} — {}", a.id(), util::truncate(&piece.title, 44))));
     }
     let t = store.find_task(needle)?;
-    let pane = store.panes_for_task(&t.id).into_iter().next()?;
-    Some((pane, format!("{} — {}", t.id, util::truncate(&t.title, 44))))
+    // The seat holding the row's claim, and named as that: a row started twice
+    // in one tree has two, and a tell to the other reaches nobody who owns it
+    // (`wsp-603`).
+    let panes = store.panes_for_task(&t.id);
+    let held = store.claims().get(&t.id).and_then(|c| claim_holder(c, &panes, &store.agents_held()));
+    let title = util::truncate(&t.title, 44);
+    match held {
+        Some(pane) => Some((pane.clone(), format!("{} — {title} · {pane} holds the claim", t.id))),
+        None => Some((panes.into_iter().next()?, format!("{} — {title}", t.id))),
+    }
 }
 
 /// The message: the rest of the line, or a stream.
@@ -3943,6 +3951,33 @@ fn end_claim(store: &Store, task_id: &str) {
     store.git_commit(&format!("wsp: release {task_id}"));
 }
 
+/// The seat that holds a row's claim, of the seats bound to the row: the one
+/// whose agent is the claim's. One bound seat is the holder whatever the claim
+/// says; with several and no agent matching, nobody can say (`wsp-603`).
+pub(crate) fn claim_holder(
+    claim: &Value,
+    panes: &[String],
+    agents: &BTreeMap<String, Value>,
+) -> Option<String> {
+    if let [only] = panes {
+        return Some(only.clone());
+    }
+    let agent = claim.get("agent_id")?.as_str()?;
+    panes.iter().find(|p| Store::agent_in_seat_from_map(agents, p).as_deref() == Some(agent)).cloned()
+}
+
+/// `Some((row, holder))` when `pane` is bound to a claimed row whose claim is
+/// another seat's.
+pub(crate) fn claim_elsewhere(store: &Store, row: &str, pane: &str) -> Option<(String, String)> {
+    let claim = store.claims().get(row).cloned()?;
+    let panes = store.panes_for_task(row);
+    if !panes.iter().any(|p| p == pane) {
+        return None;
+    }
+    let holder = claim_holder(&claim, &panes, &store.agents_held())?;
+    (holder != pane).then(|| (row.to_string(), holder))
+}
+
 /// Drop a pane's binding and, with it, the claim it stood for.
 ///
 /// The mechanism of `release` with no printing in it, because there are two
@@ -3953,6 +3988,18 @@ fn end_claim(store: &Store, task_id: &str) {
 pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) {
     let had = store.bindings().get(pane).cloned();
     let mut released: Option<String> = None;
+    // **A seat that does not hold the row's claim never releases it**
+    // (`wsp-603`). A member started twice in one tree has two seats bound to
+    // one row; ending the one the claim is not on used to end the claim, with
+    // the real seat still running. Its own binding goes, and nothing else.
+    if had.as_ref().and_then(|b| b.get("task_id")).and_then(|t| t.as_str()).and_then(|t| claim_elsewhere(store, t, pane)).is_some() {
+        let removed = store.clear_binding(pane);
+        if removed {
+            let mut cache = sync::Cache::default();
+            let _ = sync::sync(store, &mut cache, true);
+        }
+        return (removed, None);
+    }
     if let Some(binding) = &had {
         if let Some(task_id) = binding.get("task_id").and_then(|t| t.as_str()) {
             crate::ending::handed_to_legs(store, task_id, pane, binding);
@@ -10412,6 +10459,33 @@ mod tests {
         let w = Wip::live(&store);
         assert_eq!(w.since.get("w1:p1"), Some(&long_ago), "and the turn still reads two hours");
         assert!(far.asked().is_empty());
+    }
+
+    /// `wsp-603`: ending the seat that does not hold a row's claim ends that
+    /// seat's binding and leaves the claim, and the holder's binding, standing.
+    #[test]
+    fn releasing_a_seat_that_is_not_the_claims_leaves_the_claim_with_its_holder() {
+        let _env = util::isolated("release-the-twin");
+        let store = Store::open();
+        store.save_task(&wip_task("t-001", "doubled", Some("wsp"), "doing")).unwrap();
+        store.set_agent("a-1", json!({ "seat": "cpd-1", "started": "2026-10-01T00:00:00Z" }));
+        store.set_agent("a-2", json!({ "seat": "cpd-2", "started": "2026-10-01T00:00:01Z" }));
+        store.set_binding("cpd-1", json!({ "task_id": "t-001", "pane_id": "cpd-1" }));
+        store.set_binding("cpd-2", json!({ "task_id": "t-001", "pane_id": "cpd-2" }));
+        store.set_claim("t-001", json!({ "agent_id": "a-2", "claimed_at": "2026-10-01T00:00:02Z" }));
+
+        let (removed, released) = release_pane(&store, "cpd-1");
+        assert!(removed && released.is_none(), "its own binding goes and no claim is released");
+        assert!(store.claims().contains_key("t-001"), "the claim stays");
+        assert!(store.bindings().contains_key("cpd-2"), "with its holder");
+
+        let panes = store.panes_for_task("t-001");
+        let held = claim_holder(&store.claims()["t-001"], &panes, &store.agents_held());
+        assert_eq!(held.as_deref(), Some("cpd-2"));
+
+        let (_, released) = release_pane(&store, "cpd-2");
+        assert_eq!(released.as_deref(), Some("t-001"), "the holder's release still ends the claim");
+        assert!(!store.claims().contains_key("t-001"));
     }
 
     /// A compound seat directory whose pid is dead, last written `ago` seconds

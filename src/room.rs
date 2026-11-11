@@ -416,7 +416,14 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
         .filter_map(|(seat, b)| Some((seat.clone(), b.get("task_id")?.as_str()?.to_string())))
         .collect();
     held.extend(r.claimed());
+    // **A row's seats count once** (`wsp-603`): a member started twice in one
+    // tree held two places for one row. Its legs and pieces are counted above,
+    // by their own entries, and are not among these.
+    let mut rows_counted = BTreeSet::new();
     for (seat, id) in held {
+        if rows_counted.contains(&id) {
+            continue;
+        }
         let Some(s) = status(&id) else { continue };
         // **A sent-back row whose seat took no tell holds nothing owed to the cap**
         // (`compounding-285`): the run is about to end that seat and start the row
@@ -424,7 +431,11 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
         let holds_nothing = in_parked_list(r, &id)
             || r.tasks.iter().any(|t| t.id == id && (crate::inner::run_inside(t) || crate::repair::undelivered_reason(t).is_some()));
         let weight = r.weight_of(&id);
-        take(&mut out, Some(&seat), id, weight, finished(s) || holds_nothing, false, None);
+        let before = out.len();
+        take(&mut out, Some(&seat), id.clone(), weight, finished(s) || holds_nothing, false, None);
+        if out.len() > before {
+            rows_counted.insert(id);
+        }
     }
 
     // A member the run moved to `doing` whose agent has not claimed it yet:
@@ -637,6 +648,14 @@ mod tests {
     fn counted(r: &Records, looks: &[(&str, Look)]) -> Vec<String> {
         let looks: BTreeMap<&str, Look> = looks.iter().copied().collect();
         working(r, &|s| looks.get(s).copied().unwrap_or(Look::Unknown)).into_iter().map(|c| c.what).collect()
+    }
+
+    /// `wsp-603`: two seats bound to one row hold one place, not two.
+    #[test]
+    fn a_rows_seats_count_once() {
+        let r = records(vec![task("twice", Status::Doing)], &[("w1:p1", "twice"), ("w1:p2", "twice")]);
+        let counted = counted(&r, &[("w1:p1", Look::Working), ("w1:p2", Look::Working)]);
+        assert_eq!(counted, vec!["twice".to_string()], "{counted:?}");
     }
 
     /// The rules in the module docs, one seat each: what is working counts,
