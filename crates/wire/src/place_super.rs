@@ -1542,6 +1542,10 @@ impl Place for Supervisor<'_> {
         last_written(&self.dir_of(seat).ok()?)
     }
 
+    fn stopped(&self, seat: &Seat) -> Option<crate::place::Stopped> {
+        crate::place::stopped_of(&self.said(seat))
+    }
+
     fn root(&self, seat: &Seat) -> Option<u32> {
         self.record(seat).ok()?.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32)
     }

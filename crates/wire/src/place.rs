@@ -992,6 +992,31 @@ impl std::fmt::Display for Refusal {
 
 pub type Result<T> = std::result::Result<T, Refusal>;
 
+
+/// A turn's end as a seat's hooks recorded it — [`Place::stopped`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    /// The `Stop` hook's time, in epoch seconds.
+    pub at: i64,
+    /// The transcript the session was writing, where the hook named one.
+    pub transcript: Option<String>,
+}
+
+/// [`Place::stopped`] off a seat's `said.json`: a `Stop` that is still the
+/// last word, with a time that reads.
+pub(crate) fn stopped_of(said: &serde_json::Value) -> Option<Stopped> {
+    let s = |k: &str| said.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    if s("hook") != "Stop" {
+        return None;
+    }
+    let at = crate::util::epoch_of(&s("at"));
+    if at == 0 {
+        return None;
+    }
+    let path = s("transcript_path");
+    Some(Stopped { at, transcript: (!path.is_empty()).then_some(path) })
+}
+
 /// Where wsp puts work.
 ///
 /// Nine methods. Every one of them is a clause of the sentence at the top of
@@ -1193,6 +1218,15 @@ pub trait Place {
     /// idle for hours and was then killed it reads too old, which is why the
     /// only caller sweeps nothing that still holds a claim.
     fn quiet_since(&self, _seat: &Seat) -> Option<i64> {
+        None
+    }
+
+    /// When this seat's last turn ended — its `Stop` hook, in epoch seconds —
+    /// and the transcript that turn was written to, while the last thing the
+    /// seat said about itself is that `Stop` (`wsp-606`). `None` is *no stop is
+    /// the last word here*, or this backend keeps no hooks: a caller falls back
+    /// to whatever clock it had before.
+    fn stopped(&self, _seat: &Seat) -> Option<Stopped> {
         None
     }
 

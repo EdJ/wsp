@@ -228,6 +228,86 @@ pub(crate) fn last_words(screen: &str) -> Option<Words> {
     Some(Words { text: util::truncate(&joined, WORDS_SHOWN), asks })
 }
 
+/// What Claude Code writes in a `tool_result` when a call was refused — by the
+/// person or by auto mode's classifier (`wsp-606`).
+pub(crate) const DENIED: &str = "Permission for this action was denied";
+
+/// How a turn ended, read off its transcript rather than its screen
+/// (`wsp-606`): the turn's last assistant text, and whether any call in that
+/// turn was denied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TurnEnd {
+    /// When the turn ended — the seat's `Stop` hook, in epoch seconds.
+    pub(crate) at: i64,
+    /// The last paragraph of the turn's last assistant text, judged by
+    /// [`last_words`]'s rule.
+    pub(crate) words: Option<Words>,
+    /// A `tool_result` in the turn carried [`DENIED`].
+    pub(crate) denied: bool,
+}
+
+impl TurnEnd {
+    /// Whether this turn ended wanting somebody: a request in its last words,
+    /// or a call it was refused.
+    pub(crate) fn wants(&self) -> bool {
+        self.denied || self.words.as_ref().is_some_and(|w| w.asks)
+    }
+}
+
+/// The most of a transcript's tail read for its last turn, in bytes.
+const TRANSCRIPT_TAIL: u64 = 1 << 20;
+
+/// The last turn of a Claude Code transcript (JSONL), from its last prompt on:
+/// `(last words, denied)`. A prompt is a `user` line whose content is the
+/// person's (or wsp's) text, not a `tool_result`.
+pub(crate) fn last_turn(jsonl: &str) -> (Option<Words>, bool) {
+    let mut text: Option<String> = None;
+    let mut denied = false;
+    for line in jsonl.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let content = &v["message"]["content"];
+        match v["type"].as_str() {
+            Some("user") => {
+                let results = content.as_array().is_some_and(|a| a.iter().any(|b| b["type"] == "tool_result"));
+                if results {
+                    denied |= line.contains(DENIED);
+                } else if v["isMeta"] != true {
+                    text = None;
+                    denied = false;
+                }
+            }
+            Some("assistant") => {
+                let said: Vec<&str> = content
+                    .as_array()
+                    .map(|a| a.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect())
+                    .unwrap_or_default();
+                let said = said.join("\n\n");
+                if !said.trim().is_empty() {
+                    text = Some(said);
+                }
+            }
+            _ => {}
+        }
+    }
+    (text.as_deref().and_then(last_words), denied)
+}
+
+/// [`last_turn`] over the file at `path`, reading at most its last
+/// [`TRANSCRIPT_TAIL`] bytes. `None` where it cannot be read.
+pub(crate) fn read_last_turn(path: &std::path::Path) -> Option<(Option<Words>, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let from = len.saturating_sub(TRANSCRIPT_TAIL);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    // A tail that starts mid-line drops the partial one.
+    let text = if from > 0 { text.split_once('\n').map(|(_, r)| r.to_string()).unwrap_or_default() } else { text.into_owned() };
+    Some(last_turn(&text))
+}
+
 /// A screen line that is the agent's frame and not its words.
 fn is_chrome(l: &str) -> bool {
     l.chars().all(|c| "─━│┃╭╮╰╯┌┐└┘├┤ -=_".contains(c))
@@ -1340,4 +1420,43 @@ mod tests {
         assert!(!calm.contains("unraised"), "{calm}");
         assert!(w.turn_over("m-1", "cpd-1", None).contains("nothing readable"));
     }
+
+    /// `compounding-447`'s turn, as its transcript has it (`wsp-606`): a call
+    /// denied by auto mode, then prose. **The turn reads denied, and its last
+    /// words are the prose**; the next prompt starts a turn that is neither.
+    #[test]
+    fn a_transcripts_last_turn_carries_its_denial_and_its_last_words() {
+        let line = |v: serde_json::Value| v.to_string();
+        let earlier = [
+            line(serde_json::json!({"type":"user","message":{"role":"user","content":"go"}})),
+            line(serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"Which file first?"}]}})),
+            line(serde_json::json!({"type":"user","message":{"role":"user","content":"the chrome one"}})),
+        ];
+        let turn = [
+            line(serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}})),
+            line(serde_json::json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Permission for this action was denied. Irreversible Local Destruction"}]}})),
+            line(serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"The checkout was denied.\n\nI'm stopping here for your decision."}]}})),
+        ];
+        let jsonl = [earlier.as_slice(), turn.as_slice()].concat().join("\n");
+        let (words, denied) = last_turn(&jsonl);
+        assert!(denied, "the tool_result carries the denial");
+        assert_eq!(words.as_ref().map(|w| w.text.as_str()), Some("I'm stopping here for your decision."));
+        let end = TurnEnd { at: 1, words, denied };
+        assert!(end.wants());
+
+        let next = format!("{jsonl}\n{}\n{}",
+            line(serde_json::json!({"type":"user","message":{"role":"user","content":"agreed, you may proceed"}})),
+            line(serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"Done and landed."}]}})));
+        let (words, denied) = last_turn(&next);
+        assert!(!denied, "a new prompt is a new turn");
+        let end = TurnEnd { at: 1, words, denied };
+        assert!(!end.wants(), "nothing asked, nothing denied");
+
+        let asked = format!("{jsonl}\n{}\n{}",
+            line(serde_json::json!({"type":"user","message":{"role":"user","content":"carry on"}})),
+            line(serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"Shall I land it now?"}]}})));
+        let (words, _) = last_turn(&asked);
+        assert!(words.is_some_and(|w| w.asks), "a question is a request");
+    }
+
 }

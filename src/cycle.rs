@@ -256,6 +256,14 @@ pub(crate) trait Seats {
         None
     }
 
+    /// How the seat's last turn ended, while that `Stop` is still its last
+    /// word: when, its last words off the transcript, and whether a call in it
+    /// was denied (`wsp-606`). `None` where no hook recorded a stop, and the
+    /// default, for [`Seats::absent`]'s reason.
+    fn turn_end(&self, _seat: &str) -> Option<crate::waiting::TurnEnd> {
+        None
+    }
+
     /// Which of these are still running. A parameter for the same reason
     /// [`Seats::state`] is: a test names pids that were never processes.
     fn running(&self, pids: &[u32]) -> Vec<u32> {
@@ -4681,6 +4689,12 @@ fn say_uncommitted(store: &Store, id: &str) {
 /// The seat that answers for a run: the list's own, when somebody holds it,
 /// and otherwise — for a list run by hand — the seat routing reaches for its
 /// first member. A list wsp runs has only its own; see [`the_chain`].
+/// Whether a governor's seat is filled for this run — [`governing_scope`]
+/// answering (`wsp-606`).
+pub(crate) fn governor_seated(store: &Store, w: &Worklist) -> bool {
+    governing_scope(store, w).is_some()
+}
+
 fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
     let governors = store.governors();
     the_chain(store, w).into_iter().find(|s| crate::governors::seat_of_scope(s, &governors).is_some())

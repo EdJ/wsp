@@ -1954,6 +1954,10 @@ impl Place for Compound<'_> {
         crate::place_super::last_written(&self.dir_of(seat).ok()?)
     }
 
+    fn stopped(&self, seat: &Seat) -> Option<crate::place::Stopped> {
+        crate::place::stopped_of(&self.said(seat))
+    }
+
     /// `compound-sup` leads the group and the agent is its pty's child, so the
     /// tree under the recorded pid is the agent and its work.
     fn pids(&self, seat: &Seat) -> Option<Vec<u32>> {

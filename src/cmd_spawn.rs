@@ -5251,6 +5251,17 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
         crate::waiting::last_words(&screen)
     }
 
+    fn turn_end(&self, seat: &str) -> Option<crate::waiting::TurnEnd> {
+        let seat_id = Seat::new(seat);
+        let stop = crate::cycle::Fleet::here(seat).find_map(|b| b.stopped(&seat_id))?;
+        let (words, denied) = stop
+            .transcript
+            .as_deref()
+            .and_then(|p| crate::waiting::read_last_turn(std::path::Path::new(p)))
+            .unwrap_or_default();
+        Some(crate::waiting::TurnEnd { at: stop.at, words, denied })
+    }
+
     /// Pressed by the backend that holds the seat, and no other: a press is a
     /// keystroke, and every backend that is not this seat's answers `NoSeat`.
     fn press(&self, seat: &str) -> bool {

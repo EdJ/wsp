@@ -1203,6 +1203,20 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             }
             continue;
         }
+        // **A turn that ended wanting somebody is raised at once** (`wsp-606`).
+        // `compounding-447` was denied a `git checkout` by auto mode, ended its
+        // turn on "I'm stopping here for your decision" in prose, and sat 4 m 20 s
+        // with nothing raised: the push below waits out the window, and the
+        // list's governor seat was empty. A request in the turn's last words,
+        // or a call the turn was refused, goes to the governor when one is
+        // seated, else to the person as an ask — once per stop.
+        let end = match state {
+            State::Idle => seats.turn_end(&seat),
+            _ => None,
+        };
+        if let Some(end) = end.as_ref().filter(|e| e.wants()) {
+            raise_turn_end(store, w, at, &t.id, &seat, end);
+        }
         let gone = match state {
             State::Gone => true,
             State::Idle => match noticed(&t) {
@@ -1211,7 +1225,13 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
                 // reading `idle` before its agent has drawn a thing (a blank
                 // screen matches no detection rule), and on 2026-10-05 a member
                 // started at 07:55:37 was told and ended inside a minute.
-                None => started_at(&t).is_none_or(|at| at + STALLED_AFTER <= util::epoch_secs()),
+                //
+                // **The clock is the seat's going idle, where its hooks say when**
+                // (`wsp-606`): its `Stop`, never earlier than its start. Measured
+                // from the start, a seat that idled nine minutes into its turn was
+                // pushed within a minute and one that idled thirty seconds in
+                // waited nearly ten.
+                None => idle_since(&t, end.as_ref()).is_none_or(|at| at + STALLED_AFTER <= util::epoch_secs()),
                 Some(since) => since + STALLED_AFTER <= util::epoch_secs(),
             },
             // Working is a turn in flight and `Starting` is an agent still
@@ -1311,6 +1331,68 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
              has been told to finish, land and review, or say what is left. `wsp show {}` has its row.",
             id, w.id, id
         ));
+    }
+}
+
+/// The marker in a member's `## Log` saying its turn ended wanting somebody
+/// and was raised (`wsp-606`), with the stop it was about — so one stop is
+/// raised once, and the next stop is a new one.
+const TURN_RAISED: &str = "wsp: its turn ended wanting somebody";
+
+/// When an idle member went idle: its seat's `Stop`, never before the row's
+/// start; the start alone where no hook says.
+fn idle_since(t: &Task, end: Option<&crate::waiting::TurnEnd>) -> Option<i64> {
+    let start = started_at(t);
+    match (end.map(|e| e.at), start) {
+        (Some(stop), Some(start)) => Some(stop.max(start)),
+        (Some(stop), None) => Some(stop),
+        (None, start) => start,
+    }
+}
+
+/// Raise a member's turn that ended on a request or a denied call, once per
+/// stop: to the list's governor when one is seated, else to the person as an
+/// ask, carrying the seat's last words (`wsp-606`).
+fn raise_turn_end(store: &Store, w: &Worklist, at: usize, id: &str, seat: &str, end: &crate::waiting::TurnEnd) {
+    use crate::message::{self, About, Kind, Message, Party, Waiting};
+    let key = format!("{TURN_RAISED} (stop {})", end.at);
+    let governor = crate::cycle::governor_seated(store, w);
+    let to = if governor { "the governor" } else { "the person" };
+    let wrote = store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return false };
+        if t.section("Log").is_some_and(|l| l.contains(&key)) {
+            return false;
+        }
+        t.log(&format!("{key} — raised to {to}"));
+        t.touch();
+        store.save_task(&t).is_ok()
+    });
+    if !wrote {
+        return;
+    }
+    let how = match (end.denied, end.words.as_ref().is_some_and(|w| w.asks)) {
+        (true, true) => "after a call it made was denied, asking for something",
+        (true, false) => "after a call it made was denied",
+        _ => "asking for something",
+    };
+    let said = match &end.words {
+        Some(words) => format!("\"{}\"", words.text),
+        None => "(no text in its last turn)".to_string(),
+    };
+    let text = format!(
+        "{id} ({seat}) ended its turn {how}, and raised no ask; its last words: {said}. \
+         Nothing is working on it until somebody answers: `wsp tell {id} \"…\"` reaches it, `wsp peek {id}` shows its screen."
+    );
+    stamp(store, &format!("{} group {at}: {id} ({seat}) ended its turn {how} — raised to {to}", w.id));
+    if governor {
+        crate::cycle::tell(store, w, &text);
+        return;
+    }
+    let q = Message::question(Party::wsp(), Kind::Note, &text, Waiting::new(seat, id))
+        .about(About::Task(id.to_string()))
+        .for_the_person();
+    if let Err(e) = message::raise(store, &q) {
+        stamp(store, &format!("{} group {at}: {id}'s turn end could not be raised to the person: {e}", w.id));
     }
 }
 
@@ -3470,6 +3552,114 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             assert!(ended().is_empty(), "`{tag}`: nobody is ended");
             assert!(governed().is_empty(), "`{tag}`: and nothing is invented about the run");
         }
+    }
+
+    // ---- a turn that ended wanting somebody: wsp-606 ----------------------
+
+    /// A [`Fake`] whose seats' last turn ended at `stop` seconds ago with
+    /// `words` on it, `denied` or not.
+    struct Stopped(Fake, i64, &'static str, bool);
+
+    impl Seats for Stopped {
+        fn state(&self, seat: &str) -> Option<State> {
+            self.0.state(seat)
+        }
+        fn turn_end(&self, _seat: &str) -> Option<crate::waiting::TurnEnd> {
+            Some(crate::waiting::TurnEnd {
+                at: util::epoch_secs() - self.1,
+                words: crate::waiting::last_words(self.2),
+                denied: self.3,
+            })
+        }
+    }
+
+    /// The row's start, `ago` seconds back, as the run writes it.
+    fn started(store: &Store, id: &str, ago: i64) {
+        let mut t = store.find_task(id).unwrap();
+        let log = t.section("Log").unwrap_or_default();
+        let line = format!("- {} {} spawned cpd-1", util::iso_at(util::epoch_secs() - ago), crate::cycle::STARTED_BY);
+        let body = format!("## Log\n\n{}{line}\n", if log.trim().is_empty() { String::new() } else { format!("{}\n", log.trim_end()) });
+        crate::model::set_section_in(&mut t.body, "Log", &body);
+        store.save_task(&t).unwrap();
+    }
+
+    fn raised_texts(store: &Store) -> Vec<String> {
+        crate::message::raised(store).into_iter().map(|m| m.text).collect()
+    }
+
+    /// `compounding-447`, as a test: a member's turn ends on "stopping here for
+    /// your decision" thirty seconds in, and the list has no governor. **One
+    /// tick raises it to the person with its last words, and once**; the push
+    /// is not due, because the seat went idle thirty seconds ago.
+    #[test]
+    fn a_turn_that_ends_on_a_question_is_raised_to_the_person_within_one_tick_when_no_governor_is_seated() {
+        let (_env, store) = in_flight("turn-asks");
+        started(&store, "m-1", 40);
+        let seats = Stopped(Fake::new(&[("cpd-1", Some(State::Idle))]), 30, "⏺ The checkout was not run.\n\nShall I revert the two screenshots, or leave them?", false);
+        tick(&store, &seats, &mut Pass::new());
+        let raised = raised_texts(&store);
+        assert_eq!(raised.len(), 1, "raised at once: {raised:?}");
+        assert!(raised[0].contains("m-1 (cpd-1) ended its turn asking for something"), "{}", raised[0]);
+        assert!(raised[0].contains("\"Shall I revert the two screenshots, or leave them?\""), "its last words: {}", raised[0]);
+        assert!(governed().is_empty(), "no governor is seated, so none is told");
+        assert!(member_told().is_empty(), "the push is measured from the stop, thirty seconds ago");
+
+        tick(&store, &seats, &mut Pass::new());
+        assert_eq!(raised_texts(&store).len(), 1, "one stop is raised once");
+        assert!(ended().is_empty());
+    }
+
+    /// The same, for a turn that had a call denied and ended on no question at
+    /// all, on a list whose governor is seated: **the governor is told, and the
+    /// person is not asked**.
+    #[test]
+    fn a_turn_with_a_denied_call_is_raised_to_the_seated_governor_within_one_tick() {
+        let (_env, store) = in_flight("turn-denied");
+        seated(&store, "run", "w1", "cpd-9", "", "");
+        started(&store, "m-1", 40);
+        let seats = Stopped(Fake::new(&[("cpd-1", Some(State::Idle))]), 30, "⏺ The one step that would clear the block was denied, so I'm stopping here.", true);
+        tick(&store, &seats, &mut Pass::new());
+        let heard = governed();
+        let raised: Vec<&String> = heard.iter().filter(|l| l.contains("ended its turn")).collect();
+        assert_eq!(raised.len(), 1, "{heard:?}");
+        assert!(raised[0].contains("after a call it made was denied"), "{}", raised[0]);
+        assert!(raised[0].contains("so I'm stopping here."), "{}", raised[0]);
+        assert!(raised_texts(&store).is_empty(), "the governor has it, not the person");
+        assert!(row_log(&store, "m-1").contains(TURN_RAISED), "the row says it was raised");
+    }
+
+    /// **A turn ending on no question is pushed [`STALLED_AFTER`] after its
+    /// stop, not after its start** — and the told seat is still ended a window
+    /// later, as before (`wsp-606`).
+    #[test]
+    fn an_idle_member_with_no_question_is_pushed_a_window_after_its_stop_and_still_ended_a_window_after_that() {
+        let (_env, store) = in_flight("turn-quiet");
+        started(&store, "m-1", STALLED_AFTER + 120);
+        let words = "⏺ Committed the fix and ran the checks.";
+        let fresh = Stopped(Fake::new(&[("cpd-1", Some(State::Idle))]), 30, words, false);
+        tick(&store, &fresh, &mut Pass::new());
+        assert!(member_told().is_empty(), "started twelve minutes ago, idle thirty seconds: not pushed yet");
+        assert!(raised_texts(&store).is_empty() && governed().is_empty(), "nothing asked, nothing raised");
+
+        let stale = Stopped(Fake::new(&[("cpd-1", Some(State::Idle))]), STALLED_AFTER + 1, words, false);
+        tick(&store, &stale, &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "a window after its stop, it is pushed");
+        assert!(ended().is_empty());
+
+        age_the_notice(&store, "m-1");
+        tick(&store, &stale, &mut Pass::new());
+        assert_eq!(ended(), vec!["m-1".to_string()], "the end-and-restart a window after the push stays");
+    }
+
+    /// And the other way: a seat that idles thirty seconds after its start is
+    /// not pushed at nine and a half minutes after its start's clock, but a
+    /// window after its stop — the stop never reads earlier than the start.
+    #[test]
+    fn a_stop_older_than_the_start_is_measured_from_the_start() {
+        let (_env, store) = in_flight("turn-stale-stop");
+        started(&store, "m-1", 60);
+        tick(&store, &Stopped(Fake::new(&[("cpd-1", Some(State::Idle))]), STALLED_AFTER * 3, "⏺ done.", false), &mut Pass::new());
+        assert!(member_told().is_empty(), "a stop from before this agent started is not its idle");
     }
 
     // ---- a seat waiting on somebody: wsp-172 -------------------------------
