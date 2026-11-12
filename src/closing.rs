@@ -592,8 +592,17 @@ fn advance(
 
 fn tell_to_close(store: &Store, row: &str, leg: &str, seat: &str, idle_min: i64) {
     let baton = baton_path(store, row, leg);
+    // An exit-shaped baton that would be refused says so now, with its lines,
+    // as `exit_tell` does for the other seats (`wsp-616`).
+    let refused = match leg_exit(store, row, &std::fs::read_to_string(&baton).unwrap_or_default()) {
+        Err(lines) => format!(
+            " The baton is written as an exit and is refused as it stands — fix these lines first:\n{}\n",
+            lines.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n")
+        ),
+        Ok(_) => String::new(),
+    };
     let text = format!(
-        "wsp: leg {leg} of {row} is still open, and this seat has sat {idle_min} min without closing it. \
+        "wsp: leg {leg} of {row} is still open, and this seat has sat {idle_min} min without closing it.{refused} \
          If the work is done and committed, close it now: `wsp leg done {row} --caption \"...\"` — run as its own \
          Bash call, not chained after anything. It reads your baton from {} ($WSP_BATON); write that with a heredoc \
          first if you have not. If wsp finds it still open in {} min it will close it for you from the baton, or flag the person.",
@@ -660,6 +669,17 @@ fn tree_of(store: &Store, seat: &str) -> (Option<String>, Tree) {
     (Some(dir), tree)
 }
 
+/// A leg's baton read as its exit: `Ok(None)` for a baton in prose, the
+/// exit's summary when it validates as a leg's, else every refusal line
+/// ([`crate::cmd_submit::leg_baton`], the rules `wsp leg done` runs).
+fn leg_exit(store: &Store, row: &str, baton: &str) -> Result<Option<String>, Vec<String>> {
+    let Some(t) = store.find_task(row) else { return Ok(None) };
+    crate::cmd_submit::leg_baton(store, &t, baton).map_err(|why| {
+        let lines: Vec<String> = why.lines().skip(1).map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        if lines.is_empty() { vec![why] } else { lines }
+    })
+}
+
 /// Close the leg for a seat that did not, if that is safe, else flag the person.
 /// Returns whether the item is dealt with (closed or flagged), which is when it
 /// is not looked at again.
@@ -685,7 +705,19 @@ fn settle(store: &Store, row: &str, leg: &str, seat: &str, baton_at: Option<i64>
         flag(store, row, leg, seat, &evidence("wsp does not guess, so it is not closed"));
         return true;
     }
-    let caption = caption_of(&baton);
+    // A baton written as an exit runs the leg's exit validator first, as
+    // `wsp leg done` and `wsp submit` do (`wsp-616`, S3): refused, it is a flag
+    // with its refusal lines and the leg stays open; valid, its summary is the caption.
+    let caption = match leg_exit(store, row, &baton) {
+        Err(lines) => {
+            let said = format!("the baton is an exit and it is refused as it stands: {}", lines.join("; "));
+            crate::store::log_line(store, &format!("leg {leg} of {row}: wsp's close for {seat} not run — {said}"));
+            flag(store, row, leg, seat, &evidence(&format!("wsp does not close over a refused exit, so it is not closed — {said}")));
+            return true;
+        }
+        Ok(Some(summary)) => util::truncate(&crate::util::fold(&summary), 100),
+        Ok(None) => caption_of(&baton),
+    };
     let late = crate::leg_seat::Late { baton_at: baton_at.unwrap_or(now), by_wsp: Some(why.words()) };
     match crate::leg_seat::finish(store, row, leg, seat, &baton, &caption, Some(&late)) {
         Ok(_) => {
@@ -1223,6 +1255,42 @@ mod tests {
         write_baton(&store, "handed on\n");
         let args = crate::Args::synth("leg", &["done", "m-1"], &[("caption", "built")]);
         assert_eq!(crate::leg_seat::cmd_done(&store, &args, Some("cpd-1")), 0);
+    }
+
+    #[test]
+    fn wsps_close_of_a_leg_runs_the_leg_exit_validator_a_refused_exit_is_flagged_with_its_lines_and_stays_open() {
+        let env = util::isolated("closing-settle-leg-refused");
+        let (store, _tree) = staged_two(&env);
+        write_baton(&store, "summary: the store half is built\n\nThe store reads and writes.\n");
+        // Idle: the tell already names the refusal lines.
+        let idle = Fake(RefCell::new(Some(State::Idle)), false);
+        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().clear());
+        let t0 = util::epoch_secs();
+        tick_at(&store, &idle, t0);
+        tick_at(&store, &idle, t0 + TELL_AFTER);
+        assert_eq!(told().len(), 1, "{:?}", told());
+        assert!(told()[0].1.contains("refused as it stands") && told()[0].1.contains("owed"), "{:?}", told());
+        // Past the window wsp does not close over it: a flag, with the lines.
+        tick_at(&store, &idle, t0 + TELL_AFTER + SECOND_WINDOW);
+        assert!(running(&store), "a refused exit is never closed over");
+        let raised = crate::message::raised(&store);
+        assert_eq!(raised.len(), 1, "the person is flagged");
+        assert!(raised[0].text.contains("refused as it stands") && raised[0].text.contains("owed"), "{}", raised[0].text);
+    }
+
+    #[test]
+    fn wsps_close_of_a_leg_with_a_valid_exit_closes_it_with_the_exits_summary_as_caption() {
+        let env = util::isolated("closing-settle-leg-valid");
+        let (store, _tree) = staged_two(&env);
+        write_baton(&store, LEG_EXIT);
+        let fake = Fake(RefCell::new(Some(State::Gone)), false);
+        tick_at(&store, &fake, util::epoch_secs());
+        let t = store.find_task("m-1").unwrap();
+        let ls = legs::legs(&t);
+        assert_eq!(ls[0].state, LegState::Done, "closed by wsp");
+        assert_eq!(ls[0].caption.as_deref(), Some("the store half is built"), "the exit's summary, not its first line");
+        assert!(t.section("Log").unwrap().contains("closed by wsp: session ended"), "{}", t.section("Log").unwrap());
+        assert!(crate::message::raised(&store).is_empty());
     }
 
     /// Re-run a leg: a baton hours older than the new run's start.
