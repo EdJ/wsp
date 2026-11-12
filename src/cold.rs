@@ -189,7 +189,7 @@ fn build(store: &Store, label: &str, n: usize, j: &Job, keep: bool, log: &Path) 
 fn failed_names(built: &[Built]) -> Vec<String> {
     let mut out = Vec::new();
     for b in built {
-        out.extend(b.ran.iter().filter(|r| matches!(r.done, Done::Failed { .. } | Done::Malformed(_))).map(|r| r.step.name.clone()));
+        out.extend(b.ran.iter().filter(|r| matches!(r.done, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_))).map(|r| r.step.name.clone()));
         if let Some(why) = b.could_not.as_ref().filter(|w| w.as_str() != ALREADY) {
             out.push(format!("{} ({why})", b.project));
         }

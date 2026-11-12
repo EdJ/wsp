@@ -1215,6 +1215,19 @@ pub fn stop_checks(store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: `{bad}` is not a check — one `- name (limit): command` per line");
             return 2;
         }
+        // `wsp-609`: a line wsp would not run as written — a label it could not
+        // read, left at the front of the command — is refused here, not at the
+        // barrier, where its label's first word would have run as the program.
+        let steps: Vec<_> = items.iter().filter_map(|i| crate::check::step_of(i, crate::check::Of::Project)).collect();
+        let refused = crate::check::refused_in(&steps);
+        if !refused.is_empty() {
+            eprintln!("wsp: not written — {} stop check line(s) cannot start:", refused.len());
+            for r in &refused {
+                eprintln!("  - {r}");
+            }
+            eprintln!("  one `- name (limit): command` per line, the limit in s, m or h");
+            return 2;
+        }
         items
     };
     if let Some(open) = open_check(store, &w, ordinal) {
@@ -7672,6 +7685,29 @@ mod tests {
 
     fn flagged(store: &Store, argv: &[&str], flags: &[(&str, &str)]) -> i32 {
         dispatch(store, &Args::synth("worklist", argv, flags))
+    }
+
+    /// `wsp-609`: a stop line wsp would not run as written — its label left at
+    /// the front of the command, or a first word that is no program — is refused
+    /// where it is written, and a several-word label is read as one.
+    #[test]
+    fn stop_checks_refuse_a_line_whose_label_would_run_and_read_a_label_of_several_words() {
+        let store = scratch("stop-label");
+        task(&store, "s-1", "todo");
+        assert_eq!(run(&store, &["new", "stops", "stop lines"]), 0);
+        assert_eq!(run(&store, &["add", "stops", "s-1"]), 0);
+        let file = store.root.join("stops.md");
+        let from = file.display().to_string();
+        for bad in ["- web-chrome ctl (5 min): true\n", "- gate: wsp-no-such-program-anywhere\n"] {
+            std::fs::write(&file, bad).unwrap();
+            assert_eq!(flagged(&store, &["stop-checks", "stops", "1"], &[("from", &from)]), 2, "{bad}");
+            assert!(groups_of(&store, "stops")[0].stop_checks.is_empty(), "{bad} was written");
+        }
+        std::fs::write(&file, "- web-chrome ctl and workspace (1m): true\n").unwrap();
+        assert_eq!(flagged(&store, &["stop-checks", "stops", "1"], &[("from", &from)]), 0);
+        let items = &groups_of(&store, "stops")[0].stop_checks;
+        let step = crate::check::step_of(&items[0], crate::check::Of::Project).unwrap();
+        assert_eq!((step.name.as_str(), step.command.as_str()), ("web-chrome ctl and workspace", "true"));
     }
 
     fn groups_of(store: &Store, id: &str) -> Vec<Group> {

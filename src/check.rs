@@ -159,6 +159,12 @@ struct Head {
     end: bool,
 }
 
+/// A step's text: `label [(limit)] [on <globs>] [at barrier|end]: command`, or
+/// a bare command. The label may be several words (`web-chrome ctl and
+/// workspace: cd …`); only the command after it runs. Text that reads as a label
+/// wsp could not take (a limit that is not one, an `at` that names nothing) is
+/// kept whole as the command, and [`unparsable`] refuses to start it — it is
+/// never handed to `sh` with its label as the program.
 pub(crate) fn step_of(item: &str, of: Of) -> Option<Step> {
     let item = item.trim();
     let (head, command) = match item.split_once(": ") {
@@ -194,8 +200,15 @@ fn command_of(text: &str) -> &str {
     text.trim_matches('`').trim()
 }
 
-/// Why `sh` cannot take `command` as a script, or `None` when it parses.
+/// Why `sh` cannot take `command` as a script, or `None` when it parses. A
+/// command that still starts with a label (`slow (soon): run it`) is one: its
+/// label's first word would run as the program (`wsp-609`).
 pub(crate) fn unparsable(command: &str) -> Option<String> {
+    if let Some(label) = label_left_in(command) {
+        return Some(format!(
+            "`{label}:` reads as a label but is not one — write `label (10m): command` (a limit in s, m or h) or `label: command`"
+        ));
+    }
     let out = Command::new("sh").arg("-n").arg("-c").arg(command).stdin(Stdio::null()).output().ok()?;
     if out.status.success() {
         return None;
@@ -210,14 +223,79 @@ pub(crate) fn malformed_in(steps: &[Step]) -> Vec<String> {
     steps.iter().filter_map(|s| unparsable(&s.command).map(|why| format!("{} — {why}", s.name))).collect()
 }
 
-/// `name [(limit)] [on <globs>] [at barrier|end]`, when the text before a `: ` is one.
-fn head_of(h: &str) -> Option<Head> {
-    let mut words = h.split_whitespace().peekable();
-    let name = words.next()?;
-    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+/// A word a label may be made of: it starts with a letter or digit and holds
+/// nothing a shell would read as more than a word.
+fn label_word(w: &str) -> bool {
+    w.chars().next().is_some_and(char::is_alphanumeric) && w.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The text before a command's first `: ` when it looks like a label — label
+/// words, a parenthesised limit, `on` globs, `at` — rather than shell. `None`
+/// for a command with no `: `, or whose head carries quotes, `$`, `|`, `;`, `&`,
+/// `=` or a redirection, which make it shell.
+fn label_left_in(command: &str) -> Option<&str> {
+    let (h, _) = command.split_once(": ")?;
+    let first = h.split_whitespace().next()?;
+    let shellish = h.chars().any(|c| !(c.is_alphanumeric() || c.is_whitespace() || matches!(c, '_' | '-' | '.' | ',' | '(' | ')' | '/' | '*' | '{' | '}')));
+    (label_word(first) && !shellish).then_some(h.trim())
+}
+
+/// Why a step's command names no program wsp would run on purpose: its first
+/// word (past `VAR=value` assignments) is not a shell keyword or builtin, not a
+/// path, and not on `PATH`. Asked where a line is written — `wsp check --set`,
+/// `wsp worklist stop-checks` — not at the run, whose tree may provide it.
+pub(crate) fn unrunnable(command: &str) -> Option<String> {
+    let first = command
+        .split_whitespace()
+        .find(|w| !(w.contains('=') && w.split('=').next().is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_'))))?;
+    let first = first.trim_start_matches(['(', '{', '!']);
+    if first.is_empty() || first.contains('/') || first.starts_with(['$', '`', '"', '\'', '[']) {
         return None;
     }
-    let mut head = Head { name: name.to_string(), limit: None, on: Vec::new(), barrier: false, end: false };
+    let known = Command::new("sh")
+        .arg("-c")
+        .arg("command -v \"$1\" >/dev/null 2>&1")
+        .arg("sh")
+        .arg(first)
+        .stdin(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    (!known).then(|| format!("`{first}` is not a command here (not a builtin, a path, or on PATH)"))
+}
+
+/// What a line is refused for where it is written: it cannot start
+/// ([`malformed_in`]), or its first word is no program ([`unrunnable`]).
+pub(crate) fn refused_in(steps: &[Step]) -> Vec<String> {
+    let mut out = malformed_in(steps);
+    for s in steps {
+        if unparsable(&s.command).is_none() {
+            if let Some(why) = unrunnable(&s.command) {
+                out.push(format!("{} — {why}", s.name));
+            }
+        }
+    }
+    out
+}
+
+/// `name [(limit)] [on <globs>] [at barrier|end]`, when the text before a `: `
+/// is one. The name is one or more label words, up to a `(limit)`, `on` or `at`.
+fn head_of(h: &str) -> Option<Head> {
+    let mut words = h.split_whitespace().peekable();
+    let mut name: Vec<&str> = Vec::new();
+    while let Some(w) = words.peek().copied() {
+        if w.starts_with('(') || matches!(w, "on" | "at") {
+            break;
+        }
+        if !label_word(w) {
+            return None;
+        }
+        name.push(w);
+        words.next();
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let mut head = Head { name: name.join(" "), limit: None, on: Vec::new(), barrier: false, end: false };
     if let Some(w) = words.peek().copied() {
         if let Some(inner) = w.strip_prefix('(').and_then(|w| w.strip_suffix(')')) {
             head.limit = Some(limit_of(inner)?);
@@ -860,6 +938,10 @@ pub(crate) enum Done {
     /// The command could not start — it does not parse, or names nothing to run.
     /// The declaration is wrong; nothing the work did.
     Malformed(String),
+    /// The step wrote nothing and used no CPU for [`hung_after`], and was ended
+    /// there rather than left to its limit (`wsp-609`): the process tree it had,
+    /// one `pid command` per line.
+    Hung(String),
     /// An earlier step failed, so this one was not run.
     Skipped,
 }
@@ -867,8 +949,55 @@ pub(crate) enum Done {
 impl Done {
     /// Anything that stops a run: a red step or one that could not start.
     pub(crate) fn is_red(&self) -> bool {
-        matches!(self, Done::Failed { .. } | Done::Malformed(_))
+        matches!(self, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_))
     }
+}
+
+/// How long a step may sit with no output and no CPU before it is called hung:
+/// five minutes, or `WSP_CHECK_HUNG_SECS`.
+pub(crate) fn hung_after() -> Duration {
+    #[cfg(test)]
+    if let Some(d) = HUNG_AFTER.with(|h| h.get()) {
+        return d;
+    }
+    let secs = std::env::var("WSP_CHECK_HUNG_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    Duration::from_secs(secs)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own hung threshold, kept to its thread.
+    static HUNG_AFTER: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// The processes of group `pgid`: (`pid command` lines, their CPU time summed in
+/// hundredths of a second). `None` where `ps` does not answer.
+fn group_of(pgid: u32) -> Option<(Vec<String>, u64)> {
+    let out = Command::new("ps").args(["-A", "-o", "pid=,pgid=,time=,command="]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut lines, mut cpu) = (Vec::new(), 0u64);
+    for l in text.lines() {
+        let mut w = l.split_whitespace();
+        let (Some(pid), Some(g), Some(time)) = (w.next(), w.next(), w.next()) else { continue };
+        if g.parse::<u32>().ok() != Some(pgid) {
+            continue;
+        }
+        cpu += cpu_of(time);
+        lines.push(format!("{pid} {}", util::truncate(&w.collect::<Vec<_>>().join(" "), 160)));
+    }
+    Some((lines, cpu))
+}
+
+/// `ps`'s `time` (`[[dd-]hh:]mm:ss[.cc]`) in hundredths of a second.
+fn cpu_of(time: &str) -> u64 {
+    let (days, rest) = match time.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().unwrap_or(0), r),
+        None => (0, time),
+    };
+    let (whole, frac) = rest.split_once('.').unwrap_or((rest, "0"));
+    let secs = whole.split(':').fold(0u64, |acc, p| acc * 60 + p.parse::<u64>().unwrap_or(0));
+    let cc: u64 = format!("{frac:0<2}")[..2].parse().unwrap_or(0);
+    (days * 86_400 + secs) * 100 + cc
 }
 
 #[derive(Clone, Debug)]
@@ -909,6 +1038,12 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
         Err(e) => return failed(format!("sh: {e}")),
     };
     let mut timed_out = false;
+    // `wsp-609`: a step that writes nothing and uses no CPU for `hung_after` is
+    // ended there and named with its process tree, not left to its limit.
+    let quiet_for = hung_after();
+    let probe = (quiet_for / 4).clamp(Duration::from_millis(200), Duration::from_secs(30));
+    let (mut seen, mut quiet_since, mut probed) = ((0u64, 0u64), Instant::now(), Instant::now());
+    let mut hung: Option<String> = None;
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
@@ -917,6 +1052,20 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
                 let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).status();
                 break child.wait().ok();
             }
+            Ok(None) if probed.elapsed() >= probe => {
+                probed = Instant::now();
+                let wrote = std::fs::metadata(log).map(|m| m.len()).unwrap_or(0);
+                if let Some((pids, cpu)) = group_of(child.id()) {
+                    if (wrote, cpu) != seen {
+                        seen = (wrote, cpu);
+                        quiet_since = Instant::now();
+                    } else if quiet_since.elapsed() >= quiet_for {
+                        hung = Some(pids.join("\n"));
+                        let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).status();
+                        break child.wait().ok();
+                    }
+                }
+            }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => break None,
         }
@@ -924,6 +1073,10 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
     // `wsp-453`: whatever the step started and left in its group (a Vite
     // server, a Vitest watcher) goes with it, however it ended.
     let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).stderr(Stdio::null()).status();
+    if let Some(pids) = hung {
+        let tail = format!("hung — no output and no CPU for {}s; its processes:\n{pids}", secs(quiet_for));
+        return Ran { step: step.clone(), done: Done::Hung(pids), took: start.elapsed(), tail, first: None, reused: None };
+    }
     let ok = !timed_out && status.is_some_and(|s| s.success());
     let tail = tail_of(log);
     let done = if ok {
@@ -1052,6 +1205,7 @@ pub(crate) fn why_failed(r: &Ran) -> String {
         Done::Failed { exit: Some(n), .. } => format!("exit {n}"),
         Done::Failed { exit: None, .. } => "no exit status".into(),
         Done::Malformed(why) => format!("malformed: {why}"),
+        Done::Hung(pids) => format!("hung (no output, no CPU) — pids {}", pids.lines().filter_map(|l| l.split_whitespace().next()).collect::<Vec<_>>().join(" ")),
         _ => String::new(),
     }
 }
@@ -1070,6 +1224,7 @@ pub(crate) fn account(ran: &[Ran]) -> String {
             (Done::Passed, None) => ("✓", format!("{}s", secs(r.took))),
             (Done::Passed, Some((why, _))) => ("✓", format!("{}s · passed on a second run, the first was {why}", secs(r.took))),
             (Done::Malformed(why), _) => ("✗", format!("malformed — the line cannot start: {why}")),
+            (Done::Hung(_), _) => ("✗", format!("{}s · {}", secs(r.took), why_failed(r))),
             (Done::Failed { .. }, first) => {
                 let twice = if first.is_some() { " both times" } else { "" };
                 ("✗", format!("{}s · {}{twice}", secs(r.took), why_failed(r)))
@@ -1410,7 +1565,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
             let (mark, tail) = match &r.done {
                 Done::Passed if r.reused.is_some() => (p.green("✓"), " · reused".to_string()),
                 Done::Passed => (p.green("✓"), String::new()),
-                Done::Failed { .. } | Done::Malformed(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
+                Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
                 Done::Skipped => (p.dim("–"), " · skipped".to_string()),
             };
             println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
@@ -1834,7 +1989,7 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
     let ran = run_all(&tree, &steps, &dir.join("last.log"), None, |r| {
         let (mark, tail) = match &r.done {
             Done::Passed => (p.green("✓"), String::new()),
-            Done::Failed { .. } | Done::Malformed(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
+            Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
             Done::Skipped => (p.dim("–"), " · skipped".to_string()),
         };
         println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
@@ -1885,9 +2040,9 @@ fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
         eprintln!("wsp: no list item in that text declares a check — `- name (limit): command`");
         return 2;
     }
-    let bad = malformed_in(&steps);
+    let bad = refused_in(&steps);
     if !bad.is_empty() {
-        eprintln!("wsp: not written — {} check line(s) cannot start under `sh`:", bad.len());
+        eprintln!("wsp: not written — {} check line(s) cannot start:", bad.len());
         for b in &bad {
             eprintln!("  - {b}");
         }
@@ -2132,9 +2287,70 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_that_is_not_one_makes_the_head_part_of_the_command() {
+    fn a_limit_that_is_not_one_keeps_the_head_in_the_command_and_the_line_cannot_start() {
         let s = step("- slow (soon): run it");
         assert_eq!(s.command, "slow (soon): run it");
+        assert!(unparsable(&s.command).is_some_and(|w| w.contains("label")), "a label left at the front is refused");
+        assert!(unparsable(r#"grep -q "a: b" notes.txt"#).is_none(), "shell before a `: ` is not a label");
+    }
+
+    #[test]
+    fn a_label_of_several_words_runs_only_its_command_with_the_labels_limit() {
+        // wsp-609: `web-chrome ctl and workspace: cd …` ran `web-chrome` as the program.
+        let s = step("- web-chrome ctl and workspace: cd spikes/web-chrome && npx tsc --noEmit");
+        assert_eq!((s.name.as_str(), s.command.as_str()), ("web-chrome ctl and workspace", "cd spikes/web-chrome && npx tsc --noEmit"));
+        let s = step("- intents and more (2s): echo only-the-command; sleep 10");
+        assert_eq!(s.limit, Duration::from_secs(2));
+        let (dir, log) = scratch_log("labelled");
+        let r = run_step(&dir, &s, &log);
+        assert!(matches!(r.done, Done::Failed { timed_out: true, .. }), "the label's limit is the step's: {:?}", r.done);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "only-the-command");
+        let s = step("- say it: echo said");
+        let r = run_step(&dir, &s, &log);
+        assert_eq!(r.done, Done::Passed);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "said", "the label is not run");
+    }
+
+    #[test]
+    fn a_label_wsp_cannot_read_is_reported_at_the_run_and_nothing_runs() {
+        // `echo at nowhere: …` would run `echo`; an `at` naming nothing leaves the label unread.
+        let s = step("- echo at nowhere: touch marker");
+        assert_eq!(s.command, "echo at nowhere: touch marker");
+        let (dir, log) = scratch_log("unread-label");
+        let r = run_step(&dir, &s, &log);
+        assert!(matches!(&r.done, Done::Malformed(w) if w.contains("label")), "{:?}", r.done);
+        assert!(!dir.join("marker").exists() && std::fs::read_to_string(&log).unwrap_or_default().is_empty(), "nothing ran");
+        assert!(r.done.is_red());
+    }
+
+    #[test]
+    fn set_refuses_a_label_it_cannot_read_and_a_first_word_that_is_no_command() {
+        let (env, store, _) = world("setlabel", "- old: true", "exit 0\n");
+        let file = env.path("bad.md");
+        let args = Args::synth("check", &["pj-001"], &[("set", "true"), ("from", &file.display().to_string())]);
+        for bad in ["- slow (5 min): true\n", "- tests: wsp-no-such-program-anywhere --run\n"] {
+            std::fs::write(&file, bad).unwrap();
+            assert_eq!(check(&store, &args), 2, "{bad}");
+            assert!(store.find_task("pj-001").unwrap().section("Checks").is_none(), "{bad} was written");
+        }
+        std::fs::write(&file, "- two words (1m): true\n- path: ./scripts/x.sh\n- env: FOO=1 true\n").unwrap();
+        assert_eq!(check(&store, &args), 0);
+    }
+
+    #[test]
+    fn a_step_with_no_output_and_no_cpu_is_reported_hung_with_its_pids() {
+        HUNG_AFTER.with(|h| h.set(Some(Duration::from_secs(1))));
+        let (dir, log) = scratch_log("hung");
+        let start = Instant::now();
+        let r = run_step(&dir, &sh("sleep 30", 60), &log);
+        HUNG_AFTER.with(|h| h.set(None));
+        assert!(start.elapsed() < Duration::from_secs(20), "ended when hung, not at its limit");
+        let Done::Hung(pids) = &r.done else { panic!("{:?}", r.done) };
+        assert!(pids.contains("sleep 30"), "{pids}");
+        assert!(pids.lines().all(|l| l.split_whitespace().next().is_some_and(|p| p.parse::<u32>().is_ok())), "{pids}");
+        assert!(why_failed(&r).starts_with("hung") && r.tail.contains("sleep 30"), "{}", r.tail);
+        assert!(r.done.is_red());
+        assert!(account(std::slice::from_ref(&r)).contains("hung"));
     }
 
     fn scratch_log(name: &str) -> (PathBuf, PathBuf) {
@@ -3158,7 +3374,7 @@ mod tests {
         assert_eq!(check(&store, &Args::synth("check", &["pj"], &[("tiers", "true")])), 0);
         assert_eq!(check(&store, &Args::synth("check", &["nope"], &[("tiers", "true")])), 1);
         let file = env.path("end-only.md");
-        std::fs::write(&file, "- gold at end: gold.sh\n").unwrap();
+        std::fs::write(&file, "- gold at end: sh gold.sh\n").unwrap();
         assert_eq!(check(&store, &Args::synth("check", &["pj"], &[("set", "true"), ("from", &file.display().to_string())])), 0);
     }
 

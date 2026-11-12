@@ -458,7 +458,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
                 reused += a;
                 ran_n += b;
                 for (item, ran) in items.iter().zip(ran) {
-                    if matches!(ran.done, Done::Failed { .. } | Done::Malformed(_)) {
+                    if matches!(ran.done, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_)) {
                         failed.push(item.step.name.clone());
                         blames.push(blame(item, ran, &landed));
                     }
