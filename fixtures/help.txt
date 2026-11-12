@@ -37,11 +37,14 @@ TASKS
                                     whole
   wsp start|review <id>           move through the workflow
   wsp submit <id> [--from FILE|-] [--dry-run]
-                                    a member's exit, from $WSP_EXIT: every refusal
-                                    at once (section, line, what to write), the
-                                    project's ## Artefacts restored, then review
-                                    with the file as the account and the seat
-                                    ended; --dry-run only validates
+                                    a seat's exit, from $WSP_EXIT: every refusal
+                                    at once (section, line, what to write). A
+                                    member's restores the project's ## Artefacts
+                                    and goes to review; a verifier's is its
+                                    verdict (a block names its cause; env is no
+                                    block); a check's (<id> its list) is go,
+                                    hold or a follow-up flag; a leg's is leg
+                                    done. --dry-run only validates
   wsp review --auto-close off|<hours> -p <proj>
                                 a row at review closes itself (`done`) once
                                 landed, verified, owed nothing and quiet that
