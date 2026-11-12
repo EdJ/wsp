@@ -5117,7 +5117,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         let unsent = !a.state.turn_in_flight() && w.unsent.contains(seat);
         let dropped = !a.state.turn_in_flight() && w.dropped.contains(seat);
         let stuck = w.stuck.get(seat).copied();
-        let wait = crate::waiting::seat_wait(&crate::waiting::Facts {
+        let mut wait = crate::waiting::seat_wait(&crate::waiting::Facts {
             state: a.state,
             waiting: waiting.as_ref(),
             in_state_since: w.since.get(seat).map(|s| util::epoch_of(s)).filter(|&e| e > 0),
@@ -5129,6 +5129,14 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             rests_on: held.and_then(|t| rests_on(w, t)),
             now: util::epoch_secs(),
         });
+        // A seat stopped at Claude Code's folder-trust dialog says so and names
+        // the fix, rather than leaving a member to ask a person (`wsp-466`). Only
+        // a seat on a prompt reads its screen.
+        if let Some(sw) = wait.as_mut().filter(|_| waiting.as_ref().is_some_and(|x| x.why == crate::waiting::Why::Prompt)) {
+            if let Some(fix) = read_pane_text(seat).as_deref().and_then(crate::local_trust::dialog_fix) {
+                sw.line = format!("{} — {fix}", sw.line);
+            }
+        }
 
         rows.push(WipRow {
             project: r.project.unwrap_or_else(|| "—".into()),

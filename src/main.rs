@@ -62,6 +62,7 @@ mod cmd_migrate;
 mod cmd_project;
 mod cmd_resume;
 mod cmd_sandbox;
+mod local_trust;
 mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;

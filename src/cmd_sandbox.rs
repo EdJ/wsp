@@ -1087,7 +1087,7 @@ fn ls(store: &Store, args: &Args) -> i32 {
 /// exported a sandbox's variables (which `wsp sandbox` prints, beside "finish
 /// wsp sandbox rm") they looked under the sandbox's own state, found nothing,
 /// and `rm` still said "removed" with its directory and seats left (`wsp-424`).
-fn inside_of(state: &Path) -> Option<String> {
+pub(crate) fn inside_of(state: &Path) -> Option<String> {
     let name = state.parent()?.file_name()?.to_str()?;
     let root = state.parent()?.parent()?;
     (state.file_name()? == "state" && root.file_name()? == "sandbox" && name.starts_with(PREFIX)).then(|| name.to_string())
@@ -1166,15 +1166,21 @@ fn rm(store: &Store, args: &Args) -> i32 {
             true => (session(name).is_some(), session_children(&root, name).len()),
             false => stop_session(&root, name),
         };
+        // The trust it added to `~/.claude.json` for its seats' trees (`wsp-466`),
+        // before the directory that records it goes: an entry that cannot be
+        // removed keeps the directory, so a second `rm` can try again.
+        let (trust, trust_kept) = if had_dir { crate::local_trust::clear(&dir, dry) } else { (Vec::new(), false) };
         if !dry {
             for (repo, tree) in &trees {
                 crate::cmd_checkout::remove(repo, tree);
             }
-            let _ = std::fs::remove_dir_all(&dir);
+            if !trust_kept {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
         if had_session || had_dir || reaped > 0 || !trees.is_empty() {
             let shown: Vec<String> = trees.iter().map(|(_, t)| util::contract(t)).collect();
-            removed.push(json!({ "name": name, "processes": reaped, "trees": shown }));
+            removed.push(json!({ "name": name, "processes": reaped, "trees": shown, "trust": trust }));
         }
     }
 
@@ -1198,6 +1204,9 @@ fn rm(store: &Store, args: &Args) -> i32 {
             println!("{verb} {}{}", r["name"].as_str().unwrap_or(""), reaped_note(n, dry));
             for t in r["trees"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                 println!("  {verb} its worktree {t}");
+            }
+            for t in r["trust"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                println!("  {t}");
             }
         }
     }

@@ -634,6 +634,10 @@ for n in {d, os.path.realpath(d)}:
     if op == "add":
         entry = projects.setdefault(n, {})
         entry["hasTrustDialogAccepted"] = True
+        # The prompt that follows the trust dialog when CLAUDE.md imports a file outside
+        # the tree: acknowledged with the trust, so no person is asked.
+        entry["hasClaudeMdExternalIncludesApproved"] = True
+        entry["hasClaudeMdExternalIncludesWarningShown"] = True
     else:
         projects.pop(n, None)
 mode = 0o600
@@ -656,7 +660,7 @@ if (doc === null || typeof doc !== "object" || Array.isArray(doc)) { console.err
 if (!doc.projects || typeof doc.projects !== "object") doc.projects = {};
 let real = d; try { real = fs.realpathSync(d); } catch (e) {}
 for (const n of new Set([d, real])) {
-  if (op === "add") { doc.projects[n] = doc.projects[n] || {}; doc.projects[n].hasTrustDialogAccepted = true; }
+  if (op === "add") { doc.projects[n] = doc.projects[n] || {}; Object.assign(doc.projects[n], { hasTrustDialogAccepted: true, hasClaudeMdExternalIncludesApproved: true, hasClaudeMdExternalIncludesWarningShown: true }); }
   else delete doc.projects[n];
 }
 let mode = 0o600; try { mode = fs.statSync(f).mode & 0o777; } catch (e) {}
@@ -672,6 +676,12 @@ fi
 echo "wsp-trust: neither python3 nor node is on this machine; cannot edit $file" >&2
 exit 1
 "#;
+
+/// The helper's text, for a local sandbox seat to run it the same way
+/// (`wsp-466`): the same file edit, in the same two programs.
+pub fn trust_helper_script() -> &'static str {
+    TRUST_HELPER
+}
 
 /// Where the trust helper lives on the machine.
 pub fn trust_helper_path(m: &Machine) -> String {
@@ -1737,6 +1747,8 @@ mod tests {
         // No file yet: one is made.
         let doc = run("add");
         assert_eq!(doc["projects"]["/far/exec/trees/demos-002"]["hasTrustDialogAccepted"], true);
+        assert_eq!(doc["projects"]["/far/exec/trees/demos-002"]["hasClaudeMdExternalIncludesApproved"], true);
+        assert_eq!(doc["projects"]["/far/exec/trees/demos-002"]["hasClaudeMdExternalIncludesWarningShown"], true);
         // A file that holds other things keeps them, and the second add changes nothing.
         std::fs::write(
             &file,

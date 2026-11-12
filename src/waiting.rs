@@ -434,6 +434,10 @@ pub(crate) fn raise_prompt(
         Some(p) => format!("its screen reads: \"{p}\""),
         None => "its screen could not be read".to_string(),
     };
+    let said = match screen.and_then(crate::local_trust::dialog_fix) {
+        Some(fix) => format!("{said}. That is {fix}"),
+        None => said,
+    };
     let text = format!(
         "{what} ({seat}) is stopped on a prompt on its screen — an AskUserQuestion or a permission dialog — and nothing \
          moves until it is answered; {said}. Only a keypress at the seat answers it: `wsp peek --pane {seat}` shows it."

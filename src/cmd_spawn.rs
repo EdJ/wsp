@@ -3148,6 +3148,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // `start_agent` now, because the thing worth retrying is the pair — an
         // agent that started and then died failed the spawn exactly as one that
         // never started did, and only the second wait can tell.
+        // A sandbox seat's new tree is trusted before claude starts in it, so it
+        // reaches its first turn with no folder-trust dialog (`wsp-466`).
+        if kind == "claude" && !far_start {
+            match cwd.as_deref().map(|c| crate::local_trust::trust(store, c)) {
+                Some(Ok(Some(said))) => eprintln!("wsp: {said}"),
+                Some(Err(why)) => eprintln!("wsp: {why}; the seat may stop at Claude Code's folder-trust dialog"),
+                _ => {}
+            }
+        }
         match start_agent(place, how, &spawn, &agent, &kind, &spawn_patience(far_start)) {
             Ok(()) => {
                 started = Some(kind.clone());
