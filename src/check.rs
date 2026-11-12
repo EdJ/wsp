@@ -550,6 +550,63 @@ pub(crate) fn end_steps(store: &Store, project: &str) -> Vec<Step> {
         .unwrap_or_default()
 }
 
+// ---- artefacts and the full suite (wsp submit's validator) ------------------
+
+/// The project's `## Artefacts`: one glob per line (a `- ` bullet is allowed),
+/// `#` comments and blank lines skipped. An absent or empty section is none:
+/// nothing is restored for the member.
+pub(crate) fn artefact_globs(store: &Store, project: &str) -> Vec<String> {
+    store.project(project).and_then(|p| p.section("Artefacts")).map(|s| globs_in(&s)).unwrap_or_default()
+}
+
+fn globs_in(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).unwrap_or(l).trim().trim_matches('`').to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// The D4 key: the project's `## Full suite` section. Command lines (a bullet
+/// and backticks are allowed) name the full-suite commands; the line
+/// `members: allowed` lets a member's check or a run step below the barrier
+/// use them. Without that line a member's check naming one is refused.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct FullSuite {
+    pub commands: Vec<String>,
+    pub members_allowed: bool,
+}
+
+impl FullSuite {
+    /// Whether `command` is one of the project's full-suite commands.
+    pub(crate) fn names(&self, command: &str) -> bool {
+        let c = command.trim();
+        self.commands.iter().any(|f| f == c)
+    }
+
+    /// Whether a member may run `command`: it is no full-suite command, or the
+    /// project allows members the full suite.
+    pub(crate) fn member_may_run(&self, command: &str) -> bool {
+        !self.names(command) || self.members_allowed
+    }
+}
+
+pub(crate) fn full_suite(store: &Store, project: &str) -> FullSuite {
+    store.project(project).and_then(|p| p.section("Full suite")).map(|s| full_suite_in(&s)).unwrap_or_default()
+}
+
+fn full_suite_in(text: &str) -> FullSuite {
+    let mut out = FullSuite::default();
+    for l in globs_in(text) {
+        match l.split_once(':') {
+            Some((k, v)) if k.trim() == "members" => out.members_allowed = v.trim() == "allowed",
+            _ => out.commands.push(l),
+        }
+    }
+    out
+}
+
 /// What a landing is run against: the steps, in order, and the paths that
 /// brought the rules in.
 pub(crate) struct Plan {
@@ -2587,6 +2644,49 @@ mod tests {
         t.set_status(Status::Review);
         crate::log::note(&store, &mut t, &format!("{} {sha} on pj-001", crate::repair::LANDED)).unwrap();
         (env, store, sha)
+    }
+
+    #[test]
+    fn a_projects_artefact_globs_are_read_and_an_empty_section_reads_as_none() {
+        let env = util::isolated("check-artefacts");
+        let _ = &env;
+        let store = Store::open();
+        let mut p = Project::new("pj");
+        p.body = "## Artefacts\n# generated\nCargo.lock\n- docs/*.html\n\n## Checks\n- a: true\n".into();
+        store.save_project(&p).unwrap();
+        assert_eq!(artefact_globs(&store, "pj"), vec!["Cargo.lock", "docs/*.html"]);
+        p.body = "## Artefacts\n# none yet\n\n## Checks\n- a: true\n".into();
+        store.save_project(&p).unwrap();
+        assert!(artefact_globs(&store, "pj").is_empty());
+        p.body = "## Artefacts\n".into();
+        store.save_project(&p).unwrap();
+        assert!(artefact_globs(&store, "pj").is_empty());
+        p.body = "## Checks\n- a: true\n".into();
+        store.save_project(&p).unwrap();
+        assert!(artefact_globs(&store, "pj").is_empty());
+    }
+
+    #[test]
+    fn the_d4_key_absent_refuses_a_members_full_suite_and_present_allows_the_named_command() {
+        let env = util::isolated("check-d4");
+        let _ = &env;
+        let store = Store::open();
+        let mut p = Project::new("pj");
+        p.body = "## Full suite\n- `cargo nextest run --workspace`\n".into();
+        store.save_project(&p).unwrap();
+        let fs = full_suite(&store, "pj");
+        assert!(fs.names("cargo nextest run --workspace"));
+        assert!(!fs.member_may_run("cargo nextest run --workspace"));
+        assert!(fs.member_may_run("cargo test check::"));
+        p.body = "## Full suite\ncargo nextest run --workspace\nmembers: allowed\n".into();
+        store.save_project(&p).unwrap();
+        let fs = full_suite(&store, "pj");
+        assert!(fs.member_may_run("cargo nextest run --workspace"));
+        assert!(!fs.names("cargo build"));
+        p.body = "## Checks\n- a: true\n".into();
+        store.save_project(&p).unwrap();
+        assert_eq!(full_suite(&store, "pj"), FullSuite::default());
+        assert!(FullSuite::default().member_may_run("anything"));
     }
 
     #[test]
