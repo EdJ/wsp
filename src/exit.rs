@@ -872,6 +872,8 @@ owed:
             "- cargo test exit::",
             "- slow (soon): cargo test",
             "- tests (5m) at barrier: cargo test",
+            "- tests (café): cargo test",
+            "- done (✓): true",
         ] {
             let text = format!("summary: s\n\ndone-when:\n- held: a — b\n\nchecks:\n{bad}\n");
             let r = Exit::parse(Kind::Member, &text).expect_err(bad);

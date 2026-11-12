@@ -413,12 +413,13 @@ fn rules_of<'a>(words: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>) 
 
 fn limit_of(s: &str) -> Option<Duration> {
     let s = s.trim();
-    let (n, unit) = s.split_at(s.len().checked_sub(1)?);
-    let n: u64 = n.parse().ok()?;
+    // Split at a character, not a byte: `(✓)` or `(café)` is no limit, never a panic.
+    let unit = s.chars().last()?;
+    let n: u64 = s[..s.len() - unit.len_utf8()].parse().ok()?;
     let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
+        's' => n,
+        'm' => n * 60,
+        'h' => n * 3600,
         _ => return None,
     };
     (secs > 0).then(|| Duration::from_secs(secs))
@@ -2407,7 +2408,12 @@ mod tests {
 
         let ok = timed_line("- web-chrome ctl and workspace (5m): cd spikes/web-chrome && npx tsc --noEmit".trim_start_matches("- "));
         assert_eq!(ok, Ok(("web-chrome ctl and workspace".into(), "5m".into(), "cd spikes/web-chrome && npx tsc --noEmit".into())));
-        for bad in ["tests: cargo test", "cargo test", "slow (soon): true", "t (5m) at barrier: true", "t (5m): "] {
+        // A limit of multi-byte characters is no limit, and never a panic (cpd-4944).
+        let s = step("- echo done (✓)");
+        assert_eq!((s.name.as_str(), s.command.as_str()), ("echo", "echo done (✓)"), "a plain command, as on master");
+        assert_eq!(step("- tests (café): cargo test").command, "tests (café): cargo test");
+        assert_eq!(limit_of("né"), None);
+        for bad in ["tests: cargo test", "cargo test", "slow (soon): true", "t (5m) at barrier: true", "t (5m): ", "tests (café): cargo test", "t (✓): true"] {
             assert!(timed_line(bad).is_err_and(|w| w.contains("label (5m): command")), "{bad}");
         }
     }
