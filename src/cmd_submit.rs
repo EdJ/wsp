@@ -264,6 +264,23 @@ pub(crate) fn refusal_lines(c: &Checked) -> Vec<String> {
         .collect()
 }
 
+/// What `wsp submit --dry-run` would say of `text` as `kind`'s exit for `key`
+/// (the member's row, the verifier's member, or a check's barrier subject):
+/// `Ok` when it validates, else every refusal line (`wsp-616`). The tell at a
+/// seat's stop carries these, and so does the flag when wsp's own close of an
+/// exit is refused.
+pub(crate) fn dry_run(store: &Store, kind: closing::Kind, key: &str, text: &str) -> Result<(), Vec<String>> {
+    match kind {
+        closing::Kind::Member => {
+            let Some(t) = store.find_task(key) else { return Err(vec![format!("wsp: no row {key}")]) };
+            let c = validate(store, &t, text, None);
+            if c.refusals.is_empty() { Ok(()) } else { Err(refusal_lines(&c)) }
+        }
+        closing::Kind::Verifier => verifier_rules(text).map(|_| ()).map_err(|rs| printed(&rs)),
+        closing::Kind::Check => check_rules_of(text).map(|_| ()).map_err(|rs| printed(&rs)),
+    }
+}
+
 /// V0–V7 over `text` for row `t`, keeping every refusal.
 pub(crate) fn validate(store: &Store, t: &Task, text: &str, anyway: Option<&str>) -> Checked {
     let mut c = Checked::default();

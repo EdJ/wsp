@@ -384,6 +384,83 @@ fn route_with(
         .unwrap_or(On::Person)
 }
 
+/// The most of a prompt's text a raise carries, in characters.
+const PROMPT_SHOWN: usize = 600;
+
+/// The most of a screen's last lines a prompt's text is read from.
+const PROMPT_LINES: usize = 12;
+
+/// The prompt on a seat's screen, as one line: the last [`PROMPT_LINES`] lines
+/// with words on them, the frame's borders and the footer's key hints left out
+/// and the options kept (`wsp-616`). A dialog is drawn at the foot of the
+/// screen: an AskUserQuestion's question and numbered options, a permission
+/// dialog's call and `1. Yes / 2. No`. `None` where nothing readable is on it.
+pub(crate) fn prompt_text(screen: &str) -> Option<String> {
+    let footer = ["enter to select", "esc to cancel", "to navigate", "for shortcuts", "ctrl+", "shift+tab"];
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(|raw| raw.trim().trim_matches(|c| "│┃".contains(c)).trim())
+        .filter(|l| !l.is_empty() && !l.chars().all(|c| "─━│┃╭╮╰╯┌┐└┘├┤ -=_".contains(c)))
+        .filter(|l| !footer.iter().any(|f| l.to_lowercase().contains(f)))
+        .map(|l| l.trim_start_matches(['⏺', '●', '❯', '›']).trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let from = lines.len().saturating_sub(PROMPT_LINES);
+    (from < lines.len()).then(|| util::truncate(&lines[from..].join(" · "), PROMPT_SHOWN))
+}
+
+/// **A run seat at an on-screen prompt is raised at once** (`wsp-616`,
+/// compounding-449): a verifier sat at an AskUserQuestion with nothing
+/// raised, because a prompt is read by nobody. To whom [`route`] names — the
+/// governor that answers for the row, else the person — with the prompt's
+/// text. `what` names the seat's work (`m-1`, `the v-1 verifier's pass`);
+/// `screen` is its screen, when it could be read; `list` is the run the seat
+/// is in, whose governor hears it the way the run tells it everything else
+/// ([`crate::cycle::tell`]) when the route names that governor. Returns whom
+/// it went to.
+///
+/// A note rather than a question: a question with this seat behind it would
+/// hold the seat as waiting on an answer long after the dialog is gone.
+pub(crate) fn raise_prompt(
+    store: &Store,
+    seat: &str,
+    about: crate::message::About,
+    what: &str,
+    screen: Option<&str>,
+    list: Option<&crate::model::Worklist>,
+) -> On {
+    use crate::message::{self, Kind, Message, Party};
+    let said = match screen.and_then(prompt_text) {
+        Some(p) => format!("its screen reads: \"{p}\""),
+        None => "its screen could not be read".to_string(),
+    };
+    let text = format!(
+        "{what} ({seat}) is stopped on a prompt on its screen — an AskUserQuestion or a permission dialog — and nothing \
+         moves until it is answered; {said}. Only a keypress at the seat answers it: `wsp peek --pane {seat}` shows it."
+    );
+    let mut m = Message::new(Party::wsp(), Kind::Note, &text).about(about);
+    let on = route(store, &m);
+    match &on {
+        On::Seat(scope) => m.for_seat = Some(scope.clone()),
+        _ => m = m.for_the_person(),
+    }
+    if let Err(e) = message::raise(store, &m) {
+        crate::store::log_line(store, &format!("{what} ({seat}): its prompt could not be raised: {e}"));
+        return on;
+    }
+    crate::store::log_line(store, &format!("{what} ({seat}) is at a prompt on its screen — raised to {}", match &on {
+        On::Seat(scope) => format!("the {scope} governor"),
+        _ => "the person".to_string(),
+    }));
+    if let On::Seat(scope) = &on {
+        match list.filter(|w| &w.id == scope) {
+            Some(w) => crate::cycle::tell(store, w, &text),
+            None => crate::cmd_message::say_to_governor(store, scope, &m),
+        }
+    }
+    on
+}
+
 /// The open questions, read once, indexed by who is sitting still behind each.
 ///
 /// **Read once per pass and asked per seat**, because every reader here walks

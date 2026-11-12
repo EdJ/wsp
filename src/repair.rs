@@ -16,7 +16,7 @@
 //!
 //! | state | how it is recognised | the record it keys on |
 //! |---|---|---|
-//! | the agent is gone | the seat reads [`State::Gone`], or `Idle` past [`STALLED_AFTER`] with the row still `doing` | a marker line in the member's `## Log` |
+//! | the agent is gone | the seat reads [`State::Gone`], or `Idle` with the row still `doing` — at its `Stop` (told at once, `wsp-616`) or past [`STALLED_AFTER`] where no hook says | a marker line in the member's `## Log` |
 //! | the start never claimed | `doing`, unclaimed, wsp's own start its last word | the `started by wsp:` line `cycle` already takes on |
 //! | the landing was never recorded | settled, branch level with the trunk, no landing on the row | a landing line, which `wsp land` now writes too |
 //! | `advance` skipped a member | settled, and nothing was started for it | none, and it is stamped on every pass for that reason |
@@ -1185,7 +1185,18 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
                     "{} group {at}: {} ({seat}) is {} — not told and not ended, and held for as long as it waits",
                     w.id, t.id, wait.sentence()
                 ));
-                if wait.owed() {
+                // **A prompt on its screen is raised at once, with its text**
+                // (`wsp-616`): to whom the route names. Routed to a seat, the
+                // raise has told it; the list's line below is for a prompt
+                // routed to the person, and for the other waits.
+                let routed = match wait.why {
+                    crate::waiting::Why::Prompt => {
+                        let screen = seats.screen(&seat);
+                        Some(crate::waiting::raise_prompt(store, &seat, crate::message::About::Task(t.id.clone()), &t.id, screen.as_deref(), Some(w)))
+                    }
+                    _ => None,
+                };
+                if wait.owed() && !matches!(routed, Some(crate::waiting::On::Seat(_))) {
                     crate::cycle::tell(store, w, &format!(
                         "{} in the {} run is {} ({}). The run holds it with no ceiling: it is not told \
                          to finish and it is not ended. `wsp peek {}` shows its screen.",
@@ -1216,6 +1227,18 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         };
         if let Some(end) = end.as_ref().filter(|e| e.wants()) {
             raise_turn_end(store, w, at, &t.id, &seat, end);
+        }
+        // **A turn that stopped wanting nobody, with the row still at doing, is
+        // told at once what its exit is missing** (`wsp-616`): no exit at
+        // `$WSP_EXIT`, or the dry run's refusal lines, then `wsp submit`. Once
+        // per stop, a stop of this seat's own (never one from before its
+        // start); the end-and-restart window still runs from the first tell.
+        let stop = end.as_ref().filter(|e| !e.wants() && started_at(&t).is_none_or(|s| e.at >= s));
+        if let (State::Idle, Some(stop)) = (state, stop) {
+            let window_open = noticed(&t).is_none_or(|since| since + STALLED_AFTER > util::epoch_secs());
+            if window_open && tell_at_stop(store, w, at, &t, &seat, stop.at) {
+                continue;
+            }
         }
         let gone = match state {
             State::Gone => true,
@@ -1318,14 +1341,7 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             continue;
         }
         stamp(store, &format!("{} group {at}: {} reads {word} ({seat}) with nothing working on it — telling it", w.id, id));
-        tell_member(store, &id, &format!(
-            "wsp noticed that {id} is at doing with nothing working on it. If your work is finished, \
-             land it and run `wsp review {id}`; if it is not, say what is left. Nobody else is \
-             waiting on this row. {} If wsp finds it still at doing in {} min it will run the review for you from \
-             that file when the tree is committed, or flag the person.",
-            crate::closing::how_to_close_verdict(crate::closing::Kind::Member, &id),
-            STALLED_AFTER / 60
-        ));
+        tell_member(store, &id, &exit_tell(store, &t));
         crate::cycle::tell(store, w, &format!(
             "{} in the {} run is at doing with nothing working on it — its seat reads {word} and it \
              has been told to finish, land and review, or say what is left. `wsp show {}` has its row.",
@@ -1338,6 +1354,61 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
 /// and was raised (`wsp-606`), with the stop it was about — so one stop is
 /// raised once, and the next stop is a new one.
 const TURN_RAISED: &str = "wsp: its turn ended wanting somebody";
+
+/// The marker in a member's `## Log` for a tell at a later stop than the
+/// first (`wsp-616`): the first is a [`NOTICED`] line, which starts the window.
+const STOP_TOLD: &str = "wsp: told at its stop what its exit is missing";
+
+/// What a member at `doing` is told when its turn stops with no exit accepted.
+fn exit_tell(store: &Store, t: &Task) -> String {
+    let what = format!("{} (at doing; nobody else is waiting on it)", t.id);
+    crate::closing::exit_tell(store, crate::closing::Kind::Member, &t.id, started_at(t), &what, STALLED_AFTER / 60)
+}
+
+/// Tell a member whose turn stopped at `stop` what its exit is missing, once
+/// per stop (`wsp-616`). The first tell since its start (or its last wait) is
+/// the [`NOTICED`] line the end-and-restart window runs from; a later stop is
+/// a [`STOP_TOLD`] line, so the window is not moved. False when this stop was
+/// told already.
+fn tell_at_stop(store: &Store, w: &Worklist, at: usize, t: &Task, seat: &str, stop: i64) -> bool {
+    let key = format!("(stop {stop})");
+    let id = t.id.clone();
+    let mut first = false;
+    let wrote = store.locked(|| {
+        let Some(mut t) = store.find_task(&id) else { return false };
+        let mut told = false;
+        for l in t.section("Log").unwrap_or_default().lines() {
+            if fresh_start(l) || l.contains(WAITING) {
+                told = false;
+            } else if l.contains(&key) {
+                told = true;
+            }
+        }
+        if told || t.status() != Status::Doing {
+            return false;
+        }
+        first = noticed(&t).is_none();
+        t.log(&match first {
+            true => format!("{NOTICED} idle at its stop with this row still at doing — told what its exit is missing {key}"),
+            false => format!("{STOP_TOLD} {key}"),
+        });
+        t.touch();
+        store.save_task(&t).is_ok()
+    });
+    if !wrote {
+        return false;
+    }
+    stamp(store, &format!("{} group {at}: {id} ({seat}) stopped with no exit accepted — telling it what is missing", w.id));
+    tell_member(store, &id, &exit_tell(store, t));
+    if first {
+        crate::cycle::tell(store, w, &format!(
+            "{id} in the {} run stopped its turn at doing with no exit accepted — it has been told what its exit is \
+             missing and `wsp submit {id}`. `wsp show {id}` has its row.",
+            w.id
+        ));
+    }
+    true
+}
 
 /// When an idle member went idle: its seat's `Stop`, never before the row's
 /// start; the start alone where no hook says.
@@ -3628,27 +3699,73 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         assert!(row_log(&store, "m-1").contains(TURN_RAISED), "the row says it was raised");
     }
 
-    /// **A turn ending on no question is pushed [`STALLED_AFTER`] after its
-    /// stop, not after its start** — and the told seat is still ended a window
-    /// later, as before (`wsp-606`).
+    /// A [`Fake`] whose seats' last turn ended at the epoch `at`, on quiet
+    /// words: a stop that stays one stop however many ticks read it.
+    struct StopAt(Fake, i64);
+
+    impl Seats for StopAt {
+        fn state(&self, seat: &str) -> Option<State> {
+            self.0.state(seat)
+        }
+        fn turn_end(&self, _seat: &str) -> Option<crate::waiting::TurnEnd> {
+            Some(crate::waiting::TurnEnd { at: self.1, words: crate::waiting::last_words("⏺ Committed the fix and ran the checks."), denied: false })
+        }
+    }
+
+    fn told_m1() -> Vec<String> {
+        member_told().into_iter().filter(|(id, _)| id == "m-1").map(|(_, t)| t).collect()
+    }
+
+    /// **A turn that stops wanting nobody, with no exit accepted, is told at
+    /// its stop what is missing** (`wsp-616`) — within one tick, once per
+    /// stop, naming `$WSP_EXIT` and `wsp submit` — and the told seat is still
+    /// ended a window after the first tell, as before.
     #[test]
-    fn an_idle_member_with_no_question_is_pushed_a_window_after_its_stop_and_still_ended_a_window_after_that() {
+    fn an_idle_member_with_no_exit_is_told_at_its_stop_once_per_stop_and_still_ended_a_window_after_the_first_tell() {
         let (_env, store) = in_flight("turn-quiet");
         started(&store, "m-1", STALLED_AFTER + 120);
-        let words = "⏺ Committed the fix and ran the checks.";
-        let fresh = Stopped(Fake::new(&[("cpd-1", Some(State::Idle))]), 30, words, false);
-        tick(&store, &fresh, &mut Pass::new());
-        assert!(member_told().is_empty(), "started twelve minutes ago, idle thirty seconds: not pushed yet");
-        assert!(raised_texts(&store).is_empty() && governed().is_empty(), "nothing asked, nothing raised");
+        let now = util::epoch_secs();
+        let first = StopAt(Fake::new(&[("cpd-1", Some(State::Idle))]), now - 30);
+        tick(&store, &first, &mut Pass::new());
+        let told = told_m1();
+        assert_eq!(told.len(), 1, "told on the tick that reads the stop: {told:?}");
+        assert!(told[0].contains("no exit at") && told[0].contains("$WSP_EXIT"), "names what is missing: {}", told[0]);
+        assert!(told[0].contains("`wsp submit m-1`"), "and the one command: {}", told[0]);
+        assert!(raised_texts(&store).is_empty(), "a quiet turn is told, not raised");
 
-        let stale = Stopped(Fake::new(&[("cpd-1", Some(State::Idle))]), STALLED_AFTER + 1, words, false);
-        tick(&store, &stale, &mut Pass::new());
-        assert_eq!(member_told().len(), 1, "a window after its stop, it is pushed");
-        assert!(ended().is_empty());
+        tick(&store, &first, &mut Pass::new());
+        assert!(told_m1().is_empty(), "one stop is told once");
+
+        let second = StopAt(Fake::new(&[("cpd-1", Some(State::Idle))]), now - 5);
+        tick(&store, &second, &mut Pass::new());
+        assert_eq!(told_m1().len(), 1, "a new stop is told again");
+        tick(&store, &second, &mut Pass::new());
+        assert!(told_m1().is_empty() && ended().is_empty(), "and once; nothing is ended inside the window");
 
         age_the_notice(&store, "m-1");
-        tick(&store, &stale, &mut Pass::new());
-        assert_eq!(ended(), vec!["m-1".to_string()], "the end-and-restart a window after the push stays");
+        tick(&store, &second, &mut Pass::new());
+        assert_eq!(ended(), vec!["m-1".to_string()], "the end-and-restart a window after the first tell stays");
+    }
+
+    /// An exit written and refused is told as the dry run refuses it: every
+    /// refusal line, then `wsp submit` (`wsp-616`).
+    #[test]
+    fn a_member_with_a_refused_exit_is_told_its_refusal_lines_at_its_stop() {
+        let (_env, store) = in_flight("turn-refused");
+        started(&store, "m-1", 120);
+        let path = crate::closing::verdict_path(&store, "m-1", crate::closing::Kind::Member);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "summary: half of it\n\nThe API half is in.\n").unwrap();
+        let refused = crate::cmd_submit::dry_run(&store, crate::closing::Kind::Member, "m-1", "summary: half of it\n\nThe API half is in.\n").unwrap_err();
+        assert!(!refused.is_empty());
+        tick(&store, &StopAt(Fake::new(&[("cpd-1", Some(State::Idle))]), util::epoch_secs() - 10), &mut Pass::new());
+        let told = told_m1();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("is refused as it stands"), "{}", told[0]);
+        for line in &refused {
+            assert!(told[0].contains(line.as_str()), "the refusal line `{line}` is in the tell: {}", told[0]);
+        }
+        assert!(told[0].contains("`wsp submit m-1`"), "{}", told[0]);
     }
 
     /// And the other way: a seat that idles thirty seconds after its start is
@@ -3703,7 +3820,9 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         let why: Vec<&String> = said.iter().filter(|l| l.contains("not told and not ended")).collect();
         assert_eq!(why.len(), 1, "said once, not once a minute all night: {said:?}");
         assert!(why[0].contains("prompt only a person can answer"), "{}", why[0]);
-        assert_eq!(governed().len(), 1, "and the governor hears it once");
+        let heard = governed();
+        assert_eq!(heard.len(), 1, "and the governor hears it once: {heard:?}");
+        assert!(heard[0].contains("m-1 (cpd-1) is stopped on a prompt on its screen"), "raised at once through its route (wsp-616): {}", heard[0]);
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "the row is not put back either");
     }
 

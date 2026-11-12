@@ -252,7 +252,14 @@ pub(crate) trait Seats {
     /// (`wsp-581`). `None` where nobody can read it, and the default, for
     /// [`Seats::absent`]'s reason: a fake that read a real screen would be
     /// reading whatever this machine happens to be running.
-    fn last_words(&self, _seat: &str) -> Option<crate::waiting::Words> {
+    fn last_words(&self, seat: &str) -> Option<crate::waiting::Words> {
+        self.screen(seat).as_deref().and_then(crate::waiting::last_words)
+    }
+
+    /// The seat's screen as text, read now — what a prompt standing on it says
+    /// (`wsp-616`). `None` where nobody can read it, and the default, for
+    /// [`Seats::absent`]'s reason.
+    fn screen(&self, _seat: &str) -> Option<String> {
         None
     }
 

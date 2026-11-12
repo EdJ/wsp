@@ -44,6 +44,24 @@
 //! - **A verifier and a check** are noticed by [`tick_at`] on the legs' windows,
 //!   and closed by [`settle_verifier`] and [`settle_check`] when the file parses
 //!   to a verdict. `followup` names rows wsp cannot guess, so it is flagged.
+//!
+//! # At the stop, and at a prompt (`wsp-616`, row E5)
+//!
+//! - **A turn that stops with no exit accepted is told at once** what is
+//!   missing — no exit at `$WSP_EXIT`, or the dry run's refusal lines for the
+//!   file as it stands — then `wsp submit` ([`exit_tell`]). On the seat's own
+//!   `Stop` (one from before its start is not its), when the turn wants
+//!   nobody, once per stop; not [`TELL_AFTER`] later. The window to wsp's own
+//!   close runs from the first tell, as before. A turn that wants somebody is
+//!   `repair`'s to raise (`wsp-606`).
+//! - **A verifier or a check at an on-screen prompt is raised at once**,
+//!   through [`crate::waiting::route`] with the prompt's text
+//!   ([`crate::waiting::raise_prompt`]), and is never told or closed while it
+//!   stands there. A member's is raised the same way by `repair`.
+//! - **Closing for the seat reads the exit first** ([`submit_exit`]): a file
+//!   written as an exit is submitted as `wsp submit` would, when it validates;
+//!   one that does not is a flag to the person with its refusal lines. A
+//!   prose verdict is closed by its old verb, as above.
 
 use crate::cycle::Seats;
 use crate::legs::{self, State as LegState};
@@ -237,24 +255,92 @@ pub(crate) fn clear_verdict(store: &Store, key: &str, kind: Kind) {
     let _ = std::fs::remove_file(p.with_extension("body"));
 }
 
-/// The words the orders about closing carry for a member, a verifier and a check.
-pub(crate) fn how_to_close_verdict(kind: Kind, row: &str) -> String {
-    let (verb, shape) = match kind {
-        Kind::Member => (format!("`wsp review {row}`"), "the account of what you did and left"),
-        Kind::Verifier => (
-            format!("`wsp verified {row} --caption \"...\"`"),
-            "`holds` or `blocks` on the first line, then the verdict (a block carries a line `cause: work | check | tree | env — <one sentence>`; env, you could not verify, is no block)",
+// ---- the exit at a seat's stop (`wsp-616`) ------------------------------------
+
+/// How a seat's exit file (`$WSP_EXIT`, the kind's [`verdict_path`]) reads as
+/// it stands: what the tell at its stop says.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ExitReads {
+    /// Nothing written in this run of the seat.
+    Missing,
+    /// Written, and `wsp submit --dry-run` refuses it: every refusal line.
+    Refused(Vec<String>),
+    /// Written, and it validates: only the submit is missing.
+    Valid,
+}
+
+/// [`ExitReads`] for `key`'s exit of `kind`, written since `start`.
+pub(crate) fn exit_reads(store: &Store, kind: Kind, key: &str, start: Option<i64>) -> ExitReads {
+    if fresh_verdict(store, key, kind, start).is_none() {
+        return ExitReads::Missing;
+    }
+    let text = std::fs::read_to_string(verdict_path(store, key, kind)).unwrap_or_default();
+    if text.trim().is_empty() {
+        return ExitReads::Missing;
+    }
+    match crate::cmd_submit::dry_run(store, kind, key, &text) {
+        Ok(()) => ExitReads::Valid,
+        Err(lines) => ExitReads::Refused(lines),
+    }
+}
+
+/// The row `wsp submit` takes for `key`: a check's is its list.
+fn submit_row(kind: Kind, key: &str) -> String {
+    match kind {
+        Kind::Check => crate::barrier::parse_subject(key).map(|(l, _)| l.to_string()).unwrap_or_else(|| key.to_string()),
+        _ => key.to_string(),
+    }
+}
+
+/// What a seat whose turn stopped with no exit accepted is told (`wsp-616`):
+/// what is missing — no exit at `$WSP_EXIT`, or the dry run's refusal lines
+/// for the file as it stands — then the one command. `what` names the open
+/// item, `window` is the minutes until wsp acts on the file itself.
+pub(crate) fn exit_tell(store: &Store, kind: Kind, key: &str, start: Option<i64>, what: &str, window: i64) -> String {
+    let path = util::contract(&verdict_path(store, key, kind));
+    let state = match exit_reads(store, kind, key, start) {
+        ExitReads::Missing => format!(
+            "There is no exit at {path} ($WSP_EXIT): write it with a heredoc, `cat > \"$WSP_EXIT\" <<'EOF'` … `EOF` \
+             (a heredoc with its text, never a bare `cat`)."
         ),
-        Kind::Check => (
-            format!("`wsp worklist go {row}` (or `hold`)"),
-            "`go` or `hold` on the first line, then what you decided (a hold carries a line `cause: work | check | tree | env — <one sentence>`)",
+        ExitReads::Refused(lines) => format!(
+            "The exit at {path} ($WSP_EXIT) is refused as it stands — fix these lines:\n{}\n",
+            lines.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n")
         ),
+        ExitReads::Valid => format!("The exit at {path} ($WSP_EXIT) validates, and it is not submitted."),
     };
+    let row = submit_row(kind, key);
     format!(
-        "Close it in two separate Bash calls, never chained with anything else: first write {shape}, \
-         `cat > \"$WSP_VERDICT\" <<'EOF'` ... `EOF` (a heredoc with its text, never a bare `cat`); then, as a call of its own, {verb} \
-         (it reads $WSP_VERDICT)."
+        "wsp: {what} is open, and this seat's turn has stopped with no exit accepted. {state} \
+         Then run, as a Bash call of its own and never chained: `wsp submit {row}` (`--dry-run` checks the file first). \
+         If wsp finds it still open in {window} min it submits that file for you when it validates, or flags the person."
     )
+}
+
+/// **Closing for the seat reads the exit first** (`wsp-616`, S3): a file
+/// written as an exit in this run is submitted for the seat when it validates,
+/// exactly as `wsp submit` would; one that does not is the refusal lines, for
+/// the flag. `None` where there is no exit-shaped file, and the older verdict
+/// close decides.
+fn submit_exit(store: &Store, kind: Kind, key: &str, seat: &str, start: Option<i64>, why: Why) -> Option<Result<(), String>> {
+    let written = fresh_verdict(store, key, kind, start)?;
+    let path = verdict_path(store, key, kind);
+    let text = std::fs::read_to_string(&path).ok()?;
+    if !crate::cmd_submit::looks_like_exit(&text) {
+        return None;
+    }
+    let row = submit_row(kind, key);
+    if let Err(lines) = crate::cmd_submit::dry_run(store, kind, key, &text) {
+        return Some(Err(format!("the exit is refused as it stands: {}", lines.join("; "))));
+    }
+    let args = crate::Args::synth("submit", &[row.as_str()], &[("from", &path.display().to_string())]);
+    let code = crate::cmd_submit::submit_from(store, &args, Some(kind.seat_word()), Some(seat.to_string()));
+    if code != 0 {
+        crate::store::log_line(store, &format!("{row}: wsp's `wsp submit {row}` for {seat} was refused (exit {code})"));
+        return Some(Err(format!("wsp ran `wsp submit {row}` from the exit and it was refused (exit {code})")));
+    }
+    note_close(store, &row, "submit", written, Some(&why.words()));
+    Some(Ok(()))
 }
 
 /// The line a row's log (or the cycle log) gets when a close was not at the moment
@@ -283,6 +369,10 @@ struct Seen {
     idle_since: Option<i64>,
     told: Option<i64>,
     flagged: bool,
+    /// The seat's `Stop` it was last told at (`wsp-616`): one tell per stop.
+    stop: Option<i64>,
+    /// Its on-screen prompt was raised (`wsp-616`): once per spell at it.
+    prompted: bool,
 }
 
 fn record_path(store: &Store) -> PathBuf {
@@ -299,6 +389,8 @@ fn read(store: &Store) -> std::collections::BTreeMap<String, Seen> {
                 idle_since: e["idle_since"].as_i64(),
                 told: e["told"].as_i64(),
                 flagged: e["flagged"].as_bool().unwrap_or(false),
+                stop: e["stop"].as_i64(),
+                prompted: e["prompted"].as_bool().unwrap_or(false),
             },
         );
     }
@@ -308,7 +400,7 @@ fn read(store: &Store) -> std::collections::BTreeMap<String, Seen> {
 fn write(store: &Store, seen: &std::collections::BTreeMap<String, Seen>) {
     let v: serde_json::Map<String, Value> = seen
         .iter()
-        .map(|(k, s)| (k.clone(), json!({ "idle_since": s.idle_since, "told": s.told, "flagged": s.flagged })))
+        .map(|(k, s)| (k.clone(), json!({ "idle_since": s.idle_since, "told": s.told, "flagged": s.flagged, "stop": s.stop, "prompted": s.prompted })))
         .collect();
     let _ = std::fs::create_dir_all(&store.state);
     let _ = std::fs::write(record_path(store), Value::Object(v).to_string());
@@ -331,7 +423,8 @@ pub(crate) fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
         for l in legs::legs(t).into_iter().filter(|l| l.state == LegState::Running) {
             let Some(seat) = l.pane.clone() else { continue };
             let baton = fresh_baton(store, &t.id, &l.name, l.started.as_deref());
-            let item = Item { key: format!("{}/{}", t.id, l.name), row: &t.id, seat: &seat, written: baton };
+            let start = l.started.as_deref().map(util::epoch_of);
+            let item = Item { key: format!("{}/{}", t.id, l.name), row: &t.id, seat: &seat, written: baton, start, raise: None };
             let tell = |idle: i64| tell_to_close(store, &t.id, &l.name, &seat, idle);
             let close = |why: Why| settle(store, &t.id, &l.name, &seat, baton, why, now);
             advance(store, seats, &mut asks, &mut seen, &mut open, &item, now, &tell, &close);
@@ -343,8 +436,10 @@ pub(crate) fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
             let Some(seat) = p.pane.clone().filter(|_| p.standing()) else { continue };
             let start = Some(util::epoch_of(&p.at));
             let written = fresh_verdict(store, &t.id, Kind::Verifier, start);
-            let item = Item { key: format!("verify/{}/{seat}", t.id), row: &t.id, seat: &seat, written };
-            let tell = |idle: i64| tell_verdict(store, Kind::Verifier, &t.id, &seat, idle, &format!("{} verifier", t.id));
+            let what = format!("the {} verifier's pass", t.id);
+            let raise = Raise { about: crate::message::About::Task(t.id.clone()), what: what.clone(), list: crate::cycle::list_of(store, t) };
+            let item = Item { key: format!("verify/{}/{seat}", t.id), row: &t.id, seat: &seat, written, start, raise: Some(raise) };
+            let tell = |idle: i64| tell_verdict(store, Kind::Verifier, &t.id, &seat, idle, &what, start);
             let close = |why: Why| settle_verifier(store, &t.id, &seat, start, why, now);
             advance(store, seats, &mut asks, &mut seen, &mut open, &item, now, &tell, &close);
         }
@@ -365,8 +460,10 @@ pub(crate) fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
             let key = crate::barrier::subject(&w.id, at);
             let start = Some(util::epoch_of(&c.at));
             let written = fresh_verdict(store, &key, Kind::Check, start);
-            let item = Item { key: format!("check/{key}"), row: &w.id, seat: &seat, written };
-            let tell = |idle: i64| tell_verdict(store, Kind::Check, &key, &seat, idle, &format!("{} barrier {at} check", w.id));
+            let what = format!("the {} barrier {at} check", w.id);
+            let raise = Raise { about: crate::message::About::Scope(w.id.clone()), what: what.clone(), list: Some(w.clone()) };
+            let item = Item { key: format!("check/{key}"), row: &w.id, seat: &seat, written, start, raise: Some(raise) };
+            let tell = |idle: i64| tell_verdict(store, Kind::Check, &key, &seat, idle, &what, start);
             let close = |why: Why| settle_check(store, &w, at, &seat, start, why, now);
             advance(store, seats, &mut asks, &mut seen, &mut open, &item, now, &tell, &close);
         }
@@ -385,6 +482,19 @@ struct Item<'a> {
     seat: &'a str,
     /// When its verdict (or baton) was written in this run, if it was.
     written: Option<i64>,
+    /// When its seat started on it: a `Stop` before this is an earlier seat's.
+    start: Option<i64>,
+    /// How its seat's on-screen prompt is raised: a verifier's and a check's
+    /// (`wsp-616`). `None` for a leg, which is left as it was.
+    raise: Option<Raise>,
+}
+
+/// What a run seat at an on-screen prompt is raised about.
+struct Raise {
+    about: crate::message::About,
+    what: String,
+    /// The run the seat is in.
+    list: Option<Worklist>,
 }
 
 /// One step for one item: tell it once when its seat has sat idle (or has
@@ -413,6 +523,20 @@ fn advance(
         }
         return;
     }
+    // **A run seat at an on-screen prompt is raised at once** (`wsp-616`,
+    // compounding-449): an AskUserQuestion or a permission dialog is read by
+    // nobody on a screen nobody watches. Through [`crate::waiting::route`],
+    // with the prompt's text, once per spell at it — and never told or closed
+    // while it stands there.
+    if let (Some(State::Blocked), Some(raise)) = (state, item.raise.as_ref()) {
+        if !entry.prompted {
+            let screen = seats.screen(item.seat);
+            crate::waiting::raise_prompt(store, item.seat, raise.about.clone(), &raise.what, screen.as_deref(), raise.list.as_ref());
+            *entry = Seen { prompted: true, ..Seen::default() };
+        }
+        return;
+    }
+    entry.prompted = false;
     let since = match state {
         Some(State::Idle) => {
             // A question it asked, or a prompt, is a wait the item is owed an
@@ -421,6 +545,20 @@ fn advance(
             let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
             if crate::waiting::reading(Some(State::Idle), asks, &crate::waiting::Shells::default(), item.seat, item.row).is_some() {
                 *entry = Seen::default();
+                return;
+            }
+            // **Told at its stop, not a window after** (`wsp-616`): a turn
+            // that ended in this seat's run wanting nobody, with the item
+            // still open, has stopped short of its exit. Once per stop; the
+            // window to wsp's own close runs from the first tell, unchanged.
+            let stop = seats.turn_end(item.seat).filter(|e| !e.wants() && item.start.is_none_or(|s| e.at >= s));
+            if let Some(stop) = stop.filter(|e| entry.stop != Some(e.at)) {
+                entry.stop = Some(stop.at);
+                let since = *entry.idle_since.get_or_insert(stop.at.min(now));
+                if entry.told.is_none() {
+                    entry.told = Some(now);
+                }
+                tell((now - since) / 60);
                 return;
             }
             Some(*entry.idle_since.get_or_insert(now))
@@ -603,20 +741,8 @@ fn flag_about(store: &Store, row: &str, what: &str, seat: &str, evidence: &str, 
 }
 
 /// Said once to a verifier's or a check's seat that has sat with its item open.
-fn tell_verdict(store: &Store, kind: Kind, key: &str, seat: &str, idle_min: i64, what: &str) {
-    let path = verdict_path(store, key, kind);
-    let row = match kind {
-        Kind::Check => crate::barrier::parse_subject(key).map(|(l, _)| l.to_string()).unwrap_or_else(|| key.to_string()),
-        _ => key.to_string(),
-    };
-    let text = format!(
-        "wsp: the {what} is still open, and this seat has sat {idle_min} min without closing it. \
-         If your verdict is reached, close it now. {} Your verdict is read from {} ($WSP_VERDICT). \
-         If wsp finds it still open in {} min it will close it for you from that file when it parses to a verdict, or flag the person.",
-        how_to_close_verdict(kind, &row),
-        util::contract(&path),
-        SECOND_WINDOW / 60
-    );
+fn tell_verdict(store: &Store, kind: Kind, key: &str, seat: &str, idle_min: i64, what: &str, start: Option<i64>) {
+    let text = exit_tell(store, kind, key, start, what, SECOND_WINDOW / 60);
     crate::store::log_line(store, &format!("{what}: {seat} idle {idle_min} min with it open — told to close it"));
     crate::repair::tell_member(store, seat, &text);
 }
@@ -666,6 +792,15 @@ pub(crate) fn close_member(store: &Store, t: &crate::model::Task, seat: &str, wh
     let (_, tree) = tree_of(store, seat);
     let safe = matches!(tree, Tree::Clean(_) | Tree::NotGit);
     let id = &t.id;
+    match submit_exit(store, Kind::Member, id, seat, start, why) {
+        Some(Ok(())) => return true,
+        Some(Err(refused)) => {
+            let evidence = verdict_evidence(store, id, Kind::Member, written, &tree, why, &refused);
+            flag_member(store, t, seat, &evidence, start, !matches!(why, Why::Ended));
+            return false;
+        }
+        None => {}
+    }
     if let (true, Some((args, _, at))) = (safe, member_args_for(store, t)) {
         let code = crate::cmd_task::review(store, &args);
         if code == 0 {
@@ -746,6 +881,15 @@ fn settle_verifier(store: &Store, member: &str, seat: &str, start: Option<i64>, 
         util::contract(&verdict_path(store, member, Kind::Verifier))
     );
     let Some(t) = store.find_task(member) else { return true };
+    match submit_exit(store, Kind::Verifier, member, seat, start, why) {
+        Some(Ok(())) => return true,
+        Some(Err(refused)) => {
+            let evidence = verdict_evidence(store, member, Kind::Verifier, written, &tree, why, &refused);
+            flag_about(store, member, "the verifier", seat, &evidence, &fix, None, true);
+            return true;
+        }
+        None => {}
+    }
     let Some((args, at)) = verifier_args(store, &crate::Args::synth("verified", &[member], &[]), Some(seat)) else {
         let evidence = verdict_evidence(store, member, Kind::Verifier, written, &tree, why, "wsp does not guess, so it is not recorded");
         flag_about(store, member, "the verifier", seat, &evidence, &fix, None, true);
@@ -801,6 +945,15 @@ fn settle_check(store: &Store, w: &Worklist, at: usize, seat: &str, start: Optio
         util::contract(&verdict_path(store, &key, Kind::Check))
     );
     let what = format!("the barrier {at} check");
+    match submit_exit(store, Kind::Check, &key, seat, start, why) {
+        Some(Ok(())) => return true,
+        Some(Err(refused)) => {
+            let evidence = verdict_evidence(store, &key, Kind::Check, written, &tree, why, &refused);
+            flag_about(store, &w.id, &what, seat, &evidence, &fix, Some(w), true);
+            return true;
+        }
+        None => {}
+    }
     let parsed = verdict_source(store, &key, Kind::Check, start);
     let Some((v, body, at_written)) = parsed else {
         let evidence = verdict_evidence(store, &key, Kind::Check, written, &tree, why, "wsp does not guess, so it is not passed or held");
@@ -1234,7 +1387,7 @@ mod tests {
         clear_told();
         member_tick(&store, Some(State::Idle));
         assert_eq!(member_status(&store), Status::Doing, "told first, not closed");
-        assert!(told().iter().any(|(_, t)| t.contains("wsp review m-2") && t.contains("$WSP_VERDICT")), "the exact command and the file: {:?}", told());
+        assert!(told().iter().any(|(_, t)| t.contains("`wsp submit m-2`") && t.contains("$WSP_EXIT")), "the exact command and the file: {:?}", told());
         age_notice(&store, "m-2");
         member_tick(&store, Some(State::Idle));
         assert_eq!(member_status(&store), Status::Review, "wsp ran the review for the seat");
@@ -1346,7 +1499,7 @@ mod tests {
         tick_at(&store, &fake, t0);
         tick_at(&store, &fake, t0 + TELL_AFTER);
         assert_eq!(told().len(), 1, "told once: {:?}", told());
-        assert!(told()[0].1.contains("wsp verified v-1") && told()[0].1.contains("$WSP_VERDICT"), "{:?}", told());
+        assert!(told()[0].1.contains("`wsp submit v-1`") && told()[0].1.contains("$WSP_EXIT"), "{:?}", told());
         assert_eq!(pass_state(&store), PassState::Running);
         tick_at(&store, &fake, t0 + TELL_AFTER + SECOND_WINDOW);
         assert_eq!(pass_state(&store), PassState::Holds, "wsp recorded the verdict");
@@ -1420,6 +1573,121 @@ mod tests {
         assert_eq!(a.get("caption").as_deref(), Some("a gap"));
     }
 
+    // -- the exit at a seat's stop, and a seat at a prompt (`wsp-616`)
+
+    /// A seat reading `state`, whose last turn stopped at the epoch `stop`
+    /// wanting nobody, with `screen` on it.
+    struct AtStop(State, Option<i64>, Option<&'static str>);
+    impl Seats for AtStop {
+        fn state(&self, _seat: &str) -> Option<State> {
+            Some(self.0)
+        }
+        fn turn_end(&self, _seat: &str) -> Option<crate::waiting::TurnEnd> {
+            self.1.map(|at| crate::waiting::TurnEnd { at, words: crate::waiting::last_words("⏺ Read the tree."), denied: false })
+        }
+        fn screen(&self, _seat: &str) -> Option<String> {
+            self.2.map(str::to_string)
+        }
+    }
+
+    #[test]
+    fn a_verifier_whose_turn_stops_with_no_exit_is_told_at_once_once_per_stop_and_flagged_a_window_after_the_first_tell() {
+        let env = util::isolated("closing-v-stop");
+        let store = staged_verifier(&env, 3600);
+        clear_told();
+        let t0 = util::epoch_secs();
+        tick_at(&store, &AtStop(State::Idle, Some(t0 - 5), None), t0);
+        assert_eq!(told().len(), 1, "told on the tick that reads the stop, not {TELL_AFTER}s later: {:?}", told());
+        assert!(told()[0].1.contains("no exit at") && told()[0].1.contains("$WSP_EXIT") && told()[0].1.contains("`wsp submit v-1`"), "{:?}", told());
+        tick_at(&store, &AtStop(State::Idle, Some(t0 - 5), None), t0 + 30);
+        assert_eq!(told().len(), 1, "one stop is told once");
+        tick_at(&store, &AtStop(State::Idle, Some(t0 + 40), None), t0 + 60);
+        assert_eq!(told().len(), 2, "a new stop is told again: {:?}", told());
+        assert!(raised_texts(&store).is_empty(), "nothing flagged inside the window");
+        tick_at(&store, &AtStop(State::Idle, Some(t0 + 40), None), t0 + SECOND_WINDOW);
+        assert_eq!(raised_texts(&store).len(), 1, "flagged a window after the first tell, as before: {:?}", raised_texts(&store));
+        assert_eq!(pass_state(&store), PassState::Running, "no verdict is guessed");
+    }
+
+    /// compounding-449, as a test: a verifier stopped on an AskUserQuestion is
+    /// raised within one tick, through its route, with the prompt's text — and
+    /// never told or closed while it stands there.
+    #[test]
+    fn a_verifier_at_an_ask_user_question_prompt_is_raised_through_its_route_within_one_tick() {
+        let env = util::isolated("closing-v-prompt");
+        let store = staged_verifier(&env, 3600);
+        clear_told();
+        let screen = "⏺ The tree is read.\n\n╭──────────────────────────────╮\n│ Which check gates the barrier? │\n│ ❯ 1. cargo test                │\n│   2. npm run check             │\n╰──────────────────────────────╯\nEnter to select · ↑/↓ to navigate · Esc to cancel\n";
+        let t0 = util::epoch_secs();
+        let at = AtStop(State::Blocked, None, Some(screen));
+        tick_at(&store, &at, t0);
+        let raised = raised_texts(&store);
+        assert_eq!(raised.len(), 1, "raised on the first tick: {raised:?}");
+        assert!(raised[0].contains("the v-1 verifier's pass (cpd-3) is stopped on a prompt"), "{}", raised[0]);
+        assert!(raised[0].contains("Which check gates the barrier?") && raised[0].contains("1. cargo test"), "with the prompt's text: {}", raised[0]);
+        assert!(!raised[0].contains("Enter to select"), "the footer is left out: {}", raised[0]);
+        let m = crate::message::raised(&store).remove(0);
+        assert_eq!(crate::waiting::route(&store, &m), crate::waiting::On::Person, "no governor answers for v-1, so its route is the person");
+        assert!(m.for_person, "and it is the person's");
+        tick_at(&store, &at, t0 + TELL_AFTER + SECOND_WINDOW);
+        assert_eq!(raised_texts(&store).len(), 1, "once per spell at the prompt");
+        assert!(told().is_empty(), "a sentence typed at a dialog selects an answer nobody chose");
+        assert_eq!(pass_state(&store), PassState::Running);
+    }
+
+    #[test]
+    fn a_verifier_seat_idle_past_the_window_with_a_valid_exit_is_submitted_by_wsp() {
+        let env = util::isolated("closing-v-exit");
+        let store = staged_verifier(&env, 3600);
+        let exit = "verdict: holds\nsummary: the wiring is tested now\n\nRead in the tree; the test drives it.\n\nchecked:\n- unit (2m): cargo test wiring — pass\n";
+        assert_eq!(crate::cmd_submit::dry_run(&store, Kind::Verifier, "v-1", exit), Ok(()), "the fixture validates");
+        let wrote = put(&store, "v-1", Kind::Verifier, exit);
+        clear_told();
+        let fake = Fake(RefCell::new(Some(State::Idle)), false);
+        let t0 = wrote + 10;
+        tick_at(&store, &fake, t0);
+        tick_at(&store, &fake, t0 + TELL_AFTER);
+        assert!(told().len() == 1 && told()[0].1.contains("validates, and it is not submitted"), "{:?}", told());
+        tick_at(&store, &fake, t0 + TELL_AFTER + SECOND_WINDOW);
+        assert_eq!(pass_state(&store), PassState::Holds, "wsp submitted the exit for the seat");
+        let log = store.find_task("v-1").unwrap().section("Log").unwrap();
+        assert!(log.contains("submit · closed by wsp: seat idle"), "{log}");
+        assert!(raised_texts(&store).is_empty(), "nothing to flag");
+    }
+
+    #[test]
+    fn a_member_seat_idle_past_the_window_with_a_valid_exit_is_submitted_and_a_refused_one_is_flagged_with_its_lines() {
+        let exit = "summary: did the thing\n\nBuilt it and committed it.\n\ndone-when:\n- held: the work — the commit\n\nowed: nothing\n";
+        {
+            let env = util::isolated("closing-m-exit");
+            let (store, _tree) = staged_member(&env, 3600);
+            assert_eq!(crate::cmd_submit::dry_run(&store, Kind::Member, "m-2", exit), Ok(()), "the fixture validates");
+            put(&store, "m-2", Kind::Member, exit);
+            clear_told();
+            member_tick(&store, Some(State::Idle));
+            assert!(told().iter().any(|(_, t)| t.contains("validates, and it is not submitted")), "{:?}", told());
+            age_notice(&store, "m-2");
+            member_tick(&store, Some(State::Idle));
+            assert_eq!(member_status(&store), Status::Review, "wsp submitted the exit for the seat");
+            assert!(raised_texts(&store).is_empty(), "nothing to flag: {:?}", raised_texts(&store));
+        }
+        {
+            let env = util::isolated("closing-m-exit-refused");
+            let (store, _tree) = staged_member(&env, 3600);
+            let bad = "summary: did the thing\n\nBuilt it and committed it.\n";
+            let lines = crate::cmd_submit::dry_run(&store, Kind::Member, "m-2", bad).unwrap_err();
+            put(&store, "m-2", Kind::Member, bad);
+            clear_told();
+            member_tick(&store, Some(State::Idle));
+            age_notice(&store, "m-2");
+            member_tick(&store, Some(State::Idle));
+            assert_ne!(member_status(&store), Status::Review, "a refused exit is not submitted, and no review is guessed from it");
+            let raised = raised_texts(&store);
+            assert_eq!(raised.len(), 1, "the person is flagged: {raised:?}");
+            assert!(raised[0].contains("refused as it stands") && lines.iter().all(|l| raised[0].contains(l.as_str())), "with its refusal lines {lines:?}: {}", raised[0]);
+        }
+    }
+
     // -- a barrier check
 
     /// A running list `run` whose group 1 has a check open in `cpd-4`.
@@ -1487,7 +1755,7 @@ mod tests {
         tick_at(&store, &fake, t0);
         tick_at(&store, &fake, t0 + TELL_AFTER);
         assert_eq!(told().len(), 1, "told once: {:?}", told());
-        assert!(told()[0].1.contains("wsp worklist go run") && told()[0].1.contains("$WSP_VERDICT"), "{:?}", told());
+        assert!(told()[0].1.contains("`wsp submit run`") && told()[0].1.contains("$WSP_EXIT"), "{:?}", told());
         assert!(!held(&store));
         tick_at(&store, &fake, t0 + TELL_AFTER + SECOND_WINDOW);
         assert!(held(&store), "wsp ran the hold for the seat");
