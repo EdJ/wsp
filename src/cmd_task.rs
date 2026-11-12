@@ -9,7 +9,7 @@ use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, fold, read_source, Paint};
-use crate::Args;
+pub(crate) use crate::Args;
 
 pub fn add(store: &Store, args: &Args) -> i32 {
     // Asked only of a sub-task: the seat matters to nothing else `add` does.

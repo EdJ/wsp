@@ -48,7 +48,7 @@ use crate::message::{self, About, Message, Waiting};
 use crate::model::{Status, Task};
 use crate::store::Store;
 use crate::util::{self, fold, Paint};
-use crate::Args;
+use crate::cmd_task::Args;
 use std::path::{Path, PathBuf};
 
 pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
@@ -596,7 +596,7 @@ fn raise(store: &Store, t: &Task, ask: &Ask) -> Result<String, String> {
         crate::cmd_message::asked_of_the_person(store, &q, &t.id);
     }
     if let crate::waiting::On::Seat(scope) = &routed {
-        let _ = crate::wake::say(store, scope, &crate::cmd_message::for_a_governor(&q), Some(&q.id));
+        let _ = crate::cmd_message::say_to_governor(store, scope, &q);
     }
     Ok(q.id)
 }
@@ -806,7 +806,7 @@ mod tests {
         let path = file.display().to_string();
         let mut rest = vec!["wsp-101", "--from", path.as_str()];
         rest.extend_from_slice(flags);
-        let args = crate::Args::parse(std::iter::once("submit").chain(rest).map(String::from).collect());
+        let args = Args::parse(std::iter::once("submit").chain(rest).map(String::from).collect());
         submit_as(store, &args, Some("member"))
     }
 
@@ -978,7 +978,7 @@ mod tests {
     #[test]
     fn a_kind_other_than_a_member_is_told_its_verb() {
         let (_env, store, _tree) = member("submit-kind", ARTEFACTS);
-        let args = crate::Args::synth("submit", &["wsp-101"], &[]);
+        let args = Args::synth("submit", &["wsp-101"], &[]);
         assert_eq!(submit_as(&store, &args, Some("verifier")), 2);
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing");
     }
@@ -987,7 +987,7 @@ mod tests {
     fn a_bare_review_from_a_run_seat_warns_with_the_validators_refusals_and_outside_a_run_says_nothing() {
         let (_env, store, tree) = member("submit-warn", ARTEFACTS);
         std::fs::write(tree.join("stray.txt"), "x\n").unwrap();
-        let args = crate::Args::synth("review", &["wsp-101"], &[]);
+        let args = Args::synth("review", &["wsp-101"], &[]);
         assert!(crate::worklist::verified_by_a_run(&store, "wsp-101"));
         let warned = crate::cmd_task::exit_warnings(&store, &args, "did it\nand left nothing");
         assert!(!warned.is_empty(), "a run seat's dirty tree is warned of");
