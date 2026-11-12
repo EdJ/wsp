@@ -982,4 +982,20 @@ mod tests {
         assert_eq!(submit_as(&store, &args, Some("verifier")), 2);
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing");
     }
+
+    #[test]
+    fn a_bare_review_from_a_run_seat_warns_with_the_validators_refusals_and_outside_a_run_says_nothing() {
+        let (_env, store, tree) = member("submit-warn", ARTEFACTS);
+        std::fs::write(tree.join("stray.txt"), "x\n").unwrap();
+        let args = crate::Args::synth("review", &["wsp-101"], &[]);
+        assert!(crate::worklist::verified_by_a_run(&store, "wsp-101"));
+        let warned = crate::cmd_task::exit_warnings(&store, &args, "did it\nand left nothing");
+        assert!(!warned.is_empty(), "a run seat's dirty tree is warned of");
+        // Outside a run: unchanged, whatever the tree holds.
+        let mut w = store.worklists().into_iter().next().unwrap();
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        assert!(!crate::worklist::verified_by_a_run(&store, "wsp-101"));
+        assert!(crate::cmd_task::exit_warnings(&store, &args, "did it").is_empty());
+    }
 }

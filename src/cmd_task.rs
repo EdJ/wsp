@@ -1719,7 +1719,24 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", account.len()));
+    for line in exit_warnings(store, args, &account) {
+        eprintln!("wsp: warning (a run seat's review is read as an exit; `wsp submit` will refuse this) — {line}");
+    }
     accept(store, args, &account, said.as_deref())
+}
+
+/// What the submit validator would refuse in a bare `wsp review`'s words, from
+/// a run seat only (plan D2: a warning, never a refusal). The summary is the
+/// first line, the account the rest. Outside a run: nothing.
+pub(crate) fn exit_warnings(store: &Store, args: &Args, account: &str) -> Vec<String> {
+    let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) else { return Vec::new() };
+    if !crate::worklist::verified_by_a_run(store, &t.id) {
+        return Vec::new();
+    }
+    let (first, rest) = account.split_once('\n').unwrap_or((account, ""));
+    let text = format!("summary: {}\n\n{}\n\nowed: nothing\n", first.trim(), rest.trim());
+    let c = crate::cmd_submit::validate(store, &t, &text, args.get("anyway").as_deref());
+    crate::cmd_submit::refusal_lines(&c)
 }
 
 /// **The review core**: what `wsp review` does once it holds an account, and
