@@ -95,6 +95,16 @@
 //! since the exit, its pids read before the despawn and confirmed gone after
 //! it, the tree kept. Ended or left, it is said once on the row.
 //!
+//! **One ending per seat.** The record is taken before the verdict or the
+//! `go`/`hold` moves anything, and from then the older endings of a verifier
+//! ([`crate::cycle::passes_finished`]), of a check
+//! ([`crate::cycle::checks_finished`], `go`'s `--end-check-seat` helper) and of
+//! a member ([`tick`]'s own) step aside for it ([`exit_owns`]). The exit's
+//! ending writes what theirs would: a verifier's goes through
+//! [`crate::cycle::end_passes_keeping`], so the pass gets its end and spend; a
+//! check's marks its barrier entry ended. A seat already gone or already
+//! ended is said and forgotten, not read again every tick.
+//!
 //! **A member's seat is ended at submit, not held until the verdict** — Ed's
 //! decision D1 (2026-11-12, docs/exit-packet.md §10). A blocks verdict starts
 //! a rework seat from the verdict's `sent back:` reason, so the context the
@@ -348,6 +358,9 @@ pub(crate) fn left(r: &Reading) -> Option<Left> {
 /// off the member.
 pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
     exits(store, seats);
+    // A seat its exit is still to end (a turn in flight, or left running by it)
+    // is that ending's alone: the `--end-seat` helper may be ending it now.
+    let owned = exit_owns(store);
     let lists = open_lists(store);
     let mut tasks = None;
     let mut asks = None;
@@ -361,6 +374,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
             // and `repair`'s gone-member pass is the one that says so.
             continue;
         };
+        if owned.contains(&seat) {
+            continue;
+        }
         let w = list_of_member(&lists, &m.id);
         let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
         if end_one(store, seats, w, &m.id, &seat, &h, asks) {
@@ -872,8 +888,9 @@ fn once(store: &Store, id: &str, line: &str) -> bool {
 // ---- an accepted exit ends its seat (`wsp-615`, row E4) ----------------------
 
 /// Where the seats of accepted exits wait for their ending: seat → the row, the
-/// kind and when it was accepted. Read by the cap ([`exited_seats`]) and ended by
-/// [`end_exit`].
+/// kind and when it was accepted, and `left` once it was left running. Read by
+/// the cap ([`exited_seats`]), by the older endings that step aside for it
+/// ([`exit_owns`]), and ended by [`end_exit`].
 const EXITS: &str = "exits.json";
 
 /// The line on the row saying the seat of its accepted exit was ended.
@@ -884,6 +901,9 @@ const EXIT_LEFT: &str = "wsp: the exit is accepted and its seat is left running 
 
 /// The line on the row saying ending that seat was tried and failed.
 const EXIT_NOT_ENDED: &str = "wsp: could not end the seat of an accepted exit";
+
+/// The line on the row saying the seat had gone before its exit's ending came.
+const EXIT_GONE: &str = "wsp: the seat of an accepted exit had already gone —";
 
 fn read_exits(store: &Store) -> serde_json::Map<String, serde_json::Value> {
     std::fs::read_to_string(store.state_file(EXITS))
@@ -900,8 +920,9 @@ fn write_exits(store: &Store, all: &serde_json::Map<String, serde_json::Value>) 
 }
 
 /// `wsp submit` accepted an exit from `seat` for `row`: the seat is closing.
-/// From here it holds no place under the cap ([`exited_seats`]), and the tick
-/// — or the seat's own `Stop`, where a turn is in flight — ends it.
+/// From here it holds no place under the cap ([`exited_seats`]), the older
+/// endings leave it alone ([`exit_owns`]), and the tick — or the seat's own
+/// `Stop`, where a turn is in flight — ends it.
 pub(crate) fn exited(store: &Store, seat: &str, row: &str, kind: &str) -> bool {
     store.locked(|| {
         let mut all = read_exits(store);
@@ -913,19 +934,41 @@ pub(crate) fn exited(store: &Store, seat: &str, row: &str, kind: &str) -> bool {
 /// The seats of accepted exits not yet ended or left: none of them is counted
 /// under the cap, seen working or not, as a settled verifier is not (`wsp-385`).
 pub(crate) fn exited_seats(store: &Store) -> std::collections::BTreeSet<String> {
+    read_exits(store).into_iter().filter(|(_, e)| e["left"].as_bool() != Some(true)).map(|(s, _)| s).collect()
+}
+
+/// The seats whose ending is their exit's — closing, or left running by it.
+/// **One ending per seat**: [`crate::cycle::passes_finished`],
+/// [`crate::cycle::checks_finished`] and a `go`'s `--end-check-seat` helper
+/// skip these, so a verifier's and a check's seat are not ended twice — the
+/// exit's ending writes what theirs would (the pass's end and spend, the
+/// barrier entry's `ended`).
+pub(crate) fn exit_owns(store: &Store) -> std::collections::BTreeSet<String> {
     read_exits(store).keys().cloned().collect()
 }
 
-fn forget_exit(store: &Store, seat: &str) {
+/// The record of `seat`'s exit gone: an exit refused after all, or ended.
+pub(crate) fn forget_exit(store: &Store, seat: &str) {
     store.locked(|| {
         let mut all = read_exits(store);
         all.remove(seat).is_some() && write_exits(store, &all)
     });
 }
 
+/// A verifier's or a check's seat left running by its exit: kept on the
+/// record, so no older ending takes it after all, but counted again.
+fn mark_left(store: &Store, seat: &str) {
+    store.locked(|| {
+        let mut all = read_exits(store);
+        let Some(e) = all.get_mut(seat).and_then(|e| e.as_object_mut()) else { return false };
+        e.insert("left".into(), serde_json::Value::Bool(true));
+        write_exits(store, &all)
+    });
+}
+
 /// Every accepted exit's seat, tried once each tick.
 fn exits(store: &Store, seats: &dyn Seats) {
-    for seat in exited_seats(store) {
+    for seat in exit_owns(store) {
         end_exit(store, seats, &seat);
     }
 }
@@ -937,20 +980,42 @@ fn exits(store: &Store, seats: &dyn Seats) {
 /// after it ([`verifier_pids`], [`confirm_gone`]); the **tree is kept**, which a
 /// verifier reads in and the landing came from.
 ///
+/// **The only ending such a seat has.** A verifier's goes through
+/// [`crate::cycle::end_passes_keeping`], so its pass is written `ended` with
+/// its spend, its runs and what it did, read off the seat before the despawn
+/// clears them. A check's marks its barrier entry ended
+/// ([`crate::barrier::mark_ended`]) and says what became of its copy. A seat
+/// some other path ended first — [`Seats::absent`] says it is gone, or its pass
+/// or entry is no longer standing — is said and forgotten, not retried.
+///
 /// **No wait counts**: a `not held` exit raised its own decision ask, and the
 /// seat is ended behind it (D3) — the answer reopens the row on a fresh seat.
 ///
 /// A turn in flight, or a seat nobody can read, passes by itself and is tried
 /// again: at the seat's `Stop` by the helper `wsp submit` arranged, else on the
-/// next tick. Everything else is said once on the row and in `cycle.log`, and
-/// the record goes, so a seat left is counted again by what it is doing. `None`
-/// is not yet; `Some` is the line said.
+/// next tick. Everything else is said once on the row and in `cycle.log`. A
+/// member's record then goes, so a seat left is counted again by what it is
+/// doing; a verifier's or a check's left seat stays on the record, out of the
+/// older endings' reach, until it is gone. `None` is not yet; `Some` is the
+/// line said.
 pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<String> {
     let e = read_exits(store).get(seat).cloned()?;
     let row = e["row"].as_str().unwrap_or_default().to_string();
     let kind = e["kind"].as_str().unwrap_or("member").to_string();
     let at = e["at"].as_i64().unwrap_or(0);
+    if e["left"].as_bool() == Some(true) {
+        if seats.state(seat).is_none() && seats.absent(seat) {
+            forget_exit(store, seat);
+        }
+        return None;
+    }
     let state = seats.state(seat);
+    if state.is_none() && seats.absent(seat) {
+        return Some(said_exit(store, seat, &row, &kind, &format!("{EXIT_GONE} {seat} ({kind}) was ended by something else, or closed by hand")));
+    }
+    if !still_standing(store, seat, &row, &kind) {
+        return Some(said_exit(store, seat, &row, &kind, &format!("{EXIT_GONE} {seat} ({kind}) was already ended, and its record says so")));
+    }
     let reading = Reading {
         state,
         wait: None,
@@ -972,28 +1037,84 @@ pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<S
             let pids = match verifier_pids(seats, seat) {
                 Ok(p) => p,
                 Err(why) if why.passes() => return None,
-                Err(why) => return Some(said_exit(store, seat, &row, &format!("{EXIT_LEFT} {seat} ({kind}): {}", why.sentence()))),
+                Err(why) => return Some(said_exit(store, seat, &row, &kind, &format!("{EXIT_LEFT} {seat} ({kind}): {}", why.sentence()))),
             };
             let gone = matches!(state, Some(State::Gone | State::Empty));
-            let claimed = kind == "member" && store.claims().contains_key(&row);
-            let ending = match (claimed, gone) {
-                (true, _) => crate::cycle::despawned_keeping(store, &row, true),
-                (false, true) => Ok(()),
-                (false, false) => crate::cycle::despawn_seat_keeping(seat, true),
+            let ending = match kind.as_str() {
+                "verifier" => verifier_ended(store, seats, seat, &row),
+                "check" => check_ended(store, seats, seat, gone, &pids),
+                _ => {
+                    let claimed = store.claims().contains_key(&row);
+                    match (claimed, gone) {
+                        (true, _) => crate::cycle::despawned_keeping(store, &row, true),
+                        (false, true) => Ok(()),
+                        (false, false) => crate::cycle::despawn_seat_keeping(seat, true),
+                    }
+                    .and_then(|()| confirm_gone(seats, &pids))
+                }
             };
-            match ending.and_then(|()| confirm_gone(seats, &pids)) {
+            match ending {
                 Ok(()) => format!("{EXIT_ENDED} {} ({kind}, {seat}), no pid of it running and its tree kept", util::iso_at(at)),
                 Err(why) => format!("{EXIT_NOT_ENDED} ({kind}, {seat}) — {}", util::truncate(&why, 160)),
             }
         }
     };
-    Some(said_exit(store, seat, &row, &line))
+    Some(said_exit(store, seat, &row, &kind, &line))
+}
+
+/// Whether the record a verifier's or a check's seat is ended by still holds it
+/// standing: its pass on the member, its entry on the barrier. A member's is
+/// its seat, read above.
+fn still_standing(store: &Store, seat: &str, row: &str, kind: &str) -> bool {
+    match kind {
+        "verifier" => store
+            .find_task(row)
+            .is_some_and(|t| crate::verification::passes(&t).iter().any(|p| p.standing() && p.pane.as_deref() == Some(seat))),
+        "check" => crate::barrier::seat_of(store, seat).is_some(),
+        _ => true,
+    }
+}
+
+/// A verifier's exit, ended through the pass's own ending so its end, spend,
+/// runs and work are written on it — the tree kept.
+fn verifier_ended(store: &Store, seats: &dyn Seats, seat: &str, row: &str) -> Result<(), String> {
+    crate::cycle::end_passes_keeping(store, seats, row, true, |p| p.pane.as_deref() == Some(seat));
+    let ending = store
+        .find_task(row)
+        .and_then(|t| crate::verification::passes(&t).into_iter().find(|p| p.pane.as_deref() == Some(seat)).map(|p| p.ending));
+    match ending {
+        Some(crate::verification::Ending::Ended) => Ok(()),
+        Some(crate::verification::Ending::Failed(why)) => Err(why),
+        _ => Err("its pass was not ended — it stays standing for `wsp despawn --pane`".into()),
+    }
+}
+
+/// A check's exit: its seat ended with the tree left to [`crate::check_tree`]'s
+/// sweep, its barrier entry marked ended, and what became of its copy said —
+/// what `worklist advance --end-check-seat` did, which steps aside for this.
+fn check_ended(store: &Store, seats: &dyn Seats, seat: &str, gone: bool, pids: &[u32]) -> Result<(), String> {
+    let ended = match gone {
+        true => Ok(()),
+        false => crate::cycle::despawn_seat_keeping(seat, true),
+    }
+    .and_then(|()| confirm_gone(seats, pids));
+    crate::barrier::mark_ended(store, seat, ended.is_ok());
+    if !cfg!(test) {
+        crate::check_tree::tidy(store, &[seat.to_string()]);
+        crate::leg_tree::tidy(store, &[seat.to_string()]);
+    }
+    ended
 }
 
 /// Say `line` once on the row (where `row` is one) and in `cycle.log`, and let
-/// the record go: what is said is the end of it, ended or left.
-fn said_exit(store: &Store, seat: &str, row: &str, line: &str) -> String {
-    forget_exit(store, seat);
+/// the record go: what is said is the end of it, ended or left. A verifier's or
+/// a check's seat left running keeps its record, marked left, so the older
+/// endings still step aside for it.
+fn said_exit(store: &Store, seat: &str, row: &str, kind: &str, line: &str) -> String {
+    match line.starts_with(EXIT_LEFT) && kind != "member" {
+        true => mark_left(store, seat),
+        false => forget_exit(store, seat),
+    }
     once(store, row, line);
     crate::store::log_line(store, &format!("{row}: {}", line.trim_start_matches("wsp: ")));
     if line.starts_with(EXIT_ENDED) {
@@ -1019,6 +1140,8 @@ mod tests {
         pids: BTreeMap<String, Vec<u32>>,
         survives: Vec<u32>,
         census: Option<Vec<(String, String)>>,
+        /// Seats every backend says are gone.
+        absent: Vec<String>,
     }
 
     impl Fake {
@@ -1055,6 +1178,9 @@ mod tests {
         }
         fn census(&self) -> Option<Vec<(String, String)>> {
             self.census.clone()
+        }
+        fn absent(&self, seat: &str) -> bool {
+            self.absent.iter().any(|s| s == seat)
         }
     }
 
@@ -1861,12 +1987,28 @@ mod tests {
         crate::room::working(&r, &|_| crate::room::Look::Working).into_iter().map(|c| c.what).collect()
     }
 
-    /// The three kinds: a member claimed on `cpd-1`, its verifier on `cpd-2` and a
-    /// barrier check on `cpd-3`, each idle with a pid, nobody having typed since.
+    /// The three kinds, as their submits leave them: a member claimed on `cpd-1`,
+    /// its verifier on `cpd-2` with its verdict (holds) on the pass, and a check
+    /// on `cpd-3` standing on the barrier entry of `run`'s group 1, which it
+    /// passed. Each idle with a pid, nobody having typed since.
     fn three_exits(tag: &str) -> (util::Isolated, Store, Fake) {
         let (env, store) = verified(tag);
-        set_pass(&store, crate::verification::State::Running);
         drain(&crate::cycle::tests::KEPT);
+        // What the pass's start wrote: the load, kept at its end, and a reading
+        // the end replaces with what it reads off the seat.
+        let mut m = store.find_task("m-1").unwrap();
+        let mut ps = crate::verification::passes(&m);
+        ps[0].spent = Some(crate::verification::Spent { ran: "at its start".into(), load1: Some(250), ..Default::default() });
+        crate::verification::write(&mut m, &ps);
+        store.save_task(&m).unwrap();
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        let mut c = crate::barrier::Check::opened(None, None);
+        c.pane = Some("cpd-3".into());
+        c.state = crate::barrier::State::Passes;
+        groups[0].checks = vec![c];
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
         let mut f = Fake::at_rest();
         f.state.insert("cpd-3".into(), State::Idle);
         f.typed.insert("cpd-3".into(), false);
@@ -1874,25 +2016,76 @@ mod tests {
         (env, store, f)
     }
 
+    /// The check entry's ending on group 1.
+    fn check_ending(store: &Store) -> crate::barrier::Ending {
+        store.worklist("run").unwrap().groups()[0].checks[0].ending
+    }
+
+    fn the_pass(store: &Store) -> crate::verification::Pass {
+        crate::verification::passes(&store.find_task("m-1").unwrap()).remove(0)
+    }
+
+    /// All three record their exits, as `wsp submit` does, and the repair pass
+    /// runs in its order: the verifiers' and checks' own endings, then this
+    /// module's tick. Each seat is ended once, by its exit, its tree kept; the
+    /// pass and the barrier entry are written ended as their own endings would.
     #[test]
     fn a_member_a_verifier_and_a_check_are_ended_within_one_tick_of_an_accepted_exit_and_the_tree_kept() {
         let (_env, store, f) = three_exits("exit-three");
         assert!(counted_now(&store).contains(&"m-1".to_string()), "seen working at review, the member counted before its exit");
         assert!(exited(&store, "cpd-1", "m-1", "member"));
         assert!(exited(&store, "cpd-2", "m-1", "verifier"));
-        assert!(exited(&store, "cpd-3", "run-check-1", "check"));
+        assert!(exited(&store, "cpd-3", "run barrier 1", "check"));
         assert!(!counted_now(&store).contains(&"m-1".to_string()), "the cap drops in the submit's own call, before any tick");
+
+        crate::cycle::passes_finished(&store, &f);
+        crate::cycle::checks_finished(&store, &f);
+        assert!(drain(&DESPAWNED).is_empty(), "the older endings step aside for a seat its exit ends");
+        assert!(crate::cycle::end_checks_when_idle(&store, "run", 1).is_empty(), "and go arranges no second ending of the check");
+
         exits(&store, &f);
+        store.clear_claim("m-1"); // as the member's `wsp despawn` does
+        tick(&store, &f);
         let ended = drain(&DESPAWNED);
-        assert!(ended.contains(&"m-1".to_string()), "the member, by its claim: {ended:?}");
-        assert!(ended.contains(&"cpd-2".to_string()) && ended.contains(&"cpd-3".to_string()), "the verifier and the check, by their seats: {ended:?}");
+        for one in ["m-1", "cpd-2", "cpd-3"] {
+            assert_eq!(ended.iter().filter(|e| *e == one).count(), 1, "{one} ended once: {ended:?}");
+        }
         let kept = drain(&crate::cycle::tests::KEPT);
         assert_eq!(kept.len(), 3, "every one with --keep-tree: {kept:?}");
+        let p = the_pass(&store);
+        assert_eq!(p.ending, Ending::Ended, "the verifier's pass is written ended by its exit's ending");
+        let spent = p.spent.clone().expect("a spend on the pass");
+        assert!(spent.ran != "at its start" && spent.load1 == Some(250), "its spend written at its end, the start's load kept: {p:?}");
+        assert_eq!(check_ending(&store), crate::barrier::Ending::Ended, "the check's entry is marked ended");
         let log = log_of(&store, "m-1");
         assert_eq!(log.matches(EXIT_ENDED).count(), 2, "the member's and its verifier's, once each: {log}");
-        assert!(exited_seats(&store).is_empty(), "nothing is left to end");
+        assert!(exit_owns(&store).is_empty(), "nothing is left to end");
+
+        pass(&store, &f);
+        crate::cycle::checks_finished(&store, &f);
+        assert!(drain(&DESPAWNED).is_empty(), "and nothing is ended twice, by either path");
+        assert_eq!(the_pass(&store).ending, Ending::Ended);
+    }
+
+    /// A verifier or a check whose exit is recorded while its turn is still in
+    /// flight is not ended by the older endings either: it waits for its `Stop`.
+    #[test]
+    fn a_verifier_and_a_check_mid_turn_are_left_for_their_stop_by_every_ending() {
+        let (_env, store, f) = three_exits("exit-stop");
+        let f = f.with("cpd-2", State::Working).with("cpd-3", State::Working);
+        exited(&store, "cpd-2", "m-1", "verifier");
+        exited(&store, "cpd-3", "run barrier 1", "check");
+        crate::cycle::passes_finished(&store, &f);
+        crate::cycle::checks_finished(&store, &f);
         exits(&store, &f);
-        assert!(drain(&DESPAWNED).is_empty(), "and nothing is ended twice");
+        assert!(drain(&DESPAWNED).is_empty(), "nothing ends a seat mid-turn");
+        assert_eq!(the_pass(&store).ending, Ending::Standing);
+        let f = f.with("cpd-2", State::Idle).with("cpd-3", State::Idle);
+        assert!(end_exit(&store, &f, "cpd-2").is_some_and(|l| l.starts_with(EXIT_ENDED)), "ended at its Stop");
+        assert!(end_exit(&store, &f, "cpd-3").is_some_and(|l| l.starts_with(EXIT_ENDED)), "ended at its Stop");
+        assert_eq!(drain(&DESPAWNED), vec!["cpd-2".to_string(), "cpd-3".to_string()]);
+        assert_eq!(the_pass(&store).ending, Ending::Ended);
+        assert_eq!(check_ending(&store), crate::barrier::Ending::Ended);
     }
 
     #[test]
@@ -1904,10 +2097,16 @@ mod tests {
         exited(&store, "cpd-2", "m-1", "verifier");
         exits(&store, &f);
         exits(&store, &f);
-        assert!(drain(&DESPAWNED).is_empty(), "neither is ended");
+        pass(&store, &f);
+        assert!(drain(&DESPAWNED).is_empty(), "neither is ended, and the older endings leave them to the person too");
         let log = log_of(&store, "m-1");
         assert_eq!(log.matches("cpd-1 (member): its seat governs run").count(), 1, "{log}");
         assert_eq!(log.matches("cpd-2 (verifier): a turn began at it after the exit").count(), 1, "{log}");
+        assert!(!exited_seats(&store).contains("cpd-2"), "a seat left is counted again by what it does");
+        f.state.remove("cpd-2");
+        f.absent.push("cpd-2".into());
+        exits(&store, &f);
+        assert!(exit_owns(&store).is_empty(), "and its record goes once the seat has gone");
     }
 
     #[test]
@@ -1930,7 +2129,28 @@ mod tests {
         exited(&store, "cpd-2", "m-1", "verifier");
         exits(&store, &f);
         exits(&store, &f);
+        crate::cycle::passes_finished(&store, &f);
         assert_eq!(drain(&DESPAWNED), vec!["cpd-2".to_string()], "tried once");
         assert_eq!(log_of(&store, "m-1").matches(EXIT_NOT_ENDED).count(), 1);
+        assert!(matches!(the_pass(&store).ending, Ending::Failed(_)), "written on the pass, so its own ending does not retry it");
+    }
+
+    /// A seat every backend reports gone, or whose pass something else already
+    /// ended, is said once and forgotten — not read again every tick.
+    #[test]
+    fn a_seat_already_gone_or_already_ended_is_said_and_forgotten() {
+        let (_env, store, mut f) = three_exits("exit-gone");
+        f.state.remove("cpd-1");
+        f.absent.push("cpd-1".into());
+        exited(&store, "cpd-1", "m-1", "member");
+        exited(&store, "cpd-2", "m-1", "verifier");
+        crate::cycle::end_passes(&store, &f, "m-1", |_| true);
+        let _ = drain(&DESPAWNED);
+        exits(&store, &f);
+        assert!(drain(&DESPAWNED).is_empty(), "neither is ended again");
+        assert!(exit_owns(&store).is_empty(), "both records go");
+        assert_eq!(log_of(&store, "m-1").matches(EXIT_GONE).count(), 2, "each said once");
+        exits(&store, &f);
+        assert_eq!(log_of(&store, "m-1").matches(EXIT_GONE).count(), 2);
     }
 }

@@ -648,9 +648,15 @@ fn raise(store: &Store, t: &Task, ask: &Ask) -> Result<String, String> {
 /// to since, and whose despawn keeps the tree. The next tick ends it where the
 /// helper did not. `row` is where the ending is said: the member's, or the
 /// verifier's member, or a check's barrier.
+///
+/// **Recorded before what the exit moves**, for a verifier's verdict and a
+/// check's `go`/`hold`: from the record on, the older endings of those seats
+/// step aside ([`crate::ending::exit_owns`]), so the seat has one ending and
+/// not two racing for it. [`closing`] records, [`refused`] takes the record
+/// back where the verb then failed, and this arranges the ending.
 fn end_my_seat(store: &Store, row: &str, kind: &str, me: Option<&str>) -> Option<String> {
-    let seat = me.map(str::to_string).or_else(crate::place::my_pane)?;
-    if !crate::ending::exited(store, &seat, row, kind) {
+    let seat = closing(store, row, kind, me)?;
+    if !crate::ending::exit_owns(store).contains(&seat) {
         return Some(format!("submit: could not record {seat} as closing — `wsp despawn --pane {seat} --keep-tree` ends it"));
     }
     let arranged = match cfg!(test) {
@@ -661,6 +667,23 @@ fn end_my_seat(store: &Store, row: &str, kind: &str, me: Option<&str>) -> Option
         Ok(()) => format!("submit: the {kind} seat {seat} is closing — no place under the cap now, ended at its Stop"),
         Err(why) => format!("submit: the {kind} seat {seat} is closing — no place under the cap now; ended by the next tick ({why})"),
     })
+}
+
+/// Record this seat as closing on `row`'s exit, and answer which seat it is.
+/// Already recorded is left as it was, so a retried exit keeps its first time.
+fn closing(store: &Store, row: &str, kind: &str, me: Option<&str>) -> Option<String> {
+    let seat = me.map(str::to_string).or_else(crate::place::my_pane)?;
+    if !crate::ending::exit_owns(store).contains(&seat) {
+        crate::ending::exited(store, &seat, row, kind);
+    }
+    Some(seat)
+}
+
+/// The verb the exit moved refused it: the seat is not closing after all.
+fn refused(store: &Store, seat: Option<&str>) {
+    if let Some(seat) = seat {
+        crate::ending::forget_exit(store, seat);
+    }
 }
 
 /// `wsp submit --end-seat <seat>`, the helper [`end_my_seat`] leaves: wait for
@@ -1120,11 +1143,12 @@ fn submit_verifier(store: &Store, args: &Args, t: &Task, me: Option<String>) -> 
         println!("wsp: {} would be submitted — dry run, nothing moved", t.id);
         return 0;
     }
+    let seat = closing(store, &t.id, "verifier", me.as_deref());
     let code = crate::verification::verdict_core(store, t.clone(), judged, me.clone());
-    if code == 0 {
-        if let Some(line) = end_my_seat(store, &t.id, "verifier", me.as_deref()) {
-            log_on(store, &t.id, &[line]);
-        }
+    if code != 0 {
+        refused(store, seat.as_deref());
+    } else if let Some(line) = end_my_seat(store, &t.id, "verifier", seat.as_deref()) {
+        log_on(store, &t.id, &[line]);
     }
     code
 }
@@ -1219,14 +1243,17 @@ fn submit_check(store: &Store, args: &Args, needle: &str) -> i32 {
     let path = file.display().to_string();
     let verb = verdict.word();
     let a = Args::synth("worklist", &[verb, w.id.as_str()], &[("from", &path), ("caption", &e.summary)]);
+    // Recorded first: `go` arranges the ending of every check standing on the
+    // barrier, and this one is its exit's to end.
+    let seat = closing(store, &key, "check", None);
     let code = match verdict {
         Verdict::Go => crate::cmd_worklist::go(store, &a),
         _ => crate::cmd_worklist::hold(store, &a),
     };
-    if code == 0 {
-        if let Some(line) = end_my_seat(store, &key, "check", None) {
-            crate::store::log_line(store, &format!("{} barrier {at}: {line}", w.id));
-        }
+    if code != 0 {
+        refused(store, seat.as_deref());
+    } else if let Some(line) = end_my_seat(store, &key, "check", seat.as_deref()) {
+        crate::store::log_line(store, &format!("{} barrier {at}: {line}", w.id));
     }
     code
 }
@@ -1567,6 +1594,30 @@ mod tests {
         let t = store.task("wsp-101").unwrap();
         assert_eq!(t.status_raw, "blocked");
         assert_eq!(crate::message::raised_to_the_person(&store).len(), 1);
+    }
+
+    /// D3 (`wsp-615`): the answer to a `not held` exit's decision ask reopens
+    /// the row with the answer as its `sent back:` reason, and the wait from the
+    /// ask to the decision is written on it. An answer to any other question
+    /// moves nothing.
+    #[test]
+    fn the_answer_to_a_not_held_exits_ask_reopens_the_row_with_it_as_the_reason() {
+        let (env, store, _tree) = member("submit-answered", ARTEFACTS);
+        let text = "summary: half done\n\nThe API half is in; the UI half needs a call.\n\ndone-when:\n- not held: the work — the UI half\n\nasks:\n- person: Either keep the old panel or drop it?\n\nowed:\n- the UI half\n";
+        assert_eq!(run(&env, &store, text, &[]), 0);
+        let q = crate::message::raised_to_the_person(&store).into_iter().next().expect("the decision ask");
+        let mut other = q.clone();
+        other.id = "q-not-this-one".into();
+        answered(&store, &other, "drop it");
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "blocked", "not the row's ask, so nothing moves");
+        answered(&store, &q, "keep the old panel");
+        let t = store.task("wsp-101").unwrap();
+        assert_ne!(t.status_raw, "blocked", "the answer reopens the row");
+        let log = t.section("Log").unwrap();
+        assert!(log.contains(&format!("decided: {} answered 0m after it was asked", q.id)), "the wait is on the row: {log}");
+        assert!(log.contains("sent back: keep the old panel"), "the answer is its reason: {log}");
+        answered(&store, &q, "keep the old panel");
+        assert_eq!(store.task("wsp-101").unwrap().section("Log").unwrap().matches("decided:").count(), 1, "once");
     }
 
     #[test]

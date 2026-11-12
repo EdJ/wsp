@@ -4049,6 +4049,10 @@ pub(crate) fn end_checks_when_idle(store: &Store, list: &str, at: usize) -> Vec<
         .and_then(|w| w.groups().into_iter().nth(at - 1))
         .map(|g| crate::barrier::standing_on(&g))
         .unwrap_or_default();
+    // A check that submitted its verdict is its exit's to end (`wsp-615`): one
+    // ending per seat, and that one keeps the tree and marks the entry.
+    let owned = crate::ending::exit_owns(store);
+    let seats: Vec<String> = seats.into_iter().filter(|s| !owned.contains(s)).collect();
     for seat in &seats {
         #[cfg(test)]
         tests::CHECKS_ENDING.with(|s| s.borrow_mut().push(seat.clone()));
@@ -4080,6 +4084,10 @@ fn end_check_seat(store: &Store, list: &str, seat: &str) {
     }
     if crate::barrier::seat_of(store, seat).is_none() {
         log_line(store, &format!("{list}: the check in {seat} settled its barrier and has already gone — nothing to end"));
+        return;
+    }
+    if crate::ending::exit_owns(store).contains(seat) {
+        log_line(store, &format!("{list}: the check in {seat} submitted its verdict — its exit's ending ends it"));
         return;
     }
     log_line(store, &format!("{list}: the check in {seat} settled its barrier and its turn is over — ending it"));
@@ -4477,10 +4485,14 @@ pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
 pub(crate) fn passes_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     use crate::verification::{passes, State};
     let mut out = Vec::new();
+    // A seat whose exit was accepted is its exit's to end (`wsp-615`): one
+    // ending per seat, and that one writes the pass as this would.
+    let owned = crate::ending::exit_owns(store);
+    let due = |p: &crate::verification::Pass| p.state != State::Running && !p.pane.as_ref().is_some_and(|s| owned.contains(s));
     for t in store.tasks_shared().iter().filter(|t| t.body.contains("## Verification")) {
-        let done = passes(t).iter().any(|p| p.standing() && p.state != State::Running);
+        let done = passes(t).iter().any(|p| p.standing() && due(p));
         if done {
-            out.extend(end_passes(store, seats, &t.id, |p| p.state != State::Running));
+            out.extend(end_passes(store, seats, &t.id, due));
         }
     }
     out
@@ -4503,6 +4515,19 @@ pub(crate) fn passes_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
 ///
 /// Returns the seats it ended.
 pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: impl Fn(&crate::verification::Pass) -> bool) -> Vec<String> {
+    end_passes_keeping(store, seats, member, false, which)
+}
+
+/// [`end_passes`], with `--keep-tree` when `keep`: the ending of a verifier's
+/// accepted exit ([`crate::ending::end_exit`], `wsp-615`), which keeps the tree
+/// the verifier read in.
+pub(crate) fn end_passes_keeping(
+    store: &Store,
+    seats: &dyn Seats,
+    member: &str,
+    keep: bool,
+    which: impl Fn(&crate::verification::Pass) -> bool,
+) -> Vec<String> {
     use crate::verification::{passes, write, Ending};
     let Some(t) = store.find_task(member) else { return Vec::new() };
     let due: Vec<_> = passes(&t).into_iter().filter(|p| p.standing() && which(p)).collect();
@@ -4524,7 +4549,7 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
         let spent = crate::verification::Spent::ending(p.spent.as_ref(), ran.as_ref(), secs);
         let spent = crate::verification::Spent::with_session(spent, fixed);
         let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
-        let outcome = despawn_seat(&seat).and_then(|()| crate::ending::confirm_gone(seats, &pids));
+        let outcome = despawn_seat_keeping(&seat, keep).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {
             Ok(()) => Ending::Ended,
             Err(why) => Ending::Failed(why.clone()),
@@ -4569,6 +4594,8 @@ pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: 
 /// where its turn ends as often as not, and the tick after is when it is idle.
 pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     let mut out = Vec::new();
+    // A check whose exit was accepted is its exit's to end (`wsp-615`).
+    let owned = crate::ending::exit_owns(store);
     for w in store.worklists() {
         // A list closed by `done` while a check was still reading has nothing
         // left for that check to decide, settled or not.
@@ -4579,7 +4606,7 @@ pub(crate) fn checks_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
             let over = crate::barrier::moot(&w, &groups, i);
             for c in g.checks.iter().filter(|c| !c.open() || over) {
                 let Some(seat) = c.standing() else { continue };
-                if seats.state(seat).is_some_and(|s| s.turn_in_flight()) {
+                if owned.contains(seat) || seats.state(seat).is_some_and(|s| s.turn_in_flight()) {
                     continue;
                 }
                 let ended = despawn_seat(seat);
