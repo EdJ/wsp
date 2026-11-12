@@ -102,8 +102,9 @@ impl Kind {
     pub(crate) fn advice(self) -> &'static str {
         match self {
             Kind::SelfWait => {
-                "its pattern is on the command's own line, so the search finds the shell running it and never comes back empty. \
-                 Interrupt it, and match a pattern the line does not spell (`[c]argo test`), or wait on the pid"
+                "the `pgrep -f` pattern is on the command's own line, so it finds the shell running the loop and never comes back empty. \
+                 Never wait on `pgrep -f \"<string>\"`: wait on a pid (`wait <pid>`, or `while kill -0 <pid>; do sleep 5; done`), \
+                 or run the work with `run_in_background` and wait for its notification"
             }
             Kind::BareCat => "`cat` with no file reads a terminal nobody types at. Interrupt it, and name the file",
             Kind::WatchOutput => {
@@ -465,7 +466,22 @@ fn waits_on_itself(command: &str, simple: &[Simple]) -> bool {
     if !looped {
         return false;
     }
+    // **Only a search the loop runs again** (`wsp-611`): `pid=$(pgrep -f "tauri
+    // build" | head -1); while kill -0 $pid` searched once, before the loop, and
+    // the loop waits on the pid it found, which was the real build. A search
+    // the loop repeats is one between a `while`/`until` and its `done`.
+    let mut depth = 0usize;
     for c in simple {
+        if c.words.iter().any(|w| matches!(w.as_str(), "while" | "until")) {
+            depth += 1;
+        }
+        let in_loop = depth > 0;
+        if c.words.first().is_some_and(|w| w == "done") {
+            depth = depth.saturating_sub(1);
+        }
+        if !in_loop {
+            continue;
+        }
         let w = program(&c.words);
         let Some(prog) = w.first().map(|a| name_of(a)) else { continue };
         match prog {
@@ -733,6 +749,24 @@ mod tests {
         assert_eq!(classify("while ps aux | grep -v grep | grep 'cargo test'; do sleep 1; done"), None, "-v grep drops the shell's line too");
         assert_eq!(classify(r#"pgrep -f "cargo test""#), None, "no loop, no wait");
         assert_eq!(classify("while kill -0 123; do sleep 1; done"), None);
+    }
+
+    #[test]
+    fn the_three_loops_of_wsp_611_wait_on_themselves_and_a_pid_found_before_the_loop_does_not() {
+        assert_eq!(classify(r#"while pgrep -f "scripts/check.mjs" >/dev/null; do sleep 5; done"#), Some(Kind::SelfWait));
+        assert_eq!(classify(r#"while kill -0 $(pgrep -f "cargo test turn_") 2>/dev/null; do sleep 5; done"#), Some(Kind::SelfWait));
+        assert_eq!(classify(r#"while pgrep -f "cargo build" > /dev/null; do sleep 10; done; echo built"#), Some(Kind::SelfWait));
+        // cpd-4876's loop waited on the real build's pid, found once.
+        assert_eq!(classify(r#"pid=$(pgrep -f "tauri build" | head -1); while kill -0 $pid 2>/dev/null; do sleep 15; done"#), None);
+        assert_eq!(classify(r#"while kill -0 $pid; do sleep 5; done; pgrep -f "cargo build""#), None, "the search after the loop is not waited on");
+    }
+
+    #[test]
+    fn the_seat_is_told_why_and_to_wait_on_a_pid() {
+        let advice = Kind::SelfWait.advice();
+        for said in ["finds the shell running the loop", "Never wait on `pgrep -f", "wait <pid>", "while kill -0 <pid>", "run_in_background"] {
+            assert!(advice.contains(said), "{said}: {advice}");
+        }
     }
 
     #[test]

@@ -858,6 +858,54 @@ impl Shells {
     }
 }
 
+/// **A seat's shells that wait on themselves, ended** (`wsp-611`): a told seat
+/// in a Bash call reads the telling only when the call returns, and a loop on
+/// `pgrep -f "<its own pattern>"` returns at the tool's 600 s limit. Ending that
+/// one shell returns the call now, with the telling next. The pids ended; none
+/// when the seat has no root here or no such shell.
+pub(crate) fn end_self_waits(seat: &str, self_wait: &dyn Fn(&str) -> bool) -> Vec<u32> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let s = crate::place::Seat::new(seat);
+    let Some(root) = crate::place::local_backends().iter().find_map(|b| b.root(&s)) else { return Vec::new() };
+    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,command="]).output() else { return Vec::new() };
+    let pids = self_wait_shells(&String::from_utf8_lossy(&out.stdout), root, self_wait);
+    for pid in &pids {
+        let _ = wsp_base::calls::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+    }
+    pids
+}
+
+/// Over a `ps -o pid=,ppid=,command=` table: the outermost shells under `root`
+/// whose command waits on itself. Not `root`, and not a shell inside one of
+/// them (the `$(…)` a loop forks has the same line).
+fn self_wait_shells(ps: &str, root: u32, self_wait: &dyn Fn(&str) -> bool) -> Vec<u32> {
+    let rows: Vec<(u32, u32, String, bool)> = ps
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid = it.next()?.parse().ok()?;
+            let ppid = it.next()?.parse().ok()?;
+            let command: Vec<&str> = it.collect();
+            Some((pid, ppid, command.join(" "), runs_a_command(&command)))
+        })
+        .collect();
+    let mut tree = vec![root];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        tree.extend(rows.iter().filter(|r| r.1 == parent && !tree.contains(&r.0)).map(|r| r.0).collect::<Vec<_>>());
+        i += 1;
+    }
+    let waiting: Vec<u32> = rows
+        .iter()
+        .filter(|r| r.0 != root && tree.contains(&r.0) && r.3 && self_wait(&ran(&r.2)))
+        .map(|r| r.0)
+        .collect();
+    waiting.iter().copied().filter(|pid| !rows.iter().any(|r| r.0 == *pid && waiting.contains(&r.1))).collect()
+}
+
 /// The command a `ps` line for Claude Code's shell actually runs: what is
 /// inside `eval '…'`, un-quoted, or the whole line when there is no `eval`.
 fn ran(command: &str) -> String {
@@ -1327,6 +1375,18 @@ mod tests {
         assert_eq!(w.json()["on"], "itself");
         assert_eq!(w.json()["shells"], 1);
         assert!(w.sentence().contains("a shell of its own"), "{}", w.sentence());
+    }
+
+    #[test]
+    fn the_shell_waiting_on_itself_is_the_one_ended_and_not_its_subshell_or_a_real_build() {
+        let table = r#"100     1 claude
+101   100 /bin/zsh -c -l source /tmp/snap.sh && eval 'while kill -0 $(pgrep -f "cargo test turn_") 2>/dev/null; do sleep 5; done' < /dev/null
+102   101 /bin/zsh -c -l source /tmp/snap.sh && eval 'while kill -0 $(pgrep -f "cargo test turn_") 2>/dev/null; do sleep 5; done' < /dev/null
+103   102 pgrep -f cargo test turn_
+110   100 /bin/zsh -c -l source /tmp/snap.sh && eval 'pid=$(pgrep -f "tauri build" | head -1); while kill -0 $pid; do sleep 15; done' < /dev/null
+200     1 /bin/zsh -c -l source /tmp/snap.sh && eval 'while pgrep -f "cargo build"; do sleep 5; done' < /dev/null
+"#;
+        assert_eq!(self_wait_shells(table, 100, &crate::stuck::waits_on_itself_line), vec![101], "not the $(…) under it, the pid wait, or another seat's");
     }
 
     #[test]

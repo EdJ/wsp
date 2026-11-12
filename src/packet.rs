@@ -415,6 +415,11 @@ pub fn owed(t: &Task) -> Option<String> {
 /// the narrow filter is the member's, the full suite the barrier's.
 pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrower filter of it, for what you changed — never the full `cargo test`. The full suite runs once per group, at the barrier and (where the project declares it) in the verifier's tier; in your seat the full `cargo nextest run --workspace` is refused until you give a reason (`WSP_FULL_SUITE=\"<why>\"`, for a shared module, a fixture every test reads or a build-wide setting); the reason goes in the row's log and the verifier sees it, and a run is noted in `wsp wip`. Otherwise run your row's checks (`wsp check <row>`), name the full suite in your review summary and leave it to the barrier.";
 
+/// The one rule every packet carries on waiting (`wsp-611`): three seats in
+/// eighteen hours held to the tool's 600 s limit by a loop whose `pgrep -f`
+/// found its own shell.
+pub const WAIT_RULE: &str = "Waiting: never wait on `pgrep -f \"<string>\"` — the pattern is on the loop's own line, so it finds its own shell and never ends; wait on a pid (`wait <pid>`, or `while kill -0 <pid>; do sleep 5; done`) or on a `run_in_background` command's notification.";
+
 /// The print: a heading, the author's words, the seat's exit template
 /// (`wsp-617`), then each named file inline, refused over [`CAP`].
 fn render(head: &str, p: &Packet, root: &Path, who: &str, exit: &str) -> Result<String, String> {
@@ -434,6 +439,7 @@ fn render(head: &str, p: &Packet, root: &Path, who: &str, exit: &str) -> Result<
     if p.text.contains("cargo test") {
         out.push_str(&format!("\n{TEST_SCOPE}\n"));
     }
+    out.push_str(&format!("\n{WAIT_RULE}\n"));
     if !exit.is_empty() {
         out.push_str(&format!("\n{exit}"));
     }
@@ -678,6 +684,19 @@ mod tests {
     }
 
     #[test]
+    fn every_packet_says_never_to_wait_on_a_pgrep_and_to_wait_on_a_pid() {
+        let dir = std::env::temp_dir().join(format!("wsp-packet-wait-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        for body in ["file: src/a.rs\nverify  cargo test a::", "file: src/a.rs\nSave prints ok."] {
+            let text = build(&row(body), &dir).unwrap();
+            assert_eq!(text.matches(WAIT_RULE).count(), 1, "{text}");
+        }
+        assert!(WAIT_RULE.contains("never wait on `pgrep -f \"<string>\"`") && WAIT_RULE.contains("wait on a pid"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_print_has_the_prose_then_each_file_inline() {
         let dir = std::env::temp_dir().join(format!("wsp-packet-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -736,7 +755,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let plain = build(&row("Add the flag."), &dir).unwrap();
         let exit = crate::closing::exit_template(crate::exit::Kind::Member, "t-1", &[]);
-        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{exit}"));
+        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{WAIT_RULE}\n\n{exit}"));
         let mut t = row("Add the flag.");
         t.body.push_str("\n## Log\n- 2026-11-08 sent back: the first gap\n");
         t.set_status(crate::model::Status::Review);

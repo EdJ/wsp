@@ -734,11 +734,28 @@ pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (
 /// first tick that finds a stall in a seat records it, tells the seat what is
 /// wrong with it, and says so in `cycle.log`; the tick that finds it over says
 /// the seconds it held. `wsp wip` draws the record.
+///
+/// **A command waiting on itself is ended as well as told** (`wsp-611`): the
+/// telling is read only when the call returns, and that loop returns at the
+/// tool's 600 s limit. Its shell is ended on the tick that finds it, so the call
+/// returns now and the telling, which names the pid ended, is the next thing
+/// the seat reads. A pid found before the loop is not that shape
+/// ([`crate::stuck::classify`]), so a loop on a real build is left alone.
 pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
-    stuck_tick_with(store, seats, &|seat| crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs()));
+    stuck_tick_with(
+        store,
+        seats,
+        &|seat| crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs()),
+        &|seat| crate::waiting::end_self_waits(seat, &crate::stuck::waits_on_itself_line),
+    );
 }
 
-pub(crate) fn stuck_tick_with(store: &Store, seats: &dyn Seats, read: &dyn Fn(&str) -> Vec<crate::stuck::Stall>) {
+pub(crate) fn stuck_tick_with(
+    store: &Store,
+    seats: &dyn Seats,
+    read: &dyn Fn(&str) -> Vec<crate::stuck::Stall>,
+    end: &dyn Fn(&str) -> Vec<u32>,
+) {
     let before = held_all(store);
     let mut all = before.clone();
     let mut candidates: Vec<String> = store.bindings().keys().cloned().collect();
@@ -758,7 +775,19 @@ pub(crate) fn stuck_tick_with(store: &Store, seats: &dyn Seats, read: &dyn Fn(&s
                 }
                 let mut held = Held { kind: s.kind, command: s.command.clone(), at: s.at, told: false };
                 stamp(store, &format!("{seat}: a command has been {} for {}s: {}", s.kind.word(), s.secs, s.command));
-                let text = format!("wsp: your command has been {} for {}s — {}. ({})", s.kind.word(), s.secs, s.kind.advice(), s.command);
+                let ended = match s.kind {
+                    crate::stuck::Kind::SelfWait => end(&seat),
+                    _ => Vec::new(),
+                };
+                let what = match ended.as_slice() {
+                    [] => String::new(),
+                    pids => {
+                        let pids = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+                        stamp(store, &format!("{seat}: ended the shell waiting on itself (pid {pids})"));
+                        format!(" wsp ended it (pid {pids}): that is why the call returned with no result; run what you were waiting for again only if it had not finished.")
+                    }
+                };
+                let text = format!("wsp: your command has been {} for {}s — {}.{what} ({})", s.kind.word(), s.secs, s.kind.advice(), s.command);
                 held.told = matches!(seats.resend(&seat, &text), Some(Ok(_)));
                 all.insert(seat.clone(), held);
             }
@@ -2381,14 +2410,45 @@ pub(crate) mod tests {
     fn a_stalled_command_is_told_to_the_seat_once_and_the_seconds_it_held_are_logged() {
         let (_env, store) = in_flight("stuck-self");
         let working = Orders { state: Some(State::Working), typed: false, sent: Default::default(), pressed: Default::default() };
-        stuck_tick_with(&store, &working, &|_| vec![stall(true, 400)]);
-        stuck_tick_with(&store, &working, &|_| vec![stall(true, 460)]);
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 400)], &|_| Vec::new());
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 460)], &|_| Vec::new());
         assert_eq!(working.sent.borrow().len(), 1, "told once: {:?}", working.sent.borrow());
         assert!(working.sent.borrow()[0].contains("waiting on itself"), "{:?}", working.sent.borrow());
         assert_eq!(stuck_seats(&store).get("cpd-1").map(|(k, _)| *k), Some(crate::stuck::Kind::SelfWait));
-        stuck_tick_with(&store, &working, &|_| vec![stall(false, 505)]);
+        stuck_tick_with(&store, &working, &|_| vec![stall(false, 505)], &|_| Vec::new());
         assert!(stuck_seats(&store).is_empty());
         assert!(stamped().iter().any(|l| l.contains("cpd-1") && l.contains("ended after 505s")), "{:?}", stamped());
+    }
+
+    #[test]
+    fn a_seat_waiting_on_itself_is_told_the_fix_on_the_first_tick_and_its_shell_is_ended() {
+        let (_env, store) = in_flight("stuck-ended");
+        let working = Orders { state: Some(State::Working), typed: false, sent: Default::default(), pressed: Default::default() };
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 50)], &|seat| {
+            asked.borrow_mut().push(seat.to_string());
+            vec![4242]
+        });
+        assert_eq!(*asked.borrow(), vec!["cpd-1".to_string()], "its shell is ended on the tick that finds it");
+        let sent = working.sent.borrow();
+        assert_eq!(sent.len(), 1, "told on that same tick: {sent:?}");
+        for said in ["waiting on itself", "finds the shell running the loop", "wait on a pid", "while kill -0 <pid>", "wsp ended it (pid 4242)", "returned with no result"] {
+            assert!(sent[0].contains(said), "{said}: {}", sent[0]);
+        }
+        assert!(stamped().iter().any(|l| l.contains("cpd-1") && l.contains("pid 4242")), "{:?}", stamped());
+        // The call returned: the next tick logs the seconds and asks nothing more.
+        stuck_tick_with(&store, &working, &|_| vec![stall(false, 52)], &|_| panic!("ended once"));
+        assert!(stuck_seats(&store).is_empty());
+    }
+
+    #[test]
+    fn a_stall_of_another_shape_is_told_and_nothing_is_ended() {
+        let (_env, store) = in_flight("stuck-cat");
+        let working = Orders { state: Some(State::Working), typed: false, sent: Default::default(), pressed: Default::default() };
+        let cat = crate::stuck::Stall { kind: crate::stuck::Kind::BareCat, command: "cat".into(), at: 1000, secs: 60, open: true };
+        stuck_tick_with(&store, &working, &|_| vec![cat.clone()], &|_| panic!("only a self-wait is ended"));
+        assert_eq!(working.sent.borrow().len(), 1);
+        assert!(!working.sent.borrow()[0].contains("wsp ended it"));
     }
 
     #[test]
