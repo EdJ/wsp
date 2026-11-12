@@ -4836,6 +4836,10 @@ pub fn go(store: &Store, args: &Args) -> i32 {
             return code;
         }
     }
+    // From a check's seat the words run the check's exit validator (`wsp-614`).
+    if let Err(code) = crate::cmd_submit::check_seat_words("go", &said) {
+        return code;
+    }
     go_with(store, args, w, said, seat, crate::barrier::State::Passes, None)
 }
 
@@ -5574,6 +5578,10 @@ pub(crate) fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i3
         eprintln!("wsp: {} \"why\" — a hold with no reason on it is a run nobody can restart", how("hold", &w, seat));
         eprintln!("     `--from FILE` reads the sentence out of a file and `-` off a stream, where a shell never sees it");
         return 2;
+    }
+    // From a check's seat the reason runs the check's exit validator: a hold names its cause (`wsp-614`).
+    if let Err(code) = crate::cmd_submit::check_seat_words("hold", &said) {
+        return code;
     }
     if w.status() == WorklistStatus::Done {
         eprintln!("wsp: `{}` is done — there is nothing left in it to stop", w.id);

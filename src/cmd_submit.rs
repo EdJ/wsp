@@ -6,8 +6,21 @@
 //! The exit file a seat wrote: `--from FILE|-`, else `$WSP_EXIT`, else the
 //! place wsp keeps for it ([`crate::closing::verdict_path`], the member's, which
 //! a spawn also gives as `$WSP_VERDICT`). The kind is `$WSP_SEAT_KIND`'s, never
-//! the file's, so a member cannot write a verdict; only a member's exit is
-//! taken here so far, and another kind is told the verb it still has.
+//! the file's, so a member cannot write a verdict.
+//!
+//! # A verifier's, a check's and a leg's (`wsp-614`, row E3)
+//!
+//! A verifier submits for the member it read: `verdict: holds|blocks`, its
+//! `checked:` lines (`… — pass|fail`), and on a block a `cause:` and `owed:`.
+//! A hold with an item not held or a check failed is refused, and so is a
+//! block with neither; `owed:` is the `sent back:` reason. **`cause: env` is
+//! no block**: the pass is recorded `could not verify`, the member stays at
+//! review, and the run starts a new verifier. A barrier check submits for its
+//! list: `go`/`hold` run as those verbs, a hold names its cause, and
+//! `followup` stays a flag to the person. A leg's submit is `wsp leg done`
+//! with the file as its baton (its done-when is optional); the row's last leg
+//! submits as a member. `wsp verified`, a check seat's `worklist go`/`hold`
+//! and `wsp leg done` run the same rules on what they are given.
 //!
 //! # Every refusal at once
 //!
@@ -58,11 +71,14 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
         section: crate::verbs::Section::Tasks,
         order: 98,
         text: r##"  wsp submit <id> [--from FILE|-] [--dry-run]
-                                    a member's exit, from $WSP_EXIT: every refusal
-                                    at once (section, line, what to write), the
-                                    project's ## Artefacts restored, then review
-                                    with the file as the account and the seat
-                                    ended; --dry-run only validates"##,
+                                    a seat's exit, from $WSP_EXIT: every refusal
+                                    at once (section, line, what to write). A
+                                    member's restores the project's ## Artefacts
+                                    and goes to review; a verifier's is its
+                                    verdict (a block names its cause; env is no
+                                    block); a check's (<id> its list) is go,
+                                    hold or a follow-up flag; a leg's is leg
+                                    done. --dry-run only validates"##,
     }],
 }];
 
@@ -82,10 +98,28 @@ pub fn submit(store: &Store, args: &Args) -> i32 {
 
 /// [`submit`] with the seat's kind given, so a test is not this seat.
 pub(crate) fn submit_as(store: &Store, args: &Args, kind: Option<&str>) -> i32 {
+    submit_from(store, args, kind, crate::place::my_pane())
+}
+
+/// [`submit_as`] with the seat given too: the pane a verifier's pass or a
+/// leg is found by.
+pub(crate) fn submit_from(store: &Store, args: &Args, kind: Option<&str>, me: Option<String>) -> i32 {
     let Some(needle) = args.rest.first() else {
         eprintln!("usage: {USAGE}");
         return 2;
     };
+    let kind = match kind.filter(|k| !k.trim().is_empty()).map(|k| (k, Kind::of(k.trim()))) {
+        None => Kind::Member,
+        Some((_, Some(k))) => k,
+        Some((word, None)) => {
+            eprintln!("wsp: $WSP_SEAT_KIND is `{word}`, which is no seat kind (member, verifier, check, leg)");
+            return 2;
+        }
+    };
+    // A check's row is its list (or the barrier's subject), not a task.
+    if kind == Kind::Check {
+        return submit_check(store, args, needle);
+    }
     let t = match store.task_or_why(needle) {
         Ok(t) => t,
         Err(why) => {
@@ -93,24 +127,15 @@ pub(crate) fn submit_as(store: &Store, args: &Args, kind: Option<&str>) -> i32 {
             return 1;
         }
     };
-    match kind.filter(|k| !k.trim().is_empty()).map(|k| (k, Kind::of(k.trim()))) {
-        None | Some((_, Some(Kind::Member))) => {}
-        Some((_, Some(other))) => {
-            eprintln!(
-                "wsp: wsp submit takes a member's exit so far — a {} seat closes with {} until its exit is built",
-                other.word(),
-                match other {
-                    Kind::Verifier => "`wsp verified`",
-                    Kind::Check => "`wsp worklist go|hold|followup`",
-                    _ => "`wsp leg done`",
-                }
-            );
-            return 2;
+    match kind {
+        Kind::Verifier => return submit_verifier(store, args, &t, me),
+        Kind::Leg => {
+            if let Some(code) = submit_leg(store, args, &t, me) {
+                return code;
+            }
+            // The last leg of a row submits as a member: it ends the row.
         }
-        Some((word, None)) => {
-            eprintln!("wsp: $WSP_SEAT_KIND is `{word}`, which is no seat kind (member, verifier, check, leg)");
-            return 2;
-        }
+        _ => {}
     }
     let (text, from) = match read_exit(store, args, &t) {
         Ok(v) => v,
@@ -147,12 +172,20 @@ pub(crate) fn submit_as(store: &Store, args: &Args, kind: Option<&str>) -> i32 {
 /// The exit's text and where it came from: `--from FILE|-`, `$WSP_EXIT`, or
 /// the member's verdict path, which must have been written in this run.
 fn read_exit(store: &Store, args: &Args, t: &Task) -> Result<(String, String), i32> {
+    let kept = closing::verdict_path(store, &t.id, closing::Kind::Member);
+    read_exit_at(args, &t.id, kept, crate::repair::started_at(t))
+}
+
+/// [`read_exit`] for any kind: `kept` is the place wsp keeps the kind's file,
+/// read when no `--from` and no `$WSP_EXIT` is given, and only when written
+/// since `since` (the seat's start), so an earlier run's is never taken.
+fn read_exit_at(args: &Args, id: &str, kept_at: PathBuf, since: Option<i64>) -> Result<(String, String), i32> {
     let given = args.get("from").filter(|f| f != "true").or_else(|| args.rest.get(1).filter(|a| *a == "-").cloned());
     let (src, kept) = match given {
         Some(src) => (src, false),
         None => match std::env::var("WSP_EXIT").ok().filter(|v| !v.trim().is_empty()) {
             Some(path) => (path, false),
-            None => (closing::verdict_path(store, &t.id, closing::Kind::Member).display().to_string(), true),
+            None => (kept_at.display().to_string(), true),
         },
     };
     let named = if src == "-" { "stdin".to_string() } else { util::contract(&util::expand(&src)) };
@@ -164,11 +197,11 @@ fn read_exit(store: &Store, args: &Args, t: &Task) -> Result<(String, String), i
         let path = PathBuf::from(&src);
         match closing::written_at(&path) {
             None => {
-                eprintln!("wsp: no exit at {named} — write it with a heredoc (`cat > \"$WSP_EXIT\" <<'EOF'` … `EOF`), then `wsp submit {}`", t.id);
+                eprintln!("wsp: no exit at {named} — write it with a heredoc (`cat > \"$WSP_EXIT\" <<'EOF'` … `EOF`), then `wsp submit {id}`");
                 return Err(2);
             }
-            Some(at) if crate::repair::started_at(t).is_some_and(|s| at < s) => {
-                eprintln!("wsp: the exit at {named} is an earlier run's, written before {} started — write this run's", t.id);
+            Some(at) if since.is_some_and(|s| at < s) => {
+                eprintln!("wsp: the exit at {named} is an earlier run's, written before this seat started on {id} — write this run's");
                 return Err(2);
             }
             Some(_) => {}
@@ -736,6 +769,533 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
     0
 }
 
+// ---- verifiers, checks and legs (`wsp-614`, row E3) ---------------------------
+
+/// Whether a verdict or a baton is written as an exit: a `summary:` line of
+/// its own. Prose without one is read the way its verb always read it.
+pub(crate) fn looks_like_exit(text: &str) -> bool {
+    text.lines().any(|l| section_heading(l) == Some("summary"))
+}
+
+/// The refusals as they are printed.
+fn printed(rs: &[Refusal]) -> Vec<String> {
+    refusal_lines(&Checked { refusals: rs.to_vec(), ..Checked::default() })
+}
+
+/// The verdict and what it judged: a verifier's `holds`/`blocks`, a check's
+/// `go`/`hold`/`followup`. `structured` is an exit, whose done-when and
+/// `checked:` lines are counted; prose has only its `checked:` items.
+fn judge_rules(e: &Exit, text: &str, structured: bool) -> Vec<Refusal> {
+    use crate::exit::{Cause, Verdict};
+    let mut out = Vec::new();
+    let Some(verdict) = e.verdict else { return out };
+    let end = text.lines().count() + 1;
+    let verdict_at = heading_line(text, "verdict").unwrap_or(1);
+    let done_lines = item_lines(text, "done-when");
+    let checked_lines = item_lines(text, "checked");
+    let not_held: Vec<(usize, &crate::exit::Done)> =
+        e.done_when.iter().flatten().enumerate().filter(|(_, d)| !d.held).map(|(i, d)| (done_lines.get(i).copied().unwrap_or(0), d)).collect();
+    let failed: Vec<(usize, &crate::exit::Line)> = e
+        .checks
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.ran.as_ref().is_some_and(|r| !r.passed))
+        .map(|(i, l)| (checked_lines.get(i).copied().unwrap_or(0), l))
+        .collect();
+    let refuse = |line: usize, section: &str, said: String, write: &str| Refusal { line, section: section.into(), said, write: write.into() };
+    match verdict {
+        Verdict::Holds | Verdict::Go => {
+            let w = verdict.word();
+            let other = if verdict == Verdict::Holds { "blocks" } else { "hold" };
+            for (n, d) in &not_held {
+                out.push(refuse(
+                    *n,
+                    "done-when",
+                    format!("\"{}\" is not held, and the verdict is `{w}`", util::truncate(&d.item, 60)),
+                    &format!("`verdict: {other}` with its `cause:`, or the item as `- held: <item> — <the evidence>`"),
+                ));
+            }
+            for (n, l) in &failed {
+                out.push(refuse(
+                    *n,
+                    "checked",
+                    format!("`{}` failed, and the verdict is `{w}`", l.label),
+                    &format!("`verdict: {other}` with `cause: check`, or the line as it ran once it passes: `… — pass`"),
+                ));
+            }
+            if let Some((c, _)) = &e.cause {
+                out.push(refuse(
+                    heading_line(text, "cause").unwrap_or(0),
+                    "cause",
+                    format!("`cause: {}` on a `{w}`", c.word()),
+                    &format!("no `cause:` — a cause is a {other}'s"),
+                ));
+            }
+        }
+        Verdict::Blocks | Verdict::Hold => {
+            let w = verdict.word();
+            match &e.cause {
+                None => out.push(refuse(
+                    verdict_at,
+                    "cause",
+                    format!("`{w}` and no `cause:`"),
+                    "`cause: work | check | tree | env — <one sentence>` after the checked lines (env: you could not verify, which is no block of the work)",
+                )),
+                Some((Cause::Env, _)) => {}
+                Some(_) if verdict == Verdict::Blocks && structured => {
+                    if not_held.is_empty() && failed.is_empty() {
+                        out.push(refuse(
+                            verdict_at,
+                            "verdict",
+                            "`blocks`, and no item is not held and no check failed".into(),
+                            "the item as `- not held: <item> — <what is wrong, file:line>`, or the check as `… — fail`; or `cause: env` if you could not verify",
+                        ));
+                    }
+                    if e.owed.as_ref().is_none_or(|o| o.is_empty()) {
+                        out.push(refuse(
+                            heading_line(text, "owed").unwrap_or(end),
+                            "owed",
+                            "a block owes nothing".into(),
+                            "`owed:` and `- <what the member owes>` per line: it is the `sent back:` the member's next seat reads",
+                        ));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        Verdict::Followup => {}
+    }
+    out
+}
+
+/// What a verifier's exit records: a block's `owed:` is its `sent back:`, and
+/// `cause: env` is a pass that could not verify.
+fn judged_of(e: &Exit) -> crate::verification::Judged {
+    use crate::exit::{Cause, Verdict};
+    use crate::verification::State;
+    let state = match (e.verdict, &e.cause) {
+        (Some(Verdict::Blocks), Some((Cause::Env, _))) => State::CouldNotVerify,
+        (Some(Verdict::Blocks), _) => State::Blocks,
+        _ => State::Holds,
+    };
+    let mut text = e.account.trim().to_string();
+    let mut tail = Vec::new();
+    if !e.checks.is_empty() {
+        tail.push("checked:".to_string());
+        for l in &e.checks {
+            let ran = l.ran.as_ref().map(|r| {
+                format!(" — {}{}", if r.passed { "pass" } else { "fail" }, r.note.as_deref().map(|n| format!(" — {n}")).unwrap_or_default())
+            });
+            tail.push(format!("- {} ({}): {}{}", l.label, l.time, l.command, ran.unwrap_or_default()));
+        }
+    }
+    if let Some((c, why)) = &e.cause {
+        tail.push(format!("cause: {} — {why}", c.word()));
+    }
+    let owed: Vec<String> = e.owed.iter().flatten().cloned().collect();
+    if !owed.is_empty() {
+        tail.push("owed:".into());
+        tail.extend(owed.iter().map(|o| format!("- {o}")));
+    }
+    if !tail.is_empty() {
+        text = format!("{text}\n\n{}", tail.join("\n"));
+    }
+    let checked = e.done_when.iter().flatten().map(|d| crate::did::Checked { item: fold(&d.item), held: d.held }).collect();
+    crate::verification::Judged {
+        state,
+        text,
+        caption: e.summary.clone(),
+        checked,
+        owed: (state == State::Blocks && !owed.is_empty()).then(|| owed.join("; ")),
+        note: match &e.cause {
+            Some((Cause::Tree, why)) => Some(tree_note(why)),
+            _ => None,
+        },
+    }
+}
+
+/// The line a `cause: tree` block leaves on the member: sent back, and a
+/// defect in the gate that should have stopped it at the member's submit.
+fn tree_note(why: &str) -> String {
+    format!("submit: a `tree` block ({}) — commits missing or the tree dirty, which V1 should have refused at the member's submit: a defect in the gate", fold(why))
+}
+
+/// `text` with `verdict: <word>` on its first line, as the verb's flag gives
+/// it: added when the text has none, refused when it says another word.
+fn with_verdict(word: crate::exit::Verdict, text: &str) -> Result<String, Vec<String>> {
+    let said = text.lines().find(|l| section_heading(l) == Some("verdict"));
+    match said.map(|l| l.split_once(':').map(|(_, w)| w.trim()).unwrap_or_default()) {
+        None => Ok(format!("verdict: {}\n{text}", word.word())),
+        Some(w) if w == word.word() => Ok(text.to_string()),
+        Some(w) => Err(vec![format!("line 1 (verdict): the file says `{w}` and the verb `{}` — write one verdict, the same in both", word.word())]),
+    }
+}
+
+/// A verifier's exit, validated: the shape, the verdict against what it
+/// judged, the cause and what is owed on a block, the summary and the account.
+fn verifier_rules(text: &str) -> Result<Exit, Vec<Refusal>> {
+    let e = Exit::parse(Kind::Verifier, text)?;
+    let mut c = Checked::default();
+    c.refusals.extend(judge_rules(&e, text, true));
+    account_rules(text, &e, &mut c);
+    c.refusals.sort_by_key(|r| r.line);
+    if c.refusals.is_empty() { Ok(e) } else { Err(c.refusals) }
+}
+
+/// `wsp verified`'s verdict written as an exit, with the word typed.
+pub(crate) fn verifier_exit(word: crate::exit::Verdict, text: &str) -> Result<crate::verification::Judged, Vec<String>> {
+    let text = with_verdict(word, text)?;
+    verifier_rules(&text).map(|e| judged_of(&e)).map_err(|rs| printed(&rs))
+}
+
+/// A `cause:` line at the start of a line, taken out of prose.
+fn take_cause(text: &str) -> (String, Option<String>) {
+    let mut cause = None;
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| match l.strip_prefix("cause:").filter(|_| cause.is_none()) {
+            Some(rest) => {
+                cause = Some(rest.trim().to_string());
+                false
+            }
+            None => true,
+        })
+        .collect();
+    (kept.join("\n").trim().to_string(), cause)
+}
+
+/// A cause in the exit's grammar, `work | check | tree | env — <one sentence>`.
+fn cause_of(said: &str) -> Result<(crate::exit::Cause, String), String> {
+    let probe = format!("verdict: blocks\nsummary: s\n\na\n\ncause: {said}\n");
+    match Exit::parse(Kind::Verifier, &probe) {
+        Ok(e) => e.cause.ok_or_else(|| "no cause".to_string()),
+        Err(rs) => Err(rs.into_iter().map(|r| format!("{} — write {}", r.said, r.write)).collect::<Vec<_>>().join("; ")),
+    }
+}
+
+/// `wsp verified`'s verdict written as prose: its `checked:` items taken out,
+/// and its cause from `--cause` or a `cause:` line. A block needs the cause;
+/// a hold may not leave an item not held.
+pub(crate) fn verifier_prose(word: crate::exit::Verdict, text: &str, flag: Option<&str>) -> Result<crate::verification::Judged, Vec<String>> {
+    use crate::exit::{Cause, Done, Verdict};
+    use crate::verification::State;
+    let (prose, line) = take_cause(text);
+    let (prose, checked) = crate::did::take_checked(&prose).map_err(|why| vec![format!("wsp: {why}")])?;
+    let cause = match flag.map(str::to_string).or(line) {
+        Some(said) => Some(cause_of(&said).map_err(|why| vec![format!("the verdict's cause (cause): {why}")])?),
+        None => None,
+    };
+    let e = Exit {
+        kind: Kind::Verifier,
+        verdict: Some(word),
+        summary: String::new(),
+        account: prose.clone(),
+        done_when: Some(checked.iter().map(|c| Done { held: c.held, item: c.item.clone(), reason: String::new() }).collect()),
+        checks: Vec::new(),
+        cause: cause.clone(),
+        asks: Vec::new(),
+        owed: None,
+    };
+    let rs: Vec<Refusal> = judge_rules(&e, "", false)
+        .into_iter()
+        .map(|mut r| {
+            r.line = 0;
+            if r.section == "cause" && e.cause.is_none() {
+                r.write = "a line `cause: work | check | tree | env — <one sentence>` in the verdict, or `--cause \"work — …\"` (env: you could not verify, which is no block of the work)".into();
+            }
+            r
+        })
+        .collect();
+    if !rs.is_empty() {
+        return Err(printed(&rs));
+    }
+    let state = match (word, &cause) {
+        (Verdict::Blocks, Some((Cause::Env, _))) => State::CouldNotVerify,
+        (Verdict::Blocks, _) => State::Blocks,
+        _ => State::Holds,
+    };
+    let text = match &cause {
+        Some((c, why)) => format!("{prose}\n\ncause: {} — {why}", c.word()),
+        None => prose,
+    };
+    Ok(crate::verification::Judged {
+        state,
+        caption: String::new(),
+        text,
+        checked,
+        owed: None,
+        note: match &cause {
+            Some((Cause::Tree, why)) => Some(tree_note(why)),
+            _ => None,
+        },
+    })
+}
+
+/// `wsp submit <member>` from a verifier's seat: the exit at `$WSP_EXIT` (or
+/// the verifier's verdict path, written in this pass), validated whole and
+/// recorded as `wsp verified` records a verdict.
+fn submit_verifier(store: &Store, args: &Args, t: &Task, me: Option<String>) -> i32 {
+    let since = crate::verification::passes(t)
+        .into_iter()
+        .filter(|p| p.state == crate::verification::State::Running)
+        .rev()
+        .find(|p| me.is_none() || p.pane == me)
+        .map(|p| util::epoch_of(&p.at));
+    let kept = closing::verdict_path(store, &t.id, closing::Kind::Verifier);
+    let (text, from) = match read_exit_at(args, &t.id, kept, since) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let e = match verifier_rules(&text) {
+        Ok(e) => e,
+        Err(rs) => {
+            for l in printed(&rs) {
+                eprintln!("{l}");
+            }
+            eprintln!("wsp: {} not submitted — {} refusal(s) in {from}; nothing recorded. Fix the file and `wsp submit {}` again", t.id, rs.len(), t.id);
+            return 1;
+        }
+    };
+    let judged = judged_of(&e);
+    if args.has("dry-run") {
+        let what = match judged.state {
+            crate::verification::State::Holds => format!("  {} holds: the pass recorded, the row landed", t.id),
+            crate::verification::State::Blocks => format!("  {} blocks: sent back to doing, owed: {}", t.id, judged.owed.clone().unwrap_or_default()),
+            _ => format!("  {}: could not verify — no block; the row stays at review and the run starts a new verifier", t.id),
+        };
+        println!("{what}");
+        println!("wsp: {} would be submitted — dry run, nothing moved", t.id);
+        return 0;
+    }
+    crate::verification::verdict_core(store, t.clone(), judged, me)
+}
+
+/// The list and barrier a check's `<row>` names: the list's id, or the
+/// barrier's subject (`<list>-check-<n>`).
+fn check_list(store: &Store, needle: &str) -> Option<crate::model::Worklist> {
+    store.worklist(needle).or_else(|| crate::barrier::parse_subject(needle).and_then(|(l, _)| store.worklist(l)))
+}
+
+/// A check's exit, validated: the shape, the verdict against what it checked,
+/// a hold's cause, the summary and the account.
+fn check_rules_of(text: &str) -> Result<Exit, Vec<Refusal>> {
+    let e = Exit::parse(Kind::Check, text)?;
+    let mut c = Checked::default();
+    c.refusals.extend(judge_rules(&e, text, true));
+    account_rules(text, &e, &mut c);
+    c.refusals.sort_by_key(|r| r.line);
+    if c.refusals.is_empty() { Ok(e) } else { Err(c.refusals) }
+}
+
+/// The text a barrier's `go`/`hold` records from a check's exit: its account,
+/// with what it checked and its cause after.
+fn check_body(e: &Exit) -> String {
+    let mut j = judged_of(e);
+    for d in e.done_when.iter().flatten() {
+        j.text.push_str(&format!("\n- {}: {} — {}", if d.held { "held" } else { "not held" }, d.item, d.reason));
+    }
+    j.text
+}
+
+/// `wsp submit <list>` from a barrier check's seat: `go` and `hold` are the
+/// verbs, run with the exit's account; `followup` stays a flag to the person,
+/// because the rows it names are not ones wsp can guess.
+fn submit_check(store: &Store, args: &Args, needle: &str) -> i32 {
+    use crate::exit::Verdict;
+    let Some(w) = check_list(store, needle) else {
+        eprintln!("wsp: no list `{needle}` — a check submits for its list (or `<list>-check-<n>`)");
+        return 1;
+    };
+    let pos = crate::worklist::position(store, &w, crate::worklist::Reading::Landed);
+    let at = pos.at.unwrap_or(0);
+    let open = w.groups().into_iter().nth(at.saturating_sub(1)).and_then(|g| crate::barrier::running(&g).map(|c| util::epoch_of(&c.at)));
+    let key = crate::barrier::subject(&w.id, at);
+    let kept = closing::verdict_path(store, &key, closing::Kind::Check);
+    let (text, from) = match read_exit_at(args, &key, kept.clone(), open) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let e = match check_rules_of(&text) {
+        Ok(e) => e,
+        Err(rs) => {
+            for l in printed(&rs) {
+                eprintln!("{l}");
+            }
+            eprintln!("wsp: {} barrier {at} not submitted — {} refusal(s) in {from}; nothing moved. Fix the file and `wsp submit {}` again", w.id, rs.len(), w.id);
+            return 1;
+        }
+    };
+    let verdict = e.verdict.unwrap_or(Verdict::Followup);
+    if args.has("dry-run") {
+        let what = match verdict {
+            Verdict::Go => "passed: `wsp worklist go`",
+            Verdict::Hold => "held: `wsp worklist hold`",
+            _ => "a follow-up, flagged to the person",
+        };
+        println!("  {} barrier {at} {what}, the exit's account as the verdict", w.id);
+        println!("wsp: {} would be submitted — dry run, nothing moved", w.id);
+        return 0;
+    }
+    let body = check_body(&e);
+    if verdict == Verdict::Followup {
+        use crate::message::{Kind as MKind, Party};
+        let said = format!("{} barrier {at}: the check asks for a follow-up — {}\n\n{body}\n\nThe rows a follow-up names are not ones wsp guesses: `wsp worklist followup {}` with them, or `go`/`hold`.", w.id, e.summary, w.id);
+        let m = Message::new(Party::wsp(), MKind::Note, &said).about(About::Scope(w.id.clone())).for_the_person();
+        if let Err(why) = message::raise(store, &m) {
+            eprintln!("wsp: {}: could not flag the follow-up: {why}", w.id);
+            return 1;
+        }
+        crate::cycle::tell(store, &w, &format!("barrier {at}'s check asks for a follow-up: {} — the person is flagged", e.summary));
+        println!("✓ {} barrier {at} submitted — a follow-up, flagged to the person; the barrier stays open", w.id);
+        return 0;
+    }
+    let file = kept.with_extension("body");
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(why) = std::fs::write(&file, &body) {
+        eprintln!("wsp: cannot write {}: {why}", util::contract(&file));
+        return 1;
+    }
+    let path = file.display().to_string();
+    let verb = verdict.word();
+    let a = Args::synth("worklist", &[verb, w.id.as_str()], &[("from", &path), ("caption", &e.summary)]);
+    match verdict {
+        Verdict::Go => crate::cmd_worklist::go(store, &a),
+        _ => crate::cmd_worklist::hold(store, &a),
+    }
+}
+
+/// `worklist go`/`hold` from a check's seat: its words run the check's
+/// validator. An exit is read with the verb as its verdict; prose holds only
+/// with a `cause:` line. `Err` is the exit code, the refusals printed.
+pub(crate) fn check_seat_words(verb: &str, said: &str) -> Result<(), i32> {
+    let kind = std::env::var(crate::throttle::SEAT_KIND).ok();
+    check_words_as(kind.as_deref(), verb, said)
+}
+
+/// [`check_seat_words`] with the seat's kind given.
+pub(crate) fn check_words_as(kind: Option<&str>, verb: &str, said: &str) -> Result<(), i32> {
+    use crate::exit::Verdict;
+    if kind.map(str::trim) != Some("check") {
+        return Ok(());
+    }
+    let word = match verb {
+        "go" => Verdict::Go,
+        "hold" => Verdict::Hold,
+        _ => return Ok(()),
+    };
+    let lines = if looks_like_exit(said) {
+        let text = match with_verdict(word, said) {
+            Ok(t) => t,
+            Err(lines) => return refuse_words(verb, &lines),
+        };
+        match check_rules_of(&text) {
+            Ok(_) => return Ok(()),
+            Err(rs) => printed(&rs),
+        }
+    } else {
+        let (_, line) = take_cause(said);
+        match (word, line) {
+            (Verdict::Hold, None) => vec![
+                "the hold (cause): a check's hold names its cause — write a line `cause: work | check | tree | env — <one sentence>` in the reason".to_string(),
+            ],
+            (Verdict::Hold, Some(c)) => match cause_of(&c) {
+                Ok(_) => return Ok(()),
+                Err(why) => vec![format!("the hold's cause (cause): {why}")],
+            },
+            _ => return Ok(()),
+        }
+    };
+    refuse_words(verb, &lines)
+}
+
+fn refuse_words(verb: &str, lines: &[String]) -> Result<(), i32> {
+    for l in lines {
+        eprintln!("{l}");
+    }
+    eprintln!("wsp: `{verb}` refused — {} refusal(s); nothing moved. Fix the verdict and give it again", lines.len());
+    Err(2)
+}
+
+/// A leg's exit, validated: the shape (its done-when is the leg order's, so
+/// optional), the checks' scope, the summary and the account, and `owed:`.
+fn leg_rules(store: &Store, t: &Task, text: &str) -> Result<Exit, Vec<Refusal>> {
+    let e = Exit::parse(Kind::Leg, text)?;
+    let mut c = Checked::default();
+    check_rules(store, t, text, &e, &mut c);
+    account_rules(text, &e, &mut c);
+    if e.owed.is_none() {
+        c.refusals.push(Refusal {
+            line: text.lines().count() + 1,
+            section: "owed".into(),
+            said: "the exit has no `owed:`".into(),
+            write: "`owed: nothing`, or `owed:` and `- <what the next leg is left>` per line".into(),
+        });
+    }
+    c.refusals.sort_by_key(|r| r.line);
+    if c.refusals.is_empty() { Ok(e) } else { Err(c.refusals) }
+}
+
+/// `wsp leg done`'s baton, when it is written as an exit: validated as a leg's,
+/// and its summary the caption when none was typed. `Ok(None)` for a baton in
+/// prose, which is taken as it always was.
+pub(crate) fn leg_baton(store: &Store, t: &Task, baton: &str) -> Result<Option<String>, String> {
+    if !looks_like_exit(baton) {
+        return Ok(None);
+    }
+    leg_rules(store, t, baton).map(|e| Some(e.summary)).map_err(|rs| {
+        let lines = printed(&rs);
+        format!("the baton is an exit and {} line(s) of it are refused:\n{}", lines.len(), lines.join("\n"))
+    })
+}
+
+/// `wsp submit <row>` from a leg's seat: `wsp leg done`, with the exit file as
+/// the baton. `None` when this seat's leg is the row's last, which submits as
+/// a member.
+fn submit_leg(store: &Store, args: &Args, t: &Task, me: Option<String>) -> Option<i32> {
+    let legs = crate::legs::legs(t);
+    let Some(name) = crate::legs::actor_of(&legs, me.as_deref()) else {
+        eprintln!("wsp: {} is not the seat of a running leg of {} — only a leg's own seat submits it", me.as_deref().unwrap_or("this process"), t.id);
+        return Some(1);
+    };
+    if crate::legs::lasts(&legs).contains(&name) {
+        return None;
+    }
+    let started = legs.iter().find(|l| l.name == name).and_then(|l| l.started.as_deref()).map(util::epoch_of);
+    let kept = closing::baton_path(store, &t.id, &name);
+    let (text, from) = match read_exit_at(args, &t.id, kept.clone(), started) {
+        Ok(v) => v,
+        Err(code) => return Some(code),
+    };
+    let e = match leg_rules(store, t, &text) {
+        Ok(e) => e,
+        Err(rs) => {
+            for l in printed(&rs) {
+                eprintln!("{l}");
+            }
+            eprintln!("wsp: {} leg {name} not submitted — {} refusal(s) in {from}; the leg is still open. Fix the file and `wsp submit {}` again", t.id, rs.len(), t.id);
+            return Some(1);
+        }
+    };
+    if args.has("dry-run") {
+        println!("  {} leg {name} done, the exit as its baton · {}", t.id, e.summary);
+        println!("wsp: {} would be submitted — dry run, nothing moved", t.id);
+        return Some(0);
+    }
+    // The file is the baton: written where the leg's baton is kept, and read from there.
+    if let Some(dir) = kept.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(why) = std::fs::write(&kept, &text) {
+        eprintln!("wsp: cannot write the baton {}: {why}", util::contract(&kept));
+        return Some(1);
+    }
+    let path = kept.display().to_string();
+    let a = Args::synth("leg", &["done", t.id.as_str()], &[("from", &path), ("caption", &e.summary)]);
+    Some(crate::leg_seat::cmd_done(store, &a, me.as_deref()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,10 +1536,10 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_other_than_a_member_is_told_its_verb() {
+    fn a_word_that_is_no_seat_kind_is_refused() {
         let (_env, store, _tree) = member("submit-kind", ARTEFACTS);
         let args = Args::synth("submit", &["wsp-101"], &[]);
-        assert_eq!(submit_as(&store, &args, Some("verifier")), 2);
+        assert_eq!(submit_as(&store, &args, Some("janitor")), 2);
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing");
     }
 

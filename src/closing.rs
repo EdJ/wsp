@@ -209,8 +209,12 @@ pub(crate) fn parse_verdict(kind: Kind, text: &str) -> Option<Verdict> {
     let word = word.strip_prefix("verdict:").or_else(|| word.strip_prefix("Verdict:")).unwrap_or(word);
     let word = word.trim().trim_end_matches(['.', ':', '*']).to_lowercase();
     let body = rest.trim().to_string();
-    (kind.words().contains(&word.as_str()) && !body.is_empty())
-        .then(|| Verdict { word: Some(word), caption: caption_of(&body), body })
+    // Written as an exit (`wsp-614`), its summary is the line a glance reads.
+    let caption = match body.lines().find_map(|l| l.strip_prefix("summary:")).map(str::trim).filter(|s| !s.is_empty()) {
+        Some(summary) if crate::cmd_submit::looks_like_exit(&body) => util::truncate(&crate::util::fold(summary), 100),
+        _ => caption_of(&body),
+    };
+    (kind.words().contains(&word.as_str()) && !body.is_empty()).then_some(Verdict { word: Some(word), caption, body })
 }
 
 /// The verdict for `key` if one was written in this run and parses: what it says,
@@ -239,11 +243,11 @@ pub(crate) fn how_to_close_verdict(kind: Kind, row: &str) -> String {
         Kind::Member => (format!("`wsp review {row}`"), "the account of what you did and left"),
         Kind::Verifier => (
             format!("`wsp verified {row} --caption \"...\"`"),
-            "`holds` or `blocks` on the first line, then the verdict",
+            "`holds` or `blocks` on the first line, then the verdict (a block carries a line `cause: work | check | tree | env — <one sentence>`; env, you could not verify, is no block)",
         ),
         Kind::Check => (
             format!("`wsp worklist go {row}` (or `hold`)"),
-            "`go` or `hold` on the first line, then what you decided",
+            "`go` or `hold` on the first line, then what you decided (a hold carries a line `cause: work | check | tree | env — <one sentence>`)",
         ),
     };
     format!(
@@ -1014,6 +1018,60 @@ mod tests {
         assert!(t.section("Log").unwrap().contains("closed late: done at"), "{}", t.section("Log").unwrap());
     }
 
+    /// `staged`'s row with a second leg `finish` waiting on `build`, so
+    /// `build` is not the row's last.
+    fn staged_two(env: &util::Isolated) -> (Store, PathBuf) {
+        let (store, tree) = staged(env);
+        let mut t = store.find_task("m-1").unwrap();
+        let mut ls = legs::legs(&t);
+        ls.push(Leg::pending("finish", "finish it"));
+        legs::write(&mut t, &ls);
+        store.save_task(&t).unwrap();
+        (store, tree)
+    }
+
+    fn submit_leg(env: &util::Isolated, store: &Store, text: &str) -> i32 {
+        let file = env.path("exit.md");
+        std::fs::write(&file, text).unwrap();
+        let from = file.display().to_string();
+        let args = crate::Args::synth("submit", &["m-1"], &[("from", &from)]);
+        crate::cmd_submit::submit_from(store, &args, Some("leg"), Some("cpd-1".into()))
+    }
+
+    const LEG_EXIT: &str = "summary: the store half is built\n\nThe store reads and writes; the panel is the next leg's.\n\nchecks:\n- unit (2m): true\n\nowed:\n- the panel\n";
+
+    #[test]
+    fn a_leg_seats_submit_closes_the_leg_as_leg_done_does_with_the_file_as_its_baton() {
+        let env = util::isolated("closing-submit-leg");
+        let (store, _tree) = staged_two(&env);
+        assert_eq!(submit_leg(&env, &store, LEG_EXIT), 0);
+        let t = store.find_task("m-1").unwrap();
+        let ls = legs::legs(&t);
+        assert_eq!(ls[0].state, LegState::Done, "the leg is closed");
+        assert_eq!(ls[0].caption.as_deref(), Some("the store half is built"), "the summary is its caption");
+        assert!(ls[0].baton.contains("The store reads and writes") && ls[0].baton.contains("- the panel"), "the file is the baton: {}", ls[0].baton);
+        assert!(t.section("Log").unwrap().contains("leg build ended"), "{}", t.section("Log").unwrap());
+        assert_eq!(ls[1].state, LegState::Pending, "the next leg is the run's to start");
+    }
+
+    #[test]
+    fn a_leg_exit_that_does_not_validate_leaves_the_leg_open_and_leg_done_runs_the_same_rules() {
+        let env = util::isolated("closing-submit-leg-bad");
+        let (store, _tree) = staged_two(&env);
+        let no_owed = "summary: the store half is built\n\nThe store reads and writes.\n";
+        assert_eq!(submit_leg(&env, &store, no_owed), 1);
+        assert!(running(&store), "nothing moved");
+        // `wsp leg done` with the same file as its baton: refused the same way.
+        write_baton(&store, no_owed);
+        let args = crate::Args::synth("leg", &["done", "m-1"], &[]);
+        assert_eq!(crate::leg_seat::cmd_done(&store, &args, Some("cpd-1")), 1);
+        assert!(running(&store));
+        // A baton in prose is taken as it always was.
+        write_baton(&store, "handed on\n");
+        let args = crate::Args::synth("leg", &["done", "m-1"], &[("caption", "built")]);
+        assert_eq!(crate::leg_seat::cmd_done(&store, &args, Some("cpd-1")), 0);
+    }
+
     /// Re-run a leg: a baton hours older than the new run's start.
     fn rerun_with_an_old_baton(store: &Store) {
         let p = baton_path(store, "m-1", "build");
@@ -1388,6 +1446,34 @@ mod tests {
 
     fn held(store: &Store) -> bool {
         store.worklist("run").unwrap().status() == WorklistStatus::Held
+    }
+
+    fn submit_check(env: &util::Isolated, store: &Store, text: &str) -> i32 {
+        let file = env.path("exit.md");
+        std::fs::write(&file, text).unwrap();
+        let from = file.display().to_string();
+        let args = crate::Args::synth("submit", &["run"], &[("from", &from)]);
+        crate::cmd_submit::submit_from(store, &args, Some("check"), Some("cpd-4".into()))
+    }
+
+    #[test]
+    fn a_checks_exit_holds_only_with_a_cause_and_a_followup_stays_a_flag_to_the_person() {
+        let env = util::isolated("closing-submit-check");
+        let store = staged_check(&env);
+        let hold = "verdict: hold\nsummary: the barrier's suite is red\n\nTwo tests fail after the group landed.\n\nchecked:\n- suite (20m): cargo nextest run --workspace — fail\n";
+        assert_eq!(submit_check(&env, &store, hold), 1, "a hold with no cause is refused");
+        assert!(!held(&store));
+        let followup = "verdict: followup\nsummary: two rows to file\n\nThe docs and the help drifted.\n";
+        assert_eq!(submit_check(&env, &store, followup), 0);
+        assert!(!held(&store), "a follow-up moves nothing");
+        assert!(raised_texts(&store).iter().any(|t| t.contains("asks for a follow-up")), "{:?}", raised_texts(&store));
+        let caused = format!("{hold}\ncause: check — the suite fails at two tests\n");
+        assert_eq!(submit_check(&env, &store, &caused), 0);
+        assert!(held(&store), "the hold is `worklist hold`");
+        // A check seat's `worklist hold` in prose runs the same rule.
+        assert!(crate::cmd_submit::check_words_as(Some("check"), "hold", "it is red").is_err());
+        assert!(crate::cmd_submit::check_words_as(Some("check"), "hold", "it is red\ncause: check — two tests fail").is_ok());
+        assert!(crate::cmd_submit::check_words_as(None, "hold", "it is red").is_ok(), "a person's hold is unchanged");
     }
 
     #[test]

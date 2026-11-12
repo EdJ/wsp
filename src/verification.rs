@@ -66,6 +66,11 @@ pub(crate) enum State {
     /// A newer landing came in while this pass was reading. It was ended and
     /// its verdict, if one arrives, is refused.
     Superseded,
+    /// The verifier could not verify (`cause: env`: its tree lost, the load,
+    /// a tool missing — compounding-449). **Not a block of the work** (`wsp-614`):
+    /// the member stays at review, nothing is sent back, and the run starts a
+    /// new verifier, as it does after a superseded pass.
+    CouldNotVerify,
 }
 
 impl State {
@@ -75,6 +80,7 @@ impl State {
             State::Holds => "holds",
             State::Blocks => "blocks",
             State::Superseded => "superseded",
+            State::CouldNotVerify => "could not verify",
         }
     }
 
@@ -84,6 +90,7 @@ impl State {
             "holds" => State::Holds,
             "blocks" => State::Blocks,
             "superseded" => State::Superseded,
+            "could not verify" => State::CouldNotVerify,
             _ => return None,
         })
     }
@@ -891,11 +898,20 @@ pub fn cmd_verified(store: &Store, args: &Args) -> i32 {
 
 /// [`cmd_verified`] as the seat `me`, which is how wsp closes for a verifier that
 /// did not (`wsp-374`): the process is not the verifier's, so its pass is named.
+///
+/// **An alias of `wsp submit` for the verifier kind** (`wsp-614`): the verdict
+/// it is given runs the same validator. Written as an exit (a `summary:` line
+/// and its sections), it is read as one, with the word typed as its `verdict:`;
+/// written as prose, its `checked:` lines are taken out as before and a
+/// `cause:` line (or `--cause`) is taken out too. Either way `--blocks` with no
+/// cause is refused, a hold with an item not held is refused, and `cause: env`
+/// is no block: the pass is recorded `could not verify` and the member stays
+/// at review.
 pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32 {
-    const USAGE: &str = "wsp verified <member> --holds|--blocks --from FILE --caption \"…\"   (or `-` for stdin)";
-    let state = match (args.has("holds"), args.has("blocks")) {
-        (true, false) => State::Holds,
-        (false, true) => State::Blocks,
+    const USAGE: &str = "wsp verified <member> --holds|--blocks --from FILE --caption \"…\" [--cause \"work — …\"]   (or `-` for stdin)";
+    let word = match (args.has("holds"), args.has("blocks")) {
+        (true, false) => crate::exit::Verdict::Holds,
+        (false, true) => crate::exit::Verdict::Blocks,
         _ => {
             eprintln!("usage: {USAGE}");
             eprintln!("       one of --holds or --blocks, and the verdict to go with it");
@@ -907,23 +923,18 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
         return 2;
     };
     let caption = match crate::caption::flag(args, false) {
-        Ok(Some(c)) if !c.is_empty() => c,
-        Ok(_) => return crate::caption::refuse(state.as_str()),
+        Ok(c) => c.filter(|c| !c.is_empty()),
         Err(code) => return code,
     };
     let text = match crate::cmd_task::prose_kept(args, USAGE) {
         Ok(t) => t,
         Err(code) => return code,
     };
-    // The `checked:` lines are the verifier's own record of the done-when items
-    // it looked at; they leave the prose and sit beside what wsp derived.
-    let (text, checked) = match crate::did::take_checked(&text) {
-        Ok(taken) => taken,
-        Err(why) => {
-            eprintln!("wsp: {why}");
-            return 2;
-        }
-    };
+    // An exit carries its own caption (its summary); prose needs one typed.
+    let exit_form = crate::cmd_submit::looks_like_exit(&text);
+    if caption.is_none() && !exit_form {
+        return crate::caption::refuse(if word == crate::exit::Verdict::Holds { "holds" } else { "blocks" });
+    }
     let member = match store.task_or_why(&needle) {
         Ok(t) => t,
         Err(why) => {
@@ -931,12 +942,52 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
             return 1;
         }
     };
+    let cause = args.get("cause").filter(|c| c != "true");
+    let read = match exit_form {
+        true => crate::cmd_submit::verifier_exit(word, &text),
+        false => crate::cmd_submit::verifier_prose(word, &text, cause.as_deref()),
+    };
+    let judged = match read {
+        Ok(j) => j,
+        Err(lines) => {
+            for l in &lines {
+                eprintln!("{l}");
+            }
+            eprintln!("wsp: {} — the verdict is refused ({} refusal(s)); nothing recorded. Fix it and give it again", member.id, lines.len());
+            return 2;
+        }
+    };
+    let mut judged = judged;
+    if let Some(c) = caption.filter(|c| !(exit_form && c.starts_with("summary:"))) {
+        judged.caption = c;
+    }
+    verdict_core(store, member, judged, me)
+}
+
+/// What [`verdict_core`] records: the pass's state, its text and caption, the
+/// done-when items it checked, and — on a block from an exit — what is owed,
+/// which becomes the `sent back:` line in place of the verdict's prose.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Judged {
+    pub state: State,
+    pub text: String,
+    pub caption: String,
+    pub checked: Vec<crate::did::Checked>,
+    pub owed: Option<String>,
+    /// A line for the member's log besides the pass: a `tree` block's defect.
+    pub note: Option<String>,
+}
+
+/// A verdict once read and validated: the superseded case, the land a hold
+/// does, the pass written, the member sent back on a block.
+pub(crate) fn verdict_core(store: &Store, member: Task, judged: Judged, me: Option<String>) -> i32 {
+    let Judged { state, text, caption, checked, owed: owes, note } = judged;
     // A row sent back while this verifier read it (a failed check, a person) is
     // not landed by the hold: the send-back owns the row until it returns to
     // review, where a fresh verifier reads what comes back.
     if state == State::Holds && member.status() == Status::Doing && crate::repair::ready(&member).is_some() {
         let said = format!("{}\n\n(not landed: {} was sent back to doing while this read it)", text.trim(), member.id);
-        let _ = record_checked(store, &member.id, State::Superseded, &said, me.as_deref(), Some(&caption), checked);
+        let _ = record_checked(store, &member.id, State::Superseded, &said, me.as_deref(), Some(&caption), checked, None);
         store.git_commit(&format!("wsp: verified {} superseded — sent back while read", member.id));
         eprintln!(
             "wsp: {} was sent back to doing while you read it, so your hold lands nothing and is recorded as superseded; \
@@ -950,6 +1001,7 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
     let mut state = state;
     let mut text = text;
     let mut caption = caption;
+    let mut owes = owes;
     let mut landing = None;
     let mut reran = Vec::new();
     let mut land_owes = None;
@@ -970,11 +1022,12 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
                 state = State::Blocks;
                 caption = "the hold could not land the row".to_string();
                 text = format!("{}\n\n{why}", text.trim());
+                owes = None;
                 println!("{}", Paint::new().red("■ the hold could not land the row, so it is recorded as a block"));
             }
         }
     }
-    let recorded = record_checked(store, &member.id, state, &text, me.as_deref(), Some(&caption), checked);
+    let recorded = record_checked(store, &member.id, state, &text, me.as_deref(), Some(&caption), checked, owes.as_deref());
     let pass = match recorded {
         Ok(p) => p,
         Err(why) => {
@@ -998,6 +1051,12 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
     if state == State::Holds {
         fold_pieces(store, &member.id);
     }
+    if let Some(line) = note.as_deref().filter(|_| state == State::Blocks) {
+        store.locked(|| {
+            let mut t = store.find_task(&member.id)?;
+            crate::log::note(store, &mut t, line).ok()
+        });
+    }
     store.log_event(
         "task-verified",
         serde_json::json!({
@@ -1011,21 +1070,28 @@ pub(crate) fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32
     // verdict. With no rework leg (the row is at the leg cap) nothing does, so the
     // reason is delivered as for any member sent back.
     if state == State::Blocks {
-        deliver_unless_reworked(store, &member.id, &owed(&text, &pass.checked));
+        let reason = owes.clone().unwrap_or_else(|| owed(&text, &pass.checked));
+        deliver_unless_reworked(store, &member.id, &reason);
     }
     crate::cycle::poke_task(store, &member.id, "verified");
 
     let p = Paint::new();
     let mark = match state {
         State::Holds => p.green("✓"),
+        State::CouldNotVerify => p.yellow("■"),
         _ => p.red("■"),
     };
     let read = pass.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default();
     println!("{mark} {}  {}{read}  {}", p.bold(&member.id), state.as_str(), p.dim(&crate::caption::of_pass(state.as_str(), Some(&caption), "").text));
-    if state == State::Blocks {
-        println!("  {}", p.dim("sent back to doing with your verdict as what is owed; its governor is told"));
+    match state {
+        State::Blocks => println!("  {}", p.dim("sent back to doing with what is owed; its governor is told")),
+        State::CouldNotVerify => println!(
+            "  {}",
+            p.dim(&format!("cause env: no block of the work — {} stays at review, and the run starts a new verifier", member.id))
+        ),
+        _ => {}
     }
-    if pass.checked.is_empty() {
+    if pass.checked.is_empty() && state != State::CouldNotVerify {
         println!("  {}", p.dim("no `checked:` lines — one per done-when item you looked at, ending in held or not held, is what `wsp verifications` counts"));
     }
     0
@@ -1224,10 +1290,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 
 #[cfg(test)]
 pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: Option<&str>, caption: Option<&str>) -> Result<Pass, String> {
-    record_checked(store, member, state, text, me, caption, Vec::new())
+    record_checked(store, member, state, text, me, caption, Vec::new(), None)
 }
 
-/// [`record`] with the done-when items the verifier checked (`wsp-325`).
+/// [`record`] with the done-when items the verifier checked (`wsp-325`), and on
+/// a block the text that is owed when it is not the verdict's own (`wsp-614`:
+/// an exit's `owed:` lines are the `sent back:` reason).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_checked(
     store: &Store,
     member: &str,
@@ -1236,6 +1305,7 @@ pub(crate) fn record_checked(
     me: Option<&str>,
     caption: Option<&str>,
     checked: Vec<crate::did::Checked>,
+    owes: Option<&str>,
 ) -> Result<Pass, String> {
     store.locked(|| {
         let Some(mut t) = store.find_task(member) else { return Err(format!("no task {member}")) };
@@ -1275,7 +1345,15 @@ pub(crate) fn record_checked(
         let pass = ps[at].clone();
         write(&mut t, &ps);
         if state == State::Blocks {
-            send_back(&mut t, now, "the verifier blocked", pass.read.as_deref(), &owed(text, &pass.checked), None);
+            let reason = owes.map(str::to_string).unwrap_or_else(|| owed(text, &pass.checked));
+            send_back(&mut t, now, "the verifier blocked", pass.read.as_deref(), &reason, None);
+        }
+        if state == State::CouldNotVerify {
+            t.log(&format!(
+                "could not verify{}: the verifier's environment, not the work — {} stays at review and a new verifier is owed",
+                pass.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default(),
+                t.id
+            ));
         }
         store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
         Ok(pass)
@@ -1813,11 +1891,11 @@ mod tests {
         assert_eq!(cmd_verified(&store, &refused), 2);
         assert!(passes(&store.find_task("m-1").unwrap()).is_empty(), "a refused verdict writes nothing");
 
-        let ok = verdict("Blocks, the replay is short.\n\nchecked: the gate holds the verifier — held\n- **checked:** the replay covers 20 rows — not held\n");
+        let ok = verdict("Blocks, the replay is short.\n\nchecked: the gate holds the verifier — held\n- **checked:** the replay covers 20 rows — not held\ncause: work — the replay is short\n");
         assert_eq!(cmd_verified(&store, &ok), 0);
         let t = store.find_task("m-1").unwrap();
         let p = passes(&t).pop().unwrap();
-        assert_eq!(p.text, "Blocks, the replay is short.");
+        assert_eq!(p.text, "Blocks, the replay is short.\n\ncause: work — the replay is short", "the cause is kept on the pass");
         assert_eq!(
             p.checked,
             vec![
@@ -1861,6 +1939,112 @@ mod tests {
         assert_eq!(newest["caption"]["word"], "blocks");
         assert_eq!(newest["caption"]["tail"], "the wiring between the two has no test");
         assert_eq!(newest["caption"]["at"], newest["decided"], "a verdict's caption is dated by the verdict");
+    }
+
+    // ---- `wsp-614`: a verifier's exit ------------------------------------------
+
+    /// A member `m-1` at review with one pass reading it, no repository behind it.
+    fn reading(tag: &str) -> (util::Isolated, Store) {
+        let (env, store) = scratch(tag);
+        let mut t = Task::new("a member", "m-1");
+        t.status_raw = "review".into();
+        t.body = "## Overview\nthe work\n\n## Log\n\n- 2026-11-12 review: done\n".into();
+        write(&mut t, &[Pass::opened(None, None)]);
+        store.save_task(&t).unwrap();
+        (env, store)
+    }
+
+    /// Submit `text` for m-1 from a verifier's seat, from a file.
+    fn submit_verdict(env: &util::Isolated, store: &Store, text: &str) -> i32 {
+        let file = env.path("exit.md");
+        std::fs::write(&file, text).unwrap();
+        let from = file.display().to_string();
+        let args = Args::synth("submit", &["m-1"], &[("from", &from)]);
+        crate::cmd_submit::submit_from(store, &args, Some("verifier"), None)
+    }
+
+    fn newest(store: &Store) -> Pass {
+        passes(&store.find_task("m-1").unwrap()).pop().unwrap()
+    }
+
+    const BLOCKS: &str = "verdict: blocks\nsummary: the second caller has no test\n\nThe wiring is in; the second caller is untested.\n\ndone-when:\n- not held: the wiring is tested — no test of the second caller, src/x.rs:9\n\nchecked:\n- unit (2m): cargo test x:: — pass\n\n";
+
+    #[test]
+    fn a_verifier_exit_that_blocks_without_a_cause_is_refused_naming_the_line() {
+        let (env, store) = reading("exit-nocause");
+        let text = format!("{BLOCKS}owed:\n- a test of the second caller\n");
+        let lines = crate::cmd_submit::verifier_exit(crate::exit::Verdict::Blocks, &text).unwrap_err();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].starts_with("line 1 (cause): `blocks` and no `cause:`") && lines[0].contains("cause: work | check | tree | env"), "{lines:#?}");
+        assert_eq!(submit_verdict(&env, &store, &text), 1);
+        assert_eq!(newest(&store).state, State::Running, "nothing recorded");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Review);
+        // The alias: `wsp verified --blocks` in prose with no cause is refused the same.
+        let file = env.path("prose.md");
+        std::fs::write(&file, "the second caller has no test").unwrap();
+        let from = file.display().to_string();
+        let args = Args::synth("verified", &["m-1", "--from", &from], &[("blocks", "true"), ("caption", "no test")]);
+        assert_eq!(verified_as(&store, &args, None), 2);
+        assert_eq!(newest(&store).state, State::Running);
+        // A block that names nothing not held and no failed check is refused too.
+        let empty = "verdict: blocks\nsummary: s\n\nprose\n\ncause: work — it is thin\n\nowed:\n- more\n";
+        let lines = crate::cmd_submit::verifier_exit(crate::exit::Verdict::Blocks, empty).unwrap_err();
+        assert!(lines.iter().any(|l| l.contains("no item is not held and no check failed")), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_verifier_exit_that_blocks_on_the_work_sends_the_row_back_with_its_owed_lines_as_the_reason() {
+        let (env, store) = reading("exit-work");
+        let text = format!("{BLOCKS}cause: work — the second caller is untested\n\nowed:\n- a test of the second caller\n- its error path named\n");
+        assert_eq!(submit_verdict(&env, &store, &text), 0);
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Doing, "sent back");
+        let p = newest(&store);
+        assert_eq!(p.state, State::Blocks);
+        assert_eq!(p.caption.as_deref(), Some("the second caller has no test"), "the summary is the caption");
+        assert_eq!(p.checked, vec![crate::did::Checked { item: "the wiring is tested".into(), held: false }]);
+        assert!(p.text.contains("cause: work — the second caller is untested") && p.text.contains("- unit (2m): cargo test x:: — pass"), "{}", p.text);
+        let sent = t.section("Log").unwrap().lines().find(|l| l.contains(crate::cycle::SENT_BACK)).unwrap_or_default().to_string();
+        assert!(sent.contains("a test of the second caller; its error path named"), "owed: is the reason: {sent}");
+        assert!(!sent.contains("The wiring is in"), "the account is not the reason: {sent}");
+    }
+
+    #[test]
+    fn a_verifier_exit_with_cause_env_leaves_the_row_at_review_and_the_run_owes_a_new_verifier() {
+        let (env, store) = reading("exit-env");
+        let text = "verdict: blocks\nsummary: could not build: the tree was removed\n\nMy tree went away mid-read; I read nothing of the work.\n\ncause: env — the tree was removed under me\n\nowed: nothing\n";
+        assert_eq!(submit_verdict(&env, &store, text), 0);
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Review, "a member is never sent back on a verifier's environment");
+        assert!(!t.section("Log").unwrap().contains(crate::cycle::SENT_BACK));
+        assert!(t.section("Log").unwrap().contains("could not verify"), "{}", t.section("Log").unwrap());
+        let p = newest(&store);
+        assert_eq!(p.state, State::CouldNotVerify);
+        assert!(t.body.contains(" could not verify · "), "the entry says so: {}", t.body);
+        let tasks = vec![t.clone()];
+        assert!(!verified(&tasks, "m-1") && blocked(&tasks, "m-1").is_none(), "neither a hold nor a block");
+        let opened = crate::cycle::open_verifier(&store, &t, &crate::model::Policy::parse("claude").unwrap(), &|_: &str| false, &|| true);
+        assert!(opened.is_some(), "the run owes a new verifier");
+        let states: Vec<State> = passes(&store.find_task("m-1").unwrap()).iter().map(|p| p.state).collect();
+        assert_eq!(states, vec![State::CouldNotVerify, State::Running]);
+    }
+
+    #[test]
+    fn a_verifier_exit_that_holds_with_a_failed_check_is_refused() {
+        let (env, store) = reading("exit-holds-fail");
+        let text = "verdict: holds\nsummary: it holds\n\nRead it in the tree.\n\ndone-when:\n- held: the wiring is tested — src/x.rs:30\n\nchecked:\n- unit (2m): cargo test x:: — fail\n\nowed: nothing\n";
+        let lines = crate::cmd_submit::verifier_exit(crate::exit::Verdict::Holds, text).unwrap_err();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].starts_with("line 10 (checked): `unit` failed, and the verdict is `holds`"), "{lines:#?}");
+        assert_eq!(submit_verdict(&env, &store, text), 1);
+        assert_eq!(newest(&store).state, State::Running);
+        // And a hold with an item not held, through `wsp verified --holds`'s prose.
+        let file = env.path("prose.md");
+        std::fs::write(&file, "mostly fine\nchecked: the wiring is tested — not held\n").unwrap();
+        let from = file.display().to_string();
+        let args = Args::synth("verified", &["m-1", "--from", &from], &[("holds", "true"), ("caption", "fine")]);
+        assert_eq!(verified_as(&store, &args, None), 2);
+        assert_eq!(newest(&store).state, State::Running);
     }
 
     // ---- `wsp-341`: the hold lands the row ------------------------------------
@@ -1940,7 +2124,8 @@ mod tests {
     impl Ground {
         fn verdict(&self, flag: &str) -> i32 {
             let from = self.store.root.join("verdict.md");
-            std::fs::write(&from, "read it in the tree; that is the verdict").unwrap();
+            let cause = if flag == "blocks" { "\ncause: work — it does not do what was asked" } else { "" };
+            std::fs::write(&from, format!("read it in the tree; that is the verdict{cause}")).unwrap();
             let from = from.display().to_string();
             let args = Args::synth("verified", &["m-1", "--from", &from], &[(flag, "true"), ("caption", "it was read in the tree")]);
             // The seat is said here (none: the member's pass is the newest

@@ -2932,7 +2932,7 @@ pub(crate) fn retry_owed_land(store: &Store, list: &str, at: usize, member: &Tas
     log_line(store, &format!("{list} group {at}: {} {said}", member.id));
 }
 
-fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
+pub(crate) fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::commit_of(member);
     let landed_again = |p: &v::Pass| match (&now_landing, &p.read) {
@@ -2989,6 +2989,10 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) 
                     return None;
                 }
             }
+            // **A pass that could not verify is no verdict on the work**
+            // (`wsp-614`, `cause: env`): the member stayed at review, so the
+            // run owes it a new verifier now, at the same commit or not.
+            Some(p) if p.state == State::CouldNotVerify => {}
             // The newest was superseded and nothing opened after it — a start
             // that failed — so this is the fresh pass it was waiting for.
             Some(_) => {}
@@ -3016,7 +3020,7 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) 
 
 /// What [`open_verifier`] did: a fresh pass, or a wedged one taken again, and
 /// the seat of a pass it superseded, which is ended at once.
-struct Opened {
+pub(crate) struct Opened {
     superseded: Option<String>,
     again: bool,
     /// The seat of a running pass that went without wsp ending it.
@@ -3306,8 +3310,10 @@ fn verifier_base(store: &Store, member: &Task) -> String {
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
          - {holds};\n\
-         - it does not: `wsp verified {m} --blocks --from FILE --caption \"…\"`. {m} goes back to doing with \
-         your verdict as what is owed, and its governor is told.\n\n\
+         - it does not: `wsp verified {m} --blocks --from FILE --caption \"…\"`, with a line \
+         `cause: work | check | tree | env — <one sentence>` in the file (a block without one is refused). {m} goes back to doing with \
+         your verdict as what is owed, and its governor is told. `cause: env` is for when you could not verify \
+         (your tree lost, the load, a tool missing): it is no block of the work, {m} stays at review, and the run starts another verifier.\n\n\
          {caption}\n\n\
          {checked}{reuse}\n\n\
          There is no row of your own: the verdict is recorded on {m} under `## Verification`, \
@@ -6204,7 +6210,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
         crate::verification::name_seat(&store, "m-1", "cpd-9");
         let checked = vec![crate::did::Checked { item: "the gate holds".into(), held: false }];
-        crate::verification::record_checked(&store, "m-1", V::Blocks, "it does not", Some("cpd-9"), None, checked.clone()).unwrap();
+        crate::verification::record_checked(&store, "m-1", V::Blocks, "it does not", Some("cpd-9"), None, checked.clone(), None).unwrap();
 
         // The transcript Claude Code would have written, where it looks for it.
         let home = env.path("home");
@@ -6922,7 +6928,8 @@ fn only_a_working_screen_is_ever_overruled() {
         }
         fn verdict(&self, flag: &str) {
             let from = self.store.root.join("verdict.md");
-            std::fs::write(&from, "read in the member's tree").unwrap();
+            let cause = if flag == "blocks" { "\ncause: work — it does not do what was asked" } else { "" };
+            std::fs::write(&from, format!("read in the member's tree{cause}")).unwrap();
             let from = from.display().to_string();
             let args = crate::Args::synth("verified", &["m-1", "--from", &from], &[(flag, "true"), ("caption", "read in its tree")]);
             assert_eq!(crate::verification::cmd_verified(&self.store, &args), 0);

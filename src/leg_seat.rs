@@ -304,6 +304,13 @@ fn done(store: &Store, args: &Args, task: &str, pane: Option<&str>) -> Result<()
     let started = old.iter().find(|l| l.name == name).and_then(|l| l.started.clone());
     let fresh = crate::closing::fresh_baton(store, &t.id, &name, started.as_deref());
     let baton = baton_text(store, args, &t.id, &name, fresh.is_some())?;
+    // A baton written as an exit runs the leg's exit validator, and its summary
+    // is the caption when none was typed (`wsp-614`: `leg done` is `submit`'s alias).
+    let summary = crate::cmd_submit::leg_baton(store, &t, &baton)?;
+    let caption = match summary {
+        Some(s) if caption.is_empty() => crate::util::fold(&s),
+        _ => caption,
+    };
     let late = fresh
         .filter(|_| args.get("from").is_none())
         .filter(|at| util::epoch_secs() - at >= crate::closing::LATE_AFTER)
