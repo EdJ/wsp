@@ -48,7 +48,7 @@ use crate::message::{self, About, Message, Waiting};
 use crate::model::{Status, Task};
 use crate::store::Store;
 use crate::util::{self, fold, Paint};
-use crate::cmd_task::Args;
+use crate::base::args::Args;
 use std::path::{Path, PathBuf};
 
 pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {

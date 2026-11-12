@@ -2062,6 +2062,12 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     },
 ];
 
+/// Tell a governor's seat a question was filed for it (`wsp submit`'s asks), kept
+/// here because this module already reaches the seat layer and `cmd_submit` may not.
+pub(crate) fn say_to_governor(store: &Store, scope: &str, q: &Message) {
+    let _ = crate::wake::say(store, scope, &for_a_governor(q), Some(&q.id));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3456,10 +3462,4 @@ mod tests {
             store.save_task(&t).unwrap();
         }
     }
-}
-
-/// Tell a governor's seat a question was filed for it (`wsp submit`'s asks), kept
-/// here because this module already reaches the seat layer and `cmd_submit` may not.
-pub(crate) fn say_to_governor(store: &Store, scope: &str, q: &Message) {
-    let _ = crate::wake::say(store, scope, &for_a_governor(q), Some(&q.id));
 }
