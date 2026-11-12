@@ -1866,7 +1866,18 @@ pub fn close_from_pane(store: &Store, id: &str, by: &Party, act: Act, text: &str
 }
 
 fn close(store: &Store, id: &str, by: &Party, act: Act, text: &str, choice: Option<&Value>) -> Result<Closed, Refused> {
-    store.locked(|| close_locked(store, id, by, act, text, choice))
+    store.locked(|| close_locked(store, id, by, act, text, choice, false))
+}
+
+/// [`answer`] or [`answer_choice`] by the governor seat a person's question is
+/// routed to (`wsp-608`): Ed, 2026-11-12, *governors should be able to answer
+/// questions … that's the same as a raised hand*. The store cannot walk the
+/// route (the running lists are the binary's), so the caller has: `wsp answer`
+/// calls this only once `waiting::route` names `by`'s own scope. Any other
+/// party is refused here as [`answer`] refuses it, and a hook-held dialog is
+/// never routed to a seat.
+pub fn answer_routed(store: &Store, id: &str, by: &Party, text: &str, choice: Option<&Value>) -> Result<Closed, Refused> {
+    store.locked(|| close_locked(store, id, by, Act::Answered, text, choice, matches!(by, Party::Seat(_))))
 }
 
 fn close_locked(
@@ -1876,6 +1887,7 @@ fn close_locked(
     act: Act,
     text: &str,
     choice: Option<&Value>,
+    routed: bool,
 ) -> Result<Closed, Refused> {
     // A structured answer writes its own sentence, so only the words-only road
     // owes one here; the rest is checked below, once the question is read.
@@ -1895,7 +1907,7 @@ fn close_locked(
     // waiting (`wsp-301`) is how `closed_json` comes to say `timeout`. It cannot
     // answer for the person, and no seat or agent can do either.
     let wsp_giving_up = act == Act::Abandoned && by.is_wsp();
-    if q.for_person && matches!(by, Party::Seat(_) | Party::Agent(_) | Party::Pane { .. }) && !wsp_giving_up {
+    if q.for_person && matches!(by, Party::Seat(_) | Party::Agent(_) | Party::Pane { .. }) && !wsp_giving_up && !routed {
         return Err(Refused::NotThePersons(by.byline()));
     }
     let waiting = q.waiting.clone().ok_or(Refused::NobodyWaiting)?;

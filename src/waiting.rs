@@ -344,6 +344,46 @@ impl Wait {
     }
 }
 
+/// Whether a hook is holding a dialog for this question: the person's,
+/// whatever governs the row, because only they can answer it.
+fn hook_held(m: &crate::message::Message) -> bool {
+    m.for_person && m.choices.as_ref().is_some_and(|c| c.json().get("via").and_then(|v| v.as_str()) == Some("hook"))
+}
+
+/// Whom an open question waits on: the governor that answers for its task, or
+/// the person when no seat is above it or a hook holds a dialog for it.
+///
+/// **One route, read by the line that says who is owed and by the verb that
+/// lets them close it** (`wsp-608`). The barrier once said a member waited "on
+/// the compounding governor" while `wsp answer` refused that governor, so a run
+/// stood overnight on a question nobody it named could close. Ed, 2026-11-12:
+/// *governors should be able to answer questions … that's the same as a raised
+/// hand*. So the seat this names may answer it, and [`crate::cmd_message`]
+/// asks this rather than a copy.
+pub(crate) fn route(store: &Store, m: &crate::message::Message) -> On {
+    let index = crate::resolve::Index::new(store.projects());
+    let lists = crate::worklist::Running::read(store);
+    route_with(store, m, &index, &lists, &store.governors())
+}
+
+fn route_with(
+    store: &Store,
+    m: &crate::message::Message,
+    index: &crate::resolve::Index,
+    lists: &crate::worklist::Running,
+    governors: &BTreeMap<String, serde_json::Value>,
+) -> On {
+    if hook_held(m) {
+        return On::Person;
+    }
+    m.about
+        .task()
+        .and_then(|id| store.find_task(id))
+        .and_then(|t| crate::governors::seat_for(governors, index, lists.list_of(&t.id), t.project.as_deref()))
+        .map(|s| On::Seat(s.scope))
+        .unwrap_or(On::Person)
+}
+
 /// The open questions, read once, indexed by who is sitting still behind each.
 ///
 /// **Read once per pass and asked per seat**, because every reader here walks
@@ -391,15 +431,8 @@ impl Asks {
             let Some(w) = &m.waiting else { continue };
             // A hook-held dialog is the person's whatever governs the row:
             // only they can answer it, and a seat's guard refuses it.
-            let held = m.for_person && m.choices.as_ref().is_some_and(|c| c.json().get("via").and_then(|v| v.as_str()) == Some("hook"));
-            let on = m
-                .about
-                .task()
-                .and_then(|id| store.find_task(id))
-                .and_then(|t| crate::governors::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref()))
-                .map(|s| On::Seat(s.scope))
-                .filter(|_| !held)
-                .unwrap_or(On::Person);
+            let held = hook_held(m);
+            let on = route_with(store, m, &index, &lists, &governors);
             // Oldest first and the later one wins, so the question a seat names
             // is its most recent — the one it is most likely sitting on.
             if !w.pane.is_empty() {

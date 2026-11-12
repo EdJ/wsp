@@ -763,27 +763,23 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         }
     };
     let (me, pane) = whoami(store);
-    // `wsp-233`: a governor can add to the person's list and never answer it.
-    // Past this check the closer is the person, and is recorded as one.
-    let me = match q.for_person {
-        false => me,
-        true => {
-            let caller = Caller {
-                seat: me.scope().is_some(),
-                agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p))
-                    || an_agent_process(|k| std::env::var_os(k)),
-                as_person: args.has("as-person"),
-            };
-            if let Err(why) = the_person(&caller) {
-                eprintln!("wsp: {why}");
-                eprintln!("     a seat or an agent says what it knows with `wsp note`, and the person answers it here");
-                return 1;
-            }
-            Party::Human
+    let caller = Caller {
+        seat: me.scope().is_some(),
+        agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)) || an_agent_process(|k| std::env::var_os(k)),
+        as_person: args.has("as-person"),
+    };
+    let me = match closer(store, &q, me, &caller) {
+        Ok(me) => me,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            eprintln!("     a seat or an agent says what it knows with `wsp note`, and the person answers it here");
+            return 1;
         }
     };
 
+    let routed = q.for_person && me.scope().is_some();
     let closed = match (giving_up, &choice) {
+        (false, c) if routed => message::answer_routed(store, &q.id, &me, &text, c.as_ref()),
         (false, Some(c)) => message::answer_choice(store, &q.id, &me, &text, c),
         (false, None) => message::answer(store, &q.id, &me, &text),
         (true, _) => message::abandon(store, &q.id, &me, &text),
@@ -941,6 +937,34 @@ fn the_person(c: &Caller) -> Result<(), String> {
             if c.seat { "a governor seat" } else { "an agent's pane" }
         )),
     }
+}
+
+/// Who closes this question, recorded as whom — or why this caller may not.
+///
+/// `wsp-233`: a governor can add to the person's list and never answer it, and
+/// past [`the_person`] the closer is the person and is recorded as one.
+///
+/// **Except the governor a member's question is routed to** (`wsp-608`). Ed,
+/// 2026-11-12: *governors should be able to answer questions, or at least veto
+/// that they need to go to a user — that's the same as a raised hand*. A
+/// member's `wsp ask` about its own row is waiting on the seat
+/// [`crate::waiting::route`] names, and the barrier says so; that seat answers
+/// it, as itself, the way it answers a raised hand. A question the route gives
+/// to the person — no seat above the row, or a dialog a hook holds — stays the
+/// person's, and the primary (which governs nothing) still says `--as-person`.
+fn closer(store: &Store, q: &Message, me: Party, caller: &Caller) -> Result<Party, String> {
+    if !q.for_person {
+        return Ok(me);
+    }
+    // A member's: a seat's own question to the person (the primary's, `wsp-279`,
+    // or a governor's) is the person's, whoever governs the row it is about.
+    let a_members = !matches!(q.from, Party::Seat(_));
+    if let (true, Some(scope), crate::waiting::On::Seat(routed)) = (a_members, me.scope(), crate::waiting::route(store, q)) {
+        if scope == routed && !caller.as_person {
+            return Ok(me);
+        }
+    }
+    the_person(caller).map(|_| Party::Human)
 }
 
 /// Does this pane hold an agent: bound to a task, or a seat wsp started one in?
@@ -2389,6 +2413,64 @@ mod tests {
         assert!(the_person(&c(true, false, false)).unwrap_err().contains("governor seat"));
         assert!(the_person(&c(false, true, false)).unwrap_err().contains("agent's pane"));
         assert!(the_person(&c(true, false, true)).is_ok(), "`--as-person`: Ed typing `!` into a seat's pane");
+    }
+
+    /// `wsp-608`, Ed's decision on question 3: a member's question about its
+    /// own row is answered by the governor it is routed to, as a raised hand
+    /// is — the barrier names that seat, so that seat may close it, and it is
+    /// recorded as the seat, not as the person. The primary governs nothing
+    /// here and still needs `--as-person`.
+    #[test]
+    fn the_governor_a_members_question_is_routed_to_answers_it_and_the_primary_still_says_as_person() {
+        let _env = util::isolated("ask-gov-answers");
+        let store = scratch("ask-gov-answers");
+        task(&store, "m-1");
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+        store.set_governor(crate::governors::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
+        let raise = |text: &str| {
+            let q = Message::question(Party::pane("cpd-4845", ""), Kind::Note, text, Waiting::new("cpd-4845", "m-1"))
+                .about(About::Task("m-1".into()))
+                .for_the_person();
+            message::raise(&store, &q).unwrap();
+            q
+        };
+        let q = raise("m-1: ready at 340f83ed2f, and the verifier lands it");
+        assert_eq!(crate::waiting::route(&store, &q), crate::waiting::On::Seat("ux-next".into()), "the barrier names ux-next");
+
+        // The primary: refused without `--as-person`, as before.
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
+        assert_eq!(answer(&store, &crate::Args::synth("answer", &[q.id.as_str(), "noted"], &[])), 1);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert!(store.message(&q.id).unwrap().is_open(), "the primary did not close it");
+
+        // The governor it is routed to: closes it, as itself.
+        std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
+        assert_eq!(answer(&store, &crate::Args::synth("answer", &[q.id.as_str(), "noted: nothing for the person"], &[])), 0);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        let m = store.message(&q.id).unwrap();
+        assert!(!m.is_open(), "the governor closed it");
+        assert_eq!(m.closed_json().unwrap()["by"].as_str(), Some("seat"), "recorded as the seat, not the person: {:?}", m.closed_json());
+
+        // A seat that is not the route's is still refused: the primary's own
+        // question about m-1 is the person's, not ux-next's.
+        let primarys = Message::question(Party::seat(crate::governors::PRIMARY), Kind::Note, "keep the bump?", Waiting::new("cpd-1", ""))
+            .about(About::Task("m-1".into()))
+            .for_the_person();
+        message::raise(&store, &primarys).unwrap();
+        std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
+        assert_eq!(answer(&store, &crate::Args::synth("answer", &[primarys.id.as_str(), "yes"], &[])), 1);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert!(store.message(&primarys.id).unwrap().is_open());
+        // And the primary, saying it is the person, may close the member's.
+        let again = raise("another report");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
+        assert_eq!(answer(&store, &answer_args(&again.id, &[], &["read it"])), 0);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert!(!store.message(&again.id).unwrap().is_open());
     }
 
     /// An agent in a pane wsp never bound still reads as an agent: the guard

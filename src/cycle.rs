@@ -1282,7 +1282,15 @@ fn holding_barrier(
         // group is owed. Group 5 of react-pass-1 waited 51 minutes on a dev
         // server. A prompt or an open question of its own still holds.
         let shells = Default::default();
-        if let Some(wait) = state.and_then(|st| crate::waiting::reading(Some(st), &asks, &shells, &seat, &s.id)) {
+        // **A question from a member whose row has landed does not hold it**
+        // (`wsp-608`): the work is on the trunk, and what the member still
+        // asks is owed by its governor without the group standing behind it.
+        // React-parity-now's group 9 stood overnight on a member's "ready at
+        // 340f83ed2f" filed as a question. A prompt on its screen still holds.
+        let wait = state.and_then(|st| crate::waiting::reading(Some(st), &asks, &shells, &seat, &s.id));
+        let landed = store.find_task(&s.id).is_some_and(|t| t.section("Log").is_some_and(|l| l.contains(crate::log::LANDED)));
+        let wait = wait.filter(|w| !(landed && matches!(w.why, crate::waiting::Why::Answer(_) | crate::waiting::Why::Question(_))));
+        if let Some(wait) = wait {
             waiting.push(format!("{seat} ({}) is {}", s.id, wait.sentence()));
             continue;
         }
@@ -5660,6 +5668,52 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_message(&answered).unwrap();
         step(&store, &w, &Fixed::new(&[("cpd-1", State::Idle)]));
         assert_eq!(checks(&store, 1).len(), 1, "answered and idle: it opens");
+    }
+
+    /// `wsp-608`: react-parity-now's group 9 stood overnight on cpd-4845's
+    /// "ready at 340f83ed2f, and the verifier lands it", filed as a question
+    /// after its row had landed. A question from a member whose row is on the
+    /// trunk does not hold the barrier; the same question before the land does,
+    /// and its wait line names the seat the question is routed to.
+    #[test]
+    fn a_question_from_a_member_whose_row_has_landed_no_longer_holds_its_barrier() {
+        let (_env, store) = scratch("landedq");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        let _ = spawned();
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        let mut q = crate::message::Message::question(
+            crate::message::Party::pane("cpd-1", ""),
+            crate::message::Kind::Note,
+            "m-1: ready at 340f83ed2f, and the verifier lands it",
+            crate::message::Waiting::new("cpd-1", "m-1"),
+        )
+        .about(crate::message::About::Task("m-1".into()));
+        q.for_person = true;
+        store.save_message(&q).unwrap();
+
+        tests::SAID.with(|s| s.borrow_mut().clear());
+        step(&store, &w, &Fixed::new(&[("cpd-1", State::Idle)]));
+        assert!(checks(&store, 1).is_empty(), "before the land, its question holds");
+        let said = tests::SAID.with(|s| s.borrow().clone());
+        let line = said.iter().find(|l| l.contains("barrier waits")).expect("the barrier says why");
+        // No governor is seated over m-1, so only the person can close it, and
+        // the line says so rather than naming a seat that would be refused.
+        assert!(line.contains(&format!("waiting on a person to answer its question {}", q.id)), "{line}");
+        assert_eq!(crate::waiting::route(&store, &q), crate::waiting::On::Person);
+
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{} 340f83ed2f", crate::log::LANDED));
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Fixed::new(&[("cpd-1", State::Idle)]));
+        assert_eq!(checks(&store, 1).len(), 1, "landed: the question is its governor's, and the group goes on");
+        assert!(store.message(&q.id).unwrap().wants_answering(), "and the question itself is still open for whoever owes it");
+
+        // A prompt on a landed member's screen still holds: that is a keypress
+        // somebody owes now, not a report.
     }
 
     /// `wsp-428`: group 5 of react-pass-1 waited 51 minutes on a verified
