@@ -991,6 +991,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // verifiers and checks as well (`wsp-231`): a group anywhere on the
     // machine finishes before the next work fans out.
     if all {
+        end_second_seats(store, seats, &w, at, &g.members);
         let holds = crate::after::waiting(store, g);
         let unstarted = pos.members.iter().any(|s| {
             !holds.contains_key(&s.id) && store.find_task(&s.id).is_some_and(|t| t.status() == Status::Todo)
@@ -1024,7 +1025,11 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
             if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap, &gate) {
                 log_line(store, &format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
                 // A failed member start is told, retried and flagged by `spawn`.
-                if spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string())) {
+                let took = spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string()));
+                // The spawn has returned and the row's `doing` is on disk: a
+                // later pick reads that, and the mark has done its work.
+                crate::starts::ended(store, &s.id);
+                if took {
                     started.push(s.id.clone());
                 }
                 began += 1;
@@ -1199,9 +1204,14 @@ fn tell_barrier(store: &Store, w: &Worklist, check: &str, members: &[String]) {
         w.id,
         w.id
     );
+    tell_seat(store, check, &text, "the group moved under it");
+}
+
+/// `wsp tell <seat> -` with `text`, said in `cycle.log` as `told <seat>: <what>`.
+fn tell_seat(store: &Store, check: &str, text: &str, what: &str) {
     if cfg!(test) {
         #[cfg(test)]
-        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((check.to_string(), text)));
+        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((check.to_string(), text.to_string())));
         return;
     }
     let Ok(exe) = std::env::current_exe() else { return };
@@ -1223,12 +1233,63 @@ fn tell_barrier(store: &Store, w: &Worklist, check: &str, members: &[String]) {
         let _ = writeln!(to, "{text}");
     }
     match child.wait_with_output() {
-        Ok(o) if o.status.success() => log_line(store, &format!("told {check}: the group moved under it")),
+        Ok(o) if o.status.success() => log_line(store, &format!("told {check}: {what}")),
         Ok(o) => log_line(store, &format!(
             "told {check}: not delivered — {}",
             util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)
         )),
         Err(e) => log_line(store, &format!("told {check}: not delivered — {e}")),
+    }
+}
+
+/// End every seat but the claim's that stands on a member of this group, and
+/// tell the claim's seat (`wsp-607`). Two seats in one member's tree write the
+/// same files: react-parity-now's compounding-428 had cpd-4814 and cpd-4815
+/// both editing it, a test failing on a symbol declared twice, and both
+/// stopping to ask a person which one keeps the tree. The claim answers that —
+/// its seat keeps the tree, and the other is ended with the tree left to it.
+/// A row with two seats and no claim, or none whose agent is the claim's, is
+/// left alone: nobody can say which one is the member.
+fn end_second_seats(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, members: &[String]) {
+    let claims = store.claims();
+    for id in members {
+        let Some(claim) = claims.get(id) else { continue };
+        let panes = store.panes_for_task(id);
+        if panes.len() < 2 {
+            continue;
+        }
+        let Some(holder) = crate::address::claim_holder(claim, &panes, &store.agents_held()) else { continue };
+        for p in panes.iter().filter(|p| **p != holder) {
+            if !seats.state(p).is_some_and(|s| !matches!(s, State::Gone | State::Empty)) {
+                continue;
+            }
+            match despawn_seat_keeping(p, true) {
+                Ok(()) => {
+                    log_line(store, &format!(
+                        "{} group {at}: {id} had a second seat, {p}, beside {holder} which holds its claim — ended {p}, its tree left to {holder}",
+                        w.id
+                    ));
+                    if let Some(mut row) = store.task(id) {
+                        let _ = crate::log::note(store, &mut row, &format!("a second seat {p} stood on this beside {holder}, which holds the claim; wsp ended {p}"));
+                    }
+                    tell_seat(
+                        store,
+                        &holder,
+                        &format!(
+                            "A second seat, {p}, was started on {id} and stood in your tree beside you. You hold the claim, \
+                             so wsp ended {p} and the tree is yours: carry on. Check `git status` and `git diff` before your next \
+                             commit — anything there you did not write is {p}'s, and is yours to keep or drop."
+                        ),
+                        &format!("{p} was ended and the tree of {id} is its"),
+                    );
+                }
+                Err(why) => log_line(store, &format!(
+                    "{} group {at}: {id} has a second seat, {p}, beside {holder} which holds its claim, and it could not be ended: {}",
+                    w.id,
+                    util::truncate(&why, 200)
+                )),
+            }
+        }
     }
 }
 
@@ -1691,6 +1752,27 @@ fn take_member(
             return None;
         }
         let policy = store.worklist(list)?.groups().get(at - 1)?.policy_for(&id)?;
+        // The start's own mark, which only one pick can take (`wsp-607`): a
+        // second pick of this row inside the spawn window — this tick's next
+        // pass, or an `advance` beside the daemon's tick, with the store lock
+        // given up under load — finds it and starts nothing. Read the row again
+        // once it is held: a pick that read it before the first start's
+        // `doing` reached the disk, and took the mark after that start let it
+        // go, sees the row moved and starts nothing either.
+        // A test's stall between the read and the write, as load made one.
+        #[cfg(test)]
+        if let Some(d) = tests::STALL.with(|s| s.get()) {
+            std::thread::sleep(d);
+        }
+        if !crate::starts::begin(store, &id) {
+            log_line(store, &format!("{list} group {at}: {id} is already being started — not starting it twice"));
+            return None;
+        }
+        let moved = store.find_task(&id).is_none_or(|now| now.status() != t.status() || now.updated != t.updated);
+        if moved {
+            crate::starts::ended(store, &id);
+            return None;
+        }
         let mut t = t;
         if prerequisite.is_some() {
             t.log(&format!("{PREREQUISITE_LANDED}: {}", prerequisites_named(&t).join(" ")));
@@ -1706,7 +1788,10 @@ fn take_member(
         t.set_status(Status::Doing);
         t.log(&format!("{STARTED_BY} {list} group {at}"));
         t.touch();
-        store.save_task(&t).ok()?;
+        if store.save_task(&t).is_err() {
+            crate::starts::ended(store, &id);
+            return None;
+        }
         Some((why, policy))
     })?;
     store.git_commit(&format!("wsp: {list} group {at} starts {id}"));
@@ -5089,6 +5174,9 @@ pub(crate) mod tests {
         /// What the governor above a list was told (`wsp-263`) — distinct from
         /// `TOLD`, the list's own seat, as `MEMBER_TOLD` is.
         pub(crate) static HEARD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// Set, and a member's pick on this thread stalls this long between its
+        /// read of the row and its start, as load stalled compounding-428's.
+        pub(crate) static STALL: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
         /// Set, and every start in this thread fails with it.
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.
@@ -8305,6 +8393,149 @@ fn only_a_working_screen_is_ever_overruled() {
         let w = capped_group(&store, "components", 6, 2);
         step(&store, &w, &Blind);
         assert_eq!(spawned().len(), 2, "no seat cap, no free places to speak of");
+    }
+
+    // ---- a member is started once, however many picks race (wsp-607) ----------
+
+    /// The ids the passes in `run` started, from every thread they ran on.
+    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids
+    }
+
+    /// Two passes of the start loop in one tick: the second reads the first's
+    /// start and starts nothing again.
+    #[test]
+    fn two_passes_in_one_tick_start_each_member_once() {
+        let (_env, store) = scratch("twice-one-tick");
+        for m in ["m-1", "m-2"] {
+            task(&store, m, Status::Todo);
+        }
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        step(&store, &w, &Blind);
+        step(&store, &w, &Blind);
+        let ids = sorted(spawned().into_iter().map(|(id, _)| id).collect());
+        assert_eq!(ids, ["m-1", "m-2"], "one spawn for each row");
+    }
+
+    /// A pick that comes while another start of the same row is under way —
+    /// its mark taken, its `doing` not yet read — starts nothing, and says so.
+    #[test]
+    fn a_row_whose_start_is_under_way_is_not_started_again() {
+        let (_env, store) = scratch("under-way");
+        for m in ["m-1", "m-2"] {
+            task(&store, m, Status::Todo);
+        }
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        assert!(crate::starts::begin(&store, "m-1"), "the first start takes the mark");
+        let _ = drained(&SAID);
+        step(&store, &w, &Blind);
+        let ids: Vec<String> = spawned().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["m-2"]);
+        assert!(drained(&SAID).iter().any(|l| l.contains("m-1 is already being started")), "said, not silent");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo, "and the row is left as the first start has it");
+        crate::starts::ended(&store, "m-1");
+        step(&store, &w, &Blind);
+        assert_eq!(spawned().into_iter().map(|(id, _)| id).collect::<Vec<_>>(), ["m-1"], "started once its mark is let go");
+        assert!(!crate::starts::under_way(&store, "m-1"), "and the spawn's return lets its own mark go");
+    }
+
+    /// Two steps at once — the daemon's tick and an `advance` by hand — with the
+    /// store lock held elsewhere throughout, so every section gives it up after
+    /// two seconds and carries on without it, as under compounding-428's load,
+    /// and each pick stalls between its read and its write as that one did (the
+    /// row's log kept only the second start's line: it was written over the
+    /// first). Each row is spawned once.
+    fn race(tag: &str, kind: &str, n: usize, cap: usize, seat_cap: Option<usize>) -> (Vec<String>, usize) {
+        let (_env, store) = scratch(tag);
+        store.set_seat_cap(seat_cap).unwrap();
+        let w = capped_group(&store, kind, n, cap);
+        let lock = store.state.join(".lock");
+        let (root, state) = (store.root.clone(), store.state.clone());
+        let go = std::sync::Barrier::new(2);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let ids: Vec<String> = std::thread::scope(|sc| {
+            // Whoever holds it is busy for the whole race: an ending that
+            // removes the file is put back at once, as a held lock would be.
+            sc.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::write(&lock, "1 elsewhere\n");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            let runs: Vec<_> = (0..2)
+                .map(|_| {
+                    let (root, state, w, go) = (root.clone(), state.clone(), w.clone(), &go);
+                    sc.spawn(move || {
+                        let store = Store::at(root, state);
+                        STALL.with(|s| s.set(Some(std::time::Duration::from_millis(300))));
+                        go.wait();
+                        step(&store, &w, &Blind);
+                        spawned().into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let ids = runs.into_iter().flat_map(|r| r.join().unwrap()).collect();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            ids
+        });
+        let _ = std::fs::remove_file(&lock);
+        let unique = ids.iter().collect::<std::collections::BTreeSet<_>>().len();
+        (sorted(ids), unique)
+    }
+
+    #[test]
+    fn an_advance_during_a_tick_spawns_each_member_once() {
+        let (ids, unique) = race("advance-in-tick", "wiring", 3, 3, None);
+        assert_eq!(ids, ["m-1", "m-2", "m-3"], "one spawn for each row");
+        assert_eq!(unique, 3);
+    }
+
+    /// The path that raises a components group's `xN` to the seat's free places
+    /// picks through the same guard.
+    #[test]
+    fn the_free_places_path_spawns_each_member_once_under_a_race() {
+        let (ids, unique) = race("free-places-race", "components", 6, 2, Some(4));
+        assert_eq!(unique, ids.len(), "no row twice: {ids:?}");
+        assert!(ids.len() <= 6, "{ids:?}");
+        assert!(ids.len() >= 4, "x2 raised to the seat's four still starts them: {ids:?}");
+    }
+
+    /// Two seats on one claimed member: the one without the claim is ended,
+    /// its tree kept for the holder, and the holder is told.
+    #[test]
+    fn a_second_seat_on_a_claimed_member_is_ended_and_the_claimant_told() {
+        let (_env, store) = scratch("second-seat");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        store.set_binding("cpd-2", serde_json::json!({ "task_id": "m-1" }));
+        store.set_agent("a-1", serde_json::json!({ "seat": "cpd-1" }));
+        store.set_agent("a-2", serde_json::json!({ "seat": "cpd-2" }));
+        store.set_claim("m-1", serde_json::json!({ "agent_id": "a-2", "pane": "cpd-2" }));
+        let _ = drained(&ENDED);
+        let _ = drained(&KEPT);
+        let _ = drained(&MEMBER_TOLD);
+        step(&store, &w, &Fixed::new(&[("cpd-1", State::Working), ("cpd-2", State::Working)]));
+        assert_eq!(drained(&ENDED), ["cpd-1"], "the seat without the claim is ended");
+        assert_eq!(drained(&KEPT), ["cpd-1"], "and the tree is left to the holder");
+        let told = drained(&MEMBER_TOLD);
+        assert!(told.iter().any(|(to, text)| to == "cpd-2" && text.contains("cpd-1") && text.contains("m-1")), "{told:?}");
+        assert!(spawned().is_empty(), "nothing is started");
+    }
+
+    /// Of two seats where nobody can say which holds the claim, neither is ended.
+    #[test]
+    fn two_seats_with_no_holder_named_are_left_alone() {
+        let (_env, store) = scratch("second-seat-unknown");
+        task(&store, "m-1", Status::Doing);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        store.set_binding("cpd-2", serde_json::json!({ "task_id": "m-1" }));
+        store.set_claim("m-1", serde_json::json!({ "agent_id": "a-9" }));
+        let _ = drained(&ENDED);
+        step(&store, &w, &Fixed::new(&[("cpd-1", State::Working), ("cpd-2", State::Working)]));
+        assert!(drained(&ENDED).is_empty());
     }
 
     /// `wsp-471`: a member blocked for 20 minutes is flagged, told to the governor and

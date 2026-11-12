@@ -207,3 +207,67 @@ mod tests {
         assert!(forgive(&store, "m-2") && !forgive(&store, "m-2"));
     }
 }
+
+// ---- a start under way (wsp-607) ---------------------------------------------
+//
+// react-parity-now group 8 started compounding-428 twice, 3 s apart, both
+// `(new)`: two picks read the row at `todo` before either's `doing` was on disk.
+// The store lock is not enough on its own — under load it gives up after two
+// seconds and "carries on without it" — so a start also takes a mark of its own,
+// one file per row made with `create_new`, which only one process can make.
+// Taken in the same section that decides the start, and let go when the spawn
+// has returned: by then the row's `doing` is written, and every later pick reads
+// it. A mark older than [`STARTING_FOR`] is a start that died and is taken over.
+
+/// How long a mark stands before it is a start that died: well past a slow
+/// spawn (compounding-428's took 76 s from `spawn` to `started`).
+const STARTING_FOR: i64 = 15 * 60;
+
+fn mark_path(store: &Store, row: &str) -> std::path::PathBuf {
+    store.state.join("starting").join(row.replace('/', "_"))
+}
+
+/// Take `row`'s start: whether this caller is the one starting it. `false` is
+/// another start of the same row under way, in this process or another.
+pub(crate) fn begin(store: &Store, row: &str) -> bool {
+    let path = mark_path(store, row);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut fh) => {
+                use std::io::Write;
+                let _ = writeln!(fh, "{} {}", std::process::id(), util::epoch_secs());
+                return true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let at = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.split_whitespace().nth(1).and_then(|n| n.parse::<i64>().ok()))
+                    .unwrap_or_else(util::epoch_secs);
+                if util::epoch_secs() - at <= STARTING_FOR {
+                    return false;
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            // An unwritable state directory is not a reason to start nothing.
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Let `row`'s start go: its spawn has returned, or it was not made.
+pub(crate) fn ended(store: &Store, row: &str) {
+    let _ = std::fs::remove_file(mark_path(store, row));
+}
+
+/// Whether a start of `row` is under way.
+pub(crate) fn under_way(store: &Store, row: &str) -> bool {
+    let path = mark_path(store, row);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|n| n.parse::<i64>().ok()))
+        .is_some_and(|at| util::epoch_secs() - at <= STARTING_FOR)
+}
