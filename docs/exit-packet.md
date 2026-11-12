@@ -312,7 +312,7 @@ Checks`, and both are the person's to write.
 
 ```markdown
 ## Artefacts
-<!-- one glob per line: paths a check always rewrites, which wsp restores at submit -->
+# one glob per line: paths a check always rewrites, which wsp restores at submit
 
 ## Full suite
 - `cargo nextest run --workspace`
@@ -320,8 +320,9 @@ members: allowed
 ```
 
 `## Artefacts` is one glob per line (a `- ` bullet and backticks allowed),
-matched as `check::matches` matches a rule's `on`. An empty section, or one
-holding only a comment, reads as none. `## Full suite` names the project's
+matched as `check::matches` matches a rule's `on`. A line starting `#` is a
+comment (an HTML comment is not: it would be read as a glob). An empty section,
+or one holding only comments, reads as none. `## Full suite` names the project's
 full-suite commands; the line `members: allowed` lets a member's check or a run
 step below the barrier use them, logged. Without it a member's check naming one
 is refused (V3). `check::a_projects_artefact_globs_are_read_and_an_empty_section_reads_as_none`
@@ -477,7 +478,7 @@ carries `$WSP_EXIT` and `$WSP_SEAT_KIND`." (`wsp project edit wsp --handbook -`.
 
 ```markdown
 ## Artefacts
-<!-- paths a check always rewrites, which wsp restores at submit; none yet (compounding-456 sends the shots to a temp dir unless BLESS=1) -->
+# none yet: paths a check always rewrites go here, one glob per line, and wsp restores them at submit (compounding-456 sends the shots to a temp dir unless BLESS=1)
 ```
 
 ## 12. Owed
