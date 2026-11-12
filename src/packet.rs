@@ -272,25 +272,26 @@ pub fn give_leg(store: &Store, task: &str, leg: &str, root: &Path, full: bool, n
     });
 }
 
-/// How a leg ends: `leg done`, or `review` for the leg nothing waits on.
+/// How a leg ends, on one ASCII line for its order: `wsp submit`, which is
+/// `leg done` for a leg and the row's close for the leg nothing waits on.
 pub fn leg_finish(task: &str, last: bool) -> String {
     match last {
-        true => format!("You are the last leg: commit, then `wsp review {task} \"...\"`, as a Bash call of its own, ends the row."),
-        false => format!(
-            "Commit, write your baton with a heredoc into $WSP_BATON (`cat > \"$WSP_BATON\" <<'EOF'` ... `EOF`), then end with \
-             `wsp leg done {task} --caption \"...\"` as a Bash call of its own, never chained after another command."
-        ),
+        true => format!("You are the last leg: commit, then {}", crate::closing::how_to_close(task, true)),
+        false => format!("Commit, then {}", crate::closing::how_to_close(task, false)),
     }
 }
 
 /// A leg's packet, printed: the file its order names, read as a `## Packet`
-/// section is (its `file:` lines inlined), then the leg's finish line.
+/// section is (its `file:` lines inlined), with the leg's exit template — a
+/// member's for the last leg, which submits as one (`wsp-617`).
 pub fn build_leg(task: &str, leg: &str, path: &str, root: &Path, last: bool) -> Result<String, String> {
     let at = if Path::new(path).is_absolute() { PathBuf::from(path) } else { root.join(path) };
     let text = std::fs::read_to_string(&at)
         .map_err(|e| format!("leg {leg}'s `packet: {path}` cannot be read from {}: {e}", util::contract(root)))?;
     let p = parse(&text);
-    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), &leg_finish(task, last))
+    let kind = if last { crate::exit::Kind::Member } else { crate::exit::Kind::Leg };
+    let exit = crate::closing::exit_template(kind, task, &[]);
+    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), &exit)
 }
 
 /// A leg spawn's decision: the size of its packet when it starts short, `None`
@@ -339,7 +340,8 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
         Some(owed) => format!("# Packet · {} · {}\n\n{owed}\n## The original brief\nWhat the row first asked, for what it names. Whatever of it already landed is done.\n", t.id, t.title),
         None => format!("# Packet · {} · {}\n", t.id, t.title),
     };
-    render(&head, &p, root, &t.id, "")
+    let exit = crate::closing::exit_template(crate::exit::Kind::Member, &t.id, &crate::cmd_submit::packet_items(t));
+    render(&head, &p, root, &t.id, &exit)
 }
 
 /// Bytes of the owed block: the newest reason is always in (cut to this if it
@@ -413,9 +415,9 @@ pub fn owed(t: &Task) -> Option<String> {
 /// the narrow filter is the member's, the full suite the barrier's.
 pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrower filter of it, for what you changed — never the full `cargo test`. The full suite runs once per group, at the barrier and (where the project declares it) in the verifier's tier; in your seat the full `cargo nextest run --workspace` is refused until you give a reason (`WSP_FULL_SUITE=\"<why>\"`, for a shared module, a fixture every test reads or a build-wide setting); the reason goes in the row's log and the verifier sees it, and a run is noted in `wsp wip`. Otherwise run your row's checks (`wsp check <row>`), name the full suite in your review summary and leave it to the barrier.";
 
-/// The print: a heading, the author's words, each named file inline, and a tail
-/// (a leg's finish line), refused over [`CAP`].
-fn render(head: &str, p: &Packet, root: &Path, who: &str, tail: &str) -> Result<String, String> {
+/// The print: a heading, the author's words, the seat's exit template
+/// (`wsp-617`), then each named file inline, refused over [`CAP`].
+fn render(head: &str, p: &Packet, root: &Path, who: &str, exit: &str) -> Result<String, String> {
     let mut parts: Vec<(String, String)> = Vec::new();
     for f in &p.files {
         if !inside(f) {
@@ -432,11 +434,11 @@ fn render(head: &str, p: &Packet, root: &Path, who: &str, tail: &str) -> Result<
     if p.text.contains("cargo test") {
         out.push_str(&format!("\n{TEST_SCOPE}\n"));
     }
+    if !exit.is_empty() {
+        out.push_str(&format!("\n{exit}"));
+    }
     for (path, body) in &parts {
         out.push_str(&format!("\n## {path}\n```\n{}\n```\n", body.trim_end()));
-    }
-    if !tail.is_empty() {
-        out.push_str(&format!("\n{tail}\n"));
     }
     if out.len() > CAP {
         let mut sizes: Vec<(usize, &str)> = parts.iter().map(|(f, b)| (b.len(), f.as_str())).collect();
@@ -691,6 +693,29 @@ mod tests {
     /// `compounding-220`: the second seat of a reopened row read the first
     /// brief and re-reported a commit that had landed. The packet opens with
     /// what is owed, newest first, read from the log, before the original brief.
+    /// `wsp-617`: the packet carries the member's exit template after the brief
+    /// and before the files, its done-when pre-filled from the row's bullets;
+    /// with no files it is the packet's end.
+    #[test]
+    fn a_packet_carries_the_member_template_with_the_rows_done_when_pre_filled() {
+        let dir = std::env::temp_dir().join(format!("wsp-packet-exit-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let mut t = Task::new("a row", "wsp-9");
+        t.body = "## Overview\nMake a.\n\n### Done when\n- a returns 1\n- the test covers it\n\n## Packet\nMake a return 1.\nfile: src/a.rs\n".into();
+        let out = build(&t, &dir).unwrap();
+        let tmpl = crate::closing::exit_template(crate::exit::Kind::Member, "wsp-9", &["a returns 1".into(), "the test covers it".into()]);
+        let (words, at, file) = (out.find("Make a return 1.").unwrap(), out.find(&tmpl).expect("the member template"), out.find("## src/a.rs").unwrap());
+        assert!(words < at && at < file, "after the brief, before the files: {out}");
+        assert!(out.contains("done-when:\n- held: a returns 1 — \n- held: the test covers it — \n"), "{out}");
+        assert!(out.contains("`wsp submit wsp-9 --dry-run` once"), "{out}");
+
+        t.body = "## Overview\nMake a.\n\nDone when:\n- a returns 1\n\n## Packet\nMake a return 1.\n".into();
+        let bare = build(&t, &dir).unwrap();
+        assert!(bare.ends_with(&crate::closing::exit_template(crate::exit::Kind::Member, "wsp-9", &["a returns 1".into()])), "{bare}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_reopened_rows_packet_opens_with_what_is_owed_newest_first_before_the_original_brief() {
         let dir = std::env::temp_dir();
@@ -710,7 +735,8 @@ mod tests {
     fn a_row_not_sent_back_or_back_at_review_prints_as_it_always_did() {
         let dir = std::env::temp_dir();
         let plain = build(&row("Add the flag."), &dir).unwrap();
-        assert_eq!(plain, "# Packet · t-1 · Add a flag\n\nAdd the flag.\n");
+        let exit = crate::closing::exit_template(crate::exit::Kind::Member, "t-1", &[]);
+        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{exit}"));
         let mut t = row("Add the flag.");
         t.body.push_str("\n## Log\n- 2026-11-08 sent back: the first gap\n");
         t.set_status(crate::model::Status::Review);
@@ -771,9 +797,13 @@ mod tests {
         let mid = build_leg("t-1", "hint", "change.md", &dir, false).unwrap();
         assert!(mid.starts_with("# Packet · t-1 · leg hint\n"), "{mid}");
         assert!(mid.contains("Make a return 1.") && mid.contains("## src/a.rs\n```\nfn a() {}\n```"), "{mid}");
-        assert!(mid.trim_end().ends_with(&leg_finish("t-1", false)) && mid.contains("wsp leg done t-1"), "{mid}");
+        // The leg's exit template, after its words and before its files (`wsp-617`).
+        let exit = crate::closing::exit_template(crate::exit::Kind::Leg, "t-1", &[]);
+        let (words, tmpl, file) = (mid.find("Make a return 1.").unwrap(), mid.find(&exit).expect("the leg template"), mid.find("## src/a.rs").unwrap());
+        assert!(words < tmpl && tmpl < file, "{mid}");
+        assert!(mid.contains("wsp submit t-1") && mid.contains("closes the leg") && !mid.contains("\ndone-when:\n"), "{mid}");
         let last = build_leg("t-1", "hint", "change.md", &dir, true).unwrap();
-        assert!(last.contains("wsp review t-1") && !last.contains("leg done"), "{last}");
+        assert!(last.contains(&crate::closing::exit_template(crate::exit::Kind::Member, "t-1", &[])), "the last leg submits as a member: {last}");
         assert!(build_leg("t-1", "hint", "gone.md", &dir, false).unwrap_err().contains("gone.md"));
 
         let order = "packet: change.md\n\nthe hint";
@@ -790,8 +820,8 @@ mod tests {
     #[test]
     fn a_legs_order_names_its_packet_verb_and_its_finish() {
         let o = leg_order("t-1", "hint", false);
-        assert!(o.contains("`wsp packet t-1 --leg hint`") && o.contains("wsp leg done t-1") && !o.contains('\n'), "{o}");
-        assert!(leg_order("t-1", "hint", true).contains("wsp review t-1"));
+        assert!(o.contains("`wsp packet t-1 --leg hint`") && o.contains("`wsp submit t-1` alone") && o.contains("leg done") && !o.contains('\n'), "{o}");
+        assert!(leg_order("t-1", "hint", true).contains("last leg") && leg_order("t-1", "hint", true).contains("ends the row"));
         assert!(o.is_ascii(), "a spawn once hung on one character");
     }
 
@@ -944,7 +974,7 @@ mod tests {
         assert!(written.contains("Show the packet size") || written.contains("pj-001"), "the row: {written}");
         let printed = build_leg("pj-001", "edit", &path, &repo, true).unwrap();
         assert_eq!(at_leg_spawn("pj-001", "edit", &order, &repo, true, false, false, true), Some(printed.len() as u64));
-        assert!(printed.contains("pub fn a() {}") && printed.contains("wsp review pj-001"), "{printed}");
+        assert!(printed.contains("pub fn a() {}") && printed.contains("wsp submit pj-001"), "{printed}");
         let again = edit_order(&store);
         give_leg(&store, "pj-001", "edit", &repo, false, false, true);
         assert_eq!(edit_order(&store), again, "a leg that has one is not given a second");

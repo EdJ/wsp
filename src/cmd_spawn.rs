@@ -2749,6 +2749,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // when `--from` is not given, and the orders say to write it there.
     if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {
         order.env.insert("WSP_BATON".into(), crate::closing::baton_path(store, task, name).display().to_string());
+        // The same file is the leg's exit (`wsp-617`): `wsp submit` reads it from
+        // `$WSP_EXIT` and, told it is a leg's, closes the leg with it as baton.
+        order.env.insert("WSP_EXIT".into(), crate::closing::baton_path(store, task, name).display().to_string());
+        order.env.insert(crate::throttle::SEAT_KIND.into(), crate::exit::Kind::Leg.word().into());
     }
     // A row's scratch has an owner (`wsp-373`): build dirs and copies outside
     // its tree go here, and wsp removes them when the row closes.
@@ -7691,6 +7695,32 @@ mod tests {
     /// the governor's tree and the governor's pane, and would read all three as
     /// its own. So the assertion is on the pair: the claimed task is in the
     /// brief and the one this session is holding is not.
+    /// `wsp-617`: a member's seat has `$WSP_EXIT` in its environment, at the
+    /// path `$WSP_VERDICT` names, beside `$WSP_SEAT_KIND`.
+    #[test]
+    fn a_spawned_members_seat_has_its_exit_path_beside_its_verdict_and_kind() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("exit-env");
+        let mut proj = Project::new("core");
+        proj.roots = vec![rooted(&store, "core")];
+        store.save_project(&proj).unwrap();
+        let mut t = crate::model::Task::new("a row", "t-1");
+        t.project = Some("core".into());
+        t.body = "## Overview\nthe work\n".into();
+        store.save_task(&t).unwrap();
+
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("agent", "true"), ("kind", "opencode"), ("no-tree", "true")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags)), 0);
+        let opened = place.1.borrow().first().cloned().expect("no seat was opened");
+        let path = crate::closing::verdict_path(&store, "t-1", crate::closing::Kind::Member).display().to_string();
+        assert_eq!(opened.env.get("WSP_EXIT"), Some(&path), "{:?}", opened.env);
+        assert_eq!(opened.env.get("WSP_VERDICT"), Some(&path));
+        assert_eq!(opened.env.get(crate::throttle::SEAT_KIND).map(String::as_str), Some("member"));
+    }
+
     #[test]
     fn a_spawn_composes_the_brief_for_the_seat_it_opened_and_not_for_itself() {
         let _guard = no_backend();
@@ -7930,6 +7960,11 @@ mod tests {
         assert!(log.contains("leg scout started by pane w9:p1 · spawned at sonnet/medium"), "{log}");
         assert!(!log.contains("claimed by pane"), "{log}");
         assert_eq!(place.1.borrow()[0].label, "t-1 · scout");
+        // Its exit is its baton's file, and `wsp submit` is told it is a leg's (`wsp-617`).
+        let baton = crate::closing::baton_path(&store, "t-1", "scout").display().to_string();
+        assert_eq!(place.1.borrow()[0].env.get("WSP_EXIT"), Some(&baton));
+        assert_eq!(place.1.borrow()[0].env.get("WSP_BATON"), Some(&baton));
+        assert_eq!(place.1.borrow()[0].env.get(crate::throttle::SEAT_KIND).map(String::as_str), Some("leg"));
         let argv = place.0.borrow()[0].args.clone();
         assert_eq!(place.0.borrow()[0].kind, "claude", "the entry's kind, not the flag's");
         assert!(argv.iter().any(|a| a == "sonnet") && !argv.iter().any(|a| a.contains("opus")), "{argv:?}");
@@ -7937,7 +7972,7 @@ mod tests {
         assert!(place.2.borrow().is_empty(), "no tell for an order that went out in argv");
         let order = argv.last().cloned().expect("the order is the last argument");
         assert_eq!(argv[argv.len() - 2], "--");
-        assert!(order.contains("leg scout of t-1") && order.contains("wsp leg done t-1"), "{order}");
+        assert!(order.contains("leg scout of t-1") && order.contains("End with `wsp submit t-1`"), "{order}");
         assert!(!order.contains("wsp review") && !order.contains("last leg"), "a leg that is not last is not told of review: {order}");
         assert!(!order.contains('\n'), "{order:?}");
 
@@ -7952,8 +7987,8 @@ mod tests {
         assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags("plan"))), 0);
         let order = place.0.borrow().last().and_then(|a| a.args.last().cloned()).expect("the last leg's order is in argv");
         assert!(place.2.borrow().is_empty(), "and not told");
-        assert!(order.contains("leg plan of t-1") && order.contains("last leg: end with `wsp review t-1"), "{order}");
-        assert!(order.contains("as a call of its own, `wsp review t-1"), "{order}");
+        assert!(order.contains("leg plan of t-1") && order.contains("last leg: end with `wsp submit t-1`"), "{order}");
+        assert!(order.contains("then `wsp submit t-1` alone") && order.contains("ends the row"), "{order}");
         assert!(!order.contains('\n'), "{order:?}");
     }
 

@@ -157,16 +157,16 @@ pub(crate) fn tier_of(leg: &Leg) -> (String, Option<String>, Option<String>) {
     (kind, model, effort)
 }
 
-/// The one command that ends a leg, in words: a leg that is not last ends with
-/// `leg done`; the last leg ends with `review`, which closes its leg and the
-/// row, unless it adds a leg after itself, which makes `leg done` the end.
+/// The one command that ends a leg, in words: `wsp submit` (`wsp-617`), which
+/// is `leg done` for a leg that is not last and closes the row for the last,
+/// unless it adds a leg after itself, which makes it `leg done` again.
 pub(crate) fn ending_clause(task: &str, last: bool) -> String {
     match last {
         true => format!(
-            "You are the last leg: end with `wsp review {task} \"...\"`, which closes your leg and ends the row; \
-             if you add a leg after yourself, end with `wsp leg done {task} --caption \"...\"` instead."
+            "You are the last leg: end with `wsp submit {task}`, which closes your leg and ends the row; \
+             if you add a leg after yourself, the same submit closes only your leg."
         ),
-        false => format!("End with `wsp leg done {task} --caption \"...\"`."),
+        false => format!("End with `wsp submit {task}`, which is `wsp leg done` for a leg."),
     }
 }
 
@@ -591,11 +591,13 @@ mod tests {
 
     #[test]
     fn an_order_line_names_the_one_command_that_ends_the_leg() {
+        // Since `wsp-617` both end with `wsp submit`: a leg's is its `leg done`.
         let mid = order_line("m-1", "plan", false, false);
-        assert!(mid.contains("End with `wsp leg done m-1 --caption") && !mid.contains("wsp review"), "{mid}");
+        assert!(mid.contains("End with `wsp submit m-1`") && mid.contains("$WSP_EXIT") && !mid.contains("wsp review"), "{mid}");
+        assert!(mid.contains("`wsp submit m-1 --dry-run` once") && mid.contains("closes the leg"), "{mid}");
         let last = order_line("m-1", "build", false, true);
-        assert!(last.contains("last leg: end with `wsp review m-1") && last.contains("instead"), "{last}");
-        assert!(!last.contains("separate Bash calls, never chained with anything else: first write the baton, `cat > \"$WSP_BATON\" <<'EOF'` ... `EOF` (a heredoc with its text, never a bare `cat`); then, as a call of its own, `wsp leg done"), "{last}");
+        assert!(last.contains("last leg: end with `wsp submit m-1`") && last.contains("ends the row"), "{last}");
+        assert!(!last.contains('\n') && last.is_ascii(), "{last:?}");
     }
 
     fn chain() -> Vec<Leg> {

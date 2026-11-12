@@ -228,6 +228,9 @@ pub(crate) fn build(store: &Store, t: &Task) -> Option<String> {
          A verifier runs the box check, never the full suite.\n\n{RERUN}\n",
         command(&ws, &files, &mjs)
     ));
+    // It ends with the verifier's exit, the row's done-when pre-filled (`wsp-617`).
+    let items = crate::cmd_submit::packet_items(t);
+    out.push_str(&format!("\n{}", crate::closing::exit_template(crate::exit::Kind::Verifier, &t.id, &items)));
     Some(out)
 }
 
@@ -322,6 +325,10 @@ mod tests {
         assert!(order.contains("\n-  old();\n+  next();\n"), "the diff keeps its lines: {order}");
         assert!(order.contains("npm run check:box -- pane src/pane/Pane.tsx"), "the one command: {order}");
         assert!(order.contains("rerun") && order.contains("N25"), "{order}");
+        // It ends with the verifier's exit template (`wsp-617`).
+        let tmpl = crate::closing::exit_template(crate::exit::Kind::Verifier, "pj-001", &crate::cmd_submit::packet_items(&t));
+        assert!(order.trim_end().ends_with(tmpl.trim_end()), "{order}");
+        assert!(order.contains("verdict: holds | blocks") && order.contains("`wsp submit pj-001 --dry-run` once"), "{order}");
 
         let line = crate::cycle::verifier_order_line(&store, &t);
         assert!(!line.contains('\n'), "what the spawn types is one line: {line:?}");

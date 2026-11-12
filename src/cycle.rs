@@ -3449,7 +3449,8 @@ pub(crate) fn check_order(store: &Store, list: &str, at: usize) -> Option<String
 
 /// What the check is handed so it need not gather it (`wsp-326`): each member
 /// and its verdict, the stop's mechanical items, and — when wsp ran the
-/// barrier's checks — what they said and whose fault a failure reads as.
+/// barrier's checks — what they said and whose fault a failure reads as; then
+/// the check's exit template (`wsp-617`).
 fn packet_text(store: &Store, w: &Worklist, at: usize, g: &Group) -> String {
     let tasks = store.tasks_shared();
     let mut out = format!("**The packet.** The members and their verifiers' verdicts:\n\n{}", crate::barrier_run::head_text(&tasks, g));
@@ -3467,6 +3468,8 @@ fn packet_text(store: &Store, w: &Worklist, at: usize, g: &Group) -> String {
         )),
         None => out.push_str("\nwsp ran no checks for this barrier; build and test the group yourself.\n"),
     }
+    // It ends with the check's exit, submitted for the list (`wsp-617`).
+    out.push_str(&format!("\n{}", crate::closing::exit_template(crate::exit::Kind::Check, &w.id, &[])));
     out
 }
 
@@ -5330,6 +5333,11 @@ pub(crate) mod tests {
         assert!(bare.contains("The packet") && bare.contains("m-1"), "{bare}");
         assert!(bare.contains("gate (1m): sh gate.sh"), "the stop's mechanical items are shown: {bare}");
         assert!(bare.contains("ran no checks for this barrier"), "{bare}");
+        // The packet ends with the check's exit template, submitted for the list (`wsp-617`).
+        let w = store.worklist("run").unwrap();
+        let packet = packet_text(&store, &w, 1, &w.groups()[0]);
+        assert!(packet.ends_with(&crate::closing::exit_template(crate::exit::Kind::Check, "run", &[])), "{packet}");
+        assert!(bare.contains("verdict: go | hold | followup") && bare.contains("`wsp submit run --dry-run` once"), "{bare}");
 
         let file = crate::barrier_run::packet_file(&store, "run", 1);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();

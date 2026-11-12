@@ -10,7 +10,8 @@
 //! - **A baton at a place wsp knows** ([`baton_path`]): a leg's seat has
 //!   `$WSP_BATON` set, `wsp leg done` reads it when `--from` is not given, and
 //!   the orders say to write it with a heredoc and to run the closing verb as
-//!   its own Bash call ([`how_to_close`]).
+//!   its own Bash call ([`how_to_close`]; since `wsp-617` the exit into
+//!   `$WSP_EXIT` and `wsp submit`, which is `leg done` for a leg).
 //! - **Noticing** ([`tick`]): a leg that is `running` while its seat has sat
 //!   idle (or has a baton written and nothing after it) for [`TELL_AFTER`] is
 //!   told once, with the exact command. If it is still open [`SECOND_WINDOW`]
@@ -131,18 +132,91 @@ pub(crate) fn caption_of(baton: &str) -> String {
     util::truncate(&crate::util::fold(first), 100)
 }
 
-/// The words every order about closing carries (wsp-372): its own call, never
-/// chained, and the baton from a heredoc into `$WSP_BATON`.
+/// The words every order about closing carries (wsp-372, one line since
+/// `wsp-617`): the exit from a heredoc into `$WSP_EXIT` in one call, `wsp
+/// submit --dry-run` once, then `wsp submit` in a call of its own, never
+/// chained. A leg's submit is its `leg done`; the last leg's ends the row.
+/// ASCII, because a leg's order goes out in argv.
 pub(crate) fn how_to_close(task: &str, last: bool) -> String {
-    let verb = match last {
-        true => format!("`wsp review {task} \"...\"`"),
-        false => format!("`wsp leg done {task} --caption \"...\"`"),
+    let what = match last {
+        true => "it ends the row, as `wsp review` did",
+        false => "it closes the leg, as `wsp leg done` did, with the file as the baton",
     };
+    format!("{} ({what}).", submit_words(task))
+}
+
+/// The one line of how a seat closes on `row`: write, dry-run, submit.
+pub(crate) fn submit_words(row: &str) -> String {
     format!(
-        "Close it in two separate Bash calls, never chained with anything else: first write the baton, \
-         `cat > \"$WSP_BATON\" <<'EOF'` ... `EOF` (a heredoc with its text, never a bare `cat`); then, as a call of its own, {verb} \
-         (it reads $WSP_BATON). A close chained after another command waits on that command, and nobody sees it wait."
+        "Close in three Bash calls, none chained: write it with a heredoc, `cat > \"$WSP_EXIT\" <<'EOF'` ... `EOF` \
+         (never a bare `cat`); `wsp submit {row} --dry-run` once, fixing what it refuses; then `wsp submit {row}` alone"
     )
+}
+
+// ---- the exit template every packet ends with (`wsp-617`, row E6) --------------
+
+/// The template a packet ends with for a seat of `kind` (docs/exit-packet.md
+/// §2): its sections in order, ready to fill, then how to close. `done` is the
+/// row's own done-when items ([`crate::cmd_submit::packet_items`]), pre-filled
+/// as `- held: <item> — ` for the seat to finish or flip; with none, the line's
+/// shape. `row` is what `wsp submit` takes (a check's is its list). Under
+/// [`TEMPLATE_MAX`] bytes before the items.
+pub(crate) fn exit_template(kind: crate::exit::Kind, row: &str, done: &[String]) -> String {
+    use crate::exit::Kind as K;
+    let done_lines = |evidence: &str| match done.is_empty() {
+        true => format!("- held: <item, as the packet says it> — <{evidence}>\n- not held: <item> — <why>\n"),
+        false => done.iter().map(|i| format!("- held: {} — \n", fold_line(i))).collect(),
+    };
+    let checks = |word: &str, ran: &str| format!("{word}:\n- <label> (<time>): <command>{ran}\n\n");
+    let (body, note) = match kind {
+        K::Member => (
+            format!(
+                "summary: <under 100 chars: what is true now>\n\n<the account: what you did and left>\n\n\
+                 done-when:\n{}\n{}asks:\n- governor: <a decision for the governor>\n\
+                 - person: <a decision only the person can make>\n- note: <it asks nothing>\n\nowed: nothing\n",
+                done_lines("a test name, file:line"),
+                checks("checks", "")
+            ),
+            "Finish or flip each `held:`; keep the asks you have; `owed:` and `- <item>` lines if any is left.",
+        ),
+        K::Leg => (
+            format!(
+                "summary: <one line: what is true now>\n\n<the account: what the next leg needs>\n\n{}owed: nothing\n",
+                checks("checks", "")
+            ),
+            "`owed:` and `- <item>` lines for what the next leg is left; `done-when:` is optional.",
+        ),
+        K::Verifier => (
+            format!(
+                "verdict: holds | blocks\nsummary: <one line>\n\n<the verdict in prose>\n\ndone-when:\n{}\n{}\
+                 cause: work | check | tree | env — <one sentence>\n\nowed:\n- <what the member owes>\n",
+                done_lines("the evidence you read or ran"),
+                checks("checked", " — pass | fail")
+            ),
+            "On `holds`: no `cause:`, and `owed: nothing`. `cause: env` (you could not verify) blocks nothing.",
+        ),
+        K::Check => (
+            format!(
+                "verdict: go | hold | followup\nsummary: <one line>\n\n<the verdict in prose>\n\n{}\
+                 cause: work | check | tree | env — <one sentence>\n\nowed: nothing\n",
+                checks("checked", " — pass | fail")
+            ),
+            "`cause:` only on `hold`; a `followup` is a flag to the person.",
+        ),
+    };
+    let close = match kind {
+        K::Leg => how_to_close(row, false),
+        _ => format!("{}.", submit_words(row)),
+    };
+    format!("## Your exit\n\nTo `$WSP_EXIT`, in this order, each at a line's start:\n```text\n{body}```\n{note}\n{close}\n")
+}
+
+/// The most an exit template may cost a packet, before its done-when items.
+pub(crate) const TEMPLATE_MAX: usize = 800;
+
+/// A done-when item on one line, so the template keeps one line per item.
+fn fold_line(item: &str) -> String {
+    item.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 // ---- verdicts: a place for them, and what they parse to --------------------------
@@ -1369,9 +1443,53 @@ mod tests {
 
     #[test]
     fn the_closing_words_say_own_call_and_heredoc() {
+        // One line since `wsp-617`: the exit by heredoc, a dry run, the submit alone.
         let w = how_to_close("m-1", false);
-        assert!(w.contains("separate Bash calls") && w.contains("<<'EOF'") && w.contains("$WSP_BATON") && w.contains("wsp leg done m-1"), "{w}");
-        assert!(how_to_close("m-1", true).contains("wsp review m-1"));
+        assert!(w.contains("none chained") && w.contains("<<'EOF'") && w.contains("$WSP_EXIT") && w.contains("never a bare `cat`"), "{w}");
+        assert!(w.contains("`wsp submit m-1 --dry-run` once") && w.contains("then `wsp submit m-1` alone") && w.contains("leg done"), "{w}");
+        assert!(how_to_close("m-1", true).contains("ends the row"));
+        for last in [false, true] {
+            let w = how_to_close("m-1", last);
+            assert!(!w.contains('\n') && w.is_ascii(), "one ASCII line, for an order in argv: {w:?}");
+        }
+    }
+
+    /// `wsp-617`: every seat's template has its sections in the exit's order,
+    /// stays under [`TEMPLATE_MAX`] for a long row id, and ends with the close.
+    #[test]
+    fn each_seats_exit_template_has_its_sections_in_order_and_fits() {
+        use crate::exit::Kind as K;
+        let row = "compounding-456";
+        for (kind, heads) in [
+            (K::Member, &["summary:", "done-when:", "checks:", "asks:", "owed:"][..]),
+            (K::Leg, &["summary:", "checks:", "owed:"][..]),
+            (K::Verifier, &["verdict: holds | blocks", "summary:", "done-when:", "checked:", "cause:", "owed:"][..]),
+            (K::Check, &["verdict: go | hold | followup", "summary:", "checked:", "cause:", "owed:"][..]),
+        ] {
+            let t = exit_template(kind, row, &[]);
+            assert!(t.len() < TEMPLATE_MAX, "{kind:?} is {} bytes: {t}", t.len());
+            let at: Vec<usize> = heads.iter().map(|h| t.find(&format!("\n{h}")).unwrap_or_else(|| panic!("{kind:?} has no {h}: {t}"))).collect();
+            assert!(at.windows(2).all(|w| w[0] < w[1]), "{kind:?}'s sections are out of order: {t}");
+            assert!(t.contains("$WSP_EXIT") && t.trim_end().ends_with(&format!("`wsp submit {row}` alone.")) || kind == K::Leg, "{t}");
+            assert!(t.contains(&format!("`wsp submit {row} --dry-run` once")), "{t}");
+        }
+        assert!(!exit_template(K::Leg, row, &[]).contains("\ndone-when:\n"), "a leg's done-when is its order's");
+        assert!(!exit_template(K::Check, row, &[]).contains("\ndone-when:\n"));
+    }
+
+    /// The row's done-when bullets come pre-filled, one line each, for the
+    /// seat to finish or flip; with none, the line's shape is shown.
+    #[test]
+    fn a_templates_done_when_is_pre_filled_from_the_rows_items() {
+        use crate::exit::Kind as K;
+        let items = vec!["the parser reads it".to_string(), "a  long\nitem".to_string()];
+        let t = exit_template(K::Member, "m-1", &items);
+        assert!(t.contains("done-when:\n- held: the parser reads it — \n- held: a long item — \n\n"), "{t}");
+        assert!(!t.contains("<item, as the packet says it>"), "{t}");
+        let v = exit_template(K::Verifier, "m-1", &items);
+        assert!(v.contains("- held: the parser reads it — \n"), "{v}");
+        let bare = exit_template(K::Member, "m-1", &[]);
+        assert!(bare.contains("- held: <item, as the packet says it> — <a test name, file:line>\n- not held: <item> — <why>"), "{bare}");
     }
 
     // ---- wsp-374: a member, a verifier and a check ----------------------------------
