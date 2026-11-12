@@ -3460,7 +3460,7 @@ pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
 
 /// Set on the `--ending` helper [`rotate_on_behalf`] starts: wait until the
 /// predecessor is not mid-turn, rather than for a process to exit.
-pub(crate) const END_WHEN_IDLE: &str = "WSP_END_WHEN_IDLE";
+const END_WHEN_IDLE: &str = "WSP_END_WHEN_IDLE";
 
 fn arrange_ending_when_idle(store: &Store, scope: &str) -> Result<(), String> {
     when_idle(store, &["govern", scope, "--ending"])
@@ -5293,6 +5293,10 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn wait_idle(&self, seat: &str) {
         wait_for_pane(seat)
+    }
+
+    fn end_exit_when_idle(&self, store: &Store, seat: &str) -> Result<(), String> {
+        end_exit_when_idle(store, seat)
     }
 
     fn census(&self) -> Option<Vec<(String, String)>> {

@@ -655,7 +655,7 @@ fn end_my_seat(store: &Store, row: &str, kind: &str, me: Option<&str>) -> Option
     }
     let arranged = match cfg!(test) {
         true => Ok(()),
-        false => crate::cmd_spawn::end_exit_when_idle(store, &seat),
+        false => crate::cycle::Seats::end_exit_when_idle(&crate::cycle::Fleet, store, &seat),
     };
     Some(match arranged {
         Ok(()) => format!("submit: the {kind} seat {seat} is closing — no place under the cap now, ended at its Stop"),
@@ -664,12 +664,12 @@ fn end_my_seat(store: &Store, row: &str, kind: &str, me: Option<&str>) -> Option
 }
 
 /// `wsp submit --end-seat <seat>`, the helper [`end_my_seat`] leaves: wait for
-/// the seat's turn to end, then end it by [`crate::ending::end_exit`].
+/// the seat's turn to end, then end it by [`crate::ending::end_exit`]. Through
+/// the [`crate::cycle::Seats`] port, so this module reaches no seat verb.
 fn end_at_stop(store: &Store, seat: &str) -> i32 {
-    if std::env::var_os(crate::cmd_spawn::END_WHEN_IDLE).is_some_and(|v| !v.is_empty()) {
-        crate::cmd_spawn::wait_for_pane(seat);
-    }
-    match crate::ending::end_exit(store, &crate::cycle::Fleet, seat) {
+    let fleet = crate::cycle::Fleet;
+    crate::cycle::Seats::wait_idle(&fleet, seat);
+    match crate::ending::end_exit(store, &fleet, seat) {
         Some(line) => println!("{line}"),
         None => println!("wsp: {seat} is still in a turn or unreadable — the next tick ends it"),
     }

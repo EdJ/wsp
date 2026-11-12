@@ -296,6 +296,13 @@ pub(crate) trait Seats {
     /// Block until the pane is not mid-turn, or twenty minutes have passed —
     /// `cmd_spawn::wait_for_pane`. Returns at once by default.
     fn wait_idle(&self, _seat: &str) {}
+
+    /// Arrange the ending of an accepted exit's seat at its `Stop` —
+    /// `cmd_spawn::end_exit_when_idle` (`wsp-615`). Does nothing by default, for
+    /// [`Seats::end_when_idle`]'s reason; the tick ends the seat instead.
+    fn end_exit_when_idle(&self, _store: &Store, _seat: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The real reading, over the backends on this machine — with opencode's own
