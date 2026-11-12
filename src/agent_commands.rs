@@ -3592,6 +3592,42 @@ mod tests {
         );
     }
 
+    /// The exit is `wsp submit` (docs/exit-packet.md §3), and every packet ends
+    /// by telling the seat to run it. A seat refused it could not leave: its
+    /// turn would stop with no exit accepted, and closing for the seat would be
+    /// the only way out. So the verb, and each of its aliases, is in the
+    /// registry `wsp help` is built from, and no deny a spawned opencode is
+    /// configured with reaches any of them.
+    #[test]
+    fn a_spawned_opencode_may_submit_its_exit_and_submit_is_in_the_help() {
+        let exits = ["submit", "review", "verified", "leg done", "worklist go", "worklist hold"];
+        let registered = |word: &str| crate::registry::ALL.iter().flat_map(|m| m.iter()).any(|v| v.names.contains(&word));
+        for exit in exits {
+            let head = exit.split_whitespace().next().unwrap();
+            assert!(registered(head), "`wsp {head}` is a registered verb");
+        }
+        let submit = crate::cmd_submit::VERBS.iter().find(|v| v.names.contains(&"submit")).expect("submit is registered");
+        assert!(
+            submit.help.iter().any(|h| h.section == crate::verbs::Section::Tasks && h.text.trim_start().starts_with("wsp submit <id>")),
+            "`wsp help` lists submit under TASKS"
+        );
+
+        let env = of("opencode").env(None, &Reach::default());
+        let v: Value = serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        let denies: Vec<String> = v["permission"]["bash"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, a)| *a == "deny")
+            .map(|(p, _)| p.trim_end_matches('*').to_string())
+            .collect();
+        assert!(!denies.is_empty(), "the denies are still there to check against");
+        for exit in exits {
+            let line = format!("wsp {exit} wsp-618 --dry-run");
+            assert!(!denies.iter().any(|d| line.starts_with(d.as_str())), "`{line}` meets a deny in {denies:?}");
+        }
+    }
+
     /// What may be written under `external_directory`, and what may never be.
     ///
     /// `core-041` d2 forbade the key because setting it cannot both state the

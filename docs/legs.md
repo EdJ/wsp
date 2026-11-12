@@ -285,7 +285,16 @@ way, on its entry, whether it runs alone or beside a sibling. One rule for both.
   d1's `3/5` is dropped: in a graph the position in the list does not say how
   far along the row is.
 
-**Ending a leg:** `wsp leg done <task> --from FILE --caption "…"`. The command:
+**Ending a leg:** `wsp submit <task>` (wsp-614, wsp-617; docs/exit-packet.md
+§2.4). A leg's seat carries `$WSP_EXIT` and `$WSP_SEAT_KIND=leg`, and its
+packet ends with the leg's exit template: `summary:`, the account, `checks:`
+and `owed:`, with `done-when:` optional. The seat writes it to `$WSP_EXIT` with
+a heredoc, runs `wsp submit <task> --dry-run` once, then `wsp submit <task>`.
+The submit is `wsp leg done` with the file as the baton and its summary as the
+caption, and the last leg's submit ends the row as a member's exit does. `wsp
+leg done <task> --from FILE --caption "…"` is its alias and runs the same rules
+on an exit-shaped baton; a refused one leaves the leg open. Either way the
+command:
 
 1. **Refuses if the leg's tree has uncommitted tracked changes.** Every leg
    boundary is a commit. That lets the legs that wait on it trust `git log`
@@ -297,11 +306,11 @@ way, on its entry, whether it runs alone or beside a sibling. One rule for both.
    leg's spend.
 4. Pokes the run.
 
-**`wsp review` from a leg ends the row** when no other leg is running. The
+**The last leg's submit (or `wsp review`) from a leg ends the row** when no other leg is running. The
 remaining pending legs are written `skipped · ended by review`. A scout that
 finds nothing to do should not have to walk the graph. With a sibling still
 running, `review` is refused and names it: the row is not finished while work
-on it is open. The last leg always types `review`, since nothing else is
+on it is open. The last leg always submits, since nothing else is
 running by then. **`wsp block` from a leg** blocks the row, as it does today,
 and siblings already running finish their legs. Nothing new starts on a
 blocked row. A leg that finds the baton too thin to work from blocks rather
@@ -751,7 +760,7 @@ is written:
   then `plan` (decides from the baton plus targeted reads, and adds the
   build legs; Opus only with a `why:`), then `build-<layer>` × N (edits,
   runs the loop, commits), then `finish` (the full test, rebase, review —
-  `wsp leg done` from the last leg marks the row ready and a verifier lands it;
+  `wsp submit` from the last leg marks the row ready and a verifier lands it;
   a row in no run still lands). The plan leg decides whether the builds are a chain or siblings.
 - **Do not stage** a row under ~80 turns that sits in one layer. The extra
   starts and re-reads cost more than they save, against the same row
