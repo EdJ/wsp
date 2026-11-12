@@ -209,6 +209,9 @@ pub(crate) struct Records {
     pub held_asks: BTreeSet<String>,
     /// Each project's `light:` tags, its nearest parent's where it has none.
     pub lights: BTreeMap<String, Vec<String>>,
+    /// The seats of accepted exits not yet ended (`wsp-615`): closing, so not
+    /// counted, seen working or not.
+    pub exited: BTreeSet<String>,
 }
 
 /// The panes and tasks waiting on a person's answer for longer than `after`
@@ -238,6 +241,7 @@ impl Records {
             agents: store.agents_held(),
             governors: store.governors(),
             lights: lights_of(&store.projects()),
+            exited: crate::ending::exited_seats(store),
         }
     }
 
@@ -329,7 +333,7 @@ pub(crate) fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> 
     // no place whatever its screen shows; the tick ends it by its pane.
     let mut take = |out: &mut Vec<Counted>, seat: Option<&str>, what: String, weight: usize, finished: bool, settled: bool, since: Option<&str>| {
         if let Some(s) = seat {
-            if !here(s) || governor(s) || r.held_asks.contains(s) || !seen.insert(s.to_string()) || settled || !look(s).counts(finished) {
+            if !here(s) || governor(s) || r.held_asks.contains(s) || r.exited.contains(s) || !seen.insert(s.to_string()) || settled || !look(s).counts(finished) {
                 return;
             }
             let never_up = look(s) == Look::Starting && since.is_some_and(|at| now - util::epoch_of(at) > crate::barrier::NOT_UP_AFTER);
@@ -642,6 +646,7 @@ mod tests {
             governors: BTreeMap::new(),
             held_asks: BTreeSet::new(),
             lights: BTreeMap::new(),
+            exited: BTreeSet::new(),
         }
     }
 

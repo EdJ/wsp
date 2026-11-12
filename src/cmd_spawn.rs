@@ -3460,7 +3460,7 @@ pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
 
 /// Set on the `--ending` helper [`rotate_on_behalf`] starts: wait until the
 /// predecessor is not mid-turn, rather than for a process to exit.
-const END_WHEN_IDLE: &str = "WSP_END_WHEN_IDLE";
+pub(crate) const END_WHEN_IDLE: &str = "WSP_END_WHEN_IDLE";
 
 fn arrange_ending_when_idle(store: &Store, scope: &str) -> Result<(), String> {
     when_idle(store, &["govern", scope, "--ending"])
@@ -3481,6 +3481,14 @@ fn arrange_ending_when_idle(store: &Store, scope: &str) -> Result<(), String> {
 /// for that reason.
 pub(crate) fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
     when_idle(store, &["despawn", "--pane", seat, "--keep-tree"])
+}
+
+/// The seat of an accepted exit (`wsp-615`), ended at its `Stop`: `wsp submit
+/// --end-seat <seat>`, detached, under [`END_WHEN_IDLE`] — which waits for the
+/// turn to end and then runs [`crate::ending::end_exit`], its guards and its
+/// confirmation, rather than a bare despawn.
+pub(crate) fn end_exit_when_idle(store: &Store, seat: &str) -> Result<(), String> {
+    when_idle(store, &["submit", "--end-seat", seat])
 }
 
 /// Run `wsp <argv>` detached, under [`END_WHEN_IDLE`], with its output in the

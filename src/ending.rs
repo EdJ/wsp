@@ -82,6 +82,28 @@
 //! drops the binding, and [`original_seats`] ends that pane once every leg is
 //! `done` or `skipped` and the row is landed — by the same rules and the same
 //! confirmation as a member's.
+//!
+//! # An accepted exit ends its seat in the same call (`wsp-615`, E4)
+//!
+//! `wsp submit` (docs/exit-packet.md) is a seat's way out, and once its exit is
+//! accepted the seat has nothing left to do: a **member's**, a **verifier's**
+//! and a **barrier check's** alike. The submit records the seat ([`exited`]) and
+//! from that call on it holds no place under the cap ([`exited_seats`], read by
+//! [`crate::room`]); it is ended at its `Stop` by a helper the submit leaves
+//! behind, and by the next tick where that helper is not there ([`end_exit`]).
+//! The rules are this module's: never a governor seat, never one a turn began at
+//! since the exit, its pids read before the despawn and confirmed gone after
+//! it, the tree kept. Ended or left, it is said once on the row.
+//!
+//! **A member's seat is ended at submit, not held until the verdict** — Ed's
+//! decision D1 (2026-11-12, docs/exit-packet.md §10). A blocks verdict starts
+//! a rework seat from the verdict's `sent back:` reason, so the context the
+//! held seat would have kept is not what a rework is made from; a seat held
+//! until its verdict held a place under the cap for the whole verification.
+//! The `handed`/`holds` endings above stay for rows that reach review without
+//! `submit`. A `not held` exit with a decision ask ends its seat too (D3): the
+//! answer reopens the row, with the answer as its `sent back:` reason, on a
+//! fresh seat ([`crate::cmd_submit::answered`]).
 
 use crate::cycle::Seats;
 use crate::model::{Status, Task, Worklist, WorklistStatus};
@@ -325,6 +347,7 @@ pub(crate) fn left(r: &Reading) -> Option<Left> {
 /// off the **open** lists alone — their groups that wsp runs — and the verdict
 /// off the member.
 pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
+    exits(store, seats);
     let lists = open_lists(store);
     let mut tasks = None;
     let mut asks = None;
@@ -844,6 +867,139 @@ fn once(store: &Store, id: &str, line: &str) -> bool {
         t.touch();
         store.save_task(&t).is_ok()
     })
+}
+
+// ---- an accepted exit ends its seat (`wsp-615`, row E4) ----------------------
+
+/// Where the seats of accepted exits wait for their ending: seat → the row, the
+/// kind and when it was accepted. Read by the cap ([`exited_seats`]) and ended by
+/// [`end_exit`].
+const EXITS: &str = "exits.json";
+
+/// The line on the row saying the seat of its accepted exit was ended.
+pub(crate) const EXIT_ENDED: &str = "ended: its exit was accepted at";
+
+/// The line on the row saying that seat is left running, and why.
+const EXIT_LEFT: &str = "wsp: the exit is accepted and its seat is left running —";
+
+/// The line on the row saying ending that seat was tried and failed.
+const EXIT_NOT_ENDED: &str = "wsp: could not end the seat of an accepted exit";
+
+fn read_exits(store: &Store) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(store.state_file(EXITS))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn write_exits(store: &Store, all: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let file = store.state_file(EXITS);
+    let tmp = file.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::Value::Object(all.clone()).to_string()).is_ok() && std::fs::rename(&tmp, &file).is_ok()
+}
+
+/// `wsp submit` accepted an exit from `seat` for `row`: the seat is closing.
+/// From here it holds no place under the cap ([`exited_seats`]), and the tick
+/// — or the seat's own `Stop`, where a turn is in flight — ends it.
+pub(crate) fn exited(store: &Store, seat: &str, row: &str, kind: &str) -> bool {
+    store.locked(|| {
+        let mut all = read_exits(store);
+        all.insert(seat.to_string(), serde_json::json!({ "row": row, "kind": kind, "at": util::epoch_secs() }));
+        write_exits(store, &all)
+    })
+}
+
+/// The seats of accepted exits not yet ended or left: none of them is counted
+/// under the cap, seen working or not, as a settled verifier is not (`wsp-385`).
+pub(crate) fn exited_seats(store: &Store) -> std::collections::BTreeSet<String> {
+    read_exits(store).keys().cloned().collect()
+}
+
+fn forget_exit(store: &Store, seat: &str) {
+    store.locked(|| {
+        let mut all = read_exits(store);
+        all.remove(seat).is_some() && write_exits(store, &all)
+    });
+}
+
+/// Every accepted exit's seat, tried once each tick.
+fn exits(store: &Store, seats: &dyn Seats) {
+    for seat in exited_seats(store) {
+        end_exit(store, seats, &seat);
+    }
+}
+
+/// End the seat of an accepted exit — member, verifier or check — by ending.rs's
+/// own rules: never a governor seat, never one a turn began at since the exit
+/// was accepted ([`Seats::turn_began_since`], a backend that cannot say holds),
+/// and never mid-turn. Its pids are read before the despawn and confirmed gone
+/// after it ([`verifier_pids`], [`confirm_gone`]); the **tree is kept**, which a
+/// verifier reads in and the landing came from.
+///
+/// **No wait counts**: a `not held` exit raised its own decision ask, and the
+/// seat is ended behind it (D3) — the answer reopens the row on a fresh seat.
+///
+/// A turn in flight, or a seat nobody can read, passes by itself and is tried
+/// again: at the seat's `Stop` by the helper `wsp submit` arranged, else on the
+/// next tick. Everything else is said once on the row and in `cycle.log`, and
+/// the record goes, so a seat left is counted again by what it is doing. `None`
+/// is not yet; `Some` is the line said.
+pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<String> {
+    let e = read_exits(store).get(seat).cloned()?;
+    let row = e["row"].as_str().unwrap_or_default().to_string();
+    let kind = e["kind"].as_str().unwrap_or("member").to_string();
+    let at = e["at"].as_i64().unwrap_or(0);
+    let state = seats.state(seat);
+    let reading = Reading {
+        state,
+        wait: None,
+        governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat)),
+        typed: seats.turn_began_since(seat, at),
+        pids: seats.pids(seat),
+    };
+    let line = match left(&reading) {
+        Some(why) if why.passes() => return None,
+        Some(why) => {
+            let sentence = match why {
+                Left::Typed => "a turn began at it after the exit was accepted, so somebody is using it and it is theirs to end".into(),
+                Left::Untold => "it cannot say whether anybody has typed to it since the exit was accepted".into(),
+                other => other.sentence(),
+            };
+            format!("{EXIT_LEFT} {seat} ({kind}): {sentence}")
+        }
+        None => {
+            let pids = match verifier_pids(seats, seat) {
+                Ok(p) => p,
+                Err(why) if why.passes() => return None,
+                Err(why) => return Some(said_exit(store, seat, &row, &format!("{EXIT_LEFT} {seat} ({kind}): {}", why.sentence()))),
+            };
+            let gone = matches!(state, Some(State::Gone | State::Empty));
+            let claimed = kind == "member" && store.claims().contains_key(&row);
+            let ending = match (claimed, gone) {
+                (true, _) => crate::cycle::despawned_keeping(store, &row, true),
+                (false, true) => Ok(()),
+                (false, false) => crate::cycle::despawn_seat_keeping(seat, true),
+            };
+            match ending.and_then(|()| confirm_gone(seats, &pids)) {
+                Ok(()) => format!("{EXIT_ENDED} {} ({kind}, {seat}), no pid of it running and its tree kept", util::iso_at(at)),
+                Err(why) => format!("{EXIT_NOT_ENDED} ({kind}, {seat}) — {}", util::truncate(&why, 160)),
+            }
+        }
+    };
+    Some(said_exit(store, seat, &row, &line))
+}
+
+/// Say `line` once on the row (where `row` is one) and in `cycle.log`, and let
+/// the record go: what is said is the end of it, ended or left.
+fn said_exit(store: &Store, seat: &str, row: &str, line: &str) -> String {
+    forget_exit(store, seat);
+    once(store, row, line);
+    crate::store::log_line(store, &format!("{row}: {}", line.trim_start_matches("wsp: ")));
+    if line.starts_with(EXIT_ENDED) {
+        store.git_commit(&format!("wsp: {row}'s seat ended on its exit"));
+    }
+    line.to_string()
 }
 
 #[cfg(test)]
@@ -1696,4 +1852,85 @@ mod tests {
         assert!(crate::check_tree::left_line(&crate::check_tree::Left { row: "f-1".into(), tree: "/r/.worktrees/f-1".into(), pids: vec![1, 2], spared: vec![] }, 2048).contains("2 processes (2 MB)"));
     }
 
+
+    // ---- `wsp-615`: an accepted exit ends its seat ----------------------------
+
+    /// The run's places, with every seat seen working: what the cap counts.
+    fn counted_now(store: &Store) -> Vec<String> {
+        let r = crate::room::Records::read(store);
+        crate::room::working(&r, &|_| crate::room::Look::Working).into_iter().map(|c| c.what).collect()
+    }
+
+    /// The three kinds: a member claimed on `cpd-1`, its verifier on `cpd-2` and a
+    /// barrier check on `cpd-3`, each idle with a pid, nobody having typed since.
+    fn three_exits(tag: &str) -> (util::Isolated, Store, Fake) {
+        let (env, store) = verified(tag);
+        set_pass(&store, crate::verification::State::Running);
+        drain(&crate::cycle::tests::KEPT);
+        let mut f = Fake::at_rest();
+        f.state.insert("cpd-3".into(), State::Idle);
+        f.typed.insert("cpd-3".into(), false);
+        f.pids.insert("cpd-3".into(), vec![303]);
+        (env, store, f)
+    }
+
+    #[test]
+    fn a_member_a_verifier_and_a_check_are_ended_within_one_tick_of_an_accepted_exit_and_the_tree_kept() {
+        let (_env, store, f) = three_exits("exit-three");
+        assert!(counted_now(&store).contains(&"m-1".to_string()), "seen working at review, the member counted before its exit");
+        assert!(exited(&store, "cpd-1", "m-1", "member"));
+        assert!(exited(&store, "cpd-2", "m-1", "verifier"));
+        assert!(exited(&store, "cpd-3", "run-check-1", "check"));
+        assert!(!counted_now(&store).contains(&"m-1".to_string()), "the cap drops in the submit's own call, before any tick");
+        exits(&store, &f);
+        let ended = drain(&DESPAWNED);
+        assert!(ended.contains(&"m-1".to_string()), "the member, by its claim: {ended:?}");
+        assert!(ended.contains(&"cpd-2".to_string()) && ended.contains(&"cpd-3".to_string()), "the verifier and the check, by their seats: {ended:?}");
+        let kept = drain(&crate::cycle::tests::KEPT);
+        assert_eq!(kept.len(), 3, "every one with --keep-tree: {kept:?}");
+        let log = log_of(&store, "m-1");
+        assert_eq!(log.matches(EXIT_ENDED).count(), 2, "the member's and its verifier's, once each: {log}");
+        assert!(exited_seats(&store).is_empty(), "nothing is left to end");
+        exits(&store, &f);
+        assert!(drain(&DESPAWNED).is_empty(), "and nothing is ended twice");
+    }
+
+    #[test]
+    fn a_governor_seat_and_one_typed_to_since_are_not_ended_and_each_is_said_once() {
+        let (_env, store, mut f) = three_exits("exit-left");
+        store.set_governor("run", serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
+        f.typed.insert("cpd-2".into(), true);
+        exited(&store, "cpd-1", "m-1", "member");
+        exited(&store, "cpd-2", "m-1", "verifier");
+        exits(&store, &f);
+        exits(&store, &f);
+        assert!(drain(&DESPAWNED).is_empty(), "neither is ended");
+        let log = log_of(&store, "m-1");
+        assert_eq!(log.matches("cpd-1 (member): its seat governs run").count(), 1, "{log}");
+        assert_eq!(log.matches("cpd-2 (verifier): a turn began at it after the exit").count(), 1, "{log}");
+    }
+
+    #[test]
+    fn a_seat_mid_turn_is_left_for_its_stop_and_counts_for_nothing_meanwhile() {
+        let (_env, store, f) = three_exits("exit-turn");
+        let f = f.with("cpd-1", State::Working);
+        exited(&store, "cpd-1", "m-1", "member");
+        assert_eq!(end_exit(&store, &f, "cpd-1"), None, "a turn in flight passes by itself");
+        assert!(drain(&DESPAWNED).is_empty());
+        assert!(!counted_now(&store).contains(&"m-1".to_string()), "closing, so no place under the cap while it turns");
+        let f = f.with("cpd-1", State::Idle);
+        assert!(end_exit(&store, &f, "cpd-1").is_some_and(|l| l.starts_with(EXIT_ENDED)), "ended at its Stop");
+        assert_eq!(drain(&DESPAWNED), vec!["m-1".to_string()]);
+    }
+
+    #[test]
+    fn a_seat_whose_pid_outlives_the_despawn_is_said_not_ended_once_and_not_retried() {
+        let (_env, store, mut f) = three_exits("exit-survives");
+        f.survives = vec![202];
+        exited(&store, "cpd-2", "m-1", "verifier");
+        exits(&store, &f);
+        exits(&store, &f);
+        assert_eq!(drain(&DESPAWNED), vec!["cpd-2".to_string()], "tried once");
+        assert_eq!(log_of(&store, "m-1").matches(EXIT_NOT_ENDED).count(), 1);
+    }
 }

@@ -53,7 +53,11 @@
 //! [`crate::waiting::route`]. `owed:` lines that open `person:` are the steps
 //! owed to the person (compounding-470): the row still goes on, they are logged
 //! by name and its governor is told they belong to the list's closing person
-//! row. Either way the seat is ended once it is not mid-turn (D1).
+//! row. Either way the seat is ended (D1, `wsp-615`): from this call it holds no
+//! place under the cap, and [`crate::ending::end_exit`] ends it at its `Stop`,
+//! the tree kept — a verifier's and a check's seat the same. The answer to a
+//! decision ask reopens the row with the answer as its `sent back:` reason
+//! ([`answered`]).
 
 use crate::closing;
 use crate::exit::{Ask, Exit, Kind, Outcome, Refusal, To};
@@ -92,6 +96,10 @@ const FULL_SUITE: &[&str] = &["cargo nextest run --workspace", "npm run check"];
 const MEMBER_MAX_SECS: u64 = 30 * 60;
 
 pub fn submit(store: &Store, args: &Args) -> i32 {
+    // The helper an accepted exit leaves behind: its seat, ended at its `Stop`.
+    if let Some(seat) = args.get("end-seat") {
+        return end_at_stop(store, &seat);
+    }
     let kind = std::env::var(crate::throttle::SEAT_KIND).ok();
     submit_as(store, args, kind.as_deref())
 }
@@ -130,7 +138,7 @@ pub(crate) fn submit_from(store: &Store, args: &Args, kind: Option<&str>, me: Op
     match kind {
         Kind::Verifier => return submit_verifier(store, args, &t, me),
         Kind::Leg => {
-            if let Some(code) = submit_leg(store, args, &t, me) {
+            if let Some(code) = submit_leg(store, args, &t, me.clone()) {
                 return code;
             }
             // The last leg of a row submits as a member: it ends the row.
@@ -166,7 +174,7 @@ pub(crate) fn submit_from(store: &Store, args: &Args, kind: Option<&str>, me: Op
         println!("wsp: {} would be submitted — dry run, nothing moved", t.id);
         return 0;
     }
-    take(store, args, &t, &checked, exit, &text, &from)
+    take(store, args, &t, &checked, exit, &text, &from, me.as_deref())
 }
 
 /// The exit's text and where it came from: `--from FILE|-`, `$WSP_EXIT`, or
@@ -571,7 +579,7 @@ fn plan_lines(t: &Task, c: &Checked, e: &Exit) -> Vec<String> {
     for s in owed_to_the_person(e) {
         out.push(format!("  owed to the person: {s} — its governor is told, for the list's closing person row"));
     }
-    out.push("  the seat ended once it is not mid-turn".into());
+    out.push("  the seat closing: no place under the cap from this call, ended at its Stop with its tree kept".into());
     out
 }
 
@@ -634,19 +642,64 @@ fn raise(store: &Store, t: &Task, ask: &Ask) -> Result<String, String> {
     Ok(q.id)
 }
 
-/// End this seat once it is not mid-turn (D1), unless it governs something.
-fn end_my_seat(store: &Store, id: &str) -> Option<String> {
-    let seat = crate::place::my_pane()?;
-    if let Some(scope) = crate::place::governs(&store.governors(), &crate::place::Seat::new(&seat)) {
-        return Some(format!("submit: the seat {seat} governs {scope}, so it is not ended"));
+/// An accepted exit's seat is closing, in this call (`wsp-615`, E4; D1): it
+/// holds no place under the cap from here, and it is ended at its `Stop` — by
+/// [`crate::ending::end_exit`], whose guards keep a governor seat and one typed
+/// to since, and whose despawn keeps the tree. The next tick ends it where the
+/// helper did not. `row` is where the ending is said: the member's, or the
+/// verifier's member, or a check's barrier.
+fn end_my_seat(store: &Store, row: &str, kind: &str, me: Option<&str>) -> Option<String> {
+    let seat = me.map(str::to_string).or_else(crate::place::my_pane)?;
+    if !crate::ending::exited(store, &seat, row, kind) {
+        return Some(format!("submit: could not record {seat} as closing — `wsp despawn --pane {seat} --keep-tree` ends it"));
     }
-    Some(match crate::cycle::end_seat_when_idle(store, &seat) {
-        Ok(()) => format!("submit: the seat {seat} is ended once it is not mid-turn"),
-        Err(why) => format!("submit: could not arrange the end of {seat}: {why} — `wsp despawn --pane {seat} --keep-tree` ends it ({id})"),
+    let arranged = match cfg!(test) {
+        true => Ok(()),
+        false => crate::cmd_spawn::end_exit_when_idle(store, &seat),
+    };
+    Some(match arranged {
+        Ok(()) => format!("submit: the {kind} seat {seat} is closing — no place under the cap now, ended at its Stop"),
+        Err(why) => format!("submit: the {kind} seat {seat} is closing — no place under the cap now; ended by the next tick ({why})"),
     })
 }
 
-fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str, from: &str) -> i32 {
+/// `wsp submit --end-seat <seat>`, the helper [`end_my_seat`] leaves: wait for
+/// the seat's turn to end, then end it by [`crate::ending::end_exit`].
+fn end_at_stop(store: &Store, seat: &str) -> i32 {
+    if std::env::var_os(crate::cmd_spawn::END_WHEN_IDLE).is_some_and(|v| !v.is_empty()) {
+        crate::cmd_spawn::wait_for_pane(seat);
+    }
+    match crate::ending::end_exit(store, &crate::cycle::Fleet, seat) {
+        Some(line) => println!("{line}"),
+        None => println!("wsp: {seat} is still in a turn or unreadable — the next tick ends it"),
+    }
+    0
+}
+
+/// The answer to a decision ask a `not held` exit raised (D3): it reopens the
+/// row, with the answer as its `sent back:` reason, on a fresh seat — and the
+/// time from the ask to the decision is written on the row and as a
+/// `decision-waited` event, so a slow decision is seen in the effort and the
+/// retro. Nothing for any other question.
+pub(crate) fn answered(store: &Store, q: &Message, answer: &str) {
+    let Some(w) = q.waiting.as_ref().filter(|w| w.pane.is_empty() && !w.task.is_empty()) else { return };
+    let Some(t) = store.find_task(&w.task) else { return };
+    let ours = t.section("Log").is_some_and(|l| l.lines().any(|x| x.contains("asked (") && x.ends_with(&format!(" · {}", q.id))));
+    if t.status() != Status::Blocked || !ours {
+        return;
+    }
+    let secs = (util::epoch_secs() - util::epoch_of(&q.at)).max(0);
+    log_on(store, &t.id, &[format!("decided: {} answered {}m after it was asked", q.id, secs / 60)]);
+    store.log_event("decision-waited", serde_json::json!({ "id": t.id, "question": q.id, "asked": q.at, "secs": secs }));
+    let answer = fold(answer);
+    let reason = match answer.is_empty() {
+        true => format!("decided ({})", q.id),
+        false => answer,
+    };
+    let _ = crate::cmd_task::reopen(store, &Args::synth("reopen", &[&t.id, &reason], &[]));
+}
+
+fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str, from: &str, me: Option<&str>) -> i32 {
     let id = t.id.clone();
     let mut said: Vec<String> = Vec::new();
     // V1: the artefacts, put back by wsp.
@@ -753,7 +806,7 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
             &format!("{id} is submitted with {} step(s) owed to the person, for the list's closing person row: {}", person.len(), person.join("; ")),
         );
     }
-    if let Some(line) = end_my_seat(store, &id) {
+    if let Some(line) = end_my_seat(store, &id, "member", me) {
         said.push(line);
     }
     log_on(store, &id, &said);
@@ -1067,7 +1120,13 @@ fn submit_verifier(store: &Store, args: &Args, t: &Task, me: Option<String>) -> 
         println!("wsp: {} would be submitted — dry run, nothing moved", t.id);
         return 0;
     }
-    crate::verification::verdict_core(store, t.clone(), judged, me)
+    let code = crate::verification::verdict_core(store, t.clone(), judged, me.clone());
+    if code == 0 {
+        if let Some(line) = end_my_seat(store, &t.id, "verifier", me.as_deref()) {
+            log_on(store, &t.id, &[line]);
+        }
+    }
+    code
 }
 
 /// The list and barrier a check's `<row>` names: the list's id, or the
@@ -1160,10 +1219,16 @@ fn submit_check(store: &Store, args: &Args, needle: &str) -> i32 {
     let path = file.display().to_string();
     let verb = verdict.word();
     let a = Args::synth("worklist", &[verb, w.id.as_str()], &[("from", &path), ("caption", &e.summary)]);
-    match verdict {
+    let code = match verdict {
         Verdict::Go => crate::cmd_worklist::go(store, &a),
         _ => crate::cmd_worklist::hold(store, &a),
+    };
+    if code == 0 {
+        if let Some(line) = end_my_seat(store, &key, "check", None) {
+            crate::store::log_line(store, &format!("{} barrier {at}: {line}", w.id));
+        }
     }
+    code
 }
 
 /// `worklist go`/`hold` from a check's seat: its words run the check's

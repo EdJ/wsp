@@ -815,6 +815,10 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
     if closed.question.for_person {
         tell_the_list(store, &closed, args);
     }
+    // A `not held` exit's decision ask: its seat is gone, and the answer reopens the row (D3).
+    if !giving_up {
+        crate::cmd_submit::answered(store, &closed.question, &closed.reply.text);
+    }
     deliver(store, &closed, args)
 }
 
