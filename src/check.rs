@@ -151,7 +151,7 @@ pub(crate) fn parse_steps(text: &str, of: Of) -> Vec<Step> {
 }
 
 /// What stands before the `: ` of a step.
-struct Head {
+pub(crate) struct Head {
     name: String,
     limit: Option<Duration>,
     on: Vec<String>,
@@ -167,9 +167,9 @@ struct Head {
 /// never handed to `sh` with its label as the program.
 pub(crate) fn step_of(item: &str, of: Of) -> Option<Step> {
     let item = item.trim();
-    let (head, command) = match item.split_once(": ") {
-        Some((h, c)) if head_of(h).is_some() => (head_of(h), c),
-        _ => (None, item),
+    let (head, command) = match line_of(item) {
+        Some((h, c)) => (Some(h), c),
+        None => (None, item),
     };
     let command = command_of(command);
     if command.is_empty() {
@@ -277,6 +277,78 @@ pub(crate) fn refused_in(steps: &[Step]) -> Vec<String> {
     out
 }
 
+/// The one check-line grammar, read by `## Checks` ([`step_of`]), `wsp check
+/// --set`, `--stop` lines and an exit's `checks:` / `checked:`
+/// ([`timed_line`]), so the four cannot disagree (`wsp-612`, the exit plan's
+/// V3): the head and the command of `label (time)[ on <globs>][ at
+/// barrier|end]: command`, or of wsp-609's untimed `label words: command`.
+///
+/// A timed label is everything before the last ` (` that is followed by a time
+/// (`Ns`, `Nm`, `Nh`) and `)`, so it may be several words of anything
+/// (`web-chrome ctl & workspace (5m): …`); only a label with no `: ` and no
+/// open `"` or backtick counts, so a timed pattern inside the command is not
+/// mistaken for the head. Without a time the label is wsp-609's label words. `None` when no
+/// head can be read: the whole text is then the command, and [`unparsable`]
+/// says why it cannot start.
+pub(crate) fn line_of(item: &str) -> Option<(Head, &str)> {
+    let item = item.trim();
+    for (i, _) in item.rmatch_indices(" (") {
+        let label = item[..i].trim();
+        // A label that opens a quote is shell, and its ` (time): ` is inside the command.
+        let open = |q: char| label.matches(q).count() % 2 == 1;
+        if label.is_empty() || label.contains(": ") || open('"') || open('`') {
+            continue;
+        }
+        let rest = &item[i + 2..];
+        let Some(close) = rest.find(')') else { continue };
+        let Some(limit) = limit_of(&rest[..close]) else { continue };
+        let after = &rest[close + 1..];
+        let (tail, command) = if let Some(c) = after.strip_prefix(": ") {
+            ("", c)
+        } else if after.starts_with(" on ") || after.starts_with(" at ") {
+            match after.split_once(": ") {
+                Some(split) => split,
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        let mut words = tail.split_whitespace().peekable();
+        let Some(mut head) = rules_of(&mut words) else { continue };
+        head.name = label.to_string();
+        head.limit = Some(limit);
+        return Some((head, command));
+    }
+    let (h, c) = item.split_once(": ")?;
+    Some((head_of(h)?, c))
+}
+
+/// A check line as an exit writes it, strictly: `label (time): command`, and
+/// nothing else — no bare command, no untimed label, no `on` or `at` (those are
+/// the project's rules). The label, the time as written, and the command; or
+/// the shape to write instead. A line refused here is never run.
+pub(crate) fn timed_line(item: &str) -> Result<(String, String, String), String> {
+    const SHAPE: &str = "write `label (5m): command` (a time in s, m or h)";
+    let item = item.trim();
+    let Some((head, command)) = line_of(item) else {
+        return Err(format!("`{item}` has no `label (time): ` — {SHAPE}"));
+    };
+    let Some(limit) = head.limit else {
+        return Err(format!("`{}:` carries no (time) — {SHAPE}", head.name));
+    };
+    if !head.on.is_empty() || head.barrier || head.end {
+        return Err(format!("`{}` names `on` or `at`, which belong to the project's `## Checks` — {SHAPE}", head.name));
+    }
+    let command = command.trim();
+    if command.is_empty() {
+        return Err(format!("`{}` names no command — {SHAPE}", head.name));
+    }
+    let time = item[..item.len() - command.len()].trim_end().trim_end_matches(':').trim_end();
+    let time = time.rsplit_once(" (").map(|(_, t)| t.trim_end_matches(')')).unwrap_or_default();
+    debug_assert_eq!(limit_of(time), Some(limit));
+    Ok((head.name, time.to_string(), command.to_string()))
+}
+
 /// `name [(limit)] [on <globs>] [at barrier|end]`, when the text before a `: `
 /// is one. The name is one or more label words, up to a `(limit)`, `on` or `at`.
 fn head_of(h: &str) -> Option<Head> {
@@ -295,13 +367,23 @@ fn head_of(h: &str) -> Option<Head> {
     if name.is_empty() {
         return None;
     }
-    let mut head = Head { name: name.join(" "), limit: None, on: Vec::new(), barrier: false, end: false };
+    let mut limit = None;
     if let Some(w) = words.peek().copied() {
         if let Some(inner) = w.strip_prefix('(').and_then(|w| w.strip_suffix(')')) {
-            head.limit = Some(limit_of(inner)?);
+            limit = Some(limit_of(inner)?);
             words.next();
         }
     }
+    let mut head = rules_of(&mut words)?;
+    head.name = name.join(" ");
+    head.limit = limit;
+    Some(head)
+}
+
+/// The `[on <globs>] [at barrier|end]` that may follow a head's limit, and
+/// nothing after them.
+fn rules_of<'a>(words: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>) -> Option<Head> {
+    let mut head = Head { name: String::new(), limit: None, on: Vec::new(), barrier: false, end: false };
     if words.peek() == Some(&"on") {
         words.next();
         let mut globs = String::new();
@@ -2309,6 +2391,25 @@ mod tests {
         let r = run_step(&dir, &s, &log);
         assert_eq!(r.done, Done::Passed);
         assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "said", "the label is not run");
+    }
+
+    #[test]
+    fn a_timed_label_is_everything_before_the_last_time_and_the_exits_grammar_is_the_same_function() {
+        // wsp-612: the label is all before the last ` (` that a time and `)` follow.
+        let s = step("- lint & types (front) (90s): npm run lint");
+        assert_eq!((s.name.as_str(), s.command.as_str(), s.limit), ("lint & types (front)", "npm run lint", Duration::from_secs(90)));
+        let s = step("- web suite (20m) on web/**, docs/*.md at barrier: npm test");
+        assert_eq!((s.name.as_str(), s.on.len(), s.barrier, s.command.as_str()), ("web suite", 2, true, "npm test"));
+        let s = step(r#"- grep -q "x (5m): y" notes.txt"#);
+        assert_eq!(s.command, r#"grep -q "x (5m): y" notes.txt"#, "a time inside a quote is the command's");
+        let s = step("- unit (5m): echo 'a (1s): b'");
+        assert_eq!((s.name.as_str(), s.command.as_str()), ("unit", "echo 'a (1s): b'"), "a label never holds a `: `");
+
+        let ok = timed_line("- web-chrome ctl and workspace (5m): cd spikes/web-chrome && npx tsc --noEmit".trim_start_matches("- "));
+        assert_eq!(ok, Ok(("web-chrome ctl and workspace".into(), "5m".into(), "cd spikes/web-chrome && npx tsc --noEmit".into())));
+        for bad in ["tests: cargo test", "cargo test", "slow (soon): true", "t (5m) at barrier: true", "t (5m): "] {
+            assert!(timed_line(bad).is_err_and(|w| w.contains("label (5m): command")), "{bad}");
+        }
     }
 
     #[test]

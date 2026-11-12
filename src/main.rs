@@ -35,6 +35,7 @@ mod hold_close;
 #[cfg(test)]
 mod testkit;
 mod check;
+mod exit;
 mod auto_close;
 mod build_output;
 mod list_sweep;
