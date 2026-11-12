@@ -26,6 +26,7 @@ pub const ALL: &[&[crate::verbs::Verb]] = &[
     crate::cmd_spawn::VERBS,
     crate::cmd_stamp::VERBS,
     crate::cmd_task::VERBS,
+    crate::cmd_submit::VERBS,
     crate::cmd_verifications::VERBS,
     crate::cmd_verify::VERBS,
     crate::cmd_watch::VERBS,

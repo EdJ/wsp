@@ -411,7 +411,7 @@ fn rules_of<'a>(words: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>) 
     words.next().is_none().then_some(head)
 }
 
-fn limit_of(s: &str) -> Option<Duration> {
+pub(crate) fn limit_of(s: &str) -> Option<Duration> {
     let s = s.trim();
     // Split at a character, not a byte: `(✓)` or `(café)` is no limit, never a panic.
     let unit = s.chars().last()?;
@@ -553,7 +553,8 @@ pub(crate) fn end_steps(store: &Store, project: &str) -> Vec<Step> {
 // ---- artefacts and the full suite (wsp submit's validator) ------------------
 
 /// The project's `## Artefacts`: one glob per line (a `- ` bullet is allowed),
-/// `#` comments and blank lines skipped. An absent or empty section is none:
+/// `#` comments and blank lines skipped, and a ` — why` after the glob is its
+/// note (docs/exit-packet.md §4's shape). An absent or empty section is none:
 /// nothing is restored for the member.
 pub(crate) fn artefact_globs(store: &Store, project: &str) -> Vec<String> {
     store.project(project).and_then(|p| p.section("Artefacts")).map(|s| globs_in(&s)).unwrap_or_default()
@@ -563,7 +564,8 @@ fn globs_in(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).unwrap_or(l).trim().trim_matches('`').to_string())
+        .map(|l| l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).unwrap_or(l))
+        .map(|l| l.split_once(" — ").map_or(l, |(g, _)| g).trim().trim_matches('`').to_string())
         .filter(|l| !l.is_empty())
         .collect()
 }
@@ -2655,6 +2657,9 @@ mod tests {
         p.body = "## Artefacts\n# generated\nCargo.lock\n- docs/*.html\n\n## Checks\n- a: true\n".into();
         store.save_project(&p).unwrap();
         assert_eq!(artefact_globs(&store, "pj"), vec!["Cargo.lock", "docs/*.html"]);
+        p.body = "## Artefacts\n- `docs/shots/*.png` — rewritten by `npm run check`\n".into();
+        store.save_project(&p).unwrap();
+        assert_eq!(artefact_globs(&store, "pj"), vec!["docs/shots/*.png"], "the note after ` — ` is not the glob");
         p.body = "## Artefacts\n# none yet\n\n## Checks\n- a: true\n".into();
         store.save_project(&p).unwrap();
         assert!(artefact_globs(&store, "pj").is_empty());

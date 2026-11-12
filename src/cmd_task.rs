@@ -1719,6 +1719,17 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", account.len()));
+    accept(store, args, &account, said.as_deref())
+}
+
+/// **The review core**: what `wsp review` does once it holds an account, and
+/// what `wsp submit` runs once a member's exit is accepted (`wsp-613`, the
+/// exit plan's "acceptance is the same core"). Every gate a review has — the
+/// treecopy match, an owed land, the ready commit of a clean tree, wsp-529's
+/// blocked commit, `## Checks` that cannot start, a leg's siblings — and then
+/// the row to `review` with `account` as its `review:` line. `args` names the
+/// row as its first word and may carry `--anyway` and `--hold-review`.
+pub(crate) fn accept(store: &Store, args: &Args, account: &str, said: Option<&str>) -> i32 {
     // A row copied to an executor is reviewed only at the tree `verify` ran on.
     if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
         if let Some(tree) = crate::cmd_checkout::member_tree(store, &t.id) {
@@ -1812,13 +1823,13 @@ pub fn review(store: &Store, args: &Args) -> i32 {
     // the last running leg the rest are skipped (`docs/legs.md`, *A leg is a
     // seat*). Refused before the row moves.
     if let Some(needle) = args.rest.first() {
-        if let Err(why) = crate::leg_seat::on_review(store, needle, &account, crate::place::my_pane().as_deref()) {
+        if let Err(why) = crate::leg_seat::on_review(store, needle, account, crate::place::my_pane().as_deref()) {
             eprintln!("wsp: {why}");
             return 1;
         }
     }
     let hold = args.has("hold-review");
-    let code = mutate_saying(store, args, "review", said.as_deref(), |t| {
+    let code = mutate_saying(store, args, "review", said, |t| {
         t.set_status(Status::Review);
         if hold && !t.tags.iter().any(|g| g == crate::auto_close::HOLD) {
             t.tags.push(crate::auto_close::HOLD.into());
@@ -1863,7 +1874,7 @@ pub fn review(store: &Store, args: &Args) -> i32 {
 
 /// The newest pass on the row when it is a block read at `tip`: the commit a
 /// seat is putting up again, unchanged (`wsp-529`).
-fn blocked_at(t: &Task, tip: &str) -> Option<crate::verification::Pass> {
+pub(crate) fn blocked_at(t: &Task, tip: &str) -> Option<crate::verification::Pass> {
     let p = crate::verification::passes(t).pop()?;
     let read = p.read.as_deref()?;
     (p.state == crate::verification::State::Blocks && crate::verification::same_commit(read, tip)).then_some(p)
@@ -1871,7 +1882,7 @@ fn blocked_at(t: &Task, tip: &str) -> Option<crate::verification::Pass> {
 
 /// What `wsp review` says to a seat putting up a commit a verifier blocked: the
 /// verdict's first lines, where the whole of it is, and the two ways on.
-fn blocked_refusal(id: &str, pass: &crate::verification::Pass) -> Vec<String> {
+pub(crate) fn blocked_refusal(id: &str, pass: &crate::verification::Pass) -> Vec<String> {
     let mut out = vec![format!(
         "wsp: {id} is at {}, which a verifier already blocked, and nothing has changed since — a second verifier would read the same commit",
         pass.read.as_deref().unwrap_or_default()

@@ -2713,8 +2713,8 @@ pub fn dirty_files(dir: &Path) -> Vec<(String, String)> {
 /// one the checks write, and a new file is either their output or work nobody
 /// committed.
 pub fn dirty_refusal(tree: &str, files: &[(String, String)]) -> String {
-    let (written, added): (Vec<_>, Vec<_>) = files.iter().partition(|(code, _)| code != "??");
-    let names = |v: &[&(String, String)]| v.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>().join(", ");
+    let (written, added) = dirty_split(files);
+    let names = dirty_names;
     let mut out = format!("wsp: {tree} has uncommitted work, so the hold's land is owed and nothing was landed");
     if !written.is_empty() {
         out.push_str(&format!(
@@ -2727,6 +2727,35 @@ pub fn dirty_refusal(tree: &str, files: &[(String, String)]) -> String {
     }
     out.push_str(&format!(
         "\n  revert what the checks wrote (`git -C {tree} checkout -- <file>`) or commit what is work; the run lands the hold once the tree is clean, with no new verifier"
+    ));
+    out
+}
+
+/// `git status --porcelain` entries split into tracked paths changed and
+/// untracked paths new: the two halves [`dirty_refusal`] names apart.
+fn dirty_split(files: &[(String, String)]) -> (Vec<&(String, String)>, Vec<&(String, String)>) {
+    files.iter().partition(|(code, _)| code != "??")
+}
+
+fn dirty_names(v: &[&(String, String)]) -> String {
+    v.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>().join(", ")
+}
+
+/// [`dirty_refusal`]'s words for a member's exit (`wsp submit`, the exit
+/// plan's V1): every path named, tracked apart from new, once the project's
+/// `## Artefacts` have been taken out — what is left is work, or a check's
+/// output the project has not declared.
+pub fn dirty_submit_refusal(tree: &str, row: &str, files: &[(String, String)]) -> String {
+    let (written, added) = dirty_split(files);
+    let mut out = format!("wsp: {tree} has uncommitted work that is not one of the project's ## Artefacts, so {row} is not submitted");
+    if !written.is_empty() {
+        out.push_str(&format!("\n  changed, tracked: {}", dirty_names(&written)));
+    }
+    if !added.is_empty() {
+        out.push_str(&format!("\n  new, untracked — a check's output, or work nobody committed: {}", dirty_names(&added)));
+    }
+    out.push_str(&format!(
+        "\n  commit what is work (`wsp commit-help`) and revert what a check wrote (`git -C {tree} checkout -- <file>`); a check's output the project always writes belongs in its ## Artefacts, which is the person's to add"
     ));
     out
 }

@@ -65,6 +65,7 @@ mod cmd_sandbox;
 mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;
+mod cmd_submit;
 mod cmd_verifications;
 mod leg_seat;
 mod piece_seat;
@@ -264,6 +265,8 @@ fn dry_run(args: &Args) -> (bool, String) {
         "project" | "proj" | "p" => named(matches!(sub, "rm" | "remove" | "delete")),
         "sandbox" => named(matches!(sub, "rm" | "remove" | "stop")),
         "scratch" => (true, args.cmd.clone()),
+        // `submit` validates the exit and says what it would do (`wsp-613`).
+        "submit" => (true, args.cmd.clone()),
         // `group` the way `verify` is: only its removing branch, `--drop`,
         // has anything to look at first. `cut` is the cascade shape: the row
         // is named and what rests on it is computed, so `-n` is the only
