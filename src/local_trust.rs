@@ -26,7 +26,6 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-use crate::store::Store;
 
 const LEDGER: &str = "trust.json";
 
@@ -38,12 +37,6 @@ pub(crate) fn claude_json() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default();
     base.join(".claude.json")
-}
-
-/// The sandbox directory this store lives in, when it is one's.
-fn sandbox_dir(store: &Store) -> Option<PathBuf> {
-    crate::cmd_sandbox::inside_of(&store.state)?;
-    store.state.parent().map(Path::to_path_buf)
 }
 
 #[derive(Default)]
@@ -94,9 +87,11 @@ fn helper(dir: &Path, op: &str, tree: &str) -> Result<(), String> {
 
 /// Trust a seat's tree before claude starts in it, when this is a sandbox's
 /// spawn and the tree is one it made. `Ok(None)` for anything else (nothing was
-/// written); `Ok(Some(line))` says what was.
-pub(crate) fn trust(store: &Store, tree: &str) -> Result<Option<String>, String> {
-    let Some(dir) = sandbox_dir(store) else { return Ok(None) };
+/// written); `Ok(Some(line))` says what was. `sandbox` is the directory of the
+/// sandbox this spawn runs in (`cmd_sandbox::dir_of`), `None` outside one: the
+/// caller reads it, so this module needs nothing from the layer above it.
+pub(crate) fn trust(sandbox: Option<PathBuf>, tree: &str) -> Result<Option<String>, String> {
+    let Some(dir) = sandbox else { return Ok(None) };
     let t = Path::new(tree);
     let a_worktree = t.parent().and_then(Path::file_name).is_some_and(|n| n == crate::cmd_checkout::WORKTREES) && t.join(".git").exists();
     if !a_worktree {
@@ -179,6 +174,7 @@ pub(crate) fn dialog_fix(screen: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wsp-local-trust-{tag}-{}", std::process::id()));
@@ -220,10 +216,10 @@ mod tests {
         let (new, known) = (mk("new-1"), root.join("repo/.worktrees/known-1"));
         std::fs::create_dir_all(known.join(".git")).unwrap();
         // Not a tree wsp made: nothing is written.
-        assert_eq!(trust(&store, &root.join("elsewhere").display().to_string()).unwrap(), None);
+        assert_eq!(trust(crate::cmd_sandbox::dir_of(&store), &root.join("elsewhere").display().to_string()).unwrap(), None);
         assert_eq!(json_of(&file)["projects"].as_object().unwrap().len(), 2);
 
-        let said = trust(&store, &new).unwrap().expect("a new tree is trusted");
+        let said = trust(crate::cmd_sandbox::dir_of(&store), &new).unwrap().expect("a new tree is trusted");
         assert!(said.contains(&new), "{said}");
         let doc = json_of(&file);
         for k in ["hasTrustDialogAccepted", "hasClaudeMdExternalIncludesApproved", "hasClaudeMdExternalIncludesWarningShown"] {
@@ -234,10 +230,10 @@ mod tests {
         assert_eq!(backups.len(), 1, "one backup before the first write");
         assert!(!std::fs::read_to_string(backups[0].path()).unwrap().contains("new-1"), "the backup is of the file as it was");
         // A second seat in the same tree writes the same and backs up nothing more.
-        trust(&store, &new).unwrap().unwrap();
+        trust(crate::cmd_sandbox::dir_of(&store), &new).unwrap().unwrap();
         assert_eq!(std::fs::read_dir(state_root.join("trust-backups")).unwrap().count(), 1);
         // An entry that was there before this sandbox is its owner's.
-        assert_eq!(trust(&store, &known.display().to_string()).unwrap(), None);
+        assert_eq!(trust(crate::cmd_sandbox::dir_of(&store), &known.display().to_string()).unwrap(), None);
         assert!(json_of(&file)["projects"][known.display().to_string()].get("hasTrustDialogAccepted").is_none());
 
         let (lines, kept) = clear(&sb, true);
@@ -252,7 +248,7 @@ mod tests {
         assert!(!sb.join(LEDGER).exists());
         // Outside a sandbox nothing is written at all.
         let live = Store::at(root.join("live/wsp"), root.join("live/state"));
-        assert_eq!(trust(&live, &new).unwrap(), None);
+        assert_eq!(trust(crate::cmd_sandbox::dir_of(&live), &new).unwrap(), None);
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&root);
     }

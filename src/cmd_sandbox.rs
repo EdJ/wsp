@@ -1093,6 +1093,12 @@ pub(crate) fn inside_of(state: &Path) -> Option<String> {
     (state.file_name()? == "state" && root.file_name()? == "sandbox" && name.starts_with(PREFIX)).then(|| name.to_string())
 }
 
+/// The sandbox directory this store lives in, when it is one's.
+pub(crate) fn dir_of(store: &Store) -> Option<PathBuf> {
+    inside_of(&store.state)?;
+    store.state.parent().map(Path::to_path_buf)
+}
+
 /// The refusal for a verb that has to run on the real store, or `None`.
 fn outside_only(store: &Store, verb: &str) -> Option<i32> {
     let name = inside_of(&store.state)?;

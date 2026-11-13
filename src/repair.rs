@@ -746,7 +746,7 @@ pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
         store,
         seats,
         &|seat| crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs()),
-        &|seat| crate::waiting::end_self_waits(seat, &crate::stuck::waits_on_itself_line),
+        &|seat| crate::waiting::end_self_waits(seat, &crate::stuck::Kind::is_self_wait),
     );
 }
 

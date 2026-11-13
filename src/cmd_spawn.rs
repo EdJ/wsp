@@ -3151,7 +3151,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // A sandbox seat's new tree is trusted before claude starts in it, so it
         // reaches its first turn with no folder-trust dialog (`wsp-466`).
         if kind == "claude" && !far_start {
-            match cwd.as_deref().map(|c| crate::local_trust::trust(store, c)) {
+            match cwd.as_deref().map(|c| crate::local_trust::trust(crate::cmd_sandbox::dir_of(store), c)) {
                 Some(Ok(Some(said))) => eprintln!("wsp: {said}"),
                 Some(Err(why)) => eprintln!("wsp: {why}; the seat may stop at Claude Code's folder-trust dialog"),
                 _ => {}

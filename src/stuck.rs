@@ -70,6 +70,13 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
+    /// Whether a command line is [`Kind::SelfWait`]: what the daemon's pass reads
+    /// a seat's shell for without holding the seat. Here, on the type `repair`
+    /// already names, so the engine does not reach up for a function of this layer.
+    pub(crate) fn is_self_wait(command: &str) -> bool {
+        classify(command) == Some(Kind::SelfWait)
+    }
+
     pub(crate) fn word(self) -> &'static str {
         match self {
             Kind::SelfWait => "waiting on itself",
