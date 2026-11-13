@@ -889,7 +889,9 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             let (Some(ts), Some(kind)) = (v["ts"].as_str(), v["kind"].as_str()) else { continue };
             let data = v["data"].clone();
             let mine = data["id"].as_str().is_some_and(|d| ids.iter().any(|x| x == d));
-            let keep = if data["id"].as_str() == Some(id) { true } else { mine && kind == "task-verified" };
+            // A question the seat asked, and the answer to one (`compounding-465`): about the row, under the message's own id.
+            let message = kind == "message-raised" && data["about"]["task"].as_str() == Some(id) && (data["shape"] == "question" || data["reply_to"].is_string());
+            let keep = if data["id"].as_str() == Some(id) { true } else { message || (mine && kind == "task-verified") };
             if keep {
                 i.events.push((util::epoch_of(ts), kind.to_string(), data));
             }
@@ -1512,6 +1514,45 @@ pub(crate) struct RowFigures {
     pub between_attempts: i64,
 }
 
+/// Who a question the seat asked is waiting on.
+#[derive(Clone, Copy)]
+enum Whom {
+    Governor,
+    Person,
+}
+
+impl Whom {
+    /// The reason the seat idle is booked under while the question is open.
+    fn waiting(self, what: &str) -> String {
+        match self {
+            Whom::Governor => format!("waiting on the governor's answer ({what})"),
+            Whom::Person => format!("waiting on a person's answer ({what})"),
+        }
+    }
+}
+
+/// The run's line that holds a seat for an answer (`waiting::Waiting::sentence`) —
+/// `<list> group <n>: <row> (<seat>) is waiting on the react-chat governor to answer its question
+/// <id> — not told and not ended`, `… is held in a tool call for a person to answer <id> — …`, or
+/// `… is stopped on a prompt only a person can answer — …` — as who `row`'s seat waits on, and the
+/// question where it names one.
+fn held_wait<'a>(l: &'a str, row: &str) -> Option<(Whom, Option<&'a str>)> {
+    let (_, rest) = l.split_once(&format!(": {row} ("))?;
+    let (_, rest) = rest.split_once(") is ")?;
+    let rest = rest.split(" — ").next().unwrap_or(rest);
+    let whom = |w: &str| if w.ends_with("governor") { Whom::Governor } else { Whom::Person };
+    if let Some(r) = rest.strip_prefix("waiting on ") {
+        let (w, q) = r.split_once(" to answer its question ")?;
+        return Some((whom(w), Some(q.trim())));
+    }
+    if let Some(r) = rest.strip_prefix("held in a tool call for ") {
+        let (w, q) = r.split_once(" to answer ")?;
+        return Some((whom(w), Some(q.trim())));
+    }
+    let w = rest.strip_prefix("stopped on a prompt only ")?.strip_suffix(" can answer")?;
+    Some((whom(w), None))
+}
+
 /// What the lines the log already writes for a row say it was waiting on, from
 /// the moment each is written: a verdict sent back, the tell reaching the seat
 /// or not, a reopen, a rebase refused, a hand-off to another row, a block, an
@@ -1539,14 +1580,40 @@ pub(crate) fn idle_markers(i: &Inputs) -> Vec<(i64, String)> {
         };
         out.push((*t, why));
     }
+    // The seat asked a question and waits on the governor or a person (`compounding-465`): from the
+    // run's line that holds it, or from the question's own event where that is earlier, and until the
+    // answer to it is written. The run's line says who the question reached; the event, who it was
+    // addressed to, so a question the run routed on is one reason, not two.
+    let held: Vec<(i64, Whom, Option<&str>)> = i.cycle.iter().filter_map(|(t, l)| held_wait(l, id).map(|(w, q)| (*t, w, q))).collect();
+    let mut asked: Vec<&str> = Vec::new();
+    for (t, _, d) in i.events.iter().filter(|(_, k, d)| k == "message-raised" && d["about"]["task"] == id) {
+        let Some(mid) = d["id"].as_str() else { continue };
+        if d["shape"] == "question" && d["from"]["pane"].is_string() {
+            let routed = held.iter().find(|h| h.2 == Some(mid)).map(|h| h.1);
+            let addressed = if d["for"]["seat"].is_string() { Some(Whom::Governor) } else if d["for"] == "person" { Some(Whom::Person) } else { None };
+            if let Some(w) = routed.or(addressed) {
+                asked.push(mid);
+                out.push((*t, w.waiting(&format!("question {mid}"))));
+            }
+        } else if d["reply_to"].as_str().is_some_and(|q| asked.contains(&q)) {
+            out.push((*t, "answered: the seat has the answer and has not moved yet".into()));
+        }
+    }
+    for (t, w, q) in held {
+        out.push((t, w.waiting(&q.map_or("a prompt on its screen".to_string(), |q| format!("question {q}")))));
+    }
     for (t, l) in &i.cycle {
         let why = if l.contains("of its own still running") && l.contains(" is waiting on ") {
             "the seat waiting on shells of its own (wakes when they end)".to_string()
         } else if l.contains("A verifier found a problem") && l.starts_with("tell ") {
             "sent back: the verdict with the governor".into()
-        } else if l.starts_with(&format!("tell {id}: not delivered")) {
+        } else if l.starts_with(&format!("tell {id}: not delivered")) || l.starts_with(&format!("told {id}: not delivered")) {
             "sent back: the tell not delivered, the seat busy".into()
-        } else if l.starts_with(&format!("tell {id}: it has the sentence")) || l.contains("was typed to it, now it reads idle") {
+        } else if l.starts_with(&format!("tell {id}: it has the sentence"))
+            || l.starts_with(&format!("told {id}: it has the sentence"))
+            || l.starts_with(&format!("told {id}: delivered, acknowledged"))
+            || l.contains("was typed to it, now it reads idle")
+        {
             "told: the seat has the sentence".into()
         } else if l.starts_with("told ") && l.contains("typed at the seat") {
             "told: typed at the seat, no turn seen yet".into()
@@ -1854,6 +1921,45 @@ mod tests {
         assert_eq!(at(115), crate::wallbuckets::NONE_RECORDED);
         assert!(m.windows(2).all(|w| w[0].0 <= w[1].0), "sorted");
         assert!(!m.iter().any(|x| x.1.contains("r-7")), "another row's line is not this row's reason");
+    }
+
+    /// A seat that asked a question and waits on the governor or a person reads as that, from the
+    /// moment of the question, to the answer (`compounding-465`), in the lines the real log writes.
+    #[test]
+    fn a_seat_waiting_on_the_governors_or_a_persons_answer_is_named_with_the_question() {
+        let mut i = row();
+        i.events.push(ev(500, "message-raised", json!({"id": "m-g", "about": {"task": "r-1"}, "for": {"seat": "g"}, "from": {"pane": "cpd-1"}, "shape": "question"})));
+        i.events.push(ev(800, "message-raised", json!({"id": "m-a", "about": {"task": "r-1"}, "for": null, "from": {"human": true}, "reply_to": "m-g", "shape": "notification"})));
+        i.events.push(ev(900, "message-raised", json!({"id": "m-p", "about": {"task": "r-1"}, "for": "person", "from": {"pane": "cpd-1"}, "shape": "question"})));
+        i.events.push(ev(901, "message-raised", json!({"id": "m-other", "about": {"task": "r-9"}, "for": "person", "from": {"pane": "cpd-9"}, "shape": "question"})));
+        i.cycle.push((560, "g group 1: r-1 (cpd-1) is waiting on the g governor to answer its question m-g — not told and not ended, and held for as long as it waits".into()));
+        i.cycle.push((561, "tell g: r-1 in the g run is waiting on the g governor to answer its question m-g (waiting · p…".into()));
+        i.cycle.push((950, "g group 1: r-1 (cpd-1) is held in a tool call for a person to answer m-p — not told and not ended, and held for as long as it waits".into()));
+        i.cycle.push((1200, "g group 1: r-1 (cpd-1) is stopped on a prompt only a person can answer — not told and not ended".into()));
+        i.cycle.push((1300, "g group 1: r-7 (cpd-7) is waiting on a person to answer its question m-x — not told".into()));
+        let m = idle_markers(&i);
+        let at = |t: i64| m.iter().filter(|x| x.0 <= t).last().map(|x| x.1.as_str()).unwrap_or("-");
+        assert_eq!(at(500), "waiting on the governor's answer (question m-g)", "from the question, before the run's line");
+        assert_eq!(at(700), "waiting on the governor's answer (question m-g)");
+        assert!(at(800).starts_with("answered:"), "{m:?}");
+        assert_eq!(at(900), "waiting on a person's answer (question m-p)");
+        assert_eq!(at(960), "waiting on a person's answer (question m-p)", "a tool call held for a person");
+        assert_eq!(at(1250), "waiting on a person's answer (a prompt on its screen)");
+        assert_eq!(at(1400), "waiting on a person's answer (a prompt on its screen)", "another row's wait is not this row's");
+        assert!(!m.iter().any(|x| x.1.contains("m-x") || x.1.contains("m-other")), "{m:?}");
+        assert_eq!(m.iter().filter(|x| x.1.contains("m-g")).count(), 2, "the question and its held line are one reason");
+    }
+
+    /// The run's lines say `told`, not `tell`, for a row's own seat (`compounding-465`).
+    #[test]
+    fn the_told_lines_for_the_row_read_as_the_tell_pending_or_delivered() {
+        let mut i = row();
+        i.cycle.push((395, "told r-1: not delivered — wsp: r-1 was not told: cpd-1: delivery still pending after 30s".into()));
+        i.cycle.push((500, "told r-1: it has the sentence".into()));
+        let m = idle_markers(&i);
+        let at = |t: i64| m.iter().filter(|x| x.0 <= t).last().map(|x| x.1.as_str()).unwrap_or("-");
+        assert!(at(400).contains("not delivered"), "{m:?}");
+        assert!(at(510).contains("has the sentence"), "{m:?}");
     }
 
     /// The verifier's seat is up long before wsp says `started` (`wsp-429`): the
