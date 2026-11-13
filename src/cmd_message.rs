@@ -647,16 +647,42 @@ fn told(q: &Message) -> String {
 
 /// Wait, print, and say how it ended in the exit code: 0 with the answer on
 /// stdout, 3 with the reason on stderr for an abandon or a timeout.
+///
+/// **The wait never outlives the tool call that holds it** (`wsp-469`). A seat
+/// runs this inside a shell tool call with a 600 s limit, and a wait the limit
+/// kills leaves nothing to take the answer: the waiter's mark is a dead pid, the
+/// person's answer is held for a seat that reads `working` and typed only at its
+/// next idle, minutes late. So the wait ends itself at [`TOOL_SLICE`] with the
+/// question still open and the waiter's mark taken off under the lock
+/// ([`message::release`], which returns an answer that landed at the deadline),
+/// and says to ask again. A longer `--timeout` is cut to it; the question's own
+/// expiry (`--choices`) is the person's, and is not touched.
 fn wait_and_report(store: &Store, id: &str, timeout: Option<u64>, args: &Args, clock: &dyn Clock) -> i32 {
-    let ended = match wait_for(store, id, timeout, clock) {
+    let sliced = timeout.is_none_or(|t| t > TOOL_SLICE);
+    let bound = Some(timeout.map_or(TOOL_SLICE, |t| t.min(TOOL_SLICE)));
+    let ended = match wait_for(store, id, bound, clock) {
         Ok(e) => e,
         Err(why) => {
             eprintln!("wsp: {why}");
             return 1;
         }
     };
+    if sliced && ended == Ended::TimedOut {
+        eprintln!(
+            "wsp: still waiting on {id} after {TOOL_SLICE}s — nobody has answered; the tool call would end at 600s, so this one ends now. \
+             It stays open: run `wsp ask {id} --wait` again at once"
+        );
+        if args.json() {
+            println!("{}", json!({ "id": id, "outcome": "still-waiting", "after": TOOL_SLICE }));
+        }
+        return 3;
+    }
     report_wait(store, id, &ended, timeout, args)
 }
+
+/// How long one `--wait` holds a shell command: under the 600 s a seat's tool
+/// call is ended at, with a minute for the seat to ask again.
+const TOOL_SLICE: u64 = 540;
 
 fn report_wait(store: &Store, id: &str, ended: &Ended, timeout: Option<u64>, args: &Args) -> i32 {
     // The answer has come back through the tool call; a copy typed at the
@@ -1696,6 +1722,27 @@ pub(crate) fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<cra
     Some(how.tell(place.as_ref(), &crate::place::Seat::new(pane), text))
 }
 
+/// How long a held answer is asked about again after a delivery that did not
+/// complete (`wsp-469`). A quarter of an hour is the compound backend's pending
+/// window for one tell (`DELIVER_PENDING_FOR`); past it the failure is ended and said.
+const HELD_RETRY_FOR: i64 = 900;
+
+/// Seconds since the reply was last held.
+fn held_for(reply: &Message) -> i64 {
+    let since = reply.via.last().map(|h| util::epoch_of(&h.at)).unwrap_or(0);
+    (util::epoch_secs() - since).max(0)
+}
+
+/// Whether a refusal from the typing is one a later tick may ask again, for an
+/// answer held `held` seconds: the backend not answering in time or at all.
+/// A `Failed` (the supervisor already retried), a gone seat, an unsupported
+/// seat, and text typed and not taken are final, and typing again would put a
+/// second copy behind the first.
+fn retry_held(e: &crate::place::Refusal, held: i64) -> bool {
+    use crate::place::Refusal;
+    matches!(e, Refusal::Backend(_) | Refusal::Unreachable(_)) && held < HELD_RETRY_FOR
+}
+
 type TypeAt<'a> = dyn Fn(&str, &str) -> Option<crate::place::Result<crate::place::Delivery>> + 'a;
 
 /// [`deliver_held`] with the typing passed in, so a test can be the pane.
@@ -1757,9 +1804,27 @@ fn deliver_held_through(store: &Store, seats: &dyn crate::cycle::Seats, type_at:
                     question.id
                 ));
             }
+            // **A delivery that is still pending is not a delivery that failed**
+            // (`wsp-469`). compound's `deliver` gives a tick 30 s and answers
+            // "still pending, asked again next tick under the same id"; this arm
+            // used to end the hold on that answer too, so the tick that said
+            // "asked again next tick" had just dropped the answer and no later
+            // tick asked. The hold stands while the refusal is the backend's
+            // own word and the answer is young (`HELD_RETRY_FOR`); the line is
+            // written each time, which is a bounded few.
+            Some(Err(e)) if retry_held(&e, held_for(&reply)) => {
+                said.push(format!(
+                    "answer to {} held for {pane} since {since}: not typed yet — {e}; the hold stands and the next tick asks again",
+                    question.id
+                ));
+            }
             Some(Err(e)) => {
                 end(message::Act::Noted, &format!("{pane} was not told: {e}"));
-                said.push(format!("answer to {} held for {pane} since {since}: not told — {e}", question.id));
+                said.push(format!(
+                    "answer to {} held for {pane} since {since}: NOT TOLD — {e}; it is on {}'s log and `wsp tell {pane} --anyway -` types it",
+                    question.id,
+                    question.about.task().unwrap_or("the list")
+                ));
             }
         }
     }
@@ -1995,7 +2060,10 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     answer (label, free text, `talk: …`,
                                     `allow`/`deny: …`), exit 0; exit 3 with the
                                     reason on stderr if abandoned or timed out
-                                    (the question stays open on a timeout)"##,
+                                    (the question stays open on a timeout);
+                                    ends itself at 540s, under the tool call's
+                                    600s, with exit 3 "still waiting" — run
+                                    `wsp ask <mid> --wait` again at once"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
@@ -2338,6 +2406,95 @@ mod tests {
         let said = deliver_held_through(&store, &gone, &type_at);
         assert!(said[0].contains("the pane is gone"), "{said:?}");
         assert!(message::held_replies(&store).is_empty(), "and the hold is over");
+    }
+
+    /// **`wsp-469`, the replay.** A seat asks the person with `--wait`; the tool
+    /// timeout would end the wait at 600 s, so the wait ends itself at 540 s with
+    /// the question open and nobody marked on it; the person answers five
+    /// minutes later while the seat is mid-turn, and the answer is held; the
+    /// first tick that reads the seat idle finds the backend's delivery still
+    /// pending, and the hold *stands*, so the tick after types it, once.
+    #[test]
+    fn a_wait_ends_before_the_tool_timeout_and_the_answer_after_it_is_typed_once_the_seat_reads_idle() {
+        let _env = util::isolated("slice-replay");
+        let store = scratch("slice-replay");
+        task(&store, "wsp-149");
+        let args = crate::Args::synth("ask", &[], &[]);
+        let q = waited_on(&store, "wsp-149", None);
+        let clock = Fake::new();
+        assert_eq!(wait_and_report(&store, &q.id, None, &args, &clock), 3, "no answer: the wait ends, not the tool call");
+        assert_eq!(clock.now.get(), 540_000, "at the slice, under the 600 s the tool call is ended at");
+        let after = store.message(&q.id).unwrap();
+        assert!(after.is_open() && after.awaited.is_none(), "still open, and nobody is marked as waiting on it");
+
+        // Five minutes on, with the seat mid-turn (it had not yet asked again).
+        let closed = message::answer(&store, &q.id, &Party::Human, "yes, land").unwrap();
+        assert!(closed.question.awaited.is_none(), "no live waiter to carry the answer");
+        message::held(&store, &closed.reply.id, "cpd-893", "the seat is mid-turn").unwrap();
+        let pane = Pane { state: std::cell::Cell::new(Some(crate::place::State::Working)), gone: false };
+        let tries = std::cell::Cell::new(0);
+        let typed = std::cell::RefCell::new(Vec::<String>::new());
+        let type_at = |_: &str, text: &str| {
+            tries.set(tries.get() + 1);
+            if tries.get() == 1 {
+                return Some(Err(crate::place::Refusal::Backend(
+                    "cpd-893: delivery still pending after 30s, asked again next tick under the same id".into(),
+                )));
+            }
+            typed.borrow_mut().push(text.to_string());
+            Some(Ok(crate::place::Delivery::Started))
+        };
+        assert!(deliver_held_through(&store, &pane, &type_at).is_empty(), "working: nothing typed, nothing said");
+        pane.state.set(Some(crate::place::State::Idle));
+        let said = deliver_held_through(&store, &pane, &type_at);
+        assert!(said[0].contains("the hold stands"), "a pending delivery is said, not hidden: {said:?}");
+        assert_eq!(message::held_replies(&store).len(), 1, "and it is not dropped: the next tick asks again");
+        let said = deliver_held_through(&store, &pane, &type_at);
+        assert!(said[0].contains("typed now it is idle"), "{said:?}");
+        assert_eq!(typed.borrow().len(), 1);
+        assert!(typed.borrow()[0].contains("yes, land"));
+        assert!(message::held_replies(&store).is_empty());
+        assert!(deliver_held_through(&store, &pane, &type_at).is_empty());
+        assert_eq!(typed.borrow().len(), 1, "once");
+    }
+
+    /// An answer that lands at the slice's deadline is returned by the wait, and
+    /// a longer `--timeout` is cut to the slice while a shorter one is its own.
+    #[test]
+    fn the_slice_returns_an_answer_at_its_deadline_and_cuts_only_a_longer_timeout() {
+        let _env = util::isolated("slice-bound");
+        let store = scratch("slice-bound");
+        task(&store, "wsp-149");
+        let args = crate::Args::synth("ask", &[], &[]);
+        let q = waited_on(&store, "wsp-149", None);
+        let clock = Fake::new();
+        clock.at(540_000, || {
+            message::answer(&store, &q.id, &Party::Human, "ok").unwrap();
+        });
+        assert_eq!(wait_and_report(&store, &q.id, None, &args, &clock), 0, "an answer at the deadline is not lost");
+
+        let q = waited_on(&store, "wsp-149", None);
+        let clock = Fake::new();
+        wait_and_report(&store, &q.id, Some(3_600), &args, &clock);
+        assert_eq!(clock.now.get(), 540_000, "an hour is cut to the slice");
+        let q = waited_on(&store, "wsp-149", None);
+        let clock = Fake::new();
+        wait_and_report(&store, &q.id, Some(60), &args, &clock);
+        assert_eq!(clock.now.get(), 60_000, "a shorter timeout is the caller's own");
+    }
+
+    /// Only the backend's own word is asked about again, and only while the
+    /// answer is young; a supervisor's `failed` and text typed and not taken
+    /// are final.
+    #[test]
+    fn only_a_backend_that_did_not_answer_is_retried_and_only_for_a_while() {
+        use crate::place::{Refusal, Seat};
+        assert!(retry_held(&Refusal::Backend("pending".into()), 30));
+        assert!(retry_held(&Refusal::Unreachable("no socket".into()), 30));
+        assert!(!retry_held(&Refusal::Backend("pending".into()), HELD_RETRY_FOR), "and not for ever");
+        assert!(!retry_held(&Refusal::Failed("sup gave up".into()), 30));
+        assert!(!retry_held(&Refusal::NoSeat(Seat::new("cpd-1")), 30));
+        assert!(!retry_held(&Refusal::NotTaken, 30), "typed already: a retry is a second copy");
     }
 
     /// The receipt names the party the answer is *for*. It named the answerer,

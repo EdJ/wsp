@@ -818,7 +818,10 @@ PLUMBING
                                     answer (label, free text, `talk: …`,
                                     `allow`/`deny: …`), exit 0; exit 3 with the
                                     reason on stderr if abandoned or timed out
-                                    (the question stays open on a timeout)
+                                    (the question stays open on a timeout);
+                                    ends itself at 540s, under the tool call's
+                                    600s, with exit 3 "still waiting" — run
+                                    `wsp ask <mid> --wait` again at once
   wsp ask <mid> --wait [--timeout S]  wait again on one that stayed open
   wsp ask <id|list> --person "…"    a question only the person may answer: it is
                                     in `wsp yours`, holds the barrier of the
