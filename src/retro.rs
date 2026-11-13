@@ -51,7 +51,10 @@ impl Figures {
         let rows = effort["groups"].as_array().map_or(0, |gs| gs.iter().map(|g| g["members"].as_array().map_or(0, Vec::len)).sum());
         Figures {
             list: effort["list"].as_str().unwrap_or("").to_string(),
-            wall: secs(wb, "wall_seconds").max(secs(&effort["totals"], "wall_seconds")),
+            // The header's wall is the buckets' total, so the lines under it sum
+            // to it (`compounding-468`: 629m over buckets that summed to 622m).
+            // An older list with no `attributed_seconds` keeps the larger wall.
+            wall: wb.get("attributed_seconds").and_then(Value::as_i64).filter(|a| *a > 0).unwrap_or_else(|| secs(wb, "wall_seconds").max(secs(&effort["totals"], "wall_seconds"))),
             rows,
             // An older list left no `wall_buckets`: it has no figure, not zeros.
             // `parked` is shown only where a person parked the list.
@@ -399,6 +402,21 @@ mod tests {
         let mut w = list(&store, "l");
         w.project = Some("proj".into());
         assert!(eligible_with(&store, &w, 9, 9999).unwrap_err().contains("retro = off"));
+    }
+
+    #[test]
+    fn the_headers_wall_is_the_buckets_total_so_the_lines_under_it_sum_to_it() {
+        // totals.wall_seconds reads 3780 s; the buckets are 3600 s and say so.
+        let mut e = effort("l");
+        e["totals"]["wall_seconds"] = json!(3780);
+        let wb = &mut e["totals"]["wall_buckets"];
+        for (k, v) in [("wall_seconds", 3600), ("working_seconds", 1000), ("waiting_seconds", 1200), ("serialised_seconds", 600), ("barrier_run_seconds", 300), ("check_seat_seconds", 300), ("between_groups_seconds", 200), ("attributed_seconds", 3600)] {
+            wb[k] = json!(v);
+        }
+        let f = Figures::of(&e);
+        assert_eq!(f.wall, 3600);
+        assert_eq!(f.buckets.iter().map(|(_, s)| s).sum::<i64>(), f.wall, "{f:?}");
+        assert!(f.line().contains("wall 60m"), "{}", f.line());
     }
 
     #[test]

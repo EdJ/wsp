@@ -187,7 +187,17 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
         let what = before.rsplit_once(": ").map_or(before, |(_, w)| w);
         names(what, who).then(|| after.to_string())
     });
-    if let Some(after) = cap {
+    // The cycle log said the barrier was held: by an open question, a verifier,
+    // a member (`group N: barrier waits: …`). That is what the stretch was, not
+    // a barrier running (`compounding-468`).
+    let hold = crate::barrier::parse_label(who).and_then(|(list, at)| {
+        let head = format!("{list} group {at}: barrier waits: ");
+        i.cycle.iter().filter(|(t, _)| *t >= from && *t <= to).filter_map(|(_, l)| l.split_once(&head).map(|(_, w)| w.trim().to_string())).last()
+    });
+    if let Some(held) = hold.filter(|h| !h.is_empty()) {
+        let held: String = held.chars().take(300).collect();
+        format!("{}{held}", crate::wallbuckets::BARRIER_HOLD)
+    } else if let Some(after) = cap {
         let held = cap_holders(i, &after, to);
         if held.is_empty() { "the seat's cap (a place to come free)".into() } else { format!("the seat's cap (a place to come free) — held by {held}") }
     } else if span <= HAND_OFF {
@@ -2044,6 +2054,31 @@ mod tests {
         let ph = build(&i);
         let wait = ph.iter().find(|p| p.label.starts_with("last verdict → barrier 1 run started")).unwrap();
         assert_eq!((wait.start, wait.end), (900, 940), "r-1 was verified at 380; r-2's legs ran to 900, and that is not the barrier's wait: {ph:?}");
+    }
+
+    #[test]
+    fn a_barrier_held_by_a_member_question_names_the_holder_and_is_waiting_not_the_run() {
+        let mut i = row();
+        i.group = Some(("list".into(), 1, vec!["r-1".into()]));
+        for t in (400..3000).step_by(60) {
+            i.cycle.push((t, "list group 1: barrier waits: cpd-9 (r-9) is waiting on the list governor to answer its question m-abc".into()));
+        }
+        i.cycle.push((3000, "list group 1: started list · barrier 1".into()));
+        i.cycle.push((3250, "list group 1: barrier run — 19 step(s), 0 reused, 19 ran, 0 failed, 223s".into()));
+        i.cycle.push((3260, "tell list: Barrier 1 of list passed".into()));
+        let ph = build(&i);
+        let wait = ph.iter().find(|p| p.label.starts_with("last verdict → barrier 1 run started")).expect("the wait is a phase");
+        assert!(wait.waiting_for.as_deref().is_some_and(|w| w.starts_with(crate::wallbuckets::BARRIER_HOLD) && w.contains("(r-9)") && w.contains("m-abc")), "{wait:?}");
+        let r1 = crate::wallbuckets::MemberIn {
+            id: "r-1".into(),
+            spans: ph.iter().map(crate::wallbuckets::Span::of).collect(),
+            ..Default::default()
+        };
+        let g = crate::wallbuckets::group_wall(&[r1], None, Some(3260)).unwrap();
+        assert_eq!(g.seconds("barrier_run"), 223 + 10, "the run (and the second to the pass), not the hold: {g:?}");
+        assert_eq!(g.barrier_run, 223 + 10, "{g:?}");
+        assert!(g.waits.iter().any(|((_, c), s)| c.starts_with(crate::wallbuckets::BARRIER_HOLD) && c.contains("m-abc") && *s >= 2500), "{g:?}");
+        assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
     }
 
     #[test]

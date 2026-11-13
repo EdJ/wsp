@@ -47,6 +47,10 @@ pub(crate) enum Class {
     Barrier,
     /// The barrier's check seat, and the wait before it.
     Check,
+    /// The barrier held before it started, by a line of the cycle log naming
+    /// what it waits on (an open question, a verifier, a member): the group is
+    /// waiting on that, and no barrier is running (`compounding-468`).
+    BarrierWait(String),
     /// Overlaps the barrier (clean-up, the seat released late): not counted.
     Alongside,
 }
@@ -62,7 +66,11 @@ impl Span {
     pub(crate) fn of(p: &Phase) -> Span {
         let l = p.label.as_str();
         let class = if p.shared {
-            if l.contains("check seat") { Class::Check } else { Class::Barrier }
+            match p.waiting_for.as_deref() {
+                Some(w) if p.gap && w.starts_with(BARRIER_HOLD) => Class::BarrierWait(w.to_string()),
+                _ if l.contains("check seat") => Class::Check,
+                _ => Class::Barrier,
+            }
         } else if p.gap {
             Class::Gap(p.waiting_for.clone().unwrap_or_else(|| "unnamed".into()))
         } else if l.contains("alongside") {
@@ -79,6 +87,11 @@ impl Span {
         Span { start: p.start, end: p.end, class }
     }
 }
+
+/// What a barrier gap's cause starts with where the cycle log says the barrier
+/// was held (`group N: barrier waits: …`): `timeline::wait_name` writes it, and
+/// the wall books the stretch as waiting on that, not as the barrier's run.
+pub(crate) const BARRIER_HOLD: &str = "the barrier waits: ";
 
 /// Sorted, overlapping and touching intervals joined.
 pub(crate) fn merge(v: &[(i64, i64)]) -> Vec<(i64, i64)> {
@@ -232,12 +245,12 @@ pub(crate) fn group_wall_parked(members: &[MemberIn], open: Option<i64>, pass: O
     let started: Vec<(&MemberIn, i64, i64)> = members
         .iter()
         .filter_map(|m| {
-            let own: Vec<&Span> = m.spans.iter().filter(|s| !matches!(s.class, Class::Barrier | Class::Check | Class::Alongside)).collect();
+            let own: Vec<&Span> = m.spans.iter().filter(|s| !matches!(s.class, Class::Barrier | Class::Check | Class::BarrierWait(_) | Class::Alongside)).collect();
             Some((m, own.iter().map(|s| s.start).min()?, own.iter().map(|s| s.end).max()?))
         })
         .collect();
     let first_start = started.iter().map(|x| x.1).min()?;
-    let shared: Vec<&Span> = members.iter().flat_map(|m| m.spans.iter()).filter(|s| matches!(s.class, Class::Barrier | Class::Check)).collect();
+    let shared: Vec<&Span> = members.iter().flat_map(|m| m.spans.iter()).filter(|s| matches!(s.class, Class::Barrier | Class::Check | Class::BarrierWait(_))).collect();
     let last_member = started.iter().map(|x| x.2).max()?;
     // The window opens at the previous group's pass, whether or not a member
     // started before it (a row cut from the previous group and started again, a
@@ -308,7 +321,13 @@ pub(crate) fn group_wall_parked(members: &[MemberIn], open: Option<i64>, pass: O
         }
         if within(&barrier, a) {
             let at = |s: &&&Span| a >= s.start && a < s.end;
-            if shared.iter().filter(at).any(|s| s.class == Class::Check) {
+            let held = shared.iter().filter(at).find_map(|s| if let Class::BarrierWait(c) = &s.class { Some(c.clone()) } else { None });
+            let running = shared.iter().filter(at).any(|s| matches!(s.class, Class::Barrier | Class::Check));
+            if let (Some(cause), false) = (held, running) {
+                // Held by a named wait: nobody is running the barrier.
+                add(&mut g, "waiting", b - a);
+                *g.waits.entry((String::new(), cause)).or_insert(0) += b - a;
+            } else if shared.iter().filter(at).any(|s| s.class == Class::Check) {
                 add(&mut g, "check_seat", b - a);
             } else {
                 add(&mut g, "barrier_run", b - a);
@@ -411,6 +430,35 @@ mod tests {
         assert_eq!(g.seconds("working"), 90 + 90 + 80, "r-1, r-2 and the follow-up r-3");
         assert_eq!(g.seconds("waiting"), 20 + 10 + 400, "the starts, r-3's, and 1100-1500 with every member done");
         assert_eq!(g.by.values().sum::<i64>(), 1600, "the buckets sum to the wall");
+    }
+
+    #[test]
+    fn a_barrier_held_by_a_named_wait_is_waiting_on_it_and_only_the_run_is_barrier_run() {
+        // r-1 works 0-100. The barrier is held from 100 to 2650 (a member's open
+        // question, from the cycle log), runs 2650-2873 and its check seat to 2900.
+        let mut ms = vec![seat("r-1", 0, 100, &[(10, 100)], &[])];
+        let cause = format!("{BARRIER_HOLD}cpd-1 (r-9) is waiting on the governor to answer its question m-1");
+        for m in ms.iter_mut() {
+            m.spans.push(Span { start: 100, end: 2650, class: Class::BarrierWait(cause.clone()) });
+            m.spans.push(Span { start: 2650, end: 2873, class: Class::Barrier });
+            m.spans.push(Span { start: 2873, end: 2900, class: Class::Check });
+        }
+        let g = group_wall(&ms, None, Some(2900)).unwrap();
+        assert_eq!(g.seconds("barrier_run"), 223, "the run, not the hold");
+        assert_eq!(g.barrier_run, 223);
+        assert_eq!(g.seconds("check_seat"), 27);
+        assert_eq!(g.seconds("waiting"), 10 + 2550, "the start, then the hold");
+        assert_eq!(g.waits.get(&(String::new(), cause)), Some(&2550));
+        assert_eq!(g.by.values().sum::<i64>(), 2900, "the buckets tile the window");
+    }
+
+    #[test]
+    fn a_barrier_hold_phase_is_a_wait_class_and_an_unheld_gap_stays_the_barriers() {
+        let gap = |why: String| Phase { label: "last verdict → barrier 2 run started".into(), start: 0, end: 10, gap: true, waiting_for: Some(why), shared: true };
+        let held = gap(format!("{BARRIER_HOLD}x"));
+        let hand_off = gap("the hand-off (a poke and a spawn)".into());
+        assert_eq!(Span::of(&held).class, Class::BarrierWait(format!("{BARRIER_HOLD}x")));
+        assert_eq!(Span::of(&hand_off).class, Class::Barrier);
     }
 
     #[test]
