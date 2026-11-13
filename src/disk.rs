@@ -286,15 +286,107 @@ fn private_size(_: &Path) -> Option<u64> {
 
 /// The biggest of `items` that are on the volume mounted at `volume`, at most
 /// [`NAMED`], largest first.
-pub(crate) fn biggest(items: &[(PathBuf, &str)], volume: &str) -> Vec<Removable> {
+///
+/// Each is sized through [`Sizes`] under `state`: a tree whose [`stamp`] is
+/// what it was at its last sizing is not walked again (`wsp-630`).
+pub(crate) fn biggest(state: &Path, items: &[(PathBuf, &str)], volume: &str) -> Vec<Removable> {
+    let mut sizes = Sizes::load(state);
     let mut found: Vec<Removable> = items
         .iter()
         .filter(|(p, _)| free_of(p).is_some_and(|(v, _)| v == volume))
-        .filter_map(|(p, kind)| size_of(p).map(|s| Removable { path: p.display().to_string(), bytes: s.bytes, exact: s.exact, upto: s.upto, kind: kind.to_string() }))
+        .filter_map(|(p, kind)| sizes.size(p).map(|s| Removable { path: p.display().to_string(), bytes: s.bytes, exact: s.exact, upto: s.upto, kind: kind.to_string() }))
         .collect();
+    sizes.save(items.iter().map(|(p, _)| p.as_path()));
     found.sort_by(|a, b| b.upto.max(b.bytes).cmp(&a.upto.max(a.bytes)));
     found.truncate(NAMED);
     found
+}
+
+/// What a tree looked like when it was last sized, cheaply: the mtime of every
+/// directory down to [`STAMP_DEPTH`] below it, and how many there are. A file
+/// made or removed anywhere in the top `STAMP_DEPTH + 1` levels moves one —
+/// every cargo build adds to `<profile>/deps`, `.fingerprint` or `incremental`
+/// — and reading it costs one `lstat` per directory near the top instead of
+/// one `lstat` and one `getattrlist` per file in the tree.
+const STAMP_DEPTH: usize = 2;
+
+/// How long a size that its stamp still vouches for is believed, in seconds:
+/// a file grown in place deep in a tree moves no directory, so it is walked
+/// again at least this often.
+const SIZE_LIFE: i64 = 6 * 60 * 60;
+
+pub(crate) fn stamp(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut stack = vec![(path.to_path_buf(), 0usize)];
+    let (mut newest, mut dirs) = (i128::MIN, 0u64);
+    while let Some((p, depth)) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        dirs += 1;
+        newest = newest.max(meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128);
+        if depth < STAMP_DEPTH {
+            for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push((e.path(), depth + 1));
+                }
+            }
+        }
+    }
+    (dirs > 0).then(|| format!("{newest}/{dirs}"))
+}
+
+fn sizes_path(state: &Path) -> PathBuf {
+    state.join("disk-sizes.json")
+}
+
+/// The sizes of the trees [`biggest`] has measured, by path, each with the
+/// [`stamp`] it was measured at, kept in `disk-sizes.json`.
+pub(crate) struct Sizes {
+    state: PathBuf,
+    known: serde_json::Map<String, serde_json::Value>,
+    /// How many trees this reading walked; the test reads it.
+    pub walked: usize,
+}
+
+impl Sizes {
+    pub(crate) fn load(state: &Path) -> Sizes {
+        let known = std::fs::read_to_string(sizes_path(state))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        Sizes { state: state.to_path_buf(), known, walked: 0 }
+    }
+
+    /// `path`'s size: the one recorded while its stamp is unchanged and the
+    /// record younger than [`SIZE_LIFE`], else walked now and recorded.
+    pub(crate) fn size(&mut self, path: &Path) -> Option<Sized> {
+        let key = path.display().to_string();
+        let now = stamp(path);
+        if let (Some(now), Some(was)) = (&now, self.known.get(&key)) {
+            let fresh = was.get("at").and_then(|a| a.as_i64()).is_some_and(|at| util::epoch_secs() - at <= SIZE_LIFE);
+            if fresh && was.get("stamp").and_then(|s| s.as_str()) == Some(now.as_str()) {
+                if let (Some(bytes), Some(upto)) = (was.get("bytes").and_then(|b| b.as_u64()), was.get("upto").and_then(|u| u.as_u64())) {
+                    return Some(Sized { bytes, exact: was.get("exact").and_then(|e| e.as_bool()).unwrap_or(false), upto });
+                }
+            }
+        }
+        self.walked += 1;
+        let sized = size_of(path)?;
+        if let Some(now) = now {
+            self.known.insert(key, json!({ "stamp": now, "at": util::epoch_secs(), "bytes": sized.bytes, "exact": sized.exact, "upto": sized.upto }));
+        }
+        Some(sized)
+    }
+
+    /// Written back, keeping only the trees still among `live`.
+    pub(crate) fn save<'a>(mut self, live: impl Iterator<Item = &'a Path>) {
+        let live: BTreeSet<String> = live.map(|p| p.display().to_string()).collect();
+        self.known.retain(|k, _| live.contains(k));
+        let _ = std::fs::write(sizes_path(&self.state), serde_json::Value::Object(self.known).to_string());
+    }
 }
 
 fn record_path(state: &Path) -> PathBuf {
@@ -323,6 +415,20 @@ fn recorded(state: &Path, volume: &str) -> Vec<Removable> {
         )
     };
     read().unwrap_or_default()
+}
+
+/// When `volume`'s reclaimable items were last measured, found or not.
+fn measured_at(state: &Path, volume: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(record_path(state)).ok()?).ok()?;
+    v.get(volume)?.get("at")?.as_i64()
+}
+
+/// Whether the daemon should measure `volume` again: never measured, or the
+/// last measurement older than [`FRESH`]. A measurement that found nothing
+/// counts — re-walking every tick because nothing was found is what kept the
+/// daemon at 140 % (`wsp-630`).
+fn due(state: &Path, volume: &str) -> bool {
+    measured_at(state, volume).is_none_or(|at| util::epoch_secs() - at > FRESH)
 }
 
 fn record(state: &Path, volume: &str, found: &[Removable]) {
@@ -357,7 +463,7 @@ pub(crate) fn read(store: &Store, limit: u64, measure: bool) -> Vec<Disk> {
             if disk.low() {
                 disk.items = recorded(&store.state, &disk.volume);
                 if disk.items.is_empty() && measure {
-                    disk.items = biggest(&reclaimable(store), &disk.volume);
+                    disk.items = biggest(&store.state, &reclaimable(store), &disk.volume);
                     record(&store.state, &disk.volume, &disk.items);
                 }
             }
@@ -420,13 +526,13 @@ pub(crate) fn tidy(store: &Store) {
         if !disk.low() {
             continue;
         }
-        if disk.items.is_empty() && !MEASURING.swap(true, Ordering::SeqCst) {
+        if due(&store.state, &disk.volume) && !MEASURING.swap(true, Ordering::SeqCst) {
             let (paths, volume, state) = (reclaimable(store), disk.volume.clone(), store.state.clone());
             std::thread::spawn(move || {
-                let found = biggest(&paths, &volume);
-                if !found.is_empty() {
-                    record(&state, &volume, &found);
-                }
+                let found = biggest(&state, &paths, &volume);
+                // Recorded even when empty, so the next is due a FRESH later
+                // and not on the next tick.
+                record(&state, &volume, &found);
                 MEASURING.store(false, Ordering::SeqCst);
             });
         }
@@ -497,7 +603,9 @@ mod tests {
         fill(&big, 512);
         fill(&mid, 256);
         let volume = free_of(&small).unwrap().0;
-        let found = biggest(&[(small.clone(), "build output"), (big.clone(), "build output"), (mid.clone(), "scratch of a closed row")], &volume);
+        let sizes = env.path("sizes");
+        std::fs::create_dir_all(&sizes).unwrap();
+        let found = biggest(&sizes, &[(small.clone(), "build output"), (big.clone(), "build output"), (mid.clone(), "scratch of a closed row")], &volume);
         assert_eq!(found.iter().map(|r| r.path.clone()).collect::<Vec<_>>(), [big.clone(), mid.clone(), small.clone()].map(|p| p.display().to_string()));
         assert_eq!(found[1].kind, "scratch of a closed row");
         assert!(found[0].bytes >= 512 * 1024, "{}", found[0].bytes);
@@ -509,6 +617,49 @@ mod tests {
         std::fs::remove_dir_all(&big).unwrap();
         let after = recorded(&state, &volume);
         assert_eq!(after.len(), 2, "a record named a directory that is gone");
+    }
+
+    /// A tree sized once is not walked again while nothing in it has moved;
+    /// a build writing into it, or a record gone stale, walks it again
+    /// (`wsp-630`).
+    #[test]
+    fn an_unchanged_tree_is_not_walked_again() {
+        let env = util::isolated("disk-sizes");
+        let (tree, state) = (env.path("t/target"), env.path("state"));
+        fill(&tree.join("debug/deps"), 64);
+        std::fs::create_dir_all(&state).unwrap();
+
+        let mut first = Sizes::load(&state);
+        let a = first.size(&tree).unwrap();
+        assert_eq!(first.walked, 1);
+        first.save([tree.as_path()].into_iter());
+
+        let mut again = Sizes::load(&state);
+        let b = again.size(&tree).unwrap();
+        assert_eq!(again.walked, 0, "an unchanged tree was walked again");
+        assert_eq!((a.bytes, a.upto, a.exact), (b.bytes, b.upto, b.exact));
+        again.save([tree.as_path()].into_iter());
+
+        // A build adds a file two levels down: its directory's mtime moves.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(tree.join("debug/deps/libx.rlib"), vec![2u8; 128 * 1024]).unwrap();
+        let mut built = Sizes::load(&state);
+        let c = built.size(&tree).unwrap();
+        assert_eq!(built.walked, 1, "a tree a build wrote into was not walked");
+        assert!(c.upto > b.upto, "{} {}", c.upto, b.upto);
+        built.save(std::iter::empty());
+        assert_eq!(Sizes::load(&state).known.len(), 0, "a tree no longer reclaimable was kept");
+    }
+
+    /// A measurement that found nothing still makes the next one wait.
+    #[test]
+    fn a_measurement_that_found_nothing_is_not_due_again_at_once() {
+        let env = util::isolated("disk-due");
+        let state = env.path("state");
+        std::fs::create_dir_all(&state).unwrap();
+        assert!(due(&state, "/v"));
+        record(&state, "/v", &[]);
+        assert!(!due(&state, "/v"), "an empty measurement was due again on the next tick");
     }
 
     /// `du` reads a `cp -cR` clone in full; the volume gives back only what
