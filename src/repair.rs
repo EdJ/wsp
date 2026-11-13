@@ -1815,7 +1815,22 @@ fn retry_undelivered_tells(store: &Store, seats: &dyn Seats) {
         if crate::waiting::reading(Some(State::Idle), asks, &seats.shells(&[&seat]), &seat, &t.id).is_some() {
             continue;
         }
-        if crate::cmd_task::deliver(store, &t.id, &format!("wsp sent {} back: {reason}", t.id)) {
+        let told = crate::cmd_task::deliver_as(store, &t.id, &format!("wsp sent {} back: {reason}", t.id));
+        // **A pending delivery is asked again, not counted as a refusal**
+        // (`wsp-469`): the backend's "still pending after 30s, asked again next
+        // tick under the same id" is a seat busy past the wait, not a seat that
+        // refused. It keeps the mark, types nothing new, and is asked again at
+        // the next idle tick for [`TELL_RETRY_FOR`] after the send-back; past
+        // that it is read as the refusal it has become.
+        let waited = sent_back_age(t);
+        if told == crate::cmd_task::Told::Pending && waited.is_some_and(|w| w < TELL_RETRY_FOR) {
+            stamp(store, &format!(
+                "{}: the send-back to {seat} is still pending in its backend — asked again next tick ({}s since it was sent back)",
+                t.id, waited.unwrap_or(0)
+            ));
+            continue;
+        }
+        if told == crate::cmd_task::Told::Yes {
             store.locked(|| {
                 let Some(mut t) = store.find_task(&t.id) else { return };
                 let _ = crate::log::note(store, &mut t, TELL_DELIVERED);
@@ -1836,6 +1851,18 @@ fn retry_undelivered_tells(store: &Store, seats: &dyn Seats) {
             crate::cycle::despawn(store, &t.id);
         }
     }
+}
+
+/// How long a send-back whose delivery is pending in the backend is asked about
+/// again at each idle tick (`wsp-469`): the compound backend's own window for one
+/// tell (`DELIVER_PENDING_FOR`), and `cmd_message`'s `HELD_RETRY_FOR` for an answer.
+const TELL_RETRY_FOR: i64 = 900;
+
+/// Seconds since the row's newest send-back line.
+fn sent_back_age(t: &Task) -> Option<i64> {
+    let log = t.section("Log")?;
+    let at = log.lines().filter(|l| l.contains(crate::cycle::SENT_BACK)).last().and_then(stamp_of)?;
+    Some((util::epoch_secs() - at).max(0))
 }
 
 // ---- a landing nobody recorded -------------------------------------------
@@ -4413,6 +4440,55 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         crate::cycle::tests::TELL_REFUSED.with(|r| r.set(false));
         assert_eq!(ended(), ["m-1"], "refused on an idle seat: ended in one tick");
         assert!(stamped().iter().any(|l| l.contains("m-1") && l.contains("ending it")));
+    }
+
+    /// `compounding-469`: the verdict path made the held answer's mistake — compound's
+    /// "delivery still pending after 30s, asked again next tick under the same id" read as
+    /// a refusal, and a second one ended the seat.
+    #[test]
+    fn a_send_back_still_pending_in_the_backend_is_asked_again_and_not_counted_as_refused() {
+        let (_env, store) = in_flight("pendingbackend");
+        let mut t = store.find_task("m-1").unwrap();
+        crate::log::note(&store, &mut t, "sent back: the verifier blocked: not held").unwrap();
+        note_tell_pending(&store, "m-1");
+        let _ = (member_told(), ended(), stamped());
+
+        // First idle tick, the backend still pending; and again, and again.
+        crate::cycle::tests::TELL_PENDING_BACKEND.with(|r| r.set(true));
+        for _ in 0..3 {
+            tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        }
+        crate::cycle::tests::TELL_PENDING_BACKEND.with(|r| r.set(false));
+        assert!(ended().is_empty(), "a pending delivery does not end the seat, however many ticks");
+        assert!(member_told().iter().all(|(_, t)| !t.contains("sent m-1 back")), "nothing typed while pending");
+        assert!(undelivered_reason(&store.find_task("m-1").unwrap()).is_some(), "still owed");
+        assert!(stamped().iter().any(|l| l.contains("m-1") && l.contains("still pending")));
+
+        // The backend finishes: typed at the next idle tick, once.
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        let told = member_told();
+        assert_eq!(told.iter().filter(|(id, t)| id == "m-1" && t.contains("sent m-1 back")).count(), 1, "{told:?}");
+        assert!(undelivered_reason(&store.find_task("m-1").unwrap()).is_none());
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert!(member_told().iter().all(|(_, t)| !t.contains("sent m-1 back")), "once");
+        assert!(ended().is_empty());
+    }
+
+    /// A delivery pending for longer than the backend's own window is a failure that has
+    /// lasted, and ends the seat as a refusal does.
+    #[test]
+    fn a_send_back_pending_past_the_retry_window_is_read_as_refused() {
+        let (_env, store) = in_flight("pendingold");
+        let mut t = store.find_task("m-1").unwrap();
+        let old = crate::util::iso_at(crate::util::epoch_secs() - TELL_RETRY_FOR - 60);
+        crate::model::set_section_in(&mut t.body, "Log", &format!("- {old} sent back: the verifier blocked: not held"));
+        store.save_task(&t).unwrap();
+        note_tell_pending(&store, "m-1");
+        let _ = ended();
+        crate::cycle::tests::TELL_PENDING_BACKEND.with(|r| r.set(true));
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        crate::cycle::tests::TELL_PENDING_BACKEND.with(|r| r.set(false));
+        assert_eq!(ended(), ["m-1"]);
     }
 
     /// What each state of a row's log answers, in one place.

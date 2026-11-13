@@ -5245,6 +5245,9 @@ pub(crate) mod tests {
         pub(crate) static DESPAWN_FAILS: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and a member's seat takes no tell on this thread (`deliver` is false).
         pub(crate) static TELL_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set, and a member's seat answers every tell "delivery still pending" on this
+        /// thread (`deliver_as` is `Pending`), ahead of [`TELL_REFUSED`].
+        pub(crate) static TELL_PENDING_BACKEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The barrier checks whose ending a verb arranged on this thread
         /// (`wsp-230`) — a launched process each, which a test cannot run.
         pub(crate) static CHECKS_ENDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };

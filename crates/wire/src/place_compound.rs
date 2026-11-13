@@ -1226,6 +1226,10 @@ const DELIVER_PENDING: &str = "deliver.pending";
 /// a repeat of the words is a new tell.
 const DELIVER_PENDING_FOR: i64 = 900;
 
+/// The words a delivery that did not finish in time opens its refusal with: what a
+/// caller that only sees the text (`wsp tell`'s stderr) reads as "asked again, not failed".
+pub const DELIVERY_PENDING: &str = "delivery still pending";
+
 /// The id this sentence is delivered under: the one still pending for the same
 /// words, or a fresh one, recorded in the seat's directory.
 fn delivery_id(dir: &Path, text: &str) -> String {
@@ -1283,7 +1287,7 @@ fn deliver_through(sup: &Path, session: &Path, dir: &Path, seat: &Seat, text: &s
         Err(_) => {
             let _ = Command::new("kill").arg(pid.to_string()).stderr(Stdio::null()).status();
             return Err(Refusal::Backend(format!(
-                "{seat}: delivery still pending after {}s, asked again next tick under the same id",
+                "{seat}: {DELIVERY_PENDING} after {}s, asked again next tick under the same id",
                 wait.as_secs()
             )));
         }

@@ -1535,22 +1535,47 @@ pub(crate) fn deliver_notice(store: &Store, id: &str, text: &str) {
 /// Types `line` to the member's pane. `false` only when there was a pane and it
 /// did not get it; no pane is nothing owed.
 pub(crate) fn deliver(store: &Store, id: &str, line: &str) -> bool {
+    deliver_as(store, id, line) == Told::Yes
+}
+
+/// What typing a sentence to a member's pane came to (`wsp-469`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Told {
+    /// The pane has the sentence, or there was no pane and nothing is owed.
+    Yes,
+    /// The backend did not finish in time and will be asked again under the
+    /// same id: not a refusal, and the seat is not at fault.
+    Pending,
+    /// The pane refused, or `wsp tell` could not run.
+    No,
+}
+
+/// [`deliver`] saying which way it did not deliver. **A pending delivery is
+/// not a failed one**: compound's `deliver` answers a seat that is busy for
+/// longer than the tick waits with `delivery still pending after 30s, asked
+/// again next tick under the same id`, and a caller that reads that as a refusal
+/// ends a seat that was never asked twice (the verdict path of the same
+/// mistake `cmd_message`'s held answers made, `wsp-469`).
+pub(crate) fn deliver_as(store: &Store, id: &str, line: &str) -> Told {
     // Nothing to tell: a row nobody is holding has no pane, and saying so
     // would be noise on every reopen of finished work.
     if store.panes_for_task(id).is_empty() {
-        return true;
+        return Told::Yes;
     }
     if cfg!(test) {
         #[cfg(test)]
         {
+            if crate::cycle::tests::TELL_PENDING_BACKEND.with(|r| r.get()) {
+                return Told::Pending;
+            }
             if crate::cycle::tests::TELL_REFUSED.with(|r| r.get()) {
-                return false;
+                return Told::No;
             }
             crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), line.to_string())));
         }
-        return true;
+        return Told::Yes;
     }
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = std::env::current_exe() else { return Told::No };
     let mut child = match wsp_base::calls::Command::new(exe)
         .args(["tell", id, "-"])
         .stdin(std::process::Stdio::piped())
@@ -1561,25 +1586,29 @@ pub(crate) fn deliver(store: &Store, id: &str, line: &str) -> bool {
         Ok(c) => c,
         Err(e) => {
             crate::store::log_line(store, &format!("tell {id}: could not run `wsp tell` ({e})"));
-            return false;
+            return Told::No;
         }
     };
     if let Some(mut to) = child.stdin.take() {
         use std::io::Write;
         let _ = writeln!(to, "{line}");
     }
-    let (delivered, said) = match child.wait_with_output() {
-        Ok(o) if o.status.success() => (true, "it has the sentence".to_string()),
-        Ok(o) => (false, format!("not delivered — {}", util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120))),
-        Err(e) => (false, format!("not delivered — {e}")),
+    let (told, said) = match child.wait_with_output() {
+        Ok(o) if o.status.success() => (Told::Yes, "it has the sentence".to_string()),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let told = if err.contains(crate::place_compound::DELIVERY_PENDING) { Told::Pending } else { Told::No };
+            (told, format!("not delivered — {}", util::truncate(err.trim(), 120)))
+        }
+        Err(e) => (Told::No, format!("not delivered — {e}")),
     };
     crate::store::log_line(store, &format!("tell {id}: {said}"));
-    if !delivered {
+    if told != Told::Yes {
         crate::store::log_line(store, &format!(
             "{id} is at doing with the reason on its row, but its pane did not get it — wsp retries when its seat reads idle, or `wsp tell {id} --anyway -`"
         ));
     }
-    delivered
+    told
 }
 
 /// Reads its prose the same way `note` does — see [`payload_source`].
