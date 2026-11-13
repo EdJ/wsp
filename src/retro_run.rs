@@ -30,6 +30,12 @@ pub fn html(_store: &Store, w: &Worklist, s: &Value) -> String {
     b.push_str("<p class=\"dim\">Time and cost are in <a href=\"effort.html\">effort.html</a>; the work in <a href=\"work.html\">work.html</a>.</p>");
     // A baseline list with no bucket figures (an older `effort.json`) has no figure.
     let base: Vec<&Value> = arr(s, "baseline").iter().filter(|f| f["buckets"].as_object().is_some_and(|o| o.values().filter_map(Value::as_i64).sum::<i64>() > 0)).collect();
+    // Where a person parked the whole list, the wall without the park beside the
+    // full one: a retro attributes the working wall, not a night off (`compounding-464`).
+    if let Some(wall) = s["wall"].as_i64().filter(|_| s["parked"].as_i64().unwrap_or(0) > 0) {
+        let parked = s["parked"].as_i64().unwrap_or(0);
+        b.push_str(&format!("<p>Wall {}; without the {} a person parked the list, {}.</p>", mins(wall), mins(parked), mins((wall - parked).max(0))));
+    }
     b.push_str("<h2>Where the time went</h2><table><thead><tr><th>bucket</th><th>this list</th><th>baseline</th><th>ratio</th></tr></thead><tbody>");
     for (name, secs) in s["buckets"].as_object().into_iter().flatten() {
         let secs = secs.as_i64().unwrap_or(0);
@@ -129,6 +135,7 @@ pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, Strin
     s["retros"] = json!(on);
     s["started"] = json!(util::now_iso());
     s["wall"] = json!(f.wall);
+    s["parked"] = json!(f.parked);
     s["rows"] = json!(f.rows);
     s["buckets"] = json!(f.buckets.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, Value>>());
     s["baseline"] = json!(retro::baseline(store, &w).iter().map(|b| json!({ "list": b.list, "wall": b.wall, "buckets": b.buckets.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, Value>>() })).collect::<Vec<_>>());
@@ -617,5 +624,15 @@ mod tests {
         assert!(h.contains("the wall was a wrong-repo stall") && !h.contains("{&quot;summary") && !h.contains("{\"summary"), "{h}");
         let plain = html(&store, &w, &json!({ "buckets": {}, "summary": "nothing to file: inside the baseline" }));
         assert!(plain.contains("<pre>nothing to file: inside the baseline</pre>"));
+    }
+
+    #[test]
+    fn retro_html_shows_the_wall_without_a_park_beside_the_full_one() {
+        let w = Worklist::new("h", "A list");
+        let (_env, store) = crate::testkit::isolated_store("retro-html-park");
+        let h = html(&store, &w, &json!({ "wall": 7200, "parked": 4000, "buckets": { "parked": 4000 }, "baseline": [] }));
+        assert!(h.contains("Wall 120m; without the 67m a person parked the list, 53m."), "{h}");
+        let none = html(&store, &w, &json!({ "wall": 7200, "parked": 0, "buckets": {}, "baseline": [] }));
+        assert!(!none.contains("parked the list"), "{none}");
     }
 }

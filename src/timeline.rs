@@ -80,6 +80,66 @@ pub(crate) struct Inputs {
     pub seat_first: Option<i64>,
     /// The verifier seats the row's sessions name, read off their transcripts.
     pub verifiers: Vec<VerifierSeat>,
+    /// The stretches a person parked the row's whole list (`worklist-parked` to
+    /// `worklist-resumed`), which no row's own log says.
+    pub parks: Vec<Park>,
+}
+
+/// One park of a list, from its park event to the resume that took it back.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Park {
+    pub start: i64,
+    pub end: i64,
+    /// Who parked it where the event names one; `somebody` where it names no one.
+    pub by: String,
+    pub why: String,
+    /// Still parked at the end of what was read: `end` is where reading stopped.
+    pub open: bool,
+}
+
+impl Park {
+    /// What it was, for a cause or a bucket: who, when, why, until when.
+    pub(crate) fn words(&self) -> String {
+        let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
+        let why: String = self.why.trim().chars().take(140).collect();
+        let until = if self.open { "still parked".to_string() } else { format!("resumed at {}", at(self.end)) };
+        format!("the list was parked by {} at {}, {until}{}", self.by, at(self.start), if why.is_empty() { String::new() } else { format!(": {why}") })
+    }
+}
+
+/// The parks of a list, read off the event log.
+pub(crate) fn list_parks(store: &Store, list: &str) -> Vec<Park> {
+    let mut ev: Vec<(i64, String, Value)> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(store.state_file("events.jsonl")) {
+        for line in text.lines().filter(|l| l.contains("\"worklist-parked\"") || l.contains("\"worklist-resumed\"")) {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            if let (Some(ts), Some(kind)) = (v["ts"].as_str(), v["kind"].as_str()) {
+                ev.push((util::epoch_of(ts), kind.to_string(), v["data"].clone()));
+            }
+        }
+    }
+    parks_of(&ev, list, util::epoch_secs())
+}
+
+/// The parks of `list` in an event log's lines, in order. A park with no resume
+/// after it runs to `now`.
+pub(crate) fn parks_of(events: &[(i64, String, Value)], list: &str, now: i64) -> Vec<Park> {
+    let mut out: Vec<Park> = Vec::new();
+    let mut at: Vec<&(i64, String, Value)> = events.iter().filter(|(_, k, d)| (k == "worklist-parked" || k == "worklist-resumed") && d["id"].as_str() == Some(list)).collect();
+    at.sort_by_key(|e| e.0);
+    for (t, kind, d) in at {
+        if kind == "worklist-parked" {
+            if out.last().is_some_and(|p| p.open) {
+                continue;
+            }
+            let by = d["by"].as_str().filter(|b| !b.is_empty()).unwrap_or("somebody").to_string();
+            out.push(Park { start: *t, end: now.max(*t), by, why: d["why"].as_str().unwrap_or_default().to_string(), open: true });
+        } else if let Some(p) = out.last_mut().filter(|p| p.open) {
+            p.end = *t;
+            p.open = false;
+        }
+    }
+    out
 }
 
 /// One verifier seat as its own transcript has it (`wsp-429`). wsp's
@@ -288,6 +348,15 @@ pub(crate) fn attempts(i: &Inputs) -> Vec<Attempt> {
 fn between_attempts(i: &Inputs, prev: &Attempt, to: i64) -> (String, String) {
     let id = i.id.as_str();
     let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
+    // A person parking the whole list releases every seat in it and writes no
+    // line on any row: the list's park record says it. A park that covers most of
+    // the stretch is what it was, whether the row was released or sent back and
+    // reopened (`compounding-464`).
+    let from = prev.review.unwrap_or_else(|| prev.end.unwrap_or(prev.claim));
+    let parked_for = |p: &Park| (p.end.min(to) - p.start.max(from)).max(0);
+    if let Some(p) = i.parks.iter().filter(|p| parked_for(p) * 2 > to - from).max_by_key(|p| parked_for(p)) {
+        return (format!("parked at {} → seat started again", at(p.start.max(from))), format!("{PARKED_CAUSE} — {}, until the seat was started again at {}", p.words(), at(to)));
+    }
     if let Some(rv) = prev.review {
         return (
             format!("reviewed at {} → sent back → seat started again", at(rv)),
@@ -834,6 +903,9 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             .into_iter()
             .map(|l| LegIn { skipped: l.skipped.is_some(), after: l.after.clone().unwrap_or_default(), name: l.name })
             .collect();
+    }
+    if let Some(l) = &list {
+        i.parks = list_parks(store, l);
     }
     i.group = group;
     // The seats a cap line named as holders, and when they ended.
@@ -2280,5 +2352,56 @@ mod tests {
         assert_eq!(r.phases[1].tools.get("Bash"), None, "the leg's wait is in no phase");
         assert_eq!(r.phases[1].calls, 1);
         assert_eq!((r.phases[2].start, r.phases[2].end, r.phases[2].calls), (400, 460, 1));
+    }
+
+    /// react-chat (`compounding-464`): a person parked the whole list, every seat
+    /// was released, and the rows were started again at the resume. The stretch
+    /// between is the list's park, by whom and why, not "waiting to be restarted".
+    #[test]
+    fn a_stretch_inside_a_list_park_is_named_for_the_park_and_not_a_wait_to_be_restarted() {
+        let mut i = two_seatings(true);
+        i.events.retain(|(_, k, _)| k != "task-after" && k != "task-parked");
+        i.group = Some(("l".into(), 1, vec!["r-1".into()]));
+        let evs = vec![
+            (140, "worklist-parked".to_string(), json!({"id": "l", "why": "stop everything, he needs the machine", "by": "person"})),
+            (1980, "worklist-resumed".to_string(), json!({"id": "l", "at": 1, "said": "go", "by": "person"})),
+        ];
+        i.parks = parks_of(&evs, "l", 9999);
+        let ph = build(&i);
+        let gap = ph.iter().find(|p| p.gap && p.label.starts_with("parked at")).expect("named");
+        let why = gap.waiting_for.as_deref().unwrap();
+        assert!(why.starts_with(PARKED_CAUSE) && why.contains("parked by person") && why.contains("he needs the machine"), "{why}");
+        assert!(!why.contains("waiting to be restarted"), "{why}");
+        assert_eq!(figures_of(&ph, &SeatReport::default()).between_attempts, 1840);
+    }
+
+    /// react-parity-now (`compounding-464`): rows sent back at a rebase sat idle
+    /// through a list park; the stretch is the park, not rework.
+    #[test]
+    fn a_sent_back_row_idle_through_a_list_park_is_the_park_and_not_rework() {
+        let mut i = two_seatings(false);
+        let evs = vec![
+            (210, "worklist-parked".to_string(), json!({"id": "l", "why": "stop", "by": "person"})),
+            (1980, "worklist-resumed".to_string(), json!({"id": "l"})),
+        ];
+        i.parks = parks_of(&evs, "l", 9999);
+        let ph = build(&i);
+        let why = ph.iter().find(|p| p.gap && p.label.starts_with("parked at")).and_then(|p| p.waiting_for.clone()).expect("named for the park");
+        assert!(why.contains("parked by person") && !why.contains("rework"), "{why}");
+    }
+
+    #[test]
+    fn parks_are_read_from_the_park_to_the_resume_and_a_record_naming_no_one_is_somebody() {
+        let evs = vec![
+            (10, "worklist-parked".to_string(), json!({"id": "l", "why": "w"})),
+            (50, "worklist-resumed".to_string(), json!({"id": "l"})),
+            (60, "worklist-parked".to_string(), json!({"id": "l", "why": "again", "by": "primary"})),
+            (70, "worklist-parked".to_string(), json!({"id": "other", "why": "x"})),
+        ];
+        let p = parks_of(&evs, "l", 100);
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].start, p[0].end, p[0].by.as_str(), p[0].open), (10, 50, "somebody", false));
+        assert_eq!((p[1].start, p[1].end, p[1].by.as_str(), p[1].open), (60, 100, "primary", true));
+        assert!(p[1].words().contains("still parked") && p[0].words().contains("parked by somebody"));
     }
 }

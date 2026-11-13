@@ -6414,7 +6414,7 @@ pub fn park(store: &Store, args: &Args) -> i32 {
     if code != 0 {
         return code;
     }
-    store.log_event("worklist-parked", json!({ "id": w.id, "why": said, "was": if was_held { "held" } else { "running" } }));
+    store.log_event("worklist-parked", json!({ "id": w.id, "why": said, "was": if was_held { "held" } else { "running" }, "by": crate::cmd_message::caller(store) }));
     crate::cycle::poke_list(store, &w.id, "park", None);
 
     if args.json() {
@@ -6508,7 +6508,7 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
     if code != 0 {
         return code;
     }
-    store.log_event("worklist-resumed", json!({ "id": w.id, "at": pos.at, "said": said }));
+    store.log_event("worklist-resumed", json!({ "id": w.id, "at": pos.at, "said": said, "by": crate::cmd_message::caller(store) }));
     crate::cycle::poke_list(store, &w.id, "resume", None);
 
     let st = state(store, &w, &pos);

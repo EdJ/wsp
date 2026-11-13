@@ -152,7 +152,7 @@ pub(crate) const PASS_WAIT: &str = "waiting for the pass (the barrier done, the 
 /// pass is given by a person.
 pub(crate) const PASS_WAIT_MANUAL: &str = "waiting for the pass (manual group: no barrier ran, the pass not yet given)";
 
-pub(crate) const BUCKETS: [&str; 6] = ["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups"];
+pub(crate) const BUCKETS: [&str; 7] = ["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups", "parked"];
 
 /// One group's wall by bucket, and what the waiting and the barrier were.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -167,6 +167,9 @@ pub(crate) struct GroupWall {
     /// Of `working`, the seconds where only a member's legs were running: no
     /// seat was in a call or a tool (`wsp-218`).
     pub legs: i64,
+    /// Parked seconds by what parked the list (who, when, why): the whole list
+    /// stood still, so nobody's working, waiting or barrier run is in them.
+    pub parked: BTreeMap<String, i64>,
 }
 
 impl GroupWall {
@@ -216,7 +219,16 @@ fn state(m: &MemberIn, t: i64, first: i64, last: i64) -> State {
 /// A group's wall. `open` is the previous group's pass (`None` for the first or
 /// where it is not found: the group's first start), `pass` its own barrier's
 /// pass (`None`: the end of the last stretch the members record).
+#[cfg(test)]
 pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i64>) -> Option<GroupWall> {
+    group_wall_parked(members, open, pass, &[])
+}
+
+/// [`group_wall`] with the stretches a person parked the whole list, `(start,
+/// end, words)`: a second inside one is `parked` and nothing else, whatever the
+/// members or the barrier were doing or owed there (the barrier's wait is not
+/// its run, `compounding-464`).
+pub(crate) fn group_wall_parked(members: &[MemberIn], open: Option<i64>, pass: Option<i64>, parks: &[(i64, i64, String)]) -> Option<GroupWall> {
     let started: Vec<(&MemberIn, i64, i64)> = members
         .iter()
         .filter_map(|m| {
@@ -239,7 +251,18 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
     let mut g = GroupWall { open, close, ..Default::default() };
     let add = |g: &mut GroupWall, k: &'static str, secs: i64| *g.by.entry(k).or_insert(0) += secs;
 
-    add(&mut g, "between_groups", first - open);
+    // A park before the group's first start is the list's, not a pass waiting
+    // for a start.
+    let mut between = first - open;
+    for (a, b, why) in parks {
+        let got = ((*b).min(first) - (*a).max(open)).max(0);
+        if got > 0 {
+            add(&mut g, "parked", got);
+            *g.parked.entry(why.clone()).or_insert(0) += got;
+            between -= got;
+        }
+    }
+    add(&mut g, "between_groups", between.max(0));
 
     // The window instant by instant: where a barrier span lies it is the
     // barrier's (its run, or its check seat); after the last it is the barrier's
@@ -251,6 +274,9 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
     let mut cuts: Vec<i64> = vec![first, barrier_from, close, last_barrier];
     for s in &shared {
         cuts.extend([s.start, s.end]);
+    }
+    for (a, b, _) in parks {
+        cuts.extend([*a, *b]);
     }
     for (m, ..) in &started {
         for s in &m.spans {
@@ -266,6 +292,11 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
     cuts.dedup();
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
+        if let Some((_, _, why)) = parks.iter().find(|(x, y, _)| a >= *x && a < *y) {
+            add(&mut g, "parked", b - a);
+            *g.parked.entry(why.clone()).or_insert(0) += b - a;
+            continue;
+        }
         if a >= last_barrier {
             // After the barrier's last run and its check seat, up to the pass:
             // nobody is running the barrier, the group is waiting for its pass
@@ -518,5 +549,40 @@ mod tests {
     #[test]
     fn a_group_with_no_started_member_has_no_wall() {
         assert!(group_wall(&[MemberIn::default()], None, None).is_none());
+    }
+
+    /// exit-packet's group 1 (`compounding-464`): the last verdict at 100, the
+    /// barrier's span 100-1100 (its wait, then its run), the list parked 150-1000.
+    /// The park is the list's, not the barrier's.
+    #[test]
+    fn a_park_inside_the_barriers_wait_is_parked_and_the_barrier_run_is_not_the_park() {
+        let mut m = seat("r-1", 0, 100, &[(10, 100)], &[]);
+        m.spans.push(Span { start: 100, end: 1100, class: Class::Barrier });
+        let parks = vec![(150, 1000, "the list was parked by somebody".to_string())];
+        let g = group_wall_parked(&[m.clone()], None, Some(1100), &parks).unwrap();
+        assert_eq!(g.seconds("parked"), 850);
+        assert_eq!(g.parked.get("the list was parked by somebody"), Some(&850));
+        assert_eq!(g.seconds("barrier_run"), 50 + 100, "100-150 and 1000-1100: the wait left and the run, none of the park");
+        assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the window tiles");
+        let plain = group_wall(&[m], None, Some(1100)).unwrap();
+        assert_eq!(plain.seconds("barrier_run"), 1000, "without the park record the wait is the barrier's");
+    }
+
+    #[test]
+    fn a_park_before_the_groups_first_start_is_parked_and_not_between_groups() {
+        let m = seat("r-2", 700, 800, &[(710, 800)], &[]);
+        let parks = vec![(100, 650, "parked".to_string())];
+        let g = group_wall_parked(&[m], Some(0), Some(900), &parks).unwrap();
+        assert_eq!((g.seconds("parked"), g.seconds("between_groups")), (550, 150), "{g:?}");
+        assert_eq!(g.by.values().sum::<i64>(), 900);
+    }
+
+    #[test]
+    fn a_park_after_the_barrier_and_before_the_pass_is_parked_and_not_waiting_for_the_pass() {
+        let mut ms = vec![seat("r-1", 0, 100, &[(10, 100)], &[])];
+        barrier(&mut ms, (100, 200), (200, 220));
+        let g = group_wall_parked(&ms, None, Some(1000), &[(300, 900, "p".to_string())]).unwrap();
+        assert_eq!((g.seconds("parked"), g.seconds("waiting")), (600, 10 + 80 + 100), "{g:?}");
+        assert_eq!(g.by.values().sum::<i64>(), 1000);
     }
 }

@@ -30,7 +30,7 @@ wsp retro start <list> [--replaces ROW]";
 
 /// The bucket names of the wall, as `effort.json` spells them under
 /// `totals.wall_buckets` (`<name>_seconds`).
-pub const BUCKETS: &[&str] = &["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups"];
+pub const BUCKETS: &[&str] = &["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups", "parked"];
 
 /// A cleared list's wall figures: what the baseline is made of.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +39,9 @@ pub struct Figures {
     pub wall: i64,
     pub rows: usize,
     pub buckets: Vec<(String, i64)>,
+    /// Of `wall`, the seconds a person parked the whole list (`compounding-464`):
+    /// the list stood still, so a retro attributes `working_wall()`.
+    pub parked: i64,
 }
 
 impl Figures {
@@ -51,16 +54,32 @@ impl Figures {
             wall: secs(wb, "wall_seconds").max(secs(&effort["totals"], "wall_seconds")),
             rows,
             // An older list left no `wall_buckets`: it has no figure, not zeros.
-            buckets: if wb.is_object() { BUCKETS.iter().map(|b| (b.to_string(), secs(wb, &format!("{b}_seconds")))).collect() } else { Vec::new() },
+            // `parked` is shown only where a person parked the list.
+            buckets: if wb.is_object() { BUCKETS.iter().map(|b| (b.to_string(), secs(wb, &format!("{b}_seconds")))).filter(|(b, s)| *s > 0 || *b != "parked").collect() } else { Vec::new() },
+            parked: secs(wb, "parked_seconds"),
+        }
+    }
+
+    /// The wall without the stretches a person parked the list.
+    pub fn working_wall(&self) -> i64 {
+        (self.wall - self.parked).max(0)
+    }
+
+    /// `1310m`, or `642m without a 668m park` where a person parked the list.
+    pub fn wall_words(&self) -> String {
+        if self.parked > 0 {
+            format!("{} ({} without a {} park)", mins(self.wall), mins(self.working_wall()), mins(self.parked))
+        } else {
+            mins(self.wall)
         }
     }
 
     fn line(&self) -> String {
         if self.buckets.is_empty() {
-            return format!("{} · {} rows · wall {} · no bucket figures", self.list, self.rows, mins(self.wall));
+            return format!("{} · {} rows · wall {} · no bucket figures", self.list, self.rows, self.wall_words());
         }
         let parts: Vec<String> = self.buckets.iter().map(|(b, s)| format!("{b} {}", mins(*s))).collect();
-        format!("{} · {} rows · wall {} · {}", self.list, self.rows, mins(self.wall), parts.join(" · "))
+        format!("{} · {} rows · wall {} · {}", self.list, self.rows, self.wall_words(), parts.join(" · "))
     }
 }
 
@@ -103,7 +122,7 @@ pub fn eligible_with(store: &Store, w: &Worklist, rows: usize, wall: i64) -> Res
 /// Whether the list gets a retro, and if not why not.
 pub fn eligible(store: &Store, w: &Worklist) -> Result<(), String> {
     let f = Figures::of(&crate::cmd_report::effort(store, w, None));
-    eligible_with(store, w, f.rows.max(w.groups().iter().map(|g| g.members.len()).sum()), f.wall)
+    eligible_with(store, w, f.rows.max(w.groups().iter().map(|g| g.members.len()).sum()), f.working_wall())
 }
 
 fn read_effort(slug: &str) -> Option<Value> {
@@ -170,11 +189,11 @@ pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures]
     let mut o = String::new();
     let f = Figures::of(effort);
     o.push_str(&format!("# Retro · {} · {}\n\n", w.id, w.title));
-    o.push_str(&format!("You are the retro seat of `{}`, a cleared list: {} rows, {} of wall. Read where the wall went, name the causes, and file what is worth filing. Nothing here is a task to implement.\n\n", w.id, f.rows, mins(f.wall)));
+    o.push_str(&format!("You are the retro seat of `{}`, a cleared list: {} rows, {} of wall. Read where the wall went, name the causes, and file what is worth filing. Nothing here is a task to implement.\n\n", w.id, f.rows, f.wall_words()));
 
     o.push_str("## Rules\n\n");
     for r in [
-        "Attribute the wall to its causes within 10 %: the causes you name must add up to the wall to within a tenth of it.",
+        "Attribute the wall to its causes within 10 %: the causes you name must add up to the wall to within a tenth of it. Where a person parked the whole list the wall is shown with and without the park: the park is not a cause to fix (the list stood still, and who parked it is in the bucket), so attribute the wall without it.",
         "Name every cause that is over 10 minutes in total or over 10 % of the wall — even one with nothing to fix.",
         "Search every project's rows before you file anything: `wsp ls --all` (every project, rows at review included, and the `landed` ones too — a bare `wsp ls` lists only your own project), then `wsp show <row>` on what looks like it.",
         "Where an open row already covers a cause, add the new evidence to it with `wsp retro note` — do not file a duplicate. Where a `landed` row already fixed the cause, note it on that row (\"recurs / fixed by\") instead of filing it again.",
@@ -196,7 +215,7 @@ pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures]
         o.push_str("\n\n");
     }
 
-    o.push_str(&format!("## The wall: {}\n\n", mins(f.wall)));
+    o.push_str(&format!("## The wall: {}\n\n", f.wall_words()));
     for (b, s) in &f.buckets {
         let pct = if f.wall > 0 { *s as f64 * 100.0 / f.wall as f64 } else { 0.0 };
         o.push_str(&format!("- {b}: {} ({pct:.0} %)\n", mins(*s)));
@@ -431,5 +450,21 @@ mod tests {
         }
         let b = baseline(&store, &w);
         assert_eq!(b.iter().map(|f| f.list.as_str()).collect::<Vec<_>>(), ["c4", "c3", "c2"]);
+    }
+
+    /// A list a person parked: the packet and the baseline line give the wall with
+    /// and without the park, and eligibility reads the working wall (`compounding-464`).
+    #[test]
+    fn a_parked_list_shows_the_wall_with_and_without_the_park() {
+        let mut e = effort("l");
+        e["totals"]["wall_buckets"]["parked_seconds"] = json!(4000);
+        e["totals"]["wall_buckets"]["working_seconds"] = json!(0);
+        let f = Figures::of(&e);
+        assert_eq!((f.wall, f.parked, f.working_wall()), (7200, 4000, 3200));
+        assert_eq!(f.wall_words(), "120m (53m without a 67m park)");
+        assert!(f.line().contains("wall 120m (53m without a 67m park)") && f.line().contains("parked 67m"), "{}", f.line());
+        let plain = Figures::of(&effort("l"));
+        assert_eq!(plain.wall_words(), "120m");
+        assert!(!plain.buckets.iter().any(|(b, _)| b == "parked"), "no park, no bucket line");
     }
 }
