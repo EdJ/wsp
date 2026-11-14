@@ -5711,6 +5711,15 @@ fn read_body(r: &serde_json::Value) -> &serde_json::Value {
 /// What herdr shows on a pane now, as text; `None` where herdr is not there
 /// or would not read it.
 pub(crate) fn read_pane_text(pane: &str) -> Option<String> {
+    // A test that draws the wip view (`wip_rows`) without taking
+    // `crate::util::isolated()` has no herdr to ask, and asking anyway trips
+    // `herdr::socket_path`'s guard for the live one. `isolated()` sets this
+    // variable and a test that never took it has none, so there is nothing to
+    // read from. Compiled out of the binary, like the guard it keeps quiet.
+    #[cfg(test)]
+    if std::env::var_os("HERDR_SOCKET_PATH").is_none() {
+        return None;
+    }
     if !herdr::available() {
         return None;
     }
