@@ -316,7 +316,7 @@ fn list_of(store: &Store, args: &Args) -> Result<(Worklist, Value), i32> {
     };
     let Some(w) = store.worklist(slug) else { return Err(fail(&format!("no list `{slug}`"))) };
     let s = state(&w.id);
-    if s.is_null() || s["done"] == true {
+    if s.is_null() || (s["done"] == true && !sent_back(store, &s)) {
         return Err(fail(&format!("{} has no retro running — `wsp retro show {}` reads the one that ran, `wsp retro start {}` starts one", w.id, w.id, w.id)));
     }
     if let Some(why) = wrong_seat(store, &w, &s, caller_pane().as_deref()) {
@@ -407,31 +407,70 @@ pub fn note(store: &Store, args: &Args) -> i32 {
     0
 }
 
-/// Whether the list's retro of record has `done` recorded but its row is open
-/// again: the verifier sent it back.
-fn sent_back(store: &Store, args: &Args) -> bool {
-    let Some(w) = args.rest.get(1).and_then(|s| store.worklist(s)) else { return false };
-    let s = state(&w.id);
-    s["done"] == true
-        && s["row"].as_str().and_then(|r| store.task(r)).is_some_and(|t| !matches!(t.status(), Status::Review | Status::Done))
+/// Whether a retro record has `done` recorded but its row is open again: the
+/// verifier sent it back. `file`, `note` and `done` all take this path, so a
+/// row sent back may add to its record and record `done` again.
+fn sent_back(store: &Store, s: &Value) -> bool {
+    s["done"] == true && s["row"].as_str().and_then(|r| store.task(r)).is_some_and(|t| !matches!(t.status(), Status::Review | Status::Done))
+}
+
+/// Why a withdraw is refused: the caller's pane is bound to the retro row
+/// itself. Pure over the bindings and the pane.
+pub fn own_withdraw(store: &Store, row: &str, pane: Option<&str>) -> Option<String> {
+    let pane = pane.filter(|p| !p.is_empty())?;
+    let mine = store.bindings().get(pane).and_then(|b| b["task_id"].as_str().map(str::to_string))?;
+    (mine == row).then(|| format!("you are the retro seat {row}; a `done` is withdrawn by the verifier or the coordinator, not by the seat that wrote it"))
+}
+
+/// `wsp retro withdraw <list> [--notes]`: takes a wrongly written `done` (its
+/// summary, time and writer) off the record and opens the retro row again, on
+/// the verifier's or the coordinator's say — so it is refused to the retro
+/// row's own seat. `--notes` also drops the record's list of notes; the text
+/// already added to those rows stays on them. What was filed stays filed.
+pub fn withdraw(store: &Store, args: &Args) -> i32 {
+    let Some(slug) = args.rest.get(1) else {
+        eprintln!("usage: wsp retro withdraw <list> [--notes]");
+        return 2;
+    };
+    let Some(w) = store.worklist(slug) else { return fail(&format!("no list `{slug}`")) };
+    let mut s = state(&w.id);
+    if s.is_null() || s["done"] != true {
+        return fail(&format!("{} has no recorded `done` to withdraw — `wsp retro show {}` reads the record", w.id, w.id));
+    }
+    let row = s["row"].as_str().unwrap_or("").to_string();
+    if let Some(why) = own_withdraw(store, &row, caller_pane().as_deref()) {
+        return fail(&why);
+    }
+    let was = s["done_by"].as_str().unwrap_or("").to_string();
+    if let Some(o) = s.as_object_mut() {
+        for k in ["done", "summary", "finished", "done_by"] {
+            o.remove(k);
+        }
+        if args.has("notes") {
+            o.remove("notes");
+        }
+    }
+    if let Err(e) = save(store, &w, &s, "timing retro done withdrawn") {
+        return fail(&e);
+    }
+    if let Some(mut t) = store.task(&row) {
+        if matches!(t.status(), Status::Review | Status::Done) {
+            t.status_raw = "doing".into();
+        }
+        t.log("retro done withdrawn");
+        let _ = store.save_task(&t);
+    }
+    store.log_event("retro-withdrawn", json!({ "list": w.id, "by": writer(store), "was": was }));
+    println!("{} retro done withdrawn{}; {row} is open again", w.id, if args.has("notes") { " with its notes" } else { "" });
+    0
 }
 
 pub fn done(store: &Store, args: &Args) -> i32 {
     // A retro row sent back after its `done` (open again, not at review or
-    // done) records `done` again.
-    let again = sent_back(store, args);
-    let (w, mut s) = if again {
-        let w = store.worklist(&args.rest[1]).unwrap();
-        let s = state(&w.id);
-        if let Some(why) = wrong_seat(store, &w, &s, caller_pane().as_deref()) {
-            return fail(&why);
-        }
-        (w, s)
-    } else {
-        match list_of(store, args) {
-            Ok(x) => x,
-            Err(c) => return c,
-        }
+    // done) records `done` again: `list_of` lets it through.
+    let (w, mut s) = match list_of(store, args) {
+        Ok(x) => x,
+        Err(c) => return c,
     };
     let Some(path) = args.rest.get(2) else {
         eprintln!("usage: wsp retro done <list> FILE");
@@ -611,6 +650,71 @@ mod tests {
         assert_eq!(done(&store, &a(&two)), 0);
         assert!(show_text(&store, &store.worklist("d").unwrap()).contains("corrected reading"));
         assert_eq!(store.task(&seat).unwrap().status_raw, "review");
+    }
+
+    #[test]
+    fn a_sent_back_retro_can_file_and_note_and_record_done_again() {
+        let (env, store) = crate::testkit::isolated_store("retro-sent-back-file");
+        let mut w = Worklist::new("e", "A list");
+        w.body = "## Groups\n\n1. a-1\n".into();
+        store.save_worklist(&w).unwrap();
+        let seat = start(&store, &w, true).unwrap();
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let args = |rest: &[&str], flags: &[(&str, &str)]| Args::synth("retro", rest, flags);
+        let ok = put(&tmp, "ok", "nothing to file: first reading");
+        assert_eq!(done(&store, &args(&["done", "e", &ok], &[])), 0);
+        let ev = put(&tmp, "ev", "start waited 20m unclaimed");
+        let fx = put(&tmp, "fx", "claim sooner");
+        let dw = put(&tmp, "dw", "start under 2m");
+        let flags = [("defect", ""), ("title", "Unclaimed start waits twenty minutes"), ("evidence", ev.as_str()), ("fix", fx.as_str()), ("done-when", dw.as_str())];
+        assert_eq!(file(&store, &args(&["file", "e"], &flags)), 1, "at review, the record stands");
+        let mut t = store.task(&seat).unwrap();
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        assert_eq!(file(&store, &args(&["file", "e"], &flags)), 0);
+        let rows = store.worklist("retro-2").unwrap().groups()[0].members.clone();
+        let nt = put(&tmp, "nt", "seen again: 18m unclaimed");
+        assert_eq!(note(&store, &args(&["note", "e", &rows[0], &nt], &[])), 0);
+        assert!(store.task(&rows[0]).unwrap().body.contains("seen again: 18m unclaimed"));
+        let two = put(&tmp, "two", "filed one defect and noted it");
+        assert_eq!(done(&store, &args(&["done", "e", &two], &[])), 0);
+        let s = state("e");
+        assert_eq!(s["done"], true);
+        assert_eq!(arr(&s, "filed").len(), 1);
+        assert_eq!(arr(&s, "notes").len(), 1);
+        assert!(show_text(&store, &store.worklist("e").unwrap()).contains("filed one defect"));
+        assert_eq!(store.task(&seat).unwrap().status_raw, "review");
+    }
+
+    #[test]
+    fn a_wrong_done_is_withdrawn_and_the_row_opens_again() {
+        let (env, store) = crate::testkit::isolated_store("retro-withdraw");
+        let mut w = Worklist::new("f", "A list");
+        w.body = "## Groups\n\n1. a-1\n".into();
+        store.save_worklist(&w).unwrap();
+        let seat = start(&store, &w, true).unwrap();
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let args = |rest: &[&str], flags: &[(&str, &str)]| Args::synth("retro", rest, flags);
+        assert_eq!(withdraw(&store, &args(&["withdraw", "f"], &[])), 1, "nothing recorded yet");
+        let ok = put(&tmp, "ok", "nothing to file: wrong reading");
+        assert_eq!(done(&store, &args(&["done", "f", &ok], &[])), 0);
+        assert_eq!(store.task(&seat).unwrap().status_raw, "review");
+        // the retro row's own seat may not withdraw what it wrote
+        store.set_binding("pane-f", json!({ "task_id": seat }));
+        assert!(own_withdraw(&store, &seat, Some("pane-f")).is_some());
+        assert!(own_withdraw(&store, &seat, Some("pane-other")).is_none());
+        assert!(own_withdraw(&store, &seat, None).is_none());
+        assert_eq!(state("f")["done"], true);
+        assert_eq!(withdraw(&store, &args(&["withdraw", "f"], &[("notes", "")])), 0);
+        let s = state("f");
+        assert!(s["done"] != true && s["summary"].is_null() && s["finished"].is_null());
+        assert_ne!(store.task(&seat).unwrap().status_raw, "review");
+        // the record is open: it can record done again
+        let two = put(&tmp, "two", "nothing to file: the right reading");
+        assert_eq!(done(&store, &args(&["done", "f", &two], &[])), 0);
+        assert_eq!(withdraw(&store, &args(&["withdraw", "f"], &[])), 0);
     }
 
     #[test]

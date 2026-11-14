@@ -25,6 +25,7 @@ pub const SYNTAX: &str = "\
 wsp retro file <list> --defect|--strategic --title T --evidence FILE --fix FILE --done-when FILE [--ask FILE]
 wsp retro note <list> <row> FILE
 wsp retro done <list> FILE
+wsp retro withdraw <list> [--notes]
 wsp retro show <list>
 wsp retro start <list> [--replaces ROW]";
 
@@ -307,6 +308,7 @@ pub fn retro(store: &Store, args: &Args) -> i32 {
         Some("file") if args.rest.len() > 1 => return crate::retro_run::file(store, args),
         Some("note") if args.rest.len() > 1 => return crate::retro_run::note(store, args),
         Some("done") if args.rest.len() > 1 => return crate::retro_run::done(store, args),
+        Some("withdraw") if args.rest.len() > 1 => return crate::retro_run::withdraw(store, args),
         Some("show") if args.rest.len() > 1 => return crate::retro_run::show(store, &args.rest[1]),
         Some("start") if args.rest.len() > 1 => return crate::retro_run::start_by_hand(store, args),
         _ => {}
