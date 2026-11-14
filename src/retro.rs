@@ -43,6 +43,10 @@ pub struct Figures {
     /// Of `wall`, the seconds a person parked the whole list (`compounding-464`):
     /// the list stood still, so a retro attributes `working_wall()`.
     pub parked: i64,
+    /// Where the list is still running (no pass for its last started group): the
+    /// time its wall was cut at, which is then to that time and not to a last
+    /// pass (`wsp-628`).
+    pub cut_at: Option<String>,
 }
 
 impl Figures {
@@ -61,6 +65,7 @@ impl Figures {
             // `parked` is shown only where a person parked the list.
             buckets: if wb.is_object() { BUCKETS.iter().map(|b| (b.to_string(), secs(wb, &format!("{b}_seconds")))).filter(|(b, s)| *s > 0 || *b != "parked").collect() } else { Vec::new() },
             parked: secs(wb, "parked_seconds"),
+            cut_at: effort["totals"]["cut_at"].as_str().filter(|_| effort["totals"]["still_running"] == true).map(str::to_string),
         }
     }
 
@@ -71,10 +76,14 @@ impl Figures {
 
     /// `1310m`, or `642m without a 668m park` where a person parked the list.
     pub fn wall_words(&self) -> String {
-        if self.parked > 0 {
+        let w = if self.parked > 0 {
             format!("{} ({} without a {} park)", mins(self.wall), mins(self.working_wall()), mins(self.parked))
         } else {
             mins(self.wall)
+        };
+        match &self.cut_at {
+            Some(t) => format!("{w} so far, still running, cut at {t}"),
+            None => w,
         }
     }
 
@@ -193,7 +202,11 @@ pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures]
     let mut o = String::new();
     let f = Figures::of(effort);
     o.push_str(&format!("# Retro · {} · {}\n\n", w.id, w.title));
-    o.push_str(&format!("You are the retro seat of `{}`, a cleared list: {} rows, {} of wall. Read where the wall went, name the causes, and file what is worth filing. Nothing here is a task to implement.\n\n", w.id, f.rows, f.wall_words()));
+    if f.cut_at.is_some() {
+        o.push_str(&format!("You are the retro seat of `{}`, a list still running: {} rows, {} of wall. The list has no pass yet, so the wall is partial — from the first spawn to the cut, not to a last pass — and a retro row on the list counts in it. Read where the wall went so far, name the causes, and file what is worth filing. Nothing here is a task to implement.\n\n", w.id, f.rows, f.wall_words()));
+    } else {
+        o.push_str(&format!("You are the retro seat of `{}`, a cleared list: {} rows, {} of wall. Read where the wall went, name the causes, and file what is worth filing. Nothing here is a task to implement.\n\n", w.id, f.rows, f.wall_words()));
+    }
 
     o.push_str("## Rules\n\n");
     for r in [

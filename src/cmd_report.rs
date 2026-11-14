@@ -251,6 +251,11 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     // `parked` in the wall buckets and in no other (`compounding-464`).
     let parks: Vec<(i64, i64, String)> = crate::timeline::list_parks(store, &w.id).into_iter().map(|p| (p.start, p.end, p.words())).collect();
     let mut walls: Vec<Option<crate::wallbuckets::GroupWall>> = Vec::new();
+    // What each group's wall was read from, so a list still running can have its
+    // last started group read again to the cut (`wsp-628`).
+    let mut sweeps: Vec<(Vec<crate::wallbuckets::MemberIn>, Option<i64>)> = Vec::new();
+    let running = w.status() == crate::model::WorklistStatus::Running;
+    let cut = util::epoch_secs();
 
     for (gi, g) in groups.iter().enumerate() {
         let (mut gwall, mut gmodel, mut gtool) = (0i64, 0i64, 0i64);
@@ -368,16 +373,8 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         // written a moment before (`compounding-217`: 4 s unattributed).
         let pass = passes.get(&(gi as u64 + 1)).copied();
         let pass = if gi + 1 == groups.len() { pass.map(|p| p.max(gend)) } else { pass };
-        let mut gw = crate::wallbuckets::group_wall_parked(&sweep, open, pass, &parks);
-        // The wait for the pass is named by its group, so that two groups' waits
-        // are two lines, and says whether a barrier ran or the group is manual.
-        if let Some(g) = gw.as_mut() {
-            let waits = std::mem::take(&mut g.waits);
-            for ((row, cause), s) in waits {
-                let cause = if cause == crate::wallbuckets::PASS_WAIT || cause == crate::wallbuckets::PASS_WAIT_MANUAL { format!("group {}: {cause}", gi + 1) } else { cause };
-                *g.waits.entry((row, cause)).or_insert(0) += s;
-            }
-        }
+        let gw = named_wall(&sweep, open, pass, &parks, gi, false);
+        sweeps.push((sweep, open));
         walls.push(gw);
         let gcost = cost["groups"].get(gi).and_then(|c| c.get("total")).cloned().unwrap_or(Value::Null);
         // How the group's barrier was scoped, against a full run (`wsp-431`).
@@ -400,6 +397,23 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "kind": g.kind, "barrier_scope": note.as_ref().map(|n| n.json()).unwrap_or(Value::Null),
             "wall_buckets": walls.last().and_then(|x| x.as_ref()).map_or(Value::Null, wall_json),
         }));
+    }
+    // A list still running has no pass for its last started group, so the wall
+    // read from the records stops at the last line a seat wrote: a started row
+    // with one line reads 15 s of a list that has run for minutes (`wsp-628`).
+    // Its last started group is read again to the cut, and the stretch after the
+    // last record is named for what it is, not for a pass nobody has given.
+    let still_running = running && walls.iter().flatten().next().is_some() && {
+        let li = walls.iter().rposition(Option::is_some).unwrap_or(0);
+        passes.get(&(li as u64 + 1)).is_none()
+    };
+    if still_running {
+        let li = walls.iter().rposition(Option::is_some).unwrap_or(0);
+        let (sweep, open) = &sweeps[li];
+        let close = walls[li].as_ref().map_or(0, |g| g.close);
+        let gw = named_wall(sweep, *open, Some(cut.max(close)), &parks, li, true);
+        group_json[li]["wall_buckets"] = gw.as_ref().map_or(Value::Null, wall_json);
+        walls[li] = gw;
     }
     let wall = if end > start { end - start } else { 0 };
     // The buckets tile the windows from the first group's open to the last
@@ -486,12 +500,41 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         "cost": cost,
     });
     v["totals"]["last_verdict_wall_seconds"] = json!(wall);
+    // Said where the wall is partial: no pass yet, the wall run to the cut. A
+    // retro row on the list it reads is one of its rows, and counts in it.
+    v["totals"]["still_running"] = json!(still_running);
+    v["totals"]["cut_at"] = if still_running { json!(util::now_iso()) } else { Value::Null };
+    v["totals"]["still_running_note"] = if still_running {
+        json!("the list has no pass for its last started group, so its wall runs from the first spawn to the cut (cut_at), not to a last pass; the stretch after the last record is booked as waiting, named 'still running'. A retro row on the list it reads is one of its rows and counts in the wall.")
+    } else {
+        Value::Null
+    };
     v["totals"]["legs_running_seconds"] = json!(legs_total);
     v["totals"]["between_attempts_seconds"] = json!(between);
     if let Some(b) = baseline {
         v["baseline"] = against(&v, b);
     }
     v
+}
+
+/// A group's wall with the wait for its pass named by its group (so two
+/// groups' waits are two lines) and by whether a barrier ran or the group is
+/// manual; or, where the list is still running and the group has no pass, for
+/// what it is: the group still running, cut at the pass handed in.
+fn named_wall(sweep: &[crate::wallbuckets::MemberIn], open: Option<i64>, pass: Option<i64>, parks: &[(i64, i64, String)], gi: usize, running: bool) -> Option<crate::wallbuckets::GroupWall> {
+    let mut gw = crate::wallbuckets::group_wall_parked(sweep, open, pass, parks);
+    if let Some(g) = gw.as_mut() {
+        let waits = std::mem::take(&mut g.waits);
+        for ((row, cause), s) in waits {
+            let cause = if cause == crate::wallbuckets::PASS_WAIT || cause == crate::wallbuckets::PASS_WAIT_MANUAL {
+                if running { format!("group {}: still running — no pass yet, the stretch after the last record to the cut", gi + 1) } else { format!("group {}: {cause}", gi + 1) }
+            } else {
+                cause
+            };
+            *g.waits.entry((row, cause)).or_insert(0) += s;
+        }
+    }
+    gw
 }
 
 fn wall_json(g: &crate::wallbuckets::GroupWall) -> Value {
@@ -1426,6 +1469,37 @@ mod tests {
         let un = effort_over(&store, &w, None, &fig, json!({"groups": [{"group": 1, "members": [{"task": "r-2", "total": {"seats": 1, "unmeasured": 1, "turns": 0, "output_tokens": 0}}]}]}));
         let r2 = un["groups"][0]["members"].as_array().unwrap().iter().find(|m| m["task"] == "r-2").unwrap().clone();
         assert_eq!((r2["record_empty_seat_measured"].clone(), r2["calls"].clone()), (json!(false), json!(0)));
+    }
+
+    #[test]
+    fn a_running_list_with_one_started_row_and_no_pass_reads_its_wall_to_the_cut_and_says_so() {
+        use crate::timeline::RowFigures;
+        use crate::wallbuckets::{Class, Span};
+        let (_e, store, mut w) = list("running", &["r-1"]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        let now = util::epoch_secs();
+        // Spawned 300 s ago; the one line the row has written is 15 s in.
+        let f = RowFigures { start: now - 300, end: now - 285, wall: 15, spans: vec![Span { start: now - 300, end: now - 285, class: Class::Start }], ..Default::default() };
+        // The governor's seat alone has run 127 s; the member's 171.
+        let cost = json!({"total": {"seconds": 298}, "groups": [{"group": 1, "members": [{"task": "r-1", "total": {"seats": 1, "unmeasured": 0, "turns": 3, "output_tokens": 9, "seconds": 171}}]}]});
+        let v = effort_over(&store, &w, None, &|_| f.clone(), cost.clone());
+        let t = &v["totals"];
+        let wall = t["wall_seconds"].as_i64().unwrap();
+        assert!((300..330).contains(&wall), "the wall runs to now, neither the 15 s to the first line nor under the governor's 127: {wall}");
+        assert_eq!(t["wall_buckets"]["wall_seconds"], wall);
+        assert_eq!(t["wall_buckets"]["unattributed_seconds"], 0, "{}", t["wall_buckets"]);
+        assert_eq!((t["still_running"].clone(), t["cut_at"].is_string()), (json!(true), true), "{t}");
+        let causes = t["wall_buckets"]["waiting_by_cause"].to_string();
+        assert!(causes.contains("still running"), "the stretch after the last record is named: {causes}");
+        let fig = crate::retro::Figures::of(&v);
+        assert!(fig.wall >= 300 && fig.cut_at.is_some(), "{fig:?}");
+        let head = crate::retro::packet_from(&store, &w, &v, &[], "");
+        assert!(head.contains("still running, cut at") && head.contains("a list still running") && !head.contains("a cleared list"), "{}", head.lines().take(3).collect::<Vec<_>>().join("\n"));
+        // The same record on a list that is not running keeps the wall it had.
+        let mut done = w.clone();
+        done.set_status(crate::model::WorklistStatus::Done);
+        let v = effort_over(&store, &done, None, &|_| f.clone(), cost);
+        assert_eq!((v["totals"]["still_running"].clone(), v["totals"]["wall_seconds"].clone()), (json!(false), json!(15)));
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub fn html(_store: &Store, w: &Worklist, s: &Value) -> String {
     let base: Vec<&Value> = arr(s, "baseline").iter().filter(|f| f["buckets"].as_object().is_some_and(|o| o.values().filter_map(Value::as_i64).sum::<i64>() > 0)).collect();
     // Where a person parked the whole list, the wall without the park beside the
     // full one: a retro attributes the working wall, not a night off (`compounding-464`).
+    if let Some(cut) = s["cut_at"].as_str().filter(|_| s["still_running"] == true) {
+        b.push_str(&format!("<p>Still running, cut at {}: the wall is partial, from the first spawn to the cut, not to a last pass.</p>", esc(cut)));
+    }
     if let Some(wall) = s["wall"].as_i64().filter(|_| s["parked"].as_i64().unwrap_or(0) > 0) {
         let parked = s["parked"].as_i64().unwrap_or(0);
         b.push_str(&format!("<p>Wall {}; without the {} a person parked the list, {}.</p>", mins(wall), mins(parked), mins((wall - parked).max(0))));
@@ -137,6 +140,9 @@ pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, Strin
     s["started"] = json!(util::now_iso());
     s["wall"] = json!(f.wall);
     s["parked"] = json!(f.parked);
+    // A list still running has a partial wall, to the cut (`wsp-628`).
+    s["still_running"] = json!(f.cut_at.is_some());
+    s["cut_at"] = json!(f.cut_at);
     s["rows"] = json!(f.rows);
     s["buckets"] = json!(f.buckets.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, Value>>());
     s["baseline"] = json!(retro::baseline(store, &w).iter().map(|b| json!({ "list": b.list, "wall": b.wall, "buckets": b.buckets.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, Value>>() })).collect::<Vec<_>>());
