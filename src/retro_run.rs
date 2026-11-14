@@ -87,7 +87,8 @@ pub fn html(_store: &Store, w: &Worklist, s: &Value) -> String {
     if let Some(t) = s["summary"].as_str() {
         // A seat that handed `done` JSON still gets its summary shown as text.
         let text = serde_json::from_str::<Value>(t).ok().and_then(|v| v["summary"].as_str().map(str::to_string)).unwrap_or_else(|| t.to_string());
-        b.push_str(&format!("<h2>Summary</h2><pre>{}</pre>", esc(&text)));
+        let by = s["done_by"].as_str().map(|b| format!("<p class=\"dim\">Written by {}.</p>", esc(b))).unwrap_or_default();
+        b.push_str(&format!("<h2>Summary</h2>{by}<pre>{}</pre>", esc(&text)));
     } else {
         b.push_str("<p class=\"dim\">The retro seat has not finished.</p>");
     }
@@ -166,7 +167,7 @@ pub fn show_text(store: &Store, w: &Worklist) -> String {
         s["retros"].as_str().unwrap_or("—")
     );
     if s["done"] == true {
-        o.push_str(&format!("done {}\n\n{}\n", s["finished"].as_str().unwrap_or(""), s["summary"].as_str().unwrap_or("").trim()));
+        o.push_str(&format!("done {}{}\n\n{}\n", s["finished"].as_str().unwrap_or(""), s["done_by"].as_str().map(|b| format!(" by {b}")).unwrap_or_default(), s["summary"].as_str().unwrap_or("").trim()));
     } else {
         o.push_str("not done: the retro seat has not recorded its `done`\n");
     }
@@ -271,6 +272,43 @@ fn fail(msg: &str) -> i32 {
     1
 }
 
+/// Why the caller may not write `w`'s retro, if it may not: its seat is bound
+/// to a row that is not the retro row of record (`s["row"]`). A hand outside
+/// any seat, or in a pane bound to no row, is let through (`wsp-626`). Pure
+/// over the bindings and the pane, so each caller is proved without an
+/// environment.
+pub fn wrong_seat(store: &Store, w: &Worklist, s: &Value, pane: Option<&str>) -> Option<String> {
+    let pane = pane.filter(|p| !p.is_empty())?;
+    let mine = store.bindings().get(pane).and_then(|b| b["task_id"].as_str()).filter(|t| !t.is_empty()).map(str::to_string)?;
+    let record = s["row"].as_str().or_else(|| w.retro.as_ref().map(|(_, r)| r.as_str()));
+    if record == Some(mine.as_str()) {
+        return None;
+    }
+    let of = store.worklists().into_iter().find(|l| l.retro.as_ref().is_some_and(|(_, r)| *r == mine));
+    let who = match of {
+        Some(l) => format!("you are the retro of {} ({mine})", l.id),
+        None => format!("you are on {mine}, which is not a retro row"),
+    };
+    Some(format!("{who}; this is {}'s, whose retro is {} — a retro seat writes only its own list's retro", w.id, record.unwrap_or("not on a row")))
+}
+
+/// Who is running the verb: its pane, when it is in one.
+fn caller_pane() -> Option<String> {
+    crate::place::my_pane()
+}
+
+/// The seat that recorded a `done`, as `retro show` and `retro.html` say it:
+/// the pane, else a hand.
+fn writer(store: &Store) -> String {
+    match caller_pane().filter(|p| !p.is_empty()) {
+        Some(p) => match store.bindings().get(&p).and_then(|b| b["task_id"].as_str()) {
+            Some(row) => format!("{p} on {row}"),
+            None => p,
+        },
+        None => "a hand outside any seat".into(),
+    }
+}
+
 fn list_of(store: &Store, args: &Args) -> Result<(Worklist, Value), i32> {
     let Some(slug) = args.rest.get(1) else {
         eprintln!("usage:\n{}", retro::SYNTAX);
@@ -280,6 +318,9 @@ fn list_of(store: &Store, args: &Args) -> Result<(Worklist, Value), i32> {
     let s = state(&w.id);
     if s.is_null() || s["done"] == true {
         return Err(fail(&format!("{} has no retro running — `wsp retro show {}` reads the one that ran, `wsp retro start {}` starts one", w.id, w.id, w.id)));
+    }
+    if let Some(why) = wrong_seat(store, &w, &s, caller_pane().as_deref()) {
+        return Err(fail(&why));
     }
     Ok((w, s))
 }
@@ -382,6 +423,9 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     let (w, mut s) = if again {
         let w = store.worklist(&args.rest[1]).unwrap();
         let s = state(&w.id);
+        if let Some(why) = wrong_seat(store, &w, &s, caller_pane().as_deref()) {
+            return fail(&why);
+        }
         (w, s)
     } else {
         match list_of(store, args) {
@@ -404,6 +448,7 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     s["summary"] = json!(text.trim());
     s["done"] = json!(true);
     s["finished"] = json!(util::now_iso());
+    s["done_by"] = json!(writer(store));
     if let Err(e) = save(store, &w, &s, "timing retro finished") {
         return fail(&e);
     }
@@ -634,5 +679,54 @@ mod tests {
         assert!(h.contains("Wall 120m; without the 67m a person parked the list, 53m."), "{h}");
         let none = html(&store, &w, &json!({ "wall": 7200, "parked": 0, "buckets": {}, "baseline": [] }));
         assert!(!none.contains("parked the list"), "{none}");
+    }
+
+    #[test]
+    fn a_retro_verb_refuses_a_list_its_seat_is_not_the_retro_of() {
+        let (env, store) = crate::testkit::isolated_store("retro-wrong-seat");
+        let mut rows = Vec::new();
+        for id in ["a", "b"] {
+            let mut w = Worklist::new(id, "A list");
+            w.body = "## Groups\n\n1. x-1\n".into();
+            store.save_worklist(&w).unwrap();
+            rows.push(start(&store, &w, true).unwrap());
+        }
+        store.set_binding("pane-a", json!({ "task_id": rows[0] }));
+        store.set_binding("pane-b", json!({ "task_id": rows[1] }));
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ok = put(&tmp, "ok", "nothing to file: the wall was inside the baseline");
+        let ev = put(&tmp, "ev", "start waited 20m unclaimed");
+        let fx = put(&tmp, "fx", "claim sooner");
+        let dw = put(&tmp, "dw", "start under 2m");
+        let args = |rest: &[&str], flags: &[(&str, &str)]| Args::synth("retro", rest, flags);
+        let flags = [("defect", ""), ("title", "Unclaimed start waits twenty minutes"), ("evidence", ev.as_str()), ("fix", fx.as_str()), ("done-when", dw.as_str())];
+        let b_before = (snapshot(&dir("b")), store.task(&rows[1]).unwrap().status_raw);
+
+        std::env::set_var(crate::base::seat::SEAT_ENV, "pane-a");
+        assert_eq!(done(&store, &args(&["done", "b", &ok], &[])), 1);
+        assert_eq!(note(&store, &args(&["note", "b", &rows[1], &ok], &[])), 1);
+        assert_eq!(file(&store, &args(&["file", "b"], &flags)), 1);
+        let why = wrong_seat(&store, &store.worklist("b").unwrap(), &state("b"), Some("pane-a")).unwrap();
+        assert!(why.contains("you are the retro of a") && why.contains("this is b's"), "{why}");
+        assert!(b_before == (snapshot(&dir("b")), store.task(&rows[1]).unwrap().status_raw), "b is unchanged");
+        assert!(store.worklist("retro-2").is_none(), "nothing was filed");
+
+        // its own list: file, note, done; and a sent-back retro records done again
+        assert_eq!(file(&store, &args(&["file", "a"], &flags)), 0);
+        assert_eq!(done(&store, &args(&["done", "a", &ok], &[])), 0);
+        assert!(show_text(&store, &store.worklist("a").unwrap()).contains("by pane-a on "), "done says who wrote it");
+        assert!(std::fs::read_to_string(dir("a").join("retro.html")).unwrap().contains("Written by pane-a"));
+        let mut t = store.task(&rows[0]).unwrap();
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        assert_eq!(done(&store, &args(&["done", "a", &ok], &[])), 0);
+        // and pane-a's seat is still refused on b once a is sent back
+        assert_eq!(done(&store, &args(&["done", "b", &ok], &[])), 1);
+
+        // a hand outside any seat writes either
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert_eq!(done(&store, &args(&["done", "b", &ok], &[])), 0);
+        assert!(show_text(&store, &store.worklist("b").unwrap()).contains("by a hand outside any seat"));
     }
 }
