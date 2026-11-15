@@ -101,6 +101,7 @@ mod retro;
 mod retro_run;
 mod retro_series;
 mod retro_yours;
+mod stale;
 mod room;
 mod size_check;
 mod split;

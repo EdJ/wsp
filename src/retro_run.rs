@@ -273,6 +273,10 @@ fn near_duplicate(store: &Store, title: &str) -> Option<(String, String)> {
     })
 }
 
+/// The source a retro refusal comes from: a landed row that touched these is
+/// one the installed build may predate (`compounding-622`).
+const RETRO_SRC: &[&str] = &["src/retro_run.rs", "src/retro.rs"];
+
 fn fail(msg: &str) -> i32 {
     eprintln!("wsp: {msg}");
     1
@@ -323,10 +327,10 @@ fn list_of(store: &Store, args: &Args) -> Result<(Worklist, Value), i32> {
     let Some(w) = store.worklist(slug) else { return Err(fail(&format!("no list `{slug}`"))) };
     let s = state(&w.id);
     if s.is_null() || (s["done"] == true && !sent_back(store, &s)) {
-        return Err(fail(&format!("{} has no retro running — `wsp retro show {}` reads the one that ran, `wsp retro start {}` starts one", w.id, w.id, w.id)));
+        return Err(fail(&crate::stale::refusal(store, &format!("{} has no retro running — `wsp retro show {}` reads the one that ran, `wsp retro start {}` starts one", w.id, w.id, w.id), RETRO_SRC)));
     }
     if let Some(why) = wrong_seat(store, &w, &s, caller_pane().as_deref()) {
-        return Err(fail(&why));
+        return Err(fail(&crate::stale::refusal(store, &why, RETRO_SRC)));
     }
     Ok((w, s))
 }
