@@ -200,6 +200,11 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
     } else if let Some(after) = cap {
         let held = cap_holders(i, &after, to);
         if held.is_empty() { "the seat's cap (a place to come free)".into() } else { format!("the seat's cap (a place to come free) — held by {held}") }
+    } else if let Some(park) = i.parks.iter().filter(|p| parked_within(p, from, to) * 2 > span).max_by_key(|p| parked_within(p, from, to)) {
+        // A person parked the whole list and nothing ran: the park is what it
+        // waited on, by whom and why, not nothing the logs name (`wsp-645`:
+        // wsp-635's 65m between its check and the verifier's spawn).
+        format!("{PARKED_LIST} — {}", park.words())
     } else if span <= HAND_OFF {
         "the hand-off (a poke and a spawn)".into()
     } else if span <= TICK + HAND_OFF {
@@ -207,6 +212,14 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
     } else {
         "nothing the logs name — the step did not run for longer than a tick".into()
     }
+}
+
+/// The cause of a stretch a person's park of the whole list covered.
+pub(crate) const PARKED_LIST: &str = "the list parked";
+
+/// Seconds of `from..to` a park covers.
+fn parked_within(p: &Park, from: i64, to: i64) -> i64 {
+    (p.end.min(to) - p.start.max(from)).max(0)
 }
 
 /// One place a cap line lists after its colon (`x in cpd-1, y starting, 2
@@ -392,6 +405,54 @@ fn between_attempts(i: &Inputs, prev: &Attempt, to: i64) -> (String, String) {
     (format!("{head} at {} → seat started again", at(end)), format!("{PARKED_CAUSE} — {why}"))
 }
 
+/// The stretch `from..to` between two attempts, as phases (`wsp-645`). The row's
+/// own checks that timed out under load and were rerun (`task-checked` with state
+/// `waiting`) ran in it: each is work, from its start to the event. A park that
+/// covers most of it ends where the list resumed: what follows the resume is the
+/// row waiting to be started again, not the park (`wsp-629`: the park ended at
+/// 12:58, and 40m more of checks and a restart were booked to it).
+fn between_phases(i: &Inputs, from: i64, to: i64, label: String, why: String) -> Vec<Phase> {
+    let mut out = Vec::new();
+    if to <= from {
+        return out;
+    }
+    let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
+    // Where the park the cause names ends, when it ends inside the stretch.
+    let resumed = i
+        .parks
+        .iter()
+        .filter(|p| !p.open && why.contains(&p.words()))
+        .map(|p| p.end)
+        .find(|e| *e > from && *e < to);
+    let mut cursor = from;
+    let (mut label, mut why) = (label, why);
+    if let Some(r) = resumed {
+        out.push(Phase::gap(label, from, r, why));
+        cursor = r;
+        label = format!("resumed at {} → seat started again", at(r));
+        why = format!("{PARKED_CAUSE} — the list resumed at {}, and the row was not started again until {}", at(r), at(to));
+    }
+    let mut waiting: Vec<(i64, i64, &Value)> = i
+        .kind("task-checked", &i.id)
+        .into_iter()
+        .filter(|(t, d)| *t > cursor && *t <= to && d["state"] == "waiting")
+        .map(|(t, d)| (t, d["took"].as_i64().unwrap_or(0).max(0), d))
+        .collect();
+    waiting.sort_by_key(|(t, _, _)| *t);
+    for (c, took, event) in waiting {
+        let start = (c - took).max(cursor);
+        if start > cursor {
+            out.push(Phase::gap(label.clone(), cursor, start, why.clone()));
+        }
+        out.push(Phase::work(format!("the row's own check timed out under load, to be rerun once the load falls{}", check_start_note(event)), start, c));
+        cursor = c;
+    }
+    if to > cursor {
+        out.push(Phase::gap(label, cursor, to, why));
+    }
+    out
+}
+
 /// The phases of a row, in time order.
 pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let id = i.id.as_str();
@@ -437,9 +498,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         let prev = &seated[k - 1];
         let Some(from) = prev.review.or(prev.end) else { continue };
         let (label, why) = between_attempts(i, prev, a.claim);
-        if a.begin() > from {
-            out.push(Phase::gap(label, from, a.begin(), why));
-        }
+        out.extend(between_phases(i, from, a.begin(), label, why));
         if let Some(s) = a.spawn {
             out.push(Phase::work(format!("spawn requested → seat claimed{}", of(k + 1)), s, a.claim));
         }
@@ -2564,6 +2623,50 @@ mod tests {
         assert!(why.starts_with(PARKED_CAUSE) && why.contains("parked by person") && why.contains("he needs the machine"), "{why}");
         assert!(!why.contains("waiting to be restarted"), "{why}");
         assert_eq!(figures_of(&ph, &SeatReport::default()).between_attempts, 1840);
+    }
+
+    /// wsp-629 (`wsp-645`): the list resumed at 12:58, and the row's checks timed
+    /// out under load, and were rerun, until it was started again at 13:38. The
+    /// park ends at the resume; the checks are work, not the park.
+    #[test]
+    fn check_timeouts_after_a_resume_are_booked_to_the_checks_and_the_park_ends_at_the_resume() {
+        let mut i = two_seatings(true);
+        i.events.retain(|(_, k, _)| k != "task-after" && k != "task-parked");
+        i.group = Some(("l".into(), 1, vec!["r-1".into()]));
+        let evs = vec![
+            (140, "worklist-parked".to_string(), json!({"id": "l", "why": "he needs the machine", "by": "person"})),
+            (1100, "worklist-resumed".to_string(), json!({"id": "l", "at": 1, "said": "go", "by": "person"})),
+        ];
+        i.parks = parks_of(&evs, "l", 9999);
+        for n in 0..5 {
+            i.events.push(ev(1200 + n * 100, "task-checked", json!({"id": "r-1", "state": "waiting", "took": 23})));
+        }
+        let ph = build(&i);
+        let park = ph.iter().find(|p| p.gap && p.label.starts_with("parked at")).expect("the park");
+        assert_eq!((park.start, park.end), (150, 1100));
+        let checks: Vec<&Phase> = ph.iter().filter(|p| !p.gap && p.label.starts_with("the row's own check timed out")).collect();
+        assert_eq!(checks.len(), 5, "{ph:?}");
+        assert!(checks.iter().all(|p| p.seconds() == 23));
+        let booked: i64 = ph.iter().filter(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with(PARKED_CAUSE))).map(|p| p.seconds()).sum();
+        assert_eq!(booked, 1990 - 150 - 5 * 23, "the checks are not between attempts");
+        let f = figures_of(&ph, &SeatReport::default());
+        assert_eq!(f.between_attempts, booked);
+        assert!(ph.iter().filter(|p| p.gap && p.start >= 1100).all(|p| !p.waiting_for.as_deref().unwrap().contains("parked by")), "{ph:?}");
+    }
+
+    /// wsp-635 (`wsp-645`): a stretch a list park covered is named for it, not
+    /// as nothing the logs name.
+    #[test]
+    fn a_stretch_inside_a_list_park_is_named_for_the_park_by_wait_name() {
+        let mut i = two_seatings(true);
+        let evs = vec![
+            (140, "worklist-parked".to_string(), json!({"id": "l", "why": "he needs the machine", "by": "person"})),
+            (1900, "worklist-resumed".to_string(), json!({"id": "l", "at": 1, "said": "go", "by": "person"})),
+        ];
+        i.parks = parks_of(&evs, "l", 9999);
+        let why = wait_name(&i, 300, 1950, "r-1");
+        assert!(why.starts_with(PARKED_LIST) && why.contains("he needs the machine"), "{why}");
+        assert!(wait_name(&i, 1890, 2900, "r-1").starts_with("nothing the logs"), "a park under half of it names nothing");
     }
 
     /// react-parity-now (`compounding-464`): rows sent back at a rebase sat idle
