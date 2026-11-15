@@ -853,7 +853,7 @@ pub(crate) fn health(warnings: &mut Vec<String>) {
 /// `wsp install`; returns the paths written.
 pub(crate) fn write_settings() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    for (file, body) in [(PRIMARY_FILE, PRIMARY_SETTINGS), (GOVERNOR_FILE, GOVERNOR_SETTINGS), (RETRO_FILE, RETRO_SETTINGS)] {
+    for (file, body) in [(PRIMARY_FILE, PRIMARY_SETTINGS), (GOVERNOR_FILE, GOVERNOR_SETTINGS)] {
         let path = settings_path(file);
         if std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
             continue;
@@ -888,18 +888,31 @@ pub(crate) fn settings_args(kind: &str, scope: Option<&str>, primary: bool) -> V
     }
 }
 
+/// Where the retro seat's settings file lives: under wsp's own state, not in
+/// `~/.claude`. Only `--settings <path>` reads it, so it need not sit beside the
+/// person's own settings, and a build run in `wsp sandbox` makes its own copy.
+pub(crate) fn retro_settings_path(state: &std::path::Path) -> std::path::PathBuf {
+    state.join("claude-code").join(RETRO_FILE)
+}
+
 /// The argument pair a retro seat's Claude Code is started with: `--settings
 /// <file>`, which allows the read-only verbs its packet tells it to search with
-/// (`wsp ls`, `wsp find`, `wsp show`). Only when the file is there.
-pub(crate) fn retro_settings_args(kind: &str) -> Vec<String> {
+/// (`wsp ls`, `wsp find`, `wsp show`). The file is written under `state` when
+/// it is missing or differs; if it cannot be written the seat starts without.
+pub(crate) fn retro_settings_args(kind: &str, state: &std::path::Path) -> Vec<String> {
     if kind != "claude" {
         return Vec::new();
     }
-    let path = settings_path(RETRO_FILE);
-    match path.exists() {
-        true => vec!["--settings".into(), path.display().to_string()],
-        false => Vec::new(),
+    let path = retro_settings_path(state);
+    if !std::fs::read_to_string(&path).is_ok_and(|s| s == RETRO_SETTINGS) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if crate::store::write_atomic(&path, RETRO_SETTINGS).is_err() {
+            return Vec::new();
+        }
     }
+    vec!["--settings".into(), path.display().to_string()]
 }
 
 /// Whether a spawn is a retro seat's: its row is tagged `retro` and it is not
@@ -910,9 +923,9 @@ pub(crate) fn retro_wanted(verifying: bool, row_tags: &[String]) -> bool {
 
 /// What a spawn adds for a retro seat: the settings pair when the row is
 /// tagged `retro` and the seat is not its verifier, nothing otherwise.
-pub(crate) fn retro_spawn_args(kind: &str, verifying: bool, row_tags: &[String]) -> Vec<String> {
+pub(crate) fn retro_spawn_args(kind: &str, verifying: bool, row_tags: &[String], state: &std::path::Path) -> Vec<String> {
     match retro_wanted(verifying, row_tags) {
-        true => retro_settings_args(kind),
+        true => retro_settings_args(kind, state),
         false => Vec::new(),
     }
 }
@@ -1208,7 +1221,7 @@ mod tests {
         assert!(settings_args("opencode", Some("x"), false).is_empty());
         assert!(settings_args("claude", None, false).is_empty(), "a member gets neither file");
         assert_eq!(allow(RETRO_SETTINGS), ["Bash(wsp ls:*)", "Bash(wsp find:*)", "Bash(wsp show:*)"]);
-        assert!(retro_settings_args("opencode").is_empty());
+        assert!(retro_settings_args("opencode", std::path::Path::new("/nonexistent")).is_empty());
         let v: Value = serde_json::from_str(RETRO_SETTINGS).unwrap();
         let prose = v["autoMode"]["allow"].as_array().unwrap();
         assert!(prose.iter().any(|p| {
@@ -1224,7 +1237,26 @@ mod tests {
         assert!(!retro_wanted(true, &retro), "its verifier is not a retro seat");
         assert!(!retro_wanted(false, &["wsp".to_string()]), "a member is not");
         assert!(!retro_wanted(false, &[]));
-        assert!(retro_spawn_args("opencode", false, &retro).is_empty());
-        assert!(retro_spawn_args("claude", true, &retro).is_empty());
+        let state = std::env::temp_dir().join(format!("wsp-retro-args-{}", std::process::id()));
+        assert!(retro_spawn_args("opencode", false, &retro, &state).is_empty());
+        assert!(retro_spawn_args("claude", true, &retro, &state).is_empty());
+        assert!(retro_spawn_args("claude", false, &["wsp".to_string()], &state).is_empty());
+    }
+
+    #[test]
+    fn the_retro_args_name_a_file_under_the_state_holding_the_retro_settings() {
+        let state = std::env::temp_dir().join(format!("wsp-retro-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let args = retro_settings_args("claude", &state);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--settings");
+        let path = std::path::PathBuf::from(&args[1]);
+        assert!(path.starts_with(&state), "{path:?} is not under {state:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), RETRO_SETTINGS);
+        // A stale copy is replaced, and the args are the same path.
+        std::fs::write(&path, "stale").unwrap();
+        assert_eq!(retro_settings_args("claude", &state), args);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), RETRO_SETTINGS);
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
