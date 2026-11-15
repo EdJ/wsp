@@ -483,7 +483,21 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             .or_else(|| done_event.map(|(t, _, _)| *t))
             .or_else(|| reviews.iter().copied().find(|r| *r >= s));
         if ready > 0 && s > ready {
-            out.push(Phase::gap(format!("gap before leg {}", leg.name), ready, s, wait_name(i, ready, s, id)));
+            // A review typed between two legs ran the row's own check, which
+            // failed and sent the row back: that run is work, not a wait
+            // (`compounding-506`: 299s and 650s booked as nothing the logs name).
+            let mut from = ready;
+            for (r, c, event) in own_checks(i, &reviews, ready, s) {
+                if r > from {
+                    out.push(Phase::gap(format!("gap before leg {}", leg.name), from, r, wait_name(i, from, r, id)));
+                }
+                out.push(Phase::work(format!("the row's own check (wsp check, run by review — sent the row back){}", check_start_note(event)), r, c));
+                from = c;
+            }
+            if s > from {
+                let label = if from > ready { format!("row's check ended → leg {} started", leg.name) } else { format!("gap before leg {}", leg.name) };
+                out.push(Phase::gap(label, from, s, wait_name(i, from, s, id)));
+            }
         }
         let up = i.first_learned_after(s);
         let label = match up {
@@ -682,6 +696,22 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     }
     let _ = begin;
     out.sort_by_key(|p| (p.start, p.end));
+    out
+}
+
+/// The row's own check runs that began with a review inside `from..to`: each
+/// review typed there, with the `task-checked` that ended its run before the
+/// next review or `to`.
+fn own_checks<'a>(i: &'a Inputs, reviews: &[i64], from: i64, to: i64) -> Vec<(i64, i64, &'a Value)> {
+    let inside: Vec<i64> = reviews.iter().copied().filter(|r| *r >= from && *r <= to).collect();
+    let checked = i.kind("task-checked", &i.id);
+    let mut out = Vec::new();
+    for (n, r) in inside.iter().enumerate() {
+        let until = inside.get(n + 1).copied().unwrap_or(to);
+        if let Some((c, event)) = checked.iter().copied().filter(|(t, _)| *t >= *r && *t <= until).max_by_key(|(t, _)| *t) {
+            out.push((*r, c, event));
+        }
+    }
     out
 }
 
@@ -2131,6 +2161,26 @@ mod tests {
         let after = ph.iter().find(|p| p.label.starts_with("row's check ended")).unwrap();
         assert_eq!(after.seconds(), 5);
         assert!(after.waiting_for.as_deref().unwrap().contains("hand-off"));
+    }
+
+    #[test]
+    fn a_check_that_failed_between_two_legs_is_work_not_nothing_the_logs_name() {
+        // compounding-506: review at 305 ran the row's check for 299s, it failed,
+        // and the rework leg started at 620.
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k != "task-verified");
+        i.events.push(ev(604, "task-checked", json!({"id": "r-1", "took": 299})));
+        i.events.push(ev(170, "leg-added", json!({"id": "r-1", "leg": "b"})));
+        i.cycle.retain(|(_, l)| !l.starts_with("spawn r-1 --agent --verify"));
+        i.cycle.push((620, "list group 1: starting leg b of r-1".into()));
+        i.legs.push(LegIn { name: "b".into(), ..Default::default() });
+        i.legs[0].name = "a".into();
+        let ph = build(&i);
+        let check = ph.iter().find(|p| p.label.starts_with("the row's own check")).expect("named");
+        assert_eq!((check.start, check.end, check.gap), (305, 604, false), "{ph:?}");
+        let after = ph.iter().find(|p| p.label.starts_with("row's check ended")).expect("the rest is a gap");
+        assert_eq!((after.start, after.end), (604, 620));
+        assert!(!ph.iter().any(|p| p.gap && p.start == 305), "no gap books the check run: {ph:?}");
     }
 
     #[test]
