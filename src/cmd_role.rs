@@ -354,7 +354,7 @@ pub(crate) fn parse_ps(line: &str) -> Option<Proc> {
     Some(Proc { pid, ppid, age, cpu, cputime, command })
 }
 
-fn processes() -> Vec<Proc> {
+pub(crate) fn processes() -> Vec<Proc> {
     let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,pcpu=,time=,command="]).output() else {
         return Vec::new();
     };

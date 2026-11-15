@@ -86,6 +86,7 @@ mod detail;
 mod did;
 mod draw;
 mod ending;
+mod ended_panes;
 mod history;
 mod kanban;
 mod live;

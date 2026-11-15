@@ -4343,6 +4343,8 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     picked_up.extend(silent_lines(store));
     // wsp-453: a finished row's tree that still has processes.
     picked_up.extend(crate::ending::finished_wip_lines(store));
+    // wsp-637: a pane whose seat has ended.
+    picked_up.extend(crate::ended_panes::wip_lines(store));
     match args.json() {
         true => {
             let mut v = wip_json(&w);
