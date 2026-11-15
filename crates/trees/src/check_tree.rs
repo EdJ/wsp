@@ -349,6 +349,34 @@ fn host_named(exe: &str) -> Option<String> {
     HOSTS.contains(&b).then(|| format!("a host or server ({b})"))
 }
 
+/// Is this executable a person's launched app (`wsp-633`): inside a `.app`
+/// bundle or under an `Applications` folder. A person's program, not an agent's.
+fn app_named(exe: &str) -> Option<String> {
+    let inside = exe.contains(".app/") || exe.contains("/Applications/");
+    inside.then(|| format!("an app ({})", base_of(exe)))
+}
+
+/// The nearest app above `pid`, as `(its pid, why)`, climbing until a host
+/// (whose children are the host's, and say so elsewhere) or the top.
+fn app_above(pid: u32, table: &[(u32, u32, String)]) -> Option<(u32, String)> {
+    let find = |p: u32| table.iter().find(|(q, _, _)| *q == p);
+    let mut at = find(pid)?.1;
+    for _ in 0..table.len() {
+        if at <= 1 {
+            break;
+        }
+        let &(_, up, ref exe) = find(at)?;
+        if host_named(exe).is_some() {
+            return None;
+        }
+        if let Some(why) = app_named(exe) {
+            return Some((at, why));
+        }
+        at = up;
+    }
+    None
+}
+
 /// Does the executable live under `tree`? A relative one was run from the
 /// working directory, which is in the tree.
 fn exe_in(exe: &str, tree: &Path) -> bool {
@@ -379,6 +407,14 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     }
     if built {
         return Verdict::Spare(format!("a server ({}) that is not the tree's build", base_of(exe)));
+    }
+    // A person's app and all it started, a dev tool by name too: not the row's
+    // (`wsp-633`: web-chrome.app's children were TERMed every cycle for a day).
+    if let Some(why) = app_named(exe) {
+        return Verdict::Spare(format!("{why} that a person launched, standing there by working directory"));
+    }
+    if let Some((app, why)) = app_above(pid, table) {
+        return Verdict::Spare(format!("it descends from {why}, pid {app}, a person's launched app"));
     }
     if DEV_TOOLS.contains(&base_of(exe)) {
         return Verdict::Stop;
@@ -422,6 +458,17 @@ pub fn sorted(lsof: &str, lefts: Vec<Left>, table: &[(u32, u32, String)]) -> Vec
             (!l.pids.is_empty() || !l.spared.is_empty()).then_some(l)
         })
         .collect()
+}
+
+/// What a spared process is said once under: its pid, or, where it is spared
+/// for descending from an app, that app (`wsp-633`: a new child each cycle is
+/// the same lineage and is not named again).
+pub fn spared_key(l: &Left, pid: u32, why: &str) -> String {
+    if why.starts_with("it descends from an app") {
+        format!("{}|{why}", l.tree)
+    } else {
+        format!("{}|{pid}", l.tree)
+    }
 }
 
 /// The `cycle.log` line for a process the sweep spared, said once per pid.
@@ -1043,6 +1090,29 @@ mod tests {
         assert_eq!(judged(21, &[20, 21], &table), Verdict::Stop, "a child of a process in the tree");
         assert_eq!(judged(22, &[20, 22], &table), Verdict::Stop, "and its descendants");
         assert!(matches!(judged(21, &[21], &table), Verdict::Spare(_)), "its parent was not in the tree");
+    }
+
+    /// `wsp-633`: a person's app's children were TERMed by cwd every cycle.
+    #[test]
+    fn a_persons_app_and_what_it_started_are_spared_even_a_dev_tool() {
+        let table = [
+            proc(85319, 1, "/Users/e/Applications/web-chrome.app/Contents/MacOS/web-chrome"),
+            proc(85320, 85319, "/usr/local/bin/helper"),
+            proc(85321, 85320, "/usr/local/bin/node"),
+            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(61, 60, "/bin/sh"),
+            proc(62, 61, "/usr/local/bin/node"),
+        ];
+        let all = [85319, 85320, 85321, 62];
+        for pid in [85319, 85320, 85321] {
+            let v = judged(pid, &all, &table);
+            assert!(matches!(&v, Verdict::Spare(_)), "{pid}: {v:?}");
+        }
+        // Under a host the host decides, as before: a dev tool is still the tree's.
+        assert_eq!(judged(62, &all, &table), Verdict::Stop);
+        let l = Left { row: "c-1".into(), tree: "/r/.worktrees/c-1".into(), pids: vec![], spared: vec![] };
+        let (Verdict::Spare(a), Verdict::Spare(b)) = (judged(85320, &all, &table), judged(85321, &all, &table)) else { panic!() };
+        assert_eq!(spared_key(&l, 85320, &a), spared_key(&l, 85321, &b), "one lineage, one name");
     }
 
     #[test]

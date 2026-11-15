@@ -433,12 +433,12 @@ pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
 /// What the sweep let be, said in `cycle.log` once per pid for as long as this
 /// process lives (`wsp-478`). Returns the lines said.
 fn say_spared(store: &Store, found: &[crate::check_tree::Left]) -> Vec<String> {
-    static SAID: std::sync::Mutex<std::collections::BTreeSet<u32>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    static SAID: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
     let mut said = Vec::new();
     let mut seen = SAID.lock().unwrap_or_else(|e| e.into_inner());
     for l in found {
         for (pid, why) in &l.spared {
-            if seen.insert(*pid) {
+            if seen.insert(crate::check_tree::spared_key(l, *pid, why)) {
                 let line = crate::check_tree::spared_line(l, *pid, why);
                 crate::store::log_line(store, &line);
                 said.push(line);
@@ -1976,6 +1976,35 @@ mod tests {
         assert!(said.iter().any(|l| l.starts_with("spared") && l.contains("row f-4")), "{said:?}");
         assert!(!said.iter().any(|l| l.contains("f-2") || l.contains("f-3")), "{said:?}");
         assert!(crate::check_tree::left_line(&crate::check_tree::Left { row: "f-1".into(), tree: "/r/.worktrees/f-1".into(), pids: vec![1, 2], spared: vec![] }, 2048).contains("2 processes (2 MB)"));
+    }
+
+    /// `wsp-633`: the children of a person's app, a new pid each cycle, were
+    /// named and TERMed every cycle for a day. They are spared, and the one
+    /// lineage is named once, whatever pids it has by the next cycle.
+    #[test]
+    fn a_persons_apps_children_in_a_removed_tree_are_named_once_and_never_stopped() {
+        let env = util::isolated("check-tree-app-lineage");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let tree = "/r/.worktrees/app-633";
+        let app = "/Users/e/Applications/web-chrome.app/Contents/MacOS/web-chrome";
+        let mut said = Vec::new();
+        for cycle in 0..4u32 {
+            let (app_pid, child, grandchild) = (7000, 7100 + cycle, 7200 + cycle);
+            let table = vec![
+                (app_pid, 1, app.to_string()),
+                (child, app_pid, "/usr/local/bin/helper".to_string()),
+                (grandchild, child, "/usr/local/bin/node".to_string()),
+            ];
+            let lsof = format!("p{app_pid}\nn{tree}\np{child}\nn{tree}/web\np{grandchild}\nn{tree}/web\n");
+            let lefts = crate::check_tree::finished_trees(&lsof, &|n| n == "app-633", &[]);
+            let found = crate::check_tree::sorted(&lsof, lefts, &table);
+            assert!(found.iter().all(|l| l.pids.is_empty()), "cycle {cycle}: nothing is the row's to stop: {found:?}");
+            said.extend(say_spared(&store, &found));
+        }
+        let app_lines: Vec<_> = said.iter().filter(|l| l.contains("descends from an app")).collect();
+        assert_eq!(app_lines.len(), 1, "one lineage named once: {said:?}");
+        assert_eq!(said.len(), 2, "the app itself once more, by its own pid: {said:?}");
     }
 
 
