@@ -1609,7 +1609,7 @@ fn tell_seat(
                 "at": util::epoch_secs(), "turn": false,
             }),
         );
-        let word = format!("{what} is unreachable — held ({n} waiting), delivered when the link returns");
+        let word = format!("{what} is unreachable — held ({n} waiting), delivered when the link is back and the seat is ready");
         match args.json() {
             true => println!("{}", json!({ "held": true, "pane": seat, "waiting": n })),
             false => println!("{} {word}", p.yellow("…")),
@@ -5082,8 +5082,12 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // (`wsp-301`), §26.8 D9: it is `working` to the screen and `stopped` is
         // false, and it is stopped on a person all the same.
         let in_ask_wait = waiting.as_ref().is_some_and(|w| matches!(w.why, crate::waiting::Why::Question(_)));
+        // **Not from a stale read** (wsp-639): a far seat whose machine's beat
+        // is late is not known to have stopped, only not heard lately, and a
+        // seat read `idle` off the last answer is not owed to anybody.
+        let fresh = !w.silent.late.contains(seat);
         let needs_you = in_ask_wait
-            || cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some())
+            || fresh && cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some())
                 && waiting.as_ref().is_none_or(|w| w.owed())
                 // A leg that has written its baton is finished: its seat stands
                 // until the tick ends it, and nobody is owed anything from it.
@@ -10199,6 +10203,16 @@ mod tests {
         let mut bare = wip_world();
         bare.agents.clear();
         assert!(wip_lines(&bare, &Paint::new(), false).join("\n").contains("idle panes: none"));
+    }
+
+    /// wsp-639: a far seat on a machine whose beat is late is not known to have
+    /// stopped, so it does not draw `← needs you` off the last answer.
+    #[test]
+    fn wip_does_not_call_a_far_seat_that_needs_you_from_a_late_beat() {
+        let mut w = wip_world();
+        assert!(wip_rows(&w).iter().any(|r| r.pane == "w2:p1" && r.needs_you));
+        w.silent.late.insert("w2:p1".into());
+        assert!(wip_rows(&w).iter().all(|r| !r.needs_you), "a stale read asks nobody");
     }
 
     /// An idle agent on a task that is still `doing` is a person being the

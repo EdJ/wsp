@@ -848,7 +848,7 @@ pub const LINK_PROBE: Duration = Duration::from_secs(8);
 /// ([`beat_idle`]), so an idle machine reads off the probe, not off the last
 /// beat of a seat that is gone (wsp-588).
 pub fn is_silent(m: &Machine, l: &MachineLive) -> bool {
-    !l.reachable || (!l.heard.is_empty() && heard_is_stale(m, crate::util::since(&l.heard)))
+    !l.reachable || (!l.heard.is_empty() && heard_is_stale_at(m, l, crate::util::since(&l.heard)))
 }
 
 /// The silence rule with no clock in it: a beat last answered `age` seconds ago
@@ -856,6 +856,24 @@ pub fn is_silent(m: &Machine, l: &MachineLive) -> bool {
 /// for a late tick, which is a slow daemon and not a dead link (wsp-588).
 pub fn heard_is_stale(m: &Machine, age: i64) -> bool {
     age > i64::from(m.lease_secs()) + beat_every(m).as_secs() as i64
+}
+
+/// [`heard_is_stale`] for a machine whose daemon has been seen to tick slowly:
+/// the beat is sent from the tick, so silence allows the lease and one beat as
+/// late as the slowest recent tick (wsp-639). A daemon that ticks every 78 s
+/// beats every 78 s, and a lease of 60 s plus a 20 s beat was 80 s: two seconds
+/// of margin, and none at all on the next slower tick.
+pub fn heard_is_stale_at(m: &Machine, l: &MachineLive, age: i64) -> bool {
+    let late = (beat_every(m).as_secs() as i64).max(l.tick_secs);
+    age > i64::from(m.lease_secs()) + late
+}
+
+/// Whether a far machine's last beat is older than its lease while the machine
+/// is not yet silent: the beat is late, and what is known of its seats is a
+/// stale read, not a fresh one (wsp-639). A surface does not call such a seat
+/// idle or in need of anybody.
+pub fn beat_is_late(m: &Machine, l: &MachineLive) -> bool {
+    l.reachable && !l.heard.is_empty() && crate::util::since(&l.heard) > i64::from(m.lease_secs()) && !is_silent(m, l)
 }
 
 /// When a silent machine was last heard: the last answered beat, else the
@@ -887,12 +905,20 @@ pub fn unreachable_word(at: &str) -> String {
 pub struct Silence {
     pub line: Option<String>,
     pub seats: std::collections::BTreeMap<String, String>,
+    /// Far seats whose machine's beat is late but not silent ([`beat_is_late`]):
+    /// what is read of them is a stale read (wsp-639).
+    pub late: std::collections::BTreeSet<String>,
 }
 
 impl Silence {
     pub fn read(store: &crate::store::Store) -> Silence {
         let (machines, live) = (store.machines(), store.machines_live());
-        let mut out = Silence { line: loud(&machines, &live), seats: Default::default() };
+        let mut out = Silence { line: loud(&machines, &live), ..Default::default() };
+        for m in machines.iter().filter(|m| m.is_active() && !m.name.is_empty()) {
+            if live.get(&m.name).is_some_and(|l| beat_is_late(m, l)) {
+                out.late.extend(crate::place_compound::beat_seats(store, &m.name).into_iter().map(|s| s.id));
+            }
+        }
         if out.line.is_none() {
             return out;
         }
@@ -2177,6 +2203,29 @@ mod tests {
         // And the rule still means something: a beat a lease and a beat old.
         assert!(!heard_is_stale(&m, 60 + 20));
         assert!(heard_is_stale(&m, 60 + 21));
+    }
+
+    /// wsp-639: a daemon that ticks every 78 s beats every 78 s, and a 60 s lease
+    /// never reads silent or late-and-silent while it does; a beat past the slowest
+    /// tick and one more is still silence.
+    #[test]
+    fn a_far_seat_working_through_a_slow_tick_never_reads_silent() {
+        let mut m = Machine::new("mb2", "mb2");
+        m.lease = Some(60);
+        let ago = |secs: i64| crate::util::iso_at(crate::util::epoch_secs() - secs);
+        let slow = |heard: i64, tick: i64| MachineLive { reachable: true, last_seen: ago(5), heard: ago(heard), tick_secs: tick, ..Default::default() };
+        // Unmeasured, 78 s is what a 60 s lease and one 20 s beat nearly allow.
+        assert!(!is_silent(&m, &slow(78, 0)));
+        // Measured, every age up to the tick's gap is inside the allowance, and
+        // 1 s more than the lease and the gap is not.
+        for age in 0..=(60 + 78) {
+            assert!(!is_silent(&m, &slow(age, 78)), "silent at {age}s of a 78 s tick");
+        }
+        assert!(is_silent(&m, &slow(60 + 79 + 1, 78)));
+        // Late is between the lease and silence, and only there.
+        assert!(!beat_is_late(&m, &slow(50, 78)), "inside the lease");
+        assert!(beat_is_late(&m, &slow(70, 78)), "past the lease, not yet silent");
+        assert!(!beat_is_late(&m, &slow(200, 78)), "silent is not late");
     }
 
     /// wsp-588: with no far seat left to beat, the last beat is forgotten, so the

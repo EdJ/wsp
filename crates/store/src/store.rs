@@ -245,6 +245,11 @@ pub struct MachineLive {
     /// is. This is the whole diagnostic surface for "why is mb2 grey", so it
     /// keeps the message rather than a code.
     pub error: String,
+    /// How far apart the daemon's ticks have lately run, in seconds (wsp-639).
+    /// A beat is sent from the tick, so a loaded daemon beats as slowly as it
+    /// ticks, and a reader that allowed only the lease would call a working seat
+    /// silent between two slow beats. `0`: not measured yet.
+    pub tick_secs: i64,
 }
 
 impl MachineLive {
@@ -268,6 +273,7 @@ impl MachineLive {
             check_error: s("check_error"),
             shim_warning: s("shim_warning"),
             error: s("error"),
+            tick_secs: v.get("tick_secs").and_then(|x| x.as_i64()).unwrap_or(0),
         }
     }
 
@@ -286,6 +292,7 @@ impl MachineLive {
             "check_error": self.check_error,
             "shim_warning": self.shim_warning,
             "error": self.error,
+            "tick_secs": self.tick_secs,
         })
     }
 }

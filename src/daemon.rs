@@ -781,6 +781,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             }
         }
 
+        // The tells held for a far seat go the tick its link answers and the
+        // seat is ready, not at the attention pass's own interval, which is
+        // longer and can fall wholly outside a short ready window (wsp-639).
+        // Cheap when nothing is held.
+        crate::wake::flush_held_tells_now(store);
+
         // On its own interval, every tick: a stopped agent changes nothing in
         // the store and raises no event, so a pass that ran only when something
         // woke us would never run on the one condition it exists to notice.

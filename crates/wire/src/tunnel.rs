@@ -107,6 +107,8 @@ struct Tunnel {
     answered_at: Option<Instant>,
     /// The ssh program: `ssh`, or a script in a test.
     ssh: String,
+    /// When this tunnel was last stepped, to measure the daemon's tick (wsp-639).
+    last_step: Option<Instant>,
 }
 
 impl Tunnel {
@@ -127,7 +129,19 @@ impl Tunnel {
             master_answered: false,
             answered_at: None,
             ssh: "ssh".into(),
+            last_step: None,
         }
+    }
+
+    /// Note that a tick has reached this tunnel, and how long since the last:
+    /// the beat goes out on the tick, so the gap between ticks is the slowest a
+    /// beat can come, and [`crate::far::heard_is_stale_at`] allows for it. The
+    /// slow gap is kept for a few ticks (half of it decays each fast tick), so a
+    /// loaded daemon that catches up once does not read silent on the next lag.
+    fn ticked(&mut self) {
+        let gap = self.last_step.map_or(0, |t| t.elapsed().as_secs() as i64);
+        self.last_step = Some(Instant::now());
+        self.live.tick_secs = gap.max(self.live.tick_secs / 2);
     }
 
     /// Whether a failure that reached the far side keeps the machine reachable:
@@ -488,6 +502,7 @@ impl Supervisor {
         let ssh = self.ssh.clone();
         let t = self.tunnels.entry(m.name.clone()).or_insert_with(|| Tunnel { ssh, ..Tunnel::new() });
         t.live.socket = sock.to_string_lossy().into_owned();
+        t.ticked();
 
         // Has the ssh we started fallen over since last time?
         if let Some(child) = t.child.as_mut() {
@@ -1397,6 +1412,27 @@ mod tests {
         assert!(t.live.heard.is_empty() && t.live.leases.is_empty(), "{:?}", t.live);
         assert!(!crate::far::is_silent(&m, &t.live));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// wsp-639: the tunnel measures the daemon's tick, so a loaded daemon's slow
+    /// beat is allowed for, and the allowance stays a while after it catches up.
+    #[test]
+    fn a_slow_tick_is_measured_and_a_working_far_seat_does_not_read_silent_through_it() {
+        let mut t = Tunnel::new();
+        t.live.reachable = true;
+        t.ticked();
+        assert_eq!(t.live.tick_secs, 0, "the first tick has no gap");
+        t.last_step = Some(Instant::now() - Duration::from_secs(78));
+        t.ticked();
+        assert_eq!(t.live.tick_secs, 78);
+        t.live.heard = crate::util::iso_at(crate::util::epoch_secs() - 78);
+        let mut m = far_machine();
+        m.lease = Some(60);
+        assert!(!crate::far::is_silent(&m, &t.live), "a beat 78 s ago on a 78 s tick");
+        // Fast ticks bring the allowance down by halves, not at once.
+        t.ticked();
+        assert_eq!(t.live.tick_secs, 39);
+        assert_eq!(MachineLive::from_value(&t.live.to_value()).tick_secs, 39, "and it is written where readers look");
     }
 
     /// A machine with no `exec_dir` cannot name its controller: every seat fails
