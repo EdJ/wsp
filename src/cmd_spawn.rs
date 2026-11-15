@@ -2532,6 +2532,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: not starting it: {}", crate::resolve::NO_ROOT_HOLDS);
         return 1;
     }
+    // A row whose files are another project's is in the wrong project: no seat
+    // is started in a tree that cannot hold its work (compounding-613).
+    if let (Some(p), None) = (work.project.as_deref(), args.get("cwd")) {
+        if let Some(other) = index.elsewhere(p, &named) {
+            eprintln!("wsp: not starting it: {}", crate::resolve::wrong_project(p, &other));
+            return 1;
+        }
+    }
     let cwd = args
         .get("cwd")
         .or(project_root)
@@ -6456,6 +6464,33 @@ mod tests {
         // A row naming nothing keeps the first root; one naming files no root holds has none.
         assert_eq!(index.root_for("compounding", &[]), Some(compound.display().to_string()));
         assert_eq!(index.root_for("compounding", &["spikes/gone/x.ts".into()]), None, "{}", crate::resolve::NO_ROOT_HOLDS);
+    }
+
+    /// compounding-613: a row filed in one project whose packet names files only
+    /// another project's root holds is refused at spawn, naming that project,
+    /// before any seat is opened.
+    #[test]
+    fn a_row_whose_files_are_another_projects_is_refused_at_spawn_before_a_seat() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("wrong-project");
+        let (mine, theirs) = (rooted(&store, "mine"), rooted(&store, "theirs"));
+        std::fs::create_dir_all(format!("{theirs}/src")).unwrap();
+        std::fs::write(format!("{theirs}/src/filing.rs"), "").unwrap();
+        std::fs::create_dir_all(format!("{mine}/lean")).unwrap();
+        std::fs::write(format!("{mine}/lean/own.rs"), "").unwrap();
+        let place = Told(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("agent", "true"), ("kind", "opencode"), ("no-tree", "true")];
+        for (id, file, want) in [("t-1", "src/filing.rs", 1), ("t-2", "lean/own.rs", 0)] {
+            let mut m = crate::model::Task::new("a row", id);
+            m.project = Some("mine".into());
+            m.status_raw = crate::model::Status::Todo.as_str().into();
+            m.body = format!("## Overview\nChange `{file}`.\n");
+            store.save_task(&m).unwrap();
+            assert_eq!(place_work(&place, &store, &Args::synth("spawn", &[id], &flags)), want, "{id}");
+        }
+        assert_eq!(place.1.borrow().len(), 1, "only the row in its own project was seated");
     }
 
     /// wsp-112: `roots_of` is `root_of`'s walk with nothing dropped — every

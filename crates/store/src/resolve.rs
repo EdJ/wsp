@@ -12,6 +12,12 @@ use crate::util;
 /// its roots holds: a tree there could not do the work.
 pub const NO_ROOT_HOLDS: &str = "the files this row names are in none of its project's roots, so no tree could do its work";
 
+/// What filing or a spawn says when a row's files are in none of its project's
+/// roots but are in another project's: the row is in the wrong tree.
+pub fn wrong_project(project: &str, other: &str) -> String {
+    format!("the files this row names are in none of {project}'s roots but are in {other}'s — its fix is {other}'s source; file it with `-p {other}` (or `wsp mv` it there)")
+}
+
 pub struct Index {
     pub projects: Vec<Project>,
 }
@@ -152,6 +158,27 @@ impl Index {
             let dir = util::expand(root);
             named.iter().any(|n| dir.join(n).exists())
         })
+    }
+
+    /// The project whose root holds the files `named` while none of `project`'s
+    /// roots holds any: the row is filed in the wrong project. `None` when
+    /// `named` is empty, the project has no roots, any of its roots holds one,
+    /// or no other project's root does. The one holding most of them wins.
+    pub fn elsewhere(&self, project: &str, named: &[String]) -> Option<String> {
+        let held = |roots: &[String]| -> usize {
+            named.iter().filter(|n| roots.iter().any(|r| util::expand(r).join(n).exists())).count()
+        };
+        let own = self.roots_of(project).filter(|r| !r.is_empty())?;
+        if named.is_empty() || held(&own) > 0 {
+            return None;
+        }
+        self.projects
+            .iter()
+            .filter(|p| p.id != project)
+            .filter_map(|p| Some((p.id.clone(), held(&self.roots_of(&p.id)?))))
+            .filter(|(_, n)| *n > 0)
+            .max_by_key(|(_, n)| *n)
+            .map(|(id, _)| id)
     }
 
     pub fn ancestors(&self, id: &str) -> Vec<String> {

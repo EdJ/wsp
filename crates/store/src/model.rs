@@ -1135,17 +1135,7 @@ impl Task {
     pub fn named_paths(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for name in ["Overview", "Packet"] {
-            for word in self.section(name).unwrap_or_default().split_whitespace() {
-                let w = word
-                    .trim_end_matches(|c: char| "`\"'()[],;:*.".contains(c))
-                    .trim_start_matches(|c: char| "`\"'()[],;:*".contains(c));
-                let last = w.rsplit('/').next().unwrap_or("");
-                let ext = last.rsplit_once('.').is_some_and(|(stem, e)| !stem.is_empty() && !e.is_empty());
-                let looks = (w.contains('/') && ext) || w.ends_with(".rs");
-                if looks && !w.contains("://") && !w.starts_with("..") && !w.starts_with('/') && !w.starts_with('~') && !out.iter().any(|o| o == w) {
-                    out.push(w.to_string());
-                }
-            }
+            paths_in(&self.section(name).unwrap_or_default(), &mut out);
         }
         out
     }
@@ -3638,5 +3628,21 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         let p = Policy::parse("claude high").unwrap();
         assert_eq!(p.model.as_deref(), None);
         assert_eq!(p.effort.as_deref(), Some("high"));
+    }
+}
+
+/// The words of `text` that read as files of a repository (see
+/// [`Task::named_paths`]), added to `out` once each.
+pub fn paths_in(text: &str, out: &mut Vec<String>) {
+    for word in text.split_whitespace() {
+        let w = word
+            .trim_end_matches(|c: char| "`\"'()[],;:*.".contains(c))
+            .trim_start_matches(|c: char| "`\"'()[],;:*".contains(c));
+        let last = w.rsplit('/').next().unwrap_or("");
+        let ext = last.rsplit_once('.').is_some_and(|(stem, e)| !stem.is_empty() && !e.is_empty());
+        let looks = (w.contains('/') && ext) || w.ends_with(".rs");
+        if looks && !w.contains("://") && !w.starts_with("..") && !w.starts_with('/') && !w.starts_with('~') && !out.iter().any(|o| o == w) {
+            out.push(w.to_string());
+        }
     }
 }

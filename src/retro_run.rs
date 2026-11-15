@@ -359,6 +359,15 @@ pub fn file(store: &Store, args: &Args) -> i32 {
             (Ok(e), Ok(f), Ok(d)) => (e, f, d),
             (Err(c), _, _) | (_, Err(c), _) | (_, _, Err(c)) => return c,
         };
+        // A fix that names another project's files is filed there, not here
+        // (compounding-613): seated in the wrong tree, it is worked and thrown away.
+        if let Some(p) = project.as_deref() {
+            let mut named = Vec::new();
+            crate::model::paths_in(&format!("{f}\n{e}"), &mut named);
+            if let Some(other) = crate::resolve::Index::new(store.projects()).elsewhere(p, &named) {
+                return fail(&crate::resolve::wrong_project(p, &other));
+            }
+        }
         series::file_defect(store, &title, &e, &f, &d, project.as_deref()).map(|id| (id, series::DEFECTS))
     } else {
         let (e, a) = match (get("evidence"), get("ask")) {
@@ -516,6 +525,51 @@ mod tests {
         let p = dirp.join(name);
         std::fs::write(&p, text).unwrap();
         p.to_string_lossy().into_owned()
+    }
+
+    /// compounding-613: a defect whose fix names files that are another project's
+    /// is refused at filing, naming that project; one naming its own files files.
+    #[test]
+    fn a_defect_whose_fix_is_another_projects_source_is_refused_naming_it() {
+        let (env, store) = crate::testkit::isolated_store("retro-wrong-project");
+        let (a, b) = (env.path("a-root"), env.path("b-root"));
+        crate::testkit::repo_at(&a, &[("lean/store.rs", "")], "a: first");
+        crate::testkit::repo_at(&b, &[("src/retro_run.rs", "")], "b: first");
+        for (id, root) in [("a", &a), ("b", &b)] {
+            let mut p = crate::model::Project::new(id);
+            p.roots = vec![root.display().to_string()];
+            store.save_project(&p).unwrap();
+        }
+        let mut w = Worklist::new("l", "A list");
+        w.project = Some("a".into());
+        w.body = "## Groups\n\n1. a-1\n".into();
+        let mut t = Task::new("row", "a-1");
+        t.status_raw = "done".into();
+        t.project = Some("a".into());
+        store.save_task(&t).unwrap();
+        store.save_worklist(&w).unwrap();
+        let seat = start(&store, &w, true).unwrap();
+        assert!(store.task(&seat).is_some());
+
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let args = |flags: &[(&str, &str)]| Args::synth("retro", &["file", "l"], flags);
+        let ev = put(&tmp, "ev", "a wait of 378 s");
+        let dw = put(&tmp, "dw", "refused at filing");
+        let elsewhere = put(&tmp, "fx-b", "change `src/retro_run.rs` to check the filing project");
+        let own = put(&tmp, "fx-a", "change `lean/store.rs` to say so");
+        let before = store.tasks().len();
+        let code = file(&store, &args(&[("defect", ""), ("title", "A fix in b's tree"), ("evidence", &ev), ("fix", &elsewhere), ("done-when", &dw)]));
+        assert_eq!(code, 1, "refused");
+        assert_eq!(store.tasks().len(), before, "nothing is filed");
+        assert_eq!(
+            crate::resolve::Index::new(store.projects()).elsewhere("a", &["src/retro_run.rs".into()]).as_deref(),
+            Some("b"),
+            "the sentence names the project to use"
+        );
+        assert!(crate::resolve::wrong_project("a", "b").contains("-p b"));
+        let code = file(&store, &args(&[("defect", ""), ("title", "A fix in a's tree"), ("evidence", &ev), ("fix", &own), ("done-when", &dw)]));
+        assert_eq!(code, 0, "its own files file");
     }
 
     #[test]
