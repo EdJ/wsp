@@ -1275,7 +1275,15 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
         return Ran { step: step.clone(), done: Done::Hung(pids), took: start.elapsed(), tail, first: None, reused: None };
     }
     let ok = !timed_out && status.is_some_and(|s| s.success());
-    let tail = tail_of(log);
+    let mut tail = tail_of(log);
+    // A step the system ended (a signal, not a limit of ours) has no exit
+    // status; say which signal, so "no exit status" is not all the row learns.
+    if !ok && !timed_out {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.and_then(|s| s.signal()) {
+            tail = format!("{tail}\nended by signal {sig} (not by its limit)");
+        }
+    }
     let done = if ok {
         Done::Passed
     } else if let Some(why) = failed_to_start(status.and_then(|s| s.code()), &tail) {
