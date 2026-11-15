@@ -2734,28 +2734,37 @@ mod tests {
 
     /// A settings dir of its own, so the check can be pointed somewhere real
     /// without touching whatever the machine running the suite actually has.
+    ///
+    /// `CLAUDE_CONFIG_DIR` is the process's, not the test's: every scratch holds
+    /// `SETTINGS_ENV` for its whole life, so two tests never point it at
+    /// different places at once (a slow machine made them overlap).
+    static SETTINGS_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct SettingsScratch {
         dir: PathBuf,
         saved: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl SettingsScratch {
         fn write(hooks: &Value) -> SettingsScratch {
+            let lock = SETTINGS_ENV.lock().unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir()
                 .join(format!("wsp-cc-settings-{}-{}", std::process::id(), util::epoch_nanos()));
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("settings.json"), json!({ "hooks": hooks }).to_string()).unwrap();
             let saved = std::env::var_os("CLAUDE_CONFIG_DIR");
             std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
-            SettingsScratch { dir, saved }
+            SettingsScratch { dir, saved, _lock: lock }
         }
 
         fn missing() -> SettingsScratch {
+            let lock = SETTINGS_ENV.lock().unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir()
                 .join(format!("wsp-cc-settings-{}-{}", std::process::id(), util::epoch_nanos()));
             let saved = std::env::var_os("CLAUDE_CONFIG_DIR");
             std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
-            SettingsScratch { dir, saved }
+            SettingsScratch { dir, saved, _lock: lock }
         }
     }
 
