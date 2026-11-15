@@ -2408,10 +2408,23 @@ fn with_conflicts(dir: &Path, why: String) -> String {
 /// first puts such a stop back with `rebase --abort`. A conflict is returned
 /// at once, as git said it, with the rebase left stopped for the caller.
 fn rebase_onto(dir: &Path, onto: &str) -> Result<(), String> {
+    // A stop wsp's own earlier rebase left (an interrupted run, a restarted
+    // daemon, an abort that met a lock) is put back before the first try, so
+    // the member is not sent back for it. A stop with no mark is the member's
+    // own, mid-conflict, and is left for git to refuse.
+    if rebase_in_progress(dir) && wsp_mark(dir).is_some_and(|m| m.exists()) {
+        stop_rebase(dir);
+    }
     let mut tries = 0;
     loop {
         tries += 1;
-        let Err(e) = git_ok(dir, &["rebase", onto]) else { return Ok(()) };
+        if !rebase_in_progress(dir) {
+            mark_rebase(dir, onto);
+        }
+        let Err(e) = git_ok(dir, &["rebase", onto]) else {
+            unmark_rebase(dir);
+            return Ok(());
+        };
         // After a first try, a "already a rebase-merge directory" is our own
         // earlier stop that its abort could not clear (the abort met the same
         // lock): not a stranger's rebase, so it is put back and tried again.
@@ -2421,6 +2434,26 @@ fn rebase_onto(dir: &Path, onto: &str) -> Result<(), String> {
         }
         stop_rebase(dir);
         std::thread::sleep(std::time::Duration::from_millis(150 * u64::from(tries)));
+    }
+}
+
+/// The file in the git dir that says a stopped rebase there is wsp's own.
+fn wsp_mark(dir: &Path) -> Option<PathBuf> {
+    let p = PathBuf::from(git(dir, &["rev-parse", "--git-path", "wsp-rebase"])?.trim());
+    Some(if p.is_absolute() { p } else { dir.join(p) })
+}
+
+/// Records that wsp is starting a rebase onto `onto` from the current head.
+fn mark_rebase(dir: &Path, onto: &str) {
+    if let Some(m) = wsp_mark(dir) {
+        let head = git(dir, &["rev-parse", "HEAD"]).unwrap_or_default();
+        let _ = std::fs::write(m, format!("onto {onto}\nhead {}\n", head.trim()));
+    }
+}
+
+fn unmark_rebase(dir: &Path) {
+    if let Some(m) = wsp_mark(dir) {
+        let _ = std::fs::remove_file(m);
     }
 }
 
@@ -2435,10 +2468,12 @@ fn stale_stop(why: &str) -> bool {
 fn stop_rebase(dir: &Path) {
     for n in 1..=REBASE_TRIES {
         if !rebase_in_progress(dir) {
+            unmark_rebase(dir);
             return;
         }
         let _ = git_ok(dir, &["rebase", "--abort"]);
         if !rebase_in_progress(dir) {
+            unmark_rebase(dir);
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(n)));
@@ -3067,6 +3102,54 @@ mod tests {
         releaser.join().unwrap();
         assert!(!rebase_in_progress(&wt), "a rebase-merge dir was left behind: {said}");
         assert!(!dirty(&wt), "the tree is clean again");
+    }
+
+    /// `compounding-615`: a rebase-merge dir an earlier wsp rebase left is put
+    /// back and the rebase made on the first call; a member's own stopped
+    /// rebase (no wsp mark) is not aborted.
+    #[test]
+    fn a_stop_wsp_left_is_rebased_clean_on_the_first_attempt() {
+        let (_env, dir) = scratch("leftstop");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-11");
+        ensure(&dir, &wt, "t-11", "master").unwrap();
+        std::fs::write(wt.join("kept.txt"), "mine\n").unwrap();
+        run(&wt, &["commit", "--quiet", "-am", "mine"]);
+        let before = git(&dir, &["rev-parse", "master"]).unwrap().trim().to_string();
+        std::fs::write(dir.join("kept.txt"), "theirs\n").unwrap();
+        run(&dir, &["commit", "--quiet", "-am", "theirs"]);
+        // wsp's own rebase conflicts and is not aborted: a leftover
+        assert!(rebase_onto(&wt, "master").is_err());
+        assert!(rebase_in_progress(&wt), "the conflict should leave the stop");
+        // the trunk now holds something that applies cleanly
+        std::fs::write(dir.join("other.txt"), "x\n").unwrap();
+        run(&dir, &["checkout", "--quiet", "-B", "master", &before]);
+        run(&dir, &["add", "other.txt"]);
+        run(&dir, &["commit", "--quiet", "-m", "other"]);
+        let r = rebase_onto(&wt, "master");
+        assert!(r.is_ok(), "{r:?}");
+        assert!(!rebase_in_progress(&wt), "a rebase-merge dir was left behind");
+        assert!(git_ok(&wt, &["merge-base", "--is-ancestor", "master", "HEAD"]).is_ok());
+        assert_eq!(ahead(&dir, "master", "t-11").len(), 1);
+    }
+
+    /// `compounding-615`: a stop with no wsp mark is the member's own and is
+    /// refused, not aborted.
+    #[test]
+    fn a_members_own_stopped_rebase_is_not_aborted() {
+        let (_env, dir) = scratch("ownstop");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-12");
+        ensure(&dir, &wt, "t-12", "master").unwrap();
+        std::fs::write(wt.join("kept.txt"), "mine\n").unwrap();
+        run(&wt, &["commit", "--quiet", "-am", "mine"]);
+        std::fs::write(dir.join("kept.txt"), "theirs\n").unwrap();
+        run(&dir, &["commit", "--quiet", "-am", "theirs"]);
+        git_ok(&wt, &["rebase", "master"]).unwrap_err();
+        assert!(rebase_in_progress(&wt));
+        let r = rebase_onto(&wt, "master");
+        assert!(r.is_err());
+        assert!(rebase_in_progress(&wt), "the member's rebase was aborted");
     }
 
     /// `compounding-615`: a rebase our own failed abort left stopped is put
