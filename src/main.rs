@@ -78,6 +78,7 @@ mod pieces;
 mod inner;
 mod verification;
 mod cmd_watch;
+mod refusals;
 mod wake;
 mod cmd_worklist;
 mod cycle;

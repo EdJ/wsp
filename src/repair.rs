@@ -400,7 +400,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // (`wsp-386`): counted here, drawn by `wsp wip`.
     wsp_base::calls::phase("repair:unsent");
     unsent_tick(store, seats);
-    // And a governor whose supervisor has refused every tell for [`crate::wake::REFUSED_TICKS`]
+    // And a governor whose supervisor has refused every tell for [`crate::refusals::REFUSED_TICKS`]
     // ticks running (`wsp-634`): ended, so the pass below seats a successor.
     wsp_base::calls::phase("repair:refusing");
     refusal_tick(store, seats);
@@ -675,19 +675,19 @@ pub(crate) fn unsent_tick(store: &Store, seats: &dyn Seats) {
 /// supervisor answered `failed` — `refused`, composer empty and the seat idle —
 /// and the sentence was held and tried again, tick after tick, three times on
 /// 2026-11-14 for hours, until a person ended the seat by hand. After
-/// [`crate::wake::REFUSED_TICKS`] in a row the daemon does that: the seat is
+/// [`crate::refusals::REFUSED_TICKS`] in a row the daemon does that: the seat is
 /// ended once it is not mid-turn, it reads `gone`, and [`seat_vacant`] seats a
 /// successor on the next pass. The reason goes in `cycle.log` and in the list's
 /// own log, where the person who comes back to the list reads it.
 pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
     let governors = store.governors();
-    for (scope, (n, why)) in crate::wake::refusing(store) {
-        if n < crate::wake::REFUSED_TICKS {
+    for (scope, (n, why)) in crate::refusals::refusing(store) {
+        if n < crate::refusals::REFUSED_TICKS {
             continue;
         }
         let Some(seat) = cmd_govern::seat_held(&scope, &governors) else {
             // Nobody is in the seat any more: the count belongs to one that is gone.
-            crate::wake::accepted(store, &scope);
+            crate::refusals::accepted(store, &scope);
             continue;
         };
         // A turn in flight is a seat that is hearing something; leave it.
@@ -695,7 +695,7 @@ pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
             continue;
         }
         // The successor starts its own count.
-        crate::wake::accepted(store, &scope);
+        crate::refusals::accepted(store, &scope);
         let line = format!(
             "{scope}: {} refused delivery {n} ticks running ({why}) — ended so a successor is seated",
             seat.pane
@@ -2575,9 +2575,9 @@ pub(crate) mod tests {
         seated(&store, "run", "w1", "cpd-1", "", "");
         let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
         let refuse = || {
-            crate::wake::refuse(&store, "run", "cpd-1: refused");
+            crate::refusals::refuse(&store, "run", "cpd-1: refused");
         };
-        for _ in 0..crate::wake::REFUSED_TICKS - 1 {
+        for _ in 0..crate::refusals::REFUSED_TICKS - 1 {
             refuse();
         }
         refusal_tick(&store, &idle);
@@ -2589,7 +2589,7 @@ pub(crate) mod tests {
 
         refusal_tick(&store, &idle);
         assert_eq!(ended(), vec!["cpd-1".to_string()]);
-        assert!(crate::wake::refusing(&store).is_empty(), "the successor starts its own count");
+        assert!(crate::refusals::refusing(&store).is_empty(), "the successor starts its own count");
         let said = stamped().join("\n");
         assert!(said.contains("cpd-1 refused delivery 5 ticks running (cpd-1: refused) — ended so a successor is seated"), "{said}");
         let log = store.worklist("run").unwrap().render();

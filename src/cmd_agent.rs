@@ -4621,7 +4621,7 @@ impl Wip {
             unsent: crate::repair::unsent_seats(store),
             refusing: {
                 let governors = store.governors();
-                crate::wake::refusing(store)
+                crate::refusals::refusing(store)
                     .into_iter()
                     .filter_map(|(scope, v)| crate::cmd_govern::seat_held(&scope, &governors).map(|s| (s.pane, v)))
                     .collect()
