@@ -409,7 +409,8 @@ fn between_attempts(i: &Inputs, prev: &Attempt, to: i64) -> (String, String) {
     (format!("{head} at {} → seat started again", at(end)), format!("{PARKED_CAUSE} — {why}"))
 }
 
-/// The stretch `from..to` between two attempts, as phases (`wsp-645`). The row's
+/// The stretch `from..to` between two attempts, as phases (`wsp-645`). A stretch
+/// that is not the park-or-release one (a rework stretch) stays one gap. The row's
 /// own checks that timed out under load and were rerun (`task-checked` with state
 /// `waiting`) ran in it: each is work, from its start to the event. A park that
 /// covers most of it ends where the list resumed: what follows the resume is the
@@ -418,6 +419,13 @@ fn between_attempts(i: &Inputs, prev: &Attempt, to: i64) -> (String, String) {
 fn between_phases(i: &Inputs, from: i64, to: i64, label: String, why: String) -> Vec<Phase> {
     let mut out = Vec::new();
     if to <= from {
+        return out;
+    }
+    // Only a parked or released stretch has checks of the row's own in it. A
+    // sent-back stretch (review, reopened) holds the verifier's checks, and the
+    // wait after one is the rework wait, not the check waiting to rerun.
+    if !why.starts_with(PARKED_CAUSE) {
+        out.push(Phase::gap(label, from, to, why));
         return out;
     }
     let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
@@ -2699,6 +2707,26 @@ mod tests {
         assert_eq!(booked, first - 150, "{ph:?}");
         let f = figures_of(&ph, &SeatReport::default());
         assert_eq!(f.between_attempts, booked);
+    }
+
+    /// A sent-back row's stretch holds the verifier's failed check (`wsp-645`):
+    /// the wait after it is the rework wait, still booked to `between_attempts`.
+    /// A failure is booked as a check wait only in a parked stretch, where it is
+    /// the row's own check the load made it rerun; after a review it is the seat
+    /// fixing the work.
+    #[test]
+    fn a_failed_check_in_a_sent_back_stretch_stays_under_rework() {
+        let mut i = two_seatings(false);
+        i.events.push(ev(600, "task-checked", json!({"id": "r-1", "state": "failed", "took": 23, "start": {"load": 4.0}, "load_end": 4.0})));
+        i.events.push(ev(900, "task-checked", json!({"id": "r-1", "state": "waiting", "took": 23, "start": {"load": 40.0}, "load_end": 9.0})));
+        let ph = build(&i);
+        let gaps: Vec<&Phase> = ph.iter().filter(|p| p.gap && p.start >= 200 && p.end <= 1990).collect();
+        assert_eq!(gaps.len(), 1, "{ph:?}");
+        assert!(gaps[0].waiting_for.as_deref().unwrap().starts_with(REWORK_CAUSE));
+        assert_eq!((gaps[0].start, gaps[0].end), (200, 1990));
+        assert!(!ph.iter().any(|p| p.label.starts_with("the row's own check")), "{ph:?}");
+        let f = figures_of(&ph, &SeatReport::default());
+        assert_eq!(f.between_attempts, 1790);
     }
 
     /// wsp-635's 65m (`wsp-645`): a stretch no park explains still names its row.
