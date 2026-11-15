@@ -342,7 +342,7 @@ impl Command {
         let t = Instant::now();
         let r = self.inner.spawn();
         note_child(&self.name, 1, t.elapsed());
-        r.map(|c| Child { inner: c, name: self.name.clone(), started: Instant::now(), waited: false })
+        r.map(|c| Child { inner: Some(c), name: self.name.clone(), started: Instant::now(), waited: false })
     }
 }
 
@@ -354,14 +354,40 @@ impl std::fmt::Debug for Command {
 
 /// A spawned child. Dereferences to `std::process::Child` for `id`, `kill`,
 /// `stdin` and the rest; the waits are its own so the run is timed.
+///
+/// **A child dropped without a wait is reaped, not left defunct.** `std`'s
+/// `Child` does nothing on drop, so a detached child (`spawn().map(drop)`, a
+/// `let _ = cmd.spawn()`) that exits stays a zombie of this process until this
+/// process exits — in a daemon that is days. Dropping one that was never
+/// waited on hands it to a thread that waits for it, so it is reaped whenever
+/// it ends and this process never blocks on it.
 pub struct Child {
-    inner: std::process::Child,
+    inner: Option<std::process::Child>,
     name: String,
     started: Instant,
     waited: bool,
 }
 
+impl Drop for Child {
+    fn drop(&mut self) {
+        let Some(mut inner) = self.inner.take() else { return };
+        if self.waited {
+            return;
+        }
+        // Already gone: reap it here and skip the thread.
+        if matches!(inner.try_wait(), Ok(Some(_)) | Err(_)) {
+            return;
+        }
+        let _ = std::thread::Builder::new().name("reap".into()).spawn(move || {
+            let _ = inner.wait();
+        });
+    }
+}
+
 impl Child {
+    fn inner_mut(&mut self) -> &mut std::process::Child {
+        self.inner.as_mut().expect("a child that has not been taken")
+    }
     fn ended(&mut self) {
         if !self.waited {
             self.waited = true;
@@ -369,22 +395,22 @@ impl Child {
         }
     }
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let r = self.inner.wait();
+        let r = self.inner_mut().wait();
         self.ended();
         r
     }
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let r = self.inner.try_wait();
+        let r = self.inner_mut().try_wait();
         if matches!(r, Ok(Some(_))) {
             self.ended();
         }
         r
     }
-    pub fn wait_with_output(self) -> std::io::Result<std::process::Output> {
-        let Child { inner, name, started, waited } = self;
+    pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        let inner = self.inner.take().expect("a child that has not been taken");
         let r = inner.wait_with_output();
-        if !waited {
-            note_child(&name, 0, started.elapsed());
+        if !self.waited {
+            note_child(&self.name, 0, self.started.elapsed());
         }
         r
     }
@@ -399,13 +425,13 @@ impl std::fmt::Debug for Child {
 impl std::ops::Deref for Child {
     type Target = std::process::Child;
     fn deref(&self) -> &std::process::Child {
-        &self.inner
+        self.inner.as_ref().expect("a child that has not been taken")
     }
 }
 
 impl std::ops::DerefMut for Child {
     fn deref_mut(&mut self) -> &mut std::process::Child {
-        &mut self.inner
+        self.inner_mut()
     }
 }
 
@@ -1006,6 +1032,31 @@ mod tests {
     /// with its wall time; and a drain empties the accumulator.
     /// The accumulator is process-wide, so the tests that drain it take turns.
     static KIDS_TEST: Mutex<()> = Mutex::new(());
+
+    /// **The daemon's leak.** A child dropped without a wait (the detached
+    /// `wsp govern --ending`, `wsp submit --end-seat`, the cycle's `launch`) was
+    /// a `<defunct>` entry of the process until it exited. Dropped now, it is
+    /// reaped once it ends, whether it ended before the drop or after.
+    #[test]
+    fn a_child_dropped_without_a_wait_is_reaped_and_not_left_defunct() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        fn gone(pid: u32) -> bool {
+            let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().is_empty()
+        }
+        let quick = Command::new("true").spawn().unwrap().id();
+        let slow = {
+            let c = Command::new("sleep").arg("0.3").spawn().unwrap();
+            let pid = c.id();
+            drop(c);
+            pid
+        };
+        let t = Instant::now();
+        while !(gone(quick) && gone(slow)) {
+            assert!(t.elapsed() < Duration::from_secs(10), "still defunct: quick={} slow={}", !gone(quick), !gone(slow));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn a_wrapped_child_is_counted_by_its_program_name() {
