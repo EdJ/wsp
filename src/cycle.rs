@@ -1399,6 +1399,19 @@ fn holding_barrier(
     let mut waiting = Vec::new();
     let mut long = Vec::new();
     let asks = crate::waiting::Asks::read(store);
+    // A member whose `## Checks` runs its own check (`wsp check <itself>`) can
+    // only fail the barrier, after a full suite: the barrier is not started on
+    // it. Refused at review and at the hold since; this is the row that got by.
+    for s in &pos.members {
+        let Some(t) = store.find_task(&s.id) else { continue };
+        let calls = crate::check::calls_itself_in(&t.id, &crate::check::task_steps(&t));
+        if !calls.is_empty() {
+            waiting.push(format!(
+                "{}'s check line calls its own check ({}) — `wsp check {} --set -` to fix it, then `wsp reopen {} \"what is owed\"`",
+                s.id, calls.join("; "), s.id, s.id
+            ));
+        }
+    }
     for s in &pos.members {
         let Some(seat) = bound_seat(store, &s.id) else { continue };
         let state = seats.state(&seat);
@@ -5948,6 +5961,37 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_message(&answered).unwrap();
         step(&store, &w, &Fixed::new(&[("cpd-1", State::Idle)]));
         assert_eq!(checks(&store, 1).len(), 1, "answered and idle: it opens");
+    }
+
+    /// compounding-617: a held member whose `## Checks` runs `wsp check` on its
+    /// own row — compounding-520's, wsp-638's — can only fail the barrier, after
+    /// a full suite. The barrier is not started on it, and the wait line names the
+    /// line; another member's line that merely mentions a different row is no
+    /// cause. Fixing the line lets the barrier open.
+    #[test]
+    fn a_held_member_whose_check_line_runs_its_own_check_does_not_start_the_barrier() {
+        let (_env, store) = scratch("selfcheck");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        let _ = spawned();
+        let write = |line: &str| {
+            let mut t = store.find_task("m-1").unwrap();
+            crate::model::set_section_in(&mut t.body, "Checks", line);
+            store.save_task(&t).unwrap();
+        };
+        write("- timeline tests (2s): wsp check m-1");
+        tests::SAID.with(|s| s.borrow_mut().clear());
+        step(&store, &w, &Blind);
+        assert!(checks(&store, 1).is_empty(), "no barrier over a check line that calls itself");
+        let said = tests::SAID.with(|s| s.borrow().clone());
+        let line = said.iter().find(|l| l.contains("barrier waits")).expect("the barrier says why");
+        assert!(line.contains("m-1's check line calls its own check") && line.contains("timeline tests"), "{line}");
+
+        write("- timeline tests (2s): cargo test timeline::");
+        step(&store, &w, &Blind);
+        assert_eq!(checks(&store, 1).len(), 1, "with the line fixed it opens");
     }
 
     /// `wsp-608`: react-parity-now's group 9 stood overnight on cpd-4845's

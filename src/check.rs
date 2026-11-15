@@ -223,6 +223,61 @@ pub(crate) fn malformed_in(steps: &[Step]) -> Vec<String> {
     steps.iter().filter_map(|s| unparsable(&s.command).map(|why| format!("{} — {why}", s.name))).collect()
 }
 
+/// Each step of `steps` whose command runs `wsp check`, `wsp review` or `wsp
+/// submit` on row `id` — by its id, or with no row named at all, which is the
+/// row the check runs in. Such a line calls the very check that is running it:
+/// `wsp check <id>` from inside a check of `<id>` is refused as already
+/// running and exits 1 every time, so the line can never pass (compounding-520,
+/// wsp-638). `name — reason`, like [`malformed_in`].
+pub(crate) fn calls_itself_in(id: &str, steps: &[Step]) -> Vec<String> {
+    steps
+        .iter()
+        .filter(|s| calls_row(&s.command, id))
+        .map(|s| {
+            format!(
+                "{} — `{}` runs {id}'s own check from inside it, so it is always refused as already running; \
+                 drop the line (the check runs the other lines) or name what it was meant to run",
+                s.name,
+                s.command.trim()
+            )
+        })
+        .collect()
+}
+
+/// Whether `command` has a simple command `wsp check|review|submit` that names
+/// `id`, or names no row.
+fn calls_row(command: &str, id: &str) -> bool {
+    // Separators are words of their own, so a simple command ends where one is.
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, words: &mut Vec<String>| {
+        if !cur.is_empty() {
+            words.push(std::mem::take(cur).trim_matches(['"', '\'']).to_string());
+        }
+    };
+    for c in command.chars() {
+        if matches!(c, ';' | '&' | '|' | '(' | ')' | '\n' | '`') {
+            flush(&mut cur, &mut words);
+            words.push(";".into());
+        } else if c.is_whitespace() {
+            flush(&mut cur, &mut words);
+        } else {
+            cur.push(c);
+        }
+    }
+    flush(&mut cur, &mut words);
+    words.split(|w| w == ";").any(|simple| {
+        let Some(at) = simple.iter().position(|w| w == "wsp" || w.ends_with("/wsp")) else { return false };
+        let rest = &simple[at + 1..];
+        let Some(verb) = rest.first() else { return false };
+        if !matches!(verb.as_str(), "check" | "review" | "submit") {
+            return false;
+        }
+        let args: Vec<&String> = rest[1..].iter().filter(|w| !w.starts_with('-')).collect();
+        args.is_empty() || args.iter().any(|w| w.as_str() == id)
+    })
+}
+
 /// A word a label may be made of: it starts with a letter or digit and holds
 /// nothing a shell would read as more than a word.
 fn label_word(w: &str) -> bool {
@@ -2209,6 +2264,14 @@ fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
                 return 1;
             }
         };
+        let calls = calls_itself_in(&t.id, &steps);
+        if !calls.is_empty() {
+            eprintln!("wsp: not written — {} check line(s) call {}'s own check:", calls.len(), t.id);
+            for b in &calls {
+                eprintln!("  - {b}");
+            }
+            return 2;
+        }
         crate::model::set_section_in(&mut t.body, SECTION, &text);
         if let Err(e) = store.save_task(&t) {
             eprintln!("wsp: {e}");
@@ -2379,6 +2442,19 @@ pub(crate) fn after_land(store: &Store, id: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_line_that_runs_the_rows_own_check_is_read_as_calling_itself() {
+        let calls = |id: &str, cmd: &str| !calls_itself_in(id, &parse_steps(&format!("- t (2s): {cmd}"), Of::Task)).is_empty();
+        assert!(calls("compounding-520", "wsp check compounding-520"));
+        assert!(calls("wsp-638", "cd x && wsp check wsp-638 --json | tail"));
+        assert!(calls("wsp-638", "wsp review wsp-638 \"done\""));
+        assert!(calls("wsp-638", "wsp submit wsp-638 --dry-run"));
+        assert!(calls("wsp-638", "wsp check"), "no row named is the row it runs in");
+        assert!(!calls("wsp-638", "wsp check wsp-639"), "another row's check is another row's");
+        assert!(!calls("wsp-638", "cargo test wsp_check_wsp-638"));
+        assert!(!calls("wsp-638", "wsp show wsp-638"));
+    }
     use super::*;
 
     fn step(text: &str) -> Step {

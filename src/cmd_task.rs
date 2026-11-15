@@ -1864,6 +1864,15 @@ pub(crate) fn accept(store: &Store, args: &Args, account: &str, said: Option<&st
             eprintln!("  fix them with `wsp check {} --set -` (a note after the command goes outside its backticks)", t.id);
             return 2;
         }
+        let calls = crate::check::calls_itself_in(&t.id, &crate::check::task_steps(&t));
+        if !calls.is_empty() {
+            eprintln!("wsp: {} not moved to review — its ## Checks has line(s) that call its own check:", t.id);
+            for b in &calls {
+                eprintln!("  - {b}");
+            }
+            eprintln!("  fix them with `wsp check {} --set -`", t.id);
+            return 2;
+        }
     }
     // From a leg's seat the row is not finished while a sibling runs, and from
     // the last running leg the rest are skipped (`docs/legs.md`, *A leg is a
@@ -3973,6 +3982,25 @@ pub(crate) mod tests {
         assert!(log.contains(&format!("{} {tip} on wsp-101", crate::repair::READY)), "{log}");
         let repo = tree.parent().unwrap().parent().unwrap();
         assert_ne!(git_at(repo, &["rev-parse", "master"]), tip, "nothing reached the trunk");
+    }
+
+    /// compounding-617: a `## Checks` line that runs `wsp check` on its own row
+    /// (compounding-520, wsp-638) is refused at review, named, and the row does
+    /// not move; with the line fixed the review goes through.
+    #[test]
+    fn review_refuses_a_check_line_that_runs_the_rows_own_check() {
+        let (_env, store, _tree) = a_member_with_a_commit("review-self-check");
+        let write = |line: &str| {
+            let mut t = store.task("wsp-101").unwrap();
+            crate::model::set_section_in(&mut t.body, "Checks", line);
+            store.save_task(&t).unwrap();
+        };
+        write("- timeline tests (2s): wsp check wsp-101");
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 2);
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing", "and it did not move");
+        write("- timeline tests (2s): cargo test timeline::");
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 0);
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "review");
     }
 
     /// `wsp-529`: a commit a verifier blocked is not put up again unchanged —

@@ -1005,6 +1005,19 @@ pub(crate) fn verdict_core(store: &Store, member: Task, judged: Judged, me: Opti
     let mut landing = None;
     let mut reran = Vec::new();
     let mut land_owes = None;
+    // A hold on a row whose `## Checks` runs its own check is a block: the line
+    // can never pass, and the barrier would spend a full suite finding that out.
+    if state == State::Holds {
+        let calls = crate::check::calls_itself_in(&member.id, &crate::check::task_steps(&member));
+        if !calls.is_empty() {
+            state = State::Blocks;
+            caption = "a check line calls the row's own check".to_string();
+            let why = format!("its ## Checks has line(s) that call its own check, which is always refused as already running:\n- {}\nFix them with `wsp check {} --set -`.", calls.join("\n- "), member.id);
+            text = format!("{}\n\n{why}", text.trim());
+            owes = Some(why);
+            println!("{}", Paint::new().red("■ a check line calls the row's own check, so the hold is recorded as a block"));
+        }
+    }
     if state == State::Holds && crate::repair::ready(&member).is_some() {
         match crate::cmd_checkout::land_verdict(store, &member.id) {
             crate::cmd_checkout::Verdict::Nothing => {}
