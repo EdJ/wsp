@@ -210,7 +210,8 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
     } else if span <= TICK + HAND_OFF {
         format!("a daemon tick (every {TICK}s) — nothing poked the step")
     } else {
-        "nothing the logs name — the step did not run for longer than a tick".into()
+        // Named for its row, so the bucket in a list's report says whose.
+        format!("nothing the logs name — the step of {who} did not run for longer than a tick")
     }
 }
 
@@ -321,6 +322,9 @@ impl Attempt {
 /// The cause of the stretch between an attempt that was released before it
 /// reached review and the next one.
 pub(crate) const PARKED_CAUSE: &str = "the row parked or released between attempts";
+/// The cause of the stretch between a row's own checks that timed out or failed
+/// and the rerun, after its list resumed: the check waiting for the load to fall.
+pub(crate) const CHECK_WAIT_CAUSE: &str = "the row's check timed out and waited to rerun";
 /// The cause of the stretch from an attempt's review to the next attempt: the
 /// row was sent back and reopened. The row's `rework` block books the attempt.
 pub(crate) const REWORK_CAUSE: &str = "rework: the row sent back after review and reopened";
@@ -432,25 +436,55 @@ fn between_phases(i: &Inputs, from: i64, to: i64, label: String, why: String) ->
         label = format!("resumed at {} → seat started again", at(r));
         why = format!("{PARKED_CAUSE} — the list resumed at {}, and the row was not started again until {}", at(r), at(to));
     }
-    let mut waiting: Vec<(i64, i64, &Value)> = i
+    // The row's own checks that did not pass (`waiting`: timed out under load, to
+    // be rerun; `failed`): each ran from its start to the event, and what lies
+    // between one and the next, or the next claim, is the row waiting to rerun
+    // it, not the park nor a release.
+    let mut checks: Vec<(i64, i64, &Value)> = i
         .kind("task-checked", &i.id)
         .into_iter()
-        .filter(|(t, d)| *t > cursor && *t <= to && d["state"] == "waiting")
+        .filter(|(t, d)| *t > cursor && *t <= to && (d["state"] == "waiting" || d["state"] == "failed"))
         .map(|(t, d)| (t, d["took"].as_i64().unwrap_or(0).max(0), d))
         .collect();
-    waiting.sort_by_key(|(t, _, _)| *t);
-    for (c, took, event) in waiting {
+    checks.sort_by_key(|(t, _, _)| *t);
+    let wait_why = check_wait_cause(&checks, to - checks.first().map_or(to, |c| (c.0 - c.1).max(cursor)));
+    let mut first = true;
+    for (c, took, event) in checks {
         let start = (c - took).max(cursor);
         if start > cursor {
-            out.push(Phase::gap(label.clone(), cursor, start, why.clone()));
+            if first {
+                out.push(Phase::gap(label.clone(), cursor, start, why.clone()));
+            } else {
+                out.push(Phase::gap("waiting to rerun the check".to_string(), cursor, start, wait_why.clone()));
+            }
         }
-        out.push(Phase::work(format!("the row's own check timed out under load, to be rerun once the load falls{}", check_start_note(event)), start, c));
+        first = false;
+        let what = if event["state"] == "failed" { "the row's own check failed" } else { "the row's own check timed out under load, to be rerun once the load falls" };
+        out.push(Phase::work(format!("{what}{}", check_start_note(event)), start, c));
         cursor = c;
     }
     if to > cursor {
-        out.push(Phase::gap(label, cursor, to, why));
+        if first {
+            out.push(Phase::gap(label, cursor, to, why));
+        } else {
+            out.push(Phase::gap("waiting to rerun the check → seat started again".to_string(), cursor, to, wait_why));
+        }
     }
     out
+}
+
+/// What the row waited on between its checks: they timed out or failed and were
+/// rerun when the load fell (`wsp-645`). Counted by how many, over how long, and
+/// the load at the first one's start and the last one's end.
+fn check_wait_cause(checks: &[(i64, i64, &Value)], secs: i64) -> String {
+    let load = |v: &Value| v.as_f64().map(|l| format!("{l:.0}"));
+    let a = checks.first().and_then(|c| load(&c.2["start"]["load"]));
+    let b = checks.last().and_then(|c| load(&c.2["load_end"]));
+    let loads = match (a, b) {
+        (Some(a), Some(b)) => format!(", load {a} → {b}"),
+        _ => String::new(),
+    };
+    format!("{CHECK_WAIT_CAUSE} ({} checks, {}{loads})", checks.len(), util::duration_human(secs))
 }
 
 /// The phases of a row, in time order.
@@ -2639,19 +2673,40 @@ mod tests {
         ];
         i.parks = parks_of(&evs, "l", 9999);
         for n in 0..5 {
-            i.events.push(ev(1200 + n * 100, "task-checked", json!({"id": "r-1", "state": "waiting", "took": 23})));
+            let state = if n == 3 { "failed" } else { "waiting" };
+            i.events.push(ev(1200 + n * 100, "task-checked", json!({"id": "r-1", "state": state, "took": 23, "start": {"load": 40.0 - n as f64}, "load_end": 9.0})));
         }
         let ph = build(&i);
         let park = ph.iter().find(|p| p.gap && p.label.starts_with("parked at")).expect("the park");
         assert_eq!((park.start, park.end), (150, 1100));
-        let checks: Vec<&Phase> = ph.iter().filter(|p| !p.gap && p.label.starts_with("the row's own check timed out")).collect();
+        let checks: Vec<&Phase> = ph.iter().filter(|p| !p.gap && p.label.starts_with("the row's own check")).collect();
         assert_eq!(checks.len(), 5, "{ph:?}");
         assert!(checks.iter().all(|p| p.seconds() == 23));
+        assert!(checks.iter().any(|p| p.label.starts_with("the row's own check failed")), "the failed one is a check too");
+        // Nothing after the first check is the park or a release: the minutes
+        // between the checks, and from the last one to the restart, are the
+        // checks waiting to rerun.
+        let first = 1200 - 23;
+        let after: Vec<&Phase> = ph.iter().filter(|p| p.gap && p.start >= first).collect();
+        assert!(!after.is_empty());
+        assert!(after.iter().all(|p| p.waiting_for.as_deref().unwrap().starts_with(CHECK_WAIT_CAUSE)), "{after:?}");
+        let waited: i64 = after.iter().map(|p| p.seconds()).sum();
+        assert_eq!(waited, 1990 - first - 5 * 23);
+        let why = after[0].waiting_for.as_deref().unwrap();
+        assert!(why.contains("5 checks") && why.contains("load 40"), "{why}");
         let booked: i64 = ph.iter().filter(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with(PARKED_CAUSE))).map(|p| p.seconds()).sum();
-        assert_eq!(booked, 1990 - 150 - 5 * 23, "the checks are not between attempts");
+        // The park, then the resume to the first check's start.
+        assert_eq!(booked, first - 150, "{ph:?}");
         let f = figures_of(&ph, &SeatReport::default());
         assert_eq!(f.between_attempts, booked);
-        assert!(ph.iter().filter(|p| p.gap && p.start >= 1100).all(|p| !p.waiting_for.as_deref().unwrap().contains("parked by")), "{ph:?}");
+    }
+
+    /// wsp-635's 65m (`wsp-645`): a stretch no park explains still names its row.
+    #[test]
+    fn the_stretch_the_logs_do_not_name_names_its_row() {
+        let i = two_seatings(true);
+        let why = wait_name(&i, 300, 2900, "r-1");
+        assert!(why.starts_with("nothing the logs name") && why.contains("r-1"), "{why}");
     }
 
     /// wsp-635 (`wsp-645`): a stretch a list park covered is named for it, not
