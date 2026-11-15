@@ -106,7 +106,7 @@ fn master_of(root: &Path) -> Option<&'static str> {
 /// is current, cannot say what it was built from, or no declared root knows its
 /// commit.
 pub fn note(store: &Store, files: &[&str]) -> Option<String> {
-    note_at(store, crate::COMMIT, files)
+    note_at(store, crate::base::stamp::COMMIT, files)
 }
 
 /// [`note`] for an install built at `installed`, so a test can name the commit.
@@ -129,7 +129,7 @@ pub fn note_at(store: &Store, installed: &str, files: &[&str]) -> Option<String>
 
 /// The refusal `msg`, with the lag appended on a second line when there is one.
 pub fn refusal(store: &Store, msg: &str, files: &[&str]) -> String {
-    refusal_at(store, crate::COMMIT, msg, files)
+    refusal_at(store, crate::base::stamp::COMMIT, msg, files)
 }
 
 fn refusal_at(store: &Store, installed: &str, msg: &str, files: &[&str]) -> String {
