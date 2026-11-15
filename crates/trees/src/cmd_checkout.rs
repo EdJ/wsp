@@ -2412,13 +2412,36 @@ fn rebase_onto(dir: &Path, onto: &str) -> Result<(), String> {
     loop {
         tries += 1;
         let Err(e) = git_ok(dir, &["rebase", onto]) else { return Ok(()) };
-        if tries >= REBASE_TRIES || !transient_lock(&e) {
+        // After a first try, a "already a rebase-merge directory" is our own
+        // earlier stop that its abort could not clear (the abort met the same
+        // lock): not a stranger's rebase, so it is put back and tried again.
+        let ours = tries > 1 && stale_stop(&e);
+        if tries >= REBASE_TRIES || !(transient_lock(&e) || ours) {
             return Err(with_conflicts(dir, e));
         }
-        if rebase_in_progress(dir) {
-            let _ = git_ok(dir, &["rebase", "--abort"]);
-        }
+        stop_rebase(dir);
         std::thread::sleep(std::time::Duration::from_millis(150 * u64::from(tries)));
+    }
+}
+
+/// Whether git's refusal is that a rebase is already stopped in the tree.
+fn stale_stop(why: &str) -> bool {
+    why.contains("already a rebase-merge directory") || why.contains("already a rebase-apply directory")
+}
+
+/// Puts a stopped rebase in `dir` back until none is left: `rebase --abort`
+/// can itself meet the lock that stopped the rebase (`compounding-615`), and
+/// a single try that is not looked at left the `rebase-merge` directory behind.
+fn stop_rebase(dir: &Path) {
+    for n in 1..=REBASE_TRIES {
+        if !rebase_in_progress(dir) {
+            return;
+        }
+        let _ = git_ok(dir, &["rebase", "--abort"]);
+        if !rebase_in_progress(dir) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(n)));
     }
 }
 
@@ -2427,7 +2450,7 @@ fn rebase_onto(dir: &Path, onto: &str) -> Result<(), String> {
 /// stopped mid-rebase for whoever opens it next. Nobody is in the tree to
 /// resolve it, so the refusal goes to the person.
 fn abort_rebase(dir: &Path, onto: &str, why: &str) -> String {
-    let _ = git_ok(dir, &["rebase", "--abort"]);
+    stop_rebase(dir);
     format!(
         "the rebase onto {onto} does not apply cleanly: {why}\nwsp: the rebase was aborted and {} is as it was",
         util::contract(dir)
@@ -3016,6 +3039,42 @@ mod tests {
         assert!(!rebase_in_progress(&wt), "a rebase-merge dir was left behind");
         assert_eq!(ahead(&dir, "master", "t-8").len(), 1);
         assert!(git_ok(&wt, &["merge-base", "--is-ancestor", "master", "HEAD"]).is_ok(), "not on the trunk's tip");
+    }
+
+    /// `compounding-615`: an abort that meets the lock too is tried again, so
+    /// no `rebase-merge` directory is left for the member to be sent back on.
+    #[test]
+    fn an_abort_that_meets_the_lock_is_retried_until_the_rebase_is_gone() {
+        let (_env, dir) = scratch("abortlock");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-10");
+        ensure(&dir, &wt, "t-10", "master").unwrap();
+        std::fs::write(wt.join("kept.txt"), "mine\n").unwrap();
+        run(&wt, &["commit", "--quiet", "-am", "mine"]);
+        std::fs::write(dir.join("kept.txt"), "theirs\n").unwrap();
+        run(&dir, &["commit", "--quiet", "-am", "theirs"]);
+        let e = git_ok(&wt, &["rebase", "master"]).unwrap_err();
+        assert!(rebase_in_progress(&wt), "the conflict should stop the rebase: {e}");
+
+        let lock = PathBuf::from(git(&wt, &["rev-parse", "--absolute-git-dir"]).unwrap().trim()).join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let held = lock.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = std::fs::remove_file(held);
+        });
+        let said = abort_rebase(&wt, "master", &e);
+        releaser.join().unwrap();
+        assert!(!rebase_in_progress(&wt), "a rebase-merge dir was left behind: {said}");
+        assert!(!dirty(&wt), "the tree is clean again");
+    }
+
+    /// `compounding-615`: a rebase our own failed abort left stopped is put
+    /// back and the rebase made, not returned as "already a rebase-merge".
+    #[test]
+    fn a_stop_left_by_a_failed_abort_is_not_a_refusal() {
+        assert!(stale_stop("fatal: It seems that there is already a rebase-merge directory, and I wonder"));
+        assert!(!stale_stop("CONFLICT (content): Merge conflict in kept.txt"));
     }
 
     /// `wsp-571`: a conflict is not retried, and the refusal names the files.
