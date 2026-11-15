@@ -1105,9 +1105,29 @@ impl Sink for Tell<'_> {
         // whole seconds while the type is still returning, so a stamp taken
         // after would postdate the very turn it is waiting for.
         let before = util::epoch_secs();
-        let outcome = how.tell(place.as_ref(), &addressee, &text);
+        let outcome = scripted_answer().unwrap_or_else(|| how.tell(place.as_ref(), &addressee, &text));
         self.settle(outcome, before)
     }
+}
+
+/// What the seat's supervisor answers to the next tell, scripted by a test
+/// (`wsp-634`): the one thing a fake herdr cannot say, because `failed refused`
+/// is `compound-sup deliver`'s own word. Empty in every other test, and in the
+/// binary there is nothing here at all.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SUPERVISOR: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<crate::place::Delivery>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+fn scripted_answer() -> Option<crate::place::Result<crate::place::Delivery>> {
+    SUPERVISOR.with(|s| s.borrow_mut().pop_front())
+}
+
+#[cfg(not(test))]
+fn scripted_answer() -> Option<crate::place::Result<crate::place::Delivery>> {
+    None
 }
 
 impl Tell<'_> {
@@ -1854,14 +1874,84 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let _ = std::fs::remove_dir_all(&env.state());
     }
 
+    /// **wsp-634, the incident end to end.** A list's governor sits idle with an
+    /// empty composer — the fake herdr reads it `idle` and takes anything typed —
+    /// while its supervisor answers `failed refused` to every tell, because its
+    /// hook never fired. Driven through the real wake tick and the real repair
+    /// tick, with only the supervisor's answer scripted:
+    /// (a) the tell is kept and asked again each tick, nothing typed or stamped,
+    ///     the retry saying what it is retrying after;
+    /// (b) the count `wsp wip` draws as `refusing delivery` runs up tick by tick;
+    /// (c) at the fifth the seat is ended, with the reason in `cycle.log` and in
+    ///     the list's own log, and the count starts over for the successor;
+    /// (d) once the seat answers `delivered`, the held tell is taken, and the
+    ///     count is gone.
+    #[test]
+    fn a_governor_whose_supervisor_refuses_every_tell_is_retried_then_ended_and_takes_the_tell_once_it_answers() {
+        use crate::place::{Delivery, Refusal, State};
+        use crate::fake::Spot;
+
+        let (_env, store, fake) = a_governor("wake-refusing-e2e", State::Idle);
+        let mut stage = fake.stage();
+        let mut seat = Spot::agent("w2:p1", "claude", "run", State::Idle);
+        seat.space = "w2".into();
+        stage.put(seat);
+        fake.restage(stage);
+        a_list_under_demo(&store);
+        let why = "cpd-1: refused";
+        let refused = || Err(Refusal::Failed(why.into()));
+        SUPERVISOR.with(|s| s.borrow_mut().clear());
+        let _ = crate::cycle::tests::ENDED.with(|s| s.borrow_mut().drain(..).collect::<Vec<_>>());
+        let log = || std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        let idle = Idle;
+
+        SUPERVISOR.with(|s| s.borrow_mut().extend((0..crate::refusals::REFUSED_TICKS).map(|_| refused())));
+        let report = say(&store, "run", "group 1 is at its barrier", None);
+        assert!(!report.arrived() && report.held == 1, "refused, so still owed: {report:?}");
+        for tick in 1..crate::refusals::REFUSED_TICKS {
+            assert_eq!(refusing(&store).get("run"), Some(&(tick, why.to_string())), "tick {tick}");
+            crate::repair::refusal_tick(&store, &idle);
+            assert!(crate::cycle::tests::ENDED.with(|s| s.borrow().is_empty()), "{tick} refusals are not yet a deaf seat");
+            wake(&store, &[], util::epoch_secs() + tick as i64);
+            assert_eq!(spool_of(&store, "run").depth(), 1, "kept, tick {tick}");
+        }
+        assert_eq!(told_count(&fake), 0, "a refusal types nothing");
+        assert!(log().contains("refused 5 ticks running — retrying; the last answer was `cpd-1: refused`"), "{}", log());
+        assert_eq!(delivered_to(&store, "run"), 0);
+
+        // The fifth refusal is on the books: the daemon ends the seat and says why.
+        assert_eq!(refusing(&store).get("run"), Some(&(crate::refusals::REFUSED_TICKS, why.to_string())));
+        crate::repair::refusal_tick(&store, &idle);
+        let ended = crate::cycle::tests::ENDED.with(|s| s.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(ended, vec!["w2:p1".to_string()], "the deaf governor is ended so a successor is seated");
+        assert!(refusing(&store).is_empty(), "the successor starts its own count");
+        let said = format!("w2:p1 refused delivery {} ticks running ({why}) — ended so a successor is seated", crate::refusals::REFUSED_TICKS);
+        assert!(log().contains(&said), "{}", log());
+        assert!(store.worklist("run").unwrap().render().contains("refused delivery 5 ticks running"), "the list's own log");
+
+        // The seat answers at last: the tell that was held is taken on the next tick.
+        SUPERVISOR.with(|s| s.borrow_mut().push_back(Ok(Delivery::Acked)));
+        wake(&store, &[], util::epoch_secs() + 10);
+        assert_eq!(spool_of(&store, "run").depth(), 0, "taken");
+        assert_eq!(delivered_to(&store, "run"), 1);
+        assert!(refusing(&store).is_empty());
+        SUPERVISOR.with(|s| assert!(s.borrow().is_empty(), "every scripted answer was asked for"));
+    }
+
     /// The three readings a seat can give [`crate::repair::reading`], as fakes.
     struct Gone;
+    struct Idle;
     struct Working;
     struct Silent;
 
     impl crate::cycle::Seats for Gone {
         fn state(&self, _: &str) -> Option<crate::place::State> {
             Some(crate::place::State::Gone)
+        }
+    }
+    impl crate::cycle::Seats for Idle {
+        fn state(&self, _: &str) -> Option<crate::place::State> {
+            Some(crate::place::State::Idle)
         }
     }
     impl crate::cycle::Seats for Working {
