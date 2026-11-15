@@ -1145,6 +1145,9 @@ pub(crate) struct Facts<'a> {
     /// `unreachable 4m`, for a seat on a far machine gone silent.
     pub(crate) unreachable: Option<String>,
     pub(crate) unsent: bool,
+    /// The seat's supervisor has refused a tell this many ticks running, and the
+    /// last reason it gave (`wsp-634`). Nothing was typed, so it is not `unsent`.
+    pub(crate) refusing: Option<(u64, String)>,
     pub(crate) dropped: bool,
     /// The first row or list its own row rests on that has not finished, and
     /// that one's standing: `("pieces-trial", "planned: alone")`.
@@ -1236,6 +1239,9 @@ pub(crate) fn seat_wait(f: &Facts) -> Option<SeatWait> {
             quiet_secs: None,
             line: format!("working{}", aged(now, f.in_state_since)),
         });
+    }
+    if let Some((n, why)) = &f.refusing {
+        return Some(cannot("refusing", f.in_state_since, format!("refusing delivery, {n} ticks running: {why}")));
     }
     if f.unsent {
         return Some(cannot("unsent", f.in_state_since, "typed, not sent".to_string()));

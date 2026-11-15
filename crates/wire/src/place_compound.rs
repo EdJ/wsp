@@ -2430,6 +2430,29 @@ mod tests {
         assert!(matches!(deliver_through(&sup, &session, &scratch.root, &seat, "go", wait), Err(Refusal::Backend(_))));
     }
 
+    /// wsp-634: a supervisor that refuses an idle seat with an empty composer
+    /// (its hook never fired, so it reads the seat as holding other text) answers
+    /// `failed … refused` every time it is asked. A failed delivery is not held
+    /// to its id: the same sentence tried again is a new delivery under a new id,
+    /// so the seat that starts taking tells takes the held one on the next try.
+    #[test]
+    fn a_refused_delivery_is_retried_under_a_new_id_and_taken_when_the_seat_does() {
+        let scratch = Scratch::new("deliver-refused");
+        let (seat, session) = (Seat::new("cpd-1"), scratch.root.join("s.sock"));
+        let wait = Duration::from_secs(20);
+
+        let (sup, _, asked) = script_sup(&scratch, "echo \"failed $3 refused\"; exit 1");
+        let refused = Err(Refusal::Failed("cpd-1: refused".into()));
+        assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "tell", wait), refused);
+        let first = fs::read_to_string(&asked).unwrap();
+        assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "tell", wait), refused);
+        let second = fs::read_to_string(&asked).unwrap();
+        assert_ne!(first, second, "a failed id is not asked again: its answer would be `failed` again");
+
+        script_sup(&scratch, "echo \"delivered $3\"");
+        assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "tell", wait), Ok(Delivery::Acked));
+    }
+
     /// wsp-477, the verifier's block 3: a wait that runs out is an answer that is
     /// not `failed`, and the same words asked again are asked under the same id,
     /// so the sup's exactly-once covers it. An answer read ends that id.

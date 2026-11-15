@@ -400,6 +400,10 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // (`wsp-386`): counted here, drawn by `wsp wip`.
     wsp_base::calls::phase("repair:unsent");
     unsent_tick(store, seats);
+    // And a governor whose supervisor has refused every tell for [`crate::wake::REFUSED_TICKS`]
+    // ticks running (`wsp-634`): ended, so the pass below seats a successor.
+    wsp_base::calls::phase("repair:refusing");
+    refusal_tick(store, seats);
     // And a first work order that started no turn (`wsp-420`).
     first_order_tick(store, seats);
     // And a shell command waiting on itself (`wsp-397`).
@@ -664,6 +668,46 @@ pub(crate) fn unsent_tick(store: &Store, seats: &dyn Seats) {
     if now != before {
         let _ = std::fs::create_dir_all(&store.state);
         let _ = std::fs::write(store.state.join(UNSENT_FILE), serde_json::json!(now).to_string());
+    }
+}
+
+/// **A governor that refuses every tell is deaf** (`wsp-634`). The seat's
+/// supervisor answered `failed` — `refused`, composer empty and the seat idle —
+/// and the sentence was held and tried again, tick after tick, three times on
+/// 2026-11-14 for hours, until a person ended the seat by hand. After
+/// [`crate::wake::REFUSED_TICKS`] in a row the daemon does that: the seat is
+/// ended once it is not mid-turn, it reads `gone`, and [`seat_vacant`] seats a
+/// successor on the next pass. The reason goes in `cycle.log` and in the list's
+/// own log, where the person who comes back to the list reads it.
+pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
+    let governors = store.governors();
+    for (scope, (n, why)) in crate::wake::refusing(store) {
+        if n < crate::wake::REFUSED_TICKS {
+            continue;
+        }
+        let Some(seat) = cmd_govern::seat_held(&scope, &governors) else {
+            // Nobody is in the seat any more: the count belongs to one that is gone.
+            crate::wake::accepted(store, &scope);
+            continue;
+        };
+        // A turn in flight is a seat that is hearing something; leave it.
+        if seats.state(&seat.pane) == Some(State::Working) {
+            continue;
+        }
+        // The successor starts its own count.
+        crate::wake::accepted(store, &scope);
+        let line = format!(
+            "{scope}: {} refused delivery {n} ticks running ({why}) — ended so a successor is seated",
+            seat.pane
+        );
+        stamp(store, &line);
+        if let Some(mut w) = store.worklist(&scope) {
+            w.log(&line);
+            let _ = store.save_worklist(&w);
+        }
+        if let Err(e) = crate::cycle::end_seat_when_idle(store, &seat.pane) {
+            stamp(store, &format!("{scope}: could not arrange {}'s ending: {e}. `wsp despawn --pane {} --force` ends it", seat.pane, seat.pane));
+        }
     }
 }
 
@@ -2517,6 +2561,39 @@ pub(crate) mod tests {
         assert!(unsent_seats(&store).is_empty(), "a prompt that cannot be read, or is empty, leaves the record");
         unsent_tick(&store, &Typing(Fake::new(&[("cpd-1", Some(State::Working))])));
         assert!(unsent_seats(&store).is_empty(), "and a seat mid-turn queues what is typed at it");
+    }
+
+    /// **wsp-634: a governor that refuses every tell is ended, once, and the
+    /// reason is in both logs.** An idle seat whose composer reads empty and whose
+    /// hook never fires is refused by its supervisor on every tick; a count short
+    /// of the threshold leaves it, a mid-turn seat is left, and at the threshold
+    /// the seat is ended (so the reconciler seats a successor) and its count
+    /// starts over.
+    #[test]
+    fn a_governor_that_has_refused_for_five_ticks_is_ended_and_the_list_log_says_why() {
+        let (_env, store) = in_flight("refusing");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+        let refuse = || {
+            crate::wake::refuse(&store, "run", "cpd-1: refused");
+        };
+        for _ in 0..crate::wake::REFUSED_TICKS - 1 {
+            refuse();
+        }
+        refusal_tick(&store, &idle);
+        assert!(ended().is_empty(), "four refusals are not yet a deaf seat");
+
+        refuse();
+        refusal_tick(&store, &Fake::new(&[("cpd-1", Some(State::Working))]));
+        assert!(ended().is_empty(), "a seat mid-turn is hearing something");
+
+        refusal_tick(&store, &idle);
+        assert_eq!(ended(), vec!["cpd-1".to_string()]);
+        assert!(crate::wake::refusing(&store).is_empty(), "the successor starts its own count");
+        let said = stamped().join("\n");
+        assert!(said.contains("cpd-1 refused delivery 5 ticks running (cpd-1: refused) — ended so a successor is seated"), "{said}");
+        let log = store.worklist("run").unwrap().render();
+        assert!(log.contains("refused delivery 5 ticks running"), "the list's own log: {log}");
     }
 
     /// A [`Fake`] that also says which seats are **positively** not there — every

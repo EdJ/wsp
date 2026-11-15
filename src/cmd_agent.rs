@@ -4472,6 +4472,10 @@ pub(crate) struct Wip {
     /// tick (`wsp-386`) — [`crate::repair::unsent_seats`]. Drawn as `typed, not
     /// sent` in place of `idle`.
     pub unsent: std::collections::BTreeSet<String>,
+    /// Seats whose supervisor has answered `failed` to a tell, tick after tick
+    /// (`wsp-634`): pane → (ticks, the last reason). Drawn as `refusing delivery`,
+    /// which is what is true when `typed, not sent` is not — nothing was typed.
+    pub refusing: std::collections::BTreeMap<String, (u64, String)>,
     /// Seats whose first work order was sent again and still started no turn
     /// (`wsp-420`) — [`crate::repair::dropped_seats`]. Drawn as `order not
     /// received` in place of `idle`.
@@ -4615,6 +4619,13 @@ impl Wip {
             since,
             spawned: store.spawned(),
             unsent: crate::repair::unsent_seats(store),
+            refusing: {
+                let governors = store.governors();
+                crate::wake::refusing(store)
+                    .into_iter()
+                    .filter_map(|(scope, v)| crate::cmd_govern::seat_held(&scope, &governors).map(|s| (s.pane, v)))
+                    .collect()
+            },
             dropped: crate::repair::dropped_seats(store),
             full_suite: crate::throttle::full_suite_seats(&store.state),
             stuck: crate::repair::stuck_seats(store),
@@ -5116,7 +5127,8 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             (role, _) => role,
         };
         let (answers_to, answers_to_empty) = answers_to(w, &role, seat, r.project.as_deref(), &running, &homes);
-        let unsent = !a.state.turn_in_flight() && w.unsent.contains(seat);
+        let refusing = w.refusing.get(seat).filter(|_| !a.state.turn_in_flight()).cloned();
+        let unsent = !a.state.turn_in_flight() && w.unsent.contains(seat) && refusing.is_none();
         let dropped = !a.state.turn_in_flight() && w.dropped.contains(seat);
         let stuck = w.stuck.get(seat).copied();
         let mut wait = crate::waiting::seat_wait(&crate::waiting::Facts {
@@ -5127,6 +5139,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             said: held.map(crate::repair::run_said).unwrap_or_default(),
             unreachable: w.silent.seats.get(seat).cloned(),
             unsent,
+            refusing,
             dropped,
             rests_on: held.and_then(|t| rests_on(w, t)),
             now: util::epoch_secs(),
@@ -9378,6 +9391,7 @@ mod tests {
             since: Default::default(),
             spawned: Default::default(),
             unsent: Default::default(),
+            refusing: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
             stuck: Default::default(),
@@ -9603,6 +9617,7 @@ mod tests {
             since: Default::default(),
             spawned: Default::default(),
             unsent: Default::default(),
+            refusing: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
             stuck: Default::default(),
@@ -11969,6 +11984,19 @@ mod tests {
         assert_eq!(unsent["kind"], "cannot_be_told", "{unsent}");
         assert_eq!(unsent["target"], "unsent", "{unsent}");
         assert_eq!(unsent["line"], "cannot be told: typed, not sent", "{unsent}");
+    }
+
+    /// wsp-634: a seat whose supervisor refuses delivery typed nothing, and is
+    /// drawn as that and not as `typed, not sent` — even where both are true.
+    #[test]
+    fn wip_json_says_refusing_delivery_and_not_typed_not_sent() {
+        let mut w = waits_world();
+        w.refusing.insert("w10:p1".into(), (6, "cpd-1: refused".into()));
+        let j = wip_json(&w);
+        let refusing = wait_of(&j, "w10:p1");
+        assert_eq!(refusing["kind"], "cannot_be_told", "{refusing}");
+        assert_eq!(refusing["target"], "refusing", "{refusing}");
+        assert_eq!(refusing["line"], "cannot be told: refusing delivery, 6 ticks running: cpd-1: refused", "{refusing}");
         // A shell call `stuck.rs` named never ends, so a tell queues behind it.
         let stuck = wait_of(&j, "w11:p1");
         assert_eq!(stuck["kind"], "cannot_be_told", "{stuck}");
@@ -11997,6 +12025,7 @@ mod tests {
             said,
             unreachable: None,
             unsent: false,
+            refusing: None,
             dropped: false,
             rests_on: None,
             now: util::epoch_secs(),

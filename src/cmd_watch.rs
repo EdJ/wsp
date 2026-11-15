@@ -2498,6 +2498,7 @@ impl Source for Poll<'_> {
             // Read for state, never published, for `mandates`' reason.
             spawned: Default::default(),
             unsent: Default::default(),
+            refusing: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
             stuck: Default::default(),

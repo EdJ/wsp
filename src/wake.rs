@@ -729,7 +729,63 @@ const NO_SEAT: &str = "no seat on this scope";
 /// A `failed` reason that says nothing reached the seat, so the sentence is
 /// still wholly owed and trying again is safe (wsp-477).
 fn took_nothing(why: &str) -> bool {
-    ["no_composer", "no composer", "session_gone", "session gone"].iter().any(|r| why.contains(r))
+    ["no_composer", "no composer", "session_gone", "session gone", "refused", "refusing"].iter().any(|r| why.contains(r))
+}
+
+/// Where the scopes whose seat's supervisor keeps answering `failed` are
+/// counted: scope → `{ n, since, why }` (wsp-634). A seat that refuses every
+/// tick is a governor that is deaf, and nothing else says so.
+const REFUSED_FILE: &str = "refused-deliveries.json";
+
+/// How many consecutive ticks a seat may refuse a tell before the daemon ends it
+/// so the reconciler seats a successor (wsp-634). Five: a refusal is the
+/// supervisor's answer after its own four tries, so five of those is minutes.
+pub(crate) const REFUSED_TICKS: u64 = 5;
+
+fn refused_all(store: &Store) -> BTreeMap<String, Value> {
+    std::fs::read_to_string(store.state.join(REFUSED_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn refused_write(store: &Store, all: &BTreeMap<String, Value>) {
+    let _ = std::fs::create_dir_all(&store.state);
+    let _ = std::fs::write(store.state.join(REFUSED_FILE), json!(all).to_string());
+}
+
+/// A refusal on this scope's seat, counted. Returns how many in a row, and the
+/// reason the one before it gave (so a retry can say what it is retrying after).
+pub(crate) fn refuse(store: &Store, scope: &str, why: &str) -> (u64, Option<String>) {
+    let mut all = refused_all(store);
+    let was = all.get(scope).cloned().unwrap_or(Value::Null);
+    let n = was.get("n").and_then(Value::as_u64).unwrap_or(0) + 1;
+    let since = was.get("since").and_then(Value::as_i64).unwrap_or_else(util::epoch_secs);
+    let before = was.get("why").and_then(Value::as_str).map(str::to_string);
+    all.insert(scope.to_string(), json!({ "n": n, "since": since, "why": why }));
+    refused_write(store, &all);
+    (n, before)
+}
+
+/// The seat took a tell, or nothing is owed it: the count ends.
+pub(crate) fn accepted(store: &Store, scope: &str) {
+    let mut all = refused_all(store);
+    if all.remove(scope).is_some() {
+        refused_write(store, &all);
+    }
+}
+
+/// The scopes whose seat has refused delivery: scope → (ticks in a row, the last
+/// reason). Read by `wsp wip` and by the reconciler.
+pub(crate) fn refusing(store: &Store) -> BTreeMap<String, (u64, String)> {
+    refused_all(store)
+        .into_iter()
+        .map(|(scope, v)| {
+            let n = v.get("n").and_then(Value::as_u64).unwrap_or(0);
+            (scope, (n, v.get("why").and_then(Value::as_str).unwrap_or_default().to_string()))
+        })
+        .filter(|(_, (n, _))| *n > 0)
+        .collect()
 }
 
 /// The seat reads occupied and the agent in it could not be found to type at.
@@ -1113,10 +1169,14 @@ impl Tell<'_> {
     /// What became of a typing, as the batch's fate: `true` clears it.
     fn settle(&mut self, outcome: crate::place::Result<crate::place::Delivery>, before: i64) -> bool {
         match outcome {
-            Ok(crate::place::Delivery::Started) => true,
+            Ok(crate::place::Delivery::Started) => {
+                accepted(self.store, &self.scope);
+                true
+            }
             // The seat's supervisor acknowledged it (wsp-477): delivered
             // exactly once, nothing owed, no turn to wait for.
             Ok(crate::place::Delivery::Acked) => {
+                accepted(self.store, &self.scope);
                 crate::store::log_line(self.store, &format!("told {}: delivered, acknowledged by the seat", self.scope));
                 true
             }
@@ -1129,6 +1189,16 @@ impl Tell<'_> {
             Err(crate::place::Refusal::Failed(why)) => {
                 self.why = format!("the seat's supervisor failed to deliver it: {why}");
                 self.escalate(&why);
+                // Counted, and the reason kept: a retry on the next tick says what
+                // it is retrying after, and a seat that goes on refusing is
+                // reseated by [`crate::repair::refusal_tick`] (wsp-634).
+                let (n, last) = refuse(self.store, &self.scope, &why);
+                if let (true, Some(last)) = (n > 1 && took_nothing(&why), last) {
+                    crate::store::log_line(
+                        self.store,
+                        &format!("told {}: refused {n} ticks running — retrying; the last answer was `{last}`", self.scope),
+                    );
+                }
                 if !took_nothing(&why) {
                     self.typed = true;
                     self.typed_at = Some(before);
@@ -1141,6 +1211,7 @@ impl Tell<'_> {
                 // Typed, and nothing read it. Returning false puts the whole
                 // batch back, and the stamp is what tells the next tick to look
                 // for a turn rather than to type again.
+                accepted(self.store, &self.scope);
                 self.why = UNREAD.into();
                 self.typed = true;
                 self.typed_at = Some(before);
@@ -1802,6 +1873,38 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let mut tell = Tell::new(&store, &Working, "demo");
         assert!(!tell.settle(Err(Refusal::Failed("cpd-1: no_composer".into())), before));
         assert!(!tell.typed && tell.typed_at.is_none(), "not stamped: nothing was typed");
+        let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// **wsp-634: a refusal is not a typing.** The supervisor answers `failed …
+    /// refused` for an idle seat with an empty composer (the hook never fired, so
+    /// it reads the seat as holding other text). Nothing was typed, so the batch
+    /// is not stamped — the next tick takes it again, under a new id — and the
+    /// refusals are counted, with the reason, until the seat takes one.
+    #[test]
+    fn a_refusal_types_nothing_is_retried_and_counted_until_the_seat_takes_a_tell() {
+        use crate::place::{Delivery, Refusal};
+        let env = util::isolated("wake-refused");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let log = || std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        let why = "cpd-1: refused";
+        let before = util::epoch_secs();
+
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(!tell.settle(Err(Refusal::Failed(why.into())), before));
+        assert!(!tell.typed && tell.typed_at.is_none(), "nothing was typed, so it is not `typed, not sent`");
+        assert_eq!(refusing(&store).get("demo"), Some(&(1, why.to_string())));
+
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(!tell.settle(Err(Refusal::Failed(why.into())), before + 20));
+        assert!(!tell.typed, "and not held for a retype window: the next tick asks again");
+        assert_eq!(refusing(&store).get("demo"), Some(&(2, why.to_string())));
+        assert!(log().contains("refused 2 ticks running — retrying; the last answer was `cpd-1: refused`"), "{}", log());
+
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(tell.settle(Ok(Delivery::Acked), before + 40));
+        assert!(refusing(&store).is_empty(), "a seat that takes a tell is not refusing");
         let _ = std::fs::remove_dir_all(&env.state());
     }
 

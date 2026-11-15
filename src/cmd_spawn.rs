@@ -9956,6 +9956,7 @@ mod tests {
             since: Default::default(),
             spawned: store.spawned(),
             unsent: Default::default(),
+            refusing: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
             stuck: Default::default(),
