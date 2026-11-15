@@ -42,6 +42,8 @@ pub(crate) const PRIMARY_SETTINGS: &str = include_str!("../claude-code/primary.s
 /// The settings a governor seat is started with.
 pub(crate) const GOVERNOR_SETTINGS: &str = include_str!("../claude-code/governor.settings.json");
 
+pub(crate) const RETRO_SETTINGS: &str = include_str!("../claude-code/retro.settings.json");
+const RETRO_FILE: &str = "wsp-retro.settings.json";
 const PRIMARY_FILE: &str = "wsp-primary.settings.json";
 const GOVERNOR_FILE: &str = "wsp-governor.settings.json";
 
@@ -851,7 +853,7 @@ pub(crate) fn health(warnings: &mut Vec<String>) {
 /// `wsp install`; returns the paths written.
 pub(crate) fn write_settings() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    for (file, body) in [(PRIMARY_FILE, PRIMARY_SETTINGS), (GOVERNOR_FILE, GOVERNOR_SETTINGS)] {
+    for (file, body) in [(PRIMARY_FILE, PRIMARY_SETTINGS), (GOVERNOR_FILE, GOVERNOR_SETTINGS), (RETRO_FILE, RETRO_SETTINGS)] {
         let path = settings_path(file);
         if std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
             continue;
@@ -880,6 +882,20 @@ pub(crate) fn settings_args(kind: &str, scope: Option<&str>, primary: bool) -> V
         (false, None) => return Vec::new(),
     };
     let path = settings_path(file);
+    match path.exists() {
+        true => vec!["--settings".into(), path.display().to_string()],
+        false => Vec::new(),
+    }
+}
+
+/// The argument pair a retro seat's Claude Code is started with: `--settings
+/// <file>`, which allows the read-only verbs its packet tells it to search with
+/// (`wsp ls`, `wsp find`, `wsp show`). Only when the file is there.
+pub(crate) fn retro_settings_args(kind: &str) -> Vec<String> {
+    if kind != "claude" {
+        return Vec::new();
+    }
+    let path = settings_path(RETRO_FILE);
     match path.exists() {
         true => vec!["--settings".into(), path.display().to_string()],
         false => Vec::new(),
@@ -1176,5 +1192,7 @@ mod tests {
         assert_eq!(allow(GOVERNOR_SETTINGS), ["Bash(wsp despawn:*)", "Bash(wsp reap:*)"]);
         assert!(settings_args("opencode", Some("x"), false).is_empty());
         assert!(settings_args("claude", None, false).is_empty(), "a member gets neither file");
+        assert_eq!(allow(RETRO_SETTINGS), ["Bash(wsp ls:*)", "Bash(wsp find:*)", "Bash(wsp show:*)"]);
+        assert!(retro_settings_args("opencode").is_empty());
     }
 }

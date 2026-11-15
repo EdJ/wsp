@@ -1,0 +1,10 @@
+{
+  "_comment": "Passed to a retro seat's Claude Code with --settings (compounding-614). The retro packet tells the seat to search every project's rows; auto mode's classifier denied it the read-only verbs that do it. A verifier seat reads them fine; this gives the retro seat the same.",
+  "permissions": {
+    "allow": [
+      "Bash(wsp ls:*)",
+      "Bash(wsp find:*)",
+      "Bash(wsp show:*)"
+    ]
+  }
+}

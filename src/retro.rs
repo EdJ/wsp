@@ -212,7 +212,7 @@ pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures]
     for r in [
         "Attribute the wall to its causes within 10 %: the causes you name must add up to the wall to within a tenth of it. Where a person parked the whole list the wall is shown with and without the park: the park is not a cause to fix (the list stood still, and who parked it is in the bucket), so attribute the wall without it.",
         "Name every cause that is over 10 minutes in total or over 10 % of the wall — even one with nothing to fix.",
-        "Search every project's rows before you file anything: `wsp ls --all` (every project, rows at review included, and the `landed` ones too — a bare `wsp ls` lists only your own project), then `wsp show <row>` on what looks like it.",
+        "Search every project's rows before you file anything: `wsp ls --all` (every project, rows at review included, and the `landed` ones too — a bare `wsp ls` lists only your own project), then `wsp show <row>` on what looks like it. Where one of these commands is denied (`wsp find --all`, a second `wsp ls --all`, `wsp show`), do not stop: file the unambiguous defects anyway, and name in each row's evidence the search you could not finish.",
         "Where an open row already covers a cause, add the new evidence to it with `wsp retro note` — do not file a duplicate. Where a `landed` row already fixed the cause, note it on that row (\"recurs / fixed by\") instead of filing it again.",
         &format!("File at most {MAX_NEW} new rows."),
         "A **defect** is something that did not do what it was built or documented to do: a bug, a stall that a documented rule should have prevented, a measurement that is wrong. It goes on the planned retro list. A **strategic** question is a choice between ways of working — cap, parallelism, ordering, the shape of a plan, what to spend — where nothing is broken and a person must decide. It goes on the asked list, with `--ask`. When in doubt, strategic.",
@@ -440,7 +440,7 @@ mod tests {
         let w = list(&store, "l");
         let base = vec![Figures::of(&effort("old-1"))];
         let p = packet_from(&store, &w, &effort("l"), &base, "x l group 2: waits — room\nx other\n");
-        for want in ["wsp ls --all", "`landed` row already fixed", "`done` takes prose", "within 10 %", "10 minutes", "at most 5 new rows", "When in doubt, strategic", "never edits a plan", SYNTAX, "blocked on a person", "a-2 — blocked", "### a-1 (group 1)", "waits — room", "old-1 · 3 rows · wall 120m", "\"wall_seconds\": 7200"] {
+        for want in ["wsp ls --all", "the search you could not finish", "`landed` row already fixed", "`done` takes prose", "within 10 %", "10 minutes", "at most 5 new rows", "When in doubt, strategic", "never edits a plan", SYNTAX, "blocked on a person", "a-2 — blocked", "### a-1 (group 1)", "waits — room", "old-1 · 3 rows · wall 120m", "\"wall_seconds\": 7200"] {
             assert!(p.contains(want), "packet lacks `{want}`:\n{p}");
         }
         assert!(!p.contains("x other"), "only the list's own cycle lines");
