@@ -7212,7 +7212,7 @@ pub fn status(store: &Store, args: &Args) -> i32 {
             None => format!("put back to todo: {} was cancelled", w.id),
         };
         for id in groups.iter().flat_map(|g| g.members.iter()) {
-            let seats = crate::cmd_spawn::seats_of_row(store, id);
+            let seats = crate::attention::seats_of_row(store, id);
             let moved = store.locked(|| {
                 let Some(mut t) = store.find_task(id) else { return false };
                 if !t.status().is_open() {
@@ -7230,7 +7230,7 @@ pub fn status(store: &Store, args: &Args) -> i32 {
             if moved {
                 put_back.push(id.clone());
                 // Nobody holds it now (`wsp-649`).
-                crate::cmd_spawn::row_let_go(store, id, &seats);
+                crate::attention::row_let_go(store, id, &seats);
             }
         }
         if !put_back.is_empty() {

@@ -538,6 +538,38 @@ pub(crate) fn seat_gone(store: &Store, row: Option<&str>, seat: Option<&str>) ->
     })
 }
 
+/// The seats a row is held by: those bound to it, and its claim's agent's.
+pub(crate) fn seats_of_row(store: &Store, row: &str) -> Vec<String> {
+    let mut seats = store.panes_for_task(row);
+    let agents = store.agents_held();
+    let held = store.claims().get(row).and_then(|c| c.get("agent_id")?.as_str().map(str::to_string));
+    seats.extend(held.and_then(|a| agents.get(&a)?.get("seat")?.as_str().map(str::to_string)));
+    seats.sort();
+    seats.dedup();
+    seats
+}
+
+/// A row has been let go of without a despawn — parked, or put back by a list's
+/// cancel (`wsp-649`): what the pass says about it stops, and the agent record
+/// of each of `seats` that is no longer standing gets its end. A seat still
+/// running keeps its record, which is the identity its mandate hangs on.
+pub(crate) fn row_let_go(store: &Store, row: &str, seats: &[String]) {
+    for seat in seats.iter().filter(|s| !seat_stands(s)) {
+        store.end_agents_in(seat);
+    }
+    seat_gone(store, Some(row), None);
+}
+
+/// Whether `seat` is still standing, as `cmd_spawn::seat_is_live` asks it: a far
+/// seat is taken to be, a local one is looked for in the backends' census. Here
+/// and not asked of `cmd_spawn`, which is a layer above the rows that call this.
+fn seat_stands(seat: &str) -> bool {
+    crate::herdr::host_of(seat).is_some()
+        || crate::place::local_backends()
+            .iter()
+            .any(|b| b.census().is_ok_and(|c| c.seats().any(|s| s.seat.as_str() == seat)))
+}
+
 /// `wsp watch --forget daemon/ledger/<key>`: let go of one standing level by the
 /// key `wsp doctor` printed. `None` when the key is not a ledger key at all.
 pub(crate) fn forget_level(store: &Store, key: &str) -> Option<Vec<String>> {

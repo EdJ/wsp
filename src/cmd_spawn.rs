@@ -4804,28 +4804,6 @@ fn closed_row_seat(store: &Store, task: &str) -> Option<String> {
     (!seat.is_empty() && !store.bindings().contains_key(&seat)).then_some(seat)
 }
 
-/// The seats a row is held by: those bound to it, and its claim's agent's.
-pub(crate) fn seats_of_row(store: &Store, row: &str) -> Vec<String> {
-    let mut seats = store.panes_for_task(row);
-    let agents = store.agents_held();
-    let held = store.claims().get(row).and_then(|c| c.get("agent_id")?.as_str().map(str::to_string));
-    seats.extend(held.and_then(|a| agents.get(&a)?.get("seat")?.as_str().map(str::to_string)));
-    seats.sort();
-    seats.dedup();
-    seats
-}
-
-/// A row has been let go of without a despawn — parked, or put back by a list's
-/// cancel (`wsp-649`): what the pass says about it stops, and the agent record
-/// of each of `seats` that is no longer standing gets its end. A seat still
-/// running keeps its record, which is the identity its mandate hangs on.
-pub(crate) fn row_let_go(store: &Store, row: &str, seats: &[String]) {
-    for seat in seats.iter().filter(|s| !seat_is_live(s)) {
-        store.end_agents_in(seat);
-    }
-    crate::attention::seat_gone(store, Some(row), None);
-}
-
 /// Whether `seat` is still standing: a far seat is taken to be (its stop is
 /// the question, and a seat already gone says so), a local one is looked for
 /// in the backends' census.
@@ -8637,11 +8615,11 @@ mod tests {
         store.set_agent("a-gone", json!({ "seat": "cpd-9@eds", "started": "2026-11-15T00:00:00Z" }));
         store.set_agent("a-far", json!({ "seat": "w1:p1", "started": "2026-11-15T00:00:00Z" }));
         store.set_claim("t-260816-095", json!({ "agent_id": "a-gone" }));
-        let seats = seats_of_row(&store, "t-260816-095");
+        let seats = crate::attention::seats_of_row(&store, "t-260816-095");
         assert_eq!(seats, ["cpd-9@eds", "w1:p1"]);
         // `cpd-9@eds` is a far seat, which is taken to stand; `w1:p1` is
         // looked for in a census that has nothing in it.
-        row_let_go(&store, "t-260816-095", &seats);
+        crate::attention::row_let_go(&store, "t-260816-095", &seats);
         assert!(store.agents_held()["a-far"]["ended"].is_string());
         assert!(store.agents_held()["a-gone"].get("ended").is_none(), "a far seat is not known gone");
         let _ = std::fs::remove_dir_all(&store.root);
