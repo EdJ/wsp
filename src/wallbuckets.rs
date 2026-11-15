@@ -165,6 +165,11 @@ pub(crate) const PASS_WAIT: &str = "waiting for the pass (the barrier done, the 
 /// pass is given by a person.
 pub(crate) const PASS_WAIT_MANUAL: &str = "waiting for the pass (manual group: no barrier ran, the pass not yet given)";
 
+/// The waiting cause for the stretch from the previous group's pass to a manual
+/// group's first start: the pass is given, and nobody has put a hand to the
+/// group (a manual group is started by a person, not the run).
+pub(crate) const START_WAIT_MANUAL: &str = "waiting for a hand to start (manual group: the previous pass is given, no member started yet)";
+
 pub(crate) const BUCKETS: [&str; 7] = ["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups", "parked"];
 
 /// One group's wall by bucket, and what the waiting and the barrier were.
@@ -242,6 +247,14 @@ pub(crate) fn group_wall(members: &[MemberIn], open: Option<i64>, pass: Option<i
 /// members or the barrier were doing or owed there (the barrier's wait is not
 /// its run, `compounding-464`).
 pub(crate) fn group_wall_parked(members: &[MemberIn], open: Option<i64>, pass: Option<i64>, parks: &[(i64, i64, String)]) -> Option<GroupWall> {
+    group_wall_for(members, open, pass, parks, false)
+}
+
+/// [`group_wall_parked`] for a group that is `manual` or not: a manual group's
+/// stretch from the previous pass to its first start is a person's wait for a
+/// hand to start it, `waiting` and named, not `between_groups` (where the run
+/// itself is the one starting the next group).
+pub(crate) fn group_wall_for(members: &[MemberIn], open: Option<i64>, pass: Option<i64>, parks: &[(i64, i64, String)], manual: bool) -> Option<GroupWall> {
     let started: Vec<(&MemberIn, i64, i64)> = members
         .iter()
         .filter_map(|m| {
@@ -275,7 +288,12 @@ pub(crate) fn group_wall_parked(members: &[MemberIn], open: Option<i64>, pass: O
             between -= got;
         }
     }
-    add(&mut g, "between_groups", between.max(0));
+    if manual && between > 0 {
+        add(&mut g, "waiting", between);
+        *g.waits.entry((String::new(), START_WAIT_MANUAL.into())).or_insert(0) += between;
+    } else {
+        add(&mut g, "between_groups", between.max(0));
+    }
 
     // The window instant by instant: where a barrier span lies it is the
     // barrier's (its run, or its check seat); after the last it is the barrier's
@@ -491,6 +509,21 @@ mod tests {
         assert_eq!(g.seconds("between_groups"), 100);
         assert_eq!((g.open, g.close), (400, 720));
         assert_eq!(g.by.values().sum::<i64>(), 320);
+    }
+
+    #[test]
+    fn a_manual_groups_wait_for_a_hand_to_start_is_waiting_and_named_not_between_groups() {
+        let mk = || {
+            let mut ms = vec![seat("r-1", 500, 600, &[(510, 600)], &[])];
+            barrier(&mut ms, (600, 700), (700, 720));
+            ms
+        };
+        let g = group_wall_for(&mk(), Some(400), Some(720), &[], true).unwrap();
+        assert_eq!(g.seconds("between_groups"), 0);
+        assert_eq!(g.waits.get(&(String::new(), START_WAIT_MANUAL.to_string())), Some(&100));
+        assert_eq!(g.by.values().sum::<i64>(), 320, "the window still tiles");
+        let run = group_wall_for(&mk(), Some(400), Some(720), &[], false).unwrap();
+        assert_eq!(run.seconds("between_groups"), 100, "a run-started group's stretch is unchanged");
     }
 
     #[test]
