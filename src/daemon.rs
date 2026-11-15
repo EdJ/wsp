@@ -823,6 +823,9 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // look for the same answer.
         if repair_pass.due(now) {
             store.steady(|| crate::repair::tick(store, &crate::cycle::Fleet, &mut repair_pass));
+            // A pane whose seat has ended, its agent gone (`wsp-637`).
+            wsp_base::calls::phase("sweep:ended-panes");
+            store.steady(|| crate::ended_panes::tidy(store));
             // Answered retro questions plan their list (`wsp-472`); idempotent.
             wsp_base::calls::phase("retro");
             store.steady(|| crate::retro_series::sweep(store));

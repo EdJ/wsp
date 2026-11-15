@@ -393,10 +393,6 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // never-end rules and its own once-only record. See [`crate::ending`].
     wsp_base::calls::phase("ending:verification");
     crate::ending::tick(store, seats);
-    // And the pane of a seat that has ended, its agent gone and a bare shell
-    // left (`wsp-637`).
-    wsp_base::calls::phase("sweep:ended-panes");
-    crate::ended_panes::tidy(store);
     // And a governor seat with nothing left to govern (`wsp-337`).
     wsp_base::calls::phase("stand-down");
     crate::stand_down::tick(store, seats);
