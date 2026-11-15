@@ -556,6 +556,16 @@ impl Compound<'_> {
         );
         self.append_hooks_log(&dir, hook, state);
         tally_burn(&dir, payload);
+        // `wsp-637`: an agent that has left for good takes its pane with it.
+        if hook == "SessionEnd" && leaves_for_good(payload) {
+            if let Ok(rec) = self.record(seat) {
+                if rec.get("agent").is_some() && str_of(&rec, "machine").is_empty() {
+                    if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
+                        close_pane_soon(pid as u32);
+                    }
+                }
+            }
+        }
     }
 
     /// Append one line to [`HOOKS_FILE`]. Best-effort, like everything else a
@@ -1664,6 +1674,34 @@ impl Compound<'_> {
         }
     }
 }
+
+/// Whether a `SessionEnd` is the agent leaving, and not `/clear` or a resume
+/// that goes on in the same process (`wsp-637`).
+pub(crate) fn leaves_for_good(payload: &Value) -> bool {
+    !matches!(str_of(payload, "reason").as_str(), "clear" | "resume" | "compact")
+}
+
+/// Ends the pane of a seat whose agent has left: the supervisor, its shell and
+/// the renderer, a few seconds on so the agent finishes its own exit. Detached
+/// and in its own group, because the hook that calls it runs under the very
+/// group it ends. The daemon's sweep (`ended_panes`) is the backstop for an ending
+/// that never said `SessionEnd`.
+fn close_pane_soon(sup: u32) {
+    if sup == std::process::id() {
+        return;
+    }
+    let script = format!("sleep {CLOSE_AFTER_SECS}; kill -TERM -- -{sup}; sleep 2; kill -KILL -- -{sup}");
+    let _ = Command::new("sh")
+        .args(["-c", &script])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Seconds an exited agent's pane stays before it is closed.
+const CLOSE_AFTER_SECS: u32 = 2;
 
 /// The forwards the seats on `machine` should have, as `(local socket, far
 /// socket)`, read from the seat records. What the tunnel supervisor re-adds when
@@ -2809,6 +2847,45 @@ mod tests {
         }
         for seat in &seats[1..] {
             assert!(place.record(seat).is_ok(), "{seat} lost its record with the check");
+        }
+    }
+
+    #[test]
+    fn an_agent_that_leaves_for_good_takes_its_pane_with_it_and_a_clear_does_not() {
+        let scratch = Scratch::new("pane-ends");
+        let place = scratch.place();
+        let mut held = Vec::new();
+        for (label, reason, closed) in [("wsp-1", "prompt_input_exit", true), ("wsp-2", "clear", false)] {
+            let seat = place.open(&Order { label: label.into(), ..Order::default() }).unwrap();
+            let mut rec = place.record(&seat).unwrap();
+            rec["agent"] = json!({ "program": "claude" });
+            let mut leader = wsp_base::calls::Command::new("sh")
+                .args(["-c", "sleep 60 & wait"])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = leader.id();
+            place.record_pid_for_test(&seat, pid);
+            let mut rec2 = place.record(&seat).unwrap();
+            rec2["agent"] = rec["agent"].clone();
+            write_atomic(&place.dir_of(&seat).unwrap().join(SEAT_FILE), &rec2.to_string()).unwrap();
+            held.push((pid, std::thread::spawn(move || leader.wait()), seat, reason, closed));
+        }
+        let _ends = held.iter().map(|h| EndsOnDrop(h.0)).collect::<Vec<_>>();
+        for (_, _, seat, reason, _) in &held {
+            place.heard(seat, "SessionEnd", State::Gone, &json!({ "session_id": "a", "reason": reason }));
+        }
+        for (pid, _, _, reason, closed) in &held {
+            match closed {
+                true => assert!(until(|| alive(&[*pid]).is_empty()), "{reason}: the pane outlived the agent"),
+                false => {
+                    std::thread::sleep(std::time::Duration::from_secs(CLOSE_AFTER_SECS as u64 + 3));
+                    assert!(alive(&[*pid]).contains(pid), "{reason}: a pane that goes on was closed");
+                }
+            }
         }
     }
 
