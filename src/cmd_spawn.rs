@@ -3151,9 +3151,8 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
         // A retro seat is told to search every project's rows; it gets the
         // read-only verbs that do it (compounding-614).
-        if !verifying && work.task.as_deref().and_then(|t| store.find_task(t)).is_some_and(|t| t.tags.iter().any(|g| g == "retro")) {
-            spawn_args.extend(crate::cmd_role::retro_settings_args(&kind));
-        }
+        let row_tags = work.task.as_deref().and_then(|t| store.find_task(t)).map(|t| t.tags).unwrap_or_default();
+        spawn_args.extend(crate::cmd_role::retro_spawn_args(&kind, verifying, &row_tags));
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args };
         let far_start = args.get("on").is_some();
         // Two waits, and they are different questions: `start` comes back when

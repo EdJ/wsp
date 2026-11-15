@@ -902,6 +902,21 @@ pub(crate) fn retro_settings_args(kind: &str) -> Vec<String> {
     }
 }
 
+/// Whether a spawn is a retro seat's: its row is tagged `retro` and it is not
+/// the row's verifier.
+pub(crate) fn retro_wanted(verifying: bool, row_tags: &[String]) -> bool {
+    !verifying && row_tags.iter().any(|g| g == "retro")
+}
+
+/// What a spawn adds for a retro seat: the settings pair when the row is
+/// tagged `retro` and the seat is not its verifier, nothing otherwise.
+pub(crate) fn retro_spawn_args(kind: &str, verifying: bool, row_tags: &[String]) -> Vec<String> {
+    match retro_wanted(verifying, row_tags) {
+        true => retro_settings_args(kind),
+        false => Vec::new(),
+    }
+}
+
 pub const VERBS: &[crate::verbs::Verb] = &[
     crate::verbs::Verb {
         names: &["done", "close"],
@@ -1194,5 +1209,22 @@ mod tests {
         assert!(settings_args("claude", None, false).is_empty(), "a member gets neither file");
         assert_eq!(allow(RETRO_SETTINGS), ["Bash(wsp ls:*)", "Bash(wsp find:*)", "Bash(wsp show:*)"]);
         assert!(retro_settings_args("opencode").is_empty());
+        let v: Value = serde_json::from_str(RETRO_SETTINGS).unwrap();
+        let prose = v["autoMode"]["allow"].as_array().unwrap();
+        assert!(prose.iter().any(|p| {
+            let p = p.as_str().unwrap();
+            p.contains("wsp ls") && p.contains("wsp find") && p.contains("wsp show") && p.contains("read-only")
+        }));
+    }
+
+    #[test]
+    fn only_a_retro_rows_own_seat_is_started_with_the_retro_settings() {
+        let retro = vec!["wsp".to_string(), "retro".to_string()];
+        assert!(retro_wanted(false, &retro));
+        assert!(!retro_wanted(true, &retro), "its verifier is not a retro seat");
+        assert!(!retro_wanted(false, &["wsp".to_string()]), "a member is not");
+        assert!(!retro_wanted(false, &[]));
+        assert!(retro_spawn_args("opencode", false, &retro).is_empty());
+        assert!(retro_spawn_args("claude", true, &retro).is_empty());
     }
 }

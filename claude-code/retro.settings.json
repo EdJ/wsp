@@ -1,10 +1,16 @@
 {
-  "_comment": "Passed to a retro seat's Claude Code with --settings (compounding-614). The retro packet tells the seat to search every project's rows; auto mode's classifier denied it the read-only verbs that do it. A verifier seat reads them fine; this gives the retro seat the same.",
+  "_comment": "Passed to a retro seat's Claude Code with --settings (compounding-614). The retro packet tells the seat to search every project's rows; auto mode's classifier denied it the read-only verbs that do it (\"Unauthorized Access\" on `wsp show` of another project's row) although ~/.claude/settings.json already allowed them as permission rules, so the allow list alone is not enough: autoMode.allow is the classifier's own rule.",
   "permissions": {
     "allow": [
       "Bash(wsp ls:*)",
       "Bash(wsp find:*)",
       "Bash(wsp show:*)"
+    ]
+  },
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "`wsp ls`, `wsp find` and `wsp show` are read-only: run by a retro seat across every project, including rows of projects other than its own, they are the sanctioned way to read the work it is asked to analyse, authorised by Ed."
     ]
   }
 }
