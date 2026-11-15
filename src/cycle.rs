@@ -123,7 +123,7 @@
 use std::process::Stdio;
 use wsp_base::calls::Command;
 
-use crate::model::{Group, Policy, Status, Task, Worklist, WorklistStatus};
+use crate::model::{Group, Policy, Status, Task, Worklist, WorklistStatus, DEFAULT_POLICY, MANUAL};
 use crate::place::State;
 use crate::store::Store;
 use crate::util;
@@ -816,11 +816,22 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     let pos = worklist::position(store, &w, Reading::Landed);
     let Some(at) = pos.at else { return started };
     let Some(g) = groups.get(at - 1) else { return started };
-    let Some(policy) = g.policy() else { return started };
+    // A `manual` group stands still, with one exception (`wsp-629`): once every
+    // member has landed and its stop is one an agent can check, its barrier is
+    // opened on the list's usual line, so the list does not sit "waiting on
+    // Ed" with nothing left for Ed to do. Only the barrier: nothing of the
+    // members is started or verified here.
+    let (policy, barrier_only) = match g.policy() {
+        Some(p) => (p, false),
+        None => match manual_barrier_policy(&groups, at, g, &pos) {
+            Some(p) => (p, true),
+            None => return started,
+        },
+    };
     let all = starts == Starts::All;
     // A prerequisite a member names with `after` and no list holds joins the
     // group first (`wsp-495`), and the pass reads the group as it now stands.
-    if all && pull_prerequisites(store, &w, at) {
+    if all && !barrier_only && pull_prerequisites(store, &w, at) {
         return step_in(store, &w, seats, starts);
     }
     // The seat's cap (`wsp-231`), asked by each of the three starts below
@@ -837,7 +848,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // 1a. Every seat the group is waiting on a first turn from, whose order
     // went in and started nothing (`wsp-252`). Before the verifiers and the
     // barrier, so a seat replaced here is opened again below.
-    if all {
+    if all && !barrier_only {
         crate::untaken::look(store, seats, &w, at, g, &pos);
     }
 
@@ -851,7 +862,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // fans out. With no cap the order changes nothing — each start is keyed on
     // its own record.
     let gone = |seat: &str| seats.absent(seat) || seats.state(seat) == Some(State::Gone);
-    for s in pos.members.iter().filter(|s| s.owes_a_verifier()) {
+    for s in pos.members.iter().filter(|s| !barrier_only && s.owes_a_verifier()) {
         let Some(member) = store.find_task(&s.id) else { continue };
         // On the kind the work ran on — `wsp-134` d1 (C) — which in a
         // mixed group is the member's own line and not the group's.
@@ -903,7 +914,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // log has to say: tokenhub-003 went to review with its commit still on
     // its branch, this started nothing and wrote nothing, and its governor
     // went looking for the cause in the wrong record (`wsp-142`).
-    if all {
+    if all && !barrier_only {
         for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
             log_line(store, &format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
         }
@@ -912,7 +923,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // 3. The barrier, once every member is landed, every verdict is in, and
     // every member has stopped working. `wsp-164`.
     let tasks = store.tasks_shared();
-    if pos.at_barrier() && pos.members.iter().all(|s| verified(&tasks, &s.id)) {
+    if pos.at_barrier() && (barrier_only || pos.members.iter().all(|s| verified(&tasks, &s.id))) {
         match holding_barrier(store, seats, &w, &pos) {
             // A Barrier row filed before `wsp-230` and still open is that
             // barrier's check, whose agent may be mid-read: nothing is owed.
@@ -1014,7 +1025,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // **Last**, and under the seat's cap after every other running list's
     // verifiers and checks as well (`wsp-231`): a group anywhere on the
     // machine finishes before the next work fans out.
-    if all {
+    if all && !barrier_only {
         end_second_seats(store, seats, &w, at, &g.members);
         let holds = crate::after::waiting(store, g);
         let unstarted = pos.members.iter().any(|s| {
@@ -1100,6 +1111,41 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         log_line(store, &format!("{} group {at}: started {}", w.id, started.join(" ")));
     }
     started
+}
+
+/// The line a check is opened on for a `manual` group whose barrier is ready,
+/// or `None` when the group is left to its person. `wsp-629`.
+///
+/// All of: the group's line is `manual` itself (an empty one is a list from
+/// before `agent:` and stays by hand); every member has landed; the stop is
+/// written and names no person ([`names_a_person`]). The line is the list's
+/// usual one ([`usual_line`]).
+fn manual_barrier_policy(groups: &[Group], at: usize, g: &Group, pos: &worklist::Position) -> Option<Policy> {
+    if g.agent.trim() != MANUAL || !pos.at_barrier() || pos.members.is_empty() {
+        return None;
+    }
+    let stop = g.stop.trim();
+    if stop.is_empty() || names_a_person(stop) {
+        return None;
+    }
+    Policy::parse(&usual_line(groups, at))
+}
+
+/// Whether a stop says it is for a person to read — `by Ed`, `Ed's results`,
+/// `the person` — which an agent cannot check and the run leaves to them.
+pub(crate) fn names_a_person(stop: &str) -> bool {
+    let lower = stop.to_lowercase();
+    lower.split(|c: char| !c.is_alphabetic()).any(|w| matches!(w, "ed" | "person"))
+}
+
+/// The agent line a list usually runs on: the nearest group at or before
+/// `at` (1-based) that has one, then any group that has, then
+/// [`DEFAULT_POLICY`]. For a group left `manual` that a hand is to switch on.
+pub(crate) fn usual_line(groups: &[Group], at: usize) -> String {
+    let has = |g: &&Group| g.policy().is_some();
+    let before = groups.iter().take(at).rev().find(has);
+    let any = groups.iter().find(has);
+    before.or(any).map(|g| g.agent.trim().to_string()).unwrap_or_else(|| DEFAULT_POLICY.to_string())
 }
 
 /// What the seat's cap held back on a list this pass, said once in `cycle.log`
@@ -8082,6 +8128,90 @@ fn only_a_working_screen_is_ever_overruled() {
             step(&store, &w, &Blind);
             assert!(spawned().is_empty(), "`{agent}` is run by hand");
             assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo);
+        }
+    }
+
+    /// `wsp-629`: a group left `manual` after its person's row moved out is
+    /// turned on while it runs, and the run then starts what has not started —
+    /// and goes on leaving a member already started to the agent it has.
+    #[test]
+    fn a_running_groups_line_changed_from_manual_makes_the_run_start_its_unstarted_members() {
+        let (_env, store) = scratch("turnon");
+        task(&store, "m-1", Status::Todo);
+        task(&store, "m-2", Status::Doing);
+        let w = list(&store, &[(&["m-1", "m-2"], "manual")]);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "manual: nothing starts");
+
+        let bare = Args::synth("worklist", &["group", "run", "1"], &[("agent", "opencode some/model")]);
+        assert_eq!(crate::cmd_worklist::group(&store, &bare), 2, "a reason is owed, as for the stop");
+        assert_eq!(store.worklist("run").unwrap().groups()[0].agent, "manual");
+
+        let said = Args::synth("worklist", &["group", "run", "1"], &[("agent", "opencode some/model"), ("why", "its person's row moved out")]);
+        assert_eq!(crate::cmd_worklist::group(&store, &said), 0);
+        let now = store.worklist("run").unwrap();
+        assert_eq!(now.groups()[0].agent, "opencode some/model");
+        assert!(now.body.contains("agent line changed while it runs — why: its person's row moved out"), "{}", now.body);
+
+        step(&store, &now, &Blind);
+        assert_eq!(spawned(), vec![("m-1".into(), "opencode".into())], "the member not started starts, on the new line");
+        assert_eq!(store.find_task("m-2").unwrap().status(), Status::Doing, "and the one started is not touched");
+
+        let back = Args::synth("worklist", &["group", "run", "1"], &[("agent", "manual"), ("why", "the person has it again")]);
+        assert_eq!(crate::cmd_worklist::group(&store, &back), 0);
+        task(&store, "m-3", Status::Todo);
+        let mut w = store.worklist("run").unwrap();
+        let mut g = w.groups();
+        g[0].members.push("m-3".into());
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "an agent kind to manual stops new starts");
+    }
+
+    /// `wsp-629`: a `manual` group whose members have all landed and whose
+    /// stop an agent can check is not left "waiting on Ed".
+    #[test]
+    fn a_manual_barrier_with_a_checkable_stop_and_every_member_landed_starts_a_check_seat() {
+        let (_env, store) = scratch("manualcheck");
+        task(&store, "m-1", Status::Review);
+        task(&store, "g-1", Status::Review);
+        let mut w = list(&store, &[(&["m-1"], "manual"), (&["g-1"], "claude sonnet high")]);
+        let mut g = w.groups();
+        g[0].stop = "the full check is green on the trunk".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+
+        step(&store, &w, &Blind);
+        assert_eq!(
+            spawned(),
+            vec![(crate::barrier::seat_label("run", 1), "claude".into())],
+            "the check starts, on the list's usual line, and nothing of the member"
+        );
+        assert_eq!(checks(&store, 1).len(), 1);
+    }
+
+    /// The other side of it: a stop that names the person, one not written, a
+    /// member that has not landed, and an empty (hand-run) line all stay put.
+    #[test]
+    fn a_manual_barrier_waits_for_its_person_when_the_stop_names_one_or_a_member_is_out() {
+        let cases: [(&str, &str, Status); 4] = [
+            ("manual", "waiting on Ed's results", Status::Review),
+            ("manual", "", Status::Review),
+            ("manual", "the full check is green", Status::Doing),
+            ("", "the full check is green", Status::Review),
+        ];
+        for (i, (agent, stop, status)) in cases.iter().enumerate() {
+            let (_env, store) = scratch(&format!("manualwait{i}"));
+            task(&store, "m-1", *status);
+            let mut w = list(&store, &[(&["m-1"], agent), (&["m-2"], "claude")]);
+            let mut g = w.groups();
+            g[0].stop = stop.to_string();
+            w.set_groups(&g);
+            store.save_worklist(&w).unwrap();
+            step(&store, &w, &Blind);
+            assert!(spawned().is_empty(), "case {i} ({agent:?}, {stop:?}, {status:?}): nothing starts");
+            assert!(checks(&store, 1).is_empty(), "case {i}: and no check is opened");
         }
     }
 

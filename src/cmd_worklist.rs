@@ -1113,10 +1113,15 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         return 0;
     }
 
+    // What the row leaves behind it, read before it goes: a row taken out of a
+    // `manual` group is a person's, and the group made for it is too (`wsp-629`).
+    let from_manual = groups[from].agent.trim() == MANUAL;
+    let from_stop = groups[from].stop.clone();
     groups[from].members.retain(|m| m != &id);
     // A member's own line goes where it goes: it is about the member, and the
     // group it lands in has no opinion on it.
     let own = groups[from].member_agents.remove(&id);
+    let left_behind = groups[from].members.clone();
     // The source emptying shifts everything after it up one, including the
     // destination that was just named. Corrected here rather than by refusing
     // the move: a group with one member in it is the ordinary case for the
@@ -1131,11 +1136,19 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     }
 
     if fresh {
-        let agent = match agent_for_new(args, &groups, at - 1) {
-            Ok(a) => a,
-            Err(code) => return code,
+        // `manual` stays with the row, and its person's stop with it, rather
+        // than the new group taking the list's line and starting an agent on
+        // a person's row. An `--agent` said is still what is said.
+        let keeps_manual = !args.has("agent") && (from_manual || own.as_deref().map(str::trim) == Some(MANUAL));
+        let (agent, stop) = if keeps_manual {
+            (MANUAL.to_string(), if from_manual { from_stop.clone() } else { String::new() })
+        } else {
+            match agent_for_new(args, &groups, at - 1) {
+                Ok(a) => (a, String::new()),
+                Err(code) => return code,
+            }
         };
-        groups.insert(at - 1, Group { members: vec![id.clone()], agent, ..Group::default() });
+        groups.insert(at - 1, Group { members: vec![id.clone()], agent, stop, ..Group::default() });
     } else {
         groups[at - 1].members.push(id.clone());
     }
@@ -1154,6 +1167,15 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     } else {
         let tail = if emptied { " · the group it left was emptied and dropped" } else { "" };
         println!("{id} → {} group {at} of {}{tail}", w.id, groups.len());
+        if from_manual && !emptied {
+            // The group it left, where it stands now: a group made ahead of it
+            // pushed it down one.
+            let now = if fresh && at - 1 <= from { from + 2 } else { from + 1 };
+            let usual = crate::cycle::usual_line(&groups, now);
+            for line in manual_left_lines(&w.id, now, &left_behind, &usual, false) {
+                println!("{line}");
+            }
+        }
     }
     0
 }
@@ -1293,6 +1315,7 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         eprintln!("{USAGE}");
         eprintln!("       --weight light|heavy says what each member counts as under the seat's cap, over the project's `light:` (a light row is half a place)");
         eprintln!("       --parallel caps the work; --agent says who runs it; --stop is the prose read at the barrier after it");
+        eprintln!("       the group being run takes --agent (and --stop) alone, with --why: a member started keeps its agent, the rest and the barrier use the new line");
         eprintln!("       --caption is the line a glance reads for it; --drop takes the group out whole");
         eprintln!("       --kind says what the group is for, which scopes its barrier's run (docs/scoped-barriers.md)");
         eprintln!("       --together keeps the list from starting until the group's whole width and a verifier are free, so its");
@@ -1367,9 +1390,27 @@ pub fn group(store: &Store, args: &Args) -> i32 {
                 Err(code) => code,
             };
         }
+        // The line alone is the other edit the group being run takes
+        // (`wsp-629`), for the same reason and on the same terms: a reason,
+        // logged. A member already started keeps the agent it has; the ones
+        // not yet started, the verifiers and the barrier read the new line.
+        let only_agent = args.has("agent") && !set_together && !args.has("parallel") && !args.has("stop") && !args.has("kind") && !args.has("weight");
+        if live && only_agent {
+            let Some(why) = why else {
+                eprintln!("wsp: group {ordinal} of `{}` is being run, so its agent line is changed with a reason, which is logged", w.id);
+                eprintln!("     `wsp worklist group {} {ordinal} --agent \"…\" --why \"…\"`", w.id);
+                return 2;
+            };
+            let line = match policy_word(&args.get("agent").unwrap_or_default()) {
+                Ok(a) => a,
+                Err(code) => return code,
+            };
+            return amend_running_agent(store, args, &w.id, ordinal, line, caption, &why);
+        }
         let code = win.refuse(ordinal, "will not change");
         if live {
             eprintln!("     its stop alone may still be corrected, with a reason: `--stop --from FILE --why -`");
+            eprintln!("     and its agent line, with a reason: `--agent \"claude sonnet high\"|manual --why \"…\"`");
         }
         return code;
     }
@@ -1545,6 +1586,71 @@ fn amend_running_stop(store: &Store, args: &Args, id: &str, ordinal: usize, text
             ))
         );
     }
+    0
+}
+
+/// Change the agent line of the group being run. `wsp-629`.
+///
+/// **The line is read afresh on every pass of the run** (`crate::cycle`), so
+/// the edit is the whole change: `manual` to an agent kind makes the next pass
+/// start the group's unstarted members, and an agent kind to `manual` stops new
+/// starts. A member already started is a seat with its agent and is not touched;
+/// a member's own line (`agent <member>:`) is not either. A group left `manual`
+/// after its person's row moved out (react-pass-5-plan's group 9) stood 80
+/// minutes with nothing in it for the person, because this edit was refused.
+///
+/// A reason, logged, as the stop's amendment has. Read again inside the lock,
+/// so a `go` in another process that passed the group first is not edited.
+fn amend_running_agent(store: &Store, args: &Args, id: &str, ordinal: usize, line: String, caption: Option<String>, why: &str) -> i32 {
+    let outcome = store.locked(|| -> Result<(Worklist, Option<String>), i32> {
+        let mut w = store.worklist(id).ok_or(1)?;
+        let mut groups = w.groups();
+        let win = window(store, &w);
+        if win.at != Some(ordinal) {
+            return Err(win.refuse(ordinal, "will not change the agent line of"));
+        }
+        let before = std::mem::replace(&mut groups[ordinal - 1].agent, line.clone());
+        if let Some(c) = &caption {
+            groups[ordinal - 1].caption = c.clone();
+        }
+        if before == line && caption.is_none() {
+            return Ok((w, None));
+        }
+        w.log(&format!(
+            "group {ordinal} agent line changed while it runs — why: {why} · was: {} · now: {line}",
+            if before.trim().is_empty() { MANUAL } else { before.trim() }
+        ));
+        w.set_groups(&groups);
+        if let Err(e) = store.save_worklist(&w) {
+            eprintln!("wsp: write failed: {e}");
+            return Err(1);
+        }
+        Ok((w, Some(before)))
+    });
+    let (w, before) = match outcome {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    if before.is_some() {
+        store.log_event("worklist-edited", json!({ "id": w.id, "what": "agent", "group": ordinal, "why": why }));
+        store.git_commit(&format!("wsp: worklist {} group {ordinal} agent line changed while it runs", w.id));
+    }
+    if args.json() {
+        println!("{}", worklist_json(store, &w));
+        return 0;
+    }
+    let g = &w.groups()[ordinal - 1];
+    if before.is_none() {
+        println!("{} group {ordinal}: the line already reads {}, so nothing was changed", w.id, g.agent);
+        return 0;
+    }
+    println!("{} group {ordinal}: agent: {} while it runs", w.id, g.agent);
+    let tail = if g.policy().is_some() {
+        "members not yet started, the verifiers and the barrier use it; one already started keeps the agent it has"
+    } else {
+        "no new member is started; one already started goes on as it is, and the group is run by hand"
+    };
+    println!("  {}", Paint::new().dim(&format!("why: {} · {tail}", util::truncate(why, 60))));
     0
 }
 
@@ -1898,7 +2004,7 @@ fn cut_by_reading(store: &Store, args: &Args, here: &[String], governs: Option<S
     };
     let row = store.find_task(&row).map(|t| t.id).unwrap_or(row);
 
-    let outcome = store.locked(|| -> Result<(Worklist, Cut, usize), i32> {
+    let outcome = store.locked(|| -> Result<(Worklist, Cut, usize, Option<String>), i32> {
         // Read again inside the lock: a `go` in another process may have
         // passed this barrier since.
         let mut w = store.worklist(&w0.id).ok_or(1)?;
@@ -1930,6 +2036,9 @@ fn cut_by_reading(store: &Store, args: &Args, here: &[String], governs: Option<S
                 return Err(1);
             }
         };
+        // A group left `manual` with rows in it after its person's row went
+        // out (`wsp-629`): the line the run would use if it were turned on.
+        let left_manual = (groups[got.group - 1].agent.trim() == MANUAL).then(|| crate::cycle::usual_line(&groups, got.group));
         let running = &mut groups[got.group - 1];
         let (agent, cap, stop) = (running.agent.clone(), running.cap, running.stop.clone());
         running.members.retain(|m| !got.takes.contains(m));
@@ -1955,9 +2064,9 @@ fn cut_by_reading(store: &Store, args: &Args, here: &[String], governs: Option<S
             store.log_event("worklist-edited", json!({ "id": w.id, "what": "cut", "group": got.group, "rows": got.takes, "why": why, "by": by }));
             store.git_commit(&format!("wsp: worklist {} cut {} from group {} into group {}", w.id, got.takes.join(" "), got.group, got.group + 1));
         }
-        Ok((w, got, count))
+        Ok((w, got, count, left_manual))
     });
-    let (w, got, count) = match outcome {
+    let (w, got, count, left_manual) = match outcome {
         Ok(o) => o,
         Err(code) => return code,
     };
@@ -1966,14 +2075,34 @@ fn cut_by_reading(store: &Store, args: &Args, here: &[String], governs: Option<S
         if let Some(o) = out.as_object_mut() {
             o.insert("cut".into(), json!({ "from": got.group, "into": got.group + 1, "rows": got.takes, "stays": got.stays, "why": why, "by": by }));
             o.insert("dry_run".into(), json!(dry));
+            o.insert("stays_manual".into(), json!(left_manual.is_some()));
         }
         println!("{}", out);
     } else {
         for line in cut_lines(&w.id, &got, count, dry) {
             println!("{line}");
         }
+        if let Some(usual) = &left_manual {
+            for line in manual_left_lines(&w.id, got.group, &got.stays, usual, dry) {
+                println!("{line}");
+            }
+        }
     }
     0
+}
+
+/// What `cut` and `mv` say of a group that is `manual` and still holds rows
+/// once a row has gone out of it: it is left manual with nobody to run it
+/// unless it is turned on. `wsp-629`. Said, and not done, because the rows
+/// left may be a person's too: nothing on a row says it is.
+fn manual_left_lines(list: &str, group: usize, stays: &[String], usual: &str, dry: bool) -> Vec<String> {
+    let verb = if dry { "would stay" } else { "stays" };
+    vec![
+        format!("  group {group} {verb} `manual` with {} in it — nothing starts them", stays.join(" ")),
+        format!(
+            "  if none of them is a person's row, hand it to the run: `wsp worklist group {list} {group} --agent \"{usual}\" --why \"…\"` — it starts the rows not yet started, and a barrier whose stop names no person is checked"
+        ),
+    ]
 }
 
 /// What [`cut_by`] prints, held apart so "`-n` names what would move" is a
@@ -7949,8 +8078,15 @@ mod tests {
         started(&store, "mix");
         store.set_claim("ml-2", json!({ "workspace_id": "cpd-9" }));
 
-        // The group's own line is frozen with its membership, as before.
-        assert_eq!(flagged(&store, &["group", "mix", "1"], &[("agent", "claude")]), 1);
+        // The group's own line is changed with a reason (`wsp-629`), and not
+        // without one; its cap and membership stay frozen with it.
+        assert_eq!(flagged(&store, &["group", "mix", "1"], &[("agent", "claude")]), 2, "a reason is owed");
+        assert_eq!(flagged(&store, &["group", "mix", "1"], &[("agent", "claude"), ("parallel", "2")]), 1, "the cap is still frozen");
+        assert_eq!(groups_of(&store, "mix")[0].agent, "opencode m-free");
+        assert_eq!(flagged(&store, &["group", "mix", "1"], &[("agent", "claude"), ("why", "the free model is gone")]), 0);
+        assert_eq!(groups_of(&store, "mix")[0].agent, "claude");
+        assert_eq!(flagged(&store, &["group", "mix", "1"], &[("agent", "opencode m-free"), ("why", "put back")]), 0);
+        assert!(groups_of(&store, "mix")[0].member_agents.is_empty(), "no member's own line moved with it");
 
         assert_eq!(flagged(&store, &["member", "mix", "ml-3"], &[("agent", "claude opus high")]), 0, "not started: open");
         assert_eq!(groups_of(&store, "mix")[0].member_agents.get("ml-3").map(String::as_str), Some("claude opus high"));
@@ -11399,6 +11535,59 @@ mod tests {
         assert_eq!(g[3].members, ["c-5"], "the planned group renumbers to 4");
         assert_eq!(g[0].members, ["c-1"]);
         assert!(g[2].id.is_some() && g[2].id != g[1].id && g[2].id != g[3].id, "a group of its own, by name");
+    }
+
+    /// `wsp-629`: cutting a row out of a `manual` group leaves the group
+    /// manual with rows in it, which is said with the way to switch it, and the
+    /// group made for the cut row is manual with its stop.
+    #[test]
+    fn a_cut_out_of_a_manual_group_keeps_the_new_group_manual_and_says_the_old_one_stays_so() {
+        let (_env, store) = cut_store("cut-manual");
+        let mut w = store.worklist("cl").unwrap();
+        let mut g = w.groups();
+        g[1].agent = "manual".into();
+        g[1].stop = "Ed's results are in".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(cut_as(&store, "c-2", Some("Ed's sitting holds the group up"), &[], None), 0);
+        let g = groups_of(&store, "cl");
+        assert_eq!((g[1].members.as_slice(), g[1].agent.as_str()), (["c-4".to_string()].as_slice(), "manual"));
+        assert_eq!((g[2].agent.as_str(), g[2].stop.as_str()), ("manual", "Ed's results are in"), "the person's row stays manual, with its stop");
+
+        let usual = crate::cycle::usual_line(&g, 2);
+        assert_eq!(usual, DEFAULT_POLICY, "no group has a line, so the default is offered");
+        let lines = manual_left_lines("cl", 2, &["c-4".to_string()], &usual, false);
+        assert!(lines[0].contains("group 2 stays `manual` with c-4"), "{lines:?}");
+        assert!(lines[1].contains("wsp worklist group cl 2 --agent") && lines[1].contains("--why"), "{lines:?}");
+    }
+
+    /// `wsp-629`: the group `mv` makes for a row taken out of a `manual` group
+    /// is manual with that group's stop, and not the list's line, which would
+    /// start an agent on a person's row. A line said stays what is said.
+    #[test]
+    fn a_mv_into_a_new_group_from_a_manual_one_keeps_the_row_manual_and_its_stop() {
+        for said in [None, Some("claude sonnet high")] {
+            let store = scratch(&format!("mv-manual-{}", said.is_some()));
+            for id in ["p-1", "p-2", "p-3"] {
+                task(&store, id, "todo");
+            }
+            let mut w = Worklist::new("pl", "Plan");
+            w.set_groups(&[
+                Group { members: vec!["p-1".into()], agent: "claude sonnet high".into(), ..Group::default() },
+                Group { members: vec!["p-2".into(), "p-3".into()], agent: "manual".into(), stop: "Ed's results are in".into(), ..Group::default() },
+            ]);
+            store.save_worklist(&w).unwrap();
+            let flags: Vec<(&str, &str)> = [("after", "2")].into_iter().chain(said.map(|a| ("agent", a))).collect();
+            assert_eq!(flagged(&store, &["mv", "pl", "p-3"], &flags), 0);
+            let g = groups_of(&store, "pl");
+            assert_eq!(g.len(), 3);
+            assert_eq!(g[1].members, ["p-2"], "the group left keeps its line and stop");
+            assert_eq!((g[1].agent.as_str(), g[1].stop.as_str()), ("manual", "Ed's results are in"));
+            match said {
+                None => assert_eq!((g[2].agent.as_str(), g[2].stop.as_str()), ("manual", "Ed's results are in")),
+                Some(a) => assert_eq!((g[2].agent.as_str(), g[2].stop.as_str()), (a, "")),
+            }
+        }
     }
 
     #[test]
