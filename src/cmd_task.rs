@@ -2180,9 +2180,16 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
             return code;
         }
         let said = from.map(|src| format!("{} characters from {src}", text.len()));
-        return mutate_saying(store, args, "decided", said.as_deref(), |t| {
+        let blocked = t.status() == Status::Blocked;
+        let code = mutate_saying(store, args, "decided", said.as_deref(), |t| {
             crate::decisions::decide_task(t, &text, &supersedes);
         });
+        // A decision made on a blocked row is its answer (`wsp-635`): the run
+        // reopens the member, so it is asked now and not at the next tick.
+        if code == 0 && blocked {
+            crate::cycle::poke_task(store, &t.id, "decided");
+        }
+        return code;
     }
 
     let index = Index::new(store.projects());

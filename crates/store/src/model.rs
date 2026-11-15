@@ -663,6 +663,10 @@ pub fn localise_dates(body: &str) -> String {
 pub struct Decision {
     /// The date it was taken, in the reader's zone. See [`decisions`].
     pub when: String,
+    /// The instant it was taken, as stored (`2026-11-15T18:05:11Z`), or the
+    /// bare date of an entry that has no more. What a reader that compares
+    /// decisions with the log's own stamps needs, which `when` cannot give.
+    pub at: String,
     /// `d4`, or empty for an entry written before ids existed and not yet
     /// touched by [`append_decision`].
     pub id: String,
@@ -724,18 +728,19 @@ pub fn decisions_of(body: &str) -> Vec<Decision> {
         .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
         .filter(|l| !l.is_empty())
         .map(|l| {
-            let (when, rest) = match l.split_once(' ') {
-                Some((d, rest)) if util::is_stamp(d) => (util::local_ymd(d), rest.trim()),
-                _ => (String::new(), l.as_str()),
+            let (at, when, rest) = match l.split_once(' ') {
+                Some((d, rest)) if util::is_stamp(d) => (d.to_string(), util::local_ymd(d), rest.trim()),
+                _ => (String::new(), String::new(), l.as_str()),
             };
             match split_head(rest) {
                 Some((id, supersedes, text)) => Decision {
                     when,
+                    at,
                     id,
                     supersedes,
                     text: text.to_string(),
                 },
-                None => Decision { when, text: rest.to_string(), ..Default::default() },
+                None => Decision { when, at, text: rest.to_string(), ..Default::default() },
             }
         })
         .collect()

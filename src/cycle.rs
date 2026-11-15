@@ -681,10 +681,17 @@ fn told_about_task(store: &Store, id: &str, verb: &str) {
     } else {
         "A member is blocked"
     };
-    let cut = if what == "A member is blocked" { cut_line(&w.id, &t.id) } else { String::new() };
+    let member = what == "A member is blocked";
+    let cut = if member { cut_line(&w.id, &t.id) } else { String::new() };
+    // The answer that needs no seat and no second verb (`wsp-635`).
+    let answer = if member {
+        format!(" To answer it, `wsp decide {} \"…\"` — the run reopens the row on a decision made since the block, seats it if nobody is on it, and no person is asked.", t.id)
+    } else {
+        String::new()
+    };
     tell(store, &w, &format!(
         "{what} in the {} run: {} ({}) is blocked. `wsp show {}` says on what. \
-         The run waits here until it is unblocked.{cut}",
+         The run waits here until it is unblocked.{answer}{cut}",
         w.id, t.id, util::truncate(&t.title, 60), t.id
     ));
 }
@@ -822,6 +829,9 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     let gate = crate::room::Gate::new(store, seats);
     if all {
         retry_after_hold(store, &w.id);
+        // Before any start below, so a member the answer reopens with no seat
+        // is seated in this very pass (`wsp-635`).
+        reopen_the_answered(store, &w, at, &pos);
     }
 
     // 1a. Every seat the group is waiting on a first turn from, whose order
@@ -1571,6 +1581,76 @@ pub(crate) fn blocked_since(t: &Task) -> Option<i64> {
     })
 }
 
+/// What the run writes after [`SENT_BACK`] when it reopens a blocked member
+/// because the row carries a decision made since the block (`wsp-635`).
+pub(crate) const ANSWERED_BY: &str = "answered by decision";
+
+/// The decision that answers a blocked member's question: the newest on its
+/// row recorded at or after its newest `blocked:` line.
+///
+/// **A decision is an answer** (`wsp-635`). On 2026-11-14 compounding-547 asked
+/// a question, blocked, and its seat ended; the list's custodian answered with
+/// `wsp decide`, which records the answer and leaves the row `blocked` with
+/// nobody on it. The cycle logged `compounding-552 waits on compounding-547`
+/// every 78 s for seven hours, because nothing read the decision as a reason to
+/// move the row. `None` for a row that is not blocked, or has no decision newer
+/// than its block. An entry with no instant of its own (a bare date, or none)
+/// cannot be placed against the block, so it answers nothing.
+pub(crate) fn answer_since_block(t: &Task) -> Option<crate::model::Decision> {
+    let since = blocked_since(t)?;
+    crate::model::decisions_of(&t.body)
+        .into_iter()
+        .rev()
+        .find(|d| !d.id.is_empty() && d.at.len() == 20 && util::epoch_of(&d.at) >= since)
+}
+
+/// A blocked member of the running group whose row has a decision made since
+/// its block is sent back by the run, as `wsp reopen` would: `doing`, the
+/// answer on its log as a `sent back:` line (which the step reads as "reseat
+/// this", so a member with no seat is seated in the same pass), the decision
+/// told to a seat that is still in it, and the list's own log and `cycle.log`
+/// saying why. No person is needed for it (`wsp-635`).
+fn reopen_the_answered(store: &Store, w: &Worklist, at: usize, pos: &worklist::Position) {
+    for s in &pos.members {
+        let took = store.locked(|| {
+            let mut t = store.find_task(&s.id)?;
+            let d = answer_since_block(&t)?;
+            let question = t.blocked_question().unwrap_or_else(|| "its question".to_string());
+            let answer = util::fold(&d.text);
+            t.set_status(Status::Doing);
+            t.log(&format!(
+                "{SENT_BACK} {ANSWERED_BY} {} to its block ({}): {}",
+                d.id,
+                util::truncate(&util::fold(&question), 80),
+                util::truncate(&answer, 400)
+            ));
+            store.save_task(&t).ok()?;
+            if let Some(mut wl) = store.worklist(&w.id) {
+                wl.log(&format!(
+                    "wsp: group {at} reopens {} — decision {} answers its block ({}), so it is sent back with no person asked",
+                    t.id,
+                    d.id,
+                    util::truncate(&util::fold(&question), 80)
+                ));
+                let _ = store.save_worklist(&wl);
+            }
+            Some((t, d))
+        });
+        let Some((t, d)) = took else { continue };
+        store.log_event("task-reopened", serde_json::json!({ "id": t.id, "project": t.project, "status": "doing", "by": "decision", "decision": d.id }));
+        store.git_commit(&format!("wsp: reopen {} — decision {} answers its block", t.id, d.id));
+        log_line(store, &format!(
+            "{} group {at}: {} was blocked and decision {} answers it — reopened, no person asked",
+            w.id, t.id, d.id
+        ));
+        crate::cmd_task::deliver_reason(
+            store,
+            &t.id,
+            &format!("{ANSWERED_BY} {}: {} (`wsp show {}` has it whole)", d.id, util::truncate(&util::fold(&d.text), 400), t.id),
+        );
+    }
+}
+
 /// The move for a member blocked with no answer in sight while the rest of its
 /// group has landed (`wsp-517`, wsp-513's last part): cut it, say why, tell the
 /// person. Waiting is for a block the person is about to answer.
@@ -1608,17 +1688,17 @@ fn escalate_the_blocked(store: &Store, w: &Worklist, at: usize, pos: &worklist::
         log_line(store, &format!("{} group {at}: {} blocked for {mins} min — flagged", w.id, t.id));
         let text = format!(
             "{}: blocked for {mins} min, and the {} run waits on it\n\n\
-             It asked: {question}\n\nAnswering it is what lets group {at} go on: tell the seat (`wsp tell {}`) or `wsp reopen {} \"what is owed\"`.\n\n\
+             It asked: {question}\n\nAnswering it is what lets group {at} go on: `wsp decide {} \"…\"` (the run reopens the row on a decision made since the block, and seats it), tell the seat (`wsp tell {}`) or `wsp reopen {} \"what is owed\"`.\n\n\
              If no answer is coming, `wsp worklist cut {} {} --why \"…\"` takes it out and the group goes on without it.",
-            t.id, w.id, t.id, t.id, w.id, t.id
+            t.id, w.id, t.id, t.id, t.id, w.id, t.id
         );
         let m = crate::message::Message::new(crate::message::Party::wsp(), crate::message::Kind::Note, &text)
             .about(crate::message::About::Task(t.id.clone()));
         let _ = crate::message::raise(store, &m);
         tell(store, w, &format!(
             "{} ({}) has been blocked for {mins} min and the {} run waits on it; the person is flagged. \
-             It is waiting on: {question} — an answer to that (`wsp tell {}`) or `wsp reopen {} \"what is owed\"` is what unblocks it.{}",
-            t.id, util::truncate(&t.title, 60), w.id, t.id, t.id, cut_line(&w.id, &t.id)
+             It is waiting on: {question} — `wsp decide {} \"…\"` (the run reopens the row), an answer to that (`wsp tell {}`) or `wsp reopen {} \"what is owed\"` is what unblocks it.{}",
+            t.id, util::truncate(&t.title, 60), w.id, t.id, t.id, t.id, cut_line(&w.id, &t.id)
         ));
     }
 }
@@ -3162,6 +3242,14 @@ pub(crate) fn sent_back_order(t: &Task) -> Option<String> {
         return None;
     }
     let reason = heads[back].trim_start_matches(SENT_BACK).trim();
+    if reason.starts_with(ANSWERED_BY) {
+        // Not a verdict: the member asked, and was answered (`wsp-635`).
+        return Some(ascii_line(&format!(
+            " {id} was blocked on a question and the run reopened it, so it is yours to carry on: {reason}. \
+             The decision is under ## Decisions (`wsp show {id}`). Act on it, commit, and `wsp review {id}` when done.",
+            id = t.id,
+        )));
+    }
     let verdict = crate::verification::passes(t)
         .pop()
         .filter(|p| p.state == crate::verification::State::Blocks && !p.text.trim().is_empty())
@@ -8626,6 +8714,66 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert_eq!(flags_on(&store, "m-1").len(), 1, "once per block");
         assert!(drained(&TOLD).is_empty());
+    }
+
+    /// `wsp-635` (react-pass-7-plan, 2026-11-14): a member blocked, its seat
+    /// ended, and the answer arrived as `wsp decide`, which leaves the row
+    /// blocked. The run reads the decision as the answer: the row is `doing`,
+    /// it is seated in the same step, and the row, the list and cycle.log say why.
+    #[test]
+    fn a_decision_made_since_a_block_reopens_the_member_and_seats_it() {
+        let (_env, store) = scratch("decided-reopens");
+        task(&store, "m-1", Status::Blocked);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let stamp = |ago: i64| util::iso_at(util::epoch_secs() - ago);
+        let mut t = store.find_task("m-1").unwrap();
+        t.body = format!("## Log\n- {} blocked: which one?\n", stamp(300));
+        store.save_task(&t).unwrap();
+        // A decision from before the block answers nothing.
+        let mut t = store.find_task("m-1").unwrap();
+        t.body.push_str(&format!("\n## Decisions\n- {} (d1) an older choice\n", stamp(900)));
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Blocked, "an older decision is not the answer");
+        assert!(spawned().is_empty());
+        // The governor's answer, after the block.
+        let mut t = store.find_task("m-1").unwrap();
+        crate::decisions::decide_task(&mut t, "take the second shape", &[]);
+        store.save_task(&t).unwrap();
+        let _ = std::fs::write(store.state_file("cycle.log"), "");
+        step(&store, &w, &Blind);
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Doing, "reopened with no person asked");
+        let log = t.section("Log").unwrap();
+        assert!(log.contains(&format!("{SENT_BACK} {ANSWERED_BY} d2 to its block (which one?): take the second shape")), "{log}");
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "seated in the same step");
+        assert!(said(&store).contains("m-1 was blocked and decision d2 answers it"), "{}", said(&store));
+        let list_log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(list_log.contains("reopens m-1") && list_log.contains("decision d2"), "{list_log}");
+        let order = sent_back_order(&t).unwrap();
+        assert!(order.contains("take the second shape") && !order.contains("verifier"), "{order}");
+        assert!(flags_on(&store, "m-1").is_empty(), "nobody was flagged");
+        // And once: the row is `doing` now, and a later block is a new question.
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty());
+    }
+
+    /// A block asked after the decision is a new question, not answered by it.
+    #[test]
+    fn a_decision_older_than_the_latest_block_answers_nothing() {
+        let (_env, store) = scratch("decided-before-block");
+        task(&store, "m-1", Status::Blocked);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let mut t = store.find_task("m-1").unwrap();
+        t.body = format!(
+            "## Decisions\n- {} (d1) first answer\n\n## Log\n- {} blocked: and now this?\n",
+            util::iso_at(util::epoch_secs() - 600),
+            util::iso_at(util::epoch_secs() - 60)
+        );
+        store.save_task(&t).unwrap();
+        assert!(answer_since_block(&store.find_task("m-1").unwrap()).is_none());
+        step(&store, &w, &Blind);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Blocked);
     }
 
     /// An edge to a task the list does not hold is carried and never held on:
