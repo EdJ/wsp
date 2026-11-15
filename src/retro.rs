@@ -117,6 +117,9 @@ pub fn eligible_with(store: &Store, w: &Worklist, rows: usize, wall: i64) -> Res
     if w.no_retro {
         return Err(format!("{} was run with --no-retro", w.id));
     }
+    if crate::retro_series::is_series_id(&w.id) || crate::retro_series::is_retros_list(w) {
+        return Err(format!("{} is a retro list; a retro list gets no retro", w.id));
+    }
     if project_off(store, w) {
         return Err(format!("the project of {} says retro = off", w.id));
     }
@@ -394,6 +397,18 @@ mod tests {
         w.no_retro = false;
         w.retro = Some(("2026-11-07T10:00:00Z".into(), "cpd-1".into()));
         assert!(eligible_with(&store, &w, 9, 9999).unwrap_err().contains("already ran"));
+    }
+
+    #[test]
+    fn a_retro_series_list_gets_no_retro_even_with_the_flag_off() {
+        let (_env, store) = crate::testkit::isolated_store("retro-guards-series");
+        for id in ["retro-7", "retro-ask-2"] {
+            let w = list(&store, id);
+            assert!(!w.no_retro);
+            assert!(eligible_with(&store, &w, 9, 9999).unwrap_err().contains("a retro list gets no retro"), "{id}");
+        }
+        let w = list(&store, "retro-notes");
+        assert_eq!(eligible_with(&store, &w, 9, 9999), Ok(()));
     }
 
     #[test]

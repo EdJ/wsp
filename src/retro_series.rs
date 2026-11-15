@@ -19,6 +19,12 @@ fn number_of(series: &str, id: &str) -> Option<u32> {
     id.strip_prefix(series)?.strip_prefix('-')?.parse().ok()
 }
 
+/// Whether an id is one of the retro series' (`retro-N`, `retro-ask-N`): such a
+/// list is the retro machinery's own, and a retro of it would measure retros.
+pub fn is_series_id(id: &str) -> bool {
+    number_of(DEFECTS, id).is_some() || number_of(QUESTIONS, id).is_some()
+}
+
 /// A list of the series that nothing has started. A defect list stays open
 /// once planned; an ask list that has been answered (planned) is Ed's decision
 /// made, and the next question opens the next number.
@@ -68,6 +74,7 @@ pub fn place_retro(store: &Store, row: &str, project: Option<&str>) -> Result<St
     let mut w = Worklist::new(&id, &format!("Timing retros {next}"));
     w.set_planned();
     w.alone = Some(false);
+    w.no_retro = true;
     w.project = project.map(str::to_string);
     w.set_groups(&[Group { members: vec![row.to_string()], cap: Some(2), agent: RETRO_AGENT.into(), stop: RETRO_STOP.into(), ..Group::default() }]);
     w.log(&format!("{row} → group 1 · the timing retro"));
@@ -85,6 +92,7 @@ pub fn open_list(store: &Store, series: &str) -> Result<Worklist, String> {
     let id = format!("{series}-{next}");
     let title = if series == DEFECTS { format!("Timing retro defects {next}") } else { format!("Timing retro questions {next}") };
     let mut w = Worklist::new(&id, &title);
+    w.no_retro = true;
     if series == DEFECTS {
         w.set_planned();
     }
@@ -292,6 +300,18 @@ mod tests {
         assert_eq!(t.status(), Status::Done);
         assert!(t.body.contains("declined by Ed"));
         assert!(sweep(&store).is_empty(), "idempotent");
+    }
+
+    #[test]
+    fn a_list_made_by_each_creator_gets_no_retro() {
+        let (_env, store) = crate::testkit::isolated_store("retro-series-no-retro");
+        place_retro(&store, "a-1", None).unwrap();
+        assert!(store.worklist("retro-1").unwrap().no_retro, "the retros list");
+        file_defect(&store, "d", "e", "f", "d", None).unwrap();
+        let defects = store.worklists().into_iter().filter(|w| w.title.starts_with("Timing retro defects")).collect::<Vec<_>>();
+        assert!(!defects.is_empty() && defects.iter().all(|w| w.no_retro), "the defects list");
+        file_question(&store, "q?", "ev", &ask(), None).unwrap();
+        assert!(store.worklist("retro-ask-1").unwrap().no_retro, "the questions list");
     }
 
     #[test]
