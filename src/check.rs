@@ -1398,7 +1398,12 @@ pub(crate) fn secs(d: Duration) -> u64 {
 
 pub(crate) fn why_failed(r: &Ran) -> String {
     match &r.done {
-        Done::Failed { timed_out: true, .. } => format!("timed out after {}s", r.step.limit.as_secs()),
+        Done::Failed { timed_out: true, .. } => format!(
+            "timed out after {}s (declared budget {}s, measured {}s)",
+            r.step.limit.as_secs(),
+            r.step.limit.as_secs(),
+            secs(r.took)
+        ),
         Done::Failed { exit: Some(n), .. } => format!("exit {n}"),
         Done::Failed { exit: None, .. } => "no exit status".into(),
         Done::Malformed(why) => format!("malformed: {why}"),
@@ -1550,7 +1555,13 @@ pub(crate) fn settle_started(store: &Store, id: &str, at: &str, ran: &[Ran], too
 
 /// [`settle_started`], with the load at the end given.
 fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration, start: Option<&Start>, load_end: Option<f64>) -> Settled {
-    let busy = start.and_then(|s| timed_out_under_load(ran, s, load_end));
+    // `wsp-644`: a step that took its whole budget at a commit it already timed
+    // out at under load is not read as load again: the budget is under the step's
+    // own run time, and a third and fourth run would only time out again.
+    let before = store.find_task(id).map(|t| v::runs(&t)).unwrap_or_default();
+    let read_now = before.iter().find(|r| r.at == at).and_then(|r| r.read.clone());
+    let timed_before = before.iter().any(|r| r.at != at && r.state == RunState::Waiting && r.read == read_now);
+    let busy = start.filter(|_| !timed_before).and_then(|s| timed_out_under_load(ran, s, load_end));
     let state = if passed(ran) {
         RunState::Passed
     } else if busy.is_some() {
@@ -1594,6 +1605,14 @@ fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration,
                 let now = start.map(|s| format!(", then at normal {}", s.line())).unwrap_or_default();
                 owes = format!("Timed out twice: under load ({}){now}.\n\n{owes}", earlier.join("; "));
             }
+            if let Some(r) = ran.iter().find(|r| matches!(r.done, Done::Failed { timed_out: true, .. })) {
+                owes = format!(
+                    "`{}` took its whole budget: declared {}s, measured {}s. Raise the step's limit past its run time (`wsp check <id> --set -`) or make it faster; it is not queued to rerun.\n\n{owes}",
+                    r.step.name,
+                    r.step.limit.as_secs(),
+                    secs(r.took)
+                );
+            }
             v::send_back(&mut t, util::now_iso(), "wsp check failed", read.as_deref(), &owes, Some(CHECK_HEAD));
             out = Settled::SentBack;
         }
@@ -1621,10 +1640,14 @@ pub(crate) const WAITING: &str = "timed out under load, ";
 /// at the start or at the end, stood over the line at which new work is held
 /// (`wsp-595`): a timeout on a machine nobody can work on is not a verdict on
 /// the change. Says which loads, for the line on the row.
+///
+/// `wsp-644`: only the load **at the start** excuses a timeout. The load at the
+/// end is the step's own (a test that builds and spawns raises it), so a step
+/// that began on a machine under the line and took its whole budget is a
+/// verdict on its budget, not on the machine.
 pub(crate) fn timed_out_under_load(ran: &[Ran], start: &Start, load_end: Option<f64>) -> Option<String> {
     ran.iter().find(|r| matches!(r.done, Done::Failed { timed_out: true, .. }))?;
-    let over = |l: Option<f64>| l.filter(|l| crate::throttle::load_over_hold(*l, start.cores));
-    over(start.load).or(over(load_end))?;
+    start.load.filter(|l| crate::throttle::load_over_hold(*l, start.cores))?;
     let f = |l: Option<f64>| l.map(|l| format!("{l:.1}")).unwrap_or_else(|| "?".into());
     Some(format!("load {} at the start, {} at the end, of {} cores", f(start.load), f(load_end), start.cores))
 }
@@ -2942,6 +2965,31 @@ mod tests {
         assert_eq!(settle_loaded(&store, "pj-001", &at, &timed_out(), Duration::from_secs(900), Some(&at_load(2.0)), Some(2.0)), Settled::SentBack);
         let log = store.find_task("pj-001").unwrap().section("Log").unwrap();
         assert!(log.contains("Timed out twice") && log.contains("load 30.0") && log.contains("load 2.0"), "{log}");
+    }
+
+    #[test]
+    fn a_step_declared_at_2s_that_runs_3s_is_sent_back_once_with_both_figures_whatever_the_end_load() {
+        let (_env, store, sha) = world("budget", "- build: cargo build", "exit 0\n");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        let mut ran = timed_out();
+        ran[0].step.limit = Duration::from_secs(2);
+        ran[0].took = Duration::from_secs(3);
+        // the load at the end is the step's own: only the start excuses
+        assert_eq!(settle_loaded(&store, "pj-001", &at, &ran, Duration::from_secs(3), Some(&at_load(2.0)), Some(30.0)), Settled::SentBack);
+        let log = store.find_task("pj-001").unwrap().section("Log").unwrap();
+        assert!(log.contains("declared 2s") && log.contains("measured 3s") && !log.contains("under load"), "{log}");
+        assert_eq!(v::runs(&store.find_task("pj-001").unwrap()).len(), 1, "no rerun is queued");
+    }
+
+    #[test]
+    fn a_second_timeout_is_sent_back_even_when_the_load_is_over_the_line_again() {
+        let (_env, store, sha) = world("twiceloaded", "- build: cargo build", "exit 0\n");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        settle_loaded(&store, "pj-001", &at, &timed_out(), Duration::from_secs(900), Some(&at_load(30.0)), Some(30.0));
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        assert_eq!(settle_loaded(&store, "pj-001", &at, &timed_out(), Duration::from_secs(900), Some(&at_load(30.0)), Some(30.0)), Settled::SentBack);
+        let log = store.find_task("pj-001").unwrap().section("Log").unwrap();
+        assert!(log.contains("declared 900s") && log.contains("measured 900s"), "{log}");
     }
 
     #[test]
