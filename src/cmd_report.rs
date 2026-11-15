@@ -427,7 +427,17 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     };
     let list_wall = wall.max(reach);
     let wall_buckets = wall_buckets_json(&walls, &group_json, list_wall);
-    let gov = governor_wall(store, &w.id, &group_starts);
+    let mut gov = governor_wall(store, &w.id, &group_starts);
+    // A manual group's start waits on a person, and the cycle log says nothing
+    // of it: the window's `held_by` is the cause the wall buckets name for the
+    // same span (`compounding-519`), not null.
+    for (gi, g) in gov.iter_mut().enumerate() {
+        let Some(g) = g.as_mut().filter(|g| g.held_by.is_none()) else { continue };
+        g.held_by = walls.get(gi + 1).and_then(|x| x.as_ref()).and_then(|nw| {
+            let cause = format!("group {}: {}", gi + 2, crate::wallbuckets::START_WAIT_MANUAL);
+            nw.waits.keys().find(|(_, c)| *c == cause).map(|(_, c)| c.clone())
+        });
+    }
     for (gi, gj) in group_json.iter_mut().enumerate() {
         gj["governor_wall"] = gov.get(gi).and_then(|x| x.as_ref()).map_or(Value::Null, GovWall::json);
     }
@@ -1774,5 +1784,96 @@ mod tests {
         assert!(b["named"].as_array().unwrap().iter().any(|x| x["group"] == 2 && x["seconds"] == 2220 && x["what"].as_str().unwrap().contains("manual group")), "{b}");
         let html = effort_html(&v);
         assert!(html.contains("first spawn to last pass") && html.contains("42m"), "the report prints the one wall");
+    }
+
+    #[test]
+    fn a_manual_groups_wait_for_a_hand_to_start_is_named_in_the_wall_buckets_and_the_governor_wall() {
+        use crate::timeline::RowFigures;
+        use crate::wallbuckets::{Class, Span};
+        let (_e, store, _w) = list("handwait", &["r-1"]);
+        store.save_task(&Task::new("r-2", "r-2")).unwrap();
+        assert_eq!(run(&store, &["add", "handwait", "r-2"], &[]), 0);
+        assert_eq!(run(&store, &["group", "handwait", "2"], &[("agent", "manual")]), 0);
+        let w = store.worklist("handwait").unwrap();
+        let t0: i64 = 1_000_000_000;
+        // Group 1 passes at 110; nobody starts the manual group 2 for 9 h 53 m
+        // (35 580 s), its member runs 180 s, and its pass is given at 36 000.
+        // The cycle log says nothing of the list in that time.
+        let start2 = 110 + 35_580;
+        let ev = |at: i64, n: u64| json!({ "ts": util::iso_at(t0 + at), "kind": "worklist-go", "data": { "id": "handwait", "passed": n, "started": false } }).to_string();
+        std::fs::write(store.state_file("events.jsonl"), format!("{}\n{}\n", ev(110, 1), ev(36_000, 2))).unwrap();
+        let sp = |a: i64, b: i64, class| Span { start: t0 + a, end: t0 + b, class };
+        let fig = |id: &str| {
+            if id == "r-1" {
+                RowFigures {
+                    start: t0,
+                    end: t0 + 110,
+                    wall: 110,
+                    spans: vec![sp(0, 10, Class::Start), sp(10, 100, Class::Seat), sp(100, 107, Class::Barrier), sp(107, 110, Class::Check)],
+                    active: vec![(t0 + 10, t0 + 100)],
+                    measured: true,
+                    ..Default::default()
+                }
+            } else {
+                RowFigures {
+                    start: t0 + start2,
+                    end: t0 + start2 + 180,
+                    wall: 180,
+                    spans: vec![sp(start2, start2 + 10, Class::Start), sp(start2 + 10, start2 + 180, Class::Seat)],
+                    active: vec![(t0 + start2 + 10, t0 + start2 + 180)],
+                    measured: true,
+                    ..Default::default()
+                }
+            }
+        };
+        let v = effort_with(&store, &w, None, &fig);
+        let b = &v["totals"]["wall_buckets"];
+        assert_eq!(b["attributed_seconds"], b["wall_seconds"], "{b}");
+        assert_eq!(b["unattributed_seconds"], 0, "{b}");
+        let g2 = &v["groups"][1]["wall_buckets"];
+        assert_eq!(g2["between_groups_seconds"], 0, "a manual group's wait for a start is not between_groups: {g2}");
+        let cause = format!("group 2: {}", crate::wallbuckets::START_WAIT_MANUAL);
+        assert!(cause.contains("waiting for a hand to start"), "{cause}");
+        let by = g2["waiting_by"].as_array().unwrap();
+        let wait = by.iter().find(|x| x["cause"] == cause.as_str()).unwrap_or_else(|| panic!("{g2}"));
+        assert_eq!(wait["seconds"], 35_580 - 0, "{g2}");
+        let in_totals = b["waiting_by_cause"].as_array().unwrap().iter().find(|x| x["cause"] == cause.as_str()).unwrap_or_else(|| panic!("{b}"));
+        assert_eq!(in_totals["seconds"], 35_580);
+        assert!(b["named"].as_array().unwrap().iter().any(|x| x["group"] == 2 && x["seconds"] == 35_580 && x["what"].as_str().unwrap().contains("waiting for a hand to start")), "the stalls list names it: {b}");
+        let gw = &v["groups"][0]["governor_wall"];
+        assert_eq!(gw["seconds_to_first_start"], 35_580, "{gw}");
+        assert_eq!(gw["held_by"], cause.as_str(), "the cycle log is silent, the cause is the wall buckets': {gw}");
+        assert!(v["groups"][1]["governor_wall"].is_null(), "the last group has no next start");
+    }
+
+    /// An agent group's start is the run's: a cycle-log line still names it, and
+    /// with none the window says nothing, and its seconds stay `between_groups`.
+    #[test]
+    fn a_run_started_groups_wait_keeps_between_groups_and_no_held_by() {
+        use crate::timeline::RowFigures;
+        use crate::wallbuckets::{Class, Span};
+        let (_e, store, _w) = list("runstart", &["r-1"]);
+        store.save_task(&Task::new("r-2", "r-2")).unwrap();
+        assert_eq!(run(&store, &["add", "runstart", "r-2"], &[]), 0);
+        let w = store.worklist("runstart").unwrap();
+        assert_eq!(w.groups().len(), 2);
+        let t0: i64 = 1_000_000_000;
+        let ev = |at: i64, n: u64| json!({ "ts": util::iso_at(t0 + at), "kind": "worklist-go", "data": { "id": "runstart", "passed": n, "started": false } }).to_string();
+        std::fs::write(store.state_file("events.jsonl"), format!("{}\n{}\n", ev(110, 1), ev(400, 2))).unwrap();
+        let sp = |a: i64, b: i64, class| Span { start: t0 + a, end: t0 + b, class };
+        let fig = |id: &str| {
+            if id == "r-1" {
+                RowFigures { start: t0, end: t0 + 110, wall: 110, spans: vec![sp(0, 10, Class::Start), sp(10, 100, Class::Seat), sp(100, 107, Class::Barrier), sp(107, 110, Class::Check)], active: vec![(t0 + 10, t0 + 100)], measured: true, ..Default::default() }
+            } else {
+                RowFigures { start: t0 + 150, end: t0 + 390, wall: 240, spans: vec![sp(150, 160, Class::Start), sp(160, 390, Class::Seat)], active: vec![(t0 + 160, t0 + 390)], measured: true, ..Default::default() }
+            }
+        };
+        let v = effort_with(&store, &w, None, &fig);
+        let g2 = &v["groups"][1]["wall_buckets"];
+        assert_eq!(g2["between_groups_seconds"], 40, "{g2}");
+        assert!(!g2["waiting_by"].to_string().contains("waiting for a hand to start"), "{g2}");
+        assert!(v["groups"][0]["governor_wall"]["held_by"].is_null(), "{}", v["groups"][0]["governor_wall"]);
+        let b = &v["totals"]["wall_buckets"];
+        assert_eq!(b["attributed_seconds"], b["wall_seconds"], "{b}");
     }
 }
