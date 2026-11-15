@@ -62,15 +62,29 @@ fn tar_excludes() -> Vec<String> {
 
 /// The far manifest, as a script. Run by `sh -c`, with the tree as `$1`.
 ///
-/// "A ten-line script beside the shim", not a wsp binary: the far side has `find`
-/// and a sha tool, and nothing of ours.
+/// "A short script beside the shim", not a wsp binary: the far side has `find`
+/// and a sha tool, and nothing of ours. Files are hashed in batches (`xargs`
+/// hands the hasher many paths per process); a process per file cost 4 min 25 s
+/// for 8,788 files. Only links, and files with a backslash in the name (which GNU
+/// `sha256sum` escapes in its output), are done one at a time.
 const FAR_MANIFEST: &str = r#"cd "$1" || exit 3
 if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; else H="shasum -a 256"; fi
-find . -name .git -prune -o \( -type d \( -name target -o -name node_modules -o -name .venv -o -name .worktrees \) \) -prune -o \( -type f -o -type l \) ! -name '*.log' -print | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r p; do
+T=$(mktemp -d "${TMPDIR:-/tmp}/wsp-manifest.XXXXXX") || exit 4
+trap 'rm -rf "$T"' EXIT
+walk() { find . -name .git -prune -o \( -type d \( -name target -o -name node_modules -o -name .venv -o -name .worktrees \) \) -prune -o "$@"; }
+walk -type f ! -name '*.log' \( -perm -100 -o -perm -010 -o -perm -001 \) -print > "$T/x"
+walk -type f ! -name '*.log' ! -path '*\\*' -print0 | xargs -0 $H > "$T/h"
+awk -v X="$T/x" 'BEGIN { while ((getline l < X) > 0) x[l] = 1 }
+  substr($0, 67, 2) == "./" && length($0) > 68 { p = substr($0, 67); printf "%s %s %s\n", (p in x) ? "755" : "644", substr($0, 1, 64), substr(p, 3) }' "$T/h" > "$T/out"
+{
+  walk -type l ! -name '*.log' -print
+  walk -type f ! -name '*.log' -path '*\\*' -print
+} | sed 's|^\./||' | while IFS= read -r p; do
   if [ -L "$p" ]; then m=120000; h=$(readlink "$p" | $H | cut -d' ' -f1)
   else if [ -x "$p" ]; then m=755; else m=644; fi; h=$($H < "$p" | cut -d' ' -f1); fi
   printf '%s %s %s\n' "$m" "$h" "$p"
-done
+done >> "$T/out"
+LC_ALL=C sort -t' ' -k3 "$T/out"
 "#;
 
 // ---- sha256 -------------------------------------------------------------
@@ -301,7 +315,15 @@ impl Remote {
         v
     }
 
-    fn run_in(&self, cmd: &str, stdin: Option<&[u8]>) -> Result<String, String> {
+    /// Whether the ControlMaster socket takes a connection now. `None` when this
+    /// remote has no socket to speak of.
+    fn control_up(&self) -> Option<bool> {
+        let c = self.control.as_ref()?;
+        Some(std::os::unix::net::UnixStream::connect(c).is_ok())
+    }
+
+    /// One try of `cmd` over ssh.
+    fn try_in(&self, cmd: &str, stdin: Option<&[u8]>) -> Result<std::process::Output, String> {
         let mut words = self.ssh_words();
         let prog = words.remove(0);
         let mut c = Command::new(prog);
@@ -312,17 +334,33 @@ impl Remote {
         if let (Some(data), Some(mut si)) = (stdin, child.stdin.take()) {
             let _ = si.write_all(data);
         }
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            Err(format!(
-                "`{}` on {} said: {}",
-                cmd.chars().take(80).collect::<String>(),
-                self.host,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
+        child.wait_with_output().map_err(|e| e.to_string())
+    }
+
+    fn run_in(&self, cmd: &str, stdin: Option<&[u8]>) -> Result<String, String> {
+        let started = std::time::Instant::now();
+        let mut out = self.try_in(cmd, stdin)?;
+        let mut retried = false;
+        // ssh's own failure (255) with a socket that is gone, or with nothing said,
+        // is a dropped mux more often than a refusal: once more, on the same words.
+        if out.status.code() == Some(255)
+            && self.control.is_some()
+            && (self.control_up() == Some(false) || out.stderr.iter().all(u8::is_ascii_whitespace))
+        {
+            retried = true;
+            out = self.try_in(cmd, stdin)?;
         }
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        Err(format!(
+            "`{}` on {} said: {} ({}{})",
+            cmd.chars().take(80).collect::<String>(),
+            self.host,
+            String::from_utf8_lossy(&out.stderr).trim(),
+            exit_words(&out.status, started.elapsed(), self.control_up()),
+            if retried { ", after one retry" } else { "" }
+        ))
     }
 
     fn run(&self, cmd: &str) -> Result<String, String> {
@@ -346,6 +384,23 @@ impl Remote {
         let text = self.run(&format!("sh -c {} sh {}", shq(FAR_MANIFEST), shq(tree)))?;
         Ok(Manifest::parse(&text))
     }
+}
+
+/// How a far command ended, for a message whose stderr may be empty: the exit
+/// status or the signal, the time it took, and whether the control socket was up.
+fn exit_words(status: &std::process::ExitStatus, took: std::time::Duration, control: Option<bool>) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let how = match (status.code(), status.signal()) {
+        (Some(c), _) => format!("exit status {c}"),
+        (None, Some(sig)) => format!("killed by signal {sig}"),
+        (None, None) => "no exit status".to_string(),
+    };
+    let sock = match control {
+        Some(true) => "control socket up",
+        Some(false) => "control socket down",
+        None => "no control socket",
+    };
+    format!("{how} after {:.1}s, {sock}", took.as_secs_f64())
 }
 
 /// A shell pipeline, run here.
@@ -1186,6 +1241,54 @@ mod tests {
         let far = r.copy.remote.manifest(&r.seat.display().to_string()).unwrap();
         assert_eq!(here, far, "one rule, two implementations");
         assert_eq!(here.tree_hash(), far.tree_hash());
+    }
+
+    /// The batched script holds the seat's manifest on the awkward names too:
+    /// spaces, a backslash, a leading dash, a link, an empty file, and an empty tree.
+    #[test]
+    fn the_batched_far_manifest_is_byte_for_byte_the_seats_on_awkward_names() {
+        let r = rig("manifest-odd", false);
+        run(&r.seat, "echo s > 'a b.txt' && echo b > 'back\\slash' && echo d > ./-dash && : > empty && mkdir 'sp ace' && echo q > 'sp ace/x y' && chmod +x 'a b.txt' && ln -s 'a b.txt' 'link two' && ln -s nowhere dangling");
+        let here = Manifest::of_dir(&r.seat).unwrap();
+        for p in ["a b.txt", "back\\slash", "-dash", "empty", "sp ace/x y", "link two", "dangling"] {
+            assert!(here.0.contains_key(p), "{p} is in the seat's manifest");
+        }
+        let text = r.copy.remote.run(&format!("sh -c {} sh {}", shq(FAR_MANIFEST), shq(&r.seat.display().to_string()))).unwrap();
+        assert_eq!(text, here.render(), "the same bytes, not only the same entries");
+        let bare = Dir::new("manifest-empty");
+        assert_eq!(r.copy.remote.manifest(&bare.0.display().to_string()).unwrap(), Manifest::default());
+    }
+
+    /// A far command that fails with nothing on stderr still says how and when.
+    #[test]
+    fn a_far_failure_with_no_stderr_says_its_exit_status_and_how_long() {
+        let r = rig("quiet-fail", false);
+        let e = r.copy.remote.run("exit 7").unwrap_err();
+        assert!(e.contains("said:") && e.contains("exit status 7") && e.contains("after ") && e.contains("no control socket"), "{e}");
+    }
+
+    /// ssh's 255 with the control socket gone is tried once more, and the second
+    /// answer stands; a second 255 is reported with the retry named.
+    #[test]
+    fn a_255_with_the_control_socket_down_is_retried_once() {
+        let r = rig("retry-255", false);
+        let dir = r.far_root.parent().unwrap().to_path_buf();
+        let count = dir.join("tries");
+        let flaky = |fails: u32| {
+            let ssh = dir.join(format!("flaky-ssh-{fails}"));
+            fs::write(&ssh, format!("#!/bin/sh\necho x >> {c}\nn=$(wc -l < {c})\nif [ \"$n\" -le {fails} ]; then exit 255; fi\necho ok\n", c = shq(&count.display().to_string()))).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut remote = r.copy.remote.clone();
+            remote.ssh = ssh.display().to_string();
+            remote.control = Some(dir.join("cm-gone"));
+            remote
+        };
+        assert_eq!(flaky(1).run("true").unwrap().trim(), "ok", "the retry answered");
+        fs::remove_file(&count).unwrap();
+        let e = flaky(5).run("true").unwrap_err();
+        assert!(e.contains("exit status 255") && e.contains("control socket down") && e.contains("after one retry"), "{e}");
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2, "once more and no more");
     }
 
     #[test]
