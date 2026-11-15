@@ -1732,6 +1732,20 @@ pub fn seat_machine(store: &Store, seat: &str) -> String {
     str_of(&read_json(&store.state.join(SEATS).join(seat).join(SEAT_FILE)), "machine")
 }
 
+/// Whether a compound seat still has a supervisor behind it (`wsp-649`): its
+/// record is there and the pid it names is alive. A seat on another machine is
+/// taken to have one — its link is the question, and that is not this one.
+pub fn supervised(store: &Store, seat: &str) -> bool {
+    let rec = read_json(&store.state.join(SEATS).join(seat).join(SEAT_FILE));
+    if !str_of(&rec, "machine").is_empty() {
+        return true;
+    }
+    match rec.get("pid").and_then(|p| p.as_u64()) {
+        Some(pid) if pid > 0 => alive(&[pid as u32]).contains(&(pid as u32)),
+        _ => false,
+    }
+}
+
 /// Every seat of this store that names `machine`, started or not: what owns a
 /// session or a lease file on that machine.
 pub fn seats_on(store: &Store, machine: &str) -> Vec<String> {

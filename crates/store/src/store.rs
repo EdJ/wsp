@@ -2360,6 +2360,28 @@ impl Store {
         });
     }
 
+    /// Close the record of every agent that sat in `seat`, with the time
+    /// (`wsp-649`). The seat is gone — despawned, or its row let go of — and a
+    /// record with no end on it is read as an agent still there. Returns the
+    /// ids closed; an agent already ended keeps the end it has. The row is kept
+    /// rather than removed: it is what a claim's `agent_id` and a mandate are
+    /// keyed on, and [`Store::agent_in_seat`] skips it once it has an end.
+    pub fn end_agents_in(&self, seat: &str) -> Vec<String> {
+        let mut ended = Vec::new();
+        self.update_json("agents.json", |a| {
+            for (id, v) in a.iter_mut() {
+                if v.get("seat").and_then(|s| s.as_str()) != Some(seat) || v.get("ended").is_some() {
+                    continue;
+                }
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("ended".into(), json!(util::now_iso()));
+                    ended.push(id.clone());
+                }
+            }
+        });
+        ended
+    }
+
     /// The agent sitting in a seat, by the seat a backend named — the join
     /// that turns a census row into an identity (`compound` d9's "attribute,
     /// never the identity", read back the one direction that needs it).
@@ -2378,7 +2400,7 @@ impl Store {
     pub fn agent_in_seat_from_map(agents: &BTreeMap<String, Value>, seat: &str) -> Option<String> {
         agents
             .iter()
-            .filter(|(_, v)| v.get("seat").and_then(|s| s.as_str()) == Some(seat))
+            .filter(|(_, v)| v.get("seat").and_then(|s| s.as_str()) == Some(seat) && v.get("ended").is_none())
             .max_by(|a, b| {
                 let at = |v: &Value| v.get("started").and_then(|s| s.as_str()).unwrap_or("").to_string();
                 at(&a.1).cmp(&at(&b.1))

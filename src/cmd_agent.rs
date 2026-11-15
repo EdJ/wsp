@@ -7049,6 +7049,8 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // to report *to*. The pass is the fix for "nothing notices unattended" and
     // an empty `hooks/` would make it a fix that notices and tells no one.
     crate::attention::health(store, &mut notes);
+    // And a level the pass is holding for a seat that has gone (`wsp-649`).
+    warnings.extend(crate::attention::orphans(store).into_iter().map(|(_, line)| line));
     // And whether Claude Code itself is still telling wsp anything: a
     // partly-installed hook snippet looks configured — SessionStart fires, a
     // brief arrives — while every other turn boundary is silently invisible

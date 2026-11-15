@@ -4501,7 +4501,9 @@ fn despawn_lost(store: &Store, args: &Args) -> i32 {
     };
     let (_, ended) = cmd_agent::release_pane(store, seat.as_str());
     crate::lapse::seat_ended(store, seat.as_str());
+    store.end_agents_in(seat.as_str());
     let task = ended.or(task);
+    crate::attention::seat_gone(store, task.as_deref(), Some(seat.as_str()));
     for subject in task.iter() {
         let _ = std::fs::remove_file(brief_path(store, subject));
     }
@@ -4802,6 +4804,28 @@ fn closed_row_seat(store: &Store, task: &str) -> Option<String> {
     (!seat.is_empty() && !store.bindings().contains_key(&seat)).then_some(seat)
 }
 
+/// The seats a row is held by: those bound to it, and its claim's agent's.
+pub(crate) fn seats_of_row(store: &Store, row: &str) -> Vec<String> {
+    let mut seats = store.panes_for_task(row);
+    let agents = store.agents_held();
+    let held = store.claims().get(row).and_then(|c| c.get("agent_id")?.as_str().map(str::to_string));
+    seats.extend(held.and_then(|a| agents.get(&a)?.get("seat")?.as_str().map(str::to_string)));
+    seats.sort();
+    seats.dedup();
+    seats
+}
+
+/// A row has been let go of without a despawn — parked, or put back by a list's
+/// cancel (`wsp-649`): what the pass says about it stops, and the agent record
+/// of each of `seats` that is no longer standing gets its end. A seat still
+/// running keeps its record, which is the identity its mandate hangs on.
+pub(crate) fn row_let_go(store: &Store, row: &str, seats: &[String]) {
+    for seat in seats.iter().filter(|s| !seat_is_live(s)) {
+        store.end_agents_in(seat);
+    }
+    crate::attention::seat_gone(store, Some(row), None);
+}
+
 /// Whether `seat` is still standing: a far seat is taken to be (its stop is
 /// the question, and a seat already gone says so), a local one is looked for
 /// in the backends' census.
@@ -4962,6 +4986,11 @@ fn end_work(
     // is closed here as well (`wsp-308`). For a bound seat this is a second
     // look that finds nothing.
     crate::lapse::seat_ended(store, seat.as_str());
+    // The seat's agent record gets its end, and the pass stops saying anything
+    // about the seat or its row (`wsp-649`) — what a despawn leaves behind is
+    // exactly what a governor was being woken about.
+    store.end_agents_in(seat.as_str());
+    crate::attention::seat_gone(store, ended.as_deref().or(task.as_deref()), Some(seat.as_str()));
     // What the binding said, unless the release found something else there —
     // which it will not, and if it ever does, the release is the later reading.
     let task = ended.or(task);
@@ -8566,6 +8595,55 @@ mod tests {
             "the tree is tidied last, and named by the task the release ended"
         );
 
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-649`: a despawn closes the seat's agent record with an end, and the
+    /// pass's levels about the seat and its row go from the ledger and the spool.
+    #[test]
+    fn despawn_ends_the_agent_record_and_drops_what_the_pass_held_for_the_seat() {
+        let _env = no_backend();
+        let store = seat("stop-649");
+        working(&store, "t-260816-095", "w1:p1");
+        store.set_agent("a-1", json!({ "seat": "w1:p1", "started": "2026-11-15T00:00:00Z" }));
+        let stall = crate::cmd_watch::Signal::new(
+            crate::cmd_watch::Kind::NeedsAPerson,
+            "t-260816-095",
+            "w1:p1 · no turn running",
+        );
+        let mut rec = json!({ "ledger": {}, "build": crate::build_stamp(), "pid": 0 });
+        let mut v = stall.json();
+        v["since"] = json!(0);
+        v["told"] = json!(true);
+        rec["ledger"][stall.key()] = v;
+        store.set_watch("daemon", rec);
+
+        let place = Ends::ok();
+        let tidied = Tidied::default();
+        assert_eq!(end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Caller::default(), &tidied.f()), 0);
+
+        assert!(store.agents_held()["a-1"]["ended"].is_string(), "the record kept an agent that is gone");
+        assert!(store.watches()["daemon"]["ledger"].as_object().unwrap().is_empty(), "the stall outlived the seat");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-649`: a row parked or put back by a cancel ends the records of the
+    /// seats that are gone, and keeps one whose seat still stands.
+    #[test]
+    fn a_row_let_go_of_ends_the_agents_whose_seats_are_gone_only() {
+        let _env = no_backend();
+        let store = seat("let-go-649");
+        working(&store, "t-260816-095", "w1:p1");
+        store.set_agent("a-gone", json!({ "seat": "cpd-9@eds", "started": "2026-11-15T00:00:00Z" }));
+        store.set_agent("a-far", json!({ "seat": "w1:p1", "started": "2026-11-15T00:00:00Z" }));
+        store.set_claim("t-260816-095", json!({ "agent_id": "a-gone" }));
+        let seats = seats_of_row(&store, "t-260816-095");
+        assert_eq!(seats, ["cpd-9@eds", "w1:p1"]);
+        // `cpd-9@eds` is a far seat, which is taken to stand; `w1:p1` is
+        // looked for in a census that has nothing in it.
+        row_let_go(&store, "t-260816-095", &seats);
+        assert!(store.agents_held()["a-far"]["ended"].is_string());
+        assert!(store.agents_held()["a-gone"].get("ended").is_none(), "a far seat is not known gone");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 

@@ -289,8 +289,14 @@ pub(crate) fn tick(store: &Store, pass: &mut Pass, source: &mut dyn Source, at: 
         return Vec::new();
     }
     pass.ticks += 1;
-    let now = source.sample();
+    let mut now = source.sample();
     let (mut ledger, known) = load(store).unwrap_or_default();
+    // **A seat that is gone says nothing** (`wsp-649`). Read neither as a level
+    // nor held across a tick that could not see: see [`orphaned`].
+    let claims = store.claims();
+    let gone = |s: &Signal| orphaned(store, &claims, s);
+    now.retain(|s| !gone(s));
+    ledger.drop_where(&gone);
     // Priming on the first pass ever, for `Ledger::prime`'s reason: a
     // subscription is to changes from now, and a daemon started on a machine
     // with six standing stalls must not announce six things that have been true
@@ -436,6 +442,125 @@ pub(crate) fn standing(store: &Store) -> BTreeMap<String, &'static str> {
 /// A source over the whole machine, for the daemon.
 pub(crate) fn machine_source(store: &Store) -> Poll<'_> {
     Poll::new(store, Scope::machine(), Kind::every().into_iter().collect(), None)
+}
+
+/// The kinds that say something about a *seat*, whose detail opens with the
+/// seat's id (`cpd-5529 · no turn running …`): what its going leaves standing.
+fn about_a_seat(kind: Kind) -> bool {
+    matches!(kind, Kind::NeedsAPerson | Kind::AgentGone)
+}
+
+/// The seat a seat-shaped level names, off the front of its detail.
+fn seat_named(s: &Signal) -> Option<&str> {
+    s.detail.split_once(" · ").map(|(seat, _)| seat).filter(|seat| !seat.is_empty() && !seat.contains(' '))
+}
+
+/// Whether a needs-a-person level is about a seat that has gone (`wsp-649`):
+/// its row holds no claim, and the seat has no supervisor behind it.
+///
+/// **Why this is the pass's to say and not only despawn's.** A level of a kind
+/// that could not be read this tick is held rather than cleared
+/// ([`Kind::needs_herdr`]), so one raised about a seat that was ended while
+/// herdr was unreadable stood in the ledger for ever, and woke the governor on
+/// every spool flush. A seat id with a `:` is herdr's, and what the pass cannot
+/// see it does not judge; only a compound seat, whose supervisor is a record and
+/// a pid on this machine, is called gone from here.
+fn orphaned(store: &Store, claims: &BTreeMap<String, Value>, s: &Signal) -> bool {
+    if s.kind != Kind::NeedsAPerson || claims.contains_key(&s.subject) {
+        return false;
+    }
+    match seat_named(s) {
+        Some(seat) if !seat.contains(':') => !crate::place_compound::supervised(store, seat),
+        _ => false,
+    }
+}
+
+/// Drop every level `matches` from the ledger and from every seat's wake spool,
+/// and say which. Nothing is cleared or announced: the thing the level was about
+/// has gone, and an edge for it would be one more line for the same absence.
+fn drop_levels(store: &Store, matches: &dyn Fn(&Signal) -> bool) -> Vec<String> {
+    let mut dropped = Vec::new();
+    let register = store.watches();
+    for key in register.keys() {
+        let is_ledger = key == KEY;
+        if !is_ledger && !key.starts_with("wake:") {
+            continue;
+        }
+        let hit = |rec: &Value| -> bool {
+            let of = |v: &Value| Signal::of_json(v).is_some_and(|s| matches(&s));
+            match is_ledger {
+                true => rec.get("ledger").and_then(Value::as_object).is_some_and(|l| l.values().any(of)),
+                false => rec.get("spool").and_then(Value::as_array).is_some_and(|a| a.iter().filter_map(|e| e.get("signal")).any(of)),
+            }
+        };
+        // Looked at before the record is taken for change: `update_watch` writes
+        // a record it was handed absent, and a register with nothing of ours in
+        // it should be left exactly as it was.
+        if !register.get(key).is_some_and(hit) {
+            continue;
+        }
+        store.update_watch(key, |rec| {
+            let of = |v: &Value| Signal::of_json(v).is_some_and(|s| matches(&s));
+            let Some(o) = rec.as_object_mut() else { return };
+            if is_ledger {
+                if let Some(l) = o.get_mut("ledger").and_then(Value::as_object_mut) {
+                    let keys: Vec<String> = l.iter().filter(|(_, v)| of(v)).map(|(k, _)| k.clone()).collect();
+                    for k in keys {
+                        l.remove(&k);
+                        dropped.push(format!("{KEY}/ledger/{k}"));
+                    }
+                    let standing = l.len();
+                    o.insert("standing".into(), json!(standing));
+                }
+            } else if let Some(a) = o.get_mut("spool").and_then(Value::as_array_mut) {
+                let before = a.len();
+                a.retain(|e| !e.get("signal").is_some_and(of));
+                if a.len() != before {
+                    dropped.push(format!("{key}/spool ({} held)", before - a.len()));
+                }
+            }
+        });
+    }
+    dropped
+}
+
+/// A seat, or a row's hold on one, has ended (`wsp-649`): drop what the pass was
+/// saying about it. Called by `despawn`, a list's cancel and a row's park.
+///
+/// With a `seat`, the levels about it: its own subject, and its row's where the
+/// detail names it — a second seat on the same row keeps its own. Without one,
+/// every seat-shaped level on `row`.
+pub(crate) fn seat_gone(store: &Store, row: Option<&str>, seat: Option<&str>) -> Vec<String> {
+    drop_levels(store, &|s| {
+        about_a_seat(s.kind)
+            && (seat.is_some_and(|x| s.subject == x)
+                || row.is_some_and(|r| s.subject == r && seat.is_none_or(|x| seat_named(s) == Some(x))))
+    })
+}
+
+/// `wsp watch --forget daemon/ledger/<key>`: let go of one standing level by the
+/// key `wsp doctor` printed. `None` when the key is not a ledger key at all.
+pub(crate) fn forget_level(store: &Store, key: &str) -> Option<Vec<String>> {
+    let want = key.strip_prefix(KEY)?.strip_prefix("/ledger/")?.to_string();
+    Some(drop_levels(store, &|s| s.key() == want))
+}
+
+/// Levels standing for a seat that has gone, with the command that clears each,
+/// for `wsp doctor`.
+pub(crate) fn orphans(store: &Store) -> Vec<(String, String)> {
+    let Some((ledger, _)) = load(store) else { return Vec::new() };
+    let claims = store.claims();
+    ledger
+        .told()
+        .filter(|s| orphaned(store, &claims, s))
+        .map(|s| {
+            let key = format!("{KEY}/ledger/{}", s.key());
+            (key.clone(), format!(
+                "the ledger still holds `{}` for {} — {}, which has no supervisor and whose row holds no claim, so it keeps waking whoever it is addressed to. `wsp watch --forget {key}` clears it",
+                s.key(), s.subject, seat_named(s).unwrap_or("its seat")
+            ))
+        })
+        .collect()
 }
 
 /// Whether the pass has anywhere to deliver to, for `wsp doctor`.
@@ -1068,5 +1193,103 @@ mod tests {
         tick(&store, &mut pass, &mut Fake(&store, vec![]), 1_000);
         assert!(!pass.due(1_030));
         assert!(pass.due(1_000 + EVERY));
+    }
+
+    /// `wsp-649`: a compound seat with no supervisor and a row with no claim
+    /// is not saying anything, however long herdr goes unread.
+    #[test]
+    fn a_stall_on_a_gone_compound_seat_is_not_raised_and_one_with_a_claim_is() {
+        let (_env, store) = store("orphan");
+        task(&store, "a-1", None);
+        let gone = || Signal::new(Kind::NeedsAPerson, "a-1", "cpd-9 · no turn running");
+        let mut pass = Pass::new();
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![gone()]), 60);
+        assert!(standing(&store).is_empty(), "nobody is there to be waiting");
+        assert!(orphans(&store).is_empty());
+
+        // The row's claim keeps it: somebody still owns the work, and the
+        // pass is not the one to say its seat is dead.
+        store.set_claim("a-1", json!({ "claimed_at": util::now_iso() }));
+        tick(&store, &mut pass, &mut Fake(&store, vec![gone()]), 120);
+        assert_eq!(standing(&store).get("a-1").copied(), Some("needs-a-person"));
+    }
+
+    fn put_level(store: &Store, s: &Signal) {
+        let mut rec = store.watches().get(KEY).cloned().unwrap_or(json!({ "ledger": {}, "build": crate::build_stamp(), "pid": 0 }));
+        let mut v = s.json();
+        v["since"] = json!(0);
+        v["told"] = json!(true);
+        rec["ledger"][s.key()] = v;
+        store.set_watch(KEY, rec);
+        let mut wake = store.watches().get("wake:compounding").cloned().unwrap_or(json!({ "wake": true, "spool": [] }));
+        let n = wake["spool"].as_array().unwrap().len();
+        wake["spool"].as_array_mut().unwrap().push(
+            json!({ "seq": n + 1, "at": 0, "class": "news", "text": "", "edge": "up", "held": 0, "to": "everyone", "signal": s.json() }),
+        );
+        store.set_watch("wake:compounding", wake);
+    }
+
+    /// `wsp-649`: what a despawn drops is the seat's levels, in the ledger and
+    /// in the spool, and nothing else on the row.
+    #[test]
+    fn a_despawned_seat_takes_its_levels_and_the_wake_spooled_for_them() {
+        let (_env, store) = store("gone");
+        task(&store, "a-1", None);
+        put_level(&store, &Signal::new(Kind::NeedsAPerson, "a-1", "cpd-9 · no turn running"));
+        put_level(&store, &Signal::new(Kind::Review, "a-1", "ready"));
+        put_level(&store, &Signal::new(Kind::NeedsAPerson, "a-2", "cpd-8 · no turn running"));
+
+        let dropped = seat_gone(&store, Some("a-1"), Some("cpd-9"));
+        assert!(dropped.iter().any(|d| d == "daemon/ledger/needs-a-person:a-1"), "{dropped:?}");
+        let rec = store.watches()[KEY].clone();
+        let keys: Vec<&String> = rec["ledger"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["needs-a-person:a-2", "review:a-1"], "the row's review and another seat's stall stay");
+        assert_eq!(rec["standing"], 2);
+        let spooled = store.watches()["wake:compounding"]["spool"].as_array().unwrap().len();
+        assert_eq!(spooled, 2, "the review and the other seat's stall are still owed");
+    }
+
+    /// `wsp-649`: with no seat named — a park, a cancel — every seat-shaped
+    /// level on the row goes, and the doctor's key clears one by itself.
+    #[test]
+    fn a_row_let_go_of_loses_its_seat_levels_and_a_key_forgets_one() {
+        let (_env, store) = store("row");
+        put_level(&store, &Signal::new(Kind::NeedsAPerson, "a-1", "cpd-9 · no turn running"));
+        put_level(&store, &Signal::new(Kind::AgentGone, "a-1", "cpd-9 · the pane is gone"));
+        put_level(&store, &Signal::new(Kind::Blocked, "a-1", "asks"));
+        let gone = seat_gone(&store, Some("a-1"), None);
+        assert_eq!(gone.iter().filter(|g| g.starts_with("daemon/ledger/")).count(), 2, "{gone:?}");
+        assert!(store.watches()[KEY]["ledger"].get("blocked:a-1").is_some());
+
+        put_level(&store, &Signal::new(Kind::NeedsAPerson, "a-3", "cpd-3 · no turn running"));
+        assert!(forget_level(&store, "w1:p1").is_none(), "not a ledger key");
+        let one = forget_level(&store, "daemon/ledger/needs-a-person:a-3").unwrap();
+        assert_eq!(one[0], "daemon/ledger/needs-a-person:a-3");
+        assert!(store.watches()[KEY]["ledger"].get("needs-a-person:a-3").is_none());
+    }
+
+    /// `wsp-649`: the doctor names the entry and the command that clears it.
+    #[test]
+    fn doctor_names_a_level_held_for_a_gone_seat_with_the_command_that_clears_it() {
+        let (_env, store) = store("doctor");
+        put_level(&store, &Signal::new(Kind::NeedsAPerson, "a-1", "cpd-9 · no turn running"));
+        let found = orphans(&store);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "daemon/ledger/needs-a-person:a-1");
+        assert!(found[0].1.contains("wsp watch --forget daemon/ledger/needs-a-person:a-1"), "{}", found[0].1);
+    }
+
+    /// `wsp-649`: a seat's agent record gets its end and is not read as sitting
+    /// in the seat any more.
+    #[test]
+    fn an_ended_agent_is_no_longer_the_one_in_its_seat() {
+        let (_env, store) = store("ended");
+        store.set_agent("a-1", json!({ "seat": "cpd-9", "started": "2026-11-15T00:00:00Z" }));
+        assert_eq!(store.agent_in_seat("cpd-9").as_deref(), Some("a-1"));
+        assert_eq!(store.end_agents_in("cpd-9"), ["a-1"]);
+        assert!(store.agents_held()["a-1"]["ended"].is_string());
+        assert_eq!(store.agent_in_seat("cpd-9"), None);
+        assert!(store.end_agents_in("cpd-9").is_empty(), "an end is kept, not moved");
     }
 }

@@ -1968,10 +1968,17 @@ pub fn park(store: &Store, args: &Args) -> i32 {
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", reason.len()));
-    mutate_saying(store, args, "parked", said.as_deref(), |t| {
+    let row = args.rest.first().and_then(|n| store.task_or_why(n).ok()).map(|t| t.id);
+    let seats = row.as_deref().map(|r| crate::cmd_spawn::seats_of_row(store, r)).unwrap_or_default();
+    let code = mutate_saying(store, args, "parked", said.as_deref(), |t| {
         t.set_status(Status::Parked);
         t.log(&format!("parked: {reason}"));
-    })
+    });
+    // A parked row has nobody to be waiting on (`wsp-649`).
+    if let (0, Some(row)) = (code, row.as_deref()) {
+        crate::cmd_spawn::row_let_go(store, row, &seats);
+    }
+    code
 }
 
 /// Is this payload naming a stream to read the prose from, rather than being

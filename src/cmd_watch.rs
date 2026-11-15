@@ -1745,6 +1745,11 @@ impl Ledger {
         self.up.values().filter(|h| h.told).map(|h| &h.signal)
     }
 
+    /// Forget every level `gone` names, saying nothing about it (`wsp-649`).
+    pub(crate) fn drop_where(&mut self, gone: &dyn Fn(&Signal) -> bool) {
+        self.up.retain(|_, h| !gone(&h.signal));
+    }
+
     pub(crate) fn json(&self) -> Value {
         Value::Object(
             self.up
@@ -3833,6 +3838,14 @@ pub fn watch(store: &Store, args: &Args) -> i32 {
         return status(store, args);
     }
     if let Some(key) = args.get("forget") {
+        // A level the ledger holds, named by the key `wsp doctor` prints.
+        if let Some(dropped) = crate::attention::forget_level(store, &key) {
+            println!("{}", match dropped.is_empty() {
+                true => format!("nothing standing as {key}"),
+                false => format!("dropped {}", dropped.join(", ")),
+            });
+            return 0;
+        }
         let gone = store.clear_watch(&key);
         println!("{}", match gone {
             true => format!("forgot the watch record for {key}"),
