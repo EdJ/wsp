@@ -1435,6 +1435,51 @@ mod tests {
         assert_eq!(MachineLive::from_value(&t.live.to_value()).tick_secs, 39, "and it is written where readers look");
     }
 
+    /// wsp-639: the daemon's very first slow tick — nothing measured, a stall far
+    /// past the lease and the beat's allowance — never reads a working seat
+    /// silent: a reader judges by the beats the daemon sent, and a stalled daemon
+    /// sent none. A seat that is sent beats and does not answer them still is.
+    /// This drives the tunnel's own beat step against a scripted wire: a real
+    /// `wsp sandbox --fake` stands in for herdr and has no far machine to ask.
+    #[test]
+    fn the_first_slow_tick_past_the_lease_does_not_read_a_working_seat_silent() {
+        let (store, root) = store_with_seats("stall", &[("cpd-7", "mb2")]);
+        let mut m = far_machine();
+        m.lease = Some(60);
+        let wire = script();
+        let mut t = Tunnel::new();
+        t.live.reachable = true;
+        t.live.last_seen = util::now_iso();
+        t.ticked();
+        t.beat_tick(&store, &m, &wire);
+        assert!(!t.live.heard.is_empty() && t.live.heard == t.live.beat_at);
+        assert!(!crate::far::is_silent(&m, &t.live));
+
+        // The tick stalls 200 s: the beat on disk is that old, and so is the one
+        // the daemon sent. Nothing was measured (`tick_secs` is 0), and the seat
+        // is not silent: it is late, which wip does not read as idle.
+        let then = crate::util::iso_at(crate::util::epoch_secs() - 200);
+        t.live.heard = then.clone();
+        t.live.beat_at = then;
+        assert_eq!(t.live.tick_secs, 0);
+        let on_disk = MachineLive::from_value(&t.live.to_value());
+        assert!(!crate::far::is_silent(&m, &on_disk), "a stalled daemon is not a silent seat");
+        assert!(crate::far::beat_is_late(&m, &on_disk), "but its read is stale");
+
+        // The tick comes: the beat is answered and nothing is late any more.
+        t.next_beat = Some(Instant::now() - Duration::from_secs(1));
+        t.beat_tick(&store, &m, &wire);
+        assert!(!crate::far::is_silent(&m, &t.live) && !crate::far::beat_is_late(&m, &t.live), "{:?}", t.live);
+
+        // A seat that is sent beats and answers none of them is silent.
+        *wire.deaf.borrow_mut() = vec!["cpd-7".into()];
+        t.live.heard = crate::util::iso_at(crate::util::epoch_secs() - 200);
+        t.next_beat = Some(Instant::now() - Duration::from_secs(1));
+        t.beat_tick(&store, &m, &wire);
+        assert!(crate::far::is_silent(&m, &t.live), "beats sent and unanswered: {:?}", t.live);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A machine with no `exec_dir` cannot name its controller: every seat fails
     /// with that said, rather than the beat dialling something else.
     #[test]

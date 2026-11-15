@@ -250,6 +250,12 @@ pub struct MachineLive {
     /// ticks, and a reader that allowed only the lease would call a working seat
     /// silent between two slow beats. `0`: not measured yet.
     pub tick_secs: i64,
+    /// When the daemon last sent a beat, answered or not (wsp-639). A reader
+    /// judges how long a seat has gone unheard by what the daemon sent since
+    /// `heard`, not by the wall clock: a daemon stalled for longer than any
+    /// allowance has sent nothing, and a seat that was not asked is not silent.
+    /// Empty: no beat sent, and the wall clock is the measure.
+    pub beat_at: String,
 }
 
 impl MachineLive {
@@ -274,6 +280,7 @@ impl MachineLive {
             shim_warning: s("shim_warning"),
             error: s("error"),
             tick_secs: v.get("tick_secs").and_then(|x| x.as_i64()).unwrap_or(0),
+            beat_at: s("beat_at"),
         }
     }
 
@@ -293,6 +300,7 @@ impl MachineLive {
             "shim_warning": self.shim_warning,
             "error": self.error,
             "tick_secs": self.tick_secs,
+            "beat_at": self.beat_at,
         })
     }
 }

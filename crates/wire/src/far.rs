@@ -848,7 +848,19 @@ pub const LINK_PROBE: Duration = Duration::from_secs(8);
 /// ([`beat_idle`]), so an idle machine reads off the probe, not off the last
 /// beat of a seat that is gone (wsp-588).
 pub fn is_silent(m: &Machine, l: &MachineLive) -> bool {
-    !l.reachable || (!l.heard.is_empty() && heard_is_stale_at(m, l, crate::util::since(&l.heard)))
+    !l.reachable || (!l.heard.is_empty() && heard_is_stale_at(m, l, unheard_for(l)))
+}
+
+/// How long a seat has gone unheard, in seconds: from `heard` to the last beat
+/// the daemon sent, and to now only when none is recorded (wsp-639). A daemon
+/// that stalls — a first slow tick, with nothing measured yet — sends no beat
+/// and hears no answer, and the time it stood still is no evidence about the
+/// seat: only beats sent and not answered are.
+pub fn unheard_for(l: &MachineLive) -> i64 {
+    match l.beat_at.is_empty() {
+        true => crate::util::since(&l.heard),
+        false => (crate::util::epoch_of(&l.beat_at) - crate::util::epoch_of(&l.heard)).max(0),
+    }
 }
 
 /// The silence rule with no clock in it: a beat last answered `age` seconds ago
@@ -984,6 +996,7 @@ pub fn beat_wait(m: &Machine) -> Duration {
 /// read `unreachable` over a working link (wsp-588).
 pub fn beat_idle(live: &mut MachineLive) {
     live.heard.clear();
+    live.beat_at.clear();
     live.leases.clear();
 }
 
@@ -1123,6 +1136,7 @@ pub fn beat(m: &Machine, seats: &[BeatSeat], wire: &dyn Wire, live: &mut Machine
     if answered {
         live.heard = now.to_string();
     }
+    live.beat_at = now.to_string();
     live.leases.retain(|id, _| seats.iter().any(|s| &s.id == id));
     failed
 }
