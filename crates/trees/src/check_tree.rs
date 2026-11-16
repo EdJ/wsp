@@ -395,6 +395,21 @@ fn exe_in(exe: &str, tree: &Path) -> bool {
 ///
 /// `in_tree` is every pid standing in the tree; `table` is [`exes`]. A seat's
 /// processes never get here: `keep` took them before.
+/// The nearest host above `at` (itself included), when it is a `wsp`.
+fn wsp_above(mut at: u32, table: &[(u32, u32, String)]) -> Option<u32> {
+    for _ in 0..table.len() {
+        if at <= 1 {
+            return None;
+        }
+        let &(_, up, ref exe) = table.iter().find(|(q, _, _)| *q == at)?;
+        if host_named(exe).is_some() {
+            return (base_of(exe) == "wsp").then_some(at);
+        }
+        at = up;
+    }
+    None
+}
+
 pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, String)]) -> Verdict {
     let find = |p: u32| table.iter().find(|(q, _, _)| *q == p);
     let Some(&(_, ppid, ref exe)) = find(pid) else { return Verdict::Spare("it is not in the process table".into()) };
@@ -417,6 +432,12 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
         return Verdict::Spare(format!("it descends from {why}, pid {app}, a person's launched app"));
     }
     if DEV_TOOLS.contains(&base_of(exe)) {
+        // A cargo under a `wsp` is a `wsp check` building in the tree (`wsp-541`):
+        // stopping it sends the row back with exit 137. Only a `wsp` is asked, the
+        // nearest host above; a pane's herdr does not spare its dev tools.
+        if let Some(wsp) = wsp_above(ppid, table) {
+            return Verdict::Spare(format!("it descends from a running wsp, pid {wsp}: a check builds in this tree"));
+        }
         return Verdict::Stop;
     }
     // Up through its parents, to the first that decides it: a host makes it
@@ -1113,6 +1134,25 @@ mod tests {
         let l = Left { row: "c-1".into(), tree: "/r/.worktrees/c-1".into(), pids: vec![], spared: vec![] };
         let (Verdict::Spare(a), Verdict::Spare(b)) = (judged(85320, &all, &table), judged(85321, &all, &table)) else { panic!() };
         assert_eq!(spared_key(&l, 85320, &a), spared_key(&l, 85321, &b), "one lineage, one name");
+    }
+
+    /// `wsp-541`: the sweep killed the cargo a `wsp check` ran in a finished row's tree.
+    #[test]
+    fn a_cargo_that_a_wsp_check_started_in_a_finished_tree_is_spared() {
+        let table = [
+            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(61, 60, "/bin/sh"),
+            proc(19582, 61, "/usr/local/bin/wsp"),
+            proc(20694, 19582, "/Users/e/.cargo/bin/cargo"),
+            proc(20699, 20694, "/Users/e/.rustup/bin/rustc"),
+            proc(62, 61, "/usr/local/bin/cargo"),
+        ];
+        let all = [19582, 20694, 20699, 62];
+        for pid in [19582, 20694, 20699] {
+            let v = judged(pid, &all, &table);
+            assert!(matches!(&v, Verdict::Spare(_)), "{pid}: {v:?}");
+        }
+        assert_eq!(judged(62, &all, &table), Verdict::Stop, "a cargo only under a pane's herdr is still the tree's");
     }
 
     #[test]
