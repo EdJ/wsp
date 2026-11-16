@@ -384,15 +384,17 @@ fn exe_in(exe: &str, tree: &Path) -> bool {
     (!p.is_absolute() && exe.contains('/')) || p.starts_with(tree)
 }
 
-/// The nearest host above `at` (itself included), when it is a `wsp`.
-fn wsp_above(mut at: u32, table: &[(u32, u32, String)]) -> Option<u32> {
+/// The nearest host above `at` (itself included), when it is a `wsp` that
+/// stands in the tree (`in_tree`): a wsp elsewhere, one a seat's agent ran the
+/// test suite under, is not this tree's check.
+fn wsp_above(mut at: u32, in_tree: &[u32], table: &[(u32, u32, String)]) -> Option<u32> {
     for _ in 0..table.len() {
         if at <= 1 {
             return None;
         }
         let &(_, up, ref exe) = table.iter().find(|(q, _, _)| *q == at)?;
         if host_named(exe).is_some() {
-            return (base_of(exe) == "wsp").then_some(at);
+            return (base_of(exe) == "wsp" && in_tree.contains(&at)).then_some(at);
         }
         at = up;
     }
@@ -421,7 +423,7 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     // and the tool names, so a node under a node, or an esbuild under the tree's
     // `node_modules`, is spared as the cargo is. Only a `wsp` is asked, the nearest
     // host above; a pane's herdr does not spare what it holds.
-    if let Some(wsp) = wsp_above(ppid, table) {
+    if let Some(wsp) = wsp_above(ppid, in_tree, table) {
         return Verdict::Spare(format!("it descends from a running wsp, pid {wsp}: a check runs in this tree"));
     }
     let built = BUILT_SERVERS.contains(&base_of(exe));
