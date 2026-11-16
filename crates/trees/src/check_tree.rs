@@ -1014,7 +1014,6 @@ mod tests {
     fn what_ending_a_check_would_signal_leaves_a_seat_standing_in_its_tree_alone() {
         use crate::place::{Order, Seat};
         use crate::place_compound::Compound;
-        use std::os::unix::process::CommandExt;
         let root = std::env::temp_dir().join(format!("wsp-388-{}-{}", std::process::id(), util::epoch_nanos()));
         let tree = root.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
