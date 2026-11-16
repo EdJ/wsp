@@ -416,6 +416,14 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     if let Some(why) = host_named(exe) {
         return Verdict::Spare(format!("{why} that stands there by working directory"));
     }
+    // Whatever descends from a `wsp` is that wsp's check (`wsp-541`, `wsp-653`):
+    // stopping it sends the row back with exit 137. Asked before the executable
+    // and the tool names, so a node under a node, or an esbuild under the tree's
+    // `node_modules`, is spared as the cargo is. Only a `wsp` is asked, the nearest
+    // host above; a pane's herdr does not spare what it holds.
+    if let Some(wsp) = wsp_above(ppid, table) {
+        return Verdict::Spare(format!("it descends from a running wsp, pid {wsp}: a check runs in this tree"));
+    }
     let built = BUILT_SERVERS.contains(&base_of(exe));
     if exe_in(exe, tree) {
         return Verdict::Stop;
@@ -432,12 +440,6 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
         return Verdict::Spare(format!("it descends from {why}, pid {app}, a person's launched app"));
     }
     if DEV_TOOLS.contains(&base_of(exe)) {
-        // A cargo under a `wsp` is a `wsp check` building in the tree (`wsp-541`):
-        // stopping it sends the row back with exit 137. Only a `wsp` is asked, the
-        // nearest host above; a pane's herdr does not spare its dev tools.
-        if let Some(wsp) = wsp_above(ppid, table) {
-            return Verdict::Spare(format!("it descends from a running wsp, pid {wsp}: a check builds in this tree"));
-        }
         return Verdict::Stop;
     }
     // Up through its parents, to the first that decides it: a host makes it
@@ -1152,6 +1154,34 @@ mod tests {
             assert!(matches!(&v, Verdict::Spare(_)), "{pid}: {v:?}");
         }
         assert_eq!(judged(62, &all, &table), Verdict::Stop, "a cargo only under a pane's herdr is still the tree's");
+    }
+
+    /// `wsp-653`: the process table at 04:22:45Z, a web-chrome row's `npx vitest`
+    /// under `sh -c` under `wsp`: the wsp and its shell were spared, the rest stopped.
+    #[test]
+    fn everything_a_wsp_check_runs_in_a_finished_tree_is_spared_whatever_runs_it() {
+        let table = [
+            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(61, 60, "/bin/sh"),
+            proc(85802, 61, "/usr/local/bin/wsp"),
+            proc(85960, 85802, "/bin/sh"),
+            proc(85961, 85960, "node"),
+            proc(86241, 85961, "node"),
+            proc(86475, 86241, "/opt/homebrew/bin/node"),
+            proc(90715, 86475, "node_modules/@esbuild/darwin-arm64/bin/esbuild"),
+            proc(90733, 86475, "/r/.worktrees/c-1/node_modules/.bin/vitest"),
+            proc(90735, 86475, "/usr/bin/some-worker"),
+            proc(70, 61, "node"),
+            proc(71, 70, "node"),
+        ];
+        let all = [85802, 85960, 85961, 86241, 86475, 90715, 90733, 90735, 70, 71];
+        for pid in [85802, 85960, 85961, 86241, 86475, 90715, 90733, 90735] {
+            let v = judged(pid, &all, &table);
+            assert!(matches!(&v, Verdict::Spare(_)), "{pid}: {v:?}");
+        }
+        for pid in [70, 71] {
+            assert_eq!(judged(pid, &all, &table), Verdict::Stop, "{pid}: a node only under a pane's herdr is still the tree's");
+        }
     }
 
     #[test]
