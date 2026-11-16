@@ -384,17 +384,6 @@ fn exe_in(exe: &str, tree: &Path) -> bool {
     (!p.is_absolute() && exe.contains('/')) || p.starts_with(tree)
 }
 
-/// Is `pid`, standing in `tree` by working directory, the tree's to stop?
-///
-/// **Only what the tree started**: a process whose executable is under the tree
-/// or a named dev tool ([`DEV_TOOLS`]), or one that descends from a process that
-/// stood in the tree. Never a host, a login shell, or what one of those
-/// started, and never an installed server ([`BUILT_SERVERS`]). A process there
-/// by working directory alone — somebody started it from that directory — is
-/// spared and says why.
-///
-/// `in_tree` is every pid standing in the tree; `table` is [`exes`]. A seat's
-/// processes never get here: `keep` took them before.
 /// The nearest host above `at` (itself included), when it is a `wsp`.
 fn wsp_above(mut at: u32, table: &[(u32, u32, String)]) -> Option<u32> {
     for _ in 0..table.len() {
@@ -410,6 +399,17 @@ fn wsp_above(mut at: u32, table: &[(u32, u32, String)]) -> Option<u32> {
     None
 }
 
+/// Is `pid`, standing in `tree` by working directory, the tree's to stop?
+///
+/// **Only what the tree started**: a process whose executable is under the tree
+/// or a named dev tool ([`DEV_TOOLS`]), or one that descends from a process that
+/// stood in the tree. Never a host, a login shell, or what one of those
+/// started, and never an installed server ([`BUILT_SERVERS`]). A process there
+/// by working directory alone — somebody started it from that directory — is
+/// spared and says why.
+///
+/// `in_tree` is every pid standing in the tree; `table` is [`exes`]. A seat's
+/// processes never get here: `keep` took them before.
 pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, String)]) -> Verdict {
     let find = |p: u32| table.iter().find(|(q, _, _)| *q == p);
     let Some(&(_, ppid, ref exe)) = find(pid) else { return Verdict::Spare("it is not in the process table".into()) };
