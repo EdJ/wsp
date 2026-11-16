@@ -559,8 +559,21 @@ Each step lands behind the previous one, the live fleet runs on every intermedia
 taken with `wsp calls` before and after. **Baselines (1.5):** `wip --json` p50 1,597 ms and 1.54 CPU-s per call;
 host polling 1,992 CPU-s per 4.5 h; per tick 143 git, 43 screen renders, 34 ps, 0.4 lsof; tick p50 2.2 s, p95 54 s.
 
+**Amended 2026-11-16 (wsp-652, a draft like the rest).** Ed, 2026-11-15: *"I think we should start by segregating
+local operations into an "agent manager" such that each agent host becomes fully delineated from wsp"*. The
+executor seam that step 3 drew after the server now comes **first**, as steps **M0–M4** of docs/agent-manager.md
+section 6. There is one agent manager per host, the Mac included, and wsp reaches each one over TCP. The manager
+steps need no store and no server. Steps 0–6 then run on top of them, changed as the rows below say. The baselines
+for M0–M4 are 2026-11-16's (agent-manager 6.1): per tick 37.5 ps, 59.5 renders and 24.6 df, tick p50 19.5 s, spawn
+p50 9.4 s.
+
 | step | what | measure: done when | rollback |
 |---|---|---|---|
+| **M0. herdr out, seam named** (agent-manager 6.2) | wsp-120 (D20). `host-api` types. Every OS-touching call outside tree work goes behind one in-process `Host` trait. | no probe outside the in-process host; herdr references → 0; spawn p50 no worse | revert (pure move) |
+| **M1. The manager on the Mac** | The in-process host becomes a launchd process. wsp dials it on TCP. Hooks, journal and events go to it, and the daemon folds the events. | ps per tick → ≤ 1; renders → 0; `wip` < 0.2 CPU-s; wsp-411-kind → 0 | `WSP_HOST=inproc` |
+| **M2. The i5 under its own manager** | The heartbeat replaces the tick-paced beat. Per-seat ssh forwards and the tunnel go. | ssh for install and tree bytes only; no wsp-639 flap; far manifest < 15 s | machine `transport: ssh` |
+| **M3. Tree jobs under the manager** | check, build, verify and barrier processes run as manager jobs. check_tree's sweep and leaked_agents go. | lsof → 0; wsp-478-kind → 0 | jobs in-process behind a flag |
+| **M4. Trees placed** (only if Ed chooses T2, agent-manager Q6) | checkout and land on the agents' hosts, with a fenced push to the trunk | a list on two hosts with no copies | T1 (rows on the Mac) |
 | **0** (prep, could ride fleet-fixes' tail) | `rusqlite` behind the C-cached wrapper (section 9); the contract crate's types; the conformance suite against an in-memory fake | a cold tree builds SQLite in < 5 s from cache | nothing to roll back |
 | **1. Server and store, read path; compound subscribes** | The daemon opens SQLite and **mirrors** today's files into it each tick (a projection; files still the truth). `api.sock` serves `state`/reads/`subscribe`. compound's host subscribes; `wip --json` reads through the API | host polling calls → 0; `wip --json` < 100 ms wall, < 0.1 CPU-s; no `ps`/`lsof` in read verbs; daemon tick no slower | the host goes back to `poll` (one flag); the CLI reads files |
 | **2. Orders machine** | Orders become commands; delivery via compound-sup's deliver verb and ack (wsp-477) under a `deliver:<seat>` lease; `repair:unsent` deleted | screen renders per tick → 0; `typed-unsent`/`first-orders`/`stuck-commands` files gone; incidents of "typed but unsent" and wait-loop stalls → 0 over a fortnight | `repair:unsent` restored behind a flag |
@@ -571,6 +584,16 @@ host polling 1,992 CPU-s per 4.5 h; per tick 143 git, 43 screen renders, 34 ps, 
 
 Nothing in steps 1–5 builds network transport or sharing (Ed's rule). Step 6 waits until the local server runs the
 fleet.
+
+**What the manager steps change in steps 1–6** (wsp-652):
+- **Step 1** folds the managers' events into its mirror, rather than mirroring files that probes wrote. It is served
+  over the network from the start (D19).
+- **Step 2** keeps the orders machine. Delivery and ack already come from the manager (M1), so the step is the store
+  owning the order record and the `deliver:<seat>` lease. Its screen-render measure is met at M1.
+- **Step 3** shrinks to *the server takes the manager connections over from the daemon, and the seat machine owns
+  the record*. Its ps, lsof and cwd deletions are done at M1 and M3. Its herdr rollback is gone with M0.
+- **Step 6** keeps auth and principals only. Network transport moved into step 1 (D19), and into M1 for managers,
+  which carry one token each until D13 is settled.
 
 ---
 
@@ -737,9 +760,12 @@ Bundled plus cache is the safer default. This is Q12.
 7. **Event retention.** Keep every event forever (today's 9 MB `events.jsonl` suggests years fit), or compact past N
    months to snapshots, with `subscribe from` an old id answering `too_old`?
 8. **Executor shape.** One compound-sup per machine as the executor, or keep one compound-sup per seat behind a
-   per-machine executor face?
+   per-machine executor face? *(D14: Ed's lean is "one central process that spawns durable supervisors". Carried
+   forward as docs/agent-manager.md Q1–Q3, which recommends one agent manager per host over one compound-sup per
+   seat, ahead of the server.)*
 9. **herdr seats.** Should herdr panes be a second executor kind behind the protocol, or be retired once compound
-   seats run everything?
+   seats run everything? *(Settled by D15: there is no herdr executor. Its removal, wsp-120, is step M0 of
+   docs/agent-manager.md, which is agent-manager Q9.)*
 10. **One host, several instances.** One writer with forwarding, as D1 reads, or let every same-host instance write
     under SQLite's own lock and keep the writer lease only for once-only work (8.3)?
 11. **The Postgres trigger.** Is "a second host must run an instance" the trigger? Should a write-rate or tenant

@@ -1,0 +1,606 @@
+# The agent manager: every host's local operations behind one process
+
+Plan `wsp-652`, 2026-11-16. **This is a draft for Ed to discuss, not a design he has approved.** It changes no code
+and files no rows. Where it recommends something, the options are beside it. The open points are the numbered
+questions in section 7.
+
+**Diagram: [agent-manager.svg](agent-manager.svg)**. The top panel shows the target. The bottom panel shows what
+crosses the host boundary today and is removed.
+
+Ed, 2026-11-15, prompting the server conversion (wsp-483, D12): *"let's start with planning for the wsp server
+conversion - I think we should start by segregating local operations into an "agent manager" such that each agent
+host becomes fully delineated from wsp"*.
+
+**What this plan takes as settled** (the decisions on wsp-483):
+- D5: tree work stays where the tree is, and only its record moves to the server.
+- D5b: machine facts come from executors. This is a working choice, open to correction.
+- D8: the server does not run on the UI's machine or on an agent's machine.
+- D14: Ed leans towards "one central process that spawns durable supervisors".
+- D15: there is no herdr executor.
+- D19: network transport comes from the start.
+- D20: wsp-120, herdr's removal, is a line in the first pass.
+
+Ed's newer remark (2026-11-15) reopens D5's *where*, and it is raised as Q6: *"checkouts etc will likely need to
+live with the agents in the future, but let's discuss"*.
+
+**Short answer.**
+1. **The seam moves first.** state-core put executors at step 3, behind the server. This plan puts an **agent
+   manager** on every agent host *before* the server (step M, section 6). The manager is one long-lived process per
+   host, under launchd. It owns every operation that is local to its host: starting an agent, stopping one, the
+   agent's process tree, delivering an order and hearing it acknowledged, the hooks, transcripts and spend, the
+   host's load, memory, disk and power, and the processes of tree work. wsp (the CLI and the daemon now, the server
+   later) reaches it only through one protocol (section 3). The Mac is a host like the i5. Nothing in wsp assumes that
+   it shares a machine with an agent.
+2. **It is mostly code that exists.** The per-seat durable supervisor is compound-sup, and it stays as it is.
+   compound-remote's `serve` is already a per-host controller: one socket, `spawn`/`list`/`close`/`lease`/`version`,
+   and no state of its own beyond the sockets (compound crates/compound-remote/src/server.rs:24, sessions.rs:1). The
+   OS half of wsp's `Place` backends, `far.rs`, the tree copy and the probes move from wsp into the manager. Its
+   decisions stay in wsp.
+3. **The protocol is state-core 5.1, with three changes.** The manager exists before any server, so on day one the
+   wsp side dials it. It listens on TCP from the start, including on the Mac (D19), so the local host uses the same
+   path as a far one. Its events carry ids, and a reconnecting client asks for them `from` the last one it saw. Day
+   one's fencing is idempotency keys and seat epochs. Leases between hosts arrive with the server.
+4. **The largest change on the wsp side is what it stops guessing.** Who owns a process, whether a seat is alive,
+   whether an order was taken and whether a seat has ended all become events the manager sends. On the last day's
+   figures that removes about 37 `ps`, 60 screen renders, 25 `df` and 1 `lsof` per daemon tick, and the 41,459 `ps`
+   and 195,490 renders that compound's host polling cost in 24 hours.
+5. **Tree work is the open question.** The recommendation is to put tree work's *processes* under the manager now,
+   so the manager owns them and the `lsof`/`ps` sweeps go. The *trees* stay where D5 put them for the present, and
+   Ed decides whether they move to the agents' hosts (Q6). Section 1.3 gives the cost of each choice.
+
+---
+
+## 1. The boundary
+
+### 1.1 How it was taken
+
+The inventory below was taken from the code at `ee8c1de` (the trunk this row started at). The counts are from
+`grep` over `src/` and `crates/`, leaving out lines after a file's trailing `#[cfg(test)] mod`. Costs are from
+`wsp calls --since 24h` at 2026-11-16T06:48Z: 1,633 daemon ticks, 43,898 calls and 146,483 CPU-s.
+
+Per tick, averaged over those 1,633 ticks (the `"k":"tick"` lines' `children`):
+
+| child | per tick |
+|---|---|
+| git | 162.5 |
+| compound-render | 59.5 |
+| ps | 37.5 |
+| df | 24.6 |
+| sysctl | 3.5 |
+| pmset | 1.9 |
+| memory_pressure | 1.3 |
+| vm_stat | 1.3 |
+| kill | 1.3 |
+| lsof | 0.9 |
+
+The tick's p50 is 19.5 s and its p95 116 s. On 2026-11-08 they were 2.2 s and 54 s.
+
+Several of state-core 1.4's sites have moved since `47126dc`:
+- check_tree's second `lsof` is now :579, not :507.
+- `Shells::read` is waiting.rs:745 (its `ps` is at :762), not :355.
+- `read_screen` is place_compound.rs:808, not :746.
+- `typed` is :1972, not :1824.
+- `turn_began_since` is :2027, not :1875.
+
+The lines below are current.
+
+Each line has one of four verdicts:
+- **M**: it moves into the manager.
+- **W**: it stays in wsp.
+- **D**: it is deleted, because an event replaces the inference.
+- **C**: it stays compound's.
+
+### 1.2 The inventory
+
+**Starting an agent**
+
+| operation | site | verdict | why |
+|---|---|---|---|
+| The `Place` port: `open`, `start`, `tell`, `typed`, `stop`, `state`, `turn_began_since`, `pids`, `census` | crates/wire/src/place.rs:1032–1271 | **W (shape), M (bodies)** | The port is the wsp side of the protocol. Its implementors are the OS half and they move. |
+| compound seat: `sup_command` builds `compound-sup spawn --label --agent --cwd`, `spawn_sup` runs it, `open`, `start` | crates/wire/src/place_compound.rs:1364, :1430, :1821, :1866 | **M** | Forking a supervisor is local to the host. |
+| headless seat: fork and pipe, observed through hooks | crates/wire/src/place_super.rs:1330, :1382 | **M** | The same. |
+| far seat: a shell line run over ssh that starts `compound-sup` and greps its handshake | crates/wire/src/far.rs:488 (`launch`), :125 (`ssh_run`) | **M (the far manager does it locally); D (the ssh line)** | The i5's manager forks compound-sup itself. No handshake needs to cross ssh. |
+| what the agent is run with: argv, environment, the opencode config, the brief | src/agent_commands.rs:1198 (`config`), `Kind::env`; crates/wire/src/place.rs:344 (`CHILD_MARKER`) | **W** | This is policy. wsp composes an *agent spec* and sends it in `seat.spawn`. The manager runs what it is given. |
+| handing over the first order, then waiting until a turn starts on it | src/cmd_spawn.rs:1732 (`hand_over`), :1824 (`took_it`) | **W (the decision); D (the polling)** | wsp waits for the manager's `order.acked` event instead of polling `state` and `typed`. |
+
+**Stopping and signalling**
+
+| operation | site | verdict | why |
+|---|---|---|---|
+| A seat's process tree from `ps`, then a kill by pgid | crates/wire/src/place_super.rs:844, :886; crates/wire/src/place_compound.rs:1298 | **M** | The manager started the tree, so it ends it and reports the pids. |
+| leaked agents: agents found by `ps` and killed | src/leaked_agents.rs:126 | **D** | Every agent on a host is one of the manager's seats. An agent that is nobody's cannot exist, except one started by hand, and that is not wsp's to kill. |
+| `wsp role reap`: `ps`, `lsof` and kill | src/cmd_role.rs:360, :629, :671 | **D**, or a manager verb if Ed wants a person's reap | The same reason. |
+| a shell waiting on itself, found by `ps` and killed with TERM | src/waiting.rs:872, :875 | **M** | The shell is in the seat's tree. The manager reports `seat.stuck` and wsp decides whether to end it. |
+| strays in a finished tree: `lsof -d cwd`, then kill (wsp-478) | crates/trees/src/check_tree.rs:221, :259, :327, :579, :592 | **D** once tree jobs run under the manager (1.3) | Ownership becomes a record, not a cwd. |
+| a check's own child group, killed on timeout | src/check.rs:1249, :1261, :1272; crates/trees/src/at_stop.rs:98 | **with tree work** (1.3) | The process holds a handle on the child it spawned. This is not inference. |
+| a sandbox's agents | src/cmd_sandbox.rs:507 | **M** | A sandbox is a set of seats on a host. |
+
+**Asking the OS about processes**
+
+| probe | site | verdict | replaced by |
+|---|---|---|---|
+| `ps -A -o pid,ppid,command` and `ps -A -o pid,ppid` | crates/base/src/base/procs.rs:20, :39 | **D** (wsp side) | events with the pid root that the manager recorded |
+| a seat's running shells, per `wip` | src/waiting.rs:745, :762 | **M** | `seats` replies carry `shells` |
+| memory per seat | src/memory.rs:122, :145 | **M** | per-seat RSS in the heartbeat |
+| is a recorded pid alive | crates/base/src/util.rs:1536 | **D** for seats; **with tree work** for build slots | `seat.stopped` |
+| build-slot holders alive; a check's pid identity; check liveness | crates/store/src/sharing.rs:390; crates/store/src/checks.rs:144; src/check.rs:1119, :1173; crates/trees/src/gc.rs:54; crates/trees/src/throttle.rs:839 | **with tree work** (1.3) | `job.ended` |
+| ended panes: `lsof` for a renderer whose agent has exited | src/ended_panes.rs:81 | **D** | `seat.stopped`, which says whether the renderer is left |
+
+**Host facts**
+
+| fact | site | verdict | why |
+|---|---|---|---|
+| thermal state (`pmset -g therm`), load (`sysctl vm.loadavg`), memory pressure, swap, `vm_stat` | crates/trees/src/throttle.rs:307, :322 (`load1` :337), :652, :694, :702 | **M (reading); W or tree host (deciding)** | They are facts about a host (state-core correction 2). They go in the heartbeat every 10 s. The throttle's admission decision is made where the build runs (Q11). |
+| disk free and use (`df -Pk`, `du -sk`) | src/disk.rs:120, :214 | **M** | Disk belongs to a host. Today `df` runs 10,555 times a day, 24.6 per tick. |
+
+**Screens and panes**
+
+| operation | site | verdict | why |
+|---|---|---|---|
+| render a seat's screen and read the composer (is an order typed but unsent; the trust prompt) | crates/wire/src/place_compound.rs:808, :423, :1972; callers src/repair.rs:650, src/cmd_spawn.rs:1824 | **D** with compound-sup's `deliver` and ack (wsp-477, compound supervisor/src/proto.rs:252); **M** for a person's `peek` | The 195,490 renders that compound's host polling made in 24 hours go. A person's peek becomes a `seat.read` request to the manager. |
+| herdr `pane.read` | src/cmd_agent.rs:5745 | **D** (wsp-120) | There is no herdr executor (D15). |
+
+**Hooks, turns, spend and transcripts**
+
+| operation | site | verdict | why |
+|---|---|---|---|
+| `wsp hook`: the agent's hooks write `compound-seats/<seat>/hooks.jsonl`, `said.json` and `burn.json` under wsp's state | src/cmd_agent.rs:6103; crates/wire/src/place_compound.rs:255; crates/wire/src/place_super.rs:367, :904 | **M** | The hook fires on the agent's host and reports to that host's manager. The manager folds it into `turn`, `seat.said` and `seat.spent` events. wsp's state directory no longer holds per-seat files. |
+| did a turn start since T | crates/wire/src/place_compound.rs:2027 | **D** | `order.acked` and `turn` events |
+| reading a transcript (path, digest, spend, last word) | src/agent_commands.rs:2723; src/did.rs:463; callers in timeline, cmd_verifications, `attempts` | **M** | The transcript is on the agent's host (on the i5 it already is). The manager reads it and sends digests. wsp keeps a reference (host, path) for a person who wants the whole file. |
+| opencode's session export and `opencode db` reads | src/agent_commands.rs:1687, :1774 | **M** | The same reason, for opencode. |
+
+**Delivery**
+
+| operation | site | verdict | why |
+|---|---|---|---|
+| `tell` through the backend | crates/wire/src/place.rs:1118; place_compound.rs:1904 (compound-sup `deliver`); place_herdr.rs:781 | **M** | The manager calls compound-sup's `deliver` on a local socket and answers `delivered` or `refused`, with the reason. |
+| the order queue, the held tells for an unreachable seat, flushing them | src/wake.rs:540, :566, :607 | **W** | Policy: who gets told what, and when. |
+| retyping unsent text, a first order owed, a shell waiting on itself | src/repair.rs:650, :937, :788 | **D** (unsent, first order); **M** (stuck, reported as `seat.stuck`) | This is the I3 inference. |
+
+**Far machines, ssh and launchd**
+
+| operation | site | verdict | why |
+|---|---|---|---|
+| the tunnel supervisor: one ControlMaster per machine, plus per-seat `-O forward` | crates/wire/src/tunnel.rs:460, :744; daemon phase src/daemon.rs:768 | **D** | wsp holds one TCP connection to each host's manager, and nothing per seat. |
+| the beat: `lease <seat> ok` through each far seat's forwarded controller socket, paced by the tick (wsp-639) | crates/wire/src/far.rs:1124, :978, :971, :779; tunnel.rs:185 | **D (the beat); M (the lease file)** | The connection's own heartbeat replaces it (section 3.4). The manager writes the gate's lease file locally. |
+| the far manifest and the tree copy (wsp-638: 4 min 25 s for 8,788 files) | crates/trees/src/treecopy.rs:612, :709, :969, :1093 | **with tree work** (1.3); the far half **M** | The manager hashes in-process on its host, with no fork per file. |
+| `machine check`: wire version, a throwaway session, a headless `claude -p` | crates/wire/src/far.rs:80 | **M** (`hello` reports the wire, `check` runs the session); **W** keeps the verdict | |
+| the daemon's own launchd agent | crates/wire/src/launchd.rs:297, :393, :418, :465, :558 | **W** | It is wsp's process. The manager has its own launchd agent (section 2.4). |
+
+**herdr.** crates/wire/src/herdr.rs (951 lines) and crates/wire/src/place_herdr.rs (1,598) remain. Outside them there
+are 264 non-test references in about 30 files: cmd_agent 64, panel/verbs 22, detail/run 19, cmd_govern 16,
+panel/install 15, cmd_spawn 14, and others. **All of it is D, as wsp-120, at step M0** (section 6). The manager
+never learns herdr.
+
+### 1.3 Tree work: where it falls
+
+Tree work is `checkout` (crates/trees/src/cmd_checkout.rs:1799), `check` (src/check.rs:1669), `verify`
+(crates/trees/src/cmd_verify.rs:1244), `land` (cmd_checkout.rs:2666), barrier runs (src/barrier_run.rs), builds under
+the throttle (crates/trees/src/throttle.rs:1200 `run_in`, :1742), warm targets (crates/store/src/sharing.rs:145) and
+the tree copy (treecopy.rs). It is two-thirds of wsp's CPU: `throttle run` 56.1% and `check` 15.2% of 146,483 CPU-s in
+24 hours.
+
+There are two separate questions here.
+
+**(a) Who owns tree work's processes.** The recommendation, for any placement of the trees: **the manager on the
+tree's host runs tree work as jobs.** A job is `job.run {key, argv, cwd, class}` and it ends with
+`job.ended {exit, log}`. The throttle's slots become the manager's admission per class, either `build` or `check`.
+The manager's job table is then the record of who started what in a tree. The cwd guess behind wsp-478, the `ps`
+walk in check_tree and the slot-liveness probes in sharing.rs and checks.rs all go. Today the tree's host is the Mac,
+so this changes no placement.
+
+**(b) Where the trees live.** Ed: *"checkouts etc will likely need to live with the agents in the future, but let's
+discuss."* There are three options.
+
+| | T1. Trees stay on the store's host (D5 as written) | T2. Trees live with the agents, under each host's manager | T3. Working trees with the agents, the trunk and its land on one trunk host |
+|---|---|---|---|
+| what | Today. The Mac holds every row's worktree. A far host gets a copy and sends work back (remote-agents v1 §6). | Each agent host checks out its rows' trees from the trunk repository. `check` and `verify` run there. `land` rebases there and pushes to the trunk, with a fenced push. The barrier runs on a host the list names. | Generalised remote-agents v1. Every host works in its own copy. The trunk host (the Mac today) receives copy-backs and does every land and every barrier. |
+| copies | One per far row, both ways (wsp-638's cost). | None. git fetch and push only. | One per row, both ways, local rows included (a no-op on the trunk host). |
+| git as transport | No (Ed's 2026-11-05 decision for v1). | **Yes.** That reverses the 2026-11-05 decision "copied, not pushed git to git", which was made for far seats. | No. |
+| warm targets | One set, on the Mac. | One set per host per project. The i5 starts cold, and so does a third host. sccache (already used for SQLite, D11) can share compiled objects between hosts. | Per host for the agents' own iteration. The verdict is built on the trunk host, so it has two sets. |
+| disk | The Mac holds everything (`barrier/` 37 GB, `checks/` 34 GB in state-core 1.3). | Spread across hosts, with every host's manager running its own sweep. | The Mac still holds every tree that is verified. |
+| the trunk | The Mac's repository. | A remote every host can reach: a bare repository on a trunk host, or the forge. A person's checkout becomes a clone that pulls. | The Mac's repository. |
+| verify and land | On the Mac. A heavy row's verifier already runs on the i5 (remote-agents 11.3). | On the tree's host. A land is a push with `--force-with-lease` against the trunk head the verifier read. That push is the fence, so two hosts cannot both land on one head. | On the trunk host, after copy-back. |
+| load moved off the Mac | Heavy rows only (remote-agents §11). | All work placed on another host. | The agents' iteration only. Verdicts, lands and barriers stay on the Mac. |
+| what the manager needs | Jobs, and the far half of the copy. | Jobs, checkout, rebase, push, the sweep of its own trees, a trunk fetch on each spawn. | Jobs, and both halves of the copy for every row. |
+
+**The recommendation.** Build (a) now, at step M3, whatever is chosen for (b). Plan the protocol so that (b) changes
+placement, not architecture:
+- jobs name a tree by `(row, host)`, never by a path on wsp's machine;
+- `checkout` and `land` are manager verbs from the start, even while every manager that runs them is the Mac's.
+
+T1 then stays the running state until Ed decides between T1 and T2 (Q6). T3 is listed for completeness. It keeps
+every cost of the copy and moves the least load. It earns its place only if the trunk must stay on one machine for a
+reason this plan does not know.
+
+**What T2 costs, in work.**
+1. A trunk remote per project that each host can reach. Hosts are on the tailnet, so this can be a bare repository
+   on the Mac served over ssh. That uses the ssh door, not a new one.
+2. A fetch at each spawn and a push at each land, by the manager, with the push fenced as above.
+3. Warm targets per host (an i5 cold build is measured in remote-agents §11.5's early proof). sccache narrows the
+   gap.
+4. The barrier's host named per list. The default is the trunk's host, which is remote-agents' rule that "the
+   barrier stays here".
+5. `wsp checkout` by a person: either on the person's own host, which then has a manager, or refused with a pointer
+   to the host.
+6. The remote-agents copy machinery (treecopy.rs, 1.5k lines with its tests) is retired once no host uses T1 for far
+   rows.
+
+---
+
+## 2. The manager's shape
+
+### 2.1 One manager per host, supervising durable per-seat supervisors (recommended)
+
+```
+launchd (per host, the logged-in user's session)
+ └─ the agent manager             one per host: protocol, seat table, journal, jobs, facts, hooks endpoint
+     ├─ compound-sup  <cpd-N>     one per seat, setsid, durable: pty, child, deliver/ack (unchanged)
+     │   └─ the agent (claude / opencode) and its tool processes
+     ├─ compound-sup  <cpd-M>
+     └─ job  <check|build|verify> one per tree job, its own process group
+```
+
+This is D14's lean: "one central process that spawns durable supervisors". The manager is the one central process
+*per host*. compound-sup is the durable supervisor, one per seat, and it outlives the manager (2.5).
+
+The alternatives:
+
+| | shape | for | against |
+|---|---|---|---|
+| **A** (recommended) | One manager per host, and one compound-sup per seat beneath it | One connection per host. Facts are read once per host. A manager restart loses no agent. A seat's crash stays the seat's. It matches compound-remote `serve` and compound-sup as they are. | One more long-lived process per host. |
+| B | No manager. wsp speaks to each compound-sup directly over the network: one socket per seat, which is today's far shape. | Nothing new to run. | One forward per seat, as today. Facts, hooks, transcripts and jobs have no home on the host, so wsp still reaches in. This is the status quo. |
+| C | One supervisor for the whole host: compound-sup grown to many sessions | One process | One crash ends every seat. It reverses compound's supervisor-per-session design (remote-agents §2). |
+| D | The wsp daemon runs on every host and is its manager | It reuses the most code. | wsp's whole binary and store logic would live on each agent host. It blurs the boundary this plan draws, and a second daemon raises the `daemon.json` singleton question again. |
+
+### 2.2 What it is built from
+
+- **compound-sup, unchanged.** Spawn, vitals, close, `deliver <id>` with its at-most-once answer, and `submitted`
+  from the agent's `UserPromptSubmit` hook (compound crates/compound-sup/src/main.rs:43,
+  crates/supervisor/src/proto.rs:238–262). The manager is its only caller on a host.
+- **compound-remote `serve`, as the seed of the process.** It is already one controller per host: a socket in
+  `<exec_dir>`, a thread per connection, and `spawn`/`list`/`close`/`lease`/`version`. It keeps no state beyond the
+  sockets ("the sockets under the executor directory are the list", sessions.rs:1). It also holds the Claude token
+  for the child (proto.rs `TOKEN_ENV`). The manager needs that loop, that listing and that token handling. Q2 asks
+  whether the manager *is* compound-remote grown, or a separate process that uses it.
+- **compound-remote `gate`, unchanged.** It reads `<exec_dir>/lease/<seat>`. The manager writes that file, where a
+  beat through a forward writes it today (section 5).
+- **wsp's far and OS code.** It moves out of wsp and into the manager:
+  - the OS halves of place_compound.rs and place_super.rs: spawning, the pid tree, stopping, the hook files and spend
+    tallies;
+  - far.rs's `machine check` session;
+  - treecopy.rs's far half: the manifest, computed in-process;
+  - waiting.rs's shell reader, memory.rs, disk.rs's `df`/`du`, throttle.rs's fact readers;
+  - the transcript readers in agent_commands.rs and did.rs.
+
+  Their *decisions* stay in wsp: which seat, what agent spec, when to end it, what counts as stuck, whether to admit
+  a build.
+
+### 2.3 Which repository and crate
+
+| option | where | for | against |
+|---|---|---|---|
+| **R1** (recommended) | **wsp's repository.** A crate `crates/manager` (binary `wsp-manager`; the name is a placeholder) and a protocol crate `crates/host-api`, with types only, as R2 of components.md. The binary depends on host-api, wsp-base and the moved OS code, and on *nothing* of wsp-store. | Most of the code that moves is wsp's. The protocol and both of its sides change in one repository, under R5 (a contract changes only by a row of its own). It needs no compound release to change a transcript reader. | It runs compound-sup as an external binary, as wsp does today, and must match its wire version. |
+| R2 | **compound's repository**, growing compound-remote into the manager | It sits next to compound-sup and shares `supervisor::proto`. | wsp-specific readers (opencode's database, the stuck-shell matcher, the throttle's facts) land in compound, and every wsp change to them becomes a compound row. |
+| R3 | A third repository, holding the manager and host-api | It is neutral. | A third release train and a third place to look. |
+
+Under R1, state-core section 6's "executor: in compound (`compound-sup`)" becomes "the manager, in wsp, over
+compound-sup". `wsp-api`'s executor messages become `host-api` (section 3).
+
+### 2.4 Installed and kept running
+
+- **launchd today.** There is one LaunchAgent per host, `<label>.manager`, in the user's GUI (Aqua) session. That is
+  where compound-remote already has to run for the keychain and token (remote-agents §8). `KeepAlive` is true and
+  `ThrottleInterval` is 5 s. It writes its own log in `<exec_dir>/log/`. The plist is written the way
+  crates/wire/src/launchd.rs writes the daemon's.
+- **Install and upgrade over the ssh door.** `wsp machine install <host>` copies the binaries at one commit,
+  writes the plist and the manager's token, and loads it. That is today's `scripts/remote-ship.sh` path. On the Mac
+  `wsp install` does the same locally.
+- **Linux or a container later**: a systemd unit or the container's init. Only the service file differs.
+- **One per host.** It binds its port and refuses to start if another manager answers there, as compound-remote
+  `serve` refuses (server.rs:28).
+
+### 2.5 What survives a manager restart
+
+| thing | survives? | how |
+|---|---|---|
+| the agents and their conversations | **yes** | compound-sup is `setsid` and daemonized. It does not depend on the manager. |
+| the seat table | **yes** | The manager rebuilds it from the sessions' sockets in `<exec_dir>` (as compound-remote's `list` does) and joins them to its journal by label. |
+| an order in flight | **yes** | compound-sup owns the delivery once it is asked, and answers the same id with the same answer (proto.rs:246). The manager asks again with the same id on restart. |
+| events not yet heard by wsp | **yes** | The manager's **journal** (`<exec_dir>/journal.jsonl`) is appended before an event is sent. Ids are a per-manager sequence. A client reconnects and asks `from` its last id. |
+| a tree job | **mostly** | A job runs in its own process group under a small wrapper that writes its exit to `<exec_dir>/jobs/<key>`. A job that finished while the manager was down is reported on restart. A job still running is re-adopted by pid and start time. |
+| host facts | **not needed** | They are read again on the next heartbeat. |
+| the gate's lease files | **yes, but they age** | A restart that outlasts the lease holds the far seats' tool calls. That is correct: nobody can hear them. |
+
+A wsp restart (the daemon or the server) touches none of this. wsp reconnects and asks `from` its last id.
+
+---
+
+## 3. The protocol
+
+### 3.1 Base and changes
+
+The base is state-core 5.1's message table. The changes follow from the manager existing before the server.
+
+1. **The wsp side dials, on day one.** The CLI and the daemon open a connection to each host's manager. Later the
+   server does the same. 5.1 had the executor dialling the server. That needs a server, and before one exists the
+   only long-lived wsp process is the daemon on the person's Mac. Q4 asks whether managers should dial out once the
+   server exists: a cloud host can only make outbound connections. The messages are the same in both directions. Only
+   who opens the connection changes.
+2. **The manager's events carry ids**, and a client asks `subscribe {from}`. This is the shape of state-core 4.3, at
+   host scale. The daemon holds one subscription per manager and folds the events into today's files. The server will
+   fold them into the store.
+3. **No leases between hosts on day one.** Fencing is by idempotency keys and seat epochs (3.3). Executor leases
+   (5.1's `lease`) arrive with the server, where there are several instances to fence.
+
+### 3.2 What wsp sends and what it hears
+
+| message | direction | carries | replaces |
+|---|---|---|---|
+| `hello` | both | wsp: role (`cli`, `daemon`, later `server`), version, the client's last event id. Manager: host id, manager version, the compound-sup and compound-render wire range, journal head, seats it runs, capacity. | `far::probe_command`, the wire check over ssh, `wire_health` |
+| `seat.spawn` | W → M | key `(row, attempt)`, the wsp-minted seat id, the agent spec (argv, env *names*, kind, model), the tree `(row, host)` or cwd, `gate: required \| none`, the first order (optional) | `Place::open` + `start`, compound-sup over ssh, per-seat forwards |
+| `seat.started` / `seat.refused` | M → W | seat, epoch, pid root, sockets (for a renderer to attach) / a named reason | 150 ms `state` polling (crates/wire/src/place.rs:1184, :1303) |
+| `seat.stop` | W → M | seat, epoch, `grace` | every `kill` of a seat's pids found by `ps` |
+| `seat.stopped` | M → W | seat, epoch, exit, the pids it ended, whether a renderer is left | census-by-absence (I4), `ended_panes`, `finished-wip.json` |
+| `order.deliver` / `order.cancel` | W → M | order id, seat, text, `now` | `Place::tell`, screen reads |
+| `order.delivered` / `order.refused` / `order.acked` | M → W | order id; for a refusal, compound-sup's `FailWhy` (busy, no composer, refused, session gone, no renderer, …); for an ack, the turn's start | `typed-unsent.json`, `repair:unsent`, `first-orders.json`, `turn_began_since` |
+| `turn` | M → W | seat, `began` or `ended`, order id if any | `seat-since.json` sampling |
+| `seat.said` / `seat.spent` / `seat.did` | M → W | last word; tokens and cost; a digest of the turn, with a transcript ref `(host, path)` | `said.json`, `burn.json`, `spent.jsonl` writes; transcript reads in wsp |
+| `seat.stuck` | M → W | seat, the command, how long it has waited on itself | `stuck_tick`'s `ps` |
+| `seats` | W → M (request) | — ; the reply has per seat: state, epoch, rss, shells, last turn, last word | `wip`'s `ps`, `lsof` and renders |
+| `seat.read` | W → M (request) | seat; the reply is the screen text | `peek` (a person asked for it, never a tick) |
+| `job.run` / `job.stop` | W → M | key, class (`build` or `check`), argv, tree `(row, host)`, timeout | `throttle run`'s slots, check's own kill on timeout, check_tree's sweep |
+| `job.started` / `job.ended` | M → W | key, pgid / exit, log ref, CPU-s | slot liveness probes, `kill -0` |
+| `tree.checkout` / `tree.land` / `tree.copy` | W → M | only under T2 or T3 (1.3); listed so they are reserved | — |
+| `beat` | both | every 10 s on each side's own timer. The manager adds host facts (load, memory pressure, swap, disk free per volume, thermal state) and per-seat RSS. | `df` ×24.6, `sysctl`, `pmset`, `vm_stat`, `memory_pressure` per tick; the far beat |
+| `events` / `subscribe` | W → M | `from` id | — |
+
+The manager does **not** decide anything that is wsp's to decide. It does not choose a seat, pick a row, end a seat
+of its own accord (except at the gate's existing rule, section 5), hold a tell, or judge a check's output. It does
+refuse a malformed or duplicate command, and every refusal it makes carries a reason.
+
+### 3.3 Identity and fencing, kept to day one
+
+D13 leaves identity for later, so day one carries only what stops the fleet from hurting itself.
+- **A manager token.** The manager makes it at install, keeps it at mode 0600 in `<exec_dir>`, and wsp keeps a copy
+  in the machine record's secret file. `hello` must carry it, and a connection without it is closed. It is one token
+  per host, not one per seat. Per-seat and per-person principals are state-core step 6 (D13).
+- **Idempotency keys.** `seat.spawn` is keyed by `(row, attempt)`. A retry after a lost reply gets the same
+  `seat.started`, never a second agent. `job.run` is keyed the same way. Order ids are already compound-sup's
+  at-most-once key.
+- **Seat epochs.** The manager numbers each start of a seat. `seat.stop` and `order.deliver` name the epoch and are
+  refused against a later one. So a stop that was sent before a respawn cannot end the respawn. Seat ids are minted
+  fresh today (`cpd-N`), so this costs one integer and guards the day a seat id is reused.
+- **No controller lease yet.** Two daemons on one store (today's `daemon.json` is last-writer-wins) would both be
+  accepted. Keys and epochs make their duplicates harmless. The server's leases (state-core 8.2) close it properly.
+
+### 3.4 Transport: network from the start, the local host on the same path
+
+- **TCP, newline-delimited JSON**, the framing that compound-remote's controller and state-core 4.1 already use,
+  behind one `Connection` trait so that TLS or a WebSocket is a new implementation and not a new protocol.
+- **On the tailnet.** The manager binds its host's tailnet address and loopback, and nothing else. On day one the
+  link is encrypted by WireGuard. TLS is added when a host leaves the tailnet (Q5).
+- **The local host uses the same path.** wsp on the Mac dials the Mac's manager over TCP, either on loopback or on
+  the tailnet address, with the same token and the same code. No unix-socket special case is kept, so "local" is a
+  fact about an address and not a code path. On the Mac this costs one TCP connection per CLI call, measured in
+  microseconds next to today's 57 ms `ps`.
+- **Heartbeats on their own timers.** Each side beats every 10 s on a timer of its own, not on the daemon's tick. A
+  side that misses three beats reconnects. This removes the class behind wsp-639, where the beat was paced by a
+  78-second tick against a 60-second lease.
+
+---
+
+## 4. What wsp becomes on the other side
+
+### 4.1 The seat state it keeps
+
+wsp keeps the **record**, and the manager keeps the **process**. wsp keeps:
+- the seat id, host, row, epoch, kind and model, spawn time;
+- the last state, as the manager's events gave it (`spawning`, `started`, `working`, `idle`, `ending`, `gone`, plus
+  `lost` when the host is silent);
+- the orders and held tells;
+- the claim and the binding;
+- the last event id heard from each host.
+
+Until state-core step 1 moves state into the store, this lives in today's files (`spawned.json`, `bindings.json`,
+`claims.json`, `said.json`). The daemon writes them from events, never from a probe. state-core's seat machine
+(3.2) is then a change of where the same record lives.
+
+### 4.2 The inferences it deletes
+
+| inference (state-core 1.6) | deleted from wsp | replaced by |
+|---|---|---|
+| I1: who owns a process (cwd, descent) | `lsof -d cwd` (check_tree.rs:221, :579; ended_panes.rs:81; cmd_role.rs:671), the `procs.rs` callers, leaked_agents.rs, `leaked-agents.json`, `reap-seen.json` | the manager's seat and job tables |
+| I2: is a seat alive, and in what state | `util::alive` per seat, `seat-since.json`, memory.rs's `ps`, waiting.rs's `ps`, herdr's `agent.list` | `turn`, `seat.stopped`, `seats` |
+| I3: was an order delivered and taken | screen renders (59.5 per tick), `typed-unsent.json`, `first-orders.json`, the `hooks.jsonl` scans, `stuck-commands.json` | `order.*`, `seat.stuck` |
+| I4: has a seat ended | census-by-absence, `finished-wip.json` | `seat.stopped` |
+| transcript reads in wsp | agent_commands.rs:2723's callers, did.rs:463, the opencode reads | `seat.said`, `seat.spent`, `seat.did` |
+
+I5 (row state) is state-core's rows machine and is not this plan's.
+
+### 4.3 How the verbs read through the manager
+
+- **`wip`** sends one `seats` request to each host in the machine records, in parallel. Each host's answer is
+  `Census::heard(host, seats)`. A host that does not answer within 1 s is `Census::silent(host, why)`, which keeps
+  remote-agents' rule that unreachable is never empty (crates/wire/src/place.rs:784, :794, :804). wip runs no `ps`, `lsof`, render or `df`.
+  Host facts come from the same replies.
+- **`spawn`** sends `seat.spawn` with the first order and waits for `seat.started`, then `order.acked`, by
+  subscription. `hand_over` keeps its patience rules and loses its polling.
+- **`despawn`** sends `seat.stop` and waits for `seat.stopped`. Its report names the pids the manager ended, not the
+  pids wsp guessed.
+- **`tell`** sends `order.deliver`. While a host is silent the tell is held (wake.rs:540, unchanged) and flushed when
+  the host's connection returns.
+- **`watch`** and the wait verbs subscribe to the managers they need and filter on the client.
+- **The daemon tick** holds one subscription per manager, folds events into the files, and runs wsp's decisions
+  (cycle, ending, closing, attention) over the folded state. These phases go:
+  - `tunnels`;
+  - `repair:unsent`;
+  - `sweep:leaked-agents`;
+  - `sweep:ended-panes`;
+  - `sweep:check-trees`, once tree jobs are the manager's (M3).
+
+  These phases stay but read the manager's facts rather than probing: `ending:verification` (from `seat.did` digests,
+  not transcripts), `sweep:disk` and `sweep:throttle`.
+
+### 4.4 herdr's removal (wsp-120)
+
+D20 makes wsp-120 a line of the first pass. In this plan it is **step M0**, *before* the seam is drawn, for two
+reasons:
+- A backend that no host runs should not be given a protocol face (D15).
+- The 264 references across about 30 files are the shape that keeps bending `Place` (wsp-120's own finding: the
+  tests are herdr-shaped).
+
+The removal covers what D20 lists:
+- the readers;
+- the unreachable warnings;
+- the cmd_agent tests that reach a live herdr (wsp-632);
+- the panel's herdr focus and install calls (panel/run.rs:481–490, panel/install.rs:259–325);
+- "control plane for herdr" in `wsp help`, which still prints today.
+
+After M0 the `Place` implementors are `place_compound`, `place_super` and `fake`, and only those three need a manager
+face.
+
+---
+
+## 5. The far machine
+
+The i5 today (remote-agents v1, with wsp-638 and wsp-639 at review):
+- one ssh ControlMaster from the Mac's daemon, plus two `-O forward`s per seat;
+- `compound-sup` started by a shell line over ssh;
+- a beat every 30 s, sent on the tick, through each seat's forwarded controller socket;
+- a `compound-remote gate` hook reading the lease file;
+- trees copied up and back by rsync with a far manifest;
+- the agent's own `wsp` verbs run back over ssh by the shim.
+
+Under this plan the i5 runs **the same manager as the Mac**, installed the same way, and wsp dials it over the
+tailnet.
+
+| piece of v1 | becomes |
+|---|---|
+| ControlMaster and per-seat forwards (tunnel.rs) | Gone. There is one TCP connection per host and no per-seat forward. The 104-byte `SUN_PATH_MAX` concern goes with them. |
+| `compound-sup spawn` over ssh (far.rs:488) | `seat.spawn` to the i5's manager, which forks compound-sup locally, inside the GUI session for the keychain token |
+| the beat through a forwarded socket, on the tick (far.rs:1124) | The connection's heartbeat on its own 10 s timer. On each beat from a wsp holder the manager writes `<exec_dir>/lease/<seat>` `ok` for each seat whose claim wsp says is held, and `stop` for one that is released. The gate is unchanged and still **fails closed**. wsp-639's flap cannot happen: the beat is no longer paced by the tick. |
+| the lease, a machine field (default 180 s) | Unchanged in meaning. The manager reads it from `hello`. |
+| `machine check`: wire, a throwaway session, `claude -p` | `hello` reports the wire, and a `check` request runs the session on the host. |
+| the far manifest and copy (treecopy.rs) | Under T1 the far half runs inside the manager, hashing in-process (wsp-638's 4 min 25 s was a fork per file). The bytes still go by rsync over ssh, or by a `tree.copy` stream in the protocol (Q7). Under T2 it is retired. |
+| the far verifier (remote-agents 11.3) | A seat like any other on the i5, with its checks run as the i5 manager's jobs. |
+| unreachable, `despawn --lost`, `machine retire` | Unchanged. A host is silent when its connection has missed three beats past the lease, and its seats read `lost`. |
+
+**What of the ssh door stays:**
+1. **Install and upgrade**: copying binaries, the plist and the token, and `launchctl` on the far side. The manager
+   cannot install itself.
+2. **The tree bytes under T1**, unless Q7 moves them into the protocol.
+3. **The agent's own `wsp` calls** (the shim: `say`, `note`, `review`, `submit`, the SessionStart brief). These are
+   calls *to* wsp's state, and the state is on the Mac until the server. The recommendation is to keep the shim's ssh
+   until state-core step 1 gives the agent a network API. The alternative is to relay them through the manager's
+   connection. That needs a wsp process on the Mac to run each relayed verb, which is the daemon running CLI verbs on
+   behalf of agents (Q8).
+4. **A person's debugging**, which ssh always serves.
+
+The far-only fields `exec_dir` and `wire` stay on the machine record. `transport` gains the value `manager` next to
+`ssh` (remote-agents §4: "the machine record names its transport").
+
+---
+
+## 6. Migration
+
+### 6.1 Baselines
+
+From `wsp calls --since 24h`, 2026-11-16T06:48Z.
+
+**Per tick** (1,633 ticks): 37.5 `ps`, 59.5 `compound-render`, 24.6 `df`, 0.9 `lsof`, 1.3 `kill`. The tick's p50 is
+19.5 s and its p95 116 s.
+
+**Per verb:**
+
+| verb | measure |
+|---|---|
+| `wip` | 464 calls, 1,360 CPU-s (2.9 CPU-s per call), p50 3.5 s |
+| `wip --json` | p50 2.7 s |
+| `spawn` | **p50 9.4 s**, p95 35.7 s |
+| `despawn` | p50 2.9 s |
+| `tell` | p50 0.86 s |
+
+**compound's host polling** (`none via host`): 28,032 calls and 25,268 CPU-s, 17.2% of the total, with `ps` 41,459×,
+`compound-render` 195,490× and `lsof` 2,227×. **ssh**: 147 runs, p95 38 s.
+
+**Incidents.**
+- **wsp-478 kind** (a process stopped for standing in a tree it did not start): cycle.log lines `stopped in finished
+  row … TERM` whose pids were not started by that row.
+- **wsp-411 kind**, which is state-core 1.6's I4: a seat's end inferred from absence, such as a second idle seat
+  after a re-plan. Row wsp-411 itself is the wire cut, and state-core files this incident class under it. Counted as
+  seats reaped by a census that later answered.
+
+`wsp calls` records costs, not incidents, so M0 adds an `--incidents` view over cycle.log and events.jsonl that
+counts both kinds. The before figure is taken from it.
+
+### 6.2 The steps
+
+Each step lands behind the previous one, and the live fleet runs on every intermediate state. Each step's measure is
+taken with `wsp calls` over a day before and a day after, and its incident counts over a week.
+
+| step | what | measure: done when | rollback |
+|---|---|---|---|
+| **M0. herdr out, seam named** | wsp-120 (4.4). `host-api` holds the types of 3.2. Every OS-touching call outside tree work goes through one `Host` trait. Its only implementation is **in-process**: today's code, behind the trait. `wsp calls --incidents`. | `grep` finds no `ps`, `lsof`, `kill`, render, transcript or fact probe outside the in-process host (tree work excepted). Spawn p50 ≤ 9.4 s, `wip` CPU no worse, tick no slower. Herdr references → 0. | Revert. It is a pure move plus deletions, behind the same tests. |
+| **M1. The manager on the Mac** | The in-process host becomes the `wsp-manager` process under launchd. wsp dials it on TCP (3.4). Hooks report to it, and the journal and subscription are in use. The daemon folds events. `wip` reads `seats`. compound's host keeps polling `wip --json`, which is now cheap. | **ps** per tick 37.5 → ≤ 1. **renders** per tick 59.5 → 0. **`df`** 24.6 → 0. **lsof** in `wip` → 0. `wip` < 0.2 CPU-s per call (from 2.9). Host polling CPU-s per day 25,268 → under 2,500. Spawn p50 no worse than 9.4 s. wsp-411-kind incidents → 0 over a week. A manager kill -9 mid-turn loses no seat and no order (a scripted proof, 10×). | `WSP_HOST=inproc`: the same code linked into wsp, as at M0. Seats started by the manager stay alive (compound-sup is durable), and the in-process host adopts them by socket. |
+| **M2. The i5 under its own manager** | The same binary on the i5. wsp dials it over the tailnet. The beat becomes the heartbeat. Per-seat forwards and tunnel.rs's masters go, and the far half of the copy moves into the manager. | **ssh** runs per day 147 → install and tree bytes only. A far seat working through a slowed tick never reads unreachable (a wsp-639 sandbox reproduction plus a week live). The far manifest of compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s). `spawn --on` p50 no worse. | A machine field `transport: ssh`, which keeps the v1 path compiled until a fortnight passes on `manager`. |
+| **M3. Tree jobs under the manager** | `throttle run`, `check`, `verify`'s checks and barrier runs become `job.run` on the tree's host (the Mac). The throttle admits by the manager's facts. check_tree's sweep, the slot probes and leaked_agents go. | **lsof** → 0 and **ps** → 0 on the wsp side. Every `kill` is by a manager, on a pgid it started. wsp-478-kind incidents → 0 over a week. `throttle run`'s wall per build no worse. | Jobs fall back to wsp running them in-process behind a flag. The sweep is restored with them. |
+| **M4. Trees placed (if Q6 says T2)** | `tree.checkout` and `tree.land` on every host's manager, a fenced push to the trunk, per-host warm targets, and the barrier's host named. | A list runs with members on two hosts and no copy-up or copy-back. Land conflicts are refused by the push and never overwritten. Cold-build cost on the i5 is measured against remote-agents' early proof. | Rows placed on the Mac only (T1), which is the state at M3. |
+
+Spawn p50 is the guard rail at every step: a step that makes it worse than 9.4 s, measured the same way, does not
+finish.
+
+### 6.3 How this reorders state-core section 7
+
+The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the
+OS work that would otherwise be carried into the server and then extracted again. Then:
+- state-core **step 1** (the server, its read path and compound subscribing) folds manager events into the store's
+  mirror, rather than mirroring files that probes wrote.
+- state-core **step 2** (the orders machine) keeps its state machine, but its delivery half already exists. Delivery
+  and ack come from the manager at M1, so step 2 is the store owning the order record and the `deliver:<seat>` lease.
+- state-core **step 3** (seats via executors) shrinks to *the server takes the manager connections over from the
+  daemon, and the seat machine owns the record*. The ps/lsof deletions it listed are done at M1 and M3.
+- state-core **step 6**'s network transport is already in step 1 (D19) and in M1 for managers. Step 6 keeps auth and
+  principals.
+
+The amended table is in docs/state-core.md section 7.
+
+---
+
+## 7. Questions for Ed
+
+1. **The manager's shape.** Option A: one manager per host, supervising one durable compound-sup per seat (2.1,
+   recommended, D14's lean)? Or B (no manager, wsp to each compound-sup), C (one supervisor for the whole host) or D
+   (the wsp daemon on every host)?
+2. **The manager and compound-remote.** Should the manager fork compound-sup itself, with compound-remote keeping only
+   `gate` (recommended: one process fewer, and the manager runs in the GUI session already)? Or should it delegate to
+   compound-remote `serve` as a separate process?
+3. **Repository.** R1: wsp's repository, with crates `manager` and `host-api` (recommended)? R2: compound's,
+   growing compound-remote? Or R3: a third repository (2.3)?
+4. **Who dials.** wsp dials the managers on day one (recommended). Should managers dial out to the server once it
+   exists, for cloud hosts that accept no inbound connections? Or should the server keep dialling?
+5. **Day-one identity.** Is one token per manager, plus binding to the tailnet and loopback only, enough until D13 is
+   discussed? When does TLS come in: at the first host off the tailnet, or from M1?
+6. **Where trees live.** T1 (trees on the store's host, D5 as written, the far copy kept), T2 (trees with the agents,
+   with land as a fenced push to a trunk remote; this reverses 2026-11-05's "copied, not pushed git to git" for far
+   rows) or T3 (copies everywhere, the trunk on one host) (1.3)? The recommendation is T1 now, with M3's jobs and
+   M4's verbs reserved so that T2 changes placement only.
+7. **Tree bytes under T1.** Should copy-up and copy-back stay rsync over ssh, or become a `tree.copy` stream in the
+   protocol so that ssh is left for install only?
+8. **The agent's own `wsp` calls on a far host.** Keep the shim's ssh until the server's network API (recommended),
+   or relay them through the manager's connection?
+9. **wsp-120 at M0.** Is herdr's removal the first line of the manager work (recommended), as D20 put it in the
+   first pass? Or does it wait for state-core's first pass?
+10. **Renderers.** The manager reports a seat's sockets so that compound's host can attach a compound-render. Should
+    *attaching* stay wholly compound's business (recommended), or should the manager also start renderers for seats
+    a person is watching?
+11. **The throttle's decision.** Should admission (whether a build may start now) move into the manager with the jobs,
+    since the facts and the slots are both there? Or should wsp keep the decision and read the facts from the
+    heartbeat? This is D5(b) again, at host scale.
+12. **The gate for local seats.** Today only far seats are gated, and "a local seat hears nothing". If the Mac is a
+    host like any other, should its seats be gated too when its manager stops hearing wsp? That is safer, but a
+    daemon restart would then pause the Mac's agents.
+13. **Measures.** Is a day of `wsp calls` before and after each step, a week for incidents, and spawn p50 no worse
+    than 9.4 s the right bar?
+14. **Scheduling.** By D12 nothing is filed until Ed prompts it. When prompted, should M0–M3 be one list with M4 left
+    for Q6, or should each step be its own list?
