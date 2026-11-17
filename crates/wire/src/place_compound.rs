@@ -1168,12 +1168,25 @@ fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut
     // speaking to an older compound-sup too. Only a constant outside the
     // range is the refusal compound-026 was filed for.
     match ask_wire_range(&sup) {
-        Some((lo, hi)) if !(lo..=hi).contains(&WIRE_VERSION) => problems.push(format!(
-            "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup accepts {} — bump WIRE_VERSION in \
-             src/place_compound.rs to match crates/supervisor/src/proto.rs (compound-026)",
-            if lo == hi { hi.to_string() } else { format!("{lo}..={hi}") }
+        Some(Ok((lo, hi))) if !(lo..=hi).contains(&WIRE_VERSION) => {
+            let range = if lo == hi { hi.to_string() } else { format!("{lo}..={hi}") };
+            problems.push(if WIRE_VERSION > hi {
+                format!(
+                    "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup accepts {range} — compound-sup is \
+                     behind: rebuild and reinstall it from a compound commit that speaks {WIRE_VERSION} (compound-026)"
+                )
+            } else {
+                format!(
+                    "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup accepts {range} — bump WIRE_VERSION in \
+                     src/place_compound.rs to match crates/supervisor/src/proto.rs (compound-026)"
+                )
+            })
+        }
+        Some(Ok(_)) => {}
+        Some(Err(said)) => problems.push(format!(
+            "{} answered `wire-version` with {said:?}, which is not a version range — wsp cannot check its WIRE_VERSION ({WIRE_VERSION}) against it (compound-026)",
+            util::contract(&sup),
         )),
-        Some(_) => {}
         None => notes.push(format!(
             "{} does not answer `wire-version` — wsp cannot check its WIRE_VERSION ({WIRE_VERSION}) against it (compound-026)",
             util::contract(&sup),
@@ -1181,23 +1194,18 @@ fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut
     }
 }
 
-/// `compound-sup wire-version` → the range it accepts, or `None` if the
-/// installed binary predates that verb (an older build, not a broken one) or
-/// will not answer at all. A current build prints `OLDEST VERSION`; an older
-/// one prints a bare number, which accepts only that — the same rule
-/// `far::readiness` applies to a far machine's compound-sup.
-fn ask_wire_range(bin: &std::path::Path) -> Option<(u32, u32)> {
+/// `compound-sup wire-version` → the range it accepts (`Ok`), what it said
+/// if that is not a range (`Err`), or `None` if the installed binary predates
+/// that verb (an older build, not a broken one) or will not answer at all. A
+/// current build prints `OLDEST VERSION`; an older one a bare number, which
+/// accepts only that. Parsed by `far::parse_wire`, the rule far machines get.
+fn ask_wire_range(bin: &std::path::Path) -> Option<std::result::Result<(u32, u32), String>> {
     let out = Command::new(bin).arg("wire-version").stderr(Stdio::null()).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let nums: Vec<u32> = text.split_whitespace().map(|t| t.parse().ok()).collect::<Option<_>>()?;
-    match nums[..] {
-        [v] => Some((v, v)),
-        [lo, hi] if lo <= hi => Some((lo, hi)),
-        _ => None,
-    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(crate::far::parse_wire(&text).ok_or(text))
 }
 
 fn dial(socket: &PathBuf, timeout: Duration) -> Result<UnixStream> {
@@ -4028,6 +4036,29 @@ mod tests {
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
         wire_health_of(&sup, &mut problems, &mut notes);
         assert!(problems.is_empty(), "{problems:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// compound-sup behind wsp: the fix is a compound-sup rebuild, not wsp's
+    /// constant; and an answer that is not a range is a problem, not a note.
+    #[test]
+    fn wire_health_names_the_side_that_is_behind_and_refuses_a_garbled_answer() {
+        let scratch = Scratch::new("wire-sup-behind");
+        let sup = fake_sup(&scratch.root, Some(&format!("{} {}", WIRE_VERSION - 2, WIRE_VERSION - 1)));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("compound-sup is behind"), "{}", problems[0]);
+        assert!(!problems[0].contains("bump WIRE_VERSION"), "{}", problems[0]);
+        for (i, reply) in [format!("{} {}", WIRE_VERSION + 5, WIRE_VERSION), format!("9 {WIRE_VERSION} x")].iter().enumerate() {
+            let scratch = Scratch::new(&format!("wire-garbled-{i}"));
+            let sup = fake_sup(&scratch.root, Some(reply));
+            let (mut problems, mut notes) = (Vec::new(), Vec::new());
+            wire_health_of(&sup, &mut problems, &mut notes);
+            assert_eq!(problems.len(), 1, "{reply:?}: {problems:?}");
+            assert!(problems[0].contains("not a version range"), "{}", problems[0]);
+            assert!(notes.is_empty(), "{notes:?}");
+        }
         assert!(notes.is_empty(), "{notes:?}");
     }
 
