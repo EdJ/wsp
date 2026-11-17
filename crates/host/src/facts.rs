@@ -1,16 +1,17 @@
 //! The host's facts for the manager's beat (`docs/agent-manager.md` 3.2's
 //! `beat`): load, memory pressure, swap, disk free per volume and thermal
 //! state, read in three asks of [`InProcess`] (one `sysctl`, one `df`, one
-//! `pmset`) and turned into `wsp-host-api`'s [`HostFacts`].
+//! `pmset`; two more for the throttle's facts, below) and turned into `wsp-host-api`'s [`HostFacts`].
 //!
 //! [`HostFacts`] has no "unknown" in its first fields, so a fact this host does
 //! not answer is reported at its quiet value (load 0, memory `normal`, swap 0,
 //! thermal `nominal`) and named in [`Read::missing`] for the reader's log.
 //!
 //! The throttle's facts (wsp-044) are optional. The five- and fifteen-minute
-//! load and the speed limit come out of the same answers; HID idle, free
-//! memory and pageouts need asks this reading does not make yet, and are
-//! `None` until the row that serves the throttle adds them.
+//! load and the speed limit come out of the same answers; HID idle (`ioreg`)
+//! and free memory and pageouts (`vm_stat`) take two asks more (wsp-049), the
+//! ones `crates/trees/src/throttle.rs` makes in its own process today. An
+//! optional fact this host does not answer is `None`, and not named missing.
 
 use std::path::{Path, PathBuf};
 
@@ -35,7 +36,64 @@ pub fn read(host: &InProcess, volumes: &[PathBuf]) -> Read {
     let paths: Vec<&Path> = volumes.iter().map(PathBuf::as_path).collect();
     let df = host.disks_free(&paths).unwrap_or_default();
     let therm = host.thermal();
-    assemble(&sys, &df, therm.as_deref())
+    let mut read = assemble(&sys, &df, therm.as_deref());
+    throttle_facts(&mut read.facts, host.idle().as_deref(), host.pageouts().as_deref());
+    read
+}
+
+/// The throttle's facts that need asks of their own: HID idle out of `ioreg
+/// -c IOHIDSystem`, free memory and pageouts out of `vm_stat`. A fact whose
+/// answer is absent or unreadable is left as it was.
+pub fn throttle_facts(facts: &mut HostFacts, ioreg: Option<&str>, vm_stat: Option<&str>) {
+    if let Some(idle) = ioreg.and_then(parse_hid_idle) {
+        facts.hid_idle_secs = Some(idle);
+    }
+    if let Some(out) = vm_stat {
+        if let Some(free) = parse_free_memory(out) {
+            facts.free_memory_bytes = Some(free);
+        }
+        if let Some(n) = parse_pageouts(out) {
+            facts.pageouts = Some(n);
+        }
+    }
+}
+
+/// `"HIDIdleTime" = 125000000000` in `ioreg -c IOHIDSystem`, nanoseconds, in
+/// whole seconds.
+pub fn parse_hid_idle(ioreg: &str) -> Option<u64> {
+    let line = ioreg.lines().find(|l| l.contains("\"HIDIdleTime\""))?;
+    let ns: u64 = line.split('=').nth(1)?.trim().parse().ok()?;
+    Some(ns / 1_000_000_000)
+}
+
+/// `vm_stat`'s page size, out of its first line `Mach Virtual Memory
+/// Statistics: (page size of 16384 bytes)`: 4096 where it does not say.
+fn page_size(vm_stat: &str) -> u64 {
+    vm_stat
+        .lines()
+        .next()
+        .and_then(|l| l.split("page size of").nth(1))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(4096)
+}
+
+/// The count on `vm_stat`'s `<label>:   12205611.` line.
+fn vm_count(vm_stat: &str, label: &str) -> Option<u64> {
+    let line = vm_stat.lines().find(|l| l.starts_with(label))?;
+    line[label.len()..].trim().trim_end_matches('.').parse().ok()
+}
+
+/// Memory free now, in bytes: `vm_stat`'s `Pages free` times its page size.
+pub fn parse_free_memory(vm_stat: &str) -> Option<u64> {
+    Some(vm_count(vm_stat, "Pages free:")? * page_size(vm_stat))
+}
+
+/// Pages paged out since boot, in 4 KB pages whatever the host's page size,
+/// out of `vm_stat`'s `Pageouts:`: the unit the throttle's pageout lines are
+/// drawn in (throttle.rs's `parse_pageouts`).
+pub fn parse_pageouts(vm_stat: &str) -> Option<u64> {
+    Some(vm_count(vm_stat, "Pageouts:")? * page_size(vm_stat) / 4096)
 }
 
 /// The facts out of the three answers.
@@ -247,7 +305,25 @@ mod tests {
         assert_eq!(parse_swap_used("nonsense"), None);
     }
 
-    /// The live host answers all three asks: the beat carries real facts.
+    #[test]
+    fn the_throttle_facts_are_read_out_of_ioreg_and_vm_stat() {
+        let mut r = assemble(SYSCTL, DF, Some(PMSET));
+        let ioreg = "    | |   \"HIDIdleTime\" = 125000000000\n    | |   \"Other\" = 1\n";
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+            Pages free:                               2919.\n\
+            Pageouts:                                 1000.\n";
+        throttle_facts(&mut r.facts, Some(ioreg), Some(vm));
+        assert_eq!(r.facts.hid_idle_secs, Some(125));
+        assert_eq!(r.facts.free_memory_bytes, Some(2919 * 16384));
+        assert_eq!(r.facts.pageouts, Some(4000), "in 4 KB pages");
+        let mut bare = assemble(SYSCTL, DF, Some(PMSET));
+        throttle_facts(&mut bare.facts, None, Some("nothing"));
+        assert_eq!((bare.facts.hid_idle_secs, bare.facts.free_memory_bytes, bare.facts.pageouts), (None, None, None));
+        assert!(bare.missing.is_empty(), "an optional fact is not named missing");
+    }
+
+    /// The live host answers every ask: the beat carries real facts, the
+    /// throttle's included.
     #[cfg(target_os = "macos")]
     #[test]
     fn this_mac_answers_every_fact() {
@@ -255,5 +331,10 @@ mod tests {
         assert!(r.missing.is_empty(), "missing: {:?}", r.missing);
         assert_eq!(r.facts.disks.len(), 1);
         assert!(r.facts.disks[0].total_bytes > 0);
+        let f = &r.facts;
+        assert!(f.load5_centi.is_some() && f.load15_centi.is_some() && f.speed_limit_pct.is_some(), "{f:?}");
+        assert!(f.hid_idle_secs.is_some(), "ioreg's HID idle: {f:?}");
+        assert!(f.free_memory_bytes.is_some_and(|b| b > 0), "vm_stat's free pages: {f:?}");
+        assert!(f.pageouts.is_some(), "vm_stat's pageouts: {f:?}");
     }
 }
