@@ -797,6 +797,33 @@ fn the_api_links_the_contract_alone_and_does_no_io() {
     assert!(found.is_empty(), "wsp-api does no IO (R2):\n{}", found.join("\n"));
 }
 
+/// `wsp-server`, the state core's server, goes through `Store` only (`docs/state-core.md`
+/// section 6; wsp-073): its normal dependencies are `wsp-api` and `wsp-store-contract`, and with
+/// its tests it reaches only those and `wsp-store-conformance` (for `MemStore`) of the workspace,
+/// so nothing that does OS or store-file work: never `wsp-store-sqlite` ("not the sqlite crate,
+/// except in main"), `wsp-store`, `wsp-wire`, `wsp-host` or `wsp-manager`. Its one external
+/// dependency is `serde_json`.
+#[test]
+fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_file_work() {
+    let dir = root().join("crates/server");
+    let normal: Vec<String> = path_deps(&dir.join("Cargo.toml"), false).into_keys().collect();
+    assert_eq!(normal, ["wsp-api", "wsp-store-contract"], "wsp-server's normal dependencies are the api and the contract");
+
+    const MAY: &[&str] = &["wsp-api", "wsp-store-contract", "wsp-store-conformance"];
+    let bad = beyond(&reached_from(&dir, "wsp-server"), MAY);
+    assert!(
+        bad.is_empty(),
+        "wsp-server must link only {MAY:?} of the workspace, its tests included (docs/state-core.md section 6):\n{bad}"
+    );
+
+    let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
+    let extra: Vec<&String> = named
+        .iter()
+        .filter(|d| !["serde_json", "wsp-api", "wsp-store-contract", "wsp-store-conformance"].contains(&d.as_str()))
+        .collect();
+    assert!(extra.is_empty(), "wsp-server depends on serde_json, the api and the contract alone, not {extra:?}");
+}
+
 #[test]
 fn the_dependency_lister_reads_each_manifest_form() {
     let m = "[package]\nname = \"x\"\n\n[dependencies]\nserde = { version = \"1\" }\n\"serde_json\" = \"1\"\n\

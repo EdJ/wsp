@@ -294,6 +294,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsp-server"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-api",
+ "wsp-store-conformance",
+ "wsp-store-contract",
+]
+
+[[package]]
 name = "wsp-store"
 version = "0.1.0"
 dependencies = [
