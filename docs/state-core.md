@@ -595,6 +595,42 @@ fleet.
 - **Step 6** keeps auth and principals only. Network transport moved into step 1 (D19), and into M1 for managers,
   which carry one token each until D13 is settled.
 
+### Step 0's breakdown (wsp-043, 2026-11-17)
+
+The list is `s0-state-core`, at status init. Per d1 it runs after M3, so it is not started. It follows wsp-018's
+rules. Each row adds something beside the old code and is green on its own, and nothing in wsp uses what step 0
+adds, so there is nothing to contract. Each row's checks build the workspace and test every crate it touches, with
+budgets of at least 120 s per cargo step (wsp-015).
+
+| group | kind | row | tier | what | creates / changes |
+|---|---|---|---|---|---|
+| 1 | components | wsp-045 | sonnet high | C compiles through sccache (section 9, option 1), and SQLite enters the tree | creates `.cargo/cc-wrap`, `crates/store-sqlite` (`wsp-store-sqlite`: `rusqlite` bundled, pinned, no type exposed), `tests/cc_wrap.rs`; changes `.cargo/config.toml` (`[env] CC`), `Cargo.toml`, `Cargo.lock`, `tests/layering.rs` (rusqlite in `wsp-store-sqlite` only), docs/components.md (D2's amendment to the one-external-dependency gate) |
+| 2 | contract | wsp-046 | opus high | The contract's types (2.1, 2.2, the commands of 4.2, the event semantics of 4.3), types only (R2), by a row of its own (R5) | changes `crates/store-contract` (new modules, `MAP.md`, a serde round-trip test), `Cargo.lock`, docs/components.md |
+| 3 | components | wsp-047 | opus high | `wsp-store-conformance`: the ten cases of 2.3 as generic functions, `mem::MemStore` (the fake), a test domain, and bite tests that show each case fails against a fake broken in the matching way. Three legs: `fake`, `state`, `events` | creates `crates/store-conformance`; changes `Cargo.toml`, `Cargo.lock`, `tests/layering.rs`, docs/components.md, this section's 2.3 |
+| 4 | insitu | wsp-048 | sonnet high | The measure: a fresh worktree builds `wsp-store-sqlite` in debug and release with sccache warm from another tree, plus both fallbacks, written into section 9 as "Step 0's result" | changes this document (sections 7 and 9) |
+
+The groups run one at a time. Each row of groups 1–3 changes `Cargo.lock`, and groups 1 and 3 each add a workspace
+member on `Cargo.toml`'s one `members` line, so in parallel they would conflict at land. The stop after group 3 asks
+for sccache to be installed before the measure.
+
+**Found while planning.** sccache is not installed on this Mac: it is not on `PATH`, in `/usr/local/bin` or in
+`/opt/homebrew/bin`. So `.cargo/rustc-wrap` falls back to bare rustc today, and no Rust compile is cached across
+trees either. Section 9's figures come from Ed's machine. On this one (M4 Pro, 12 cores, load about 4, no cache), a
+scratch crate on `rusqlite 0.32.1` with `libsqlite3-sys 0.30.1` bundled built cold in 3.1 s (debug) and 12.7 s
+(release). The `libsqlite3-sys` rebuild alone took 2.0 s (debug) and 12.1 s (release). So debug already builds
+under 5 s here without a cache. The cache matters for release builds (`wsp install`, `verify --release`) and for the
+i5.
+
+**Left for the person** (the review note on wsp-043):
+- (a) Where `apply`'s validation runs. Recommended: the contract declares a `Domain` trait with two signatures,
+  `decide(&State, &Command)` and `evolve(State, &Event)`. A backend runs `decide` and appends its events in one
+  atomic write, which matches 2.2's `apply(cmd)`. The suite brings a test domain now, and `wsp-machines` brings the
+  real one.
+- (b) Installing sccache on this Mac, before group 4.
+- (c) Whether step 0 waits for M3, as d1 says (recommended), or rides beside it (Q14).
+- `wsp-api` (4.1's envelope) is not in step 0. It belongs to step 1's breakdown, where whether it reuses
+  `wsp-host-api`'s `Connection` is decided.
+
 ---
 
 ## 8. Resilience and scale
