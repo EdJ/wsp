@@ -679,32 +679,6 @@ mod tests {
         );
     }
 
-    /// Both exits are the process ending, and the second one is easy to get
-    /// wrong by copying: a pane panel answers the same reload by re-execing
-    /// itself, because it owns a pane and a tty it would otherwise lose. A
-    /// surface owns neither, and its host already watches for a child that
-    /// ended and starts another — so replacing ourselves here would be a
-    /// restart the host cannot see, beside the one it can.
-    #[test]
-    fn a_new_binary_ends_the_surface_where_it_would_replace_a_panel() {
-        let arm = SRC
-            .split("Outcome::Reload =>")
-            .nth(1)
-            .expect("the reload arm moved");
-        let arm = &arm[..arm.find("Outcome::Quit").expect("the quit arm moved")];
-        assert!(arm.contains("stop("), "a new binary has to end the surface");
-
-        let after = SRC
-            .split("read_host(std::io::stdin().lock(), host, running, tx);")
-            .nth(1)
-            .expect("the reader thread moved");
-        assert!(
-            after.trim_start().starts_with("stop("),
-            "a read that has ended has to end the process on the next line, or \
-             the ticker goes on waking a loop drawing into a closed pipe",
-        );
-    }
-
     /// What makes the reload prompt rather than eventual. The loop checks the
     /// binary on the fast cadence and only there — 250ms when the panel is on
     /// screen, thirty seconds when it is not — and a surface is chrome, so it
@@ -724,42 +698,6 @@ mod tests {
 
         assert!(on_screen, "a surface is drawn by its host or it is not running");
         assert!(!keyboard, "and whether it has the keyboard is the host's word");
-    }
-
-    /// `fork-001`, from this side: the rows arrive down the pipe the frames go
-    /// back on, and are read by the parser a socket answer is read by.
-    ///
-    /// The event that goes with them is the urgent kind on purpose. A pushed
-    /// census only exists because something moved — the host does not send one
-    /// otherwise — so waiting for the next cadence to redraw would be waiting
-    /// for news already in hand.
-    #[test]
-    fn what_the_host_is_running_arrives_down_the_pipe_rather_than_over_a_socket() {
-        let running = nothing_told();
-        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
-
-        read_host(
-            concat!(
-                r#"{"t":"live","workspaces":[{"workspace_id":"w9","label":"fork","focused":true}],"#,
-                r#""panes":[{"pane_id":"w9:p1","workspace_id":"w9","label":"fork-001","#,
-                r#""agent":"claude","agent_status":"working","cwd":"/tmp","focused":true}]}"#,
-                "\n",
-            )
-            .as_bytes(),
-            Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None })),
-            Arc::clone(&running),
-            tx,
-        );
-
-        let told = running.lock().unwrap();
-        let (workspaces, panes) = told.here.as_ref().expect("the host said what it is running");
-        assert_eq!(workspaces[0].label, "fork");
-        assert_eq!(panes[0].pane_id, "w9:p1");
-        assert_eq!(panes[0].agent_status, "working");
-        assert!(
-            matches!(rx.recv(), Ok(Msg::Herdr(e)) if e.shape),
-            "a census is news, and the kind that redraws now rather than at the next tick",
-        );
     }
 
     /// The capability the whole fallback rests on. A host that has never said

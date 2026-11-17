@@ -274,10 +274,9 @@ AGENTS
                                     first
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
-                 [--model <m>] [--effort <e>] [--subagents] [--herdr]
+                 [--model <m>] [--effort <e>] [--subagents]
                                     open a workspace on it and claim it there;
-                                    in a compound session by default — --herdr
-                                    opens it in the fork instead, and
+                                    in a compound session by default, or
                                     --headless in a supervisor with no terminal
                                     at all. --agent starts an agent in it too. --focus
                                     to go there, --on to run it on another

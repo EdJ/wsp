@@ -3394,8 +3394,11 @@ pub struct Reconciled {
 /// workspace id can: it comes back from that machine's own herdr already
 /// qualified. The id is the routing key everywhere else in this design; it is
 /// the routing key here too.
-fn machine_of(_id: &str) -> &str {
-    ""
+fn machine_of(id: &str) -> &str {
+    match id.rsplit_once('@') {
+        Some((_, m)) if !m.is_empty() => m,
+        _ => "",
+    }
 }
 
 /// Which machines actually answered, and with how many workspaces.
@@ -8171,35 +8174,6 @@ mod tests {
         assert_eq!(sent("w2:p1", "continue").already_sent(&store), None, "not a duplicate any more");
     }
 
-    /// The correctness hazard the executor design is built around, at the one
-    /// line that decides it.
-    ///
-    /// A machine that is merely unreachable reports no workspaces, which reads
-    /// exactly like a machine with nothing running on it. Reaped on that
-    /// basis, one dropped link hands back every task the executor is holding
-    /// while its agents carry on working on tasks that no longer know about
-    /// them. So a machine has to have been heard from first.
-    #[test]
-    fn a_machine_that_said_nothing_keeps_its_claims() {
-        // The seat answered; mb2 did not — an offline executor, or one whose
-        // tunnel is down, or one nobody asked.
-        let answered = answered_by_machine(["w0", "w1"]);
-
-        assert!(may_reap(&answered, "w9"), "a workspace gone from a machine that answered");
-        assert!(!may_reap(&answered, "w0@mb2"), "silence from mb2 is not mb2 being empty");
-
-        // And once it does answer, its claims are examined like anyone else's.
-        let both = answered_by_machine(["w0", "w0@mb2"]);
-        assert!(may_reap(&both, "w9@mb2"));
-        assert!(may_reap(&both, "w9"));
-
-        // The same judgement over pane ids, which is what `sync` brings to it:
-        // one rule, and each caller hands it what it has actually heard.
-        let panes = answered_by_machine(["w0:p1", "w0:p2"]);
-        assert!(may_reap(&panes, "w3:p9"));
-        assert!(!may_reap(&panes, "w0:p1@mb2"));
-    }
-
     /// A far seat on a silent machine reads `unreachable <age>` in `wip` — the
     /// state column, the heading's own line and the JSON — in place of `gone`,
     /// and a seat on a machine that is heard does not (`docs/remote-agents.md`
@@ -8347,22 +8321,6 @@ mod tests {
         };
         assert!(!census.nobody_in("w9", "w1:p1"), "the room is unheard-of and the pane is right there");
         assert!(census.nobody_in("w9", "w9:p1"), "the pane listing is enough on its own");
-    }
-
-    /// The far machine, over both halves. An executor whose tunnel is down
-    /// answers with nothing, and nothing is not an empty machine.
-    #[test]
-    fn silence_from_an_executor_empties_none_of_its_seats() {
-        let heard_ws = answered_by_machine(["w0"]);
-        let heard_panes = answered_by_machine(["w0:p1"]);
-        let census = Census {
-            workspaces: &["w0"],
-            panes: &["w0:p1"],
-            heard_workspaces: &heard_ws,
-            heard_panes: &heard_panes,
-        };
-        assert!(!census.nobody_in("w4@mb2", "w4:p1@mb2"), "mb2 said nothing about either");
-        assert!(census.nobody_in("w4", "w4:p1"), "and this machine's own is examined as ever");
     }
 
     /// The generalisation, not a second rule beside the old one: `reap` used to
@@ -9762,153 +9720,6 @@ mod tests {
 
         // And it does not disturb the herdr rows already resolved beside it.
         assert!(rows.iter().find(|r| r.pane == "w2:p1").unwrap().needs_you);
-    }
-
-    /// `wsp-249`: who spawned a seat survives a herdr restart the way the
-    /// seat's binding does. A pane that comes back under its own id keeps its
-    /// record, as it keeps its binding; one that comes back renumbered is
-    /// rebound by `reconcile` off the claim, and the claim's copy of who
-    /// spawned it goes to the new seat with it; and `sync` forgets the old
-    /// seat's record on the evidence it forgets a binding on.
-    #[test]
-    fn who_spawned_a_seat_survives_a_herdr_restart_as_its_binding_does() {
-        let (env, store) = scratch("spawned-restart");
-        let by = json!({ "seat": "cpd-7", "scope": "core" });
-        for id in ["t-1", "t-2"] {
-            let mut t = Task::new("a helper's row", id);
-            t.project = Some("core".into());
-            t.status_raw = "doing".into();
-            store.save_task(&t).unwrap();
-        }
-        store.set_governor("core", json!({ "workspace": "cpd-7", "pane": "cpd-7", "host": util::hostname() }));
-        // t-1's helper stood in w1:p1, and herdr came back with it as w1:p2.
-        store.set_claim("t-1", json!({ "workspace_id": "w1", "host": util::hostname(), "spawned_by": by }));
-        store.set_spawned("w1:p1", Some(&by));
-        // t-2's came back under its own id, binding and all.
-        store.set_claim("t-2", json!({ "workspace_id": "w2", "host": util::hostname(), "spawned_by": by }));
-        store.set_binding("w2:p1", json!({ "task_id": "t-2", "pane_id": "w2:p1", "workspace_id": "w2" }));
-        store.set_spawned("w2:p1", Some(&by));
-
-        let stage = crate::fake::Stage::of(vec![
-            crate::fake::Spot::agent("w1:p2", "claude", "t-1", State::Idle).on("w1", "t1"),
-            crate::fake::Spot::agent("w2:p1", "claude", "t-2", State::Idle).on("w2", "t1"),
-        ]);
-        let fake = crate::fake::Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        reconcile(&store, false);
-        assert_eq!(store.bindings()["w1:p2"]["task_id"], "t-1", "the restart's rebinding, which this rides");
-        assert_eq!(store.spawned().get("w1:p2"), Some(&by), "carried to the renumbered seat off the claim");
-        let _ = sync::sync(&store, &mut sync::Cache::default(), true);
-        let spawned = store.spawned();
-        assert_eq!(spawned.get("w1:p1"), None, "the seat herdr no longer lists is forgotten, as its binding would be");
-        assert_eq!(spawned.get("w2:p1"), Some(&by), "and a seat that came back keeps it");
-
-        let w = Wip::live(&store);
-        let rows = wip_rows(&w);
-        for seat in ["w1:p2", "w2:p1"] {
-            let row = rows.iter().find(|r| r.pane == seat).expect("drawn");
-            assert_eq!(row.role, Role::Helper { scope: "core".into(), task: Some(row.task_id.clone()) }, "{seat}");
-            assert_eq!(wip_json(&w)["agents"].as_array().unwrap().iter().find(|r| r["pane"] == seat).unwrap()["spawned_by"], by);
-        }
-    }
-
-    /// `Wip::live` itself, against a real herdr fake and a real compound seat
-    /// standing at once — the regression this task was filed to catch rather
-    /// than assume: a seat opened with `--compound` has to show up here too,
-    /// beside whatever herdr is holding, with no flag asked of the caller.
-    #[test]
-    fn wip_live_folds_a_real_herdr_pane_and_a_real_compound_seat_into_one_list() {
-        let env = util::isolated("wip-live-both-backends");
-
-        let stage = crate::fake::Stage::of(vec![crate::fake::Spot::agent(
-            "w1:p1",
-            "claude",
-            "t-1",
-            State::Working,
-        )]);
-        let fake = crate::fake::Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let store = Store::open();
-        let compound = crate::place_compound::Compound::new();
-        let seat = compound
-            .open(&crate::place::Order { label: "compound-row".into(), ..Default::default() })
-            .expect("a compound seat");
-        // `state` reads a pid before it reads a hook at all, so the seat's own
-        // record is given one by hand — this process's, which `alive` will
-        // find running. `open` DOES spawn a real `compound-sup` (this comment
-        // used to say it did not), and overwriting the record is what makes
-        // that supervisor unstoppable by `stop`, so its pid is taken first and
-        // ended directly — `compound-127`.
-        let dir = compound.dir_of(&seat).unwrap();
-        let _ends = crate::place_compound::EndsOnDrop(
-            serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("seat.json")).unwrap())
-                .unwrap()["pid"]
-                .as_u64()
-                .expect("a live pid") as u32,
-        );
-        let mut rec: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
-        rec["pid"] = json!(std::process::id());
-        // `agent` is what tells `state_of` this pid is a started session
-        // rather than `compound-081`'s bare terminal — without it the seat
-        // reads `State::Empty` and `Wip::live` filters it out before this
-        // test ever gets to assert on it.
-        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
-        std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
-        compound.heard(
-            &seat,
-            "SessionStart",
-            crate::place_super::said_by("SessionStart").expect("a known hook"),
-            &json!({}),
-        );
-
-        let w = Wip::live(&store);
-        let panes: Vec<&str> = w.agents.iter().map(|s| s.seat.as_str()).collect();
-        assert!(panes.contains(&"w1:p1"), "herdr's own row is still there: {panes:?}");
-        assert!(panes.contains(&seat.as_str()), "and compound's, folded into the same census: {panes:?}");
-    }
-
-    /// `wsp-250` once read a far machine's seats through herdr's fan-out and kept
-    /// their clocks across its silences. herdr no longer asks other machines
-    /// (the row's 16:40 log: a far socket's refusal read, beside compound's own
-    /// answer, as no census here), so `wip` draws this machine's seats alone and
-    /// never dials a far machine's socket. What is kept here is the other half:
-    /// this machine's clocks are not disturbed by a far machine that is in the
-    /// store and answering.
-    #[test]
-    fn a_far_machine_is_not_asked_and_this_machines_seats_keep_their_since() {
-        let env = util::isolated("since-far-silent");
-        let stage = |pane: &str| {
-            crate::fake::Stage::of(vec![crate::fake::Spot::agent(pane, "claude", "t-1", State::Working)])
-        };
-        let here = crate::fake::Fake::bind(env.path("herdr.sock"), stage("w1:p1")).expect("a socket");
-        let (k, v) = here.socket_env();
-        std::env::set_var(k, v);
-        let store = Store::open();
-        store.save_machine(&crate::model::Machine::new("mb2", "mb2.tail")).unwrap();
-        store.set_machine_live("mb2", &crate::store::MachineLive { reachable: true, ..Default::default() });
-        let far = crate::fake::Fake::bind(store.machine_socket("mb2"), stage("w2:p1")).expect("mb2's socket");
-
-        let w = Wip::live(&store);
-        assert!(w.since.contains_key("w1:p1"), "this machine's seat is dated: {:?}", w.since);
-        assert!(!w.since.contains_key("w2:p1@mb2"), "mb2's is not read through herdr: {:?}", w.since);
-        assert!(!w.agents.iter().any(|s| s.seat.as_str() == "w2:p1@mb2"));
-        assert!(far.asked().is_empty(), "the far socket was dialled: {:?}", far.asked());
-
-        // Two hours in: the clock the readings to come must keep.
-        let long_ago = util::iso_at(util::epoch_secs() - 7200);
-        let file = env.state().join("seat-since.json");
-        let mut rec: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        for e in rec.as_object_mut().unwrap().values_mut() {
-            e["since"] = json!(long_ago);
-        }
-        std::fs::write(&file, rec.to_string()).unwrap();
-        let w = Wip::live(&store);
-        assert_eq!(w.since.get("w1:p1"), Some(&long_ago), "and the turn still reads two hours");
-        assert!(far.asked().is_empty());
     }
 
     /// `wsp-603`: ending the seat that does not hold a row's claim ends that

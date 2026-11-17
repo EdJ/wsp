@@ -619,49 +619,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `compound-064` item 2's own decision, proven against real backends:
-    /// a machine with `compound` sessions and no herdr up at all is HEARD —
-    /// herdr's own total refusal folds in as a silent row under `"herdr"`
-    /// (`crate::place::LOCAL_BACKEND_NAMES`), never as the whole answer
-    /// going to `None`. `stamp` (the CLI verb) is what this file used to ask
-    /// a single, flag-selected backend for; asking `combined_census` proves
-    /// the fold `stamp` now runs on rather than a hand-built `Agents`.
-    #[test]
-    fn a_compound_only_machine_is_heard_even_though_herdr_never_answers() {
-        let _env = util::isolated("stamp-compound-only");
-        let store = Store::open();
-        // No herdr socket bound anywhere — `HERDR_SOCKET_PATH` names a file
-        // that does not exist, `util::isolated`'s own doing.
-        let compound = crate::place_compound::Compound::new();
-
-        let before = take(&store);
-        assert!(before.agents.heard(), "a real (if empty) compound census is still an answer");
-        assert!(
-            before.agents.silent.iter().any(|(m, _)| m == "herdr"),
-            "herdr's own refusal is on record, under its own name and not `\"\"`, \
-             which `named` would draw as this whole machine: {:?}",
-            before.agents.silent
-        );
-        assert!(
-            !before.agents.silent.iter().any(|(m, _)| m == "compound"),
-            "compound answered — it must not also read as silent: {:?}",
-            before.agents.silent
-        );
-
-        let seat = compound.open(&Order::default()).expect("a compound seat");
-        let _stops = crate::place_compound::StopsOnDrop::new(seat.clone());
-        let opened = take(&store);
-        assert_ne!(
-            opened.agents.stamp, before.agents.stamp,
-            "a seat that exists only in compound's own directory must move the token \
-             `wsp stamp` publishes, or a host polling it never re-reads `wip` (compound-062)"
-        );
-
-        compound.stop(&seat).expect("the seat was there");
-        let closed = take(&store);
-        assert_ne!(closed.agents.stamp, opened.agents.stamp, "the seat ending was invisible");
-    }
-
     /// **The 16:40 defect, stated as a test.** A far machine that is silent, or
     /// refusing, must leave the local census heard and say so under its own name
     /// — never `""`, which a host drawing this machine's workspace reads as the

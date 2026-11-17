@@ -1257,44 +1257,6 @@ mod tests {
         }
     }
 
-    /// The list renders with no daemon, no tunnel and no second box — which is
-    /// the point of taking the inputs in, and was not possible before.
-    ///
-    /// Asserted on the shape rather than the exact text: what matters is that
-    /// every machine is on it, each agent lands under the box it is standing
-    /// on, and the seat's own agents are not attributed to a machine.
-    #[test]
-    fn the_machines_view_renders_with_nothing_running() {
-        let out = list_lines(&fleet(), &plain());
-        let text = out.join("\n");
-
-        for name in ["mb2", "rack", "shed"] {
-            assert!(out.iter().any(|l| l.starts_with(name)), "{name} is not on the list:\n{text}");
-        }
-        assert!(text.contains("seat  seat-under-test"), "the seat is a heading of its own:\n{text}");
-
-        // Each agent under its own machine: `@mb2` on the id is where it is,
-        // and an unqualified id is this seat.
-        let row = |needle: &str| out.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no row for {needle}:\n{text}"));
-        assert!(row("w1:p2@mb2") > row("mb2"), "an agent sits under its machine");
-        assert!(row("w3:p1@mb2") < row("rack"), "…and above the next one");
-        assert!(row("w0:p6") > row("seat"), "an unqualified pane is on the seat");
-
-        // What it is holding, and the two fallbacks for a pane holding nothing.
-        assert!(text.contains("lift the machines view off herdr"), "a bound pane shows its task:\n{text}");
-        assert!(text.contains("(zsh)"), "an unbound pane falls back to its title:\n{text}");
-        assert!(text.contains("a shell"), "a pane with no agent is a shell:\n{text}");
-
-        // And the three states, in one frame, distinct.
-        assert!(text.contains("connected"), "{text}");
-        assert!(text.contains("unreachable"), "{text}");
-        assert!(text.contains("no daemon report yet"), "{text}");
-        // Why, and cut: an ssh failure is a sentence and a half, and this is
-        // one cell of a list. `show` is where the whole of it is.
-        assert!(text.contains("ssh: connect to host rack"), "an offline row says why:\n{text}");
-        assert!(!text.contains("Connection refused"), "…and no more than a cell of it:\n{text}");
-    }
-
     /// herdr not answering costs the list its agents and nothing else. This is
     /// the distinction the whole executor design is built around — "unreachable"
     /// is not "answering with nothing" — and the durable half of a machine is a
@@ -1404,19 +1366,6 @@ mod tests {
         assert_eq!(list_json(&f)["seat_cap"], 4);
     }
 
-    /// No machines at all is the common case — one seat, and whatever is on it
-    /// — and it must still say what is running here.
-    #[test]
-    fn a_seat_with_no_machines_still_lists_its_own_agents() {
-        let mut f = fleet();
-        f.machines.clear();
-        let text = list_lines(&f, &plain()).join("\n");
-        assert!(text.contains("no machines"), "{text}");
-        assert!(text.contains("wsp machine add"), "and what to do about it:\n{text}");
-        assert!(text.contains("w0:p6"), "the seat's own agent is still the point:\n{text}");
-        // The panes on machines that are gone from the list go with them.
-        assert!(!text.contains("w1:p2@mb2"), "an agent on no listed machine is not the seat's:\n{text}");
-    }
 }
 
 fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {

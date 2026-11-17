@@ -1877,8 +1877,8 @@ mod tests {
         t
     }
 
-    fn pane(id: &str, ws: &str, cwd: &str, agent: &str, title: &str) -> herdr::Pane {
-        herdr::Pane {
+    fn pane(id: &str, ws: &str, cwd: &str, agent: &str, title: &str) -> overlap::Pane {
+        overlap::Pane {
             pane_id: id.to_string(),
             workspace_id: ws.to_string(),
             cwd: cwd.to_string(),
@@ -1913,9 +1913,9 @@ mod tests {
                     pane("w9:p1", "w9", "/home/ed/music", "", "zsh"),
                 ],
                 workspaces: vec![
-                    herdr::Workspace { id: "w1".into(), label: "mine".into(), ..Default::default() },
-                    herdr::Workspace { id: "w2".into(), label: "theirs".into(), ..Default::default() },
-                    herdr::Workspace { id: "w9".into(), label: "music".into(), ..Default::default() },
+                    overlap::Workspace { id: "w1".into(), label: "mine".into(), ..Default::default() },
+                    overlap::Workspace { id: "w2".into(), label: "theirs".into(), ..Default::default() },
+                    overlap::Workspace { id: "w9".into(), label: "music".into(), ..Default::default() },
                 ],
                 tasks: vec![
                     task("t-001", "the task in hand", Some("wsp"), "doing"),

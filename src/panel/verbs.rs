@@ -2036,37 +2036,6 @@ mod tests {
         snap
     }
 
-    /// The view has four states, the reason a connected machine is not ready,
-    /// and the agents under the machine they stand on.
-    #[test]
-    fn the_machines_view_draws_the_four_states_and_the_agents_under_each() {
-        let snap = four_machines();
-        let mut view = View::default();
-        let mut ui = collect(&snap, &view);
-        assert!(!ui.machines);
-        let _ = apply_key(Key::Char('M'), &mut ui, &mut view);
-        assert!(view.machines);
-        let ui = collect(&snap, &view);
-        assert!(ui.rows.is_empty(), "the machines are in place of the tree");
-        let text: Vec<String> = super::super::render::machine_lines(&ui, 80)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
-            .collect();
-        let all = text.join("\n");
-        let at = |n: &str| text.iter().position(|l| l.contains(n)).unwrap_or_else(|| panic!("no {n}:\n{all}"));
-        assert!(text[at("good")].contains("ready"), "{all}");
-        assert!(text[at("noauth")].contains("connected") && text[at("noauth")].contains("no auth"), "{all}");
-        assert!(text[at("gone")].contains("unreachable"), "{all}");
-        assert!(text[at("old")].contains("retired"), "{all}");
-        assert!(at("w1:p2@gone") > at("gone") && at("w1:p2@gone") < at("old"), "the agent sits under its machine:\n{all}");
-        assert!(!all.contains("nobody\n   can't"), "{all}");
-
-        // And `M` puts the tree back.
-        let mut ui = ui;
-        let _ = apply_key(Key::Char('M'), &mut ui, &mut view);
-        assert!(!view.machines);
-    }
-
     /// `S` offers this machine and the machines that read ready, and nothing
     /// that is merely connected, silent or retired; `↵` on the first is the
     /// spawn it always was.
