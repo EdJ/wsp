@@ -98,6 +98,7 @@ use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::verification::{self as v, Run, RunState};
 use crate::Args;
+use crate::host::Host;
 
 /// The heading a project or a task lists its checks under.
 pub(crate) const SECTION: &str = "Checks";
@@ -1116,7 +1117,7 @@ impl TreeLock {
             // Being written this instant, or garbage: garbage ages out.
             return std::fs::metadata(path).and_then(|m| m.modified()).map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(60)).unwrap_or(false);
         };
-        !Command::new("kill").args(["-0", pid]).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(true)
+        !pid.parse().is_ok_and(|pid| crate::host::LOCAL.signal(&[pid], "0"))
     }
 }
 
@@ -1170,8 +1171,7 @@ thread_local! {
 /// The processes of group `pgid`: (`pid command` lines, their CPU time summed in
 /// hundredths of a second). `None` where `ps` does not answer.
 fn group_of(pgid: u32) -> Option<(Vec<String>, u64)> {
-    let out = Command::new("ps").args(["-A", "-o", "pid=,pgid=,time=,command="]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = crate::host::LOCAL.table("pid=,pgid=,time=,command=", false)?;
     let (mut lines, mut cpu) = (Vec::new(), 0u64);
     for l in text.lines() {
         let mut w = l.split_whitespace();
@@ -1246,7 +1246,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
             Ok(Some(s)) => break Some(s),
             Ok(None) if start.elapsed() > step.limit => {
                 timed_out = true;
-                let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).status();
+                crate::host::LOCAL.signal_group(child.id(), "KILL");
                 break child.wait().ok();
             }
             Ok(None) if probed.elapsed() >= probe => {
@@ -1258,7 +1258,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
                         quiet_since = Instant::now();
                     } else if quiet_since.elapsed() >= quiet_for {
                         hung = Some(pids.join("\n"));
-                        let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).status();
+                        crate::host::LOCAL.signal_group(child.id(), "KILL");
                         break child.wait().ok();
                     }
                 }
@@ -1269,7 +1269,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
     };
     // `wsp-453`: whatever the step started and left in its group (a Vite
     // server, a Vitest watcher) goes with it, however it ended.
-    let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).stderr(Stdio::null()).status();
+    crate::host::LOCAL.signal_group(child.id(), "KILL");
     if let Some(pids) = hung {
         let tail = format!("hung — no output and no CPU for {}s; its processes:\n{pids}", secs(quiet_for));
         return Ran { step: step.clone(), done: Done::Hung(pids), took: start.elapsed(), tail, first: None, reused: None };
@@ -2667,7 +2667,7 @@ mod tests {
         assert_eq!(r.done, Done::Passed);
         let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
         let alive = || {
-            Command::new("kill").args(["-0", &pid]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+            pid.parse().is_ok_and(|pid| crate::host::LOCAL.probe(pid))
         };
         let until = Instant::now() + Duration::from_secs(5);
         while alive() && Instant::now() < until {

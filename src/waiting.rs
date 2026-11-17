@@ -869,11 +869,10 @@ pub(crate) fn end_self_waits(seat: &str, self_wait: &dyn Fn(&str) -> bool) -> Ve
     }
     let s = crate::place::Seat::new(seat);
     let Some(root) = crate::place::local_backends().iter().find_map(|b| b.root(&s)) else { return Vec::new() };
-    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,command="]).output() else { return Vec::new() };
-    let pids = self_wait_shells(&String::from_utf8_lossy(&out.stdout), root, self_wait);
-    for pid in &pids {
-        let _ = wsp_base::calls::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
-    }
+    use crate::host::{Host, LOCAL};
+    let Some(out) = LOCAL.table("pid=,ppid=,command=", false) else { return Vec::new() };
+    let pids = self_wait_shells(&out, root, self_wait);
+    LOCAL.signal(&pids, "TERM");
     pids
 }
 

@@ -32,6 +32,7 @@
 //! business (`dev.sh stop` does).
 
 use std::path::Path;
+use crate::host::Host;
 use std::process::Stdio;
 use wsp_base::calls::Command;
 use std::time::{Duration, Instant};
@@ -95,7 +96,7 @@ pub fn run_command(dir: &Path, command: &str, limit: Duration) -> Ran {
             Ok(None) if start.elapsed() >= limit => {
                 // The group, because `sh -c` runs the command as a child of
                 // its own and killing only `sh` would leave that running.
-                let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).status();
+                crate::host::LOCAL.signal_group(child.id(), "KILL");
                 let _ = child.kill();
                 let _ = child.wait();
                 break Ended::TimedOut;

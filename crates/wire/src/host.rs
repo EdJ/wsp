@@ -20,7 +20,13 @@
 //! run in this process. At M1 the manager takes this module and a second
 //! implementation sends the same calls as messages.
 //!
-//! Not here yet: tree work (section 1.3, which stays wsp's), the far machine's
+//! The `ps`, `kill` and `lsof` of seat and tree work are here too, as `seats`'s
+//! process table, signals and working directories (wsp-008). Tree work's
+//! check_tree sweep, the throttle's and gc's liveness probes and a
+//! check's kill on timeout ask [`LOCAL`], so at M3 their jobs move and their
+//! calls do not.
+//!
+//! Not here yet: tree work's jobs (section 1.3, which stays wsp's), the far machine's
 //! ssh (`far.rs`'s [`crate::far::Wire`], M2's subject), and the doctor's
 //! checks of installed hook snippets, which read config rather than a seat.
 
@@ -133,6 +139,49 @@ pub trait Host: Sync {
     fn tree_of(&self, root: u32) -> Vec<u32>;
     /// Whether something accepts on this socket.
     fn answers(&self, socket: &Path) -> bool;
+
+    // ---- seats: the process table, signals and working directories
+    // (wsp-008). Every `ps`, `kill` and `lsof` outside this module comes
+    // through these; at M1 they become the `seats` reply, `seat.stop` and
+    // `job.stop`, and at M3 the tree work's callers stop asking.
+    /// `ps -A -o <columns>`, each line with its process's environment when
+    /// `env` (`ps -E`). `None` when `ps` would not run or failed.
+    fn table(&self, columns: &str, env: bool) -> Option<String>;
+    /// `ps -o <columns> -p <pids>`: the rows of those still running. `None`
+    /// when `ps` would not run.
+    fn rows_of(&self, pids: &[u32], columns: &str) -> Option<String>;
+    /// `kill -<sig>` to every pid of `pids` (`"0"` only asks), and whether it
+    /// reached them all. An empty list sends nothing and answers `false`.
+    fn signal(&self, pids: &[u32], sig: &str) -> bool;
+    /// `sig` to a whole process group, by its leader's id — never this
+    /// process's own group.
+    fn signal_group(&self, group: u32, sig: &str);
+    /// `lsof -d cwd -Fpn`, of `pids` alone when given: every process's working
+    /// directory as lsof's field lines. `None` when `lsof` would not run.
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String>;
+
+    /// Whether `pid` is running: `kill -0`, which a zombie still answers.
+    fn probe(&self, pid: u32) -> bool {
+        pid != 0 && self.signal(&[pid], "0")
+    }
+    /// Every process as `(pid, ppid, the rest of the line)`, where the rest
+    /// includes the environment.
+    ///
+    /// `ps -E` is how a process's environment is readable without a dependency
+    /// or a `/proc`, and the environment is the only place a plugin's child says
+    /// which backend started it: its command line is `wsp daemon`, identical to
+    /// the live one's. `ppid` comes back in the same call so the ancestors of
+    /// this process can be ruled out of anything about to be killed
+    /// ([`wsp_base::base::procs::ancestors`]).
+    fn processes(&self) -> Vec<(u32, u32, String)> {
+        wsp_base::base::procs::read_processes(&self.table("pid=,ppid=,command=", true).unwrap_or_default())
+    }
+    /// Every process as `(pid, ppid, "")`: the parent links alone, for a caller
+    /// that only walks `ancestors`. Without `-E` the table is a fifth of the
+    /// work to read.
+    fn parents(&self) -> Vec<(u32, u32, String)> {
+        wsp_base::base::procs::read_parents(&self.table("pid=,ppid=", false).unwrap_or_default())
+    }
 
     // ---- seat.read
     /// The renderer's screen, as bare text.
@@ -325,6 +374,56 @@ impl Host for InProcess {
 
     fn tree_of(&self, root: u32) -> Vec<u32> {
         tree_of(root)
+    }
+
+    fn table(&self, columns: &str, env: bool) -> Option<String> {
+        let mut cmd = Command::new("ps");
+        cmd.arg("-A");
+        if env {
+            cmd.arg("-E");
+        }
+        let out = cmd.args(["-o", columns]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn rows_of(&self, pids: &[u32], columns: &str) -> Option<String> {
+        if pids.is_empty() {
+            return Some(String::new());
+        }
+        let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        // `ps -p` fails when any pid has gone and still lists the rest.
+        let out = Command::new("ps").args(["-o", columns, "-p", &list]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn signal(&self, pids: &[u32], sig: &str) -> bool {
+        if pids.is_empty() {
+            return false;
+        }
+        Command::new("kill")
+            .arg(format!("-{sig}"))
+            .args(pids.iter().map(u32::to_string))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    fn signal_group(&self, group: u32, sig: &str) {
+        signal_group(group, sig)
+    }
+
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
+        let mut cmd = Command::new("lsof");
+        match pids {
+            Some(pids) => {
+                let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                cmd.args(["-a", "-d", "cwd", "-Fpn", "-p", &list])
+            }
+            None => cmd.args(["-d", "cwd", "-Fpn"]),
+        };
+        let out = cmd.stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     fn answers(&self, socket: &Path) -> bool {

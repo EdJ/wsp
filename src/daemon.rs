@@ -227,7 +227,7 @@ pub(crate) fn state_of(rest: &str) -> PathBuf {
 /// process list could not be read at all — which no caller may read as "none",
 /// because a machine with no processes on it is a machine that cannot answer.
 pub(crate) fn running(state: &Path) -> Option<Vec<u32>> {
-    let all = crate::base::procs::processes();
+    let all = crate::host::Host::processes(&crate::host::LOCAL);
     if all.is_empty() {
         return None;
     }

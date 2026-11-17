@@ -43,6 +43,7 @@ use crate::cmd_verify::git;
 use crate::place::Place;
 use crate::store::Store;
 use crate::util;
+use crate::host::{Host, LOCAL};
 
 /// The check a directory under `.worktrees/` is the tree of, if it is one.
 ///
@@ -218,12 +219,12 @@ fn seated(backends: &[&dyn Place]) -> Option<Vec<u32>> {
 /// What is running with `dir` as its working directory, other than this process
 /// and its parents, and other than a seat's of `backends`.
 fn running_among(dir: &Path, backends: &[&dyn Place]) -> Vec<u32> {
-    let Ok(out) = wsp_base::calls::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output() else { return Vec::new() };
+    let Some(out) = LOCAL.cwds(None) else { return Vec::new() };
     let Some(seats) = seated(backends) else { return Vec::new() };
     let dir = util::real(&dir.display().to_string());
-    let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
+    let mut keep = crate::base::procs::ancestors(&LOCAL.processes());
     keep.extend(seats);
-    strays(&String::from_utf8_lossy(&out.stdout), &dir, &keep)
+    strays(&out, &dir, &keep)
 }
 
 /// [`running_among`] the backends wsp can spawn onto here.
@@ -242,7 +243,7 @@ fn here_of(all: &[Box<dyn Place>]) -> Vec<&dyn Place> {
 /// failed says nothing about whose processes are whose.
 pub fn live_seat_pids() -> Option<Vec<u32>> {
     let all = crate::place::local_backends();
-    let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
+    let mut keep = crate::base::procs::ancestors(&LOCAL.processes());
     keep.extend(seated(&here_of(&all))?);
     Some(keep)
 }
@@ -250,14 +251,7 @@ pub fn live_seat_pids() -> Option<Vec<u32>> {
 /// Send `sig` to `pids`, and say nothing of it: a process that has gone is the
 /// outcome wanted.
 pub fn signal(sig: &str, pids: &[u32]) {
-    if !pids.is_empty() {
-        let _ = wsp_base::calls::Command::new("kill")
-            .arg(sig)
-            .args(pids.iter().map(|p| p.to_string()))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+    LOCAL.signal(pids, sig);
 }
 
 /// Stop the dev servers and watchers a check left running in its tree (a Vite
@@ -272,12 +266,12 @@ fn stop_running(dir: &Path) -> (Vec<u32>, Vec<u32>) {
         return (Vec::new(), Vec::new());
     }
     let found = running_in(dir);
-    signal("-TERM", &found);
+    signal("TERM", &found);
     let mut killed = Vec::new();
     if !found.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         killed = running_in(dir);
-        signal("-KILL", &killed);
+        signal("KILL", &killed);
     }
     (found, killed)
 }
@@ -319,9 +313,8 @@ pub enum Verdict {
 
 /// Every process as `(pid, ppid, executable)`, from `ps -o comm=`.
 pub fn exes() -> Vec<(u32, u32, String)> {
-    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,comm="]).output() else { return Vec::new() };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
+    let Some(out) = LOCAL.table("pid=,ppid=,comm=", false) else { return Vec::new() };
+    out.lines()
         .filter_map(|l| {
             let (pid, rest) = l.trim_start().split_once(char::is_whitespace)?;
             let (ppid, rest) = rest.trim_start().split_once(char::is_whitespace)?;
@@ -558,7 +551,7 @@ pub fn left_in_finished(
     staged: &dyn Fn(&crate::model::Task) -> bool,
 ) -> Option<Vec<Left>> {
     let mut live = BTreeSet::new();
-    let mut keep = crate::base::procs::ancestors(&crate::base::procs::parents());
+    let mut keep = crate::base::procs::ancestors(&LOCAL.parents());
     for (seat, label) in census {
         live.insert(label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string());
         keep.extend(pids(&seat).unwrap_or_default());
@@ -571,8 +564,7 @@ pub fn left_in_finished(
                 matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done) && !staged(&t)
             })
     };
-    let out = wsp_base::calls::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output().ok()?;
-    let lsof = String::from_utf8_lossy(&out.stdout);
+    let lsof = LOCAL.cwds(None)?;
     let found = finished_trees(&lsof, &finished, &keep);
     // The executables are read only for processes there are to sort (`wsp-480`).
     if found.is_empty() {
@@ -583,9 +575,8 @@ pub fn left_in_finished(
 
 /// The resident memory of `pids` in kilobytes.
 pub fn rss_kb(pids: &[u32]) -> u64 {
-    let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-o", "rss=", "-p", &list]).output() else { return 0 };
-    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<u64>().ok()).sum()
+    let Some(out) = LOCAL.rows_of(pids, "rss=") else { return 0 };
+    out.lines().filter_map(|l| l.trim().parse::<u64>().ok()).sum()
 }
 
 /// The sentence `wsp wip` says of a finished tree with processes in it.

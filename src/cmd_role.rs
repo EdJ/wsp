@@ -357,10 +357,10 @@ pub(crate) fn parse_ps(line: &str) -> Option<Proc> {
 }
 
 pub(crate) fn processes() -> Vec<Proc> {
-    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,pcpu=,time=,command="]).output() else {
+    let Some(out) = crate::host::Host::table(&crate::host::LOCAL, "pid=,ppid=,etime=,pcpu=,time=,command=", false) else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout).lines().filter_map(parse_ps).collect()
+    out.lines().filter_map(parse_ps).collect()
 }
 
 /// Every process's working directory, from `lsof -d cwd -Fpn`.
@@ -593,10 +593,10 @@ pub(crate) fn end_pids(pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
     if cfg!(test) || pids.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    crate::check_tree::signal("-TERM", pids);
+    crate::check_tree::signal("TERM", pids);
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let still: Vec<u32> = util::alive(pids).into_iter().collect();
-    crate::check_tree::signal("-KILL", &still);
+    crate::check_tree::signal("KILL", &still);
     (pids.to_vec(), still)
 }
 
@@ -626,7 +626,7 @@ fn observe(store: &Store, procs: &[Proc], now: i64) -> BTreeMap<u32, u64> {
 }
 
 fn signal(sig: &str, pid: u32) {
-    let _ = wsp_base::calls::Command::new("kill").args([sig, &pid.to_string()]).status();
+    crate::host::Host::signal(&crate::host::LOCAL, &[pid], sig);
 }
 
 /// Why `role` may not run `wsp reap` (`list` is the read-only form), if it may
@@ -668,11 +668,7 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
         return refuse(store, "reap", &role, "no backend answered, so whose processes are whose is not known — nothing stopped");
     };
     let procs = processes();
-    let cwds = wsp_base::calls::Command::new("lsof")
-        .args(["-d", "cwd", "-Fpn"])
-        .output()
-        .map(|o| parse_cwds(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default();
+    let cwds = crate::host::Host::cwds(&crate::host::LOCAL, None).map(|o| parse_cwds(&o)).unwrap_or_default();
     let idle = observe(store, &procs, util::epoch_secs());
 
     let claims = store.claims();
@@ -724,7 +720,7 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
                     store,
                     &format!("reap {pid} by {}: {} — {}", role.name(), proof.text, util::truncate(&p.command, 100)),
                 );
-                signal("-TERM", pid);
+                signal("TERM", pid);
                 stopped.push((pid, proof));
             }
             Err(why) => {
@@ -739,7 +735,7 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
         let still = util::alive(&stopped.iter().map(|(p, _)| *p).collect::<Vec<_>>());
         for (pid, proof) in &stopped {
             if still.contains(pid) {
-                signal("-KILL", *pid);
+                signal("KILL", *pid);
                 println!("{pid}  killed ({})", proof.text);
             } else {
                 println!("{pid}  stopped ({})", proof.text);

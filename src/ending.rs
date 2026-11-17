@@ -412,10 +412,10 @@ pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
         return said;
     }
     let all = |l: &[crate::check_tree::Left]| l.iter().flat_map(|t| t.pids.clone()).collect::<Vec<u32>>();
-    crate::check_tree::signal("-TERM", &all(&found));
+    crate::check_tree::signal("TERM", &all(&found));
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let still = left_in_finished_by(store, seats).unwrap_or_default();
-    crate::check_tree::signal("-KILL", &all(&still));
+    crate::check_tree::signal("KILL", &all(&still));
     for t in &found {
         let kill: Vec<u32> = still.iter().filter(|s| s.tree == t.tree).flat_map(|s| s.pids.clone()).collect();
         let path = util::contract(std::path::Path::new(&t.tree));
@@ -1902,7 +1902,7 @@ mod tests {
         let after = crate::place_super::tree_of(root.id());
         let running = crate::cycle::Fleet.running(&tree);
         // By pid, never by pattern — this test's own sleep and nothing else.
-        let _ = wsp_base::calls::Command::new("kill").arg(child.to_string()).status();
+        crate::host::Host::signal(&crate::host::LOCAL, &[child], "TERM");
         assert!(after.contains(&child), "still in the group with its parent gone: {after:?}");
         assert_eq!(running, vec![child], "the seat's root is gone and its agent is not");
     }
@@ -1966,7 +1966,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             ended.push((*id, child.try_wait().unwrap().is_some()));
             // The group, for the `sleep` under the shell.
-            let _ = wsp_base::calls::Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+            crate::host::Host::signal_group(&crate::host::LOCAL, child.id(), "KILL");
             let _ = child.kill();
             let _ = child.wait();
         }

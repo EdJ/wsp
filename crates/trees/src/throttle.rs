@@ -64,6 +64,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use crate::host::Host;
 use std::process::Stdio;
 use wsp_base::calls::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -835,8 +836,7 @@ pub fn weight(tool: &str, args: &[String]) -> Weight {
 }
 
 fn alive(pid: u32) -> bool {
-    pid != 0
-        && Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    crate::host::LOCAL.probe(pid)
 }
 
 fn fnv(s: &str) -> String {
@@ -2246,11 +2246,7 @@ mod tests {
     /// The niceness the test process itself runs at: `nice -n 12 cargo test`
     /// hands every fake cargo that base, throttled or not.
     fn base_nice() -> i32 {
-        let out = Command::new("ps")
-            .args(["-o", "ni=", "-p", &std::process::id().to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        crate::host::LOCAL.rows_of(&[std::process::id()], "ni=").unwrap().trim().parse().unwrap()
     }
 
     fn nice_of(line: &str) -> i32 {
