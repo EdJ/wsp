@@ -126,8 +126,9 @@ pub(crate) struct View {
     /// workspace.
     ///
     /// What it changes is the way out. The sidebar refuses to be quit by a
-    /// stray `q` — losing it buys nothing. This one is a tab somebody opened a moment ago and will close
-    /// again, so `q`, `esc` and `Z` all close it, and the footer says so.
+    /// stray `q` — losing it buys nothing. This one is a tab somebody opened a
+    /// moment ago and will close again, so `q`, `esc` and `Z` all close it,
+    /// and the footer says so.
     pub(super) full: bool,
     /// Include `done` tasks, and the projects that hold only those.
     pub(super) show_done: bool,

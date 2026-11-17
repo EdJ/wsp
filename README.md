@@ -904,9 +904,9 @@ pane and outliving it: measured against the live server, it survives a switch to
 another workspace and back, and `pane.focus` will move the keyboard onto a pane
 the zoom is hiding, so what is on the screen and what the keys reach stop being
 the same question. The panel is furniture — thought about by nobody — and
-furniture must not hold a workspace in a mode it
-cannot see the state of and whose only undo is a key inside itself. A tab hides
-nothing, backend's own switcher lists it, and closing it puts you back.
+furniture must not hold a workspace in a mode it cannot see the state of and
+whose only undo is a key inside itself. A tab hides nothing, backend's own
+switcher lists it, and closing it puts you back.
 
 The fullscreen panel gets its own detail pane, in its own tab: `↵` splits it
 underneath, the same way the sidebar does. That is why `inspect` splits off *our
