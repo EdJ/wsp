@@ -417,7 +417,12 @@ fn simple_commands(command: &str) -> Vec<Simple> {
         }
         i += 1;
     }
-    end_command!(false);
+    if has_word {
+        words.push(word);
+    }
+    if !words.is_empty() {
+        out.push(Simple { words, after_pipe, pipeline });
+    }
     out
 }
 
