@@ -397,36 +397,10 @@ pub fn said_by(hook: &str) -> Option<State> {
     })
 }
 
-/// Whether a hook came from a session other than the one standing in the seat
-/// (`wsp-364`): a `claude -p` that the agent, or a script it ran, started from
-/// inside the seat. The child inherits `WSP_SEAT_ID`, so its hooks arrive here
-/// naming the parent's seat, and its `SessionEnd` used to make the seat read
-/// gone two minutes into a ten-minute turn.
-///
-/// The seat's session is whichever one reported first — `said.json`'s
-/// `session_id`, written by the first hook on a fresh seat and kept by every
-/// one after. A hook naming another session is a child's and says nothing
-/// about the seat: not its state, not its end.
-///
-/// | `said.json` | the hook | a child's? |
-/// |---|---|---|
-/// | no session yet | any | no — the first to report takes the seat |
-/// | the seat's session said `SessionEnd` | any | no — `/clear` ends one session and starts the next in the same agent |
-/// | session A | `source: "clear"` | no — the same `/clear`, its start seen first |
-/// | session A | no `session_id` | no — nothing to judge it by, so it is believed, as before |
-/// | session A | session A | no |
-/// | session A | session B | **yes** |
-pub fn a_childs(was: &Value, payload: &Value) -> bool {
-    let theirs = str_of(payload, "session_id");
-    let seats = str_of(was, "session_id");
-    // `/clear` starts its new session with `source: "clear"`; a `claude -p`
-    // child starts with `startup`. Either order of `/clear`'s two hooks lands.
-    let cleared = str_of(payload, "source") == "clear";
-    if theirs.is_empty() || seats.is_empty() || cleared || str_of(was, "state") == "gone" {
-        return false;
-    }
-    theirs != seats
-}
+/// Whether a hook came from a nested session rather than the seat's own
+/// (`wsp-364`): moved down to `wsp-host`, whose hook fold judges it the same
+/// way (wsp-023).
+pub use wsp_host::hooks::a_childs;
 
 /// What a hook says the agent needs, written to `said.json` beside the state it
 /// is read as (`wsp-301`): `PermissionRequest` and `Elicitation` are `Working`
@@ -628,7 +602,11 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
     // state; it is only ever here to close a question (`wsp-302`).
     let state = said_by(&hook);
     let closes = (place::above().closes)(&hook);
-    if state.is_none() && !closes {
+    // Under `WSP_HOST=manager` every hook goes to the host's manager, which
+    // reads turns and spend out of hooks `said_by` has no state for
+    // (`PostToolUse`); wsp-023.
+    let dial = wsp_host::hooks::Dial::from_env();
+    if state.is_none() && !closes && dial == wsp_host::hooks::Dial::Inproc {
         return 0;
     }
     let payload: Value = match args.has("payload") {
@@ -648,7 +626,6 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
     if closes {
         (place::above().heard)(store, &hook, &payload);
     }
-    let Some(state) = state else { return 0 };
     // `--hold SECS` is the other thing this verb does for a hook: not saying
     // what happened but waiting on the person (`wsp-301`), and the only time
     // it prints anything. It is its own hook entry with its own long timeout,
@@ -662,16 +639,35 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
             _ => 0,
         };
     }
-    let super_place = Supervisor::new();
-    if super_place.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
-        super_place.heard(&seat, &hook, state, &payload);
-        return 0;
-    }
-    let compound = crate::place_compound::Compound::new();
-    if compound.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
-        compound.heard(&seat, &hook, state, &payload);
-    }
+    report_to(&dial, &Supervisor::new(), &crate::place_compound::Compound::new(), &seat, &hook, state, &payload);
     0
+}
+
+/// Where one hook goes: to the manager `dial` names, or, under `inproc` or
+/// when the manager does not take it, to the seat's directory as at M0 (the
+/// directory that holds the seat's name, headless or compound). What it came
+/// to.
+pub fn report_to(
+    dial: &wsp_host::hooks::Dial,
+    super_place: &Supervisor,
+    compound: &crate::place_compound::Compound,
+    seat: &Seat,
+    hook: &str,
+    state: Option<State>,
+    payload: &Value,
+) -> wsp_host::hooks::Sent {
+    let epoch = wsp_host::hooks::epoch_from_env();
+    let sent = wsp_host::hooks::report(dial, seat.as_str(), epoch, hook, payload);
+    if matches!(sent, wsp_host::hooks::Sent::Taken(_)) {
+        return sent;
+    }
+    let Some(state) = state else { return sent };
+    if super_place.dir_of(seat).map(|d| d.is_dir()).unwrap_or(false) {
+        super_place.heard(seat, hook, state, payload);
+    } else if compound.dir_of(seat).map(|d| d.is_dir()).unwrap_or(false) {
+        compound.heard(seat, hook, state, payload);
+    }
+    sent
 }
 
 
@@ -1340,6 +1336,40 @@ mod tests {
         // nothing here parses one, and `w1:p1` is a perfectly good file name.
         let backends = Seat::new("w1:p1");
         assert_eq!(place.state(&backends), Err(Refusal::NoSeat(backends)));
+    }
+
+    /// wsp-023: the hook command under `WSP_HOST=manager` with no manager
+    /// answering, and under `inproc`, still writes the seat's hook log as at
+    /// M0, and a hook with no state (`PostToolUse`) still writes nothing there.
+    #[test]
+    fn with_no_manager_the_hook_command_still_writes_the_hook_log() {
+        use wsp_host::hooks::{Dial, Sent};
+        let scratch = Scratch::new("hook-fallback");
+        let place = scratch.place();
+        let compound = crate::place_compound::Compound::at(scratch.root.join("compound"));
+        // A compound seat: the backend that keeps the hook log.
+        let seat = Seat::new("cpd-1");
+        let dir = compound.dir_of(&seat).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join(wsp_host::inproc::HOOKS_FILE);
+        let token = scratch.root.join("manager.token");
+        fs::write(&token, "a-token\n").unwrap();
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let gone = Dial::Manager { addr, token_file: token };
+
+        let sent = report_to(&gone, &place, &compound, &seat, "UserPromptSubmit", Some(State::Working), &json!({}));
+        assert!(matches!(sent, Sent::Unanswered(_)), "{sent:?}");
+        let sent = report_to(&gone, &place, &compound, &seat, "PostToolUse", None, &json!({}));
+        assert!(matches!(sent, Sent::Unanswered(_)), "{sent:?}");
+        let sent = report_to(&Dial::Inproc, &place, &compound, &seat, "Stop", Some(State::Idle), &json!({}));
+        assert_eq!(sent, Sent::Inproc);
+
+        let hooks: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| str_of(&serde_json::from_str(l).unwrap(), "hook"))
+            .collect();
+        assert_eq!(hooks, ["UserPromptSubmit", "Stop"]);
     }
 
     /// The launch window, closed by an announcement rather than by a timer — and

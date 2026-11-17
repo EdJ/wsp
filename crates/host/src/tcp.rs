@@ -89,11 +89,22 @@ impl Connection for Tcp {
     }
 
     fn recv(&mut self, wait: Duration) -> Result<Option<Frame>, ConnError> {
+        match self.recv_line(wait)? {
+            Some(line) => serde_json::from_slice(&line).map(Some).map_err(|e| ConnError::Malformed(e.to_string())),
+            None => Ok(None),
+        }
+    }
+}
+
+impl Tcp {
+    /// The next whole line, without its newline, undecoded: for the manager's
+    /// first line, which is a frame or a hook post ([`crate::hooks`]).
+    pub fn recv_line(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, ConnError> {
         let deadline = Instant::now() + wait;
         let mut chunk = [0u8; 8192];
         loop {
             if let Some(line) = self.take_line() {
-                return serde_json::from_slice(&line).map(Some).map_err(|e| ConnError::Malformed(e.to_string()));
+                return Ok(Some(line));
             }
             if self.partial.len() > MAX_LINE {
                 return Err(ConnError::Io(format!("a line longer than {MAX_LINE} bytes")));

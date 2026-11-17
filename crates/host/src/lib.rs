@@ -12,6 +12,7 @@
 //! paths.
 
 pub mod facts;
+pub mod hooks;
 pub mod inproc;
 pub mod port;
 pub mod price;

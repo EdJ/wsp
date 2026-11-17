@@ -338,3 +338,126 @@ fn a_client_that_misses_three_beats_is_dropped() {
     assert!(log.contains("dropped, nothing heard for 3 beats"), "{log}");
     m.stop();
 }
+
+// ---------------------------------------------------------------- hooks (wsp-023)
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hooks");
+
+/// A recorded hook payload, its `transcript_path` pointed at `transcript`.
+fn payload(name: &str, transcript: &Path) -> serde_json::Value {
+    let text = fs::read_to_string(Path::new(FIXTURES).join(name)).unwrap();
+    serde_json::from_str(&text.replace("TRANSCRIPT", &transcript.to_string_lossy())).unwrap()
+}
+
+/// Append a recorded slice of the transcript, as Claude Code writes it.
+fn transcript_gains(transcript: &Path, name: &str) {
+    use std::io::Write;
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(transcript).unwrap();
+    f.write_all(&fs::read(Path::new(FIXTURES).join(name)).unwrap()).unwrap();
+}
+
+/// Every journalled event that arrives within `wait`, its time zeroed.
+fn hook_events(conn: &mut Tcp, wait: Duration) -> Vec<Message> {
+    let until = Instant::now() + wait;
+    let mut out = Vec::new();
+    while let Ok(Some(f)) = next(conn, until.saturating_duration_since(Instant::now())) {
+        assert!(f.id.is_some(), "only events arrive after subscribe: {f:?}");
+        out.push(match f.msg {
+            Message::Turn(t) => Message::Turn(wsp_host_api::Turn { at: At(0), ..t }),
+            Message::SeatSaid(s) => Message::SeatSaid(SeatSaid { at: At(0), ..s }),
+            Message::SeatDid(d) => Message::SeatDid(wsp_host_api::SeatDid { at: At(0), ..d }),
+            other => other,
+        });
+    }
+    out
+}
+
+#[test]
+fn the_hook_command_posts_to_the_manager_which_journals_turn_said_spent_and_did() {
+    use wsp_host::hooks::{report, Dial, Sent};
+    use wsp_host_api::{FileRef, HostId, OrderId, SeatDid, SeatSpent, Tokens, Turn, TurnEdge};
+
+    let dir = exec_dir("hooks");
+    let m = start(&dir);
+    let addr = m.addrs()[0];
+    let seat = SeatId("cpd-7".into());
+    let epoch = Epoch(3);
+    m.awaiting(seat.clone(), OrderId("ord-1".into()));
+    let transcript = dir.join("session.jsonl");
+    let dial = Dial::Manager { addr, token_file: dir.join(TOKEN_FILE) };
+
+    transcript_gains(&transcript, "transcript_1.jsonl");
+    let post = |hook: &str, file: &str| report(&dial, &seat.0, epoch, hook, &payload(file, &transcript));
+    assert_eq!(post("UserPromptSubmit", "user_prompt_submit.json"), Sent::Taken(1));
+    assert_eq!(post("PostToolUse", "post_tool_use.json"), Sent::Taken(1));
+    transcript_gains(&transcript, "transcript_2.jsonl");
+    assert_eq!(post("Stop", "stop.json"), Sent::Taken(4));
+
+    let model = "claude-opus-4-1-20250805";
+    let first = wsp_host::price::cost(model, 120, 40, 3000, 500);
+    let both = first + wsp_host::price::cost(model, 10, 25, 3500, 0);
+    let turn = |edge, order: Option<&str>| {
+        Message::Turn(Turn { seat: seat.clone(), epoch, edge, at: At(0), order: order.map(|o| OrderId(o.into())) })
+    };
+    let spent = |tokens, cost_micros| Message::SeatSpent(SeatSpent { seat: seat.clone(), epoch, tokens, cost_micros });
+    let want = vec![
+        turn(TurnEdge::Began, Some("ord-1")),
+        spent(Tokens { input: 120, output: 40, cache_read: 3000, cache_write: 500 }, first),
+        spent(Tokens { input: 130, output: 65, cache_read: 6500, cache_write: 500 }, both),
+        Message::SeatSaid(SeatSaid {
+            seat: seat.clone(),
+            epoch,
+            at: At(0),
+            text: "Fixed: `add` subtracted. The test passes now.".into(),
+        }),
+        Message::SeatDid(SeatDid {
+            seat: seat.clone(),
+            epoch,
+            at: At(0),
+            digest: "asked: Fix the failing test in src/lib.rs; tools: Edit 1; edited: /Users/x/src/demo/src/lib.rs".into(),
+            transcript: FileRef { host: HostId("test-host".into()), path: transcript.to_string_lossy().into_owned() },
+        }),
+        turn(TurnEdge::Ended, None),
+    ];
+
+    let (mut conn, hello) = connect(addr, token(&dir));
+    assert_eq!(hello.journal_head, Some(EventId(6)));
+    subscribe(&mut conn, None);
+    assert_eq!(hook_events(&mut conn, Duration::from_millis(500)), want);
+
+    // A second prompt begins a turn no order was awaited for.
+    assert_eq!(post("UserPromptSubmit", "user_prompt_submit.json"), Sent::Taken(1));
+    assert_eq!(hook_events(&mut conn, Duration::from_millis(500)), vec![turn(TurnEdge::Began, None)]);
+
+    // A nested session's hook names the seat and says nothing of it (wsp-364).
+    let mut child = payload("stop.json", &transcript);
+    child["session_id"] = "a-claude-p-child".into();
+    assert_eq!(report(&dial, &seat.0, epoch, "Stop", &child), Sent::Taken(0));
+
+    // The wrong token is refused, logged, and journals nothing.
+    let bad = dir.join("not-the-token");
+    fs::write(&bad, "nope\n").unwrap();
+    let wrong = Dial::Manager { addr, token_file: bad };
+    assert!(matches!(report(&wrong, &seat.0, epoch, "Stop", &payload("stop.json", &transcript)), Sent::Unanswered(why) if why.contains("wrong token")));
+    assert_eq!(m.head(), Some(EventId(7)));
+    let log = fs::read_to_string(m.log_path()).unwrap();
+    assert!(log.contains("a hook post for cpd-7 carried the wrong token"), "{log}");
+    m.stop();
+}
+
+#[test]
+fn with_no_manager_the_hook_command_says_so_and_posts_nothing() {
+    use wsp_host::hooks::{report, Dial, Sent};
+    let dir = exec_dir("hooks-none");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(TOKEN_FILE), "a-token\n").unwrap();
+    // A port nothing listens on: bound, then let go.
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let began = Instant::now();
+    let sent = report(&Dial::Manager { addr, token_file: dir.join(TOKEN_FILE) }, "cpd-7", Epoch(0), "Stop", &serde_json::json!({}));
+    assert!(matches!(sent, Sent::Unanswered(_)), "{sent:?}");
+    assert!(began.elapsed() < Duration::from_secs(1), "a refused dial on loopback is quick");
+    let no_token = Dial::Manager { addr, token_file: dir.join("missing.token") };
+    assert!(matches!(report(&no_token, "cpd-7", Epoch(0), "Stop", &serde_json::json!({})), Sent::Unanswered(_)));
+    assert_eq!(report(&Dial::Inproc, "cpd-7", Epoch(0), "Stop", &serde_json::json!({})), Sent::Inproc);
+}

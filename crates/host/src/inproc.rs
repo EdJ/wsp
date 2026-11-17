@@ -1678,7 +1678,7 @@ pub fn mangle(cwd: &str) -> String {
 /// does the same; this one does not count the write toward the store's own
 /// `steady` passes, which walk the task, project and list directories and
 /// never a seat's.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(

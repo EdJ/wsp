@@ -28,12 +28,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// `$WSP_MANAGER_DIR`, else `~/.local/state/wsp-manager`.
+/// `$WSP_MANAGER_DIR`, else `~/.local/state/wsp-manager`: where the hooks
+/// look for the token too.
 fn default_exec_dir() -> PathBuf {
-    match std::env::var_os("WSP_MANAGER_DIR") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => wsp_base::util::home().join(".local/state/wsp-manager"),
-    }
+    wsp_host::hooks::manager_dir()
 }
 
 fn run(argv: Vec<String>) -> Result<(), String> {
