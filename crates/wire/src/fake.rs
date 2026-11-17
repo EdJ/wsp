@@ -704,7 +704,7 @@ impl Stage {
 /// The reading a herdr would give of a seat: what it calls the agent, its
 /// status, and whether it will take a prompt.
 ///
-/// The inverse of [`crate::place_herdr::state_of_agent`], and the one function in this file that
+/// The inverse of `place_herdr::state_of_agent` (deleted), and the one function in this file that
 /// is a *claim about herdr* rather than a translation. Every line of it was
 /// recorded from herdr 0.7.5 on 2026-08-17 except where marked:
 ///
@@ -2099,7 +2099,6 @@ fn mtime(path: &Path) -> Option<std::time::SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr;
     use crate::util;
 
 
@@ -2199,176 +2198,6 @@ mod tests {
         }
     }
 
-    /// The dialect and the readings wsp makes of herdr are one mapping seen
-    /// from two sides, so a wrong belief about herdr can only be wrong in one
-    /// place. This is that assertion — and it is where the fake earned its
-    /// keep, because it failed the first time it was run.
-    ///
-    /// **Two states do not survive the trip, and only one of them is herdr's
-    /// fault.**
-    ///
-    /// `Gone` is the known one. herdr cannot tell an exited agent's pane from a
-    /// shell somebody opened, so it comes back as `Empty`; `place.rs` says the
-    /// adapter answers `Empty` from a census and `Gone` from the event stream,
-    /// and this is what forces that to stay true.
-    ///
-    /// `Starting` is the finding, and it is worth reading twice. The port
-    /// decided an agent was starting from `ready == Some(false)` — and **herdr
-    /// never sends `false`**. Recorded against a live Claude Code on 2026-08-17:
-    /// for 3.3 seconds after `agent.start`, `agent.get` answers
-    /// `agent_status: "idle"` with `launch_pending: true` and *no*
-    /// `interactive_ready` field at all, and then the fields swap —
-    /// `interactive_ready: true`, no `launch_pending`. Absence is the signal, in
-    /// both directions.
-    ///
-    /// So the port's own translation mapped the launch window to
-    /// [`State::Idle`], whose `will_take_a_prompt` says yes, which is exactly
-    /// the bug `place.rs` names three paragraphs above the function that had it:
-    /// the work order goes into a pane still drawing its banner.
-    ///
-    /// The fake keeps herdr's answer rather than the convenient one. That is
-    /// the whole discipline: a fake that sent `Some(false)` would make this
-    /// test pass, the port look right, and the bug arrive in production.
-    ///
-    /// **Repaired 2026-08-17 by robustness-018**, which is what this assertion
-    /// asked for in as many words: the reading moved out of `place.rs` and into
-    /// the herdr adapter, where it takes a parsed reply instead of three loose
-    /// arguments — so `Starting` now survives the trip, and there is no longer a
-    /// way to hand it a shape herdr does not send.
-    #[test]
-    fn the_dialect_is_the_inverse_of_the_readings_wsp_makes() {
-        let read = |spot: &Spot| crate::place_herdr::state_of_agent(&herdr::parse_pane(&agent_json(spot)));
-
-        for state in
-            [State::Empty, State::Starting, State::Idle, State::Working, State::Blocked, State::Unknown]
-        {
-            let spot = Spot::agent("s1", "claude", "t-1", state);
-            assert_eq!(
-                read(&spot),
-                state,
-                "{state:?} does not survive the round trip through herdr's words"
-            );
-        }
-
-        let gone = Spot::agent("s1", "claude", "t-1", State::Gone);
-        assert_eq!(
-            read(&gone),
-            State::Empty,
-            "herdr's blind spot has been quietly fixed by the fake, which makes tests green on a lie"
-        );
-
-        // The launch window is the one that mattered, and the absence is still
-        // the only thing marking it: nothing here was made to send a readiness
-        // herdr does not send.
-        let starting = Spot::agent("s1", "claude", "t-1", State::Starting);
-        assert_eq!(of_state(&starting).2, None, "herdr was made to send a readiness it does not send");
-        assert!(!read(&starting).will_take_a_prompt(), "the port would tell a caller to prompt a banner");
-    }
-
-    /// The reading this fake could not produce until worklist-010, and the one
-    /// every seat in the store answers with.
-    ///
-    /// `interactive_ready` is `managed_agent_interactive_ready`
-    /// (`app/agents.rs:390`): true only for an agent herdr launched itself, and
-    /// `skip_serializing_if = "is_false"`, so for an agent a person started it
-    /// is absent at every status rather than `false`. Recorded 2026-08-19 from
-    /// one `agent.list` on this machine: `w1:p6`, the `wsp` seat, `agent_status:
-    /// "working"` with no `interactive_ready` and no `name`; `w3R:p1`, spawned
-    /// by wsp, working, with both.
-    ///
-    /// The dialect claimed the second reading for every agent because every
-    /// recording behind it was taken from one wsp had spawned — so a fake full
-    /// of managed agents was the whole population under test, and the verb that
-    /// only misbehaves against seats had a green suite over it.
-    #[test]
-    fn an_agent_a_person_started_carries_no_readiness_at_any_status() {
-        for state in [State::Idle, State::Working, State::Blocked] {
-            let by_hand = Spot::agent("w1:p6", "claude", "", state).by_hand();
-            let seen = agent_json(&by_hand);
-            assert_eq!(seen.get("interactive_ready"), None, "{state:?} was given a readiness flag");
-            assert_eq!(seen.get("launch_pending"), None, "{state:?} is not a launch window either");
-            assert_eq!(
-                of_state(&by_hand).1,
-                of_state(&Spot::agent("w1:p6", "claude", "", state)).1,
-                "the status word is scraped off the screen and does not depend on who started it",
-            );
-
-            // Which wsp reads two ways, and the difference is worklist-010:
-            // readiness-qualified it is not knowable, and as a plain status word
-            // it is exactly what herdr said.
-            let pane = herdr::parse_pane(&seen);
-            assert_eq!(crate::place_herdr::state_of_agent(&pane), State::Unknown);
-            assert_eq!(crate::place_herdr::state_of_pane(&pane), state);
-        }
-    }
-
-    /// `done` is the one status in herdr's vocabulary with no `Spot`, and the
-    /// asymmetry is deliberate rather than missing — so it is asserted here
-    /// instead of being left to be discovered as a hole.
-    ///
-    /// herdr sends it for an agent that went idle while nobody was looking
-    /// (`app/api_helpers.rs:104`), which makes it a fact about a viewer's
-    /// window rather than about an agent. The adapter reads it as `Idle`, so it
-    /// cannot round-trip, and a fake that gave it its own state would be
-    /// offering wsp a distinction wsp has decided not to have.
-    #[test]
-    fn done_is_a_word_herdr_uses_for_idle_and_the_fake_never_sends_it() {
-        let done = herdr::parse_pane(&json!({
-            "pane_id": "s1", "agent": "claude", "agent_status": "done", "interactive_ready": true,
-        }));
-        assert_eq!(crate::place_herdr::state_of_agent(&done), State::Idle);
-        assert!(
-            crate::place_herdr::state_of_agent(&done).will_take_a_prompt(),
-            "read as Unknown this agent was unreachable, and four of twelve on this machine were it"
-        );
-
-        for state in [State::Idle, State::Working, State::Blocked, State::Starting] {
-            let spot = Spot::agent("s1", "claude", "t-1", state);
-            assert_ne!(of_state(&spot).1, "done", "{state:?} was given herdr's viewer flag");
-        }
-    }
-
-    /// The launch window is something [`Stage::unnamed`] *does*, not something
-    /// it *is* — so a stage of agents that are already up is unaffected by it
-    /// being on by default.
-    ///
-    /// Worth pinning because the default is the risky half of that change: every
-    /// existing fixture builds its seats with agents already in them and never
-    /// calls `agent.start`, so if the window were a property of a seat rather
-    /// than of a start, turning it on would have made the fake disagree with a
-    /// herdr that finished launching an hour ago. The countdown is armed by
-    /// `agent.start` and by nothing else, which is what these two readings say.
-    #[test]
-    fn a_stage_of_agents_that_are_already_up_never_enters_the_launch_window() {
-        let env = util::isolated("fake-already-up");
-        let stage = Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]);
-        assert!(stage.unnamed > 0, "the window is off, and this asserts nothing");
-        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let read = || {
-            let v = herdr::call("agent.get", json!({ "target": "w1:p1" })).expect("the fake answered");
-            herdr::parse_pane(v.get("agent").expect("a record"))
-        };
-        assert_eq!(read().agent, "claude", "a seat nobody started went blind");
-        assert_eq!(read().agent, "claude", "…and again, so this is not a countdown running out");
-
-        // Armed by a start and by nothing else, so the same seat read *after*
-        // one is in the window. The pair is the field: same stage, same seat,
-        // and the only thing between the two readings is `agent.start`.
-        herdr::call("agent.start", json!({ "pane_id": "w1:p1", "kind": "claude", "name": "t-1" }))
-            .expect("started");
-        let coming_up = read();
-        assert_eq!(coming_up.agent, "", "the launch window named an agent");
-        assert_eq!(coming_up.launch_pending, Some(true));
-        assert_eq!(
-            crate::place_herdr::state_of_agent(&coming_up),
-            State::Empty,
-            "which wsp reads as an empty seat, and that is the whole of t-260817-010"
-        );
-    }
-
     /// Which readings can tell a starting agent from an idle one, recorded
     /// rather than reasoned about — because `place.rs` reasons about it and
     /// gets it half right.
@@ -2409,72 +2238,6 @@ mod tests {
         let v = pane_json(&Spot::empty("w1:p1").at("/tmp"));
         assert_eq!(v["agent_status"], "unknown");
         assert!(v.get("agent").is_none(), "an empty pane carried an agent field");
-        assert_eq!(crate::place_herdr::state_of_agent(&herdr::parse_pane(&v)), State::Empty);
-    }
-
-    /// The whole point of the thing: wsp's own client, over a real socket, and
-    /// a state nobody could put a herdr into — a seat that is starting, one
-    /// that is working, one that has gone and a shell with nobody in it.
-    #[test]
-    fn wsps_own_client_reads_a_state_no_herdr_could_be_put_in() {
-        let env = util::isolated("fake-client");
-        let stage = Stage::of(vec![
-            Spot::agent("w1:p1", "claude", "t-1", State::Starting).labelled("one").on("w1", "w1:t1"),
-            Spot::agent("w1:p2", "claude", "t-2", State::Working).labelled("two").on("w1", "w1:t1"),
-            Spot::agent("w2:p1", "claude", "t-3", State::Gone)
-                .session("s-3")
-                .labelled("three")
-                .on("w2", "w2:t1"),
-            Spot::empty("w2:p2").labelled("a shell").on("w2", "w2:t1"),
-        ]);
-        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let panes = herdr::panes().expect("the fake answered");
-        assert_eq!(panes.len(), 4, "every seat is a pane, whatever is in it");
-        assert_eq!(panes[0].agent, "claude");
-        assert_eq!(panes[0].agent_status, "idle", "starting reads as idle from a listing");
-        assert_eq!(panes[1].agent_status, "working");
-        assert_eq!(panes[2].agent, "", "an agent that has gone leaves a pane that looks like a shell");
-        // And it takes its session with it, recorded against a live herdr on
-        // 2026-08-17 by killing a spawned Claude Code and reading the next
-        // `pane.list`. This is the reading `cmd_agent::sessions_learned` must
-        // not act on: it is silence, not a correction, and treating it as one
-        // would erase the id `claude --resume` needs at the one moment it is
-        // wanted.
-        assert_eq!(panes[2].session_id, "", "a dead agent's pane offers no session id");
-        assert_eq!(panes[3].agent_status, "unknown");
-
-        // …and `agent.list` is the narrower question, which a gone agent is not
-        // an answer to.
-        let agents = herdr::agents().expect("the fake answered");
-        assert_eq!(agents.len(), 2, "a gone agent was listed as a live one");
-    }
-
-    /// Silence, in both its forms, is not an empty list. This is robustness-015's
-    /// class of bug, at the seam it came in through — and it is the state the
-    /// task exists for, since a live herdr cannot be asked to stop answering.
-    #[test]
-    fn a_backend_that_is_not_answering_is_an_error_and_never_an_empty_list() {
-        let env = util::isolated("fake-quiet");
-        let fake = Fake::bind(
-            env.path("herdr.sock"),
-            Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]),
-        )
-        .unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        assert_eq!(herdr::panes().expect("answering").len(), 1);
-
-        // Hangs up: arrives at once, and is what a server restarting under a
-        // caller looks like.
-        fake.goes(Quiet::HangsUp);
-        assert!(herdr::panes().is_err(), "a hang-up was read as a machine with no panes");
-
-        fake.goes(Quiet::No);
-        assert_eq!(herdr::panes().expect("answering again").len(), 1);
     }
 
     /// The order `spawn` depends on, driven end to end: open a seat, start an
@@ -2554,46 +2317,6 @@ mod tests {
         );
     }
 
-    /// The subscribe stream, which is the half neither port could test before:
-    /// hold a connection open, change the state, and the event arrives on it.
-    /// wsp's own subscriber reads it, so the qualification and the
-    /// dots-to-underscores rename are exercised rather than assumed.
-    #[test]
-    fn a_state_change_reaches_a_watcher_that_was_already_listening() {
-        let env = util::isolated("fake-watch");
-        let fake = Fake::bind(
-            env.path("herdr.sock"),
-            Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]),
-        )
-        .unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let (tx, rx) = mpsc::channel::<(String, Value)>();
-        std::thread::spawn(move || {
-            let _ = herdr::subscribe(&["pane.updated", "pane.closed", "pane.agent_detected"], |name, data| {
-                tx.send((name.to_string(), data.clone())).is_ok()
-            });
-        });
-        // The stream has to be up before the change, or the test is asserting
-        // nothing: a watcher that subscribes afterwards learns nothing at all,
-        // which is the failure mode the daemon lives with. Asked of the register
-        // the event will be delivered to rather than slept for — see
-        // [`Fake::watched`].
-        assert!(fake.watched(), "the subscriber never reached the fake");
-
-        let seat = Seat::new("w1:p1");
-        fake.moves(&seat, State::Working);
-        let (name, data) = rx.recv_timeout(DELIVERY).expect("no event arrived");
-        assert_eq!(name, "pane_updated", "the stream renames dots to underscores");
-        assert_eq!(data["pane"]["agent_status"], "working");
-
-        fake.closes(&seat);
-        let (name, data) = rx.recv_timeout(DELIVERY).expect("no close arrived");
-        assert_eq!(name, "pane_closed");
-        assert_eq!(data["pane_id"], "w1:p1");
-    }
-
     /// One entry missing its `pane_id` refuses **every other entry with it**,
     /// and the server then hangs up. Recorded from herdr 0.7.5, and reproduced
     /// rather than smoothed over: `daemon::EVENTS` and `panel::SHAPE` are both
@@ -2601,14 +2324,7 @@ mod tests {
     /// both of them look arbitrary.
     #[test]
     fn one_per_pane_subscription_refuses_the_whole_list() {
-        let env = util::isolated("fake-subs");
-        let fake = Fake::bind(env.path("herdr.sock"), Stage::new()).unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let err = herdr::subscribe(&["pane.created", "pane.agent_status_changed"], |_, _| true)
-            .expect_err("a list herdr would have refused");
-        assert!(err.to_string().contains("pane_id"), "{err}");
+        assert!(subscription_error(&[json!({ "type": "pane.created" }), json!({ "type": "pane.agent_status_changed" })]).is_some());
 
         // Naming a pane is what makes it legal, which is why the panel
         // subscribes per pane for those three and globally for the rest.

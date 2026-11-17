@@ -1,13 +1,13 @@
 # wsp-wire
 
 The `Place` port and its backends (`docs/components.md`, cut `c4`). Depends on `wsp-base`, `wsp-store` and
-`serde_json`. The root re-exports each module at its old path (`crate::place`, `crate::herdr`, …).
+`serde_json`. The root re-exports each module at its old path (`crate::place`, `crate::far`, …).
 
 ## Holds
 
 - `place` — the `Place` port, its eight verbs, `Seat`, `State`, `Refusal`, `Rect`, and `Above` (what `main` installs for `agent_commands`, `hold`, `hold_close`)
-- `place_herdr`, `place_compound`, `place_super` — the three backends; `herdr`, `tunnel`, `far` — the sockets and ssh they use
-- `launchd`, `detect_override`
+- `place_compound`, `place_super` — the two real backends; `tunnel`, `far` — the sockets and ssh they use
+- `launchd`
 - `fake` — the fake herdr (also served by `wsp sandbox`); it moved here with `Rect`, because the backends' own tests bind it
 
 ## Does not hold

@@ -450,7 +450,7 @@ pub fn shed_env() -> BTreeMap<String, String> {
 ///
 /// herdr does not quite supply this, and the shortfall is not the one this
 /// comment used to claim. Measured 2026-08-19 (`robustness-084`, and see
-/// [`crate::place_herdr`] for the transcript): a pane number inside a surviving
+/// `place_herdr` for the transcript): a pane number inside a surviving
 /// workspace never comes round again, but a *workspace* id does — herdr's
 /// counter is process-local, and a restart reserves only one above the highest
 /// workspace that survived. So an id above that mark is handed out again, and
@@ -1926,7 +1926,6 @@ mod tests {
 
 /// Which seat this process is standing in, or none.
 ///
-/// The one reading of it, and it is now the port's rather than herdr's:
 /// `place::Place::here` is the verb, and which variable carries the answer is
 /// the adapter's business. Every agent-side verb — `claim`, `say`, `release` —
 /// is downstream of this, and so is `despawn`'s refusal to end the seat it is
@@ -1936,32 +1935,11 @@ mod tests {
 /// a binding's key, the `--pane` a person types are all the same string, and
 /// converting them all is `place::Seat`'s own migration rather than this one's.
 ///
-/// No socket is opened: [`Herdr::here`] reads what herdr set before this process
-/// existed, which is a rule of the port and not an optimisation. Constructing
-/// the backend costs four durations and a clock reference.
-///
-/// # Which backend is this process standing in
-///
-/// Two backends can seat an agent and each has its own name for the seat it
-/// hands its occupant — `HERDR_PANE_ID` for a pane, `place::SEAT_ENV` for a
-/// supervisor. Neither adapter is allowed to read the other's:
-/// `place_herdr::here` says why in as many words, and the mirror image holds —
-/// two answers to *which seat is this* is a way to be in two seats, and under
-/// herdr a stale `WSP_SEAT_ID` would bind a task to a pane that backend never
-/// issued.
-///
-/// So the choice is made here, one level up, and it is made by **which name the
-/// seat arrived under** rather than by asking anything. A process started by a
-/// supervisor has the supervisor's variable and nothing else; a shell in a pane
-/// has herdr's. The order matters only for the case that should not exist —
-/// both set — and the supervisor wins it because it is the backend that forked
-/// this process, whatever multiplexer the shell it came from was in.
+/// No socket is opened: the supervisor's `here` reads `place::SEAT_ENV`, set
+/// before this process existed, which is a rule of the port and not an
+/// optimisation.
 pub fn my_pane() -> Option<String> {
-    let seat = match crate::place_super::Supervisor::new().here() {
-        Some(s) => Some(s),
-        None => crate::place_herdr::Herdr::new().here(),
-    };
-    seat.map(|s| s.to_string())
+    crate::place_super::Supervisor::new().here().map(|s| s.to_string())
 }
 
 /// Every backend wsp can spawn onto, for the readers that do not get to ask —
@@ -1973,30 +1951,19 @@ pub fn my_pane() -> Option<String> {
 /// see `robustness-022`'s three fates.
 ///
 /// The same "one copy" argument [`backend`] makes: a reader that built its
-/// own array would be a second list to update when a fifth implementor
+/// own array would be a second list to update when another implementor
 /// lands.
-pub fn local_backends() -> [Box<dyn Place>; 2] {
-    [Box::new(crate::place_herdr::Herdr::new()), Box::new(crate::place_compound::Compound::new())]
+pub fn local_backends() -> [Box<dyn Place>; 1] {
+    [Box::new(crate::place_compound::Compound::new())]
 }
 
 /// The name a whole backend's own silence is filed under — `wsp stamp`
 /// (`compound-064` item 2), paired with [`local_backends`] by position, so
 /// this file stays the one place that ordering is named rather than
-/// re-assumed at a call site. `""` is herdr's own local machine
-/// ([`Census::heard`]'s spelling, unchanged); `"compound"` distinguishes
-/// the second backend's total refusal from a machine of that name, since a
-/// backend is not a machine and the two silences must not collide in a
-/// listing.
-/// `herdr` rather than `""`: the empty string is unique among BACKENDS but
+/// re-assumed at a call site. `"compound"` rather than `""`: the empty string
 /// collides with the MACHINE namespace, where `cmd_stamp::named` reads it as
-/// "this machine". Since `compound-112` herdr is normally absent, so its total
-/// refusal is the ordinary case, and under `""` it drew as the whole machine
-/// having gone silent while `heard` was true and compound had answered in full
-/// — `cmd_stamp`'s own doc asks for a name that cannot be mistaken for a
-/// machine's, and this is that name. Only herdr's WHOLESALE refusal is labelled
-/// here; when its census answers, `place_herdr` names each row by machine
-/// itself.
-pub const LOCAL_BACKEND_NAMES: [&str; 2] = ["herdr", "compound"];
+/// "this machine", and a backend is not a machine.
+pub const LOCAL_BACKEND_NAMES: [&str; 1] = ["compound"];
 
 /// The scope this workspace is the custodian of — a project or a worklist — if
 /// it is the custodian of one.
