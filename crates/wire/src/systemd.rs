@@ -13,6 +13,26 @@
 //! - `ThrottleInterval` is `RestartSec`.
 //! - stdout and stderr are appended to `<state>/daemon.log`, the same file.
 //!
+//! # KillMode=process, and why
+//!
+//! systemd's default `KillMode=control-group` kills every process in the
+//! unit's cgroup when the unit stops, restarts or exits, whatever `setsid` or
+//! `process_group(0)` the process called: a cgroup is not a process group. The
+//! daemon spawns long-lived agents (headless claude and its feeder,
+//! `compound-sup` sessions, detached `wsp govern --ending` children), and under
+//! the default every restart of the daemon would kill them all. launchd only
+//! signals the job's own process (`AbandonProcessGroup` aside, its children
+//! outlive it), so `KillMode=process` is what keeps the two the same: only the
+//! daemon itself is signalled. A later improvement is to launch agents with
+//! `systemd-run --user --scope`, so each lives in a cgroup of its own.
+//!
+//! # Type=exec
+//!
+//! `Type=simple` is "active" the moment systemd forks, before `exec`, so a
+//! missing binary (status 203/EXEC) reads as started. `Type=exec` waits for the
+//! exec and fails the start job if it fails. Both it and `StandardOutput=append:`
+//! need systemd 240, which [`ensure`] checks.
+//!
 //! # Linger
 //!
 //! A user unit runs while the user has a session. On a VM nobody logs into,
@@ -68,6 +88,23 @@ fn quote(s: &str) -> String {
     out
 }
 
+/// Quote an `Environment=` assignment: `Environment=` does not expand `$`, so
+/// unlike [`quote`] this leaves it alone; `\`, `"` and the `%` specifier are
+/// escaped.
+fn quote_env(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A path as the value of `StandardOutput=append:`: unquoted, `%` doubled.
 fn bare(s: &str) -> String {
     s.replace('%', "%%")
@@ -81,7 +118,8 @@ pub fn unit(bin: &Path, state: &Path, path_var: &str) -> String {
          Description=wsp daemon\n\
          \n\
          [Service]\n\
-         Type=simple\n\
+         Type=exec\n\
+         KillMode=process\n\
          ExecStart={bin} daemon\n\
          Environment={path}\n\
          Restart=on-failure\n\
@@ -92,7 +130,7 @@ pub fn unit(bin: &Path, state: &Path, path_var: &str) -> String {
          [Install]\n\
          WantedBy=default.target\n",
         bin = quote(&bin.display().to_string()),
-        path = quote(&format!("PATH={path_var}")),
+        path = quote_env(&format!("PATH={path_var}")),
         sec = RESTART_SEC,
         log = bare(&log),
     )
@@ -235,6 +273,10 @@ pub fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> 
     let path = unit_path();
     let want = unit(bin, state, path_var);
     let change = plan(&want, &path);
+    if !crate::launchd::sandboxed() {
+        let v = Command::new("systemctl").arg("--version").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        check_version(v.as_deref())?;
+    }
     let step = decide(&change, active(), crate::launchd::sandboxed());
     let linger = linger();
     if step == Step::Nothing {
@@ -253,16 +295,125 @@ pub fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> 
     Ok(Done { path, wrote: change == Plan::Write, loaded: true, linger })
 }
 
+/// What `systemctl --user show` said about the unit.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Show {
+    pub active: String,
+    pub sub: String,
+    pub main_pid: u32,
+    pub restarts: u32,
+    pub result: String,
+    pub exec_status: Option<i32>,
+}
+
+/// Read `show -p ActiveState,SubState,MainPID,NRestarts,Result,ExecMainStatus`.
+pub fn show_from(out: &str) -> Show {
+    let mut s = Show::default();
+    for l in out.lines() {
+        let Some((k, v)) = l.split_once('=') else { continue };
+        let v = v.trim();
+        match k {
+            "ActiveState" => s.active = v.into(),
+            "SubState" => s.sub = v.into(),
+            "MainPID" => s.main_pid = v.parse().unwrap_or(0),
+            "NRestarts" => s.restarts = v.parse().unwrap_or(0),
+            "Result" => s.result = v.into(),
+            "ExecMainStatus" => s.exec_status = v.parse().ok(),
+            _ => {}
+        }
+    }
+    s
+}
+
+/// What one sample means.
+#[derive(Debug, PartialEq)]
+pub enum Sample {
+    /// Running as this pid after this many restarts.
+    Running(u32, u32),
+    /// Exited cleanly and not restarted: the daemon stood down on purpose
+    /// (another holds the store), launchd's `Idle(Some(0))`.
+    StoodDown,
+    /// Anything else: starting, auto-restarting, failed.
+    Other,
+}
+
+pub fn sample(s: &Show) -> Sample {
+    match (s.active.as_str(), s.sub.as_str()) {
+        ("active", "running") if s.main_pid != 0 => Sample::Running(s.main_pid, s.restarts),
+        ("inactive", _) if s.result == "success" && s.exec_status == Some(0) => Sample::StoodDown,
+        _ => Sample::Other,
+    }
+}
+
+/// The settling rule, pure: `held` is the running `(pid, restarts)` seen and
+/// since when (ms), `now` is ms. Returns whether the unit has settled. A pid or
+/// restart-count change restarts the clock, so a crash loop never settles.
+pub fn settled(held: &mut Option<(u32, u32, u64)>, s: &Show, now: u64, hold_ms: u64) -> bool {
+    match sample(s) {
+        Sample::StoodDown => true,
+        Sample::Running(pid, n) => {
+            match held {
+                Some((p, r, _)) if *p == pid && *r == n => {}
+                _ => *held = Some((pid, n, now)),
+            }
+            held.is_some_and(|(_, _, since)| now - since >= hold_ms)
+        }
+        Sample::Other => {
+            *held = None;
+            false
+        }
+    }
+}
+
+/// One sentence for a unit that did not settle.
+pub fn describe(s: &Show) -> String {
+    format!(
+        "{LABEL} is {}/{} (result {}, exec status {}, {} restarts) — `journalctl --user -u {LABEL}`",
+        s.active,
+        s.sub,
+        if s.result.is_empty() { "unknown" } else { &s.result },
+        s.exec_status.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+        s.restarts
+    )
+}
+
+fn show() -> Show {
+    Command::new("systemctl")
+        .args(["--user", "show", "-p", "ActiveState,SubState,MainPID,NRestarts,Result,ExecMainStatus", LABEL])
+        .output()
+        .map(|o| show_from(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
 fn settle(limit: Duration) -> Result<(), String> {
     let t = std::time::Instant::now();
+    let mut held = None;
     loop {
-        if active() {
+        let s = show();
+        if settled(&mut held, &s, t.elapsed().as_millis() as u64, 2000) {
             return Ok(());
         }
         if t.elapsed() >= limit {
-            return Err(format!("{LABEL} was started but is not running (`journalctl --user -u {LABEL}`)"));
+            return Err(describe(&s));
         }
         std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `systemctl --version`'s first line, `systemd 255 (255.4-1ubuntu8)`.
+pub fn version_from(out: &str) -> Option<u32> {
+    out.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Oldest systemd with `Type=exec` and `StandardOutput=append:`.
+const MIN_SYSTEMD: u32 = 240;
+
+/// Refuse a systemd too old for the unit this writes.
+pub fn check_version(out: Option<&str>) -> Result<(), String> {
+    match out.and_then(version_from) {
+        Some(v) if v >= MIN_SYSTEMD => Ok(()),
+        Some(v) => Err(format!("systemd {v} is too old: the unit needs Type=exec and StandardOutput=append: (systemd {MIN_SYSTEMD} or newer)")),
+        None => Err("cannot read `systemctl --version`: is systemd running here?".into()),
     }
 }
 
@@ -275,9 +426,10 @@ pub fn reload() -> Result<String, String> {
     }
     ctl(&["daemon-reload"])?;
     ctl(&["enable", LABEL])?;
-    ctl(&["restart", LABEL])?;
+    // `start`, like launchd's kickstart without -k: a running job is left alone.
+    ctl(&["start", LABEL])?;
     settle(Duration::from_secs(8))?;
-    Ok(format!("{LABEL} restarted"))
+    Ok(format!("{LABEL} started"))
 }
 
 #[cfg(test)]
@@ -293,6 +445,59 @@ mod tests {
         assert!(u.contains("StandardOutput=append:/home/u/.local/state/wsp/daemon.log\n"));
         assert!(u.contains("StandardError=append:/home/u/.local/state/wsp/daemon.log\n"));
         assert!(u.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn unit_keeps_agents_alive_and_waits_for_exec() {
+        let u = unit(Path::new("/b/wsp"), Path::new("/s"), "/p");
+        assert!(u.contains("KillMode=process\n"), "{u}");
+        assert!(u.contains("Type=exec\n"));
+        assert!(u.contains("Restart=on-failure\n"));
+    }
+
+    #[test]
+    fn environment_keeps_dollar_but_escapes_percent_and_quotes() {
+        let u = unit(Path::new("/b/wsp"), Path::new("/s"), "/a$b:/c%d\"e");
+        assert!(u.contains("Environment=\"PATH=/a$b:/c%%d\\\"e\"\n"), "{u}");
+    }
+
+    #[test]
+    fn show_is_judged() {
+        let run = show_from("ActiveState=active\nSubState=running\nMainPID=42\nNRestarts=0\nResult=success\nExecMainStatus=0\n");
+        assert_eq!(sample(&run), Sample::Running(42, 0));
+        let exec_fail = show_from("ActiveState=activating\nSubState=auto-restart\nMainPID=0\nNRestarts=3\nResult=exit-code\nExecMainStatus=203\n");
+        assert_eq!(sample(&exec_fail), Sample::Other);
+        assert!(describe(&exec_fail).contains("203"));
+        let down = show_from("ActiveState=inactive\nSubState=dead\nMainPID=0\nNRestarts=0\nResult=success\nExecMainStatus=0\n");
+        assert_eq!(sample(&down), Sample::StoodDown);
+        let failed = show_from("ActiveState=failed\nSubState=failed\nMainPID=0\nResult=exit-code\nExecMainStatus=1\n");
+        assert_eq!(sample(&failed), Sample::Other);
+    }
+
+    #[test]
+    fn settling_needs_the_same_pid_and_restarts_for_the_hold() {
+        let at = |pid, n| Show { active: "active".into(), sub: "running".into(), main_pid: pid, restarts: n, result: "success".into(), exec_status: Some(0) };
+        let mut h = None;
+        assert!(!settled(&mut h, &at(5, 0), 0, 2000));
+        assert!(!settled(&mut h, &at(5, 0), 1500, 2000));
+        assert!(settled(&mut h, &at(5, 0), 2000, 2000));
+        let mut h = None;
+        assert!(!settled(&mut h, &at(5, 0), 0, 2000));
+        assert!(!settled(&mut h, &at(6, 1), 1900, 2000), "a restart resets the clock");
+        assert!(!settled(&mut h, &at(6, 1), 3000, 2000));
+        assert!(settled(&mut h, &at(6, 1), 3900, 2000));
+        let mut h = None;
+        assert!(!settled(&mut h, &at(5, 0), 0, 2000));
+        assert!(!settled(&mut h, &Show::default(), 1000, 2000));
+        assert!(!settled(&mut h, &at(5, 0), 2500, 2000), "a gap in running resets it");
+    }
+
+    #[test]
+    fn version_gate() {
+        assert_eq!(version_from("systemd 255 (255.4-1ubuntu8)\n+PAM"), Some(255));
+        assert!(check_version(Some("systemd 255 (x)")).is_ok());
+        assert!(check_version(Some("systemd 239 (x)")).unwrap_err().contains("too old"));
+        assert!(check_version(None).is_err());
     }
 
     #[test]
