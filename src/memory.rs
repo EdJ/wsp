@@ -152,8 +152,7 @@ pub(crate) fn read(state: &Path, agents: &[Seated], bindings: &BTreeMap<String, 
 /// each process's environment to its command.
 #[cfg(target_os = "macos")]
 fn table() -> Option<String> {
-    let out = wsp_base::calls::Command::new("ps").args(["-A", "-E", "-o", "pid=,ppid=,rss=,command="]).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    crate::host::Host::seat_memory(&crate::host::LOCAL)
 }
 
 /// Elsewhere (`ps -E` is BSD-only): the same rows from `/proc`. Only the one
@@ -168,7 +167,7 @@ fn table() -> Option<String> {
         let Ok(status) = std::fs::read_to_string(dir.join("status")) else { continue };
         let Some((ppid, kb)) = proc_status(&status) else { continue };
         let pane = std::fs::read(dir.join("environ")).ok().and_then(|b| pane_from_environ(&b));
-        out.push_str(&format!("{pid} {ppid} {kb} proc{}\n", pane.map(|p| format!(" HERDR_PANE_ID={p}")).unwrap_or_default()));
+        out.push_str(&format!("{pid} {ppid} {kb} proc{}\n", pane.map(|p| format!(" WSP_BACKEND_PANE_ID={p}")).unwrap_or_default()));
     }
     Some(out)
 }
@@ -183,12 +182,12 @@ fn proc_status(status: &str) -> Option<(u32, u64)> {
     Some((ppid, kb))
 }
 
-/// `HERDR_PANE_ID` out of a NUL-separated `/proc/<pid>/environ`.
+/// `WSP_BACKEND_PANE_ID` out of a NUL-separated `/proc/<pid>/environ`.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn pane_from_environ(environ: &[u8]) -> Option<String> {
     environ
         .split(|b| *b == 0)
-        .find_map(|kv| kv.strip_prefix(b"HERDR_PANE_ID="))
+        .find_map(|kv| kv.strip_prefix(b"WSP_BACKEND_PANE_ID="))
         .map(|v| String::from_utf8_lossy(v).into_owned())
         .filter(|v| !v.is_empty() && !v.contains(char::is_whitespace))
 }
@@ -288,9 +287,9 @@ mod tests {
     fn proc_files_read_as_rows() {
         assert_eq!(proc_status("Name:\tx\nPPid:\t7\nVmRSS:\t  1234 kB\n"), Some((7, 1234)));
         assert_eq!(proc_status("Name:\tkthreadd\nPPid:\t0\n"), Some((0, 0)));
-        assert_eq!(pane_from_environ(b"A=1\0HERDR_PANE_ID=w1:p1\0B=2\0"), Some("w1:p1".into()));
-        assert_eq!(pane_from_environ(b"XHERDR_PANE_ID=w1:p1\0"), None);
-        assert_eq!(pane_from_environ(b"HERDR_PANE_ID=\0"), None);
+        assert_eq!(pane_from_environ(b"A=1\0WSP_BACKEND_PANE_ID=w1:p1\0B=2\0"), Some("w1:p1".into()));
+        assert_eq!(pane_from_environ(b"XWSP_BACKEND_PANE_ID=w1:p1\0"), None);
+        assert_eq!(pane_from_environ(b"WSP_BACKEND_PANE_ID=\0"), None);
     }
 
     #[test]

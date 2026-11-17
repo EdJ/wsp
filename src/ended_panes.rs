@@ -105,7 +105,7 @@ pub(crate) fn tidy(store: &Store) {
         crate::store::log_line(store, &format!("closed {}", line(&e)));
         crate::check_tree::signal("HUP", &[e.shell]);
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        let left: Vec<u32> = crate::util::alive(&e.pids).into_iter().collect();
+        let left: Vec<u32> = crate::host::Host::alive(&crate::host::LOCAL, &e.pids).into_iter().collect();
         crate::check_tree::signal("TERM", &left);
     }
 }

@@ -23,7 +23,7 @@
 //! exist, and the answer is: the same ones `place_super` already uses.
 //! Claude Code fires the same lifecycle hooks whether its stdin is a `tail
 //! -f` or a real pty — a hook does not know what is on the other end of its
-//! stdio — so [`crate::place_super::said_by`], [`crate::util::alive`]
+//! stdio — so [`crate::place_super::said_by`], [`crate::host::Host::alive`]
 //! and [`crate::host::tally_burn`] are reused verbatim rather than
 //! copied. What differs is only what a seat *records*: a `compound-sup`
 //! socket and pid instead of a `tail`/agent process pair. Two directories,
@@ -137,7 +137,14 @@ use crate::place_super::{read_json, str_of};
 // end real supervisors for a test, and the tests that drive the moved helpers
 // by name, reach them from here.
 #[cfg(any(test, feature = "test-support"))]
-use {crate::host::signal_group, crate::util::alive, wsp_base::calls::Command};
+use {crate::host::signal_group, wsp_base::calls::Command};
+
+/// Which of these pids are running, asked of the in-process host.
+#[cfg(any(test, feature = "test-support"))]
+fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
+    use crate::host::Host;
+    crate::host::LOCAL.alive(pids)
+}
 #[cfg(test)]
 use {
     crate::host::{

@@ -16,6 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use wsp_base::calls::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -24,6 +25,7 @@ use serde_json::json;
 
 use crate::cmd_checkout::WORKTREES;
 use crate::store::Store;
+use crate::host::{Host, LOCAL};
 use crate::util;
 
 /// Under this the status surfaces say so, and name what could be reclaimed.
@@ -117,8 +119,7 @@ pub(crate) fn free_at(path: &Path) -> Option<u64> {
 }
 
 fn free_of(path: &Path) -> Option<(String, u64)> {
-    let out = Command::new("df").args(["-Pk"]).arg(path).output().ok().filter(|o| o.status.success())?;
-    parse_df(&String::from_utf8_lossy(&out.stdout))
+    parse_df(&LOCAL.disk_free(path)?)
 }
 
 /// Every `target/` wsp can rebuild: a tree under a repository's `.worktrees/`,
@@ -211,8 +212,7 @@ pub(crate) fn size_of(path: &Path) -> Option<Sized> {
     if let Some((bytes, upto)) = private_tree(path) {
         return Some(Sized { bytes, exact: true, upto });
     }
-    let out = Command::new("du").args(["-sk"]).arg(path).output().ok()?;
-    let kb: u64 = String::from_utf8_lossy(&out.stdout).split_whitespace().next()?.parse().ok()?;
+    let kb: u64 = LOCAL.disk_use(path)?.split_whitespace().next()?.parse().ok()?;
     Some(Sized { bytes: kb * 1024, exact: false, upto: kb * 1024 })
 }
 

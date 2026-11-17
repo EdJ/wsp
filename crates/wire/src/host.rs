@@ -16,7 +16,8 @@
 //!
 //! The methods are grouped by the host-api message they become at M1
 //! (section 3.2): `seat.spawn`, `seat.stop`, `seats`, `seat.read`,
-//! `order.deliver`, `seat.said`/`seat.spent`, `seat.did`, `turn` and `hello`.
+//! `order.deliver`, `seat.said`/`seat.spent`, `seat.did`, `turn`, `beat`
+//! (the host's facts: disk, load, memory, swap, thermal state) and `hello`.
 //! Each takes plain values (paths, pids, ids, text), never a seat record, so a
 //! call turns into a message without a wsp type crossing the wire.
 //!
@@ -29,6 +30,10 @@
 //! check_tree sweep, the throttle's and gc's liveness probes and a
 //! check's kill on timeout ask [`LOCAL`], so at M3 their jobs move and their
 //! calls do not.
+//!
+//! The layers below this crate (base, store) cannot name the host, so where
+//! they need a fact (a pid's liveness, when it started) their callers pass the
+//! host's answer in: `sharing::Alive`, `checks::StartOf`.
 //!
 //! Not here yet: tree work's jobs (section 1.3, which stays wsp's), the far machine's
 //! ssh (`far.rs`'s [`crate::far::Wire`], M2's subject), and the doctor's
@@ -151,6 +156,20 @@ pub trait Host: Sync {
     fn tree_of(&self, root: u32) -> Vec<u32>;
     /// Whether something accepts on this socket.
     fn answers(&self, socket: &Path) -> bool;
+    /// Whether this one pid is running: [`Host::alive`] for one.
+    fn is_alive(&self, pid: u32) -> bool {
+        self.alive(&[pid]).contains(&pid)
+    }
+    /// When `pid` started, as `ps -o lstart=,stat=` says it with its spaces written
+    /// as `_`; `None` for no such process or a defunct one, `Err` where `ps` could not tell.
+    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()>;
+    /// The process table a seat's running shells are read from:
+    /// `ps -A -o pid=,ppid=,etime=,time=,command=`. `None` when `ps` did not run.
+    fn shells(&self) -> Option<String>;
+    /// The process table per-seat memory is read from, environments included
+    /// so a seat's id finds its processes: `ps -A -E -o pid=,ppid=,rss=,command=`.
+    /// `None` when `ps` did not run or failed.
+    fn seat_memory(&self) -> Option<String>;
 
     // ---- seats: the process table, signals and working directories
     // (wsp-008). Every `ps`, `kill` and `lsof` outside this module comes
@@ -259,6 +278,28 @@ pub trait Host: Sync {
     /// Whether [`HOOKS_FILE`] shows the seat's own prompt submitted at or
     /// after `since`; `None` when there is no log to say.
     fn turn_began(&self, dir: &Path, since: i64) -> Option<bool>;
+
+    // ---- beat (host facts)
+    // Each is the probe's own text; what it means is read by the caller's
+    // parser, so a fact crosses as the same text at M1 until `HostFacts` carries it.
+    /// `df -Pk <path>`, when it succeeded.
+    fn disk_free(&self, path: &Path) -> Option<String>;
+    /// `du -sk <path>`, when it ran.
+    fn disk_use(&self, path: &Path) -> Option<String>;
+    /// The load averages: `/proc/loadavg` where there is one, else
+    /// `sysctl -n vm.loadavg`.
+    fn load(&self) -> Option<String>;
+    /// `pmset -g therm`, when it succeeded.
+    fn thermal(&self) -> Option<String>;
+    /// `memory_pressure`, when it succeeded.
+    fn memory_pressure(&self) -> Option<String>;
+    /// `sysctl -n vm.swapusage`, when it succeeded.
+    fn swap(&self) -> Option<String>;
+    /// `vm_stat`, when it succeeded.
+    fn pageouts(&self) -> Option<String>;
+    /// `ioreg -c IOHIDSystem -d 4`, when it succeeded: how long the person has
+    /// been away from the keyboard.
+    fn idle(&self) -> Option<String>;
 
     // ---- hello
     /// What the doctor says about the installed `compound-sup`'s wire.
@@ -395,7 +436,7 @@ impl Host for InProcess {
         signal_group(stop.group, "TERM");
         let Some(pid) = stop.watch else { return };
         let deadline = stop.clock.now() + stop.grace;
-        while util::alive(&[pid]).contains(&pid) {
+        while self.is_alive(pid) {
             if stop.clock.now() >= deadline {
                 signal_group(stop.group, "KILL");
                 break;
@@ -428,7 +469,58 @@ impl Host for InProcess {
     }
 
     fn alive(&self, pids: &[u32]) -> BTreeSet<u32> {
-        util::alive(pids)
+        alive(pids)
+    }
+
+    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
+        let out = Command::new("ps").args(["-o", "lstart=,stat=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
+        crate::checks::ps_says(out.status.code(), &out.stdout)
+    }
+
+    fn shells(&self) -> Option<String> {
+        let out = Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,time=,command="]).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn seat_memory(&self) -> Option<String> {
+        succeeded(Command::new("ps").args(["-A", "-E", "-o", "pid=,ppid=,rss=,command="]))
+    }
+
+    fn disk_free(&self, path: &Path) -> Option<String> {
+        succeeded(Command::new("df").args(["-Pk"]).arg(path))
+    }
+
+    fn disk_use(&self, path: &Path) -> Option<String> {
+        let out = Command::new("du").args(["-sk"]).arg(path).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn load(&self) -> Option<String> {
+        if let Ok(s) = fs::read_to_string("/proc/loadavg") {
+            return Some(s);
+        }
+        let out = Command::new("sysctl").args(["-n", "vm.loadavg"]).stderr(Stdio::null()).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn thermal(&self) -> Option<String> {
+        succeeded(Command::new("pmset").args(["-g", "therm"]).stderr(Stdio::null()))
+    }
+
+    fn memory_pressure(&self) -> Option<String> {
+        succeeded(Command::new("memory_pressure").stderr(Stdio::null()))
+    }
+
+    fn swap(&self) -> Option<String> {
+        succeeded(Command::new("sysctl").args(["-n", "vm.swapusage"]).stderr(Stdio::null()))
+    }
+
+    fn pageouts(&self) -> Option<String> {
+        succeeded(Command::new("vm_stat").stderr(Stdio::null()))
+    }
+
+    fn idle(&self) -> Option<String> {
+        succeeded(Command::new("ioreg").args(["-c", "IOHIDSystem", "-d", "4"]).stderr(Stdio::null()))
     }
 
     fn tree_of(&self, root: u32) -> Vec<u32> {
@@ -677,6 +769,49 @@ impl Host for InProcess {
 /// A set-but-missing `$COMPOUND_SUP` falls through rather than failing, and a
 /// caller whose `PATH` lacks `~/.local/bin` (a seat's shell running `advance`)
 /// still finds the binary the daemon's own `PATH` has (`wsp-602`).
+/// A probe's stdout, when it ran and exited 0.
+fn succeeded(cmd: &mut Command) -> Option<String> {
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Which of these pids are running, in one ask.
+///
+/// One `ps` rather than one `kill -0` each, because `Place::census` would
+/// otherwise fork once per seat. An empty list forks nothing.
+///
+/// **A zombie is not alive**, and that arm is not hypothetical. `wsp spawn`
+/// starts the agent and then polls its readiness from the same process, so an
+/// agent that dies in its first second is a child nobody has reaped and sits in
+/// the process table looking exactly like a running one. Reporting it as alive
+/// is the same class of defect as robustness-041 with the sign flipped: an agent
+/// declared healthy while its corpse cools.
+fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
+    if pids.is_empty() {
+        return std::collections::BTreeSet::new();
+    }
+    let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    let out = match Command::new("ps").args(["-o", "pid=,state=", "-p", &list]).output() {
+        Ok(o) => o,
+        // Not an empty set: `ps` failing to run is not evidence that every agent
+        // on this machine has stopped, and a caller that reaped on the strength
+        // of it would end every claim at once. The rule is `sync.rs:41`'s and is
+        // older than this file.
+        Err(_) => return pids.iter().copied().collect(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid: u32 = it.next()?.parse().ok()?;
+            match it.next().unwrap_or("").starts_with('Z') {
+                true => None,
+                false => Some(pid),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn compound_sup_binary() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from));
     find_sup(

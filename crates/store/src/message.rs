@@ -838,11 +838,6 @@ impl Awaited {
     pub fn here() -> Awaited {
         Awaited { pid: std::process::id(), at: util::now_iso() }
     }
-
-    /// Whether the waiter is still there to be handed the answer.
-    pub fn alive(&self) -> bool {
-        crate::util::alive(&[self.pid]).contains(&self.pid)
-    }
 }
 
 impl Message {

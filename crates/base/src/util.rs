@@ -1522,43 +1522,6 @@ pub fn is_agent_id(s: &str) -> bool {
     s.starts_with("a-") && s.rsplit('-').next().is_some_and(|tail| tail.starts_with('p'))
 }
 
-/// Which of these pids are running, in one ask.
-///
-/// One `ps` rather than one `kill -0` each, because [`Place::census`] would
-/// otherwise fork once per seat. An empty list forks nothing.
-///
-/// **A zombie is not alive**, and that arm is not hypothetical. `wsp spawn`
-/// starts the agent and then polls its readiness from the same process, so an
-/// agent that dies in its first second is a child nobody has reaped and sits in
-/// the process table looking exactly like a running one. Reporting it as alive
-/// is the same class of defect as robustness-041 with the sign flipped: an agent
-/// declared healthy while its corpse cools.
-pub fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
-    if pids.is_empty() {
-        return std::collections::BTreeSet::new();
-    }
-    let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
-    let out = match crate::calls::Command::new("ps").args(["-o", "pid=,state=", "-p", &list]).output() {
-        Ok(o) => o,
-        // Not an empty set: `ps` failing to run is not evidence that every agent
-        // on this machine has stopped, and a caller that reaped on the strength
-        // of it would end every claim at once. The rule is `sync.rs:41`'s and is
-        // older than this file.
-        Err(_) => return pids.iter().copied().collect(),
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let pid: u32 = it.next()?.parse().ok()?;
-            match it.next().unwrap_or("").starts_with('Z') {
-                true => None,
-                false => Some(pid),
-            }
-        })
-        .collect()
-}
-
 /// One entry is one line, so text that arrives on several becomes one.
 ///
 /// Not tidying: the `## Log` section is read line-by-line by everything that

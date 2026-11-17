@@ -274,7 +274,7 @@ pub(crate) trait Seats {
     /// Which of these are still running. A parameter for the same reason
     /// [`Seats::state`] is: a test names pids that were never processes.
     fn running(&self, pids: &[u32]) -> Vec<u32> {
-        crate::util::alive(pids).into_iter().collect()
+        crate::host::Host::alive(&crate::host::LOCAL, pids).into_iter().collect()
     }
 
     /// Every seat the backends here hold, with its label — for the sweeps that

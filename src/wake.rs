@@ -923,7 +923,7 @@ fn unseated(store: &Store, scope: &str) -> String {
         .map(|(pid, _)| pid)
         // The daemon asking about itself needs no `ps` (`wsp-320`): this runs
         // once per vacant seat on every pass, and that was a fork each.
-        .is_some_and(|pid| pid == std::process::id() || crate::util::alive(&[pid]).contains(&pid));
+        .is_some_and(|pid| pid == std::process::id() || crate::host::Host::alive(&crate::host::LOCAL, &[pid]).contains(&pid));
     // **Five readings and not two, and each is one a reader can act on
     // differently.** `reseating` and `daemon down` were the two `wsp-148` asked
     // for; the other three are states that arrived with it and that those two

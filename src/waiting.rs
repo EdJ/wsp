@@ -523,7 +523,7 @@ impl Asks {
             // A wait stands only while its process does: a waiter killed with
             // Esc leaves the mark behind, and the seat is then at its prompt
             // like any asker.
-            if m.for_person && m.awaited.as_ref().is_some_and(|a| a.alive()) {
+            if m.for_person && m.awaited.as_ref().is_some_and(|a| crate::host::Host::is_alive(&crate::host::LOCAL, a.pid)) {
                 if !w.pane.is_empty() {
                     asks.awaited_pane.insert(w.pane.clone(), m.id.clone());
                 }
@@ -751,17 +751,17 @@ impl Shells {
         if roots.is_empty() {
             return Shells::default();
         }
-        match wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,time=,command="]).output() {
-            Ok(out) => {
+        match crate::host::Host::shells(&crate::host::LOCAL) {
+            Some(ps) => {
                 let now = util::epoch_secs();
                 let mut memory = Memory::load();
-                let shells = Shells::of(&String::from_utf8_lossy(&out.stdout), &roots, now, &mut memory, self_wait);
+                let shells = Shells::of(&ps, &roots, now, &mut memory, self_wait);
                 memory.save(now);
                 shells
             }
             // Not "waiting": a `ps` that did not run is no evidence of a shell,
             // and the cost of reading none is a seat told, which is a sentence.
-            Err(_) => Shells::default(),
+            None => Shells::default(),
         }
     }
 
