@@ -1,0 +1,7 @@
+# What the code still does outside the in-process host (crates/wire/src/host.rs): `path: kind  # why`, one per line.
+# The host seam's guard (tests/host_seam.rs, docs/agent-manager.md 6.2 M0) fails on a hit not here and on a line the code no longer has.
+# This file only shrinks: delete a line when the code stops doing it; never add one.
+crates/wire/src/far.rs: shell ioreg  # DISPLAY_PROBE, run on the far machine over ssh; the far machine is M2's (host.rs: "Not here yet")
+crates/wire/src/far.rs: shell ps  # holdings_command, run on the far machine over ssh; M2's, with DISPLAY_PROBE
+crates/trees/src/warm.rs: shell kill  # remove_when_gone: tree work (section 1.3) waiting on its own pid before an rm; M3 makes it a job
+src/did.rs: reads transcripts (~/.claude/projects)  # is_scratch names the directory to classify a path a tool call touched; it reads nothing
