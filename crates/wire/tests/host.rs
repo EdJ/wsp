@@ -134,7 +134,26 @@ fn manager(dir: &Path, sup: &Path, port: u16) -> Manager {
     let mut cfg = Config::new(&dir.join("exec"), "test-host");
     cfg.port = port;
     cfg.sup = Some(sup.to_path_buf());
-    Manager::start(cfg).expect("the manager starts on loopback")
+    start(cfg)
+}
+
+/// `Manager::start`, which a restart in this same process may find
+/// `Locked` by itself for a few milliseconds: a child another test is
+/// forking holds a copy of the lock's descriptor until its `exec` closes it.
+/// A manager restarted for real is a new process, and never meets this.
+fn start(cfg: Config) -> Manager {
+    let since = Instant::now();
+    loop {
+        match Manager::start(cfg.clone()) {
+            Ok(m) => return m,
+            Err(wsp_manager::StartError::Locked { holder, .. })
+                if holder == std::process::id().to_string() && since.elapsed() < Duration::from_secs(2) =>
+            {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(e) => panic!("the manager starts on loopback: {e}"),
+        }
+    }
 }
 
 fn token(dir: &Path) -> Token {
@@ -841,7 +860,14 @@ fn a_seat_started_in_process_is_adopted_by_the_manager_then_told_and_stopped_thr
     let sweep = Sweep::default();
     let inproc = InProcess::with_sup(&sup);
     let before = Compound { host: &inproc, ..Compound::at(dir.join("seats")).insisting() };
+    // A label no other test's session carries: the manager finds an adopted
+    // seat's compound-sup by `spawn --label <seat>` in one `ps`, and every
+    // test's fake is a `sup` running `cpd-1` in this process's run directory,
+    // so two under one label are left alone (it does not guess).
+    fs::create_dir_all(dir.join("seats")).unwrap();
+    fs::write(dir.join("seats").join("next"), std::process::id().to_string()).unwrap();
     let seat = opened(&before, &dir);
+    assert_eq!(seat.as_str(), format!("cpd-{}", std::process::id()));
     before.start(&seat, &agent(0)).expect("the seat starts in-process");
     let pid = before.root(&seat).expect("a session pid");
     sweep.add(pid);
