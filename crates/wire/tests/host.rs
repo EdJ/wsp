@@ -804,6 +804,109 @@ fn under_manager_await_up_hears_a_start_by_its_first_turn_its_stop_or_neither() 
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// wsp-040: a verifier spawned on a row whose member seat has stopped. The
+/// member ran under the row's key (`wsp-038`, 0), so once it stopped that key
+/// is spent and a spawn under it is refused, as `spawn wsp-038 --agent --verify`
+/// was live. The verifier goes out keyless (cmd_spawn never keys a verifier by
+/// the row) after `open`'s bare terminal ran under the seat's `(seat, 0)`, and
+/// is accepted under `(seat, 1)`, not refused as `(seat, 0)` already run. Its
+/// first start stopped and the seat left standing, as wsp-037's retry leaves
+/// one, the re-start is accepted under `(seat, 2)`. Read off the journal.
+#[test]
+fn a_verifier_on_a_row_whose_member_stopped_is_accepted_and_so_is_its_restart() {
+    let (dir, sup) = place("vrf");
+    let sweep = Sweep::default();
+    let m = manager(&dir, &sup, 0);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let compound = Compound { host: &tcp, ..Compound::at(dir.join("seats")) };
+    let keyed = |key: Option<Key>| Agent { kind: "claude".into(), name: "wsp-038".into(), args: vec![], key };
+    let row = |attempt| Some(Key { row: RowId("wsp-038".into()), attempt });
+    let refused_as_ran = |said: PResult<()>| match said {
+        Err(Refusal::Backend(why)) => assert!(why.contains("Duplicate") && why.contains("already ran"), "{why}"),
+        other => panic!("{other:?}"),
+    };
+
+    // The member: started under the row's key, then stopped.
+    let member = opened(&compound, &dir);
+    compound.start(&member, &keyed(row(0))).expect("the member starts");
+    sweep.add(compound.root(&member).expect("the member's pid"));
+    compound.end(&member).expect("the member's seat stops");
+    let spent = opened(&compound, &dir);
+    if let Some(pid) = compound.root(&spent) {
+        sweep.add(pid);
+    }
+    refused_as_ran(compound.start(&spent, &keyed(row(0))));
+    let _ = compound.end(&spent);
+
+    // The verifier, keyless: accepted.
+    let verifier = opened(&compound, &dir);
+    let agent = keyed(None);
+    compound.start(&verifier, &agent).expect("the verifier is accepted with the member's key spent");
+    let first = compound.root(&verifier).expect("the verifier's pid");
+    sweep.add(first);
+
+    // Its first start stopped and the seat left standing, as a start judged
+    // dead is: the same keyless agent again is the seat's next attempt.
+    tcp.stop(Stop { group: first, watch: Some(first), grace: Duration::from_secs(2), poll: Duration::from_millis(50), clock: &Wall });
+    wait_until("the verifier's first start ended", || !tcp.is_alive(first));
+    compound.start(&verifier, &agent).expect("the verifier's re-start is accepted under the next key");
+    let second = compound.root(&verifier).expect("the re-started pid");
+    sweep.add(second);
+    assert_ne!(second, first, "a re-start is another agent");
+    let rows = tcp.seats().expect("the manager answers seats");
+    assert!(rows.iter().any(|r| r.seat.0 == verifier.as_str()), "the manager runs the verifier: {rows:?}");
+    let journal = fs::read_to_string(dir.join("exec").join(wsp_manager::JOURNAL_FILE)).unwrap();
+    let keys: Vec<Value> = journal
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|f| f["type"] == "seat.started" && f["seat"] == verifier.as_str())
+        .map(|f| f["key"].clone())
+        .collect();
+    let at = |attempt: u32| serde_json::json!({ "row": verifier.as_str(), "attempt": attempt });
+    assert_eq!(keys, vec![at(0), at(1), at(2)], "open's terminal, the verifier, its re-start: {journal}");
+
+    compound.end(&verifier).expect("the verifier stops");
+    drop(tcp);
+    m.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// wsp-040: `wsp despawn` of a seat started in-process (`cpd-250`) while the
+/// manager runs, which the manager does not run and never adopted. The
+/// despawn's hosted place ends it through the in-process half, with its group
+/// among the pids, its session gone and its record removed, so the despawn
+/// goes on to release the claim; never "the manager does not run" and the
+/// claim kept.
+#[test]
+fn despawn_of_a_seat_the_manager_does_not_run_ends_it_in_process() {
+    let (dir, sup) = place("unrun");
+    let sweep = Sweep::default();
+    let m = manager(&dir, &sup, 0);
+    let inproc = InProcess::with_sup(&sup);
+    let here = Compound { host: &inproc, ..Compound::at(dir.join("seats")).insisting() };
+    let seat = opened(&here, &dir);
+    here.start(&seat, &agent(0)).expect("the seat starts in-process");
+    let pid = here.root(&seat).expect("a session pid");
+    sweep.add(pid);
+
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let despawner = Compound { host: &tcp, ..Compound::at(dir.join("seats")) };
+    assert!(despawner.hosted());
+    let rows = tcp.seats().expect("the manager answers seats");
+    assert!(rows.iter().all(|r| r.seat.0 != seat.as_str()), "the manager does not run {seat}: {rows:?}");
+
+    let ended = despawner.end(&seat).expect("a seat the manager does not run is ended, not refused");
+    assert!(ended.contains(&pid), "its group was ended: {ended:?} vs {pid}");
+    assert_eq!(despawner.root(&seat), None, "its record went with it");
+    wait_until("the in-process session ended", || !inproc.is_alive(pid));
+
+    drop(tcp);
+    m.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A port nothing listens on: bound, then let go.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()

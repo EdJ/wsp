@@ -1173,8 +1173,12 @@ impl Compound<'_> {
         args: &[String],
         spawn: &mut dyn FnMut(&host::Spawn<'_>) -> Result<host::Session>,
     ) -> Result<Value> {
-        let host::Session { pid, socket, render } = spawn(&Self::spawn_of(seat, rec, key, program, args))?;
         let mut rec = rec.clone();
+        let key = match key {
+            Some(key) => key.clone(),
+            None => self.seat_key(seat, &mut rec),
+        };
+        let host::Session { pid, socket, render } = spawn(&Self::spawn_of(seat, &rec, Some(&key), program, args))?;
         rec["pid"] = json!(pid);
         rec["socket"] = json!(socket.display().to_string());
         if let Some(render) = &render {
@@ -1182,6 +1186,31 @@ impl Compound<'_> {
         }
         rec["started_at"] = json!(util::now_iso());
         Ok(rec)
+    }
+
+    /// The key a spawn with no row goes out under: the seat's own id, at the
+    /// attempt after the last one the seat's record spent (0 for `open`'s bare
+    /// terminal, 1 for the agent `start` puts in its place, 2 for a re-start
+    /// after a start judged dead). Spent on the record before it is sent, so a
+    /// spawn that fails or is refused is never sent again under the same key.
+    /// A fixed `(seat, 0)` was `open`'s key as well as the agent's: under the
+    /// manager the shell's run spent it, and every keyless start after it (a
+    /// verifier, a rotation onto a project) was refused as a key that had
+    /// already run (wsp-040).
+    fn seat_key(&self, seat: &Seat, rec: &mut Value) -> wsp_host_api::Key {
+        let on_disk = self.record(seat).ok();
+        let spent = [Some(&*rec), on_disk.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.get("attempt").and_then(|a| a.as_u64()))
+            .max();
+        let attempt = spent.map_or(0, |a| a as u32 + 1);
+        rec["attempt"] = json!(attempt);
+        if let (Some(mut was), Ok(dir)) = (on_disk, self.dir_of(seat)) {
+            was["attempt"] = json!(attempt);
+            let _ = write_atomic(&dir.join(SEAT_FILE), &was.to_string());
+        }
+        wsp_host_api::Key { row: wsp_host_api::RowId(seat.to_string()), attempt }
     }
 
     /// A local seat's start, its `seat.spawn` asked of the host by `spawn`:
