@@ -54,7 +54,7 @@ use wsp_host_api::{
     SeatState, SeatStop, Seats, SeatsList, Subscribe, Token, Workdir, WspHello, BEAT_SECS, MISSED_BEATS, PROTOCOL,
 };
 
-use crate::host::{Forked, Headless, Host, InProcess, Session, Spawn, Stop};
+use crate::host::{Ended, Forked, Headless, Host, InProcess, Session, Spawn, Stop};
 /// What a `seats` reply carries, for a caller that reads it (`wip`).
 pub use wsp_host_api::{DiskFree, HostFacts as Facts, SeatRow as Row};
 use crate::manager::{self, Local};
@@ -473,17 +473,27 @@ impl Tcp {
         }
     }
 
-    /// `seat.stop` of a seat this process knows, and its `seat.stopped`
-    /// waited for up to `wait` (nothing waited for when zero).
-    fn stop_seat(&self, seat: &str, k: &Known, grace: Duration, wait: Duration) {
+    /// `seat.stop` of `seat` at `epoch`, and its `seat.stopped` waited for up
+    /// to `wait` (nothing waited for when zero): what the manager ended.
+    fn stop_seat(&self, seat: &str, epoch: Epoch, grace: Duration, wait: Duration) -> Result<Ended> {
         let msg = Message::SeatStop(SeatStop {
             seat: SeatId(seat.to_string()),
-            epoch: k.epoch,
+            epoch,
             grace_secs: u32::try_from(grace.as_secs() + u64::from(grace.subsec_nanos() > 0)).unwrap_or(u32::MAX),
         });
-        let said = self.ask(msg, wait, |m| matches!(m, Message::SeatStopped(_)));
-        if matches!(said.as_deref(), Ok([.., Message::SeatStopped(_)])) {
-            self.known.lock().unwrap_or_else(|e| e.into_inner()).remove(seat);
+        let said = self.ask(msg, wait, |m| matches!(m, Message::SeatStopped(_)))?;
+        match said.into_iter().last() {
+            Some(Message::SeatStopped(s)) => {
+                self.known.lock().unwrap_or_else(|e| e.into_inner()).remove(seat);
+                Ok(Ended { pids: s.ended, exit: s.exit })
+            }
+            Some(Message::Refused(r)) => Err(Refusal::Backend(format!("the manager refused to stop {seat}: {:?} {}", r.why, r.detail))),
+            _ if wait.is_zero() => Ok(Ended::default()),
+            _ => Err(Refusal::Unreachable(format!(
+                "host silent: no seat.stopped for {seat} within {}s from the manager at {}",
+                wait.as_secs(),
+                self.addr
+            ))),
         }
     }
 
@@ -602,13 +612,26 @@ impl Host for Tcp {
     // ---- seat.stop / seat.stopped
     fn stop(&self, stop: Stop<'_>) {
         match self.known_by(|k| k.pid == stop.group) {
-            Some((seat, k)) => self.stop_seat(&seat, &k, stop.grace, stop.grace + MARGIN),
+            Some((seat, k)) => {
+                let _ = self.stop_seat(&seat, k.epoch, stop.grace, stop.grace + MARGIN);
+            }
             None => self.local.stop(stop),
+        }
+    }
+    /// By seat, so a `despawn` in a process that started nothing finds the seat
+    /// in the manager's own list: the manager's pids, or the plain reason it
+    /// could not say.
+    fn end(&self, seat: &str, stop: Stop<'_>) -> Result<Ended> {
+        match self.epoch_of(seat)? {
+            Some(epoch) => self.stop_seat(seat, epoch, stop.grace, stop.grace + MARGIN),
+            None => Err(Refusal::Backend(format!("the manager at {} does not run {seat}", self.addr))),
         }
     }
     fn stop_soon(&self, group: u32) {
         match self.known_by(|k| k.pid == group) {
-            Some((seat, k)) => self.stop_seat(&seat, &k, Duration::from_secs(1), Duration::ZERO),
+            Some((seat, k)) => {
+                let _ = self.stop_seat(&seat, k.epoch, Duration::from_secs(1), Duration::ZERO);
+            }
             None => self.local.stop_soon(group),
         }
     }

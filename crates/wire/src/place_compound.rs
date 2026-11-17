@@ -1200,7 +1200,7 @@ impl Compound<'_> {
                 if rec.get("agent").is_some() {
                     return Err(Refusal::Backend(format!("{seat} already has a session running")));
                 }
-                self.end_process(seat, &rec);
+                self.end_process(seat, &rec)?;
             }
         }
         let (program, argv) = (crate::place::above().command)(&agent.kind, &agent.args);
@@ -1413,9 +1413,15 @@ impl Compound<'_> {
     /// currently occupies a seat's pty — whether the SEAT is going with it
     /// ([`Place::stop`]) or is about to hold a fresh session in its place
     /// ([`Place::start`] replacing a bare terminal, `compound-081`).
-    fn end_process(&self, seat: &Seat, rec: &Value) {
+    ///
+    /// What ended, as the host says: the manager's own pids under
+    /// `WSP_HOST=manager`. A host that cannot say (silent, or not running the
+    /// seat) is the error, before anything of the seat is cleared.
+    fn end_process(&self, seat: &Seat, rec: &Value) -> Result<Vec<u32>> {
+        let mut ended = Vec::new();
         if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32) {
-            self.host.stop(host::Stop { group: pid, watch: Some(pid), grace: self.linger, poll: self.poll, clock: self.clock });
+            let stop = host::Stop { group: pid, watch: Some(pid), grace: self.linger, poll: self.poll, clock: self.clock };
+            ended = self.host.end(seat.as_str(), stop)?.pids;
         }
         // A signalled `compound-sup` skips its own unlink, and so does a
         // signalled renderer: each leaves a headstone the host clears.
@@ -1425,6 +1431,7 @@ impl Compound<'_> {
         if let Some(render) = self.render_socket_of(seat) {
             self.host.clear_socket(&render, &[]);
         }
+        Ok(ended)
     }
 }
 
@@ -1715,20 +1722,28 @@ impl Place for Compound<'_> {
     /// its own `SessionEnd`-on-the-way-out the same as `place_super`
     /// measures, then `SIGKILL`; the directory goes either way.
     fn stop(&self, seat: &Seat) -> Result<()> {
+        self.end(seat).map(|_| ())
+    }
+
+    fn hosted(&self) -> bool {
+        self.host.hears_orders()
+    }
+
+    fn end(&self, seat: &Seat) -> Result<Vec<u32>> {
         let rec = self.record(seat)?;
         let dir = self.dir_of(seat)?;
         if !str_of(&rec, "machine").is_empty() {
             self.stop_far(seat, &rec)?;
             fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
-            return Ok(());
+            return Ok(Vec::new());
         }
         // `compound-031` is where the general case (a session whose host is
         // gone and nobody asked it to stop) is filed; this is the one seat
         // this call just ended.
-        self.end_process(seat, &rec);
+        let ended = self.end_process(seat, &rec)?;
         self.host.bank(&dir);
         fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
-        Ok(())
+        Ok(ended)
     }
 
     fn state(&self, seat: &Seat) -> Result<State> {
