@@ -1029,7 +1029,10 @@ What M1's live defects taught, carried into the rows:
   until the next prune, or it has no record and is forgotten. The beat sweeps every period, and `job.run`, `jobs`
   and a start sweep too. `manager.log` names each job pruned. A key asked again after its job was pruned starts a
   new run, because nothing of the old one is left to refuse it by. So the retention has to be longer than any
-  caller's retry window.
+  caller's retry window. The journal is never compacted and still holds the old run's `job.ended`. So at start
+  each key is joined to the end that follows its latest `job.started`, and an earlier run's end counts for
+  nothing. Without this rule, a rerun the restart found running would be taken as ended: it would not be watched,
+  and a retry would be answered the old exit.
 
 Tests (`tests/jobs.rs`) run a loopback manager with `sh` jobs under a scratch tree root. They check that:
 - two `job.run`s under one key run once, and a third connection's retry takes the job over;
@@ -1041,7 +1044,9 @@ Tests (`tests/jobs.rs`) run a loopback manager with `sh` jobs under a scratch tr
   while it was down, one was re-adopted), starts nothing again, and resumes events `from` the last id;
 - `jobs` lists each job as running or ended;
 - an ended job is answered the same `job.ended` on a retry inside a 3 s retention, its log still readable. With no
-  client connected, the beat then removes its four files and its row (wsp-062).
+  client connected, the beat then removes its four files and its row (wsp-062);
+- a key run again after its prune, with the manager stopped and started while the rerun is running, is re-adopted
+  as running. Its retry gets the new `job.started`, and its own end is reported with a new id (wsp-062).
 
 #### M3 group 4: `Host::run_job` (wsp-051, 2026-11-17)
 

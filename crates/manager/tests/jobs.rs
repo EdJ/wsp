@@ -502,3 +502,45 @@ fn an_ended_job_is_kept_for_a_retry_inside_the_retention_and_pruned_past_it() {
     assert!(log.contains("job wsp-050/0/check@p pruned"), "the log names the prune: {log}");
     m.stop();
 }
+
+#[test]
+fn a_key_run_again_after_its_prune_is_readopted_running_across_a_restart() {
+    let (dir, root) = place("rerun");
+    let _sweep = Sweep::new(&dir);
+    let mut cfg = config(&dir, &root);
+    cfg.job_retention = Duration::from_secs(1);
+    let m = Manager::start(cfg.clone()).expect("the manager starts");
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+
+    // The first run ends; its job.ended is journalled.
+    started(c.ask(run_msg("check@r", JobClass::Check, "echo first", false)));
+    c.hear_until(WAIT, |c| c.ended("check@r") == 1);
+    let old = c.events.iter().find(|f| matches!(&f.msg, Message::JobEnded(_))).cloned().expect("the first job.ended");
+    // Past the retention, the next job.run prunes it and runs the key again.
+    std::thread::sleep(Duration::from_millis(1500));
+    let rerun = c.send(run_msg("check@r", JobClass::Check, "sleep 3; echo second", true));
+    let rerun = c.answer_frame(rerun);
+    let pgid = started(rerun.msg.clone());
+    assert!(alive(pgid), "the rerun runs");
+    drop(c);
+
+    // A restart mid-rerun: the journal holds the old run's end, and the new run's start after it.
+    m.stop();
+    let m = Manager::start(cfg).expect("the manager starts again");
+    assert_eq!(m.jobs(), vec![(key("check@r"), pgid, true)], "the rerun is re-adopted running, not taken as ended");
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+    let again = c.send(run_msg("check@r", JobClass::Check, "sleep 3; echo second", true));
+    let again = c.answer_frame(again);
+    assert_eq!((&again.msg, again.id), (&rerun.msg, rerun.id), "a retry gets the rerun's job.started, not the old end");
+
+    // Its own end is reported, with a new id.
+    c.hear_until(WAIT, |c| c.ended("check@r") == 1);
+    let Some(end) = c.events.iter().find(|f| matches!(&f.msg, Message::JobEnded(_))).cloned() else {
+        panic!("the rerun's end is reported: {:?}", c.events)
+    };
+    assert!(end.id.is_some() && end.id > old.id, "a new job.ended, after the old one: {end:?} vs {old:?}");
+    let Message::JobEnded(e) = &end.msg else { unreachable!() };
+    assert_eq!(e.exit, Some(0));
+    assert_eq!(fs::read_to_string(&e.log.path).unwrap(), "second\n");
+    m.stop();
+}

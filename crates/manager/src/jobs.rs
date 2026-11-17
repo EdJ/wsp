@@ -42,7 +42,9 @@
 //!   `<key>.exit`, `<key>.job` and last its `<key>.run`, so a stop part-way
 //!   leaves a `.run` the next start sees again. The beat sweeps, and so do
 //!   `job.run`, `jobs` and a start. A key asked again past the retention is a
-//!   new run: nothing of the old one is left to refuse it by.
+//!   new run: nothing of the old one is left to refuse it by. The old run's
+//!   `job.ended` stays in the journal, so a start joins a key to the end that
+//!   follows its latest `job.started`, never an earlier run's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -550,7 +552,10 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
     prune(shared, &mut t);
 }
 
-/// The journalled `job.started` and `job.ended` of `keys`.
+/// The journalled `job.started` and `job.ended` of each of `keys`' latest
+/// run. The journal is in order and never compacted, and a key pruned past
+/// the retention may run again (wsp-062), so a `job.started` drops the key's
+/// earlier `job.ended`: an end counts only after the start it ends.
 fn journalled(shared: &Shared, keys: BTreeSet<JobKey>) -> (BTreeMap<JobKey, Frame>, BTreeMap<JobKey, Frame>) {
     let (mut started, mut ended) = (BTreeMap::new(), BTreeMap::new());
     let journal = shared.journal.lock().unwrap_or_else(|e| e.into_inner());
@@ -564,6 +569,7 @@ fn journalled(shared: &Shared, keys: BTreeSet<JobKey>) -> (BTreeMap<JobKey, Fram
     for f in frames {
         match &f.msg {
             Message::JobStarted(JobStarted { key, .. }) if keys.contains(key) => {
+                ended.remove(key);
                 started.insert(key.clone(), f);
             }
             Message::JobEnded(JobEnded { key, .. }) if keys.contains(key) => {
