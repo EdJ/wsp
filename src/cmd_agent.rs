@@ -6688,6 +6688,13 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         if let Some(w) = uncommitted_warning(&store_uncommitted(&store.root)) {
             warnings.push(w);
         }
+        let missing = store.git_identity_missing();
+        if !missing.is_empty() {
+            problems.push(format!(
+                "store git sets no repo-local {} — commits can fail on a machine with no global identity; `wsp init` fills them (repo-local only)",
+                missing.join(", ")
+            ));
+        }
     }
 
     let index = Index::new(store.projects());

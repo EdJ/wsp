@@ -3549,9 +3549,12 @@ use wsp_base::calls::Command;
         // the same file, so it is worth waiting out — and worth saying so if
         // waiting does not help. Silence here is what let the original defect
         // run for a day.
+        let mut said = String::new();
         for wait in [20, 80, 200] {
-            if self.git(&cmd).is_some() {
-                return;
+            match self.git_raw(&cmd) {
+                Some(out) if out.status.success() => return,
+                Some(out) => said = String::from_utf8_lossy(&out.stderr).into_owned(),
+                None => {}
             }
             std::thread::sleep(Duration::from_millis(wait));
         }
@@ -3564,11 +3567,22 @@ use wsp_base::calls::Command;
             paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" "),
             util::contract(&self.root)
         );
+        if identity_refused(&said) {
+            eprintln!(
+                "wsp: git has no identity to commit as in this store; `wsp init` gives it its own ({GIT_NAME} <{GIT_EMAIL}>, repo-local only), then the change commits with the next write"
+            );
+        }
     }
 
     /// `Some` when git said yes. Output is captured rather than inherited so a
     /// commit never prints over whatever the command is saying.
     fn git(&self, args: &[&OsStr]) -> Option<std::process::Output> {
+        self.git_raw(args).filter(|out| out.status.success())
+    }
+
+    /// Git's answer whether or not it was yes, for the caller that wants to say
+    /// why it was no.
+    fn git_raw(&self, args: &[&OsStr]) -> Option<std::process::Output> {
         let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(&self.root)
@@ -3579,11 +3593,44 @@ use wsp_base::calls::Command;
             .args(args)
             .output()
             .ok()?;
-        out.status.success().then_some(out)
+        Some(out)
+    }
+
+    /// The repo-local settings the store needs to commit on a machine whose
+    /// global git config gives it no identity, and which of them this repo
+    /// does not set. Only the repo's own `.git/config` is asked: a global
+    /// identity is the user's and is neither read nor written here.
+    pub fn git_identity_missing(&self) -> Vec<&'static str> {
+        if !self.root.join(".git").exists() {
+            return Vec::new();
+        }
+        GIT_SETTINGS
+            .iter()
+            .filter(|(key, _)| {
+                let set = self
+                    .git(&[OsStr::new("config"), OsStr::new("--local"), OsStr::new("--get"), OsStr::new(key)])
+                    .is_some();
+                !set
+            })
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    /// Give the store its own committer identity and unsigned commits, for the
+    /// keys it does not already set. Repo-local, so never the user's global
+    /// config. Returns the keys it filled.
+    pub fn git_ensure_identity(&self) -> Vec<&'static str> {
+        let missing = self.git_identity_missing();
+        for key in &missing {
+            let value = GIT_SETTINGS.iter().find(|(k, _)| k == key).map(|(_, v)| *v).unwrap_or_default();
+            self.git(&[OsStr::new("config"), OsStr::new("--local"), OsStr::new(key), OsStr::new(value)]);
+        }
+        missing
     }
 
     pub fn git_init(&self) {
         if self.root.join(".git").exists() {
+            self.git_ensure_identity();
             return;
         }
         use std::process::Stdio;
@@ -3596,7 +3643,26 @@ use wsp_base::calls::Command;
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        self.git_ensure_identity();
     }
+}
+
+/// The name the store commits as, when the repo sets none of its own.
+pub const GIT_NAME: &str = "wsp";
+/// A placeholder that cannot route: `.invalid` is reserved (RFC 2606), so a
+/// commit made as the store never looks like anybody's real address.
+pub const GIT_EMAIL: &str = "wsp@wsp.invalid";
+/// Repo-local git settings `wsp init` fills when missing.
+const GIT_SETTINGS: [(&str, &str); 3] =
+    [("user.name", GIT_NAME), ("user.email", GIT_EMAIL), ("commit.gpgsign", "false")];
+
+/// Whether a failed `git commit` said it was for want of an identity.
+fn identity_refused(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("tell me who you are")
+        || s.contains("unable to auto-detect email")
+        || s.contains("empty ident name")
+        || s.contains("author identity unknown")
 }
 
 /// Replace whole identifier tokens using `map`, returning the text and how many
@@ -4548,6 +4614,64 @@ mod tests {
 
     fn scratch(tag: &str) -> Store {
         crate::testkit::store(tag)
+    }
+
+    /// **A store commits on a machine whose git has no identity.** Temp HOME,
+    /// an empty global config, no system config: `git commit` has nobody to be.
+    /// `git_init` gives the repo its own (and only when the repo sets none),
+    /// and never writes the global config.
+    #[test]
+    fn a_fresh_store_commits_with_no_global_git_identity() {
+        let env = crate::util::isolated("git-identity");
+        let global = env.home().join("empty-gitconfig");
+        std::fs::write(&global, "").unwrap();
+        let saved: Vec<_> = ["HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "WSP_NO_COMMIT", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        std::env::set_var("HOME", env.state());
+        std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        for k in ["WSP_NO_COMMIT", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"] {
+            std::env::remove_var(k);
+        }
+
+        let store = Store::at(env.home().join("store"), env.state());
+        store.ensure_dirs().unwrap();
+        store.git_init();
+        assert!(store.git_identity_missing().is_empty(), "init fills what is missing");
+        std::fs::write(store.root.join("a.md"), "one").unwrap();
+        store.git_commit_all("wsp: first");
+        let log = std::process::Command::new("git").arg("-C").arg(&store.root).args(["log", "--format=%an <%ae>"]).output().unwrap();
+        let log = String::from_utf8_lossy(&log.stdout).to_string();
+
+        // An existing store with a key of its own keeps it; only the rest is filled.
+        let old = Store::at(env.home().join("old"), env.state());
+        old.ensure_dirs().unwrap();
+        std::process::Command::new("git").arg("-C").arg(&old.root).args(["init", "-q"]).status().unwrap();
+        std::process::Command::new("git").arg("-C").arg(&old.root).args(["config", "user.name", "someone"]).status().unwrap();
+        assert_eq!(old.git_identity_missing(), vec!["user.email", "commit.gpgsign"]);
+        assert_eq!(old.git_ensure_identity(), vec!["user.email", "commit.gpgsign"]);
+        let name = std::process::Command::new("git").arg("-C").arg(&old.root).args(["config", "user.name"]).output().unwrap();
+        let global_after = std::fs::read_to_string(&global).unwrap();
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert_eq!(log.trim(), format!("{GIT_NAME} <{GIT_EMAIL}>"), "the store's commit has its own identity");
+        assert_eq!(String::from_utf8_lossy(&name.stdout).trim(), "someone", "a key already set is kept");
+        assert_eq!(global_after, "", "the global config is never written");
+    }
+
+    /// A commit refused for want of an identity is recognised as that.
+    #[test]
+    fn an_identity_refusal_is_recognised() {
+        assert!(identity_refused("Author identity unknown\n\n*** Please tell me who you are."));
+        assert!(identity_refused("fatal: unable to auto-detect email address (got 'x@y.(none)')"));
+        assert!(!identity_refused("fatal: Unable to create '.git/index.lock': File exists."));
     }
 
     /// A scratch store that is a git repo with one commit behind it, so the

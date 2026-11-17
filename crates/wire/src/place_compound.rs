@@ -568,6 +568,22 @@ impl Compound<'_> {
         }
     }
 
+    /// A sign of life from a tool hook (`PreToolUse`/`PostToolUse`): a seat
+    /// whose record says `working` has it re-dated, so a turn that runs tools
+    /// for longer than [`VOUCH_SECS`] does not age into the screen fallback.
+    /// Any other record is left alone: a tool hook that arrives after `Stop`
+    /// must not make an idle seat read working, and a nested session's is not
+    /// the seat's (`wsp-364`).
+    pub fn touched(&self, seat: &Seat, payload: &Value) {
+        let Ok(dir) = self.dir_of(seat) else { return };
+        let mut was = read_json(&dir.join(SAID_FILE));
+        if str_of(&was, "state") != "working" || crate::place_super::a_childs(&was, payload) {
+            return;
+        }
+        was["at"] = json!(util::now_iso());
+        let _ = write_atomic(&dir.join(SAID_FILE), &was.to_string());
+    }
+
     /// Append one line to [`HOOKS_FILE`]. Best-effort, like everything else a
     /// hook touches — a write that fails here must not be the write that
     /// fails the hook, and a reader missing one line is a smaller loss than a
@@ -666,7 +682,10 @@ impl Compound<'_> {
         let started = util::epoch_of(&str_of(rec, "started_at"));
         let kind = rec.get("agent").map(|a| str_of(a, "kind")).unwrap_or_default();
         // Claude-only: the start window is a fact about Claude Code's hooks; a
-        // data kind has none and must not be taken for it.
+        // data kind has none and must not be taken for it. pi is left to its
+        // screen: its extension may not be installed, and a seat held Starting
+        // for want of a hook that never comes is worse than one read off the
+        // screen a little early.
         if kind == "claude" && started > 0 && at < started && util::epoch_secs() - started < STARTING_WINDOW {
             // A far seat's hooks fire on the far machine and never write this
             // seat's `said.json`, so the window would hold it `Starting` for its
@@ -3120,6 +3139,53 @@ mod tests {
 
         let _ = write_atomic(&dir.join(SEAT_FILE), &started(now, "opencode"));
         assert_ne!(place.state(&seat).unwrap(), State::Starting, "opencode fires no hooks to wait for");
+    }
+
+    /// **A tool hook keeps a working seat fresh and nothing else** (the pi
+    /// extension's tool events, Claude's `PostToolUse`). A seat whose last word
+    /// is two minutes old reads off the screen; a tool that ran a second ago
+    /// makes it a second old again. An idle record is not made working by a
+    /// straggler, and a nested session's tool is not the seat's.
+    #[test]
+    fn a_tool_hook_refreshes_a_working_record_and_only_a_working_one() {
+        let scratch = Scratch::new("touched");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
+        let now = util::epoch_secs();
+        let _ = write_atomic(
+            &dir.join(SEAT_FILE),
+            &json!({
+                "pid": std::process::id(),
+                "started_at": util::iso_at(now - 1000),
+                "agent": { "kind": "pi", "name": "a", "args": [] },
+            })
+            .to_string(),
+        );
+        let said = |state: &str, age: i64| {
+            let _ = write_atomic(
+                &dir.join(SAID_FILE),
+                &json!({ "state": state, "hook": "UserPromptSubmit", "at": util::iso_at(now - age), "session_id": "s1" })
+                    .to_string(),
+            );
+        };
+        // Working, but the word is older than VOUCH_SECS: refreshed.
+        said("working", VOUCH_SECS + 60);
+        place.touched(&seat, &json!({ "session_id": "s1" }));
+        assert_eq!(place.state(&seat).unwrap(), State::Working, "a tool ran: the record is fresh");
+
+        // Idle stays idle (and stale stays stale).
+        said("idle", VOUCH_SECS + 60);
+        place.touched(&seat, &json!({ "session_id": "s1" }));
+        let at = util::epoch_of(&str_of(&place.said(&seat), "at"));
+        assert!(now - at > VOUCH_SECS, "an idle record is not re-dated");
+
+        // Another session's tool is not the seat's.
+        said("working", VOUCH_SECS + 60);
+        place.touched(&seat, &json!({ "session_id": "other" }));
+        let at = util::epoch_of(&str_of(&place.said(&seat), "at"));
+        assert!(now - at > VOUCH_SECS, "a nested session's tool is not the seat's");
     }
 
     thread_local! {
