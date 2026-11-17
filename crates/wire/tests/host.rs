@@ -737,3 +737,49 @@ fn the_subscription_resubscribes_from_the_last_id_after_a_dropped_connection() {
     m.stop();
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// `WSP_HOST=manager`: a tell is `order.deliver`, acked and typed once; to a
+/// manager that is stopped it is `Unreachable` (which `wsp tell` holds), and
+/// asked again under the same order id once the manager answers, it is typed
+/// once more at most and never twice under one id.
+#[test]
+fn a_tell_under_manager_is_delivered_and_a_silent_manager_is_unreachable_then_delivered_on_return() {
+    let (dir, sup) = place("tell");
+    let m = manager(&dir, &sup, 0);
+    let port = m.addrs()[0].port();
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let compound = Compound { host: &tcp, ..Compound::at(dir.join("seats")).insisting() };
+    let seat = opened(&compound, &dir);
+    let order = FirstOrder { order: new_order_id(&seat), text: "go".into() };
+    assert_eq!(compound.start_ordered(&seat, &agent(0), &order, Duration::from_secs(20)), Some(Ok(Heard::Acked)));
+
+    assert_eq!(compound.tell(&seat, "first sentence"), Ok(Delivery::Acked));
+    let run = dir.join("exec").join(wsp_manager::seats::RUN_DIR);
+    assert!(typed_under(&run).iter().any(|t| t.ends_with(" first sentence")), "{:?}", typed_under(&run));
+
+    // The manager stopped: silent, and the tell is Unreachable — the refusal
+    // `wsp tell` holds on.
+    drop(tcp);
+    m.stop();
+    let gone = Tcp::with_local(SocketAddr::from(([127, 0, 0, 1], port)), Token("t".into()), Role::Cli, "test", InProcess::with_sup(&sup));
+    let silent = Compound { host: &gone, ..Compound::at(dir.join("seats")).insisting() };
+    match silent.tell(&seat, "held sentence") {
+        Err(Refusal::Unreachable(_)) => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(!typed_under(&run).iter().any(|t| t.ends_with(" held sentence")));
+    drop(gone);
+
+    // It is back: the flush's ask is delivered, once.
+    let m = manager(&dir, &sup, port);
+    let back = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let again = Compound { host: &back, ..Compound::at(dir.join("seats")).insisting() };
+    assert_eq!(again.tell(&seat, "held sentence"), Ok(Delivery::Acked));
+    let n = typed_under(&run).iter().filter(|t| t.ends_with(" held sentence")).count();
+    assert_eq!(n, 1, "{:?}", typed_under(&run));
+
+    let _ = again.stop(&seat);
+    drop(back);
+    m.stop();
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -608,7 +608,10 @@ pub(crate) fn flush_held_tells_now(store: &Store) -> (usize, usize) {
     if store.watch_keys(HELD_TELL).is_empty() {
         return (0, 0);
     }
-    let backends = crate::place::local_backends();
+    // Under `WSP_HOST=manager` a manager that does not answer leaves them all held.
+    let Ok(backends) = crate::cmd_spawn::told_backends(false) else {
+        return (0, 0);
+    };
     let read = |seat: &str| {
         let mut unsure = false;
         for b in backends.iter() {

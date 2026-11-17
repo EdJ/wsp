@@ -2424,6 +2424,17 @@ pub(crate) fn insisting_backends() -> [Box<dyn Place>; 1] {
     [Box::new(crate::place_compound::Compound::new().insisting())]
 }
 
+/// The backends a tell or a flush of held tells goes through: compound's host
+/// is `WSP_HOST`'s, so under `manager` the sentence is `order.deliver`. A host
+/// that does not answer is the error, and the caller holds the tell.
+pub(crate) fn told_backends(insist: bool) -> Result<[Box<dyn Place>; 1], crate::host::HostError> {
+    let c = crate::place_compound::Compound::chosen(crate::VERSION)?;
+    Ok([Box::new(match insist {
+        true => c.insisting(),
+        false => c,
+    })])
+}
+
 fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());

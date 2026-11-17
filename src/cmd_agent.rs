@@ -1408,20 +1408,10 @@ fn tell_seat(
     // `compound`-hosted agent could not be told anything at all.
     // `--anyway` is a person saying they have looked at the seat and it is
     // waiting; see `place_compound::Compound::insist`.
-    let backends = match args.has("anyway") {
-        true => crate::cmd_spawn::insisting_backends(),
-        false => crate::place::local_backends(),
-    };
-    let Some((place, row)) = locate_seat(&backends, &seat) else {
-        eprintln!("wsp: nothing answers for {seat} — `wsp wip` says who holds what");
-        return 1;
-    };
-    // A seat on a machine that has gone silent is held, not gone, and a tell to
-    // it waits in the wake spool for the link: `docs/remote-agents.md` section 3.
-    // Only a seat that was found gets here; one nothing answers for was refused
-    // above and nothing was kept for it.
+    // Under `WSP_HOST=manager` the host is the manager's; one that is silent
+    // holds the tell, for a seat this machine's records say exists.
     let said = dressed(from, &message_id(&seat, text), text, !args.has("no-reply"));
-    if row.state == State::Unreachable {
+    let held = |why: &str| -> i32 {
         let n = crate::wake::hold_tell(store, &seat, &said);
         // Written as held, so the log shows it before the link returns and
         // `flush_held_tells` settles it after (`wsp-522`).
@@ -1433,12 +1423,33 @@ fn tell_seat(
                 "at": util::epoch_secs(), "turn": false,
             }),
         );
-        let word = format!("{what} is unreachable — held ({n} waiting), delivered when the link is back and the seat is ready");
+        let word = format!("{what} is {why} — held ({n} waiting), delivered when the link is back and the seat is ready");
         match args.json() {
             true => println!("{}", json!({ "held": true, "pane": seat, "waiting": n })),
             false => println!("{} {word}", p.yellow("…")),
         }
-        return 0;
+        0
+    };
+    let backends = match crate::cmd_spawn::told_backends(args.has("anyway")) {
+        Ok(b) => b,
+        Err(e) => {
+            if crate::place_compound::Compound::new().holds(&crate::place::Seat::new(&seat)) {
+                return held("unreachable");
+            }
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
+    let Some((place, row)) = locate_seat(&backends, &seat) else {
+        eprintln!("wsp: nothing answers for {seat} — `wsp wip` says who holds what");
+        return 1;
+    };
+    // A seat on a machine that has gone silent is held, not gone, and a tell to
+    // it waits in the wake spool for the link: `docs/remote-agents.md` section 3.
+    // Only a seat that was found gets here; one nothing answers for was refused
+    // above and nothing was kept for it.
+    if row.state == State::Unreachable {
+        return held("unreachable");
     }
     if row.agent.kind.is_empty() {
         match addressed {
@@ -1447,13 +1458,8 @@ fn tell_seat(
         }
         return 1;
     }
-    // The one state a message must not be sent into, and the reason it is
-    // checked here rather than left to the backend. A blocked agent has a
-    // permission dialog holding the keyboard, so the text does not queue behind
-    // anything — it is typed *at the dialog*, where a sentence about what to do
-    // next can select an answer nobody chose. Asked of the port's own `State`
-    // now rather than a screen-scraped one, so this guard holds for
-    // whichever backend answered.
+    // The one state a message must not be sent into: a blocked agent has a
+    // permission dialog holding the keyboard, so the text would be typed at it.
     if let Some(wait) = crate::waiting::on_screen(row.state) {
         eprintln!("wsp: {what} is {} — answer that first", wait.sentence());
         eprintln!("     `wsp peek {peek}` shows what it is asking");
@@ -1461,9 +1467,7 @@ fn tell_seat(
     }
 
     // A seat that cannot vouch for itself refuses rather than typing into
-    // whatever is on screen (`compound-097`), and this is the way past it for
-    // somebody who has looked. Named here as well as refused below, because a
-    // refusal whose remedy is not in the message is one people work around.
+    // whatever is on screen (`compound-097`); `--anyway` is the way past it.
     if !row.state.will_take_a_prompt() && !args.has("anyway") {
         eprintln!(
             "wsp: {what} cannot say whether it is at a prompt — it reads {}",
@@ -1484,7 +1488,12 @@ fn tell_seat(
             return twice(&sent, ago, p);
         }
     }
-    delivered(store, how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &said), &sent)
+    match how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &said) {
+        // The host went silent between the census and the order: held, as a
+        // seat found unreachable is, and asked again under the same order id.
+        Err(Refusal::Unreachable(_)) => held("unreachable"),
+        outcome => delivered(store, outcome, &sent),
+    }
 }
 
 /// The sentence as the seat reads it (`wsp-521`): it opens by saying who
@@ -9061,6 +9070,36 @@ mod tests {
         store.clear_claim("t-001");
         let (_, what) = target(&store, "t-001", &|_| false).expect("a seat still");
         assert!(!what.contains("holds the claim"), "{what}");
+    }
+
+    /// `WSP_HOST=manager` with a manager that does not answer: a tell to a seat
+    /// this machine holds is held (and said so), not refused, and a flush with
+    /// the manager still silent keeps it.
+    #[test]
+    fn a_tell_to_a_silent_manager_is_held_and_the_flush_keeps_it() {
+        let env = util::isolated("tell-silent-manager");
+        let store = Store::open();
+        let exec = store.state.join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        std::fs::write(exec.join(crate::manager::TOKEN_FILE), "some-token\n").unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut local = crate::manager::Local::new(&exec, port);
+        local.host = "test-host".into();
+        crate::manager::install_record(&store.state, &local, std::time::Duration::from_secs(1)).unwrap();
+        std::fs::create_dir_all(crate::place_compound::Compound::new().root.join("cpd-held")).unwrap();
+        let _ = &env;
+
+        std::env::set_var("WSP_HOST", "manager");
+        let args = Args::synth("tell", &["cpd-held", "carry on"], &[]);
+        let code = tell_seat(
+            &store, &args, &Paint::new(), "me", None, "carry on", "cpd-held", true, None, "cpd-held".into(), "pane cpd-held".into(),
+        );
+        let (flushed, held) = (crate::wake::flush_held_tells_now(&store), crate::wake::held_tells(&store, "cpd-held"));
+        std::env::remove_var("WSP_HOST");
+        assert_eq!(code, 0, "held is not a failure");
+        assert_eq!(held.len(), 1, "one tell waits: {held:?}");
+        assert!(held[0].1.contains("carry on"));
+        assert_eq!(flushed, (0, 0), "a silent manager leaves it held");
     }
 
     /// A compound seat directory whose pid is dead, last written `ago` seconds
