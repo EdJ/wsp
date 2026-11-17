@@ -29,6 +29,7 @@ pub const READ_ONLY: &[&str] = &[
     "tree",     // the project tree
     "projects", // the project list
     "burn",     // token cost
+    "spend",    // tokens and cost by day, model, project and list
     "calls",    // this log
 ];
 
