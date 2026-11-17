@@ -29,6 +29,7 @@
 //! ([`folded_path`], `<state>/manager/<host>.folded`) and an id at or below it
 //! is skipped, so a resubscribe folds nothing twice.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,6 +37,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use wsp_host_api::{EventId, Frame, Message, TurnEdge};
+use wsp_server::SharedStore;
+use wsp_store_contract::{
+    self as c, At as CAt, Command, Entity, IdempotencyKey, MachineName, OrderState, Principal, RowId, SeatId, SeatState, Transport,
+};
 
 use crate::host::{Host as _, HostError, Subscription, LOCAL};
 use crate::place::Seat;
@@ -165,11 +170,22 @@ fn since(store: &Store, seat: &str, state: &str) {
 /// `false` when it was skipped: an event already folded, or a frame that
 /// carries nothing to keep.
 pub fn fold(store: &Store, host: &str, frame: &Frame) -> bool {
+    fold_into(store, None, host, frame)
+}
+
+/// [`fold`], and with a `db` the event's one `Command::Mirror` after the files
+/// are written and before `.folded` moves (wsp-075). Built from the event and
+/// from what `apply` just wrote, never from a probe.
+pub fn fold_into(store: &Store, db: Option<&SharedStore>, host: &str, frame: &Frame) -> bool {
     if let Message::Beat(b) = &frame.msg {
         if b.host.is_none() {
             return false;
         }
         write(&beat_path(&store.state, host), &json!({ "heard": util::epoch_secs(), "beat": b }));
+        if let Some(db) = db {
+            let cmd = mirror_beat(host, b);
+            mirror_apply(store, db, host, "beat", cmd);
+        }
         return true;
     }
     let Some(id) = frame.id else { return false };
@@ -177,12 +193,146 @@ pub fn fold(store: &Store, host: &str, frame: &Frame) -> bool {
         return false;
     }
     apply(store, host, &frame.msg);
+    if let Some(db) = db {
+        if let Some(cmd) = mirror_of(store, db, host, &frame.msg) {
+            mirror_apply(store, db, host, &id.0.to_string(), cmd);
+        }
+    }
     let path = folded_path(&store.state, host);
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
     }
     let _ = write_atomic(&path, &format!("{}\n", id.0));
     true
+}
+
+fn mirror_apply(store: &Store, db: &SharedStore, host: &str, id: &str, cmd: Command) {
+    // An event's key is its id, so a replay after a restart is the same
+    // command; a beat's is its own moment, and an unchanged one decides silent.
+    let key = match id {
+        "beat" => format!(
+            "fold:{host}:beat:{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        ),
+        id => format!("fold:{host}:{id}"),
+    };
+    if let Err(e) = db.apply(cmd, IdempotencyKey(key), Principal::Manager(MachineName(host.to_string()))) {
+        wsp_store::store::log_line(store, &format!("mirror: fold of {host} {id} not applied: {e:?}"));
+    }
+}
+
+fn scalars(m: &serde_json::Map<String, Value>, keys: &[&str], into: &mut BTreeMap<String, String>) {
+    for k in keys {
+        match m.get(*k) {
+            Some(Value::String(s)) if !s.is_empty() => {
+                into.insert((*k).into(), s.clone());
+            }
+            Some(v @ (Value::Number(_) | Value::Bool(_))) => {
+                into.insert((*k).into(), v.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The seat as the files now say it, over what the database held of it.
+fn seat_entity(store: &Store, db: &SharedStore, host: &str, seat: &str, state: SeatState) -> c::Seat {
+    let held = db.snapshot().ok().and_then(|(s, _)| s.seats.get(&SeatId(seat.to_string())).cloned());
+    let rec = match store.spawned().remove(seat) {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let mut fields = held.as_ref().map(|h| h.fields.clone()).unwrap_or_default();
+    if let Some(Value::Object(st)) = rec.get("started") {
+        scalars(st, &["host", "epoch"], &mut fields);
+    }
+    if let Some(Value::Object(b)) = store.bindings().get(seat) {
+        scalars(b, &["task_id", "pane_id", "host", "epoch"], &mut fields);
+    }
+    let started = rec.get("started").and_then(Value::as_object);
+    let row = started
+        .and_then(|s| s.get("row"))
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty())
+        .map(|r| RowId(r.to_string()))
+        .or_else(|| held.as_ref().and_then(|h| h.row.clone()));
+    let attempt = started.and_then(|s| s.get("attempt")).and_then(Value::as_u64).map(|n| n as u32);
+    let text = |k: &str| rec.get(k).and_then(Value::as_str).map(str::to_string);
+    c::Seat {
+        id: SeatId(seat.to_string()),
+        machine: MachineName(host.to_string()),
+        kind: text("kind").or_else(|| held.as_ref().map(|h| h.kind.clone())).unwrap_or_else(|| "claude".into()),
+        model: text("model").or_else(|| held.as_ref().and_then(|h| h.model.clone())),
+        state,
+        before_lost: None,
+        row,
+        attempt: attempt.or_else(|| held.as_ref().map(|h| h.attempt)).unwrap_or(0),
+        pid: started.and_then(|s| s.get("pid")).and_then(Value::as_u64).map(|p| p as u32).or_else(|| held.as_ref().and_then(|h| h.pid)),
+        fields,
+    }
+}
+
+fn put_cmd(put: Vec<Entity>) -> Command {
+    Command::Mirror { put, gone: Vec::new() }
+}
+
+fn mirror_beat(host: &str, b: &wsp_host_api::Beat) -> Command {
+    let mut f = BTreeMap::new();
+    if let Some(Value::Object(m)) = b.host.as_ref().and_then(|h| serde_json::to_value(h).ok()) {
+        for (k, v) in m {
+            f.insert(
+                k,
+                match v {
+                    Value::String(s) => s,
+                    v => v.to_string(),
+                },
+            );
+        }
+    }
+    put_cmd(vec![Entity::Machine(c::Machine {
+        name: MachineName(host.to_string()),
+        transport: Transport::Local,
+        beat: Some(CAt(b.at.0)),
+        facts: f,
+    })])
+}
+
+fn mirror_of(store: &Store, db: &SharedStore, host: &str, msg: &Message) -> Option<Command> {
+    Some(match msg {
+        Message::SeatStarted(s) => {
+            let seat = s.seat.0.as_str();
+            let mut put = vec![Entity::Seat(seat_entity(store, db, host, seat, SeatState::Started))];
+            let row = s.key.row.0.as_str();
+            if !row.is_empty() && row != seat {
+                // The claim as the file holds it, projected as the rows half does.
+                let mut one = BTreeMap::new();
+                if let Some(v) = store.claims().get(row) {
+                    one.insert(row.to_string(), v.clone());
+                }
+                put.extend(crate::mirror::claims(&one).into_iter().filter(|e| matches!(e, Entity::Claim(c) if c.seat.0 == seat)));
+            }
+            put_cmd(put)
+        }
+        Message::SeatStopped(s) => {
+            put_cmd(vec![Entity::Seat(seat_entity(store, db, host, &s.seat.0, SeatState::Gone))])
+        }
+        Message::OrderDelivered(o) => put_cmd(vec![order_entity(db, host, &o.order.0, &o.seat.0, OrderState::Delivered)]),
+        Message::OrderAcked(o) => put_cmd(vec![order_entity(db, host, &o.order.0, &o.seat.0, OrderState::Acknowledged)]),
+        Message::OrderRefused(o) => put_cmd(vec![order_entity(db, host, &o.order.0, &o.seat.0, OrderState::Failed)]),
+        _ => return None,
+    })
+}
+
+fn order_entity(db: &SharedStore, host: &str, order: &str, seat: &str, state: OrderState) -> Entity {
+    let held = db.snapshot().ok().and_then(|(s, _)| s.orders.get(&c::OrderId(order.to_string())).cloned());
+    Entity::Order(c::Order {
+        id: c::OrderId(order.to_string()),
+        from: held.as_ref().map(|h| h.from.clone()).unwrap_or(Principal::Manager(MachineName(host.to_string()))),
+        to: SeatId(seat.to_string()),
+        text: held.as_ref().map(|h| h.text.clone()).unwrap_or_default(),
+        state,
+        attempts: held.map(|h| h.attempts).unwrap_or(0),
+    })
 }
 
 fn apply(store: &Store, host: &str, msg: &Message) {
@@ -403,16 +553,16 @@ pub(crate) struct Reported {
 
 /// One ask of the subscription, and its frame folded. `Ok(true)` when a frame
 /// was written.
-pub fn step(store: &Store, host: &str, sub: &mut Subscription, wait: Duration) -> Result<bool, HostError> {
-    Ok(sub.next(wait)?.is_some_and(|f| fold(store, host, &f)))
+pub fn step(store: &Store, db: Option<&SharedStore>, host: &str, sub: &mut Subscription, wait: Duration) -> Result<bool, HostError> {
+    Ok(sub.next(wait)?.is_some_and(|f| fold_into(store, db, host, &f)))
 }
 
 /// The thread's loop: ask, fold, again, until `stop`. A manager that cannot be
 /// reached is asked again after a wait that doubles to [`RETRY_MAX`].
-pub fn follow(store: &Store, host: &str, sub: &mut Subscription, stop: &AtomicBool) {
+pub fn follow(store: &Store, db: Option<&SharedStore>, host: &str, sub: &mut Subscription, stop: &AtomicBool) {
     let mut retry = Duration::from_secs(1);
     while !stop.load(Ordering::SeqCst) {
-        match step(store, host, sub, ASK) {
+        match step(store, db, host, sub, ASK) {
             Ok(_) => retry = Duration::from_secs(1),
             Err(_) => {
                 std::thread::sleep(retry);
@@ -425,7 +575,7 @@ pub fn follow(store: &Store, host: &str, sub: &mut Subscription, stop: &AtomicBo
 
 /// Start the thread for the manager the local machine record names, under
 /// `WSP_HOST=manager` only. `None` under `inproc`, or with no record.
-pub fn start(store: &Store) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
+pub fn start(store: &Store, db: Option<SharedStore>) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
     if !matches!(crate::host::Choice::from_env(), Ok(crate::host::Choice::Manager)) {
         return None;
     }
@@ -438,7 +588,7 @@ pub fn start(store: &Store) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBo
         .spawn(move || {
             let store = Store::at(root, state.clone());
             let mut sub = Subscription::new(local.socket(), token, &local.host, &state, env!("CARGO_PKG_VERSION"));
-            follow(&store, &local.host, &mut sub, &flag);
+            follow(&store, db.as_ref(), &local.host, &mut sub, &flag);
         })
         .ok()?;
     Some((handle, stop))
@@ -512,7 +662,7 @@ mod tests {
         let mut n = 0;
         let start = Instant::now();
         while n < want && start.elapsed() < Duration::from_secs(10) {
-            if step(store, HOST, sub, Duration::from_millis(500)).unwrap() {
+            if step(store, None, HOST, sub, Duration::from_millis(500)).unwrap() {
                 n += 1;
             }
         }
@@ -543,7 +693,7 @@ mod tests {
         let start = Instant::now();
         while !beat_path(&store.state, HOST).exists() {
             assert!(start.elapsed() < Duration::from_secs(10), "no beat with host facts within 10s");
-            step(&store, HOST, &mut sub, Duration::from_millis(500)).unwrap();
+            step(&store, None, HOST, &mut sub, Duration::from_millis(500)).unwrap();
         }
         assert!(read(&beat_path(&store.state, HOST))["beat"]["host"]["cpus"].as_u64().is_some_and(|n| n > 0));
 
@@ -694,5 +844,72 @@ mod tests {
         let kept = read(&beat_path(&store.state, HOST));
         assert_eq!(kept["beat"]["host"]["memory"], "warn", "{kept}");
         assert_eq!(read_folded(&store.state, HOST), None, "a beat is not an event");
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+    use wsp_host_api::{Epoch, Key, RowId, SeatId, SeatStarted, SeatStopped};
+    use wsp_store_contract::{EventKind, Events};
+
+    fn open(state: &Path) -> SharedStore {
+        Arc::new(wsp_store_sqlite::SqliteStore::open(state.join("state.db"), Arc::new(wsp_server::Mirror)).unwrap())
+    }
+
+    fn frame(id: u64, msg: Message) -> Frame {
+        Frame { id: Some(EventId(id)), req: None, msg }
+    }
+
+    fn puts(db: &SharedStore) -> Vec<(String, String)> {
+        db.events_after(wsp_store_contract::EventId(0), 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EventKind::MirrorPut)
+            .map(|e| (format!("{:?}", e.subject), e.payload.to_string()))
+            .collect()
+    }
+
+    /// A manager's `seat.started` and `seat.stopped` each put the seat once;
+    /// a new fold over the same database (a restart, with even the `.folded`
+    /// id lost) puts neither again.
+    #[test]
+    fn a_started_and_a_stopped_each_put_the_seat_once_across_a_restart() {
+        let env = util::isolated("fold-mirror");
+        let store = Store::open();
+        let started = frame(
+            1,
+            Message::SeatStarted(SeatStarted {
+                key: Key { row: RowId("wsp-t1".into()), attempt: 1 },
+                seat: SeatId("cpd-t1".into()),
+                epoch: Epoch(1),
+                pid: 4242,
+                sockets: vec![],
+            }),
+        );
+        let stopped = frame(
+            2,
+            Message::SeatStopped(SeatStopped { seat: SeatId("cpd-t1".into()), epoch: Epoch(1), exit: Some(0), ended: vec![4242], renderer_left: false }),
+        );
+        let db = open(&env.state());
+        assert!(fold_into(&store, Some(&db), "h", &started));
+        let seat_puts = |db: &SharedStore| puts(db).into_iter().filter(|(s, p)| s.contains("cpd-t1") || p.contains("cpd-t1")).collect::<Vec<_>>();
+        let first = seat_puts(&db);
+        assert_eq!(first.len(), 2, "the seat and its claim: {first:?}");
+        assert!(first.iter().any(|(_, p)| p.contains("\"started\"") && p.contains("4242")), "{first:?}");
+        assert!(fold_into(&store, Some(&db), "h", &stopped));
+        let both = seat_puts(&db);
+        assert_eq!(both.len(), 3, "the stop is one more put: {both:?}");
+        assert!(both[2].1.contains("\"gone\""), "{both:?}");
+        let head = db.head().unwrap();
+        drop(db);
+
+        // The restart: the same file, a new store handle, and the fold again.
+        let db = open(&env.state());
+        assert!(!fold_into(&store, Some(&db), "h", &started), ".folded keeps it once");
+        let _ = std::fs::remove_file(folded_path(&store.state, "h"));
+        fold_into(&store, Some(&db), "h", &started);
+        fold_into(&store, Some(&db), "h", &stopped);
+        assert_eq!(db.head().unwrap(), head, "the same keys write nothing");
     }
 }

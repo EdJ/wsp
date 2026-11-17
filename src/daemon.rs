@@ -341,6 +341,7 @@ fn tailnet_addrs() -> Vec<std::net::IpAddr> {
 
 /// What `start_api` started; ended with the daemon.
 pub(crate) struct Api {
+    pub(crate) db: wsp_server::SharedStore,
     _server: Option<wsp_server::Server>,
     _mirror: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
 }
@@ -370,8 +371,8 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
             None
         }
     };
-    let mirror = Some(crate::mirror::start(store, db));
-    Some(Api { _server: server, _mirror: mirror })
+    let mirror = Some(crate::mirror::start(store, db.clone()));
+    Some(Api { db, _server: server, _mirror: mirror })
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,
@@ -555,12 +556,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // Under `WSP_HOST=manager`, the manager's events on a thread of their own,
     // not paced by the tick (`docs/agent-manager.md` 3.4; wsp-028): each is
     // folded into the store's files as it comes. Under `inproc`, nothing.
-    let _fold = crate::fold::start(store);
 
     // The state core's database, its API and the mirror of the files into it
     // (wsp-075). Beside everything else the daemon does; `WSP_API=off` starts
     // none of it, and nothing here ends the run.
     let _api = start_api(store);
+    let _fold = crate::fold::start(store, _api.as_ref().map(|a| a.db.clone()));
 
     // Every executor's ssh master, held open on this machine. Inert until
     // somebody runs `wsp machine add`; see `crate::tunnel`.
@@ -1157,7 +1158,7 @@ mod tests {
                 exec_dir: exec.to_path_buf(),
             };
             crate::manager::write_record(&store.state, &local, token.trim()).unwrap();
-            let (thread, stop) = fold::start(store).expect("under WSP_HOST=manager with a record, the fold runs");
+            let (thread, stop) = fold::start(store, None).expect("under WSP_HOST=manager with a record, the fold runs");
             let start = Instant::now();
             while !fold::beat_path(&store.state, HOST).exists() {
                 assert!(start.elapsed() < Duration::from_secs(10), "no beat folded within 10s");
@@ -1294,7 +1295,7 @@ mod tests {
             let _env = util::isolated("tick-inproc");
             let _host = HostVar::set("inproc");
             let store = Store::open();
-            assert!(fold::start(&store).is_none(), "no fold under inproc");
+            assert!(fold::start(&store, None).is_none(), "no fold under inproc");
             // Files a manager would have left: none of them is read here.
             let facts = HostFacts {
                 load_centi: 4000,
