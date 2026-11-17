@@ -60,3 +60,37 @@ fn case_6_snapshot() {
 fn case_9_machine_guards() {
     case_machine_guards(&SqliteHarness).unwrap();
 }
+
+#[test]
+fn case_3_lease_exclusivity() {
+    case_lease_exclusivity(&SqliteHarness).unwrap();
+}
+
+#[test]
+fn case_10_text() {
+    case_text(&SqliteHarness).unwrap();
+}
+
+/// D1: no `rusqlite` type crosses the crate's surface. Any `pub` line of src naming `rusqlite` or
+/// `Connection` fails.
+#[test]
+fn no_pub_line_names_rusqlite_or_connection() {
+    let mut bad = vec![];
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        for (n, line) in std::fs::read_to_string(&path).unwrap().lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            if (t.starts_with("pub ") || t.starts_with("pub(")) && (t.contains("rusqlite") || t.contains("Connection")) {
+                bad.push(format!("{}:{}: {}", path.display(), n + 1, t));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "rusqlite types on the public surface (D1):\n{}", bad.join("\n"));
+}

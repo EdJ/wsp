@@ -694,13 +694,35 @@ fn rusqlite_is_the_sqlite_crates_alone_and_that_crate_links_no_store_wire_host_o
         "wsp-store-sqlite pins rusqlite exactly (`=`) with `bundled`"
     );
 
-    const MAY: &[&str] = &["wsp-base", "wsp-store-contract"];
+    // Normal dependencies: the contract alone. With dev-dependencies, the suite and what it may link.
+    let normal: Vec<String> = path_deps(&sqlite, false).into_keys().collect();
+    assert_eq!(normal, ["wsp-store-contract"], "wsp-store-sqlite's normal dependencies reach wsp-store-contract alone");
+    const MAY: &[&str] = &["wsp-store-contract", "wsp-store-conformance", "wsp-testkit"];
     let bad = beyond(&reached_from(&root().join("crates/store-sqlite"), "wsp-store-sqlite"), MAY);
     assert!(
         bad.is_empty(),
-        "wsp-store-sqlite must link only {MAY:?} of the workspace, never wsp-store, wsp-wire, wsp-host or \
-         wsp-manager (docs/state-core.md section 6):\n{bad}"
+        "wsp-store-sqlite must link only {MAY:?} of the workspace (dev-dependencies included), never wsp-store, \
+         wsp-wire, wsp-host or wsp-manager (docs/state-core.md section 6):\n{bad}"
     );
+}
+
+/// No manifest of the workspace but the root's names `wsp-store-sqlite`: nothing but the root
+/// binary links the backend.
+#[test]
+fn no_manifest_but_the_roots_names_the_sqlite_crate() {
+    let root_manifest = root().join("Cargo.toml");
+    for m in manifests() {
+        if m == root_manifest {
+            continue;
+        }
+        let text = fs::read_to_string(&m).unwrap();
+        let own = text.lines().any(|l| l.trim() == "name = \"wsp-store-sqlite\"");
+        assert!(
+            own || !text.contains("wsp-store-sqlite"),
+            "{} names wsp-store-sqlite; only the root manifest may (docs/state-core.md section 6)",
+            m.display()
+        );
+    }
 }
 
 /// `wsp-store-conformance`, the suite of 2.3, depends on `wsp-store-contract` and `wsp-testkit`
