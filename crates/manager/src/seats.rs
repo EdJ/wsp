@@ -741,6 +741,15 @@ pub(crate) fn list(shared: &Shared, asker: Asker) {
             last_word: r.last_word.clone(),
         })
         .collect();
+    // The turn as the seat's hooks last said, over the order's ack (wsp-038):
+    // an ack says a turn began and nothing ever says it ended, and a turn the
+    // person started at the pane has no ack at all. Read after the table is let
+    // go, since an order's answer takes the hooks while it holds the table.
+    let heard: Vec<Option<TurnEdge>> = {
+        let fold = shared.hooks.lock().unwrap_or_else(|e| e.into_inner());
+        looks.iter().map(|l| fold.turn(&l.seat, l.epoch)).collect()
+    };
+    let looks: Vec<Look> = looks.into_iter().zip(heard).map(|(l, h)| Look { turn: h.or(l.turn), ..l }).collect();
     let ps = if looks.is_empty() { Vec::new() } else { host(shared).table("pid=,ppid=,rss=,comm=", false).map(|t| rows(&t)).unwrap_or_default() };
     let sup = sup_path(shared);
     let mut seats = Vec::new();

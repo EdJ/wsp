@@ -261,6 +261,8 @@ pub struct Fold {
     root: PathBuf,
     host: HostId,
     awaiting: BTreeMap<SeatId, OrderId>,
+    /// Each seat's last turn edge, by the epoch that posted it ([`Fold::turn`]).
+    turns: BTreeMap<SeatId, (Epoch, TurnEdge)>,
     inproc: InProcess,
 }
 
@@ -268,7 +270,7 @@ impl Fold {
     /// A fold keeping its per-seat files under `<exec_dir>/`[`SEATS_DIR`], and
     /// naming transcripts as on `host`.
     pub fn new(exec_dir: &Path, host: HostId) -> Fold {
-        Fold { root: exec_dir.join(SEATS_DIR), host, awaiting: BTreeMap::new(), inproc: InProcess::new() }
+        Fold { root: exec_dir.join(SEATS_DIR), host, awaiting: BTreeMap::new(), turns: BTreeMap::new(), inproc: InProcess::new() }
     }
 
     /// The next turn `seat` begins is `order`'s: its ack (3.2's `order.acked`
@@ -285,6 +287,17 @@ impl Fold {
         if self.awaiting.get(seat) == Some(order) {
             self.awaiting.remove(seat);
         }
+    }
+
+    /// Whether `seat`'s turn is open, as its hooks last said (wsp-038): began
+    /// at a `UserPromptSubmit`, or at a tool hook when the prompt went unheard
+    /// (a manager started mid-turn); ended at a `Stop` or the session's end.
+    /// `None` when nothing of this epoch's was heard. The manager's `seats`
+    /// reads a seat's state from this, so a turn the person started at the
+    /// pane, or one whose order was acked before its `Stop`, reads as it is
+    /// rather than as the last order left it.
+    pub fn turn(&self, seat: &SeatId, epoch: Epoch) -> Option<TurnEdge> {
+        self.turns.get(seat).filter(|(e, _)| *e == epoch).map(|(_, edge)| *edge)
     }
 
     /// The events one post makes, oldest first. A nested session's hook makes
@@ -315,6 +328,17 @@ impl Fold {
         let _ = crate::inproc::write_atomic(&session_file, &now.to_string());
 
         let (seat, epoch) = (post.seat.clone(), post.epoch);
+        // What the post says of the turn, kept whatever events it makes: a
+        // tool hook makes no `turn` (its count would be a guess) but is
+        // evidence one is open.
+        let edge = match hook {
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(TurnEdge::Began),
+            "Stop" | "StopFailure" | "SessionEnd" => Some(TurnEdge::Ended),
+            _ => None,
+        };
+        if let Some(edge) = edge {
+            self.turns.insert(seat.clone(), (epoch, edge));
+        }
         let turn = |edge, order| Message::Turn(Turn { seat: seat.clone(), epoch, edge, at, order });
         let mut out = Vec::new();
         match hook {
@@ -523,5 +547,64 @@ mod tests {
         assert!(!a_childs(&was, &json!({ "session_id": "B", "source": "clear" })));
         assert!(!a_childs(&json!({ "session_id": "A", "state": "gone" }), &json!({ "session_id": "B" })));
         assert!(!a_childs(&json!({}), &json!({ "session_id": "B" })));
+    }
+
+    /// wsp-038: `wip` under the manager drew seats mid-turn as `idle ← needs
+    /// you`, because the manager's seat table took its turn from an order's
+    /// ack alone. The fold keeps what the hooks said.
+    mod fold {
+        use super::*;
+
+        fn post(seat: &str, epoch: u64, hook: &str, session: &str) -> Post {
+            Post {
+                token: "t".into(),
+                seat: SeatId(seat.into()),
+                epoch: Epoch(epoch),
+                hook: hook.into(),
+                payload: json!({ "session_id": session }),
+            }
+        }
+
+        fn fold_in(name: &str) -> (Fold, PathBuf) {
+            let dir = std::env::temp_dir().join(format!("wsp-hooks-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            (Fold::new(&dir, HostId("h".into())), dir)
+        }
+
+        #[test]
+        fn a_turn_started_and_not_stopped_reads_working_and_a_stop_reads_idle() {
+            let (mut f, dir) = fold_in("open-turn");
+            let seat = SeatId("cpd-242".into());
+            assert_eq!(f.turn(&seat, Epoch(1)), None, "nothing heard is nothing known");
+
+            let made = f.fold(&post("cpd-242", 1, "UserPromptSubmit", "A"), At(1)).unwrap();
+            assert!(matches!(&made[..], [Message::Turn(t)] if t.edge == TurnEdge::Began));
+            assert_eq!(f.turn(&seat, Epoch(1)), Some(TurnEdge::Began), "a prompt without its stop is a turn open");
+            f.fold(&post("cpd-242", 1, "PreToolUse", "A"), At(2)).unwrap();
+            f.fold(&post("cpd-242", 1, "PostToolUse", "A"), At(3)).unwrap();
+            assert_eq!(f.turn(&seat, Epoch(1)), Some(TurnEdge::Began), "still open across its tools");
+
+            // A child's stop, from a session the seat did not start, ends nothing.
+            assert!(f.fold(&post("cpd-242", 1, "Stop", "B"), At(4)).unwrap().is_empty());
+            assert_eq!(f.turn(&seat, Epoch(1)), Some(TurnEdge::Began));
+
+            f.fold(&post("cpd-242", 1, "Stop", "A"), At(5)).unwrap();
+            assert_eq!(f.turn(&seat, Epoch(1)), Some(TurnEdge::Ended), "a stop reads idle");
+            assert_eq!(f.turn(&seat, Epoch(2)), None, "and another start of the seat inherits none of it");
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn a_tool_hook_with_its_prompt_unheard_reads_a_turn_open() {
+            // A manager started mid-turn hears no prompt: the next tool hook
+            // is the evidence, and it makes no `turn` event of its own.
+            let (mut f, dir) = fold_in("unheard-prompt");
+            let seat = SeatId("cpd-244".into());
+            assert!(f.fold(&post("cpd-244", 3, "PreToolUse", "A"), At(1)).unwrap().is_empty());
+            assert_eq!(f.turn(&seat, Epoch(3)), Some(TurnEdge::Began));
+            f.fold(&post("cpd-244", 3, "SessionEnd", "A"), At(2)).unwrap();
+            assert_eq!(f.turn(&seat, Epoch(3)), Some(TurnEdge::Ended));
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }
