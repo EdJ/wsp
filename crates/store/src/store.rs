@@ -3679,8 +3679,8 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 ///
 /// So: durable for anything a person would have to type again, and this for
 /// state that is only true while a process is up and is rewritten by that
-/// process within a tick. The surface's last frame is the case it was added
-/// for — see `panel::surface_frame`.
+/// process within a tick, or is a cache the next reading rebuilds — the task
+/// heads file is the case — see `Store::save_heads`.
 pub fn write_atomic_unsynced(path: &Path, contents: &str) -> std::io::Result<()> {
     replace(path, contents, false)
 }

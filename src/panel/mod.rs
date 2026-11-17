@@ -6,9 +6,8 @@
 //! hang off projects, and agents attach to tasks. A workspace is only ever a
 //! destination, never a heading.
 //!
-//! It keeps the two things backend's sidebar is genuinely good at — live agent
-//! status and jumping to a terminal — by subscribing to the same event stream
-//! and calling `workspace.focus`/`pane.focus` on Enter.
+//! It keeps live agent status, the thing backend's sidebar is genuinely good
+//! at, by subscribing to the same event stream.
 //!
 //! No TUI crate: we own one pane, so a string buffer plus ANSI is enough, and
 //! the dependency list stays at `serde_json`.
