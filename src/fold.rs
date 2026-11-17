@@ -189,20 +189,30 @@ fn apply(store: &Store, host: &str, msg: &Message) {
     let state = &store.state;
     match msg {
         Message::SeatStarted(s) => {
-            let (seat, row) = (s.seat.0.as_str(), s.key.row.0.as_str());
+            let seat = s.seat.0.as_str();
+            // No row: a seat the manager adopted from the in-process host
+            // goes out with an empty one, and a spawn without a key is keyed
+            // by its seat's own id. Neither names a row of the store's.
+            let row = Some(s.key.row.0.as_str()).filter(|r| !r.is_empty() && *r != seat);
             let mut rec = match store.spawned().remove(seat) {
                 Some(Value::Object(m)) => m,
                 _ => serde_json::Map::new(),
             };
             rec.remove("refused");
+            // Without a row, the row and attempt the record already has stand.
+            let prior = rec.get("started").filter(|_| row.is_none());
+            let (row_was, attempt) = match prior {
+                Some(p) => (p.get("row").cloned().unwrap_or(json!("")), p.get("attempt").cloned().unwrap_or(json!(0))),
+                None => (json!(row.unwrap_or("")), json!(s.key.attempt)),
+            };
             rec.insert(
                 "started".into(),
-                json!({ "host": host, "row": row, "attempt": s.key.attempt, "epoch": s.epoch.0, "pid": s.pid, "sockets": s.sockets }),
+                json!({ "host": host, "row": row_was, "attempt": attempt, "epoch": s.epoch.0, "pid": s.pid, "sockets": s.sockets }),
             );
             store.set_spawned(seat, Some(&Value::Object(rec)));
             // The row as the spawn named it, where nothing holds the seat or
             // the row already: a spawn's own records are richer and stand.
-            if !row.is_empty() {
+            if let Some(row) = row {
                 store.locked(|| {
                     match store.bindings().get(seat) {
                         None => store.set_binding(
@@ -610,6 +620,50 @@ mod tests {
         assert_eq!(read_folded(&store.state, HOST), Some(later));
         drop(again);
         m.stop();
+    }
+
+    /// wsp-029: a seat the manager adopts from the in-process host goes out
+    /// with an empty row, and a spawn without a key is keyed by its own seat:
+    /// folding either writes no claim and no binding for a row named after
+    /// the seat, and the seat's binding and its `spawned` row stand.
+    #[test]
+    fn an_adopted_seats_start_claims_no_row_and_leaves_its_records() {
+        let _env = util::isolated("fold-adopted");
+        let store = Store::open();
+        let bound = json!({ "task_id": "wsp-100", "pane_id": "cpd-a1", "host": HOST, "epoch": 1, "started_at": "2026-11-17T00:00:00Z" });
+        store.set_binding("cpd-a1", bound.clone());
+        store.set_spawned("cpd-a1", Some(&json!({ "started": { "host": HOST, "row": "wsp-100", "attempt": 2, "epoch": 1, "pid": 7, "sockets": [] } })));
+        let started = |id: u64, seat: &str, row: &str| Frame {
+            id: Some(EventId(id)),
+            req: None,
+            msg: Message::SeatStarted(SeatStarted {
+                key: Key { row: RowId(row.into()), attempt: 0 },
+                seat: SeatId(seat.into()),
+                epoch: Epoch(2),
+                pid: 4343,
+                sockets: vec![format!("/run/{seat}.sock")],
+            }),
+        };
+        // Adopted (an empty row), for a seat the store knows and one it does
+        // not; and a keyless spawn's start, its row its own seat.
+        assert!(fold(&store, HOST, &started(1, "cpd-a1", "")));
+        assert!(fold(&store, HOST, &started(2, "cpd-a2", "")));
+        assert!(fold(&store, HOST, &started(3, "cpd-a3", "cpd-a3")));
+
+        let claims = store.claims();
+        for row in ["", "cpd-a1", "cpd-a2", "cpd-a3"] {
+            assert!(!claims.contains_key(row), "a claim on {row:?}: {claims:?}");
+        }
+        let bindings = store.bindings();
+        assert_eq!(bindings.get("cpd-a1"), Some(&bound), "the seat's binding stands");
+        assert!(!bindings.contains_key("cpd-a2") && !bindings.contains_key("cpd-a3"), "{bindings:?}");
+
+        let spawned = store.spawned();
+        let s = &spawned["cpd-a1"]["started"];
+        assert_eq!((&s["row"], &s["attempt"]), (&json!("wsp-100"), &json!(2)), "its spawned row stands: {s}");
+        assert_eq!((&s["epoch"], &s["pid"]), (&json!(2), &json!(4343)), "the new start is recorded: {s}");
+        assert_eq!(spawned["cpd-a2"]["started"]["row"], "", "{spawned:?}");
+        assert_eq!(spawned["cpd-a3"]["started"]["row"], "", "{spawned:?}");
     }
 
     /// A beat's host facts are kept where `sweep:disk` and `sweep:throttle`
