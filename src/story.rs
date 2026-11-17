@@ -2660,9 +2660,8 @@ mod tests {
     ///
     /// Both halves are asserted, because either alone is the wrong fix. The
     /// guard holds — `q` on the sidebar still does not quit the panel — and the
-    /// key that reached for
-    /// a way out now opens the list of them instead of printing a sentence
-    /// naming the one exit that takes the sidebar with it.
+    /// key that reached for a way out now opens the list of them instead of
+    /// printing a sentence naming the one exit that takes the sidebar with it.
     #[test]
     fn q_with_nothing_in_front_of_it_opens_the_menu_rather_than_refusing() {
         let w = world();

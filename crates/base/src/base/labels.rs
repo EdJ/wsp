@@ -1,7 +1,7 @@
-//! The labels backend carries on the panes wsp installs.
+//! The labels backend carries on wsp's own panes.
 
-/// backend's label on the panes we install. Ours are furniture and never appear
-/// in the tree as work.
+/// backend's label on a panel, so we can find ours again. Ours are furniture
+/// and never appear in the tree as work.
 pub const PANEL_LABEL: &str = "wsp";
 
 /// The label backend carries on a detail pane, so we can find ours again.
@@ -19,8 +19,8 @@ pub const VIEW_LABEL: &str = "wsp:view";
 /// switch to another workspace and back, and `pane.focus` will move the keyboard
 /// onto a pane the zoom is hiding, so what is on the screen and what the keys
 /// reach stop being the same question. The panel is furniture — thought about
-/// by nobody — and furniture has no business holding a workspace in a mode it cannot see the state of, whose only undo is
-/// a key inside itself.
+/// by nobody — and furniture has no business holding a workspace in a mode it
+/// cannot see the state of, whose only undo is a key inside itself.
 ///
 /// A tab hides nothing, backend's own switcher lists it, and closing it puts you
 /// back where you were.

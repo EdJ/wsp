@@ -308,9 +308,9 @@ pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standin
         if p.pane_id == me {
             continue;
         }
-        // Our own furniture is not company. Every workspace has a panel and
-        // most have a view, and reporting them would bury the one pane that
-        // matters under the ones we installed ourselves.
+        // Our own furniture is not company. A panel or a view is ours, found
+        // by its label, and reporting them would bury the one pane that
+        // matters under our own.
         if p.label == crate::base::labels::PANEL_LABEL || p.label == crate::base::labels::VIEW_LABEL {
             continue;
         }
@@ -521,8 +521,8 @@ mod tests {
         assert_eq!(out[0].relation, Relation::SameCwd);
     }
 
-    /// The panel and the view are in every workspace by construction. Counting
-    /// them would bury the one pane that matters.
+    /// The panel and the view are ours, not company. Counting them would bury
+    /// the one pane that matters.
     #[test]
     fn our_own_furniture_is_not_company() {
         let mut panel = pane("p", "w1", "/home/ed/claude/wsp");

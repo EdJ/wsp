@@ -339,9 +339,9 @@ fn said_full(task: &Task, said: &str) -> Option<String> {
 /// checked for a name of ours.
 ///
 /// `wsp` and `wsp:view` are withheld. They are how the panel finds its own
-/// panes, and `install` adopts a stray pane labelled `wsp` as a panel it lost
-/// track of — an agent that said "wsp" would be adopted as furniture. Nothing
-/// scoped can collide: a scope carries a `/` and those two do not.
+/// panes, and the tree drops every pane wearing one as furniture — an agent
+/// that said "wsp" would vanish from it. Nothing scoped can collide: a scope
+/// carries a `/` and those two do not.
 ///
 /// Withheld here rather than after the cut: all three are short words, so the
 /// check reads the same on either side of it, and this side is the string
@@ -7654,10 +7654,9 @@ mod tests {
         assert!(!may_reap(&answered, ""), "a claim too old to carry a workspace id either");
     }
 
-    /// The two names an unscoped pane may not take. `install` treats any pane
-    /// labelled `wsp` as a panel it lost track of, so an agent that said "wsp"
-    /// while holding nothing would be adopted as furniture and dropped from
-    /// the tree — the panel filters its own panes out of it.
+    /// The two names an unscoped pane may not take. The panel filters its own
+    /// panes out of the tree by label, so an agent that said "wsp" while
+    /// holding nothing would be taken for furniture and dropped from it.
     #[test]
     fn a_pane_never_takes_the_panels_own_name() {
         assert_eq!(plain_full("wsp"), None);
