@@ -1460,6 +1460,13 @@ impl Default for Patience<'static> {
     }
 }
 
+/// Whether this thread's test asked for a quick spawn ([`tests::quick`]): the
+/// press windows of `agent_commands::pressing` follow it too.
+#[cfg(test)]
+pub(crate) fn quick_test() -> bool {
+    tests::QUICK.with(|q| q.get())
+}
+
 /// What `place_work` waits with: [`Patience::default`], and in a test that asks
 /// for it ([`tests::quick`]) the same loops with nothing to wait for, so a spawn
 /// whose order is dropped can be driven through its whole retry in a moment.

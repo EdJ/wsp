@@ -1031,7 +1031,7 @@ impl Kind for Plain {
     }
 
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &pressing())
     }
 
     /// Nothing to ask. An agent wsp knows nothing about beyond its name is one
@@ -1510,7 +1510,7 @@ impl Kind for OpenCode {
     /// The argument is on that method, which is where a later kind will read
     /// it.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &pressing())
     }
 
     /// Nothing to ask. The backend is the only witness, as for [`Plain`].
@@ -2044,7 +2044,7 @@ impl Kind for Pi {
 
     /// Typed at, like [`Plain`].
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &pressing())
     }
 
     fn running(&self, _spawn: &Spawn) -> Option<bool> {
@@ -2444,7 +2444,7 @@ impl Kind for Claude {
     /// thing to do inside a spawn verb, so this delegates, and the failure path
     /// in `cmd_spawn` reports the address instead.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &pressing())
     }
 
     /// The census, asked about the handle wsp minted — which is why minting had
@@ -2852,6 +2852,20 @@ pub fn recovery(address: Option<Address>) -> Option<String> {
 #[allow(dead_code)]
 pub fn no_channel() -> Refusal {
     Refusal::Unsupported("reach this agent except through its terminal")
+}
+
+/// The windows every `Kind::tell` presses submit through:
+/// [`crate::place::Pressing::default`], and in a test that asked for a quick
+/// spawn (`cmd_spawn::tests::quick`) the same four windows, each a few
+/// milliseconds, so a press is still a press and a test waits for none of
+/// the eighteen seconds.
+pub(crate) fn pressing() -> crate::place::Pressing<'static> {
+    #[cfg(test)]
+    if crate::cmd_spawn::quick_test() {
+        const QUICK: [std::time::Duration; 4] = [std::time::Duration::from_millis(5); 4];
+        return crate::place::Pressing { windows: &QUICK, poll: std::time::Duration::from_millis(1), ..crate::place::Pressing::default() };
+    }
+    crate::place::Pressing::default()
 }
 
 #[cfg(test)]
