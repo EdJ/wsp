@@ -1,7 +1,7 @@
 //! A pane whose seat has ended: `wsp-637`.
 //!
 //! On 2026-11-15, 25 of 33 `compound-sup` supervisors held a bare idle shell and
-//! a `compound-render`: the agent had exited, the pane stayed, and `wsp wip` did
+//! a renderer: the agent had exited, the pane stayed, and `wsp wip` did
 //! not count it. Compound's host reattached to all of them on start.
 //!
 //! **An ended seat's pane** is a `compound-sup spawn --label cpd-N` whose label is
@@ -56,7 +56,7 @@ pub(crate) fn find(
         let Some(cwd) = cwd_of(sup.pid).filter(|c| in_row_tree(c)) else { continue };
         let kids: Vec<&Proc> = procs.iter().filter(|p| p.ppid == sup.pid).collect();
         let shells: Vec<&&Proc> = kids.iter().filter(|p| SHELLS.contains(&base(&p.command).trim_start_matches('-'))).collect();
-        let renders: Vec<&&Proc> = kids.iter().filter(|p| base(&p.command) == "compound-render").collect();
+        let renders: Vec<&&Proc> = kids.iter().filter(|p| crate::place_compound::RENDER_NAMES[0] == base(&p.command)).collect();
         let [shell] = shells.as_slice() else { continue };
         if kids.len() != shells.len() + renders.len() || procs.iter().any(|p| p.ppid == shell.pid) {
             continue;
@@ -123,11 +123,14 @@ mod tests {
         Proc { pid, ppid, age, cpu: 0.0, cputime: 0, command: command.into() }
     }
 
+    /// The renderer this OS's supervisor starts, by the name the lookup uses.
+    const RENDER: &str = crate::place_compound::RENDER_NAMES[0];
+
     fn table() -> Vec<Proc> {
         vec![
             p(10, 1, 3600, "/u/compound-sup spawn --label cpd-1 -- /bin/zsh"),
             p(11, 10, 3600, "-zsh"),
-            p(12, 10, 3600, "compound-render"),
+            p(12, 10, 3600, RENDER),
             p(20, 1, 3600, "/u/compound-sup spawn --label cpd-2 -- /bin/zsh"),
             p(21, 20, 3600, "-zsh"),
             p(22, 21, 100, "claude"),
@@ -146,6 +149,16 @@ mod tests {
         assert_eq!(found[0].label, "cpd-1");
         assert_eq!(found[0].pids, vec![10, 11, 12]);
         assert_eq!(find(&table(), &cwd, &|_| false, &|_| true, 0).len(), 3, "young ones count for wip");
+    }
+
+    /// The renderer is `compound-reader` on Linux and `compound-render` on
+    /// macOS; a pane is read by this OS's name, not a hard-coded one.
+    #[test]
+    fn the_renderer_is_known_by_the_name_this_os_starts() {
+        assert_eq!(RENDER, if cfg!(target_os = "macos") { "compound-render" } else { "compound-reader" });
+        let cwd = |_| Some("/r/.worktrees/wsp-1".to_string());
+        let found = find(&table(), &cwd, &|l| l != "cpd-1", &|_| true, 0);
+        assert_eq!(found.iter().map(|e| e.pids.clone()).collect::<Vec<_>>(), vec![vec![10, 11, 12]]);
     }
 
     #[test]

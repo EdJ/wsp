@@ -6260,6 +6260,8 @@ fn store_uncommitted(root: &std::path::Path) -> Vec<String> {
         .arg("-C")
         .arg(root)
         .args(["status", "--porcelain"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .stderr(std::process::Stdio::null())
         .output()
@@ -6688,19 +6690,19 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         if let Some(w) = uncommitted_warning(&store_uncommitted(&store.root)) {
             warnings.push(w);
         }
-        let missing = store.git_identity_missing();
-        if !missing.is_empty() {
-            if args.has("fix") {
-                let filled = store.git_ensure_identity();
-                notes.push(format!("store git: set repo-local {} (nothing else changed)", filled.join(", ")));
-            } else if store.git_can_commit() {
-                notes.push(format!(
-                    "store git sets no repo-local {} (commits work through the global identity); `wsp doctor --fix` sets only those",
-                    missing.join(", ")
-                ));
+        // Only a store git cannot commit in has anything to repair: a store
+        // whose commits work (global identity, signing, environment) is left
+        // as it is, and `--fix` and `--fix-identity` both leave it so.
+        if !store.git_can_commit() {
+            let missing = store.git_identity_missing();
+            if args.has("fix") || args.has("fix-identity") {
+                match store.git_ensure_identity() {
+                    Ok(filled) => notes.push(format!("store git: set repo-local {} (nothing else changed)", filled.join(", "))),
+                    Err(e) => problems.push(format!("store git: could not set the identity: {e}")),
+                }
             } else {
                 problems.push(format!(
-                    "store git has no identity to commit as and sets no repo-local {} — every store write fails to commit; `wsp doctor --fix` sets only those (repo-local, never the global config)",
+                    "store git has no identity to commit as and sets no repo-local {} — every store write fails to commit; `wsp doctor --fix-identity` sets only those (repo-local, never the global config)",
                     missing.join(", ")
                 ));
             }
@@ -7511,8 +7513,12 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
                 order: 150,
-                text: r##"  wsp doctor [--fix]                integrity check; --fix sets the store git's
-                                    missing repo-local identity, nothing else"##,
+                text: r##"  wsp doctor [--fix | --fix-identity]
+                                    integrity check. --fix-identity only gives a
+                                    store git that cannot commit its own repo-
+                                    local identity. --fix does that too, and
+                                    folds stray sections back in task bodies and
+                                    clears stale gc state in the repos"##,
             },
         ],
     },

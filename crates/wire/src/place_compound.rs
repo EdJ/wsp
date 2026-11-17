@@ -348,7 +348,7 @@ fn compound_render_binary() -> Option<PathBuf> {
 /// both answer the same `screen` and `state` verbs. Without the second name a
 /// Linux machine reads every seat's screen as "cannot read", and a seat whose
 /// hooks have aged past [`VOUCH_SECS`] reads `unknown`.
-const RENDER_NAMES: [&str; 2] =
+pub const RENDER_NAMES: [&str; 2] =
     if cfg!(target_os = "macos") { ["compound-render", "compound-reader"] } else { ["compound-reader", "compound-render"] };
 
 fn find_render(path: Option<std::ffi::OsString>, beside_sup: Option<PathBuf>) -> Option<PathBuf> {
@@ -3551,8 +3551,9 @@ mod tests {
     /// pins). With the renderer's updated pi rules a spinner line reads
     /// `Working` and a select prompt `Blocked`. A renderer from before them
     /// reads both `Idle` (the manifest only had a `Working...` literal), so the
-    /// answer depends on which binary is installed: on such a renderer the test
-    /// skips, saying so, rather than pinning the old gap.
+    /// answer depends on which binary is installed. Such a renderer fails this
+    /// test unless `WSP_RENDERER_PREDATES_PI_RULES` is set, which skips: a
+    /// skip by default would hide a regression of the rules behind a green run.
     ///
     /// Skips without `compound-sup` and `compound-render`/`compound-reader` (not
     /// hermetic about them, like the `#[ignore]`d smokes); a script named `pi`
@@ -3592,8 +3593,18 @@ mod tests {
             assert!(drawn, "{name}: the screen never drew: {:?}", place.read_screen(&seat));
             let got = place.state(&seat).unwrap();
             if got == State::Idle && matches!(want, State::Working | State::Blocked) && name != "Working... literal" {
-                eprintln!("skipped: the installed renderer predates pi's spinner and select rules ({name} reads idle)");
-                return;
+                // A skip here would hide exactly the regression this test is
+                // for (the rules lost or never loaded) behind a green run, so
+                // it is not the default: a renderer known to predate the pi
+                // rules has to be named as such.
+                if std::env::var_os("WSP_RENDERER_PREDATES_PI_RULES").is_some() {
+                    eprintln!("skipped: WSP_RENDERER_PREDATES_PI_RULES is set and the renderer reads idle ({name})");
+                    return;
+                }
+                panic!(
+                    "{name}: the renderer reads idle where the pi rules say {want:?}. If this renderer is a foreign build that \
+                     predates them, set WSP_RENDERER_PREDATES_PI_RULES=1 to skip; otherwise the rules regressed"
+                );
             }
             assert_eq!(got, want, "{name}");
         }

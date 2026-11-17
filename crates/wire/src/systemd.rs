@@ -225,7 +225,7 @@ pub fn linger() -> Option<bool> {
     linger_from(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Run `systemctl --user ...`, turning a failure into its first stderr line.
+/// Run `systemctl --user ...`, turning a failure into its last non-empty stderr line.
 fn ctl(args: &[&str]) -> Result<(), String> {
     let out = Command::new("systemctl")
         .arg("--user")
@@ -242,6 +242,37 @@ fn ctl(args: &[&str]) -> Result<(), String> {
         args.first().copied().unwrap_or(""),
         if why.is_empty() { format!("exit {}", out.status.code().unwrap_or(-1)) } else { why.to_string() }
     ))
+}
+
+/// [`ctl`] for the calls that start the unit: a failure there carries what the
+/// unit itself said — the last lines of `systemctl --user status` and its exec
+/// status — since the stderr line of `enable --now` alone seldom says why the
+/// daemon would not run.
+fn ctl_start(args: &[&str]) -> Result<(), String> {
+    ctl(args).map_err(|e| format!("{e}{}", unit_said()))
+}
+
+fn unit_said() -> String {
+    let status = Command::new("systemctl")
+        .args(["--user", "status", "--no-pager", "-n", "5", LABEL])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    said(&show(), &status)
+}
+
+/// What to append to a start failure: the unit's state and exec status, and the
+/// last few lines `status` printed. Empty when there is nothing to add.
+pub fn said(show: &Show, status: &str) -> String {
+    let mut out = String::new();
+    if !show.active.is_empty() {
+        out.push_str(&format!("\n  unit: {}", describe(show)));
+    }
+    let tail: Vec<&str> = status.lines().filter(|l| !l.trim().is_empty()).collect();
+    for l in &tail[tail.len().saturating_sub(5)..] {
+        out.push_str(&format!("\n  | {}", l.trim_end()));
+    }
+    out
 }
 
 fn active() -> bool {
@@ -274,8 +305,12 @@ pub fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> 
     let want = unit(bin, state, path_var);
     let change = plan(&want, &path);
     if !crate::launchd::sandboxed() {
-        let v = Command::new("systemctl").arg("--version").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-        check_version(v.as_deref())?;
+        let v = Command::new("systemctl")
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .map_err(|e| e.to_string());
+        check_version(v.as_deref().map_err(|e| e.as_str()))?;
     }
     let step = decide(&change, active(), crate::launchd::sandboxed());
     let linger = linger();
@@ -287,9 +322,9 @@ pub fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> 
             .map_err(|e| format!("cannot write {}: {e}", util::contract(&path)))?;
         ctl(&["daemon-reload"])?;
     }
-    ctl(&["enable", "--now", LABEL])?;
+    ctl_start(&["enable", "--now", LABEL])?;
     if step == Step::Restart {
-        ctl(&["restart", LABEL])?;
+        ctl_start(&["restart", LABEL])?;
     }
     settle(Duration::from_secs(8))?;
     Ok(Done { path, wrote: change == Plan::Write, loaded: true, linger })
@@ -408,12 +443,18 @@ pub fn version_from(out: &str) -> Option<u32> {
 /// Oldest systemd with `Type=exec` and `StandardOutput=append:`.
 const MIN_SYSTEMD: u32 = 240;
 
-/// Refuse a systemd too old for the unit this writes.
-pub fn check_version(out: Option<&str>) -> Result<(), String> {
-    match out.and_then(version_from) {
+/// Refuse a systemd too old for the unit this writes. `Err` is why
+/// `systemctl --version` could not be run at all (no such binary), which is a
+/// different answer from one that ran and printed nothing readable.
+pub fn check_version(out: Result<&str, &str>) -> Result<(), String> {
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Err(format!("cannot run `systemctl`: {e} — is systemd installed (a systemd user manager is needed)?")),
+    };
+    match version_from(out) {
         Some(v) if v >= MIN_SYSTEMD => Ok(()),
         Some(v) => Err(format!("systemd {v} is too old: the unit needs Type=exec and StandardOutput=append: (systemd {MIN_SYSTEMD} or newer)")),
-        None => Err("cannot read `systemctl --version`: is systemd running here?".into()),
+        None => Err("`systemctl --version` printed no version wsp can read".into()),
     }
 }
 
@@ -427,7 +468,7 @@ pub fn reload() -> Result<String, String> {
     ctl(&["daemon-reload"])?;
     ctl(&["enable", LABEL])?;
     // `start`, like launchd's kickstart without -k: a running job is left alone.
-    ctl(&["start", LABEL])?;
+    ctl_start(&["start", LABEL])?;
     settle(Duration::from_secs(8))?;
     Ok(format!("{LABEL} started"))
 }
@@ -495,9 +536,20 @@ mod tests {
     #[test]
     fn version_gate() {
         assert_eq!(version_from("systemd 255 (255.4-1ubuntu8)\n+PAM"), Some(255));
-        assert!(check_version(Some("systemd 255 (x)")).is_ok());
-        assert!(check_version(Some("systemd 239 (x)")).unwrap_err().contains("too old"));
-        assert!(check_version(None).is_err());
+        assert!(check_version(Ok("systemd 255 (x)")).is_ok());
+        assert!(check_version(Ok("systemd 239 (x)")).unwrap_err().contains("too old"));
+        let unreadable = check_version(Ok("")).unwrap_err();
+        assert!(unreadable.contains("printed no version") && !unreadable.contains("running"), "{unreadable}");
+        let missing = check_version(Err("No such file or directory (os error 2)")).unwrap_err();
+        assert!(missing.contains("cannot run `systemctl`") && missing.contains("installed"), "{missing}");
+    }
+
+    #[test]
+    fn a_failed_start_says_what_the_unit_said() {
+        let s = show_from("ActiveState=activating\nSubState=auto-restart\nMainPID=0\nNRestarts=3\nResult=exit-code\nExecMainStatus=203\n");
+        let m = said(&s, "x unit\n   Active: activating\n\nNov 17 wsp[1]: boom\n");
+        assert!(m.contains("exec status 203") && m.contains("boom"), "{m}");
+        assert_eq!(said(&Show::default(), ""), "");
     }
 
     #[test]
