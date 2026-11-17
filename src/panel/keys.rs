@@ -125,9 +125,8 @@ pub(crate) struct View {
     /// This panel *is* the tab: the one `Z` opened, drawn at the width of the
     /// workspace.
     ///
-    /// What it changes is the way out. The sidebar is installed furniture and
-    /// refuses to be quit by a stray `q` — losing it costs a reinstall and buys
-    /// nothing. This one is a tab somebody opened a moment ago and will close
+    /// What it changes is the way out. The sidebar refuses to be quit by a
+    /// stray `q` — losing it buys nothing. This one is a tab somebody opened a moment ago and will close
     /// again, so `q`, `esc` and `Z` all close it, and the footer says so.
     pub(super) full: bool,
     /// Include `done` tasks, and the projects that hold only those.
@@ -446,8 +445,8 @@ pub(super) fn where_key(k: Key, ui: &mut Ui, view: &mut View, mut w: Where) -> E
 /// It is also the answer to a guard rather than a hole in one, and that is
 /// worth saying here because the next reader will otherwise find a `q` that
 /// refuses to quit sitting beside a menu that offers to, and take one of them
-/// for a mistake. The rule in [`View::full`] is that the sidebar is installed
-/// furniture and must not be lost to a stray keystroke. That was the whole
+/// for a mistake. The rule in [`View::full`] is that the sidebar must not be
+/// lost to a stray keystroke. That was the whole
 /// story while the panel was a pane and backend's own menu was still there; the
 /// fork made this surface *be* backend's sidebar, so the guard that stopped the
 /// stray `q` also removed the last door out of the terminal — Ed, on the day:

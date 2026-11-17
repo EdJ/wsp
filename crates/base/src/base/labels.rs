@@ -18,9 +18,8 @@ pub const VIEW_LABEL: &str = "wsp:view";
 /// one pane and outliving it: measured against the live server, it survives a
 /// switch to another workspace and back, and `pane.focus` will move the keyboard
 /// onto a pane the zoom is hiding, so what is on the screen and what the keys
-/// reach stop being the same question. The panel is furniture — installed in
-/// every workspace, thought about by nobody — and furniture has no business
-/// holding a workspace in a mode it cannot see the state of, whose only undo is
+/// reach stop being the same question. The panel is furniture — thought about
+/// by nobody — and furniture has no business holding a workspace in a mode it cannot see the state of, whose only undo is
 /// a key inside itself.
 ///
 /// A tab hides nothing, backend's own switcher lists it, and closing it puts you

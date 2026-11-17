@@ -1775,7 +1775,7 @@ fn scenes() -> Vec<Scene> {
             .says("quit all")
             .scene(
                 "The menu",
-                "q gives back whatever is in front of you — the key map, a search, the detail pane, room a widened sidebar borrowed, the tab Z opened — and when there is nothing left to give back it opens this. The panel itself is never what q closes: it is installed furniture, and losing it to a stray keystroke costs a reinstall. That guard was the whole story while the panel was a pane and backend's own menu was two clicks away; the fork made this surface *be* backend's sidebar, so the guard that stopped the stray q also took away the last door out of the terminal. A menu is what the guard was protecting for rather than a hole in it — a list you open and a row you pick is deliberate, two-step and readable, which is exactly what a stray keystroke is not. Close is the first row, because it is the thing whose absence built the menu.",
+                "q gives back whatever is in front of you — the key map, a search, the detail pane, room a widened sidebar borrowed, the tab Z opened — and when there is nothing left to give back it opens this. The panel itself is never what q closes: it is always there, and a stray keystroke has no business taking it down. That guard was the whole story while the panel was a pane and backend's own menu was two clicks away; the fork made this surface *be* backend's sidebar, so the guard that stopped the stray q also took away the last door out of the terminal. A menu is what the guard was protecting for rather than a hole in it — a list you open and a row you pick is deliberate, two-step and readable, which is exactly what a stray keystroke is not. Close is the first row, because it is the thing whose absence built the menu.",
             ),
     );
 
@@ -2659,8 +2659,8 @@ mod tests {
     /// lost the backend menu."*
     ///
     /// Both halves are asserted, because either alone is the wrong fix. The
-    /// guard holds — `q` on the sidebar still does not quit the panel, which is
-    /// installed furniture and costs a reinstall — and the key that reached for
+    /// guard holds — `q` on the sidebar still does not quit the panel — and the
+    /// key that reached for
     /// a way out now opens the list of them instead of printing a sentence
     /// naming the one exit that takes the sidebar with it.
     #[test]
@@ -4347,9 +4347,9 @@ mod tests {
 
     /// `Z` opens the whole tree in a tab, and in that tab it closes it again.
     ///
-    /// The asymmetry underneath is the point. The sidebar is installed
-    /// furniture: quitting it costs a reinstall and buys nothing, so `q` refuses
-    /// and says which key does mean it. The tab is the opposite — somebody
+    /// The asymmetry underneath is the point. The sidebar is always there:
+    /// quitting it buys nothing, so `q` refuses and says which key does mean
+    /// it. The tab is the opposite — somebody
     /// opened it a minute ago, `Z` opens it again for nothing, and a fullscreen
     /// whose exit you have to hunt for is one you close by closing the tab.
     #[test]
