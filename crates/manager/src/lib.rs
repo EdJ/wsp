@@ -328,12 +328,6 @@ impl Manager {
         self.shared.emit(msg)
     }
 
-    /// The next turn `seat` begins is `order`'s, and its `turn` says so. The
-    /// order delivery of wsp-022 is its caller; until then, tests.
-    pub fn awaiting(&self, seat: wsp_host_api::SeatId, order: wsp_host_api::OrderId) {
-        self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).awaiting(seat, order);
-    }
-
     /// The journal's newest id.
     pub fn head(&self) -> Option<EventId> {
         self.shared.journal.lock().unwrap_or_else(|e| e.into_inner()).head()

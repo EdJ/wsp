@@ -18,9 +18,13 @@
 //! - **Orders** go through `compound-sup deliver <socket> <id>`, whose id is its
 //!   at-most-once key. Before it is asked the order is written to
 //!   `<exec_dir>/orders/`; its answer is journalled and only then is the file
-//!   removed. `delivered` is answered `order.delivered` and `order.acked` (and
-//!   a `turn` that began): compound-sup says `delivered` only once the agent's
-//!   own `UserPromptSubmit` hook has said the turn began. `failed <why>` is
+//!   removed. `delivered` is answered `order.delivered` and `order.acked`:
+//!   compound-sup says `delivered` only once the agent's own
+//!   `UserPromptSubmit` hook has said the turn began. That `turn` is the hook
+//!   fold's to journal (wsp-032), never this file's: before compound-sup is
+//!   asked, the fold is told the seat's next turn is this order's
+//!   ([`wsp_host::hooks::Fold::awaiting`]), so the `turn` began it journals
+//!   carries the order id. `failed <why>` is
 //!   `order.refused` with compound-sup's `FailWhy`. A repeat of an answered
 //!   order gets the same answer and is never typed again.
 //! - **Restart.** The table is rebuilt from the `*.sock` files in
@@ -52,7 +56,7 @@ use wsp_host::{Delivery, InProcess, Refusal as HostRefusal, Seat as HostSeat};
 use wsp_host_api::{
     At, Epoch, Frame, Gate, Key, Message, OrderAcked, OrderCancel, OrderDeliver, OrderDelivered, OrderFail,
     OrderId, OrderRefused, Refusal, Refused, ReqId, SeatEpoch, SeatId, SeatRead, SeatRefused, SeatRow,
-    SeatScreen, SeatSpawn, SeatStarted, SeatState, SeatStop, SeatStopped, SeatsList, Turn, TurnEdge, Workdir,
+    SeatScreen, SeatSpawn, SeatStarted, SeatState, SeatStop, SeatStopped, SeatsList, TurnEdge, Workdir,
 };
 
 use crate::{now, Shared};
@@ -567,6 +571,8 @@ fn ask(shared: &Arc<Shared>, o: OrderDeliver) {
         return;
     };
     let seat = HostSeat::new(&o.seat.0);
+    // The hook fires before compound-sup answers: tell the fold first.
+    shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).awaiting(o.seat.clone(), o.order.clone());
     let mut tries = 0u32;
     let outcome = loop {
         if shared.stopping.load(Ordering::SeqCst) {
@@ -622,11 +628,10 @@ fn answered(shared: &Shared, o: &OrderDeliver, outcome: Result<At, OrderFail>) {
                 run.turn = Some(TurnEdge::Began);
                 run.last_turn = Some(began);
             }
-            let turn = Turn { seat: o.seat.clone(), epoch: o.epoch, edge: TurnEdge::Began, at: began, order: Some(o.order.clone()) };
-            emit(shared, Message::Turn(turn), &[]);
             vec![delivered, acked]
         }
         Err(why) => {
+            shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).not_awaiting(&o.seat, &o.order);
             let refused = Message::OrderRefused(OrderRefused { order: o.order.clone(), seat: o.seat.clone(), why });
             emit(shared, refused.clone(), &waiters);
             vec![refused]

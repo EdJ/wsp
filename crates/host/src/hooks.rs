@@ -267,9 +267,19 @@ impl Fold {
     }
 
     /// The next turn `seat` begins is `order`'s: its ack (3.2's `order.acked`
-    /// is the same edge). The order delivery of wsp-022 says it.
+    /// is the same edge). The manager's order delivery says it before it asks
+    /// compound-sup, whose `delivered` comes only after the agent's
+    /// `UserPromptSubmit` hook has fired.
     pub fn awaiting(&mut self, seat: SeatId, order: OrderId) {
         self.awaiting.insert(seat, order);
+    }
+
+    /// `order` was not delivered: no turn of `seat`'s is its. A later order
+    /// awaited for the seat is kept.
+    pub fn not_awaiting(&mut self, seat: &SeatId, order: &OrderId) {
+        if self.awaiting.get(seat) == Some(order) {
+            self.awaiting.remove(seat);
+        }
     }
 
     /// The events one post makes, oldest first. A nested session's hook makes

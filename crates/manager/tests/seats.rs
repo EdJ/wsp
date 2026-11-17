@@ -3,6 +3,8 @@
 //! order naming a stale epoch is refused; an order answers delivered, then
 //! acked; and a manager killed with SIGKILL mid-order, restarted, still lists
 //! the seat, answers the order once, and resumes events `from` the last id.
+//! And (wsp-032) a delivered order and its seat's hooks journal one `turn`
+//! began, carrying the order id, and one `turn` ended.
 //!
 //! Nothing here spawns claude. The fake's sessions are a sleeping process group
 //! each, which ends with this test process at the latest; every test also
@@ -373,7 +375,8 @@ fn an_order_answers_delivered_then_acked() {
         }
         other => panic!("expected order.delivered then order.acked, got {other:?}"),
     }
-    c.hear_until(WAIT, |ev| ev.iter().any(|f| matches!(&f.msg, Message::Turn(_))));
+    c.hear_until(WAIT, |ev| ev.iter().any(|f| matches!(&f.msg, Message::OrderAcked(_))));
+    c.hear_until(Duration::from_millis(300), |_| false);
     let kinds: Vec<&str> = c
         .events
         .iter()
@@ -385,7 +388,7 @@ fn an_order_answers_delivered_then_acked() {
             _ => "other",
         })
         .collect();
-    assert_eq!(kinds, vec!["seat.started", "order.delivered", "order.acked", "turn"], "each event once, in order");
+    assert_eq!(kinds, vec!["seat.started", "order.delivered", "order.acked"], "each event once, in order; a turn is the hooks' to say");
 
     // Asked again: the same answer, and nothing typed twice.
     let req = c.send(order("o-1", "cpd-o", s.epoch.0, "do the work"));
@@ -414,6 +417,52 @@ fn an_order_answers_delivered_then_acked() {
     assert!(fs::read_dir(dir.join(wsp_manager::seats::ORDERS_DIR)).map_or(true, |d| d.count() == 0), "no order is left in flight");
 
     assert!(matches!(c.ask(stop_msg("cpd-o", s.epoch.0)), Message::SeatStopped(_)));
+    m.stop();
+}
+
+/// wsp-032: one owner of `turn`. An order delivered to a seat, then the seat's
+/// hook command posting `UserPromptSubmit` and `Stop` to this manager, give
+/// exactly one `turn` began, carrying the order's id, and one `turn` ended.
+#[test]
+fn a_delivered_order_and_its_hooks_journal_one_turn_began_with_the_order_and_one_ended() {
+    use wsp_host::hooks::{report, Dial, Sent};
+    use wsp_host_api::TurnEdge;
+
+    let (dir, sup) = place("turn");
+    let _sweep = Sweep::new(&dir);
+    let m = start(&dir, &sup);
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+    c.subscribe(None);
+    let Message::SeatStarted(s) = c.ask(spawn_msg("wsp-32", 1, "cpd-t", &dir)) else { panic!("started") };
+
+    let req = c.send(order("o-t", "cpd-t", s.epoch.0, "do the work"));
+    assert!(matches!(c.answer(req), Message::OrderDelivered(_)));
+    assert!(matches!(c.answer(req), Message::OrderAcked(_)));
+
+    // The seat's hook command, as `wsp report <hook>` runs it.
+    let dial = Dial::Manager { addr: m.addrs()[0], token_file: dir.join(TOKEN_FILE) };
+    let payload = serde_json::json!({ "session_id": "sess-t" });
+    assert_eq!(report(&dial, "cpd-t", s.epoch, "UserPromptSubmit", &payload), Sent::Taken(1));
+    assert_eq!(report(&dial, "cpd-t", s.epoch, "Stop", &payload), Sent::Taken(1));
+
+    c.hear_until(WAIT, |ev| ev.iter().any(|f| matches!(&f.msg, Message::Turn(t) if t.edge == TurnEdge::Ended)));
+    c.hear_until(Duration::from_millis(300), |_| false);
+    let turns: Vec<_> = c
+        .events
+        .iter()
+        .filter_map(|f| match &f.msg {
+            Message::Turn(t) => Some((t.seat.0.as_str(), t.epoch, t.edge, t.order.as_ref().map(|o| o.0.as_str()))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        turns,
+        vec![("cpd-t", s.epoch, TurnEdge::Began, Some("o-t")), ("cpd-t", s.epoch, TurnEdge::Ended, None)],
+        "one began with the order, one ended: {:?}",
+        c.events
+    );
+
+    assert!(matches!(c.ask(stop_msg("cpd-t", s.epoch.0)), Message::SeatStopped(_)));
     m.stop();
 }
 
@@ -484,7 +533,7 @@ fn a_manager_killed_mid_order_restarts_with_its_seat_and_answers_the_order_once(
 
     // From the last id heard: the order's answer, once, and nothing before it.
     back.subscribe(Some(last));
-    back.hear_until(WAIT, |ev| ev.iter().any(|f| matches!(f.msg, Message::Turn(_))));
+    back.hear_until(WAIT, |ev| ev.iter().any(|f| matches!(&f.msg, Message::OrderAcked(a) if a.order.0 == "o-slow")));
     back.hear_until(Duration::from_millis(500), |_| false);
     assert!(back.events.iter().all(|f| f.id > Some(last)), "only events after {last:?}");
     let delivered = back.events.iter().filter(|f| matches!(&f.msg, Message::OrderDelivered(d) if d.order.0 == "o-slow")).count();

@@ -773,11 +773,15 @@ in-process code, instead of refusing them.
   seat's epoch in the reason.
 - **Orders go through `compound-sup deliver <socket> <id>`.** The order is written to `<exec_dir>/orders/`
   before compound-sup is asked, and the file is removed only after the answer is journalled. A `delivered`
-  answer becomes `order.delivered`, `order.acked` and a `turn` that began, because compound-sup says `delivered`
-  only once the agent's `UserPromptSubmit` hook has said the turn began. A `failed <why>` answer becomes
-  `order.refused` with compound-sup's `FailWhy`. An order asked again gets the same answer and is never typed a
-  second time. The ack's `turn_began` is the time the manager read the answer, and a turn's end is not heard,
-  until hooks report to the manager (wsp-023).
+  answer becomes `order.delivered` and `order.acked`; compound-sup says `delivered` only once the agent's
+  `UserPromptSubmit` hook has said the turn began. A `failed <why>` answer becomes `order.refused` with
+  compound-sup's `FailWhy`. An order asked again gets the same answer and is never typed a second time. The
+  ack's `turn_began` is the time the manager read the answer.
+- **One owner of `turn` (wsp-032).** The hook fold (wsp-023) journals every `turn`, began on `UserPromptSubmit`
+  and ended on `Stop`; the order delivery journals none. Before compound-sup is asked, the delivery tells the
+  fold that the seat's next turn is this order's, so the `turn` began carries the order id; a refused order is
+  forgotten. A seat whose hook could not reach the manager (it fell back to `hooks.jsonl`) gets no `turn` from
+  the manager, which M1 accepts.
 - **`seats`** takes one `ps` for every seat's rss and shells, plus a `compound-sup vitals` per seat, and renders
   no screen. **`seat.read`** is the one render.
 - **Restart (2.5).** At start the table is rebuilt from the `*.sock` files in `<exec_dir>/run`. Each socket is
