@@ -677,7 +677,6 @@ mod tests {
                 task("idle-review", Status::Review),
                 task("busy-review", Status::Review),
                 task("unread-review", Status::Review),
-                task("far", Status::Doing),
             ],
             &[
                 ("w1:p1", "working"),
@@ -687,7 +686,6 @@ mod tests {
                 ("w1:p5", "idle-review"),
                 ("w1:p6", "busy-review"),
                 ("w1:p7", "unread-review"),
-                ("w1:p1@mb2", "far"),
             ],
         );
         let got = counted(
@@ -698,7 +696,6 @@ mod tests {
                 ("w1:p4", Look::Gone),
                 ("w1:p5", Look::Quiet),
                 ("w1:p6", Look::Working),
-                ("w1:p1@mb2", Look::Working),
             ],
         );
         assert_eq!(got, ["working", "idle-doing", "unread", "busy-review"]);

@@ -402,7 +402,7 @@ mod tests {
         let ran = run_for(&store, &repo, &dir, LIMIT).unwrap();
         assert_eq!(ran.ended, Ended::Exited(3));
         assert!(ran.tail.contains("one") && ran.tail.contains("two"), "{}", ran.tail);
-        let line = said("t", &ran);
+        let line = said_of("at_stop", "t", &ran);
         assert!(line.contains("FAILED, exit 3") && line.contains("two"), "{line}");
         crate::cmd_checkout::remove(&repo, &dir);
         assert!(!dir.exists());
