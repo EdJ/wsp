@@ -572,14 +572,30 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
             log_line(store, &format!("{list}: {spent} start(s) that gave up are tried from the top"));
         }
     }
-    let lists: Vec<Worklist> = match &named {
-        Some(n) => store.worklist(n).into_iter().collect(),
-        None => store.worklists(),
-    };
-    for w in lists.iter().filter(|w| w.status() == WorklistStatus::Running) {
-        let _ = step(store, w, &Fleet);
+    for w in stepped(store, named.as_deref(), args.get("task").as_deref()) {
+        let _ = step(store, &w, &Fleet);
     }
     0
+}
+
+/// The running lists an `advance` steps: the one named; with no list named but
+/// a task, only the list that holds that task — as member, as a member's
+/// verifier, or as its barrier row — and none when no list holds it; and with
+/// neither, every running list.
+///
+/// **A task's trigger steps its own list and no other** (`wsp-662`). It fell
+/// through to every running list, so each `checked` or `verified` was a full
+/// step of all of them — ~500 git and ~200 other spawns, minutes of wall — and
+/// ten verifiers landing together ran ten of those at once and took load past
+/// 400 on 8 cores on 2026-11-17. The other lists lose nothing: the daemon's
+/// tick steps every running list each minute.
+fn stepped(store: &Store, named: Option<&str>, task: Option<&str>) -> Vec<Worklist> {
+    let lists: Vec<Worklist> = match (named, task) {
+        (Some(n), _) => store.worklist(n).into_iter().collect(),
+        (None, Some(id)) => store.find_task(id).and_then(|t| list_of(store, &t)).into_iter().collect(),
+        (None, None) => store.worklists(),
+    };
+    lists.into_iter().filter(|w| w.status() == WorklistStatus::Running).collect()
 }
 
 /// What a pass wsp runs leaves behind it: the group's agents ended, and then
@@ -9016,6 +9032,40 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(advance(&store, &args), 0);
         assert!(drained(&ENDED).is_empty(), "already gone");
         assert!(drained(&SAID).iter().any(|l| l.contains("already gone")));
+    }
+
+    /// `wsp-662`: a task's trigger steps the list that holds it and no other,
+    /// and none where no list does; a list named, or no task, keeps its reach.
+    #[test]
+    fn a_tasks_advance_steps_only_the_list_that_holds_it() {
+        let (_env, store) = scratch("stepped");
+        for id in ["a-1", "b-1", "loose"] {
+            task(&store, id, Status::Review);
+        }
+        let mut v = Task::new("verify a-1", "va-1");
+        v.tags = vec![VERIFY_TAG.into()];
+        v.parent = Some("a-1".into());
+        store.save_task(&v).unwrap();
+        for (id, member) in [("list-a", "a-1"), ("list-b", "b-1")] {
+            let mut w = Worklist::new(id, id);
+            w.set_status(WorklistStatus::Running);
+            w.set_groups(&[Group { members: vec![member.into()], agent: "claude".into(), ..Group::default() }]);
+            store.save_worklist(&w).unwrap();
+        }
+        let cases: &[(Option<&str>, Option<&str>, &[&str], &str)] = &[
+            (None, Some("a-1"), &["list-a"], "a member of A steps A and not B"),
+            (None, Some("b-1"), &["list-b"], "a member of B steps B and not A"),
+            (None, Some("va-1"), &["list-a"], "a verifier under A's member steps A"),
+            (None, Some("loose"), &[], "a task no list holds steps no list"),
+            (None, Some("nobody"), &[], "a task that is not there steps no list"),
+            (Some("list-b"), Some("a-1"), &["list-b"], "a list named is the one stepped"),
+            (None, None, &["list-a", "list-b"], "the bare form steps every running list"),
+        ];
+        for (named, id, want, why) in cases {
+            let mut got: Vec<String> = stepped(&store, *named, *id).into_iter().map(|w| w.id).collect();
+            got.sort();
+            assert_eq!(got, *want, "{why}");
+        }
     }
 
     pub(crate) fn drained<T>(k: &'static std::thread::LocalKey<RefCell<Vec<T>>>) -> Vec<T> {
