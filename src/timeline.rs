@@ -601,7 +601,15 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                 out.push(Phase::gap(label, from, s, wait_name(i, from, s, id)));
             }
         }
-        let up = i.first_learned_after(s);
+        // A seat that came up only after the leg had ended is not this leg's.
+        let up = i.first_learned_after(s).filter(|u| finished.is_none_or(|f| *u <= f));
+        if let (None, Some(f)) = (up, finished) {
+            // No seat ever came up for the leg: the stretch is not work.
+            out.push(Phase::gap(format!("leg {} (no seat came up)", leg.name), s, f, format!("leg {}: no seat came up (not work)", leg.name)));
+            done.push((leg.name.clone(), f));
+            last_end = Some(last_end.map_or(f, |e| e.max(f)));
+            continue;
+        }
         let label = match up {
             Some(u) => format!("leg {} (seat up after {}s)", leg.name, u - s),
             None => format!("leg {}", leg.name),
@@ -2172,6 +2180,16 @@ mod tests {
         let ver = ph.iter().find(|p| p.label.starts_with("review typed → verifier")).unwrap();
         assert_eq!(ver.seconds(), 1);
         assert!(ver.waiting_for.as_deref().unwrap().contains("hand-off"));
+    }
+
+    #[test]
+    fn a_leg_with_no_seat_is_a_gap_not_work() {
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k != "session-learned");
+        let ph = build(&i);
+        let leg = ph.iter().find(|p| p.label.starts_with("leg a (no seat")).expect("the leg is named");
+        assert!(leg.gap && leg.seconds() > 0, "{leg:?}");
+        assert!(!ph.iter().any(|p| !p.gap && p.label.starts_with("leg a")), "{ph:?}");
     }
 
     #[test]
