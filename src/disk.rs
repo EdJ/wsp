@@ -483,6 +483,24 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>, notes: &mut Vec<
     }
 }
 
+/// [`loud`] off the volumes a host's manager reported (`seats`'s host facts,
+/// `docs/agent-manager.md` 4.3): no `df` here.
+pub(crate) fn loud_of(store: &Store, disks: &[crate::host_tcp::DiskFree]) -> Option<String> {
+    let low: Vec<String> = disks
+        .iter()
+        .map(|d| {
+            let mut disk = Disk { volume: d.volume.clone(), free: d.free_bytes, limit: LOW, items: Vec::new() };
+            if disk.low() {
+                disk.items = recorded(&store.state, &disk.volume);
+            }
+            disk
+        })
+        .filter(Disk::low)
+        .map(|d| d.line())
+        .collect();
+    (!low.is_empty()).then(|| low.join("\n"))
+}
+
 /// The low volumes alone, for the headings that are for faults: `wsp wip`.
 pub(crate) fn loud(store: &Store) -> Option<String> {
     let low: Vec<String> = read(store, LOW, false).iter().filter(|d| d.low()).map(Disk::line).collect();

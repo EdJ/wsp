@@ -459,6 +459,19 @@ const WIP_LINES_FOR_SECS: i64 = 30;
 /// seconds. The scan leaves its lines in `finished-wip.json`; a `wip` within
 /// [`WIP_LINES_FOR_SECS`] of it draws those. The tick, which stops what the
 /// lines name, scans for itself and never reads this.
+/// [`finished_wip_lines`] as the last scan left them, and nothing when it is
+/// stale: no scan here. `wip` under `WSP_HOST=manager` runs no `ps`
+/// (`docs/agent-manager.md` 4.3); the daemon's tick still scans.
+pub(crate) fn finished_wip_lines_held(store: &Store) -> Vec<String> {
+    let now = util::epoch_secs();
+    std::fs::read_to_string(store.state_file("finished-wip.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|v| now - v["at"].as_i64().unwrap_or(0) < WIP_LINES_FOR_SECS)
+        .and_then(|v| v["lines"].as_array().map(|l| l.iter().filter_map(|l| l.as_str().map(str::to_string)).collect()))
+        .unwrap_or_default()
+}
+
 pub(crate) fn finished_wip_lines(store: &Store) -> Vec<String> {
     let file = store.state_file("finished-wip.json");
     let now = util::epoch_secs();

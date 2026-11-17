@@ -839,6 +839,19 @@ impl Shells {
         self.by_seat.get(seat).map(|o| Wait { why: Why::Shell(o.n), on: On::Itself, own: Some(o.clone()) })
     }
 
+    /// The shells each seat's manager counted under its agent (`seats`'s
+    /// `shells`, `docs/agent-manager.md` 4.3), for the idle seats asked: no
+    /// `ps` here. A count alone: the manager does not yet say the work under a
+    /// shell, its age or its quiet, so the bounds [`Shells`] names are the
+    /// manager's to keep.
+    pub(crate) fn counted<'a>(seats: impl IntoIterator<Item = &'a str>, counts: &BTreeMap<String, u32>) -> Shells {
+        let by_seat = seats
+            .into_iter()
+            .filter_map(|s| counts.get(s).filter(|n| **n > 0).map(|n| (s.to_string(), Own { n: *n as usize, ..Own::default() })))
+            .collect();
+        Shells { by_seat }
+    }
+
     #[cfg(test)]
     pub(crate) fn own(seat: &str, own: Own) -> Shells {
         Shells { by_seat: BTreeMap::from([(seat.to_string(), own)]) }

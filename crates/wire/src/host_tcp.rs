@@ -47,13 +47,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use wsp_host_api::{
     AgentSpec, At, Beat, ConnError, Connection, Epoch, EventId, Frame, Gate, Hello, Key, ManagerHello, Message,
-    OrderDeliver, OrderFail, OrderId, Refusal as Why, ReqId, Role, RowId, SeatId, SeatRead, SeatRow, SeatSpawn, SeatStop,
-    Seats, Subscribe, Token, Workdir, WspHello, BEAT_SECS, MISSED_BEATS, PROTOCOL,
+    HostFacts, OrderDeliver, OrderFail, OrderId, Refusal as Why, ReqId, Role, RowId, SeatId, SeatRead, SeatRow, SeatSpawn,
+    SeatState, SeatStop, Seats, SeatsList, Subscribe, Token, Workdir, WspHello, BEAT_SECS, MISSED_BEATS, PROTOCOL,
 };
 
 use crate::host::{Forked, Headless, Host, InProcess, Session, Spawn, Stop};
+/// What a `seats` reply carries, for a caller that reads it (`wip`).
+pub use wsp_host_api::{DiskFree, HostFacts as Facts, SeatRow as Row};
 use crate::manager::{self, Local};
-use crate::place::{Delivery, Refusal, Result, Seat, State};
+use crate::place::{Census, Delivery, Refusal, Result, Seat, State};
 
 /// How long a manager has to answer `hello` before it is silent.
 pub const SILENT: Duration = Duration::from_secs(1);
@@ -158,6 +160,97 @@ pub fn choose(choice: Choice, state: &Path, version: &str) -> std::result::Resul
 /// [`choose`] by `$WSP_HOST`.
 pub fn chosen(state: &Path, version: &str) -> std::result::Result<&'static dyn Host, HostError> {
     choose(Choice::from_env()?, state, version)
+}
+
+// ---------------------------------------------------------------- the census
+
+/// What `wip` reads under `WSP_HOST=manager` (`docs/agent-manager.md` 4.3):
+/// one `seats` request to each host in the machine records, in parallel.
+#[derive(Debug, Clone)]
+pub struct Reading {
+    /// Each host's answer is [`Census::heard`]; a host that did not answer
+    /// within [`SILENT`] is [`Census::silent`], never an empty answer.
+    pub census: Census,
+    /// The rows as the managers sent them, by seat: rss and shells.
+    pub rows: BTreeMap<String, SeatRow>,
+    /// Each answering host's facts, from the same reply, by the census's
+    /// name for it (`""` is this machine).
+    pub facts: BTreeMap<String, HostFacts>,
+}
+
+impl Reading {
+    /// Whether any host answered.
+    pub fn heard(&self) -> bool {
+        self.census.answers().next().is_some()
+    }
+}
+
+/// A manager's word for a seat, as the census's [`State`].
+pub fn state_of(s: SeatState) -> State {
+    match s {
+        SeatState::Starting => State::Starting,
+        SeatState::Idle => State::Idle,
+        SeatState::Working => State::Working,
+        // Being ended: its agent is going, and no order reaches it.
+        SeatState::Stopping => State::Gone,
+    }
+}
+
+/// One `seats` to every manager the machine records under `state` name, in
+/// parallel, each heard or silent within [`SILENT`] of the start: the dial,
+/// the `hello` and the reply together. Today the records hold this machine's
+/// manager alone (`<state>/manager/local.json`, wsp-024), filed as `""`.
+///
+/// Reaches no OS here: a seat's label, directory and agent are read from
+/// compound's record files, and its state, rss and shells are the manager's.
+pub fn census(state: &Path, version: &str) -> Reading {
+    let hosts: Vec<(String, std::result::Result<Tcp, HostError>)> = vec![(String::new(), Tcp::from_record(state, Role::Cli, version))];
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start = Instant::now();
+    let mut waiting = BTreeSet::new();
+    for (name, tcp) in hosts {
+        waiting.insert(name.clone());
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let said = tcp.and_then(|t| t.seats_within(SILENT));
+            let _ = tx.send((name, said));
+        });
+    }
+    drop(tx);
+    let mut said: Vec<(String, std::result::Result<SeatsList, HostError>)> = Vec::new();
+    while !waiting.is_empty() {
+        let left = SILENT.saturating_sub(start.elapsed());
+        match rx.recv_timeout(left) {
+            Ok((name, s)) => {
+                waiting.remove(&name);
+                said.push((name, s));
+            }
+            Err(_) => break,
+        }
+    }
+    let silent = |why: String| Refusal::Unreachable(format!("host silent: {why}"));
+    let compound = crate::place_compound::Compound::new();
+    let mut census: Option<Census> = None;
+    let mut rows = BTreeMap::new();
+    let mut facts = BTreeMap::new();
+    let mut fold = |c: Census| census = Some(match census.take() { Some(all) => all.and(c), None => c });
+    for (name, s) in said {
+        match s {
+            Ok(list) => {
+                let seats = list.seats.iter().map(|r| compound.seated_as(&Seat::new(&r.seat.0), state_of(r.state))).collect();
+                fold(Census::heard(&name, seats));
+                rows.extend(list.seats.into_iter().map(|r| (r.seat.0.clone(), r)));
+                if let Some(f) = list.host {
+                    facts.insert(name, f);
+                }
+            }
+            Err(e) => fold(Census::silent(&name, Refusal::from(e))),
+        }
+    }
+    for name in waiting {
+        fold(Census::silent(&name, silent(format!("no answer to `seats` within {}s", SILENT.as_secs()))));
+    }
+    Reading { census: census.unwrap_or_else(|| Census::silent("", silent("no machine record names a manager".into()))), rows, facts }
 }
 
 // ---------------------------------------------------------------- the connection
@@ -359,11 +452,17 @@ impl Tcp {
 
     /// `seats`: what the manager runs, per seat.
     pub fn seats(&self) -> std::result::Result<Vec<SeatRow>, HostError> {
-        let said = self.ask(Message::Seats(Seats {}), SPAWN_WAIT, |m| matches!(m, Message::SeatsList(_)))?;
+        self.seats_within(SPAWN_WAIT).map(|l| l.seats)
+    }
+
+    /// `seats`, with the host facts the reply carries, answered within `wait`
+    /// or [`HostError::Silent`].
+    pub fn seats_within(&self, wait: Duration) -> std::result::Result<SeatsList, HostError> {
+        let said = self.ask(Message::Seats(Seats {}), wait, |m| matches!(m, Message::SeatsList(_)))?;
         match said.into_iter().next() {
-            Some(Message::SeatsList(l)) => Ok(l.seats),
+            Some(Message::SeatsList(l)) => Ok(l),
             Some(Message::Refused(r)) => Err(HostError::Refused { why: r.why, detail: r.detail }),
-            _ => Err(HostError::Silent { addr: self.addr, why: "no answer to `seats`".into() }),
+            _ => Err(HostError::Silent { addr: self.addr, why: format!("no answer to `seats` within {}s", wait.as_secs()) }),
         }
     }
 

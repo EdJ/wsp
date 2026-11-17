@@ -325,6 +325,7 @@ fn table() -> Vec<Frame> {
                     last_turn: Some(At(4)),
                     last_word: Some("building".into()),
                 }],
+                host: None,
             }),
         ),
         request(7, Message::SeatRead(SeatRead { seat: seat() })),

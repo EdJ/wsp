@@ -754,7 +754,12 @@ pub(crate) fn list(shared: &Shared, asker: Asker) {
         let (rss_bytes, shells) = measure(&ps, l.pid);
         seats.push(SeatRow { seat: l.seat, epoch: l.epoch, state, rss_bytes, shells, last_turn: l.last_turn, last_word: l.last_word });
     }
-    asker.send(Message::SeatsList(SeatsList { seats }));
+    // The host's facts, as the last beat read them: one reply carries both.
+    let host = match shared.last_beat.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|f| &f.msg) {
+        Some(Message::Beat(b)) => b.host.clone(),
+        _ => None,
+    };
+    asker.send(Message::SeatsList(SeatsList { seats, host }));
 }
 
 pub(crate) fn read(shared: &Shared, asker: Asker, r: SeatRead) {

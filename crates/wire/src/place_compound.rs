@@ -694,6 +694,15 @@ impl Compound<'_> {
         }
     }
 
+    /// A seat as a census row: wsp's record of it, in the state its host's
+    /// manager reported. Files only, no `ps` and no render: what `wip` reads
+    /// under `WSP_HOST=manager` (`docs/agent-manager.md` 4.3), where the state
+    /// is the manager's and not this backend's survey.
+    pub fn seated_as(&self, seat: &Seat, state: State) -> Seated {
+        let rec = self.record(seat).unwrap_or(json!({}));
+        self.seated(seat, &rec, state)
+    }
+
     fn survey(&self) -> Vec<Seated> {
         let seats: Vec<(Seat, Value)> = self
             .ids()
