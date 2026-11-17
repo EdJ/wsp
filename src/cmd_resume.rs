@@ -1,8 +1,8 @@
 //! `wsp resume` — offer back the agents a restart interrupted, and put the
 //! chosen ones on the thread they were on.
 //!
-//! `robustness-060` made a session *recordable*: a binding carries the id herdr
-//! reports as `agent_session.value`, which is Claude Code's `sessionId`, and
+//! `robustness-060` made a session *recordable*: a binding carries the agent's
+//! session id, which is Claude Code's `sessionId`, and
 //! `cmd_agent::learn_sessions` keeps it true. This is the other half — the
 //! reader and the verb — plus the thing 060 could not have known it was
 //! missing, and the two boundaries a person set once it existed.
@@ -24,64 +24,19 @@
 //! is now [`crate::cmd_govern::learn_seats`], beside the one for bindings and
 //! following the same two rules; this file is what reads either of them.
 //!
-//! # What is resumable, and it is not "everything wsp has ever seen"
+//! # One id a person names, and nothing else
 //!
-//! Ed, 2026-08-18: *"only resume an agent if the user asks for it, or if it was
-//! ACTIVE at the moment of the restart"* — and active means **it was in the
-//! agents section of the panel**, which is to say the census a person was
-//! actually looking at.
+//! There used to be a second door: a batch offer of every agent the last
+//! census held, put up unasked when the daemon started after a restart. That
+//! census was the runner's, the runner went with `wsp-120`, and the offer had
+//! been empty since — so it is gone, and `wsp resume` takes an id. Nothing is
+//! resumed without being asked for, and what a person names may reach further
+//! back than any census did: see [`Source`].
 //!
-//! So the list comes from [`Store::roster`]: one row per running agent, written
-//! by `sync` on the same tick that feeds the panel and overwritten whole every
-//! time. What that buys is a boundary nothing else can draw. The event log
-//! holds every session ever learned — 134 of them on the machine this was
-//! written on — and a startup that walked it would open dozens of workspaces
-//! nobody asked for; the roster holds the twelve that were up. An agent that
-//! ended before the restart is *not* in the last census, and an agent that
-//! ended is not one a restart interrupted.
-//!
-//! **A crash is the case that decides the shape.** Nothing is written at
-//! shutdown, because a machine that is going down cannot be relied on to run
-//! anything: the roster is rewritten on every tick while things are *normal*,
-//! so the newest one is at worst a tick old whether herdr exited cleanly, was
-//! killed, or took the power with it. A file written on the way out would be
-//! exactly the file missing after the failures worth recovering from.
-//!
-//! One id a person names is the other door, and it may reach further: see
-//! [`Source`]. A list is never built that way.
-//!
-//! # And the snapshot is checked again before it is acted on
-//!
-//! The census being a snapshot is right. Treating the *offer* built from it as
-//! still true is not, and `render-077` is what that cost: a picker left open
-//! across a rebuild re-spawned two agents onto work that had landed, been
-//! reviewed and been cleaned up. Every row is therefore re-checked at the
-//! moment it is answered rather than at the moment it is drawn — [`Stale`] —
-//! and a row that no longer holds is refused with its reason rather than
-//! dropped. The rule generalises past this file: anything holding a roster of
-//! "who was live" has the same problem, and the answer is always the second
-//! lookup rather than a fresher snapshot.
-//!
-//! # Nothing is resumed without being asked for
-//!
-//! Ed, same day: *"it is not automatic: on load, ask the user."* The daemon
-//! does not bring anything back. What it does at startup is put the question
-//! where whoever is there will find it — [`ask_on_startup`] — and the question
-//! is a list with a box on each row, because "resume everything" and "resume
-//! nothing" are both wrong answers most mornings: a governor is usually worth
-//! having back and a task agent that was halfway through something you have
-//! since decided against is not.
-//!
-//! **Found, not forced.** The question opens unfocused and raises a hand on
-//! each row instead of taking the screen; [`ask_on_startup`] carries what the
-//! old behaviour cost, and it is not a small story.
-//!
-//! And it is asked about a smaller set than it used to be. Herdr 0.8.0 resumes
-//! agents itself where its own integration recorded a session, so the case this
-//! path was written for has shrunk to exactly the agents herdr could *not*
-//! bring back. [`resumable`] is where that line is drawn, and drawing it wrong
-//! is worse than the original fault: an offer to resume an agent already back
-//! on screen is a stolen screen for a question with no content.
+//! Every answer is re-checked at the moment it is acted on rather than trusted
+//! from when it was read — [`Stale`], and `render-077` is what the difference
+//! cost: a picker left open across a rebuild re-spawned two agents onto work
+//! that had landed, been reviewed and been cleaned up.
 //!
 //! # How far back a resume reaches, for one id a person names
 //!
@@ -116,48 +71,14 @@
 //!
 //! # What "brought back" means on `compound` (`compound-122`)
 //!
-//! Everything above was written for herdr, where the event is one thing: herdr
-//! restarts, restores every workspace it drew, and kills every agent that was
-//! in them (`robustness-053`). One restart, one moment, one census of what to
-//! offer back — which is exactly what [`resumable`] and [`ask_on_startup`]
-//! are: a read of `sync`'s roster, itself nothing but a projection of the
-//! store into *herdr's own sidebar tokens* (see that module's own first
-//! line). Neither reaches past herdr's panes, on purpose, and neither should
-//! be widened to.
-//!
-//! **A compound-hosted session does not have that event.** `place_compound`'s
-//! own docs are the reason: `compound-sup` daemonizes with `setsid()` and
-//! keeps a seat's agent running "whether or not anything is attached to it".
-//! The host — wsp's own window, or herdr's, whichever spawned it — can close,
-//! restart, or crash, and the seat is untouched, because it was never the
-//! thing holding the agent up. So the herdr question — "what was running
-//! before the thing hosting it went away" — has no compound answer, because
-//! closing the host is not an event a compound seat survives *badly*; it is
-//! one it does not notice.
-//!
-//! The event that does end a compound seat is narrower: `compound-sup`
-//! itself being killed — a crash, a `kill -9`, the machine going down — which
-//! takes the pty and the agent under it with it. That is the only thing on
-//! compound this verb is for, and it is reached the one way this file already
-//! reaches anything durable: **by name.** `wsp resume <task>` /
-//! `wsp resume <project>` reads the claim or the governor record — backend-
-//! agnostic, written by whichever backend ran the agent — rather than
-//! herdr's roster, and [`bring_back`] has started an agent on whichever
-//! backend it is given since `compound-076`. So a compound seat killed this
-//! way is found and restarted exactly the way a herdr one is, through the
-//! door that was never herdr's to begin with.
-//!
-//! **What stays out of scope, and why it is not this row's gap to close:**
-//! the *batch* offer — `wsp resume` with no id, and the one [`ask_on_startup`]
-//! puts up unasked — stays herdr-only. There is no single moment analogous to
-//! "herdr just restarted" that a compound machine's daemon start can key off:
-//! compound-sup processes are independent of wsp's own restart and of each
-//! other, so there is no one roster of "what a restart just interrupted" to
-//! read back, and inventing one — polling every seat's liveness on every
-//! daemon start to guess what might have died since — would be answering a
-//! question this backend does not ask in the shape herdr asks it. A smaller,
-//! correct verb: named resume reaches compound; the unprompted offer does
-//! not, and is not supposed to.
+//! A compound-hosted session survives its host closing: `compound-sup`
+//! daemonizes with `setsid()` and keeps a seat's agent running whether or not
+//! anything is attached to it. The event that does end a compound seat is
+//! `compound-sup` itself being killed — a crash, a `kill -9`, the machine going
+//! down — which takes the pty and the agent under it with it. That is reached
+//! **by name**: `wsp resume <task>` / `wsp resume <project>` reads the claim or
+//! the governor record, written by whichever backend ran the agent, and
+//! [`bring_back`] starts it on whichever backend it is given (`compound-076`).
 
 use std::io::{Read, Write};
 
@@ -227,7 +148,7 @@ pub struct Thread {
 
 impl Thread {
     /// The line a person can run by hand, which is the whole of the recovery
-    /// path when herdr itself is what is broken. Printed by `--print` and by
+    /// path when the backend itself is what is broken. Printed by `--print` and by
     /// every refusal below, because a verb that cannot do it should still say
     /// how.
     ///
@@ -278,40 +199,6 @@ fn text(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
-// ---- the list a restart offers back ---------------------------------------
-
-/// What that census holds that herdr is not answering for — the offer, in the
-/// order it was drawn.
-///
-/// **`pane.list` rather than `agent.list`, and that is the whole of the fix in
-/// this file.** Herdr resumes agents itself now, and a restart is precisely the
-/// moment when what herdr *will* run is not yet running: `persist::restore`
-/// hangs the snapshot's `agent_session` on the restored pane and arms a resume
-/// plan that fires seconds later, when the pane first gets a rect. Asked at
-/// daemon start — which is where [`ask_on_startup`] asks — `agent.list` reads
-/// every one of those as gone, and the offer becomes a stolen screen for a
-/// question with no content, which is worse than the fault the offer was
-/// written for.
-///
-/// `pane.list` reports the same `agent_session`, from the same terminal record,
-/// and it is set on restore *before the process exists*. So it answers "what
-/// herdr holds" rather than "what is running", and the two differ by exactly
-/// the panes herdr is in the middle of bringing back. What survives the filter
-/// is what herdr could not resume — the agents whose session herdr's own
-/// integration never reported — which is the set this question is now about.
-///
-/// The named door is unaffected: `wsp resume <id>` never comes through here, so
-/// a person who wants a second copy can still say so.
-///
-/// An unreachable herdr answers nothing rather than everything: with no listing
-/// there is no evidence any of these agents is gone, and offering to resume a
-/// machine's worth of live sessions is the one failure this list must not have.
-pub fn resumable(_store: &Store) -> Vec<Thread> {
-    // The listing that said which sessions were already held was herdr's, and
-    // with herdr gone there is none: nothing is offered.
-    Vec::new()
-}
-
 // ---- what is no longer true -----------------------------------------------
 
 /// Why a row that was true at the restart is not true now.
@@ -322,7 +209,7 @@ pub fn resumable(_store: &Store) -> Vec<Thread> {
 /// between the two agents finish, tasks move to `review` and worktrees are
 /// removed. The longer the picker sits, the more of it is false.
 ///
-/// `render-077`, on a picker left open across a herdr rebuild: by the time it
+/// `render-077`, on a picker left open across a rebuild: by the time it
 /// was answered the two agents it offered had landed, been reviewed and been
 /// cleaned up. Answering it re-spawned both onto finished work, dragged their
 /// tasks back from `review` to `doing`, and both came up stuck on Claude Code's
@@ -590,12 +477,6 @@ pub fn thread_for_seat(store: &Store, project: &str) -> Option<Thread> {
 /// makes `wsp resume wsp` the sentence a person means: the thing worth bringing
 /// back by the name of a project is the agent that was custodian of it.
 fn thread_for(store: &Store, needle: &str) -> Result<Thread, String> {
-    // The census first, and only for an exact name: what a person means by an
-    // id they can see on the offered list is that row, with its kind and its
-    // cwd, rather than a second reading of the same agent through the store.
-    if let Some(t) = resumable(store).into_iter().find(|t| t.what == needle) {
-        return Ok(t);
-    }
     if let Some(t) = store.find_task(needle) {
         return thread_for_task(store, &t.id)
             .ok_or_else(|| format!("no session recorded against {} — nothing to resume", t.id));
@@ -613,9 +494,9 @@ fn thread_for(store: &Store, needle: &str) -> Result<Thread, String> {
 
 /// Where to start the agent: back in the room it was in, or a new one.
 ///
-/// **Back in the room wherever there is one.** herdr restores workspaces and
-/// their layouts across a restart and kills every agent in them
-/// (`robustness-053`), so the signature of the case this exists for is a
+/// **Back in the room wherever there is one.** A host that restores its
+/// workspaces across a restart and kills every agent in them
+/// (`robustness-053`) leaves the signature of the case this exists for: a
 /// workspace that is still there with nothing running in it. Opening a second
 /// workspace for that would leave a person with two rooms called
 /// `governor · wsp`, one of them empty, and the seat record pointing at
@@ -627,10 +508,10 @@ fn thread_for(store: &Store, needle: &str) -> Result<Thread, String> {
 /// **Except for a kind that needs an environment, and that is the half
 /// `core-038` found by driving.** A seat wsp did not open cannot be given one:
 /// `agent.start` takes `pane_id`, `kind`, `name`, `args` and a timeout and no
-/// environment at all (herdr protocol 19), and the only calls that carry `env`
+/// environment at all, and the only calls that carry `env`
 /// are the ones that make a new shell — `workspace.create` and `pane.split`.
 /// So whatever the restored pane's shell has is what the agent gets, and
-/// measured 2026-08-22 against a sandbox herdr stopped and started again, what
+/// measured 2026-08-22 against a sandbox host stopped and started again, what
 /// it has is the *server's* environment: the pane came back with the same id
 /// and the same cwd and `OPENCODE_CONFIG_CONTENT` unset. That is precisely the
 /// case this function exists for, so for opencode the tidy answer and the
@@ -758,11 +639,10 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
             // that no longer exists would make the verb unusable exactly when
             // it is needed.
             //
-            // And with where the seat is, for `spawn`'s reason (`wsp-142`): a
-            // seat herdr does not draw is not on herdr's list, and the claim
-            // would otherwise record no room and this process's directory. The
-            // tree only where this opened the seat in it — a seat stood in
-            // already is on herdr's list, which knows better than the thread.
+            // And with where the seat is, for `spawn`'s reason (`wsp-142`): the
+            // claim would otherwise record no room and this process's
+            // directory. The tree only where this opened the seat in it — a
+            // seat stood in already knows its own room better than the thread.
             let room = place.room(&seat);
             let mut flags = vec![("pane", seat.as_str()), ("force", "true"), ("kind", kind.as_str())];
             if let Some(r) = &room {
@@ -1014,7 +894,10 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
                 return 2;
             }
         },
-        None => resumable(store),
+        None => {
+            eprintln!("wsp: resume needs a task or a project to bring back — `wsp resume <id>`");
+            return 2;
+        }
     };
 
     if threads.is_empty() {
@@ -1096,16 +979,15 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
 
     let mut failed = 0;
     let (mut resumed, mut refused) = (0, 0);
-    // `cmd_spawn::backend(args)`, not a bare `Herdr::new()` — `compound-076`.
-    // `bring_back` used to hardcode herdr because herdr was the only place an
-    // agent could BE; `compound-064` made that false, and a `compound`-hosted
+    // `cmd_spawn::backend(args)`, not a hardcoded backend — `compound-076`.
+    // `bring_back` used to hardcode the one place an agent could BE; `compound-064` made that false, and a `compound`-hosted
     // session still could not be resumed through this command at all until
     // this line asked the same question `spawn` and `stamp` already ask.
     for r in &chosen {
         let t = &r.thread;
         if !t.here() {
             // Not a failure and not attempted. The id is another machine's, the
-            // tunnel is for herdr rather than for the agent's own runtime, and
+            // tunnel is for wsp rather than for the agent's own runtime, and
             // the honest answer is the line to run over there.
             println!("{} is on {} — {}", p.bold(&t.what), t.host, t.by_hand_says());
             continue;
@@ -1202,55 +1084,6 @@ fn as_json(r: &Row) -> Value {
 /// exactly where it is. A one-line constant is the whole of that guarantee.
 const HAND: &str = "its agent did not come back after the restart";
 
-/// Raise a hand on every offered row that names a task.
-///
-/// The question is in a workspace nobody is looking at, on purpose (see
-/// [`ask_on_startup`]), so something has to point at it — and the panel is
-/// already drawn in every workspace and already pins flags at its foot. A row
-/// per agent rather than one notice, because that is what a person acts on: the
-/// task whose agent is missing, with the door on it.
-///
-/// **Never twice for the same restart, and never a word about anybody else's
-/// hand.** This used to be a stronger claim than it needed to be: a flag was one
-/// record per task and `set_flag` replaced it, so raising here at all risked
-/// clobbering an agent's own question with a restart notice — and the guard was
-/// therefore *raise nothing if anything is up*. `worklist-017` removed the
-/// hazard: a hand is a message with an id of its own and there is nothing left
-/// to overwrite, so the guard narrows to what it was always about, which is
-/// idempotence. A daemon that starts twice puts up one notice, and an agent's
-/// own question standing beside it is two hands rather than one lost.
-///
-/// A seat gets no hand, because a custodian holds no task and there is no row
-/// to raise one on. The workspace label and the daemon's own line are what that
-/// case has, and it is named in the note on `fork-016`.
-fn raise_hands(store: &Store, waiting: &[Thread]) {
-    for t in waiting {
-        let Some(task) = &t.task else { continue };
-        if ours(store, task).is_some() {
-            continue;
-        }
-        // `wsp` and not a pane, because this is the one raised hand on the
-        // machine that no agent put up: the daemon noticed a restart and said
-        // so. A byline naming a pane that no longer exists would be worse than
-        // none, and `Party::Human` would read as Ed having typed it.
-        let mut m = crate::message::Message::new(
-            crate::message::Party::Agent("wsp".into()),
-            crate::message::Kind::Note,
-            &crate::message::compose(
-                HAND,
-                "",
-                &format!("`wsp resume {task}` brings it back on the thread it was on."),
-            ),
-        );
-        m.about = crate::message::About::Task(task.clone());
-        // The same record and the same event `wsp flag` writes, because the
-        // seam is the same one: `~/wsp/hooks/on-message-raised` is how a
-        // restart that lost four agents becomes a desktop notification rather
-        // than a line in a log.
-        let _ = crate::message::raise(store, &m);
-    }
-}
-
 /// The restart notice this file put up on one task, if it is still up.
 ///
 /// Recognised by its sentence, which is what [`HAND`] is for: a hand an agent
@@ -1296,51 +1129,6 @@ fn lower_hand(store: &Store, task: &str) {
     }
 }
 
-/// Put the question where whoever is there will find it when herdr comes up.
-///
-/// Called once from the daemon's start, beside the `reconcile` that rebuilds
-/// bindings from claims and for the same reason: herdr has just restored its
-/// workspaces and killed every agent that was in them, and this is the one
-/// moment both facts are true.
-///
-/// **It starts no agent.** What it opens is one terminal running `wsp resume`,
-/// which is the picker above — so the answer comes from a person looking at a
-/// list of what they had, and the failure mode of this whole feature is a
-/// window nobody wanted rather than a machine full of agents nobody asked for.
-///
-/// # It does not take the screen, and this is the reason
-///
-/// It used to, deliberately, and the doc line said why: *"a question behind
-/// another window is not one."* That argument was written when wsp had nowhere
-/// else to ask. What it cost, on 2026-08-18 and traced on `fork-003`: the new
-/// workspace took the screen **and the keyboard**, the two characters Ed had
-/// already typed (`nc`) landed in its shell, and the `pane.send_text` below
-/// appended `wsp resume\n` to the same line. The pane held `ncwsp resume` and
-/// `zsh: command not found: ncwsp`, and it cost this project a false accusation
-/// against a governor before the call site was found.
-///
-/// So: **`show: false`, and `exec` rather than typing at a prompt.** Unfocused
-/// is what stops another window's keystrokes arriving here at all; `exec` is
-/// what stops a prompt that already has characters in it from fusing with this
-/// one, and it makes the command *be* the pane — answering the question closes
-/// it, with no shell left behind to close twice. `panel/verbs.rs` opens its
-/// full-tree tab exactly this way.
-///
-/// And the question is still a question, because two things point at it: the
-/// workspace is labelled with the count, which herdr draws in its own chrome,
-/// and [`raise_hands`] puts a flag on each task, which the panel pins at its
-/// foot in every workspace. A hand raised on the row is a better question than
-/// a window in front of the face, and it does not land two keystrokes in a
-/// shell.
-///
-/// Silent when the last census is empty, which is every daemon start that is
-/// not following a restart — and, since `resumable` started reading `pane.list`,
-/// silent on every restart herdr resumed everything from.
-pub fn ask_on_startup(store: &Store) -> usize {
-    let _ = store;
-    0
-}
-
 /// The verbs this module answers to, each with the help it carries. `main` and
 /// the help text are assembled from these; nothing in `main.rs` names them.
 pub const VERBS: &[crate::verbs::Verb] = &[
@@ -1351,12 +1139,10 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
                 order: 310,
-                text: r##"  wsp resume [<id>] [--print]       the agents that were running before herdr
-                                    restarted, offered back one row at a time:
-                                    ␣ to pick, ↵ to bring those back on the
-                                    session they were on. With an id, that one —
-                                    which may reach further back than the last
-                                    census. --print says how to do it by hand"##,
+                text: r##"  wsp resume <id> [--print]         bring the agent on a task, or a project's
+                                    seat, back on the session it was on — which
+                                    may reach further back than the last census.
+                                    --print says how to do it by hand"##,
             },
         ],
     },
@@ -1548,7 +1334,7 @@ mod tests {
 
     /// An agent re-taking the seat it already holds keeps its thread. The
     /// window this closes is small and fatal: `wsp resume` itself calls `take`,
-    /// and a herdr restart inside it would lose the seat for good.
+    /// and a restart inside it would lose the seat for good.
     #[test]
     fn re_taking_the_same_seat_does_not_erase_its_session() {
         let (_env, store) = store("resume-retake");
@@ -1675,25 +1461,12 @@ mod tests {
         assert_eq!((t.kind.as_str(), t.from), ("opencode", Source::Record));
     }
 
-    /// `compound-122`: what the named door reaches that the batch offer
-    /// cannot, and the reason the two differ.
-    ///
-    /// `resumable` is herdr's own roster, filtered by herdr's own panes — it
-    /// exists because herdr restarting kills every agent in the workspaces it
-    /// restores, and `sync` is the projection that feeds herdr's sidebar in
-    /// the first place (see that module's own doc line one). A compound seat
-    /// is never in it, and every test in this file runs against a herdr that
-    /// answers nothing at all (`crate::util::isolated`), which is this
-    /// machine's honest state once `compound-112` made compound the default:
-    /// no herdr, so an empty roster and an empty offer, correctly.
-    ///
-    /// `wsp resume <task>` does not go through that roster. It reads the
-    /// claim — the durable record `bring_back` and every backend already
-    /// share — so a task never offered because no herdr ever held it is still
-    /// found by name, and `compound-076`'s threaded backend still starts it.
-    /// Nothing here asks herdr anything, which is the whole of the answer.
+    /// `compound-122`: `wsp resume <task>` reads the claim — the durable
+    /// record `bring_back` and every backend already share — so a task no
+    /// census ever held is found by name, and `compound-076`'s threaded
+    /// backend still starts it.
     #[test]
-    fn a_task_named_directly_is_found_though_the_batch_offer_never_held_it() {
+    fn a_task_named_directly_is_found_though_no_census_held_it() {
         let (_env, store) = store("resume-compound-task");
         task_at(&store, "cpd-001", Status::Doing);
         store.set_claim(
@@ -1705,13 +1478,9 @@ mod tests {
                 "host": util::hostname(),
             }),
         );
-        assert!(
-            resumable(&store).is_empty(),
-            "herdr never held this session, so it is not on the batch offer"
-        );
         let t = thread_for(&store, "cpd-001").expect("the claim finds it anyway");
         assert_eq!(t.session, "ses-1");
-        assert!(t.workspace.is_empty(), "no herdr workspace was ever recorded for it");
+        assert!(t.workspace.is_empty(), "no workspace was ever recorded for it");
 
         let place = Opens(std::cell::RefCell::new(Vec::new()));
         let seat = bring_back(&store, &place, cmd_spawn::Chosen::Compound, &t).expect("it starts on whatever place it is given");
@@ -1788,8 +1557,8 @@ mod tests {
     }
 
     /// The copy that outlives the tick, and the two ways a row leaves it. The
-    /// ordering this protects is the daemon's: `sync` empties the roster one
-    /// second after herdr comes up, so an offer read from the roster alone
+    /// ordering this protects is the daemon's: the roster is rewritten whole
+    /// on the next tick, so an offer read from the roster alone
     /// would be gone before anybody looked at it.
     #[test]
     fn the_held_census_survives_the_roster_being_overwritten() {

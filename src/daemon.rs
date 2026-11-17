@@ -5,12 +5,8 @@
 //! the argument for how a second one is turned away is under *one daemon per
 //! store* below.
 //!
-//! **It speaks to compound and to nothing of herdr's** (`wsp-544`). It used to
-//! subscribe to herdr's events, sync herdr's sidebar tokens every tick and
-//! subscribe to every far machine's herdr; none of those had a socket at the
-//! far end since `compound-112`, and the sync's failure was a `daemon.log` line
-//! every tick — 11,020 of them. The inventory is on `wsp-544`. Nothing wakes it
-//! early now: every pass below runs on its own interval, off a [`TICK`].
+//! **It speaks to compound and nothing else** (`wsp-544`, `wsp-120`). Nothing
+//! wakes it early: every pass below runs on its own interval, off a [`TICK`].
 //!
 //! It carries one passenger, and being the only long-lived process is the whole
 //! qualification for it: [`crate::attention`] derives what is wrong on this
@@ -102,106 +98,26 @@ fn reaper_off() -> bool {
 
 /// Is there nothing at all for the daemon to run for?
 ///
-/// Read this before touching the herdr-only gate it replaces: the gate used
-/// to be `!herdr::available()`, which refused every start on the ordinary
-/// machine since `compound-112` made compound the default backend and took
-/// herdr off it. `cmd_spawn::local_backends()` is the fold every other
-/// reader — `wip`, `tell`, `census` — already uses instead of asking herdr
-/// alone, and a machine with compound and no herdr has a backend: `Compound`
-/// surveys a local directory and never fails to answer it, herdr or no. So
-/// this is `true` only when literally nothing does — every backend's
-/// [`crate::place::Place::census`] came back `Err` — which in practice means
-/// the process list or the compound state directory itself could not be
-/// read, not "no herdr socket".
-///
-///
-/// The daemon no longer asks herdr anything else either (`wsp-544`): the
-/// herdr sync, its event subscriptions and the start-up reconcile were all
-/// taken out, so a compound-only machine is the whole of what it runs on.
+/// `place::local_backends()` is the fold every other reader — `wip`, `tell`,
+/// `census` — uses, and `Compound` surveys a local directory and never fails
+/// to answer it. So this is `true` only when literally nothing does — every
+/// backend's [`crate::place::Place::census`] came back `Err` — which in
+/// practice means the process list or the compound state directory itself
+/// could not be read.
 fn nothing_answered(backend_ok: &[bool]) -> bool {
     backend_ok.iter().all(|ok| !ok)
-}
-
-/// Why this daemon must not run: it is pointed at a herdr that is not the
-/// machine's, and at a store nobody named.
-///
-/// The third defence in robustness-021, and the one that holds when the other two
-/// are got right and something starts a daemon anyway. A herdr session server
-/// starts every enabled plugin's `[[startup]]` command — `plugins.json` is
-/// global, not per session — with its own environment. So a sandbox whose
-/// server was started carelessly gets a daemon holding *its* socket and the
-/// *live* store, and the first thing a daemon does is sync: `herdr::panes()`
-/// answers with nothing, and `reap_bindings` takes every binding in the real
-/// store with it. One line of environment between a test instance and everyone
-/// else's claims.
-///
-/// The rule is narrow on purpose. A daemon on the default socket is the
-/// ordinary one and is never refused, whatever its store. Only a daemon that is
-/// somewhere else has to say which store it is for — and it has to say *both*
-/// halves, because `WSP_HOME` alone leaves state at `~/.local/state/wsp`, which
-/// is where bindings and claims actually live (robustness-011).
-///
-/// # The socket decides, and `HERDR_SESSION` deliberately does not
-///
-/// There are two signals for "this is not the machine's herdr" and only one of
-/// them is ours. The socket path is a fact wsp can observe: this is where I am
-/// pointed, that is where the default is, they differ. `HERDR_SESSION` is
-/// herdr's own vocabulary — herdr calls the main session `default`, and if a
-/// server ever exported `HERDR_SESSION=default` to its `[[startup]]` plugins,
-/// a predicate that read it would refuse the *real* daemon on every herdr
-/// restart, and nobody would notice until claims stopped syncing. It does not
-/// today: neither the live daemon nor any live pane carries the variable, while
-/// a `--session` pane does.
-///
-/// So it stays in the message, where `herdr session `wsp-w1`` beats a path for
-/// telling you what you are looking at, and out of the predicate. The general
-/// rule, which is the argument of robustness-017: given two signals for the same
-/// question, prefer the one that survives the backend changing. Anything that
-/// is herdr's naming convention rather than an observable fact is something
-/// herdr can change without telling us, and something a different backend would
-/// not have at all — so the next person reading this should not re-add the
-/// session check as an obvious improvement.
-fn misdirected(
-    session: Option<&str>,
-    socket: Option<&str>,
-    home: Option<&str>,
-    state: Option<&str>,
-) -> Option<String> {
-    let default_socket = crate::util::home().join(".config/herdr/herdr.sock");
-    let elsewhere = socket
-        .map(|s| !s.trim().is_empty() && std::path::Path::new(s) != default_socket)
-        .unwrap_or(false);
-    if !elsewhere {
-        return None;
-    }
-    let told = |v: Option<&str>| v.map(|s| !s.trim().is_empty()).unwrap_or(false);
-    if told(home) && told(state) {
-        return None;
-    }
-    let which = match session {
-        Some(s) if !s.trim().is_empty() => format!("herdr session `{}`", s.trim()),
-        _ => format!("the herdr at {}", socket.unwrap_or("")),
-    };
-    Some(format!(
-        "refusing to run against {}: it is not this machine's herdr, and no WSP_HOME/WSP_STATE says which store it is for.\n\
-         wsp: a daemon started by another herdr would run the cycle and the repairs on the live store.\n\
-         wsp: set both, or start the session with `wsp sandbox`, which does.",
-        which
-    ))
 }
 
 // ---- one daemon per store ---------------------------------------------------
 //
 // Two of these ran for forty-two hours and nothing noticed (t-260817-052). One
-// was started by hand on the 15th with `-v`, survived herdr's death still
-// retrying its socket, and was still there when herdr came back and its
-// `[[startup]]` hook started a second. So the trigger is not carelessness: it is
-// any crash or restart, and the hand-started daemon that outlives the terminal
-// it was typed in is the ordinary way to get one.
+// was started by hand on the 15th with `-v`, outlived the session that started
+// it, and was still there when a startup hook started a second. So the trigger
+// is not carelessness: it is any crash or restart, and the hand-started daemon
+// that outlives the terminal it was typed in is the ordinary way to get one.
 //
-// Both then do everything twice against one store and one herdr: push tokens,
-// refresh TTLs, and reap. `sync` reaps bindings against the pane list herdr
-// answers with, and render-040 is the record of what one wrong reap costs.
+// Both then do everything twice against one store: refresh TTLs, run the
+// cycle, and repair. render-040 is the record of what one wrong reap costs.
 // The loser of any race is silent, which is why forty-two hours passed.
 //
 // # Refuse, not take over
@@ -212,8 +128,6 @@ fn misdirected(
 // *verified live* daemon on this store, and for that one there is no scenario
 // where the newcomer is the more correct process:
 //
-// - A newcomer pointed at the wrong herdr or an unnamed store is already
-//   refused, earlier and for a sharper reason — see `misdirected`.
 // - An incumbent running old code already replaces itself; see `reload`.
 //
 // What taking over would add is killing a working process on the strength of a
@@ -373,7 +287,7 @@ fn daemons(all: &[(u32, u32, String)], me: u32, state: &Path) -> Vec<u32> {
 ///
 /// Asked of the process list rather than of a marker wsp writes, because the
 /// fact wanted is "is one running now", and a file saying so outlives the
-/// process that wrote it — through a herdr that was killed, a crash, or a fork
+/// process that wrote it — through a crash, or a fork
 /// somebody has stopped running. There is nothing to go stale here.
 ///
 /// Ancestors are **not** excluded, and [`running`] no longer excludes them
@@ -395,13 +309,9 @@ pub(crate) fn surface_drawing(state: &Path) -> bool {
 /// The gate on [`loud`], and one function rather than four ad-hoc readings of
 /// "is this machine doing anything".
 ///
-/// It used to be `herdr`'s own census, which was the right question on a
-/// machine where herdr was the only backend and the wrong one here: this
-/// machine runs compound, herdr is not on it, and `doctor` therefore said
-/// nothing about a daemon that had been gone for a week while `wip`, a brief's
-/// seat line and `wsp watch --status` all said it loudly. One predicate, four
-/// call sites — and four call sites that had drifted into three answers is the
-/// failure the doc on [`loud`] claims not to have.
+/// It is asked of every local backend: one predicate, four call sites — and
+/// four call sites that had drifted into three answers is the failure the doc
+/// on [`loud`] claims not to have.
 pub(crate) fn a_backend_answered() -> bool {
     crate::place::local_backends().iter().any(|b| b.census().is_ok())
 }
@@ -409,7 +319,7 @@ pub(crate) fn a_backend_answered() -> bool {
 /// The one sentence four surfaces show when this machine has no daemon.
 ///
 /// **`wsp-145`, and why it is a function and not a paragraph.** The daemon was
-/// started by herdr's `[[startup]]` and herdr stopped being on this machine, so
+/// started by a startup hook that stopped being on this machine, so
 /// nothing was starting it — and the one surface that *did* notice was
 /// `wsp doctor`, which nobody runs unless something is already wrong. For six
 /// days the symptom was silence from a watchdog, and `wsp watch --status` said
@@ -432,7 +342,7 @@ pub(crate) fn a_backend_answered() -> bool {
 /// `None` for `running` says nothing, for [`health`]'s reason: a `ps` that will
 /// not answer is not an empty machine, and "no daemon running" would send
 /// somebody to start a second one. `backend_up` is `health`'s own gate — a
-/// machine with no herdr and nothing to spawn onto wants no daemon, and is told
+/// machine with nothing to spawn onto wants no daemon, and is told
 /// nothing.
 pub(crate) fn loud(running: Option<&[u32]>, backend_up: bool) -> Option<String> {
     match running {
@@ -458,7 +368,7 @@ pub(crate) fn loud(running: Option<&[u32]>, backend_up: bool) -> Option<String> 
 pub(crate) fn health(
     holder: Option<u32>,
     running: Option<&[u32]>,
-    herdr_up: bool,
+    backend_up: bool,
     problems: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
@@ -473,7 +383,7 @@ pub(crate) fn health(
             // a person who is told it in one place and finds it missing in the
             // next is not being given two truths, and `wsp-145` is not paid for
             // four times in wording.
-            notes.extend(loud(Some(running), herdr_up));
+            notes.extend(loud(Some(running), backend_up));
         }
         [one] => match holder == Some(*one) {
             true => notes.push(format!("daemon up, pid {one}")),
@@ -570,15 +480,6 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // Before anything is spawned: a child here already is one the image before
     // an `exec`-reload started, whose reaping thread the exec ended (wsp-667).
     adopt_carried_over(store);
-    if let Some(why) = misdirected(
-        std::env::var("HERDR_SESSION").ok().as_deref(),
-        std::env::var("HERDR_SOCKET_PATH").ok().as_deref(),
-        std::env::var("WSP_HOME").ok().as_deref(),
-        std::env::var("WSP_STATE").ok().as_deref(),
-    ) {
-        eprintln!("wsp: {why}");
-        return 2;
-    }
     let backend_ok: Vec<bool> =
         crate::place::local_backends().iter().map(|b| b.census().is_ok()).collect();
     if nothing_answered(&backend_ok) {
@@ -586,7 +487,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         return 1;
     }
 
-    // Third gate, and after the other two on purpose: a daemon that is going to
+    // Second gate, and after the first on purpose: a daemon that is going to
     // refuse for a sharper reason should never have written itself into the
     // marker, and one with nothing at all to run for is not the daemon this
     // store wants to be holding it.
@@ -647,9 +548,8 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // us. See `reload` at the top of the loop.
     let mut started_as = crate::util::exe_stamp();
 
-    // Claims and worked records for tasks that no longer exist. Store-only:
-    // the herdr reconcile that used to run beside this was dead on a machine
-    // with no herdr (`wsp-544`).
+    // Claims and worked records for tasks that no longer exist. Store-only
+    // (`wsp-544`).
     let live: Vec<String> = store.tasks().into_iter().map(|t| t.id).collect();
     let dropped = store.reap_claims(&live) + store.reap_worked(&live);
     if verbose && dropped > 0 {
@@ -891,91 +791,21 @@ mod tests {
 
     use super::*;
 
-    /// The gate this replaces refused every start with no herdr socket, which
-    /// since `compound-112` is the ordinary machine. One backend answering —
+    /// One backend answering —
     /// compound's local directory, which never fails to survey — is enough to
     /// run for; only every backend failing is "nothing to run for".
     #[test]
     fn the_daemon_runs_if_any_local_backend_answers() {
-        assert!(!nothing_answered(&[true, false]), "herdr down, compound up, refused anyway");
+        assert!(!nothing_answered(&[true, false]), "one down, one up, refused anyway");
         assert!(!nothing_answered(&[false, true]), "order should not matter");
         assert!(!nothing_answered(&[true, true]));
         assert!(nothing_answered(&[false, false]), "nothing answering was let through");
         assert!(nothing_answered(&[]), "an empty backend list answered for nobody");
     }
 
-    /// The guard that would have stopped robustness-021 on its own.
-    ///
-    /// A `wsp daemon` was started by a sandbox's herdr from the global
-    /// `plugins.json`, holding that session's socket and — because nobody told
-    /// it otherwise — the live store. Its first sync asks an empty herdr for
-    /// panes and reaps every binding in the real store against the answer.
-    ///
-    /// Both halves of the store have to be named, not just `WSP_HOME`: state is
-    /// where bindings and claims live, and a scratch store with live state is
-    /// the same accident wearing a different hat (robustness-011).
-    #[test]
-    fn a_daemon_on_somebody_elses_herdr_must_be_told_which_store() {
-        // Built from this machine's home rather than a literal: the rule is
-        // "not the default socket", and a test that had to set `HOME` to say so
-        // would be a test no other test could run beside.
-        let home = crate::util::home();
-        let sock = home.join(".config/herdr/sessions/wsp-w1/herdr.sock").display().to_string();
-        let default = home.join(".config/herdr/herdr.sock").display().to_string();
-        let (sock, default) = (sock.as_str(), default.as_str());
-
-        // Exactly what was found running: a session socket and no store.
-        assert!(
-            misdirected(Some("wsp-w1"), Some(sock), None, None).is_some(),
-            "the daemon that reaps the live store would have started"
-        );
-        // Half-told is not told: state is where bindings and claims are.
-        assert!(misdirected(Some("wsp-w1"), Some(sock), Some("/tmp/s/wsp"), None).is_some());
-        assert!(misdirected(Some("wsp-w1"), Some(sock), None, Some("/tmp/s/state")).is_some());
-        // A sandbox that says which instance it is, is what this is for.
-        assert!(
-            misdirected(Some("wsp-w1"), Some(sock), Some("/tmp/s/wsp"), Some("/tmp/s/state"))
-                .is_none(),
-            "a properly made sandbox was refused its own daemon"
-        );
-
-        // The ordinary daemon is never refused, whatever its store — this
-        // machine's herdr is the one case where the default store is right.
-        assert!(misdirected(None, None, None, None).is_none());
-        assert!(misdirected(None, Some(default), None, None).is_none());
-        assert!(misdirected(Some(""), Some(""), None, None).is_none());
-        // …including a deliberate non-default store on the real socket, which
-        // is `WSP_HOME=… wsp daemon` and nobody's accident.
-        assert!(misdirected(None, Some(default), Some("/tmp/s/wsp"), None).is_none());
-
-        // A socket somewhere else with no session name is the same danger: the
-        // socket is what decides, and it is the half wsp can observe for itself.
-        assert!(misdirected(None, Some("/tmp/somewhere/herdr.sock"), None, None).is_some());
-
-        // …and a session name on the *default* socket is not, however it is
-        // spelled. herdr calls the main session `default`, so a server that one
-        // day exported `HERDR_SESSION` to its startup plugins would otherwise
-        // have this refuse the real daemon on every restart — a naming
-        // convention we do not own deciding whether the machine syncs.
-        for named in ["default", "wsp-w1", "anything at all"] {
-            assert!(
-                misdirected(Some(named), Some(default), None, None).is_none(),
-                "HERDR_SESSION={named} on this machine's own socket refused the ordinary daemon"
-            );
-            assert!(misdirected(Some(named), None, None, None).is_none());
-        }
-        // The name is still what the message leads with, because it is better
-        // diagnostics than a path.
-        assert!(
-            misdirected(Some("wsp-w1"), Some(sock), None, None)
-                .is_some_and(|m| m.contains("herdr session `wsp-w1`")),
-            "the refusal stopped saying which session it was about"
-        );
-    }
-
     /// The marker a crash leaves behind must never be the reason a machine has
-    /// no daemon. This is the case t-260817-052 says will happen most: herdr
-    /// died, its daemon did not, and the pid in the marker is not there any more
+    /// no daemon. This is the case t-260817-052 says will happen most: the
+    /// session died, its daemon did not, and the pid in the marker is not there any more
     /// — or, on the 15th's numbers coming round again, is something else
     /// entirely wearing that pid.
     #[test]
@@ -1002,7 +832,7 @@ mod tests {
     /// backend is up and which has no daemon, said out loud.
     ///
     /// Both exclusions are load-bearing rather than politeness. A machine with
-    /// no herdr and nothing to spawn onto does not need a daemon, and telling
+    /// nothing to spawn onto does not need a daemon, and telling
     /// it one is missing is a line in the most expensive output wsp has, on a
     /// machine where it is false. And a `ps` that would not answer is not an
     /// empty machine — `health` has always refused to read it that way, because
@@ -1017,8 +847,7 @@ mod tests {
 
     /// The one case that is a real contest, and the house answer to it. The
     /// incumbent is running and answering, so the newcomer is not more correct
-    /// than it: a newcomer on the wrong herdr was refused earlier by
-    /// `misdirected`, and an incumbent on an old binary replaces itself.
+    /// than it: an incumbent on an old binary replaces itself.
     #[test]
     fn a_second_daemon_on_a_store_a_live_one_holds_refuses_and_says_which_pid() {
         assert_eq!(claim(Some(22121), 88994, Some(&[22121])), Claim::Refuse(22121));
@@ -1057,7 +886,7 @@ mod tests {
         assert!(is_daemon("wsp daemon"));
         // Flags are somebody's business and not ours: `-v` is how the daemon
         // found on the 15th had been started.
-        assert!(is_daemon("/Users/e/.local/bin/wsp daemon -v HERDR_SESSION=default"));
+        assert!(is_daemon("/Users/e/.local/bin/wsp daemon -v WSP_HOME=/tmp/s"));
 
         assert!(!is_daemon("/Users/e/.local/bin/wsp panel PATH=/usr/bin"));
         assert!(!is_daemon("wsp"));
@@ -1114,9 +943,9 @@ mod tests {
     /// daemon has a problem.
     #[test]
     fn doctor_calls_two_daemons_a_problem_and_one_a_note() {
-        let check = |holder: Option<u32>, running: Option<&[u32]>, herdr_up: bool| {
+        let check = |holder: Option<u32>, running: Option<&[u32]>, backend_up: bool| {
             let (mut p, mut n) = (Vec::new(), Vec::new());
-            health(holder, running, herdr_up, &mut p, &mut n);
+            health(holder, running, backend_up, &mut p, &mut n);
             (p, n)
         };
 
@@ -1144,10 +973,10 @@ mod tests {
             assert_eq!(notes.len(), 1, "one daemon said more than one line about itself");
         }
 
-        // None, and whether that is worth saying. A machine with no herdr on it
-        // is a machine wsp works on and does not want a daemon for.
-        assert_eq!(check(None, Some(&[]), true).1.len(), 1, "a herdr with no daemon went unsaid");
-        assert!(check(None, Some(&[]), false).1.is_empty(), "a machine with no herdr was told to run a daemon");
+        // None, and whether that is worth saying. A machine with no backend on
+        // it is a machine wsp works on and does not want a daemon for.
+        assert_eq!(check(None, Some(&[]), true).1.len(), 1, "a backend with no daemon went unsaid");
+        assert!(check(None, Some(&[]), false).1.is_empty(), "a machine with no backend was told to run a daemon");
 
         // And the answer we do not have. `ps` refusing is not an empty machine.
         let (problems, notes) = check(Some(88994), None, true);

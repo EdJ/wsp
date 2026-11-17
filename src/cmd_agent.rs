@@ -1,5 +1,5 @@
 //! Agent binding, context resolution, and the views that join the store to
-//! herdr's live panes.
+//! the live seats.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,12 +13,11 @@ use crate::place::{Delivery, Place, Refusal, State};
 pub(crate) use crate::place::my_pane;
 use crate::resolve::{self, Index};
 use crate::store::Store;
-use crate::sync;
 use crate::util::{self, Paint};
 use crate::Args;
 
-/// One pane row, as the views in this file read one. Nothing fills it live:
-/// no host runs herdr.
+/// One pane row, as the views in this file read one. Nothing fills it live
+/// (`wsp-120`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Pane {
     pub pane_id: String,
@@ -76,7 +75,7 @@ pub fn live_holders<'a>(
 /// decided here rather than in [`resolve::resolve`]: where the mandate sits,
 /// and the label lookup at the bottom. Those two had no test, because reading
 /// them took a pane with the right environment, a store with the right
-/// mandate, and a herdr answering with the right label at once.
+/// mandate, and a host answering with the right label at once.
 pub(crate) struct Here {
     pub index: Index,
     pub pins: std::collections::BTreeMap<String, String>,
@@ -110,7 +109,7 @@ impl Here {
             // all a `Here` reads of a task (`wsp-320`).
             tasks: store.tasks_with_sections(&[crate::verification::SECTION]),
             workspaces: Vec::new(),
-            // The seat, through the one reading of it, rather than herdr's
+            // The seat, through the one reading of it, rather than a host's
             // variable directly. A binding is keyed on a seat and a
             // supervisor's seats are not panes, so an agent hosted with no
             // terminal resolved to no binding at all: measured 2026-08-17, a
@@ -178,7 +177,7 @@ pub(crate) fn standing_in(h: &Here) -> Option<String> {
         return r.project;
     }
 
-    // Last resort: the workspace's own label, which is the only link herdr
+    // Last resort: the workspace's own label, which is the only link a host
     // supplies and the only one that goes away when it stops answering.
     let ws = h.workspace.as_deref()?;
     let w = h.workspaces.iter().find(|w| w.id == ws)?;
@@ -187,7 +186,7 @@ pub(crate) fn standing_in(h: &Here) -> Option<String> {
 
 /// The task this pane is holding, out of the two records that say so.
 ///
-/// The binding is herdr's live answer and the claim is the durable one, and the
+/// The binding is the live answer and the claim is the durable one, and the
 /// order is that: a binding names the pane in front of you, where a claim keyed
 /// on the workspace survives a restart the daemon has not reconciled yet, so a
 /// session that comes back early still knows what it was doing.
@@ -251,8 +250,8 @@ fn pane_id(args: &Args) -> Option<String> {
     args.get("pane").or_else(my_pane)
 }
 
-/// The width every label wsp writes is cut to — the 44 characters `sync`
-/// already gives the `task` token. A herdr sidebar is 26 columns and draws its
+/// The width every label wsp writes is cut to — 44 characters. A sidebar is
+/// 26 columns and draws its
 /// own ellipsis, so this is not about what fits: it is about not putting a
 /// paragraph on the wire as a name.
 ///
@@ -263,7 +262,7 @@ fn pane_id(args: &Args) -> Option<String> {
 /// rule this constant states was never the mistake; being the only copy was.
 const LABEL_MAX: usize = 44;
 
-/// The one cut, and the only place a name of ours is shortened for herdr.
+/// The one cut, and the only place a name of ours is shortened for the wire.
 fn on_the_wire(full: &str) -> String {
     util::truncate(full, LABEL_MAX)
 }
@@ -571,7 +570,7 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
     }
     // Who is raising it: `whoami`'s reading, the one `wsp ask` already makes —
     // the post a seat holds, else the pane, else a person at a shell. It read
-    // herdr's `HERDR_PANE_ID` alone, which a compound-hosted agent does not
+    // one host's pane variable alone, which a compound-hosted agent does not
     // have, so every hand one raised was recorded as the person's (`wsp-272`:
     // three of the eight up on 2026-10-10 were agents' and seats', reading
     // `from: human`). `--pane` still names one outright.
@@ -684,9 +683,9 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         return 2;
     }
     // Nothing to hand it to. A claim needs a pane to claim *into*, and asking
-    // from outside herdr would draw a `y` that could not do anything.
+    // from outside a seat would draw a `y` that could not do anything.
     if ask == "claim" && pane.is_empty() {
-        eprintln!("wsp: --ask claim needs a pane to hand it to — run it inside a herdr pane");
+        eprintln!("wsp: --ask claim needs a pane to hand it to — run it inside a seat, or pass --pane");
         return 2;
     }
 
@@ -1080,7 +1079,7 @@ fn glyph_flag() -> &'static str {
 
 /// And the panel's mark for a governor's slot, borrowed for the same reason.
 /// The words come from [`cmd_govern::governor_of`], which carries no mark of its
-/// own — a label goes to herdr, which has no column to put one in.
+/// own — a label goes to a host, which has no column to put one in.
 fn glyph_seat() -> &'static str {
     crate::panel::glyph::SEAT
 }
@@ -1130,7 +1129,7 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     // row instead. `--seat` is for the agent that only wants its own.
     let index = Index::new(store.projects());
     let governors = store.governors();
-    // Off `my_pane()` and not `HERDR_WORKSPACE_ID`, `whoami`'s reason
+    // Off `my_pane()` and not a host's workspace variable, `whoami`'s reason
     // (`compound-095`) and `compound-105`'s: a compound-hosted agent has no
     // workspace to read, only the seat, and `my_pane()` already picks the
     // right one either way.
@@ -1402,11 +1401,10 @@ fn tell_seat(
         false => needle.to_string(),
     };
 
-    // Asked of every backend wsp can spawn onto (`compound-077`), not herdr
-    // alone: a seat is a herdr pane, a compound seat, or nothing this
-    // machine knows, and only the census that made it can say which. This is
+    // Asked of every backend wsp can spawn onto (`compound-077`), not one
+    // alone: only the census that made a seat can say whose it is. This is
     // the same fold `Wip::live` already does — `wsp tell` had its own copy of
-    // "herdr or nothing" until this row, which is why a headless or
+    // "one backend or nothing" until this row, which is why a headless or
     // `compound`-hosted agent could not be told anything at all.
     // `--anyway` is a person saying they have looked at the seat and it is
     // waiting; see `place_compound::Compound::insist`.
@@ -1454,7 +1452,7 @@ fn tell_seat(
     // permission dialog holding the keyboard, so the text does not queue behind
     // anything — it is typed *at the dialog*, where a sentence about what to do
     // next can select an answer nobody chose. Asked of the port's own `State`
-    // now rather than herdr's screen-scraped one, so this guard holds for
+    // now rather than a screen-scraped one, so this guard holds for
     // whichever backend answered.
     if let Some(wait) = crate::waiting::on_screen(row.state) {
         eprintln!("wsp: {what} is {} — answer that first", wait.sentence());
@@ -1800,7 +1798,7 @@ impl Sent {
     /// The idempotence half of worklist-010, and it is the half that addresses
     /// the *harm* rather than the report. A verb that says "was not told" about
     /// a message it delivered turns one paragraph into three, and the fix for
-    /// the report — `place_herdr::tell`, which no longer lies — cannot undo a
+    /// the report — a backend `tell` that no longer lies — cannot undo a
     /// retry that has already been typed. This can: the second send of the same
     /// text is recognised and refused, whatever made somebody type it.
     ///
@@ -1869,7 +1867,7 @@ pub fn twice(sent: &Sent, ago: i64, p: &Paint) -> i32 {
 ///
 /// **The rule this enforces is worklist-010's and it is a constraint rather
 /// than a preference: never report failure for a send that happened.** The old
-/// path printed `the wsp seat was not told` on a herdr wait timing out, and the
+/// path printed `the wsp seat was not told` on a backend wait timing out, and the
 /// seat it was addressed to had already read the message — so the governor
 /// retried, and one paragraph was delivered three times. `delivered, no turn
 /// seen` is a true sentence about the same event, and it is what
@@ -1985,10 +1983,10 @@ pub(crate) fn locate_seat<'a>(
 }
 
 /// Whether compound minted `needle` and still holds it — the seat id read by
-/// who made it rather than by how herdr spells one (`wsp-156`).
+/// who made it rather than by how one is spelled (`wsp-156`).
 ///
 /// `target` and `peek_target` both used to take "has a colon" to mean "is a
-/// seat", which is herdr's spelling and nobody else's: a compound seat is
+/// seat", which was one host's spelling and nobody else's: a compound seat is
 /// `cpd-N`, so `wsp peek cpd-347` and `wsp tell cpd-347` fell through to the
 /// task search and answered "nothing holds" for a seat that was live and
 /// claimed. A backend's own record is the only thing that can say what it
@@ -2148,8 +2146,8 @@ pub(crate) fn piped_message() -> Result<String, i32> {
 /// The sentence goes into `said.json` first and unconditionally, keyed on the
 /// seat [`my_pane`] resolved, and a surface with no label of ours to wear —
 /// `wsp wip`, a compound pane header — reads it back through [`sentence`].
-/// herdr's rename is decoration applied afterwards, and only to a seat herdr
-/// issued. This verb used to open on `herdr::available()` and return 1, which
+/// A host's rename is decoration applied afterwards, and only to a seat that
+/// host issued. This verb used to open on a host check and return 1, which
 /// on a machine whose seats are all compound's was every call from every
 /// agent, and the one verb the brief tells them to use as they go.
 pub fn say(store: &Store, args: &Args) -> i32 {
@@ -2182,8 +2180,8 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     }
 
     // Home is the task this pane holds. Without one there is nothing to fall
-    // back to, so the label is cleared outright and herdr goes back to naming
-    // the pane whatever it named it before.
+    // back to, so the label is cleared outright and the host goes back to
+    // naming the pane whatever it named it before.
     let held = store
         .bindings()
         .get(&pane)
@@ -2224,7 +2222,7 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     // reader can tell when it has gone stale without anybody clearing it. The
     // `label`/`full` half is written unconditionally too: it is only read
     // while the pane is wearing `label`, so a rename that failed, or a seat
-    // herdr never drew, leaves a half that matches nothing rather than one
+    // no host drew, leaves a half that matches nothing rather than one
     // that lies. `--clear`, and a sentence [`plain_full`] withholds, take the
     // whole entry away — the agent withdrew what it said.
     let spoken = !(said.is_empty() || args.has("clear")) && full.is_some();
@@ -2257,7 +2255,7 @@ pub fn say(store: &Store, args: &Args) -> i32 {
 /// What a pane wears while its agent is looking for a task.
 ///
 /// State first, project second, because the ellipsis falls on the right: a
-/// herdr sidebar draws 26 columns, and `looking for work in stra…` still says
+/// sidebar draws 26 columns, and `looking for work in stra…` still says
 /// the thing a person scanning a column of panes is scanning for. The project
 /// is the half they can usually read off the workspace row anyway.
 fn looking_label(project: Option<&str>, found: bool) -> String {
@@ -2275,7 +2273,7 @@ fn looking_label(project: Option<&str>, found: bool) -> String {
 /// found it. `claim` names the pane after the task, so everything from the
 /// claim onwards is visible from outside — but the minute or two before it, in
 /// which an agent reads a backlog, writes an overview and decides, showed
-/// whatever the pane was called last. From herdr that is indistinguishable
+/// whatever the pane was called last. From outside that is indistinguishable
 /// from an agent that read its instruction and did nothing.
 ///
 /// Two conditions, and both are about the caller rather than the answer:
@@ -2295,11 +2293,10 @@ fn looking_label(project: Option<&str>, found: bool) -> String {
 /// the same bargain `claim`'s rename makes.
 ///
 /// Said the way [`say`] says things, since wsp-115: into the record first, so
-/// a seat herdr does not draw still says it is looking, and onto herdr's label
-/// only where herdr draws. *An agent* is asked of the backend that seated it —
-/// a supervisor sets its seat variable only on a process it spawned as one,
-/// so a seat that arrived by that name is driven by construction, and a herdr
-/// pane is asked of herdr's own pane list as before.
+/// a seat no host draws still says it is looking. *An agent* is asked of the
+/// backend that seated it — a supervisor sets its seat variable only on a
+/// process it spawned as one, so a seat that arrived by that name is driven by
+/// construction.
 pub fn say_looking(store: &Store, project: Option<&str>, found: bool) {
     let Some(pane) = my_pane() else { return };
     if crate::place::seat_from_env().is_none() {
@@ -2321,7 +2318,7 @@ pub fn say_looking(store: &Store, project: Option<&str>, found: bool) {
 /// `Trance Video · 3h12m` — a claim as one line.
 ///
 /// Both this and `worked_line` join what they have and skip what they do not,
-/// because every part is optional: a claim made outside herdr has no label, and
+/// because every part is optional: a claim made outside a seat has no label, and
 /// one made before the clock was recorded has no duration. Formatting them with
 /// fixed separators left `" · 3s · to prio1-001"` hanging off nothing.
 pub fn claim_line(c: &serde_json::Value) -> String {
@@ -2613,7 +2610,7 @@ pub fn hand_off(store: &Store, task_id: &str, to: Option<&str>, reason: &str) {
 /// Every task this pane, or the workspace it sits in, is about to stop working.
 ///
 /// Two lists rather than one, because a claim outlives the pane that made it:
-/// after a herdr restart the binding is gone and only the claim says the
+/// after a restart the binding is gone and only the claim says the
 /// workspace was on that task, so migrating there without looking would leave
 /// the old claim standing and `reconcile` would bind the agent straight back
 /// to the task it had left.
@@ -2687,9 +2684,8 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         return 2;
     };
 
-    // What is in the seat, from wsp's own port — compound unless `--herdr`
-    // asks for the other one. Never herdr by default: the fleet is on
-    // compound, and a seat herdr does not draw is not on its list, so a
+    // What is in the seat, from wsp's own port — compound. Asked of another
+    // host's list, a seat that host does not draw is not on it, so a
     // worklist spawn's claim came back with no room, no session and the tree
     // the detached `worklist advance` happened to be standing in — the
     // previous member's, or the trunk (`wsp-142`).
@@ -2798,8 +2794,8 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // Refused before anything is written, so a refusal costs nothing: this
     // agent has not yet let go of whatever it was holding.
     //
-    // Read off the same census as the target. It was herdr's pane list, on
-    // which no compound seat appears, so under compound this never refused.
+    // Read off the same census as the target. It was one host's pane list,
+    // on which no compound seat appears, so under compound this never refused.
     let held_by: Vec<&crate::place::Seated> = seats
         .iter()
         .filter(|r| !r.agent.kind.is_empty() && r.state.is_running())
@@ -2872,7 +2868,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         hand_off(store, task, Some(&t.id), "handoff");
     }
 
-    // The seat's own label, as the port reports it. herdr's workspace was
+    // The seat's own label, as the port reports it. A host's workspace was
     // renamed after the task here so a restart could find it by name; a seat
     // wsp opens is named by wsp and found by its id.
     let ws_label = target.as_ref().map(|r| r.label.clone()).unwrap_or_default();
@@ -3004,10 +3000,6 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     );
     store.git_commit(&format!("wsp: claim {} — {}", t.id, t.title));
 
-    // Reflect it in the sidebar immediately rather than waiting for the daemon.
-    let mut cache = sync::Cache::default();
-    let _ = sync::sync(store, &mut cache, true);
-
     if args.json() {
         println!(
             "{}",
@@ -3120,9 +3112,8 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
 /// obvious fix is to carry `--kind` down into the claim beside `--model`, and
 /// it is worse in two ways: it cannot answer for an agent wsp did not start —
 /// a person's own claude claiming at its own shell — and it records what wsp
-/// *asked for* rather than what is there. herdr already reports the kind on
-/// every `pane.list` row, which `sync` reads on every tick anyway, so the fact
-/// is free and it is first-hand. That is also what makes
+/// *asked for* rather than what is there. The backend reports the kind on
+/// every census row, so the fact is free and it is first-hand. That is also what makes
 /// [`crate::cmd_spawn::kind_or_default`]'s fallback safe: an absence lasts one
 /// tick on any record whose agent is still alive.
 ///
@@ -3219,14 +3210,12 @@ pub fn learn_sessions<'a>(
     learned.len()
 }
 
-/// Rebuild bindings from claims and whatever herdr currently has open.
+/// Rebuild bindings from claims and whatever is open now.
 ///
-/// This is what makes a binding disposable. herdr restores workspaces, their
-/// layouts and their agent sessions across a restart, but pane ids are not
-/// stable across it and nothing outside wsp knows which task a pane was on.
-/// So: for every claim belonging to this host, find the workspace it names —
-/// by id, or failing that by the label and cwd herdr persists — and bind its
-/// most plausible pane.
+/// This is what makes a binding disposable: seat ids need not be stable across
+/// a restart, and nothing outside wsp knows which task a seat was on. So: for
+/// every claim belonging to this host, find the workspace it names — by id, or
+/// failing that by its label and cwd — and bind its most plausible pane.
 ///
 /// What one pass put right.
 #[derive(Debug, Default, Clone, Copy)]
@@ -3251,13 +3240,13 @@ pub struct Reconciled {
 
 /// Returns what it put right.
 ///
-/// `reap` additionally ends every claim whose workspace herdr no longer knows —
-/// the other half of retiring a set of workspaces, because a claim naming one
-/// that has been closed goes on saying work is being done in it, and herdr
-/// hands ids out again. Asked for rather than automatic: a claim outliving its
-/// *pane* is an accident of process lifetime and must stand, and a daemon
-/// starting before herdr has finished restoring a session would otherwise read
-/// a half-built world as a mass closure.
+/// `reap` additionally ends every claim whose workspace no backend knows any
+/// more — the other half of retiring a set of workspaces, because a claim
+/// naming one that has been closed goes on saying work is being done in it.
+/// Asked for rather than automatic: a claim outliving its *pane* is an accident
+/// of process lifetime and must stand, and a daemon starting before a host has
+/// finished restoring a session would otherwise read a half-built world as a
+/// mass closure.
 /// The machine an id sits on, as a map key: `""` for this seat, the `@mb2`
 /// suffix for anywhere else.
 ///
@@ -3268,8 +3257,7 @@ pub struct Reconciled {
 /// `hostname()` as the process that wrote the claim saw it — and an agent on
 /// an executor runs a `wsp` shim that executes on the seat, so its claims
 /// record the seat's hostname and `host` cannot tell the machines apart. The
-/// workspace id can: it comes back from that machine's own herdr already
-/// qualified. The id is the routing key everywhere else in this design; it is
+/// workspace id can: it comes back from that machine already qualified. The id is the routing key everywhere else in this design; it is
 /// the routing key here too.
 fn machine_of(_id: &str) -> &str {
     ""
@@ -3314,7 +3302,7 @@ fn machine_of(_id: &str) -> &str {
 /// exists to make private — and it reads *answered* off the rows that came back,
 /// so a machine that answered holding nothing is filed under silence, and for as
 /// long as it holds nothing its claims cannot be swept at all. Here that is the
-/// conservative reading rather than a defect — an empty answer is what a herdr
+/// conservative reading rather than a defect — an empty answer is what a host
 /// restoring a session gives for a second or two — but it is a reading nobody
 /// chose, because the two facts arrive as one. A census reports who answered as
 /// its own fact, and leaves the choice to the caller that reaps.
@@ -3343,13 +3331,13 @@ pub(crate) fn answered_by_machine<'a>(
 ///
 /// **An empty id names no machine, so it is never examined either
 /// (`compound-124`).** `machine_of("")` reads as `""` — this same local
-/// bucket herdr's own workspaces and panes fall in — so once herdr had
+/// bucket a host's own workspaces and panes fall in — so once a host had
 /// answered with even one of its own, an empty id used to be waved through as
 /// belonging to a machine that had spoken. A compound claim's `workspace_id`
 /// is empty this way in the ordinary case: `cmd_agent::claim` falls back to
-/// `""` for a seat no herdr workspace backs, which is every compound seat, so
+/// `""` for a seat no host workspace backs, which is every compound seat, so
 /// this is not a stale or half-written record but compound's normal shape.
-/// The shape `compound-123` fixed in `sync` — herdr's own local answer read
+/// The shape `compound-123` fixed — one backend's own local answer read
 /// as evidence a second backend's seat had gone — is reachable here through
 /// this field instead of a pane id, and the fix is the same rule stated
 /// where every caller of this function meets it: an id that names no machine
@@ -3389,7 +3377,7 @@ pub fn release(store: &Store, args: &Args) -> i32 {
 
 fn release_here(store: &Store, args: &Args) -> i32 {
     let Some(pane) = pane_id(args) else {
-        eprintln!("wsp: no pane — pass --pane or run inside herdr");
+        eprintln!("wsp: no pane — pass --pane or run it from a seat");
         return 2;
     };
     let (removed, task) = release_pane(store, &pane);
@@ -3434,7 +3422,7 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
 
     // Every pane bound to it, not the first: two bindings on one task is a
     // state `claim` works to prevent and `reconcile` can still leave behind
-    // after a herdr restart, and releasing half of it would leave the task
+    // after a restart, and releasing half of it would leave the task
     // looking held by a pane that no longer has a claim to stand on.
     let panes = store.panes_for_task(&t.id);
     for pane in &panes {
@@ -3452,8 +3440,6 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
         end_claim(store, &t.id);
     }
     if !panes.is_empty() || where_held.is_some() {
-        let mut cache = sync::Cache::default();
-        let _ = sync::sync(store, &mut cache, true);
         // The legs a row staged start now, as `leg done` and `review` start
         // what they owe — not on the daemon's next tick, which after a release
         // was 24s on a quiet machine and 291s on a loaded one (`wsp timeline
@@ -3474,7 +3460,7 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
     } else if !panes.is_empty() {
         println!("released {} from {}", t.id, panes.join(", "));
     } else if let Some(where_held) = where_held {
-        // A claim with no pane under it is the ordinary aftermath of a herdr
+        // A claim with no pane under it is the ordinary aftermath of a
         // restart, and saying so is the difference between "that worked" and
         // "did it find the right thing?".
         println!("released {} — the claim in {where_held}, with no pane bound", t.id);
@@ -3546,10 +3532,6 @@ pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) 
     // the real seat still running. Its own binding goes, and nothing else.
     if had.as_ref().and_then(|b| b.get("task_id")).and_then(|t| t.as_str()).and_then(|t| claim_elsewhere(store, t, pane)).is_some() {
         let removed = store.clear_binding(pane);
-        if removed {
-            let mut cache = sync::Cache::default();
-            let _ = sync::sync(store, &mut cache, true);
-        }
         return (removed, None);
     }
     if let Some(binding) = &had {
@@ -3563,8 +3545,6 @@ pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) 
             released = Some(task_id.to_string());
             end_claim(store, task_id);
         }
-        let mut cache = sync::Cache::default();
-        let _ = sync::sync(store, &mut cache, true);
     }
     (removed, released)
 }
@@ -3584,7 +3564,7 @@ fn pin_seat(_ws: &str) -> Option<String> {
 
 pub fn pin(store: &Store, args: &Args) -> i32 {
     let Some(ws) = args.get("workspace") else {
-        eprintln!("wsp: no workspace — pass -w, or run inside herdr");
+        eprintln!("wsp: no workspace — pass -w, or run it from a seat");
         return 2;
     };
     let Some(seat) = pin_seat(&ws) else {
@@ -3617,8 +3597,6 @@ pub fn pin(store: &Store, args: &Args) -> i32 {
     };
 
     store.set_pin(&agent_id, &proj.id);
-    let mut cache = sync::Cache::default();
-    let _ = sync::sync(store, &mut cache, true);
 
     if args.json() {
         println!("{}", json!({ "workspace": ws, "project": proj.id }));
@@ -3630,15 +3608,13 @@ pub fn pin(store: &Store, args: &Args) -> i32 {
 
 pub fn unpin(store: &Store, args: &Args) -> i32 {
     let Some(ws) = args.get("workspace") else {
-        eprintln!("wsp: no workspace — pass -w, or run inside herdr");
+        eprintln!("wsp: no workspace — pass -w, or run it from a seat");
         return 2;
     };
     // A clear works from outside the room, unlike a set: it only has to name
     // whichever key holds the pin, and `clear_pin` already checks both.
     let agent = pin_seat(&ws).and_then(|seat| store.agent_in_seat(&seat));
     let removed = store.clear_pin(agent.as_deref(), &ws);
-    let mut cache = sync::Cache::default();
-    let _ = sync::sync(store, &mut cache, true);
     if args.json() {
         println!("{}", json!({ "workspace": ws, "unpinned": removed }));
     } else if removed {
@@ -3654,7 +3630,7 @@ pub fn unpin(store: &Store, args: &Args) -> i32 {
 /// The subject here is the resolution chain — pin > binding > mandate > cwd >
 /// workspace label — and the chain is already pure in [`resolve::resolve`].
 /// What was not pure is *gathering the five things it compares*, which took a
-/// pane with the right environment, a store with the right pins, and a herdr
+/// pane with the right environment, a store with the right pins, and a host
 /// answering with the right label. So the one question worth asking of this
 /// command — which link won, and what it beat — had no test.
 pub(crate) struct Whereabouts {
@@ -3666,7 +3642,7 @@ pub(crate) struct Whereabouts {
     /// For the label of the workspace this pane stands in, which is both a
     /// link in the chain and how a claim is matched to a workspace.
     pub workspaces: Vec<Workspace>,
-    /// The seat this process is standing in, and the workspace herdr's
+    /// The seat this process is standing in, and the workspace a host's
     /// environment names — the second of which only a multiplexer has.
     pub pane: Option<String>,
     pub workspace: Option<String>,
@@ -3674,7 +3650,7 @@ pub(crate) struct Whereabouts {
     /// ahead of `workspace` everywhere a claim or a pin is matched
     /// (`compound-106`), the same precedence `Here` gives it.
     pub agent: Option<String>,
-    /// The process's own directory rather than the pane's: herdr reports the
+    /// The process's own directory rather than the pane's: a host reports the
     /// shell's cwd, which is stale the moment anyone `cd`s.
     pub cwd: Option<String>,
 }
@@ -3797,8 +3773,8 @@ fn where_lines(at: &Located, p: &Paint) -> Vec<String> {
 /// of [`crate::agent_commands::kinds`] so a chrome offering "New agent ▸" holds
 /// no list of its own. Needs no store.
 ///
-/// Any other name `--kind` is given is still passed to herdr, which owns the
-/// full catalogue; the text says so and the JSON carries it as `passthrough`.
+/// Any other name `--kind` is given is still passed to the backend, which
+/// judges it; the text says so and the JSON carries it as `passthrough`.
 pub fn agent(_store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(String::as_str) {
         Some("kinds") => kinds(args),
@@ -3859,7 +3835,7 @@ fn kinds(args: &Args) -> i32 {
     for (p, why) in crate::agent_commands::refusals() {
         println!("refused  {}: {why}", p.display());
     }
-    println!("any other kind herdr can start is passed through by --kind");
+    println!("any other kind is passed through by --kind, for the backend to judge");
     0
 }
 
@@ -3944,7 +3920,7 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
 /// The same bargain [`crate::panel::Snapshot`] and [`crate::cmd_machine::Fleet`]
 /// make. This view's whole subject is the join — an agent that has stopped on
 /// a task that is still `doing` is a person being the blocker — and while it
-/// read the store and asked herdr mid-print, seeing that state took two live
+/// read the store and asked a backend mid-print, seeing that state took two live
 /// agents in the states you wanted and a task in the right status underneath
 /// them. There was nowhere to put one.
 pub(crate) struct Wip {
@@ -3960,11 +3936,10 @@ pub(crate) struct Wip {
     /// and every row asks it the same question.
     pub governors: std::collections::BTreeMap<String, serde_json::Value>,
     /// Every seat holding an agent, through the place-work port rather than
-    /// any one backend's shape — a shell with nobody in it is not here, on
-    /// the same rule `herdr::agents()` used to apply: `wip` is about who is
-    /// working. `wsp-100` moved `stamp`'s census onto this port and left this
+    /// any one backend's shape — a shell with nobody in it is not here, because
+    /// `wip` is about who is working. `wsp-100` moved `stamp`'s census onto this port and left this
     /// one on `Pane`; this asks every backend wsp can spawn onto
-    /// (`robustness-017`) rather than herdr alone, which is the whole reason
+    /// (`robustness-017`) rather than one alone, which is the whole reason
     /// a seat opened with `--compound` now shows up here too.
     pub agents: Vec<crate::place::Seated>,
     /// agent id -> agent record, read once so each row's claim and pin lookup
@@ -3972,7 +3947,7 @@ pub(crate) struct Wip {
     /// the same reason `governors` above is read once for every row).
     pub agents_held: std::collections::BTreeMap<String, serde_json::Value>,
     /// `said.json`, for the sentence each agent last said about itself — see
-    /// [`sentence`]. A seat herdr does not draw has no label to read it off,
+    /// [`sentence`]. A seat no host draws has no label to read it off,
     /// so this is where a compound seat's status line is seen at all.
     pub said: std::collections::BTreeMap<String, serde_json::Value>,
     /// The machine's daemon, when it has none — [`crate::daemon::loud`]'s one
@@ -4077,7 +4052,7 @@ pub(crate) fn seat_clocks<'a>(
 }
 
 /// The name [`seat_clocks`] files a seat's source under: the backend, and the
-/// machine when it is not this one — `herdr`, `herdr@mb2`, `compound`.
+/// machine when it is not this one — `compound`, `compound@mb2`.
 fn clock_source(backend: &str, machine: &str) -> String {
     match machine {
         "" => backend.to_string(),
@@ -4224,8 +4199,7 @@ pub(crate) const GONE_FOR: i64 = 24 * 60 * 60;
 /// [`GONE_FOR`], and holding nothing (`wsp-169`, wsp-158 item 5).
 ///
 /// **Every refusal here leaves the row drawn, and that is the direction to
-/// fail in.** An undated seat (`None` — herdr keeps no record of a pane that
-/// has gone, and a compound seat whose directory cannot be read has none
+/// fail in.** An undated seat (`None` — a compound seat whose directory cannot be read has none
 /// either) is not "long ago"; a seat that holds something is the
 /// reconciler's (`repair::gone_member`, `repair::seat_vacant`), which finds
 /// it *through* this census and would otherwise be told nothing. Only a seat
@@ -4294,9 +4268,9 @@ pub(crate) struct WipRow {
     pub(crate) state: String,
     /// The same fact, typed, straight off [`place::Seated::state`] rather than
     /// re-derived from the string above. `state` is wsp's own vocabulary
-    /// (`State::as_str`), not herdr's — a caller that fed it back through
-    /// `place_herdr::of_word` would be reading a non-herdr row's word through
-    /// herdr's table, which is exactly the mistake `compound-064` refused. A
+    /// (`State::as_str`), not one backend's — a caller that fed it back through
+    /// a backend's word table would be reading another backend's word through
+    /// it, which is exactly the mistake `compound-064` refused. A
     /// caller that wants to branch on the state reads this field and does no
     /// parsing at all.
     ///
@@ -4598,11 +4572,11 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             .and_then(|t| t.as_str())
             .and_then(|id| w.tasks.iter().find(|t| t.id == id));
 
-        // herdr spells a seat `<workspace>:<pane>`, which is the durable id
-        // `pins` and `governors` are keyed on — the port has no word of its
-        // own for a workspace (`robustness-017` d2), so this reads the one
-        // herdr already put in the seat rather than asking herdr again. A
-        // backend with no workspace of its own mints a seat with no `:`, and
+        // A seat spelled `<workspace>:<pane>` carries the durable id `pins`
+        // and `governors` are keyed on — the port has no word of its own for a
+        // workspace (`robustness-017` d2), so this reads the one already in
+        // the seat. A backend with no workspace of its own mints a seat with
+        // no `:`, and
         // the whole string stands in for one that matches nothing, which pins
         // and governors already treat as the seat holding no project.
         let workspace_id = seat.split(':').next().unwrap_or(seat);
@@ -4627,8 +4601,8 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
 
         // Not `agent_status == "idle"`, which was three words short: see
         // `cmd_govern::needs_a_person`. Running and not turning is the whole
-        // predicate, and it is asked of the port rather than of herdr's
-        // spelling so the next word herdr adds does not read as work.
+        // predicate, and it is asked of the port rather than of a
+        // backend's spelling so the next word one adds does not read as work.
         let stopped = a.state.stopped();
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
         let governs = crate::place::governs(&w.governors, &crate::place::seat_query(workspace_id, Some(seat)));
@@ -4981,7 +4955,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         out.push(p.dim(&w.idle_memory.line()));
     } else {
         // Not `all busy`, which is what this said and was the same sentence
-        // `doctor`'s `herdr up, 12 agents` was saying on the night seven of
+        // `doctor`'s `up, 12 agents` was saying on the night seven of
         // them had stopped. `needs you` is a narrower question — stopped *on a
         // task that is still `doing`* — so a machine full of agents that had
         // finished and were holding their slots answered it truthfully with
@@ -5100,7 +5074,7 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             };
             // What the agent said it is doing, in place of what the work is
             // called, when it has said something about this work — the trade a
-            // herdr label has always made, and on a seat herdr does not draw
+            // pane label has always made, and on a seat no host draws
             // this is the only place a person reading `wip` sees it.
             let doing = r.said.as_deref().unwrap_or(&r.task);
             let flag = match r.full_suite {
@@ -5289,8 +5263,9 @@ pub fn overlap(store: &Store, args: &Args) -> i32 {
     0
 }
 
-/// What herdr shows on a pane now, as text; `None` where herdr is not there
-/// or would not read it.
+/// What a non-compound pane shows now, as text. `None`: no such backend reads
+/// a screen since `wsp-120`, and a compound seat is read through
+/// `Compound::read_screen` by the callers that know it is one.
 pub(crate) fn read_pane_text(_pane: &str) -> Option<String> {
     None
 }
@@ -5303,29 +5278,27 @@ pub(crate) fn read_pane_text(_pane: &str) -> Option<String> {
 /// pane was displaying the answer and the agent that wrote the code could not
 /// see it, so the loop was guess, build, install, ask, wait.
 ///
-/// herdr has been able to answer this all along — `pane.read` returns the
-/// characters on a pane. What was missing is a way to name the pane you mean.
+/// The backend can read the characters on a seat. What was missing is a way to
+/// name the pane you mean.
 /// Nobody reaches for it under pressure if reaching for it starts with listing
 /// every pane on the machine and picking through the JSON.
 ///
 /// So the target resolves the way everything else in wsp resolves: by what you
-/// call the thing, not by the id herdr filed it under.
-/// What a needle named, once it has been read against the panes herdr
-/// reported.
+/// call the thing, not by the id the backend filed it under.
+/// What a needle named, once it has been read against the panes reported.
 ///
-/// Reading the pane is herdr's and cannot be anything else. *Naming* it is
-/// ours, and it is the half with rules in it — which label, preferring this
+/// Reading the pane is the backend's and cannot be anything else. *Naming* it
+/// is ours, and it is the half with rules in it — which label, preferring this
 /// workspace, falling back to any; a pane id only if a pane wears it; a task
 /// only if the store knows it. Those rules were inside `peek`, between a
-/// socket check and a `pane.read`, so none of them could be asked about
-/// without a herdr and two panels open in different workspaces.
+/// socket check and a screen read, so none of them could be asked about
+/// without a live host and two panels open in different workspaces.
 pub(crate) enum Peeked {
     /// A pane to read, and what to call it in the header.
     At(String, String),
-    /// The panel, when the panel is not a pane: `wsp surface`, drawn into
-    /// herdr's sidebar rect by the fork. It carries no pane id because it has
-    /// none — that is the property the fork exists to get — so the frame comes
-    /// off disk rather than out of `pane.read`.
+    /// The panel, when the panel is not a pane: `wsp surface`, drawn into a
+    /// host's sidebar rect. It carries no pane id because it has none, so the
+    /// frame comes off disk rather than off a screen read.
     Surface,
     /// The needle named something real that nothing is currently on. Carries
     /// the hint, which names what is *missing* rather than what was asked for:
@@ -5345,7 +5318,7 @@ pub(crate) struct Holder {
     pub panes: Vec<String>,
 }
 
-/// Read a needle against what herdr reported.
+/// Read a needle against the panes reported.
 ///
 /// `here` is the workspace to prefer — the caller's, or whatever `--workspace`
 /// said. A label is preferred within it and accepted outside it, because there
@@ -5387,9 +5360,9 @@ pub(crate) fn peek_target(
         // The common case, and the reason there is a default at all: "what
         // does the sidebar look like right now".
         //
-        // A surface wins outright rather than being tried second. Under the
-        // fork the sidebar *is* the surface — a child of herdr, in no
-        // workspace — and a panel pane standing beside one is either a husk an
+        // A surface wins outright rather than being tried second. Where a
+        // surface runs, the sidebar *is* the surface — a child of its host,
+        // in no workspace — and a panel pane standing beside one is either a husk an
         // older wsp left or somebody deliberately comparing the two, which is
         // what `panel install` says when it makes one. Either way it is not
         // what the person is looking at, and it stays reachable by its pane id.
@@ -5409,12 +5382,12 @@ pub(crate) fn peek_target(
             named(mine(crate::panel::FULL_LABEL), "the whole tree", NOTHING_HOLDS)
         }
         "me" => named(me.map(str::to_string), "this pane", NOTHING_HOLDS),
-        // A pane id, given as herdr writes them.
+        // A pane id, given as a host writes them.
         n if n.contains(':') && panes.iter().any(|p| p.pane_id == n) => {
             Peeked::At(n.to_string(), format!("pane {n}"))
         }
-        // A seat a backend other than herdr minted (`cpd-N`), which no herdr
-        // pane list will ever contain and which has no colon to be taken for
+        // A seat compound minted (`cpd-N`), which no host's pane list will
+        // ever contain and which has no colon to be taken for
         // one by. Read by asking who holds it, not by its spelling (`wsp-156`).
         n if seated(n) => Peeked::At(n.to_string(), format!("seat {n}")),
         // Otherwise a task: whichever pane holds it. This is how you look at
@@ -5431,11 +5404,9 @@ pub(crate) fn peek_target(
 }
 
 pub fn peek(store: &Store, args: &Args) -> i32 {
-    // Not gated on `herdr::available()` any more — that refused every peek
-    // outright on a compound-only machine, although `peek_target` below
-    // already tolerates no herdr (an empty pane list) and `Peeked::At` can
-    // name a `cpd-` seat this process resolves through the store rather than
-    // through herdr's census at all.
+    // Not gated on a host being up: `peek_target` tolerates an empty pane
+    // list, and `Peeked::At` can name a `cpd-` seat this process resolves
+    // through the store.
     let here = args.get("workspace");
     let panes: Vec<Pane> = Vec::new();
     let needle = args.rest.first().cloned().unwrap_or_default();
@@ -5472,12 +5443,10 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
     // when the question is what happened rather than what is showing.
     let source = args.get("source").unwrap_or_else(|| "visible".into());
 
-    // Which backend holds this pane, asked rather than assumed to be herdr's
-    // (`compound-091`'s fold). `wsp peek` used to call herdr's `pane.read`
-    // unconditionally, so a `cpd-` seat read back "herdr would not read
-    // cpd-2" — the seat's id already said which backend it was on, and this
-    // is the one verb that had no workaround for it, unlike `wsp despawn
-    // --compound`.
+    // Which backend holds this pane, asked rather than assumed
+    // (`compound-091`'s fold). `wsp peek` used to read every pane through one
+    // host unconditionally, so a `cpd-` seat read back as unreadable — the
+    // seat's id already said which backend it was on.
     //
     // A targeted `socket_of` rather than a full `census()` scan: the latter
     // reads every compound seat's record to answer a question about one, and
@@ -5491,8 +5460,8 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
         // No scrollback here: `compound-render screen` (`compound-sup` before
         // the pty/renderer split, `compound-136`) is one frame, the same
         // limit `panel::surface_frame` already lives with, so `--source` and
-        // `--lines` — herdr's reach into what has scrolled past — have
-        // nothing to ask for on this backend.
+        // `--lines` — a reach into what has scrolled past — have nothing to
+        // ask for on this backend.
         match compound.read_screen(&compound_seat) {
             Ok(t) => (t, false),
             Err(e) => {
@@ -5501,7 +5470,7 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
             }
         }
     } else {
-        eprintln!("wsp: no herdr socket");
+        eprintln!("wsp: {pane} is not a compound seat, and nothing else here reads a screen");
         return 1;
     };
     let text = text.as_str();
@@ -5528,7 +5497,7 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
 ///
 /// The whole of `peek`'s job is to put the picture a person is looking at in
 /// front of an agent that cannot see it, and every other target reaches that
-/// picture by asking herdr to read a pane. A surface has no pane, so it leaves
+/// picture by asking the backend to read a seat. A surface has no pane, so it leaves
 /// each frame it draws beside the bindings instead, and this prints that — see
 /// `panel::surface_frame`, which carries the argument for why it is the frame
 /// the host was handed rather than a fresh one drawn here.
@@ -5598,17 +5567,6 @@ fn peek_surface(store: &Store, args: &Args) -> i32 {
     } else {
         println!("{}", text.trim_end());
     }
-    0
-}
-
-pub fn sync_once(_store: &Store, _args: &Args) -> i32 {
-    eprintln!("wsp: no herdr socket");
-    1
-}
-
-/// Entry point for herdr `[[events]]` hooks. The event name arrives as an
-/// argument, its payload in `HERDR_PLUGIN_EVENT_JSON`.
-pub fn hook(_store: &Store, _args: &Args) -> i32 {
     0
 }
 
@@ -5742,61 +5700,28 @@ fn store_uncommitted(root: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// What asking herdr got us, as `doctor` needs to distinguish it.
-///
-/// Three answers, not two, and telling them apart is the whole of what this
-/// part of `doctor` is for. A socket that is not there is a normal machine. A
-/// socket that is there and will not answer is broken. A socket that answers
-/// with nothing is a herdr running with no agents in it — which reads exactly
-/// like the second one if you only look at the length of the list, and is the
-/// confusion the reap guard exists to survive.
-///
-/// `Up` carries both listings, because neither alone can tell a pane that is
-/// gone from a pane whose agent is. `agent.list` drops a pane the moment the
-/// process inside it exits; `pane.list` keeps it, because the pane is still
-/// there holding the shell the agent was started from. Asking only the first
-/// is what made `doctor` call an emptied pane a dead one — see [`Bound`].
-pub(crate) enum Probe {
-    Down,
-}
-
-impl Probe {
-    pub(crate) fn live() -> Probe {
-        Probe::Down
-    }
-}
-
 /// Every seat on this machine, from every backend that will answer.
 ///
 /// **The one fleet reading, and it exists because there were three
 /// (`wsp-119`).** `wip`, the panel and the attention pass each built a census,
 /// and the one that judged a *binding* — [`bound_state`], and with it `doctor`
-/// and the `agent-gone` signal — built it out of two herdr listings and nothing
-/// else. A compound seat is not a herdr pane, so on the machine
-/// `compound-112`'s flip makes the ordinary one, that reading had no answer for
-/// every seat in the fleet and said so by reporting nothing.
+/// and the `agent-gone` signal — built it out of one backend's pane listings
+/// and nothing else, so on the machine `compound-112`'s flip makes the
+/// ordinary one, that reading had no answer for every seat in the fleet and
+/// said so by reporting nothing.
 ///
 /// Three readers of one question is already two too many; three *definitions*
 /// of it is how the exception for a seat nobody is watching got quietly lost
-/// from one of them. So the fold lives here, beside [`Probe`] because herdr's
-/// half is the probe's two listings rather than a second round trip — two
-/// listings taken a moment apart is how a pane comes to be in one and not the
-/// other, which is the fault [`Probe::Up`] exists to keep out.
+/// from one of them. So the fold lives here, once.
 ///
 /// A backend that said nothing is a [`crate::place::Census::silent`] entry and
 /// not an absence: `unheard()` is how `wsp watch` tells a governor which source
 /// it is blind through, and dropping the entry would have it report blindness
 /// nowhere on a machine that is blind everywhere.
-pub(crate) fn fleet_census(probe: &Probe) -> crate::place::Census {
-    let herdr = match probe {
-        Probe::Down => crate::place::Census::silent(
-            "",
-            crate::place::Refusal::Unreachable("no herdr socket on this machine".to_string()),
-        ),
-    };
+pub(crate) fn fleet_census() -> crate::place::Census {
     match crate::place_compound::Compound::new().census() {
-        Ok(compound) => herdr.and(compound),
-        Err(e) => herdr.and(crate::place::Census::silent("compound", e)),
+        Ok(compound) => compound,
+        Err(e) => crate::place::Census::silent("compound", e),
     }
 }
 
@@ -5820,28 +5745,28 @@ pub(crate) fn fleet_census(probe: &Probe) -> crate::place::Census {
 /// because a row in `agent.list` was taken for work happening. It is not: on
 /// 2026-08-18 an API overload left seven agents with their processes alive,
 /// their conversations intact and their turns abandoned, and `doctor` counted
-/// all seven and said `herdr up, 12 agents`. Nothing had been written to a task
+/// all seven and said `up, 12 agents`. Nothing had been written to a task
 /// in hours. The reading that separates them was on the socket the whole time
 /// (`place::State::turn_in_flight`), and this asks it.
 ///
-/// **[`Bound::Emptied`] is the third, and it is this function being asked a
-/// herdr question and handed a compound seat.** `wsp-119`. This took two
-/// `Pane` listings, so a seat no herdr socket lists — every seat
+/// **[`Bound::Emptied`] is the third, and it is this function being asked one
+/// backend's question and handed a compound seat.** `wsp-119`. This took two
+/// `Pane` listings, so a seat that backend did not list — every seat
 /// `compound-112`'s flip opens, which after it is every seat on the ordinary
 /// machine — missed both arms and fell to [`may_reap`], which a compound seat
-/// never passes: it names no herdr machine, so the answer is [`Bound::Unheard`]
+/// never passes: it names no machine, so the answer is [`Bound::Unheard`]
 /// and the check concludes it knows nothing about a seat it could have read in
 /// full. The failure was not a threshold and no threshold would have fixed it.
 /// **A dead compound seat raised nothing**: its pid had exited, its claim and
 /// its worktree were still held, and the one reading that could have seen that
-/// was a herdr listing with nothing in it.
+/// was another backend's listing with nothing in it.
 ///
 /// So the rows come from the port now, from the same folded [`crate::place::Census`]
-/// `wip` builds, and this function is a reading of *a seat* rather than of a
-/// herdr pane. That is the whole of the repair, and it is two defects rather
+/// `wip` builds, and this function is a reading of *a seat* rather than of one
+/// backend's pane. That is the whole of the repair, and it is two defects rather
 /// than one: a dead compound seat raised nothing, and the readers that judged
 /// a stopped seat were reading two different sources — `wip` and the panel off
-/// the census, this and `doctor` off herdr — so nothing stopped a signal and
+/// the census, this and `doctor` off another backend — so nothing stopped a signal and
 /// the census beside it from disagreeing about the same seat in the same
 /// second.
 pub(crate) enum Bound {
@@ -5851,13 +5776,11 @@ pub(crate) enum Bound {
     /// waiting on a person — see [`State::turn_in_flight`] for why this does not
     /// try to say which, and [`quiet_note`] for what makes it worth reporting.
     Quiet(State),
-    /// The seat is still there and its agent is not: a pane herdr lists with
+    /// The seat is still there and its agent is not: a pane listed with
     /// nothing in it, or a compound seat whose pid has exited. `despawn`, then
     /// decide.
     Emptied,
     /// No source lists it, and the machine that could have said something did.
-    /// `sync` reaps it — this arm exists to agree with the sweep exactly, and
-    /// [`crate::sync`] is where that agreement is load-bearing.
     Gone,
     /// Nothing that could have listed this seat said anything, so nothing is
     /// known. Never reaped on, never reported.
@@ -5869,10 +5792,9 @@ pub(crate) fn bound_state(
     rows: &[crate::place::Seated],
     answered: &std::collections::BTreeMap<&str, usize>,
 ) -> Bound {
-    // The census's own reading, unqualified. See `place_herdr::state_of_pane`
-    // for why a reading of *whether work is happening* must not be qualified by
-    // readiness — and [`fleet_census`] for why the qualification herdr's *own*
-    // census does apply is the one that has to stand, so that this and `wip`
+    // The census's own reading, unqualified: a reading of *whether work is
+    // happening* must not be qualified by readiness, and the census's own
+    // qualification is the one that has to stand, so that this and `wip`
     // cannot answer differently about one seat.
     match rows.iter().find(|r| r.seat.as_str() == seat) {
         Some(r) => match r.state {
@@ -5884,8 +5806,7 @@ pub(crate) fn bound_state(
             // A seat that is still there with nothing running in it. A pane with
             // no agent in it and a compound seat whose pid has exited are the
             // same fact reached two ways, and `State::Gone`'s own doc is the
-            // second of them — herdr cannot answer it from a listing, which is
-            // why this arm reads the agent as well as the state: a row whose
+            // second of them — a listing cannot answer it, which is why this arm reads the agent as well as the state: a row whose
             // state nobody can vouch for but which names an agent in it is an
             // agent we cannot see, not an empty seat, and the two want opposite
             // handling.
@@ -5985,36 +5906,29 @@ fn few(named: &[String]) -> String {
     }
 }
 
-/// What `doctor` says about herdr, and about the bindings that outlived it.
+/// What `doctor` says about the seats, and about the bindings that outlived them.
 ///
 /// `tasks` is here for one reason: an agent's last turn is a fact about a seat
 /// and its last *output* is a fact about the store, and the check this function
 /// gained needs both in the same place. See [`quiet_note`].
 ///
-/// **`seats` rather than a herdr listing, and the binding loop is no longer
-/// inside the `Probe::Up` arm (`wsp-119`).** It used to be both, and each was
-/// right about the machine it was written for: a machine with no herdr on it has
-/// nothing to say about bindings *herdr* holds, and one with herdr up has no
-/// compound seats to have gone quiet. Which left the ordinary machine — the one
-/// `compound-112`'s flip leaves with every seat on it a compound seat — with a
-/// `doctor` that reported no problem about any of them, on the day six of seven
-/// agents were killed by a limit. The census is asked instead, and it answers
-/// for every backend wsp can spawn onto; what is left of the probe is the
-/// machine's own health, which is the only part of this that is herdr's to say.
+/// **`seats` rather than one backend's listing (`wsp-119`).** The binding loop
+/// used to run only where that one backend was up, which left the ordinary
+/// machine — the one `compound-112`'s flip leaves with every seat on it a
+/// compound seat — with a `doctor` that reported no problem about any of them,
+/// on the day six of seven agents were killed by a limit. The census is asked
+/// instead, and it answers for every backend wsp can spawn onto.
 fn seat_health(
-    probe: &Probe,
     seats: &[crate::place::Seated],
     bindings: &std::collections::BTreeMap<String, serde_json::Value>,
     tasks: &[Task],
     problems: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
-    // Nothing was heard from, so nothing may be judged: `answered` comes out
-    // empty and every binding on a herdr machine reads [`Bound::Unheard`],
-    // which is the same judgement `sync` makes before it reaps.
+    // No machine answers for a seat the census does not list, so nothing may
+    // be judged gone: a binding no row names reads [`Bound::Unheard`].
     let answered = answered_by_machine(std::iter::empty());
-    // The sweep over every binding, judged on the census rather than on the
-    // machine herdr happens to be on.
+    // The sweep over every binding, judged on the census.
     let (mut emptied, mut gone) = (Vec::new(), Vec::new());
     let (mut quiet, mut turning) = (Vec::new(), 0usize);
     for (pane, b) in bindings {
@@ -6052,7 +5966,7 @@ fn seat_health(
     if !emptied.is_empty() {
         notes.push(format!(
             "{} seat(s) alive with the agent gone — {} — claim and worktree \
-             still held, and `wsp sync` will not touch these. `wsp despawn <id>` \
+             still held. `wsp despawn <id>` \
              gives one up; `wsp spawn <id>` puts a fresh agent on it",
             emptied.len(),
             few(&emptied)
@@ -6060,7 +5974,7 @@ fn seat_health(
     }
     if !gone.is_empty() {
         notes.push(format!(
-            "{} binding(s) on panes herdr no longer lists — `wsp sync` reaps them",
+            "{} binding(s) on seats no backend lists any more — `wsp release <id>` ends one",
             gone.len()
         ));
     }
@@ -6069,16 +5983,7 @@ fn seat_health(
     // that cost a night. The conversation in each of these is intact, so
     // `wsp tell` is the first thing to try and `wsp despawn` the last.
     problems.extend(quiet.iter().cloned());
-    // And then the machine itself, which is the only part of this herdr's to
-    // answer. It goes last because on a machine with no herdr on it the sweep
-    // above can still have found something, and a line saying the socket is
-    // missing reads as the whole report.
-    let Probe::Down = probe;
-    // Not a problem. A machine with no herdr on it is a machine wsp works
-    // on, and calling that broken is how a check nobody can act on gets
-    // ignored along with the ones they can.
     let _ = turning;
-    notes.push("herdr socket not found (CLI still works, sidebar tokens will not update)".into());
 }
 
 /// What `doctor` says about a reference that names nothing in the live store.
@@ -6448,19 +6353,14 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
 
     section_damage(store, args, &tasks, &index.projects, &mut problems, &mut notes);
 
-    let probe = Probe::live();
     // The census every backend answers for, and the same one `wip` builds — so
     // a binding this reports on and a row a person is looking at cannot be two
     // readings of one seat. `wsp-119`; see [`seat_health`].
-    let seats: Vec<crate::place::Seated> = fleet_census(&probe).seats().cloned().collect();
-    seat_health(&probe, &seats, &bindings, &tasks, &mut problems, &mut notes);
+    let seats: Vec<crate::place::Seated> = fleet_census().seats().cloned().collect();
+    seat_health(&seats, &bindings, &tasks, &mut problems, &mut notes);
     // Whether the machine has the one daemon it should have, said in the same
     // words as `wip`, a brief's seat line and `wsp watch --status` say it —
-    // through `a_backend_answered`, which used to be herdr's census alone.
-    // That was right while herdr was the only backend and wrong on this
-    // machine, which runs compound and has no herdr on it: `doctor` said
-    // nothing about a daemon that had been gone for a week, and the three
-    // surfaces a person actually reads said it every time. A gate that is
+    // through `a_backend_answered`, the one gate all four ask. A gate that is
     // asked two ways is a gate that is really two gates.
     crate::daemon::health(
         store.daemon_holder().map(|(pid, _)| pid),
@@ -6634,20 +6534,6 @@ fn section_damage(
     }
 }
 
-/// Turn live herdr workspaces into tasks the store knows about.
-///
-/// The old workspaces carry their meaning in a hand-typed label — "Trance
-/// Video", "TET -> EIN" — and nowhere else. Closing them without reading them
-/// first throws away the only record that the work exists. So: for every
-/// workspace with no claim on it, propose a task in whichever project the
-/// label or the cwd points at, and claim it there.
-///
-/// Prints a plan and does nothing unless `--yes`.
-pub fn adopt(_store: &Store, _args: &Args) -> i32 {
-    eprintln!("wsp: no herdr socket");
-    1
-}
-
 /// `wsp reconcile` — rebuild bindings from claims, and say what it did.
 pub fn reconcile_verb(store: &Store, args: &crate::Args) -> i32 {
     let r = reconcile(store, args.has("reap"));
@@ -6740,7 +6626,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 text: r##"  wsp agent kinds [--json]          the agent kinds wsp has behaviour for — name,
                                     default, resume, models, efforts — for a menu
                                     that should not keep its own list. Any other
-                                    kind herdr can start is passed by --kind"##,
+                                    kind is passed by --kind, for the backend"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
@@ -6789,28 +6675,6 @@ pub const VERBS: &[crate::verbs::Verb] = &[
         ],
     },
     crate::verbs::Verb {
-        names: &["sync"],
-        run: sync_once,
-        help: &[
-            crate::verbs::Help {
-                section: crate::verbs::Section::Plumbing,
-                order: 70,
-                text: r##"  wsp sync [--force]                push tokens to herdr once"##,
-            },
-        ],
-    },
-    crate::verbs::Verb {
-        names: &["hook"],
-        run: hook,
-        help: &[
-            crate::verbs::Help {
-                section: crate::verbs::Section::Plumbing,
-                order: 90,
-                text: r##"  wsp hook <event>                  herdr event-hook entrypoint"##,
-            },
-        ],
-    },
-    crate::verbs::Verb {
         names: &["doctor"],
         run: doctor,
         help: &[
@@ -6826,17 +6690,6 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     global config). --fix does that too, and
                                     folds stray sections back in task bodies and
                                     clears stale gc state in the repos"##,
-            },
-        ],
-    },
-    crate::verbs::Verb {
-        names: &["adopt"],
-        run: adopt,
-        help: &[
-            crate::verbs::Help {
-                section: crate::verbs::Section::Plumbing,
-                order: 370,
-                text: r##"  wsp adopt [--yes]                 turn live workspaces into tasks"##,
             },
         ],
     },
@@ -7132,7 +6985,7 @@ mod tests {
     }
 
     /// A pin is a mandate with a different word on it (`compound-106`), and
-    /// setting one is refused the same way: with no herdr environment there
+    /// setting one is refused the same way: with no seat environment there
     /// is no seat this process is standing in, so there is nothing to attach
     /// a fresh agent id to.
     #[test]
@@ -7187,14 +7040,8 @@ mod tests {
     fn a_hand_raised_under_a_seat_is_owed_by_that_seat_rather_than_only_drawn() {
         let (_env, store) = scratch("flag-to-seat");
         a_task(&store, "wsp-001");
-        // The governor record written directly rather than through `take`, and
-        // the reason is `herdr::available`'s process-wide cache: `take` renames
-        // the seat's workspace, which asks herdr, and this test stands up no
-        // fake — so it would be the first caller in the binary to latch that
-        // answer `false` and every later test that wants a census would inherit
-        // it. Found by running the suite, which is the only place this is
-        // visible; `cmd_watch`'s tests are sorted after these and would have
-        // failed first.
+        // The governor record written directly rather than through `take`:
+        // the record is what is under test, not the verb that writes it.
         store.set_governor(
             "wsp",
             json!({ "workspace": "w1", "pane": "w1:p1", "host": util::hostname(), "since": util::iso_at(1_000) }),
@@ -7261,8 +7108,8 @@ mod tests {
         assert!(m.is_the_persons(), "the only reader there is");
     }
 
-    /// A compound-hosted seat has `WSP_SEAT_ID` and no `HERDR_PANE_ID`, and
-    /// `wsp flag` read only herdr's variable — so a hand a compound seat raised
+    /// A compound-hosted seat has `WSP_SEAT_ID` and no other host's pane
+    /// variable, and `wsp flag` read only that variable — so a hand a compound seat raised
     /// was recorded as the person's (three of the eight up on 2026-10-10).
     #[test]
     fn a_hand_raised_from_a_compound_seat_is_not_recorded_as_the_person() {
@@ -7270,7 +7117,6 @@ mod tests {
         a_task(&store, "wsp-001");
         // A compound seat's record names the seat as its room as well as its pane.
         store.set_governor("tooling", json!({ "workspace": "cpd-41", "pane": "cpd-41", "host": util::hostname() }));
-        std::env::remove_var("HERDR_PANE_ID");
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-41");
         let governs = raise_one(&store, &["wsp-001", "possibly moot"], &[]);
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-42");
@@ -7777,19 +7623,18 @@ mod tests {
     }
 
     /// **The defect this row was filed for, in the one direction that was
-    /// silent** (`wsp-119`): a seat that is not a herdr pane, whose agent has
-    /// exited, with its claim and its worktree still held.
+    /// silent** (`wsp-119`): a compound seat whose agent has exited, with its claim and its worktree still held.
     ///
-    /// A compound seat never appears in either herdr listing, so the old
-    /// signature missed both arms and fell through to the reap guard — which a
-    /// compound id cannot pass, because it names no herdr machine. The answer
+    /// A compound seat never appeared in the old backend's two listings, so the
+    /// old signature missed both arms and fell through to the reap guard —
+    /// which a compound id cannot pass, because it names no machine. The answer
     /// was `Unheard`, and `Unheard` is the arm that says *nothing is known*, so
     /// the check reported ignorance about a seat it could have read in full, and
     /// said nothing about a dead one. Both callers inherited it: `doctor` on
-    /// every machine, and the `agent-gone` signal on every machine without a
-    /// herdr socket, which after `compound-112` is every machine.
+    /// every machine, and the `agent-gone` signal on every machine without
+    /// that backend, which after `compound-112` is every machine.
     ///
-    /// Driven through the census rather than through a herdr fixture, because
+    /// Driven through the census rather than through a pane fixture, because
     /// the whole of the fault was that the answer came from somewhere that
     /// could not see the seat.
     #[test]
@@ -7807,15 +7652,12 @@ mod tests {
         }];
         assert!(
             matches!(bound_state("cpd-70", &rows, &answered), Bound::Emptied),
-            "the seat is there and its agent is not, which is what herdr calls an emptied pane"
+            "the seat is there and its agent is not, which is an emptied seat"
         );
         // The other answer, and it is `may_reap`'s rather than this function's:
-        // a seat no source listed is `Gone` exactly when `sync` would reap its
-        // binding, which is the agreement `doctor` has to keep with the sweep
-        // (`sync.rs`'s `kept_bindings` — compound-119 folded compound's own live
-        // seats into that `live` for exactly this id shape).
+        // a seat no source listed is `Gone` once its machine has answered.
         assert!(matches!(bound_state("cpd-71", &[], &answered), Bound::Gone));
-        // And on a machine where no herdr answered, nothing may be judged at
+        // And on a machine where nothing answered, nothing may be judged at
         // all — the arm that has to mean *nobody knows anything about this*.
         assert!(matches!(bound_state("cpd-71", &[], &BTreeMap::new()), Bound::Unheard));
     }
@@ -7825,7 +7667,7 @@ mod tests {
     ///
     /// The arm that would send a person to `wsp despawn` a seat that may still
     /// have a live agent in it is the one that has to be careful, and the way to
-    /// be careful is to read the agent as well as the state: herdr cannot
+    /// be careful is to read the agent as well as the state: a listing cannot
     /// distinguish an exited agent's pane from a shell, so a row whose state is
     /// unreadable but which names an agent is an agent we cannot *see* — and
     /// `State::stopped`'s own doc is the rule, applied one step earlier.
@@ -7910,7 +7752,7 @@ mod tests {
         assert_eq!(target(&store, "nothing-like-this", &|_| false), None);
 
         // A seat a backend minted without a colon is a pane too, and is read
-        // by asking who holds it — not by herdr's spelling (`wsp-156`).
+        // by asking who holds it — not by its spelling (`wsp-156`).
         let compound = |n: &str| n == "cpd-347";
         assert_eq!(
             target(&store, "cpd-347", &compound).map(|(p, w)| (p, w)),
@@ -7927,7 +7769,7 @@ mod tests {
     /// about a message that had arrived, so the seat retried, and one paragraph
     /// was delivered to the `wsp` seat two or three times in a day — a governor
     /// sending the same direction three times to an agent that acted on the
-    /// first. `place_herdr::tell` no longer lies, which stops the retries this
+    /// first. A backend `tell` that no longer lies stops the retries this
     /// channel *caused*; this stops the ones anything else causes.
     ///
     /// The id does the work and it is derived rather than minted: the same text
@@ -8022,10 +7864,10 @@ mod tests {
     }
 
     /// The generalisation, not a second rule beside the old one: `reap` used to
-    /// refuse outright when herdr answered with nothing at all, for exactly
+    /// refuse outright when the backend answered with nothing at all, for exactly
     /// this reason, on the one machine there was. That case still holds.
     #[test]
-    fn a_herdr_answering_with_nothing_still_reaps_nothing() {
+    fn a_backend_answering_with_nothing_still_reaps_nothing() {
         let answered = answered_by_machine(std::iter::empty());
         assert!(!may_reap(&answered, "w0"));
         assert!(!may_reap(&answered, ""), "a claim too old to carry a workspace id either");
@@ -8042,8 +7884,8 @@ mod tests {
         assert_eq!(plain_full("wsp:view"), None);
         assert_eq!(plain_full(""), None);
 
-        // Anything else is itself, whole — and cut to the width `sync` already
-        // uses for the same title only on the way to herdr.
+        // Anything else is itself, whole — and cut to `LABEL_MAX` only on the
+        // way to the wire.
         assert_eq!(plain_full("wsp panel"), Some("wsp panel".to_string()));
         let long = "Agents should rename as they pick up new tasks, and say so";
         assert_eq!(plain_full(long), Some(long.to_string()));
@@ -8109,7 +7951,7 @@ mod tests {
 
         // The same entry against a pane wearing something else: a person
         // renamed it, or a claim did. What is on screen wins, always — a long
-        // name that disagrees with herdr's is a worse answer than a short one.
+        // name that disagrees with the pane's is a worse answer than a short one.
         assert_eq!(full_name(&said, "w1:p1", "claude", Some(&t)), None);
         assert_eq!(full_name(&said, "w9:p9", &wire, Some(&t)), None, "another pane's sentence");
 
@@ -8206,7 +8048,7 @@ mod tests {
     }
 
     /// The two states an agent with nothing in hand can be in, and the reason
-    /// the project is not what the label leads with: a herdr sidebar draws 26
+    /// the project is not what the label leads with: a sidebar draws 26
     /// columns and cuts the right-hand end, so a project-first label loses the
     /// state — which is the half a person scanning for a free agent is reading.
     #[test]
@@ -8218,7 +8060,7 @@ mod tests {
         assert_eq!(looking_label(None, true), "looking for work");
         assert_eq!(looking_label(None, false), "nothing actionable");
 
-        // What survives herdr's cut is the state, for the longest slug we have.
+        // What survives a 26-column cut is the state, for the longest slug we have.
         let long = looking_label(Some("strata-prototype"), true);
         assert!(long.chars().take(26).collect::<String>().starts_with("looking for work"));
 
@@ -8229,9 +8071,9 @@ mod tests {
         }
     }
 
-    /// wsp-115's acceptance, on the seat it was filed from: a compound seat, on
-    /// a machine with no herdr, says something. It used to answer `no herdr
-    /// socket` and exit 1 before looking at the sentence; the exit code is
+    /// wsp-115's acceptance, on the seat it was filed from: a compound seat
+    /// says something. It used to refuse and exit 1 before looking at the
+    /// sentence; the exit code is
     /// asserted as well as the record, because a version that wrote the record
     /// and still refused would pass on the store alone.
     ///
@@ -8239,8 +8081,8 @@ mod tests {
     /// label is already whole, so a record that lived only in that half would
     /// hold nothing for exactly the sentences agents usually say.
     #[test]
-    fn a_compound_seat_with_no_herdr_says_something_and_it_is_kept() {
-        let iso = util::isolated("say-no-herdr");
+    fn a_compound_seat_says_something_and_it_is_kept() {
+        let iso = util::isolated("say-compound");
         let store = Store::at(iso.home(), iso.state());
         store.ensure_dirs().unwrap();
         let mut t = Task::new("Say where you have got to", "wsp-900");
@@ -8252,7 +8094,7 @@ mod tests {
 
         let code = say(&store, &Args::synth("say", &["running the suite"], &[]));
         std::env::remove_var(crate::base::seat::SEAT_ENV);
-        assert_eq!(code, 0, "no herdr is not a reason to refuse a status line");
+        assert_eq!(code, 0, "a compound seat is not a reason to refuse a status line");
 
         let said = store.said();
         assert_eq!(said["cpd-9"]["said"], "running the suite", "the sentence, as typed: {said:?}");
@@ -8349,12 +8191,12 @@ mod tests {
     }
 
     /// The minute an agent spends looking for work is visible on a compound
-    /// seat too. It used to return on `!herdr::available()` before reading
-    /// which seat it was in, so the one agent a person would most want to see
+    /// seat too. It used to return on a host check before reading which
+    /// seat it was in, so the one agent a person would most want to see
     /// was looking read as the one that had done nothing.
     #[test]
-    fn a_compound_seat_looking_for_work_says_so_with_no_herdr() {
-        let iso = util::isolated("looking-no-herdr");
+    fn a_compound_seat_looking_for_work_says_so() {
+        let iso = util::isolated("looking-compound");
         let store = Store::at(iso.home(), iso.state());
         store.ensure_dirs().unwrap();
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-9");
@@ -8399,10 +8241,9 @@ mod tests {
     // ---- wip, offline ------------------------------------------------------
 
     /// A `Pane` as `agent.list` and `pane.list` render one, **with** the
-    /// `interactive_ready` a herdr sends for an agent it launched. That field is
-    /// not decoration: `place_herdr::state_of_agent` refuses to read a status
-    /// word without it, so a fixture that omits it is an agent herdr has never
-    /// described, and the census reads it as `Unknown` — a seat wsp cannot see.
+    /// `interactive_ready` a host sends for an agent it launched. That field is
+    /// not decoration: a census refuses to read a status word without it, so a
+    /// fixture that omits it is an agent the host has never described, and the census reads it as `Unknown` — a seat wsp cannot see.
     /// `wsp-119`: `bound_state` used to read the status off such a row anyway,
     /// which is how `doctor` and `wip` came to hold opposite facts about one
     /// agent.
@@ -8430,7 +8271,7 @@ mod tests {
         assert!(wip_json(&w)["agents"].to_string().contains("closed_row") || wip_json(&w).to_string().contains("closed_row"));
     }
 
-    /// herdr's own status word, as a census reads it.
+    /// A runner's own status word, as a census reads it.
     fn of_word(status: &str) -> State {
         match status.trim() {
             "working" => State::Working,
@@ -8451,7 +8292,7 @@ mod tests {
         }
     }
 
-    /// A census row, as `Wip::live` now builds one. `state` is herdr's own
+    /// A census row, as `Wip::live` now builds one. `state` is the runner's own
     /// word for it — `of_word` is the translation a census applies, so a test
     /// can still write `"done"` and mean the same thing `agent_status` used
     /// to. `label` is what the seat was opened with, the fallback a row shows
@@ -8476,7 +8317,7 @@ mod tests {
     /// Two agents on two tasks, one of them stopped on work that is still
     /// `doing` — plus the three queues waiting on a person underneath.
     ///
-    /// The state this view exists to show is a join of a herdr fact (an agent
+    /// The state this view exists to show is a join of a runner fact (an agent
     /// is idle) with a store fact (its task is still open), and standing it up
     /// live means two real agents in the states you want with the right rows
     /// underneath them. This is the fixture there was nowhere to hang.
@@ -9147,7 +8988,7 @@ mod tests {
         assert!(text.contains("3 running a turn"), "{text}");
     }
 
-    /// The other two words herdr has for a pane with no turn running, and this
+    /// The other two words a runner has for a pane with no turn running, and this
     /// view called both of them busy.
     ///
     /// `done` is not rare and this is the measurement that says so: on this
@@ -9167,7 +9008,7 @@ mod tests {
             assert_eq!(flagged, ["w2:p1"], "`{word}` is a pane running no turn");
         }
 
-        // And a word herdr has never sent is still not evidence of work. An
+        // And a word no runner has ever sent is still not evidence of work. An
         // absence stays an absence — the rule the whole port is built on — so
         // it is not called stopped either.
         let mut w = wip_world();
@@ -9175,12 +9016,12 @@ mod tests {
         assert!(wip_rows(&w).iter().all(|r| !r.needs_you), "not knowing is not knowing it stopped");
     }
 
-    /// `state` on the row is wsp's own vocabulary (`State::as_str`), not
-    /// herdr's — `working`/`idle`/`blocked`/`gone`/`starting`/`empty`/`unknown`,
-    /// not herdr's `idle`/`working`/`blocked`/`done`. A caller that fed it back
-    /// through `place_herdr::of_word` — as `cmd_watch` did before this row —
-    /// would be reading it as herdr's raw word and losing `starting` and
-    /// `gone`, which `of_word` has no arm for. `state_typed` is the port's own
+    /// `state` on the row is wsp's own vocabulary (`State::as_str`) —
+    /// `working`/`idle`/`blocked`/`gone`/`starting`/`empty`/`unknown`, not a
+    /// runner's `idle`/`working`/`blocked`/`done`. A caller that fed it back
+    /// through a runner's word table — as `cmd_watch` did before this row —
+    /// would be reading it as a raw word and losing `starting` and `gone`,
+    /// which `of_word` has no arm for. `state_typed` is the port's own
     /// answer, carried alongside rather than re-derived, so it survives the
     /// round trip.
     #[test]
@@ -9193,10 +9034,9 @@ mod tests {
             assert_eq!(row.state, w.agents[1].state.as_str(), "{word}");
         }
 
-        // `starting` and `gone` are real answers a backend other than herdr's
-        // census can give (`place_compound`, `place_super`), and words neither
-        // one is in `place_herdr::of_word`'s table — that function only
-        // understands herdr's own vocabulary. Re-parsing the row's string
+        // `starting` and `gone` are real answers a backend's census can give
+        // (`place_compound`, `place_super`), and neither is in `of_word`'s
+        // table — that function only understands a runner's raw vocabulary. Re-parsing the row's string
         // through it loses both; reading `state_typed` does not.
         for state in [crate::place::State::Starting, crate::place::State::Gone] {
             let mut w = wip_world();
@@ -9228,13 +9068,12 @@ mod tests {
         assert_eq!(rows.iter().find(|r| r.pane == "w3:p1").unwrap().task, "(unbound)");
     }
 
-    /// Both backends coexist, so a mixed census must resolve every row rather
-    /// than only the herdr-shaped ones. `Wip::live` now asks herdr and
-    /// compound both and folds the answers into one list — this is the join
-    /// each row goes through once they are in it, proven against a seat with
+    /// A mixed census must resolve every row rather than only the
+    /// `<workspace>:<pane>`-shaped ones — this is the join each row goes
+    /// through, proven against a seat with
     /// no `:` in it at all, which is what a compound session mints.
     #[test]
-    fn a_compound_seat_resolves_beside_a_herdr_pane_in_the_same_census() {
+    fn a_compound_seat_resolves_beside_a_workspace_pane_in_the_same_census() {
         let mut w = wip_world();
         w.bindings.insert("cpd-0".to_string(), json!({ "task_id": "t-002" }));
         w.agents.push(seated_agent("cpd-0", "working", "compound-064"));
@@ -9245,7 +9084,7 @@ mod tests {
         assert_eq!(cpd.workspace, "cpd-0", "no `:` to split, so the seat stands for its own workspace");
         assert!(cpd.turning);
 
-        // And it does not disturb the herdr rows already resolved beside it.
+        // And it does not disturb the pane rows already resolved beside it.
         assert!(rows.iter().find(|r| r.pane == "w2:p1").unwrap().needs_you);
     }
 
@@ -9372,14 +9211,14 @@ mod tests {
         assert!(!forgotten(State::Idle, old, now, false), "only a gone seat is ever swept");
     }
 
-    /// `compound-077`: `wsp tell` used to ask herdr alone whether a seat
+    /// `compound-077`: `wsp tell` used to ask one backend alone whether a seat
     /// existed at all, so a `compound`-hosted agent read as "nothing holds
     /// this" no matter what it was doing. `locate_seat` is the fix, proven
-    /// directly against a real compound seat and no herdr socket at all —
+    /// directly against a real compound seat —
     /// the case that used to fail before this row even reached the
     /// "no agent"/"blocked" checks below it.
     #[test]
-    fn locate_seat_finds_a_compound_hosted_agent_with_no_herdr_socket_up() {
+    fn locate_seat_finds_a_compound_hosted_agent() {
         let _env = util::isolated("locate-seat-compound");
         let compound = crate::place_compound::Compound::new();
         let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
@@ -9400,7 +9239,7 @@ mod tests {
 
         let backends = crate::place::local_backends();
         let (_, row) = locate_seat(&backends, seat.as_str())
-            .unwrap_or_else(|| panic!("{} answers for itself even with no herdr up", seat.as_str()));
+            .unwrap_or_else(|| panic!("{} answers for itself", seat.as_str()));
         assert_eq!(row.seat, seat);
         assert_eq!(row.agent.kind, "claude", "the agent this seat holds, not just that it exists");
 
@@ -9450,13 +9289,13 @@ mod tests {
         let claimed = util::iso_at(util::epoch_secs() - 3 * 3600);
         w.claims.insert("t-001".into(), json!({ "claimed_at": claimed }));
         let t0 = util::epoch_secs() - 3600;
-        let herdr: BTreeSet<String> = ["herdr".to_string()].into();
+        let compound: BTreeSet<String> = ["compound".to_string()].into();
         let clocks = |w: &Wip, answered: &BTreeSet<String>, at: i64| {
-            seat_clocks(&store, w.agents.iter().map(|s| (s, Some("herdr".to_string()))), answered, at)
+            seat_clocks(&store, w.agents.iter().map(|s| (s, Some("compound".to_string()))), answered, at)
         };
         let read_at = |w: &mut Wip, state: State, at: i64| {
             w.agents[0].state = state;
-            w.since = clocks(w, &herdr, at);
+            w.since = clocks(w, &compound, at);
             let v = wip_json(w);
             let row = v["agents"].as_array().unwrap().iter().find(|a| a["pane"] == "w1:p1").unwrap().clone();
             (row["since"].as_str().map(str::to_string), row["held"].clone())
@@ -9494,7 +9333,7 @@ mod tests {
         // On the TUI: a seat on a prompt, stopped twelve minutes ago.
         let twelve = util::epoch_secs() - 12 * 60 - 5;
         w.agents[0].state = State::Blocked;
-        w.since = clocks(&w, &herdr, twelve);
+        w.since = clocks(&w, &compound, twelve);
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         let line = text.lines().find(|l| l.contains("w1:p1")).unwrap_or_default();
         assert!(line.contains("waiting 12m · person"), "{text}");
@@ -9598,7 +9437,7 @@ mod tests {
     /// is still `doing`, which for a worker means a person has become the
     /// blocker — and for a seat means it is between the agents it is
     /// sequencing, which is where a seat spends most of its time. The same
-    /// pane, the same herdr reading, and the opposite answer.
+    /// pane, the same census reading, and the opposite answer.
     #[test]
     fn a_seat_idle_between_its_agents_does_not_read_as_one_that_has_stalled() {
         let mut w = wip_world();
@@ -9618,7 +9457,7 @@ mod tests {
     }
 
     /// A seat on the laptop is not a seat the desktop can reach: the record
-    /// names a herdr workspace, and herdr's ids are per machine. Read the other
+    /// names a workspace, and workspace ids are per machine. Read the other
     /// way, every agent in that workspace here would stop reading as stalled.
     #[test]
     fn a_seat_recorded_on_another_machine_changes_no_row_here() {
@@ -9631,11 +9470,11 @@ mod tests {
         );
     }
 
-    /// herdr silent costs the view its agents and nothing else. The queues
+    /// No census costs the view its agents and nothing else. The queues
     /// below are the store's, and they are what you read `wip` for when
     /// nothing is running.
     #[test]
-    fn no_herdr_is_wip_without_the_agents() {
+    fn no_census_is_wip_without_the_agents() {
         let mut w = wip_world();
         w.agents.clear();
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -9784,11 +9623,11 @@ mod tests {
         assert_eq!((at.project.as_deref(), at.source), (Some("wsp"), "pin"));
     }
 
-    /// herdr silent costs the chain one link — the workspace label — and the
+    /// A silent host costs the chain one link — the workspace label — and the
     /// rest of it answers as it did. A pane with nothing else to go on falls
     /// through to the directory rather than to nothing.
     #[test]
-    fn no_herdr_costs_the_chain_its_label_and_no_more() {
+    fn a_silent_host_costs_the_chain_its_label_and_no_more() {
         let mut w = standing();
         w.workspaces.clear();
         w.bindings.clear();
@@ -9854,7 +9693,7 @@ mod tests {
     /// asked about, and on compound that is a refusal** (`wsp-142` moved the
     /// read; nothing drove it).
     ///
-    /// The holder list was herdr's `pane.list`, on which no compound seat
+    /// The holder list was one host's `pane.list`, on which no compound seat
     /// appears, so under compound the guard against two agents on one task
     /// never refused — the second took the work over silently and the first
     /// went on editing the same tree. Driven through the real compound census
@@ -9914,11 +9753,11 @@ mod tests {
         );
     }
 
-    /// **`doctor` on the machine `compound-112`'s flip leaves** (`wsp-119`): no
-    /// herdr socket, one compound seat, its agent killed.
+    /// **`doctor` on the machine `compound-112`'s flip leaves** (`wsp-119`):
+    /// one compound seat, its agent killed.
     ///
-    /// The whole binding sweep used to live inside the `Probe::Up` arm, so on
-    /// this machine it did not run at all — and `doctor`, the one tool a person
+    /// The whole binding sweep used to run only where another backend was up,
+    /// so on this machine it did not run at all — and `doctor`, the one tool a person
     /// runs to tell a broken machine from a healthy one, printed *no problems*
     /// over a claim and a worktree held by a seat with nothing in it. That is
     /// `robustness-083`'s failure wearing a different hat: everything reporting
@@ -9927,7 +9766,7 @@ mod tests {
     /// Driven through the real census rather than a hand-built row, because the
     /// fault was never in the reading — it was in which seats got read.
     #[test]
-    fn doctor_reports_a_compound_seat_with_a_dead_agent_on_a_machine_with_no_herdr() {
+    fn doctor_reports_a_compound_seat_with_a_dead_agent() {
         let env = util::isolated("doctor-compound-dead");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -9954,25 +9793,14 @@ mod tests {
         let bindings = store.bindings();
         assert_eq!(bindings.len(), 1, "the seat is bound: {bindings:?}");
 
-        // `Probe::Down` and not `Probe::live()`: `herdr::available` caches its
-        // answer for the process, so in a full run some earlier test's fake
-        // server has already latched it to `true` and the live probe would be
-        // answering about that socket rather than about this machine. The value
-        // under test is the shape of the sweep when herdr is not here, and that
-        // is a constructor.
-        let probe = Probe::Down;
-        let seats = fleet_census(&probe).seats().cloned().collect::<Vec<_>>();
+        let seats = fleet_census().seats().cloned().collect::<Vec<_>>();
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
-        seat_health(&probe, &seats, &bindings, &store.tasks(), &mut problems, &mut notes);
+        seat_health(&seats, &bindings, &store.tasks(), &mut problems, &mut notes);
 
         assert!(problems.is_empty(), "a dead agent is not a fault in the store: {problems:?}");
         let empty = note_about(&notes, "agent gone");
         assert!(empty.contains("cpd-70"), "named by the work: {empty}");
         assert!(empty.contains("wsp despawn"), "{empty}");
-        // And the machine's own line is still said, because a reader who is told
-        // the socket is missing has to be able to tell that from the whole
-        // report.
-        assert!(notes.iter().any(|n| n.contains("socket not found")), "{notes:?}");
     }
 
     fn labelled(pane: &str, ws: &str, label: &str) -> Pane {
@@ -10017,7 +9845,7 @@ mod tests {
         // A workspace with no panel of its own falls through to one that has.
         assert_eq!(at(peek_target(&panes, Some("w7"), None, false, "panel", none_seated, no_task)).0, "w1:p9");
         // …and so does a caller with no workspace at all, which is what a
-        // shell outside herdr is.
+        // shell outside any seat is.
         assert_eq!(at(peek_target(&panes, None, None, false, "panel", none_seated, no_task)).0, "w1:p9");
 
         // The view is a different surface with a different label, and asking
@@ -10081,13 +9909,13 @@ mod tests {
         assert_eq!(at(peek_target(&panes, None, None, false, "w1:p3", none_seated, no_task)).1, "pane w1:p3");
         assert!(matches!(peek_target(&panes, None, None, false, "w9:p1", none_seated, no_task), Peeked::Unknown));
 
-        // `me` is this pane, whatever herdr reported — and a caller herdr has
-        // not told about itself has no `me` to look at.
+        // `me` is this pane, whatever was reported — and a caller nothing has
+        // told about itself has no `me` to look at.
         assert_eq!(at(peek_target(&panes, None, Some("w1:p3"), false, "me", none_seated, no_task)).0, "w1:p3");
         assert!(matches!(peek_target(&panes, None, None, false, "me", none_seated, no_task), Peeked::Nothing(_)));
     }
 
-    /// `wsp-156`: a compound seat is `cpd-N` — no colon, and never in herdr's
+    /// `wsp-156`: a compound seat is `cpd-N` — no colon, and never in a host's
     /// pane list — so it was refused as "no pane, task or project matching" while
     /// live and claimed. What makes it a seat is that its backend holds it.
     #[test]
@@ -10181,16 +10009,16 @@ mod tests {
         assert_eq!(standing_in(&h).as_deref(), Some("wsp"));
     }
 
-    /// The bottom of the chain is the only link herdr supplies, so it is the
-    /// only one that goes away when herdr stops answering. Everything above it
+    /// The bottom of the chain is the only link a host supplies, so it is the
+    /// only one that goes away when the host stops answering. Everything above it
     /// is the store's and answers the same either way.
     #[test]
-    fn the_workspace_label_is_the_last_resort_and_the_only_herdr_link() {
+    fn the_workspace_label_is_the_last_resort_and_the_only_host_link() {
         let mut h = here();
         h.cwd = None;
         assert_eq!(standing_in(&h).as_deref(), Some("music"), "matched by its name");
 
-        // herdr silent: the label link is gone and nothing else is.
+        // The host silent: the label link is gone and nothing else is.
         h.workspaces.clear();
         assert_eq!(standing_in(&h), None);
         h.cwd = Some("/home/ed/claude/wsp".into());
@@ -10205,7 +10033,7 @@ mod tests {
     }
 
     /// A mandate names a machine as well as a workspace: workspace ids are
-    /// herdr's and mean nothing on another host, which is why a claim carries
+    /// per machine and mean nothing on another host, which is why a claim carries
     /// one too. Somebody else's mandate must not place this pane.
     #[test]
     fn a_mandate_from_another_machine_places_nobody() {
@@ -10226,11 +10054,11 @@ mod tests {
         assert_eq!(standing_in(&h).as_deref(), Some("music"));
     }
 
-    /// A pane herdr has told us nothing about — a shell outside it, or a hook
+    /// A pane nothing has told us about — a shell outside any seat, or a hook
     /// with no environment — falls through to the directory, which is the one
     /// link that needs neither a pane nor a workspace.
     #[test]
-    fn a_pane_herdr_never_named_still_has_a_directory() {
+    fn a_pane_nothing_named_still_has_a_directory() {
         let mut h = here();
         h.pane = None;
         h.workspace = None;
@@ -10271,11 +10099,11 @@ mod tests {
     fn a_seat_claimed_before_its_agent_existed_learns_the_session_when_one_appears() {
         let store = bound(&[("w1:p1", "robustness-060", Some(""))]);
 
-        // Between claim and start: herdr has a pane and nothing in it.
+        // Between claim and start: there is a pane and nothing in it.
         let nothing = sessions_learned(&store, [("w1:p1", "", "")].into_iter());
         assert!(nothing.is_empty(), "no agent, no session, nothing to write");
 
-        // The agent comes up and herdr says which session it is.
+        // The agent comes up and the backend says which session it is.
         let learned = sessions_learned(&store, [("w1:p1", "309b2e2c", "claude")].into_iter());
         assert_eq!(
             learned,
@@ -10328,12 +10156,12 @@ mod tests {
         );
 
         // And the ordinary tick, where nothing has changed, writes nothing:
-        // `sync` runs this every 20s against every pane on the machine.
+        // the census runs this every tick against every pane on the machine.
         let same = sessions_learned(&store, [("w1:p1", "309b2e2c", "claude")].into_iter());
         assert!(same.is_empty(), "a store write per tick per pane is not a projection");
     }
 
-    /// Only seats wsp has bound. herdr reports a session for every agent on the
+    /// Only seats wsp has bound. A backend reports a session for every agent on the
     /// machine — a colleague's pane, the governor, a `claude` somebody started
     /// by hand — and none of those is a binding this may invent.
     #[test]
@@ -10393,9 +10221,7 @@ mod tests {
 
     /// A store on disk with one pane holding one task.
     ///
-    /// The cases below stop before anything reaches herdr on purpose: a real
-    /// herdr is usually up on the machine running these tests, and `sync`
-    /// writes metadata to whatever it finds there. What is under test is which
+    /// What is under test is which
     /// claim the command *selects*, which is decided before any of that.
     fn holding(tag: &str, pane: &str, task: &str) -> Store {
         let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));

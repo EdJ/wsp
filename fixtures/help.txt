@@ -321,12 +321,10 @@ AGENTS
                                     back: release the claim, the row to todo,
                                     keep the worktree on the seat. A far seat
                                     only; a local one is refused
-  wsp resume [<id>] [--print]       the agents that were running before herdr
-                                    restarted, offered back one row at a time:
-                                    ␣ to pick, ↵ to bring those back on the
-                                    session they were on. With an id, that one —
-                                    which may reach further back than the last
-                                    census. --print says how to do it by hand
+  wsp resume <id> [--print]         bring the agent on a task, or a project's
+                                    seat, back on the session it was on — which
+                                    may reach further back than the last census.
+                                    --print says how to do it by hand
   wsp reap <pid>… | --list          stop processes by pid, never by pattern: a dev
                                     or test tool over an hour old in the tree of a
                                     row no seat or claim holds, a zsh busy loop, a test
@@ -389,7 +387,7 @@ AGENTS
   wsp agent kinds [--json]          the agent kinds wsp has behaviour for — name,
                                     default, resume, models, efforts — for a menu
                                     that should not keep its own list. Any other
-                                    kind herdr can start is passed by --kind
+                                    kind is passed by --kind, for the backend
   wsp agent pi-extension            the pi extension this binary carries, which
                                     `wsp install` writes into pi's extensions
   wsp wip                           everything in flight, with agents
@@ -730,11 +728,9 @@ PLUMBING
   wsp surface                       the panel for a host that owns the cells:
                                     one JSON object per line each way, frames
                                     out. Started by herdr, not by a person
-  wsp sync [--force]                push tokens to herdr once
   wsp daemon [-v]                   cycle, repair and attention loop (launchd)
   wsp daemon reload                 put the launchd job back when no daemon
                                     answers; the primary seat's, refused if one does
-  wsp hook <event>                  herdr event-hook entrypoint
   wsp report <hook>                 a headless agent's Claude Code hook, saying
                                     what it is doing; silent outside a seat
   wsp burn [--json]                 tokens by seat, dearest first — input,
@@ -844,7 +840,6 @@ PLUMBING
                                     --closed lists those and counts as looking
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
                                     --reap ends claims whose workspace is gone
-  wsp adopt [--yes]                 turn live workspaces into tasks
   wsp code [<proj> [<code>]]        the prefix a project's ids take, so a long
                                     slug can still number short: strata-prototype
                                     with code sp gives sp-062. Defaults to the

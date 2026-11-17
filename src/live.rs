@@ -1,23 +1,16 @@
 //! What is running, in wsp's own words.
 //!
 //! One indirection, and it is the whole of this file: a view asks *here* what
-//! panes exist, and [`crate::herdr`] is on this side of the answer rather than
-//! inside the view's own struct.
-//!
-//! Before it, all three views carried the runner's types — `panel::Snapshot`
-//! held `Vec<herdr::Workspace>` and `Vec<herdr::Pane>`, `detail::Ctx` and
-//! `kanban::Ctx` a pane list each. So a renderer handed a view was handed a
-//! herdr type on every surface, and `story.rs` opened by fabricating
-//! `herdr::Pane`s to draw pictures that have nothing to do with a runner.
-//! `draw.rs` reported that while the renderer port was being written, because a
-//! renderer is handed a view and a canvas renderer for a phone would therefore
-//! have had to link wsp's herdr socket client to compile.
+//! panes exist, and whatever runner answers is on this side of the answer
+//! rather than inside the view's own struct. A renderer is handed a view, so a
+//! view that carried a runner's types would make every renderer link that
+//! runner to compile. No runner answers today (`wsp-120`): [`read`] is empty.
 //!
 //! # [`AgentRef`] is not a new type
 //!
 //! It is the projection the panel had already written *inside* `collect()`,
-//! moved up to where the socket call is. The three view and render layers were
-//! measured at 96b37a4 and read eight fields off herdr's two types —
+//! moved up to where the runner is asked. The three view and render layers were
+//! measured at 96b37a4 and read eight fields off the runner's two types —
 //! `pane_id`, `workspace_id`, `label`, `title`, `agent`, `agent_status`, `cwd`
 //! and `focused`. Seven of them are what a row here carries; the eighth is
 //! below, and does not travel in a view at all.
@@ -41,7 +34,7 @@
 //!
 //! # Focus does not travel inside a view
 //!
-//! herdr answers two focus questions — which workspace is on screen, and which
+//! A runner answers two focus questions — which workspace is on screen, and which
 //! pane in it has the keyboard — and neither is drawn. Their only readers are
 //! in the panel's event loop: the cadence it schedules itself on (250ms for the
 //! workspace being looked at, 30s for the twenty-one that are not) and what a
@@ -65,7 +58,7 @@ pub(crate) struct AgentRef {
     /// holding a second list to join against: it is read to name the pane when
     /// nothing better exists, and to place a pane whose cwd resolves nowhere.
     pub(crate) workspace_label: String,
-    /// herdr's own label for the pane, which `claim` and `wsp say` keep
+    /// The runner's own label for the pane, which `claim` and `wsp say` keep
     /// current. Kept raw beside [`AgentRef::where_`] because the panel decides
     /// what is *furniture* by it — our own panels wear a label we wrote, and a
     /// pane that merely happens to be titled `wsp` is not one of ours.
@@ -76,7 +69,7 @@ pub(crate) struct AgentRef {
     /// launched from the directory above every checkout stands in no project by
     /// this measure, which is why the panel can end up having to ask.
     pub(crate) cwd: String,
-    /// herdr's word for what the agent is doing, kept raw. Five of them —
+    /// The runner's word for what the agent is doing, kept raw. Five of them —
     /// `working`, `idle`, `blocked`, `done`, `unknown` — plus the empty string
     /// for a pane that has not said, and **four of the six mean no turn is
     /// running**. Read through [`crate::panel::agent_state`], which joins it
@@ -85,7 +78,7 @@ pub(crate) struct AgentRef {
     pub(crate) state: String,
     /// Whether an agent is running here, or it is just a shell.
     pub(crate) agent: bool,
-    /// Which agent, as herdr spells it — `claude`, `codex`, `gemini` — and the
+    /// Which agent, as the runner spells it — `claude`, `codex`, `gemini` — and the
     /// empty string for a shell. Carried because one thing a verb does to a
     /// pane is not the same sentence at every kind: emptying a context is
     /// `/clear` at Claude Code and something else, or nothing, everywhere else.
@@ -108,7 +101,7 @@ pub(crate) struct AgentRef {
     /// The whole of the name this pane's label is a cut-down of, when there is
     /// one and a surface has room for it.
     ///
-    /// A label goes over the wire cut to `cmd_agent::LABEL_MAX` — a herdr
+    /// A label goes over the wire cut to `cmd_agent::LABEL_MAX` — a
     /// sidebar is 26 columns, and the rule is right. It was also the only copy,
     /// so `panel --full`, which is the whole tree at the width of the workspace,
     /// drew forty-four characters into a hundred columns and there was nothing
@@ -175,24 +168,20 @@ impl Claimed {
 impl AgentRef {
     /// The machine the pane stands on, or the empty string for this seat.
     ///
-    /// Read here for the same reason as [`AgentRef::stopped`]: the pane id
-    /// spells the machine as an `@machine` suffix, and only the herdr adapter
-    /// knows that spelling.
+    /// Read here for the same reason as [`AgentRef::stopped`]: how a pane id
+    /// spells its machine is the runner's business, and no runner answers.
     pub(crate) fn machine(&self) -> &str {
         ""
     }
 
     /// There is an agent in this pane and no turn is running in it.
     ///
-    /// Read here rather than at the call sites, and the guard in
-    /// [`tests::no_view_names_the_runner`] is why: the answer needs the herdr
-    /// adapter's word table, and a view that reached for it would link wsp's
-    /// socket client into every renderer. This file is already on the other
-    /// side of that seam, so the translation happens once, here, and the views
-    /// get a bool.
+    /// Read here rather than at the call sites: the answer needs the runner's
+    /// word table, and this file is already on the other side of that seam, so
+    /// the translation happens once, here, and the views get a bool.
     ///
-    /// The predicate is [`crate::place::State::stopped`] — three of herdr's
-    /// five words, not the one the panel and `wip` used to test for. See it for
+    /// The predicate is [`crate::place::State::stopped`] — three of the
+    /// runner's five words, not the one the panel and `wip` used to test for. See it for
     /// what the other two cost.
     pub(crate) fn stopped(&self) -> bool {
         let state = match self.state.trim() {
@@ -279,14 +268,14 @@ pub(crate) fn pane_name(label: &str, title: &str, workspace: &str) -> String {
 /// focus that no view draws.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Live {
-    /// Every pane herdr reports, ours included. Filtering the furniture out is
+    /// Every pane the runner reports, ours included. Filtering the furniture out is
     /// the panel's business and not the same rule on the board — see
     /// `panel::rows::collect`.
     pub(crate) panes: Vec<AgentRef>,
     /// pane id -> whether it has the keyboard. Read through
     /// [`Live::has_keyboard`], which carries what an absent answer means.
     keyboard: BTreeMap<String, bool>,
-    /// workspace id -> whether herdr is showing it. Read through
+    /// workspace id -> whether the runner is showing it. Read through
     /// [`Live::on_screen`]. A map rather than "the focused one", because panes
     /// can arrive from more than one machine and each of them is showing
     /// something.
@@ -296,10 +285,9 @@ pub(crate) struct Live {
 impl Live {
     /// Does this pane have the keyboard?
     ///
-    /// A pane herdr has never heard of counts as focused, and so does a panel
-    /// that cannot name itself: both mean there is no focus to lose — a panel
-    /// running outside herdr, or one whose census arrived empty because the
-    /// socket was not answering — and a panel that read either as "somebody
+    /// A pane the runner has never heard of counts as focused, and so does a
+    /// panel that cannot name itself: both mean there is no focus to lose — a
+    /// panel running outside any runner, or one whose census arrived empty — and a panel that read either as "somebody
     /// else has the keyboard" would swallow every click it was sent.
     pub(crate) fn has_keyboard(&self, pane: Option<&str>) -> bool {
         pane.and_then(|p| self.keyboard.get(p)).copied().unwrap_or(true)
@@ -316,18 +304,16 @@ impl Live {
     }
 }
 
-/// Ask herdr what is running, and answer in wsp's types.
+/// What is running, in wsp's types.
 ///
-/// A herdr that is not answering degrades to an empty list rather than an
-/// error, so every surface still shows the durable half. Two socket calls,
-/// because a pane carries the name of the workspace it stands in and only the
-/// workspace list has it.
+/// Nothing answers since the runner went (`wsp-120`), so this is the empty
+/// list, and every surface still shows the durable half.
 pub(crate) fn read() -> Live {
     of(Vec::new(), Vec::new())
 }
 
-/// One row of what was running, with only the fields [`of`] reads. herdr's own
-/// record is gone (wsp-120); nothing fills this live.
+/// One row of what was running, with only the fields [`of`] reads. Nothing
+/// fills this live (`wsp-120`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Pane {
     pub pane_id: String,
@@ -350,13 +336,10 @@ pub(crate) struct Workspace {
 
 /// The same reading, from rows somebody already has.
 ///
-/// Split out of [`read`] because asking is not the only way to come by them.
-/// herdr's forked sidebar is **told**: the host it is drawn in is the thing
-/// running the agents, so it pushes its own `pane.list` rows down the pipe the
-/// surface is already on rather than answering the same question four times a
-/// second — see `panel::surface`. The rows are herdr's either way, parsed by
-/// the same [`crate::herdr::parse_pane`], and the join below is the one this
-/// file exists to be the only copy of.
+/// Split out of [`read`] because asking is not the only way to come by them:
+/// a surface can be **told** its rows down the pipe it is already on — see
+/// `panel::surface`. The join below is the one this file exists to be the
+/// only copy of.
 pub(crate) fn of(workspaces: Vec<Workspace>, panes: Vec<Pane>) -> Live {
     let label = |id: &str| -> String {
         workspaces.iter().find(|w| w.id == id).map(|w| w.label.clone()).unwrap_or_default()
@@ -394,41 +377,10 @@ pub(crate) fn panes() -> Vec<AgentRef> {
 mod tests {
     use super::*;
 
-    /// The whole of what this file bought, and the one check that can say so.
-    ///
-    /// Read the way `panel/run.rs` reads its own source: the assertion is over
-    /// what the binary is built from, rather than a restatement of it that can
-    /// drift. Three views and a storyboard, named one at a time rather than by
-    /// directory, because the rest of `panel/` and `detail/` talks to herdr
-    /// legitimately — installing panes, sending text, and the event loop — and
-    /// a check over the whole directory would fail for the work that is
-    /// supposed to be there.
-    ///
-    /// It fails the moment somebody reaches past the seam for a ninth field,
-    /// which is the cheap version of the thing it protects: a renderer under
-    /// `crate::draw` is handed a view, so a view that names herdr makes every
-    /// target link wsp's socket client, including the ones that have no socket.
-    #[test]
-    fn no_view_names_the_runner() {
-        let views = [
-            ("panel/rows.rs", include_str!("panel/rows.rs")),
-            ("detail/render.rs", include_str!("detail/render.rs")),
-            ("kanban/mod.rs", include_str!("kanban/mod.rs")),
-            ("story.rs", include_str!("story.rs")),
-        ];
-        for (name, src) in views {
-            assert!(
-                !src.contains(concat!("herdr", "::")),
-                "{name} names a herdr type again — the projection is `live::AgentRef`, \
-                 and if it is missing a field, add the field here",
-            );
-        }
-    }
-
     /// The reading four censuses share, and the two words that used to be
     /// missing from all four.
     ///
-    /// `done` is the expensive one because it is not rare: herdr sends it for
+    /// `done` is the expensive one because it is not rare: a runner sends it for
     /// an agent that finished a turn while nobody was looking at its workspace,
     /// which on a machine running agents in the background is most of them —
     /// four of twelve here on 2026-08-19. Every panel, `wip` row and brief read
@@ -458,7 +410,7 @@ mod tests {
     /// that pane and another in every other. This is where the panel's loop
     /// starts from and where it recovers to when the event stream has been
     /// away — so what an *absent* answer means is the part worth pinning: a
-    /// panel that read "herdr did not mention you" as "somebody else is typing"
+    /// panel that read "the runner did not mention you" as "somebody else is typing"
     /// would swallow every click it was ever sent.
     #[test]
     fn a_pane_nobody_reported_still_holds_its_own_keyboard() {
@@ -469,8 +421,8 @@ mod tests {
 
         assert!(!live.has_keyboard(Some("w1:p1")));
         assert!(live.has_keyboard(Some("w0:p3")));
-        assert!(live.has_keyboard(Some("w9:p9")), "a pane herdr has never heard of");
-        assert!(live.has_keyboard(None), "and a panel running outside herdr");
+        assert!(live.has_keyboard(Some("w9:p9")), "a pane the runner has never heard of");
+        assert!(live.has_keyboard(None), "and a panel running outside any runner");
 
         assert!(!live.on_screen(Some("w1")));
         assert!(live.on_screen(Some("w9")));
