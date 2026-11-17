@@ -6476,6 +6476,25 @@ pub(crate) fn done_when(t: &crate::model::Task) -> Option<String> {
 
 // ---- park -------------------------------------------------------------
 
+/// Park a running list for a cause that is the same for every row of it, so
+/// the run stops on the first refusal and says why, rather than starting each
+/// row again to be refused the same way (wsp-017). `false` when the list is not
+/// running, or could not be written.
+pub(crate) fn park_for_cause(store: &Store, w: &mut Worklist, why: &str) -> bool {
+    if w.status() != WorklistStatus::Running {
+        return false;
+    }
+    w.set_status(WorklistStatus::Parked);
+    w.log(&format!("{PARKED} {why}"));
+    let groups = w.groups();
+    let msg = format!("park {}", w.id);
+    if save(store, w, &groups, "park", &msg) != 0 {
+        return false;
+    }
+    store.log_event("worklist-parked", json!({ "id": w.id, "why": why, "was": "running", "by": "wsp" }));
+    true
+}
+
 /// `wsp worklist park [<slug>] "why"` — a person's pause. `wsp-173`.
 ///
 /// **Not `hold`, and the difference is the way back.** `hold` is a barrier's

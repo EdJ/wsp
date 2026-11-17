@@ -1120,7 +1120,13 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         let (cap, raised) = raised_cap(&g.kind, own_cap, gate.cap);
         let going_before = members_going(store, &g.members, "", &store.claims());
         let mut began = 0usize;
-        for s in &pos.members {
+        // What every seat needs, before any is opened: a want that is the same
+        // for every row parks the list on this line, with nothing tried.
+        let blocked = if unstarted { list_wide_blocker(store, &g.members) } else { None };
+        if let Some(why) = &blocked {
+            park_list_for(store, &w.id, why);
+        }
+        for s in pos.members.iter().filter(|_| blocked.is_none()) {
             if let Some(on) = holds.get(&s.id) {
                 log_line(store, &format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
                 continue;
@@ -1148,6 +1154,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                     started.push(s.id.clone());
                 }
                 began += 1;
+                // A refusal every row would meet parked the list: no more tries.
+                if !took && store.worklist(&w.id).is_some_and(|l| l.status() == WorklistStatus::Parked) {
+                    break;
+                }
             }
         }
         // Said when it made a difference, and not on every pass.
@@ -3808,9 +3818,59 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
         store.git_commit(&format!("wsp: spawn failed on {id}"));
     }
     if matches!(undo, Undo::Member) {
-        member_start_failed(store, owned.0, id, &why);
+        if is_list_wide(&why) {
+            list_wide_refusal(store, owned.0, id, &why);
+        } else {
+            member_start_failed(store, owned.0, id, &why);
+        }
     }
     false
+}
+
+/// What a refusal says when its cause is the same for every row of the list,
+/// not the row's own: the pack builder is not built.
+const LIST_WIDE: &[&str] = &["the pack builder is not built", "WSP_PACK_BIN="];
+
+/// Whether a spawn was refused for a cause no other row of the list escapes.
+fn is_list_wide(why: &str) -> bool {
+    LIST_WIDE.iter().any(|m| why.contains(m))
+}
+
+/// What every seat of a group needs and does not have yet, in one line, or
+/// `None`. Checked before any seat is opened: a start that fails this fails for
+/// every row, five times over, with a seat's minute each (wsp-017).
+fn list_wide_blocker(store: &Store, rows: &[String]) -> Option<String> {
+    #[cfg(test)]
+    {
+        let _ = (store, rows);
+        return tests::PACK_MISSING.with(|p| p.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        let needs = rows.iter().any(|id| store.find_task(id).is_some_and(|t| t.status() == Status::Todo && crate::packet_gen::eligible(&t).is_ok()));
+        if !needs {
+            return None;
+        }
+        crate::packet_gen::pack_bin().err()
+    }
+}
+
+/// Park the list for a cause shared by every row, after one try. The row is
+/// already back at `todo`; its seat is ended and the governor is told.
+fn list_wide_refusal(store: &Store, list: &str, id: &str, why: &str) {
+    despawn(store, id);
+    let why = util::truncate(why, 300);
+    park_list_for(store, list, &why);
+}
+
+/// Park `list` with the cause, log it and tell its seat.
+fn park_list_for(store: &Store, list: &str, why: &str) {
+    let Some(mut w) = store.worklist(list) else { return };
+    let said = format!("every seat of this run needs what is missing, so nothing is started: {why}");
+    if crate::cmd_worklist::park_for_cause(store, &mut w, &said) {
+        log_line(store, &format!("{list}: parked — {why}"));
+        tell(store, &w, &format!("wsp parked the {list} run without trying each row: {why}. Fix it, then `wsp worklist resume {list}`."));
+    }
 }
 
 /// `wsp spawn <id> --agent …`, and its refusal if it refused.
@@ -5460,6 +5520,8 @@ pub(crate) mod tests {
         pub(crate) static STALL: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
         /// Set, and every start in this thread fails with it.
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// Set, and the pack builder is missing for every start in this thread.
+        pub(super) static PACK_MISSING: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.
         pub(super) static END_FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// The ends that asked for the tree to be kept (`--keep-tree`).
@@ -8353,6 +8415,37 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// The cap is on the work, and a member already going counts against it.
+    #[test]
+    fn a_group_start_with_no_pack_builder_makes_no_spawn_attempt_and_names_it() {
+        let (_env, store) = scratch("nopack");
+        for m in ["m-1", "m-2"] {
+            task(&store, m, Status::Todo);
+        }
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        PACK_MISSING.with(|p| *p.borrow_mut() = Some("the pack builder is not built: set WSP_PACK_BIN".into()));
+        step(&store, &w, &Blind);
+        PACK_MISSING.with(|p| *p.borrow_mut() = None);
+        assert!(spawned().is_empty(), "nothing is started while a seat cannot be given a packet");
+        let w = store.worklist(&w.id).unwrap();
+        assert_eq!(w.status(), WorklistStatus::Parked);
+        assert!(w.section("Log").unwrap_or_default().contains("the pack builder is not built"), "{}", w.section("Log").unwrap_or_default());
+    }
+
+    #[test]
+    fn a_list_wide_spawn_refusal_parks_the_list_after_one_try() {
+        let (_env, store) = scratch("listwide");
+        for m in ["m-1", "m-2"] {
+            task(&store, m, Status::Todo);
+        }
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        FAIL.with(|f| *f.borrow_mut() = Some("m-1 is not given a packet: the pack builder is not built".into()));
+        step(&store, &w, &Blind);
+        FAIL.with(|f| *f.borrow_mut() = None);
+        assert_eq!(spawned().len(), 1, "one try, and the second row is not tried");
+        assert_eq!(store.worklist(&w.id).unwrap().status(), WorklistStatus::Parked);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo);
+    }
+
     #[test]
     fn a_capped_group_starts_no_more_than_its_cap() {
         let (_env, store) = scratch("cap");
