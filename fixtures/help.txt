@@ -748,6 +748,10 @@ PLUMBING
                                     polls (polls.jsonl), --all both; each view
                                     says the time its file covers
                                     (WSP_NO_CALLS=1 stops the recording)
+  wsp spend [--json]                tokens and cost over 30 days off the stop
+                                    ledger: by day and model, today/7d/30d,
+                                    by project and list, and the cost per row
+                                    landed (a verifier's holds) in those days
   wsp throttle [off|on|auto] [--json]
                                     how builds are held back for the person at
                                     the machine: niced, capped in jobs, and a

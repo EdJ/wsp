@@ -275,7 +275,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
         text: r##"  wsp spend [--json]                tokens and cost over 30 days off the stop
                                     ledger: by day and model, today/7d/30d,
                                     by project and list, and the cost per row
-                                    landed (a verifier's holds) in the 30"##,
+                                    landed (a verifier's holds) in those days"##,
     }],
 }];
 
