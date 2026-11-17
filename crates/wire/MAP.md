@@ -9,6 +9,10 @@ and `serde_json`. The root re-exports each module at its old path (`crate::place
 - `place_compound`, `place_super` — the two real backends; `tunnel`, `far` — the sockets and ssh they use
 - `host` — the `Host` trait, `LOCAL`, and the adapter: `host::InProcess` wraps `wsp-host`'s, each method calling
   the one of the same name; everything else of `wsp_host::inproc` is re-exported here (wsp-020)
+- `host_tcp` — `host::Tcp`, the second `Host`: each moved method as its 3.2 message to the manager the local
+  record names, the rest in-process; `WSP_HOST=inproc|manager` (`Choice`, `chosen`; default `inproc`); "host
+  silent" when no `hello` comes back within 1 s; `Subscription`, `subscribe {from}` with the last id kept per
+  host in `<state>/manager/<host>.last` (wsp-025). `tests/host.rs` holds both implementations to one contract
 - `launchd` — the daemon's agent and the manager's (`<label>.manager`, wsp-024)
 - `manager` — wsp's side of the manager on this machine: the local record and secret file `wsp install` writes, and `doctor`'s hello probe
 - `fake` — the fake backend (also served by `wsp sandbox`); it moved here with `Rect`, because the backends' own tests bind it

@@ -21,7 +21,7 @@
 //! Each takes plain values (paths, pids, ids, text), never a seat record, so a
 //! call turns into a message without a wsp type crossing the wire.
 //!
-//! [`InProcess`] is the only implementation, and it is not here: it is
+//! [`InProcess`] is the first implementation, and it is not here: it is
 //! `wsp-host` (`crates/host`, wsp-020), which depends on `wsp-base` and
 //! `wsp-host-api` and on nothing of the store or this crate, so the agent
 //! manager can link it. This module is the thin adapter over it: the trait,
@@ -29,8 +29,10 @@
 //! in-process host's method of the same name. Everything else `wsp-host`'s
 //! in-process module holds (the spawn and stop types, the hook file names,
 //! the transcript paths) is re-exported here whole, so a caller names it as
-//! `host::…` as it did before the move. At M1 a second implementation
-//! (`host::Tcp`) sends the same calls as messages.
+//! `host::…` as it did before the move. At M1 a second implementation,
+//! [`Tcp`] (`host_tcp.rs`, wsp-025), sends the same calls as messages to the
+//! host's manager, chosen by `WSP_HOST=inproc|manager` ([`chosen`]; `inproc`
+//! until wsp-029).
 //!
 //! The `ps`, `kill` and `lsof` of seat and tree work are there too, as
 //! `seats`'s process table, signals and working directories (wsp-008). Tree
@@ -60,6 +62,10 @@ use crate::place::{Delivery, Result, Seat, State};
 /// names, the transcript paths), named here as before the move. Its
 /// `InProcess` is wrapped below, and the local type shadows the glob.
 pub use wsp_host::inproc::*;
+
+/// M1's second implementation, over the manager's connection (wsp-025), and
+/// `WSP_HOST`'s choice between the two.
+pub use crate::host_tcp::{choose, chosen, Choice, HostError, Subscription, Tcp};
 
 /// Every OS operation a seat needs, grouped by the host-api message it
 /// becomes (`docs/agent-manager.md` section 3.2).

@@ -258,7 +258,7 @@ pub fn health_of(
     }
 }
 
-fn sup_in_range(sup: Option<&Path>, range: WireRange, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+pub(crate) fn sup_in_range(sup: Option<&Path>, range: WireRange, problems: &mut Vec<String>, notes: &mut Vec<String>) {
     let Some(sup) = sup else {
         notes.push("compound-sup not found ($COMPOUND_SUP or PATH) — nothing to check against the manager's wire range".into());
         return;

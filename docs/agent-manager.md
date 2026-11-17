@@ -798,6 +798,50 @@ process group for each session. Nothing spawns claude. They check that:
 - the `wsp-manager` binary, killed with SIGKILL mid-order and restarted, still lists the seat, answers the order
   once (typed once), and resumes events `from` the last id.
 
+#### Group 4: `host::Tcp`, the `Host` over the connection (wsp-025, 2026-11-17)
+
+`crates/wire/src/host_tcp.rs` holds the wire's second `Host`, `host::Tcp`. It dials the manager that the local
+machine record names (`<state>/manager/local.json` and its secret file, wsp-024) over `wsp-host`'s `Tcp`.
+- **The moved methods become messages:**
+  - `spawn_session` → `seat.spawn`;
+  - `stop` and `stop_soon` → `seat.stop`, for a seat this process started through it;
+  - `deliver` → `order.deliver`, for a seat the manager runs. A refusal is worded as the in-process host words
+    compound-sup's (`Failed("<seat>: busy")`, `NoSeat`);
+  - `read_screen` → `seat.read`;
+  - `can_deliver` and `wire_health` → `hello`;
+  - `Tcp::seats` asks `seats`.
+- **Everything else stays in-process under both choices:**
+  - the process table, signals and working directories (tree work's until M3);
+  - hook files and transcripts (the manager reports them as events, which group 5 folds);
+  - the fact probes' text (the beat carries `HostFacts`, not text);
+  - headless seats, typing at a renderer, and any seat the manager does not run (adoption is wsp-029's).
+- **One connection per process (3.4).** It opens at the first message, and is reopened once if the manager
+  closed it. The client beats during a long wait.
+- **Heard or silent.** A manager that does not answer `hello` within 1 s is `HostError::Silent`, whose message
+  begins "host silent". Through the trait it is `Refusal::Unreachable`, never an empty answer.
+- **`WSP_HOST=inproc|manager`.** `host::chosen` reads it, and `host::choose` takes the choice as an argument.
+  The default stays `inproc`. Nothing calls them yet: callers move in group 5.
+- **The spawn's key and env are stand-ins.** The idempotency key is `(seat, 0)`, because `Spawn` carries no
+  `(row, attempt)` and wsp mints seat ids fresh. The seat's env values cross as an `env -u K -- K=V` prefix on
+  the argv, because 3.2's agent spec carries names only and a seat's values (its row, its store) are not in the
+  manager's environment.
+- **`host::Subscription`** sends `subscribe {from}` with the last event id heard of that host, kept in
+  `<state>/manager/<host>.last`. It hands out events and beats one at a time. An id is kept once the next is
+  asked for, so delivery is at least once. A dropped connection, or three silent beats, means it subscribes
+  again from that id. A replay that overlaps the kept id is skipped.
+
+Tests (`cargo test -p wsp-wire --test host`) hold `InProcess` and `Tcp` to one contract with the same fake
+compound-sup. The `Tcp` runs on a loopback manager. The contract checks that:
+- a spawn gives a session;
+- an order is acked, and asked again under its id it is typed once;
+- `busy` is refused as in-process;
+- a stop ends the group;
+- an order to a gone seat is `NoSeat`.
+
+They also check that `WSP_HOST=manager` against a closed port, or a listener that never answers, is "host
+silent" within the second, and that the subscription resumes from the last id across a manager restart and in
+a new subscription. `tests/host_seam.rs` holds: `host_tcp` reaches no OS itself.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the
