@@ -718,6 +718,73 @@ fn the_conformance_suite_links_the_contract_and_the_test_kit_only() {
     );
 }
 
+/// Every dependency a manifest names, of any kind (normal, build, dev, and their `[target.….…]`
+/// forms), in the inline form (`name = …`) or the table form (`[dependencies.name]`).
+fn deps_named(manifest: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut in_deps = false;
+    for line in manifest.lines() {
+        let l = line.split('#').next().unwrap().trim();
+        if let Some(h) = l.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            let h = h.trim();
+            in_deps = h.ends_with("dependencies");
+            if let Some((_, name)) = h.rsplit_once("dependencies.") {
+                out.insert(name.trim_matches('"').to_string());
+            }
+        } else if in_deps {
+            if let Some((name, _)) = l.split_once('=') {
+                out.insert(name.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `wsp-api`, the API's wire types, is a contract crate (R2, R5): it depends on
+/// `wsp-store-contract` and on nothing else of the workspace, directly or through it, its own
+/// tests included (`docs/state-core.md` section 6; wsp-071). Its only other dependencies are
+/// `serde` and `serde_json`, so no IO crate, and its source names no IO of the standard library:
+/// a carrier is `wsp-server`'s or `wsp-client`'s.
+#[test]
+fn the_api_links_the_contract_alone_and_does_no_io() {
+    const MAY: &[&str] = &["wsp-store-contract"];
+    let dir = root().join("crates/api");
+    let bad = beyond(&reached_from(&dir, "wsp-api"), MAY);
+    assert!(
+        bad.is_empty(),
+        "wsp-api must link only {MAY:?} of the workspace (docs/state-core.md section 6):\n{bad}"
+    );
+
+    let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
+    let extra: Vec<&String> =
+        named.iter().filter(|d| !["serde", "serde_json", "wsp-store-contract", "wsp-api"].contains(&d.as_str())).collect();
+    assert!(extra.is_empty(), "wsp-api depends on serde, serde_json and the contract alone, not {extra:?}");
+
+    const IO: &[&str] = &[
+        "std::fs", "std::net", "std::process", "std::io", "std::os", "std::env", "std::thread", "File::", "TcpStream",
+        "TcpListener", "UnixStream",
+    ];
+    let mut found = vec![];
+    for e in fs::read_dir(dir.join("src")).unwrap() {
+        let p = e.unwrap().path();
+        let code = strip(&fs::read_to_string(&p).unwrap());
+        for io in IO.iter().filter(|io| code.contains(*io)) {
+            found.push(format!("{}: {io}", p.strip_prefix(root()).unwrap().display()));
+        }
+    }
+    assert!(found.is_empty(), "wsp-api does no IO (R2):\n{}", found.join("\n"));
+}
+
+#[test]
+fn the_dependency_lister_reads_each_manifest_form() {
+    let m = "[package]\nname = \"x\"\n\n[dependencies]\nserde = { version = \"1\" }\n\"serde_json\" = \"1\"\n\
+             \n[dependencies.wsp-store-contract]\npath = \"../store-contract\"\n\
+             \n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\" # a comment\n\
+             \n[dev-dependencies]\n# tokio = \"1\"\nwsp-api = { path = \".\" }\n\n[features]\ntest-support = []\n";
+    let names: Vec<String> = deps_named(m).into_iter().collect();
+    assert_eq!(names, ["libc", "serde", "serde_json", "wsp-api", "wsp-store-contract"]);
+}
+
 #[test]
 fn the_rusqlite_reader_finds_each_manifest_form_and_not_a_lookalike() {
     assert!(declares("[dependencies]\nrusqlite = \"0.32\"\n", "rusqlite"));

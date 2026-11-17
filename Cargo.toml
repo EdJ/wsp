@@ -9,7 +9,7 @@ name = "wsp"
 path = "src/main.rs"
 
 [workspace]
-members = ["crates/wire", "crates/trees", "crates/base", "crates/store", "crates/store-contract", "crates/store-conformance", "crates/store-sqlite", "crates/testkit", "crates/host-api", "crates/host", "crates/manager"]
+members = ["crates/wire", "crates/trees", "crates/base", "crates/store", "crates/store-contract", "crates/store-conformance", "crates/store-sqlite", "crates/testkit", "crates/host-api", "crates/host", "crates/manager", "crates/api"]
 
 [dependencies]
 serde_json = "1"
