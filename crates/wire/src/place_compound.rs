@@ -1727,7 +1727,7 @@ fn close_pane_soon(sup: u32) {
     if sup == std::process::id() {
         return;
     }
-    let script = format!("sleep {CLOSE_AFTER_SECS}; kill -TERM -- -{sup}; sleep 2; kill -KILL -- -{sup}");
+    let script = format!("sleep {CLOSE_AFTER_SECS}; kill -s TERM -- -{sup}; sleep 2; kill -s KILL -- -{sup}");
     let _ = Command::new("sh")
         .args(["-c", &script])
         .process_group(0)
