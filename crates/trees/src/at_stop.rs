@@ -118,12 +118,6 @@ fn tail_of(text: &str) -> String {
     joined.chars().skip(skip).collect()
 }
 
-/// The line that says what happened, for the logs. `None` for a clean exit
-/// with nothing to say, which is what a teardown that worked looks like.
-fn said(path: &str, ran: &Ran) -> String {
-    said_of("at_stop", path, ran)
-}
-
 fn said_of(key: &str, path: &str, ran: &Ran) -> String {
     let how = match &ran.ended {
         Ended::Exited(0) => "exit 0".to_string(),

@@ -308,8 +308,8 @@ impl Records {
 }
 
 /// On this machine: a seat qualified `@machine` is that machine's to count.
-fn here(seat: &str) -> bool {
-    !matches!(seat.rsplit_once('@'), Some((_, m)) if !m.is_empty())
+fn here(_seat: &str) -> bool {
+    true
 }
 
 /// A member of a list somebody parked: nothing of it starts or is read until

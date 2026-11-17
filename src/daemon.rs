@@ -364,53 +364,6 @@ pub(crate) fn surface_drawing(state: &Path) -> bool {
         .any(|(_, _, rest)| is_wsp(rest, "surface") && for_store(rest, state))
 }
 
-/// The panes of this machine that still have a wsp of this store's running in
-/// them, or `None` when the process list could not be read at all.
-///
-/// The question behind it is "is this pane still a panel, or only the shape one
-/// left" — a husk, in `render-074`'s words. herdr restores a *layout* across a
-/// restart, so a pane labelled `wsp` outlives the panel that was in it, and
-/// there is nothing in herdr's answer to tell the two apart: the label is the
-/// same, the tab is the same, and the pane is the same size it always was.
-///
-/// A running process is the fact that does distinguish them, and the panel puts
-/// one in the pane it owns — `install_one` `exec`s over the shell, and a reload
-/// `exec`s again over itself, so from the pane's first frame to its last there
-/// is a `wsp` there with `HERDR_PANE_ID` in its environment. `ps -E` prints
-/// that environment beside the command, which is what makes this answerable
-/// without asking herdr anything it does not know.
-///
-/// **`None` is not "no panes".** The one caller closes panes on the strength of
-/// this, and a `ps` that would not answer must never read as "nothing is
-/// running anywhere" — that is a list of every panel on the machine to close.
-/// Same rule, same reason, as [`running`].
-pub(crate) fn wsp_panes(state: &Path) -> Option<std::collections::HashSet<String>> {
-    let all = crate::base::procs::processes();
-    if all.is_empty() {
-        return None;
-    }
-    Some(manned(&all, state))
-}
-
-/// That reading of a process list, without the list. Any subcommand, not just
-/// `panel`: the detail pane, the board and the fullscreen tree are ours too and
-/// are drawn by other words, and what is being asked is whether *anything* of
-/// ours is alive in there.
-fn manned(all: &[(u32, u32, String)], state: &Path) -> std::collections::HashSet<String> {
-    all.iter()
-        .filter(|(_, _, rest)| is_exe(argv(rest).next()) && for_store(rest, state))
-        .filter_map(|(_, _, rest)| pane_of(rest))
-        .collect()
-}
-
-/// The pane a process is running in, from the environment `ps -E` appends.
-fn pane_of(rest: &str) -> Option<String> {
-    rest.split_whitespace()
-        .find_map(|w| w.strip_prefix("HERDR_PANE_ID="))
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-}
-
 /// Has anything on this machine that wants a daemon answered?
 ///
 /// The gate on [`loud`], and one function rather than four ad-hoc readings of
@@ -900,41 +853,6 @@ mod tests {
         assert!(!nothing_answered(&[true, true]));
         assert!(nothing_answered(&[false, false]), "nothing answering was let through");
         assert!(nothing_answered(&[]), "an empty backend list answered for nobody");
-    }
-
-    /// The husk test's evidence, and the field it is read out of: `ps -E`
-    /// prints the command and the environment as one blob, so the pane a
-    /// process is in is there to be had without asking herdr — which could not
-    /// answer it anyway, since herdr's pane knows its label and not what is
-    /// running inside it.
-    #[test]
-    fn a_panel_is_found_by_the_pane_its_environment_names() {
-        let state = Store::default_state();
-        let line = |s: &str| vec![(1u32, 1u32, s.to_string())];
-
-        assert_eq!(
-            manned(&line("/usr/local/bin/wsp panel HERDR_PANE_ID=w1:p2 SHELL=/bin/zsh"), &state),
-            ["w1:p2".to_string()].into_iter().collect()
-        );
-        // The board, the detail pane and the fullscreen tree are ours too, and
-        // are not `wsp panel`. Anything of ours in the pane holds it.
-        assert_eq!(
-            manned(&line("wsp detail t-1 HERDR_PANE_ID=w1:p3"), &state).len(),
-            1
-        );
-        // Somebody else's binary in a pane of ours says nothing about ours.
-        assert!(manned(&line("/bin/zsh -l HERDR_PANE_ID=w1:p6G"), &state).is_empty());
-        // A sandbox's panel is not this store's, and its pane is not one this
-        // store may close — the same filter that keeps `doctor` from crying
-        // wolf about a second daemon.
-        assert!(manned(
-            &line("wsp panel WSP_STATE=/tmp/sandbox/state HERDR_PANE_ID=w1:p2"),
-            &state
-        )
-        .is_empty());
-        // A wsp with no pane in its environment is a wsp somebody typed at a
-        // shell outside herdr. It holds nothing.
-        assert!(manned(&line("wsp panel"), &state).is_empty());
     }
 
     /// The guard that would have stopped robustness-021 on its own.

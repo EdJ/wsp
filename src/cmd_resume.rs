@@ -177,8 +177,6 @@ use crate::Args;
 /// Where a session id came from, which is how much it is worth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// The last census: this agent was running when anything last looked.
-    Census,
     /// A binding or a seat: the id of the agent that is, or last was, there.
     Record,
     /// The event log, because no record survives. Current as of its line and
@@ -189,7 +187,6 @@ pub enum Source {
 impl Source {
     fn as_str(self) -> &'static str {
         match self {
-            Source::Census => "was running",
             Source::Record => "on the record",
             Source::Log => "from the log",
         }
@@ -282,54 +279,6 @@ fn text(v: &Value, key: &str) -> String {
 }
 
 // ---- the list a restart offers back ---------------------------------------
-
-/// One census row as a thread, or `None` for a row nothing can be done with.
-fn of_row(row: &Value) -> Option<Thread> {
-    let session = text(row, "session");
-    if session.is_empty() {
-        return None;
-    }
-    let task = Some(text(row, "task")).filter(|s| !s.is_empty());
-    let seat_of = Some(text(row, "seat")).filter(|s| !s.is_empty());
-    let pane = text(row, "pane");
-    Some(Thread {
-        // What to call it, in the order a person would: the work, then the
-        // post, then the label herdr had for the pane. A row with none of the
-        // three is an agent somebody started by hand, and its own label is the
-        // only name it has ever had.
-        what: task
-            .clone()
-            .or_else(|| seat_of.clone())
-            .unwrap_or_else(|| match text(row, "label").is_empty() {
-                true => pane.clone(),
-                false => text(row, "label"),
-            }),
-        task,
-        seat_of,
-        session,
-        cwd: text(row, "cwd"),
-        host: util::hostname(),
-        workspace: text(row, "workspace"),
-        kind: cmd_spawn::kind_or_default(&text(row, "kind")),
-        from: Source::Census,
-    })
-}
-
-/// The census that is on offer: the one a restart interrupted if the daemon
-/// held one back, and otherwise whatever is newest.
-///
-/// Two sources and they are the same list at different ages. The roster is
-/// rewritten on every tick — including the tick after a restart, which writes
-/// an empty one — so what is worth offering survives only because
-/// [`ask_on_startup`] takes a copy before that happens. Reading the copy first
-/// is what makes the question still answerable ten minutes later, when a person
-/// has walked back to the machine.
-fn offered(store: &Store) -> Vec<Value> {
-    match store.held() {
-        rows if !rows.is_empty() => rows,
-        _ => store.roster(),
-    }
-}
 
 /// What that census holds that herdr is not answering for — the offer, in the
 /// order it was drawn.
@@ -661,22 +610,6 @@ fn thread_for(store: &Store, needle: &str) -> Result<Thread, String> {
 }
 
 // ---- putting one back -----------------------------------------------------
-
-/// Whether this kind's seat has an environment in it, and so may only be one
-/// wsp opened itself.
-///
-/// The whole of the rule [`somewhere_to_stand`] applies about the kind, split
-/// out because it needs no socket to be true and a test should not need one to
-/// say so. `env` rather than a property of the kind, because the question is
-/// *what would this resume have to deliver* — the same argument [`bring_back`]
-/// passes — so a kind that one day needs configuring only sometimes answers
-/// correctly without this line being revisited.
-///
-/// Asked with the emptiest seat there is — no brief, nothing outside the tree —
-/// so the answer is about the kind and not about which row is being resumed.
-fn needs_a_seat_wsp_opened(kind: &str) -> bool {
-    !agent_commands::of(kind).env(None, &cmd_spawn::Reach::default()).is_empty()
-}
 
 /// Where to start the agent: back in the room it was in, or a new one.
 ///
@@ -1827,7 +1760,7 @@ mod tests {
             host: util::hostname(),
             workspace: String::new(),
             kind: "codex".into(),
-            from: Source::Census,
+            from: Source::Record,
         };
         assert_eq!(t.by_hand(), None);
         assert!(t.by_hand_says().contains("codex"), "{}", t.by_hand_says());
@@ -1854,60 +1787,6 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_hand_is_raised_per_task_and_never_over_one_somebody_else_raised() {
-        let (_env, store) = store("resume-hands");
-        let mut theirs = crate::message::Message::new(
-            crate::message::Party::pane("w1:p6", "ws"),
-            crate::message::Kind::Note,
-            "blocked on you",
-        );
-        theirs.about = crate::message::About::Task("render-019".into());
-        crate::message::raise(&store, &theirs).unwrap();
-
-        let waiting: Vec<Thread> =
-            [row("render-061", "s1"), row("render-019", "s2")].iter().filter_map(of_row).collect();
-        raise_hands(&store, &waiting);
-
-        assert_eq!(hands_on(&store, "render-061"), vec![HAND.to_string()], "the row gets the hand");
-        assert_eq!(
-            hands_on(&store, "render-019"),
-            vec!["blocked on you".to_string(), HAND.to_string()],
-            "an agent's own question is untouched, and the restart notice stands beside it",
-        );
-
-        // Twice is once. A daemon that restarts must not put a second copy of
-        // the same notice on a row somebody has not answered yet.
-        raise_hands(&store, &waiting);
-        assert_eq!(hands_on(&store, "render-061"), vec![HAND.to_string()], "raised twice");
-    }
-
-    /// Answering the question puts the hands down — and only the ones it put
-    /// up. The offer is dropped in the same act, because they are one fact.
-    #[test]
-    fn answering_lowers_the_hands_it_raised_and_leaves_the_others() {
-        let (_env, store) = store("resume-answered");
-        store.set_held(vec![row("render-061", "s1"), row("render-019", "s2")]);
-        let mut theirs = crate::message::Message::new(
-            crate::message::Party::pane("w1:p6", "ws"),
-            crate::message::Kind::Note,
-            "blocked on you",
-        );
-        theirs.about = crate::message::About::Task("render-019".into());
-        crate::message::raise(&store, &theirs).unwrap();
-        let waiting: Vec<Thread> = store.held().iter().filter_map(of_row).collect();
-        raise_hands(&store, &waiting);
-
-        answered(&store);
-        assert!(store.held().is_empty(), "the census goes with the answer");
-        assert!(hands_on(&store, "render-061").is_empty(), "our hand comes down");
-        assert_eq!(
-            hands_on(&store, "render-019"),
-            vec!["blocked on you".to_string()],
-            "and somebody else's does not — including the one it was standing beside",
-        );
-    }
-
     /// The copy that outlives the tick, and the two ways a row leaves it. The
     /// ordering this protects is the daemon's: `sync` empties the roster one
     /// second after herdr comes up, so an offer read from the roster alone
@@ -1930,9 +1809,17 @@ mod tests {
 
     /// A thread, as the census gives one, standing in a directory that exists.
     fn thread(task: &str, cwd: &std::path::Path) -> Thread {
-        let mut t = of_row(&row(task, "s1")).unwrap();
-        t.cwd = cwd.display().to_string();
-        t
+        Thread {
+            what: task.to_string(),
+            task: Some(task.to_string()),
+            seat_of: None,
+            session: "s1".into(),
+            cwd: cwd.display().to_string(),
+            host: util::hostname(),
+            workspace: String::new(),
+            kind: cmd_spawn::kind_or_default(""),
+            from: Source::Record,
+        }
     }
 
     fn task_at(store: &Store, id: &str, status: Status) {
@@ -2010,22 +1897,6 @@ mod tests {
         assert!(cfg.contains("permission"), "the brake is what the config is for: {cfg}");
         assert!(!cfg.contains("instructions"), "the session already holds its brief: {cfg}");
         assert_eq!(env.get("WSP_TASK").map(String::as_str), Some("oc-001"));
-    }
-
-    /// The half no order can fix: a pane wsp did not open cannot be given an
-    /// environment, so a kind that needs one may not be stood back up in it.
-    ///
-    /// herdr's `agent.start` takes a pane, a kind, a name and args — no
-    /// environment — and the only calls that carry one make a new shell. Driven
-    /// 2026-08-22 against a sandbox herdr stopped and started again: the pane
-    /// came back with the same id and cwd, and `OPENCODE_CONFIG_CONTENT` unset.
-    /// That is the exact case `somewhere_to_stand` exists for, so for this one
-    /// kind the tidy answer and the correct one are opposites.
-    #[test]
-    fn a_kind_that_needs_configuring_may_not_be_stood_back_up_where_wsp_cannot_configure_it() {
-        assert!(needs_a_seat_wsp_opened("opencode"));
-        assert!(!needs_a_seat_wsp_opened("claude"), "every resume that worked this way still does");
-        assert!(!needs_a_seat_wsp_opened("codex"), "and a kind wsp knows nothing about is unchanged");
     }
 
     /// The `render-077` incident, as the check that would have caught it. The
@@ -2185,47 +2056,6 @@ mod tests {
         let deliberate = Row::new(&store, thread("wsp-079", &tree));
         assert_eq!(deliberate.stale, now, "shown and now are the same, so nothing has changed");
         assert!(!deliberate.stale.unwrap().fatal());
-    }
-
-    /// A census row with no session cannot be offered: the row would fail the
-    /// moment it was taken.
-    #[test]
-    fn a_row_with_no_session_is_not_an_offer() {
-        assert!(of_row(&row("render-061", "")).is_none());
-        assert!(of_row(&row("render-061", "s")).is_some());
-    }
-
-    /// Everything starts ticked, `␣` flips one, and `esc` is a real answer
-    /// that takes nothing.
-    #[test]
-    fn the_list_opens_with_everything_ticked_and_esc_takes_none_of_it() {
-        let rows: Vec<Thread> =
-            [row("a", "s1"), row("b", "s2"), row("c", "s3")].iter().filter_map(of_row).collect();
-        let mut p = Picker::new(clean(rows));
-        assert_eq!(p.chosen().len(), 3);
-
-        assert_eq!(p.press(Key::Down), Step::Stay);
-        assert_eq!(p.press(Key::Char(' ')), Step::Stay);
-        let names: Vec<&str> = p.chosen().iter().map(|r| r.thread.what.as_str()).collect();
-        assert_eq!(names, ["a", "c"], "the row under the cursor came off and nothing else moved");
-
-        assert_eq!(p.press(Key::Esc), Step::Walk);
-        assert_eq!(p.press(Key::Enter), Step::Take);
-        assert_eq!(p.chosen().len(), 2, "walking away does not change what was ticked");
-    }
-
-    /// `n` then `↵` is how a person says "none of these" without pressing space
-    /// eleven times, and it must not be read as "all of them".
-    #[test]
-    fn none_then_enter_resumes_nothing() {
-        let rows: Vec<Thread> = [row("a", "s1"), row("b", "s2")].iter().filter_map(of_row).collect();
-        let mut p = Picker::new(clean(rows));
-        p.press(Key::Char('n'));
-        assert_eq!(p.press(Key::Enter), Step::Take);
-        assert!(p.chosen().is_empty());
-
-        p.press(Key::Char('a'));
-        assert_eq!(p.chosen().len(), 2);
     }
 
     /// The cursor cannot leave the list, including when the list is empty —

@@ -481,15 +481,6 @@ pub(super) fn tell_refused(ui: &Ui, pane: &str, task: &str) -> Option<Tell> {
     })
 }
 
-/// Between the sentence and the return that sends it.
-const RETURN_MS: u64 = 150;
-/// How long to wait for a cleared agent to come back as a new session, and how
-/// often to ask. Measured at four hundred milliseconds on this machine, which
-/// is a Claude Code resetting and running its `SessionStart` hooks; the ceiling
-/// is for a machine having a worse day, not for a clear that is never coming.
-const CLEAR_MS: u64 = 5_000;
-const CLEAR_POLL_MS: u64 = 100;
-
 /// Hand an agent a sentence, on an empty context where we can give it one.
 ///
 /// The clear is the point. A pane that takes a claim is nearly always an agent
@@ -1012,16 +1003,6 @@ pub(super) fn open_full(self_ws: Option<&str>) -> String {
         return "no workspace on screen to open a tab in".into();
     }
     "could not create a tab".into()
-}
-
-/// The `wsp kanban` a board's tab runs, as argv.
-///
-/// One line, and it is here rather than inline so a test can hold it: the page
-/// and the tab that stands in for it have to be a board of the same thing, and
-/// what makes that true is [`Scope::label`] being the word the command line
-/// reads back — see [`Scope::named`].
-pub(super) fn board_argv(scope: &Scope) -> Vec<String> {
-    vec!["kanban".into(), scope.label()]
 }
 
 /// Open a board full-size in a tab of its own.
@@ -2517,28 +2498,6 @@ mod tests {
             WHOLE_SCREEN > PAGE_MIN * 10,
             "asking past the end only works while it is past every end there is",
         );
-    }
-
-    /// The page and the tab it falls back to have to be a board of the same
-    /// thing, and what holds that together is one value used twice: the scope
-    /// names itself the way the command line reads it back.
-    ///
-    /// Broken by renaming a scope's label for the look of it, which is exactly
-    /// the change nobody would think to test by hand — the tab is the path that
-    /// only runs on an older herdr.
-    #[test]
-    fn the_tab_a_board_falls_back_to_is_a_board_of_the_same_thing() {
-        let index = crate::resolve::Index::new(vec![crate::model::Project::new("wsp")]);
-        for scope in [Scope::Project("wsp".into()), Scope::Inbox, Scope::Everything] {
-            let argv = board_argv(&scope);
-            assert_eq!(argv[0], "kanban");
-            assert_eq!(
-                crate::kanban::Scope::named(&argv[1], &index),
-                Some(scope.clone()),
-                "`wsp {}` is not a board of {scope:?}",
-                argv.join(" "),
-            );
-        }
     }
 
     /// A panel acts on the workspace it is in, and never asks which one is on
