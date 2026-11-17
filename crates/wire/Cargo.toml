@@ -10,12 +10,14 @@ path = "src/lib.rs"
 [dependencies]
 serde_json = "1"
 wsp-base = { path = "../base" }
+wsp-host = { path = "../host" }
 wsp-store = { path = "../store" }
 
 [dev-dependencies]
 wsp-base = { path = "../base", features = ["test-support"] }
+wsp-host = { path = "../host", features = ["test-support"] }
 wsp-store = { path = "../store", features = ["test-support"] }
 wsp-testkit = { path = "../testkit" }
 
 [features]
-test-support = []
+test-support = ["wsp-host/test-support"]

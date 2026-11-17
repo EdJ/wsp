@@ -84,7 +84,10 @@ everything else hangs from. The 80 that remain, by direction (with `main` in `to
 `tests/layering.rs` (row `p0`, wsp-400) reads this table: one row per component, lowest first, so a module may use
 its own row and the rows above it in this table, never a row below. It is `assign.py`'s `put(...)` lines with `main`
 in `top`, where §3 puts it (so today's `crate::Args` uses count as upward until `p1` moves `Args` to base), and the
-modules added since the spike placed. A new module goes in this table or the test fails. Every upward use the code
+modules added since the spike placed. A new module goes in this table or the test fails. `host` is the `wsp-host` crate's
+modules (wsp-020), below the store because it uses none of it; the same file's
+`the_host_crate_links_neither_the_store_nor_the_wire` holds the crate's own rule, which is about Cargo dependencies
+rather than `crate::` paths. Every upward use the code
 has today is listed in `docs/components-upward.txt`; the test fails on one not listed and on a listed one the code
 no longer has, and that file may only lose lines. `cargo test --test layering -- --nocapture` prints the per-pair count.
 
@@ -95,6 +98,7 @@ cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 
 | component | modules |
 |---|---|
 | `base` | `base`, `util`, `calls`, `fm`, `input`, `risk`, `memory`, `choices` |
+| `host` | `inproc`, `port`, `price`, `shed`, `test_sups` |
 | `store` | `model`, `checks`, `caption`, `store`, `resolve`, `message`, `lapse`, `sharing`, `cmd_migrate`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags` |
 | `wire` | `herdr`, `place`, `place_herdr`, `place_compound`, `place_super`, `host`, `artefact`, `cmd_mandate`, `tunnel`, `far`, `launchd`, `systemd`, `detect_override`, `fake` |
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `at_stop`, `gc` |
@@ -137,6 +141,7 @@ not a structure problem (row `c0-fixtures` below).
 |---|---|---|---|---|
 | `wsp` (root) | `src/` | — | every module not yet cut; the binary, `build.rs`, the stamp (`src/base/stamp.rs`) | this file |
 | `wsp-base` | `crates/base` | `c1` (wsp-408) | `util`, `fm`, `input`, `risk`, `choices`, `base::{args, git, labels, seat, term}` | `crates/base/MAP.md` |
+| `wsp-host` | `crates/host` | M1 group 1 (wsp-020) | the in-process host: `InProcess` and the OS code it is built from (processes, signals, the screen, delivery, hook files, transcripts, host facts), and what it needed of the wire (`Seat`, `State`, `Refusal`, `Delivery`, the shed list, the prices); the wire re-exports each at its old path and keeps the `Host` trait as an adapter. **Depends on `wsp-base` only (`wsp-host-api` may join), never on `wsp-store` or `wsp-wire`**: `tests/layering.rs` walks its path dependencies | `crates/host/MAP.md` |
 | `wsp-testkit` | `crates/testkit` | `c1` (wsp-408) | the git repository fixture (`repo`, `repo_at`, `git`); the store-backed half is in `crates/store/src/testkit.rs` (a `wsp-testkit` that depended on `wsp-store` would give the store's own unit tests a second `Store`) | its `lib.rs` |
 | `wsp-store` | `crates/store` | `c5` (wsp-412) | `model`, `store`, `resolve`, `message`, `lapse`, `sharing`, `checks`, `caption`, `governors`, `agent_kind`, `log`, `decisions`, `tags`, `verbs`; the store-backed test kit | `crates/store/MAP.md` |
 | `wsp-store-contract` | `crates/store-contract` | `c5` (wsp-412) | the constants the records name (`SCHEMA`, the section lists, `DEFAULT_LEASE`, the policy words); the types stay in `wsp-store` while they carry inherent methods | its `lib.rs` |
@@ -168,6 +173,7 @@ The rules are `docs/widget-contract.md` in compounding, applied rather than copi
 | crate | its contract (what others may use) | one-writer facts (only this crate…) |
 |---|---|---|
 | `wsp-base` | `Args`, `Stamp`, `git(…)`, `Clock`, `Colour` | …owns no state. Anything stateful is refused here |
+| `wsp-host` | `InProcess` and its methods, the spawn and stop types, `Seat`, `State`, `Refusal`, `Delivery` | …runs every OS operation a seat needs: `ps`, `kill`, `lsof`, the fact probes, `compound-render`, transcript and hook-log reads (`tests/host_seam.rs` allows them under `crates/host/src/` alone). Owns no record; links nothing of the store, so the agent manager can link it |
 | `wsp-store` | `Store` (open/read/save/lock), `Task`, `Project`, `Worklist`, `Message`, `Machine`, `Status`, the section accessors | …writes the task, project, worklist, message and machine records and `~/.local/state/wsp`; **one verb per section** (`log`, `decide`, `verification`, `claim`), so the 22 `save_task` callers become calls. `lapse` runs inside the store's own writes, as it does today |
 | `wsp-wire` | the `Place` port and its eight verbs, `Seat`, `State`, `Refusal`, `Backend` list | …talks to herdr, compound and supervisors. Nothing else opens a socket or an ssh. The fake backend lives here |
 | `wsp-trees` | `Tree`, `Flow`, `land`, `verify`, `TreeLock`, `Throttle` | …creates, rebases, removes and locks worktrees and build trees; runs the throttled cargo |

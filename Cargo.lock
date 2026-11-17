@@ -112,6 +112,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsp-host"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-base",
+]
+
+[[package]]
 name = "wsp-host-api"
 version = "0.1.0"
 dependencies = [
@@ -153,6 +161,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "wsp-base",
+ "wsp-host",
  "wsp-store",
  "wsp-testkit",
 ]

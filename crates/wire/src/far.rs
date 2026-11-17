@@ -81,18 +81,9 @@ pub fn probe_command(m: &Machine) -> String {
     format!("{} wire-version", quote(&sup_of(m)))
 }
 
-/// `compound-sup wire-version` output → the range it accepts, `(OLDEST,
-/// VERSION)`. A current build prints `OLDEST VERSION` (`9 14`); an older build
-/// prints a bare number, which is the range `VERSION VERSION`. Anything else
-/// (a word, a third token, OLDEST above VERSION) is no answer.
-pub fn parse_wire(out: &str) -> Option<(u32, u32)> {
-    let toks: Vec<u32> = out.split_whitespace().map(|t| t.parse().ok()).collect::<Option<_>>()?;
-    match toks[..] {
-        [v] => Some((v, v)),
-        [o, v] if o <= v => Some((o, v)),
-        _ => None,
-    }
-}
+/// `compound-sup wire-version` output → the range it accepts: moved down to
+/// `wsp-host` with the doctor's wire check, which reads it there.
+pub use wsp_host::inproc::parse_wire;
 
 /// Does the machine's recorded range hold the seat's wire version? A record
 /// with no `wire_oldest` (a bare version, or one written before the range was

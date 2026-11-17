@@ -677,6 +677,29 @@ cannot be staged is one row run as legs; every row's checks build and test every
 host-api already holds 3.2's types and the `Connection` trait (wsp-002), so no group changes the contract crate. A
 gap found on the way is a row of its own (components.md R5).
 
+#### Group 1: the in-process host in its own crate (wsp-020, 2026-11-17)
+
+The in-process host is now `crates/host` (`wsp-host`). It depends on `wsp-base` and nothing else of the
+workspace, and `tests/layering.rs` (`the_host_crate_links_neither_the_store_nor_the_wire`) walks its path
+dependencies to keep it that way. It holds:
+- `InProcess`: its methods are the old `impl Host for InProcess`, with the same names.
+- The free functions those methods are built from. These are every free function the guard names.
+- What they needed of the wire, moved down:
+  - `place`'s `Seat`, `State`, `Refusal`, `Delivery` and `Result`, and the shed list.
+  - `place_super`'s prices, `read_json` and `str_of`.
+  - `place_compound`'s `WIRE_VERSION`, `DELIVERY_PENDING`, `reads_kind` and `test_sups`.
+- The store's `checks::ps_says`, which went to `wsp-base`'s `procs` instead.
+
+The wire re-exports each item at its old path, so no caller changed. `crates/wire/src/host.rs` is the adapter.
+It keeps the `Host` trait and `LOCAL`, plus a `host::InProcess` that wraps `wsp_host::InProcess`, with each
+trait method calling the in-process method of the same name. It is a newtype rather than the type itself, so
+a caller still names the trait to ask the host anything. `host::Tcp` (group 4) stands beside it. Only the
+host's `write_atomic` is new code: it is the store's, without the write counter of the store's `steady`
+passes. Those passes never walk a seat's directory. The guard (`tests/host_seam.rs`) now allows the probes
+under `crates/host/src/` and nowhere else. Run with the exclusion lifted, it finds all of them (16 hits) in
+`crates/host/src/inproc.rs`, and none in the wire. `host-api` is not a dependency yet. It joins when the
+manager's messages are spoken here (group 2 and after).
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the

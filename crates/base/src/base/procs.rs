@@ -62,6 +62,30 @@ pub fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
     out
 }
 
+/// What a finished `ps -o lstart=,stat= -p <pid>` says. A defunct (zombie)
+/// process, its `stat` starting with `Z`, still has a pid and a start time but
+/// is no run: it reads as no process at all, so a barrier whose run died
+/// unreaped is not waited on forever. It says there is no such
+/// process by exiting 1 with nothing on stdout (stderr is free text, and a pid
+/// too large for the system gets a complaint there with the same exit). Any
+/// other end — killed by a signal, or another exit status — says nothing about
+/// the pid, so it is `Err` and a live run is not read as dead on it. A `ps` that
+/// itself fails with exit 1 and prints nothing cannot be told from a missing
+/// pid, and reads as gone: the lock (`open_unless_held`) is what covers that.
+pub fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
+    if code != Some(0) && !(code == Some(1) && stdout.iter().all(u8::is_ascii_whitespace)) {
+        return Err(());
+    }
+    let s = String::from_utf8_lossy(stdout);
+    let mut words = s.split_whitespace().collect::<Vec<_>>();
+    let Some(stat) = words.pop() else { return Ok(None) };
+    if stat.starts_with('Z') {
+        return Ok(None);
+    }
+    let s = words.join("_");
+    Ok((!s.is_empty()).then_some(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

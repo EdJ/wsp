@@ -375,7 +375,14 @@ fn no_new_upward_edge_and_the_allowlist_only_shrinks() {
     for c in comp.values() {
         assert!(rank.contains_key(c.as_str()));
     }
-    let (mods, edges) = product_edges(&[root.join("src"), root.join("crates/base/src"), root.join("crates/store/src"), root.join("crates/wire/src"), root.join("crates/trees/src")]);
+    let (mods, edges) = product_edges(&[
+        root.join("src"),
+        root.join("crates/base/src"),
+        root.join("crates/host/src"),
+        root.join("crates/store/src"),
+        root.join("crates/wire/src"),
+        root.join("crates/trees/src"),
+    ]);
 
     let unmapped: Vec<&String> = mods.iter().filter(|m| !comp.contains_key(*m)).collect();
     assert!(
@@ -463,6 +470,129 @@ fn no_new_upward_edge_and_the_allowlist_only_shrinks() {
             );
         }
     }
+}
+
+/// The workspace crates a manifest names as `path` dependencies, `name ->
+/// directory`: under `[dependencies]`, `[build-dependencies]` and their
+/// `[target.….…]` forms, and `[dev-dependencies]` too when `dev`. Both the
+/// inline form (`name = { path = "…" }`) and the table form
+/// (`[dependencies.name]` then `path = "…"`) are read.
+fn path_deps(manifest: &Path, dev: bool) -> BTreeMap<String, PathBuf> {
+    let text = fs::read_to_string(manifest).unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
+    let dir = manifest.parent().unwrap();
+    let kinds: &[&str] = if dev { &["dependencies", "build-dependencies", "dev-dependencies"] } else { &["dependencies", "build-dependencies"] };
+    let path_in = |v: &str| -> Option<String> {
+        let at = v.find("path")?;
+        let rest = v[at + 4..].trim_start().strip_prefix('=')?.trim_start().strip_prefix('"')?;
+        Some(rest[..rest.find('"')?].to_string())
+    };
+    let mut out = BTreeMap::new();
+    // The section's kind, and the crate a `[dependencies.name]` table is about.
+    let mut section: Option<Option<String>> = None;
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap().trim();
+        if let Some(h) = l.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            // `target.<spec>.<kind>[.<name>]`: the spec may hold dots, so the
+            // kind is found as a whole dotted segment.
+            let h = match h.strip_prefix("target.") {
+                Some(t) => kinds
+                    .iter()
+                    .find_map(|k| {
+                        t.match_indices(&format!(".{k}"))
+                            .map(|(i, _)| &t[i + 1..])
+                            .find(|r| r.len() == k.len() || r[k.len()..].starts_with('.'))
+                    })
+                    .unwrap_or(""),
+                None => h,
+            };
+            section = kinds.iter().find_map(|k| {
+                if h == *k {
+                    Some(None)
+                } else {
+                    h.strip_prefix(&format!("{k}.")).map(|n| Some(n.trim_matches('"').to_string()))
+                }
+            });
+            continue;
+        }
+        match &section {
+            Some(None) => {
+                if let Some((name, v)) = l.split_once('=') {
+                    if let Some(p) = path_in(v) {
+                        out.insert(name.trim().trim_matches('"').to_string(), dir.join(p));
+                    }
+                }
+            }
+            Some(Some(name)) => {
+                if let Some(p) = l.starts_with("path").then(|| path_in(l)).flatten() {
+                    out.insert(name.clone(), dir.join(p));
+                }
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// `wsp-host`, the in-process host, is what the agent manager links, and the
+/// manager links nothing of the store (`docs/agent-manager.md` 2.3, R1;
+/// `docs/components.md` R1). So the crate depends on `wsp-base` (and
+/// `wsp-host-api`, once it speaks the manager's messages) and on nothing else
+/// of the workspace, directly or through them, its own tests included: never
+/// `wsp-store`, `wsp-store-contract` or `wsp-wire` (wsp-020).
+#[test]
+fn the_host_crate_links_neither_the_store_nor_the_wire() {
+    let root = root();
+    let host = root.join("crates/host/Cargo.toml");
+    let text = fs::read_to_string(&host).unwrap();
+    assert!(text.lines().any(|l| l.trim() == "name = \"wsp-host\""), "crates/host is no longer the package wsp-host");
+
+    const MAY: &[&str] = &["wsp-base", "wsp-host-api"];
+    const NEVER: &[&str] = &["wsp-store", "wsp-store-contract", "wsp-wire", "wsp-trees", "wsp-testkit", "wsp"];
+    // Every workspace crate the host reaches, and by which path.
+    let mut reached: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut stack: Vec<(PathBuf, Vec<String>, bool)> = vec![(host, vec!["wsp-host".into()], true)];
+    while let Some((manifest, via, dev)) = stack.pop() {
+        for (name, dir) in path_deps(&manifest, dev).into_iter().filter(|(n, _)| n != "wsp-host") {
+            let mut chain = via.clone();
+            chain.push(name.clone());
+            if reached.insert(name.clone(), chain.clone()).is_none() {
+                stack.push((dir.join("Cargo.toml"), chain, false));
+            }
+        }
+    }
+    println!("wsp-host reaches: {:?}", reached.keys().collect::<Vec<_>>());
+    let bad: Vec<String> = reached
+        .iter()
+        .filter(|(n, _)| NEVER.contains(&n.as_str()) || !MAY.contains(&n.as_str()))
+        .map(|(_, chain)| format!("  {}\n", chain.join(" -> ")))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "wsp-host must link only {MAY:?} of the workspace (the agent manager links it and nothing of the store; \
+         docs/agent-manager.md 2.3, docs/components.md R1):\n{}",
+        bad.concat()
+    );
+}
+
+#[test]
+fn the_manifest_reader_finds_path_dependencies_in_each_form() {
+    let d = std::env::temp_dir().join(format!("wsp-layering-manifest-{}", std::process::id()));
+    fs::create_dir_all(&d).unwrap();
+    let m = d.join("Cargo.toml");
+    fs::write(
+        &m,
+        "[package]\nname = \"x\"\npath = \"not-a-dep\"\n\n[dependencies]\nserde_json = \"1\"\nwsp-base = { path = \"../base\" }\n\
+         \n[dependencies.wsp-store]\nversion = \"0.1\"\npath = \"../store\"\n\
+         \n[target.'cfg(unix)'.dependencies]\nwsp-wire = { path = \"../wire\", features = [\"x\"] }\n\
+         \n[target.x86_64-apple-darwin.build-dependencies]\nwsp-trees = { path = \"../trees\" }\n\
+         \n[dev-dependencies]\nwsp-testkit = { path = \"../testkit\" } # a comment\n\n[features]\ntest-support = []\n",
+    )
+    .unwrap();
+    let names = |dev| path_deps(&m, dev).into_keys().collect::<Vec<_>>();
+    assert_eq!(names(false), ["wsp-base", "wsp-store", "wsp-trees", "wsp-wire"]);
+    assert_eq!(names(true), ["wsp-base", "wsp-store", "wsp-testkit", "wsp-trees", "wsp-wire"]);
+    assert_eq!(path_deps(&m, false)["wsp-base"], d.join("../base"));
+    let _ = fs::remove_dir_all(&d);
 }
 
 #[test]
