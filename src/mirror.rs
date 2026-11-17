@@ -498,7 +498,16 @@ fn held(state: &c::State, half: Half) -> BTreeMap<Subject, Entity> {
             all.extend(state.rows.values().cloned().map(Entity::Row));
             all.extend(state.lists.values().cloned().map(Entity::List));
             all.extend(state.claims.values().cloned().map(Entity::Claim));
-            all.extend(state.machines.values().cloned().map(Entity::Machine));
+            // Only machines this half projects: the fold's beats name the local
+            // machine by its hostname, and no file does, so they are not held here.
+            all.extend(
+                state
+                    .machines
+                    .values()
+                    .filter(|m| m.name.0 == LOCAL || !matches!(m.transport, c::Transport::Local))
+                    .cloned()
+                    .map(Entity::Machine),
+            );
         }
         Half::Attention => all.extend(state.asks.values().cloned().map(Entity::Ask)),
     }
@@ -684,5 +693,31 @@ mod tests {
         both.extend(key(&read_attention(&s)));
         let Command::Mirror { gone, .. } = diff_half(&both, read_rows_etc(&s, "here"), Half::RowsEtc) else { panic!() };
         assert!(!gone.iter().any(|g| matches!(g, Subject::Ask(_))));
+    }
+
+    /// A restart's first pass diffs the files against what the database holds;
+    /// the machine the fold's beats put under the hostname is no file's, so it
+    /// is not held by this half and is not sent `mirror.gone`.
+    #[test]
+    fn a_restart_does_not_send_gone_for_the_machine_the_folds_beats_put() {
+        let s = seed("mirror-machine");
+        let mut state = c::State::default();
+        for e in read_rows_etc(&s, LOCAL) {
+            if let Entity::Machine(m) = e {
+                state.machines.insert(m.name.clone(), m);
+            }
+        }
+        let beat = c::Machine {
+            name: MachineName("Jespers-MBP".into()),
+            transport: Transport::Local,
+            beat: Some(At(1)),
+            facts: BTreeMap::new(),
+        };
+        state.machines.insert(beat.name.clone(), beat);
+        let held = held(&state, Half::RowsEtc);
+        assert!(!held.contains_key(&Subject::Machine(MachineName("Jespers-MBP".into()))));
+        assert!(held.contains_key(&Subject::Machine(MachineName("far".into()))));
+        let Command::Mirror { gone, .. } = diff_half(&held, read_rows_etc(&s, LOCAL), Half::RowsEtc) else { panic!() };
+        assert!(gone.iter().all(|g| !matches!(g, Subject::Machine(_))), "{gone:?}");
     }
 }

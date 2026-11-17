@@ -114,48 +114,166 @@ fn seeded(tag: &str, port: u16) -> Sandbox {
     sb
 }
 
-#[test]
-fn a_snapshot_equals_the_files() {
-    let mut sb = Sandbox::up("snap");
-    sb.wsp(&["add", "one", "--prio", "high", "-t", "a"]);
-    sb.wsp(&["add", "two"]);
-    let port = free_port();
-    sb.start_daemon(port, false);
-    // Let the first pass land before the snapshot is taken.
-    let client = sb.client(Duration::from_secs(20));
+/// The store the sandbox's files are, opened for seeding what no verb makes
+/// here: a claim, a list with groups, an ask, a flag and a machine record.
+fn files_of(sb: &Sandbox) -> wsp_store::store::Store {
+    wsp_store::store::Store::at(PathBuf::from(&sb.env["WSP_HOME"]), sb.state.clone())
+}
+
+fn ask_message(id: &str, text: &str) -> wsp_store::message::Message {
+    use wsp_store::message::{Kind, Message, Party, Waiting};
+    let mut m = Message::question(
+        Party::Pane { pane: "cpd-2".into(), workspace: "w".into() },
+        Kind::Direction,
+        text,
+        Waiting::new("cpd-2", "m-two"),
+    );
+    m.id = id.into();
+    m
+}
+
+fn snapshot_with(client: &Client, ready: impl Fn(&Value) -> bool) -> Value {
     let mut feed = client.subscribe(None);
-    let files: Vec<Value> = serde_json::from_str(&sb.wsp(&["ls", "--json"])).expect("ls --json");
-    assert_eq!(files.len(), 2);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let state = loop {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
         match feed.next_within(Duration::from_millis(500)) {
             Some(Item::State { state, .. }) => {
                 let v = serde_json::to_value(&state).unwrap();
-                if v["rows"].as_object().is_some_and(|r| r.len() == files.len()) {
-                    break v;
+                if ready(&v) {
+                    return v;
                 }
                 // The mirror had not landed yet: resubscribe.
                 feed = client.subscribe(None);
             }
-            _ if Instant::now() > deadline => panic!("the snapshot never held the files' rows"),
+            _ if Instant::now() > deadline => panic!("the snapshot never held the files"),
             _ => {}
         }
-    };
-    for f in &files {
+    }
+}
+
+#[test]
+fn a_snapshot_equals_the_files() {
+    use wsp_store::model::{self, Machine, Task, Worklist, WorklistStatus};
+    let mut sb = Sandbox::up("snap");
+    sb.wsp(&["add", "one", "--prio", "high", "-t", "a"]);
+    sb.wsp(&["add", "two"]);
+    sb.wsp(&["block", "inbox-002", "waiting on the test"]);
+    let files: Vec<Value> = serde_json::from_str(&sb.wsp(&["ls", "--json"])).expect("ls --json");
+    assert_eq!(files.len(), 2);
+    let ids: Vec<String> = files.iter().map(|f| f["id"].as_str().unwrap().to_string()).collect();
+
+    // What no verb makes here, written the way the store does.
+    let store = files_of(&sb);
+    store.set_claim(&ids[0], serde_json::json!({ "workspace_label": "cpd-2", "agent_id": "a-2" }));
+    let mut w = Worklist::new("list-a", "A list");
+    w.set_status(WorklistStatus::Running);
+    let mut g1 = model::Group::default();
+    g1.members = vec![ids[0].clone()];
+    g1.verdict = "holds".into();
+    let mut g2 = model::Group::default();
+    g2.members = vec![ids[1].clone()];
+    w.set_groups(&[g1, g2]);
+    store.save_worklist(&w).unwrap();
+    store.save_message(&ask_message("m-1", "may I?")).unwrap();
+    store.set_legacy_flag(&ids[1], serde_json::json!({ "pane": "cpd-4", "reason": "stuck" }));
+    let mut mf = Machine::default();
+    mf.name = "far".into();
+    mf.ssh = "far-alias".into();
+    mf.os = "linux".into();
+    mf.status = "active".into();
+    store.save_machine(&mf).unwrap();
+    let tasks: Vec<Task> = ids.iter().map(|i| store.task(i).unwrap()).collect();
+
+    let port = free_port();
+    sb.start_daemon(port, false);
+    let client = sb.client(Duration::from_secs(20));
+    let state = snapshot_with(&client, |v| {
+        let n = |k: &str| v[k].as_object().map_or(0, |o| o.len());
+        n("rows") == 2 && n("claims") == 1 && n("lists") == 1 && n("asks") == 2 && v["machines"].get("far").is_some()
+    });
+
+    // Rows: the files' `--json` and the task files, key by key.
+    for (f, t) in files.iter().zip(&tasks) {
         let id = f["id"].as_str().unwrap();
         let row = &state["rows"][id];
-        assert!(row.is_object(), "{id} is not in the snapshot: {state}");
         assert_eq!(row["title"], f["title"], "{id} title");
+        assert_eq!(row["project"], "inbox", "{id} project");
         let fields = &row["fields"];
+        assert_eq!(fields["status"], f["status"], "{id} status");
         assert_eq!(fields["prio"], f["priority"], "{id} prio");
         assert_eq!(fields["caption"], f["caption"]["text"], "{id} caption");
         let tags = f["tags"].as_array().map(|t| t.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","));
         // The projection leaves an empty value out of `fields`.
         assert_eq!(fields["tags"].as_str().unwrap_or(""), tags.unwrap_or_default(), "{id} tags");
         assert_eq!(fields["created"], f["created"], "{id} created");
+        assert_eq!(fields["updated"].as_str().unwrap_or(""), t.updated, "{id} updated");
+        assert_eq!(fields["after"].as_str().unwrap_or(""), t.after.join(","), "{id} after");
+        assert_eq!(fields["refs"].as_str().unwrap_or(""), t.refs.join(","), "{id} refs");
     }
-    // No row the files do not have.
-    assert_eq!(state["rows"].as_object().unwrap().len(), files.len());
+    let (r0, r1) = (&state["rows"][&ids[0]], &state["rows"][&ids[1]]);
+    for (f, r) in files.iter().zip([r0, r1]) {
+        // An inbox task waits like a todo one.
+        let want = if f["status"] == "inbox" { "todo" } else { f["status"].as_str().unwrap() };
+        assert_eq!(r["state"], want, "{} state", f["id"]);
+    }
+    assert!(files.iter().any(|f| f["status"] == "blocked") && files.iter().any(|f| f["status"] == "inbox"));
+    assert_eq!(r0["seat"], "cpd-2");
+    assert_eq!(r0["group"], serde_json::json!({ "list": "list-a", "n": 1 }));
+    assert_eq!(r1["group"], serde_json::json!({ "list": "list-a", "n": 2 }));
+    assert!(r1["seat"].is_null());
+    assert_eq!(state["rows"].as_object().unwrap().len(), files.len(), "a row the files do not have");
+
+    // Claims.
+    let claims = state["claims"].as_object().unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!((claims[&ids[0]]["row"].as_str(), claims[&ids[0]]["seat"].as_str()), (Some(ids[0].as_str()), Some("cpd-2")));
+
+    // Lists and groups.
+    let list = &state["lists"]["list-a"];
+    assert_eq!((list["state"].as_str(), list["fields"]["title"].as_str(), list["fields"]["status"].as_str()), (Some("running"), Some("A list"), Some("running")));
+    let groups = list["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!((groups[0]["state"].as_str(), groups[0]["fields"]["verdict"].as_str()), (Some("passed"), Some("holds")));
+    assert_eq!(groups[0]["members"], serde_json::json!([ids[0]]));
+    assert_eq!(groups[1]["state"], "running");
+    assert_eq!(groups[1]["members"], serde_json::json!([ids[1]]));
+
+    // Asks: the message and the flag.
+    let asks = state["asks"].as_object().unwrap();
+    assert_eq!(asks.len(), 2);
+    let q = &asks["m-1"];
+    assert_eq!((q["kind"].as_str(), q["state"].as_str(), q["text"].as_str()), (Some("ask"), Some("raised"), Some("may I?")));
+    assert_eq!(q["from"], serde_json::json!({ "seat": "cpd-2" }));
+    let fl = &asks[&format!("flag:{}", ids[1])];
+    assert_eq!((fl["kind"].as_str(), fl["fields"]["reason"].as_str(), fl["fields"]["pane"].as_str()), (Some("flag"), Some("stuck"), Some("cpd-4")));
+
+    // Machines: the record, and not one more.
+    let machines = state["machines"].as_object().unwrap();
+    assert_eq!(machines.keys().collect::<Vec<_>>(), vec!["far"]);
+    assert_eq!(machines["far"]["transport"], serde_json::json!({ "tcp": { "addr": "far-alias" } }));
+    assert_eq!((machines["far"]["facts"]["os"].as_str(), machines["far"]["facts"]["status"].as_str()), (Some("linux"), Some("active")));
+
+    // The attention half moves on its own: a second ask reaches the subscriber.
+    let mut feed = client.subscribe(None);
+    store.save_message(&ask_message("m-2", "and may I again?")).unwrap();
+    let end = Instant::now() + Duration::from_secs(3);
+    let mut put = false;
+    while Instant::now() < end && !put {
+        if let Some(Item::Event(e)) = feed.next_within(Duration::from_millis(100)) {
+            let v = serde_json::to_value(&e).unwrap();
+            put = v["kind"] == "mirror.put" && v.to_string().contains("m-2");
+        }
+    }
+    assert!(put, "a raised ask did not reach the subscriber as mirror.put");
+    // And answered: the same ask puts again, now answered.
+    store.save_message(&{
+        let mut m = ask_message("m-2", "and may I again?");
+        m.state_raw = "answered".into();
+        m
+    })
+    .unwrap();
+    let state = snapshot_with(&client, |v| v["asks"]["m-2"]["state"] == "answered");
+    assert_eq!(state["asks"]["m-2"]["state"], "answered");
 }
 
 #[test]

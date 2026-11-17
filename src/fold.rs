@@ -208,7 +208,8 @@ pub fn fold_into(store: &Store, db: Option<&SharedStore>, host: &str, frame: &Fr
 
 fn mirror_apply(store: &Store, db: &SharedStore, host: &str, id: &str, cmd: Command) {
     // An event's key is its id, so a replay after a restart is the same
-    // command; a beat's is its own moment, and an unchanged one decides silent.
+    // command; a beat's is its own moment, so each beat (every 10 s) writes one
+    // mirror.put, its `beat` time having moved.
     let key = match id {
         "beat" => format!(
             "fold:{host}:beat:{}",
@@ -844,6 +845,105 @@ mod tests {
         let kept = read(&beat_path(&store.state, HOST));
         assert_eq!(kept["beat"]["host"]["memory"], "warn", "{kept}");
         assert_eq!(read_folded(&store.state, HOST), None, "a beat is not an event");
+    }
+
+    /// wsp-075's done-when: a manager's `seat.started` and `seat.stopped`,
+    /// through the loopback manager and the fold running against a database a
+    /// `wsp_server::Server` serves, reach a subscriber as `mirror.put` for the
+    /// seat once each; and a daemon restart (the fold stopped and run again on
+    /// the same database, a new subscription, even with the `.folded` id and
+    /// the subscription's place lost) puts neither again.
+    #[test]
+    fn seat_events_reach_a_subscriber_once_each_across_a_daemon_restart() {
+        use wsp_store_contract::Principal as P;
+        let env = util::isolated("fold-served");
+        let store = Store::open();
+        let exec = env.state().join("exec");
+        let m = manager(&exec, 0);
+        let addr = m.addrs()[0];
+        let db: SharedStore = Arc::new(
+            wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), Arc::new(wsp_server::Mirror)).unwrap(),
+        );
+        let mut cfg = wsp_server::Config::new(&store.state);
+        cfg.port = 0;
+        let server = wsp_server::Server::start(db.clone(), cfg).expect("the API serves on loopback");
+        let client = wsp_client::Client::dial(&store.state, P::Wsp("test".into()), Duration::from_secs(10)).expect("dial");
+
+        // A daemon's fold thread, as `start` runs it.
+        let run_fold = |tok: Token| {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let (root, state, db) = (store.root.clone(), store.state.clone(), db.clone());
+            let h = std::thread::spawn(move || {
+                let store = Store::at(root, state.clone());
+                let mut sub = Subscription::new(addr, tok, HOST, &state, "test");
+                follow(&store, Some(&db), HOST, &mut sub, &stop_ref(&flag));
+            });
+            (h, stop)
+        };
+        fn stop_ref(f: &Arc<AtomicBool>) -> &AtomicBool {
+            f
+        }
+        let seat_puts = |from: Option<u64>, wait: Duration| -> Vec<Value> {
+            let mut feed = client.subscribe(from.map(wsp_api::EventId));
+            let end = Instant::now() + wait;
+            let mut out = Vec::new();
+            while Instant::now() < end {
+                if let Some(wsp_client::Item::Event(e)) = feed.next_within(Duration::from_millis(100)) {
+                    let v = serde_json::to_value(&e).unwrap();
+                    if v["kind"] == "mirror.put" && v.to_string().contains("cpd-f1") {
+                        out.push(v);
+                    }
+                }
+            }
+            out
+        };
+
+        let (h, stop) = run_fold(token(&exec));
+        let started = m
+            .emit(Message::SeatStarted(SeatStarted {
+                key: Key { row: RowId("wsp-075".into()), attempt: 1 },
+                seat: seat(),
+                epoch: Epoch(1),
+                pid: 4242,
+                sockets: vec![],
+            }))
+            .unwrap();
+        let stopped = m
+            .emit(Message::SeatStopped(SeatStopped { seat: seat(), epoch: Epoch(1), exit: Some(0), ended: vec![4242], renderer_left: false }))
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while read_folded(&store.state, HOST) != Some(EventId(stopped.0)) {
+            assert!(Instant::now() < end, "the fold never reached the stop ({:?}, {started:?})", read_folded(&store.state, HOST));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let before = seat_puts(Some(0), Duration::from_secs(2));
+        let seat_of = |v: &Value, word: &str| v.to_string().contains(word);
+        let seats: Vec<&Value> = before.iter().filter(|v| v["subject"].to_string().contains("seat")).collect();
+        assert_eq!(seats.len(), 2, "one put for the seat's start and one for its stop: {before:?}");
+        assert!(seat_of(seats[0], "started") && seat_of(seats[1], "gone"), "{seats:?}");
+        let head = db.head().unwrap();
+
+        // The daemon restarts: the fold stops and runs again over the same
+        // database, with its place and the folded id lost.
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_file(wsp_wire::host_tcp::last_path(&store.state, HOST));
+        let _ = std::fs::remove_file(folded_path(&store.state, HOST));
+        let (h, stop) = run_fold(token(&exec));
+        let end = Instant::now() + Duration::from_secs(10);
+        while read_folded(&store.state, HOST) != Some(EventId(stopped.0)) {
+            assert!(Instant::now() < end, "the second fold never replayed the journal");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let live = seat_puts(Some(head.0), Duration::from_secs(2));
+        assert!(live.is_empty(), "the replay put the seat again: {live:?}");
+        let all = seat_puts(Some(0), Duration::from_secs(2));
+        assert_eq!(all.len(), before.len(), "the journal holds each put once: {all:?}");
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        server.stop();
+        m.stop();
     }
 }
 
