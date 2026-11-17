@@ -678,6 +678,7 @@ const USAGE: &str = "usage: wsp stuck <transcript.jsonl>…   the commands in th
 /// `wsp stuck FILE…`: the stalls in whole transcripts, one line each and a
 /// total, which is how the rate is counted (`wsp-397`).
 pub fn stuck(args: &crate::Args) -> i32 {
+    use crate::host::Host;
     if args.rest.is_empty() {
         eprintln!("{USAGE}");
         return 2;
@@ -685,12 +686,12 @@ pub fn stuck(args: &crate::Args) -> i32 {
     let (mut files, mut hit, mut secs) = (0, 0, 0);
     let mut lines = Vec::new();
     for path in &args.rest {
-        let Ok(f) = std::fs::File::open(path) else {
+        let Some(mut src) = crate::host::LOCAL.read_transcript(std::path::Path::new(path)) else {
             eprintln!("wsp: cannot read {path}");
             continue;
         };
         files += 1;
-        let stalls = scan(&mut std::io::BufReader::new(f), 0);
+        let stalls = scan(&mut src, 0);
         if !stalls.is_empty() {
             hit += 1;
         }
