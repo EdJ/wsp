@@ -2461,7 +2461,13 @@ pub(crate) fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crat
 
 /// What the seat's agent did since `since` (`wsp-325`): [`ran_of_seat`]'s
 /// reading of the same session, for the lines a verdict carries.
+///
+/// Under `WSP_HOST=manager`, the seat's `seat.did` digests as folded
+/// ([`crate::fold::did_since`]), and no transcript is read (wsp-028).
 pub(crate) fn did_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::did::Did> {
+    if crate::fold::under_manager() {
+        return crate::fold::did_since(store, seat, util::epoch_of(since));
+    }
     let (kind, session, cwd) = session_of_seat(store, seat)?;
     crate::agent_commands::of(&kind).did(&session, &cwd, util::epoch_of(since))
 }

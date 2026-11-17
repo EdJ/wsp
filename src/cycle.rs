@@ -4780,9 +4780,13 @@ pub(crate) fn end_passes_keeping(
             }
         };
         // Read before the despawn: it clears the binding the session is found by.
-        let ran = crate::cmd_agent::ran_of_seat(store, &seat, &p.at);
-        let secs = crate::cmd_agent::secs_of_seat(store, &seat, &p.at);
-        let fixed = crate::cmd_agent::fixed_of_seat(store, &seat);
+        // Under `WSP_HOST=manager` no transcript is read (wsp-028): the spend is
+        // the pass's own and the folded `seat.spent`'s, and what it did the
+        // `seat.did` digests'.
+        let transcripts = !crate::fold::under_manager();
+        let ran = transcripts.then(|| crate::cmd_agent::ran_of_seat(store, &seat, &p.at)).flatten();
+        let secs = transcripts.then(|| crate::cmd_agent::secs_of_seat(store, &seat, &p.at)).flatten();
+        let fixed = transcripts.then(|| crate::cmd_agent::fixed_of_seat(store, &seat)).flatten();
         let spent = crate::verification::Spent::ending(p.spent.as_ref(), ran.as_ref(), secs);
         let spent = crate::verification::Spent::with_session(spent, fixed);
         let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
