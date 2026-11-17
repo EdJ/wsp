@@ -75,6 +75,22 @@ pub trait Host: Sync {
     fn spawn_session(&self, spawn: &Spawn<'_>) -> Result<Session>;
     /// A headless agent forked with its feed, in a group of its own.
     fn spawn_headless(&self, spawn: &Headless<'_>) -> Result<Forked>;
+    /// Whether this host runs [`Host::spawn_ordered`]: it has events to wait
+    /// by. The in-process host has none, and its callers start, poll and tell.
+    fn hears_orders(&self) -> bool {
+        false
+    }
+    /// `seat.spawn` carrying its first order, then `seat.started` and that
+    /// order's `order.acked` / `order.refused` waited for as the host's events
+    /// (`docs/agent-manager.md` 4.3): the seat within `wait`, the order's answer
+    /// within what is left of it. The in-process host has no events.
+    fn spawn_ordered(&self, _spawn: &Spawn<'_>, _order: &crate::place::FirstOrder, _wait: Duration) -> Result<(Session, crate::place::Heard)> {
+        Err(crate::place::Refusal::Unsupported("a spawn that carries its first order"))
+    }
+    /// The answer to an order [`Host::spawn_ordered`] sent, waited for `wait` more.
+    fn await_order(&self, _order: &crate::place::OrderId, _wait: Duration) -> Result<crate::place::Heard> {
+        Err(crate::place::Refusal::Unsupported("an order's answer heard as an event"))
+    }
 
     // ---- seat.stop / seat.stopped
     /// `TERM` to the group, `KILL` after the grace.

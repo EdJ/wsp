@@ -34,7 +34,10 @@
 //!
 //! [`Subscription`] is the daemon's half: `subscribe {from}` with the last
 //! event id it heard of this host, kept in `<state>/manager/<host>.last`, and
-//! the same again after a dropped connection.
+//! the same again after a dropped connection. [`Subscription::at_head`] is a
+//! CLI call's: a spawn under `manager` sends `seat.spawn` with its first order
+//! ([`Tcp::spawn_ordered`]) and hears the order's `order.acked` on one, never
+//! polling the seat's state or reading its screen (4.3).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -55,7 +58,7 @@ use crate::host::{Forked, Headless, Host, InProcess, Session, Spawn, Stop};
 /// What a `seats` reply carries, for a caller that reads it (`wip`).
 pub use wsp_host_api::{DiskFree, HostFacts as Facts, SeatRow as Row};
 use crate::manager::{self, Local};
-use crate::place::{Census, Delivery, Refusal, Result, Seat, State};
+use crate::place::{Census, Delivery, FirstOrder, Heard, Refusal, Result, Seat, State};
 
 /// How long a manager has to answer `hello` before it is silent.
 pub const SILENT: Duration = Duration::from_secs(1);
@@ -334,6 +337,9 @@ pub struct Tcp {
     next_req: Mutex<u64>,
     /// The seats the manager started for this process.
     known: Mutex<BTreeMap<String, Known>>,
+    /// The first orders sent with a `seat.spawn` whose answer is not heard
+    /// yet, by order id: the seat, and the subscription that will hear it.
+    waiting: Mutex<BTreeMap<String, (String, Subscription)>>,
 }
 
 impl Tcp {
@@ -353,6 +359,7 @@ impl Tcp {
             live: Mutex::new(None),
             next_req: Mutex::new(0),
             known: Mutex::new(BTreeMap::new()),
+            waiting: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -479,6 +486,58 @@ impl Tcp {
             self.known.lock().unwrap_or_else(|e| e.into_inner()).remove(seat);
         }
     }
+
+    /// `seat.spawn`, with `first` for the manager to deliver once the seat has
+    /// started, and its `seat.started` or `seat.refused` within `wait`. The
+    /// answer is the request's own: `seat.refused` goes only to the asker, never
+    /// into the journal, so a subscription would not hear it.
+    fn spawn_with(&self, spawn: &Spawn<'_>, first: Option<FirstOrder>, wait: Duration) -> Result<Session> {
+        let msg = Message::SeatSpawn(SeatSpawn {
+            // The caller's (row, attempt), built once per spawn: `ask`'s one
+            // reopen resends this same message, so the key cannot change.
+            key: spawn.key.clone(),
+            seat: SeatId(spawn.seat.to_string()),
+            agent: AgentSpec { argv: argv_of(spawn), env: vec![], kind: spawn.kind.clone().unwrap_or_default(), model: None },
+            workdir: Workdir::Cwd(spawn.cwd.clone()),
+            gate: Gate::None,
+            first_order: first,
+        });
+        let said = self.ask(msg, wait, |m| matches!(m, Message::SeatStarted(_) | Message::SeatRefused(_)))?;
+        match said.into_iter().last() {
+            Some(Message::SeatStarted(s)) => {
+                let socket = s.sockets.first().map(PathBuf::from).unwrap_or_default();
+                let render = s.sockets.get(1).map(PathBuf::from);
+                let known = Known { epoch: s.epoch, pid: s.pid, render: render.clone() };
+                self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(spawn.seat.to_string(), known);
+                Ok(Session { pid: s.pid, socket, render })
+            }
+            Some(Message::SeatRefused(r)) => Err(Refusal::Backend(format!("the manager refused seat {}: {:?} {}", r.seat.0, r.why, r.detail))),
+            Some(Message::Refused(r)) => Err(Refusal::Backend(format!("the manager refused the spawn: {:?} {}", r.why, r.detail))),
+            _ => Err(Refusal::Backend(format!("no seat.started for {} within {}s", spawn.seat, wait.as_secs()))),
+        }
+    }
+}
+
+/// Read `sub` for `order`'s answer up to `wait`: `order.acked`, `order.refused`
+/// (worded as the in-process host words compound-sup's reason), or the seat
+/// stopping first. Everything else on the subscription is someone else's.
+fn heard_of(sub: &mut Subscription, seat: &str, order: &OrderId, wait: Duration) -> Result<Heard> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(Heard::Unanswered);
+        }
+        let Some(f) = sub.next(left)? else { continue };
+        match f.msg {
+            Message::OrderAcked(a) if a.order == *order => return Ok(Heard::Acked),
+            Message::OrderRefused(r) if r.order == *order => return Ok(Heard::Refused(format!("{seat}: {}", fail_word(r.why)))),
+            Message::SeatStopped(s) if s.seat.0 == seat => {
+                return Ok(Heard::Refused(format!("{seat} stopped before its work order was answered")))
+            }
+            _ => {}
+        }
+    }
 }
 
 /// compound-sup's failure word for an `order.refused`, as `read_deliver`
@@ -508,29 +567,33 @@ fn argv_of(spawn: &Spawn<'_>) -> Vec<String> {
 impl Host for Tcp {
     // ---- seat.spawn / seat.started
     fn spawn_session(&self, spawn: &Spawn<'_>) -> Result<Session> {
-        let msg = Message::SeatSpawn(SeatSpawn {
-            // The caller's (row, attempt), built once per spawn: `ask`'s one
-            // reopen resends this same message, so the key cannot change.
-            key: spawn.key.clone(),
-            seat: SeatId(spawn.seat.to_string()),
-            agent: AgentSpec { argv: argv_of(spawn), env: vec![], kind: spawn.kind.clone().unwrap_or_default(), model: None },
-            workdir: Workdir::Cwd(spawn.cwd.clone()),
-            gate: Gate::None,
-            first_order: None,
-        });
-        let said = self.ask(msg, SPAWN_WAIT, |m| matches!(m, Message::SeatStarted(_) | Message::SeatRefused(_)))?;
-        match said.into_iter().last() {
-            Some(Message::SeatStarted(s)) => {
-                let socket = s.sockets.first().map(PathBuf::from).unwrap_or_default();
-                let render = s.sockets.get(1).map(PathBuf::from);
-                let known = Known { epoch: s.epoch, pid: s.pid, render: render.clone() };
-                self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(spawn.seat.to_string(), known);
-                Ok(Session { pid: s.pid, socket, render })
+        self.spawn_with(spawn, None, SPAWN_WAIT)
+    }
+    fn hears_orders(&self) -> bool {
+        true
+    }
+    fn spawn_ordered(&self, spawn: &Spawn<'_>, order: &FirstOrder, wait: Duration) -> Result<(Session, Heard)> {
+        let start = Instant::now();
+        // Subscribed before the spawn is sent, from the journal's head as it
+        // stands: the order's answer cannot come before the watch on it.
+        let sub = Subscription::at_head(self.addr, self.token.clone(), self.role, &self.version)?;
+        let session = self.spawn_with(spawn, Some(order.clone()), wait)?;
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(order.order.0.clone(), (spawn.seat.to_string(), sub));
+        let heard = self.await_order(&order.order, wait.saturating_sub(start.elapsed()))?;
+        Ok((session, heard))
+    }
+    fn await_order(&self, order: &OrderId, wait: Duration) -> Result<Heard> {
+        let Some((seat, mut sub)) = self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(&order.0) else {
+            return Err(Refusal::Backend(format!("order {} was not sent by this process's seat.spawn", order.0)));
+        };
+        let heard = heard_of(&mut sub, &seat, order, wait)?;
+        match heard {
+            Heard::Unanswered => {
+                self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(order.0.clone(), (seat, sub));
             }
-            Some(Message::SeatRefused(r)) => Err(Refusal::Backend(format!("the manager refused seat {}: {:?} {}", r.seat.0, r.why, r.detail))),
-            Some(Message::Refused(r)) => Err(Refusal::Backend(format!("the manager refused the spawn: {:?} {}", r.why, r.detail))),
-            _ => Err(Refusal::Backend(format!("the manager did not answer seat {}'s spawn within {}s", spawn.seat, SPAWN_WAIT.as_secs()))),
+            _ => sub.close(),
         }
+        Ok(heard)
     }
     fn spawn_headless(&self, spawn: &Headless<'_>) -> Result<Forked> {
         self.local.spawn_headless(spawn)
@@ -764,7 +827,10 @@ pub struct Subscription {
     addr: SocketAddr,
     token: Token,
     host: String,
-    state: PathBuf,
+    /// Where the last id is kept; `None` for a CLI call's watch, which keeps
+    /// its place in memory and never moves the daemon's.
+    state: Option<PathBuf>,
+    role: Role,
     version: String,
     conn: Option<(wsp_host::Tcp, Instant, Instant)>,
     last: Option<EventId>,
@@ -781,13 +847,38 @@ impl Subscription {
             addr,
             token,
             host: host.to_string(),
-            state: state.to_path_buf(),
+            state: Some(state.to_path_buf()),
+            role: Role::Daemon,
             version: version.to_string(),
             conn: None,
             last: read_last(state, host),
             handed: None,
             subscribed: 0,
         }
+    }
+
+    /// A watch for one CLI call (a spawn waiting on its seat's first order):
+    /// subscribed now, from the journal's head as the manager's `hello` gives
+    /// it, so it hears what happens from here on and nothing before. Its place
+    /// is kept in memory only, so it never moves the daemon's
+    /// `<state>/manager/<host>.last`; after a dropped connection it subscribes
+    /// again from the last id it heard, as the daemon's does.
+    pub fn at_head(addr: SocketAddr, token: Token, role: Role, version: &str) -> std::result::Result<Subscription, HostError> {
+        let (conn, hello) = open(addr, &token, role, version, None)?;
+        let mut sub = Subscription {
+            addr,
+            token,
+            host: hello.host.0.clone(),
+            state: None,
+            role,
+            version: version.to_string(),
+            conn: None,
+            last: hello.journal_head,
+            handed: None,
+            subscribed: 0,
+        };
+        sub.subscribe_on(conn)?;
+        Ok(sub)
     }
 
     /// The one the local machine record names.
@@ -807,7 +898,8 @@ impl Subscription {
             return;
         }
         self.last = Some(id);
-        let path = last_path(&self.state, &self.host);
+        let Some(state) = &self.state else { return };
+        let path = last_path(state, &self.host);
         if let Some(d) = path.parent() {
             let _ = fs::create_dir_all(d);
         }
@@ -815,7 +907,11 @@ impl Subscription {
     }
 
     fn subscribe(&mut self) -> std::result::Result<(), HostError> {
-        let (mut conn, _) = open(self.addr, &self.token, Role::Daemon, &self.version, self.last)?;
+        let (conn, _) = open(self.addr, &self.token, self.role, &self.version, self.last)?;
+        self.subscribe_on(conn)
+    }
+
+    fn subscribe_on(&mut self, mut conn: wsp_host::Tcp) -> std::result::Result<(), HostError> {
         let sub = Frame { id: None, req: None, msg: Message::Subscribe(Subscribe { from: self.last }) };
         conn.send(&sub).map_err(|e| HostError::Silent { addr: self.addr, why: format!("it did not take subscribe: {e:?}") })?;
         self.conn = Some((conn, Instant::now(), Instant::now()));

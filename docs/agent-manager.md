@@ -886,6 +886,22 @@ compound-sup). Under `manager`, the call log's children hold no `ps`, `lsof`, `d
 the seat is listed. Under `inproc`, the same call runs `ps`. The json's keys are the same under both. With the
 manager stopped, `unreachable` names it as host silent, still with none of those children.
 
+**Group 5, spawn (wsp-026).** `wsp spawn` builds compound through `Compound::chosen`, whose host is
+`host::chosen`'s. A silent manager is the spawn's error ("host silent"), never the in-process host in its place.
+- A work order that is told rather than put in argv goes in `seat.spawn` as `first_order`, under an id minted per
+  start (`place::new_order_id`). It goes through `Place::start_ordered` → `Host::spawn_ordered`.
+- `Tcp` subscribes from the journal's head first (`Subscription::at_head`, which keeps its place in memory and
+  never in the daemon's `.last`). Then it sends the spawn and reads `seat.started` or `seat.refused` as the
+  request's answer, because `seat.refused` is not journalled. After that it listens on the subscription for the
+  order's `order.acked` or `order.refused`, or for the seat's `seat.stopped`.
+- `cmd_spawn::start_ordered` keeps `Patience`:
+  - `ready + taken` is the wait for the seat and its ack;
+  - `nudges` are presses on an unanswered order, each followed by `taken` more (`Place::await_order`);
+  - `attempts` retries a refused seat under the next attempt's key;
+  - a silent host is said, not retried.
+- None of this polls `state` or reads a screen. Under `inproc`, `start_ordered` is `None` and the old start,
+  `wait_ready` and `hand_over` run unchanged.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the

@@ -429,7 +429,29 @@ pub struct Agent {
     pub key: Option<Key>,
 }
 
-pub use wsp_host_api::{Key, RowId};
+pub use wsp_host_api::{FirstOrder, Key, OrderId, RowId};
+
+/// What the host said of an order, heard as its events (`order.acked`,
+/// `order.refused`) rather than read off a seat's state
+/// (`docs/agent-manager.md` 4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Heard {
+    /// `order.acked`: the order was delivered and a turn began on it.
+    Acked,
+    /// `order.refused`, or the seat stopped before an answer: why, worded.
+    Refused(String),
+    /// Nothing about the order within the wait.
+    Unanswered,
+}
+
+/// A fresh id for a first order: the seat, the time and a counter, so a
+/// re-start of the same seat is a new order and never the answer to the last.
+pub fn new_order_id(seat: &Seat) -> OrderId {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    OrderId(format!("{seat}-first-{nanos:x}-{n}"))
+}
 
 /// What a seat is doing, moved down to `wsp-host` with the host that reads it
 /// off the screen (wsp-020).
@@ -700,6 +722,27 @@ pub trait Place {
     /// shell that is not ready, clear a half-typed line, wait on a container —
     /// happens in here and is never the caller's business.
     fn start(&self, seat: &Seat, agent: &Agent) -> Result<()>;
+
+    /// Start an agent with its first order in the one `seat.spawn`, and come
+    /// back when the host's events say what became of it: `seat.started`,
+    /// then `order.acked` or `order.refused` for `order`, within `wait`
+    /// (`docs/agent-manager.md` 4.3). Nothing here reads [`Place::state`] or a
+    /// screen: the answer is heard, not polled for.
+    ///
+    /// `None`: this backend has no host whose events it can wait by (the
+    /// in-process host), and nothing was started; the caller starts, waits for
+    /// ready and tells, as before. `Err` is the start refused, or the host
+    /// silent, said as such.
+    fn start_ordered(&self, _seat: &Seat, _agent: &Agent, _order: &FirstOrder, _wait: Duration) -> Option<Result<Heard>> {
+        None
+    }
+
+    /// Go on waiting, up to `wait`, for the answer to an order
+    /// [`Place::start_ordered`] sent: after a [`Place::nudge`], say. `None`
+    /// where this backend has no events to wait by.
+    fn await_order(&self, _seat: &Seat, _order: &OrderId, _wait: Duration) -> Option<Result<Heard>> {
+        None
+    }
 
     /// Give the agent in a seat a sentence to act on.
     ///
