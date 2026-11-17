@@ -1,6 +1,16 @@
 //! Commands (docs/state-core.md sections 2.2 and 4.2): one variant per command
 //! verb of 4.2, tagged by its verb, with its arguments beside it, as 4.1's
-//! envelope carries them (`"verb": "row.claim", "args": {...}`).
+//! envelope carries them (`"verb": "row.claim", "args": {...}`), and `mirror`,
+//! step 1's projection (below).
+//!
+//! **The mirror** (wsp-070, section 7's step 1). Step 1's store is a projection
+//! of today's truth (the files, and the managers' events the daemon folds), not
+//! the owner of any state, and 4.2's verbs each carry section 3's guards, so
+//! none says "this entity is now X". [`Command::Mirror`] says it: it puts whole
+//! entities and removes subjects. It is not fenced. Only the server's mirror
+//! domain (wsp-073) decides it, into `mirror.put` and `mirror.gone`; a real
+//! domain refuses it as `illegal`. Steps 2-4 remove it as each machine takes its
+//! entities over.
 //!
 //! A command issued under a lease carries a [`Fence`], and `apply` refuses it
 //! with [`Refusal::Stale`](crate::Refusal::Stale) when the lease's token has
@@ -20,7 +30,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::entity::AskKind;
+use crate::entity::{AskKind, Entity};
 use crate::event::Subject;
 use crate::id::*;
 
@@ -188,5 +198,14 @@ pub enum Command {
         transport: Option<crate::entity::Transport>,
         #[serde(default)]
         facts: BTreeMap<String, String>,
+    },
+    /// Step 1's projection (the module docs): each of `put` is now this, and
+    /// each of `gone` is no more. Not fenced; only the mirror domain decides it.
+    #[serde(rename = "mirror")]
+    Mirror {
+        #[serde(default)]
+        put: Vec<Entity>,
+        #[serde(default)]
+        gone: Vec<Subject>,
     },
 }

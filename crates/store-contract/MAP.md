@@ -14,12 +14,14 @@ state core's types yet (wsp-046): the conformance suite (wsp-047) and `wsp-store
   `LeaseName`, `ProjectId`, `RunKey`), and `Principal` (person, seat, manager, executor, `wsp:<instance>`)
 - `src/entity.rs` — 2.1's entities with section 3's states as enums: `Row`/`RowState` (3.3), `List`, `Group` and
   their shared `ListState` (3.4), `Seat`/`SeatState` (3.2), `Order`/`OrderState` (3.1), `Claim`, `Ask` (kind
-  ask/note/flag), `Run`, `Machine`/`Transport`, `Lease`; `State`, the whole domain as `snapshot()` returns it
+  ask/note/flag), `Run`, `Machine`/`Transport`, `Lease`; `State`, the whole domain as `snapshot()` returns it;
+  `Entity`, one of row, list, seat, claim, order, ask, machine, whole, as `mirror` puts it (wsp-070). `Row`,
+  `List`, `Group`, `Seat` and `Ask` carry `fields` (name → value), `Machine` its `facts`
 - `src/event.rs` — `Event` (2.1: id, at, principal, kind, subject, payload), `EventKind` (the kinds section 3's
   machines write, by wire name: `seat.started`, `order.acknowledged`, ...), `Subject`, and `Draft` (an event
-  before the backend stamps its id and moment)
+  before the backend stamps its id and moment); `mirror.put` and `mirror.gone` (step 1's, below)
 - `src/command.rs` — `Command`, one variant per command verb of 4.2, tagged `verb` with `args` as 4.1's envelope
-  carries them; `Fence { lease, token }` (2.2) and `FENCED_VERBS`; `Applied` (the new events' ids); `Block`,
+  carries them, and `Mirror { put, gone }` (wire `mirror`, step 1's); `Fence { lease, token }` (2.2) and `FENCED_VERBS`; `Applied` (the new events' ids); `Block`,
   `Verdict`, `ReleaseTo`
 - `src/refusal.rs` — `Refusal`, tagged `code`: `stale` (a fence), `too_old` (4.3), `conflict` (a text rev),
   `held`, `not_found`, `illegal` (a guard of section 3), `forbidden`, `invalid`, and `unknown` for a newer
@@ -27,12 +29,12 @@ state core's types yet (wsp-046): the conformance suite (wsp-047) and `wsp-store
 - `src/domain.rs` — `Domain`: `decide` and `evolve`, the two signatures `apply` validates through (below)
 - `src/store.rs` — 2.2's trait family: `Reads`, `Events` (`events_after`, `head`, `wait_for`), `Commands`
   (`apply`), `Leases`, `Claims`, `Texts`, and `Store`, all six, blanket-implemented; `RowFilter`, `SeatFilter`;
-  `STORE_INSTANCE`; the module docs' table of the events a store writes itself
+  `STORE_INSTANCE`; the module docs' table of the events a store writes itself, and of `mirror`'s two
 - `src/subscribe.rs` — 4.3: `Subscribe { from? }`, `Feed` (a snapshot, an event, a beat), `BEAT_SECS`,
   `MISSED_BEATS`
-- `tests/round_trip.rs` — every command, event kind, entity state and refusal round-tripped under its wire name,
+- `tests/round_trip.rs` — every command, event kind, entity, entity state and refusal round-tripped under its wire name,
   each table's coverage held by an exhaustive match; `FENCED_VERBS` held to the variants carrying `args.fence`; one
-  `State` of every entity; a trivial `Store` and `Domain`
+  `State` of every entity, with `fields`; frames from before the `fields` maps decode; a trivial `Store` and `Domain`
 
 ## Contract
 
@@ -55,11 +57,28 @@ over `impl Store`. `Reads::claim` and `Claims::claim`, and `Leases::release` and
   rendering, left to the API (step 1), since parsing it would be logic here.
 - `ListState` is one enum for lists and groups, as 3.4's table is one column.
 - `unblock` is `row.block` with `Block::Off`, and the verifier's holds/blocks is `row.land`'s `Verdict`, so the
-  commands stay the 19 verbs of 4.2. Executor reports (section 5: `started`, `delivered`, `acknowledged`, a run's
+  commands stay the 19 verbs of 4.2 (and `mirror`, below). Executor reports (section 5: `started`, `delivered`, `acknowledged`, a run's
   verdict) are not commands yet; they join at step 2 by a row of their own.
 - `Claims::claim` takes `Option<&Fence>`: 2.2 names a fence but not whose lease it is, and a person's claim has none.
 - `Project` has no entity: rows carry a `ProjectId`, and the project's record stays in files (2.5).
 - `Error::Backend` beside `Refusal`: a backend that cannot reach its file or server is no refusal, and is retried.
+
+## The mirror: step 1's alone (wsp-070)
+
+Step 1's store is a projection of today's truth (the files, and the managers' events the daemon folds), not the owner
+of any state (docs/state-core.md section 7, step 1 as wsp-652 amends it). 4.2's verbs each carry section 3's guards, so
+none can say "this entity is now X"; `Command::Mirror { put: Vec<Entity>, gone: Vec<Subject> }` says it, beside them
+(expand). It is not fenced and not in `FENCED_VERBS`.
+
+- **`decide` for `mirror` is the server's mirror domain** (`mirror::Mirror`, wsp-073): each `put` drafts `mirror.put`
+  (subject the entity's, a `Claim`'s `Claim(row)`; payload the `Entity`), each `gone` drafts `mirror.gone` (payload
+  `null`), and its `evolve` replaces or removes what they name. `src/store.rs`'s table lists both.
+- **A real domain refuses `mirror` as `illegal`.** `TestDomain` does (wsp-store-conformance), and so will
+  `wsp-machines`: a domain that owns its entities is mirrored by nothing.
+- **The `fields` maps** on `Seat`, `List`, `Group` and `Ask` (as `Row` has) carry what today's files say and the typed
+  fields do not (a seat's role, the row a governor governs, its said or working word, a group's stop, a list's
+  caption), so wip's json renders from `State` (wsp-076) without a typed field per key. Step 4 types the ones that stay.
+- **Steps 2–4 remove it** as each machine takes its entities over; `mirror` and `Entity` go with the last.
 
 ## What a backend and a domain must agree on (wsp-065)
 

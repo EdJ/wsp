@@ -16,7 +16,8 @@ it (section 6; `tests/layering.rs`). Nothing in wsp uses it yet; `wsp-store-sqli
   `crash_next_apply`/`reopen` (case 8), `Knobs` (the bite tests' four breakages), `fence_of(&Command)`. The
   module docs say what it writes for leases, claims and texts
 - `src/domain.rs` — `TestDomain`: rows, seats, claims and orders, with the guards case 9 drives (the table in
-  its module docs); `claim_lease`, `verify_lease`, `verb`
+  its module docs); `claim_lease`, `verify_lease`, `verb`. It refuses step 1's `mirror` as `illegal` (state
+  `owned`), as a real domain does (wsp-070; the contract's MAP.md), and a unit test holds it
 - `src/cases/` — the ten cases, each `pub fn case_x<H: Harness>(h: &H) -> CaseResult`, one file each (wsp-047's legs
   `state` and `events`); `mod.rs` holds `CaseFailure` (case number, name, what broke) and the setup helpers:
   `case_atomicity` (1, `atomicity.rs`), `case_idempotency` (2), `case_lease_exclusivity` (3, `leases.rs`),

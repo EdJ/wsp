@@ -69,7 +69,7 @@ fn ed() -> Principal {
     Principal::Person("ed".into())
 }
 
-const COMMANDS: usize = 19;
+const COMMANDS: usize = 20;
 
 fn command(c: &Command) -> (usize, &'static str) {
     match c {
@@ -92,6 +92,7 @@ fn command(c: &Command) -> (usize, &'static str) {
         Command::AskAnswer { .. } => (16, "ask.answer"),
         Command::AskAck { .. } => (17, "ask.ack"),
         Command::MachineSet { .. } => (18, "machine.set"),
+        Command::Mirror { .. } => (19, "mirror"),
     }
 }
 
@@ -184,6 +185,10 @@ fn commands() -> Vec<Command> {
             }),
             facts: BTreeMap::new(),
         },
+        Command::Mirror {
+            put: entities(),
+            gone: vec![Subject::Seat(seat()), Subject::Claim(row())],
+        },
     ]
 }
 
@@ -219,7 +224,7 @@ fn every_command_round_trips_under_its_verb() {
     });
 }
 
-const EVENT_KINDS: usize = 46;
+const EVENT_KINDS: usize = 48;
 
 fn event_kind(k: &EventKind) -> (usize, &'static str) {
     use EventKind::*;
@@ -269,7 +274,9 @@ fn event_kind(k: &EventKind) -> (usize, &'static str) {
         MachineSet => (42, "machine.set"),
         MachineBeat => (43, "machine.beat"),
         TextSet => (44, "text.set"),
-        Unknown => (45, "unknown"),
+        MirrorPut => (45, "mirror.put"),
+        MirrorGone => (46, "mirror.gone"),
+        Unknown => (47, "unknown"),
     }
 }
 
@@ -322,6 +329,8 @@ fn every_event_kind_round_trips_under_its_name() {
         MachineSet,
         MachineBeat,
         TextSet,
+        MirrorPut,
+        MirrorGone,
         Unknown,
     ];
     table(&kinds, EVENT_KINDS, event_kind, as_str);
@@ -583,7 +592,9 @@ fn state() -> State {
                 state: ListState::Barrier,
                 members: vec![row()],
                 attempt: 1,
+                fields: BTreeMap::from([("stop".into(), "after".into())]),
             }],
+            fields: BTreeMap::from([("caption".into(), "S0".into())]),
         },
     );
     s.seats.insert(
@@ -598,6 +609,10 @@ fn state() -> State {
             row: Some(row()),
             attempt: 1,
             pid: Some(4242),
+            fields: BTreeMap::from([
+                ("role".into(), "governor".into()),
+                ("governs".into(), "wsp-046".into()),
+            ]),
         },
     );
     s.claims.insert(
@@ -635,6 +650,7 @@ fn state() -> State {
             text: "?".into(),
             state: AskState::Answered,
             answer: Some("yes".into()),
+            fields: BTreeMap::from([("person".into(), "yes".into())]),
         },
     );
     s.runs.push(Run {
@@ -666,6 +682,83 @@ fn state() -> State {
         },
     );
     s
+}
+
+const ENTITIES: usize = 7;
+
+fn entity(e: &Entity) -> (usize, &'static str) {
+    match e {
+        Entity::Row(_) => (0, "row"),
+        Entity::List(_) => (1, "list"),
+        Entity::Seat(_) => (2, "seat"),
+        Entity::Claim(_) => (3, "claim"),
+        Entity::Order(_) => (4, "order"),
+        Entity::Ask(_) => (5, "ask"),
+        Entity::Machine(_) => (6, "machine"),
+    }
+}
+
+/// One of every entity `mirror` puts, taken from `state()`.
+fn entities() -> Vec<Entity> {
+    let s = state();
+    let mut out = vec![];
+    out.extend(s.rows.into_values().map(Entity::Row));
+    out.extend(s.lists.into_values().map(Entity::List));
+    out.extend(s.seats.into_values().map(Entity::Seat));
+    out.extend(s.claims.into_values().map(Entity::Claim));
+    out.extend(s.orders.into_values().map(Entity::Order));
+    out.extend(s.asks.into_values().map(Entity::Ask));
+    out.extend(s.machines.into_values().map(Entity::Machine));
+    out
+}
+
+/// Each entity round-trips under its tag, in serde's derived form (`{"seat": {...}}`).
+#[test]
+fn every_entity_round_trips_under_its_tag() {
+    table(&entities(), ENTITIES, entity, |v| {
+        let o = v.as_object().unwrap();
+        assert_eq!(o.len(), 1, "{v}");
+        o.keys().next().unwrap().clone()
+    });
+    // `mirror`'s arguments default, so `{}` is a mirror of nothing.
+    let none: Command = serde_json::from_value(json!({"verb": "mirror", "args": {}})).unwrap();
+    assert_eq!(none, Command::Mirror { put: vec![], gone: vec![] });
+    // A mirror event: the entity under its subject, and `null` for a gone one.
+    let put = trip(&Draft {
+        kind: EventKind::MirrorPut,
+        subject: Subject::Seat(seat()),
+        payload: serde_json::to_value(&entities()[2]).unwrap(),
+    });
+    assert_eq!(put["payload"]["seat"]["fields"]["role"], "governor");
+    trip(&Draft {
+        kind: EventKind::MirrorGone,
+        subject: Subject::Seat(seat()),
+        payload: Value::Null,
+    });
+}
+
+/// Frames written before wsp-070 (a `Seat`, `List`, `Group` or `Ask` with no
+/// `fields`) still decode, with no fields.
+#[test]
+fn frames_from_before_the_fields_maps_still_decode() {
+    let seat: Seat = serde_json::from_value(json!({
+        "id": "cpd-336", "machine": "mac", "kind": "claude", "model": null,
+        "state": "idle", "before_lost": null, "row": "wsp-046", "attempt": 1, "pid": 4242
+    }))
+    .unwrap();
+    assert!(seat.fields.is_empty());
+    assert_eq!(seat.state, SeatState::Idle);
+    let list: List = serde_json::from_value(json!({
+        "id": "s0-state-core", "state": "running",
+        "groups": [{"id": {"list": "s0-state-core", "n": 1}, "state": "running", "members": ["wsp-046"], "attempt": 0}]
+    }))
+    .unwrap();
+    assert!(list.fields.is_empty() && list.groups[0].fields.is_empty());
+    let ask: Ask = serde_json::from_value(json!({
+        "id": "m-1", "kind": "note", "from": {"person": "ed"}, "text": "hi", "state": "raised"
+    }))
+    .unwrap();
+    assert!(ask.fields.is_empty());
 }
 
 #[test]

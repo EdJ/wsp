@@ -151,6 +151,13 @@ pub enum EventKind {
     // Text (2.5).
     #[serde(rename = "text.set")]
     TextSet,
+    // The mirror (step 1 alone, wsp-070): what the mirror domain decides
+    // `mirror` into. `put` carries the whole [`Entity`](crate::Entity) under its
+    // subject; `gone` carries `null`.
+    #[serde(rename = "mirror.put")]
+    MirrorPut,
+    #[serde(rename = "mirror.gone")]
+    MirrorGone,
     /// A kind this build does not know, from a newer writer.
     #[serde(rename = "unknown")]
     #[serde(other)]

@@ -152,6 +152,10 @@ pub struct Group {
     /// The barrier attempt it is on, from 0.
     #[serde(default)]
     pub attempt: u32,
+    /// Its other fields, by name, as today's files say them (its stop, ...);
+    /// untyped until step 4 types the ones that stay (wsp-070).
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
 }
 
 /// A list (2.1, 3.4).
@@ -160,6 +164,10 @@ pub struct List {
     pub id: ListId,
     pub state: ListState,
     pub groups: Vec<Group>,
+    /// Its other fields, by name, as today's files say them (its caption, ...);
+    /// untyped until step 4 types the ones that stay (wsp-070).
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
 }
 
 /// A seat (2.1, 3.2).
@@ -183,6 +191,11 @@ pub struct Seat {
     /// The agent's pid, as the executor recorded it.
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Its other fields, by name, as today's files say them (its role, the row a
+    /// governor governs, its said or working word, ...); untyped until step 4
+    /// types the ones that stay (wsp-070).
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
 }
 
 /// A claim: the lease `claim:<row>`, held by a seat (2.1, 2.2).
@@ -223,6 +236,10 @@ pub struct Ask {
     pub state: AskState,
     #[serde(default)]
     pub answer: Option<String>,
+    /// Its other fields, by name, as today's files say them; untyped until step
+    /// 4 types the ones that stay (wsp-070).
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
 }
 
 /// A check, a verification or a barrier run (2.1).
@@ -257,6 +274,22 @@ pub struct Lease {
     pub holder: Principal,
     pub token: Token,
     pub expires: At,
+}
+
+/// One entity of 2.1, whole, as [`Command::Mirror`](crate::Command::Mirror)
+/// puts it and `mirror.put` carries it. Serialized in serde's derived form, as
+/// [`Subject`](crate::Subject) is (`{"seat": {...}}`). Step 1's alone (wsp-070):
+/// steps 2-4 remove it as each machine takes its entities over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Entity {
+    Row(Row),
+    List(List),
+    Seat(Seat),
+    Claim(Claim),
+    Order(Order),
+    Ask(Ask),
+    Machine(Machine),
 }
 
 /// The whole domain, as `snapshot()` returns it beside the id it is consistent

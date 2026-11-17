@@ -28,11 +28,17 @@
 //! | `seat.despawn` | `ending`; `lost` with `lost: true` | `illegal` |
 //! | `order.send` | to a seat not `ending` or `gone` | `illegal`, `not_found` |
 //! | `order.cancel` | `queued`, `typed` | `illegal` |
+//! | `mirror` | never: it is step 1's, and only the server's mirror domain decides it | `illegal` |
 //!
 //! `row.add` and `seat.spawn` are always legal (a second `seat.spawn` with the
 //! same `(row, attempt)` as a seat not `gone` changes nothing: 3.2's spawn key).
 //! The verbs of lists, asks and machines are refused with `invalid`: the test
 //! domain does not have them.
+//!
+//! `mirror` is refused as a real domain refuses it (the contract's MAP.md):
+//! `illegal`, with the state `owned` (this domain owns its entities, so nothing
+//! mirrors them), naming the first subject it would `put` or remove, or the
+//! project `""` when it names none.
 
 use serde_json::{json, Value};
 use wsp_store_contract::*;
@@ -110,6 +116,19 @@ impl TestDomain {
             Ok(())
         } else {
             Err(illegal!(Subject::Row(row.id.clone()), &row.state, cmd))
+        }
+    }
+
+    /// The subject a mirrored entity is put under.
+    fn subject_of(entity: &Entity) -> Subject {
+        match entity {
+            Entity::Row(r) => Subject::Row(r.id.clone()),
+            Entity::List(l) => Subject::List(l.id.clone()),
+            Entity::Seat(s) => Subject::Seat(s.id.clone()),
+            Entity::Claim(c) => Subject::Claim(c.row.clone()),
+            Entity::Order(o) => Subject::Order(o.id.clone()),
+            Entity::Ask(a) => Subject::Ask(a.id.clone()),
+            Entity::Machine(m) => Subject::Machine(m.name.clone()),
         }
     }
 
@@ -231,6 +250,7 @@ impl Domain for TestDomain {
                     row: row.clone(),
                     attempt: *attempt,
                     pid: None,
+                    fields: Default::default(),
                 };
                 vec![draft(EventKind::SeatRequested, Subject::Seat(id), to_value!(&seat))]
             }
@@ -274,6 +294,14 @@ impl Domain for TestDomain {
                     return Err(illegal!(Subject::Order(order.clone()), &o.state, cmd));
                 }
                 vec![draft(EventKind::OrderCancelled, Subject::Order(order.clone()), Value::Null)]
+            }
+            Command::Mirror { put, gone } => {
+                let subject = put
+                    .first()
+                    .map(Self::subject_of)
+                    .or_else(|| gone.first().cloned())
+                    .unwrap_or_else(|| Subject::Project(ProjectId(String::new())));
+                return Err(Refusal::Illegal { subject, state: "owned".into(), verb: verb(cmd) });
             }
             Command::ListGo { .. }
             | Command::ListHold { .. }
@@ -391,5 +419,25 @@ impl Domain for TestDomain {
             _ => {}
         }
         state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real domain refuses step 1's `mirror` as `illegal`, naming the first
+    /// subject it would put or remove (wsp-070).
+    #[test]
+    fn mirror_is_refused_as_illegal() {
+        let ed = Principal::Person("ed".into());
+        let seat = SeatId("s-1".into());
+        let gone = Command::Mirror { put: vec![], gone: vec![Subject::Seat(seat.clone())] };
+        assert_eq!(
+            TestDomain.decide(&State::default(), &gone, &ed),
+            Err(Refusal::Illegal { subject: Subject::Seat(seat), state: "owned".into(), verb: "mirror".into() })
+        );
+        let none = Command::Mirror { put: vec![], gone: vec![] };
+        assert!(matches!(TestDomain.decide(&State::default(), &none, &ed), Err(Refusal::Illegal { .. })));
     }
 }

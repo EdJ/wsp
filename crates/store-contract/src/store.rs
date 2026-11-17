@@ -22,6 +22,8 @@
 //! | `Claims::claim` | `claim.taken` | `Claim(row)` | the [`Claim`] | `Seat(seat)` |
 //! | `Claims::release` | `claim.released` | `Claim(row)` | `null` | the holder |
 //! | `Texts::set_text` | `text.set` | `Row(row)` | `{"section", "rev"}` | `Wsp(`[`STORE_INSTANCE`]`)` |
+//! | `Commands::apply` of `mirror`, each `put` | `mirror.put` | the entity's | the [`Entity`] | the command's |
+//! | `Commands::apply` of `mirror`, each `gone` | `mirror.gone` | the subject | `null` | the command's |
 //!
 //! A renewal is a `lease.taken` again (there is no `lease.renewed`): the fold
 //! keeps `expires` current by replacing the lease, so `evolve` reads `taken`
@@ -29,6 +31,13 @@
 //! `claim.*` kinds only, never `lease.*`. A call that changes nothing (a
 //! `renew` or `release` under a stale token, a refused take or claim) writes
 //! no event.
+//!
+//! The two `mirror` rows (wsp-070, step 1 alone) are not the backend's: the
+//! server's mirror domain (wsp-073) drafts them from `decide`, and the backend
+//! stamps them as any command's. They are in the table so that every `evolve`
+//! folds them alike: `mirror.put` replaces the entity at its subject (a
+//! `Claim`'s subject is `Claim(row)`), and `mirror.gone` removes what the
+//! subject names. A real domain refuses `mirror` as `illegal`.
 
 use std::time::Duration;
 
