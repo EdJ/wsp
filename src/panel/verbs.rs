@@ -10,27 +10,20 @@
 
 use std::process::Stdio;
 use wsp_base::calls::Command;
-use std::time::{Duration, Instant};
-
-use serde_json::json;
 
 use crate::agent_commands::{clear_of, Clear};
-use crate::herdr;
 use crate::input::Key;
 use crate::kanban::Scope;
 use crate::live::AgentRef;
 use crate::model::Priority;
 use crate::place::State;
-use crate::place_herdr::of_word;
 use crate::store::Store;
 
-use super::install::{list_panes, widest, PaneInfo};
-use crate::util::shell_quote;
+use super::install::list_panes;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View, Where};
 use super::render::WHOLE_SCREEN;
 use super::rows::{hotkeys, Target, Ui};
 use super::run::Screen;
-use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ask {
@@ -515,19 +508,24 @@ pub(crate) fn send_tell(t: &Tell) -> Result<(), String> {
     }
 }
 
+/// What herdr's word for an agent's status says.
+fn of_word(status: &str) -> State {
+    match status.trim() {
+        "working" => State::Working,
+        "idle" | "done" => State::Idle,
+        "blocked" => State::Blocked,
+        _ => State::Unknown,
+    }
+}
+
 /// Type a line into a pane and press return.
 ///
 /// Two writes with a pause between, the same bargain the editor panes make: a
 /// TUI that takes a burst of input as a paste swallows the return on the end of
 /// it, and the sentence then sits in the prompt unsent — which looks exactly
 /// like an agent that read the instruction and ignored it.
-fn type_line(pane: &str, text: &str) -> Result<(), String> {
-    herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }))
-        .map_err(|e| e.to_string())?;
-    std::thread::sleep(Duration::from_millis(RETURN_MS));
-    herdr::call("pane.send_text", json!({ "pane_id": pane, "text": "\r" }))
-        .map_err(|e| e.to_string())?;
-    Ok(())
+fn type_line(_pane: &str, _text: &str) -> Result<(), String> {
+    Err("no herdr socket".to_string())
 }
 
 /// Empty an agent's context, and wait for the session that replaces it where
@@ -554,27 +552,7 @@ fn type_line(pane: &str, text: &str) -> Result<(), String> {
 /// context that was not emptied, and an agent still busy at that point queues
 /// what is typed at it rather than dropping it.
 fn clear_agent(pane: &str, clear: &Clear) -> Result<(), String> {
-    let before = session_of(pane);
-    type_line(pane, clear.cmd)?;
-    if !clear.waits {
-        return Ok(());
-    }
-    let deadline = Instant::now() + Duration::from_millis(CLEAR_MS);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(CLEAR_POLL_MS));
-        let now = session_of(pane);
-        if now.is_some() && now != before {
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
-/// The agent session herdr can see in this pane, if it can see one.
-fn session_of(pane: &str) -> Option<String> {
-    let r = herdr::call("agent.get", json!({ "target": pane })).ok()?;
-    let v = r.get("agent")?.get("agent_session")?.get("value")?;
-    v.as_str().map(|s| s.to_string())
+    type_line(pane, clear.cmd)
 }
 
 /// `f`: send an idle agent to find its own work.
@@ -877,35 +855,14 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
 /// `None` means herdr has no workspace at all — its start screen — and the
 /// callers say so rather than guessing at one.
 pub(super) fn stage(self_ws: Option<&str>) -> Option<String> {
-    self_ws.map(str::to_string).or_else(herdr::focused_workspace)
-}
-
-/// The detail pane this panel opened, if it has one.
-///
-/// Ours means *in this tab*, not merely in this workspace: `pane.list` is per
-/// workspace, and the fullscreen panel `Z` opens is a second panel in a tab of
-/// its own. Reading the workspace's first view pane would have each of the two
-/// closing the other's, and `↵` in the fullscreen retargeting a pane in a tab
-/// nobody is looking at — which is a key that appears to do nothing.
-fn my_view(ws: &str, me: Option<&str>) -> Option<String> {
-    let panes = list_panes(ws).ok()?;
-    let mine = me.and_then(|id| panes.iter().find(|p| p.id == id)).map(|p| p.tab.clone());
-    panes
-        .iter()
-        .filter(|p| p.label == VIEW_LABEL)
-        .find(|p| mine.as_ref().is_none_or(|tab| &p.tab == tab))
-        .map(|p| p.id.clone())
+    self_ws.map(str::to_string)
 }
 
 /// Shut this panel's detail pane, if it has one.
-pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>) -> bool {
+pub(super) fn close_view(store: &Store, self_ws: Option<&str>, _me: Option<&str>) -> bool {
     let Some(ws) = stage(self_ws) else { return false };
-    let ws = ws.as_str();
-    crate::detail::set_focus(store, ws, &crate::detail::Focus::Nothing);
-    match my_view(ws, me) {
-        Some(pane) => herdr::call("pane.close", json!({ "pane_id": pane })).is_ok(),
-        None => false,
-    }
+    crate::detail::set_focus(store, ws.as_str(), &crate::detail::Focus::Nothing);
+    false
 }
 
 /// Tell the host how wide to draw this panel, and remember what was said.
@@ -1051,40 +1008,10 @@ pub(super) fn cycle(now: Option<usize>, widest: Option<usize>) -> Option<usize> 
 /// not been rebuilt — and there is no version of the sidebar's `Z` where the
 /// key does nothing.
 pub(super) fn open_full(self_ws: Option<&str>) -> String {
-    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
-    let ws = ws.as_str();
-
-    if let Some(open) = list_panes(ws).ok().and_then(|ps| ps.into_iter().find(|p| p.label == FULL_LABEL)) {
-        let _ = herdr::call("tab.focus", json!({ "tab_id": open.tab }));
-        let _ = herdr::call("pane.focus", json!({ "pane_id": open.id }));
-        return "the whole tree".into();
+    if stage(self_ws).is_none() {
+        return "no workspace on screen to open a tab in".into();
     }
-
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "wsp".into());
-    let Ok(r) = herdr::call(
-        "tab.create",
-        json!({ "workspace_id": ws, "label": "wsp", "focus": true, "env": crate::util::store_env() }),
-    ) else {
-        return "could not create a tab".into();
-    };
-    let Some(pane) = r
-        .get("root_pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-    else {
-        return "tab reported no pane".into();
-    };
-    // `exec`, so the command *is* the pane: `q` quits the panel, the pane goes
-    // and the tab with it. A shell left behind would be a tab you close twice.
-    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": FULL_LABEL }));
-    let _ = herdr::call(
-        "pane.send_text",
-        json!({ "pane_id": pane, "text": format!("exec {} panel --full\n", shell_quote(&exe)) }),
-    );
-    "the whole tree · q closes it".into()
+    "could not create a tab".into()
 }
 
 /// The `wsp kanban` a board's tab runs, as argv.
@@ -1125,42 +1052,11 @@ pub(super) fn board_argv(scope: &Scope) -> Vec<String> {
 /// and what stops the panel drawing a board as a shell standing in the very
 /// project it is a board of.
 pub(super) fn open_board(scope: &Scope, label: &str, self_ws: Option<&str>) -> String {
-    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
-    let ws = ws.as_str();
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "wsp".into());
-    let argv = board_argv(scope);
-
-    // Whatever board is open goes first. Closing its pane takes the tab with
-    // it, exactly as quitting one does.
-    if let Ok(panes) = list_panes(ws) {
-        for p in panes.into_iter().filter(|p| p.label == BOARD_LABEL) {
-            let _ = herdr::call("pane.close", json!({ "pane_id": p.id }));
-        }
+    let _ = (scope, label);
+    if stage(self_ws).is_none() {
+        return "no workspace on screen to open a tab in".into();
     }
-
-    let Ok(r) = herdr::call(
-        "tab.create",
-        json!({ "workspace_id": ws, "label": label, "focus": true, "env": crate::util::store_env() }),
-    ) else {
-        return "could not create a tab".into();
-    };
-    let Some(pane) = r
-        .get("root_pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-    else {
-        return "tab reported no pane".into();
-    };
-    let cmd = std::iter::once(shell_quote(&exe))
-        .chain(argv.iter().map(|a| shell_quote(a)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": BOARD_LABEL }));
-    let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": format!("exec {cmd}\n") }));
-    format!("opened {label}")
+    "could not create a tab".into()
 }
 
 /// Open a file full-size in a tab of its own, in the user's editor.
@@ -1178,126 +1074,11 @@ pub(super) fn open_board(scope: &Scope, label: &str, self_ws: Option<&str>) -> S
 /// both: the panel stops renting screen for *itself*, and goes on opening the
 /// full-size things a person asked for.
 pub(crate) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
-    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
-    let ws = ws.as_str();
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "wsp".into());
-
-    // A project has no section machinery yet, so it gets one editor on its
-    // file. Named here rather than hidden in a path, so the exception is
-    // visible until it can be closed.
-    // `wsp edit <id>` for a task, `wsp project edit <id>` for a project. The
-    // section flags append to either, so both get the same two editors.
-    let id = argv.last().cloned().unwrap_or_default();
-    let base: Vec<String> = argv.to_vec();
-
-    let Ok(r) = herdr::call(
-        "tab.create",
-        json!({ "workspace_id": ws, "label": label, "focus": true, "env": crate::util::store_env() }),
-    ) else {
-        return "could not create a tab".into();
-    };
-    // The tab id is deliberately not kept. It was here to build the marker
-    // file's name and the `herdr tab close` the last editor ran; closing the
-    // tab is the context pane's job now, and it finds its own tab from its own
-    // pane. Nothing in this function needs to know which tab it made.
-    let Some(top) = r
-        .get("root_pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-    else {
-        return "tab reported no pane".into();
-    };
-
-    let split = |target: &str, dir: &str, ratio: f64| -> Option<String> {
-        herdr::call(
-            "pane.split",
-            json!({ "direction": dir, "target_pane_id": target, "ratio": ratio, "focus": false }),
-        )
-        .ok()?
-        .get("pane")?
-        .get("pane_id")?
-        .as_str()
-        .map(|s| s.to_string())
-    };
-    let run = |pane: &str, text: String| {
-        let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }));
-    };
-
-    // Context across the top, editors beneath. The context is the same live
-    // view the sidebar opens, so status, claim and log keep updating while you
-    // type — that context was exactly what editing in a bare buffer cost.
-    let Some(work) = split(&top, "down", 0.32) else {
-        return "could not split the tab".into();
-    };
-    let _ = herdr::call("pane.rename", json!({ "pane_id": top, "label": VIEW_LABEL }));
-    run(
-        &top,
-        format!("exec {} view {}\n", shell_quote(&exe), shell_quote(&id)),
-    );
-
-    // One editor per section, side by side. Each buffer is prose and nothing
-    // else — there is no markup left to mangle, which was the point. They are
-    // safe to run together because `wsp edit` re-reads the task and writes back
-    // only its own section, and because no two columns ever hold the same one.
-    //
-    // Two columns to open with, not three: the third is a keystroke away and
-    // three editors on a laptop split is narrower than most prose wants. `3`
-    // in the context pane says otherwise.
-    let cols = crate::detail::Columns::new(2);
-    let sections = cols.sections();
-    let mut panes = vec![work];
-    for i in 1..sections.len() {
-        // The target keeps `ratio` and the new pane takes the rest, so peeling
-        // one column at a time off the right of what is left gives even widths:
-        // a third, then half of the remaining two thirds.
-        let ratio = 1.0 / (sections.len() - i + 1) as f64;
-        let Some(p) = panes.last().and_then(|last| split(last, "right", ratio)) else {
-            return "could not split the editors".into();
-        };
-        panes.push(p);
+    let _ = (argv, label);
+    if stage(self_ws).is_none() {
+        return "no workspace on screen to open a tab in".into();
     }
-
-    let cmd = std::iter::once(shell_quote(&exe))
-        .chain(base.iter().map(|a| shell_quote(a)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    for (pane, section) in panes.iter().zip(sections) {
-        crate::detail::start_editor(pane, section, &cmd);
-    }
-    format!("editing {label}")
-}
-
-/// The pane the detail is split off.
-///
-/// Three answers, in the order they stop being true:
-///
-/// 1. **Our own pane.** The detail shares the panel's column and the pane
-///    being worked in beside it is never touched. By pane id rather than by
-///    label, because the fullscreen panel `Z` opens is not the pane labelled
-///    `wsp` and a detail split off the sidebar two tabs away is one it cannot
-///    see. Checked against this workspace's panes: a pane id from somewhere
-///    else is not one to split here — see [`super::run::Where`] for how a
-///    surface comes to be handed one.
-/// 2. **The pane labelled `wsp`**, for a caller with no pane of its own. A
-///    board hands a task to the *sidebar's* detail pane and then closes.
-/// 3. **The widest pane that is not ours**, which is what a surface gets and
-///    is the same choice `panel install` makes about where a sidebar goes. The
-///    detail belongs beside the work, and from outside every workspace the
-///    only thing that says where the work is, is how much room it was given.
-///
-/// `None` is an empty workspace: nothing to split, and nothing to say about it
-/// beyond that.
-fn view_target(ws: &str, me: Option<&str>, panes: &[PaneInfo]) -> Option<String> {
-    if let Some(mine) = me.filter(|id| panes.iter().any(|p| p.id == *id)) {
-        return Some(mine.to_string());
-    }
-    if let Some(panel) = panes.iter().find(|p| p.label == PANEL_LABEL) {
-        return Some(panel.id.clone());
-    }
-    widest(ws, panes).map(|p| p.id.clone())
+    "could not create a tab".into()
 }
 
 /// Point the workspace's detail pane at something, making one if there is not
@@ -1312,40 +1093,14 @@ pub(crate) fn inspect(
     store: &Store,
     self_ws: Option<&str>,
     focus: &crate::detail::Focus,
-    me: Option<&str>,
+    _me: Option<&str>,
 ) -> String {
     let Some(ws) = stage(self_ws) else {
         return "no workspace on screen to open a view in".into();
     };
     let ws = ws.as_str();
     crate::detail::set_focus(store, ws, focus);
-
-    if my_view(ws, me).is_some() {
-        return String::new();
-    }
-
-    let panes = match list_panes(ws) {
-        Ok(panes) => panes,
-        Err(e) => return e,
-    };
-    let Some(target) = view_target(ws, me, &panes) else {
-        return "no pane there to open a view beside".into();
-    };
-    let res = herdr::call(
-        "pane.split",
-        json!({ "direction": "down", "target_pane_id": target, "ratio": 0.45, "focus": false }),
-    );
-    let Ok(r) = res else { return "could not split a view pane".into() };
-    let Some(pane) = r.get("pane").and_then(|p| p.get("pane_id")).and_then(|x| x.as_str()) else {
-        return "split reported no pane".into();
-    };
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "wsp".into());
-    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": VIEW_LABEL }));
-    let _ = herdr::call(
-        "pane.send_text",
-        json!({ "pane_id": pane, "text": format!("exec {} view\n", shell_quote(&exe)) }),
-    );
-    String::new()
+    list_panes(ws).err().unwrap_or_default()
 }
 
 /// Take every panel's cursor to a task, because the person is reading it now.
@@ -2595,15 +2350,6 @@ mod tests {
         );
     }
 
-    fn pane(id: &str, label: &str) -> PaneInfo {
-        PaneInfo {
-            id: id.into(),
-            label: label.into(),
-            tab: "t1".into(),
-            terminal: String::new(),
-        }
-    }
-
     /// A screen with nobody to ask: what a tty panel is, and what a herdr from
     /// before widths existed looks like from in here.
     struct Silent;
@@ -2824,71 +2570,6 @@ mod tests {
                 argv.join(" "),
             );
         }
-    }
-
-    /// The panel's own column, which is what makes `↵` cheap: the detail
-    /// arrives under the tree and the pane somebody is working in beside it is
-    /// not touched at all.
-    #[test]
-    fn a_panel_splits_its_own_pane_so_the_detail_lands_under_the_tree() {
-        let panes = vec![pane("w1:p1", ""), pane("w1:p2", PANEL_LABEL)];
-
-        assert_eq!(view_target("w1", Some("w1:p2"), &panes).as_deref(), Some("w1:p2"));
-    }
-
-    /// The `Z` panel is a panel and is not the pane labelled `wsp`, so the
-    /// label alone would send its detail to a sidebar two tabs away — a key
-    /// that appears to do nothing.
-    #[test]
-    fn the_fullscreen_panel_splits_itself_rather_than_the_sidebar_it_came_from() {
-        let panes = vec![pane("w1:p2", PANEL_LABEL), pane("w1:p7", FULL_LABEL)];
-
-        assert_eq!(view_target("w1", Some("w1:p7"), &panes).as_deref(), Some("w1:p7"));
-    }
-
-    /// The environment lies to a surface, and this is where the lie would do
-    /// damage: herdr hands its child its own environment, so a herdr started
-    /// from inside a herdr pane gives the sidebar a `HERDR_PANE_ID` belonging
-    /// to a pane in some other workspace. Splitting that would put a detail
-    /// pane in front of whoever is working there. See [`super::run::Where`].
-    #[test]
-    fn a_pane_id_that_is_not_in_this_workspace_is_not_one_to_split() {
-        let panes = vec![pane("w1:p1", "")];
-
-        assert_eq!(view_target("w1", Some("w9:p4"), &panes).as_deref(), Some("w1:p1"));
-    }
-
-    /// What a surface gets, and the reason `↵` works from a sidebar that is in
-    /// no workspace at all: the detail goes beside the work. Our own panes are
-    /// never the answer — a detail split off a detail is seven characters wide,
-    /// which is how this was found the first time.
-    #[test]
-    fn a_surface_has_no_pane_so_the_detail_goes_beside_the_work() {
-        let panes = vec![
-            pane("w1:p1", ""),
-            pane("w1:p3", VIEW_LABEL),
-            pane("w1:p4", BOARD_LABEL),
-        ];
-
-        assert_eq!(view_target("w1", None, &panes).as_deref(), Some("w1:p1"));
-    }
-
-    /// The board's case: it opens a task in the *sidebar's* detail pane and
-    /// then closes itself, so it asks with no pane of its own to offer.
-    #[test]
-    fn a_caller_with_no_pane_of_its_own_hands_the_task_to_the_sidebar() {
-        let panes = vec![pane("w1:p1", ""), pane("w1:p2", PANEL_LABEL)];
-
-        assert_eq!(view_target("w1", None, &panes).as_deref(), Some("w1:p2"));
-    }
-
-    /// A workspace whose only panes are ours. Nothing to split, and the caller
-    /// says so rather than sending `pane.split` an id it invented.
-    #[test]
-    fn a_workspace_with_nothing_but_our_own_panes_has_nowhere_to_put_a_view() {
-        let panes = vec![pane("w1:p3", VIEW_LABEL)];
-
-        assert_eq!(view_target("w1", None, &panes), None);
     }
 
     /// A panel acts on the workspace it is in, and never asks which one is on

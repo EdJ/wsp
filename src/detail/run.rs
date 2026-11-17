@@ -3,26 +3,20 @@
 use std::io::Write;
 use std::time::Duration;
 
-use serde_json::json;
 
-use crate::herdr;
 use crate::input::{self, Key};
 use crate::panel::{self, Line, Style};
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util;
 
-use super::editors::{
-    close_editors, discard_and_quit_keys, edit_tab_siblings, editor_panes, siblings_of, Closing,
-    Columns, MAX_COLUMNS,
-};
+use super::editors::{close_editors, Closing, MAX_COLUMNS};
 use super::render::{frame, Ctx};
 use super::{get_focus, Focus, Placed};
 
 pub fn run(store: &Store, args: &crate::Args) -> i32 {
     let ws = args
         .get("workspace")
-        .or_else(|| herdr::Env::read().workspace_id)
         .unwrap_or_else(|| "-".into());
 
     // An explicit id pins the view; otherwise it follows whatever the panel in
@@ -74,14 +68,6 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     let mut stuck: Vec<String> = Vec::new();
     // Half of a key chain: `d` waiting for the column to put details in.
     let mut pending: Option<&'static str> = None;
-    // The tab closes when the last editor goes, and the count is the only
-    // signal for that now the finished-editor marker is gone. Armed only once
-    // editors have actually been seen, so a context pane that paints before
-    // they have registered does not close the tab on the way up; and it takes
-    // two consecutive empty readings, so a momentary gap in what herdr reports
-    // is not mistaken for the end.
-    let mut had_editors = false;
-    let mut empty_readings = 0u8;
     let Ok(mut tty) = std::fs::File::open("/dev/tty") else { return 1 };
     let mut keys = input::Keys::new();
     let mut pressed: Vec<Key> = Vec::new();
@@ -109,29 +95,6 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
             }
         }
 
-        // Watch for the last editor going. Cheap — one herdr call per poll, the
-        // same one the menu and `W` already make.
-        if let Some(me) = herdr::Env::read().pane_id {
-            let n = edit_tab_siblings(&me).len();
-            if n > 0 {
-                had_editors = true;
-                empty_readings = 0;
-            } else if had_editors {
-                empty_readings += 1;
-                if empty_readings >= 2 {
-                    if let Ok(panes) = herdr::panes() {
-                        if let Some(mine) = panes.iter().find(|p| p.pane_id == me) {
-                            let _ = herdr::call("tab.close", json!({ "tab_id": mine.tab_id }));
-                        }
-                    }
-                    // `break` rather than setting `quit`: the loop condition
-                    // is not consulted again, and the cleanup after it is what
-                    // has to run.
-                    break;
-                }
-            }
-        }
-
         use std::io::Read;
         let mut buf = [0u8; 1];
         match tty.read(&mut buf) {
@@ -153,8 +116,9 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
             // change of mind still quits, scrolls or saves rather than being
             // swallowed by a menu the user has stopped talking to.
             if let Some(section) = pending.take() {
-                if let Key::Char(c @ '1'..='9') = k {
-                    let msg = place_section(&focus, section, c as usize - '0' as usize);
+                if let Key::Char('1'..='9') = k {
+                    let msg = "no pane id".to_string();
+                    let _ = (&focus, section);
                     footer(&msg, Style::Accent);
                     continue;
                 }
@@ -180,55 +144,18 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
                 // Same keys, two meanings, disambiguated by what came before —
                 // which is the whole reason the chain exists rather than six
                 // separate keys.
-                Key::Char(c @ '1'..='9') => {
-                    let msg = set_columns(&focus, c as usize - '0' as usize);
+                Key::Char('1'..='9') => {
+                    let msg = "no pane id".to_string();
                     footer(&msg, Style::Accent);
                 }
                 Key::Char('q') | Key::Interrupt => {
-                    // In an edit tab, `q` takes the whole thing down — leaving two
-                    // editors behind with the context gone is a tab that can only
-                    // confuse. `W` is the one that saves; this is its opposite, and
-                    // the footer says so.
-                    let me = herdr::Env::read().pane_id.unwrap_or_default();
-                    let editors = edit_tab_siblings(&me);
-                    if !editors.is_empty() {
-                        let ed = std::env::var("EDITOR").unwrap_or_default();
-                        if let Some((abort, discard)) = discard_and_quit_keys(&ed) {
-                            for p in &editors {
-                                let _ = herdr::call(
-                                    "pane.send_text",
-                                    json!({ "pane_id": p.pane_id, "text": abort }),
-                                );
-                            }
-                            std::thread::sleep(Duration::from_millis(150));
-                            for p in &editors {
-                                let _ = herdr::call(
-                                    "pane.send_text",
-                                    json!({ "pane_id": p.pane_id, "text": discard }),
-                                );
-                            }
-                            std::thread::sleep(Duration::from_millis(600));
-                        }
-                        // Close the tab whether or not they went quietly: `q` is a
-                        // decision to be rid of this, and a pane that would not
-                        // quit must not be able to veto it.
-                        if let Ok(panes) = herdr::panes() {
-                            if let Some(mine) = panes.iter().find(|p| p.pane_id == me) {
-                                let _ = herdr::call(
-                                    "tab.close",
-                                    json!({ "tab_id": mine.tab_id }),
-                                );
-                            }
-                        }
-                    }
                     quit = true;
                 }
                 // Arrows say the same thing as h/l for anyone who does not think
                 // in vim, and now say it by the same path — so an arrow reports
                 // what it could not do, which it used to swallow.
                 Key::Char('h') | Key::Char('l') | Key::Left | Key::Right => {
-                    let left = matches!(k, Key::Char('h') | Key::Left);
-                    footer(&focus_by_position(left), Style::Warn);
+                    footer("no pane id", Style::Warn);
                 }
                 // Reading keys, in the panel's own vocabulary — see
                 // `panel::run`'s `task_key`, which binds the same set on a
@@ -322,190 +249,6 @@ fn footer(msg: &str, style: Style) {
     l.fit(w);
     print!("\x1b[999;1H{}", panel::to_ansi(&[l], w, 1).trim_start_matches("\x1b[H\x1b[2J"));
     let _ = std::io::stdout().flush();
-}
-
-/// What the columns currently are, read back off the panes.
-///
-/// Deliberately not held as state in this process. The panes are the truth —
-/// a pane can go because somebody quit its editor by hand, and a remembered
-/// layout would then describe a column that is not there. Reading it back each
-/// time costs one herdr call and cannot be wrong.
-fn current_columns(me: &str) -> Columns {
-    let mut cols = Columns::new(1);
-    let panes = editor_panes(me);
-    for (i, p) in panes.iter().enumerate() {
-        if let Some(s) = crate::model::PROSE.iter().find(|s| s.eq_ignore_ascii_case(&p.label)) {
-            cols.place(s, i + 1);
-        }
-    }
-    cols.resize(panes.len().max(1));
-    cols
-}
-
-/// Make the panes match `want`, and say what happened.
-///
-/// The whole of the menu ends here: a key press changes a [`Columns`], and this
-/// is the diff between what the panes show and what it now says. Three kinds of
-/// difference, in an order that matters — **grow first, then re-point, then
-/// shrink** — because a section being moved out of a column that is about to
-/// close must reach its new home before its old one goes.
-fn apply_columns(focus: &Focus, want: &Columns) -> String {
-    let Some(me) = herdr::Env::read().pane_id else {
-        return "no pane id".into();
-    };
-    let Some(cmd) = crate::detail::edit_command(focus) else {
-        return "nothing open to edit".into();
-    };
-    let have = editor_panes(&me);
-    if have.is_empty() {
-        return "no editors open — this is a view, not an edit".into();
-    }
-    let want = want.sections();
-
-    // Grow. A new column is split off the rightmost pane, and starts life
-    // exactly as one opened with the tab does — same label, same loop — or
-    // `W`, `q` and the sibling count would all need to know the difference.
-    let mut panes: Vec<String> = have.iter().map(|p| p.pane_id.clone()).collect();
-    while panes.len() < want.len() {
-        let Some(last) = panes.last().cloned() else { break };
-        let ratio = 1.0 / (want.len() - panes.len() + 1) as f64;
-        let Some(new) = herdr::call(
-            "pane.split",
-            json!({ "direction": "right", "target_pane_id": last, "ratio": ratio, "focus": false }),
-        )
-        .ok()
-        .and_then(|r| Some(r.get("pane")?.get("pane_id")?.as_str()?.to_string())) else {
-            return "could not split another column".into();
-        };
-        crate::detail::start_editor(&new, want[panes.len()], &cmd);
-        panes.push(new);
-    }
-
-    // Re-point. Write the slot, then ask the editor to save and quit: its loop
-    // reads the slot back, sees a different section, and opens that instead.
-    let ed = std::env::var("EDITOR").unwrap_or_default();
-    let keys = super::editors::save_and_quit_keys(&ed, false);
-    let mut moving: Vec<&String> = Vec::new();
-    for (i, section) in want.iter().enumerate() {
-        let Some(pane) = panes.get(i) else { continue };
-        let showing = have.iter().find(|p| &p.pane_id == pane).map(|p| p.label.clone());
-        if showing.as_deref().map(|l| l.eq_ignore_ascii_case(section)).unwrap_or(true) {
-            continue;
-        }
-        let _ = std::fs::write(super::slot_path(pane), section.to_lowercase());
-        moving.push(pane);
-    }
-
-    // Shrink. Leave the slot alone and send the same keys: the loop reads back
-    // what it already had, breaks, and the shell exits, which is what takes the
-    // pane with it. Removing a column and re-pointing one are the same gesture
-    // — only whether the slot was written first tells them apart.
-    let closing: Vec<&String> = panes.iter().skip(want.len()).collect();
-
-    let targets: Vec<&String> = moving.iter().copied().chain(closing.iter().copied()).collect();
-    if targets.is_empty() {
-        return String::new();
-    }
-    let Some((abort, commit)) = keys else {
-        for p in &moving {
-            let _ = std::fs::remove_file(super::slot_path(p));
-        }
-        return format!("don't know how to save {ed} — quit it yourself");
-    };
-    // Two sends, for the reason `close_editors` documents: vim throws away
-    // pending type-ahead when it takes an interrupt, so the command in the same
-    // write as the Ctrl-C is eaten and the editor just sits there.
-    let send = |pane: &str, text: &str| {
-        let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }));
-    };
-    for p in &targets {
-        send(p, abort);
-    }
-    std::thread::sleep(Duration::from_millis(150));
-    for p in &targets {
-        send(p, &commit);
-    }
-    for (i, section) in want.iter().enumerate() {
-        if let Some(pane) = panes.get(i) {
-            let _ = herdr::call(
-                "pane.rename",
-                json!({ "pane_id": pane, "label": section.to_lowercase() }),
-            );
-        }
-    }
-    String::new()
-}
-
-/// `d 2` — put a section in a column.
-fn place_section(focus: &Focus, section: &'static str, col: usize) -> String {
-    let Some(me) = herdr::Env::read().pane_id else { return "no pane id".into() };
-    let mut cols = current_columns(&me);
-    cols.place(section, col);
-    let msg = apply_columns(focus, &cols);
-    if msg.is_empty() {
-        format!("{} → {col}", section.to_lowercase())
-    } else {
-        msg
-    }
-}
-
-/// A bare `1`, `2` or `3` — how many columns there are.
-fn set_columns(focus: &Focus, n: usize) -> String {
-    let Some(me) = herdr::Env::read().pane_id else { return "no pane id".into() };
-    let mut cols = current_columns(&me);
-    cols.resize(n);
-    let msg = apply_columns(focus, &cols);
-    if msg.is_empty() {
-        format!("{n} column{}", if n == 1 { "" } else { "s" })
-    } else {
-        msg
-    }
-}
-
-/// Focus the leftmost or rightmost pane below this one.
-///
-/// By position, not by name. Naming them — `o` for overview, `d` for details —
-/// put the key for the left pane under the right hand and vice versa, which is
-/// backwards every single time. `h` and `l` are left and right on the keyboard,
-/// in vim, and in herdr's own `prefix+h/l`, so the same reach means the same
-/// thing in all three.
-///
-/// The geometry comes from herdr rather than from the layout this code happens
-/// to build, so it stays true if that layout ever changes.
-fn focus_by_position(leftmost: bool) -> String {
-    let Some(me) = herdr::Env::read().pane_id else {
-        return "no pane id".into();
-    };
-    let sibs = siblings_of(&me);
-    if sibs.is_empty() {
-        return "nothing open beside this".into();
-    }
-
-    let rects = herdr::call("pane.layout", json!({ "pane_id": me }))
-        .ok()
-        .and_then(|r| r.get("layout").and_then(|l| l.get("panes").cloned()))
-        .and_then(|p| p.as_array().cloned())
-        .unwrap_or_default();
-    let x_of = |id: &str| -> i64 {
-        rects
-            .iter()
-            .find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(id))
-            .and_then(|p| p.get("rect"))
-            .and_then(|r| r.get("x"))
-            .and_then(|x| x.as_i64())
-            .unwrap_or(0)
-    };
-
-    let mut ordered: Vec<&herdr::Pane> = sibs.iter().collect();
-    ordered.sort_by_key(|p| x_of(&p.pane_id));
-    let target = if leftmost { ordered.first() } else { ordered.last() };
-    match target {
-        Some(p) => {
-            let _ = herdr::call("pane.focus", json!({ "pane_id": p.pane_id }));
-            String::new()
-        }
-        None => "nothing to focus".into(),
-    }
 }
 
 #[cfg(test)]

@@ -44,9 +44,7 @@ use std::collections::HashSet;
 
 use serde_json::json;
 
-use crate::herdr;
 use crate::store::Store;
-use crate::util::shell_quote;
 
 use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
@@ -255,27 +253,8 @@ pub(super) struct PaneInfo {
     pub(super) terminal: String,
 }
 
-pub(super) fn list_panes(ws_id: &str) -> Result<Vec<PaneInfo>, String> {
-    let r = herdr::call("pane.list", json!({ "workspace_id": ws_id })).map_err(|e| e.to_string())?;
-    let arr = r.get("panes").and_then(|p| p.as_array()).cloned().unwrap_or_default();
-    Ok(arr
-        .iter()
-        // The server has honoured the filter, but a stray pane from another
-        // workspace here would mean splitting the wrong tree.
-        .filter(|p| p.get("workspace_id").and_then(|x| x.as_str()) == Some(ws_id))
-        .filter_map(|p| {
-            Some(PaneInfo {
-                id: p.get("pane_id")?.as_str()?.to_string(),
-                label: p.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                tab: p.get("tab_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                terminal: p
-                    .get("terminal_id")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            })
-        })
-        .collect())
+pub(super) fn list_panes(_ws_id: &str) -> Result<Vec<PaneInfo>, String> {
+    Err("no herdr socket".to_string())
 }
 
 /// Is this herdr label one of ours — the sidebar itself, or one of the three
@@ -288,45 +267,21 @@ pub(super) fn is_ours(label: &str) -> bool {
 /// The pane a panel should be split off: the widest one that is not ours.
 /// Width comes from herdr's layout, because "first in the list" is an
 /// arbitrary answer that happens to be right only when there is one pane.
-pub(super) fn widest<'a>(ws_id: &str, panes: &'a [PaneInfo]) -> Option<&'a PaneInfo> {
+pub(super) fn widest<'a>(_ws_id: &str, panes: &'a [PaneInfo]) -> Option<&'a PaneInfo> {
     // Everything of ours, not just the two that live in this tab: `pane.list`
     // is per *workspace*, so a board or a fullscreen panel open in another tab
     // is in this list too, and splitting the sidebar off one of those would put
     // it in a tab nobody has the sidebar open in.
     let candidates: Vec<&PaneInfo> = panes.iter().filter(|p| !is_ours(&p.label)).collect();
-    if candidates.len() <= 1 {
-        return candidates.into_iter().next();
-    }
-    let widths: std::collections::BTreeMap<String, u64> = herdr::call(
-        "pane.layout",
-        json!({ "pane_id": candidates[0].id, "workspace_id": ws_id }),
-    )
-    .ok()
-    .and_then(|r| r.get("layout").and_then(|l| l.get("panes").cloned()))
-    .and_then(|p| p.as_array().cloned())
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|p| {
-        let id = p.get("pane_id")?.as_str()?.to_string();
-        let w = p.get("rect")?.get("width")?.as_u64()?;
-        Some((id, w))
-    })
-    .collect();
-
-    candidates.into_iter().max_by_key(|p| widths.get(&p.id).copied().unwrap_or(0))
+    // No layout to measure: no host runs herdr, so every width reads as 0 and
+    // the last candidate wins.
+    candidates.into_iter().last()
 }
 
 /// `pane.split` starts the user's shell and takes no command, so the panel is
 /// `exec`d over it — which also means quitting the panel closes the pane
 /// instead of leaving a bare prompt behind.
-pub(super) fn launch_panel(pane: &str) {
-    let cmd = panel_command().iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": "wsp" }));
-    let _ = herdr::call(
-        "pane.send_text",
-        json!({ "pane_id": pane, "text": format!("exec {cmd}\n") }),
-    );
-}
+pub(super) fn launch_panel(_pane: &str) {}
 
 /// Install into one workspace. Returns Ok(true) when a panel was added,
 /// Ok(false) when the workspace already had one.
@@ -336,104 +291,8 @@ pub(super) fn launch_panel(pane: &str) {
 /// carry it across. It does not: the tree is rebuilt from scratch and every
 /// pane in it gets a fresh terminal, which killed every running agent. So:
 /// `pane.split`, which adds one pane beside a target and touches nothing else.
-pub fn install_one(store: &Store, ws_id: &str, ratio: f64) -> Result<bool, String> {
-    let panes = list_panes(ws_id)?;
-    let mut panels = panels_state(store);
-
-    // **A pane id that resolves is not evidence.** This used to be the whole
-    // test, and it is the defect `robustness-090` was opened on: herdr's
-    // workspace counter is process-local and a restore reserves only one above
-    // the highest workspace that survived, so `w10` comes round again — and the
-    // pane numbering under the new one starts at `p1` and climbs, so a `w10`
-    // that has been split once has a `w10:p2`, which is exactly what a stale
-    // record of the *old* `w10` names. 125 of this machine's 147 entries were
-    // of that shape. Believed, `install_one` answered "already has a panel"
-    // about a stranger's pane and installed none.
-    if let Some(held) = panels.held.get(ws_id) {
-        if panes.iter().any(|p| p.id == held.pane && held.corroborated_by(p)) {
-            return Ok(false);
-        }
-    }
-    // A pane labelled `wsp` is ours even when the state file lost track of it
-    // — a crash between the split and the save would otherwise install twice.
-    // It is also the restart: the pane id survives, the terminal behind it does
-    // not, so the record above stops being believed and this adopts the pane
-    // back with the witness it has now.
-    if let Some(orphan) = panes.iter().find(|p| p.label == "wsp") {
-        panels.remember(ws_id, orphan);
-        save_panels(store, &panels);
-        return Ok(false);
-    }
-    // Never split one of our own panes. A leftover view pane used to be a
-    // candidate, and splitting it gave the panel 22% of an already-narrow
-    // column — seven usable characters.
-    let Some(target) = widest(ws_id, &panes) else {
-        return Ok(false);
-    };
-    let before: HashSet<&str> = panes.iter().map(|p| p.id.as_str()).collect();
-
-    // Splitting `right` at `ratio` leaves the *target* holding `ratio` and puts
-    // the new pane in the remainder, so the sidebar arrives on the wrong side
-    // at the wrong width. Swapping the two afterwards lands the panel in the
-    // narrow left slot without disturbing either process.
-    let res = herdr::call(
-        "pane.split",
-        json!({
-            "direction": "right",
-            "target_pane_id": target.id,
-            "ratio": ratio,
-            "focus": false,
-        }),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let new_pane = res
-        .get("pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            let after = list_panes(ws_id).ok()?;
-            after.into_iter().find(|p| !before.contains(p.id.as_str())).map(|p| p.id)
-        })
-        .ok_or_else(|| "split reported no new pane".to_string())?;
-
-    // **This swap steals the screen, and there is no way to ask it not to.**
-    // `handle_pane_swap` calls `switch_workspace_tab` unconditionally and
-    // `pane.swap` is the one mutation in herdr's API with no `focus` field —
-    // `workspace.create`, `pane.split`, `pane.move` and `layout.apply` all have
-    // one, defaulting to false. So a workspace opened deliberately in the
-    // background is dragged onto the screen 34 ms later by its own panel being
-    // installed, which is the whole of why `robustness-069` looked unfixed
-    // after `spawn` stopped opting into focus. Measured, with the chain and the
-    // line, on `fork-002`; nothing above can be reordered around it, because
-    // `SplitDirection` is `right|down` and `pane.move` refuses a move within
-    // one tab.
-    let _ = herdr::call(
-        "pane.swap",
-        json!({ "source_pane_id": target.id, "target_pane_id": new_pane }),
-    );
-    launch_panel(&new_pane);
-
-    // The witness, read *after* the swap rather than taken from what `split`
-    // answered. It costs one `pane.list` on a path that already makes four
-    // calls, and it buys not having to know whether `pane.swap` exchanges two
-    // panes' places in the layout tree or their contents — a witness recorded
-    // against the wrong one of those never matches, and a record that never
-    // matches installs a second panel every time. A herdr that sends no
-    // `terminal_id` leaves it empty and is believed, as ever.
-    let recorded = list_panes(ws_id)
-        .ok()
-        .and_then(|after| after.into_iter().find(|p| p.id == new_pane))
-        .unwrap_or(PaneInfo {
-            id: new_pane,
-            label: String::new(),
-            tab: String::new(),
-            terminal: String::new(),
-        });
-    panels.remember(ws_id, &recorded);
-    save_panels(store, &panels);
-    Ok(true)
+pub fn install_one(_store: &Store, ws_id: &str, _ratio: f64) -> Result<bool, String> {
+    list_panes(ws_id).map(|_| false)
 }
 
 /// Auto-install for a newly created workspace — but only once the panel is
@@ -460,59 +319,9 @@ pub fn install_if_adopted(store: &Store, ws_id: &str) {
     let _ = install_one(store, ws_id, 0.22);
 }
 
-pub fn install(store: &Store, args: &crate::Args) -> i32 {
-    if !herdr::available() {
-        eprintln!("wsp: no herdr socket");
-        return 1;
-    }
-    let ratio: f64 = args.get("ratio").and_then(|r| r.parse().ok()).unwrap_or(0.22);
-    let only = args.get("workspace").or_else(|| herdr::Env::read().workspace_id);
-    let all = args.has("all");
-
-    // Without `--all` this installs into exactly one workspace. Run outside a
-    // herdr pane there is no such workspace, and letting the filter fall
-    // through would quietly install into every one of them.
-    if !all && only.is_none() {
-        eprintln!("wsp: not inside a herdr pane — pass --workspace <id> or --all");
-        return 1;
-    }
-
-    // Said, not refused. `wsp panel install` is somebody typing it, and the
-    // fork is one build of one terminal — the reason to run both at once is
-    // that you are checking one against the other, which is most of what this
-    // fallback is for.
-    if crate::daemon::surface_drawing(&store.state) {
-        eprintln!("wsp: a surface is already drawing the sidebar — installing a panel beside it");
-    }
-
-    let workspaces = herdr::workspaces().unwrap_or_default();
-    let mut added = 0;
-    let mut skipped: Vec<String> = Vec::new();
-
-    for ws in &workspaces {
-        if !all {
-            if let Some(target) = &only {
-                if &ws.id != target {
-                    continue;
-                }
-            }
-        }
-        match install_one(store, &ws.id, ratio) {
-            Ok(true) => added += 1,
-            Ok(false) => {}
-            Err(e) => skipped.push(format!("{}: {e}", ws.label)),
-        }
-    }
-
-    if args.json() {
-        println!("{}", json!({ "installed": added, "skipped": skipped }));
-    } else {
-        println!("panel installed in {added} workspace(s)");
-        for sk in &skipped {
-            println!("  skipped {sk}");
-        }
-    }
-    0
+pub fn install(_store: &Store, _args: &crate::Args) -> i32 {
+    eprintln!("wsp: no herdr socket");
+    1
 }
 
 /// Take the panel back out of a workspace, or out of all of them.
@@ -533,96 +342,9 @@ pub fn install(store: &Store, args: &crate::Args) -> i32 {
 /// "there is no such workspace" were one line and one exit code, which reads as
 /// the first while being the second — the reading that sends somebody looking
 /// for a pane wsp has already told them it removed.
-pub fn uninstall(store: &Store, args: &crate::Args) -> i32 {
-    if !herdr::available() {
-        eprintln!("wsp: no herdr socket");
-        return 1;
-    }
-    let mut panels = panels_state(store);
-    let only = args.get("workspace");
-
-    // Where to look: every workspace herdr has, plus any the state file still
-    // names. A workspace that has gone took its panes with it, but its entry is
-    // ours to forget, and a run that never visits it never forgets it.
-    let mut targets: Vec<String> =
-        herdr::workspaces().unwrap_or_default().into_iter().map(|w| w.id).collect();
-    for ws in panels.held.keys() {
-        if !targets.contains(ws) {
-            targets.push(ws.clone());
-        }
-    }
-    if let Some(want) = &only {
-        targets.retain(|ws| ws == want);
-        if targets.is_empty() {
-            eprintln!(
-                "wsp: no workspace `{want}` — herdr does not list it, and nothing is recorded there"
-            );
-            return 1;
-        }
-    }
-
-    let mut cleared = 0;
-    let mut closed = 0;
-    let mut bare: Vec<String> = Vec::new();
-    let mut failed: Vec<String> = Vec::new();
-
-    for ws in &targets {
-        let panes = match list_panes(ws) {
-            Ok(panes) => panes,
-            // Said, never swallowed. This is the other silent zero: a
-            // workspace we could not look inside is not a workspace with
-            // nothing in it.
-            Err(e) => {
-                failed.push(format!("{ws}: {e}"));
-                continue;
-            }
-        };
-        // The recorded id as well as the labels, for the one pane a label
-        // cannot find: a rename by hand, or a herdr that lost the label across
-        // a restart. It costs one comparison and it closes a pane that would
-        // otherwise be nobody's to close.
-        let recorded = panels.held.get(ws).map(|h| h.pane.clone());
-        let mut here = 0;
-        let mine = |p: &&PaneInfo| is_ours(&p.label) || Some(&p.id) == recorded.as_ref();
-        for pane in panes.iter().filter(mine) {
-            match herdr::call("pane.close", json!({ "pane_id": pane.id })) {
-                Ok(_) => here += 1,
-                Err(e) => failed.push(format!("{}: {e}", pane.id)),
-            }
-        }
-        panels.held.remove(ws);
-        closed += here;
-        if here > 0 {
-            cleared += 1;
-        } else {
-            bare.push(ws.clone());
-        }
-    }
-    // Taking the panel out of everything is the withdrawal; taking it out of
-    // one workspace is not. Those used to be the same sentence, because
-    // adoption was spelled "the map is not empty" — and under a sweep that
-    // spelling would make forgetting a dead workspace a withdrawal too.
-    if only.is_none() {
-        panels.adopted = false;
-    }
-    save_panels(store, &panels);
-
-    if args.json() {
-        println!(
-            "{}",
-            json!({ "removed": cleared, "panes": closed, "empty": bare, "failed": failed })
-        );
-    } else if closed > 0 {
-        println!("panel removed from {cleared} workspace(s), {closed} pane(s) closed");
-    } else if let Some(want) = &only {
-        println!("nothing of ours is open in {want} — no panel to remove");
-    } else {
-        println!("nothing of ours is open in any of {} workspace(s)", targets.len());
-    }
-    for f in &failed {
-        eprintln!("wsp: {f}");
-    }
-    i32::from(!failed.is_empty())
+pub fn uninstall(_store: &Store, _args: &crate::Args) -> i32 {
+    eprintln!("wsp: no herdr socket");
+    1
 }
 
 /// Close the panel panes an older wsp left standing, and say how many.
@@ -653,23 +375,8 @@ pub fn uninstall(store: &Store, args: &crate::Args) -> i32 {
 /// adopted here, not that these particular panes exist, and somebody who rolls
 /// back to an upstream herdr should find their panels install again as they
 /// always did — nothing here decides that the fork is permanent.
-pub(super) fn sweep_husks(state: &std::path::Path) -> usize {
-    let Some(manned) = crate::daemon::wsp_panes(state) else {
-        return 0;
-    };
-    let Ok(workspaces) = herdr::workspaces() else {
-        return 0;
-    };
-    let mut closed = 0;
-    for ws in workspaces.iter().filter(|w| herdr::host_of(&w.id).is_none()) {
-        let Ok(panes) = list_panes(&ws.id) else { continue };
-        for pane in husks(&panes, &manned) {
-            if herdr::call("pane.close", json!({ "pane_id": pane })).is_ok() {
-                closed += 1;
-            }
-        }
-    }
-    closed
+pub(super) fn sweep_husks(_state: &std::path::Path) -> usize {
+    0
 }
 
 /// Which of a workspace's panes are husks: ours by label, with nothing of ours

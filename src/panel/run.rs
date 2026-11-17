@@ -13,9 +13,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use crate::herdr;
 use crate::input::Key;
 use crate::kanban;
 use crate::live::{self, AgentRef};
@@ -23,7 +22,7 @@ use crate::store::Store;
 use crate::util::exe_stamp;
 pub(crate) use crate::base::term::stty;
 
-use super::keys::{apply_input, say, Chore, Effect, Input, Mode, View};
+use super::keys::{apply_input, say, Effect, Input, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, Cursor, Snapshot, Target, Ui};
 use super::shared;
@@ -355,10 +354,6 @@ const STATUS_POLL: Duration = Duration::from_secs(3);
 /// same reason: only panes in both are compared. A pane arriving or leaving is
 /// structural, [`SHAPE`] already refetches on it at once, and counting it here
 /// as well would refetch twice for one event.
-fn status_moved(drawn: &HashMap<String, String>, now: &[herdr::Pane]) -> bool {
-    now.iter().any(|p| drawn.get(&p.pane_id).is_some_and(|was| was != &p.agent_status))
-}
-
 /// Subscriptions herdr scopes to a single pane. Its request struct for these
 /// requires a `pane_id`, and there is no wildcard — `*` and `""` both answer
 /// `pane_not_found`. Naming one here without a pane refuses the whole list,
@@ -411,44 +406,7 @@ fn status_changed(seen: &mut HashMap<String, String>, d: &Value) -> bool {
 /// of herdr with no other way to know. A surface has one — its host is herdr,
 /// and pushes the answer outright — so it starts this only for a host that
 /// turns out not to. See [`super::surface`].
-pub(super) fn spawn_events(tx: Sender<Msg>) {
-    std::thread::spawn(move || loop {
-        let tx2 = tx.clone();
-        let types: Vec<&str> = SHAPE.iter().chain(CHATTY).copied().collect();
-        // Per subscription rather than per panel: a dropped stream is a gap we
-        // cannot describe, so the map starts empty and the first event about
-        // each pane teaches it rather than firing. The background tick covers
-        // whatever changed while nobody was listening.
-        let mut seen: HashMap<String, String> = HashMap::new();
-        let res = herdr::subscribe(&types, move |e, d| {
-            // `pane.created` and `pane.updated` carry the pane as an object and
-            // the workspace id inside it; the rest put it at the top level.
-            // Reading only the top level made every event about our own pane
-            // look like an event about somebody else's.
-            let ws = d
-                .get("workspace_id")
-                .or_else(|| d.get("pane").and_then(|p| p.get("workspace_id")))
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string());
-            // First, and not behind the `||`: every event carrying a pane
-            // teaches the map, including the structural ones. A `pane.created`
-            // that did not would leave the pane's opening status unrecorded,
-            // and the next `pane.updated` would read as a change.
-            let changed = status_changed(&mut seen, d);
-            let ev = HerdrEvent {
-                workspace: ws,
-                shape: changed || is(SHAPE, e),
-                focus: e == "workspace_focused",
-            };
-            tx2.send(Msg::Herdr(ev)).is_ok()
-        });
-        if res.is_err() {
-            std::thread::sleep(Duration::from_secs(3));
-        } else {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    });
-}
+pub(super) fn spawn_events(_tx: Sender<Msg>) {}
 
 /// Did this command make something that was not there before?
 ///
@@ -476,19 +434,9 @@ fn creates(argv: &[String]) -> bool {
 ///
 /// The workspace first, then the pane: focusing a pane in a workspace that is
 /// not focused moves nothing you can see.
-fn focus_self(pane: Option<&str>, ws: Option<&str>) {
-    if let Some(ws) = ws {
-        let _ = herdr::call("workspace.focus", json!({ "workspace_id": ws }));
-    }
-    if let Some(p) = pane {
-        let _ = herdr::call("pane.focus", json!({ "pane_id": p }));
-    }
-}
+fn focus_self(_pane: Option<&str>, _ws: Option<&str>) {}
 
-pub(super) fn focus(agent: &AgentRef) {
-    let _ = herdr::call("workspace.focus", json!({ "workspace_id": agent.workspace }));
-    let _ = herdr::call("pane.focus", json!({ "pane_id": agent.pane }));
-}
+pub(super) fn focus(_agent: &AgentRef) {}
 
 /// Type a work order into an agent's pane, off the loop.
 ///
@@ -534,8 +482,7 @@ pub(super) struct Where {
 impl Where {
     /// A panel in a pane: it is where the environment says it is.
     pub(super) fn env() -> Where {
-        let env = herdr::Env::read();
-        Where { workspace: env.workspace_id, pane: env.pane_id }
+        Where::default()
     }
 
     /// A panel that is in no pane and no workspace, and knows it.
@@ -565,7 +512,7 @@ pub(super) enum Outcome {
 /// the width of the workspace, and quit rather than kept when you have finished
 /// with it. See [`super::keys::View::full`].
 pub fn run(store: &Store, full: bool) -> i32 {
-    if !herdr::available() {
+    if true {
         eprintln!("wsp: no herdr socket");
         return 1;
     }
@@ -1164,7 +1111,6 @@ pub(super) fn event_loop(
     // The status the frame in front of the reader was drawn with, and when we
     // last asked herdr whether it still holds. See [`STATUS_POLL`].
     let mut drawn_status: HashMap<String, String> = HashMap::new();
-    let mut last_poll = Instant::now();
     // Messages taken off the channel while coalescing a burst of herdr events,
     // to be handled in the order they arrived rather than thrown away.
     let mut carry: std::collections::VecDeque<Msg> = Default::default();
@@ -1515,19 +1461,7 @@ pub(super) fn event_loop(
                 // `Quit` is answered before it is reported: herdr goes, and a
                 // surface's next read of stdin ends. The word is said anyway,
                 // for the panel in a pane whose herdr is somebody else's.
-                Effect::Herdr(chore) => {
-                    let (method, done) = match chore {
-                        Chore::Quit => ("server.stop", "quitting"),
-                        Chore::ReloadConfig => ("server.reload_config", "config reloaded"),
-                    };
-                    match herdr::call(method, json!({})) {
-                        Ok(_) => say(&mut ui, done),
-                        // What herdr said, rather than "failed". A socket that
-                        // is not there and a config that will not parse are
-                        // different problems and only one of them is yours.
-                        Err(e) => say(&mut ui, format!("herdr: {e}")),
-                    }
-                }
+                Effect::Herdr(_) => say(&mut ui, "herdr: no herdr socket"),
                 Effect::Run { argv, escalate, then } => {
                     match (run_wsp(&argv), escalate) {
                         (Ok(m), _) => {
@@ -1677,24 +1611,6 @@ pub(super) fn event_loop(
                     refetch = true;
                     dirty = false;
                 }
-                // Ask the one question the event stream cannot answer, and only
-                // where it goes unanswered: an unfocused panel, between its full
-                // refetches. A status that has moved is news of exactly the kind
-                // [`SHAPE`] exists for, so it refetches now rather than waiting
-                // out the rest of the thirty seconds.
-                //
-                // An empty list is herdr not answering, not everybody finishing
-                // at once — this call degrades to empty the same way
-                // [`crate::live::read`] does, and reading that as news would
-                // clear the dock every time the socket hiccuped.
-                if !self_focused && last_poll.elapsed() >= STATUS_POLL {
-                    last_poll = Instant::now();
-                    let now = herdr::panes().unwrap_or_default();
-                    if !now.is_empty() && status_moved(&drawn_status, &now) {
-                        refetch = true;
-                        dirty = false;
-                    }
-                }
                 // The one you are looking at should feel immediate; the twenty
                 // behind it should cost nothing. Both the fingerprint stat and
                 // the two socket calls sit behind this gate, so an idle
@@ -1797,6 +1713,7 @@ pub(super) fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// `render` under `wsp`, with one task in the child — the shape a board
     /// opens a card from when the card's project is folded in the tree.
@@ -2181,52 +2098,6 @@ mod tests {
         // Nor is an event that carries no pane at all — `workspace.focused`
         // goes through the same reducer.
         assert!(!status_changed(&mut seen, &json!({ "workspace_id": "w1" })));
-    }
-
-    /// The other half of the same asymmetry, and the half that has no event at
-    /// all behind it.
-    ///
-    /// herdr is never told an agent's status — it classifies from the
-    /// transcript the hook reports — so a finish is the *absence* of writes to
-    /// a file, and nothing fires on the passing of time. Measured against the
-    /// live server, the `pane.updated` carrying a finish arrived 6.8s late
-    /// once and 28.9s late once, with 147s of silence on the stream across the
-    /// second. `pane.list` reads the same rule when asked and so has it at
-    /// once. That is what this poll is for; see [`STATUS_POLL`].
-    #[test]
-    fn a_finish_that_never_reached_the_stream_is_still_found_by_asking() {
-        let census = |panes: &[(&str, &str)]| {
-            panes
-                .iter()
-                .map(|(id, status)| herdr::Pane {
-                    pane_id: (*id).to_string(),
-                    agent_status: (*status).to_string(),
-                    ..Default::default()
-                })
-                .collect::<Vec<_>>()
-        };
-        let drawn: HashMap<String, String> = [("w0:p3", "working"), ("w1:p6", "idle")]
-            .iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect();
-
-        // The frame still says what herdr says. Nothing to do, and this is the
-        // answer on all but a few polls a minute.
-        assert!(!status_moved(&drawn, &census(&[("w0:p3", "working"), ("w1:p6", "idle")])));
-
-        // The one the event stream lost: an agent that stopped while the panel
-        // was not being looked at.
-        assert!(status_moved(&drawn, &census(&[("w0:p3", "done"), ("w1:p6", "idle")])));
-        // And the same fact from the other side.
-        assert!(status_moved(&drawn, &census(&[("w0:p3", "working"), ("w1:p6", "working")])));
-
-        // A pane the frame has never drawn is structural, and `SHAPE` has
-        // already refetched on it. Counting it here refetches twice for one
-        // event.
-        assert!(!status_moved(&drawn, &census(&[("w2:p1", "working")])));
-        // A pane that has gone likewise: it is absent from the census, which
-        // is not a status that moved.
-        assert!(!status_moved(&drawn, &census(&[("w0:p3", "working")])));
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
