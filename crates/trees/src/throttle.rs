@@ -836,7 +836,8 @@ pub fn weight(tool: &str, args: &[String]) -> Weight {
 }
 
 fn alive(pid: u32) -> bool {
-    crate::host::LOCAL.probe(pid)
+    // Could not ask reads as not alive, as it did before the Host.
+    crate::host::LOCAL.probe(pid).unwrap_or(false)
 }
 
 fn fnv(s: &str) -> String {

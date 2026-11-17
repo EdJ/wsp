@@ -1112,12 +1112,22 @@ impl TreeLock {
 
     /// Whether the pid in the lock is gone, which is the only reason to break one.
     fn dead(path: &Path) -> bool {
+        Self::dead_by(path, |pid| crate::host::LOCAL.signal(&[pid], "0"))
+    }
+
+    /// [`TreeLock::dead`] with the probe given. Only a definite "not there"
+    /// (`Some(false)`) breaks the lock: a probe that could not ask (`None`, a
+    /// `kill` that would not spawn, or at M1 a manager that does not answer)
+    /// keeps it, since a second check in a tree still in use is the worse
+    /// mistake.
+    fn dead_by(path: &Path, probe: impl Fn(u32) -> Option<bool>) -> bool {
         let text = std::fs::read_to_string(path).unwrap_or_default();
         let Some(pid) = text.split_whitespace().next().filter(|p| p.chars().all(|c| c.is_ascii_digit())) else {
             // Being written this instant, or garbage: garbage ages out.
             return std::fs::metadata(path).and_then(|m| m.modified()).map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(60)).unwrap_or(false);
         };
-        !pid.parse().is_ok_and(|pid| crate::host::LOCAL.signal(&[pid], "0"))
+        // A pid that does not parse (past u32) names no process.
+        pid.parse().map_or(true, |pid| probe(pid) == Some(false))
     }
 }
 
@@ -2507,6 +2517,20 @@ mod tests {
         assert!(!TreeLock::live(&path));
     }
 
+    /// wsp-008: a probe that could not ask (a `kill` that would not spawn, or
+    /// at M1 a manager that does not answer) keeps a held lock; only a definite
+    /// "not there" breaks it.
+    #[test]
+    fn a_tree_lock_whose_holder_cannot_be_asked_about_is_kept() {
+        let env = util::isolated("check-lock-unasked");
+        let path = env.state().join("lock");
+        let held = TreeLock::take(path.clone(), Duration::from_secs(1)).unwrap();
+        assert!(!TreeLock::dead_by(&path, |_| None), "could not ask broke the lock");
+        assert!(!TreeLock::dead_by(&path, |_| Some(true)));
+        assert!(TreeLock::dead_by(&path, |_| Some(false)), "a holder that is gone frees it");
+        drop(held);
+    }
+
     #[test]
     fn a_step_is_a_name_a_limit_and_a_command() {
         let s = step("- tests (20m): cargo test --release");
@@ -2667,7 +2691,7 @@ mod tests {
         assert_eq!(r.done, Done::Passed);
         let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
         let alive = || {
-            pid.parse().is_ok_and(|pid| crate::host::LOCAL.probe(pid))
+            pid.parse().is_ok_and(|pid| crate::host::LOCAL.probe(pid) == Some(true))
         };
         let until = Instant::now() + Duration::from_secs(5);
         while alive() && Instant::now() < until {
