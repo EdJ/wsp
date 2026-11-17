@@ -195,14 +195,23 @@ pub(crate) fn reading_in(state: &std::path::Path, seat: &str) -> Option<serde_js
                 "cache_read": n(&rec, "cache_read"),
                 "cache_write": n(&rec, "cache_write"),
                 "cost": cost_of(&rec),
+                "session_id": rec.get("session_id").cloned().unwrap_or(json!("")),
+                "transcript": rec.get("transcript").cloned().unwrap_or(json!("")),
             }));
         }
     }
-    let text = std::fs::read_to_string(state.join(crate::place_super::SPENT_FILE)).ok()?;
+    ledger_lines(state, seat).pop()
+}
+
+/// Every line the ledger holds for a seat, oldest first: one per session the
+/// seat banked at its `stop()`, each with its `session_id` and when it `ended`.
+pub(crate) fn ledger_lines(state: &std::path::Path, seat: &str) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(state.join(crate::place_super::SPENT_FILE)).unwrap_or_default();
     text.lines()
+        .filter(|l| l.contains(seat))
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter(|v| v.get("seat").and_then(|s| s.as_str()) == Some(seat))
-        .last()
+        .collect()
 }
 
 fn str_or_dash(v: &serde_json::Value, key: &str) -> String {

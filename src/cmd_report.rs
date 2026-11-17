@@ -177,6 +177,11 @@ fn usd(micros: Option<u64>) -> String {
     micros.map_or("unmeasured".into(), |m| format!("${:.2}", m as f64 / 1_000_000.0))
 }
 
+/// A figure, or "not measured" where it is null: never a 0 for what was not read.
+fn or_unread(v: &Value, f: &dyn Fn(u64) -> String) -> String {
+    v.as_u64().map_or_else(|| "not measured".to_string(), f)
+}
+
 fn n(v: &Value, k: &str) -> u64 {
     v.get(k).and_then(Value::as_u64).unwrap_or(0)
 }
@@ -442,6 +447,11 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         gj["governor_wall"] = gov.get(gi).and_then(|x| x.as_ref()).map_or(Value::Null, GovWall::json);
     }
     let govs: Vec<&crate::timeline::GovernorWindow> = gov.iter().flatten().filter_map(|x| x.to_last.as_ref()).collect();
+    let gov_windows = gov.iter().flatten().count();
+    // Not measured is null, never 0 (`wsp-066`): where no window's governor
+    // transcript was read, the sums say nothing of what the governor did.
+    let gsum = |f: &dyn Fn(&crate::timeline::GovernorWindow) -> i64| if govs.is_empty() { Value::Null } else { json!(govs.iter().map(|g| f(g)).sum::<i64>()) };
+    let seats = standing_seats(store, w, &cost);
     let held: i64 = gov.iter().flatten().map(|x| x.last - x.pass).sum();
     let followups: Vec<Value> = crate::cmd_worklist::followups(w).into_iter().map(|(row, ids)| json!({ "by": row, "rows": ids })).collect();
     let mut wait_list: Vec<(String, i64)> = waits.into_iter().collect();
@@ -459,7 +469,8 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "cost": "whole row: every seat — members, verifiers, barrier checks, governors",
             "full_suite": "full_suite_runs: full-suite `cargo test` runs started in a member's or verifier's seat (the shim's note, wsp-389), by row and group. The barrier's own run is one per group and is not counted here; the aim is zero in seats.",
             "barrier_scope": "groups[].barrier_scope: the barrier's run scoped to what the group touched (wsp-431) — scoped or full and why, the targets it ran, shared paths that widened it, its seconds against the last full run's, and net_red: scoped barriers a red full run stood behind, which is what scoping let through",
-            "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start. null where no group follows or no pass is found; the governor figures are null where its transcript is not found; its transcript is the one the seat's burn.json names, for each pane `governor-set` seated, clipped to the stretch it held the slot; burn.json holds only a seat's latest session and goes when the seat stops, so the figures are a floor",
+            "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start: governor_wall_windows is how many there were and governor_wall_windows_unread how many had no governor transcript read; the governor_* sums are over the windows read, and null (not measured, never 0) where none was. A window is null where no group follows or no pass is found; the governor figures are null where its transcript is not found; its transcript is the one the seat's burn.json names, for each pane `governor-set` seated, clipped to the stretch it held the slot; burn.json holds only a seat's latest session and goes when the seat stops, and then the session ids the ledger (spent.jsonl) banked at each stop are read, so the figures are a floor",
+            "standing_seats": "totals.standing_seats (wsp-066): each governor and barrier check seat — what a seat costs while it waits on the run — with its group, seated seconds (a governor's: the stretches it held the slot; a check's: its transcript's first stamp, else the check's opening, to its stop), turns and cost as the cost block reads them, and memory: its resident memory over its seated time from the daemon's samples (seat-memory.json, one per minute): MB-minutes, mean and peak MB, the seconds and number of samples. Any figure not read is null and not 0 — seconds or turns where the seat was never read (counted in unmeasured_seats), memory where the seat was never sampled (it ran before the daemon sampled, or on a machine it does not). governor_seconds, check_seconds and their mb_minutes are the sums over the seats read, null where none was",
             "wall_buckets": "totals.wall_buckets and groups[].wall_buckets (wsp-470): every second of the list's wall in one bucket, by what the run as a whole was doing at that second — working (some member's seat in a model call or a tool, or one of its legs running, or a check or a verifier running; legs_running_seconds is the part of working where only legs were — a member whose legs run has no call of its own then, and wsp-218 stopped calling that its seat idle), waiting (nobody working, some member started and not moving: blocked from the moment it blocks, an unclaimed or slow start, a named gap, a seat idle), serialised (nobody started, a member behind the cap or an `after`), barrier_run, check_seat, between_groups (a pass to the group's first start, where the run starts the group; a manual group's is a person's wait for a hand to start it, so it is waiting, named 'waiting for a hand to start'), parked (a person parked the whole list, worklist-parked to worklist-resumed: every second inside it is parked and in no other bucket, the barrier's wait and its run included, so barrier_run is the run and its own waits and never a park; parked_by names who, when and why; wall_without_parked_seconds is the wall less it, the working wall a retro attributes). A group's window runs from the previous group's pass to its own, so they tile the wall: a member that started before its window opened (a row cut from the previous group and started again) is read from the pass on, and attributed_seconds equals wall_seconds. between_attempts_seconds (totals, and per member) is the stretch between a row's attempts (compounding-217): a row released and started again is two seats, each with its own spawn → release or review span, and what lay between them is named for what it was — the row parked or waiting to be restarted (with the row it waited on when its `after` names one), or reviewed, sent back and reopened (rework; the row's attempt is booked in rework.attempts) — and is neither the seat finishing nor the seat idle, nor in idle_seconds. gap_seconds and idle_seconds above are member-seconds read per row, kept beside it: a stall inside a seat is not a gap there. seat_idle_seconds and seat_idle_by_reason (wsp-559), beside waiting_by in each group's wall_buckets and in the totals: the waiting that was a seat idle, split by what the row's log says it waited on from the moment it was written — sent back (the verdict given, the tell not delivered or delivered, the verdict with the governor), reopened, a rebase refused, a hand-off to another row, owed to another (an after), a block, waiting on the governor's or a person's answer to a question it asked (named with the question's id, from the question to its answer), the seat's own shells, the check and the verifier's hand-off, the verdict read — and 'none recorded' where no line precedes the second",
             "time": "per member row, spawn to verdict (wall, gaps); the seat's model and tool time are its own transcript calls inside those phases, legs only where run-leg timings exist",
         },
@@ -483,12 +494,6 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "transcripts_missing": missing_sessions,
             "full_suite_runs": suites_total,
             "pass_to_last_start_seconds": held,
-            "governor_wall_seconds": govs.iter().map(|g| g.seconds).sum::<i64>(),
-            "governor_wall_turns": govs.iter().map(|g| g.turns).sum::<u64>(),
-            "governor_wall_model_seconds": govs.iter().map(|g| g.model_secs).sum::<i64>(),
-            "governor_wall_idle_seconds": govs.iter().map(|g| g.idle_secs).sum::<i64>(),
-            "governor_looking_turns": govs.iter().map(|g| g.looking_turns).sum::<u64>(),
-            "governor_looking_seconds": govs.iter().map(|g| g.looking_secs).sum::<i64>(),
             "scoped_barriers": scoped_n,
             "full_barriers": full_n,
             "scoped_seconds_saved": saved_secs,
@@ -510,6 +515,19 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         "cost": cost,
     });
     v["totals"]["last_verdict_wall_seconds"] = json!(wall);
+    for (k, x) in [
+        ("governor_wall_windows", json!(gov_windows)),
+        ("governor_wall_windows_unread", json!(gov_windows - govs.len())),
+        ("governor_wall_seconds", gsum(&|g| g.seconds)),
+        ("governor_wall_turns", gsum(&|g| g.turns as i64)),
+        ("governor_wall_model_seconds", gsum(&|g| g.model_secs)),
+        ("governor_wall_idle_seconds", gsum(&|g| g.idle_secs)),
+        ("governor_looking_turns", gsum(&|g| g.looking_turns as i64)),
+        ("governor_looking_seconds", gsum(&|g| g.looking_secs)),
+        ("standing_seats", seats),
+    ] {
+        v["totals"][k] = x;
+    }
     // Said where the wall is partial: no pass yet, the wall run to the cut. A
     // retro row on the list it reads is one of its rows, and counts in it.
     v["totals"]["still_running"] = json!(still_running);
@@ -699,6 +717,19 @@ fn governor_sources(store: &Store, list: &str, groups: usize) -> Vec<crate::time
                 break;
             }
         }
+        // The seat stopped: its `burn.json` went with its directory, and the
+        // ledger line `stop()` banked names each session it ran (`wsp-066`:
+        // m1-fixes's governor read 0 turns for 113 the cost table counted).
+        // A line banked before the ledger carried the path names the session
+        // only, and is looked for under `~/.claude/projects`.
+        for l in crate::cmd_burn::ledger_lines(&store.state, &s.seat) {
+            let Some(sid) = l["session_id"].as_str().filter(|x| !x.is_empty()) else { continue };
+            let path = l["transcript"].as_str().filter(|t| t.starts_with('/'));
+            match out.iter_mut().find(|o| o.transcript.contains(sid) || Some(o.transcript.as_str()) == path) {
+                Some(o) => o.spans.extend(s.spans.iter().copied().filter(|sp| !o.spans.contains(sp)).collect::<Vec<_>>()),
+                None => out.push(GovSource { transcript: path.unwrap_or(sid).to_string(), spans: s.spans.clone() }),
+            }
+        }
     }
     let text = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
     let now = util::epoch_secs();
@@ -776,6 +807,55 @@ fn governor_wall_with(
         .collect()
 }
 
+/// The governor and barrier check seats of the list (`wsp-066`): what a seat
+/// costs while it waits on the run. Seconds, turns and cost are the cost
+/// block's for the seat; memory is its resident memory over its seated time as
+/// the daemon sampled it. A figure not read is null, never 0.
+fn standing_seats(store: &Store, w: &Worklist, cost: &Value) -> Value {
+    let groups = w.groups();
+    // The stretch each seat was seated, for its memory: a governor's tenure,
+    // a check's opening to its stop.
+    let mut held: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for g in crate::cmd_cost::governors(store, &w.id, groups.len()) {
+        let from = g.spans.iter().map(|s| s.0).min().unwrap_or(0);
+        let to = if g.spans.iter().any(|s| s.1 == 0) { 0 } else { g.spans.iter().map(|s| s.1).max().unwrap_or(0) };
+        held.insert(g.seat, (from, to));
+    }
+    for c in groups.iter().flat_map(|g| g.checks.iter()) {
+        let Some(pane) = c.pane.as_deref() else { continue };
+        let ended = crate::cmd_burn::reading_in(&store.state, pane).and_then(|r| r["ended"].as_str().map(util::epoch_of)).unwrap_or(0);
+        held.entry(pane.to_string()).or_insert((util::epoch_of(&c.at), ended));
+    }
+    let mut seats: Vec<Value> = Vec::new();
+    for g in cost["groups"].as_array().into_iter().flatten() {
+        for (role, key) in [("governor", "governor"), ("check", "barrier")] {
+            for e in g[key].as_array().into_iter().flatten().filter(|e| e["shared"] != true) {
+                let seat = e["seat"].as_str().unwrap_or("");
+                let memory = held.get(seat).and_then(|&(from, to)| crate::memory::seat_memory(&store.state, seat, from, to));
+                seats.push(json!({
+                    "role": role, "group": g["group"], "seat": seat,
+                    "seconds": e["seconds"], "turns": e["turns"], "usd_micros": e["usd_micros"], "measured": e["measured"],
+                    "memory": memory.as_ref().map_or(Value::Null, crate::memory::SeatMemory::json),
+                }));
+            }
+        }
+    }
+    let sum = |role: &str, f: &dyn Fn(&Value) -> Option<f64>| {
+        let read: Vec<f64> = seats.iter().filter(|s| s["role"] == role).filter_map(f).collect();
+        if read.is_empty() { Value::Null } else { json!((read.iter().sum::<f64>() * 10.0).round() / 10.0) }
+    };
+    let secs = |s: &Value| s["seconds"].as_f64();
+    let mbm = |s: &Value| s["memory"]["mb_minutes"].as_f64();
+    json!({
+        "governor_seconds": sum("governor", &secs),
+        "governor_mb_minutes": sum("governor", &mbm),
+        "check_seconds": sum("check", &secs),
+        "check_mb_minutes": sum("check", &mbm),
+        "unmeasured": seats.iter().filter(|s| s["measured"] != true).count(),
+        "seats": seats,
+    })
+}
+
 /// The previous pass beside this one, each ratio shown (this ÷ baseline).
 fn against(now: &Value, slug: &str) -> Value {
     let path = dir(slug).join("effort.json");
@@ -849,8 +929,8 @@ pub fn effort_html(v: &Value) -> String {
             vec!["unmeasured seats".into(), n(t, "unmeasured_seats").to_string()],
             vec!["transcripts not found".into(), n(t, "transcripts_missing").to_string()],
             vec!["full suites run in member or verifier seats".into(), n(t, "full_suite_runs").to_string()],
-            vec!["each pass to the next group's last start: window / governor turns / governor idle".into(), format!("{} / {} / {}", hms(n(t, "pass_to_last_start_seconds") as i64), n(t, "governor_wall_turns"), hms(n(t, "governor_wall_idle_seconds") as i64))],
-            vec!["governor turns that only looked (model time a skipped turn gives back)".into(), format!("{} ({})", n(t, "governor_looking_turns"), hms(n(t, "governor_looking_seconds") as i64))],
+            vec!["each pass to the next group's last start: window / governor turns / governor idle".into(), format!("{} / {} / {}", hms(n(t, "pass_to_last_start_seconds") as i64), or_unread(&t["governor_wall_turns"], &|x| x.to_string()), or_unread(&t["governor_wall_idle_seconds"], &|x| hms(x as i64)))],
+            vec!["governor turns that only looked (model time a skipped turn gives back)".into(), format!("{} ({})", or_unread(&t["governor_looking_turns"], &|x| x.to_string()), or_unread(&t["governor_looking_seconds"], &|x| hms(x as i64)))],
             vec!["barriers scoped / full".into(), format!("{} / {}", n(t, "scoped_barriers"), n(t, "full_barriers"))],
             vec!["seconds scoped barriers ran under a full run".into(), n(t, "scoped_seconds_saved").to_string()],
             vec!["safety-net reds scoping let through".into(), n(t, "safety_net_reds").to_string()],
@@ -860,6 +940,25 @@ pub fn effort_html(v: &Value) -> String {
             vec!["verdict to the verifier's despawn (median per row)".into(), hms(n(t, "verdict_to_despawn_median_seconds") as i64)],
         ],
     ));
+    let ss = &t["standing_seats"];
+    if let Some(seats) = ss["seats"].as_array().filter(|s| !s.is_empty()) {
+        b.push_str("<h2>1a · Governor and check seats</h2><p class=\"dim\">What a seat costs while it waits on the run (wsp-066): its seated time, turns and cost, and its resident memory over that time as the daemon sampled it. A figure not read says so, and is never 0.</p>");
+        let rows: Vec<Vec<String>> = seats
+            .iter()
+            .map(|x| {
+                let m = &x["memory"];
+                vec![
+                    format!("{} · group {}", x["role"].as_str().unwrap_or(""), x["group"]),
+                    x["seat"].as_str().unwrap_or("").into(),
+                    or_unread(&x["seconds"], &|v| hms(v as i64)),
+                    or_unread(&x["turns"], &|v| v.to_string()),
+                    usd(x["usd_micros"].as_u64()),
+                    if m.is_object() { format!("{} MB·min (mean {} MB, peak {} MB)", m["mb_minutes"], m["mean_mb"], m["peak_mb"]) } else { "not sampled".into() },
+                ]
+            })
+            .collect();
+        b.push_str(&table(&["seat", "pane", "seated", "turns", "USD", "resident memory"], &rows));
+    }
     let wb = &t["wall_buckets"];
     if wb.is_object() {
         let pct = |k: &str| {
@@ -1312,6 +1411,98 @@ mod tests {
         let last = g.to_last.as_ref().expect("the governor's turns are found through burn.json");
         assert_eq!((last.turns, last.looking_turns), (2, 1), "the governor's two turns inside its tenure, not the member's three: {last:?}");
         assert_eq!(g.json()["governor_to_last_start"]["turns"], 2);
+    }
+
+    /// `wsp-066`: m1-fixes's effort.json read its governor (113 turns, seated
+    /// 3065 s) and two barrier seats (39 and 12 turns) as 0 s, and held no
+    /// memory figure. A governor whose seat stopped is read through the session
+    /// the ledger banked; a check seat carries its seated seconds; a seat never
+    /// read is null and unmeasured, never 0; and each standing seat carries its
+    /// resident memory where the daemon sampled it.
+    #[test]
+    fn a_stopped_governor_is_read_through_the_ledger_and_a_seat_not_read_is_null_not_zero() {
+        use crate::timeline::RowFigures;
+        let (env, store, mut w) = list("gl", &["r-1", "r-2"]);
+        let t0: i64 = util::epoch_secs() - 10_000;
+        let mut gs = w.groups();
+        gs.truncate(1);
+        gs[0].members = vec!["r-1".into()];
+        gs.push(crate::model::Group { members: vec!["r-2".into()], ..Default::default() });
+        let mut read = crate::barrier::Check::opened(None, None);
+        read.at = util::iso_at(t0 + 50);
+        read.pane = Some("cpd-7".into());
+        gs[0].checks.push(read);
+        let mut unread = crate::barrier::Check::opened(None, None);
+        unread.at = util::iso_at(t0 + 250);
+        unread.pane = Some("cpd-8".into());
+        gs[1].checks.push(unread);
+        w.set_groups(&gs);
+        store.save_worklist(&w).unwrap();
+        let ev = |at: i64, kind: &str, data: Value| json!({ "ts": util::iso_at(at), "kind": kind, "data": data }).to_string();
+        let log = [
+            ev(t0, "governor-set", json!({ "project": "gl", "workspace": "cpd-1" })),
+            ev(t0 + 100, "worklist-go", json!({ "id": "gl", "passed": 1, "started": false })),
+            ev(t0 + 400, "governor-vacated", json!({ "project": "gl", "workspace": "cpd-1" })),
+        ];
+        std::fs::write(store.state_file("events.jsonl"), format!("{}\n", log.join("\n"))).unwrap();
+        // Both seats have stopped: no burn.json, only the ledger's lines.
+        let projects = env.home().join("transcripts");
+        std::fs::create_dir_all(&projects).unwrap();
+        let banked = |seat: &str, sid: &str, turns: u64, ended: i64| {
+            let path = projects.join(format!("{sid}.jsonl"));
+            json!({ "seat": seat, "session_id": sid, "transcript": path.to_string_lossy(), "turns": turns, "input": 1, "output": 10, "cache_read": 0, "cache_write": 0, "cost": 1000, "ended": util::iso_at(ended) }).to_string()
+        };
+        std::fs::write(store.state_file("spent.jsonl"), format!("{}\n{}\n", banked("cpd-7", "chk-s", 2, t0 + 300), banked("cpd-1", "gov-s", 3, t0 + 400))).unwrap();
+        let turn = |at: i64, rid: &str| {
+            json!({ "type": "assistant", "requestId": rid, "timestamp": util::iso_at(at),
+                "message": { "content": [{ "type": "tool_use", "id": rid, "name": "Bash", "input": { "command": "wsp say x" } }], "usage": { "input_tokens": 1, "output_tokens": 1 } } })
+            .to_string()
+        };
+        let gov = projects.join("gov-s.jsonl");
+        std::fs::write(&gov, [turn(t0 + 110, "g1"), turn(t0 + 150, "g2"), turn(t0 + 190, "g3")].join("\n")).unwrap();
+        std::fs::write(projects.join("chk-s.jsonl"), [turn(t0 + 120, "c1"), turn(t0 + 130, "c2")].join("\n")).unwrap();
+        // The daemon sampled the governor's seat twice: 100 then 200 MB, a minute apart.
+        let mem = crate::memory::fold(Value::Null, &[("cpd-1".into(), 100 * 1024)], t0 + 10);
+        let mem = crate::memory::fold(mem, &[("cpd-1".into(), 200 * 1024)], t0 + 70);
+        std::fs::write(store.state_file(crate::memory::SEAT_MEMORY_FILE), mem.to_string()).unwrap();
+        let fig = |id: &str| match id {
+            "r-1" => RowFigures { start: t0, end: t0 + 100, wall: 100, measured: true, ..Default::default() },
+            _ => RowFigures { start: t0 + 200, end: t0 + 300, wall: 100, measured: true, ..Default::default() },
+        };
+
+        let v = effort_with(&store, &w, None, &fig);
+        let t = &v["totals"];
+        assert_eq!(t["governor_wall_turns"], 3, "the governor's three turns, read through the ledger's session: {t}");
+        assert_eq!(t["governor_wall_seconds"], 100, "the pass to group 2's start: {t}");
+        assert_eq!((t["governor_wall_windows"].clone(), t["governor_wall_windows_unread"].clone()), (json!(1), json!(0)));
+        let seats = t["standing_seats"]["seats"].as_array().unwrap();
+        let seat = |s: &str| seats.iter().find(|x| x["seat"] == s).unwrap_or_else(|| panic!("{s}: {seats:?}"));
+        let g = seat("cpd-1");
+        assert_eq!((g["role"].clone(), g["seconds"].clone(), g["turns"].clone()), (json!("governor"), json!(400), json!(3)), "{g}");
+        assert_eq!(g["memory"]["mb_minutes"], 150.0, "(100 + 200) / 2 MB for a minute: {g}");
+        assert_eq!(g["memory"]["peak_mb"], 200);
+        let c = seat("cpd-7");
+        assert_eq!((c["role"].clone(), c["seconds"].clone(), c["turns"].clone()), (json!("check"), json!(180), json!(2)), "its first act to its stop: {c}");
+        assert!(c["memory"].is_null(), "never sampled: not measured, not 0 MB: {c}");
+        let u = seat("cpd-8");
+        assert!(u["seconds"].is_null() && u["turns"].is_null() && u["measured"] == false, "a seat never read is null, not 0: {u}");
+        assert_eq!(t["unmeasured_seats"], 1, "{t}");
+        assert_eq!(t["standing_seats"]["unmeasured"], 1);
+        assert_eq!(t["standing_seats"]["governor_seconds"], 400.0);
+        assert_eq!(t["standing_seats"]["check_seconds"], 180.0, "the unread seat is out of the sum, not a 0 in it");
+        assert!(t["standing_seats"]["check_mb_minutes"].is_null());
+        assert_eq!(v["cost"]["total"]["seconds_unread"], 1);
+
+        // The governor's transcript gone too: its window is not measured, and
+        // the totals say so — null, not 0.
+        std::fs::remove_file(&gov).unwrap();
+        let v = effort_with(&store, &w, None, &fig);
+        let t = &v["totals"];
+        for k in ["governor_wall_seconds", "governor_wall_turns", "governor_wall_idle_seconds", "governor_wall_model_seconds", "governor_looking_turns", "governor_looking_seconds"] {
+            assert!(t[k].is_null(), "{k} is not measured: {t}");
+        }
+        assert_eq!(t["governor_wall_windows_unread"], 1);
+        assert!(v["groups"][0]["governor_wall"]["governor_to_last_start"].is_null());
     }
 
     #[test]

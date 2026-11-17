@@ -269,9 +269,185 @@ fn of(ps: &str, seats: &[(String, String)], roots: &[(String, u32)], warn_kb: u6
     IdleMemory { panes, unread, warn_kb }
 }
 
+// Each seat's resident memory over its seated time (`wsp-066`).
+//
+// The reading above is a moment: what idle panes hold now. What a governor or
+// a check seat costs while it waits is a figure over its whole seat, and the
+// seat is gone by the time a retro asks — `ps` has nothing to say of it then.
+// So the daemon samples every seated agent's resident memory on its own
+// interval and folds it into `seat-memory.json`: per seat, stretches of
+// samples, each with the KB·seconds under it (trapezoids between samples),
+// its peak and its last reading. A gap longer than [`BRIDGE`] (the daemon
+// down, the seat gone and its name taken again) starts a new stretch, so it is
+// never bridged with a figure nobody read.
+
+/// The file under the state directory.
+pub(crate) const SEAT_MEMORY_FILE: &str = "seat-memory.json";
+
+/// How often the daemon samples, in seconds.
+pub(crate) const SAMPLE_EVERY: i64 = 60;
+
+/// The longest gap between two samples that is read as one stretch.
+const BRIDGE: i64 = 3 * SAMPLE_EVERY;
+
+/// Stretches whose last sample is older than this are dropped from the file.
+const KEEP: i64 = 30 * 86_400;
+
+/// Samples every seated agent among `agents` through one `ps` and banks them.
+/// Under test there is no table to ask: tests fold readings with [`fold`].
+pub(crate) fn sample(state: &Path, agents: &[Seated], ps: impl FnOnce() -> Option<String>, now: i64) {
+    let seats: Vec<(String, String)> =
+        agents.iter().filter(|a| a.state != State::Empty).map(|a| (a.seat.as_str().to_string(), a.seat.as_str().to_string())).collect();
+    if seats.is_empty() || cfg!(test) {
+        return;
+    }
+    let backends = crate::cmd_spawn::local_backends();
+    let roots: Vec<(String, u32)> = seats
+        .iter()
+        .filter_map(|(s, _)| {
+            let seat = crate::place::Seat::new(s);
+            backends.iter().find_map(|b| b.root(&seat)).map(|pid| (s.clone(), pid))
+        })
+        .collect();
+    let Some(ps) = ps() else { return };
+    let read = of(&ps, &seats, &roots, 0);
+    bank(state, &read.panes.iter().map(|p| (p.seat.clone(), p.kb)).collect::<Vec<_>>(), now);
+}
+
+/// Banks the managers' readings: `rss` is each seat's resident bytes as its
+/// `seats` reply said (`docs/agent-manager.md` 4.3).
+pub(crate) fn sample_rss(state: &Path, rss: &BTreeMap<String, u64>, now: i64) {
+    let read: Vec<(String, u64)> = rss.iter().map(|(s, b)| (s.clone(), b / 1024)).filter(|(_, kb)| *kb > 0).collect();
+    if !read.is_empty() && !cfg!(test) {
+        bank(state, &read, now);
+    }
+}
+
+fn bank(state: &Path, read: &[(String, u64)], now: i64) {
+    let path = state.join(SEAT_MEMORY_FILE);
+    let prev = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+    let _ = crate::store::write_atomic_unsynced(&path, &fold(prev, read, now).to_string());
+}
+
+/// The file with `read` (seat, KB) sampled at `now` folded in.
+pub(crate) fn fold(prev: Value, read: &[(String, u64)], now: i64) -> Value {
+    let mut all = match prev {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    for (seat, kb) in read.iter().filter(|(_, kb)| *kb > 0) {
+        let stretches = all.entry(seat.clone()).or_insert_with(|| json!([]));
+        if !stretches.is_array() {
+            *stretches = json!([]);
+        }
+        let list = stretches.as_array_mut().expect("an array");
+        let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
+        let last_to = list.last().map(|l| n(l, "to"));
+        // A sample at or before the last one (a clock stepped back, two daemons
+        // racing) adds nothing.
+        if last_to.is_some_and(|t| t >= now) {
+            continue;
+        }
+        match list.last_mut().filter(|_| last_to.is_some_and(|t| now - t <= BRIDGE)) {
+            Some(l) => {
+                let dt = now - n(l, "to");
+                let kb_secs = n(l, "kb_secs") + (n(l, "kb") + *kb as i64) * dt / 2;
+                l["kb_secs"] = json!(kb_secs);
+                l["to"] = json!(now);
+                l["kb"] = json!(kb);
+                l["peak_kb"] = json!(n(l, "peak_kb").max(*kb as i64));
+                l["samples"] = json!(n(l, "samples") + 1);
+            }
+            None => list.push(json!({ "from": now, "to": now, "kb": kb, "kb_secs": 0, "peak_kb": kb, "samples": 1 })),
+        }
+    }
+    for stretches in all.values_mut() {
+        if let Some(list) = stretches.as_array_mut() {
+            list.retain(|l| now - l.get("to").and_then(Value::as_i64).unwrap_or(0) <= KEEP);
+        }
+    }
+    all.retain(|_, v| v.as_array().is_some_and(|l| !l.is_empty()));
+    Value::Object(all)
+}
+
+/// A seat's resident memory over `[from, to]` (`to == 0`: to now): the
+/// stretches sampled that overlap it, whole.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SeatMemory {
+    pub mb_minutes: f64,
+    pub peak_mb: u64,
+    /// The seconds the samples span, and how many there were.
+    pub sampled_seconds: i64,
+    pub samples: u64,
+}
+
+impl SeatMemory {
+    pub(crate) fn json(&self) -> Value {
+        let mean = if self.sampled_seconds > 0 { self.mb_minutes * 60.0 / self.sampled_seconds as f64 } else { self.peak_mb as f64 };
+        json!({
+            "mb_minutes": (self.mb_minutes * 10.0).round() / 10.0,
+            "mean_mb": mean.round() as u64,
+            "peak_mb": self.peak_mb,
+            "sampled_seconds": self.sampled_seconds,
+            "samples": self.samples,
+        })
+    }
+}
+
+/// [`SeatMemory`] read from the state directory's file. `None` where the seat
+/// was never sampled inside the span: not measured, which is not zero.
+pub(crate) fn seat_memory(state: &Path, seat: &str, from: i64, to: i64) -> Option<SeatMemory> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(state.join(SEAT_MEMORY_FILE)).ok()?).ok()?;
+    seat_memory_in(&v, seat, from, to)
+}
+
+pub(crate) fn seat_memory_in(v: &Value, seat: &str, from: i64, to: i64) -> Option<SeatMemory> {
+    let to = if to == 0 { i64::MAX } else { to };
+    let n = |l: &Value, k: &str| l.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let hit: Vec<&Value> = v.get(seat)?.as_array()?.iter().filter(|l| n(l, "to") >= from && n(l, "from") <= to).collect();
+    if hit.is_empty() {
+        return None;
+    }
+    Some(SeatMemory {
+        mb_minutes: hit.iter().map(|l| n(l, "kb_secs")).sum::<i64>() as f64 / 1024.0 / 60.0,
+        peak_mb: hit.iter().map(|l| n(l, "peak_kb")).max().unwrap_or(0) as u64 / 1024,
+        sampled_seconds: hit.iter().map(|l| n(l, "to") - n(l, "from")).sum(),
+        samples: hit.iter().map(|l| n(l, "samples")).sum::<i64>() as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seats_samples_fold_into_megabyte_minutes_and_a_gap_is_not_bridged() {
+        let s = |kb: u64| vec![("cpd-1".to_string(), kb)];
+        let mut v = fold(Value::Null, &s(100 * MB), 1000);
+        v = fold(v, &s(300 * MB), 1060);
+        v = fold(v, &s(300 * MB), 1120);
+        // (100 + 300) / 2 MB for a minute, then 300 MB for a minute.
+        let m = seat_memory_in(&v, "cpd-1", 0, 0).unwrap();
+        assert_eq!((m.mb_minutes, m.peak_mb, m.sampled_seconds, m.samples), (500.0, 300, 120, 3));
+        // The daemon down an hour: a new stretch, with nothing under the gap.
+        v = fold(v, &s(200 * MB), 4720);
+        assert_eq!(v["cpd-1"].as_array().unwrap().len(), 2, "{v}");
+        assert_eq!(seat_memory_in(&v, "cpd-1", 0, 0).unwrap().mb_minutes, 500.0);
+        // A span is read off the stretches that overlap it; another seat's
+        // never sampled one is not measured.
+        assert_eq!(seat_memory_in(&v, "cpd-1", 4000, 0).unwrap().samples, 1);
+        assert_eq!(seat_memory_in(&v, "cpd-1", 2000, 3000), None);
+        assert_eq!(seat_memory_in(&v, "cpd-2", 0, 0), None);
+        assert_eq!(m.json()["mean_mb"], 250);
+    }
+
+    #[test]
+    fn a_stretch_long_past_is_dropped_and_a_zero_reading_is_not_a_sample() {
+        let v = fold(Value::Null, &[("old".to_string(), 50 * MB), ("none".to_string(), 0)], 1000);
+        assert!(v.get("none").is_none(), "{v}");
+        let v = fold(v, &[("new".to_string(), 50 * MB)], 1000 + KEEP + 1);
+        assert!(v.get("old").is_none() && v.get("new").is_some(), "{v}");
+    }
 
     fn seats(names: &[&str]) -> Vec<(String, String)> {
         names.iter().map(|n| (format!("w{n}:p1"), format!("wsp-{n}"))).collect()

@@ -1632,7 +1632,7 @@ mod tests {
         let place = Supervisor { poll: Duration::from_millis(10), ..Supervisor::at(base.join("seats")) };
         fs::create_dir_all(base.join("seats")).unwrap();
         let seat = place.open(&Order::default()).unwrap();
-        let burn = json!({ "session_id": "s-1", "model": "claude-sonnet-5-5", "turns": 7,
+        let burn = json!({ "session_id": "s-1", "transcript": "/t/s-1.jsonl", "model": "claude-sonnet-5-5", "turns": 7,
             "input": 1_234_567, "output": 89_012, "cache_read": 345_678_901,
             "cache_write": 2_345_678, "cost": 4_321_987 });
         fs::write(base.join("seats").join(seat.as_str()).join(BURN_FILE), burn.to_string()).unwrap();
@@ -1640,7 +1640,7 @@ mod tests {
         assert!(!base.join("seats").join(seat.as_str()).exists());
         let text = fs::read_to_string(base.join(SPENT_FILE)).expect("a ledger");
         let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-        for k in ["session_id", "model", "turns", "input", "output", "cache_read", "cache_write", "cost"] {
+        for k in ["session_id", "transcript", "model", "turns", "input", "output", "cache_read", "cache_write", "cost"] {
             assert_eq!(line[k], burn[k], "{k}");
         }
         assert_eq!(line["seat"], seat.as_str());

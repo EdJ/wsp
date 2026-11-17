@@ -521,6 +521,8 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // conditions that raise no event, and sharing a gate with a pass that *does*
     // would tie "somebody woke us" to "a member's agent exited".
     let mut repair_pass = crate::repair::Pass::new();
+    // When seats' resident memory was last sampled (`wsp-066`).
+    let mut memory_at = 0i64;
     // What we are executing, so we can notice an `install` landing underneath
     // us. See `reload` at the top of the loop.
     let mut started_as = crate::util::exe_stamp();
@@ -712,9 +714,33 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             repairs(store, &crate::cycle::Fleet, &mut repair_pass);
         }
 
+        // Every seated agent's resident memory, on its own interval, so a
+        // retro can read what a seat held over its seated time after the seat
+        // is gone (`wsp-066`).
+        if now - memory_at >= crate::memory::SAMPLE_EVERY {
+            memory_at = now;
+            wsp_base::calls::phase("seat-memory");
+            sample_seat_memory(store, now);
+        }
+
         crate::place_compound::tick_deliver_budget(false);
         wsp_base::calls::tick_end();
     }
+}
+
+/// One sample of every seated agent's resident memory into
+/// `seat-memory.json`: off the managers' `seats` replies under
+/// `WSP_HOST=manager`, else one `ps` over the local backends' census.
+fn sample_seat_memory(store: &Store, now: i64) {
+    if crate::host_tcp::Choice::from_env() == Ok(crate::host_tcp::Choice::Manager) {
+        let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        let rss: std::collections::BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
+        crate::memory::sample_rss(&store.state, &rss, now);
+        return;
+    }
+    let agents: Vec<crate::place::Seated> =
+        crate::place::local_backends().iter().filter_map(|b| b.census().ok()).flat_map(|c| c.seats().cloned().collect::<Vec<_>>()).collect();
+    crate::memory::sample(&store.state, &agents, || crate::host::Host::seat_memory(&crate::host::LOCAL), now);
 }
 
 /// The repair pass, and the sweeps after it, as one tick runs them.

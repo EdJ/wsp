@@ -1027,6 +1027,18 @@ fn transcript_at(file: &std::path::Path) -> Option<String> {
     String::from_utf8(crate::host::LOCAL.transcript_bytes(file)?).ok()
 }
 
+/// A seat's first act (`wsp-066`): the first stamp in its transcript, named
+/// by an absolute path (a seat's `burn.json`) or a bare session id (the
+/// ledger's). `None` where neither is found.
+pub(crate) fn first_act(transcript_or_session: &str) -> Option<i64> {
+    let text = match transcript_or_session {
+        "" => return None,
+        t if t.starts_with('/') => transcript_at(std::path::Path::new(t))?,
+        s => transcript(s)?,
+    };
+    first_stamp(&text)
+}
+
 /// The first line of a transcript that carries a time: the seat's first act.
 fn first_stamp(text: &str) -> Option<i64> {
     text.lines()

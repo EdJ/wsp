@@ -79,6 +79,7 @@ one goes in this plan:
 | `governors.json` | 32 KB | `set_governor` store.rs:2421, `clear_governor` :2430, `edit_governor` :2457 (14 modules) | `governors` store.rs:2414 (22 modules); also read raw at crates/base/src/calls.rs:545 to name a caller's role | S: governor seats |
 | `spawned.json` | 8 KB | `set_spawned` store.rs:2996, `reap_spawned` :3010 (cmd_agent, cmd_spawn) | `spawned` store.rs:2986 (cmd_agent, cmd_spawn, sync) | S: seat birth |
 | `seat-since.json` | 19 KB | `note_seat_states` store.rs:3041 (cmd_agent, on every `wip`) | same, cmd_agent | C: seat state's start, inferred by sampling |
+| `seat-memory.json` | new (`wsp-066`) | `memory::sample` / `sample_rss`, from the daemon's tick once a minute | `memory::seat_memory` (cmd_report: effort.json's `standing_seats`) | X → E: a seat's resident memory over its seated time, sampled; the executor's per-tick RSS replaces the `ps` |
 | `said.json` | 169 KB | `set_said` store.rs:2908, `set_sentence` :2933 (cmd_agent); place_super.rs:365, place_compound.rs:239 per seat | `said` store.rs:2897 (14 modules) | C → S: a seat's last word |
 | `worked.json` | 569 KB | `set_worked` store.rs:2833 (cmd_agent) | `worked` store.rs:2826 (cmd_agent, cmd_spawn, cmd_task, detail) | S: row ↔ seat history |
 | `watches.json` | 1.5 MB | `update_watch` store.rs:2749, `set_watch` :2773 (attention, cmd_watch, wake, repair, cmd_spawn) | `watch`/`watches` store.rs:2716–2729 (10 modules, place backends) | S + C: waits on seats |

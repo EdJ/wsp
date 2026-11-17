@@ -1149,6 +1149,9 @@ pub fn bank_burn(dir: &Path) {
         "seat": seat,
         "ended": util::now_iso(),
         "session_id": str_of(&rec, "session_id"),
+        // The transcript's path, so a reader after the seat is gone finds it
+        // without searching for the session id (`wsp-066`).
+        "transcript": str_of(&rec, "transcript"),
         "model": str_of(&rec, "model"),
         "turns": n("turns"),
         "input": n("input"),
