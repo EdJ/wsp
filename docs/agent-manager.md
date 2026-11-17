@@ -827,10 +827,15 @@ machine record names (`<state>/manager/local.json` and its secret file, wsp-024)
   begins "host silent". Through the trait it is `Refusal::Unreachable`, never an empty answer.
 - **`WSP_HOST=inproc|manager`.** `host::chosen` reads it, and `host::choose` takes the choice as an argument.
   The default stays `inproc`. Nothing calls them yet: callers move in group 5.
-- **The spawn's key and env are stand-ins.** The idempotency key is `(seat, 0)`, because `Spawn` carries no
-  `(row, attempt)` and wsp mints seat ids fresh. The seat's env values cross as an `env -u K -- K=V` prefix on
-  the argv, because 3.2's agent spec carries names only and a seat's values (its row, its store) are not in the
-  manager's environment.
+- **The spawn's key is real; its env is the 3.2 rule.** `Spawn` carries `key: (row, attempt)`, and `Tcp`
+  sends it as is, built once per spawn so `ask`'s one reopen resends the same key. wsp builds it in
+  `cmd_spawn::spawn_key` from the row's id and `cmd_attempts::attempts_of(row).len()`, puts it on
+  `place::Agent`, and `Compound::start` hands it down. `start_agent`'s own re-start after a start that did
+  not survive takes the next attempt, because the manager refuses a stopped key as `duplicate`. A seat with
+  no row (a bare-shell `open`, a rotation that is not a task) has no key to hand down, so the host keys it
+  `(seat, 0)`: wsp mints seat ids fresh, so nothing else can share it. The seat's env values still cross
+  as an `env -u K -- K=V` prefix on the argv: 3.2's rule is that the prefix carries wsp's per-seat values
+  (row, store) and never a secret.
 - **`host::Subscription`** sends `subscribe {from}` with the last event id heard of that host, kept in
   `<state>/manager/<host>.last`. It hands out events and beats one at a time. An id is kept once the next is
   asked for, so delivery is at least once. A dropped connection, or three silent beats, means it subscribes

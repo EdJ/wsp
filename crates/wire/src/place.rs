@@ -423,7 +423,13 @@ pub struct Agent {
     pub kind: String,
     pub name: String,
     pub args: Vec<String>,
+    /// The row and attempt `seat.spawn` is keyed by (3.3). `None` for a seat
+    /// with no row: the host then keys it by its own freshly minted seat id,
+    /// attempt 0, which is unique by construction.
+    pub key: Option<Key>,
 }
+
+pub use wsp_host_api::{Key, RowId};
 
 /// What a seat is doing, moved down to `wsp-host` with the host that reads it
 /// off the screen (wsp-020).

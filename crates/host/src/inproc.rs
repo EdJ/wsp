@@ -55,6 +55,10 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `seat.spawn` for a pty seat: what runs in it and where, already decided.
 pub struct Spawn<'a> {
+    /// The idempotency key `seat.spawn` carries over the wire (3.3): the row
+    /// and its attempt. `InProcess` ignores it; `host::Tcp` sends it, built once
+    /// per spawn so a retry after a lost reply reaches the manager under it.
+    pub key: wsp_host_api::Key,
     /// The seat's id, written as the session's label.
     pub seat: &'a str,
     /// The agent kind the supervisor reads a composer for, when it reads one.

@@ -845,6 +845,7 @@ mod tests {
             kind: "claude".into(),
             name: "t-260816-092".into(),
             args: vec!["--dangerously-skip-permissions".into()],
+            key: None,
         };
         let said = describe(&Filler::Agent(a));
         assert_eq!(said, "claude on t-260816-092");

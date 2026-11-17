@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use wsp_base::util::Wall;
-use wsp_host_api::{At, Epoch, EventId, Message, Role, SeatId, SeatSaid, Token};
+use wsp_host_api::{At, Epoch, EventId, Key, Message, RowId, Role, SeatId, SeatSaid, Token};
 use wsp_manager::{Config, Manager, TOKEN_FILE};
 use wsp_wire::host::{self, Choice, Host, HostError, InProcess, Spawn, Stop, Subscription, Tcp, LOCAL};
 use wsp_wire::manager::{install_record, Local};
@@ -136,7 +136,7 @@ fn contract(host: &dyn Host, dir: &Path, sweep: &Sweep) {
     let seat = Seat::new(format!("cpd-t{}", std::process::id()));
     let env = BTreeMap::from([("WSP_ROW".to_string(), "wsp-025".to_string())]);
     let args = vec!["-c".to_string(), "true".to_string()];
-    let spawn = Spawn { seat: seat.as_str(), kind: Some("claude".into()), cwd: dir.display().to_string(), env, program: "sh", args: &args };
+    let spawn = Spawn { key: Key { row: RowId("wsp-025".into()), attempt: 0 }, seat: seat.as_str(), kind: Some("claude".into()), cwd: dir.display().to_string(), env, program: "sh", args: &args };
 
     // seat.spawn: a session with its socket, its pid running.
     let session = host.spawn_session(&spawn).expect("the seat starts");
@@ -195,6 +195,45 @@ fn the_tcp_host_holds_the_contract_on_a_loopback_manager() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The key is the caller's (row, attempt), not the seat: the same key twice is
+/// one seat, and the next attempt is another.
+#[test]
+fn spawns_under_one_key_over_tcp_give_one_seat_and_another_attempt_another() {
+    let (dir, sup) = place("key");
+    let sweep = Sweep::default();
+    let m = manager(&dir, &sup, 0);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let args = vec!["-c".to_string(), "true".to_string()];
+    fn mk<'a>(dir: &Path, args: &'a [String], seat: &'a str, attempt: u32) -> Spawn<'a> {
+        Spawn {
+        key: Key { row: RowId("wsp-026".into()), attempt },
+        seat,
+        kind: Some("claude".into()),
+        cwd: dir.display().to_string(),
+        env: BTreeMap::new(),
+        program: "sh",
+        args,
+        }
+    }
+    let spawn = |seat: &'static str, attempt: u32| mk(&dir, &args, seat, attempt);
+    let first = tcp.spawn_session(&spawn("cpd-k1", 0)).expect("the first spawn");
+    sweep.add(first.pid);
+    let again = tcp.spawn_session(&spawn("cpd-k1", 0)).expect("the same key again");
+    assert_eq!((again.pid, &again.socket), (first.pid, &first.socket), "one key, one seat");
+    let run = dir.join("exec").join(wsp_manager::seats::RUN_DIR);
+    let spawns = |run: &Path| fs::read_to_string(run.join("spawns")).unwrap().lines().count();
+    assert_eq!(spawns(&run), 1, "the second spawn forked nothing");
+
+    let next = tcp.spawn_session(&spawn("cpd-k2", 1)).expect("the next attempt");
+    sweep.add(next.pid);
+    assert_ne!(next.pid, first.pid, "another attempt is another agent");
+    assert_eq!(spawns(&run), 2);
+    drop(tcp);
+    m.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A port nothing listens on: bound, then let go.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
@@ -236,7 +275,7 @@ fn wsp_host_manager_with_no_manager_running_is_host_silent() {
     // A call through the trait says it as a refusal, never as an empty answer.
     let tcp = Tcp::from_record(&state, Role::Cli, "test").unwrap();
     let args: Vec<String> = vec![];
-    let spawn = Spawn { seat: "cpd-x", kind: None, cwd: String::new(), env: BTreeMap::new(), program: "true", args: &args };
+    let spawn = Spawn { key: Key { row: RowId("cpd-x".into()), attempt: 0 }, seat: "cpd-x", kind: None, cwd: String::new(), env: BTreeMap::new(), program: "true", args: &args };
     match tcp.spawn_session(&spawn) {
         Err(Refusal::Unreachable(why)) => assert!(why.starts_with("host silent"), "{why}"),
         other => panic!("{:?}", other.map(|s| s.pid)),

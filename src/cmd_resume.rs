@@ -699,7 +699,7 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
             resume: Some(&t.session),
             brief: None,
         };
-    let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
+    let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn), key: None };
     place
         .start(&seat, &agent)
         .map_err(|e| e.to_string())

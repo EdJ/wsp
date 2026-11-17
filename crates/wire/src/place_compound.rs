@@ -683,6 +683,7 @@ impl Compound<'_> {
             agent: Agent {
                 kind: str_of(&agent, "kind"),
                 name: str_of(&agent, "name"),
+                key: None,
                 args: agent
                     .get("args")
                     .and_then(|a| a.as_array())
@@ -1147,8 +1148,8 @@ impl Compound<'_> {
     /// Returns `rec` with `pid`/`socket`/`started_at` folded in; the caller
     /// decides what else changed (`start` adds `agent`; `open` adds
     /// nothing) and writes it.
-    fn spawn_sup(&self, seat: &Seat, rec: &Value, program: &str, args: &[String]) -> Result<Value> {
-        let host::Session { pid, socket, render } = self.host.spawn_session(&Self::spawn_of(seat, rec, program, args))?;
+    fn spawn_sup(&self, seat: &Seat, rec: &Value, key: Option<&wsp_host_api::Key>, program: &str, args: &[String]) -> Result<Value> {
+        let host::Session { pid, socket, render } = self.host.spawn_session(&Self::spawn_of(seat, rec, key, program, args))?;
         let mut rec = rec.clone();
         rec["pid"] = json!(pid);
         rec["socket"] = json!(socket.display().to_string());
@@ -1161,13 +1162,14 @@ impl Compound<'_> {
 
     /// The `seat.spawn` this seat's record asks for: the agent kind its
     /// supervisor reads a composer for, its directory and its environment.
-    fn spawn_of<'s>(seat: &'s Seat, rec: &Value, program: &'s str, args: &'s [String]) -> host::Spawn<'s> {
+    fn spawn_of<'s>(seat: &'s Seat, rec: &Value, key: Option<&wsp_host_api::Key>, program: &'s str, args: &'s [String]) -> host::Spawn<'s> {
         let env: BTreeMap<String, String> = rec
             .get("env")
             .and_then(|e| e.as_object())
             .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
             .unwrap_or_default();
         host::Spawn {
+            key: key.cloned().unwrap_or_else(|| wsp_host_api::Key { row: wsp_host_api::RowId(seat.to_string()), attempt: 0 }),
             seat: seat.as_str(),
             kind: rec.get("agent").map(|a| str_of(a, "kind")),
             cwd: str_of(rec, "cwd"),
@@ -1512,7 +1514,7 @@ impl Place for Compound<'_> {
             .map_err(|e| Refusal::Backend(e.to_string()))?;
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        if let Ok(rec) = self.spawn_sup(&seat, &rec, &shell, &[]) {
+        if let Ok(rec) = self.spawn_sup(&seat, &rec, None, &shell, &[]) {
             let _ = write_atomic(&dir.join(SEAT_FILE), &rec.to_string());
         }
         Ok(seat)
@@ -1545,7 +1547,7 @@ impl Place for Compound<'_> {
         let (program, argv) = (crate::place::above().command)(&agent.kind, &agent.args);
         let mut told = rec.clone();
         told["agent"] = json!({ "kind": agent.kind });
-        let mut rec = self.spawn_sup(seat, &told, &program, &argv)?;
+        let mut rec = self.spawn_sup(seat, &told, agent.key.as_ref(), &program, &argv)?;
         rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
         // wsp-477: spawned with `--agent`, so its supervisor can `deliver`.
         if reads_kind(&agent.kind) {
@@ -2138,7 +2140,7 @@ mod tests {
     fn an_agent_seat_is_spawned_with_the_kind_its_supervisor_delivers_to() {
         let rec = json!({ "agent": { "kind": "claude" } });
         let args = |rec: &Value| -> Vec<String> {
-            sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), rec, "claude", &[]))
+            sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), rec, None, "claude", &[]))
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect()
@@ -2161,7 +2163,7 @@ mod tests {
     #[test]
     fn the_supervisor_is_started_standing_nowhere_and_the_agent_where_it_was_told() {
         let rec = json!({ "cwd": "/tmp/somewhere" });
-        let cmd = sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), &rec, "cat", &[]));
+        let cmd = sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), &rec, None, "cat", &[]));
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.windows(2).any(|w| w == ["--cwd", "/tmp/somewhere"]), "{args:?}");
@@ -2172,7 +2174,7 @@ mod tests {
     #[test]
     fn a_supervisor_a_test_starts_is_ephemeral_and_runs_outside_the_persons_compound_dir() {
         let rec = json!({ "cwd": "/tmp/somewhere" });
-        let cmd = sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), &rec, "cat", &[]));
+        let cmd = sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), &rec, None, "cat", &[]));
         test_sups::tied(&cmd).unwrap();
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let sep = args.iter().position(|a| a == "--").unwrap();
@@ -2284,7 +2286,7 @@ mod tests {
             ..Order::default()
         };
         let seat = place.open(&order).unwrap();
-        place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).unwrap();
+        place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![], key: None }).unwrap();
 
         let asked = far.asked.borrow().clone();
         let write = asked.iter().find(|a| a.starts_with("run mkdir ")).expect("the settings were written");
@@ -2402,7 +2404,7 @@ mod tests {
         assert_eq!(str_of(&rec["env"], "WSP_SEAT_ID"), seat.as_str());
         assert!(far.asked.borrow().is_empty(), "opening runs nothing over the link");
 
-        place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).unwrap();
+        place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![], key: None }).unwrap();
         let asked = far.asked.borrow().clone();
         assert_eq!(asked.len(), 6, "{asked:?}");
         assert!(asked[0].starts_with("run cat ") && asked[1].starts_with("run mkdir "), "the gate is written first: {asked:?}");
@@ -2453,7 +2455,7 @@ mod tests {
         let place = Compound { far: &far, ..Compound::at(root.join("seats")) };
         let order = Order { label: "t".into(), cwd: Some("/far/exec/trees/t".into()), on: Some("mb2".into()), ..Order::default() };
         let seat = place.open(&order).unwrap();
-        let err = place.start(&seat, &Agent { kind: "claude".into(), name: "t".into(), args: vec![] }).unwrap_err();
+        let err = place.start(&seat, &Agent { kind: "claude".into(), name: "t".into(), args: vec![], key: None }).unwrap_err();
         assert!(err.to_string().contains("forwarding"), "{err}");
         assert!(far.asked.borrow().last().unwrap().contains("close '/far/run/s.sock'"), "nothing left running there: {:?}", far.asked.borrow());
         assert!(place.socket_of(&seat).is_none(), "and nothing recorded as running");
@@ -2462,7 +2464,7 @@ mod tests {
         let (far, root2) = far_script("down", false, false);
         let place = Compound { far: &far, ..Compound::at(root2.join("seats")) };
         let seat = place.open(&order).unwrap();
-        place.start(&seat, &Agent { kind: "claude".into(), name: "t".into(), args: vec![] }).unwrap();
+        place.start(&seat, &Agent { kind: "claude".into(), name: "t".into(), args: vec![], key: None }).unwrap();
         far.link_down.set(true);
         let err = place.stop(&seat).unwrap_err();
         assert!(err.to_string().contains("cannot reach mb2"), "{err}");
@@ -3106,7 +3108,7 @@ mod tests {
         let bare_pid = place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid");
 
         place
-            .start(&seat, &Agent { kind: "cat".into(), name: "smoke".into(), args: vec![] })
+            .start(&seat, &Agent { kind: "cat".into(), name: "smoke".into(), args: vec![], key: None })
             .expect("start replaces the bare shell rather than refusing");
 
         let agent_pid = place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid");
@@ -3142,7 +3144,7 @@ mod tests {
             .open(&Order { label: "compound-064 smoke".into(), cwd: Some(cwd.display().to_string()), ..Order::default() })
             .expect("a seat");
         place
-            .start(&seat, &Agent { kind: "cat".into(), name: "smoke".into(), args: vec![] })
+            .start(&seat, &Agent { kind: "cat".into(), name: "smoke".into(), args: vec![], key: None })
             .expect("compound-sup started");
 
         assert!(until(|| place.socket_of(&seat).is_some()), "no socket announced in time");
@@ -3224,7 +3226,7 @@ mod tests {
             let seat = place
                 .open(&Order { label: "pi-support-007".into(), env: BTreeMap::from([("PATH".into(), path)]), ..Order::default() })
                 .expect("a seat");
-            place.start(&seat, &Agent { kind: "pi".into(), name: "pi".into(), args: vec![] }).expect("started");
+            place.start(&seat, &Agent { kind: "pi".into(), name: "pi".into(), args: vec![], key: None }).expect("started");
             let drawn = until(|| place.read_screen(&seat).is_ok_and(|t| t.contains("0.0%/262k")));
             assert!(drawn, "{name}: the screen never drew: {:?}", place.read_screen(&seat));
             let got = place.state(&seat).unwrap();
@@ -3262,7 +3264,7 @@ mod tests {
             .open(&Order { label: "compound-109 smoke".into(), ..Order::default() })
             .expect("a seat");
         place
-            .start(&seat, &Agent { kind: "opencode".into(), name: "smoke".into(), args: vec![] })
+            .start(&seat, &Agent { kind: "opencode".into(), name: "smoke".into(), args: vec![], key: None })
             .expect("compound-sup started");
 
         assert!(until(|| place.socket_of(&seat).is_some()), "no socket announced in time");
@@ -3344,7 +3346,7 @@ mod tests {
             .open(&Order { label: "compound-111 smoke".into(), ..Order::default() })
             .expect("a seat");
         place
-            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "printf UNIQUE-COMPOUND-111-MARK; sleep 5".into()] })
+            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "printf UNIQUE-COMPOUND-111-MARK; sleep 5".into()], key: None })
             .expect("compound-sup started");
 
         assert!(until(|| place.socket_of(&seat).is_some()), "no socket announced in time");
@@ -3393,7 +3395,7 @@ mod tests {
             .open(&Order { label: "compound-174 nudge".into(), ..Order::default() })
             .expect("a seat");
         place
-            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "while read -r line; do printf 'GOT:%s\\n' \"$line\"; done".into()] })
+            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "while read -r line; do printf 'GOT:%s\\n' \"$line\"; done".into()], key: None })
             .expect("compound-sup started");
 
         assert!(until(|| place.socket_of(&seat).is_some_and(|s| s.exists())), "compound-sup never bound its socket");
@@ -3466,7 +3468,7 @@ mod tests {
             .open(&Order { label: "compound-229 busy".into(), ..Order::default() })
             .expect("a seat");
         place
-            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "while read -r line; do printf 'GOT:%s\\n' \"$line\"; done".into()] })
+            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "while read -r line; do printf 'GOT:%s\\n' \"$line\"; done".into()], key: None })
             .expect("compound-sup started");
 
         assert!(until(|| place.socket_of(&seat).is_some_and(|s| s.exists())), "compound-sup never bound its socket");
