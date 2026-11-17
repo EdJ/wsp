@@ -105,6 +105,9 @@ pub struct Config {
     pub tree_root: PathBuf,
     /// How long `job.stop` waits after `TERM` before it sends `KILL`.
     pub job_grace: Duration,
+    /// How long an ended job, its `job.ended` journalled, keeps its table
+    /// entry and files for a retry of its key; past it both are pruned.
+    pub job_retention: Duration,
 }
 
 /// The seats a manager admits unless told otherwise.
@@ -114,6 +117,8 @@ pub const DEFAULT_BUILD: u32 = 2;
 pub const DEFAULT_CHECK: u32 = 4;
 /// `job.stop`'s grace between `TERM` and `KILL`.
 pub const DEFAULT_JOB_GRACE: Duration = Duration::from_secs(5);
+/// How long an ended job is kept for a retry before it is pruned: a day.
+pub const DEFAULT_JOB_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl Config {
     /// Loopback on [`DEFAULT_PORT`], a 10 s beat, disk free for `exec_dir`'s
@@ -133,6 +138,7 @@ impl Config {
             check: DEFAULT_CHECK,
             tree_root: wsp_base::util::home(),
             job_grace: DEFAULT_JOB_GRACE,
+            job_retention: DEFAULT_JOB_RETENTION,
         }
     }
 }
@@ -511,6 +517,7 @@ fn beat(shared: Arc<Shared>) {
             }
             *shared.last_beat.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame);
         }
+        jobs::sweep(&shared);
         let (lock, cv) = &shared.wake;
         let woken = lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = cv.wait_timeout_while(woken, shared.cfg.beat, |w| !*w);

@@ -34,12 +34,21 @@
 //!   and start time and watched again, with no owner until its key is asked
 //!   again; and one that is gone with no end is reported `job.ended` with no
 //!   exit.
+//! - **Pruning, by age.** An ended job whose `job.ended` the journal holds
+//!   (its frame has an id) is kept, table entry and files, for
+//!   [`Config::job_retention`](crate::Config::job_retention) after its end, so
+//!   a retry inside it is answered the same `job.ended` and its log can still
+//!   be read. Past it the job is forgotten: its entry, then its `<key>.log`,
+//!   `<key>.exit`, `<key>.job` and last its `<key>.run`, so a stop part-way
+//!   leaves a `.run` the next start sees again. The beat sweeps, and so do
+//!   `job.run`, `jobs` and a start. A key asked again past the retention is a
+//!   new run: nothing of the old one is left to refuse it by.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use wsp_host::jobs::{self as runner, Adopted, End, Job, Spec};
 use wsp_host::InProcess;
@@ -67,6 +76,8 @@ struct Entry {
     started_frame: Option<Frame>,
     /// The journalled `job.ended`, once it ended.
     ended: Option<Frame>,
+    /// When it ended, which the retention counts from.
+    ended_at: Option<SystemTime>,
     /// The connection that owns it: the last to ask for the key. `None` for a
     /// job re-adopted at start, until its key is asked again.
     owner: Option<Asker>,
@@ -77,6 +88,13 @@ struct Entry {
 impl Entry {
     fn running(&self) -> bool {
         self.ended.is_none()
+    }
+
+    /// Ended, its `job.ended` journalled, and past `retention` at `now`.
+    fn prunable(&self, now: SystemTime, retention: Duration) -> bool {
+        let journalled = self.ended.as_ref().is_some_and(|f| f.id.is_some());
+        let age = self.ended_at.and_then(|at| now.duration_since(at).ok()).unwrap_or_default();
+        journalled && self.ended_at.is_some() && age >= retention
     }
 }
 
@@ -179,6 +197,7 @@ fn cap(shared: &Shared, class: JobClass) -> u32 {
 
 pub(crate) fn run(shared: &Arc<Shared>, asker: Asker, r: JobRun) {
     let mut t = table(shared);
+    prune(shared, &mut t);
     if let Some(e) = t.jobs.get_mut(&r.key) {
         if !same_run(&e.run, &r) {
             return refuse(&asker, Refusal::Duplicate, format!("job {} was already run with other arguments", name(&r.key)));
@@ -242,6 +261,7 @@ pub(crate) fn run(shared: &Arc<Shared>, asker: Asker, r: JobRun) {
             started: crate::now(),
             started_frame: Some(frame),
             ended: None,
+            ended_at: None,
             owner: Some(asker),
             stopping: None,
         },
@@ -327,6 +347,7 @@ fn ended(shared: &Shared, key: &JobKey, log: &Path, end: End) {
     shared.log.line(&format!("job {} ended: {how}; its group {} killed (wsp-453)", name(key), e.pgid));
     let msg = Message::JobEnded(end.ended(key.clone(), shared.cfg.host.clone(), log));
     e.ended = Some(emit(shared, msg, &to));
+    e.ended_at = Some(SystemTime::now());
 }
 
 fn describe(end: &End) -> String {
@@ -362,7 +383,8 @@ pub(crate) fn stop(shared: &Shared, asker: Asker, s: JobStop) {
 }
 
 pub(crate) fn list(shared: &Shared, asker: Asker) {
-    let t = table(shared);
+    let mut t = table(shared);
+    prune(shared, &mut t);
     let jobs = t
         .jobs
         .iter()
@@ -393,6 +415,54 @@ pub(crate) fn closed(shared: &Shared, client: u64) {
             e.stopping = Some(("its connection closed".into(), vec![]));
         }
     }
+}
+
+// ---------------------------------------------------------------- pruning
+
+/// The beat's sweep: [`prune`] under the table.
+pub(crate) fn sweep(shared: &Shared) {
+    prune(shared, &mut table(shared));
+}
+
+/// Forget every ended job past the retention (the module's pruning rule):
+/// its table entry, then its files, the `.run` last.
+fn prune(shared: &Shared, t: &mut Table) {
+    let (now, retention) = (SystemTime::now(), shared.cfg.job_retention);
+    let gone: Vec<JobKey> = t.jobs.iter().filter(|(_, e)| e.prunable(now, retention)).map(|(k, _)| k.clone()).collect();
+    for key in gone {
+        t.jobs.remove(&key);
+        let (dir, file) = (exec_dir(shared), runner::file_key(&key));
+        let paths = [
+            runner::log_path(dir, &file),
+            runner::exit_path(dir, &file),
+            runner::record_path(dir, &file),
+            run_path(shared, &file),
+        ];
+        let mut left = Vec::new();
+        for path in paths {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => left.push(format!("{}: {e}", path.display())),
+            }
+        }
+        let secs = retention.as_secs();
+        if left.is_empty() {
+            shared.log.line(&format!("job {} pruned: ended more than {secs}s ago, its files removed", name(&key)));
+        } else {
+            shared.log.line(&format!("job {} pruned past {secs}s, but not every file went: {}", name(&key), left.join("; ")));
+        }
+    }
+}
+
+/// When a job found at start ended: its exit file's time, else its record's,
+/// else its `.run`'s, else now.
+fn ended_at(shared: &Shared, file: &str) -> SystemTime {
+    let dir = exec_dir(shared);
+    [runner::exit_path(dir, file), runner::record_path(dir, file), run_path(shared, file)]
+        .iter()
+        .find_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .unwrap_or_else(SystemTime::now)
 }
 
 /// The jobs a running manager has, for tests: `(key, pgid, running)`.
@@ -440,10 +510,12 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
             started: at,
             started_frame: started.get(&key).cloned(),
             ended: ended.get(&key).cloned(),
+            ended_at: None,
             owner: None,
             stopping: None,
         };
         if entry.ended.is_some() {
+            entry.ended_at = Some(ended_at(shared, &file));
             t.jobs.insert(key, entry);
             continue;
         }
@@ -462,6 +534,7 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
                 shared.log.line(&format!("job {} ended while the manager was down: {}", name(&key), describe(&end)));
                 let msg = Message::JobEnded(end.ended(key.clone(), shared.cfg.host.clone(), &log));
                 entry.ended = Some(emit(shared, msg, &[]));
+                entry.ended_at = Some(ended_at(shared, &file));
                 t.jobs.insert(key, entry);
             }
             Adopted::Lost => {
@@ -469,10 +542,12 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
                 let end = End::default();
                 let msg = Message::JobEnded(end.ended(key.clone(), shared.cfg.host.clone(), &log));
                 entry.ended = Some(emit(shared, msg, &[]));
+                entry.ended_at = Some(SystemTime::now());
                 t.jobs.insert(key, entry);
             }
         }
     }
+    prune(shared, &mut t);
 }
 
 /// The journalled `job.started` and `job.ended` of `keys`.

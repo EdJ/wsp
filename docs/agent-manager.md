@@ -1017,6 +1017,19 @@ What M1's live defects taught, carried into the rows:
   - a `.run` with no runner record (the manager stopped between the two) is forgotten.
 
   `Manager::stop` leaves jobs running in the same way, for the next start to adopt.
+- **Pruning, by age (wsp-062).** The retention is an age, not a count: `Config::job_retention`, a day by default.
+  An age bounds what a retry needs, because a retry of a key comes soon after it was asked, while a count would let
+  a burst of jobs push out the one a caller is about to retry. The age counts from the job's end. A job is pruned
+  only once its `job.ended` is in the journal (the frame has an id), because the journal is the record that the
+  end was said and acknowledged. A `job.ended` the journal could not take keeps the job until a restart journals it.
+  Until the retention is past, the job keeps its table entry and its files, so a retry of the key gets the same
+  `job.ended` with the same id, and the log it names can still be read. Once the retention is past, the job's
+  entry is dropped and its files are removed in this order: `<key>.log`, `<key>.exit`, `<key>.job`, and `<key>.run`
+  last. If the manager stops part-way, the next start sees the `.run` again. Either the journal's end keeps it
+  until the next prune, or it has no record and is forgotten. The beat sweeps every period, and `job.run`, `jobs`
+  and a start sweep too. `manager.log` names each job pruned. A key asked again after its job was pruned starts a
+  new run, because nothing of the old one is left to refuse it by. So the retention has to be longer than any
+  caller's retry window.
 
 Tests (`tests/jobs.rs`) run a loopback manager with `sh` jobs under a scratch tree root. They check that:
 - two `job.run`s under one key run once, and a third connection's retry takes the job over;
@@ -1026,7 +1039,9 @@ Tests (`tests/jobs.rs`) run a loopback manager with `sh` jobs under a scratch tr
 - a dropped connection stops its undetached job, and the detached one runs on;
 - the `wsp-manager` binary, killed with SIGKILL mid-job and restarted, reports each job's end once (one job ended
   while it was down, one was re-adopted), starts nothing again, and resumes events `from` the last id;
-- `jobs` lists each job as running or ended.
+- `jobs` lists each job as running or ended;
+- an ended job is answered the same `job.ended` on a retry inside a 3 s retention, its log still readable. With no
+  client connected, the beat then removes its four files and its row (wsp-062).
 
 #### M3 group 4: `Host::run_job` (wsp-051, 2026-11-17)
 

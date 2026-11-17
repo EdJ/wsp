@@ -453,3 +453,52 @@ fn a_manager_killed_mid_job_reports_its_end_once_and_resumes_from_the_last_id() 
     // Asked again after the restart: the same end, and no second run.
     assert!(matches!(back.ask(run_msg("build@short", JobClass::Build, "sleep 1; echo short", false)), Message::JobEnded(_)));
 }
+
+/// The files a job keeps under `<dir>/jobs`, by their extension.
+fn job_files(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(dir.join("jobs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.path().extension().and_then(|x| x.to_str()).map(str::to_string))
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn an_ended_job_is_kept_for_a_retry_inside_the_retention_and_pruned_past_it() {
+    let (dir, root) = place("prune");
+    let _sweep = Sweep::new(&dir);
+    let mut cfg = config(&dir, &root);
+    cfg.job_retention = Duration::from_secs(3);
+    cfg.beat = Duration::from_millis(200);
+    let m = Manager::start(cfg).expect("the manager starts");
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+
+    let script = "echo ran >> count; echo done";
+    started(c.ask(run_msg("check@p", JobClass::Check, script, false)));
+    c.hear_until(WAIT, |c| c.ended("check@p") == 1);
+    let first = c.events.iter().find(|f| matches!(&f.msg, Message::JobEnded(_))).cloned().expect("job.ended heard");
+    assert!(first.id.is_some(), "job.ended is journalled");
+    assert_eq!(job_files(&dir), ["exit", "job", "log", "run"], "an ended job keeps its files inside the retention");
+
+    // A retry inside the retention: the same journalled job.ended, not a second run.
+    let again = c.send(run_msg("check@p", JobClass::Check, script, false));
+    let again = c.answer_frame(again);
+    assert_eq!((&again.msg, again.id), (&first.msg, first.id), "the same job.ended inside the retention");
+    let Message::JobEnded(e) = &again.msg else { unreachable!() };
+    assert_eq!(fs::read_to_string(&e.log.path).unwrap(), "done\n", "its log is still there to read");
+    assert_eq!(fs::read_to_string(root.join("work/count")).unwrap(), "ran\n");
+
+    // Past it, the beat prunes the job, its files and its row, with no client
+    // asking (one left idle under a 200 ms beat would be dropped for silence).
+    drop(c);
+    assert!(within(WAIT, || job_files(&dir).is_empty()), "pruned past the retention: {:?}", job_files(&dir));
+    assert!(m.jobs().is_empty(), "the table forgets it too: {:?}", m.jobs());
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+    assert!(c.jobs().is_empty());
+    let log = fs::read_to_string(dir.join("log/manager.log")).unwrap_or_default();
+    assert!(log.contains("job wsp-050/0/check@p pruned"), "the log names the prune: {log}");
+    m.stop();
+}
