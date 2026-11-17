@@ -5,13 +5,10 @@ pub use wsp_base::{base, choices, fm, input, risk, util};
 pub use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, log, message, model, resolve, sharing, store, tags, verbs};
 
 pub mod fake;
-pub mod detect_override;
 pub mod far;
-pub mod herdr;
 pub mod launchd;
 pub mod place;
 pub mod systemd;
 pub mod place_compound;
-pub mod place_herdr;
 pub mod place_super;
 pub mod tunnel;
