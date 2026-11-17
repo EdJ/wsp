@@ -55,35 +55,6 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     --full is the whole tree at the width of the
                                     workspace, which Z in the panel opens in a tab"##,
             },
-            crate::verbs::Help {
-                section: crate::verbs::Section::Plumbing,
-                order: 40,
-                text: r##"  wsp panel install [--all]         split it into a workspace, or all of them —
-                                    the way it works without a backend that draws
-                                    the sidebar itself; skipped automatically
-                                    while `wsp surface` is running"##,
-            },
-            crate::verbs::Help {
-                section: crate::verbs::Section::Plumbing,
-                order: 50,
-                text: r##"  wsp panel uninstall [-w ws]       take it back out"##,
-            },
-        ],
-    },
-    // The same panel, drawn by a host that owns the cells rather than by a
-    // terminal: JSON in on stdin, frames out on stdout. Not for people —
-    // backend's forked sidebar spawns it.
-    crate::verbs::Verb {
-        names: &["surface"],
-        run: |store, _| surface(store),
-        help: &[
-            crate::verbs::Help {
-                section: crate::verbs::Section::Plumbing,
-                order: 60,
-                text: r##"  wsp surface                       the panel for a host that owns the cells:
-                                    one JSON object per line each way, frames
-                                    out. Started by backend, not by a person"##,
-            },
         ],
     },
 ];
@@ -203,9 +174,6 @@ pub(crate) use verbs::{follow, inspect, pop_out, run_wsp};
 // [`verbs::tell_claimed`].
 pub(crate) use verbs::{send_tell, tell_claimed, Tell};
 pub use run::run;
-// The same panel, drawn by a host that owns the cells — backend's forked sidebar
-// today. See `surface.rs` for why the frame is built here and not there.
-pub use surface::run as surface;
 // And the frame it last drew, left on disk for a reader with no pipe to it —
 // `wsp peek panel`, which under the fork has no pane to ask backend about. Named
 // for the surface out here, where `frame` already means the panel's own
