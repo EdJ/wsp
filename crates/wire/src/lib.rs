@@ -6,6 +6,7 @@ pub use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, lo
 
 pub mod fake;
 pub mod far;
+pub mod host;
 pub mod launchd;
 pub mod place;
 pub mod systemd;
