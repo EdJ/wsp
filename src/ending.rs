@@ -387,10 +387,20 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
     original_seats(store, seats);
     // `wsp-453`: what a finished row's tree still has running goes with its
     // seat, or by the next tick where the seat went some other way. Not in a
-    // test, which would signal the machine's own processes.
-    if !cfg!(test) {
+    // test, which would signal the machine's own processes, unless the test
+    // asked for it ([`tests::SCANS`]) over a tree of its own.
+    if scans_finished() {
         stop_finished(store, seats);
     }
+}
+
+/// Whether the tick scans finished trees: always, but in a test only where it
+/// asked to on its thread.
+fn scans_finished() -> bool {
+    #[cfg(test)]
+    return tests::SCANS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
 }
 
 /// [`crate::check_tree::left_in_finished`], asked of a fleet's seats.
@@ -404,8 +414,17 @@ fn left_in_finished_by(store: &Store, seats: &dyn Seats) -> Option<Vec<crate::ch
 /// then `KILL` for what is still there, and a `cycle.log` line for each tree.
 /// Run by the tick, so a row that reaches review has nothing of its own
 /// running by the next one. Returns the lines said.
+///
+/// **Under `WSP_HOST=manager` the scan is wip's too** (`wsp-034`): `wip` there
+/// runs no scan of its own and draws [`finished_wip_lines_held`], so what this
+/// scan found is left in `finished-wip.json` before anything is signalled, an
+/// empty list where nothing was. Under `inproc` `wip` scans for itself and the
+/// file is its alone, as it was.
 pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     let Some(found) = left_in_finished_by(store, seats) else { return Vec::new() };
+    if crate::fold::under_manager() {
+        hold_wip_lines(store, &wip_lines_of(&found));
+    }
     let mut said = say_spared(store, &found);
     let found: Vec<_> = found.into_iter().filter(|l| !l.pids.is_empty()).collect();
     if found.is_empty() {
@@ -451,17 +470,10 @@ fn say_spared(store: &Store, found: &[crate::check_tree::Left]) -> Vec<String> {
 /// How long the lines `wsp wip` draws for finished trees are good for.
 const WIP_LINES_FOR_SECS: i64 = 30;
 
-/// The lines `wsp wip` draws for finished trees that still have processes.
-///
-/// **One scan for every caller in the half minute** (`wsp-480`): it is an
-/// `lsof` over the whole machine and four `ps` runs, 0.35 s of CPU on a
-/// thermally limited one, and compound's host asks `wsp wip` every three
-/// seconds. The scan leaves its lines in `finished-wip.json`; a `wip` within
-/// [`WIP_LINES_FOR_SECS`] of it draws those. The tick, which stops what the
-/// lines name, scans for itself and never reads this.
-/// [`finished_wip_lines`] as the last scan left them, and nothing when it is
-/// stale: no scan here. `wip` under `WSP_HOST=manager` runs no `ps`
-/// (`docs/agent-manager.md` 4.3); the daemon's tick still scans.
+/// The lines a finished-tree scan left in `finished-wip.json`, as the last
+/// scan left them, and nothing when they are stale: no scan here. `wip` under
+/// `WSP_HOST=manager` runs no `ps` (`docs/agent-manager.md` 4.3) and draws
+/// these; the daemon's tick scans and writes them ([`stop_finished`]).
 pub(crate) fn finished_wip_lines_held(store: &Store) -> Vec<String> {
     let now = util::epoch_secs();
     std::fs::read_to_string(store.state_file("finished-wip.json"))
@@ -472,6 +484,31 @@ pub(crate) fn finished_wip_lines_held(store: &Store) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The lines `wsp wip` draws for the trees in `found` that still have
+/// processes the tree started.
+fn wip_lines_of(found: &[crate::check_tree::Left]) -> Vec<String> {
+    found.iter().filter(|l| !l.pids.is_empty()).map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect()
+}
+
+/// Leave `lines` in `finished-wip.json` for the next [`WIP_LINES_FOR_SECS`],
+/// written whole and renamed into place.
+fn hold_wip_lines(store: &Store, lines: &[String]) {
+    let file = store.state_file("finished-wip.json");
+    let tmp = file.with_extension(format!("json.{}", std::process::id()));
+    if std::fs::write(&tmp, serde_json::json!({ "at": util::epoch_secs(), "lines": lines }).to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &file);
+    }
+}
+
+/// The lines `wsp wip` draws for finished trees that still have processes.
+///
+/// **One scan for every caller in the half minute** (`wsp-480`): it is an
+/// `lsof` over the whole machine and four `ps` runs, 0.35 s of CPU on a
+/// thermally limited one, and compound's host asks `wsp wip` every three
+/// seconds. The scan leaves its lines in `finished-wip.json`; a `wip` within
+/// [`WIP_LINES_FOR_SECS`] of it draws those. The tick, which stops what the
+/// lines name, scans for itself and never reads this; under
+/// `WSP_HOST=manager` it writes it ([`stop_finished`]).
 pub(crate) fn finished_wip_lines(store: &Store) -> Vec<String> {
     let file = store.state_file("finished-wip.json");
     let now = util::epoch_secs();
@@ -484,13 +521,9 @@ pub(crate) fn finished_wip_lines(store: &Store) -> Vec<String> {
         }
     }
     let Some(found) = left_in_finished_by(store, &crate::cycle::Fleet) else { return Vec::new() };
-    let lines: Vec<String> =
-        found.iter().filter(|l| !l.pids.is_empty()).map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect();
+    let lines = wip_lines_of(&found);
     if !cfg!(test) {
-        let tmp = file.with_extension(format!("json.{}", std::process::id()));
-        if std::fs::write(&tmp, serde_json::json!({ "at": now, "lines": lines }).to_string()).is_ok() {
-            let _ = std::fs::rename(&tmp, &file);
-        }
+        hold_wip_lines(store, &lines);
     }
     lines
 }
@@ -1195,6 +1228,91 @@ mod tests {
         fn absent(&self, seat: &str) -> bool {
             self.absent.iter().any(|s| s == seat)
         }
+    }
+
+    thread_local! {
+        /// Set by a test that wants the tick's finished-tree scan
+        /// ([`super::scans_finished`]) over a tree of its own.
+        pub(super) static SCANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// `WSP_HOST` for one test, put back however it ends. Taken after
+    /// [`util::isolated`], whose lock it is held under.
+    struct HostVar;
+    impl HostVar {
+        fn set(v: &str) -> HostVar {
+            std::env::set_var(wsp_wire::host_tcp::ENV, v);
+            HostVar
+        }
+    }
+    impl Drop for HostVar {
+        fn drop(&mut self) {
+            std::env::remove_var(wsp_wire::host_tcp::ENV);
+            SCANS.with(|s| s.set(false));
+        }
+    }
+
+    /// `wsp-034`: under `WSP_HOST=manager` `wip` runs no scan and draws
+    /// `finished-wip.json`, so the daemon's tick, which scans, writes it. A row
+    /// at review with no seat and no claim has its tree's own binary standing
+    /// in it: a tick under `inproc` stops it and leaves no file (wip scans for
+    /// itself there, as before); a tick under the manager stops it and leaves
+    /// the line `wip` draws.
+    #[test]
+    fn a_tick_under_the_manager_leaves_wip_its_finished_tree_heading() {
+        let env = util::isolated("ending-finished-wip");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("fin-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        // `lsof` names the real path, and the tree's own binary is read off
+        // `ps -o comm=`, which is the name it was run under: a `sleep` named
+        // as the tree's build (a copied system binary is refused a start).
+        let base = std::fs::canonicalize(env.home()).unwrap();
+        let tree = base.join(".worktrees").join(&row);
+        std::fs::create_dir_all(&tree).unwrap();
+        let stand = || {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("/bin/sleep").arg0(tree.join("target/debug/stand")).arg("60").current_dir(&tree).spawn().unwrap()
+        };
+        let gone = |c: &mut std::process::Child| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < until {
+                if c.try_wait().unwrap().is_some() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = c.kill();
+            false
+        };
+        // The manager's seats: none, so nobody holds the row.
+        let seats = Fake { census: Some(vec![]), ..Fake::default() };
+        let held = store.state_file("finished-wip.json");
+
+        let mut child = stand();
+        let host = HostVar::set("inproc");
+        SCANS.with(|s| s.set(true));
+        tick(&store, &seats);
+        drop(host);
+        assert!(gone(&mut child), "the tick stops what the finished tree started");
+        assert!(!held.exists(), "under inproc the file is wip's own scan's, as before");
+        assert!(crate::ending::finished_wip_lines_held(&store).is_empty());
+
+        let mut child = stand();
+        let host = HostVar::set("manager");
+        SCANS.with(|s| s.set(true));
+        tick(&store, &seats);
+        drop(host);
+        assert!(gone(&mut child), "the tick under the manager stops it too");
+        let lines = finished_wip_lines_held(&store);
+        assert_eq!(lines.len(), 1, "wip draws the tick's one line: {lines:?}");
+        assert!(lines[0].starts_with(&format!("{row} is finished and has no seat, and 1 process ")), "{}", lines[0]);
+        assert!(lines[0].ends_with("the tick stops them"), "{}", lines[0]);
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert_eq!(log.matches(&format!("stopped in finished row {row} ")).count(), 2, "{log}");
     }
 
     fn drain<T>(cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>) -> Vec<T> {
