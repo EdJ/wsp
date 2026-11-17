@@ -246,6 +246,12 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::sharing::{self, Share};
+
+/// Which build-slot holders are running, asked of the in-process host.
+fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
+    use wsp_wire::host::Host;
+    wsp_wire::host::LOCAL.alive(pids)
+}
 use crate::store::Store;
 use crate::util;
 use crate::base::args::Args;
@@ -546,7 +552,7 @@ fn clear_warm(store: &Store, repo: &Path, named_for: &Path, dir: &Path, all: boo
 /// a preview without it would name three trees on a machine that has one.
 fn free_warm(store: &Store, named_for: &Path, dir: &Path, all: bool) -> Vec<crate::sharing::Warm> {
     let claimed = if all {
-        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES)
+        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES, &alive)
     } else {
         // Which one it was is not a guess: the build wrote it down.
         std::fs::read_to_string(dir.join(BUILT_AT))
@@ -554,7 +560,7 @@ fn free_warm(store: &Store, named_for: &Path, dir: &Path, all: bool) -> Vec<crat
             .map(|s| PathBuf::from(s.trim()))
             .and_then(|target| target.parent().map(Path::to_path_buf))
             .filter(|d| d.starts_with(store.state.join("warm")))
-            .and_then(|d| crate::sharing::warm_named(&d))
+            .and_then(|d| crate::sharing::warm_named(&d, &alive))
             .into_iter()
             .collect()
     };
@@ -1183,7 +1189,7 @@ fn alone(
     // as one would hand every other agent a smaller slice of the cores for the
     // whole of it, and this pass wants one core and the machine quiet.
     let exes = {
-        let share = sharing::take(state);
+        let share = sharing::take(state, &alive);
         if !json_out {
             if let Some(note) = share.note() {
                 println!("{} {}", p.dim("machine"), p.dim(&note));
@@ -1446,7 +1452,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // agent's own tree instead and pays 21s for it.
     let alone_pass_asked = args.has("alone");
     let warm = (!alone_pass_asked)
-        .then(|| sharing::warm(&store.state, &named_for, sharing::WARM_TREES))
+        .then(|| sharing::warm(&store.state, &named_for, sharing::WARM_TREES, &alive))
         .flatten();
     let (tree, target) = match &warm {
         Some(w) => (w.tree(), w.target()),
@@ -1498,7 +1504,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // Registered here rather than at the top of the command: the share is
     // held for as long as it is being used, so a verify that spends a minute
     // resolving a patch is not counted against the builds running while it does.
-    let share = sharing::take(&store.state);
+    let share = sharing::take(&store.state, &alive);
     if !json_out {
         if let Some(note) = share.note() {
             println!("{} {}", p.dim("machine"), p.dim(&note));

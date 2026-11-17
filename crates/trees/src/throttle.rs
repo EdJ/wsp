@@ -73,6 +73,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::store::Store;
+use crate::host::LOCAL;
 use crate::util;
 use crate::base::args::Args;
 
@@ -290,8 +291,7 @@ pub fn parse_hid_idle(ioreg: &str) -> Option<u64> {
 }
 
 fn hid_idle_secs() -> Option<u64> {
-    let out = Command::new("ioreg").args(["-c", "IOHIDSystem", "-d", "4"]).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_hid_idle(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_hid_idle(&LOCAL.idle()?)
 }
 
 /// `CPU_Speed_Limit 	= 31` in `pmset -g therm` output: percent of the rated
@@ -305,8 +305,7 @@ fn speed_limit() -> Option<u32> {
     if cfg!(test) {
         return None;
     }
-    let out = Command::new("pmset").args(["-g", "therm"]).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_speed_limit(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_speed_limit(&LOCAL.thermal()?)
 }
 
 /// Three load averages out of `/proc/loadavg` (`0.5 0.4 0.3 1/200 99`) or
@@ -317,11 +316,7 @@ pub fn parse_loadavg(s: &str) -> Option<(f64, f64, f64)> {
 }
 
 fn load_average() -> Option<(f64, f64, f64)> {
-    if let Some(l) = fs::read_to_string("/proc/loadavg").ok().and_then(|s| parse_loadavg(&s)) {
-        return Some(l);
-    }
-    let out = Command::new("sysctl").args(["-n", "vm.loadavg"]).stderr(Stdio::null()).output().ok()?;
-    parse_loadavg(&String::from_utf8_lossy(&out.stdout))
+    parse_loadavg(&LOCAL.load()?)
 }
 
 /// The three load averages now (`wsp-597`: a seat's death is logged with them).
@@ -650,8 +645,7 @@ fn mem_free() -> Option<u32> {
     if cfg!(test) {
         return None;
     }
-    let out = Command::new("memory_pressure").stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_mem_free(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_mem_free(&LOCAL.memory_pressure()?)
 }
 
 /// Swap in MB, `(used, total)`, out of `sysctl vm.swapusage`:
@@ -692,16 +686,14 @@ fn swap_now() -> Option<(u32, u32)> {
     if cfg!(test) {
         return None;
     }
-    let out = Command::new("sysctl").args(["-n", "vm.swapusage"]).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_swapusage(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_swapusage(&LOCAL.swap()?)
 }
 
 fn pageouts_now() -> Option<u64> {
     if cfg!(test) {
         return None;
     }
-    let out = Command::new("vm_stat").stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_pageouts(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_pageouts(&LOCAL.pageouts()?)
 }
 
 /// The last memory sample and the rates taken from it, in `mem.json`.

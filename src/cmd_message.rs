@@ -1598,7 +1598,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // closed, under the lock, against [`message::release`]. A waiter that has
     // gone (Esc killed the call) is no delivery, and the asker is told the old
     // way.
-    if let Some(w) = closed.question.awaited.as_ref().filter(|w| w.alive()) {
+    if let Some(w) = closed.question.awaited.as_ref().filter(|w| crate::host::Host::is_alive(&crate::host::LOCAL, w.pid)) {
         receipt(false, false, &format!("{} is blocked in `wsp ask --wait` (pid {}) — the answer returns through its tool call, and nothing is typed", asker(closed), w.pid));
         return 0;
     }
@@ -3372,7 +3372,7 @@ mod tests {
         task(&store, "lone-1");
         let live = waited_on(&store, "lone-1", None);
         let c = message::answer(&store, &live.id, &Party::Human, "ok").unwrap();
-        assert!(c.question.awaited.as_ref().is_some_and(|w| w.alive()), "the close carries the waiter it found");
+        assert!(c.question.awaited.as_ref().is_some_and(|w| crate::host::Host::is_alive(&crate::host::LOCAL, w.pid)), "the close carries the waiter it found");
         // `deliver` returns on it before it looks for a pane to type at; with
         // no backend here, the other road would have reported the pane gone.
         assert_eq!(deliver(&store, &c, &answer_args(&live.id, &[("json", "")], &[])), 0);
@@ -3385,7 +3385,7 @@ mod tests {
         q.awaited = Some(message::Awaited { pid: a_dead_pid(), at: util::now_iso() });
         message::raise(&store, &q).unwrap();
         let c = message::answer(&store, &q.id, &Party::Human, "ok").unwrap();
-        assert!(!c.question.awaited.as_ref().unwrap().alive());
+        assert!(!crate::host::Host::is_alive(&crate::host::LOCAL, c.question.awaited.as_ref().unwrap().pid));
     }
 
     #[test]

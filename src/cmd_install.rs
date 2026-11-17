@@ -1695,7 +1695,7 @@ fn stale_watchers(store: &Store, ours: &Built) -> Vec<crate::cmd_watch::Register
         .into_iter()
         .filter(|w| w.watching() && !w.daemon && !w.build.is_empty() && w.build != live)
         .collect();
-    let alive = crate::util::alive(&watches.iter().map(|w| w.pid).collect::<Vec<_>>());
+    let alive = crate::host::Host::alive(&crate::host::LOCAL, &watches.iter().map(|w| w.pid).collect::<Vec<_>>());
     watches.into_iter().filter(|w| alive.contains(&w.pid)).collect()
 }
 

@@ -2947,7 +2947,7 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>) {
     if watches.is_empty() {
         return;
     }
-    let live = crate::util::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
+    let live = crate::host::Host::alive(&crate::host::LOCAL, &watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
     let now = util::epoch_secs();
     for w in &watches {
         // **A seat's wake record fails in a way no liveness check can see.**
@@ -4378,7 +4378,7 @@ fn status(store: &Store, args: &Args) -> i32 {
         println!("{}", p.dim("nobody is watching · `wsp watch` starts one"));
         return 0;
     }
-    let live = crate::util::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
+    let live = crate::host::Host::alive(&crate::host::LOCAL, &watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
     for w in &watches {
         // A seat's wake record answers a different question from a watcher's,
         // so it gets a different sentence rather than a watcher's sentence with

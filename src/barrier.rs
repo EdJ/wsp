@@ -47,6 +47,12 @@ use crate::model::{Group, Status, Task, Worklist};
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
+
+/// When a pid started, asked of the in-process host: what tells a barrier's
+/// run from a process that took its pid after it.
+fn started(pid: u32) -> Result<Option<String>, ()> {
+    crate::host::Host::started(&crate::host::LOCAL, pid)
+}
 #[cfg(test)]
 pub(crate) use crate::checks::{ps_says, push, text};
 pub(crate) use crate::checks::{wait_after, RETRY_BACKOFF, TRIES, instant, Check, Ending, Run, State, Suite};
@@ -148,7 +154,7 @@ pub(crate) fn would_open(g: &Group, gone: &dyn Fn(&str) -> bool) -> bool {
         None => true,
         Some(c) => match c.pane.as_deref() {
             Some(p) => gone(p),
-            None => c.wait_before_next_try().is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w),
+            None => c.wait_before_next_try(&started).is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w),
         },
     }
 }
@@ -241,12 +247,12 @@ pub(crate) fn open_within(
                     c.ending = Ending::Ended;
                 }
                 Some(_) => return false,
-                None if c.wait_before_next_try().is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w) => {
+                None if c.wait_before_next_try(&started).is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w) => {
                     if !admit() {
                         return false;
                     }
                     let before = c.suite;
-                    let died = c.run.as_ref().filter(|_| c.run_died()).map(|r| r.pid);
+                    let died = c.run.as_ref().filter(|_| c.run_died(&started)).map(|r| r.pid);
                     c.at = util::now_iso();
                     c.run = None;
                     // A suite that never finished, or one not asked for until
@@ -423,7 +429,7 @@ pub(crate) fn note_run(store: &Store, list: &str, at: usize, suite: Suite, by: O
 /// run that is killed is seen to be dead and not believed for hours. Only while
 /// the entry reads `suite:running`.
 pub(crate) fn note_pid(store: &Store, list: &str, at: usize) -> bool {
-    let Some(run) = Run::this() else { return false };
+    let Some(run) = Run::this(&started) else { return false };
     change(store, list, at, |g| match g.checks.iter_mut().rev().find(|c| c.open() && c.suite == Some(Suite::Running)) {
         Some(c) => {
             c.run = Some(run);
@@ -435,7 +441,7 @@ pub(crate) fn note_pid(store: &Store, list: &str, at: usize) -> bool {
 
 /// Whether the open check on `g` is a mechanical run whose process has died.
 pub(crate) fn run_died(g: &Group) -> bool {
-    running(g).is_some_and(Check::run_died)
+    running(g).is_some_and(|c| c.run_died(&started))
 }
 
 /// The open check's suite state on group `at`, if it has one.
@@ -516,7 +522,7 @@ pub(crate) fn lines(p: &Paint, g: &Group) -> Vec<String> {
             if let Some(s) = c.suite {
                 parts.push(format!("suite {}", s.as_str()));
             }
-            if c.run_died() {
+            if c.run_died(&started) {
                 parts.push("barrier run died".into());
             }
             if let Some(b) = &c.by {
@@ -750,10 +756,10 @@ mod tests {
 
     #[test]
     fn this_process_is_not_gone_and_a_pid_nothing_has_is() {
-        let me = Run::this().unwrap();
-        assert!(!me.gone());
+        let me = Run::this(&started).unwrap();
+        assert!(!me.gone(&started));
         let none = Run { pid: 4_000_000, started: me.started.clone() };
-        assert!(none.gone());
+        assert!(none.gone(&started));
     }
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
@@ -899,7 +905,7 @@ mod tests {
     fn a_run_whose_process_is_alive_is_left_alone() {
         let (_env, store) = scratch("live-run");
         let _w = list(&store, &[&["m-1"]]);
-        let (_, retake) = running_with(&store, Run::this().expect("ps reads this process"));
+        let (_, retake) = running_with(&store, Run::this(&started).expect("ps reads this process"));
         let g = store.worklist("run").unwrap().groups()[0].clone();
         assert!(!run_died(&g) && !would_open(&g, &|_| false));
         assert!(retake().is_none());
@@ -909,7 +915,7 @@ mod tests {
     fn a_pid_that_has_been_reused_is_a_dead_run() {
         let (_env, store) = scratch("reused-run");
         let _w = list(&store, &[&["m-1"]]);
-        let mut other = Run::this().expect("ps reads this process");
+        let mut other = Run::this(&started).expect("ps reads this process");
         other.started = "Mon_Jan_1_00:00:00_2001".into();
         let (_, retake) = running_with(&store, other);
         assert!(run_died(&store.worklist("run").unwrap().groups()[0]));

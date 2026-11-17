@@ -595,7 +595,7 @@ pub(crate) fn end_pids(pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
     }
     crate::check_tree::signal("TERM", pids);
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    let still: Vec<u32> = util::alive(pids).into_iter().collect();
+    let still: Vec<u32> = crate::host::Host::alive(&crate::host::LOCAL, pids).into_iter().collect();
     crate::check_tree::signal("KILL", &still);
     (pids.to_vec(), still)
 }
@@ -732,7 +732,7 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
     }
     if !stopped.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        let still = util::alive(&stopped.iter().map(|(p, _)| *p).collect::<Vec<_>>());
+        let still = crate::host::Host::alive(&crate::host::LOCAL, &stopped.iter().map(|(p, _)| *p).collect::<Vec<_>>());
         for (pid, proof) in &stopped {
             if still.contains(pid) {
                 signal("KILL", *pid);
