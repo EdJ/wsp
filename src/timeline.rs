@@ -13,6 +13,7 @@
 
 use serde_json::{json, Value};
 
+use crate::host::Host;
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
@@ -926,19 +927,15 @@ fn names(line: &str, id: &str) -> bool {
     false
 }
 
-/// A session's Claude Code transcript, whole.
+/// A session's Claude Code transcript, whole, wherever it ran: the session id
+/// alone finds it, so no cwd is given.
 fn transcript(session: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    transcript_under(&std::path::Path::new(&home).join(".claude/projects"), session)
+    transcript_at(&crate::host::LOCAL.transcript_of(session, "")?)
 }
 
-fn transcript_under(root: &std::path::Path, session: &str) -> Option<String> {
-    for dir in std::fs::read_dir(root).ok()?.flatten() {
-        if let Ok(text) = std::fs::read_to_string(dir.path().join(format!("{session}.jsonl"))) {
-            return Some(text);
-        }
-    }
-    None
+/// A transcript file, whole, read through the host.
+fn transcript_at(file: &std::path::Path) -> Option<String> {
+    String::from_utf8(crate::host::LOCAL.transcript_bytes(file)?).ok()
 }
 
 /// The first line of a transcript that carries a time: the seat's first act.
@@ -1294,7 +1291,7 @@ pub(crate) struct GovSource {
 
 fn read_source(src: &GovSource) -> Option<String> {
     if src.transcript.starts_with('/') {
-        std::fs::read_to_string(&src.transcript).ok()
+        transcript_at(std::path::Path::new(&src.transcript))
     } else {
         transcript(&src.transcript)
     }

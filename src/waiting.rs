@@ -295,17 +295,9 @@ pub(crate) fn last_turn(jsonl: &str) -> (Option<Words>, bool) {
 /// [`last_turn`] over the file at `path`, reading at most its last
 /// [`TRANSCRIPT_TAIL`] bytes. `None` where it cannot be read.
 pub(crate) fn read_last_turn(path: &std::path::Path) -> Option<(Option<Words>, bool)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let from = len.saturating_sub(TRANSCRIPT_TAIL);
-    f.seek(SeekFrom::Start(from)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    // A tail that starts mid-line drops the partial one.
-    let text = if from > 0 { text.split_once('\n').map(|(_, r)| r.to_string()).unwrap_or_default() } else { text.into_owned() };
-    Some(last_turn(&text))
+    use crate::host::Host;
+    // Read through the host, which drops a partial first line.
+    Some(last_turn(&crate::host::LOCAL.transcript_tail(path, TRANSCRIPT_TAIL)?))
 }
 
 /// A screen line that is the agent's frame and not its words.

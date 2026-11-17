@@ -2409,7 +2409,8 @@ pub(crate) fn stuck_of_seat(store: &Store, seat: &str, now: i64) -> Vec<crate::s
     if kind != "claude" {
         return Vec::new();
     }
-    match crate::agent_commands::transcript(&session, &cwd) {
+    use crate::host::Host;
+    match crate::host::LOCAL.transcript_of(&session, &cwd) {
         Some(path) => crate::stuck::in_tail(&path, now),
         None => Vec::new(),
     }

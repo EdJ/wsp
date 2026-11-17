@@ -38,7 +38,7 @@
 //! matching, which is the direction that flags less.
 
 use std::collections::HashMap;
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::BufRead;
 
 use serde_json::Value;
 
@@ -224,24 +224,8 @@ fn named(kind: Option<Kind>, foreground: bool, limit: i64, secs: i64) -> Option<
 
 /// The stalls in the last [`TAIL`] bytes of a transcript file, open and closed.
 pub(crate) fn in_tail(path: &std::path::Path, now: i64) -> Vec<Stall> {
-    let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let from = len.saturating_sub(TAIL);
-    if f.seek(SeekFrom::Start(from)).is_err() {
-        return Vec::new();
-    }
-    let mut bytes = Vec::new();
-    if f.take(TAIL).read_to_end(&mut bytes).is_err() {
-        return Vec::new();
-    }
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    // The first line is cut in the middle when the read started inside the file.
-    if from > 0 {
-        match text.find('\n') {
-            Some(i) => text.drain(..=i),
-            None => return Vec::new(),
-        };
-    }
+    use crate::host::Host;
+    let Some(text) = crate::host::LOCAL.transcript_tail(path, TAIL) else { return Vec::new() };
     scan(&mut text.as_bytes(), now)
 }
 

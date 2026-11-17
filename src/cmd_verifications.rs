@@ -340,11 +340,12 @@ impl Bucket {
 /// `--transcript FILE`: the lines that transcript would give an entry — the
 /// check on the derivation, run on any session.
 fn explain(file: &str) -> i32 {
-    let Ok(f) = std::fs::File::open(file) else {
+    use crate::host::Host;
+    let Some(mut src) = crate::host::LOCAL.read_transcript(std::path::Path::new(file)) else {
         eprintln!("wsp: cannot read {file}");
         return 1;
     };
-    match crate::did::of_transcript(&mut std::io::BufReader::new(f), 0) {
+    match crate::did::of_transcript(&mut src, 0) {
         Some(d) => {
             print_lines(&d);
             0

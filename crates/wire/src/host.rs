@@ -5,16 +5,20 @@
 //! the operating system through: spawning a seat's processes, stopping them,
 //! its pids and process tree, the screen and state its renderer reports,
 //! delivering an order, and the hook files and spend tallies its agent's hooks
-//! write. Those are the OS halves of the two backends (section 2.2). The
-//! *decisions* stay with the backends: which seat, what to run in it, when a
-//! hook's word has aged out, whether a seat will take a prompt, what a seat
-//! record says.
+//! write, and whether its hook log shows a turn begun. The root crate reaches
+//! it for a seat's transcripts: where a session was written, its bytes, and
+//! opencode's export and database. Those are the OS halves of the two backends
+//! (section 2.2). The *decisions* stay with the backends: which seat, what to
+//! run in it, when a hook's word has aged out, whether a seat will take a
+//! prompt, what a seat record says. What a transcript means (what ran, what it
+//! cost, what the turn did) stays with wsp's parsers, which take what is read
+//! here.
 //!
 //! The methods are grouped by the host-api message they become at M1
 //! (section 3.2): `seat.spawn`, `seat.stop`, `seats`, `seat.read`,
-//! `order.deliver`, `seat.said`/`seat.spent` and `hello`. Each takes plain
-//! values (paths, pids, ids, text), never a seat record, so a call turns into a
-//! message without a wsp type crossing the wire.
+//! `order.deliver`, `seat.said`/`seat.spent`, `seat.did`, `turn` and `hello`.
+//! Each takes plain values (paths, pids, ids, text), never a seat record, so a
+//! call turns into a message without a wsp type crossing the wire.
 //!
 //! [`InProcess`] is the only implementation: today's code, moved here whole,
 //! run in this process. At M1 the manager takes this module and a second
@@ -38,7 +42,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use wsp_base::calls::Command;
@@ -216,7 +222,6 @@ pub trait Host: Sync {
     fn say(&self, dir: &Path, said: &Value);
     /// One line onto [`HOOKS_FILE`].
     fn log_hook(&self, dir: &Path, line: &Value);
-    fn hook_log(&self, dir: &Path) -> Option<String>;
     /// The newest write in a seat's directory.
     fn quiet_since(&self, dir: &Path) -> Option<i64>;
     /// This hook's slice of the transcript added to [`BURN_FILE`].
@@ -225,6 +230,29 @@ pub trait Host: Sync {
     fn bank(&self, dir: &Path);
     /// Every seat's burn record under `root`.
     fn burn_under(&self, root: &Path) -> Vec<(String, Value)>;
+
+    // ---- seat.did: transcripts
+    /// Where a Claude Code session was written, `seat.did`'s transcript ref:
+    /// the file named after `cwd` first, else any project's file of that id.
+    fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf>;
+    /// Where a pi session under `cwd` was written, the newest file of that id.
+    fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf>;
+    /// A transcript a line at a time; a transcript is as long as its session.
+    fn read_transcript(&self, file: &Path) -> Option<Box<dyn BufRead>>;
+    /// A transcript whole.
+    fn transcript_bytes(&self, file: &Path) -> Option<Vec<u8>>;
+    /// The last `bytes` of a transcript, from its first whole line.
+    fn transcript_tail(&self, file: &Path, bytes: u64) -> Option<String>;
+    /// `opencode export --sanitize` of one session: opencode keeps no file.
+    fn opencode_export(&self, session: &str) -> Option<Vec<u8>>;
+    /// The newest two messages of an opencode session (`role`, `created`,
+    /// `completed`), newest first, off `opencode db`.
+    fn opencode_newest(&self, session: &str) -> Option<Vec<Value>>;
+
+    // ---- turn
+    /// Whether [`HOOKS_FILE`] shows the seat's own prompt submitted at or
+    /// after `since`; `None` when there is no log to say.
+    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool>;
 
     // ---- hello
     /// What the doctor says about the installed `compound-sup`'s wire.
@@ -541,10 +569,6 @@ impl Host for InProcess {
         }
     }
 
-    fn hook_log(&self, dir: &Path) -> Option<String> {
-        fs::read_to_string(dir.join(HOOKS_FILE)).ok()
-    }
-
     fn quiet_since(&self, dir: &Path) -> Option<i64> {
         last_written(dir)
     }
@@ -559,6 +583,57 @@ impl Host for InProcess {
 
     fn burn_under(&self, root: &Path) -> Vec<(String, Value)> {
         burn_under(root)
+    }
+
+    fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
+        claude_transcript(session, cwd)
+    }
+
+    fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
+        pi_session_file(session, cwd)
+    }
+
+    fn read_transcript(&self, file: &Path) -> Option<Box<dyn BufRead>> {
+        Some(Box::new(BufReader::new(fs::File::open(file).ok()?)))
+    }
+
+    fn transcript_bytes(&self, file: &Path) -> Option<Vec<u8>> {
+        fs::read(file).ok()
+    }
+
+    fn transcript_tail(&self, file: &Path, bytes: u64) -> Option<String> {
+        tail_of(file, bytes)
+    }
+
+    /// One session as opencode publishes it, redacted of everything but the
+    /// numbers.
+    ///
+    /// The id is checked before it reaches a command line, for the reason
+    /// [`claude_transcript`] checks it before it reaches a path: it arrives from the
+    /// backend, which got it from the agent, and `spawn` is a verb agents drive. opencode
+    /// spells an id `ses_` and twenty-something alphanumerics; anything with a
+    /// space, a slash or a dash in it is not one.
+    ///
+    /// Taken through [`captured`] and not through a pipe, which is the whole of
+    /// `core-039`: this is the longest thing wsp asks any runtime for, so it is the
+    /// one that overran a pipe buffer and came back a truncated document under a
+    /// successful exit status. The argument is there.
+    fn opencode_export(&self, session: &str) -> Option<Vec<u8>> {
+        if !opencode_id(session) {
+            return None;
+        }
+        captured(opencode_bin(), &["export", "--sanitize", session]).ok()
+    }
+
+    fn opencode_newest(&self, session: &str) -> Option<Vec<Value>> {
+        if !opencode_id(session) {
+            return None;
+        }
+        opencode_rows(session)
+    }
+
+    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
+        fs::read_to_string(dir.join(HOOKS_FILE)).ok().map(|log| turn_in_log(&log, since))
     }
 
     fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
@@ -1357,4 +1432,271 @@ pub fn tally_burn(dir: &PathBuf, payload: &Value) {
 /// tally reads back as.
 pub(crate) fn u_at(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+// ---- seat.did: transcripts, moved whole from `agent_commands` -------------
+//
+// Where a session was written and how to read it are the host's, because the
+// transcript is on the host's disk (host-api's `FileRef`: wsp reads it through
+// the manager, never by opening the path). What a transcript *means* — what
+// ran, what it cost, what the turn did — stays with wsp's parsers, which take
+// what is read here.
+
+/// An opencode session id as opencode spells it: `ses_` and alphanumerics.
+/// Checked before it reaches a command line; anything else is refused.
+pub fn opencode_id(session: &str) -> bool {
+    !session.is_empty() && session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The last `bytes` of a file, from the first whole line in them.
+fn tail_of(file: &Path, bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(file).ok()?;
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = len.saturating_sub(bytes);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut read = Vec::new();
+    f.take(bytes).read_to_end(&mut read).ok()?;
+    let mut text = String::from_utf8_lossy(&read).into_owned();
+    // The first line is cut in the middle when the read started inside the file.
+    if from > 0 {
+        let i = text.find('\n')?;
+        text.drain(..=i);
+    }
+    Some(text)
+}
+
+/// Whether a hook log shows the seat's own prompt submitted at or after
+/// `since`, read newest first and stopping at the first line before it.
+pub(crate) fn turn_in_log(log: &str, since: i64) -> bool {
+    for line in log.lines().rev() {
+        let Ok(h) = serde_json::from_str::<Value>(line) else { continue };
+        if util::epoch_of(&str_of(&h, "at")) < since {
+            return false;
+        }
+        // A nested session's prompt is not the seat's turn (`wsp-364`).
+        if str_of(&h, "hook") == "UserPromptSubmit" && h.get("child").is_none() {
+            return true;
+        }
+    }
+    false
+}
+
+/// opencode, wherever it is — the same reasoning as `claude_bin` (`agent_commands`), and one
+/// extra reason of its own.
+///
+/// `~/.opencode/bin` reached `PATH` through `.zshrc`, which a **non-interactive**
+/// shell does not read, so `Command::new("opencode")` failed from a hook or a
+/// script on a machine that plainly had it. That was fixed at the source by
+/// moving the export to `~/.zshenv` on 2026-08-21, and this stays anyway: the
+/// lookup costs nothing and the failure it prevents reads as "opencode is not
+/// installed" on a machine where it is.
+pub fn opencode_bin() -> PathBuf {
+    if let Some(v) = std::env::var_os("OPENCODE_BIN") {
+        let p = PathBuf::from(v);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join("opencode");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    util::home().join(".opencode/bin/opencode")
+}
+
+/// Everything one of these runtimes wrote to stdout, through a file rather
+/// than a pipe.
+///
+/// **The pipe was losing most of it, and saying nothing.** `opencode export
+/// --sanitize` on a 53-turn session writes 165,230 bytes. Asked for down a
+/// pipe, wsp received 65,536 of them — one pipe buffer — and an exit status of
+/// *zero*, so `read_export` (`agent_commands`) was handed a JSON document cut off mid-string,
+/// returned nothing, and `ui-007` closed with no cost clause at all. That is
+/// `core-039`. It was read at first as `despawn` ending the agent before its
+/// runtime could be asked. Driven in a sandbox, both endings wrote the clause —
+/// `wsp release` on a live opencode and `wsp despawn` on another — and then the
+/// row that had lost one lost it again on a replay through `release`, with no
+/// agent left to kill. Nothing about the ending is the variable. The size of
+/// the export is.
+///
+/// The cause belongs to the runtime rather than to the subcommand: these are
+/// Bun-compiled binaries, their stdout writes are asynchronous, and the process
+/// exits without waiting for a pipe it has filled to drain. A file has no
+/// buffer to overrun and its writes complete before exit — the same export
+/// redirected to one came back 165,230 bytes three times out of three.
+///
+/// So every capture in this file goes through here, including the two that are
+/// small today: `opencode models` is 13KB and `claude agents --json` is 1.4KB,
+/// both grow with what is on the machine, and both fail plausibly rather than
+/// loudly when cut — a valid model refused, an agent that cannot be addressed.
+/// The defence is one temp file, and waiting to be the second row this costs is
+/// not a saving.
+///
+/// The file is this process's own, is opened `0600` because a sanitized export
+/// still carries the shape of one attempt and a temp directory is shared, and
+/// is removed however this ends.
+pub fn captured(bin: PathBuf, args: &[&str]) -> std::result::Result<Vec<u8>, String> {
+    // Named as the reader would type it — `opencode models`, not the resolved
+    // path — because these strings reach a person inside a refusal that is
+    // about their `--model`, not about where wsp found the binary.
+    let said = format!(
+        "{} {}",
+        bin.file_name().unwrap_or(bin.as_os_str()).to_string_lossy(),
+        args.join(" ")
+    );
+    // Unique per call and not merely per process. Nothing here runs two at
+    // once today, and a name that would silently collide the day something
+    // does is a trap laid for a reader with no reason to look here.
+    static NTH: AtomicU64 = AtomicU64::new(0);
+    let at = std::env::temp_dir().join(format!(
+        "wsp-captured-{}-{}",
+        std::process::id(),
+        NTH.fetch_add(1, Ordering::Relaxed)
+    ));
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&at)
+        .map_err(|e| format!("{said}: {e}"))?;
+    let ran = Command::new(&bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(sink))
+        .stderr(Stdio::null())
+        .status();
+    let out = match ran {
+        Err(e) => Err(format!("{said}: {e}")),
+        Ok(s) if !s.success() => Err(format!("{said} failed")),
+        Ok(_) => std::fs::read(&at).map_err(|e| format!("{said}: {e}")),
+    };
+    // Whatever happened, including the failures: a capture that could not be
+    // read is exactly the one whose leftovers nobody comes back for.
+    let _ = std::fs::remove_file(&at);
+    out
+}
+
+/// `opencode db`'s rows for one session, newest first.
+///
+/// **`opencode db` and not a sqlite crate.** `serde_json` is the whole of this
+/// tree's dependency list and it stays that way, and opencode ships the reader:
+/// `opencode db <query> --format json` prints rows as JSON, so the query is
+/// `select` over the `message` table with `json_extract` on the `data` column
+/// rather than a schema this repository has to be right about.
+pub fn opencode_rows(session: &str) -> Option<Vec<Value>> {
+    let out = Command::new(opencode_bin())
+        .args([
+            "db",
+            &format!(
+                "select json_extract(data,'$.role') as role, \
+                 json_extract(data,'$.time.created') as created, \
+                 json_extract(data,'$.time.completed') as completed \
+                 from message where session_id = '{session}' order by time_created desc limit 2"
+            ),
+            "--format",
+            "json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// The directory name pi derives from a cwd for its session store — the
+/// "mangling" pi's session-manager.js applies.
+///
+/// pi resolves the cwd, strips one leading `/` or `\`, and replaces every
+/// `/`, `\`, `:` with `-`, wrapped in `--...--`. This function is the pure
+/// half of that: given a canonical cwd, produce the directory name pi would
+/// store sessions under.
+pub fn pi_session_dir_name(cwd: &str) -> String {
+    let stripped = cwd.strip_prefix('/').or_else(|| cwd.strip_prefix('\\')).unwrap_or(cwd);
+    let mangled: String = stripped.chars().map(|c| match c {
+        '/' | '\\' | ':' => '-',
+        other => other,
+    }).collect();
+    format!("--{}--", mangled)
+}
+
+/// The session file for a pi session id under a cwd, or `None` if the id is
+/// invalid or no file is found.
+///
+/// The id is validated before it reaches a path — it arrives from the backend
+/// and must not be used to open arbitrary files. It must be non-empty and
+/// contain only alphanumerics, `-`, `_`, `.`.
+pub fn pi_session_file(session: &str, cwd: &str) -> Option<PathBuf> {
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return None;
+    }
+    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::home().join(".pi").join("agent"));
+    let dir_name = if let Ok(canonical) = std::fs::canonicalize(cwd) {
+        pi_session_dir_name(&canonical.to_string_lossy())
+    } else {
+        pi_session_dir_name(cwd)
+    };
+    let sessions = agent_dir.join("sessions").join(&dir_name);
+    let suffix = format!("_{session}.jsonl");
+    let mut best: Option<(String, PathBuf)> = None;
+    for entry in std::fs::read_dir(&sessions).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(&suffix) {
+            if best.as_ref().is_none_or(|(prev, _)| name.as_ref() > prev.as_str()) {
+                let ts = name.strip_suffix(&suffix).unwrap_or(&name).to_string();
+                best = Some((ts, entry.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// The file the session was written to, most likely place first.
+///
+/// Claude Code names the directory after the cwd with every character that is
+/// not a letter, a digit or a hyphen replaced by one — `/Users/ed/.local` is
+/// `-Users-ed--local` — so the direct hit costs one `stat` and is what happens
+/// every time an agent stayed in the tree it was spawned into.
+///
+/// **The scan is not belt and braces.** A claim's cwd is where the *work* is
+/// and the transcript is named after where the *pane* was, `wsp resume` starts
+/// a session in a new workspace at a recorded cwd, and `wsp checkout` is free
+/// to move a worktree; every one of those makes the derived path wrong while
+/// the session id stays exactly right. A session id is a uuid, so a scan
+/// cannot find the wrong file — it can only fail to find one.
+///
+/// The id is checked before it is put in a path. It arrives from the backend,
+/// which got it from the agent, and `spawn` is a verb agents drive: a session id with
+/// a `/` in it is not a session id, and refusing it here is cheaper than
+/// discovering what it opened.
+pub fn claude_transcript(session: &str, cwd: &str) -> Option<PathBuf> {
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let file = format!("{session}.jsonl");
+    let projects = util::home().join(".claude").join("projects");
+    let derived = projects.join(mangle(cwd)).join(&file);
+    if derived.is_file() {
+        return Some(derived);
+    }
+    std::fs::read_dir(&projects)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join(&file))
+        .find(|p| p.is_file())
+}
+
+/// A cwd as Claude Code spells it in a directory name.
+pub fn mangle(cwd: &str) -> String {
+    cwd.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect()
 }
