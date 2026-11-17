@@ -443,7 +443,10 @@ fn a_delivered_order_and_its_hooks_journal_one_turn_began_with_the_order_and_one
     let dial = Dial::Manager { addr: m.addrs()[0], token_file: dir.join(TOKEN_FILE) };
     let payload = serde_json::json!({ "session_id": "sess-t" });
     assert_eq!(report(&dial, "cpd-t", s.epoch, "UserPromptSubmit", &payload), Sent::Taken(1));
+    assert_eq!(state_in(&mut c, "cpd-t"), SeatState::Working, "a turn its hooks opened reads working");
     assert_eq!(report(&dial, "cpd-t", s.epoch, "Stop", &payload), Sent::Taken(1));
+    // wsp-038: the order's ack alone left this Working for good.
+    assert_eq!(state_in(&mut c, "cpd-t"), SeatState::Idle, "its Stop reads idle, over the order's ack");
 
     c.hear_until(WAIT, |ev| ev.iter().any(|f| matches!(&f.msg, Message::Turn(t) if t.edge == TurnEdge::Ended)));
     c.hear_until(Duration::from_millis(300), |_| false);
@@ -463,6 +466,44 @@ fn a_delivered_order_and_its_hooks_journal_one_turn_began_with_the_order_and_one
     );
 
     assert!(matches!(c.ask(stop_msg("cpd-t", s.epoch.0)), Message::SeatStopped(_)));
+    m.stop();
+}
+
+/// The state the manager's `seats` reply gives `seat`: what `wip` reads.
+fn state_in(c: &mut Client, seat: &str) -> SeatState {
+    let Message::SeatsList(list) = c.ask(Message::Seats(Seats {})) else { panic!("seats is answered seats.list") };
+    list.seats.iter().find(|r| r.seat.0 == seat).map(|r| r.state).unwrap_or_else(|| panic!("{seat} is listed: {list:?}"))
+}
+
+/// wsp-038: `wip` drew seats mid-turn as `idle ← needs you`. A turn the
+/// person typed at the pane has no order and so no ack: the seat's hooks are
+/// all that say it is working. A tool hook with its prompt unheard (a manager
+/// started mid-turn) says so too, and makes no `turn` of its own.
+#[test]
+fn a_turn_with_no_order_reads_working_while_open_and_idle_at_its_stop() {
+    use wsp_host::hooks::{report, Dial, Sent};
+
+    let (dir, sup) = place("open");
+    let _sweep = Sweep::new(&dir);
+    let m = start(&dir, &sup);
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+    let Message::SeatStarted(s) = c.ask(spawn_msg("wsp-38", 1, "cpd-p", &dir)) else { panic!("started") };
+    assert_eq!(state_in(&mut c, "cpd-p"), SeatState::Idle, "nothing heard yet");
+
+    let dial = Dial::Manager { addr: m.addrs()[0], token_file: dir.join(TOKEN_FILE) };
+    let payload = serde_json::json!({ "session_id": "sess-p" });
+    assert_eq!(report(&dial, "cpd-p", s.epoch, "PreToolUse", &payload), Sent::Taken(0));
+    assert_eq!(state_in(&mut c, "cpd-p"), SeatState::Working, "a tool running is a turn open");
+    assert_eq!(report(&dial, "cpd-p", s.epoch, "Stop", &payload), Sent::Taken(1));
+    assert_eq!(state_in(&mut c, "cpd-p"), SeatState::Idle, "a Stop reads idle");
+
+    assert_eq!(report(&dial, "cpd-p", s.epoch, "UserPromptSubmit", &payload), Sent::Taken(1));
+    assert_eq!(state_in(&mut c, "cpd-p"), SeatState::Working, "a prompt the person typed, without its Stop, reads working");
+    // A child session's Stop, posted under the seat's name, ends nothing.
+    assert_eq!(report(&dial, "cpd-p", s.epoch, "Stop", &serde_json::json!({ "session_id": "child" })), Sent::Taken(0));
+    assert_eq!(state_in(&mut c, "cpd-p"), SeatState::Working);
+
+    assert!(matches!(c.ask(stop_msg("cpd-p", s.epoch.0)), Message::SeatStopped(_)));
     m.stop();
 }
 
