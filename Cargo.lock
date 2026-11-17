@@ -98,6 +98,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "wsp-base",
+ "wsp-host",
  "wsp-host-api",
  "wsp-manager",
  "wsp-store",

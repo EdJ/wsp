@@ -3057,28 +3057,38 @@ esac
         a_pass(&store, &Fake::empty());
         assert_eq!(reseated(), vec!["run".to_string()]);
         // Claude Code's hook, played: claude takes its order in argv and is
-        // ready when a turn runs, which its hook says in the seat's `said`.
-        // Said once the agent is on the seat's record, and stamped after it.
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hook = {
-            let (done, state) = (done.clone(), store.state.clone());
-            std::thread::spawn(move || {
-                let seats = state.join(crate::place_compound::SEATS);
+        // ready when a turn runs, which under the manager its hook posts as
+        // the seat's turn begun, at the epoch the manager started it under
+        // (wsp-038; `wait_ready` hears it as an event, wsp-037). Posted once
+        // the agent is on the seat's record: its epoch then is the agent's,
+        // not that of the shell `open` put there first.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let dial = wsp_host::hooks::Dial::Manager { addr: m.addrs()[0], token_file: exec.join(wsp_manager::TOKEN_FILE) };
+        let code = std::thread::scope(|s| {
+            s.spawn(|| {
+                let seats = store.state.join(crate::place_compound::SEATS);
+                let mut posted = std::collections::BTreeSet::new();
                 while !done.load(std::sync::atomic::Ordering::SeqCst) {
                     for dir in std::fs::read_dir(&seats).into_iter().flatten().flatten().map(|e| e.path()) {
                         let rec: serde_json::Value = std::fs::read_to_string(dir.join("seat.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-                        if rec.get("agent").is_some() {
-                            crate::host::Host::say(&crate::host::LOCAL, &dir, &serde_json::json!({ "state": "working", "at": util::now_iso() }));
+                        let seat = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let Some(epoch) = m.seats().into_iter().find(|r| r.seat.0 == seat).map(|r| r.epoch) else { continue };
+                        if rec.get("agent").is_some() && !posted.contains(&(seat.clone(), epoch.0)) {
+                            let payload = serde_json::json!({ "session_id": format!("sess-{seat}") });
+                            // Posted again on the next round until the manager takes it.
+                            if let wsp_host::hooks::Sent::Taken(_) = wsp_host::hooks::report(&dial, &seat, epoch, "UserPromptSubmit", &payload) {
+                                posted.insert((seat, epoch.0));
+                            }
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-            })
-        };
-        // What it launched, run here (a test's `launch` starts nothing).
-        let code = crate::cmd_govern::govern(&store, &crate::Args::synth("govern", &["run"], &[("reseat", "true")]));
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = hook.join();
+            });
+            // What it launched, run here (a test's `launch` starts nothing).
+            let code = crate::cmd_govern::govern(&store, &crate::Args::synth("govern", &["run"], &[("reseat", "true")]));
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            code
+        });
         let said = || {
             let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
             format!("cycle.log:\n{}\nmanager.log:\n{}", read(store.state_file("cycle.log")), read(m.log_path()))
