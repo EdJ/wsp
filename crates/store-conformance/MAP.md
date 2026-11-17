@@ -17,16 +17,20 @@ it (section 6; `tests/layering.rs`). Nothing in wsp uses it yet; `wsp-store-sqli
   module docs say what it writes for leases, claims and texts
 - `src/domain.rs` — `TestDomain`: rows, seats, claims and orders, with the guards case 9 drives (the table in
   its module docs); `claim_lease`, `verify_lease`, `verb`
-- `src/cases/` — the ten cases, each `pub fn case_x<H: Harness>(h: &H)` (wsp-047's legs `state` and `events`)
-- `tests/mem.rs` — smoke tests: a command through MemStore read back as its event; the fenced claim path; the
-  crash hook
+- `src/cases/` — the ten cases, each `pub fn case_x<H: Harness>(h: &H) -> CaseResult`, one file each (wsp-047's legs
+  `state` and `events`); `mod.rs` holds `CaseFailure` (case number, name, what broke) and the setup helpers. Now:
+  `case_atomicity` (1), `case_idempotency` (2), `case_lease_exclusivity` (3), `case_fencing` (4),
+  `case_machine_guards` (9), `case_text` (10)
+- `tests/mem.rs` — smoke tests (a command through MemStore read back as its event; the fenced claim path; the
+  crash hook), and each case against MemStore, one `#[test]` per case
 
 ## Contract
 
 - **No backend.** Never `rusqlite`, `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `wsp-host` or `wsp-manager`
   (`tests/layering.rs`): a backend's tests depend on the suite, not the other way round.
-- **Every case is a `pub fn` generic over `Harness`**, and panics when the backend breaks its guarantee, so a
-  backend's tests call them one by one. Threads and bounds in seconds; no sleep that hopes for an interleaving.
+- **Every case is a `pub fn` generic over `Harness`**, and returns `Err(CaseFailure)` when the backend breaks its
+  guarantee (never a panic), so a backend's tests call them one by one and `unwrap()`. Threads and bounds in seconds; no sleep that
+  hopes for an interleaving.
 - **The cases bite**: each `Knobs` field breaks one guarantee, and a test shows its case then fails.
 - **`crates/store-contract` is not edited here** (R5). What the suite needed and the contract lacks is wsp-065:
   the payloads of the events a store writes itself (leases, claims, `renew`), `set_text`'s principal, a

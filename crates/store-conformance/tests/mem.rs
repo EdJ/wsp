@@ -1,4 +1,4 @@
-//! The smoke test: a command applied through MemStore, and its event read back.
+//! The smoke tests: a command applied through MemStore, and its event read back; and 2.3's cases against MemStore.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -92,5 +92,41 @@ fn the_crash_hook_stops_an_apply_and_reopen_shows_what_was_written() {
         assert!(matches!(w.head(), Err(Error::Backend { .. })), "the crashed handle is dead");
         let r = h.reopen(&w);
         assert_eq!(r.events_after(EventId(0), 100).unwrap().len(), visible + 1, "{knobs:?}");
+    }
+}
+
+// 2.3's cases against MemStore, one test each (wsp-047 leg `state`).
+mod cases {
+    use wsp_store_conformance::cases::*;
+    use wsp_store_conformance::MemHarness;
+
+    #[test]
+    fn case_1_atomicity() {
+        case_atomicity(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
+    fn case_2_idempotency() {
+        case_idempotency(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
+    fn case_3_lease_exclusivity() {
+        case_lease_exclusivity(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
+    fn case_4_fencing() {
+        case_fencing(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
+    fn case_9_machine_guards() {
+        case_machine_guards(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
+    fn case_10_text() {
+        case_text(&MemHarness::default()).unwrap();
     }
 }
