@@ -37,7 +37,7 @@ pub const READ_ONLY: &[&str] = &[
 pub const ACTIONS: &[&str] = &[
     "add", "decide", "note", "start", "block", "park", "review", "reopen", "todo", "mv", "tag", "ref", "prio", "next", "edit",
     "rename", "caption", "rm", "archive", "ask", "answer", "yours", "ack", "watch", "verified", "check", "spawn", "despawn",
-    "attend", "claim", "release", "pin", "unpin", "agent", "sync", "hook", "doctor", "adopt", "say", "tell", "flag", "reconcile",
+    "attend", "claim", "release", "pin", "unpin", "agent", "doctor", "say", "tell", "flag", "reconcile",
     "attempts", "leg", "install", "daemon", "brief", "commit-help", "machine", "migrate", "code", "retro", "packet", "sandbox",
     "mandate", "cold", "after", "scratch", "artefact", "done", "reap", "stuck", "verifications", "panel", "surface", "init",
     "project", "resume", "govern", "view", "kanban", "checkout", "land", "verify", "report", "throttle", "submit",

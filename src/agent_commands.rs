@@ -1,13 +1,12 @@
 //! The second axis: not *where* the seat is, but *what is standing in it*.
 //!
-//! `place.rs` abstracts the backend — herdr today, a TTY-less supervisor or a
-//! web runtime later. It deliberately does not abstract the agent: `Agent::kind`
-//! is a string passed straight through, because herdr owns the catalogue of
-//! kinds and a list kept here would go stale. That is right for *starting* one
+//! `place.rs` abstracts the backend — compound today, a web runtime later. It
+//! deliberately does not abstract the agent: `Agent::kind` is a string passed
+//! straight through, because a list of kinds kept here would go stale. That is right for *starting* one
 //! and insufficient for everything after it. How you hand an agent a prompt, how
 //! you tell whether it is ready, how you resume its session and where its
 //! durable output lives are facts about the **agent**, not about the thing
-//! hosting it: a Claude Code in a herdr pane has a session channel of its own,
+//! hosting it: a Claude Code in a seat has a session channel of its own,
 //! and a `codex` in the identical pane can only be typed at.
 //!
 //! So the two axes are orthogonal, and this is the other one. The argument for
@@ -39,9 +38,9 @@
 //!
 //! `claude agents --json` closes it, and needs no new mechanism on either side.
 //! It is documented for scripting and does not require a TTY, and each row
-//! carries `sessionId`, `name`, `pid`, `cwd` and `status`. herdr's
-//! `agent_session.value` **is** that `sessionId` — `herdr.rs` parses it into
-//! `Pane::session_id` and [`Seated::session`] carries it across the port — so
+//! carries `sessionId`, `name`, `pid`, `cwd` and `status`. The session id a
+//! backend reports **is** that `sessionId` — [`Seated::session`] carries it
+//! across the port — so
 //! wsp already holds the key, and one call turns it into the handle. Verified
 //! 2026-08-17 against the exact pair recorded as underivable.
 //!
@@ -57,7 +56,7 @@
 //! undocumented, and there is no `claude` subcommand that sends on it: the whole
 //! command list is `agents`, `auth`, `auto-mode`, `doctor`, `gateway`, `import`,
 //! `install`, `mcp`, `plugin`, `project`, `setup-token`, `ultrareview` and
-//! `update`. So [`Claude::tell`] delivers the way `place_herdr` always has, and
+//! `update`. So [`Claude::tell`] delivers the way the backend's own `tell` does, and
 //! the channel lands in one function when there is a supported way to speak it.
 //!
 //! What the address buys in the meantime is recovery: [`Kind::address`] is asked
@@ -74,12 +73,12 @@
 //!
 //! **The deterministic one: the backend's census is the wrong place to recompute
 //! the handle from.** `address` used to mint from `Seated::agent.name`, and on
-//! the failure path there is no such name. Measured against herdr's live socket
-//! on 2026-08-17: an `agent.list` row carries `name` and `agent_session.value`,
-//! and a `pane.list` row carries the agent's *kind* and neither of the other
-//! two. `Herdr::census` merges them per pane and falls back to the pane row —
-//! and a seat herdr has gone blind on is precisely a seat with no `agent.list`
-//! row: `State::Empty` is `agent.get` answering that this pane has no agent, and
+//! the failure path there is no such name. Measured against the multiplexer
+//! wsp then ran on, on 2026-08-17: an `agent.list` row carried `name` and the
+//! session, and a `pane.list` row carried the agent's *kind* and neither of the
+//! other two. Its census merged them per pane and fell back to the pane row —
+//! and a seat the backend has gone blind on is precisely a seat with no
+//! `agent.list` row: `State::Empty` is `agent.get` answering that this pane has no agent, and
 //! a pane with no agent has no row in the list of them either, the same record
 //! read two ways. So on every failure of the sort robustness-041 reproduces, the
 //! census offers an empty name; [`mint`] turns that into a seat-only handle
@@ -122,7 +121,7 @@
 //! them and a first pass that took all five would have been unreviewable:
 //!
 //! - **robustness-041, readiness.** `wait_ready` declares an agent dead while it
-//!   is alive, because herdr's claude detection needs a rendered pane and the
+//!   is alive, because the backend's claude detection needed a rendered pane and the
 //!   focus decision forbids rendering one. `claude agents --json` answers
 //!   liveness and `idle`/`busy` per session with no pane involved at all, which
 //!   is a per-kind reading of exactly the sort this trait is for.
@@ -188,7 +187,7 @@
 //!
 //! So the handle is the task **and** the seat, and neither half is decoration.
 //! The task id is what a person reads; the seat is what makes it unique, because
-//! herdr issues at most one live agent per pane. Both are in wsp's hand *before*
+//! a backend issues at most one live agent per seat. Both are in wsp's hand *before*
 //! [`Place::start`] is called — the port splits `open` from `start` precisely so
 //! that the seat exists before the agent does — and both are on the census row
 //! afterwards, so [`Kind::address`] can recompute the same string it minted
@@ -235,8 +234,7 @@ pub trait Kind {
 
     /// The program a backend that execs this kind runs, when it is not the
     /// kind's own name — `None` for every kind that is a binary of that name.
-    /// Such a kind cannot be started by herdr, whose agent catalogue is closed,
-    /// and `spawn` refuses `--herdr` for it before a seat is opened.
+    /// A backend with a closed agent catalogue cannot start such a kind.
     fn program(&self) -> Option<&'static str> {
         None
     }
@@ -247,8 +245,8 @@ pub trait Kind {
     /// The gate in front of [`Spawn::model`] and [`Spawn::effort`], and it is
     /// here for two reasons that pull the same way.
     ///
-    /// **An unknown tier fails late and in the wrong place.** herdr starts the
-    /// process happily whatever is on its command line; what refuses is the
+    /// **An unknown tier fails late and in the wrong place.** A backend starts
+    /// the process happily whatever is on its command line; what refuses is the
     /// agent, in a pane nobody is looking at, and `cmd_spawn` reports that as
     /// "claude started but never became ready for input" — a sentence about
     /// readiness for what is a typo. Worse, measured 2026-08-18 against Claude
@@ -279,7 +277,7 @@ pub trait Kind {
     /// pass the first and fail the second, which is exactly the case that was
     /// paid for.
     ///
-    /// **Measured 2026-08-18, Claude Code 2.1.234**, two spawns into herdr panes
+    /// **Measured 2026-08-18, Claude Code 2.1.234**, two spawns into seats
     /// differing in nothing but `--model`, on the same task and the same
     /// worktree path minutes apart. The Sonnet 5 pane opened on `auto mode on
     /// (shift+tab to cycle)`; the Haiku 4.5 pane opened on `manual mode on`,
@@ -293,7 +291,7 @@ pub trait Kind {
     /// `~/.claude/settings.json` already allows, and that allow-list is written
     /// around the wsp verbs. The haiku run stopped twenty-five seconds in, on
     /// its third action, reaching into `~/wsp` with `find` for a record its
-    /// brief already held; herdr reported the pane blocked and nothing said why.
+    /// brief already held; the backend reported the pane blocked and nothing said why.
     /// A spawn that produces that is worse than a refused flag, because the
     /// refusal is read in the second it is typed and the hang is found later by
     /// somebody wondering why a lane went quiet.
@@ -373,8 +371,8 @@ pub trait Kind {
     /// `false` for every kind but one, and the exception was measured rather
     /// than designed. `core-026` drove `--kind opencode` end to end three
     /// times and the work order failed to arrive all three: opencode's TUI
-    /// refuses typed input for **~2s after herdr's `agent.start` returns and
-    /// reports `interactive_ready`**, and text sent inside that window is
+    /// refuses typed input for **~2s after the backend's `agent.start` returns
+    /// and reports `interactive_ready`**, and text sent inside that window is
     /// *discarded* — the composer is empty afterwards, not holding an unsent
     /// sentence. Sweep of two runs × four delays, start→prompt: 0s and 1s
     /// dropped, 2s and 4s landed.
@@ -445,7 +443,7 @@ pub trait Kind {
     ///
     /// **And not argv, which is the third carrier and the one that would have
     /// made `core-038` impossible.** An agent's command line reaches a seat wsp
-    /// did not open, since herdr's `agent.start` takes `args`; an environment
+    /// did not open, since a backend's `agent.start` takes `args`; an environment
     /// does not. It is unavailable rather than declined: opencode's TUI has no
     /// config flag at all — `opencode --help` at 1.18.x offers `--model`,
     /// `--session`, `--prompt` and `--agent`, and nothing that names a config —
@@ -501,8 +499,8 @@ pub trait Kind {
     /// It is what [`crate::cmd_spawn::Route::Inline`] selects on, and it
     /// deliberately is **not** [`Kind::order_in_args`]. Those were the same
     /// predicate for one commit and it was wrong: the brief went into a
-    /// `--prompt` argv element, and herdr refuses `agent.start` args holding any
-    /// control character — a brief is multi-line, so three spawns of three were
+    /// `--prompt` argv element, and the backend refused `agent.start` args holding
+    /// any control character — a brief is multi-line, so three spawns of three were
     /// refused with `invalid_agent_argument` and no agent started. Env is not
     /// argv and that guard does not reach it.
     fn brief_file(&self) -> bool {
@@ -513,7 +511,7 @@ pub trait Kind {
     /// to the **agent** rather than to wsp.
     ///
     /// True by default, because the default delivery is [`crate::place::Place::tell`]
-    /// — herdr typing at a pane — and what receives it is whatever the agent
+    /// — the backend typing at a seat — and what receives it is whatever the agent
     /// does with a prompt that arrives mid-turn. Driven against a real Claude
     /// Code on 2026-08-21 (`core-021` d2): it *queues* it and answers it at the
     /// turn boundary, and nothing is typed at a live composer. So this is not
@@ -528,7 +526,7 @@ pub trait Kind {
     ///
     /// The candidate for `false` was opencode's ACP server (`core-020`), and it
     /// was driven against a real opencode rather than read — `core-026`,
-    /// 2026-08-21, sandbox herdr — and it answers **true** anyway, without ACP
+    /// 2026-08-21, in a sandbox — and it answers **true** anyway, without ACP
     /// being needed to find that out. What was seen: a mid-turn `wsp tell`
     /// reaches opencode's *durable session record* immediately, as a `user`
     /// message in `opencode export`, and is answered at the turn boundary. Then
@@ -637,7 +635,7 @@ pub trait Kind {
     /// [`crate::cmd_resume::Thread::by_hand`] as though every agent shared it.
     /// What that printed for a live opencode was `claude --resume ses_…` —
     /// wrong binary and wrong flag in one line, offered to a person as the
-    /// recovery path for when herdr itself is broken.
+    /// recovery path for when the backend itself is broken.
     ///
     /// [`Kind::args`] reads it too, so a kind spells its resume in one place
     /// and the argv wsp builds and the line it prints cannot drift apart.
@@ -671,11 +669,11 @@ pub trait Kind {
         None
     }
 
-    /// Whether a clear of this kind leaves a **new session** where herdr can
-    /// see one — which is the only completion signal a clear has.
+    /// Whether a clear of this kind leaves a **new session** where the backend
+    /// can see one — which is the only completion signal a clear has.
     ///
     /// `true` by default, because waiting is the shape a clear was first built
-    /// around: Claude Code's `SessionStart` hook teaches herdr the replacement
+    /// around: Claude Code's `SessionStart` hook teaches the backend the replacement
     /// session's id within a few hundred milliseconds, and the wait is what
     /// keeps a work order from landing mid-reset. A kind answering `false`
     /// says the signal never comes, so waiting would be a stall with nothing
@@ -782,7 +780,7 @@ pub struct Spawn<'a> {
     /// carrier. `None` for a spawn with nothing to brief about, for one whose
     /// brief could not be written, and for every kind that reads it from its
     /// environment or is not given one. A path and not the text, because a
-    /// brief is multi-line and herdr refuses control characters in an arg.
+    /// brief is multi-line and an arg holding control characters is refused.
     pub brief: Option<&'a Path>,
 }
 
@@ -816,9 +814,9 @@ pub fn mint(name: &str, seat: &Seat) -> Option<String> {
 /// name whose file was *refused* is not registered and falls to [`Plain`] here;
 /// [`refusal_of`] is how a caller tells that from a name with no file.
 ///
-/// Unknown kinds are not refused here. herdr owns the catalogue and refuses an
-/// unknown kind with the whole of it in the message, which is a better list than
-/// one kept in wsp and left to go stale — so this falls through to the behaviour
+/// Unknown kinds are not refused here. The backend that starts one is the
+/// judge of whether it can, which is a better list than one kept in wsp and
+/// left to go stale — so this falls through to the behaviour
 /// `cmd_spawn` had before the layer existed, and adding the layer changed
 /// nothing for `codex` or `gemini`.
 pub fn of(kind: &str) -> &'static dyn Kind {
@@ -867,7 +865,7 @@ pub fn refusals() -> &'static [(PathBuf, String)] {
 }
 
 /// Why the kind file for `kind` was refused, if there is one and it was. A name
-/// with no file at all is `None`: that is a kind herdr may know, passed through.
+/// with no file at all is `None`: that is a kind a backend may know, passed through.
 pub fn refusal_of(kind: &str) -> Option<&'static str> {
     refusals()
         .iter()
@@ -880,10 +878,10 @@ pub fn refusal_of(kind: &str) -> Option<&'static str> {
 /// offers "New agent ▸" never keeps a second list that [`of`] could disagree
 /// with.
 ///
-/// This is the kinds the code has *measured*, not the kinds herdr can start:
+/// This is the kinds the code has *measured*, not the kinds a backend can start:
 /// a kind declared as a file is consulted after this table (see [`of`]), and any
-/// other name `--kind` is given is still passed through to herdr, which owns
-/// that catalogue.
+/// other name `--kind` is given is still passed through to the backend, which
+/// judges it.
 const KNOWN: &[(&str, &'static dyn Kind)] = &[
     ("claude", &Claude),
     ("opencode", &OpenCode),
@@ -931,8 +929,7 @@ pub(crate) mod stand_in {
 
 /// The program and argv a backend that execs a kind runs for it: the kind's
 /// name and `args` unless the kind runs under a program of its own
-/// ([`Kind::program`]). One copy, for the backends that fork or exec — herdr
-/// types the kind's name into a shell and cannot.
+/// ([`Kind::program`]). One copy, for the backends that fork or exec.
 pub fn command(kind: &str, args: &[String]) -> (String, Vec<String>) {
     #[cfg(test)]
     if let Some(stand_in) = stand_in::for_kind(kind) {
@@ -992,7 +989,7 @@ fn kinds_with(reg: &Registry) -> Vec<Info> {
 pub struct Clear {
     /// Typed into the pane as its own line.
     pub cmd: &'static str,
-    /// Whether to hold the next sentence until herdr reports a new session in
+    /// Whether to hold the next sentence until the backend reports a new session in
     /// that pane. See [`Kind::clear_replaces_session`].
     pub waits: bool,
 }
@@ -1060,7 +1057,7 @@ impl Kind for Plain {
 /// The second kind wsp knows by name, and the first that can be *chosen* — see
 /// `core-020`, whose point is balancing model usage and which cannot begin until
 /// wsp can say which model. Everything here was measured against opencode
-/// 1.18.20/1.18.21 in a sandbox herdr rather than read off `--help`; `core-026`
+/// 1.18.20/1.18.21 in a sandbox rather than read off `--help`; `core-026`
 /// holds the driving and `core-027` the decisions.
 ///
 /// [`Kind::running`] stays [`Plain`]'s answer of nothing: the backend is the
@@ -1292,12 +1289,12 @@ fn config(brief: Option<&Path>, reach: &Reach) -> String {
     //
     // **This key merges with the machine's own config rather than replacing
     // it**, which is the property the whole scheme rests on and the one worth
-    // naming: `~/.config/opencode/plugins/herdr-agent-state.js` is what reports
-    // an opencode's state to herdr, and a config that clobbered `plugin` would
-    // have turned off state reporting for every agent wsp starts — silently,
+    // naming: the machine's own opencode plugins are what report an opencode's
+    // state, and a config that clobbered `plugin` would have turned off state
+    // reporting for every agent wsp starts — silently,
     // and with `needs_a_person` among the things it took with it. Driven four
     // times now: `opencode debug config` with this exact value resolves
-    // `instructions` to the file below, `plugin` still to the herdr plugin, and
+    // `instructions` to the file below, `plugin` still to the machine's plugin, and
     // — the reason it was run again for `core-040` — the bash map in the order
     // wsp wrote it rather than reordered by the merge.
     if let Some(path) = brief {
@@ -1458,8 +1455,8 @@ impl Kind for OpenCode {
     /// there for the measurement; what matters here is that the order is a
     /// **single argv element** and is therefore safe for the prose a work order
     /// actually is. Verified rather than hoped: a prompt containing backticks
-    /// and `$(…)` was passed through herdr's `agent.start` and arrived intact,
-    /// with nothing executed — herdr does not put these through a shell.
+    /// and `$(…)` was passed through `agent.start` and arrived intact, with
+    /// nothing executed — argv does not go through a shell.
     fn args(&self, spawn: &Spawn) -> Vec<String> {
         let mut argv: Vec<String> = Vec::new();
         if let Some(model) = spawn.model {
@@ -1485,7 +1482,7 @@ impl Kind for OpenCode {
     }
 
     /// `/clear`, which this runtime spells only as an alias of `/new` — start
-    /// a new session. Driven 2026-08-23 against 1.18.21 in a sandbox herdr,
+    /// a new session. Driven 2026-08-23 against 1.18.21 in a sandbox,
     /// the same rig `core-026` used: typed at an idle composer it resets the
     /// transcript view at once; the next turn opened a session of its own;
     /// `opencode export` on the old id still showed every message it had, so
@@ -1494,7 +1491,7 @@ impl Kind for OpenCode {
     ///
     /// [`clear_replaces_session`] answers false on the same drive, and that is
     /// why both facts are recorded here rather than inferred from the docs:
-    /// herdr's `agent_session` keeps the **old** id through the clear — the
+    /// the reported session keeps the **old** id through the clear — the
     /// plugin learns the replacement only when the next message creates it —
     /// so the wait that completes a Claude Code clear can never fire for this
     /// kind, and every sentence would pay its full timeout for nothing. What
@@ -1599,7 +1596,7 @@ impl Kind for OpenCode {
     }
 
     /// Nothing, and it is [`Plain`]'s answer for [`Plain`]'s reason: opencode
-    /// has a session id, but herdr is where wsp learns it and only once the
+    /// has a session id, but the backend is where wsp learns it and only once the
     /// plugin has reported one. Minting a second name here would be a handle
     /// wsp cannot address anything with.
     fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<Address> {
@@ -1671,8 +1668,8 @@ impl Kind for OpenCode {
 /// numbers.
 ///
 /// The id is checked before it reaches a command line, for the reason
-/// [`transcript`] checks it before it reaches a path: it arrives from herdr,
-/// which got it from the agent, and `spawn` is a verb agents drive. opencode
+/// [`transcript`] checks it before it reaches a path: it arrives from the
+/// backend, which got it from the agent, and `spawn` is a verb agents drive. opencode
 /// spells an id `ses_` and twenty-something alphanumerics; anything with a
 /// space, a slash or a dash in it is not one.
 ///
@@ -1985,8 +1982,8 @@ fn pi_session_dir_name(cwd: &str) -> String {
 /// The session file for a pi session id under a cwd, or `None` if the id is
 /// invalid or no file is found.
 ///
-/// The id is validated before it reaches a path — it arrives from herdr and
-/// must not be used to open arbitrary files. It must be non-empty and
+/// The id is validated before it reaches a path — it arrives from the backend
+/// and must not be used to open arbitrary files. It must be non-empty and
 /// contain only alphanumerics, `-`, `_`, `.`.
 fn pi_session_file(session: &str, cwd: &str) -> Option<PathBuf> {
     if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
@@ -2296,8 +2293,8 @@ pub struct Claude;
 /// tokens of it, the rest is Claude Code's own.
 ///
 /// **Measured against a live spawn on 2026-08-17, not estimated.** Two
-/// `wsp spawn --agent` runs into a sandbox — its own herdr session, its own
-/// store — one with `--full` and one without, read back off the two transcripts:
+/// `wsp spawn --agent` runs into a sandbox — its own seats, its own store
+/// — one with `--full` and one without, read back off the two transcripts:
 ///
 /// | | first-request context |
 /// |---|---|
@@ -2506,8 +2503,8 @@ impl Kind for Claude {
         }
         // The order, last and after `--`, so one starting `-` is never read as
         // a flag and nothing that takes a value can eat it; see
-        // [`Kind::order_in_args`]. Folded to one line because herdr refuses a
-        // control character in an `agent.start` arg, and the packet's start is
+        // [`Kind::order_in_args`]. Folded to one line because a control character
+        // in an `agent.start` arg is refused, and the packet's start is
         // one line already.
         if let Some(order) = spawn.order {
             argv.push("--".into());
@@ -2624,13 +2621,13 @@ impl Kind for Claude {
     /// "nothing answers to X" is the whole of what a person is about to do next.
     ///
     /// What minting buys here is that the answer is **exact** where [`pick`] can
-    /// only be probable. `pick` needs herdr to have seen the session id — which
+    /// only be probable. `pick` needs the backend to have seen the session id — which
     /// is the whole of robustness-041, and it often has not — and then falls back
     /// to whoever is alone in the tree. A minted name is matched against itself.
     ///
     /// The census is read **once, and only for [`pick`]**. It is the one reading
-    /// here that cannot be waited into existence: a seat whose agent herdr has
-    /// no record of has no name and no session on its row however long you ask,
+    /// here that cannot be waited into existence: a seat whose agent the backend
+    /// has no record of has no name and no session on its row however long you ask,
     /// which is the measurement in the module docs. A census wsp could not read
     /// at all is no longer fatal to the sentence for the same reason — the
     /// handle does not come from there any more.
@@ -2678,7 +2675,7 @@ impl Kind for Claude {
     /// session.
     ///
     /// Every other reading of what a Claude Code is running is a reading of
-    /// *now*: `claude agents --json` answers about live sessions, herdr's pane
+    /// *now*: `claude agents --json` answers about live sessions, a backend's
     /// row carries a session id and no tier at all, and both are gone by the
     /// time a claim ends. The transcript is written as the session goes and
     /// stays afterwards, and it carries the model on every assistant turn and
@@ -2716,8 +2713,8 @@ impl Kind for Claude {
 /// the session id stays exactly right. A session id is a uuid, so a scan
 /// cannot find the wrong file — it can only fail to find one.
 ///
-/// The id is checked before it is put in a path. It arrives from herdr, which
-/// got it from the agent, and `spawn` is a verb agents drive: a session id with
+/// The id is checked before it is put in a path. It arrives from the backend,
+/// which got it from the agent, and `spawn` is a verb agents drive: a session id with
 /// a `/` in it is not a session id, and refusing it here is cheaper than
 /// discovering what it opened.
 pub(crate) fn transcript(session: &str, cwd: &str) -> Option<PathBuf> {
@@ -2877,8 +2874,8 @@ fn answers_to(live: &[Live], handle: &str) -> bool {
 /// the transport would need and is left unparsed until there is a transport.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Live {
-    /// `sessionId`, which is the same string herdr reports as
-    /// `agent_session.value` and the port carries as `Seated::session`.
+    /// `sessionId`, which is the same string a backend reports and
+    /// the port carries as `Seated::session`.
     pub session: String,
     /// `name` — the handle the session channel is addressed by.
     pub name: String,
@@ -2974,7 +2971,7 @@ fn confirmed(live: &[Live], spawn: &Spawn, row: Option<&Seated>) -> Option<Strin
 ///
 /// Two keys, and the order is the point. The session id is **exact**: the
 /// backend saw the agent and said which session it is, and no two sessions share
-/// one. The cwd is a fallback for the case that matters most — herdr failing to
+/// one. The cwd is a fallback for the case that matters most — a backend failing to
 /// detect a live agent is the whole of robustness-041, and it leaves a seat with a
 /// cwd and no session — and it answers only when exactly one live session is in
 /// that directory.
@@ -3023,9 +3020,8 @@ fn parse_listing(json: &str) -> Vec<Live> {
 
 /// Claude Code, wherever it is.
 ///
-/// The same reasoning as `herdr::herdr_bin`, which records it: a `wsp`
-/// started by herdr's plugin runner inherits whatever `PATH` herdr was launched
-/// with, so the binary is looked up by hand rather than trusted to be on it.
+/// A `wsp` started by a plugin runner inherits whatever `PATH` that runner was
+/// launched with, so the binary is looked up by hand rather than trusted to be on it.
 fn claude_bin() -> PathBuf {
     if let Some(v) = std::env::var_os("CLAUDE_BIN") {
         let p = PathBuf::from(v);
@@ -3052,8 +3048,7 @@ fn claude_bin() -> PathBuf {
 /// clause is why it is allowed to exist at all — the decision of 2026-08-17
 /// forbids a mechanism that only works when a person happens to be looking.
 ///
-/// This machine only. herdr's ids carry an `@machine` suffix and a far agent's
-/// registry is on the far machine, so a seat that is not local has no answer
+/// This machine only. A far agent's registry is on the far machine, so a seat that is not local has no answer
 /// here — [`pick`] gets an empty listing and says nothing, which is the right
 /// answer rather than a wrong one.
 fn listing() -> std::result::Result<Vec<Live>, String> {
@@ -3194,12 +3189,12 @@ mod tests {
     /// name the session channel is addressed by.
     ///
     /// `7a188ba8-…` and `wsp-f3` are the exact pair recorded on robustness-042 as
-    /// underivable from each other — the id herdr reported for that agent, and
+    /// underivable from each other — the id the backend reported for that agent, and
     /// the name a work order actually reached it under after wsp's own delivery
     /// had failed for the fifth time running. They are one row of one documented
     /// listing apart.
     #[test]
-    fn the_session_id_herdr_reports_is_the_key_to_the_name_the_channel_wants() {
+    fn the_session_id_a_backend_reports_is_the_key_to_the_name_the_channel_wants() {
         let live = parse_listing(CAPTURE);
         assert_eq!(live.len(), 4, "{live:?}");
         assert_eq!(
@@ -3217,7 +3212,7 @@ mod tests {
 
     /// The fallback, and the case it must refuse.
     ///
-    /// A seat whose agent herdr cannot see carries a cwd and no session — that
+    /// A seat whose agent the backend cannot see carries a cwd and no session — that
     /// is the whole of robustness-041 — and one live session in that directory is
     /// an exact answer. Two are not, and this repo normally has three: a
     /// first-match rule would hand back a colleague's handle, and a work order
@@ -3265,7 +3260,7 @@ mod tests {
     /// and it wins in exactly the case the lookup cannot answer.
     ///
     /// The seat here is in `/Users/edjames/claude/wsp` with two other agents, and
-    /// its session id is empty — which is robustness-041's blind spot, herdr
+    /// its session id is empty — which is robustness-041's blind spot, a backend
     /// unable to see a live agent without a rendered pane. `pick` has nothing to
     /// go on and correctly refuses. A minted handle is matched against itself
     /// and needs neither.
@@ -3291,9 +3286,9 @@ mod tests {
     /// record for is still addressed, because the handle never needed the record.
     ///
     /// This is robustness-049's deterministic half and the row below is what was
-    /// measured on 2026-08-17: herdr's `agent.list` carries an agent's `name` and
-    /// its session, `pane.list` carries neither, and `Herdr::census` falls back
-    /// to the pane row for exactly the seat whose agent it has lost sight of —
+    /// measured on 2026-08-17: `agent.list` carried an agent's `name` and its
+    /// session, `pane.list` carried neither, and the census fell back to the
+    /// pane row for exactly the seat whose agent it has lost sight of —
     /// which is the seat every failed spawn asks about. So the old reading minted
     /// from an empty name, got a handle that is only the seat, and matched
     /// nothing; `pick` had no session id and a worktree it could not prove was
@@ -3548,7 +3543,7 @@ mod tests {
         let argv = of("claude").args(&sp);
         let n = argv.len();
         assert_eq!(&argv[n - 2..], ["--", "-dash order second line"], "after `--`, on one line");
-        assert!(argv.iter().all(|a| !a.contains('\n')), "herdr refuses a control character in an arg");
+        assert!(argv.iter().all(|a| !a.contains('\n')), "a control character in an arg is refused");
         let bare = of("claude").args(&spawn(false, "wsp-476", &seat));
         assert!(!bare.contains(&"--".to_string()), "no order, no `--`");
         assert!(of("claude").turn_marks_ready() && !of("pi").turn_marks_ready());
@@ -3843,8 +3838,7 @@ mod tests {
     /// denies would be the worst trade in this file. What cannot be asserted
     /// from here is the third and most important one, because it is opencode's
     /// behaviour and not wsp's: that this **merges** with the machine config
-    /// rather than replacing it, so
-    /// `~/.config/opencode/plugins/herdr-agent-state.js` survives. Driven
+    /// rather than replacing it, so the machine's own opencode plugins survive. Driven
     /// instead — see the note in [`config`].
     #[test]
     fn the_brief_arrives_on_the_same_variable_as_the_policy_and_does_not_disturb_it() {
@@ -4196,7 +4190,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
         let argv = of("claude").args(&packet);
         let at = |flag: &str| argv.iter().position(|a| a == flag).unwrap_or_else(|| panic!("no {flag} in {argv:?}"));
         assert_eq!(argv[at("--tools") + 1], "Bash,Read,Edit,Write", "Write, so a new file is not a heredoc");
-        assert!(!argv[at("--system-prompt") + 1].contains('\n'), "herdr refuses control characters in an arg");
+        assert!(!argv[at("--system-prompt") + 1].contains('\n'), "control characters in an arg are refused");
         assert!(argv.contains(&"--disable-slash-commands".to_string()) && argv.contains(&"--strict-mcp-config".to_string()));
         assert!(!argv.contains(&"--disallowedTools".to_string()), "the allowlist replaces the trim");
         assert_eq!(&argv[argv.len() - 2..], ["-n", "t-1-w2J:p1"], "still addressable");
@@ -4554,7 +4548,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
         assert_eq!(mangle("/Users/ed/.local/state"), "-Users-ed--local-state");
     }
 
-    /// A session id arrives from herdr, which got it from the agent, and
+    /// A session id arrives from the backend, which got it from the agent, and
     /// `spawn` is a verb agents drive. One with a path separator in it is not a
     /// session id, and refusing it is cheaper than finding out what it opened.
     #[test]
@@ -4941,7 +4935,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     /// which is the whole of why the fact lives here rather than in the panel.
     /// Claude Code's `/clear` is unchanged from the day it was written; the
     /// opencode spelling is the one render-062 drove, and it carries its own
-    /// wait semantics with it: herdr sees no replacement session until the
+    /// wait semantics with it: the backend sees no replacement session until the
     /// next prompt, so waiting for one would be a stall with nothing at the
     /// end. A kind nobody has measured answers `None`, and a caller that
     /// respects that offers nothing rather than typing a guess at somebody's

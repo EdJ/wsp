@@ -110,7 +110,6 @@ mod starts;
 mod stand_down;
 mod story;
 mod stuck;
-mod sync;
 mod timeline;
 mod wallbuckets;
 mod untaken;

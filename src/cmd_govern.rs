@@ -27,7 +27,7 @@
 //! every time it put work down.
 //!
 //! A workspace, not a pane, because a pane is the most perishable identifier
-//! herdr has — the same argument that keys claims on workspaces. An agent that
+//! a host has — the same argument that keys claims on workspaces. An agent that
 //! is cleared and restarted in place is the same seat with a shorter memory,
 //! and the record should survive that even though the thread does not.
 //!
@@ -138,12 +138,12 @@
 //!
 //! # Testing anything in this file needs `wsp sandbox`
 //!
-//! `WSP_HOME` and `WSP_STATE` isolate the store and **not herdr**, because
-//! herdr is one server per machine: [`rename_seat`] below renames a real
-//! workspace and a real pane whatever store it was pointed at. Measured the
-//! hard way on 2026-08-17 — `wsp govern robustness -w w1` against a temporary
-//! store renamed the live governor's own window. `wsp sandbox` (robustness-013)
-//! is the tool: its own herdr session, its own socket, its own store.
+//! `WSP_HOME` and `WSP_STATE` isolate the store and **not the seats**: a
+//! backend is one per machine, and a verb here that reaches a seat reaches a
+//! real one whatever store it was pointed at. Measured the hard way on
+//! 2026-08-17 — `wsp govern robustness -w w1` against a temporary store
+//! renamed the live governor's own window. `wsp sandbox` (robustness-013) is
+//! the tool: its own seats and its own store.
 //!
 //! # It costs nothing until something is addressed to it
 //!
@@ -423,11 +423,11 @@ pub fn answering_seat(store: &Store, task: &crate::model::Task) -> Option<Seat> 
 /// The first argument is named `stopped` and not `idle`, and robustness-083
 /// renamed it because the two are not the same and the difference was three
 /// silent failures wide. `agent_status == "idle"` is one of the *three* words
-/// herdr has for a pane running no turn — `done` and `blocked` are the others,
+/// a runner had for a pane running no turn — `done` and `blocked` are the others,
 /// and on this machine on 2026-08-19 four of twelve agents were answering
 /// `done`. Every one of them was stopped on live work and reported as busy.
 /// [`crate::place::State::turn_in_flight`] is the reading that answers this
-/// without enumerating herdr's spelling.
+/// without enumerating any runner's spelling.
 pub fn needs_a_person(stopped: bool, doing: bool, seat: bool) -> bool {
     stopped && doing && !seat
 }
@@ -439,7 +439,7 @@ pub fn needs_a_person(stopped: bool, doing: bool, seat: bool) -> bool {
 /// the whole reason this is a function rather than four lines inside the
 /// command. A custodian spawned into a new workspace is the *normal* way a slot
 /// gets filled now, and that caller has no environment of its own to read.
-/// What herdr calls a workspace, and the pane in it, that holds a slot.
+/// What a host calls a workspace, and the pane in it, that holds a slot.
 ///
 /// The sidebar is the other tree a person reads, and until this it described
 /// the seat by the task it had borrowed: measured 2026-08-17 on the live seat,
@@ -461,15 +461,15 @@ pub fn needs_a_person(stopped: bool, doing: bool, seat: bool) -> bool {
 /// the most assigned thing on the panel.*
 ///
 /// One string for every surface — the panel row, the pane and workspace names
-/// herdr shows, `wsp wip`'s column — and each says the **project**, because
+/// a host shows, `wsp wip`'s column — and each says the **project**, because
 /// that is the one fact a slot always knows and the one an agent's own name can
 /// never supply. `seat` is the vocabulary of the record and `slot` of the model;
 /// this is what a person reads.
 ///
 /// No glyph. `▣` is wsp's mark for the position and every surface of wsp's draws
 /// it in its own first column, so a label carrying one too came out as `▣ ▣
-/// governor · wsp` in the census at the foot of the panel. herdr's sidebar has
-/// no mark column and gets the words, which is what it had for a task as well.
+/// governor · wsp` in the census at the foot of the panel. A sidebar with no
+/// mark column gets the words, which is what it had for a task as well.
 pub fn governor_of(project: &str) -> String {
     // The one slot that governs nothing is not called a governor where a
     // person reads it (`wsp-279`); [`is_governor_label`] still protects it.
@@ -519,9 +519,8 @@ impl Verifier {
 /// The pass this room or pane verified in, if it ever verified anything.
 ///
 /// Both ids are asked because a compound seat is its own room and either may be
-/// the one the record is about to carry; a herdr room named with `-w` and no
-/// pane is asked as itself, which a herdr pane id never equals — verifiers are
-/// compound seats, so that gap is one nothing falls through today.
+/// the one the record is about to carry; a room named with `-w` and no pane is
+/// asked as itself — verifiers are compound seats, so that is one id twice.
 pub fn ever_verified(store: &Store, workspace: &str, pane: &str) -> Option<Verifier> {
     let mut tasks = store.tasks();
     tasks.extend(store.archived_tasks());
@@ -583,7 +582,7 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Result
     // `needs_a_person` for its whole life. A pane-exact write here would be the
     // opposite failure: a seat re-taken from a new pane in the same room would
     // leave the old record standing, and two records naming one workspace is a
-    // shape `rename_seat` cannot name and `occupant` cannot resolve.
+    // shape `occupant` cannot resolve.
     if let Some(had) = governs(&store.governors(), &seat_query(workspace, None)).filter(|p| p != project) {
         vacate(store, &had);
     }
@@ -591,9 +590,9 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Result
     // The thread is kept when the room is. An agent re-running `wsp govern`
     // in the seat it already holds — which `wsp resume` does, and which a
     // custodian does by hand after a `/clear` — must not erase the session it
-    // is running under, because the window between wiping it and `sync`
-    // learning it again is a window in which a herdr restart loses the seat
-    // for good. A *different* workspace is a different occupant and starts
+    // is running under, because the window between wiping it and the census
+    // learning it again is a window in which a restart loses the seat for
+    // good. A *different* workspace is a different occupant and starts
     // with nothing recorded, which is the same rule read from the other end.
     let kept = store
         .governors()
@@ -646,7 +645,7 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Result
 /// pane, host — and what is kept is the post, which is the thing another agent
 /// can be put into tomorrow.
 ///
-/// Also what `reconcile --reap` does to a slot whose workspace herdr has
+/// Also what `reconcile --reap` does to a slot whose workspace has
 /// closed: the agent is gone, the position is not.
 ///
 /// **What it drops is the occupancy and what it keeps is the way back.** The
@@ -879,7 +878,7 @@ pub fn learn_seats<'a>(
             let seat = seat_of(&project, governors.get(&project)?)?;
             // The session and the kind are the two fields a change is judged
             // on, and the cwd is not: a cwd that has moved under a session wsp
-            // already knows is herdr answering about a pane whose shell has
+            // already knows is a backend answering about a pane whose shell has
             // `cd`-ed, and the tree the agent was *started* in is the one to
             // bring it back in.
             //
@@ -986,7 +985,7 @@ pub fn tier_of(governors: &BTreeMap<String, Value>, scope: &str) -> (Option<Stri
 /// Put the kind and tier a seat was actually started at on its record.
 ///
 /// **The kind as well, because nothing else writes it on compound.** It was
-/// learned off herdr's census by `learn_seats`, so every compound governor
+/// only ever learned off a census by `learn_seats`, so every compound governor
 /// `wsp-148` reseated on 2026-10-06 — cpd-338, -339 and -340 — went on record
 /// with `kind: ""`, and the next reseat of an opencode seat would have read the
 /// default and moved it onto claude.
@@ -1215,9 +1214,9 @@ pub fn mark_stood_down(store: &Store, scope: &str) -> bool {
 /// slot answered by nobody is a vacancy rather than a stale address.
 ///
 /// **Off `locate_seat` over `local_backends()`, the same fold `wsp tell` and
-/// `wsp answer` make** (`compound-077`, `compound-091`) — not `herdr::panes()`
-/// alone, which is what stopped a `compound`-hosted governor from ever being
-/// found. `backends` is the caller's, not built here: it is a fan-out over
+/// `wsp answer` make** (`compound-077`, `compound-091`) — not one backend's
+/// pane list alone, which is what stopped a `compound`-hosted governor from
+/// ever being found. `backends` is the caller's, not built here: it is a fan-out over
 /// every backend this machine can spawn onto, and a caller that already paid
 /// for one (`wsp answer`'s own `locate_seat`, a loop over several seats) is not
 /// made to pay for it twice.
@@ -1225,10 +1224,10 @@ pub fn mark_stood_down(store: &Store, scope: &str) -> bool {
 /// # The room stood in for the pane, and it no longer can
 ///
 /// Before `compound-092` gave every agent an id of its own, an agent cleared
-/// and restarted in the same herdr window was found by asking who else was
+/// and restarted in the same window was found by asking who else was
 /// standing in that *workspace* — sound with one agent in the room, a guess
 /// with two, and worklist-035 is the night that guess went wrong. That fallback
-/// was herdr's furniture: wsp has had no workspace of its own to ask since
+/// was the old host's furniture: wsp has had no workspace of its own to ask since
 /// `compound-092`, and a `compound` seat has no workspace at all to fall back
 /// to.
 ///
@@ -1263,7 +1262,7 @@ pub fn occupant<'a>(
         }
     }
     // **Then the room, and this is `compound-174`.** A record can name no
-    // pane and still name the seat exactly: a compound seat has no herdr pane
+    // pane and still name the seat exactly: a compound seat has no separate pane
     // behind it, so one id is the room AND the seat in it, and `wsp govern` in
     // one wrote the room and left the pane empty. Looking only at the pane is
     // then looking in a field that is empty by construction, and the answer
@@ -1275,12 +1274,11 @@ pub fn occupant<'a>(
     // field off the struct deliberately; the record's own key is the durable
     // one and every other reader here already goes through it.
     //
-    // **This is a lookup, not a widening.** The match is exact, so a herdr
-    // `workspace` — `w1`, a room — resolves only to a seat literally named
+    // **This is a lookup, not a widening.** The match is exact, so a
+    // `workspace` like `w1`, a room, resolves only to a seat literally named
     // `w1`, and no seat has that name. A room that holds several panes still
     // answers *empty*, which is the despawn guard's hazard arriving by
-    // another road if this ever stops being true;
-    // `a_herdr_room_with_no_pane_is_still_not_guessed_at` holds that line.
+    // another road if this ever stops being true.
     let room = room_of(&store.governors(), &seat.scope);
     if !room.is_empty() && room != seat.pane {
         if let Some((place, row)) = crate::cmd_agent::locate_seat(backends, &room) {
@@ -1485,7 +1483,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     }
 
     let Some(ws) = workspace else {
-        eprintln!("wsp: no workspace — pass -w, or run inside herdr");
+        eprintln!("wsp: no workspace — pass -w, or run it from a seat");
         return 2;
     };
 
@@ -1552,20 +1550,14 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
 ///    sitting in *that* room, stamping it would point the despawn guard at a
 ///    pane in another workspace, and asking with it would ask the wrong
 ///    question. Unchanged by this row.
-/// 2. **herdr's variables are here, so this is a herdr pane.** They are
-///    authoritative and `WSP_SEAT_ID` is ignored entirely — `place_herdr`
-///    records that a stale `WSP_SEAT_ID` inherited from somewhere names a pane
-///    that backend never had, so believing it here would be believing exactly
-///    the value that warns against it.
-/// 3. **No herdr variables at all, which is a compound seat** (`compound-105`,
-///    `compound-174`). `WSP_SEAT_ID` names it, and a compound seat has no
-///    herdr pane behind it, so that one id is the room *and* the seat in it.
-///    Both fields are filled with it.
+/// 2. **A seat, which is a compound seat** (`compound-105`, `compound-174`).
+///    `WSP_SEAT_ID` names it, and a compound seat has no separate pane behind
+///    it, so that one id is the room *and* the seat in it. Both fields are
+///    filled with it.
 ///
-/// Case 3 is what the verb could not do before: it read herdr's environment,
-/// found nothing, and refused with *"no workspace — pass -w, or run inside
-/// herdr"* — advice that is wrong on a compound seat, where there is no herdr
-/// to run inside. With `-w` forced, the record was then written with an empty
+/// Case 2 is what the verb could not do before: it read another host's
+/// environment, found nothing, and refused — advice that was wrong on a
+/// compound seat. With `-w` forced, the record was then written with an empty
 /// pane, which is the delivery half fixed in [`occupant`].
 fn room_and_pane(named: Option<&str>) -> (Option<String>, Option<String>) {
     if let Some(ws) = named {
@@ -1604,7 +1596,7 @@ fn told(args: &Args) -> String {
 /// **post** instead of to a pane somebody had to find first.
 ///
 /// Through [`crate::agent_commands`], because how a sentence reaches an agent
-/// is a fact about the agent's kind and not about herdr. And with no `/clear`
+/// is a fact about the agent's kind and not about its host. And with no `/clear`
 /// in front of it, unlike every hand-over in `panel::verbs`: a work order is
 /// given to an agent that has just finished something else, where this is a
 /// word to one that is in the middle of a night's sequencing. Emptying the
@@ -2056,7 +2048,7 @@ pub(crate) mod tests {
         assert_eq!(seat_for(&g, &index, None, Some("wsp")), None);
     }
 
-    /// A workspace id is herdr's, and herdr's ids are per machine. A seat taken
+    /// A workspace id is a host's, and a host's ids are per machine. A seat taken
     /// on the laptop is not a seat the desktop can reach, and reading it as one
     /// would address every raised hand at a workspace that does not exist here.
     #[test]
@@ -2244,13 +2236,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// The three cases [`room_and_pane`] decides between, and the one that was
-    /// missing before `compound-174` is the third.
-    ///
-    /// The herdr cases are here as guards rather than as novelty: case 1 is
-    /// `-w`, whose refusal to stamp a pane is load-bearing (the despawn guard),
-    /// and case 2 must keep ignoring `WSP_SEAT_ID` even when it is set, because
-    /// a stale one names a pane herdr never had.
+    /// The two cases [`room_and_pane`] decides between, and the one that was
+    /// missing before `compound-174` is the second. Case 1 is `-w`, whose
+    /// refusal to stamp a pane is load-bearing (the despawn guard).
     #[test]
     fn a_governor_records_the_room_it_is_standing_in_on_whichever_backend_that_is() {
         let isolated = util::isolated("room-and-pane");
@@ -2384,9 +2372,8 @@ pub(crate) mod tests {
     }
 
     /// A store of its own — **and the process pointed at it**, which is the half
-    /// that passing a store in does not buy. `take` renames the seat's
-    /// workspace, and that goes through `herdr::panes`, which fans out over
-    /// whatever machines the *ambient* store names. See
+    /// that passing a store in does not buy. Anything that fans out
+    /// over machines reads the ones the *ambient* store names. See
     /// [`crate::util::isolated`].
     fn store(tag: &str) -> (util::Isolated, Store) {
         let env = util::isolated(&format!("govern-{tag}"));

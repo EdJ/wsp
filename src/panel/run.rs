@@ -1302,8 +1302,6 @@ pub(super) fn event_loop(
                     keyboard = false;
                 }
                 Effect::Sync => {
-                    let mut cache = crate::sync::Cache::default();
-                    let _ = crate::sync::sync(store, &mut cache, true);
                     ui.message = Some(("synced".into(), Instant::now()));
                     refetch = true;
                 }
