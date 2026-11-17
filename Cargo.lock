@@ -323,6 +323,9 @@ name = "wsp-store-sqlite"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
+ "wsp-store-conformance",
+ "wsp-store-contract",
 ]
 
 [[package]]
