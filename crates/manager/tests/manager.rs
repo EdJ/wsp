@@ -382,7 +382,6 @@ fn the_hook_command_posts_to_the_manager_which_journals_turn_said_spent_and_did(
     let addr = m.addrs()[0];
     let seat = SeatId("cpd-7".into());
     let epoch = Epoch(3);
-    m.awaiting(seat.clone(), OrderId("ord-1".into()));
     let transcript = dir.join("session.jsonl");
     let dial = Dial::Manager { addr, token_file: dir.join(TOKEN_FILE) };
 
@@ -401,7 +400,9 @@ fn the_hook_command_posts_to_the_manager_which_journals_turn_said_spent_and_did(
     };
     let spent = |tokens, cost_micros| Message::SeatSpent(SeatSpent { seat: seat.clone(), epoch, tokens, cost_micros });
     let want = vec![
-        turn(TurnEdge::Began, Some("ord-1")),
+        // No order was delivered to this seat: its turn names none (the order
+        // id is tests/seats.rs's, through a delivery).
+        turn(TurnEdge::Began, None),
         spent(Tokens { input: 120, output: 40, cache_read: 3000, cache_write: 500 }, first),
         spent(Tokens { input: 130, output: 65, cache_read: 6500, cache_write: 500 }, both),
         Message::SeatSaid(SeatSaid {
