@@ -1,11 +1,11 @@
 # wsp
 
-Workspace and task control plane for [herdr](https://herdr.dev).
+Workspace and task control plane for agent teams.
 
-herdr knows the *live* facts — which pane exists, where it's rooted, whether its
-agent is idle or working. It deliberately knows nothing about *work*. `wsp` owns
-the durable half (hierarchical projects, inherited tags, tasks, notes), joins the
-two, and pushes the join back into herdr's sidebar as metadata tokens.
+The backend knows the *live* facts — which seat exists, where it's rooted, whether
+its agent is idle or working. It deliberately knows nothing about *work*. `wsp` owns
+the durable half (hierarchical projects, inherited tags, tasks, notes) and joins
+the two.
 
 Design rationale and the full spec: `../wsp-spec.md`.
 
@@ -15,7 +15,6 @@ Design rationale and the full spec: `../wsp-spec.md`.
 cargo build --release
 wsp init                       # creates ~/wsp (git) and ~/.local/state/wsp
 wsp install                    # the release build into ~/.local/bin/wsp, and the launchd agent
-herdr plugin link "$PWD/herdr-plugin"
 ```
 
 `wsp install` and not `install -m 755`, even the first time. The copy is only
@@ -52,14 +51,12 @@ launchctl print gui/$(id -u)/com.wsp.daemon
 
 That is a change of dependency, and it is worth saying why the old one was
 dropped rather than kept alongside: `wsp daemon` used to be started by the
-plugin's `[[startup]]`, so a machine without herdr had no daemon at all — and
+plugin's `[[startup]]`, so a machine without backend had no daemon at all — and
 said nothing, because nothing in wsp said *why* the pass had stopped. A
 `[[startup]]` entry in a plugin for a terminal emulator is a load-bearing
 dependency on the emulator being up, which is not a property anybody would
-notice losing. The plugin still carries the entry, as the fallback for a machine
-that has not run `wsp install`: when both try, `daemon`'s one-per-store rule
-turns the second one away by name and pid, which is the whole of
-`herdr-plugin/herdr-plugin.toml`'s remaining job here.
+notice losing. The plugin that carried the entry is gone: `wsp install`'s launchd agent
+is the only thing that starts the daemon.
 
 Four surfaces say so when the daemon is gone rather than when it is stale:
 `wsp doctor`, the heading of `wsp wip`, the **seat line** of a brief and
@@ -67,7 +64,7 @@ Four surfaces say so when the daemon is gone rather than when it is stale:
 line alone — it is re-read on every request of every session, and an ordinary
 agent must still pay nothing for a governor's problem.
 
-Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` and
+Sidebar rows go in `~/.config/backend/config.toml` — see `[ui.sidebar.spaces]` and
 `[ui.sidebar.agents]` there; `$proj`, `$todo`, `$doing`, `$blocked`, `$task` and
 `$scope` are published by the daemon.
 
@@ -588,7 +585,7 @@ are refused.
 
 ## The panel
 
-`wsp panel` is a sidebar that runs in a pane of its own. herdr's own sidebar
+`wsp panel` is a sidebar that runs in a pane of its own. backend's own sidebar
 lists workspaces and hangs agents beneath them; this inverts that — the spine is
 the project tree, tasks hang off projects, and panes hang off whichever they
 belong to: the task they claimed, or failing that the project they are standing
@@ -629,7 +626,7 @@ that went quiet the first time it reloaded would look exactly like one that had
 died.
 
 Install splits with `pane.split` and swaps the new pane into the narrow slot.
-It must never go back to `layout.apply`: herdr rebuilds the whole tree from
+It must never go back to `layout.apply`: backend rebuilds the whole tree from
 that call and every pane in it gets a fresh terminal, which takes down any
 agent running in the workspace.
 
@@ -655,7 +652,7 @@ cannot see, where `H` can only fold what is drawn.
 ### The strip, and the agents view
 
 The top line carries one mark per running agent, and the same marks are the
-first column of the agents view `w` opens. herdr reports two states — working,
+first column of the agents view `w` opens. backend reports two states — working,
 or idle — and `idle` is an answer to a question nobody asked: an agent that has
 stopped is waiting for *something*, and which something decides whether you
 have to get up. The store holds the other half, so the two become four:
@@ -666,7 +663,7 @@ have to get up. The store holds the other half, so the two become four:
 | `?` | stopped, on a task blocked with a question written on it |
 | `●` | running |
 | `○` | spare — stopped and holding nothing at all |
-| `·` | herdr says neither, usually a pane that has not spoken since it started |
+| `·` | backend says neither, usually a pane that has not spoken since it started |
 
 What wants you sorts first and what is free comes next, in both places: there
 is nothing to do about an agent that is working, and sorting the busy ones above
@@ -917,12 +914,12 @@ the zoom is hiding, so what is on the screen and what the keys reach stop being
 the same question. The panel is furniture — installed in every workspace,
 thought about by nobody — and furniture must not hold a workspace in a mode it
 cannot see the state of and whose only undo is a key inside itself. A tab hides
-nothing, herdr's own switcher lists it, and closing it puts you back.
+nothing, backend's own switcher lists it, and closing it puts you back.
 
 The fullscreen panel gets its own detail pane, in its own tab: `↵` splits it
 underneath, the same way the sidebar does. That is why `inspect` splits off *our
 own pane* rather than the pane labelled `wsp` — with two panels in a workspace,
-the label finds whichever herdr lists first, and a detail pane in a tab you are
+the label finds whichever backend lists first, and a detail pane in a tab you are
 not looking at is a `↵` that appears to do nothing.
 
 ## The detail pane
@@ -1008,7 +1005,7 @@ The rules are the few that keep the columns honest:
   you were writing in stays put, and only the ones you asked about move.
 
 Those rules live in `Columns`, apart from any pane, because everything else
-here needs a terminal and a herdr to exercise and that does not. A key press is
+here needs a terminal and a backend to exercise and that does not. A key press is
 a function from one `Columns` to the next; moving panes is the diff between
 them, applied **grow, then re-point, then shrink** — a section moving out of a
 column that is about to close has to reach its new home before the old one goes.
@@ -1017,27 +1014,27 @@ column that is about to close has to reach its new home before the old one goes.
 
 `h` and `l`, or `←` and `→`, focus the pane on that side of the screen — by
 position, not by name, because `h` and `l` mean left and right on the keyboard,
-in vim, and in herdr's own `prefix+h/l`. The side is resolved from herdr's
+in vim, and in backend's own `prefix+h/l`. The side is resolved from backend's
 actual geometry rather than from the layout this code happens to build, so it
 stays true if that changes.
 
-That same geometry is what orders the columns the menu numbers. herdr lists
+That same geometry is what orders the columns the menu numbers. backend lists
 panes in creation order, which stops meaning "left to right" the first time a
 column is closed and another opened — which, with a menu that adds and removes
 them, is immediately. Reading the order back off the layout each time costs one
 call and cannot go stale; remembering it in the context pane would describe a
 column that somebody had since quit by hand.
 
-Moving around more generally is herdr's own: `prefix+h/j/k/l` focuses the pane
+Moving around more generally is backend's own: `prefix+h/j/k/l` focuses the pane
 left/down/up/right, where the prefix is whatever `[keys] prefix` says in
-`~/.config/herdr/config.toml`. There was no reason to reinvent that.
+`~/.config/backend/config.toml`. There was no reason to reinvent that.
 
 #### How a column moves without closing
 
 Each editor pane runs a loop around a *slot file* holding the section it is
 showing: it writes the section, runs the editor, and reads the slot back when
 the editor exits. Unchanged means you quit, and the loop ends, and the shell
-exits, and herdr reaps the pane. Changed means the menu re-pointed the pane
+exits, and backend reaps the pane. Changed means the menu re-pointed the pane
 while you were inside it, and the next turn opens what it now says.
 
 That gives the context pane one gesture for two jobs. To **move** a section,
@@ -1061,7 +1058,7 @@ closes the tab when the count reaches zero — which does not care how many
 columns there are. It arms only once editors have actually been seen, so a
 context pane that paints before they register does not close the tab on the way
 up, and it wants two consecutive empty readings, so a momentary gap in what
-herdr reports is not mistaken for the end.
+backend reports is not mistaken for the end.
 
 `W` in the context pane saves and closes every editor at once. It sends two
 things: an abort — `Ctrl-C` for the vi family, `Ctrl-G` for emacs — and then
@@ -1098,7 +1095,7 @@ section vocabulary rather than a pair of names: a pane holding `decisions` is as
 much an editor as one holding `overview`, and naming them literally is how `q`
 would have walked past one and closed the tab around it.
 
-Closing the tab from herdr while an editor is open **loses that editor's
+Closing the tab from backend while an editor is open **loses that editor's
 changes**: `wsp edit` writes back only after the editor exits. If you had saved,
 the staged file survives under `$TMPDIR/wsp-<id>-<stamp>/`. A tab rather than a split: a task's whole body —
 notes, acceptance criteria, the log — wants width, and a tab gives it without
@@ -1128,7 +1125,7 @@ disturbing a layout you will come back to.
 | | | asks which project, and remembers, if it stands nowhere |
 | `u` | task or agent | take the work back · y/n — either end of the join |
 | `U` | agent | empty its window, keep the work · y/n |
-| `O` | task, project | open a herdr workspace for it, and claim it |
+| `O` | task, project | open a backend workspace for it, and claim it |
 | `S` | task, project | the same, with an agent started in it and told |
 | `x` | flagged task | lower a hand an agent raised — either row |
 | `↵` | flagged task | the card again: what was asked, and by whom |
@@ -1194,7 +1191,7 @@ decoration: the argument parser reads any token beginning with `-` as a flag, so
 the half you reach for more often.
 
 **Inherited tags are shown, and cannot be toggled.** This is the part that
-looked broken before it was: a task under `render` reads `tags rust herdr` in
+looked broken before it was: a task under `render` reads `tags rust backend` in
 `wsp show` and in the detail pane, and owns *neither* — `render` owns nothing
 either, and both come from `wsp`, two levels up. A picker offering only the
 task's own tags drew `rust` as **absent** on a task every other surface says is
@@ -1285,7 +1282,7 @@ today); mid-turn the composer is not a composer yet; `blocked` means a dialog
 holds the keyboard, so the clear would go *to the dialog*; and a governor's
 window is refused because it is the thread the position exists to hold.
 
-Most panes resolve to nothing, and that is not the odd case — herdr reports
+Most panes resolve to nothing, and that is not the odd case — backend reports
 where a pane's *shell* started, which for every agent launched from `~/claude`
 is the directory above every checkout in it. So `f` on a pane it cannot place
 turns the tree into the picker and asks which project it works, and the answer
@@ -1676,7 +1673,7 @@ needs to — the surface you are already looking at is the one to reach.
 
 `wsp panel storyboard [--out page.html]` renders the panel offline: fixtures for
 layout, and flows that push scripted keys through the same reducer the live
-panel runs. No herdr, no store, no terminal — useful for arguing about the
+panel runs. No backend, no store, no terminal — useful for arguing about the
 design before building it. The legend above is generated from the same glyph
 constants and `Style` values the rows draw with, so it cannot drift.
 
@@ -2072,11 +2069,11 @@ collapses them all onto `vst` and only the label separates trance from ein
 from verb. Workspaces whose label is just the folder name are skipped, as are
 ones already claimed and ones pinned `--top`.
 
-Inside a herdr pane, `wsp claim <id>` binds the pane to a task (via
-`$HERDR_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
+Inside a backend pane, `wsp claim <id>` binds the pane to a task (via
+`$WSP_BACKEND_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
 work. `wsp release` unbinds; `pane.exited` does it automatically.
 
-A claim also renames the workspace and the pane after the task. herdr has no
+A claim also renames the workspace and the pane after the task. backend has no
 name of its own for a workspace nobody named — it answers with the agent
 standing in it, or the folder leaf — so three agents in one tree all read as
 `claude`, which is the one thing about them you already knew. It renames over a
@@ -2088,13 +2085,13 @@ name you typed, too, and prints what it overwrote:
   named w0 · was wsp
 ```
 
-That last line is the undo: `herdr workspace rename w0 wsp`.
+That last line is the undo: `backend workspace rename w0 wsp`.
 
 A claim is the only moment it happens, so a pane that took its work up before
-any of this existed keeps whatever herdr called it. `wsp reconcile` backfills —
+any of this existed keeps whatever backend called it. `wsp reconcile` backfills —
 it names every bound pane and its workspace after the task it holds, and picks
 up any claim whose rename was dropped on a slow socket. The daemon runs it at
-startup, so a herdr restart heals the lot.
+startup, so a backend restart heals the lot.
 
 Not in `sync`. That runs every tick, and a name reasserted every tick is a name
 you cannot change by hand; here a name you type survives until the next
@@ -2125,7 +2122,7 @@ a pane holding no task has none to wear, which is itself the difference between
 an agent on a piece of work and an agent between two. The same string goes out
 as the `$scope` token, for a sidebar row that would rather carry it on its own.
 
-A name goes onto the wire cut to 44 characters, and that rule stays: a herdr
+A name goes onto the wire cut to 44 characters, and that rule stays: a backend
 sidebar is 26 columns and draws its own ellipsis, so what the cut is really for
 is not putting a paragraph on the wire as a name. What changed is that the cut
 copy is no longer the *only* copy. Names are built whole and shortened once, at
@@ -2136,13 +2133,13 @@ a pane holding a task is named after the task and the title is in the store; the
 one string with no other home is the sentence from `wsp say`, and that is what
 `said.json` holds, beside the label it was cut to. Beside, because the long copy
 is only used while the pane is still wearing that exact label — a rename by
-anyone, for any reason, falls back to what herdr says, and a short name is a far
+anyone, for any reason, falls back to what backend says, and a short name is a far
 better answer than a long one that disagrees with the sidebar.
 
 The same entry keeps the sentence itself, as the agent typed it and with the
 task it was said about, and `wsp say` writes that before anything is renamed
-(wsp-115). The herdr label is one drawing of the record, applied afterwards and
-only to a pane herdr issued; a seat herdr does not draw — every compound seat —
+(wsp-115). The backend label is one drawing of the record, applied afterwards and
+only to a pane backend issued; a seat backend does not draw — every compound seat —
 is read through `wsp wip`, whose `--json` carries it as `said` for compound's
 pane header. It goes stale when the seat's task changes rather than when the
 pane is renamed, so neither half's writer clears the other's. Keyed by seat and
@@ -2155,7 +2152,7 @@ work, `wsp next` and `wsp brief` say it for it — `looking for work in render`,
 or `nothing actionable in render` when it asked and there was none. The claim is
 what makes an agent visible from outside, and everything before it — reading a
 backlog, writing the overview the task arrived without, deciding — used to leave
-the pane wearing whatever it was called last, which from herdr is
+the pane wearing whatever it was called last, which from backend is
 indistinguishable from an agent that read its instruction and did nothing. State
 first and project second, because the sidebar cuts the right-hand end.
 
@@ -2186,7 +2183,7 @@ wsp brief --json
 ```
 
 ```
-where  meta/tooling/wsp  rust herdr
+where  meta/tooling/wsp  rust backend
 you    t-260815-005  doing  wsp brief: what an agent is handed at session start
 under  t-260815-003  Claude Code lifecycle: agents that keep the store themselves
 open   t-260814-023  blocked   Storyboard: scripted input through the reducer…
@@ -2223,7 +2220,7 @@ A sub-task whose parent is also on the `open` list is left out of it — the
 parent's count already speaks for it, and printing both spends the cap twice on
 one piece of work.
 
-It never fails. An empty store, a herdr that is not answering, a pane belonging
+It never fails. An empty store, a backend that is not answering, a pane belonging
 to no project: each of those is a shorter brief, not an error. A hook that
 errors on a fresh machine is a hook people delete.
 
@@ -2318,18 +2315,18 @@ then. The permission policy has no such second copy, which is why it has to be
 re-delivered: for a month it was not, and a resumed opencode ran under
 opencode's shipped defaults instead of wsp's, doing the same work under a
 different policy with nothing saying so. It is also why a resumed opencode gets
-a *new* room rather than the one it was in — herdr can put an environment into a
+a *new* room rather than the one it was in — backend can put an environment into a
 shell it is creating and into nothing else, so a pane restored across a restart
 has none, and a kind whose brake lives there may only be stood back up in a seat
 wsp opened itself.
 
 That key *merges* with the machine's own config rather than replacing it, which
-is the property the whole scheme rests on: `plugin` still resolves to the herdr
+is the property the whole scheme rests on: `plugin` still resolves to the backend
 state plugin, so state reporting is untouched.
 
 It is deliberately **not** the same predicate as "the order goes in argv", and
 the day those two were one predicate cost a revert. The brief went into a
-`--prompt` element; herdr refuses `agent.start` args holding any control
+`--prompt` element; backend refuses `agent.start` args holding any control
 character, a brief is multi-line, and three spawns of three were refused with
 `invalid_agent_argument` and no agent started. Env is not argv. `codex` and
 `gemini` have no config channel wsp knows, so they still fetch — see
@@ -2467,7 +2464,7 @@ shell, or a run step — which records nothing. It is kept in `spawned.json`, ke
 because a binding is the claim's and goes on `release` while the agent stays,
 and a helper with no row has none; it is reaped on a binding's evidence, and
 `spawn` copies it onto the claim it makes, so `reconcile` and `wsp resume`
-carry it to the seat a herdr restart puts the work in.
+carry it to the seat a backend restart puts the work in.
 
 And it says whom each seat answers to, as `answers_to` (`wsp-247`): the scope
 of the governor the seat hangs under, walked the way the seat's own `wsp ask`
@@ -2491,17 +2488,17 @@ rows whose `answers_to` is its scope.
 And since when each seat has been in its `state`, as `since` (`wsp-250`), an
 RFC 3339 time: the turn's start while it turns, the stop while it is idle or
 blocked, the death once it is gone. Neither backend dates a state change —
-herdr numbers one and compound dates only its seat directory's last write — so
+backend numbers one and compound dates only its seat directory's last write — so
 wsp dates it itself, the first time a census it reads sees the change: every
 `wsp wip` and every tick of the watch, kept in `seat-since.json`. It is "first
 seen", at most one tick late, and on a seat no census has read before it is
 that first reading. A different agent session in the same seat starts its
-clock again. Each entry names the source it was read from — `herdr`,
-`herdr@mb2`, `compound` — and a seat is forgotten only when its own source
+clock again. Each entry names the source it was read from — `backend`,
+`backend@mb2`, `compound` — and a seat is forgotten only when its own source
 answers without it: a far machine that was silent, or not asked because it had
 dropped off, keeps its seats' clocks, so a turn that started two hours before
 the silence still reads two hours after it. Only `wsp wip` forgets, since it
-asks each machine apart; the watch's tick folds every herdr machine into one
+asks each machine apart; the watch's tick folds every backend machine into one
 answer and cannot tell whose went quiet, so it dates changes and drops
 nothing. `held` is a different
 clock — the claim's age — and only a member has one; every seat has a `since`.
@@ -2539,14 +2536,14 @@ code read the code instead. The loop was guess, build for five minutes, install
 into twenty-two panes, ask, wait. `peek` closes it: after installing a change to
 anything a pane draws, look at the pane.
 
-herdr could always answer this — `pane.read` has been there all along. What was
+backend could always answer this — `pane.read` has been there all along. What was
 missing was a way to *name* the pane you mean. Nobody reaches for a capability
 under pressure if reaching for it starts with listing every pane on the machine
 and picking through the JSON, so the target resolves the way everything else in
 wsp resolves: by what you call the thing. No argument is the panel, because that
 is the question nine times in ten.
 
-Under the fork the panel is not a pane. `wsp surface` is a child of herdr drawn
+Under the fork the panel is not a pane. `wsp surface` is a child of backend drawn
 into the sidebar rect, belonging to no workspace, with nothing for `pane.read`
 to read — so it leaves each frame it draws beside the bindings, and `wsp peek
 panel` prints that. Deliberately the frame the host was *handed*, rather than a
@@ -2558,7 +2555,7 @@ old it is, which are the two facts that say whether to trust it. With no surface
 running the panel is a pane again and nothing changes.
 
 Two things it does not do. It shows what is on the pane *now*, not what happened
-when a key was pressed — `herdr pane wait-output` is the tool for that, and it
+when a key was pressed — `backend pane wait-output` is the tool for that, and it
 is a different one. And it cannot press the key: a person still makes the
 gesture, and what changes is that the agent can see the result rather than be
 told it.
@@ -2588,7 +2585,7 @@ the answer better; it cannot be what triggers it.
 So panes are ranked by how close they are: the same tree (one directory inside
 the other), the same checkout (siblings under one project root), the same
 project reached another way, then everywhere else. Only the first two are a
-warning, because only they can overwrite a file you have open. herdr reports
+warning, because only they can overwrite a file you have open. backend reports
 where a pane's *shell* started rather than where its agent is working, which is
 why containment counts and not just equality — an agent launched from `~/claude`
 is working in `~/claude/wsp` soon enough.
@@ -2612,9 +2609,9 @@ chmod +x ~/claude/wsp/claude-code/wsp-session.sh
 ```
 
 Two keys, and the snippet is a snippet rather than a file to copy over the top:
-`settings.json` already holds your model, your theme, your plugins and herdr's
+`settings.json` already holds your model, your theme, your plugins and backend's
 own `SessionStart` entry, and replacing it would take those with it. The wsp
-hook goes *beside* herdr's in the same array — herdr's own file says in its
+hook goes *beside* backend's in the same array — backend's own file says in its
 header that it is overwritten on every update, and it is right to say so.
 
 `SessionStart` runs `wsp brief` and a session's context opens with it. That is
@@ -2635,7 +2632,7 @@ The other five entries — `SessionEnd`, `UserPromptSubmit`, `Stop`,
 `StopFailure`, `PermissionRequest`, `Elicitation` — are how an agent hosted with
 no terminal says what it is doing, and they are what `--headless` above is
 watching. In a session that is not in a wsp seat, which is every session in a
-herdr pane, each costs one `sh` that reads a variable and exits; the guard is
+backend pane, each costs one `sh` that reads a variable and exits; the guard is
 the first line of `wsp-session.sh`. If you already have the older
 `wsp-session.sh start` entry, the snippet's `SessionStart` **replaces** it rather
 than joining it — two entries print the brief twice, and a brief is ~3,300
@@ -2653,11 +2650,11 @@ set), and once the seat's own session has said `SessionEnd` the next one to
 report takes the seat, as does a `SessionStart` whose `source` is `clear`: both
 are what `/clear` looks like. The hook does not also
 skip on `CLAUDE_CODE_CHILD_SESSION`: that marker is only there when something
-set it, so a script calling `claude` directly would pass it by, and under herdr
+set it, so a script calling `claude` directly would pass it by, and under backend
 it can be ambient in every pane, which would silence real seats. As a
 belt-and-braces rule, **a script that starts an agent from inside a seat
-unsets `WSP_SEAT_ID` and `HERDR_PANE_ID`** for it (`env -u WSP_SEAT_ID -u
-HERDR_PANE_ID claude -p …`), and the `CLAUDE_` names `place::shed` lists if the
+unsets `WSP_SEAT_ID` and `WSP_BACKEND_PANE_ID`** for it (`env -u WSP_SEAT_ID -u
+WSP_BACKEND_PANE_ID claude -p …`), and the `CLAUDE_` names `place::shed` lists if the
 child is meant to be a session of its own.
 
 **A dialog can be answered from wsp** (`wsp-301`, from compound-562's spike). The
@@ -2765,8 +2762,8 @@ Code session:
 
 It does nothing without `WSP_SEAT_ID`, and nothing in a pi started by another
 pi's bash tool — `PI_SESSION_ID` in its environment says so, which is why
-`place::shed` keeps that name off a seat wsp starts. It sits beside herdr's
-`herdr-agent-state.ts` and does not touch it; a pane can run both. It sends
+`place::shed` keeps that name off a seat wsp starts. It sits beside backend's
+`backend-agent-state.ts` and does not touch it; a pane can run both. It sends
 pi's session id and not its session file, which `wsp burn` would misread as a
 Claude Code transcript.
 
@@ -3280,7 +3277,7 @@ both surfaces described the task it had borrowed and neither said seat, or
 `robustness`, or `wsp`:
 
 ```
-herdr tokens: scope=robustness/078  taskid=t-260816-078  tstatus=doing
+backend tokens: scope=robustness/078  taskid=t-260816-078  tstatus=doing
 ws label:     robustness/078 · build a design artefact fo…
 ```
 
@@ -3311,7 +3308,7 @@ refusal names the pane and the pass, and leaves `governors.json` as it was.
 
 **It has a place.** The slot draws in the tree directly under the project it
 belongs to, above that project's work, and its occupant is drawn there *instead
-of* under whatever task it borrowed — position is what a tree means. In herdr
+of* under whatever task it borrowed — position is what a tree means. In backend
 the workspace *and the pane* are named after the position rather than after the
 task, and neither a claim nor a release will write over that name: releasing a
 borrowed claim used to leave the panel drawing the governor as `unassigned`,
@@ -3338,7 +3335,7 @@ mid-turn on a decision when a sentence reaches it. A sentence given
 to an agent in the middle of a turn is delivered and queued behind it, so nothing
 about that agent changes and there is nothing for a watch to see: `--tell` prints
 `delivered, no turn seen` and means exactly that. For a day it printed `the wsp
-seat was not told` instead — a herdr status probe's timeout standing in for the
+seat was not told` instead — a backend status probe's timeout standing in for the
 verdict on a message that had already arrived — and the retries that report
 provoked sent one paragraph to that seat three times (worklist-010). Hence also
 the other half: the same sentence to the same pane inside two minutes is read as
@@ -3639,7 +3636,7 @@ is out — no open work *and* nobody holding it — `--for` is a time box, and a
 seat's watch ends when the seat is vacated, which costs nothing.
 
 **What it costs when nothing is happening.** One tick is one store sweep and
-three herdr calls: **45ms** measured on 2026-08-19 against 421 tasks with the
+three backend calls: **45ms** measured on 2026-08-19 against 421 tasks with the
 fleet up, against 20ms for `wsp ls` alone. At the default sixty seconds that is
 under a tenth of a percent of one core, and the reason to say the number rather
 than assume it is that a governor runs this for a night.
@@ -3905,7 +3902,7 @@ not: the mode, whether it holds this minute, and who is building.
 held 150 to 300 MB each, and seventeen of them starved the machine, so `wsp wip`
 (text and `--json`'s `idle_memory`) and `wsp watch --status` carry one line,
 `idle panes: 5 holding 1.1 GB`: the resident memory of every process in each
-idle pane, found by the backend's root pid or, for herdr, by the `HERDR_PANE_ID`
+idle pane, found by the backend's root pid or, for backend, by the `WSP_BACKEND_PANE_ID`
 in the process's environment. Past 2 GB it adds a red line naming the total and
 the three largest panes. The threshold is `{"warn_mb": 4096}` in
 `idle-memory.json` under the state directory, or `WSP_IDLE_MEMORY_MB`, which
@@ -3921,7 +3918,7 @@ nobody at all is `spawn`.
 wsp spawn t-260815-033             # a workspace, rooted where the work lives
 wsp spawn t-260815-033 --agent     # …with an agent started in it and told
 wsp spawn -p wsp --agent           # a project, no task, nothing to tell it
-wsp spawn 033 --agent --kind codex # any agent kind herdr knows
+wsp spawn 033 --agent --kind codex # any agent kind backend knows
 wsp spawn 033 --agent --focus      # …and go there, which it otherwise will not
 ```
 
@@ -3933,7 +3930,7 @@ in it and told what it holds, and whatever you were reading stays in front of
 you; `--focus` is how you ask to be taken there. It read the other way round
 until 2026-08-17 — focus unless `--no-focus` — which is fine for the one you
 typed and wrong for the queue, and the queue is the caller that runs `spawn`
-overnight fifteen times. herdr's own `workspace.create` defaults `focus` to
+overnight fifteen times. backend's own `workspace.create` defaults `focus` to
 false; this was wsp opting in. `--no-focus` still parses and now names the
 default. The pane is unaffected: an agent still gets a tty and a pane, because
 `agent.start` needs one, and the pane was never the complaint.
@@ -3960,7 +3957,7 @@ tree, which is what you would have opened by hand.
 
 The workspace is rooted at the project's root, labelled after the work, and
 carries `WSP_PROJECT` and `WSP_TASK` in its environment — so every pane inside
-it knows what it is for instead of the cwd having to imply it. herdr does not
+it knows what it is for instead of the cwd having to imply it. backend does not
 persist env across a restart, which is why the durable record is the claim; the
 env is exact for the life of the session. A root is **inherited**: `wsp/render`
 and `wsp/data` are two halves of one checkout and neither has a `roots` of its
@@ -4056,7 +4053,7 @@ harness's own names; there is no `--effort`) opens a seat running `wsp attend
    account. A respawn on `claude` is the person's call.
 
 It runs where a backend execs the kind's program — compound (the default) and
-`--headless`. herdr starts only its own catalogue, so `--herdr` is refused before
+`--headless`. backend starts only its own catalogue, so `--backend` is refused before
 a seat is opened. A row that has not opted in, or has no `## Checks`, is refused
 the same way. The harness denies itself `wsp done|land|review|block|release…`,
 `git push|stash` and `cargo fmt`; those are the wrapper's or the person's. The
@@ -4068,7 +4065,7 @@ that is ready rather than one still starting. `attention` must be on the PATH
 ### What "started" means, and what it does not
 
 `spawn` says `open`, `start`, then `tell`, and it says them to a *backend* —
-`src/place.rs` is the port and `src/place_herdr.rs` is herdr behind it. Two
+`src/place.rs` is the port and `src/place_backend.rs` is backend behind it. Two
 waits, and they are different questions: `start` returns when the agent exists,
 and only a state of `idle` in the port's sense means it will listen. What has to
 be retried to get there is the backend's business and is no longer written into
@@ -4076,7 +4073,7 @@ the command.
 
 Which matters because `agent.start` does not wait for the agent. It answers
 immediately with `launch_pending: true` — it has typed `claude` at the shell and
-nothing more — and the wait herdr's own CLI does afterwards is client-side.
+nothing more — and the wait backend's own CLI does afterwards is client-side.
 Three things about that window cost an afternoon between them, all three are
 load-bearing, and all three now live in the adapter:
 
@@ -4084,7 +4081,7 @@ load-bearing, and all three now live in the adapter:
   after `workspace.create` is refused with `agent_pane_busy`, "not an available
   shell". So the launch retries while that is the refusal, and gives up on any
   other.
-- **`idle` does not mean ready.** herdr reports `agent_status: idle` while the
+- **`idle` does not mean ready.** backend reports `agent_status: idle` while the
   agent is still starting, and `agent.prompt` refuses in that window with
   `agent_not_ready`. Waiting for `idle` therefore returned in half a second,
   every time, and the work order went into a pane still drawing its banner.
@@ -4092,13 +4089,13 @@ load-bearing, and all three now live in the adapter:
 - **A shell that is not quite at a prompt eats what is typed at it.** The
   observed failure was ` mclaude`, `command not found`, and a minute of waiting
   for an agent that was never going to exist. So `ctrl-u` and one retype — but
-  only while herdr can see no agent in the pane at all, because typing `claude`
+  only while backend can see no agent in the pane at all, because typing `claude`
   at a Claude Code that is merely still booting leaves the word in its input box
   for somebody to find later.
 
-The sentence goes through the port's `tell` — `agent.prompt` under herdr — rather
+The sentence goes through the port's `tell` — `agent.prompt` under backend — rather
 than being typed into the pane, which is what `c` still does: `c` speaks to
-agents herdr did not start and may not consider ready, and pays for it with two
+agents backend did not start and may not consider ready, and pays for it with two
 writes and a sleep between them. Here the readiness is established, so there is
 nothing to guess at.
 
@@ -4109,7 +4106,7 @@ wsp spawn 033 --agent --headless   # …hosted by a supervisor: no pane, no PTY
 wsp despawn 033 --headless         # end it the same way, on the same backend
 ```
 
-`--headless` places the work on `src/place_super.rs` instead of herdr: wsp forks
+`--headless` places the work on `src/place_super.rs` instead of backend: wsp forks
 the agent itself, hands it a pipe, and learns what it is doing from the hooks it
 fires. Nothing about the command above it changes — same order, same claim, same
 work order — which is the port earning itself.
@@ -4123,7 +4120,7 @@ The reason to want one is that its state is *announced* rather than read off a
 screen. Claude Code fires `SessionStart` when it is up, `UserPromptSubmit` when
 a turn begins, `Stop` when it ends, `SessionEnd` when it goes — measured, one
 run: ready at 870ms, a turn's start seen 45ms after the work order was written,
-and a `SessionEnd` fired 100ms after the agent was killed. Under herdr the same
+and a `SessionEnd` fired 100ms after the agent was killed. Under backend the same
 facts are inferred by matching a regex against the **spinner glyph** in a
 terminal title, from a manifest versioned by hand against Claude Code releases,
 which on 2026-08-17 reported this project's own governor seat as working while it
@@ -4164,7 +4161,7 @@ verb anybody reached for:
 ```sh
 wsp despawn <id>                   # ended the agent, released the claim
 wsp checkout <id> --rm             # removed the worktree
-herdr workspace close <ws>         # closed the workspace the pane left behind
+backend workspace close <ws>         # closed the workspace the pane left behind
 ```
 
 The other two were done by whoever noticed, which is why they were not done —
@@ -4172,8 +4169,8 @@ eighteen worktrees and nineteen workspaces left standing after one overnight
 batch, all found by accident. `wsp checkout --sweep` cannot help, because it only
 removes trees whose task is *finished* and everything here sits at `review` by
 design. Two of the three turn out to be one call: closing the last pane of a
-workspace takes the workspace with it, measured against herdr 0.8.0 and recorded
-in `src/place_herdr.rs`. The third is now part of the verb, and so is a fourth
+workspace takes the workspace with it, measured against backend 0.8.0 and recorded
+in `src/place_backend.rs`. The third is now part of the verb, and so is a fourth
 nobody had counted — a build tree under the state directory is keyed on the
 workspace, so the workspace going leaves it unreachable.
 
@@ -4200,8 +4197,8 @@ the work is for — and an agent idle for ten minutes may be waiting on you.
 `wsp checkout --rm` for a finished tree whose seat is still bound.
 
 The argument in full, including why ending a seat ends the claim rather than only
-the binding, is in `src/place.rs`; under herdr the verb is `pane.close` on the
-seat, and `src/place_herdr.rs` records what was measured to choose it over
+the binding, is in `src/place.rs`; under backend the verb is `pane.close` on the
+seat, and `src/place_backend.rs` records what was measured to choose it over
 `workspace.close`.
 
 ## Machines
@@ -4227,7 +4224,7 @@ machine's wsp back over the same connection.
 
 On the executor, four things, and only two of them are ours:
 
-- `herdr server`, headless, under launchd or systemd so it outlives the ssh
+- `backend server`, headless, under launchd or systemd so it outlives the ssh
   session that started it and comes back after a reboot
 - sshd — and, in the other direction, an ssh *out* to the seat for every wsp
   verb an agent over there runs
@@ -4243,26 +4240,26 @@ those two scripts agree about the shim's contract, and that contract is three
 environment variables that have not changed since it was written.
 
 On the seat, inside the `wsp daemon` you are already running: one ssh per
-machine, holding `-L <local.sock>:<remote herdr.sock>` open. That is the whole
+machine, holding `-L <local.sock>:<remote backend.sock>` open. That is the whole
 of it. No process of ours is long-lived on the executor at all.
 
-### How one wsp talks to two herdrs
+### How one wsp talks to two backends
 
-herdr has no idea another herdr exists. Its socket API is 89 methods and none of
+backend has no idea another backend exists. Its socket API is 89 methods and none of
 them has a host in it: one server is one machine. Two facts make spanning them
 cheap rather than a rewrite.
 
 **The socket is forwarded, not proxied.** `ssh -L` (OpenSSH ≥ 6.7) puts the far
-machine's herdr socket at a path here, and wsp's existing herdr client speaks to
+machine's backend socket at a path here, and wsp's existing backend client speaks to
 it unmodified. There is no second protocol and no re-implementation of those 89
 methods.
 
-**The id is the routing key.** Nearly every herdr method is addressed by a
+**The id is the routing key.** Nearly every backend method is addressed by a
 `pane_id`, a `workspace_id` or a `target`, so a remote pane is `w0:p3@mb2` and
-`herdr::call` splits the `@machine` off to pick the socket — stripping it on the
-way out, because the far herdr has never heard of it. Local ids stay bare, so
+`backend::call` splits the `@machine` off to pick the socket — stripping it on the
+way out, because the far backend has never heard of it. Local ids stay bare, so
 no existing call site, state file or claim changed. `@` and not `:`, because a
-herdr pane id already contains a colon: `w0:p3` is one id, not two.
+backend pane id already contains a colon: `w0:p3` is one id, not two.
 
 The calls that carry no id — `pane.list`, `workspace.list`, `agent.list`,
 `events.subscribe` — fan out across every reachable machine and qualify what
@@ -4321,23 +4318,23 @@ On the far machine:
    and not a DERP relay.
 2. Enable Remote Login (macOS) or sshd (Linux), and authorise the seat's key —
    and the seat's, this machine's.
-3. Install herdr. Then copy `executor/herdr-server.plist` to
-   `~/Library/LaunchAgents/com.herdr.server.plist`, change the four strings its
+3. Install backend. Then copy `executor/backend-server.plist` to
+   `~/Library/LaunchAgents/com.backend.server.plist`, change the four strings its
    header names, and load it into the session you are *not* in:
 
-       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.herdr.server.plist
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.backend.server.plist
 
    `gui/$UID` rather than `system/`, because the login session is where the
    login keychain is and Claude Code authenticated against it.
 4. Copy `executor/wsp` to `~/.local/bin/wsp`. Its three variables come from the
-   plist in step 3, which is where this step went: herdr starts the pane, the
+   plist in step 3, which is where this step went: backend starts the pane, the
    pane starts the agent, and that job's environment is what both inherit.
    `launchctl setenv` does the same for the whole login session, and is one more
    thing to remember after a reboot.
-5. Install Claude Code and sign in. Then `herdr integration install claude`,
+5. Install Claude Code and sign in. Then `backend integration install claude`,
    copy `claude-code/wsp-session.sh` to `~/.claude/hooks/`, and merge
    `claude-code/settings.snippet.json` into the `~/.claude/settings.json` that
-   left behind — beside herdr's own entry, not over it.
+   left behind — beside backend's own entry, not over it.
 
 On the seat:
 
@@ -4361,26 +4358,26 @@ the design had gone wrong somewhere.
 
 ### The three things that bite
 
-**The far herdr socket is an absolute path on the far machine.** `ssh -L` does
+**The far backend socket is an absolute path on the far machine.** `ssh -L` does
 not expand `~` on the remote side, so wsp records the path rather than
 discovering it — asking the machine for its `$HOME` would put a blocking round
 trip, to a machine that may be down, inside the daemon's tick. `wsp machine add`
-writes down this machine's own herdr socket, which is right while the machines
+writes down this machine's own backend socket, which is right while the machines
 mirror each other and is exactly what a Linux box breaks:
 
 ```sh
-wsp machine set mb2 backend_at=/home/ed/.config/herdr/herdr.sock
+wsp machine set mb2 backend_at=/home/ed/.config/backend/backend.sock
 ```
 
-The field is `backend_at` and not `herdr_sock` because a machine record says
+The field is `backend_at` and not `backend_sock` because a machine record says
 where its *backend* listens, in whatever words that backend uses — a socket
-path for herdr, a host and a port for something reached over TCP. wsp carries
-the string and does not read it; the adapter in `src/place_herdr.rs` is the only
+path for backend, a host and a port for something reached over TCP. wsp carries
+the string and does not read it; the adapter in `src/place_backend.rs` is the only
 thing that knows it names a file, and supplies the mirrored default when the
 record leaves it out.
 
-**The shim has to qualify ids.** herdr on the executor numbers its panes from
-zero too, so `HERDR_PANE_ID` over there is `w0:p3` and means a different pane on
+**The shim has to qualify ids.** backend on the executor numbers its panes from
+zero too, so `WSP_BACKEND_PANE_ID` over there is `w0:p3` and means a different pane on
 the seat. `executor/wsp` adds `@$WSP_MACHINE` before handing it across; that is
 what `WSP_MACHINE` is for, and it is why the shim is a file in this repository
 rather than a one-line alias in the README. It also quotes every argument for
@@ -4404,7 +4401,7 @@ nothing on screen to say what it is holding. Open Claude Code by hand once, in
 the directory agents will run in, and answer it. The permission prompts after
 that are what the allow list in `claude-code/settings.snippet.json` is for — and
 when one does come up anyway it is answerable from here, because the pane is in
-the panel like any other: `herdr pane send-keys` over ssh, or `herdr --remote`
+the panel like any other: `backend pane send-keys` over ssh, or `backend --remote`
 for a real client attached to that server.
 
 ### How many agents a machine will bear
@@ -4465,7 +4462,7 @@ Two things it does not do, both worth knowing before the number is trusted:
   worktrees win they are built first. Nothing here assumes an answer: the
   executor is handed a cwd and an agent, and how that tree got there is that
   decision's business. Until it is decided, `wsp spawn --on` still works and
-  still says the wrong thing: the cwd it asks for is a path on the seat, herdr
+  still says the wrong thing: the cwd it asks for is a path on the seat, backend
   opens `$HOME` when that path is not on the far machine, and the line wsp
   prints is the one it asked for rather than the one it got. An agent over
   there today is a shell in a home directory that can reach the store.
@@ -4476,8 +4473,8 @@ Two things it does not do, both worth knowing before the number is trusted:
   Placement is asked, never inferred — auto-placement hides the thing you most
   want to see — and because it is explicit, affinity later changes a default
   rather than a design.
-- **A wsp-shaped TUI on the executor.** `herdr --remote <target>` already
-  attaches a real herdr client to the headless server over ssh, which is the
+- **A wsp-shaped TUI on the executor.** `backend --remote <target>` already
+  attaches a real backend client to the headless server over ssh, which is the
   "see and manage the agents on that machine" this would be for. A second one
   would be a worse copy.
 
@@ -4741,7 +4738,7 @@ touched run again. Otherwise it runs in a **warm tree of wsp's own** (`<state>/c
 moved to the landed commit and left standing so the next build is incremental,
 one check at a time (a lock beside it); not under `.worktrees/`, where
 `checkout --sweep` and the check-tree sweeps would take it. The commands get the
-caller's environment less every `WSP_*` and herdr variable. Steps stop at the
+caller's environment less every `WSP_*` and backend variable. Steps stop at the
 first failure.
 
 The result is one entry under `## Verification` beside the verifiers' — each
@@ -4813,7 +4810,7 @@ the same tip reruns nothing: every step is in the ledger.
 COMMIT] [--keep]` runs the project's `at barrier` steps then its `at end` steps,
 for each repository the list's members landed in, at the trunk tip, in a fresh
 `git worktree add --detach` under `cold/<label>-<n>/` with no `target/`, `WSP_*`
-and `HERDR_*` removed. Every step runs whatever the one before did. The tree is
+and `WSP_BACKEND_*` removed. Every step runs whatever the one before did. The tree is
 removed after unless `--keep`; the log stays at `cold/<label>-<n>.log`. Greens
 are recorded as `cold`, a line goes in the list's `## Log`, and a red is flagged.
 It starts once, detached, as a list closes; a daemon-tick rule also starts it
@@ -4954,7 +4951,7 @@ goes *inside* it, at `target/wsp-verify`, and is removed by the `wsp checkout
 extra to remember. Keyed on the workspace instead, as it was until 2026-08-17,
 it outlived every workspace that named it: 9.6G in 30 trees no agent alive could
 name. `wsp verify --rm --all` clears that residue, and keeps any tree whose
-workspace herdr still reports — silence from herdr removes nothing, the same
+workspace backend still reports — silence from backend removes nothing, the same
 judgement `reconcile --reap` makes. In the trunk, which is still shared, an
 agent still gets a tree of its own under `WSP_STATE`.
 
@@ -5100,20 +5097,20 @@ revert.
 
 `verify` isolates the build. It does nothing for the verbs that *write* —
 `sync`, `reconcile --reap`, `adopt`, `spawn`, the panel's keys — because those
-talk to the one herdr everybody is standing in and the one store everybody's
+talk to the one backend everybody is standing in and the one store everybody's
 claims are in. Testing them live is how an agent ends another agent's claim
 while checking that reaping works.
 
 `wsp sandbox` needs no new mechanism: the three variables wsp has always read,
-and a herdr feature we had not noticed.
+and a backend feature we had not noticed.
 
 ```sh
-herdr --session <name> server
+backend --session <name> server
 ```
 
-brings up a second headless server under `~/.config/herdr/sessions/<name>/`
+brings up a second headless server under `~/.config/backend/sessions/<name>/`
 with its own socket and log, beside the running one and without disturbing it.
-With `WSP_HOME` and `WSP_STATE` that is a complete instance: own herdr, own
+With `WSP_HOME` and `WSP_STATE` that is a complete instance: own backend, own
 store, own state. Proved on 2026-08-16 with four agents in this checkout — a
 session came up in 0.1s, `wsp reconcile --reap` ran against it, and
 `claims.json` and `bindings.json` were byte-identical before and after.
@@ -5135,28 +5132,28 @@ step in testing something puts everyone else's live session downstream of your
 experiment. Remembering to type `target/debug/wsp` is exactly the sort of rule
 that gets followed for a day, so the sandbox holds a `bin/wsp` symlink at
 whichever binary invoked it and puts that directory first on `PATH`. `WSP_BIN`
-is exported at the same binary, which is what `herdr-plugin/run.sh` checks
+is exported at the same binary, which is what the launcher checks
 before `~/.local/bin/wsp`.
 
 **It tears the session down.** A cleanup step at the end of a long piece of work
 is a step that gets abandoned when something more interesting happens — `git
 worktree list` held four stale trees on the day this was written, and an
-abandoned herdr session is a worse version of the same thing, because it is a
+abandoned backend session is a worse version of the same thing, because it is a
 process. `--run` stops and deletes it whatever the command exited with; `ls`
 shows all three states a half-torn-down one can be in — a directory whose
 session is gone, a session whose directory is, and a **process** whose session
 and directory are both gone; and asking for a sandbox that already exists
 replaces it rather than quietly handing back whatever state the last run left.
 
-The herdr it brings up is empty, and manufacturing twenty-two workspaces is not
+The backend it brings up is empty, and manufacturing twenty-two workspaces is not
 something this can do. `--seed` copies the store — projects and tasks, so `ls`,
 `tree`, `show` and the panel have something to draw — and deliberately not the
 machine state, because a claim names a workspace id that exists in nobody's
-herdr but the live one.
+backend but the live one.
 
-#### `--fake`, for the states a herdr cannot be put in
+#### `--fake`, for the states a backend cannot be put in
 
-That residue is the whole argument for the other kind of sandbox. A herdr that
+That residue is the whole argument for the other kind of sandbox. A backend that
 comes up in 0.1s is not slow; what it cannot do is *be in a state you choose*,
 and every expensive bug in this store was a state — an empty pane list reaping
 every binding, a `pane.exited` cascade, a machine that stops answering mid-tick,
@@ -5194,21 +5191,21 @@ and says nothing, and the difference between those two clocks is where
 agent stays idle — the failure a spawn used to report as a success, and one a
 `send_keys` rescues exactly as pressing return by hand did.
 
-**The fake is for wsp's reaction to a state; the herdr sandbox stays the
-contract check against real behaviour.** A fake that is wrong about herdr makes
+**The fake is for wsp's reaction to a state; the backend sandbox stays the
+contract check against real behaviour.** A fake that is wrong about backend makes
 tests green on a lie, silently and for ever, so its replies are *generated* from
 the state through one mapping function rather than hand-written, and everything
-it asserts about herdr was recorded from a live one. Writing it that way caught
+it asserts about backend was recorded from a live one. Writing it that way caught
 two things `place.rs` had wrong on the first run, both since repaired in
-`src/place_herdr.rs`: the port decided an agent was starting from
-`interactive_ready == Some(false)`, which herdr never sends — for 3.3 measured
+`src/place_backend.rs`: the port decided an agent was starting from
+`interactive_ready == Some(false)`, which backend never sends — for 3.3 measured
 seconds it sends the field *absent* with `launch_pending: true` — so the launch
 window read as `idle` and a work order would have gone to a pane still drawing
 its banner; and the claim that a listing cannot carry `interactive_ready` is
 true of `pane.list` and false of `agent.list`, which carries the same record
 `agent.get` does.
 
-#### A sandbox's herdr starts the plugins, and they are global
+#### A sandbox's backend starts the plugins, and they are global
 
 This was got wrong first, and the way it was got wrong is worth more than the
 fix. `plugins.json` is one file for the whole machine, not one per session, and
@@ -5218,7 +5215,7 @@ headless session server **does** load it. The first live run left a daemon holdi
 session's socket and — having been told nothing else — `~/wsp` and
 `~/.local/state/wsp`: a process the sandbox created, writing to the live store,
 outliving the sandbox, reparented to launchd. Compose that with a `sync` that
-reaps every binding when herdr answers with nothing, and running a sandbox ends
+reaps every binding when backend answers with nothing, and running a sandbox ends
 every claim on the machine.
 
 Three things follow, and they are not alternatives:
@@ -5227,18 +5224,18 @@ Three things follow, and they are not alternatives:
   `WSP_BIN` and the shim `PATH` already in its environment, because a server
   hands its own environment to every plugin it starts. A process that inherits
   the socket but not the store is the worst of both.
-- **Teardown reaps what the session started**, not just the session. `herdr
+- **Teardown reaps what the session started**, not just the session. `backend
   session stop` ends the server; its children are reparented and carry on. The
   environment is the only handle — a plugin's daemon has the same command line
-  as the real one — so `HERDR_SESSION=<name>` is what is matched, ancestors of
+  as the real one — so `WSP_BACKEND_SESSION=<name>` is what is matched, ancestors of
   the process doing the reaping excluded.
 - **The daemon refuses a store it was not told about while pointed at a socket
   that is not this machine's**, for the case where the first two are right and
   something starts one anyway. Both halves must be named: `WSP_HOME` alone
   leaves state at `~/.local/state/wsp`, which is where bindings and claims
-  actually live. The socket is what decides and `HERDR_SESSION` deliberately
+  actually live. The socket is what decides and `WSP_BACKEND_SESSION` deliberately
   does not, though it is what the message leads with: the socket path is a fact
-  wsp can observe for itself, while the session name is herdr's own vocabulary —
+  wsp can observe for itself, while the session name is backend's own vocabulary —
   it calls the main session `default`, and a server that one day exported that
   to its startup plugins would have this refuse the real daemon on every
   restart. Given two signals for one question, prefer the one that survives the
@@ -5505,7 +5502,7 @@ anything else refuses the word before opening the store.
 
 Four verbs then answer it properly rather than refusing: `checkout` in all three
 of its branches, `sandbox rm`, `project rm`, and `archive`. `despawn` refuses on
-its merits and says why — ending an agent is a run of steps across herdr, each
+its merits and says why — ending an agent is a run of steps across backend, each
 one decided by the last one's answer, and its own rule is that every step reports
 what it *did* rather than what it attempted. A preview would be a report of what
 it intended, wrong on exactly the runs that matter. `wsp checkout <id> --rm -n`
@@ -5523,7 +5520,7 @@ refused is the only verb here that deletes a record outright. What decides it is
 - **A wildcard or a cascade earns a preview**, because the set it removes is one
   nobody typed and no other verb prints. `wsp verify --rm --all` is the strongest
   case in the whole enumeration: it matches every warm tree nobody is building in,
-  crossed with every build directory under the state directory that no live herdr
+  crossed with every build directory under the state directory that no live backend
   workspace owns — 9.6G in thirty of them once — and the removal itself reports a
   *count*, so `-n` is the only place those paths are ever said out loud. `wsp
   worklist rm` is the cascade: taking the last member of a group drops the group,
@@ -5542,7 +5539,7 @@ refused is the only verb here that deletes a record outright. What decides it is
 the same question the removal keys on — a lock left by a killed build reads as
 held to anything that merely looks at it, and is free to the claim that reclaims
 it. It holds them for as long as it takes to print a line, and removes nothing.
-It also says when herdr did not answer, which the act now does too: silence and
+It also says when backend did not answer, which the act now does too: silence and
 "there is no residue" are the same empty list and very much not the same fact.
 
 `-n` stays refused on the ordinary reading verbs, `wsp ls` included. Not because
@@ -5559,7 +5556,7 @@ arrives first.
 
 A tree each closes the sweeps and does not close everything. Two agents editing
 one file still produce a conflict — a better failure, not no failure. The store
-under `~/wsp`, `~/.local/bin/wsp` and the live herdr are shared by design and
+under `~/wsp`, `~/.local/bin/wsp` and the live backend are shared by design and
 have their own answers above. And an agent standing in the trunk, which is where
 a person reviewing wants to be, is back in the world every rule above describes.
 
@@ -5577,47 +5574,47 @@ fast builds are a feature here, because a session-start hook runs this binary.
 
 ## Notes
 
-- **Status is work state, not process state.** herdr's `idle`/`working` describes
+- **Status is work state, not process state.** backend's `idle`/`working` describes
   the process; `doing`/`blocked`/`review` describes the work. `wsp wip` flags the
   gap between them — process-idle on a `doing` task means a human is the blocker,
   unless the pane holds a seat (`wsp govern`), which is idle between its agents.
 - **The focused panel refreshes at 250 ms; the rest at 30 s.** Both the store
   stat and the two socket calls sit behind that gate, so twenty idle panels do
   no work between refreshes while the one you are looking at feels immediate.
-  Rendering a frame costs 0.33 ms and herdr answers in 0.6–5.6 ms — the lag was
+  Rendering a frame costs 0.33 ms and backend answers in 0.6–5.6 ms — the lag was
   never compute, it was a five-second tick.
 - **Claims outlive panes; bindings do not.** A binding is keyed on a pane id,
-  the most perishable thing herdr has. A claim names the workspace — id, label
-  and cwd, all of which herdr persists — and is cleared only by `release`. A
+  the most perishable thing backend has. A claim names the workspace — id, label
+  and cwd, all of which backend persists — and is cleared only by `release`. A
   pane exiting leaves the claim standing, and `wsp reconcile` rebuilds the
   bindings from claims against whatever is currently open. A *workspace* being
   closed is a decision rather than an accident, and `wsp reconcile --reap` is
   what ends the claims it leaves behind — asked for, never automatic, because a
-  daemon starting while herdr is still restoring a session would read a
-  half-built world as a mass closure. Herdr hands workspace ids out again, so a
+  daemon starting while backend is still restoring a session would read a
+  half-built world as a mass closure. Backend hands workspace ids out again, so a
   claim naming a closed one is not merely stale: it is waiting to attach itself
   to whatever takes the id next — measured 2026-08-19 against 0.8.0 in a
-  sandbox, and the mechanism is that herdr's workspace counter is process-local,
+  sandbox, and the mechanism is that backend's workspace counter is process-local,
   so a restart reserves only one above the highest workspace that survived.
   Every id above that mark comes round again, and with no session file at all
   the first workspace is `w1`. The daemon reaps before its first sync, which is
-  the moment herdr has just decided which ids are free.
+  the moment backend has just decided which ids are free.
   One pane takes one claim there too: two claims naming the same
   workspace used to land on the same pane, and since claims are walked in id
   order the agent came back bound to the *older* task — the one it had left.
 - **A record of a pane carries what was behind it.** `panels.json` is which pane
   holds the panel in each workspace, and nothing swept it: 147 entries on this
-  machine against six live workspaces, not one of them a workspace herdr still
+  machine against six live workspaces, not one of them a workspace backend still
   listed. Rot on its own — but ids come round, so a stale `"w10": "w10:p2"`
   matched a reissued `w10`'s second pane, and `panel install` reported a panel
   in a workspace that had none while the record went on naming a stranger's
-  pane. So the value records herdr's `terminal_id` beside the pane id and the
+  pane. So the value records backend's `terminal_id` beside the pane id and the
   test became *is this still the pane I recorded* rather than *does something
   answer to that id* — rule 1 of `src/arrange.rs`, which is where the argument
   is. A witness missing on either side is believed, since every record written
   before the field has none. The sweep goes with the claims and the seats in
   `wsp reconcile --reap`: the key is a workspace id, and a record destroyed on a
-  daemon tick is a record destroyed while herdr is still restoring a session.
+  daemon tick is a record destroyed while backend is still restoring a session.
   What it never touches is that the panel was adopted on this machine at all —
   that is a field of its own now, because it used to be spelled "the map is not
   empty" and the first sweep would have turned the plugin's auto-install off.
@@ -5661,11 +5658,11 @@ fast builds are a feature here, because a session-start hook runs this binary.
   both read the old map, both insert their key, and the second write drops the
   first. Measured on this machine before the fix, thirty-two concurrent writers
   left **two** records standing; after it, thirty-two. The window is a
-  millisecond wide, which is why it read as "herdr lost my claim" rather than as
+  millisecond wide, which is why it read as "backend lost my claim" rather than as
   a bug. A lock file around the whole read-change-write cycle closes it. It is
   reentrant, so a claim can hold it across the several files it touches, and it
   gives up after two seconds rather than hang — a lost update is recoverable,
-  a `wsp claim` that never returns is not. herdr calls stay outside it: a
+  a `wsp claim` that never returns is not. backend calls stay outside it: a
   socket round-trip is not something other agents should queue behind.
 - **Every escape sequence is consumed whole.** Reading a fixed two bytes after
   `ESC` matches the four arrows and leaves the tail of everything else in the

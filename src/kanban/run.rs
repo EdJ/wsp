@@ -3,7 +3,7 @@
 //! Everything impure: raw mode, the poll, and turning an [`Action`] into a
 //! command. The same bargain [`crate::detail`] makes — no event stream, because
 //! a board is a reader and a second subscriber per workspace would double
-//! herdr's fan-out for a pane that can wait a tenth of a second.
+//! backend's fan-out for a pane that can wait a tenth of a second.
 
 use std::io::{Read, Write};
 use std::sync::mpsc;

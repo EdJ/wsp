@@ -2645,7 +2645,7 @@ pub fn prio(store: &Store, args: &Args) -> i32 {
 ///
 /// The same bargain the panel's `Snapshot` makes. The interesting half of
 /// `next` is a join — which open task is *not* already in another live agent's
-/// hand — and while it read the store and asked herdr inline, checking the
+/// hand — and while it read the store and asked backend inline, checking the
 /// answer meant standing up two agents, binding one of them, and asking the
 /// other. Three idle agents set going at once and all handed the same task is
 /// the failure this filter exists to stop; there was nowhere to write it down.

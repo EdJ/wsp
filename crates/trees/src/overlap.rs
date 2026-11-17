@@ -2,7 +2,7 @@
 //!
 //! Three agents worked `~/claude/wsp` on 2026-08-15 and none of them knew about
 //! the others until one swept another's uncommitted work into its commit. Every
-//! fact needed to have warned all three was already in this binary: herdr knows
+//! fact needed to have warned all three was already in this binary: backend knows
 //! what panes exist and where each is standing, and the store knows who claimed
 //! what. Nothing joined them and said so.
 //!
@@ -63,7 +63,7 @@ impl Relation {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            // "tree" rather than "directory": herdr reports where a pane's
+            // "tree" rather than "directory": backend reports where a pane's
             // *shell* started, which for an agent launched from `~/claude` is
             // the parent of the checkout it is actually working in. That
             // containment is the whole reason this fires at all, so the word
@@ -82,14 +82,14 @@ impl Relation {
 #[derive(Debug, Clone)]
 pub struct Standing {
     pub pane: String,
-    /// The workspace label rather than its id — the id is herdr's business and
+    /// The workspace label rather than its id — the id is backend's business and
     /// the label is what a person recognises.
     pub workspace: String,
     pub cwd: String,
     /// Whether anyone is driving it. A shell counts: a person at one can
     /// clobber a file as thoroughly as an agent can.
     pub agent: bool,
-    /// herdr's `idle`/`working`, empty for a shell.
+    /// backend's `idle`/`working`, empty for a shell.
     pub state: String,
     /// The terminal's own title, which is all a pane holding no task can say
     /// about itself.
@@ -129,7 +129,7 @@ impl Standing {
     /// one definition of it rather than each of them keeping its own.
     ///
     /// It said `state == "idle"` until robustness-083, which is one of the
-    /// three words herdr has for a pane with nothing running in it. The two it
+    /// three words backend has for a pane with nothing running in it. The two it
     /// missed are the two nobody is watching for: `done`, which is what an
     /// agent that finished a turn in an unfocused workspace reports, and
     /// `blocked`, which is a permission prompt. Both read as busy, and this is
@@ -160,7 +160,7 @@ impl Standing {
 }
 
 /// A pane someone is standing in: the fields the reckoning reads. It was
-/// herdr's pane record; herdr is gone (wsp-120), and nothing fills it live.
+/// backend's pane record; backend is gone (wsp-120), and nothing fills it live.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Pane {
     pub pane_id: String,
@@ -180,7 +180,7 @@ pub struct Workspace {
 }
 
 /// Everything the reckoning reads, taken in rather than fetched — so a test can
-/// stand six panes in a fabricated tree with no herdr and no store, the same
+/// stand six panes in a fabricated tree with no backend and no store, the same
 /// bargain [`crate::panel`] makes with its `Snapshot`.
 pub struct World {
     pub panes: Vec<Pane>,
@@ -196,8 +196,8 @@ pub struct World {
 }
 
 impl World {
-    /// The live join: the store for who holds what. The panes came from herdr
-    /// alone, and herdr is gone (wsp-120), so no pane is live here.
+    /// The live join: the store for who holds what. The panes came from backend
+    /// alone, and backend is gone (wsp-120), so no pane is live here.
     pub fn live(store: &Store) -> World {
         World {
             panes: Vec::new(),
@@ -259,9 +259,9 @@ fn same_tree(a: &str, b: &str) -> bool {
 
 /// Everyone else standing anywhere, nearest first.
 ///
-/// `my_cwd` overrides what herdr believes about the asking pane, because a
+/// `my_cwd` overrides what backend believes about the asking pane, because a
 /// process knows its own directory better than the pane it is running in does —
-/// herdr reports the shell's cwd, which is stale the moment anyone `cd`s.
+/// backend reports the shell's cwd, which is stale the moment anyone `cd`s.
 pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standing> {
     let label_of = |ws: &str| {
         w.workspaces.iter().find(|x| x.id == ws).map(|x| x.label.clone()).unwrap_or_default()
@@ -293,7 +293,7 @@ pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standin
         .project
     };
 
-    // Where the asking pane is standing. A pane herdr has never heard of still
+    // Where the asking pane is standing. A pane backend has never heard of still
     // gets an answer, since `wsp overlap` is worth running from a bare shell.
     let mine = w.panes.iter().find(|p| p.pane_id == me);
     let my_cwd = my_cwd
@@ -435,7 +435,7 @@ mod tests {
     fn siblings_under_one_root_share_a_checkout() {
         let w = world(vec![
             pane("a", "w1", "/home/ed/claude/wsp/src"),
-            pane("b", "w2", "/home/ed/claude/wsp/herdr-plugin"),
+            pane("b", "w2", "/home/ed/claude/wsp/plugin"),
         ]);
         let out = standing_beside(&w, "a", None);
         assert_eq!(out[0].relation, Relation::SameRoot);
@@ -533,10 +533,10 @@ mod tests {
         assert!(standing_beside(&w, "me", None).is_empty());
     }
 
-    /// A process knows its own directory; herdr only knows where the pane's
+    /// A process knows its own directory; backend only knows where the pane's
     /// shell started.
     #[test]
-    fn the_callers_cwd_wins_over_herdrs() {
+    fn the_callers_cwd_wins_over_backends() {
         let w = world(vec![
             pane("me", "w0", "/home/ed/somewhere/stale"),
             pane("b", "w2", "/home/ed/claude/wsp"),
@@ -547,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_herdr_has_never_heard_of_still_gets_an_answer() {
+    fn a_pane_backend_has_never_heard_of_still_gets_an_answer() {
         let w = world(vec![pane("b", "w2", "/home/ed/claude/wsp")]);
         let out = standing_beside(&w, "not-a-pane", Some("/home/ed/claude/wsp"));
         assert_eq!(out.len(), 1);

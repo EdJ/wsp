@@ -1,6 +1,6 @@
 //! The pane: the terminal it runs in, and the loop that keeps it honest.
 //!
-//! Everything impure lives here. Raw mode, the input thread, herdr's event
+//! Everything impure lives here. Raw mode, the input thread, backend's event
 //! stream, the tick, and the loop that turns an [`Effect`] into something that
 //! actually happens.
 
@@ -97,10 +97,10 @@ pub(crate) fn term_size() -> (usize, usize) {
     (26, 40)
 }
 
-/// Where the panel is drawn, and what herdr can tell us about it.
+/// Where the panel is drawn, and what backend can tell us about it.
 ///
 /// The panel used to *be* a pane: it measured `/dev/tty`, painted escapes onto
-/// it, and asked herdr which pane had the keyboard. herdr's sidebar is the
+/// it, and asked backend which pane had the keyboard. backend's sidebar is the
 /// first place it is drawn that is none of those things — no tty, no pane id,
 /// no workspace — and this is the whole of the difference, held in three
 /// methods so that [`event_loop`] does not know which one it is driving.
@@ -123,19 +123,19 @@ pub(super) trait Screen {
     /// whether the keyboard is here, which decides what a click means, and
     /// whether this is on screen, which decides the cadence.
     ///
-    /// Answered from herdr's census for a pane, because a pane has to ask. A
+    /// Answered from backend's census for a pane, because a pane has to ask. A
     /// surface drawn as chrome does not: it is always on screen, and whether it
     /// has the keyboard is something its host says outright.
     fn focus(&self, live: &live::Live, me: Option<&str>, ws: Option<&str>) -> (bool, bool) {
         (live.has_keyboard(me), live.on_screen(ws))
     }
 
-    /// What herdr is running, for the frame about to be built.
+    /// What backend is running, for the frame about to be built.
     ///
-    /// A pane asks, because a pane is a tenant of herdr and has no other way to
+    /// A pane asks, because a pane is a tenant of backend and has no other way to
     /// know: two socket round-trips, every time the loop decides the picture
-    /// might have moved. A surface does not have to. Its host **is** herdr, and
-    /// herdr knows the instant an agent changes what it is doing, because it is
+    /// might have moved. A surface does not have to. Its host **is** backend, and
+    /// backend knows the instant an agent changes what it is doing, because it is
     /// the thing that noticed — so it pushes the answer down the pipe the
     /// surface is already on and this returns what it was told. See
     /// `super::surface`.
@@ -153,7 +153,7 @@ pub(super) trait Screen {
     /// The one thing a panel can ask its host for, and deliberately the only
     /// one. A panel has three reasons to want more room than a sidebar has —
     /// the whole tree, a task written up, a board — and if each of them were a
-    /// verb on the wire, each would be a herdr release standing between wsp and
+    /// verb on the wire, each would be a backend release standing between wsp and
     /// a change to its own surface. So the host is told a number of columns and
     /// never what is going in them, and the next caller is one line here rather
     /// than a message on both sides.
@@ -176,7 +176,7 @@ pub(super) trait Screen {
     /// `false` is a host that cannot be asked — a tty panel, which is its
     /// pane's size and has nothing to negotiate with, and any host too old to
     /// have said it takes widths. A caller that gets it falls back to whatever
-    /// it did before, which is what keeps this shippable against a herdr that
+    /// it did before, which is what keeps this shippable against a backend that
     /// has not been rebuilt: see [`super::verbs::open_full`].
     fn ask_width(&mut self, _cols: usize) -> bool {
         false
@@ -198,7 +198,7 @@ pub(super) trait Screen {
     }
 }
 
-/// The panel in a herdr pane: a tty it measures, and escapes painted onto it.
+/// The panel in a backend pane: a tty it measures, and escapes painted onto it.
 ///
 /// `last` is the frame already on screen. A panel redraws on every tick and
 /// most ticks change nothing, so the comparison is what keeps a quiet panel
@@ -258,11 +258,11 @@ pub(super) fn spawn_input(tx: Sender<Msg>) {
     });
 }
 
-/// Subscribe to herdr's event stream, and mark the panel dirty on what comes
+/// Subscribe to backend's event stream, and mark the panel dirty on what comes
 /// out of it.
 ///
 /// This is how a panel in a *pane* learns that something moved: it is a tenant
-/// of herdr with no other way to know. A surface has one — its host is herdr,
+/// of backend with no other way to know. A surface has one — its host is backend,
 /// and pushes the answer outright — so it starts this only for a host that
 /// turns out not to. See [`super::surface`].
 pub(super) fn spawn_events(_tx: Sender<Msg>) {}
@@ -318,17 +318,17 @@ fn tell(t: Tell, ui: &mut Ui, tx: &Sender<Msg>) {
 /// The pane a panel *is*, and the workspace it is in.
 ///
 /// A panel in a pane has both, and reads them where every wsp process reads
-/// them: the environment herdr sets on the pane's shell. A surface has
-/// neither — it is a child of herdr drawing chrome that belongs to no
+/// them: the environment backend sets on the pane's shell. A surface has
+/// neither — it is a child of backend drawing chrome that belongs to no
 /// workspace — and **it has to say so rather than find out**, which is the
 /// only reason this is a type and not two arguments read from the environment
 /// at the top of the loop.
 ///
 /// The failure it is against is specific and is the way this fork is built:
-/// herdr passes its own environment to the surface it spawns, and a herdr
-/// started from a terminal inside another herdr — which is how the fork is
-/// developed, and how it is installed — hands its sidebar a `HERDR_PANE_ID`
-/// and a `HERDR_WORKSPACE_ID` belonging to whichever pane it was launched
+/// backend passes its own environment to the surface it spawns, and a backend
+/// started from a terminal inside another backend — which is how the fork is
+/// developed, and how it is installed — hands its sidebar a `WSP_BACKEND_PANE_ID`
+/// and a `WSP_BACKEND_WORKSPACE_ID` belonging to whichever pane it was launched
 /// from. A surface that read those would split its detail pane into another
 /// workspace, take that pane's focus on every key that creates something, and
 /// close a view somebody else was reading.
@@ -367,7 +367,7 @@ pub(super) enum Outcome {
 /// with it. See [`super::keys::View::full`].
 pub fn run(store: &Store, full: bool) -> i32 {
     if true {
-        eprintln!("wsp: no herdr socket");
+        eprintln!("wsp: no backend socket");
         return 1;
     }
     let here = Where::env();
@@ -504,7 +504,7 @@ fn land_wish(ui: &mut Ui, snap: &Snapshot, view: &mut View, want: &mut Cursor) -
 /// paying: `expand` generalised for free — a third caller is the same call with
 /// a third number — and *what is drawn in the room* did not, because that never
 /// crosses the wire and is this process's alone. Two variants is the whole of
-/// the cost, and it is the right cost: herdr is told a number of columns and
+/// the cost, and it is the right cost: backend is told a number of columns and
 /// learns nothing about which of these is in them.
 ///
 /// One at a time, deliberately. There is one pane, and a page replaces the tree
@@ -576,7 +576,7 @@ impl TaskPage {
 /// The third caller of [`expand`] and the one that shows what the seam is for.
 /// `Z` asks for [`super::render::PAGE_MIN`] and the *same* rows get more room;
 /// this asks for [`super::render::WHOLE_SCREEN`] and draws something else
-/// entirely — and the difference between those two costs herdr nothing at all,
+/// entirely — and the difference between those two costs backend nothing at all,
 /// because the wire carries a number of columns and never a reason for wanting
 /// them.
 ///
@@ -909,7 +909,7 @@ pub(super) fn event_loop(
     // Open on what the last panel was showing rather than on a default tree.
     // A panel installed in every workspace is one panel as far as anyone using
     // it is concerned, and it should not lose the folds and the cursor every
-    // time herdr swaps which of them is on screen.
+    // time backend swaps which of them is on screen.
     // What we last wrote or took. Held so a key that changes nothing durable —
     // most of them — costs no write, and so a panel never adopts its own state
     // back on top of itself.
@@ -921,7 +921,7 @@ pub(super) fn event_loop(
     // Who we are, for taking focus when the mouse says the reader is here, and
     // for knowing whether it was already here when they clicked. Both come off
     // the [`Where`] the caller handed in rather than out of the environment,
-    // because a surface's environment is herdr's and says nothing true about
+    // because a surface's environment is backend's and says nothing true about
     // where the surface is.
     let (self_ws, me) = (here.ws(), here.pane());
     let live = screen.live();
@@ -963,9 +963,9 @@ pub(super) fn event_loop(
     // which ones there are.
     let mut last_flags = store.attention_stamp();
     // The status the frame in front of the reader was drawn with, and when we
-    // last asked herdr whether it still holds. See [`STATUS_POLL`].
+    // last asked backend whether it still holds. See [`STATUS_POLL`].
     let mut drawn_status: HashMap<String, String> = HashMap::new();
-    // Messages taken off the channel while coalescing a burst of herdr events,
+    // Messages taken off the channel while coalescing a burst of backend events,
     // to be handled in the order they arrived rather than thrown away.
     let mut carry: std::collections::VecDeque<Msg> = Default::default();
 
@@ -1167,7 +1167,7 @@ pub(super) fn event_loop(
                 // A host that cannot be asked still splits it, because a `↵`
                 // that did nothing at all would be worse than one that costs a
                 // pane — that is the fallback, and it is the whole of what a
-                // tty panel and an older herdr still do.
+                // tty panel and an older backend still do.
                 Effect::Inspect(focus) => {
                     // Built before it is asked for, so that the number asked
                     // for is the page's own and is named in one place. On a
@@ -1211,7 +1211,7 @@ pub(super) fn event_loop(
                 // the ask. What is different is the number — a board has no
                 // width that is enough, so it takes what the host has; see
                 // [`super::render::WHOLE_SCREEN`] — and what is drawn in the
-                // room, which herdr is never told. A host that cannot be asked
+                // room, which backend is never told. A host that cannot be asked
                 // opens the tab it always opened.
                 Effect::Board { scope, label } => {
                     // Built now rather than on the next refetch: this is a
@@ -1305,15 +1305,15 @@ pub(super) fn event_loop(
                     });
                 }
                 Effect::Tell(t) => tell(t, &mut ui, tx),
-                // The menu's two herdr rows. Straight down the socket, where
+                // The menu's two backend rows. Straight down the socket, where
                 // every other doing effect runs the CLI: there is no `wsp` for
                 // either of these and there should not be one, because neither
                 // touches the store — see [`Chore`].
                 //
-                // `Quit` is answered before it is reported: herdr goes, and a
+                // `Quit` is answered before it is reported: backend goes, and a
                 // surface's next read of stdin ends. The word is said anyway,
-                // for the panel in a pane whose herdr is somebody else's.
-                Effect::Herdr(_) => say(&mut ui, "herdr: no herdr socket"),
+                // for the panel in a pane whose backend is somebody else's.
+                Effect::Backend(_) => say(&mut ui, "backend: no backend socket"),
                 Effect::Run { argv, escalate, then } => {
                     match (run_wsp(&argv), escalate) {
                         (Ok(m), _) => {
@@ -1328,7 +1328,7 @@ pub(super) fn event_loop(
                                     view.land_on = Some(id.clone());
                                     say(&mut ui, format!("{id} added · E to write it up"));
                                     // …and take the keyboard, because that
-                                    // sentence names a key. herdr's focus moves
+                                    // sentence names a key. backend's focus moves
                                     // on its own — a `workspace.focused` for
                                     // every sidebar hover, an agent coming back
                                     // in another workspace — so the pane that
@@ -1342,7 +1342,7 @@ pub(super) fn event_loop(
                                     // is a statement about where you are
                                     // working. `took_focus` moves with it so a
                                     // click landing straight after does not ask
-                                    // herdr twice.
+                                    // backend twice.
                                     took_focus = Instant::now();
                                     focus_self(me, self_ws);
                                     keyboard = true;
@@ -1457,7 +1457,7 @@ pub(super) fn event_loop(
             }
             let live = screen.live();
             // Free: the panes were fetched for the frame either way, and this is
-            // the same reading herdr answers "who has the keyboard" and "which
+            // the same reading backend answers "who has the keyboard" and "which
             // workspace is on screen" out of. Both are read here rather than off
             // the frame, because a frame is what a renderer draws and neither of
             // these is ever drawn.
@@ -1472,7 +1472,7 @@ pub(super) fn event_loop(
             self_focused = on_screen;
             let snap = Snapshot::live(store, live.panes);
             // Likewise free, and it has to be taken from the same list the frame
-            // is drawn from: the poll asks whether herdr has moved on from what
+            // is drawn from: the poll asks whether backend has moved on from what
             // the reader is looking at, so what the reader is looking at is what
             // it must be compared against.
             drawn_status.clear();
@@ -1622,7 +1622,7 @@ mod tests {
     #[test]
     fn a_flag_is_read_on_every_tick_rather_than_on_the_cadence() {
         // The newline matters: `Msg::Tick => {}` appears first, in the drain
-        // that coalesces a burst of herdr events, and splitting on the bare
+        // that coalesces a burst of backend events, and splitting on the bare
         // prefix would land in that one — which reads no flags and would fail
         // this test for a reason that has nothing to do with it.
         let tick = SRC
@@ -1749,10 +1749,10 @@ mod tests {
     /// `↵` must never become a key that does nothing.
     ///
     /// The page is what a host that answers gives you; a tty panel and any
-    /// herdr from before widths existed cannot be asked, and there the detail
+    /// backend from before widths existed cannot be asked, and there the detail
     /// still has to appear somewhere — which is the pane this task exists to
     /// stop renting. Keeping both is what makes the wsp half shippable against
-    /// a herdr nobody has rebuilt, and losing the second one is a change that
+    /// a backend nobody has rebuilt, and losing the second one is a change that
     /// works perfectly for whoever makes it.
     ///
     /// Read out of the source because no fixture drives this loop; the honest
@@ -1768,7 +1768,7 @@ mod tests {
         assert!(arm.contains("if expand("), "`↵` no longer asks for the room at all");
         assert!(
             arm.contains("inspect(store"),
-            "the fallback went: on a tty panel and on an older herdr `↵` now does nothing",
+            "the fallback went: on a tty panel and on an older backend `↵` now does nothing",
         );
     }
 

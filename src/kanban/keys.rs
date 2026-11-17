@@ -1,7 +1,7 @@
 //! What a key does to the board.
 //!
 //! Pure, like [`crate::panel::apply_key`] and for the same reason: state in, an
-//! [`Action`] out, nothing that touches a terminal or herdr. A test can walk
+//! [`Action`] out, nothing that touches a terminal or backend. A test can walk
 //! the cursor across four columns and watch what a verb would be aimed at,
 //! without a store or a pane anywhere.
 

@@ -3238,14 +3238,14 @@ impl Seats for Absent {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// **A seat on a herdr pane, read by the real fleet** (`wsp-148`, live on
-    /// 2026-10-06). herdr is out of the picture, and while the fleet still asked
+    /// **A seat on a backend pane, read by the real fleet** (`wsp-148`, live on
+    /// 2026-10-06). backend is out of the picture, and while the fleet still asked
     /// it, its `Unreachable` made every such seat `Unreadable` — so compound,
     /// jolt-app and wsp sat dead with nothing coming to fill them. Compound has
     /// no record of the pane, which is a fact, and the seat reads `gone`.
     #[test]
-    fn a_seat_on_a_herdr_pane_reads_gone_to_the_real_fleet() {
-        let (_env, store) = in_flight("seat-herdr-pane");
+    fn a_seat_on_a_backend_pane_reads_gone_to_the_real_fleet() {
+        let (_env, store) = in_flight("seat-backend-pane");
         store.set_governor(
             "run",
             serde_json::json!({
@@ -3478,7 +3478,7 @@ fn the_primary_seat_is_never_reseated_by_the_daemon_however_much_is_held_for_it(
 
 /// **A stand-down survives `reconcile`, which vacates the same record.** Without
 /// this the decision lasts until the next dead pane, which on this machine is
-/// not long: `vacate` is what the reaper calls on a slot whose workspace herdr
+/// not long: `vacate` is what the reaper calls on a slot whose workspace backend
 /// has closed, so any unrelated project losing its governor would have quietly
 /// unseated every stood-down scope in the store on the same pass.
 #[test]

@@ -11,9 +11,9 @@
 //! # Driven by the verbs, not by a daemon
 //!
 //! The wake path in [`crate::wake`] already existed and had been dead for three
-//! days when this row was written: its only launcher was herdr's `[[startup]]`,
+//! days when this row was written: its only launcher was backend's `[[startup]]`,
 //! and the fleet had moved to compound. Ed's answer to "how does the daemon
-//! run without herdr" was the better question — *do we need one?* — and the
+//! run without backend" was the better question — *do we need one?* — and the
 //! answer is no. Every event a run advances on is a wsp verb run in some
 //! agent's own process: a member's `review` and `land`, a verifier's
 //! `verified`, the barrier agent's `go` or `hold`. So the verb is
@@ -316,17 +316,17 @@ pub(crate) trait Seats {
 /// database overruling a screen that has stopped repainting. `wsp-160`.
 ///
 /// **A backend that is not running here is not asked** (`wsp-148`, live on
-/// 2026-10-06). herdr is out of the picture (Ed, 2026-10-06), and while the
+/// 2026-10-06). backend is out of the picture (Ed, 2026-10-06), and while the
 /// fleet still asked it, its `Unreachable` with no server was read as "cannot
-/// say" — so every dead governor seat was `Unreadable` for as long as herdr
+/// say" — so every dead governor seat was `Unreadable` for as long as backend
 /// stayed down, which is always now, and the reconciler refilled none of them:
-/// compound, jolt-app and wsp. herdr owns its panes, so no server here means no
-/// herdr pane here to be in, and a seat recorded on one is a seat compound has
+/// compound, jolt-app and wsp. backend owns its panes, so no server here means no
+/// backend pane here to be in, and a seat recorded on one is a seat compound has
 /// no record of: nobody is in it, and a reseat fills it on compound. Only a
-/// bare id — one qualified `@machine` is that machine's herdr's to answer.
+/// bare id — one qualified `@machine` is that machine's backend's to answer.
 ///
-/// [`crate::herdr::available_now`] rather than the cached answer, because the
-/// daemon lives for days: a cache latched `false` would go on skipping herdr
+/// [`crate::backend::available_now`] rather than the cached answer, because the
+/// daemon lives for days: a cache latched `false` would go on skipping backend
 /// after it came back, and skipping is the direction that seats a successor
 /// beside a live pane. One connect, once a minute, per seat asked about.
 ///
@@ -460,8 +460,8 @@ fn launch(store: &Store, argv: &[&str]) {
         // Nobody's pane: a spawn started from here must not read itself as
         // the agent whose verb triggered it.
         .env_remove(crate::base::seat::SEAT_ENV)
-        .env_remove("HERDR_PANE_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
+        .env_remove("WSP_BACKEND_PANE_ID")
+        .env_remove("WSP_BACKEND_WORKSPACE_ID")
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err)

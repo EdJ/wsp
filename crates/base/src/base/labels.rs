@@ -1,16 +1,16 @@
-//! The labels herdr carries on the panes wsp installs.
+//! The labels backend carries on the panes wsp installs.
 
-/// herdr's label on the panes we install. Ours are furniture and never appear
+/// backend's label on the panes we install. Ours are furniture and never appear
 /// in the tree as work.
 pub const PANEL_LABEL: &str = "wsp";
 
-/// The label herdr carries on a detail pane, so we can find ours again.
+/// The label backend carries on a detail pane, so we can find ours again.
 pub const VIEW_LABEL: &str = "wsp:view";
 
 /// And on the panel `Z` opens in a tab of its own — the whole tree, at the
 /// width of the workspace.
 ///
-/// A tab rather than herdr's `pane.zoom`, which is what this started as and had
+/// A tab rather than backend's `pane.zoom`, which is what this started as and had
 /// to stop being. Ed lost a panel to it: `Z`, then a switch to another agent,
 /// and the pane never came back — "without being recoverable".
 ///
@@ -23,7 +23,7 @@ pub const VIEW_LABEL: &str = "wsp:view";
 /// holding a workspace in a mode it cannot see the state of, whose only undo is
 /// a key inside itself.
 ///
-/// A tab hides nothing, herdr's own switcher lists it, and closing it puts you
+/// A tab hides nothing, backend's own switcher lists it, and closing it puts you
 /// back where you were.
 pub const FULL_LABEL: &str = "wsp:full";
 

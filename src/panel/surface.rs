@@ -74,7 +74,7 @@ pub(crate) fn last_frame(state: &Path) -> Option<Frame> {
 
 /// Run the panel against a host on stdin and stdout.
 pub fn run(_store: &Store) -> i32 {
-    eprintln!("wsp: no herdr socket");
+    eprintln!("wsp: no backend socket");
     1
 }
 

@@ -104,7 +104,7 @@ impl Ctx {
     /// section in.
     ///
     /// The panes are taken as an argument for a sharper reason. A pane asks
-    /// herdr for them over a socket; a *surface* is told what herdr is running
+    /// backend for them over a socket; a *surface* is told what backend is running
     /// and has the answer already, which is the clock `fork-001` removed and
     /// measured — 6.9% of a core down to 2.3%. A page repainting four times a
     /// second must not put it back, so it is given the census the loop already

@@ -156,7 +156,7 @@ pub fn burn(_store: &crate::store::Store, args: &Args) -> i32 {
 /// whichever backend opened it and there are two of those** — a report that
 /// read one of them described a fraction of the machine while looking like the
 /// whole of it (`wsp-116`). This is the same fold `sync.rs`, `cmd_watch` and
-/// `cmd_checkout` already make over herdr and compound, for the same reason: a
+/// `cmd_checkout` already make over backend and compound, for the same reason: a
 /// source nobody folds is a source nobody is looking at.
 ///
 /// The concatenation is sound rather than lucky because seat ids are disjoint

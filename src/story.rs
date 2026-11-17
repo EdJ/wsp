@@ -3,7 +3,7 @@
 //! Four steps, and the shape is Ed's: **state, modification, state', render.**
 //! A fixture is a state built in memory; an input is a modification; the reducer
 //! is the only thing that produces the next state; and the frame is what that
-//! state looks like. Nothing here talks to herdr or the store, which is the
+//! state looks like. Nothing here talks to backend or the store, which is the
 //! point — the frames come out the same on a laptop with nothing running.
 //!
 //! Two kinds of scene, mirroring the pair that works well on the Daisy side:
@@ -85,7 +85,7 @@ fn tagged(mut t: Task, tags: &[&str]) -> Task {
 /// The workspaces the fixture's panes stand in.
 ///
 /// A list of places, and not a field on the snapshot: a pane row carries the
-/// name of the place it stands in, so the join herdr's two lists used to need
+/// name of the place it stands in, so the join backend's two lists used to need
 /// has already happened by the time a view sees one. What the workspaces
 /// themselves said — a label, and which was focused — is either on the row or
 /// is not a view fact at all. See `crate::live`.
@@ -155,7 +155,7 @@ fn world() -> Snapshot {
     // already on the task under test cannot show the half of it that matters:
     // adding one you have not typed.
     projects[2].tags = vec!["dsp".into(), "synth".into()];
-    projects[6].tags = vec!["rust".into(), "herdr".into()];
+    projects[6].tags = vec!["rust".into(), "backend".into()];
 
     let mut tasks = vec![
         tagged(
@@ -237,17 +237,17 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
             a
         },
         // And the case that is actually commonest: an idle agent that resolves
-        // to nothing at all. herdr reports where a pane's *shell* started, and
+        // to nothing at all. backend reports where a pane's *shell* started, and
         // an agent launched from the directory above every checkout is standing
         // in no project by that measure — which is why `f` has to be able to
         // ask rather than refuse.
         agent("w6:p1", "w6", "idle", ""),
-        // Stopped on a task it has parked with a question on it. herdr calls
+        // Stopped on a task it has parked with a question on it. backend calls
         // this idle exactly as it calls the one above idle, and they are not
         // the same thing at all: this one is waiting on an answer that is
         // written down, and that one is waiting for anything to do.
         agent("w3:p2", "w3", "idle", "waiting on the tuning table"),
-        // An agent herdr has no state for yet — a pane that has started and
+        // An agent backend has no state for yet — a pane that has started and
         // not said anything since. Common for a few seconds, and worth its own
         // mark rather than being rounded down to idle.
         {
@@ -334,7 +334,7 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
 /// rather than as a stalled worker under `verb`.
 fn seated_world() -> Snapshot {
     let mut s = world();
-    // herdr's own name for the pane, which `wsp govern` writes: a governor's
+    // backend's own name for the pane, which `wsp govern` writes: a governor's
     // pane is named after the position, because the position is the work in it.
     // It carries no `▣` — every surface of wsp's draws that in its own first
     // column, and a label with one came out as `▣ ▣ governor · wsp` in the
@@ -658,7 +658,7 @@ fn flagged_world() -> Snapshot {
     let mut asking = hand(
         "t-105",
         // A spare agent, and idle — which is what makes the sentence reach it
-        // when the ask is answered. herdr calls the pane in w5 neither working
+        // when the ask is answered. backend calls the pane in w5 neither working
         // nor idle, and a `y` there would land the claim and go untold, the
         // same way `c` does on a pane that has not spoken since it started.
         "w4:p2",
@@ -811,7 +811,7 @@ fn effect_label(e: &panel::Effect) -> String {
         panel::Effect::Sidebar => "the sidebar again".into(),
         panel::Effect::Run { argv, .. } => format!("run wsp {}", argv.join(" ")),
         panel::Effect::Tell(_) => "tell an agent".into(),
-        panel::Effect::Herdr(c) => format!("ask herdr to {}", c.said()),
+        panel::Effect::Backend(c) => format!("ask backend to {}", c.said()),
     }
 }
 
@@ -942,7 +942,7 @@ impl<'a> Driver<'a> {
     ///
     /// Every other scene is the tab, because that is the panel with room to
     /// photograph. The menu is about the sidebar specifically — it exists
-    /// because the fork made this surface *be* herdr's sidebar — and `q` means
+    /// because the fork made this surface *be* backend's sidebar — and `q` means
     /// different things in the two, so a scene about the way out of the
     /// furniture has to be taken in the furniture.
     fn as_furniture(&mut self) -> &mut Self {
@@ -1376,7 +1376,7 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .down_to_next(panel::RowKind::Section)
-            .scene("The other group", "Shells that resolve nowhere sit at the foot, after the work — a pane with nobody in it is a fact about a place, so it stays in the tree, where places are. Nothing can be added here; herdr owns panes."),
+            .scene("The other group", "Shells that resolve nowhere sit at the foot, after the work — a pane with nobody in it is a fact about a place, so it stays in the tree, where places are. Nothing can be added here; backend owns panes."),
     );
 
     out.push(
@@ -1418,7 +1418,7 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .to_pane("w6:p1")
             .key(Key::Char('f'))
-            .scene("Asking where it works", "The commonest pane of all: an idle agent standing in no project, because herdr reports where a pane's *shell* started and that is one directory above every checkout. `f` asks rather than refusing — and the answer is written down as a mandate, so the next `f` on that pane goes straight out. Picking a project for an idle agent *is* standing direction; there was never anything else it could mean."),
+            .scene("Asking where it works", "The commonest pane of all: an idle agent standing in no project, because backend reports where a pane's *shell* started and that is one directory above every checkout. `f` asks rather than refusing — and the answer is written down as a mandate, so the next `f` on that pane goes straight out. Picking a project for an idle agent *is* standing direction; there was never anything else it could mean."),
     );
     out.push(
         Driver::new(&w)
@@ -1494,7 +1494,7 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Char('w'))
             .scene(
                 "The agents, not the work",
-                "`w` puts every running agent in place of the tree, in runs under the project each one belongs to and ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ? stopped on a task parked with a question, in a colour of its own because an answer is a different thing to ask for than a nudge, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The heading is what the tree would have said by where it drew the row, and it is where the project used to be repeated down the right of every line; the groups come in the tree's own order and step in where one project lives inside another, because the panel has one spine and a second arrangement of the same projects is one more thing to hold in your head. Urgency is answered where it can be without moving a project — the strip is the whole census by state, and inside a run what wants you is at the top. Only the agents take the cursor — a heading neither folds nor selects, because every row you can reach here leads to a terminal, and that is what keeps ↵, `c` and 1-9 meaning what they mean.",
+                "`w` puts every running agent in place of the tree, in runs under the project each one belongs to and ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ? stopped on a task parked with a question, in a colour of its own because an answer is a different thing to ask for than a nudge, ● running, ○ spare, · not saying. backend reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The heading is what the tree would have said by where it drew the row, and it is where the project used to be repeated down the right of every line; the groups come in the tree's own order and step in where one project lives inside another, because the panel has one spine and a second arrangement of the same projects is one more thing to hold in your head. Urgency is answered where it can be without moving a project — the strip is the whole census by state, and inside a run what wants you is at the top. Only the agents take the cursor — a heading neither folds nor selects, because every row you can reach here leads to a terminal, and that is what keeps ↵, `c` and 1-9 meaning what they mean.",
             ),
     );
 
@@ -1772,10 +1772,10 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Char('q'))
             .now_in("the menu")
             .did("nothing")
-            .says("quit herdr")
+            .says("quit all")
             .scene(
                 "The menu",
-                "q gives back whatever is in front of you — the key map, a search, the detail pane, room a widened sidebar borrowed, the tab Z opened — and when there is nothing left to give back it opens this. The panel itself is never what q closes: it is installed furniture, and losing it to a stray keystroke costs a reinstall. That guard was the whole story while the panel was a pane and herdr's own menu was two clicks away; the fork made this surface *be* herdr's sidebar, so the guard that stopped the stray q also took away the last door out of the terminal. A menu is what the guard was protecting for rather than a hole in it — a list you open and a row you pick is deliberate, two-step and readable, which is exactly what a stray keystroke is not. Close is the first row, because it is the thing whose absence built the menu.",
+                "q gives back whatever is in front of you — the key map, a search, the detail pane, room a widened sidebar borrowed, the tab Z opened — and when there is nothing left to give back it opens this. The panel itself is never what q closes: it is installed furniture, and losing it to a stray keystroke costs a reinstall. That guard was the whole story while the panel was a pane and backend's own menu was two clicks away; the fork made this surface *be* backend's sidebar, so the guard that stopped the stray q also took away the last door out of the terminal. A menu is what the guard was protecting for rather than a hole in it — a list you open and a row you pick is deliberate, two-step and readable, which is exactly what a stray keystroke is not. Close is the first row, because it is the thing whose absence built the menu.",
             ),
     );
 
@@ -1786,10 +1786,10 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Enter)
             .now_in("a confirmation")
             .did("nothing")
-            .says("quit herdr? 7 agents running")
+            .says("quit all? 7 agents running")
             .scene(
                 "Quitting asks, and says what it costs",
-                "The one row here that cannot be un-pressed, so it asks the way X does — and the question carries the consequence, which is not on the screen anywhere else: what quitting costs is the agents. Counted off the census, so it is every agent on the machine and not only the ones the tree happens to be showing. y hands `server.stop` to herdr and herdr goes, taking every pane with it; n leaves it alone.",
+                "The one row here that cannot be un-pressed, so it asks the way X does — and the question carries the consequence, which is not on the screen anywhere else: what quitting costs is the agents. Counted off the census, so it is every agent on the machine and not only the ones the tree happens to be showing. y hands `server.stop` to backend and backend goes, taking every pane with it; n leaves it alone.",
             ),
     );
 
@@ -1803,14 +1803,14 @@ fn scenes() -> Vec<Scene> {
             .says("close it · then the menu")
             .scene(
                 "The same door, from the pointer",
-                "herdr keeps its menu behind the word `menu` at the right-hand edge of the sidebar footer, and so does this — copied rather than invented, and copied as a word rather than as a hamburger, because ≡ already means \u{201c}something is written\u{201d} on a task row here. A row is taken on one click where a row of the tree takes two: there is nothing to read on the way, the list is three rows you opened on purpose, and the row that costs anything asks y afterwards. `the key map` is the one row that is also a keystroke — a menu is the only part of the panel anybody finds without knowing a key, so it owes them the keys.",
+                "backend keeps its menu behind the word `menu` at the right-hand edge of the sidebar footer, and so does this — copied rather than invented, and copied as a word rather than as a hamburger, because ≡ already means \u{201c}something is written\u{201d} on a task row here. A row is taken on one click where a row of the tree takes two: there is nothing to read on the way, the list is three rows you opened on purpose, and the row that costs anything asks y afterwards. `the key map` is the one row that is also a keystroke — a menu is the only part of the panel anybody finds without knowing a key, so it owes them the keys.",
             ),
     );
 
     // ---- the mouse, and the pane the keyboard is in ----------------------
     //
     // Scripted for the first time here. The mouse had bitten twice in live use
-    // — a herdr restart that broke it in every pane application, and a session
+    // — a backend restart that broke it in every pane application, and a session
     // where selection worked but nothing fired — and neither had a test that
     // could have caught it, because the arithmetic was reachable and the
     // *sentence around it* was in the event loop. See `panel::apply_input`.
@@ -1859,7 +1859,7 @@ fn scenes() -> Vec<Scene> {
             .now_on("the inbox")
             .scene(
                 "Pointing at a mark in the strip",
-                "The one clickable thing on the panel that is not a row. A mark *is* an agent, so there is nothing to select and one click goes there — the strip is a line of single columns, there is nothing to read on the way, and the ← you are reaching for is one you have already decided to answer. The keyboard goes with it, which is why the panel says so rather than waiting for herdr's census to agree.",
+                "The one clickable thing on the panel that is not a row. A mark *is* an agent, so there is nothing to select and one click goes there — the strip is a line of single columns, there is nothing to read on the way, and the ← you are reaching for is one you have already decided to answer. The keyboard goes with it, which is why the panel says so rather than waiting for backend's census to agree.",
             ),
     );
 
@@ -2036,7 +2036,7 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
     vec![
         shot(
             "The board",
-            "K opens the work by state rather than by tree: one column per lane, cards in each. The same join the panel makes — what herdr says about a pane, against what the store holds — drawn as a mark on the card an agent is on. The column the cursor is in is named in the live ink, because a board with three empty columns otherwise gives no clue where a verb would land.",
+            "K opens the work by state rather than by tree: one column per lane, cards in each. The same join the panel makes — what backend says about a pane, against what the store holds — drawn as a mark on the card an agent is on. The column the cursor is in is named in the live ink, because a board with three empty columns otherwise gives no clue where a verb would land.",
             Scope::Everything,
             Cursor::default(),
             &kanban::Mode::default(),
@@ -2243,7 +2243,7 @@ fn page(scenes: &[Scene]) -> String {
         "<header>\
          <p class=\"eyebrow\">wsp · panel · detail · board</p>\
          <h1>Every state these surfaces can reach</h1>\
-         <p>Each frame below is the real renderer over a fixed fixture — no herdr, \
+         <p>Each frame below is the real renderer over a fixed fixture — no backend, \
          no store, no terminal. The flows are produced by pushing the keys shown \
          through the same reducer the live surface runs, so a scene can only show a \
          state you could actually arrive at. All three draw from one fixture, so a \
@@ -2527,7 +2527,7 @@ mod tests {
     #[test]
     fn a_seat_row_names_the_position_and_never_the_claim() {
         let mut w = seated_world();
-        // The custodian with nothing in its hands: no claim, and a pane herdr
+        // The custodian with nothing in its hands: no claim, and a pane backend
         // has nothing better to call than the word `claim` left behind.
         w.bindings.remove("w2:p1");
         if let Some(p) = w.panes.iter_mut().find(|p| p.pane == "w2:p1") {
@@ -2563,7 +2563,7 @@ mod tests {
         // `cmd_agent::say` writes for a pane holding no task: the sentence, and
         // nothing in front of it.
         if let Some(p) = w.panes.iter_mut().find(|p| p.pane == "w2:p1") {
-            p.label = "restarted after herdr died; 02 is next".into();
+            p.label = "restarted after backend died; 02 is next".into();
         }
         // The whole census, so the assertion is about what the row says rather
         // than about which five of them the foot had room for.
@@ -2656,7 +2656,7 @@ mod tests {
 
     /// The complaint this whole thing is against, as a test: *"no way to quit
     /// right now"*, and on the day the fork went live, *"annoying, since we
-    /// lost the herdr menu."*
+    /// lost the backend menu."*
     ///
     /// Both halves are asserted, because either alone is the wrong fix. The
     /// guard holds — `q` on the sidebar still does not quit the panel, which is
@@ -2702,7 +2702,7 @@ mod tests {
     /// what quitting would cost — which is the agents, and is not on the screen
     /// anywhere else.
     #[test]
-    fn quitting_herdr_costs_a_menu_a_row_and_then_a_yes() {
+    fn quitting_backend_costs_a_menu_a_row_and_then_a_yes() {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
@@ -2726,9 +2726,9 @@ mod tests {
         assert!(
             matches!(
                 panel::apply_key(Key::Char('y'), &mut ui, &mut view),
-                panel::Effect::Herdr(panel::Chore::Quit)
+                panel::Effect::Backend(panel::Chore::Quit)
             ),
-            "and only a `y` hands `server.stop` to herdr",
+            "and only a `y` hands `server.stop` to backend",
         );
     }
 
@@ -2774,7 +2774,7 @@ mod tests {
     /// the same argument the marks in the header strip are single-click for.
     ///
     /// And the border is a miss rather than the row nearest it, because the row
-    /// nearest it is `quit herdr`.
+    /// nearest it is `quit all`.
     #[test]
     fn a_menu_row_is_taken_on_the_first_click_and_the_box_edge_is_a_miss() {
         let w = world();
@@ -2918,7 +2918,7 @@ mod tests {
     ///
     /// Ed, the day the menu landed: *"it wipes the horizontal space from the
     /// rest of the panel — the menu spawns on the right hand side, and
-    /// everything on its left is undrawn. herdr's menu is a pseudo-popover
+    /// everything on its left is undrawn. backend's menu is a pseudo-popover
     /// menu, as if it were a right-click action in a GUI environment."* It was
     /// four lines that built each row from an empty line, padded it out to the
     /// box and appended it: the padding read as spacing and was an eraser.
@@ -2967,13 +2967,13 @@ mod tests {
     /// the first option"*.
     ///
     /// And the shape the brief asked for beside it — `close` is four different
-    /// promises here, because there is a pane, a tab, a workspace and herdr
+    /// promises here, because there is a pane, a tab, a workspace and backend
     /// itself. Every row names the thing it acts on, which is what a row of one
     /// word cannot do.
     #[test]
     fn close_is_the_first_row_and_no_row_is_named_by_a_word_on_its_own() {
         let menu = panel::Menu::global();
-        assert_eq!(menu.items()[0].label(), "quit herdr");
+        assert_eq!(menu.items()[0].label(), "quit all");
         for item in menu.items() {
             assert!(
                 item.label().split_whitespace().count() > 1,
@@ -3420,7 +3420,7 @@ mod tests {
                 ("verb".into(), "w2:p1".into()),
                 ("verb".into(), "w3:p2".into()),
                 ("wsp".into(), "w5:p2".into()),
-                // Neither a task nor a checkout: a pane herdr reports from one
+                // Neither a task nor a checkout: a pane backend reports from one
                 // directory above every checkout, which is the commonest pane
                 // there is.
                 ("no project".into(), "w6:p1".into()),
@@ -3480,7 +3480,7 @@ mod tests {
         assert_eq!(at("trance"), at("wsp"), "no heading above it to be indented under");
     }
 
-    /// herdr says `idle` for four of the panes in the fixture and means four
+    /// backend says `idle` for four of the panes in the fixture and means four
     /// different things by it. Which one comes from the task in the agent's
     /// hands, which is the half of the answer the store is holding.
     #[test]
@@ -3500,7 +3500,7 @@ mod tests {
         assert!(row("waiting on the tuning").contains(panel::glyph::QUESTION));
         // Idle, holding nothing at all: a person's worth of attention going spare.
         assert!(row("spare hands").contains(panel::glyph::IDLE));
-        // No state from herdr yet, and nothing here pretends otherwise.
+        // No state from backend yet, and nothing here pretends otherwise.
         assert!(row("just started").contains(panel::glyph::QUIET));
         assert!(row("Trance Video").contains(panel::glyph::WORKING));
 
@@ -4877,7 +4877,7 @@ mod tests {
         let before = panel::frame(&ui, &mut view, W, H);
         let line = before.iter().position(|l| l.selected).expect("the cursor is drawn");
 
-        // Two panes go: herdr stops reporting them, and their rows go with them.
+        // Two panes go: backend stops reporting them, and their rows go with them.
         w.panes.retain(|p| p.pane != "w4:p1" && p.pane != "w5:p1");
         panel::refetch_into(&mut ui, &w, &mut view);
 
@@ -5458,7 +5458,7 @@ mod tests {
     /// always an agent that has just finished something else, and a work order
     /// read through the last task's reasoning is the thing this stops.
     ///
-    /// Only for the kinds whose clear we know how to spell. herdr starts twenty
+    /// Only for the kinds whose clear we know how to spell. backend starts twenty
     /// of them and `/clear` is Claude Code's word: anywhere else the sentence
     /// goes in on its own, rather than behind a line the agent would read as
     /// the first half of its instructions.
@@ -5494,7 +5494,7 @@ mod tests {
     }
 
     /// The commonest pane there is: an agent that resolves to no project,
-    /// because herdr reports where its *shell* started and that is one
+    /// because backend reports where its *shell* started and that is one
     /// directory above every checkout. Refusing there made `f` useless, so it
     /// asks — and writes the answer down as a mandate, which is what stops it
     /// asking twice.
@@ -5830,7 +5830,7 @@ mod tests {
         }
     }
 
-    /// Only the kinds whose clear we know how to spell. herdr starts twenty of
+    /// Only the kinds whose clear we know how to spell. backend starts twenty of
     /// them and `/clear` is Claude Code's word — and unlike a work order, which
     /// still goes in on its own where the clear is unknown, there is nothing
     /// left to send here. So the release lands alone and no thread is started
@@ -6282,7 +6282,7 @@ mod tests {
         let dock = tag_dock(&view);
         let names: Vec<String> =
             dock.iter().map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string()).collect();
-        assert_eq!(names, ["dsp", "release", "synth", "herdr", "rust"], "{dock:?}");
+        assert_eq!(names, ["dsp", "release", "synth", "backend", "rust"], "{dock:?}");
         assert!(dock[0].trim_start().starts_with(panel::glyph::TAG_ON), "carried: {}", dock[0]);
         assert!(dock[3].trim_start().starts_with(panel::glyph::QUIET), "not carried: {}", dock[3]);
         // The one the project lends is drawn as *on*, because it is: `wsp
@@ -6302,7 +6302,7 @@ mod tests {
         assert!(dock[0].trim_start().starts_with(panel::glyph::TAG_OFF), "going: {}", dock[0]);
         assert_eq!(
             dock.iter().map(|l| l.split_whitespace().nth(1).unwrap_or("")).collect::<Vec<_>>(),
-            ["dsp", "release", "synth", "herdr", "rust"],
+            ["dsp", "release", "synth", "backend", "rust"],
             "the order is fixed when it opens",
         );
 
@@ -6325,7 +6325,7 @@ mod tests {
         // lent one is not in it, because there was never anything to send.
         match panel::apply_key(Key::Enter, &mut ui, &mut view) {
             panel::Effect::Run { argv, .. } => {
-                assert_eq!(argv, vec!["tag", "t-001", "--", "-dsp", "+herdr"]);
+                assert_eq!(argv, vec!["tag", "t-001", "--", "-dsp", "+backend"]);
             }
             _ => panic!("↵ should apply the changes"),
         }
@@ -7440,7 +7440,7 @@ mod tests {
     }
 
     /// The board's scenes are the proof that its seam is real: kanban::Ctx has
-    /// existed since the board landed and nothing outside a live herdr had ever
+    /// existed since the board landed and nothing outside a live backend had ever
     /// built one. A frame that comes out empty, or at the wrong size, or with
     /// the cursor pointing at a card that is not there, is a seam that only
     /// looks like one.

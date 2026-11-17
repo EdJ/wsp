@@ -498,8 +498,8 @@ impl About {
 
 /// The sender, and it is a small enum rather than a string.
 ///
-/// **The field that matters most.** wsp cannot make herdr attribute
-/// `agent.prompt` — that is `robustness-094` and it is herdr's — so what wsp
+/// **The field that matters most.** wsp cannot make backend attribute
+/// `agent.prompt` — that is `robustness-094` and it is backend's — so what wsp
 /// can do is carry the sender in the payload, which inverts today's default:
 ///
 /// > Today, unattributed text reads as Ed. Under this design, **attributed text

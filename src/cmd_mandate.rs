@@ -7,7 +7,7 @@
 //! being asked again.
 //!
 //! Kept beside the claims and keyed on the agent (`compound-092` stage B) —
-//! because it has to survive a herdr restart, which a claim or a binding does
+//! because it has to survive a backend restart, which a claim or a binding does
 //! not, and an agent's row does. A store on disk outlives a release, so a
 //! mandate a pre-migration store still holds — keyed on the workspace, the
 //! shape this used before — reads correctly for one release too; see
@@ -72,7 +72,7 @@ pub fn from_map(
         .and_then(|a| mandates.get(a))
         .or_else(|| workspace.and_then(|w| mandates.get(w)))?;
     // A mandate names a machine as well as its key: a workspace id is
-    // herdr's and means nothing on another host, the same reason a claim
+    // backend's and means nothing on another host, the same reason a claim
     // carries one — and an agent id, though it needs no such check to stay
     // out of another host's id space, was set from a process on some one
     // host and the direction it recorded is a fact about that host's room.
@@ -85,7 +85,7 @@ pub fn from_map(
 
 pub fn mandate(store: &Store, args: &Args) -> i32 {
     let Some(ws) = args.get("workspace") else {
-        eprintln!("wsp: no workspace — pass -w, or run inside herdr");
+        eprintln!("wsp: no workspace — pass -w, or run inside backend");
         return 2;
     };
     // The environment's own pane answers for `ws` only when `ws` is the room

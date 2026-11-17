@@ -15,7 +15,7 @@
 //! | `wsp daemon reload` | yes | refused | refused |
 //!
 //! **The role is read from the seat wsp recorded**, never from anything the
-//! caller says: the caller's seat (`WSP_SEAT_ID`, or herdr's pane) is looked up
+//! caller says: the caller's seat (`WSP_SEAT_ID`, or backend's pane) is looked up
 //! in the governors record, which names the primary seat and each list's
 //! governor. A seat that is bound to a row, or that wsp spawned (its environment
 //! carries `WSP_SEAT_ID`), and is neither of those, is a member, verifier or
@@ -1042,7 +1042,7 @@ mod tests {
             ex(101, 1, "/Users/u/.local/bin/compound-sup"),
             ex(102, 101, "/bin/zsh"),
             ex(103, 1, "/Users/u/.local/bin/compound-sup"),
-            ex(104, 1, "/opt/herdr"),
+            ex(104, 1, "/opt/backend"),
             ex(105, 1, "/Users/u/.local/bin/compound-sup"),
         ];
         let procs = vec![
@@ -1050,7 +1050,7 @@ mod tests {
             proc(101, 9000, 0.0, "/Users/u/.local/bin/compound-sup spawn --label cpd-7 -- /bin/zsh"),
             proc(102, 9000, 0.0, "/bin/zsh"),
             proc(103, 9000, 0.0, "/Users/u/.local/bin/compound-sup serve"),
-            proc(104, 9000, 0.0, "/opt/herdr"),
+            proc(104, 9000, 0.0, "/opt/backend"),
             proc(105, 9000, 0.0, "/Users/u/.local/bin/compound-sup spawn --socket /x -- /bin/zsh"),
         ];
         let got = left_by_a_seat(&[100, 101, 102, 103, 104, 105], &table, &procs, t);

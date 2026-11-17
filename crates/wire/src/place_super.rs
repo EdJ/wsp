@@ -1,7 +1,7 @@
 //! A supervisor behind the place-work port: agents with no terminal at all,
 //! observed through the hook they fire rather than the screen they draw.
 //!
-//! The third implementor of `place.rs` and the second real one — `place_herdr`
+//! The third implementor of `place.rs` and the second real one — `place_backend`
 //! is a multiplexer and `fake` is a socket with a state in it. This one has no
 //! terminal anywhere: it forks a process, hands it a pipe, and learns what it is
 //! doing because the agent says so.
@@ -12,7 +12,7 @@
 //!
 //! # The boundary, which is the thing to hold
 //!
-//! **Not a multiplexer.** The moment it needs to host a terminal it is herdr and
+//! **Not a multiplexer.** The moment it needs to host a terminal it is backend and
 //! the point is lost. A person who wants to sit down in front of an agent this
 //! backend is running is a case it refuses, and refusing is correct.
 //!
@@ -79,7 +79,7 @@
 //! | `Stop` | end of the turn |
 //! | `SessionEnd` | +100ms after `SIGTERM` — it announces its own killing |
 //!
-//! Compare what that replaces. herdr decides an agent is working by matching a
+//! Compare what that replaces. backend decides an agent is working by matching a
 //! regex against a **spinner glyph** in the terminal title: rule
 //! `osc_title_working`, priority 1100, region `osc_title`, regex
 //! `^[\x{2800}-\x{28FF}\x{25D0}-\x{25D3}]`, with a hand-written comment saying
@@ -87,23 +87,23 @@
 //! manifest is versioned against Claude Code releases by hand, it was four days
 //! old against a build three patch versions ahead of it, and on 2026-08-17 it
 //! reported this project's own governor seat as working while it sat waiting for
-//! a person. That is not a criticism of herdr's detection — matching spinners is
+//! a person. That is not a criticism of backend's detection — matching spinners is
 //! a reasonable way to observe a program that will not tell you anything. It is
 //! the argument for not being that program.
 //!
-//! # What this backend is exact about, and herdr cannot be
+//! # What this backend is exact about, and backend cannot be
 //!
-//! - **[`State::Gone`].** An agent that has exited leaves herdr a pane that
-//!   looks like a shell somebody opened, so `place_herdr` can only raise `Gone`
+//! - **[`State::Gone`].** An agent that has exited leaves backend a pane that
+//!   looks like a shell somebody opened, so `place_backend` can only raise `Gone`
 //!   from the event stream and answers `Empty` from a listing. A supervisor
 //!   holds the pid: an agent that has stopped is `Gone`, a seat nobody started
 //!   is `Empty`, and there is no reading that confuses them.
-//! - **[`State::Starting`].** herdr's launch window is three seconds of looking
+//! - **[`State::Starting`].** backend's launch window is three seconds of looking
 //!   exactly like an idle agent, marked only by the *absence* of a field. Here
 //!   it is the interval between the fork and `SessionStart`, and it ends when
 //!   the agent says so.
 //! - **[`Place::start`] returns when the agent exists**, with nothing to wait
-//!   for: the fork either produced a pid or failed. herdr's adapter types a name
+//!   for: the fork either produced a pid or failed. backend's adapter types a name
 //!   at a shell that may not be listening, and pays a retry window, a retype and
 //!   a thirty-second appearance wait for the privilege.
 //!
@@ -115,7 +115,7 @@
 //! property of how an agent can be *observed*. Local Claude Code reports itself,
 //! which is this file; remote Claude Code is observed however the far side
 //! manages; a kind that offers nothing falls back to reading a screen, which is
-//! herdr. [`Place::open`] therefore refuses `Order::on` rather than pretending,
+//! backend. [`Place::open`] therefore refuses `Order::on` rather than pretending,
 //! and [`Recipe`] is the one place a kind's hosting is written down.
 //!
 //! # What an agent with nobody in front of it cannot be asked
@@ -158,10 +158,10 @@
 //! Ids are `sup-1`, `sup-2`, allocated by `O_EXCL` on the directory and never
 //! reused, and the counter that guarantees it survives the seat being ended. The
 //! rule is not tidiness, and it is the one place in this tree where the old
-//! belief about herdr was right: herdr does hand workspace ids out again, and
+//! belief about backend was right: backend does hand workspace ids out again, and
 //! the README's oldest complaint is that a claim naming a closed one is *waiting
 //! to attach itself to whatever takes the id next*. Measured 2026-08-19
-//! (`robustness-084`) — herdr's counter is process-local, so a restart reserves
+//! (`robustness-084`) — backend's counter is process-local, so a restart reserves
 //! only one above the highest workspace that survived and every id above that
 //! mark is reissued. This counter is on disk instead, in the same directory as
 //! the claims that could point at it, so an id can only come round again once
@@ -177,7 +177,7 @@
 //! daemon and is named here so it is chosen rather than inherited.
 
 // [`Place::census`] and [`Place::watch`] have no caller outside the tests yet —
-// the daemon and `sync` are herdr's for now — for the same reason `place_herdr`
+// the daemon and `sync` are backend's for now — for the same reason `place_backend`
 // gives: a trait method a backend has never had to answer is a guess.
 #![allow(dead_code)]
 
@@ -199,7 +199,7 @@ use crate::util::{self, Clock};
 /// A supervisor as a place to put work.
 ///
 /// The two durations are `stop`'s, and they are fields for the reason
-/// `place_herdr`'s four are: a test that sits through a real two seconds to
+/// `place_backend`'s four are: a test that sits through a real two seconds to
 /// check what happens after two seconds is a test nobody runs. Everything else
 /// here answers out of the filesystem and waits for nothing.
 pub struct Supervisor<'a> {
@@ -317,7 +317,7 @@ pub fn bank_burn(dir: &Path) {
 ///
 /// So the reader is a free function over a root, each backend reaches it
 /// through its own `burn()`, and the report folds the two — the same
-/// herdr-then-compound fold `sync.rs`, `cmd_watch` and `cmd_checkout` already
+/// backend-then-compound fold `sync.rs`, `cmd_watch` and `cmd_checkout` already
 /// make, and for the same reason: a source nobody folds is a source nobody is
 /// looking at.
 ///
@@ -381,7 +381,7 @@ const ERR_FILE: &str = "err.log";
 const NEXT_FILE: &str = "next";
 
 /// What a seat is called. `sup-7` is the example `place.rs` reaches for when it
-/// wants an id that is plainly not herdr's, and this is where that comes from.
+/// wants an id that is plainly not backend's, and this is where that comes from.
 const SEAT_PREFIX: &str = "sup-";
 
 /// How a kind of agent is hosted with no terminal.
@@ -472,7 +472,7 @@ impl Recipe {
 pub fn said_by(hook: &str) -> Option<State> {
     Some(match hook.trim() {
         // The launch window closes here, and this is the whole of the readiness
-        // question herdr answers by looking for a missing field.
+        // question backend answers by looking for a missing field.
         "SessionStart" => State::Idle,
         "UserPromptSubmit" => State::Working,
         // Fires when Claude stops, which includes clear, resume and compact.
@@ -650,7 +650,7 @@ pub fn pi_agent_dir() -> PathBuf {
         .unwrap_or_else(|| util::expand("~/.pi/agent"))
 }
 
-/// Where [`PI_EXTENSION`] goes: beside herdr's `herdr-agent-state.ts`, under a
+/// Where [`PI_EXTENSION`] goes: beside backend's `backend-agent-state.ts`, under a
 /// name of its own, since pi loads every file in the directory.
 pub fn pi_extension_path() -> PathBuf {
     pi_extension_in(&pi_agent_dir())
@@ -701,7 +701,7 @@ fn pi_extension_health_in(agent_dir: &Path, problems: &mut Vec<String>, notes: &
 /// that gets deleted within a week.
 ///
 /// It answers only for the seat named in this process's environment, which is
-/// the seat's own [`place::SEAT_ENV`] — so an agent in a herdr pane, a person's
+/// the seat's own [`place::SEAT_ENV`] — so an agent in a backend pane, a person's
 /// shell and a cron job all fall through it in silence, and nothing has to ask
 /// which backend is running.
 ///
@@ -785,8 +785,8 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
 ///
 /// **An empty value is a removal here, and that is the port's own rule being
 /// kept rather than a liberty.** `place::shed_env` empties rather than unsets
-/// because a seat's environment on herdr's wire is an override-only map and
-/// there is no way to spell "unset" on it — the emptying is herdr's compromise,
+/// because a seat's environment on backend's wire is an override-only map and
+/// there is no way to spell "unset" on it — the emptying is backend's compromise,
 /// not the port's intention, and `place::seat_from_env` already reads an empty
 /// value as an absence. A supervisor mints the seat and *then* forks, so it can
 /// do the thing the wire could not.
@@ -1273,7 +1273,7 @@ impl Supervisor<'_> {
     /// | an agent | running, and has said nothing yet | [`State::Starting`] |
     /// | an agent | running | whatever it last said |
     ///
-    /// The third row is the one herdr cannot do, and the fourth is the launch
+    /// The third row is the one backend cannot do, and the fourth is the launch
     /// window closed by an announcement rather than by a timer.
     ///
     /// An agent that has said `SessionEnd` while its process is still up is
@@ -1364,7 +1364,7 @@ impl Place for Supervisor<'_> {
         let mut env: BTreeMap<String, String> = order.env.clone();
         // The seat's own name, on disk, at the moment the seat exists — which is
         // the promise `Place::here` is downstream of and the reason a supervisor
-        // can keep it where herdr cannot: it mints the seat and *then* forks.
+        // can keep it where backend cannot: it mints the seat and *then* forks.
         env.insert(place::SEAT_ENV.to_string(), seat.to_string());
         let rec = json!({
             "label": order.label,
@@ -1383,8 +1383,8 @@ impl Place for Supervisor<'_> {
     /// than asked, which is the port's rule and is free here: the supervisor put
     /// it in the child's environment itself.
     ///
-    /// herdr's own name is deliberately not consulted as a fallback, for the
-    /// reason `place_herdr` gives about the mirror image: two answers to *which
+    /// backend's own name is deliberately not consulted as a fallback, for the
+    /// reason `place_backend` gives about the mirror image: two answers to *which
     /// seat is this* is a way to be in two seats. Which backend a process is
     /// standing in is decided by which name its seat arrived under, one level
     /// up, in `cmd_agent::my_pane`.
@@ -1672,7 +1672,7 @@ impl Place for Supervisor<'_> {
 /// the help text are assembled from these; nothing in `main.rs` names them.
 pub const VERBS: &[crate::verbs::Verb] = &[
     // Not `hook`, deliberately, and the two are not variants of one thing.
-    // That one is herdr's plugin channel — a multiplexer saying a pane
+    // That one is backend's plugin channel — a multiplexer saying a pane
     // exited — and it ends in a full `sync` over the socket. This is an
     // agent saying what *it* is doing, from inside its own hook, several
     // times a turn, and it must touch nothing but its own seat's file.
@@ -1926,7 +1926,7 @@ mod tests {
 
     /// A name is not handed out twice, however many seats have come and gone.
     ///
-    /// The rule is not tidiness. herdr reissues workspace ids — measured, not
+    /// The rule is not tidiness. backend reissues workspace ids — measured, not
     /// assumed (`robustness-084`) — and the oldest complaint in this repository
     /// is that a claim naming a closed one is waiting to attach itself to
     /// whatever takes the id next. A supervisor is free of that only if it
@@ -1970,17 +1970,17 @@ mod tests {
             assert_eq!(place.state(&seat), Err(Refusal::NoSeat(seat.clone())), "{id}");
             assert_eq!(place.stop(&seat), Err(Refusal::NoSeat(seat)), "{id}");
         }
-        // A herdr id is refused for being unknown rather than for its shape:
+        // A backend id is refused for being unknown rather than for its shape:
         // nothing here parses one, and `w1:p1` is a perfectly good file name.
-        let herdrs = Seat::new("w1:p1");
-        assert_eq!(place.state(&herdrs), Err(Refusal::NoSeat(herdrs)));
+        let backends = Seat::new("w1:p1");
+        assert_eq!(place.state(&backends), Err(Refusal::NoSeat(backends)));
     }
 
     /// The launch window, closed by an announcement rather than by a timer — and
-    /// the three readings herdr cannot tell apart, told apart.
+    /// the three readings backend cannot tell apart, told apart.
     ///
     /// A seat with nothing in it, an agent still coming up, an agent that will
-    /// take a prompt: on herdr the first and third are the same `agent_status`
+    /// take a prompt: on backend the first and third are the same `agent_status`
     /// and the second is marked only by a *missing field*. Here each is a
     /// different fact, and only the last one is told anything.
     #[test]
@@ -2010,7 +2010,7 @@ mod tests {
         assert_eq!(place.state(&seat).unwrap(), State::Idle, "the turn ended");
     }
 
-    /// **The reading herdr has to raise from an event stream, because a listing
+    /// **The reading backend has to raise from an event stream, because a listing
     /// cannot carry it.** An agent that has stopped is not a seat nobody used.
     ///
     /// And the arm that is easy to leave out: `wsp spawn` starts the agent and
@@ -2042,7 +2042,7 @@ mod tests {
     /// What a seat's occupant must not inherit is *removed* here, not emptied —
     /// and the difference is measured through a real fork rather than argued.
     ///
-    /// `place::shed_env` empties because herdr's wire has no way to spell an
+    /// `place::shed_env` empties because backend's wire has no way to spell an
     /// unset. That is the multiplexer's compromise and this backend is not
     /// bound by it: it mints the seat and then forks, so the caller's session
     /// identity simply does not exist in the child. The variable that matters
@@ -2129,7 +2129,7 @@ mod tests {
     }
 
     /// A census carries what the backend started and what the agent said it was,
-    /// which is the pair `place_herdr` needs two calls and a merge to assemble.
+    /// which is the pair `place_backend` needs two calls and a merge to assemble.
     #[test]
     fn a_census_carries_the_agent_wsp_started_and_the_session_it_reported() {
         let scratch = Scratch::new("census");
@@ -2151,7 +2151,7 @@ mod tests {
         assert_eq!(of(&busy).state, State::Working);
         assert_eq!(of(&busy).agent.name, "t-1", "what it was started as");
         assert_eq!(of(&busy).agent.kind, "sleep");
-        // The session id herdr reports as `agent_session.value` and takes a
+        // The session id backend reports as `agent_session.value` and takes a
         // second call to find. Here the agent said it, in its own hook.
         assert_eq!(of(&busy).session, "7a188ba8");
     }
@@ -2857,7 +2857,7 @@ mod tests {
     }
 
     /// One entry naming `wsp-session.sh` under a hook is what "installed" means
-    /// — anything else under that key (herdr's own `SessionStart` entry,
+    /// — anything else under that key (backend's own `SessionStart` entry,
     /// beside it) is not this backend's business.
     fn hook_entry(command: &str) -> Value {
         json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command }] }])

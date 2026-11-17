@@ -7,7 +7,7 @@ use crate::calls::Command;
 ///
 /// `ps -E` is how a process's environment is readable without a dependency or a
 /// `/proc`, and the environment is the only place a plugin's child says which
-/// herdr started it: its command line is `wsp daemon`, identical to the live
+/// backend started it: its command line is `wsp daemon`, identical to the live
 /// one's. `ppid` comes back in the same call so the ancestors of this process
 /// can be ruled out of anything we are about to kill — a shell whose command
 /// line happens to mention the session is not a child of it.
@@ -92,7 +92,7 @@ pub fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
 mod tests {
     use super::*;
 
-    /// `herdr session stop` ends the server, not what it started: the daemon it
+    /// `backend session stop` ends the server, not what it started: the daemon it
     /// left was reparented to launchd and went on holding the live store. The
     /// environment is the only handle — the command line is `wsp daemon`, the
     /// same as the real one's — so the match has to be exact at the end of the
@@ -106,11 +106,11 @@ mod tests {
     #[test]
     fn a_padded_ps_line_is_still_a_process() {
         assert_eq!(
-            ps_line("  1628     1 /Users/e/wsp daemon HERDR_SESSION=wsp-w24"),
+            ps_line("  1628     1 /Users/e/wsp daemon WSP_BACKEND_SESSION=wsp-w24"),
             Some((
                 1628,
                 1,
-                "/Users/e/wsp daemon HERDR_SESSION=wsp-w24".to_string()
+                "/Users/e/wsp daemon WSP_BACKEND_SESSION=wsp-w24".to_string()
             ))
         );
         assert_eq!(

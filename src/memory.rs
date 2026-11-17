@@ -8,8 +8,8 @@
 //!
 //! A seat's processes are found two ways, because the backends differ: a
 //! backend that names a root pid (compound) is walked down from that pid, and a
-//! herdr pane is every process whose environment carries its `HERDR_PANE_ID` —
-//! herdr names no pid, but every descendant of a pane inherits the variable.
+//! backend pane is every process whose environment carries its `WSP_BACKEND_PANE_ID` —
+//! backend names no pid, but every descendant of a pane inherits the variable.
 //!
 //! The threshold is `idle-memory.json` under the state directory
 //! (`{"warn_mb": 4096}`), or `WSP_IDLE_MEMORY_MB`, which wins.
@@ -209,7 +209,7 @@ fn of(ps: &str, seats: &[(String, String)], roots: &[(String, u32)], warn_kb: u6
             let pid = it.next()?.parse().ok()?;
             let ppid = it.next()?.parse().ok()?;
             let kb = it.next()?.parse().ok()?;
-            let pane = it.find_map(|w| w.strip_prefix("HERDR_PANE_ID=")).filter(|v| !v.is_empty());
+            let pane = it.find_map(|w| w.strip_prefix("WSP_BACKEND_PANE_ID=")).filter(|v| !v.is_empty());
             Some(Row { pid, ppid, kb, pane })
         })
         .collect();
@@ -248,13 +248,13 @@ mod tests {
     const MB: u64 = 1024;
 
     #[test]
-    fn a_herdr_pane_is_every_process_carrying_its_pane_id() {
+    fn a_backend_pane_is_every_process_carrying_its_pane_id() {
         let ps = "\
-  10     1  1000 /bin/zsh -l HERDR_PANE_ID=w1:p1 HOME=/x
-  11    10 250000 claude HERDR_PANE_ID=w1:p1 HOME=/x
-  12    11  50000 node mcp HERDR_PANE_ID=w1:p1 HOME=/x
-  20     1  1000 /bin/zsh -l HERDR_PANE_ID=w2:p1 HOME=/x
-  21    20 100000 claude HERDR_PANE_ID=w2:p1 HOME=/x
+  10     1  1000 /bin/zsh -l WSP_BACKEND_PANE_ID=w1:p1 HOME=/x
+  11    10 250000 claude WSP_BACKEND_PANE_ID=w1:p1 HOME=/x
+  12    11  50000 node mcp WSP_BACKEND_PANE_ID=w1:p1 HOME=/x
+  20     1  1000 /bin/zsh -l WSP_BACKEND_PANE_ID=w2:p1 HOME=/x
+  21    20 100000 claude WSP_BACKEND_PANE_ID=w2:p1 HOME=/x
   30     1 900000 something-else HOME=/x
 ";
         let m = of(ps, &seats(&["1", "2"]), &[], 0);
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn a_pane_is_not_a_pane_whose_id_it_merely_starts_with() {
-        let ps = "  10     1  5000 claude HERDR_PANE_ID=w1:p12 HOME=/x\n";
+        let ps = "  10     1  5000 claude WSP_BACKEND_PANE_ID=w1:p12 HOME=/x\n";
         let m = of(ps, &seats(&["1"]), &[], 0);
         assert!(m.panes.is_empty());
         assert_eq!(m.unread, 1);
@@ -276,7 +276,7 @@ mod tests {
     fn a_root_pid_is_walked_down_and_counted_once_beside_the_pane_id() {
         let ps = "\
   10     1  1000 compound-sup
-  11    10 200000 claude HERDR_PANE_ID=w1:p1
+  11    10 200000 claude WSP_BACKEND_PANE_ID=w1:p1
   12    11  30000 node
   13     1 777000 unrelated
 ";
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn the_largest_panes_come_first() {
-        let ps = "  1 0 100 a HERDR_PANE_ID=w1:p1\n  2 0 300 b HERDR_PANE_ID=w2:p1\n  3 0 200 c HERDR_PANE_ID=w3:p1\n";
+        let ps = "  1 0 100 a WSP_BACKEND_PANE_ID=w1:p1\n  2 0 300 b WSP_BACKEND_PANE_ID=w2:p1\n  3 0 200 c WSP_BACKEND_PANE_ID=w3:p1\n";
         let m = of(ps, &seats(&["1", "2", "3"]), &[], 0);
         assert_eq!(m.panes.iter().map(|p| p.kb).collect::<Vec<_>>(), vec![300, 200, 100]);
     }

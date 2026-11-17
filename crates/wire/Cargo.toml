@@ -2,7 +2,7 @@
 name = "wsp-wire"
 version = "0.1.0"
 edition = "2021"
-description = "wsp's wire: the Place port and its backends (herdr, compound, supervisor), tunnel, far, launchd"
+description = "wsp's wire: the Place port and its backends (backend, compound, supervisor), tunnel, far, launchd"
 
 [lib]
 path = "src/lib.rs"

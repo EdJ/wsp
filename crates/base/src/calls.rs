@@ -26,7 +26,7 @@
 //! **Children come from the one wrapper.** [`Command`] is a drop-in for
 //! `std::process::Command` that times `output`, `status` and (at `wait`) a
 //! spawned child, and adds it to the process-wide accumulator under the
-//! program's file name. `ps`, `lsof`, `git`, `herdr`, `cargo` show up by name
+//! program's file name. `ps`, `lsof`, `git`, `backend`, `cargo` show up by name
 //! with count and total wall ms; a straggler that still uses
 //! `std::process::Command` is invisible to the split but not to the CPU totals,
 //! which come from `getrusage` and miss nothing.
@@ -749,7 +749,7 @@ pub fn exit(code: i32) -> ! {
 
 /// The seat id, if this process is in a seat.
 fn seat_id() -> Option<String> {
-    ["WSP_SEAT_ID", "HERDR_PANE_ID"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    ["WSP_SEAT_ID", "WSP_BACKEND_PANE_ID"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
 /// primary, governor, member, verifier, check, daemon or none — from the

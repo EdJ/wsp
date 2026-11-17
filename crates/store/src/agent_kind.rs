@@ -178,7 +178,7 @@ pub enum Address {
     ///
     /// **Not a guess at which name.** wsp passed this exact string to that
     /// launch as `-n`, and [`mint`] is task *and* seat precisely so that no
-    /// other agent of wsp's can be answering to it — herdr issues at most one
+    /// other agent of wsp's can be answering to it — backend issues at most one
     /// live agent per pane. So what is unconfirmed here is whether the agent
     /// exists, never who it would be, and that is what makes saying it safe: the
     /// only thing this can name wrongly is nothing at all.

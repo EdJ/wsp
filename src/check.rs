@@ -60,7 +60,7 @@
 //! `effort.json`, so a retro can tell a cold start from a slow machine. The
 //! cold build (`cold.rs`) is cold by design and takes no seed.
 //!
-//! The commands run with every `WSP_*` and `herdr` variable removed. A test
+//! The commands run with every `WSP_*` and `backend` variable removed. A test
 //! suite that finds `WSP_HOME` set fails four store tests and reads as the
 //! change under check being wrong.
 //!

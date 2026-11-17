@@ -38,7 +38,7 @@
 //!
 //!   **The second half of that answer used to read *and a stopped seat is a
 //!   subject of the same predicate, so it raises its own hand*. That is false,
-//!   and it is false three times over** — worklist-037, driven on a fake herdr
+//!   and it is false three times over** — worklist-037, driven on a fake backend
 //!   with a seated pane running no turn. A custodian holds no task, so it has
 //!   no binding: [`Poll::sample`]'s (c) skips it on `task_id.is_empty()`, its
 //!   `doing` is `false`, and [`cmd_govern::needs_a_person`]'s `!seat` excludes
@@ -58,7 +58,7 @@
 //!   seat it is about, because that seat is what failed. It is derived in
 //!   [`cmd_watch::stalled_seats`] and not here, for the reason every other
 //!   predicate is: the census, the store sweep and the routing have to be one
-//!   reading, and a second herdr probe a tick later is how a pane comes to be
+//!   reading, and a second backend probe a tick later is how a pane comes to be
 //!   in one listing and not the other. What is this pass's alone is that only a
 //!   reader with **no boundary** produces it, and [`cmd_watch::Scope::machine`]
 //!   is unreachable from argv — so the one agent that cannot report a stalled
@@ -122,7 +122,7 @@ use crate::util;
 ///
 /// Sixty, and it is `wsp watch`'s interval rather than the daemon's twenty for
 /// a reason that is arithmetic and not taste. A tick is one store sweep and
-/// three herdr calls; the daemon's own 20s tick is a debounce for herdr events,
+/// three backend calls; the daemon's own 20s tick is a debounce for backend events,
 /// which is a different job at a different price, and riding on it would have
 /// tripled this one for news that moves in minutes.
 ///
@@ -132,7 +132,7 @@ use crate::util;
 /// CPU each**, process start included and below the timer's resolution. At
 /// sixty seconds that is 0.08% of one core; at twenty it would be 0.25%.
 ///
-/// The number that would move it is the store sweep, not herdr: `Poll::sample`
+/// The number that would move it is the store sweep, not backend: `Poll::sample`
 /// reads every task file, which is what the panel and `sync` already do on
 /// their own timers. If that ever stops being free it stops being free for all
 /// three at once, and the fix belongs in `Store::tasks` rather than here.
@@ -148,7 +148,7 @@ const EVERY: i64 = 60;
 /// stopped for seconds and a turn in flight is not stopped at all, so five
 /// minutes of genuinely no turn on a task that is still `doing` is not a gap
 /// between turns. [`Signal::at_once`] carries the exception, and the reading
-/// that earns it is herdr's `blocked` — a modal holding the keyboard, where
+/// that earns it is backend's `blocked` — a modal holding the keyboard, where
 /// waiting five minutes to mention it would be waiting five minutes to say a
 /// word.
 const SETTLE: i64 = 5 * 60;
@@ -181,7 +181,7 @@ fn event_kind(edge: Edge) -> &'static str {
 ///
 /// **The ledger is on disk because the process is not durable and the levels
 /// are.** The daemon `exec`s itself whenever an install lands underneath it
-/// (`daemon::reload`), and herdr restarts it on its own restart. An in-memory
+/// (`daemon::reload`), and backend restarts it on its own restart. An in-memory
 /// ledger would be empty on the far side of both, so every level standing at
 /// that moment would be primed away — or, worse, announced again as new. Ed
 /// installs several times a day; a pass that re-announced the machine's whole
@@ -274,10 +274,10 @@ impl Pass {
 /// One tick: read the levels, diff them, deliver the edges.
 ///
 /// The source is a parameter and not built here, which is the whole of what
-/// makes this testable without a herdr. [`cmd_watch::Source`] already asks for
+/// makes this testable without a backend. [`cmd_watch::Source`] already asks for
 /// a level set rather than for news, so a fake answers it in three lines and
 /// the settle rule, the addressing and the emission are all driven without a
-/// socket. `wsp verify` runs on a machine where herdr may not be up at all.
+/// socket. `wsp verify` runs on a machine where backend may not be up at all.
 pub(crate) fn tick(store: &Store, pass: &mut Pass, source: &mut dyn Source, at: i64) -> Vec<Emit> {
     pass.last = Some(at);
     // A store that is not there reads as a machine with no work on it, so every
@@ -413,9 +413,9 @@ fn seat_named(s: &Signal) -> Option<&str> {
 ///
 /// **Why this is the pass's to say and not only despawn's.** A level of a kind
 /// that could not be read this tick is held rather than cleared
-/// ([`Kind::needs_herdr`]), so one raised about a seat that was ended while
-/// herdr was unreadable stood in the ledger for ever, and woke the governor on
-/// every spool flush. A seat id with a `:` is herdr's, and what the pass cannot
+/// ([`Kind::needs_backend`]), so one raised about a seat that was ended while
+/// backend was unreadable stood in the ledger for ever, and woke the governor on
+/// every spool flush. A seat id with a `:` is backend's, and what the pass cannot
 /// see it does not judge; only a compound seat, whose supervisor is a record and
 /// a pid on this machine, is called gone from here.
 fn orphaned(store: &Store, claims: &BTreeMap<String, Value>, s: &Signal) -> bool {
@@ -631,8 +631,8 @@ mod tests {
     ///
     /// A dozen lines, and that is the argument for [`Source`] asking for a
     /// level set rather than for news: the settle rule, the addressing, the
-    /// ledger's survival and the hook are all driven here without a herdr
-    /// socket, on a machine where `wsp verify` may be running with no herdr at
+    /// ledger's survival and the hook are all driven here without a backend
+    /// socket, on a machine where `wsp verify` may be running with no backend at
     /// all.
     ///
     /// **It addresses what it answers with, out of the store, exactly as
@@ -869,7 +869,7 @@ mod tests {
     /// A hook is `~/wsp/hooks/on-<kind>` handed one line, and the only thing it
     /// can filter on is `to`. So the fact that matters is not whether each edge
     /// is correct on its own — both were — but whether the *pair* reaches one
-    /// seat. On 2026-08-20, against a fake herdr with one flag and one worklist
+    /// seat. On 2026-08-20, against a fake backend with one flag and one worklist
     /// finishing under it, the log read
     ///
     ///     attention-raised   to=phase-four  flag demo-001  held=0

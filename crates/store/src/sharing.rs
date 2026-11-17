@@ -573,7 +573,7 @@ mod tests {
         let iso = crate::util::isolated("warm-repos");
         let root = iso.path("warm");
         let mine = claim(&root, "wsp", 1, all).unwrap();
-        let theirs = claim(&root, "herdr", 1, all).unwrap();
+        let theirs = claim(&root, "backend", 1, all).unwrap();
         assert_ne!(mine.dir, theirs.dir, "a tree warm for one crate is cold for another");
     }
 }
