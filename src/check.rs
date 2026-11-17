@@ -1372,7 +1372,10 @@ pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&R
 /// would otherwise send a row back for nothing it did. The second pass is what
 /// counts, and the first is kept on the entry — `wsp verify` makes the same
 /// rule for the same reason: a flake swallowed stops being observable.
-/// A step that timed out is not run twice.
+/// A step that timed out is run once more with its limit doubled: a measured
+/// time at its declared limit is a budget set too tight, not a failure of the
+/// code. A pass there is "limit too tight", and the row is not sent back; a
+/// step that also takes twice its limit really hangs and fails.
 ///
 /// With a `reuse`, a step already green at that commit is not run (it costs 0s
 /// and is not written again), and a pass is recorded when the tree was clean at
@@ -1389,6 +1392,10 @@ pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reus
     let ran = if matches!(first.done, Done::Failed { timed_out: false, .. }) {
         let second = run_step(dir, step, log);
         Ran { took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
+    } else if matches!(first.done, Done::Failed { timed_out: true, .. }) {
+        let wide = Step { limit: step.limit * 2, ..step.clone() };
+        let second = run_step(dir, &wide, log);
+        Ran { step: step.clone(), took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
     } else {
         first
     };
@@ -1447,6 +1454,9 @@ pub(crate) fn account(ran: &[Ran]) -> String {
                 ("✓", format!("reused (green at {at}, {}s, by {}, {}{flake})", g.took, g.who, g.when))
             }
             (Done::Passed, None) => ("✓", format!("{}s", secs(r.took))),
+            (Done::Passed, Some((why, _))) if why.starts_with("timed out") => {
+                ("✓", format!("{}s · limit too tight: passed on a second run at twice the limit, the first was {why}; raise the step's limit", secs(r.took)))
+            }
             (Done::Passed, Some((why, _))) => ("✓", format!("{}s · passed on a second run, the first was {why}", secs(r.took))),
             (Done::Malformed(why), _) => ("✗", format!("malformed — the line cannot start: {why}")),
             (Done::Hung(_), _) => ("✗", format!("{}s · {}", secs(r.took), why_failed(r))),
@@ -2712,6 +2722,16 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10), "waited on the sleep");
         assert_eq!(r.done, Done::Failed { exit: None, timed_out: true });
         assert!(why_failed(&r).contains("timed out after 1s"));
+    }
+
+    #[test]
+    fn a_step_at_its_limit_is_retried_at_twice_it_and_a_hang_still_fails() {
+        let (dir, log) = scratch_log("tight");
+        let tight = run_again(&dir, &sh("sleep 1.5", 1), &log, None);
+        assert_eq!(tight.done, Done::Passed);
+        assert!(account(&[tight]).contains("limit too tight"));
+        let hung = run_again(&dir, &sh("sleep 30", 1), &log, None);
+        assert_eq!(hung.done, Done::Failed { exit: None, timed_out: true });
     }
 
     /// `wsp-453`: a step that passes still has its group killed — the Vite and
