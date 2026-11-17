@@ -483,12 +483,13 @@ pub fn children() -> Vec<(u32, String)> {
 /// Take on children this process has but no `Child` of this image holds,
 /// waiting for each on a thread as a dropped [`Child`] is.
 ///
-/// **wsp-667.** The daemon's 155 `<defunct>` children were its agents'
-/// `compound-sup`s: each is dropped to a reaping thread when it starts, lives
-/// as long as its agent, and every install `exec`s the daemon into the new
-/// binary, which ends those threads. Each sup alive at a reload was a zombie
-/// from the moment its agent exited. The new image adopts them here, before it
-/// starts anything of its own. Never pass a child some thread waits on.
+/// **wsp-667.** The daemon's 155 `<defunct>` children were most likely the detached `wsp`
+/// processes it launches (a reseat, a barrier run, an ending's wait): each is
+/// dropped to a reaping thread when it starts, lives for minutes, and every
+/// install `exec`s the daemon into the new binary, which ends those threads.
+/// Each one alive at a reload was a zombie from the moment it exited. The new
+/// image adopts them here, before it starts anything of its own. Never pass a
+/// child some thread waits on.
 pub fn adopt(kids: &[(u32, String)]) {
     for (pid, line) in kids {
         let pid = *pid;

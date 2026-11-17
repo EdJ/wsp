@@ -76,18 +76,23 @@ fn reload(verbose: bool) -> std::io::Error {
 
 /// Wait on the children a reload carried over, and say which they were.
 ///
-/// The daemon's 155 `<defunct>` children (wsp-667) were agents' `compound-sup`s:
-/// each is handed to a reaping thread when it starts and lives as long as its
-/// agent, and an install `exec`s the daemon, which keeps the children and ends
-/// the threads. A daemon started fresh has none, and says nothing.
-fn adopt_carried_over() {
+/// The daemon's 155 `<defunct>` children (wsp-667) were most likely the detached `wsp`
+/// processes its tick launches and hands to a reaping thread: `govern <scope>
+/// --reseat` (`repair`), `worklist advance --barrier-run` and the `--end-check`
+/// waits (`cycle::launch`), and the `--ending`/despawn helpers `when_idle`
+/// starts. Each lives for minutes. An install `exec`s the daemon, which keeps
+/// the children and ends the threads, so one alive at a reload went defunct
+/// when it ended. An agent's `compound-sup` is never among them: it is the
+/// child of whichever of those processes started it, and goes to pid 1 when
+/// that one exits. A daemon started fresh has none, and says nothing.
+fn adopt_carried_over(store: &Store) {
     let kids = wsp_base::calls::children();
     if kids.is_empty() {
         return;
     }
     wsp_base::calls::adopt(&kids);
     let named: Vec<String> = kids.iter().map(|(pid, line)| format!("{pid} {line}")).collect();
-    eprintln!("wsp daemon: waiting on {} child(ren) from before the reload: {}", kids.len(), named.join("; "));
+    crate::store::log_line(store, &format!("daemon: waiting on {} child(ren) from before the reload: {}", kids.len(), named.join("; ")));
 }
 
 /// Is the per-tick reaper turned off (`WSP_NO_REAP` set, not empty, not `0`)?
@@ -611,7 +616,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     wsp_base::calls::quiet();
     // Before anything is spawned: a child here already is one the image before
     // an `exec`-reload started, whose reaping thread the exec ended (wsp-667).
-    adopt_carried_over();
+    adopt_carried_over(store);
     if let Some(why) = misdirected(
         std::env::var("HERDR_SESSION").ok().as_deref(),
         std::env::var("HERDR_SOCKET_PATH").ok().as_deref(),
@@ -744,10 +749,10 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             false => wsp_base::calls::reap_defunct(),
         };
         for (pid, line) in &reap.reaped {
-            eprintln!("wsp daemon: reaped defunct child {pid}, nothing was waiting on it: {line}");
+            crate::store::log_line(store, &format!("daemon: reaped defunct child {pid}, nothing was waiting on it: {line}"));
         }
         for (pid, name) in &reap.strays {
-            eprintln!("wsp daemon: child {pid} ({name}) is defunct and nothing in wsp holds it — a spawn that is never waited on; left for its owner");
+            crate::store::log_line(store, &format!("daemon: child {pid} ({name}) is defunct and nothing in wsp holds it — a spawn that is never waited on; left for its owner"));
         }
 
         // Both of the next two checks are here, at the top, because it is the
