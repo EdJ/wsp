@@ -571,6 +571,11 @@ pub struct Seats {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatsList {
     pub seats: Vec<SeatRow>,
+    /// The host's facts from the manager's last beat, so a `seats` caller
+    /// (`wip`, 4.3) reads the host and its seats from one reply. Absent
+    /// before the first beat, and from a manager older than the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostFacts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

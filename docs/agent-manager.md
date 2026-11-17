@@ -842,6 +842,39 @@ They also check that `WSP_HOST=manager` against a closed port, or a listener tha
 silent" within the second, and that the subscription resumes from the last id across a manager restart and in
 a new subscription. `tests/host_seam.rs` holds: `host_tcp` reaches no OS itself.
 
+#### Group 5: `wip` reads `seats` (wsp-027, 2026-11-17)
+
+Under `WSP_HOST=manager`, `wip` is `Wip::from_managers` (src/cmd_agent.rs). Under `inproc` it is `Wip::live`,
+unchanged. Both share the store half (`Wip::gathered`); they differ only in what they ask the host.
+- **The census.** `host_tcp::census` sends one `seats` to each manager the machine records name, in parallel.
+  Today that is the local record alone, filed as `""`. A host that answers within 1 s, dial and `hello`
+  included, is `Census::heard`. Any other is `Census::silent` with the "host silent" reason. A seat's label,
+  directory and agent come from compound's record files (`Compound::seated_as`). Its state is the manager's:
+  `stopping` reads `gone`.
+- **Host facts from the same reply.** `seats.list` gains `host`, the facts of the manager's last beat. The field
+  is optional both ways, so an older manager still answers.
+- **Read from the replies:**
+  - an idle member's shells are `shells` (`Shells::counted`, a count alone);
+  - idle memory is `rss_bytes` (`memory::of_rss`);
+  - a low disk is the facts' `disks` (`disk::loud_of`);
+  - the dead-daemon heading is `cycle.log` quiet past a minute, with no `ps`.
+- **Not run under the manager:**
+  - the finished-tree scan (`wip` draws the daemon's last `finished-wip.json`);
+  - the ended-panes scan (the daemon closes those).
+- **Silent is never empty.** A manager that did not answer is said in `wip`'s `unreachable` heading, which is
+  the json's existing `unreachable` key, as "this machine's manager (host silent: …) — its seats are not read,
+  not gone".
+- **Left for later:**
+  - the throttle line still reads load and thermal in process (`sysctl`, `pmset`), because the facts carry
+    neither the 5-minute load nor the speed-limit percent it words;
+  - a seat started in-process is not in the manager's answer until adoption (wsp-029);
+  - the manager's `shells` count does not apply `Shells`' settled, work and quiet bounds.
+
+`tests/wip_manager.rs` runs the `wsp` binary's `wip --json` against a loopback manager with one seat (fake
+compound-sup). Under `manager`, the call log's children hold no `ps`, `lsof`, `df` or `compound-render`, and
+the seat is listed. Under `inproc`, the same call runs `ps`. The json's keys are the same under both. With the
+manager stopped, `unreachable` names it as host silent, still with none of those children.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the

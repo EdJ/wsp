@@ -115,6 +115,39 @@ fn warn_mb_from(env: Option<&str>, file: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_WARN_MB)
 }
 
+/// The idle seats among `agents`, each with the name a person knows it by:
+/// its task when it holds one, else its label.
+fn idle(agents: &[Seated], bindings: &BTreeMap<String, Value>) -> Vec<(String, String)> {
+    agents
+        .iter()
+        .filter(|a| a.state == State::Idle)
+        .map(|a| {
+            let seat = a.seat.as_str().to_string();
+            let task = bindings.get(&seat).and_then(|b| b.get("task_id")).and_then(Value::as_str).filter(|t| !t.is_empty());
+            let name = task.map(str::to_string).or_else(|| Some(a.label.clone()).filter(|l| !l.is_empty())).unwrap_or_else(|| seat.clone());
+            (seat, name)
+        })
+        .collect()
+}
+
+/// The idle panes among `agents`, measured by their managers: `rss` is each
+/// seat's resident bytes as its `seats` reply said (`docs/agent-manager.md`
+/// 4.3), so nothing here asks the process table. A seat no manager measured
+/// is `unread`, as a far one is.
+pub(crate) fn of_rss(state: &Path, agents: &[Seated], bindings: &BTreeMap<String, Value>, rss: &BTreeMap<String, u64>) -> IdleMemory {
+    let warn_kb = warn_kb(state);
+    let mut panes = Vec::new();
+    let mut unread = 0;
+    for (seat, name) in idle(agents, bindings) {
+        match rss.get(&seat).map(|b| b / 1024).unwrap_or(0) {
+            0 => unread += 1,
+            kb => panes.push(Pane { seat, name, kb }),
+        }
+    }
+    panes.sort_by(|a, b| b.kb.cmp(&a.kb).then_with(|| a.seat.cmp(&b.seat)));
+    IdleMemory { panes, unread, warn_kb }
+}
+
 /// The idle panes among `agents`, measured. `bindings` names a seat's task.
 ///
 /// Asks the process table once, through `ps` (the caller's Host's
@@ -127,16 +160,7 @@ pub(crate) fn read(
     bindings: &BTreeMap<String, Value>,
     ps: impl FnOnce() -> Option<String>,
 ) -> IdleMemory {
-    let seats: Vec<(String, String)> = agents
-        .iter()
-        .filter(|a| a.state == State::Idle)
-        .map(|a| {
-            let seat = a.seat.as_str().to_string();
-            let task = bindings.get(&seat).and_then(|b| b.get("task_id")).and_then(Value::as_str).filter(|t| !t.is_empty());
-            let name = task.map(str::to_string).or_else(|| Some(a.label.clone()).filter(|l| !l.is_empty())).unwrap_or_else(|| seat.clone());
-            (seat, name)
-        })
-        .collect();
+    let seats = idle(agents, bindings);
     let warn_kb = warn_kb(state);
     if seats.is_empty() || cfg!(test) {
         return IdleMemory { warn_kb, unread: seats.len(), ..IdleMemory::default() };

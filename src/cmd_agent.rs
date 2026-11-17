@@ -3787,15 +3787,27 @@ fn silent_lines(store: &Store) -> Vec<String> {
 }
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
-    let w = Wip::live(store);
+    let manager = wip_reads_manager();
+    let w = match manager {
+        true => Wip::from_managers(store),
+        false => Wip::live(store),
+    };
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
     // wsp-384: the planned lists wsp started on its own, for a day after.
     let mut picked_up = crate::pickup::wip_lines(store);
     picked_up.extend(silent_lines(store));
-    // wsp-453: a finished row's tree that still has processes.
-    picked_up.extend(crate::ending::finished_wip_lines(store));
-    // wsp-637: a pane whose seat has ended.
-    picked_up.extend(crate::ended_panes::wip_lines(store));
+    match manager {
+        // No `ps` and no `lsof` under the manager (4.3): the finished trees
+        // as the daemon's last scan left them, and the ended panes are the
+        // daemon's to close.
+        true => picked_up.extend(crate::ending::finished_wip_lines_held(store)),
+        false => {
+            // wsp-453: a finished row's tree that still has processes.
+            picked_up.extend(crate::ending::finished_wip_lines(store));
+            // wsp-637: a pane whose seat has ended.
+            picked_up.extend(crate::ended_panes::wip_lines(store));
+        }
+    }
     match args.json() {
         true => {
             let mut v = wip_json(&w);
@@ -3945,6 +3957,16 @@ pub(crate) struct Wip {
     pub silent: crate::far::Silence,
 }
 
+/// What a reading asks of the host: the idle members' shells, their memory,
+/// the daemon and the disks. In process for [`Wip::live`]; from the managers'
+/// `seats` replies for [`Wip::from_managers`].
+struct Probed {
+    shells: crate::waiting::Shells,
+    memory: crate::memory::IdleMemory,
+    daemon: Option<String>,
+    disk: Option<String>,
+}
+
 /// Note this census's seats against `seat-since.json` and say since when each
 /// has been in its state — [`Store::note_seat_states`], fed the seats `wip`
 /// draws (a seat with nobody in it has no state worth a clock), each with the
@@ -3990,7 +4012,88 @@ fn checking(lists: &[crate::model::Worklist], tasks: &[Task]) -> std::collection
         .collect()
 }
 
+/// How long `cycle.log` may be quiet before [`daemon_by_log`] says so: the
+/// daemon ticks once a minute, the same bound `daemon::dead` reads it by.
+const DAEMON_QUIET_SECS: u64 = 60;
+
+/// `wip`'s dead-daemon heading without the process table, under
+/// `WSP_HOST=manager` (`docs/agent-manager.md` 4.3: no `ps`): `cycle.log`
+/// quiet past [`DAEMON_QUIET_SECS`] on a machine whose manager answered.
+fn daemon_by_log(state: &std::path::Path, heard: bool) -> Option<String> {
+    if !heard {
+        return None;
+    }
+    let quiet = std::fs::metadata(state.join("cycle.log")).ok()?.modified().ok()?.elapsed().ok()?;
+    (quiet.as_secs() > DAEMON_QUIET_SECS).then(|| {
+        format!(
+            "the daemon is not ticking — cycle.log has been silent for {} (`wsp install --daemon` loads it)",
+            util::duration_human(quiet.as_secs() as i64)
+        )
+    })
+}
+
+/// Whether `wip` reads `seats` from the managers (`WSP_HOST=manager`,
+/// `docs/agent-manager.md` 4.3) rather than surveying in this process. A
+/// `WSP_HOST` that names neither is the in-process reading, as M0's.
+fn wip_reads_manager() -> bool {
+    crate::host_tcp::Choice::from_env() == Ok(crate::host_tcp::Choice::Manager)
+}
+
 impl Wip {
+    /// `wip` under `WSP_HOST=manager` (`docs/agent-manager.md` 4.3): one
+    /// `seats` to each host in the machine records, in parallel, each heard or
+    /// silent within a second. The seats' state, rss and shells and the
+    /// host's disks come from those replies; this runs no `ps`, `lsof`,
+    /// render or `df`. A seat the manager does not run (one started
+    /// in-process) is not here until adoption (wsp-029).
+    pub(crate) fn from_managers(store: &Store) -> Wip {
+        let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        let census = &reading.census;
+        let mut from: BTreeMap<String, String> = BTreeMap::new();
+        let mut answered: BTreeSet<String> = BTreeSet::new();
+        for (machine, seats) in census.answers() {
+            answered.insert(clock_source("manager", machine));
+            from.extend(seats.iter().map(|s| (s.seat.as_str().to_string(), clock_source("manager", machine))));
+        }
+        let seen: Vec<crate::place::Seated> = census.seats().filter(|s| s.state != State::Empty).cloned().collect();
+        let since = seat_clocks(store, seen.iter().map(|s| (s, from.get(s.seat.as_str()).cloned())), &answered, util::epoch_secs());
+        let rss: BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
+        let counts: BTreeMap<String, u32> = reading.rows.iter().map(|(s, r)| (s.clone(), r.shells)).collect();
+        let disks: Vec<crate::host_tcp::DiskFree> = reading.facts.values().flat_map(|f| f.disks.iter().cloned()).collect();
+        let heard = reading.heard();
+        // Silent is never empty (remote-agents' rule): a manager that did not
+        // answer is said in the heading, beside any far machine's silence.
+        let unheard: Vec<String> = census
+            .unheard()
+            .map(|(m, why)| {
+                let who = match m {
+                    "" => "this machine's manager".to_string(),
+                    m => format!("{m}'s manager"),
+                };
+                format!("{who} ({})", match why {
+                    crate::place::Refusal::Unreachable(w) => w.clone(),
+                    other => other.to_string(),
+                })
+            })
+            .collect();
+        let mut w = Wip::gathered(store, seen.into_iter().map(|s| (s, None)).collect(), since, |agents, bindings| {
+            let shells = crate::waiting::Shells::counted(
+                agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),
+                &counts,
+            );
+            let memory = crate::memory::of_rss(&store.state, agents, bindings, &rss);
+            Probed { shells, memory, daemon: daemon_by_log(&store.state, heard), disk: crate::disk::loud_of(store, &disks) }
+        });
+        if !unheard.is_empty() {
+            let line = format!("unreachable: {} — its seats are not read, not gone", unheard.join("; "));
+            w.silent.line = Some(match w.silent.line.take() {
+                Some(far) => format!("{line}\n{far}"),
+                None => line,
+            });
+        }
+        w
+    }
+
     pub(crate) fn live(store: &Store) -> Wip {
         let backends = crate::place::local_backends();
         let mut agents = Vec::new();
@@ -4022,6 +4125,22 @@ impl Wip {
             &answered,
             util::epoch_secs(),
         );
+        Wip::gathered(store, agents, since, |agents, bindings| Probed {
+            shells: idle_members_shells(agents, bindings),
+            memory: crate::memory::read(&store.state, agents, bindings, || crate::host::Host::seat_memory(&crate::host::LOCAL)),
+            daemon: crate::daemon::dead(&store.state, crate::daemon::running(&store.state).as_deref(), heard),
+            disk: crate::disk::loud(store),
+        })
+    }
+
+    /// The store's half of a reading, joined to a census: `agents` with each
+    /// gone seat's quiet time, and `probe` for what is read of the host.
+    fn gathered(
+        store: &Store,
+        agents: Vec<(crate::place::Seated, Option<i64>)>,
+        since: BTreeMap<String, String>,
+        probe: impl FnOnce(&[crate::place::Seated], &BTreeMap<String, Value>) -> Probed,
+    ) -> Wip {
         let tasks = std::rc::Rc::new(wip_tasks(store));
         let bindings = store.bindings();
         let claims = store.claims();
@@ -4042,8 +4161,7 @@ impl Wip {
             })
             .map(|(s, _)| s)
             .collect::<Vec<_>>();
-        let shells = idle_members_shells(&agents, &bindings);
-        let idle_memory = crate::memory::read(&store.state, &agents, &bindings, || crate::host::Host::seat_memory(&crate::host::LOCAL));
+        let Probed { shells, memory: idle_memory, daemon, disk } = probe(&agents, &bindings);
         Wip {
             tasks,
             index: Index::new(store.projects()),
@@ -4054,8 +4172,8 @@ impl Wip {
             agents,
             agents_held,
             said: store.said(),
-            daemon: crate::daemon::dead(&store.state, crate::daemon::running(&store.state).as_deref(), heard),
-            disk: crate::disk::loud(store),
+            daemon,
+            disk,
             load: crate::throttle::loud(store),
             throttle: Some(crate::throttle::status_line(store)),
             idle_memory,
