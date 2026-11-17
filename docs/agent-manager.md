@@ -610,7 +610,7 @@ The before figure, over the 7 days to 2026-11-17T10:06Z on this store:
 plan's own commit), which is from before M0. So every figure the fleet records today is a before figure. The after
 figure was taken as an A/B on this machine at 2026-11-17T10:03Z, under a load average of 7.9–9.4. Two release builds
 were compared: `4be352b` (built from `git archive` into the row's scratch directory) and this tree (`90d47e3`, the
-M0 trunk plus this row). They ran alternately, with `WSP_NO_CALLS=1` so that the fleet's `calls.jsonl` was not
+M0 trunk plus this row, built before its rebase onto wsp-012's comment-only commits). They ran alternately, with `WSP_NO_CALLS=1` so that the fleet's `calls.jsonl` was not
 touched. CPU is user+sys of the process and every child it waited for (`wait4`). The script is `ab.py` and
 `spawn_ab.sh` in the row's scratch directory.
 
