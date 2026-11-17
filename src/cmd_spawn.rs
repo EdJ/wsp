@@ -1591,6 +1591,18 @@ fn seat_start(line: &str) -> bool {
     seat_line.and_then(|h| h.split_once(' ')).is_some_and(|(_, said)| said.starts_with("started by pane "))
 }
 
+/// The key of an agent started into a seat with no row (a governor's: a
+/// reseat or a rotation): the seat's own freshly minted id at attempt 1.
+///
+/// **Not attempt 0, which is the bare shell `open` ran there** (`wsp-036`):
+/// under a manager that shell is the seat's `seat.spawn` keyed `<seat>/0`, and
+/// the agent that replaces it under the same key is refused `Duplicate`, which
+/// is every keyless start into an opened seat. Named after the seat, so the
+/// fold claims no row for it (`wsp-029`); a retry is attempt 2, and so on.
+fn seat_key(seat: &Seat) -> crate::place::Key {
+    crate::place::Key { row: crate::place::RowId(seat.to_string()), attempt: 1 }
+}
+
 /// Start an agent in a seat, and try again if it does not survive the attempt.
 ///
 /// **The retry this task asked for, and the whole of the argument for why it is
@@ -3839,7 +3851,22 @@ pub(crate) fn reseat(store: &Store, scope: &str) -> i32 {
         return 1;
     }
     let args = reseat_args(&governors, scope);
-    reseat_on(backend(&args).as_ref(), store, &args, &Patience::default())
+    // **Through [`spawn_backend`], as `wsp spawn` is** (`wsp-036`): under
+    // `WSP_HOST=manager` the successor is the manager's `seat.spawn`, under
+    // its key, journalled and in `wip`'s census. [`backend`] is the
+    // in-process host whatever `WSP_HOST` says, and retro-2's cpd-241 was
+    // started that way, behind the manager's back. A manager that does not
+    // answer is the reseat failed, said on the seat, never the in-process host
+    // in its place.
+    let place = match spawn_backend(&args) {
+        Ok(place) => place,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            cmd_govern::reseat_failed(store, scope, &format!("no seat could be opened: {e}"));
+            return 1;
+        }
+    };
+    reseat_on(place.as_ref(), store, &args, &Patience::default())
 }
 
 /// The kind a reseat of this scope starts — the seat's own, read live or from
@@ -4184,7 +4211,9 @@ fn rotate_as(
     };
     let mut spawn_args = how.args(&spawn);
     spawn_args.extend(crate::cmd_role::settings_args(&kind, Some(&scope), work.primary));
-    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: spawn_args, key: spawn_key(store, Some(&scope)) };
+    // A governor has no row: its key is its seat's own (see `seat_key`).
+    let key = spawn_key(store, Some(&scope)).unwrap_or_else(|| seat_key(&seat));
+    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: spawn_args, key: Some(key) };
 
     // Step 2. Started, then heard from: a turn running is the only evidence
     // that the handover was taken, and everything after this point depends on
