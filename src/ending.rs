@@ -410,6 +410,10 @@ fn left_in_finished_by(store: &Store, seats: &dyn Seats) -> Option<Vec<crate::ch
     crate::place_super::one_ps(|| crate::check_tree::left_in_finished(store, seats.census()?, &|seat| seats.pids(seat), &crate::legs::staged))
 }
 
+/// How long [`stop_finished`] gives a `TERM` before it looks again and sends
+/// `KILL`. Short in a test, whose one process exits on `TERM` at once.
+const TERM_GRACE_MS: u64 = if cfg!(test) { 100 } else { 1500 };
+
 /// Stop what the finished rows left running (`wsp-453`): `TERM`, a moment,
 /// then `KILL` for what is still there, and a `cycle.log` line for each tree.
 /// Run by the tick, so a row that reaches review has nothing of its own
@@ -432,7 +436,7 @@ pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     }
     let all = |l: &[crate::check_tree::Left]| l.iter().flat_map(|t| t.pids.clone()).collect::<Vec<u32>>();
     crate::check_tree::signal("TERM", &all(&found));
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    std::thread::sleep(std::time::Duration::from_millis(TERM_GRACE_MS));
     let still = left_in_finished_by(store, seats).unwrap_or_default();
     crate::check_tree::signal("KILL", &all(&still));
     for t in &found {
