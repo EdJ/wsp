@@ -382,7 +382,7 @@ a defect.
 - *Ownership.* A job that is not `detach`ed is stopped when the connection that asked for it closes, so a
   `throttle run` killed with its agent leaves no build behind. `job.output` goes to that connection and no other.
 
-The manager refuses `job.run`, `job.stop` and `jobs` as `unsupported` until M3's group 3 serves them.
+The manager served none of these until M3's group 3 (wsp-050), which is written up under 6.2.
 
 The manager does **not** decide anything that is wsp's to decide. It does not choose a seat, pick a row, end a seat
 of its own accord (except at the gate's existing rule, section 5), hold a tell, or judge a check's output. It does
@@ -978,6 +978,55 @@ What M1's live defects taught, carried into the rows:
 - **Liveness judged from a state read that is not yet true** (wsp-037). Jobs are waited on by subscription.
 
 **Assumes M2:** nothing M3 builds. Rows placed on the i5 keep today's ssh path, and their builds and checks keep running in-process there, because the i5 has no manager. So the M3 measure covers the Mac's wsp only. Under T1 (d1 Q6), the tree's host is the Mac for every job.
+
+#### M3 group 3: the manager serves jobs (wsp-050, 2026-11-17)
+
+`crates/manager/src/jobs.rs` holds the job table, beside seats.rs. It runs each job on `wsp-host`'s runner
+(`crates/host/src/jobs.rs`, wsp-049). serve.rs no longer refuses `job.*`.
+- **`job.run` is keyed by `JobKey`.** A retry of a key gets the same journalled `job.started` with the same id. Once
+  the job has ended, a retry gets its `job.ended`. It never runs a second time. The retry also takes the job over:
+  its output and its ownership go to the connection that asked last. A key asked again with another argv, class or
+  place is refused `duplicate`. So is a key whose `<key>.run` is on disk but which is no longer in the table.
+- **Capacity per class** comes from `--build` and `--check` (2 and 4 by default) and is reported in `hello`'s
+  `Capacity`. It is a hard cap and nothing more. A run past it is refused `full` and is never queued. When to ask
+  stays wsp's throttle's call (d1 Q11).
+- **Where a job runs.** A `dir` is a path under `--tree-root` (the home directory by default) on this host. A path
+  that is absent, not a directory, on another host, or outside the root once links are resolved is refused
+  `no_tree`. A row's `tree` is also refused `no_tree` until Q6 places trees on hosts. Under T1, wsp names the
+  directory instead.
+- **Events.** `job.started {pgid}` and `job.ended {exit, timed_out, hung, log, cpu_ms}` are journalled before they
+  are sent, like every manager event. Subscribers get them, and so do the job's owner and anyone who asked it to
+  stop. **`job.output` is not journalled.** It goes live to the connection that owns the job and to no other, as
+  chunks of up to 64 KiB, each with its byte offset in the log. A client that was not listening reads the log,
+  which `job.ended` names.
+- **`job.stop` ends the job's own pgid.** It sends `TERM` to the group, then `KILL` once the grace (5 s) is out. The
+  manager signals no group that is not in its job table. `manager.log` names every signal it sends with its group,
+  and also the group the runner kills at every end (wsp-453). A stop of an ended job gets its `job.ended`, and a
+  stop of an unknown key is refused `no_job`.
+- **Ownership.** When a connection closes, the jobs it owns that are not `detach`ed are stopped as `job.stop` stops
+  them, and the log says why. A detached job runs on, and its output goes nowhere until its key is asked again.
+- **`jobs`** answers `jobs.list` with the table: every job the manager runs or ran since it started, with its key,
+  class, pgid, start and state.
+- **Restart (2.5).** `<exec_dir>/jobs/<key>.run` holds the `job.run`, written before the job starts. At start
+  every one of them is joined to the journal and to the runner's `<key>.job` and `<key>.exit`:
+  - an end the journal already holds is kept as it is, so it is never reported twice;
+  - an end that only the exit file holds (the job ended while the manager was down) is reported `job.ended` now;
+  - a job still running whose pid has its recorded start time is re-adopted and watched to its end. It has no
+    owner until its key is asked again, so it is not stopped for the connection the restart closed;
+  - a job that is gone and wrote no end is reported `job.ended` with no exit;
+  - a `.run` with no runner record (the manager stopped between the two) is forgotten.
+
+  `Manager::stop` leaves jobs running in the same way, for the next start to adopt.
+
+Tests (`tests/jobs.rs`) run a loopback manager with `sh` jobs under a scratch tree root. They check that:
+- two `job.run`s under one key run once, and a third connection's retry takes the job over;
+- `job.stop` ends the job's group, its background child included, while a process outside the job survives, and
+  every kill the log names is on a group in the table;
+- a run past a cap of one is refused `full` and not queued;
+- a dropped connection stops its undetached job, and the detached one runs on;
+- the `wsp-manager` binary, killed with SIGKILL mid-job and restarted, reports each job's end once (one job ended
+  while it was down, one was re-adopted), starts nothing again, and resumes events `from` the last id;
+- `jobs` lists each job as running or ended.
 
 ### 6.3 How this reorders state-core section 7
 

@@ -23,11 +23,17 @@
 //!   attempt)`, forking one compound-sup per seat; `seat.stop`; orders through
 //!   compound-sup's `deliver <id>`; `seats` and `seat.read`; seat epochs; and
 //!   on restart the seat table rebuilt from the sessions in `<exec_dir>/run`,
-//!   with an order in flight asked again under its id (2.5, 3.3).
+//!   with an order in flight asked again under its id (2.5, 3.3);
+//! - it runs tree jobs (wsp-050, [`jobs`]): `job.run` keyed by
+//!   [`JobKey`](wsp_host_api::JobKey) under a hard cap per class, `job.stop` on
+//!   the job's own pgid, `jobs`, an undetached job stopped with its
+//!   connection, and on restart the jobs re-adopted through `wsp-host`'s exit
+//!   files (6.2 M3).
 //!
 //! It depends on `wsp-host-api`, `wsp-base` and `wsp-host`, and on nothing of
 //! `wsp-store` (2.3 R1, d1 Q3).
 
+mod jobs;
 pub mod journal;
 pub mod log;
 pub mod seats;
@@ -89,13 +95,29 @@ pub struct Config {
     /// session there that answers is adopted (wsp-029, 6.2), as one under its
     /// own `<exec_dir>/run` is. Empty in [`Config::new`]: a test names its own.
     pub inproc_runs: Vec<PathBuf>,
+    /// How many `build` jobs it runs at once, as `hello`'s capacity says; a
+    /// `job.run` past it is refused `full`. A hard cap and nothing more: when
+    /// to ask is the throttle's (d1 Q11).
+    pub build: u32,
+    /// The same for `check` jobs.
+    pub check: u32,
+    /// The host's tree root: a job's `dir` is a path under it.
+    pub tree_root: PathBuf,
+    /// How long `job.stop` waits after `TERM` before it sends `KILL`.
+    pub job_grace: Duration,
 }
 
 /// The seats a manager admits unless told otherwise.
 pub const DEFAULT_SEATS: u32 = 32;
+/// The `build` and `check` jobs a manager runs at once unless told otherwise.
+pub const DEFAULT_BUILD: u32 = 2;
+pub const DEFAULT_CHECK: u32 = 4;
+/// `job.stop`'s grace between `TERM` and `KILL`.
+pub const DEFAULT_JOB_GRACE: Duration = Duration::from_secs(5);
 
 impl Config {
-    /// Loopback on [`DEFAULT_PORT`], a 10 s beat, disk free for `exec_dir`'s volume.
+    /// Loopback on [`DEFAULT_PORT`], a 10 s beat, disk free for `exec_dir`'s
+    /// volume, the home directory as the tree root.
     pub fn new(exec_dir: &Path, host: &str) -> Config {
         Config {
             exec_dir: exec_dir.to_path_buf(),
@@ -107,6 +129,10 @@ impl Config {
             sup: None,
             seats: DEFAULT_SEATS,
             inproc_runs: Vec::new(),
+            build: DEFAULT_BUILD,
+            check: DEFAULT_CHECK,
+            tree_root: wsp_base::util::home(),
+            job_grace: DEFAULT_JOB_GRACE,
         }
     }
 }
@@ -197,6 +223,9 @@ pub(crate) struct Shared {
     /// The seats it runs, their keys and epochs, and the orders it was asked.
     /// Taken before the journal, never while holding it.
     pub(crate) seats: Mutex<seats::Table>,
+    /// The jobs it runs and ran. Taken before the journal, never while
+    /// holding it.
+    pub(crate) jobs: Mutex<jobs::Table>,
 }
 
 impl Shared {
@@ -228,7 +257,7 @@ impl Shared {
     }
 
     pub(crate) fn capacity(&self) -> Capacity {
-        Capacity { seats: self.cfg.seats, build: 0, check: 0 }
+        Capacity { seats: self.cfg.seats, build: self.cfg.build, check: self.cfg.check }
     }
 }
 
@@ -309,9 +338,11 @@ impl Manager {
             last_beat: Mutex::new(None),
             hooks: Mutex::new(wsp_host::hooks::Fold::new(&cfg_dir, host_id)),
             seats: Mutex::new(Default::default()),
+            jobs: Mutex::new(Default::default()),
         });
         let _ = fs::create_dir_all(shared.run_dir());
         seats::adopt(&shared);
+        jobs::adopt(&shared);
 
         let mut threads = Vec::new();
         for l in listeners {
@@ -344,6 +375,11 @@ impl Manager {
         self.shared.seats.lock().unwrap_or_else(|e| e.into_inner()).epochs()
     }
 
+    /// The jobs it has, running and ended: `(key, pgid, running)`.
+    pub fn jobs(&self) -> Vec<(wsp_host_api::JobKey, u32, bool)> {
+        jobs::rows(&self.shared)
+    }
+
     /// How many clients have said a good `hello` and are still connected.
     pub fn clients(&self) -> usize {
         self.shared.clients.lock().unwrap_or_else(|e| e.into_inner()).len()
@@ -369,7 +405,9 @@ impl Manager {
     /// Stop listening, close every client and the beat, and release the
     /// `<exec_dir>`. The journal is left as it is, for the next start, and so
     /// are the seats: compound-sup outlives its manager, and the next start
-    /// adopts them. An order still being asked is asked again then.
+    /// adopts them. An order still being asked is asked again then. Jobs are
+    /// left running too, undetached ones included, and the next start
+    /// re-adopts them.
     pub fn stop(self) {
         self.shared.stopping.store(true, Ordering::SeqCst);
         {

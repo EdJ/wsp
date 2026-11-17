@@ -6,6 +6,9 @@
 //! Two threads per client: this one reads and answers, and a writer sends
 //! whatever is queued for the client (answers, the journal's events, the
 //! beat), so a slow client never holds the journal or the beat.
+//!
+//! When a client leaves, the jobs it asked for that are not detached are
+//! stopped ([`crate::jobs::closed`]).
 
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
@@ -95,6 +98,9 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream) {
     conn.shutdown();
     if !shared.stopping.load(Ordering::SeqCst) {
         shared.log.line(&format!("{peer}: {why}"));
+        // Its undetached jobs end with it; a manager that stops leaves them
+        // for the next start to adopt.
+        crate::jobs::closed(&shared, id);
     }
 }
 
@@ -236,9 +242,9 @@ fn answer(shared: &Arc<Shared>, id: u64, out: &Sender<Frame>, frame: Frame) {
             let (shared, asker) = (shared.clone(), asker());
             std::thread::spawn(move || seats::read(&shared, asker, r));
         }
-        Message::JobRun(_) | Message::JobStop(_) | Message::Jobs(_) => {
-            let _ = out.send(refused(req, Refusal::Unsupported, "this manager runs no jobs yet (M3)"));
-        }
+        Message::JobRun(r) => crate::jobs::run(shared, asker(), r),
+        Message::JobStop(s) => crate::jobs::stop(shared, asker(), s),
+        Message::Jobs(_) => crate::jobs::list(shared, asker()),
         Message::TreeCheckout(_) | Message::TreeLand(_) | Message::TreeCopy(_) => {
             let _ = out.send(refused(req, Refusal::Unsupported, "tree verbs wait for Q6 (T1 holds)"));
         }
