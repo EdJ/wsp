@@ -13,8 +13,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
-
 use crate::input::Key;
 use crate::kanban;
 use crate::live::{self, AgentRef};
@@ -32,7 +30,6 @@ use super::verbs::{
 
 pub(super) enum Msg {
     Key(Key),
-    Herdr(HerdrEvent),
     Tick,
     /// A line for the footer from something that took too long to do on the
     /// loop. `S` and `O` produce these — starting an agent means waiting on
@@ -40,17 +37,6 @@ pub(super) enum Msg {
     /// and so does every sentence typed at an agent, which waits on the clear
     /// in front of it.
     Note(String),
-}
-
-/// A herdr event, reduced to what the loop decides with.
-pub(super) struct HerdrEvent {
-    /// The workspace it was about, when it named one.
-    pub(super) workspace: Option<String>,
-    /// A pane or workspace appeared, went, or gained an agent. See [`SHAPE`].
-    pub(super) shape: bool,
-    /// Focus moved to some workspace. Only interesting when that workspace is
-    /// ours, and then it is very interesting — see the loop.
-    pub(super) focus: bool,
 }
 
 
@@ -272,133 +258,6 @@ pub(super) fn spawn_input(tx: Sender<Msg>) {
     });
 }
 
-/// Rare, and every one of them changes which rows exist: a pane opened or
-/// closed, a workspace came or went, a pane picked up an agent or lost one.
-/// These refetch wherever the panel is standing, focused or not.
-///
-/// That is deliberately not free. Twenty-two background panels each take a
-/// store read and two socket calls when any of these arrives — but they arrive
-/// a handful of times a minute, and the dock is the one part of the frame that
-/// cannot be allowed to go half a minute stale. It is the answer to "who is
-/// free right now", and an answer that old is not an answer.
-///
-/// `pane.agent_detected` is the event a new agent raises, and herdr raises it
-/// again when the agent goes away. `pane.agent_status_changed` is not here and
-/// cannot be: it is per-pane and its request requires a `pane_id`, so asking
-/// for it globally refuses the whole list — see the note in [`crate::herdr`].
-///
-/// An agent *finishing* belongs in this list too and cannot be in it, because
-/// no event means it and none can. [`status_changed`] recovers what it can by
-/// promoting the one `pane.updated` in a hundred that carries a status the pane
-/// did not have before, and that is worth having — but it is not a guarantee,
-/// and [`STATUS_POLL`] says why and covers the rest.
-const SHAPE: &[&str] = &[
-    "workspace.created",
-    "workspace.closed",
-    "pane.created",
-    "pane.closed",
-    "pane.exited",
-    "pane.agent_detected",
-];
-
-/// Subscribed to, and deliberately not urgent. herdr emits `workspace.focused`
-/// on every sidebar hover — about once a second — and `pane.updated` about
-/// twice a second for each agent that is working. Refetching on those would
-/// have every panel on the machine doing socket round-trips continuously to
-/// keep a glyph honest. They mark the panel dirty and the tick gate coalesces
-/// them to the cadence it already keeps: 250ms when the panel is being looked
-/// at, 30s when it is not.
-///
-/// `pane.updated` is the only global carrier of an agent going idle or working,
-/// which is what the "wants you" arrow is drawn from, so it has to be here even
-/// though it is the noisiest thing herdr sends. Chatty is what it is on
-/// average, not what it always is: the one in a hundred of them that carries a
-/// status the pane did not have before is promoted to structural by
-/// [`status_changed`], and the other ninety-nine go on being coalesced.
-const CHATTY: &[&str] = &["workspace.focused", "workspace.renamed", "pane.updated"];
-
-/// How often an unfocused panel asks herdr, itself, who has stopped.
-///
-/// Nothing pushes agent status to herdr. The hook it installs —
-/// `~/.claude/hooks/herdr-agent-state.sh` — exits without a word for every
-/// action but `session`, and the one message it does send is
-/// `pane.report_agent_session`, carrying a session id and a transcript path. It
-/// goes out of its way to drop `SubagentStop`. herdr classifies from that
-/// transcript: `pane.list` reports `agent_session {kind: "id", value: <uuid>}`
-/// per pane, and `blocked` is among the statuses, which nothing reading a PTY
-/// could know.
-///
-/// That is the whole asymmetry. An agent *starting* is an edge — a write to a
-/// file — so a filesystem notification can carry it at once, and does: measured
-/// against the live server, 0.2s. An agent *finishing* is the **absence** of
-/// writes for some quiet interval, and nothing fires on the passing of time.
-/// Worse, the last write to the transcript is the agent's closing message,
-/// which still looks like work. Only a timer can see a finish, and herdr's runs
-/// on its own schedule: the event carrying one came 6.8s late once and 28.9s
-/// late once, with 147s of unbroken silence on the stream across the second.
-///
-/// `pane.list` evaluates the same rule when it is asked, so it sees the absence
-/// for free. That makes it not the fresher of two channels but the *only* one
-/// that can report a finish on time — and a panel that waits for the event
-/// instead is the half-minute of staleness that reads as broken from a chair.
-///
-/// Hence a poll, and one this side of human patience. It is far cheaper than
-/// the refetch it guards: one socket call, where a refetch also reads the whole
-/// store off disk and rebuilds every row. Only unfocused panels run it, because
-/// a focused one already refetches four times a second.
-const STATUS_POLL: Duration = Duration::from_secs(3);
-
-/// Has any pane changed the status the frame was drawn with?
-///
-/// The poll-side twin of [`status_changed`], and it keeps the same rule for the
-/// same reason: only panes in both are compared. A pane arriving or leaving is
-/// structural, [`SHAPE`] already refetches on it at once, and counting it here
-/// as well would refetch twice for one event.
-/// Subscriptions herdr scopes to a single pane. Its request struct for these
-/// requires a `pane_id`, and there is no wildcard — `*` and `""` both answer
-/// `pane_not_found`. Naming one here without a pane refuses the whole list,
-/// which is how the panel spent its life receiving no events at all.
-#[cfg(test)]
-const PER_PANE: &[&str] =
-    &["pane.agent_status_changed", "pane.output_matched", "pane.scroll_changed"];
-
-/// The stream names events with underscores where the subscription used dots —
-/// `pane.agent_detected` is asked for that way and arrives as
-/// `pane_agent_detected`.
-fn is(types: &[&str], event: &str) -> bool {
-    types.iter().any(|t| t.replace('.', "_") == event)
-}
-
-/// Did this event say an agent started or stopped, as against saying anything
-/// else at all?
-///
-/// `pane.updated` is the only global carrier of an agent's status and also the
-/// noisiest thing herdr sends: it fires on every spinner frame in a terminal
-/// title and every token count, ten a second with four agents running, and
-/// carries the whole pane each time. The status itself changes a few times a
-/// minute. `seen` is the only thing that can tell those apart — the event does
-/// not say what it was before, so a reducer that keeps no history has to treat
-/// a stop and a spinner frame identically, which is why an agent finishing sat
-/// on the 30s cadence while an agent appearing did not.
-///
-/// A pane met for the first time is recorded and is not a change. Every pane on
-/// the machine arriving at once is what the first second of a subscription
-/// looks like, and it is not news about any of them.
-fn status_changed(seen: &mut HashMap<String, String>, d: &Value) -> bool {
-    let Some(pane) = d.get("pane") else { return false };
-    let Some(id) = pane.get("pane_id").and_then(|x| x.as_str()) else { return false };
-    // A pane with no agent in it has no status to change. herdr sends the field
-    // as an empty string rather than leaving it out.
-    let status = pane.get("agent_status").and_then(|x| x.as_str()).unwrap_or_default();
-    if status.is_empty() {
-        return false;
-    }
-    match seen.insert(id.to_string(), status.to_string()) {
-        Some(before) => before != status,
-        None => false,
-    }
-}
-
 /// Subscribe to herdr's event stream, and mark the panel dirty on what comes
 /// out of it.
 ///
@@ -482,11 +341,6 @@ pub(super) struct Where {
 impl Where {
     /// A panel in a pane: it is where the environment says it is.
     pub(super) fn env() -> Where {
-        Where::default()
-    }
-
-    /// A panel that is in no pane and no workspace, and knows it.
-    pub(super) fn nowhere() -> Where {
         Where::default()
     }
 
@@ -1520,55 +1374,6 @@ pub(super) fn event_loop(
                     refetch = true;
                 }
             },
-            Msg::Herdr(e) => {
-                // Coalesce the burst that follows a split or a focus change.
-                // Keys are put back rather than dropped: they arrived after the
-                // event but have not been acted on, and swallowing a keystroke
-                // because a pane somewhere repainted is not a trade anyone
-                // would make. `pane.updated` alone is two events a second, so
-                // this drain runs constantly and used to eat into every burst
-                // of typing.
-                let ours = |e: &HerdrEvent| e.workspace.is_some() && e.workspace.as_deref() == self_ws;
-                let mut shape = e.shape;
-                let mut focused_us = e.focus && ours(&e);
-                while let Ok(m) = rx.try_recv() {
-                    match m {
-                        Msg::Herdr(e) => {
-                            shape |= e.shape;
-                            focused_us |= e.focus && ours(&e);
-                        }
-                        Msg::Tick => {}
-                        held => carry.push_back(held),
-                    }
-                }
-                dirty = true;
-                // A pane appeared, went, or picked up an agent. Draw it now,
-                // and not only when this panel happens to be the one being
-                // looked at: an agent showing up in the dock half a minute
-                // after it started is the whole complaint this came from.
-                //
-                // Focus arriving on our own workspace is the other one that
-                // cannot wait, for a different reason. It is what moves this
-                // panel onto the fast cadence, and the cadence is read from a
-                // snapshot — so deferring it would leave the panel deciding it
-                // is slow *because* the last snapshot said it was not being
-                // looked at, and never taking the one that would say otherwise.
-                //
-                // It is also what keeps `keyboard` honest, and this is the
-                // event that can do it: measured against the live server, herdr
-                // raises `workspace.focused` on every move of the keyboard
-                // — including one pane to the next inside a single workspace,
-                // where the workspace being focused has not changed at all. So
-                // the reader stepping off this pane onto the shell beside it
-                // lands here, and the census that says who has the keyboard is
-                // re-read before the next click can ask.
-                if shape || focused_us {
-                    refetch = true;
-                    dirty = false;
-                }
-            }
-            // A spawn has landed. Refetch as well as say so: the workspace and
-            // its agent are new rows, and the claim moved a task under them.
             Msg::Note(line) => {
                 say(&mut ui, line);
                 refetch = true;
@@ -1993,111 +1798,6 @@ mod tests {
         );
     }
 
-    /// The bug this came from. A subscription list is validated as a whole, so
-    /// one per-pane type sent without a `pane_id` refuses every global type
-    /// beside it — and `subscribe` used to read that refusal as an empty
-    /// stream. The panel drew a tree that could not change.
-    #[test]
-    fn no_subscription_is_scoped_to_a_single_pane() {
-        for t in SHAPE.iter().chain(CHATTY) {
-            assert!(
-                !PER_PANE.contains(t),
-                "{t} needs a pane_id, and asking for it globally refuses the whole list",
-            );
-        }
-    }
-
-    /// Which pane has the keyboard decides what a click means, and the panel
-    /// learns that a pane at a time from the census. What makes the census
-    /// timely enough to decide a click is this subscription: measured against
-    /// the live server, herdr raises `workspace.focused` on every move of the
-    /// keyboard, including one pane to the next inside a single workspace, so
-    /// the move that matters most — off this panel onto the shell beside it —
-    /// is one the loop is told about rather than one it waits out.
-    #[test]
-    fn the_keyboard_moving_is_something_the_panel_is_told() {
-        assert!(CHATTY.contains(&"workspace.focused"));
-        assert!(is(CHATTY, "workspace_focused"), "and by the name the stream uses");
-    }
-
-    /// A pane gaining an agent is the event the dock exists for, and herdr
-    /// raises the same one when the agent goes away. It has to be urgent
-    /// rather than chatty: measured against the live server, herdr knew about
-    /// a new claude 2.4s after it launched and the panel drew it at 31.2s,
-    /// because it was waiting for the background tick.
-    #[test]
-    fn a_pane_gaining_or_losing_an_agent_is_urgent() {
-        assert!(SHAPE.contains(&"pane.agent_detected"));
-        assert!(!CHATTY.contains(&"pane.agent_detected"));
-        // The pane going entirely is the other half of the same question.
-        assert!(SHAPE.contains(&"pane.closed"));
-        assert!(SHAPE.contains(&"pane.exited"));
-        assert!(SHAPE.contains(&"workspace.closed"));
-        // And the one that cannot be had globally is nowhere near either list.
-        assert!(!SHAPE.contains(&"pane.agent_status_changed"));
-        assert!(!CHATTY.contains(&"pane.agent_status_changed"));
-    }
-
-    /// herdr sends `workspace.focused` on every sidebar hover and
-    /// `pane.updated` about twice a second per working agent. Treating either
-    /// as urgent would have every panel on the machine doing socket
-    /// round-trips continuously.
-    #[test]
-    fn the_noisy_ones_are_not_urgent() {
-        for t in ["workspace.focused", "pane.updated"] {
-            assert!(CHATTY.contains(&t), "{t} should be tick-gated");
-            assert!(!SHAPE.contains(&t), "{t} is far too noisy to refetch on");
-        }
-    }
-
-    /// The whole of the asymmetry, in one function. An agent stopping has no
-    /// event of its own that reaches every panel, so it arrives inside the
-    /// noisiest one there is — and the only thing separating it from a spinner
-    /// frame is what the pane's status was a moment ago.
-    ///
-    /// Measured against the live server with four agents running: 120s of
-    /// `pane.updated` is 335 events carrying 18 status transitions. Promoting
-    /// eighteen a couple of minutes is the handful a minute `SHAPE` is costed
-    /// for; promoting all 335 is the continuous socket traffic across every
-    /// panel on the machine that `CHATTY` exists to avoid.
-    #[test]
-    fn only_a_status_that_actually_changed_is_worth_a_refetch() {
-        let pane = |id: &str, status: &str| {
-            json!({ "pane": { "pane_id": id, "agent_status": status } })
-        };
-        let mut seen = HashMap::new();
-
-        // Meeting a pane teaches without firing: the first second of a
-        // subscription is every pane on the machine arriving at once.
-        assert!(!status_changed(&mut seen, &pane("w1:p6", "working")));
-        // And the spinner frames behind it say nothing new.
-        for _ in 0..10 {
-            assert!(!status_changed(&mut seen, &pane("w1:p6", "working")));
-        }
-
-        // Stopping is the one that must not wait.
-        assert!(status_changed(&mut seen, &pane("w1:p6", "idle")));
-        assert!(!status_changed(&mut seen, &pane("w1:p6", "idle")), "and only once");
-        // Starting again is the same fact from the other side: an arrow that
-        // says an agent wants you must come down as promptly as it went up.
-        assert!(status_changed(&mut seen, &pane("w1:p6", "working")));
-
-        // Panes are tracked apart. One agent working through another's stop
-        // used to be the same event as far as the reducer could tell.
-        assert!(!status_changed(&mut seen, &pane("w0:p3", "idle")));
-        assert!(status_changed(&mut seen, &pane("w0:p3", "working")));
-        assert!(!status_changed(&mut seen, &pane("w1:p6", "working")));
-
-        // A pane with no agent in it has no status to change. herdr sends the
-        // field empty rather than leaving it out, and an empty string is not a
-        // transition into anything.
-        assert!(!status_changed(&mut seen, &pane("w2:p1", "")));
-        assert!(!status_changed(&mut seen, &pane("w2:p1", "")));
-        // Nor is an event that carries no pane at all — `workspace.focused`
-        // goes through the same reducer.
-        assert!(!status_changed(&mut seen, &json!({ "workspace_id": "w1" })));
-    }
-
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("wsp-{}-{}", tag, std::process::id()));
         let _ = std::fs::create_dir_all(&d);
@@ -2151,18 +1851,6 @@ mod tests {
         assert!(view.show_done, "a missing file is not an instruction to reset");
         assert!(agreed.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Subscriptions are spelt with dots and the stream answers in underscores.
-    /// Classifying on the subscription's own spelling would make every event
-    /// non-urgent, which is the same silence by another route.
-    #[test]
-    fn events_are_matched_by_the_names_the_stream_actually_uses() {
-        assert!(is(SHAPE, "pane_agent_detected"));
-        assert!(is(SHAPE, "pane_created"));
-        assert!(is(CHATTY, "workspace_focused"));
-        assert!(!is(SHAPE, "pane_updated"));
-        assert!(!is(SHAPE, "pane.agent_detected"));
     }
 
     fn argv(words: &[&str]) -> Vec<String> {

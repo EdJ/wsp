@@ -93,7 +93,7 @@ pub(crate) struct Ctx {
 impl Ctx {
     /// What a pane reads, including which editors are beside it.
     pub(super) fn live(store: &Store) -> Ctx {
-        Ctx { columns: super::editors::editor_columns(), ..Ctx::read(store, live::panes()) }
+        Ctx { columns: Vec::new(), ..Ctx::read(store, live::panes()) }
     }
 
     /// What a page reads: the same thing, with the panes handed in and no

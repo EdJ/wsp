@@ -19,7 +19,6 @@ use crate::model::Priority;
 use crate::place::State;
 use crate::store::Store;
 
-use super::install::list_panes;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View, Where};
 use super::render::WHOLE_SCREEN;
 use super::rows::{hotkeys, Target, Ui};
@@ -1081,7 +1080,7 @@ pub(crate) fn inspect(
     };
     let ws = ws.as_str();
     crate::detail::set_focus(store, ws, focus);
-    list_panes(ws).err().unwrap_or_default()
+    String::new()
 }
 
 /// Take every panel's cursor to a task, because the person is reading it now.
