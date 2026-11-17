@@ -345,22 +345,6 @@ fn trust_prompt(seat: &Seat, screen: &str) -> Option<String> {
 /// never told.
 const STARTING_WINDOW: i64 = 120;
 
-/// Whether the hooks log shows a turn begun at or after `since`, newest line
-/// first and out as soon as a line is older than the question.
-fn turn_in_log(log: &str, since: i64) -> bool {
-    for line in log.lines().rev() {
-        let Ok(h) = serde_json::from_str::<Value>(line) else { continue };
-        if util::epoch_of(&str_of(&h, "at")) < since {
-            return false;
-        }
-        // A nested session's prompt is not the seat's turn (`wsp-364`).
-        if str_of(&h, "hook") == "UserPromptSubmit" && h.get("child").is_none() {
-            return true;
-        }
-    }
-    false
-}
-
 /// Whether Claude Code's prompt is holding typed text, read off its screen —
 /// [`Place::typed`] for a `claude` seat. `None` when the screen holds no
 /// prompt this recognises.
@@ -1730,13 +1714,12 @@ impl Place for Compound<'_> {
     fn turn_began_since(&self, seat: &Seat, since: i64) -> Option<bool> {
         let dir = self.dir_of(seat).ok()?;
         // No log is *cannot say*, not *no turn*: a seat that predates the file.
-        let log = self.host.hook_log(&dir);
+        let began = self.host.turn_began(&dir, since);
         // A far seat's hooks fire over there and write nothing here, so a log
         // that shows no turn is *cannot say* for it, not *no turn*: the caller
         // then reads the seat's live state, which a far screen answers
         // (wsp-589). Only a turn actually seen is a turn.
         let far = self.record(seat).ok().is_some_and(|r| !str_of(&r, "machine").is_empty());
-        let began = log.as_deref().map(|log| turn_in_log(log, since));
         match (far, began) {
             (true, Some(true)) => Some(true),
             (true, _) => None,

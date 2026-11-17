@@ -196,16 +196,13 @@
 //! `--session-id <uuid>`, the other lead, remains unrun and is now unneeded.
 
 use std::collections::{BTreeMap, HashSet};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use wsp_base::calls::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::cmd_spawn::Reach;
+use crate::host::{self, captured, opencode_bin, Host};
 use crate::place::{Delivery, Place, Refusal, Result, Seat, Seated};
 use crate::util;
 use crate::util::Clock;
@@ -595,7 +592,7 @@ pub trait Kind {
     /// Keyed on the session rather than the seat, because the seat is gone by
     /// the time this is asked — it is read when a claim ends — and the session
     /// is the one handle that outlives it. `cwd` is a hint and not a key: see
-    /// [`transcript`], which falls back to a scan when the tree has moved.
+    /// [`Host::transcript_of`], which falls back to a scan when the tree has moved.
     ///
     /// # `since` is what makes this an attempt rather than a session
     ///
@@ -1339,106 +1336,6 @@ fn opencode_models() -> std::result::Result<Vec<String>, String> {
         .collect())
 }
 
-/// opencode, wherever it is — the same reasoning as [`claude_bin`], and one
-/// extra reason of its own.
-///
-/// `~/.opencode/bin` reached `PATH` through `.zshrc`, which a **non-interactive**
-/// shell does not read, so `Command::new("opencode")` failed from a hook or a
-/// script on a machine that plainly had it. That was fixed at the source by
-/// moving the export to `~/.zshenv` on 2026-08-21, and this stays anyway: the
-/// lookup costs nothing and the failure it prevents reads as "opencode is not
-/// installed" on a machine where it is.
-fn opencode_bin() -> PathBuf {
-    if let Some(v) = std::env::var_os("OPENCODE_BIN") {
-        let p = PathBuf::from(v);
-        if !p.as_os_str().is_empty() {
-            return p;
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join("opencode");
-            if p.is_file() {
-                return p;
-            }
-        }
-    }
-    util::home().join(".opencode/bin/opencode")
-}
-
-/// Everything one of these runtimes wrote to stdout, through a file rather
-/// than a pipe.
-///
-/// **The pipe was losing most of it, and saying nothing.** `opencode export
-/// --sanitize` on a 53-turn session writes 165,230 bytes. Asked for down a
-/// pipe, wsp received 65,536 of them — one pipe buffer — and an exit status of
-/// *zero*, so [`read_export`] was handed a JSON document cut off mid-string,
-/// returned nothing, and `ui-007` closed with no cost clause at all. That is
-/// `core-039`. It was read at first as `despawn` ending the agent before its
-/// runtime could be asked. Driven in a sandbox, both endings wrote the clause —
-/// `wsp release` on a live opencode and `wsp despawn` on another — and then the
-/// row that had lost one lost it again on a replay through `release`, with no
-/// agent left to kill. Nothing about the ending is the variable. The size of
-/// the export is.
-///
-/// The cause belongs to the runtime rather than to the subcommand: these are
-/// Bun-compiled binaries, their stdout writes are asynchronous, and the process
-/// exits without waiting for a pipe it has filled to drain. A file has no
-/// buffer to overrun and its writes complete before exit — the same export
-/// redirected to one came back 165,230 bytes three times out of three.
-///
-/// So every capture in this file goes through here, including the two that are
-/// small today: `opencode models` is 13KB and `claude agents --json` is 1.4KB,
-/// both grow with what is on the machine, and both fail plausibly rather than
-/// loudly when cut — a valid model refused, an agent that cannot be addressed.
-/// The defence is one temp file, and waiting to be the second row this costs is
-/// not a saving.
-///
-/// The file is this process's own, is opened `0600` because a sanitized export
-/// still carries the shape of one attempt and a temp directory is shared, and
-/// is removed however this ends.
-fn captured(bin: PathBuf, args: &[&str]) -> std::result::Result<Vec<u8>, String> {
-    // Named as the reader would type it — `opencode models`, not the resolved
-    // path — because these strings reach a person inside a refusal that is
-    // about their `--model`, not about where wsp found the binary.
-    let said = format!(
-        "{} {}",
-        bin.file_name().unwrap_or(bin.as_os_str()).to_string_lossy(),
-        args.join(" ")
-    );
-    // Unique per call and not merely per process. Nothing here runs two at
-    // once today, and a name that would silently collide the day something
-    // does is a trap laid for a reader with no reason to look here.
-    static NTH: AtomicU64 = AtomicU64::new(0);
-    let at = std::env::temp_dir().join(format!(
-        "wsp-captured-{}-{}",
-        std::process::id(),
-        NTH.fetch_add(1, Ordering::Relaxed)
-    ));
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&at)
-        .map_err(|e| format!("{said}: {e}"))?;
-    let ran = Command::new(&bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(sink))
-        .stderr(Stdio::null())
-        .status();
-    let out = match ran {
-        Err(e) => Err(format!("{said}: {e}")),
-        Ok(s) if !s.success() => Err(format!("{said} failed")),
-        Ok(_) => std::fs::read(&at).map_err(|e| format!("{said}: {e}")),
-    };
-    // Whatever happened, including the failures: a capture that could not be
-    // read is exactly the one whose leftovers nobody comes back for.
-    let _ = std::fs::remove_file(&at);
-    out
-}
-
 impl Kind for OpenCode {
     /// The model, the session, and the work order.
     ///
@@ -1641,7 +1538,7 @@ impl Kind for OpenCode {
     ///
     /// **The session id is the whole join and `cwd` is not used.** `export`
     /// takes an id and finds the session wherever it ran, so unlike
-    /// [`transcript`] there is no path to derive and no scan to fall back to.
+    /// [`Host::transcript_of`] there is no path to derive and no scan to fall back to.
     /// A cwd fallback was considered and refused: `opencode session list` can
     /// name every session in a directory, but picking one of them by recency
     /// would attribute a person's own opencode in that tree to an agent's
@@ -1660,28 +1557,8 @@ impl Kind for OpenCode {
     /// exactly where it is paid — once when a claim ends, and on demand from
     /// `wsp attempts`. Never in `brief`, `ls` or `show`.
     fn ran(&self, session: &str, _cwd: &str, since: i64) -> Option<Ran> {
-        read_export(&export(session)?, since)
+        read_export(&host::LOCAL.opencode_export(session)?, since)
     }
-}
-
-/// One session as opencode publishes it, redacted of everything but the
-/// numbers.
-///
-/// The id is checked before it reaches a command line, for the reason
-/// [`transcript`] checks it before it reaches a path: it arrives from the
-/// backend, which got it from the agent, and `spawn` is a verb agents drive. opencode
-/// spells an id `ses_` and twenty-something alphanumerics; anything with a
-/// space, a slash or a dash in it is not one.
-///
-/// Taken through [`captured`] and not through a pipe, which is the whole of
-/// `core-039`: this is the longest thing wsp asks any runtime for, so it is the
-/// one that overran a pipe buffer and came back a truncated document under a
-/// successful exit status. The argument is there.
-fn export(session: &str) -> Option<Vec<u8>> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    captured(opencode_bin(), &["export", "--sanitize", session]).ok()
 }
 
 /// That export, reduced to what served the attempt and what it cost.
@@ -1775,14 +1652,11 @@ fn read_export(src: &[u8], since: i64) -> Option<Ran> {
 /// rather than a schema this repository has to know the shape of.
 ///
 /// **The id is checked before it reaches a command line**, for
-/// [`export`]'s reason: it arrives from a claim, which the agent behind it
+/// [`Host::opencode_export`]'s reason: it arrives from a claim, which the agent behind it
 /// wrote. opencode spells a session id `ses_` and alphanumerics; anything else
 /// is refused before a shell is anywhere near it.
 pub fn opencode_finished_at(session: &str) -> Option<i64> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    let rows = opencode_rows(session)?;
+    let rows = host::LOCAL.opencode_newest(session)?;
     newest_finished(&rows)
 }
 
@@ -1820,35 +1694,6 @@ fn newest_finished(rows: &[Value]) -> Option<i64> {
     // Milliseconds in the database, seconds in the store — opencode's own unit
     // boundary, and `read_export` makes the same crossing.
     Some(completed / 1_000)
-}
-
-/// `opencode db`'s rows for one session, newest first.
-///
-/// **`opencode db` and not a sqlite crate.** `serde_json` is the whole of this
-/// tree's dependency list and it stays that way, and opencode ships the reader:
-/// `opencode db <query> --format json` prints rows as JSON, so the query is
-/// `select` over the `message` table with `json_extract` on the `data` column
-/// rather than a schema this repository has to be right about.
-fn opencode_rows(session: &str) -> Option<Vec<Value>> {
-    let out = Command::new(opencode_bin())
-        .args([
-            "db",
-            &format!(
-                "select json_extract(data,'$.role') as role, \
-                 json_extract(data,'$.time.created') as created, \
-                 json_extract(data,'$.time.completed') as completed \
-                 from message where session_id = '{session}' order by time_created desc limit 2"
-            ),
-            "--format",
-            "json",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
 }
 
 /// pi.
@@ -1961,56 +1806,6 @@ fn pi_tier_in(m: &str, effort: Option<&str>, models: &[PiModel]) -> std::result:
         )),
         _ => Ok(()),
     }
-}
-
-/// The directory name pi derives from a cwd for its session store — the
-/// "mangling" pi's session-manager.js applies.
-///
-/// pi resolves the cwd, strips one leading `/` or `\`, and replaces every
-/// `/`, `\`, `:` with `-`, wrapped in `--...--`. This function is the pure
-/// half of that: given a canonical cwd, produce the directory name pi would
-/// store sessions under.
-fn pi_session_dir_name(cwd: &str) -> String {
-    let stripped = cwd.strip_prefix('/').or_else(|| cwd.strip_prefix('\\')).unwrap_or(cwd);
-    let mangled: String = stripped.chars().map(|c| match c {
-        '/' | '\\' | ':' => '-',
-        other => other,
-    }).collect();
-    format!("--{}--", mangled)
-}
-
-/// The session file for a pi session id under a cwd, or `None` if the id is
-/// invalid or no file is found.
-///
-/// The id is validated before it reaches a path — it arrives from the backend
-/// and must not be used to open arbitrary files. It must be non-empty and
-/// contain only alphanumerics, `-`, `_`, `.`.
-fn pi_session_file(session: &str, cwd: &str) -> Option<PathBuf> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-        return None;
-    }
-    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| util::home().join(".pi").join("agent"));
-    let dir_name = if let Ok(canonical) = std::fs::canonicalize(cwd) {
-        pi_session_dir_name(&canonical.to_string_lossy())
-    } else {
-        pi_session_dir_name(cwd)
-    };
-    let sessions = agent_dir.join("sessions").join(&dir_name);
-    let suffix = format!("_{session}.jsonl");
-    let mut best: Option<(String, PathBuf)> = None;
-    for entry in std::fs::read_dir(&sessions).ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(&suffix) {
-            if best.as_ref().is_none_or(|(prev, _)| name.as_ref() > prev.as_str()) {
-                let ts = name.strip_suffix(&suffix).unwrap_or(&name).to_string();
-                best = Some((ts, entry.path()));
-            }
-        }
-    }
-    best.map(|(_, p)| p)
 }
 
 /// A pi session JSONL file, reduced to what served it and what it cost.
@@ -2257,8 +2052,8 @@ impl Kind for Pi {
     }
 
     fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran> {
-        let file = pi_session_file(session, cwd)?;
-        let src = std::fs::read(&file).ok()?;
+        let file = host::LOCAL.pi_session_of(session, cwd)?;
+        let src = host::LOCAL.transcript_bytes(&file)?;
         read_pi_session(&src, since)
     }
 }
@@ -2687,57 +2482,17 @@ impl Kind for Claude {
     /// `~/.claude/projects/<cwd>/<session>.jsonl`, an assistant turn carrying
     /// `message.model` (`claude-opus-5`) and a top-level `effort` (`high`).
     fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran> {
-        let file = std::fs::File::open(transcript(session, cwd)?).ok()?;
-        read_ran(&mut std::io::BufReader::new(file), since)
+        let mut src = host::LOCAL.read_transcript(&host::LOCAL.transcript_of(session, cwd)?)?;
+        read_ran(&mut src, since)
     }
 
     fn did(&self, session: &str, cwd: &str, since: i64) -> Option<crate::did::Did> {
-        let file = std::fs::File::open(transcript(session, cwd)?).ok()?;
-        crate::did::of_transcript(&mut std::io::BufReader::new(file), since)
+        let mut src = host::LOCAL.read_transcript(&host::LOCAL.transcript_of(session, cwd)?)?;
+        crate::did::of_transcript(&mut src, since)
     }
 }
 
 // ---- what actually ran ----------------------------------------------------
-
-/// The file the session was written to, most likely place first.
-///
-/// Claude Code names the directory after the cwd with every character that is
-/// not a letter, a digit or a hyphen replaced by one — `/Users/ed/.local` is
-/// `-Users-ed--local` — so the direct hit costs one `stat` and is what happens
-/// every time an agent stayed in the tree it was spawned into.
-///
-/// **The scan is not belt and braces.** A claim's cwd is where the *work* is
-/// and the transcript is named after where the *pane* was, `wsp resume` starts
-/// a session in a new workspace at a recorded cwd, and `wsp checkout` is free
-/// to move a worktree; every one of those makes the derived path wrong while
-/// the session id stays exactly right. A session id is a uuid, so a scan
-/// cannot find the wrong file — it can only fail to find one.
-///
-/// The id is checked before it is put in a path. It arrives from the backend,
-/// which got it from the agent, and `spawn` is a verb agents drive: a session id with
-/// a `/` in it is not a session id, and refusing it here is cheaper than
-/// discovering what it opened.
-pub(crate) fn transcript(session: &str, cwd: &str) -> Option<PathBuf> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return None;
-    }
-    let file = format!("{session}.jsonl");
-    let projects = util::home().join(".claude").join("projects");
-    let derived = projects.join(mangle(cwd)).join(&file);
-    if derived.is_file() {
-        return Some(derived);
-    }
-    std::fs::read_dir(&projects)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().join(&file))
-        .find(|p| p.is_file())
-}
-
-/// A cwd as Claude Code spells it in a directory name.
-fn mangle(cwd: &str) -> String {
-    cwd.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect()
-}
 
 /// One transcript, reduced to what served it.
 ///
@@ -4541,11 +4296,11 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     }
 
     /// The directory rule, which is the one thing here that is a guess about
-    /// somebody else's layout — hence the scan behind it in [`transcript`].
+    /// somebody else's layout — hence the scan behind it in [`Host::transcript_of`].
     #[test]
     fn a_cwd_becomes_a_directory_name_the_way_claude_code_spells_one() {
-        assert_eq!(mangle("/Users/ed/claude/wsp/.worktrees/wsp-060"), "-Users-ed-claude-wsp--worktrees-wsp-060");
-        assert_eq!(mangle("/Users/ed/.local/state"), "-Users-ed--local-state");
+        assert_eq!(host::mangle("/Users/ed/claude/wsp/.worktrees/wsp-060"), "-Users-ed-claude-wsp--worktrees-wsp-060");
+        assert_eq!(host::mangle("/Users/ed/.local/state"), "-Users-ed--local-state");
     }
 
     /// A session id arrives from the backend, which got it from the agent, and
@@ -4553,8 +4308,8 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     /// session id, and refusing it is cheaper than finding out what it opened.
     #[test]
     fn a_session_id_that_is_not_one_never_reaches_the_filesystem() {
-        assert!(transcript("../../etc/passwd", "/tmp").is_none());
-        assert!(transcript("", "/tmp").is_none());
+        assert!(host::LOCAL.transcript_of("../../etc/passwd", "/tmp").is_none());
+        assert!(host::LOCAL.transcript_of("", "/tmp").is_none());
     }
 
     /// The same, one layer along: an opencode id reaches a command line rather
@@ -4562,9 +4317,9 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     /// never gets there.
     #[test]
     fn a_session_id_that_is_not_one_never_reaches_a_command_line() {
-        assert!(export("--help").is_none());
-        assert!(export("ses_a b").is_none());
-        assert!(export("").is_none());
+        assert!(host::LOCAL.opencode_export("--help").is_none());
+        assert!(host::LOCAL.opencode_export("ses_a b").is_none());
+        assert!(host::LOCAL.opencode_export("").is_none());
     }
 
     /// The defect this row found, and the reason every token total in wsp was
@@ -4960,11 +4715,11 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     #[test]
     fn pi_session_dir_name_mangles_the_cwd_as_pi_does() {
         assert_eq!(
-            pi_session_dir_name("/Users/jesper/src/private/wsp"),
+            host::pi_session_dir_name("/Users/jesper/src/private/wsp"),
             "--Users-jesper-src-private-wsp--"
         );
         assert_eq!(
-            pi_session_dir_name("/private/tmp/pi-005-resume"),
+            host::pi_session_dir_name("/private/tmp/pi-005-resume"),
             "--private-tmp-pi-005-resume--"
         );
     }
