@@ -15,6 +15,7 @@ workspace; owns no state. Every other component may use it, and it uses none of 
 - `src/base/git.rs` — `git`, `git_ok`, `toplevel`
 - `src/base/labels.rs`, `src/base/term.rs` — glyph table, `stty`
 - `src/base/seat.rs` — `SEAT_ENV`
+- `src/base/procs.rs` — readings of `ps` output (`read_processes`, `ancestors`, `ps_says`); the `ps` itself is the host's
 
 ## Contract
 

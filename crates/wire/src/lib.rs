@@ -1,5 +1,5 @@
 //! `wsp-wire`: the `Place` port and its backends (`docs/components.md`, cut `c4`); see `MAP.md`.
-//! Depends on `wsp-base` and `wsp-store`.
+//! Depends on `wsp-base`, `wsp-host` (the in-process host, which `host` adapts) and `wsp-store`.
 
 pub use wsp_base::{base, choices, fm, input, risk, util};
 pub use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, log, message, model, resolve, sharing, store, tags, verbs};

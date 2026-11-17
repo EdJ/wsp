@@ -1,10 +1,13 @@
 //! The host seam's guard (`docs/agent-manager.md` section 6.2, step M0's
 //! done-when line).
 //!
-//! M0 put every OS operation a seat needs behind one trait,
-//! `crates/wire/src/host.rs`, whose only implementation runs in this process.
-//! This test is what keeps it there. It reads the product code of `src/` and
-//! `crates/*/src/` and fails when any of these is reached outside `host.rs`:
+//! M0 put every OS operation a seat needs behind one trait, wire's
+//! `host::Host`, whose only implementation runs in this process. M1 moved that
+//! implementation into a crate of its own, `wsp-host` (`crates/host`, wsp-020),
+//! which the agent manager can link, and left the trait in the wire as an
+//! adapter over it. This test is what keeps the OS there. It reads the product
+//! code of `src/` and `crates/*/src/` and fails when any of these is reached
+//! outside `crates/host/src/`:
 //!
 //! - **a process probe or a signal**: `ps`, `pgrep`, `lsof`, `kill`, `pkill`,
 //!   `killall`, run as a `Command`, written into a shell line, or declared as a
@@ -41,8 +44,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const ALLOW: &str = "docs/host-seam-allowed.txt";
-/// The one file allowed to do all of it.
-const HOST: &str = "crates/wire/src/host.rs";
+/// The one crate allowed to do all of it: the in-process host.
+const HOST: &str = "crates/host/src/";
 
 /// Programs whose run is a probe, a signal or a screen read.
 const PROBES: &[&str] = &[
@@ -79,7 +82,7 @@ const FFI: &[&str] = &[
     "host_statistics64",
 ];
 
-/// host.rs's free functions that run a probe, a signal, a screen read or a
+/// The host's free functions that run a probe, a signal, a screen read or a
 /// transcript read themselves. Reaching one by name skips the trait.
 const HOST_FNS: &[&str] = &[
     "signal_group",
@@ -96,8 +99,9 @@ const HOST_FNS: &[&str] = &[
     "last_written",
 ];
 
-/// The modules that hand host.rs's free functions on (`pub use`).
-const HOST_MODS: &[&str] = &["host", "place_super", "place_compound"];
+/// The paths the host's free functions are reached by: the host crate and its
+/// module, and the wire modules that hand them on (`pub use`).
+const HOST_MODS: &[&str] = &["wsp_host", "inproc", "host", "place_super", "place_compound"];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -473,7 +477,7 @@ fn ffi_hits(src: &Src, sk: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-/// host.rs's own OS functions, reached past the trait: a path through one of
+/// The host's own OS functions, reached past the trait: a path through one of
 /// [`HOST_MODS`], a `use` that imports one, or a bare call to one so imported.
 fn host_fn_hits(src: &Src, sk: &str, out: &mut BTreeSet<String>) {
     let b = sk.as_bytes();
@@ -619,7 +623,7 @@ fn child_dir(file: &Path) -> PathBuf {
     }
 }
 
-/// `path: kind` → hit, over every product file but host.rs.
+/// `path: kind` → hit, over every product file outside the host crate.
 fn scan(root: &Path) -> BTreeSet<(String, String)> {
     let mut found = BTreeSet::new();
     for r in roots(root) {
@@ -639,7 +643,7 @@ fn scan(root: &Path) -> BTreeSet<(String, String)> {
         }
         for (f, s) in &srcs {
             let rel = f.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-            if rel == HOST || test_files.iter().any(|t| f == t || f.starts_with(t)) {
+            if rel.starts_with(HOST) || test_files.iter().any(|t| f == t || f.starts_with(t)) {
                 continue;
             }
             for h in hits(s) {
@@ -761,6 +765,13 @@ fn the_guard_reads_probes_in_product_code_and_not_in_tests_comments_or_prose() {
         ["calls host::tree_of", "imports host::tree_of"]
     );
     assert_eq!(kinds("fn f() { let b = host::compound_render_binary(); }"), ["calls host::compound_render_binary"]);
+    // The same functions by the host crate's own paths (wsp-020).
+    assert_eq!(kinds("fn f() { wsp_host::inproc::signal_group(1, \"KILL\"); }"), ["calls host::signal_group"]);
+    assert_eq!(
+        kinds("use wsp_host::inproc::{tally_burn, InProcess};\nfn f() { tally_burn(&d, &p); }"),
+        ["calls host::tally_burn", "imports host::tally_burn"]
+    );
+    assert!(kinds("pub use wsp_host::inproc::*;\nfn f(h: &InProcess) { h.tree_of(1); }").is_empty(), "the adapter's re-export and its method calls");
     assert_eq!(kinds("fn f() { home.join(\".claude\").join(\"projects\"); }"), ["reads transcripts (~/.claude/projects)"]);
     assert_eq!(kinds("fn f() { read(\"/u/.claude/projects/x.jsonl\"); }"), ["reads transcripts (~/.claude/projects)"]);
     assert_eq!(kinds("fn f() { home.join(\".pi\").join(\"agent\").join(\"sessions\"); }"), ["reads transcripts (pi sessions)"]);

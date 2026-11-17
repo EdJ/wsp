@@ -144,21 +144,10 @@ impl Run {
 /// there is none; `Err` where the host could not tell.
 pub type StartOf<'a> = &'a dyn Fn(u32) -> Result<Option<String>, ()>;
 
-/// What a finished `ps -o lstart= -p <pid>` says. It says there is no such
-/// process by exiting 1 with nothing on stdout (stderr is free text, and a pid
-/// too large for the system gets a complaint there with the same exit). Any
-/// other end — killed by a signal, or another exit status — says nothing about
-/// the pid, so it is `Err` and a live run is not read as dead on it. A `ps` that
-/// itself fails with exit 1 and prints nothing cannot be told from a missing
-/// pid, and reads as gone: the lock (`open_unless_held`) is what covers that.
-pub fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
-    if code != Some(0) && !(code == Some(1) && stdout.iter().all(u8::is_ascii_whitespace)) {
-        return Err(());
-    }
-    let s = String::from_utf8_lossy(stdout);
-    let s = s.split_whitespace().collect::<Vec<_>>().join("_");
-    Ok((!s.is_empty()).then_some(s))
-}
+/// What a finished `ps -o lstart= -p <pid>` says: moved down to `wsp-base`'s
+/// `procs` with the other readings of `ps` (wsp-020), because the in-process
+/// host (`wsp-host`) reads it and links no store.
+pub use wsp_base::base::procs::ps_says;
 
 /// Where the barrier's mechanical run is: the project's full suite, the
 /// members' recorded checks and the stop condition's `stop-checks`.
