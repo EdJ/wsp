@@ -26,7 +26,7 @@ for a in "$@"; do
     prev="$a"
 done
 
-if [ -n "$pm" ] && [ -n "$crate" ]; then
+if [ -n "$pm" ] && [ -n "$crate" ] && [ "$(uname -s)" = Darwin ]; then
     set -- "$@" -C "link-arg=-Wl,-install_name,@rpath/lib${crate}${extra}.dylib" -C link-arg=-Wl,-S
 fi
 # A registry crate that reads env!("OUT_DIR") has the tree's path in sccache's key (the
