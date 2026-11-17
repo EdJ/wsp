@@ -7782,7 +7782,7 @@ mod tests {
             seat: crate::place::Seat::new("cpd-7"),
             label: String::new(),
             cwd: String::new(),
-            agent: crate::place::Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] },
+            agent: crate::place::Agent { kind: "claude".into(), name: "t-1".into(), args: vec![], key: None },
             state: State::Unreachable,
             session: String::new(),
         }];

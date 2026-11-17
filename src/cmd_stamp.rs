@@ -509,9 +509,9 @@ mod tests {
     #[test]
     fn two_seats_cannot_be_confused_for_one_by_running_their_fields_together() {
         let mut a = seated("p1");
-        a.agent = Agent { kind: "claude".into(), name: "wsp-100".into(), args: Vec::new() };
+        a.agent = Agent { kind: "claude".into(), name: "wsp-100".into(), args: Vec::new(), key: None };
         let mut b = seated("p1");
-        b.agent = Agent { kind: "claudewsp".into(), name: "-100".into(), args: Vec::new() };
+        b.agent = Agent { kind: "claudewsp".into(), name: "-100".into(), args: Vec::new(), key: None };
         assert_ne!(census(&here(vec![a])), census(&here(vec![b])));
     }
 

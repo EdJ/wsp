@@ -347,7 +347,7 @@ fn fork(shared: &Shared, s: &SeatSpawn) -> Result<Forked, String> {
     let mut env: BTreeMap<String, String> =
         s.agent.env.iter().filter_map(|name| std::env::var(name).ok().map(|v| (name.clone(), v))).collect();
     env.insert(wsp_base::base::seat::SEAT_ENV.into(), s.seat.0.clone());
-    let spawn = Spawn { seat: &s.seat.0, kind: Some(s.agent.kind.clone()), cwd: cwd.clone(), env, program, args };
+    let spawn = Spawn { key: s.key.clone(), seat: &s.seat.0, kind: Some(s.agent.kind.clone()), cwd: cwd.clone(), env, program, args };
     let mut cmd = inproc::sup_command(&sup, &spawn);
     // After `sup_command`, so this run directory is the one it uses.
     cmd.env("COMPOUND_RUN_DIR", shared.run_dir());

@@ -887,6 +887,7 @@ impl Supervisor<'_> {
             agent: Agent {
                 kind: str_of(&agent, "kind"),
                 name: str_of(&agent, "name"),
+                key: None,
                 args: agent
                     .get("args")
                     .and_then(|a| a.as_array())
@@ -1239,7 +1240,7 @@ mod tests {
     /// one thing a live Claude Code adds is the hooks, which arrive as
     /// [`Supervisor::heard`] either way.
     fn a_process() -> Agent {
-        Agent { kind: "sleep".into(), name: "t-1".into(), args: vec!["60".into()] }
+        Agent { kind: "sleep".into(), name: "t-1".into(), args: vec!["60".into()], key: None }
     }
 
     /// Wait for something a real process does in its own time.
@@ -1421,7 +1422,7 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         place
-            .start(&seat, &Agent { kind: "true".into(), name: "t-1".into(), args: Vec::new() })
+            .start(&seat, &Agent { kind: "true".into(), name: "t-1".into(), args: Vec::new(), key: None })
             .expect("a process");
 
         assert!(
@@ -1469,6 +1470,7 @@ mod tests {
                     kind: "sh".into(),
                     name: "t-1".into(),
                     args: vec!["-c".into(), format!("env > {}", out.display())],
+                    key: None,
                 },
             )
             .expect("a process");
@@ -1508,7 +1510,7 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         place
-            .start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: Vec::new() })
+            .start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: Vec::new(), key: None })
             .expect("a process");
         place.heard(&seat, "SessionStart", State::Idle, &json!({}));
         place.tell(&seat, "pick up robustness-061").expect("it was idle");

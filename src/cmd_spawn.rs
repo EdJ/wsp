@@ -1559,6 +1559,17 @@ fn wait_ready(
     }
 }
 
+/// The key `seat.spawn` carries for a row: the row's id and the number of
+/// attempts it already has (`cmd_attempts::attempts_of`), so a second spawn of
+/// the same row is a new key. `None` for a seat with no row (a bare shell, a
+/// rotation without a task): the host then keys it by its own freshly minted
+/// seat id at attempt 0, which no other spawn can share.
+fn spawn_key(store: &Store, row: Option<&str>) -> Option<crate::place::Key> {
+    let t = store.find_task(row?)?;
+    let attempt = crate::cmd_attempts::attempts_of(&t).len() as u32;
+    Some(crate::place::Key { row: crate::place::RowId(t.id.clone()), attempt })
+}
+
 /// Start an agent in a seat, and try again if it does not survive the attempt.
 ///
 /// **The retry this task asked for, and the whole of the argument for why it is
@@ -1605,9 +1616,13 @@ fn start_agent(
 ) -> Result<(), String> {
     let seat = spawn.seat;
     let mut backoff = wait.backoff;
+    // A re-start after a start that did not survive is a new agent, so it is a
+    // new key: the manager refuses a stopped key as `duplicate` (6.2 group 3).
+    // Built once per pass, never per send, so the host's one reopen resends it.
+    let mut agent = agent.clone();
     for left in (0..=wait.attempts).rev() {
         let why = match place
-            .start(seat, agent)
+            .start(seat, &agent)
             .map_err(|e| e.to_string())
             .and_then(|()| wait_ready(place, how, spawn, kind, wait))
         {
@@ -1626,6 +1641,9 @@ fn start_agent(
             return Err(format!("{why}, and {stuck}"));
         }
         eprintln!("wsp: trying {seat} again in {}s", backoff.as_secs());
+        if let Some(key) = agent.key.as_mut() {
+            key.attempt += 1;
+        }
         wait.clock.rest(backoff);
         backoff *= wait.steeper;
     }
@@ -3134,7 +3152,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // read-only verbs that do it (compounding-614).
         let row_tags = work.task.as_deref().and_then(|t| store.find_task(t)).map(|t| t.tags).unwrap_or_default();
         spawn_args.extend(crate::cmd_role::retro_spawn_args(&kind, verifying, &row_tags, &store.state));
-        let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args };
+        let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args, key: spawn_key(store, work.task.as_deref()) };
         let far_start = args.get("on").is_some();
         // Two waits, and they are different questions: `start` comes back when
         // the agent exists, `wait_ready` when it will listen. Both are inside
@@ -3930,7 +3948,7 @@ fn rotate_as(
     };
     let mut spawn_args = how.args(&spawn);
     spawn_args.extend(crate::cmd_role::settings_args(&kind, Some(&scope), work.primary));
-    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: spawn_args };
+    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: spawn_args, key: spawn_key(store, Some(&scope)) };
 
     // Step 2. Started, then heard from: a turn running is the only evidence
     // that the handover was taken, and everything after this point depends on
@@ -6881,7 +6899,7 @@ mod tests {
     fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
         let spawn =
             crate::agent_commands::Spawn { full: false, subagents: false, packet: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None, brief: None };
-        let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new() };
+        let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new(), key: None };
         start_agent(place, how, &spawn, &agent, "claude", wait)
     }
 
@@ -9303,7 +9321,7 @@ mod tests {
         let compound = crate::place_compound::Compound::new();
         let cpd_seat = compound.open(&Order::default()).expect("a compound seat");
         let _stops = crate::place_compound::StopsOnDrop::new(cpd_seat.clone());
-        compound.start(&cpd_seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).expect("started");
+        compound.start(&cpd_seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![], key: None }).expect("started");
 
         struct MustNotBeAsked;
         impl Place for MustNotBeAsked {

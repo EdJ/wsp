@@ -413,7 +413,7 @@ impl Spot {
     pub fn agent(seat: &str, kind: &str, name: &str, state: State) -> Spot {
         Spot {
             seat: Seat::new(seat),
-            agent: Agent { kind: kind.into(), name: name.into(), args: Vec::new() },
+            agent: Agent { kind: kind.into(), name: name.into(), args: Vec::new(), key: None },
             state,
             ..Spot::default()
         }
@@ -1507,6 +1507,7 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             spot.agent = Agent {
                 kind,
                 name: sget("name"),
+                key: None,
                 args: params
                     .get("args")
                     .and_then(|a| a.as_array())
@@ -2016,7 +2017,7 @@ pub fn stage_from_json(v: &Value) -> Stage {
             seat: Seat::new(text("seat")),
             label: text("label"),
             cwd: text("cwd"),
-            agent: Agent { kind, name: text("name"), args: Vec::new() },
+            agent: Agent { kind, name: text("name"), args: Vec::new(), key: None },
             state,
             session: text("session"),
             space: text("space"),

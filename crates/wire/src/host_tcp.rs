@@ -509,9 +509,9 @@ impl Host for Tcp {
     // ---- seat.spawn / seat.started
     fn spawn_session(&self, spawn: &Spawn<'_>) -> Result<Session> {
         let msg = Message::SeatSpawn(SeatSpawn {
-            // wsp mints every seat id fresh, so the seat is the spawn's
-            // idempotency key until a caller hands down its (row, attempt).
-            key: Key { row: RowId(spawn.seat.to_string()), attempt: 0 },
+            // The caller's (row, attempt), built once per spawn: `ask`'s one
+            // reopen resends this same message, so the key cannot change.
+            key: spawn.key.clone(),
             seat: SeatId(spawn.seat.to_string()),
             agent: AgentSpec { argv: argv_of(spawn), env: vec![], kind: spawn.kind.clone().unwrap_or_default(), model: None },
             workdir: Workdir::Cwd(spawn.cwd.clone()),
