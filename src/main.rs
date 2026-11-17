@@ -48,7 +48,6 @@ mod attention;
 mod cmd_agent;
 mod cmd_attempts;
 mod cmd_brief;
-mod budget;
 mod cmd_burn;
 mod cmd_calls;
 mod cmd_cost;

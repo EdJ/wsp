@@ -10,7 +10,6 @@ pub const ALL: &[&[crate::verbs::Verb]] = &[
     crate::cmd_attempts::VERBS,
     crate::cmd_attend::VERBS,
     crate::cmd_brief::VERBS,
-    crate::budget::VERBS,
     crate::cmd_burn::VERBS,
     crate::spend::VERBS,
     crate::cmd_calls::VERBS,
