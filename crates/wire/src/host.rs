@@ -67,6 +67,15 @@ pub use wsp_host::inproc::*;
 /// `WSP_HOST`'s choice between the two.
 pub use crate::host_tcp::{choose, chosen, Choice, HostError, Subscription, Tcp};
 
+/// What a stop ended, as `seat.stopped` says it (`docs/agent-manager.md` 3.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ended {
+    /// The pids that ended.
+    pub pids: Vec<u32>,
+    /// The agent's exit status, when it exited rather than was signalled.
+    pub exit: Option<i32>,
+}
+
 /// Every OS operation a seat needs, grouped by the host-api message it
 /// becomes (`docs/agent-manager.md` section 3.2).
 pub trait Host: Sync {
@@ -95,6 +104,15 @@ pub trait Host: Sync {
     // ---- seat.stop / seat.stopped
     /// `TERM` to the group, `KILL` after the grace.
     fn stop(&self, stop: Stop<'_>);
+    /// [`Host::stop`] of `seat`, and what ended: the manager's own `seat.stopped`
+    /// (its `ended` pids and `exit`) where the host is the manager, the group
+    /// this process signalled otherwise. A manager that does not run `seat`, or
+    /// does not answer, is an error and never a stop that went well.
+    fn end(&self, _seat: &str, stop: Stop<'_>) -> Result<Ended> {
+        let group = stop.group;
+        self.stop(stop);
+        Ok(Ended { pids: vec![group], exit: None })
+    }
     /// The group ended a moment from now, by a process that outlives this one.
     fn stop_soon(&self, group: u32);
     /// A socket nothing answers on any more, removed with its sidecars.

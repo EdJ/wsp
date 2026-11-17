@@ -833,6 +833,19 @@ pub trait Place {
     /// treats it as the first half already done, and goes on to the claim.
     fn stop(&self, seat: &Seat) -> Result<()>;
 
+    /// [`Place::stop`], and the pids that ended where the host says so: the
+    /// manager's `seat.stopped` under `WSP_HOST=manager`. Empty where the
+    /// backend does not name them.
+    fn end(&self, seat: &Seat) -> Result<Vec<u32>> {
+        self.stop(seat).map(|()| Vec::new())
+    }
+
+    /// Whether the host is the manager, whose pids a report names in place of
+    /// the ones wsp would find by `ps`.
+    fn hosted(&self) -> bool {
+        false
+    }
+
     /// What is happening in one seat, right now.
     ///
     /// Separate from [`Place::census`] because `spawn` polls a single seat

@@ -4648,7 +4648,16 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
         pane.as_deref().and_then(|p| crate::place::governs(&governors, &crate::place::Seat::new(p)));
     let bound = crate::cmd_role::bound_here(store, pane.as_deref());
     let me = Caller { pane: pane.as_deref(), governs: governs.as_deref(), bound, live: Some(seat_is_live) };
-    end_work(backend(args).as_ref(), store, args, me, &tidy)
+    // Under `WSP_HOST=manager` the stop goes to the manager, which names what
+    // it ended; one that does not answer is the despawn's error, "host silent".
+    let place = match spawn_backend(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
+    end_work(place.as_ref(), store, args, me, &tidy)
 }
 
 /// `wsp despawn <row> --lost`: let go of a row held on a machine that is not
@@ -5054,13 +5063,19 @@ fn end_work(
     // supervisor is not in `local_backends()`, and keeps the existing
     // "already gone" reading for a backend seat this census can no longer see.
     let backends = crate::place::local_backends();
+    // A manager-hosted `place` is the one that stops it: `locate_seat`'s
+    // backends end seats in this process.
     let target: &dyn Place = match crate::cmd_agent::locate_seat(&backends, seat.as_str()) {
-        Some((found, _)) => found.as_ref(),
-        None => place,
+        Some((found, _)) if !place.hosted() => found.as_ref(),
+        _ => place,
     };
 
-    let closed = match target.stop(&seat) {
-        Ok(()) => true,
+    let mut ended_pids: Vec<u32> = Vec::new();
+    let closed = match target.end(&seat) {
+        Ok(pids) => {
+            ended_pids = pids;
+            true
+        }
         // Already gone. The first half of the verb is done, however it happened.
         Err(Refusal::NoSeat(_)) => false,
         Err(e) => {
@@ -5175,6 +5190,7 @@ fn end_work(
             json!({
                 "seat": seat.as_str(),
                 "closed": closed,
+                "ended_pids": target.hosted().then_some(&ended_pids),
                 "task": task,
                 "released": released,
                 "tree": match &tree {
@@ -5198,6 +5214,11 @@ fn end_work(
             true => format!("ended {seat}"),
             false => format!("{seat} was already gone"),
         }));
+        // The manager's own account of what it ended, where it is the host.
+        if closed && target.hosted() && !ended_pids.is_empty() {
+            let list = ended_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+            println!("  {}", p.dim(&format!("the manager ended pids {list}")));
+        }
         match (&task, released) {
             (Some(t), _) if claim_is.is_some() => println!(
                 "  {}",
@@ -8782,6 +8803,69 @@ mod tests {
         assert!(store.claims().contains_key("t-260816-095"), "the claim went with the agent still there");
         assert!(store.bindings().contains_key("w1:p1"), "and so did the binding");
         assert!(tidied.0.borrow().is_empty(), "a seat still standing keeps its tree too");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A manager-hosted place: its `end` is the one asked (not a backend found
+    /// by `locate_seat`), and it says what the manager ended or why it could not.
+    struct Managed(std::cell::RefCell<Vec<Seat>>, crate::place::Result<Vec<u32>>);
+
+    impl Place for Managed {
+        fn hosted(&self) -> bool {
+            true
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("a hosted despawn asks `end`, which names the pids")
+        }
+        fn end(&self, seat: &Seat) -> crate::place::Result<Vec<u32>> {
+            self.0.borrow_mut().push(seat.clone());
+            self.1.clone()
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("despawn does not open seats")
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("despawn does not start agents")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("despawn does not talk to agents")
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            panic!("despawn does not poll")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("despawn is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("despawn does not wait for anything")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// Under `WSP_HOST=manager` a despawn asks the hosted place to end the seat
+    /// and goes on as before once the manager has answered; a manager that is
+    /// silent keeps the claim and says so, and is no success.
+    #[test]
+    fn despawn_under_a_manager_asks_the_manager_and_a_silent_one_keeps_the_claim() {
+        let _env = no_backend();
+        let store = seat("managed-stop");
+        working(&store, "t-260816-095", "w1:p1");
+        let args = Args::synth("despawn", &["095"], &[]);
+
+        let silent = Managed(Default::default(), Err(Refusal::Unreachable("host silent: no seat.stopped for w1:p1".into())));
+        let tidied = Tidied::default();
+        assert_eq!(end_work(&silent, &store, &args, Caller::default(), &tidied.f()), 1);
+        assert_eq!(silent.0.borrow().len(), 1, "it asked the manager");
+        assert!(store.claims().contains_key("t-260816-095"), "a seat the manager did not end keeps its claim");
+        assert!(tidied.0.borrow().is_empty());
+
+        let heard = Managed(Default::default(), Ok(vec![4242, 4243]));
+        assert_eq!(end_work(&heard, &store, &args, Caller::default(), &tidied.f()), 0);
+        assert_eq!(heard.0.borrow().len(), 1);
+        assert!(!store.claims().contains_key("t-260816-095"), "the manager ended it, so the claim was released");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }

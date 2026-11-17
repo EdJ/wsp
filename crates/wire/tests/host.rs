@@ -593,6 +593,48 @@ fn a_spawn_in_process_has_no_ordered_start_and_starts_as_before() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `WSP_HOST=manager`: a stop is `seat.stop`, and what the stop says it ended
+/// is the manager's `seat.stopped` pids, found by a process that started
+/// nothing. A seat the manager does not run, and a manager that is gone, are
+/// said plainly and clear nothing.
+#[test]
+fn a_stop_under_manager_reports_the_pids_seat_stopped_names() {
+    let (dir, sup) = place("end");
+    let m = manager(&dir, &sup, 0);
+    let spawner = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let compound = Compound { host: &spawner, ..Compound::at(dir.join("seats")) };
+    let seat = opened(&compound, &dir);
+    let order = FirstOrder { order: new_order_id(&seat), text: "go".into() };
+    assert_eq!(compound.start_ordered(&seat, &agent(0), &order, Duration::from_secs(20)), Some(Ok(Heard::Acked)));
+    let pid = compound.root(&seat).expect("the session pid");
+
+    // A second process: it knows the seat only from the manager's list.
+    let other = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let despawner = Compound { host: &other, ..Compound::at(dir.join("seats")) };
+    assert!(despawner.hosted());
+    let ended = despawner.end(&seat).expect("the manager stops it");
+    assert!(ended.contains(&pid), "the manager's pids name the session: {ended:?} vs {pid}");
+    assert_eq!(despawner.root(&seat), None, "the seat's record went with it");
+
+    // A seat the manager does not run: said, not a silent success.
+    let ghost = Seat::new("cpd-nobody");
+    match other.end(ghost.as_str(), Stop { group: 1, watch: None, grace: Duration::from_millis(10), poll: Duration::from_millis(10), clock: &Wall }) {
+        Err(Refusal::Backend(why)) => assert!(why.contains("does not run"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+
+    drop((spawner, other));
+    m.stop();
+
+    // The manager gone: host silent, and the seat's record is still there.
+    let gone = Tcp::with_local(SocketAddr::from(([127, 0, 0, 1], free_port())), Token("t".into()), Role::Cli, "test", InProcess::with_sup(&sup));
+    match gone.end(ghost.as_str(), Stop { group: 1, watch: None, grace: Duration::from_millis(10), poll: Duration::from_millis(10), clock: &Wall }) {
+        Err(Refusal::Unreachable(why)) => assert!(why.starts_with("host silent"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A port nothing listens on: bound, then let go.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
