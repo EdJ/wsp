@@ -117,9 +117,16 @@ fn warn_mb_from(env: Option<&str>, file: Option<&str>) -> u64 {
 
 /// The idle panes among `agents`, measured. `bindings` names a seat's task.
 ///
-/// Asks the process table once, and not at all with no idle seat. Under test
-/// there is no table to ask: tests hand one to [`of`].
-pub(crate) fn read(state: &Path, agents: &[Seated], bindings: &BTreeMap<String, Value>) -> IdleMemory {
+/// Asks the process table once, through `ps` (the caller's Host's
+/// `seat_memory`, passed in because the Host sits a layer above this module),
+/// and not at all with no idle seat. Under test there is no table to ask:
+/// tests hand one to [`of`].
+pub(crate) fn read(
+    state: &Path,
+    agents: &[Seated],
+    bindings: &BTreeMap<String, Value>,
+    ps: impl FnOnce() -> Option<String>,
+) -> IdleMemory {
     let seats: Vec<(String, String)> = agents
         .iter()
         .filter(|a| a.state == State::Idle)
@@ -142,20 +149,22 @@ pub(crate) fn read(state: &Path, agents: &[Seated], bindings: &BTreeMap<String, 
             backends.iter().find_map(|b| b.root(&seat)).map(|pid| (s.clone(), pid))
         })
         .collect();
-    match table() {
+    // `ps -E` is BSD-only: elsewhere the same rows come from `/proc`.
+    #[cfg(target_os = "macos")]
+    let table = ps();
+    #[cfg(not(target_os = "macos"))]
+    let table = {
+        let _ = ps;
+        table()
+    };
+    match table {
         Some(t) => of(&t, &seats, &roots, warn_kb),
         None => IdleMemory { warn_kb, unread: seats.len(), ..IdleMemory::default() },
     }
 }
 
-/// The process table in the shape [`of`] reads. macOS: `ps -E`, which appends
-/// each process's environment to its command.
-#[cfg(target_os = "macos")]
-fn table() -> Option<String> {
-    crate::host::Host::seat_memory(&crate::host::LOCAL)
-}
-
-/// Elsewhere (`ps -E` is BSD-only): the same rows from `/proc`. Only the one
+/// The process table in the shape [`of`] reads, where `ps -E` is not (it is
+/// BSD-only): the same rows from `/proc`. Only the one
 /// variable [`of`] looks for is copied out of `environ`, and a process whose
 /// `environ` is not ours to read is a row without a pane.
 #[cfg(not(target_os = "macos"))]

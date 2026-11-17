@@ -4130,7 +4130,7 @@ impl Wip {
             .map(|(s, _)| s)
             .collect::<Vec<_>>();
         let shells = idle_members_shells(&agents, &bindings);
-        let idle_memory = crate::memory::read(&store.state, &agents, &bindings);
+        let idle_memory = crate::memory::read(&store.state, &agents, &bindings, || crate::host::Host::seat_memory(&crate::host::LOCAL));
         Wip {
             tasks,
             index: Index::new(store.projects()),
