@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # A registry proc-macro, served from a content-addressed cache (compound-965).
 # sccache does not cache `--crate-type proc-macro`; `rustc-wrap` hands those here.
 #   rustc-pm <rustc> <tree> <rustc args...>

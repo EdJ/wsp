@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # The compiler `rustc-wrap` hands sccache: the real rustc
 # ($COMPOUND_REAL_RUSTC), plus `--remap-path-prefix=<this tree>=/compound` on
 # a compile whose source is NOT in this tree and that is not incremental —
