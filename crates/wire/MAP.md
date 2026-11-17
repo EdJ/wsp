@@ -28,4 +28,4 @@ and `serde_json`. The root re-exports each module at its old path (`crate::place
 
 ## Tests
 
-`cargo test -p wsp-wire` (173 pass, 7 ignored, 6.8s of test time). `cargo test --workspace -- --list`: 2757 before and after.
+`cargo test -p wsp-wire` (171 pass, 7 ignored, 5.5s of test time, 2026-11-17 after wsp-020's move; the same 178 `#[test]` before it). `cargo test --workspace -- --list`: 2757 before and after.
