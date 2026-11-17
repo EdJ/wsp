@@ -475,6 +475,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // So the signal is caught, and the masters are asked to exit before we do.
     reap_on_term(store);
 
+    // Under `WSP_HOST=manager`, the manager's events on a thread of their own,
+    // not paced by the tick (`docs/agent-manager.md` 3.4; wsp-028): each is
+    // folded into the store's files as it comes. Under `inproc`, nothing.
+    let _fold = crate::fold::start(store);
+
     // Every executor's ssh master, held open on this machine. Inert until
     // somebody runs `wsp machine add`; see `crate::tunnel`.
     let mut tunnels = Supervisor::new();

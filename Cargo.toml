@@ -17,8 +17,10 @@ wsp-base = { path = "crates/base" }
 wsp-store = { path = "crates/store" }
 wsp-wire = { path = "crates/wire" }
 wsp-trees = { path = "crates/trees" }
+wsp-host-api = { path = "crates/host-api" }
 
 [dev-dependencies]
+wsp-manager = { path = "crates/manager" }
 wsp-testkit = { path = "crates/testkit" }
 wsp-base = { path = "crates/base", features = ["test-support"] }
 wsp-store = { path = "crates/store", features = ["test-support"] }
