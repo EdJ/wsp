@@ -1229,8 +1229,8 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // than the process it is running in.
         Key::Char('q') | Key::Esc if view.asked_width.is_some() => Effect::Sidebar,
         // …and in the tab `Z` opened, the panel itself is what is in front of
-        // you, so the same keys close that. It is not installed furniture —
-        // nothing is lost by quitting it and `Z` opens it again — and a
+        // you, so the same keys close that. Nothing is lost by quitting it —
+        // `Z` opens it again — and a
         // fullscreen with no `q` is one you go looking for the way out of.
         Key::Char('q') | Key::Esc if view.full => Effect::Quit,
         // Nothing left to give back, so the key means the last thing it can

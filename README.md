@@ -738,9 +738,8 @@ the rows it exists for. Like the key map, it takes those rows out of the tree's
 and gives them back when you press `F` again.
 
 `q` and `esc` both mean "put away what is in front of me": the key map first,
-then a search, then the detail pane. Neither quits the panel — it is installed
-furniture in every workspace, so losing one to a stray keystroke buys
-nothing. `ctrl-c` still quits, and is the deliberate way out.
+then a search, then the detail pane. Neither quits the panel — losing it to a
+stray keystroke buys nothing. `ctrl-c` still quits, and is the deliberate way out.
 
 `?` docks the key map under the tree, and `?` or `esc` puts it away — a footer
 line fits four of the two dozen keys, which is worse than showing none, because
@@ -904,8 +903,8 @@ A zoom is not a bigger pane. It is a display mode over the whole tab, set by one
 pane and outliving it: measured against the live server, it survives a switch to
 another workspace and back, and `pane.focus` will move the keyboard onto a pane
 the zoom is hiding, so what is on the screen and what the keys reach stop being
-the same question. The panel is furniture — installed in every workspace,
-thought about by nobody — and furniture must not hold a workspace in a mode it
+the same question. The panel is furniture — thought about by nobody — and
+furniture must not hold a workspace in a mode it
 cannot see the state of and whose only undo is a key inside itself. A tab hides
 nothing, backend's own switcher lists it, and closing it puts you back.
 
