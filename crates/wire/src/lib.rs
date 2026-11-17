@@ -10,6 +10,7 @@ pub mod far;
 pub mod herdr;
 pub mod launchd;
 pub mod place;
+pub mod systemd;
 pub mod place_compound;
 pub mod place_herdr;
 pub mod place_super;

@@ -1567,7 +1567,14 @@ fn pi_extension(bin: &Path, dst: &Path, dry: bool, json_out: bool, p: &util::Pai
     }
 }
 
-/// Write and load the launchd agent that keeps `wsp daemon` alive.
+/// The platform's daemon launcher: launchd on macOS, a systemd user unit
+/// elsewhere. Both expose the same small surface.
+#[cfg(target_os = "macos")]
+use crate::launchd as backend;
+#[cfg(not(target_os = "macos"))]
+use crate::systemd as backend;
+
+/// Write and load the launchd agent (a systemd user unit on Linux) that keeps `wsp daemon` alive.
 ///
 /// **A second job this verb does not have a flag for**, and every choice below
 /// follows from that. `wsp-145` replaced herdr's `[[startup]]` — a machine whose
@@ -1606,9 +1613,9 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
     if dst != default_dest() || crate::launchd::sandboxed() {
         return nothing;
     }
-    let path = crate::launchd::plist_path();
+    let path = backend::definition_path();
     let var = crate::launchd::path_for(std::env::var_os("PATH").as_deref());
-    let change = match crate::launchd::plan(&crate::launchd::plist(dst, &store.state, &var), &path) {
+    let change = match backend::plan(&backend::definition(dst, &store.state, &var), &path) {
         crate::launchd::Plan::Unchanged => "unchanged",
         crate::launchd::Plan::Write => "would write",
     };
@@ -1621,7 +1628,7 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
                 p.dim(change)
             );
         }
-        return json!({"installed": false, "label": crate::launchd::LABEL,
+        return json!({"installed": false, "label": backend::LABEL,
                       "path": util::contract(&path), "plist": change});
     }
     // The primary and governor seats' settings (wsp-473), beside the seat's own.
@@ -1633,7 +1640,7 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
             p.green("✓")
         );
     }
-    let done = crate::launchd::ensure(dst, &store.state, &var);
+    let done = backend::ensure(dst, &store.state, &var);
     // The line `wsp wip` and the brief show until a daemon is running again.
     match &done {
         Ok(_) => crate::launchd::clear_unloaded(&store.state),
@@ -1654,11 +1661,11 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
         }
     }
     match done {
-        Ok(d) => json!({"installed": true, "label": crate::launchd::LABEL,
+        Ok(d) => json!({"installed": true, "label": backend::LABEL,
                         "path": util::contract(&d.path),
                         "plist": if d.wrote { "written" } else { "unchanged" },
                         "loaded": d.loaded}),
-        Err(why) => json!({"installed": false, "label": crate::launchd::LABEL,
+        Err(why) => json!({"installed": false, "label": backend::LABEL,
                            "path": util::contract(&path), "error": why}),
     }
 }

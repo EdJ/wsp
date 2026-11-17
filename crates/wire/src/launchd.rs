@@ -100,6 +100,17 @@ pub fn plist_path() -> PathBuf {
     util::home().join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
 }
 
+/// [`plist_path`] under the name both launchers (this and [`crate::systemd`])
+/// share, for the call sites that pick one by platform.
+pub fn definition_path() -> PathBuf {
+    plist_path()
+}
+
+/// [`plist`] under the shared name.
+pub fn definition(bin: &Path, state: &Path, path_var: &str) -> String {
+    plist(bin, state, path_var)
+}
+
 /// Is this instance a sandbox, where a launchd job would reach out of it?
 ///
 /// The one place that decides, and it is the same test `cmd_install::install`
@@ -347,6 +358,9 @@ impl Done {
 /// (wsp-449): this returns the error, the install prints it and exits non-zero,
 /// and a note is kept for `wsp wip` until a daemon runs.
 pub fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("launchd is macOS only; this platform's launcher is systemd".into());
+    }
     ensure_as(LABEL, &plist_path(), bin, state, path_var)
 }
 
@@ -408,6 +422,9 @@ fn ensure_as(
 /// already established that no daemon answers (`wsp daemon reload`), so this
 /// never restarts a live one. Returns a sentence for what was done.
 pub fn reload() -> Result<String, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("launchd is macOS only; this platform's launcher is systemd".into());
+    }
     let path = plist_path();
     if !path.exists() {
         return Err(format!("{} is not there — `wsp install --daemon` writes it", util::contract(&path)));

@@ -299,7 +299,11 @@ pub fn daemon_reload(store: &Store, answering: Option<Vec<u32>>) -> i32 {
     if crate::launchd::sandboxed() {
         return refuse(store, "daemon reload", &role, "this is a sandbox, not the machine's own daemon");
     }
-    match crate::launchd::reload() {
+    #[cfg(target_os = "macos")]
+    let reloaded = crate::launchd::reload();
+    #[cfg(not(target_os = "macos"))]
+    let reloaded = crate::systemd::reload();
+    match reloaded {
         Ok(said) => {
             crate::launchd::clear_unloaded(&store.state);
             crate::store::log_line(store, &format!("daemon reload by {}: {said}", role.name()));
