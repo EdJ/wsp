@@ -1150,6 +1150,11 @@ pub(crate) enum Done {
     /// there rather than left to its limit (`wsp-609`): the process tree it had,
     /// one `pid command` per line.
     Hung(String),
+    /// The tree the step was to run in was not there (`wsp-067`): the volume
+    /// went away or the tree was removed under the run. An environment fault, as
+    /// "limit too tight" is, and not a failed step: the row is not sent back for
+    /// it. The path that was missing.
+    TreeMissing(String),
     /// An earlier step failed, so this one was not run.
     Skipped,
 }
@@ -1159,6 +1164,39 @@ impl Done {
     pub(crate) fn is_red(&self) -> bool {
         matches!(self, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_))
     }
+
+    /// Anything after which the next step is not run: a red step, or a tree
+    /// that is not there for it either.
+    pub(crate) fn stops(&self) -> bool {
+        self.is_red() || matches!(self, Done::TreeMissing(_) | Done::Skipped)
+    }
+}
+
+/// How long [`run_again`] waits for a missing tree to come back before it
+/// leaves the step at "tree missing": a minute, or `WSP_CHECK_TREE_BACK_SECS`.
+pub(crate) fn tree_back_after() -> Duration {
+    #[cfg(test)]
+    if let Some(d) = TREE_BACK.with(|h| h.get()) {
+        return d;
+    }
+    let secs = std::env::var("WSP_CHECK_TREE_BACK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own wait for a missing tree, kept to its thread.
+    static TREE_BACK: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// The step as "tree missing: <dir>", when `dir` is not a directory.
+fn tree_missing(dir: &Path, step: &Step, start: Instant) -> Option<Ran> {
+    if dir.is_dir() {
+        return None;
+    }
+    let path = util::contract(dir);
+    let tail = format!("tree missing: {path} — the step could not run there; nothing it did failed");
+    Some(Ran { step: step.clone(), done: Done::TreeMissing(path), took: start.elapsed(), tail, first: None, reused: None })
 }
 
 /// How long a step may sit with no output and no CPU before it is called hung:
@@ -1240,6 +1278,12 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
     if let Some(why) = unparsable(&step.command) {
         return Ran { done: Done::Malformed(why.clone()), tail: why, ..failed(String::new()) };
     }
+    // `wsp-067`: a tree that is gone (its volume unmounted mid-run) made `sh`
+    // fail to spawn with "No such file or directory", read as a failed step
+    // with no exit status, and sent the row back for nothing it did.
+    if let Some(missing) = tree_missing(dir, step, start) {
+        return missing;
+    }
     let Ok(out) = std::fs::File::create(log) else { return failed(format!("could not write {}", util::contract(log))) };
     let Ok(err) = out.try_clone() else { return failed("could not share the log".into()) };
     let mut cmd = Command::new("sh");
@@ -1247,7 +1291,18 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
     clean_env(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return failed(format!("sh: {e}")),
+        Err(e) => {
+            if let Some(missing) = tree_missing(dir, step, start) {
+                return missing;
+            }
+            // The tree is there, so a missing file is `sh` itself.
+            let which = if e.kind() == std::io::ErrorKind::NotFound {
+                format!(" — the tree {} is there, so it is `sh` that was not found on PATH", util::contract(dir))
+            } else {
+                String::new()
+            };
+            return failed(format!("sh: {e}{which}"));
+        }
     };
     let mut timed_out = false;
     // `wsp-609`: a step that writes nothing and uses no CPU for `hung_after` is
@@ -1285,6 +1340,13 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
     // `wsp-453`: whatever the step started and left in its group (a Vite
     // server, a Vitest watcher) goes with it, however it ended.
     crate::host::LOCAL.signal_group(child.id(), "KILL");
+    // The tree went while the step ran: what it said is the missing tree's,
+    // not a verdict on the work.
+    if status.is_none_or(|s| !s.success()) {
+        if let Some(missing) = tree_missing(dir, step, start) {
+            return missing;
+        }
+    }
     if let Some(pids) = hung {
         let tail = format!("hung — no output and no CPU for {}s; its processes:\n{pids}", secs(quiet_for));
         return Ran { step: step.clone(), done: Done::Hung(pids), took: start.elapsed(), tail, first: None, reused: None };
@@ -1341,7 +1403,7 @@ fn tail_of(log: &Path) -> String {
 pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
     let mut out: Vec<Ran> = Vec::new();
     for s in steps {
-        let stop = out.last().is_some_and(|r| r.done.is_red() || r.done == Done::Skipped);
+        let stop = out.last().is_some_and(|r| r.done.stops());
         let ran = if stop {
             Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None, reused: None }
         } else {
@@ -1388,7 +1450,19 @@ pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reus
         }
     }
     let clean = reuse.is_some_and(|r| greens::clean_at(dir, r.sha));
-    let first = run_step(dir, step, log);
+    let mut first = run_step(dir, step, log);
+    // `wsp-067`: a missing tree is waited for, and the step run once more when
+    // it is back; still gone, the step stays "tree missing".
+    if matches!(first.done, Done::TreeMissing(_)) {
+        let waited = Instant::now();
+        while !dir.is_dir() && waited.elapsed() < tree_back_after() {
+            std::thread::sleep(Duration::from_millis(200).min(tree_back_after()));
+        }
+        if !dir.is_dir() {
+            return Ran { took: first.took + waited.elapsed(), ..first };
+        }
+        first = run_step(dir, step, log);
+    }
     let ran = if matches!(first.done, Done::Failed { timed_out: false, .. }) {
         let second = run_step(dir, step, log);
         Ran { took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
@@ -1438,6 +1512,7 @@ pub(crate) fn why_failed(r: &Ran) -> String {
         Done::Failed { exit: None, .. } => "no exit status".into(),
         Done::Malformed(why) => format!("malformed: {why}"),
         Done::Hung(pids) => format!("hung (no output, no CPU) — pids {}", pids.lines().filter_map(|l| l.split_whitespace().next()).collect::<Vec<_>>().join(" ")),
+        Done::TreeMissing(path) => format!("tree missing: {path}"),
         _ => String::new(),
     }
 }
@@ -1460,6 +1535,7 @@ pub(crate) fn account(ran: &[Ran]) -> String {
             (Done::Passed, Some((why, _))) => ("✓", format!("{}s · passed on a second run, the first was {why}", secs(r.took))),
             (Done::Malformed(why), _) => ("✗", format!("malformed — the line cannot start: {why}")),
             (Done::Hung(_), _) => ("✗", format!("{}s · {}", secs(r.took), why_failed(r))),
+            (Done::TreeMissing(_), _) => ("?", format!("{}s · {} — an environment fault, not a failed step", secs(r.took), why_failed(r))),
             (Done::Failed { .. }, first) => {
                 let twice = if first.is_some() { " both times" } else { "" };
                 ("✗", format!("{}s · {}{twice}", secs(r.took), why_failed(r)))
@@ -1467,7 +1543,7 @@ pub(crate) fn account(ran: &[Ran]) -> String {
             (Done::Skipped, _) => ("–", "skipped".to_string()),
         };
         out.push(format!("{mark} {} · {} · {rest} · {}", r.step.name, r.step.command.lines().next().unwrap_or_default(), why_in(&r.step)));
-        if r.done.is_red() {
+        if r.done.is_red() || matches!(r.done, Done::TreeMissing(_)) {
             out.extend(r.tail.lines().map(|l| format!("  | {l}")));
         } else if let Some((_, tail)) = &r.first {
             out.extend(tail.lines().map(|l| format!("  ~ {l}")));
@@ -1479,6 +1555,15 @@ pub(crate) fn account(ran: &[Ran]) -> String {
 /// What a failed run owes, for the row's log and the pane: the first failing
 /// step, its command and the end of its output.
 pub(crate) fn owed(ran: &[Ran], sha: &str) -> String {
+    if let Some(r) = ran.iter().find(|r| matches!(r.done, Done::TreeMissing(_))) {
+        return format!(
+            "wsp check could not run `{}` at {}: {}. The tree went away under the run, not the work — nothing was sent back; \
+             the check runs again when the tree is back.",
+            r.step.name,
+            &sha[..sha.len().min(12)],
+            why_failed(r),
+        );
+    }
     let Some(r) = ran.iter().find(|r| r.done.is_red()) else { return String::new() };
     if let Done::Malformed(why) = &r.done {
         return format!(
@@ -1569,6 +1654,9 @@ pub(crate) enum Settled {
     /// Timed out while the machine was over its load line: not a verdict, the
     /// row stays at review, and the gate runs the check again once the load falls.
     Waiting,
+    /// A step's tree was not there (`wsp-067`): an environment fault, not a
+    /// verdict. The row stays where it is and the gate runs the check again.
+    TreeMissing,
     /// The row or its entry is gone.
     Lost,
 }
@@ -1595,9 +1683,13 @@ fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration,
     let read_now = before.iter().find(|r| r.at == at).and_then(|r| r.read.clone());
     let timed_before = before.iter().any(|r| r.at != at && r.state == RunState::Waiting && r.read == read_now);
     let busy = start.filter(|_| !timed_before).and_then(|s| timed_out_under_load(ran, s, load_end));
+    let missing = ran.iter().find_map(|r| match &r.done {
+        Done::TreeMissing(path) => Some(path.clone()),
+        _ => None,
+    });
     let state = if passed(ran) {
         RunState::Passed
-    } else if busy.is_some() {
+    } else if busy.is_some() || missing.is_some() {
         RunState::Waiting
     } else {
         RunState::Failed
@@ -1629,6 +1721,10 @@ fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration,
         };
         if ran.iter().any(|r| matches!(r.done, Done::Malformed(_))) {
             out = Settled::Malformed;
+        } else if let Some(path) = &missing {
+            t.updated = util::now_iso();
+            t.log(&format!("wsp: check tree missing: {path} — an environment fault, not the work; the row stays where it is and the check runs again"));
+            out = Settled::TreeMissing;
         } else if state == RunState::Waiting {
             t.updated = util::now_iso();
             t.log(&format!("wsp: check {WAITING}{} — the row stays where it is", busy.as_deref().unwrap_or_default()));
@@ -1819,6 +1915,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
                 Done::Passed if r.reused.is_some() => (p.green("✓"), " · reused".to_string()),
                 Done::Passed => (p.green("✓"), String::new()),
                 Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
+                Done::TreeMissing(_) => (p.dim("?"), format!(" · {}", why_failed(r))),
                 Done::Skipped => (p.dim("–"), " · skipped".to_string()),
             };
             println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
@@ -1839,7 +1936,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         );
     } else if !auto {
         if !ok {
-            let skip = if settled == Settled::Malformed { 0 } else { 2 };
+            let skip = if matches!(settled, Settled::Malformed | Settled::TreeMissing) { 0 } else { 2 };
             for l in owed(&ran, &tg.sha).lines().skip(skip) {
                 println!("    {}", p.dim(l));
             }
@@ -1847,6 +1944,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         let tail = match (&settled, record) {
             (Settled::SentBack, _) => format!(" · {} is back at doing with this as what is owed", t.id),
             (Settled::Waiting, _) => format!(" · timed out under load, rerunning once the load falls; {} stays where it is", t.id),
+            (Settled::TreeMissing, _) => format!(" · a tree was missing, not a failure; {} stays where it is", t.id),
             (_, false) => " · nothing written on the row".to_string(),
             _ => String::new(),
         };
@@ -2243,6 +2341,7 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
         let (mark, tail) = match &r.done {
             Done::Passed => (p.green("✓"), String::new()),
             Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
+            Done::TreeMissing(_) => (p.dim("?"), format!(" · {}", why_failed(r))),
             Done::Skipped => (p.dim("–"), " · skipped".to_string()),
         };
         println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
@@ -2250,7 +2349,8 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
     drop(lock);
     let ok = passed(&ran);
     if !ok {
-        for l in owed(&ran, &tg.sha).lines().skip(2) {
+        let skip = if ran.iter().any(|r| matches!(r.done, Done::TreeMissing(_))) { 0 } else { 2 };
+        for l in owed(&ran, &tg.sha).lines().skip(skip) {
             println!("    {}", p.dim(l));
         }
     }
@@ -3132,6 +3232,52 @@ mod tests {
         assert!(run.text.contains("malformed"), "{}", run.text);
         assert!(owed(&ran, &sha).contains("--set"), "and what it asks is for the line to be fixed");
         assert_eq!(gate(&store, &t), Gate::Clear, "the verifier is not held for a declaration");
+    }
+
+    #[test]
+    fn a_step_whose_tree_is_removed_before_it_runs_is_tree_missing_and_the_row_stays_at_review() {
+        TREE_BACK.with(|h| h.set(Some(Duration::from_millis(300))));
+        let (scratch, log) = scratch_log("tree-missing");
+        let tree = scratch.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::remove_dir_all(&tree).unwrap();
+        let ran = run_all(&tree, &[sh("true", 10), sh("true", 10)], &log, None, |_| {});
+        assert!(matches!(&ran[0].done, Done::TreeMissing(p) if p.ends_with("tree")), "{:?}", ran[0].done);
+        assert_eq!(ran[1].done, Done::Skipped, "the next step has no tree either");
+        assert!(!ran[0].done.is_red(), "not a failed step");
+        let text = account(&ran);
+        assert!(text.contains("tree missing") && !text.contains("no exit status") && !text.contains("No such file"), "{text}");
+
+        let (_env, store, sha) = world("treemissing", "- t: true", "exit 0\n");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(1)), Settled::TreeMissing);
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(t.status(), Status::Review, "the row stays at review");
+        let log_text = t.section("Log").unwrap();
+        assert!(!log_text.contains("sent back") && log_text.contains("tree missing"), "{log_text}");
+        let run = &v::runs(&t)[0];
+        assert_eq!(run.state, RunState::Waiting, "owed a rerun, not a verdict");
+        assert!(owed(&ran, &sha).contains("nothing was sent back"));
+    }
+
+    #[test]
+    fn a_tree_that_comes_back_is_run_once_more_and_a_failure_on_a_present_tree_still_fails() {
+        TREE_BACK.with(|h| h.set(Some(Duration::from_secs(10))));
+        let (scratch, log) = scratch_log("tree-back");
+        let tree = scratch.join("tree");
+        let _ = std::fs::remove_dir_all(&tree);
+        let back = tree.clone();
+        let maker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            std::fs::create_dir_all(&back).unwrap();
+        });
+        let r = run_again(&tree, &sh("touch ran", 10), &log, None);
+        maker.join().unwrap();
+        assert_eq!(r.done, Done::Passed, "{}", r.tail);
+        assert!(tree.join("ran").exists(), "run once the tree was back");
+        let bad = run_again(&tree, &sh("exit 4", 10), &log, None);
+        assert_eq!(bad.done, Done::Failed { exit: Some(4), timed_out: false });
+        assert!(why_failed(&bad).contains("exit 4"));
     }
 
     #[test]

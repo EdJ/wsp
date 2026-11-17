@@ -749,7 +749,7 @@ fn original_seats(store: &Store, seats: &dyn Seats) {
             let outcome = crate::cycle::despawn_seat(&seat).and_then(|()| confirm_gone(seats, &pids));
             let line = match &outcome {
                 Ok(()) => format!("{ORIGINAL_ENDED} {seat} {ORIGINAL_ENDED_TAIL}"),
-                Err(why) => format!("{ORIGINAL_NOT_ENDED} {seat} — {}", util::truncate(why, 160)),
+                Err(why) => format!("{ORIGINAL_NOT_ENDED} {seat} — {}", util::truncate(&why_not_ended(why), 200)),
             };
             if once(store, &row.id, &line) {
                 crate::store::log_line(store, &format!("{}: {}", row.id, line.trim_start_matches("wsp: ")));
@@ -886,11 +886,23 @@ fn record_ended(store: &Store, id: &str, h: &Holds) {
     }
 }
 
+/// Why an ending failed, with "the tree is in use" where the error is only
+/// "Directory not empty" (`wsp-067`): the tree was being removed while
+/// something still wrote in it, and the bare error names neither.
+pub(crate) fn why_not_ended(why: &str) -> String {
+    if why.contains("Directory not empty") || why.contains("os error 66") || why.contains("os error 39") {
+        format!("{why} — the tree is in use: a process still writes in it, so it could not be removed")
+    } else {
+        why.to_string()
+    }
+}
+
 /// A failed ending: on the row, in `cycle.log`, and to the governor — once,
 /// because the row's line is what the next pass reads as "already tried".
 fn not_ended(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, h: &Holds, why: &str) {
+    let why = &why_not_ended(why);
     let commit = &h.commit;
-    let line = format!("{NOT_ENDED} {member} ({seat}) at {commit} — {}", util::truncate(why, 160));
+    let line = format!("{NOT_ENDED} {member} ({seat}) at {commit} — {}", util::truncate(why, 200));
     if !once(store, member, &line) {
         return;
     }
@@ -1105,7 +1117,7 @@ pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<S
             };
             match ending {
                 Ok(()) => format!("{EXIT_ENDED} {} ({kind}, {seat}), no pid of it running and its tree kept", util::iso_at(at)),
-                Err(why) => format!("{EXIT_NOT_ENDED} ({kind}, {seat}) — {}", util::truncate(&why, 160)),
+                Err(why) => format!("{EXIT_NOT_ENDED} ({kind}, {seat}) — {}", util::truncate(&why_not_ended(&why), 200)),
             }
         }
     };
@@ -1176,6 +1188,13 @@ fn said_exit(store: &Store, seat: &str, row: &str, kind: &str, line: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ending_refused_with_directory_not_empty_says_the_tree_is_in_use() {
+        let why = why_not_ended("could not remove tree: Directory not empty (os error 66)");
+        assert!(why.contains("Directory not empty") && why.contains("the tree is in use"), "{why}");
+        assert_eq!(why_not_ended("no such seat"), "no such seat");
+    }
     use crate::cycle::tests::{DESPAWN_FAILS, ENDED as DESPAWNED, SAID, TOLD};
     use crate::model::Group;
     use crate::verification::Ending;
