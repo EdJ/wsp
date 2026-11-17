@@ -550,6 +550,107 @@ taken with `wsp calls` over a day before and a day after, and its incident count
 Spawn p50 is the guard rail at every step: a step that makes it worse than 9.4 s, measured the same way, does not
 finish.
 
+#### M0's result (wsp-009, 2026-11-17)
+
+**The guard.** `tests/host_seam.rs` is the done-when's `grep`, made a test. It reads the product code of `src/` and
+`crates/*/src/` with a small lexer: string literals are kept, and comments, `#[cfg(test)]` items, `test-support`
+items and files declared as test modules are left out. It fails when any of these is reached outside
+`crates/wire/src/host.rs`:
+- `ps`, `pgrep`, `lsof`, `kill`, `pkill`, `killall`, run as a `Command`, written into a shell line, or declared as a C
+  function;
+- the fact probes `df`, `du`, `sysctl`, `pmset`, `vm_stat`, `memory_pressure` and `ioreg`, the same three ways;
+- running `compound-render`, or naming `host::compound_render_binary` or the helpers that type through it;
+- building the path of a Claude Code transcript (`~/.claude/projects`) or a pi session, naming `hooks.jsonl`, or
+  asking `opencode` for its `export` or `db`;
+- calling or importing one of host.rs's own OS-touching free functions (`signal_group`, `tree_of`, `tally_burn`,
+  …), which reaches the OS past the trait.
+
+A second test fails when "herdr" appears anywhere under `src/` or `crates/`, tests and comments included. A third test
+checks the guard's reading on a fragment of each kind.
+
+What the code still does outside the host is listed in `docs/host-seam-allowed.txt`, with the reason for each line.
+That file is a ratchet like `docs/components-upward.txt`: a new hit fails, a line the code no longer has fails, and a
+line the trunk's copy lacks fails. It has four lines:
+- `far.rs` (2): `DISPLAY_PROBE` (`ioreg`) and `holdings_command` (`ps`) are shell lines run *on the far machine* over
+  ssh. host.rs leaves the far machine to M2, and these two go with it.
+- `warm.rs`: `remove_when_gone` waits on its own pid (`while kill -0`) before an `rm`. That is tree work (1.3), and
+  it becomes a job at M3.
+- `did.rs`: `is_scratch` names `/.claude/projects/` to classify a path that a tool call touched. It reads nothing.
+
+Writing the guard turned up one leak, and it was fixed: `place_super` re-exported `signal_group` and `tree_of` to the
+whole crate, and only tests used them. The re-export is now `test-support` only.
+
+The guard does not catch two things. A file read of a path handed in from elsewhere looks like any other read, so
+the guard watches where transcript paths are *built*, not every `fs::read`. And disk.rs's `private_size` walk (the
+size of wsp's own state, through `getattrlist`) is an in-process file walk, not a probe.
+
+**Incidents.** `wsp calls --incidents [--since 7d] [--json]` counts the `cycle.log` entries (a dated line with its
+continuation lines) that the daemon writes when it acts on one of state-core 1.6's inferences, by kind. A test holds
+each sign to its writer's own words. It also counts 6.1's two classes:
+- **wsp-478's**: `stopped in finished row … TERM`. All of them are counted. Whether the pids were the row's own
+  cannot be told after the fact, so this is an upper bound.
+- **wsp-411's**: a seat ended on a census (the `nothing left to do, ended:` sweeps, `ended — …, and no pid of it is
+  running`, and I4's "already gone") that is heard from afterwards. "Heard from" means an event it caused in
+  `events.jsonl` (`pane` or `by` is the seat; wsp's own `agent-told` does not count) or a line read off its own hooks
+  (`<seat>: …`).
+
+The before figure, over the 7 days to 2026-11-17T10:06Z on this store:
+
+| kind | count | what the signs were |
+|---|---|---|
+| I1 who owns a process | 0 | |
+| I2 is a seat alive | 14 | `never became ready for input` (the readiness read off the screen at spawn) |
+| I3 was an order taken | 8 | `but its pane did not get it` |
+| I4 has a seat ended | 2 | an accepted exit's seat already gone |
+| I5 row state | — | never logged as a guess (state-core's rows machine) |
+| **wsp-478 kind** | **0** | |
+| **wsp-411 kind** | **0 of 30** | seats ended on a census, none heard from afterwards |
+
+**The measures, and how they were taken.** The live daemon and every seat run the installed binary, `4be352b` (this
+plan's own commit), which is from before M0. So every figure the fleet records today is a before figure. The after
+figure was taken as an A/B on this machine at 2026-11-17T10:03Z, under a load average of 7.9–9.4. Two release builds
+were compared: `4be352b` (built from `git archive` into the row's scratch directory) and this tree (`90d47e3`, the
+M0 trunk plus this row). They ran alternately, with `WSP_NO_CALLS=1` so that the fleet's `calls.jsonl` was not
+touched. CPU is user+sys of the process and every child it waited for (`wait4`). The script is `ab.py` and
+`spawn_ab.sh` in the row's scratch directory.
+
+| measure | 6.1 baseline | live, `4be352b`, 14 h to 2026-11-17T10:01Z | A/B before (`4be352b`) | A/B after (M0) |
+|---|---|---|---|---|
+| `wip` CPU per call | 2.9 CPU-s | 0.15 (actions), 0.21 (polls) | 0.131 CPU-s p50, n=15 | 0.131 CPU-s p50 |
+| `wip --json` CPU per call | — | 0.22 (polls) | 0.133 CPU-s p50, n=15 | 0.132 CPU-s p50 |
+| `wip` wall p50 | 3.5 s | 0.16 s (actions), 0.20 s (polls) | 0.142 s | 0.142 s |
+| `spawn` p50 | **9.4 s** | **2.09 s** (62 spawns), p95 68.9 s | 0.800 s, n=12 (workspace only) | 0.800 s (workspace only) |
+| `despawn` p50 | 2.9 s | 0.08 s | 0.026 s | 0.026 s |
+| tick p50 / p95 | 19.5 s / 116 s | 85 ms / 1.60 s (974 ticks) | — | — |
+| per tick: ps, render, df, lsof, kill | 37.5, 59.5, 24.6, 0.9, 1.3 | 5.8, 3.6, 0.3, 0.6, 0.3 | — | — |
+
+How each was taken:
+- **The live columns** are `wsp calls --since 24h` and `--polls` on this store. The log covers 14 h, since the daemon
+  started at 2026-11-16T19:55Z. The tick and child figures are the same file's `"k":"tick"` lines.
+- **`wip`** was run against the live store with both binaries. With 2 seats up, it is a light fleet.
+- **`spawn`** is `wsp spawn <row>` *without* `--agent`, then `wsp despawn`, in an isolated `WSP_HOME`/`WSP_STATE`
+  per binary with a one-commit repo. It times what M0 moved (the tree, `compound-sup spawn` through `Host`, the
+  claim) and leaves out claude's own start-up, which M0 does not touch. Spawning claude twelve times per binary would
+  have bought a figure dominated by the agent's own readiness. The live column carries the agent.
+- **6.1's baselines** come from a heavier day than this store has seen since (1,633 ticks, tick p50 19.5 s). They
+  bound the result but are not its comparison. The comparison is the A/B, on one machine at one moment.
+
+**Against the done-when line:**
+- *`grep` finds no `ps`, `lsof`, `kill`, render, transcript or fact probe outside the in-process host (tree work
+  excepted)*: **met, with two named exceptions.** The guard holds. Its allowances are tree work (`warm.rs`, as the
+  line excepts), a path classifier that reads nothing (`did.rs`), and **far.rs's two ssh shell lines**. Those two are
+  not tree work. They are left to M2, which removes the ssh door they run through.
+- *Spawn p50 ≤ 9.4 s*: **met.** It is 2.09 s live, and the A/B shows the same p50 before and after.
+- *`wip` CPU no worse*: **met.** 0.131 CPU-s per call before and after.
+- *Tick no slower*: **not measured on an after binary. This is the shortfall.** There is no single-tick mode. A tick
+  run on a copy of the live state would act on the live seats (spawn agents, signal recorded pids), and the daemon
+  runs `4be352b`. M0 changes no tick logic, only where the calls are made. But the day-after `wsp calls --since 24h`
+  that 6.2 asks for is owed once the M0 trunk is installed (`wsp install`). That is the person's step, not a seat's.
+- *Herdr references → 0*: **met.** `herdr_is_gone_from_src_and_crates` holds.
+
+**Carried into M1's breakdown, first:** wsp-010. It covers the features herdr fed that nothing feeds now: overlap's
+live panes and verify's `--rm --all` sweep.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the
