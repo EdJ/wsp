@@ -763,9 +763,12 @@ PLUMBING
                                     `pmset -g therm` CPU_Speed_Limit under
                                     PERCENT) is held to, in every mode
   wsp doctor [--fix | --fix-identity]
-                                    integrity check. --fix-identity only gives a
-                                    store git that cannot commit its own repo-
-                                    local identity. --fix does that too, and
+                                    integrity check. --fix-identity only repairs a
+                                    store git that cannot commit: sets the
+                                    missing repo-local user.name/user.email and,
+                                    only if signing is what fails,
+                                    commit.gpgsign=false (repo-local, never the
+                                    global config). --fix does that too, and
                                     folds stray sections back in task bodies and
                                     clears stale gc state in the repos
   wsp say "…" | - | --from FILE     say where you have got to, on your pane;
