@@ -735,6 +735,11 @@ PLUMBING
                                     polls (polls.jsonl), --all both; each view
                                     says the time its file covers
                                     (WSP_NO_CALLS=1 stops the recording)
+  wsp calls --incidents [--since 7d] [--json]
+                                    how often wsp acted on a guess, by kind
+                                    (who owns a process, is a seat alive, was an
+                                    order taken, has a seat ended), from
+                                    cycle.log and events.jsonl
   wsp throttle [off|on|auto] [--json]
                                     how builds are held back for the person at
                                     the machine: niced, capped in jobs, and a
