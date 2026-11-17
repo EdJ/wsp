@@ -49,8 +49,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use wsp_host_api::{
-    AgentSpec, At, Beat, ConnError, Connection, Epoch, EventId, Frame, Gate, Hello, Key, ManagerHello, Message,
-    HostFacts, OrderDeliver, OrderFail, OrderId, Refusal as Why, ReqId, Role, RowId, SeatId, SeatRead, SeatRow, SeatSpawn,
+    AgentSpec, At, Beat, ConnError, Connection, Epoch, EventId, Frame, Gate, Hello, ManagerHello, Message,
+    HostFacts, OrderDeliver, OrderFail, OrderId, Refusal as Why, ReqId, Role, SeatId, SeatRead, SeatRow, SeatSpawn,
     SeatState, SeatStop, Seats, SeatsList, Subscribe, Token, Workdir, WspHello, BEAT_SECS, MISSED_BEATS, PROTOCOL,
 };
 
