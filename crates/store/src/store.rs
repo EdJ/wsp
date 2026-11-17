@@ -27,6 +27,83 @@ thread_local! {
     /// How deep we are in nested `locked` calls, so the lock can be taken once
     /// around a whole claim and again by each file it touches.
     static DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// How deep we are in [`strictly`]: inside it, `locked` waits for the lock
+    /// rather than carrying on without it (`wsp-663`).
+    static STRICT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Run `f` with every state lock inside it taken for real (`wsp-663`).
+///
+/// Outside this, [`Store::locked`] gives up after two seconds and carries on,
+/// because `wsp claim` never returning is worse than a lost update. A step of
+/// a list is the other way round: what it does without the lock is spawn or
+/// tell twice, and neither is undone by the next write. So inside `f` the lock
+/// is waited for until it is free or its holder is broken as stale — the wait
+/// is said, and `carrying on without it` never is. `docs/step-lock.md`.
+pub fn strictly<T>(f: impl FnOnce() -> T) -> T {
+    STRICT.with(|s| s.set(s.get() + 1));
+    struct Out;
+    impl Drop for Out {
+        fn drop(&mut self) {
+            STRICT.with(|s| s.set(s.get() - 1));
+        }
+    }
+    let _out = Out;
+    f()
+}
+
+/// How a `locked` call came by the lock.
+#[derive(Debug, PartialEq, Eq)]
+enum Taken {
+    /// Ours, and ours to remove.
+    Took,
+    /// Busy past patience, outside [`strictly`]: carried on, and the file is
+    /// left to whoever holds it.
+    Without,
+    /// The state directory would not take the file at all.
+    Unwritable,
+}
+
+/// Take the lock file at `path`. A holder older than `stale` is broken; past
+/// `patience` the caller carries on without it unless `strict`, in which case
+/// it waits on, saying so every ten seconds.
+fn take_lock(path: &Path, patience: Duration, stale: Duration, strict: bool) -> Taken {
+    let start = Instant::now();
+    let mut said = Duration::ZERO;
+    loop {
+        match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut fh) => {
+                let _ = write!(fh, "{} {}\n", std::process::id(), util::now_iso());
+                return Taken::Took;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let held = fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().unwrap_or_default())
+                    .unwrap_or_default();
+                if held > stale {
+                    // Whoever held this is not coming back.
+                    let _ = fs::remove_file(path);
+                    continue;
+                }
+                let waited = start.elapsed();
+                if waited > patience {
+                    if !strict {
+                        eprintln!("wsp: state lock busy for 2s — carrying on without it");
+                        return Taken::Without;
+                    }
+                    if waited >= said + Duration::from_secs(10) {
+                        said = waited;
+                        eprintln!("wsp: state lock busy for {}s — a step waits for it", waited.as_secs());
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // An unwritable state directory is a problem, but not one to
+            // discover by refusing to work.
+            Err(_) => return Taken::Unwritable,
+        }
+    }
 }
 
 /// The id prefix for a task filed nowhere.
@@ -2113,39 +2190,18 @@ impl Store {
         }
         let _ = fs::create_dir_all(&self.state);
         let path = self.lock_path();
-        let start = Instant::now();
-        loop {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut fh) => {
-                    let _ = write!(fh, "{} {}\n", std::process::id(), util::now_iso());
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let held = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .map(|t| t.elapsed().unwrap_or_default())
-                        .unwrap_or_default();
-                    if held > STALE {
-                        // Whoever held this is not coming back.
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    if start.elapsed() > PATIENCE {
-                        eprintln!("wsp: state lock busy for 2s — carrying on without it");
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                // An unwritable state directory is a problem, but not one to
-                // discover by refusing to work.
-                Err(_) => break,
-            }
-        }
+        let strict = STRICT.with(|s| s.get()) > 0;
+        let taken = take_lock(&path, PATIENCE, STALE, strict);
 
         DEPTH.with(|d| d.set(d.get() + 1));
         let out = f();
         DEPTH.with(|d| d.set(d.get() - 1));
-        let _ = fs::remove_file(&path);
+        // Only a lock this call took is this call's to remove. One that
+        // carried on without it removed the holder's file as it left, and the
+        // next process in took the lock from under that holder (`wsp-663`).
+        if taken == Taken::Took {
+            let _ = fs::remove_file(&path);
+        }
         out
     }
 
@@ -3779,6 +3835,52 @@ mod tests {
     use super::*;
     use crate::model::{Group, WorklistStatus};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn lock_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wsp-lock-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// `wsp-663`: outside a step a busy lock is carried on past; inside one
+    /// it is waited for, and taken once its holder lets go.
+    #[test]
+    fn a_strict_lock_waits_for_the_holder_where_a_loose_one_carries_on() {
+        let d = lock_dir("strict");
+        let path = d.join(".lock");
+        fs::write(&path, "1 held\n").unwrap();
+        let patience = Duration::from_millis(60);
+        let stale = Duration::from_secs(30);
+        assert_eq!(take_lock(&path, patience, stale, false), Taken::Without);
+        assert!(path.exists(), "carried on past, and left to its holder");
+
+        let p = path.clone();
+        let freed = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            fs::remove_file(&p).unwrap();
+        });
+        let t = Instant::now();
+        assert_eq!(take_lock(&path, patience, stale, true), Taken::Took);
+        assert!(t.elapsed() >= Duration::from_millis(200), "it waited for the holder");
+        freed.join().unwrap();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A `locked` that carried on without the lock leaves the holder's file
+    /// where it is: removing it handed the lock to the next process in while
+    /// its holder was still inside.
+    #[test]
+    fn a_lock_carried_on_past_is_not_removed_from_under_its_holder() {
+        let store = scratch("lock-holder");
+        let _ = fs::create_dir_all(&store.state);
+        fs::write(store.lock_path(), "1 held\n").unwrap();
+        assert_eq!(store.locked(|| 7), 7);
+        assert!(store.lock_path().exists(), "the holder's lock is still the holder's");
+        fs::remove_file(store.lock_path()).unwrap();
+        strictly(|| store.locked(|| ()));
+        assert!(!store.lock_path().exists(), "a lock taken is given back");
+    }
 
     /// The daemon marker is state and not work: a daemon starting must not look
     /// to every panel on the machine like something changed in the store, or

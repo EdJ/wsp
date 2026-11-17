@@ -827,7 +827,9 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // agent exited raises no event and writes no record. It runs in this process rather than as a `wsp worklist advance` per list
         // because that would be a process per running list every minute, and
         // because `cycle::step` is idempotent: a tick racing a verb's own
-        // advance finds the records and starts nothing twice.
+        // advance finds the records and starts nothing twice. And since
+        // `wsp-663` they do not race at all: a step holds its list, and the
+        // second one marks it to step again (`docs/step-lock.md`).
         //
         // Silent about its own failures. `repair::tick` writes what it did to
         // `cycle.log`, which is where the run's history is read from, and a

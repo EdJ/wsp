@@ -484,6 +484,12 @@ pub(crate) fn launch_out(store: &Store, argv: &[&str]) {
 /// one. The event flags are what the trigger saw, and they only decide what a
 /// governor is told: the steps themselves are read off the store.
 pub fn advance(store: &Store, args: &Args) -> i32 {
+    // Everything an advance does spawns or tells, so none of it carries on
+    // past a busy state lock (`wsp-663`, `docs/step-lock.md`).
+    crate::store::strictly(|| advance_in(store, args))
+}
+
+fn advance_in(store: &Store, args: &Args) -> i32 {
     let named = args.rest.get(1).cloned();
     log_line(store, &format!("advance {}", args.rest[1..].join(" ")));
 
@@ -803,8 +809,43 @@ pub(crate) fn list_of(store: &Store, t: &Task) -> Option<Worklist> {
 /// list: one code path means the tick and the verb cannot come to disagree
 /// about what is owed, and the tick has to reach them without a process per
 /// running list every minute.
+///
+/// **One at a time on a list** (`wsp-663`): the step holds its list's lock
+/// for as long as it runs, so two triggers cannot both read a member as owed
+/// and both start it. A trigger that finds the list already being stepped
+/// leaves a mark and returns at once; the holder takes one more step for it
+/// before letting go ([`crate::stepping`]). Other lists are not held up. And
+/// every state lock inside the step is taken for real ([`crate::store::strictly`]):
+/// a step is the thing that spawns and tells, so it never carries on without it.
 pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String> {
-    step_in(store, w, seats, Starts::All)
+    crate::store::strictly(|| {
+        match crate::stepping::one_at_a_time(&store.state, &w.id, true, |_| {
+            #[cfg(test)]
+            during_step(store, w);
+            step_in(store, w, seats, Starts::All)
+        }) {
+            crate::stepping::Stepped::Ran { steps, out } => {
+                if steps > 1 {
+                    log_line(store, &format!("{}: stepped {} more time(s), as asked while the step ran", w.id, steps - 1));
+                }
+                out
+            }
+            crate::stepping::Stepped::Marked => {
+                log_line(store, &format!("{}: a step is under way; it is marked to step again", w.id));
+                Vec::new()
+            }
+            crate::stepping::Stepped::Busy => Vec::new(),
+        }
+    })
+}
+
+/// The test seam: what a test has arrive while this thread's step runs.
+#[cfg(test)]
+fn during_step(store: &Store, w: &Worklist) {
+    tests::STEPS.with(|n| n.set(n.get() + 1));
+    if let Some(f) = tests::DURING_STEP.with(|d| d.take()) {
+        f(store, w);
+    }
 }
 
 /// Which of a step's starts to take. `wsp-231`.
@@ -1048,8 +1089,15 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
             !holds.contains_key(&s.id) && store.find_task(&s.id).is_some_and(|t| t.status() == Status::Todo)
         });
         if gate.cap.is_some() && unstarted {
+            // Each under its own list's lock, and a list already being stepped
+            // is left to its holder, which is taking these very starts: no
+            // wait, so two lists finishing each other cannot hold each other
+            // up. A mark that arrives while this holds the other list is
+            // answered with that list's whole step.
             for other in store.worklists().iter().filter(|o| o.id != w.id && o.status() == WorklistStatus::Running) {
-                let _ = step_in(store, other, seats, Starts::Finishing);
+                let _ = crate::stepping::one_at_a_time(&store.state, &other.id, false, |n| {
+                    step_in(store, other, seats, if n == 0 { Starts::Finishing } else { Starts::All })
+                });
             }
         }
         let own_cap = g.parallelism(None);
@@ -5422,6 +5470,11 @@ pub(crate) mod tests {
         pub(crate) static CLOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// Set, and a batch's close on this thread answers with it; else clean.
         pub(crate) static CLOSE_AS: std::cell::Cell<Option<fn(&Store, &str, usize) -> crate::piece_close::Closed>> = const { std::cell::Cell::new(None) };
+        /// How many steps ran on this thread under their list's lock (`wsp-663`).
+        pub(crate) static STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Set, and the next step on this thread runs it once it holds its list:
+        /// the advances that arrive while a step runs.
+        pub(crate) static DURING_STEP: std::cell::Cell<Option<fn(&Store, &Worklist)>> = const { std::cell::Cell::new(None) };
     }
 
     fn spawned() -> Vec<(String, String)> {
@@ -8782,11 +8835,14 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// Two steps at once — the daemon's tick and an `advance` by hand — with the
-    /// store lock held elsewhere throughout, so every section gives it up after
-    /// two seconds and carries on without it, as under compounding-428's load,
-    /// and each pick stalls between its read and its write as that one did (the
-    /// row's log kept only the second start's line: it was written over the
-    /// first). Each row is spawned once.
+    /// store lock held elsewhere past its two seconds' patience, as under
+    /// compounding-428's load, and each pick stalling between its read and its
+    /// write as that one did (the row's log kept only the second start's line:
+    /// it was written over the first). Each row is spawned once.
+    ///
+    /// Since `wsp-663` a step does not carry on without the lock: it waits for
+    /// the holder, and the second step finds its list held and marks it rather
+    /// than stepping beside it.
     fn race(tag: &str, kind: &str, n: usize, cap: usize, seat_cap: Option<usize>) -> (Vec<String>, usize) {
         let (_env, store) = scratch(tag);
         store.set_seat_cap(seat_cap).unwrap();
@@ -8794,15 +8850,14 @@ fn only_a_working_screen_is_ever_overruled() {
         let lock = store.state.join(".lock");
         let (root, state) = (store.root.clone(), store.state.clone());
         let go = std::sync::Barrier::new(2);
-        let done = std::sync::atomic::AtomicBool::new(false);
+        // Held elsewhere from before either step starts, for longer than a
+        // loose `locked` waits, and then let go.
+        std::fs::write(&lock, "1 elsewhere\n").unwrap();
+        let held = std::time::Instant::now();
         let ids: Vec<String> = std::thread::scope(|sc| {
-            // Whoever holds it is busy for the whole race: an ending that
-            // removes the file is put back at once, as a held lock would be.
             sc.spawn(|| {
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = std::fs::write(&lock, "1 elsewhere\n");
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                let _ = std::fs::remove_file(&lock);
             });
             let runs: Vec<_> = (0..2)
                 .map(|_| {
@@ -8816,11 +8871,10 @@ fn only_a_working_screen_is_ever_overruled() {
                     })
                 })
                 .collect();
-            let ids = runs.into_iter().flat_map(|r| r.join().unwrap()).collect();
-            done.store(true, std::sync::atomic::Ordering::Relaxed);
-            ids
+            runs.into_iter().flat_map(|r| r.join().unwrap()).collect()
         });
-        let _ = std::fs::remove_file(&lock);
+        assert!(held.elapsed() >= std::time::Duration::from_millis(2500), "the steps waited for the holder");
+        assert!(!lock.exists(), "and gave the lock back");
         let unique = ids.iter().collect::<std::collections::BTreeSet<_>>().len();
         (sorted(ids), unique)
     }
@@ -9148,6 +9202,35 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(took(Some(1)), None, "one going, cap one");
         assert_eq!(took(Some(2)), Some("new"));
         assert_eq!(took(Some(2)), None, "taken already");
+    }
+
+    /// `wsp-663`: two advances arrive while a step of the list runs — the
+    /// 2026-11-17 race that spawned compounding-709 twice. Neither steps the
+    /// list; the holder steps it exactly once more for both, and the member is
+    /// started once.
+    #[test]
+    fn two_advances_during_a_step_mark_it_once_and_start_nothing_twice() {
+        let (_env, store) = scratch("onestep");
+        task(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        fn two_advances(store: &Store, w: &Worklist) {
+            assert!(step(store, w, &Blind).is_empty(), "the list is held: marked, not stepped");
+            assert!(step(store, w, &Blind).is_empty(), "and marked again, not queued");
+        }
+        STEPS.with(|n| n.set(0));
+        DURING_STEP.with(|d| d.set(Some(two_advances)));
+        let started = step(&store, &w, &Blind);
+        assert_eq!(STEPS.with(|n| n.get()), 2, "one step, then exactly one follow-up");
+        assert_eq!(spawned(), vec![("m-1".into(), "claude".into())], "and one start: no double spawn");
+        assert_eq!(started.len(), 1, "{started:?}");
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert_eq!(log.matches("marked to step again").count(), 2, "{log}");
+        assert!(log.contains("stepped 1 more time(s)"), "{log}");
+        assert!(!store.state.join("stepping/run.lock").exists(), "and the list is let go");
+
+        step(&store, &w, &Blind);
+        assert_eq!(STEPS.with(|n| n.get()), 3, "a later step is one step");
+        assert!(spawned().is_empty());
     }
 
     /// A start that fails puts the member back and says so; one that never
