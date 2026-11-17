@@ -342,7 +342,10 @@ impl Command {
         let t = Instant::now();
         let r = self.inner.spawn();
         note_child(&self.name, 1, t.elapsed());
-        r.map(|c| Child { inner: Some(c), name: self.name.clone(), started: Instant::now(), waited: false })
+        r.map(|c| {
+            held().lock().unwrap_or_else(|e| e.into_inner()).insert(c.id());
+            Child { inner: Some(c), name: self.name.clone(), started: Instant::now(), waited: false }
+        })
     }
 }
 
@@ -368,20 +371,75 @@ pub struct Child {
     waited: bool,
 }
 
+/// The pids of children this process started through [`Command`] and has not
+/// finished with: a `Child` still held, or one handed to its reaping thread.
+/// [`reap_defunct`] leaves these to their owner.
+fn held() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static HELD: std::sync::OnceLock<Mutex<std::collections::HashSet<u32>>> = std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+fn let_go(pid: u32) {
+    held().lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+}
+
 impl Drop for Child {
     fn drop(&mut self) {
         let Some(mut inner) = self.inner.take() else { return };
+        let pid = inner.id();
         if self.waited {
+            let_go(pid);
             return;
         }
         // Already gone: reap it here and skip the thread.
         if matches!(inner.try_wait(), Ok(Some(_)) | Err(_)) {
+            let_go(pid);
             return;
         }
-        let _ = std::thread::Builder::new().name("reap".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("reap".into()).spawn(move || {
             let _ = inner.wait();
+            let_go(pid);
         });
+        if spawned.is_err() {
+            // No thread to wait on it: [`reap_defunct`] collects it once it ends.
+            let_go(pid);
+        }
     }
+}
+
+extern "C" {
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}
+
+/// Wait for every `<defunct>` child of this process that nothing is waiting
+/// for, and say how many that was.
+///
+/// The belt to [`Child`]'s braces: a daemon lives for days, so one spawn that
+/// is neither waited on nor wrapped (a `std::process::Command` dropped, a
+/// thread that failed to start) is a zombie for as long as it runs. Called once
+/// a tick. Only a child already defunct is waited on, and never one a live
+/// [`Child`] still holds, so no wait of its own is robbed of its status.
+pub fn reap_defunct() -> usize {
+    let me = std::process::id();
+    let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,stat="]).output() else { return 0 };
+    let mut reaped = 0;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut f = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(stat)) = (f.next(), f.next(), f.next()) else { continue };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else { continue };
+        if ppid != me || !stat.starts_with('Z') {
+            continue;
+        }
+        let mine = held().lock().unwrap_or_else(|e| e.into_inner());
+        if mine.contains(&pid) {
+            continue;
+        }
+        let mut status = 0;
+        if unsafe { waitpid(pid as i32, &mut status, 1) } == pid as i32 {
+            reaped += 1;
+        }
+    }
+    reaped
 }
 
 impl Child {
@@ -408,7 +466,9 @@ impl Child {
     }
     pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
         let inner = self.inner.take().expect("a child that has not been taken");
+        let pid = inner.id();
         let r = inner.wait_with_output();
+        let_go(pid);
         if !self.waited {
             note_child(&self.name, 0, self.started.elapsed());
         }
@@ -1056,6 +1116,30 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(10), "still defunct: quick={} slow={}", !gone(quick), !gone(slow));
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// A child nobody holds and nobody waits for (a `std` spawn that was
+    /// dropped) is collected by [`reap_defunct`], and a held one is not.
+    #[test]
+    fn a_defunct_child_nobody_holds_is_reaped_and_a_held_one_is_left() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        fn state(pid: u32) -> String {
+            let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        let stray = std::process::Command::new("true").spawn().unwrap();
+        let stray_pid = stray.id();
+        std::mem::forget(stray);
+        let mut held_one = Command::new("true").spawn().unwrap();
+        let t = Instant::now();
+        while !(state(stray_pid).starts_with('Z') && state(held_one.id()).starts_with('Z')) {
+            assert!(t.elapsed() < Duration::from_secs(10), "never defunct");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(reap_defunct() >= 1);
+        assert_eq!(state(stray_pid), "", "the stray is still defunct");
+        assert!(state(held_one.id()).starts_with('Z'), "a held child was waited on behind its owner's back");
+        assert!(held_one.wait().unwrap().success(), "the owner's own wait lost its status");
     }
 
     #[test]

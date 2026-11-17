@@ -709,6 +709,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // work, and is left out of it.
         wsp_base::calls::tick_begin();
         wsp_base::calls::phase("standing");
+        // Whatever this process spawned and nothing waited for is a `<defunct>`
+        // entry until the daemon exits, which is days (wsp-664).
+        let reaped = wsp_base::calls::reap_defunct();
+        if verbose && reaped > 0 {
+            eprintln!("wsp daemon: reaped {reaped} defunct child(ren)");
+        }
 
         // Both of the next two checks are here, at the top, because it is the
         // one point in the loop where nothing is half-done: no pass in flight,

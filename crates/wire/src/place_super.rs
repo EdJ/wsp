@@ -891,6 +891,12 @@ pub fn signal_group(group: u32, sig: &str) {
         .status();
 }
 
+/// What watches a seat's `tail -f` feed: `$1` the agent's pid, `$2` the feed's
+/// (the group's leader), `$3` the seat's directory. It ends the feed when the
+/// agent is gone or the directory is, which is the only thing that can tell
+/// `tail` it has no reader — it learns of one only when it next writes.
+const FEED_WATCH: &str = r#"while kill -0 "$1" 2>/dev/null && [ -d "$3" ]; do sleep 1; done; kill "$2" 2>/dev/null; exit 0"#;
+
 /// A file read as JSON, or an empty object — a seat whose record is missing is
 /// the caller's question rather than this function's.
 pub fn read_json(path: &PathBuf) -> Value {
@@ -1451,6 +1457,22 @@ impl Place for Supervisor<'_> {
                 return Err(Refusal::Backend(format!("{} did not start: {e}", agent.kind)));
             }
         };
+
+        // The feed ends with its owner. `stop` signals the group, but a seat
+        // whose agent exits on its own, or whose directory goes without a
+        // `stop` (a sandbox removed, a test killed), would otherwise leave this
+        // `tail -f` idle for good — 20 of them were 15 days old (wsp-664). In
+        // the agent's group, so a `stop` ends it too.
+        let _ = Command::new("sh")
+            .args(["-c", FEED_WATCH, "sh"])
+            .arg(child.id().to_string())
+            .arg(group.to_string())
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(group as i32)
+            .spawn();
 
         let mut rec = rec;
         rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
@@ -2359,6 +2381,44 @@ mod tests {
         // Somebody else's seat is not swept up with it.
         assert_eq!(place.state(&theirs).unwrap(), State::Starting);
     }
+    /// The `tail -f` that feeds an agent ends with its owner (wsp-664): when
+    /// the seat is stopped, when the agent exits on its own, and when the seat's
+    /// directory goes without a `stop` — the three ways 20 of them were left
+    /// idle for 15 days.
+    #[test]
+    fn the_feed_ends_with_its_agent_and_is_never_left_behind() {
+        let scratch = Scratch::new("feed");
+        let place = scratch.place();
+        let feed_of = |seat: &Seat| place.record(seat).unwrap()["group"].as_u64().unwrap() as u32;
+
+        // Stopped.
+        let stopped = place.open(&Order::default()).unwrap();
+        place.start(&stopped, &a_process()).expect("a process");
+        let feed = feed_of(&stopped);
+        assert!(alive(&[feed]).contains(&feed), "no feed was started");
+        place.stop(&stopped).unwrap();
+        assert!(until(|| !alive(&[feed]).contains(&feed)), "a stopped seat left its tail");
+
+        // The agent exits on its own, and nobody calls `stop`.
+        let exits = place.open(&Order::default()).unwrap();
+        place
+            .start(&exits, &Agent { kind: "sh".into(), name: "t-2".into(), args: vec!["-c".into(), "exit 0".into()] })
+            .expect("a process");
+        let feed = feed_of(&exits);
+        assert!(until(|| !alive(&[feed]).contains(&feed)), "an agent that exited left its tail");
+
+        // The seat's directory goes, and the agent is still standing.
+        let removed = place.open(&Order::default()).unwrap();
+        place.start(&removed, &a_process()).expect("a process");
+        let feed = feed_of(&removed);
+        let agent = place.record(&removed).unwrap()["pid"].as_u64().unwrap() as u32;
+        fs::remove_dir_all(place.dir_of(&removed).unwrap()).unwrap();
+        let gone = until(|| !alive(&[feed]).contains(&feed));
+        signal_group(feed, "KILL");
+        assert!(gone, "a seat whose directory went left its tail");
+        assert!(until(|| !alive(&[agent]).contains(&agent)));
+    }
+
     /// A transcript line Claude Code writes per assistant message, with the
     /// `usage` object the tally reads and nothing else it needs.
     fn usage_line(
