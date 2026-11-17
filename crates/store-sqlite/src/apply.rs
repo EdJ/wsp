@@ -147,7 +147,11 @@ impl Commands for SqliteStore {
         let mut g = self.lock();
         let conn = g.as_mut().ok_or_else(crashed)?;
         match self.run_apply(conn, cmd, key, by)? {
-            Outcome::Done(a) => Ok(a),
+            Outcome::Done(a) => {
+                drop(g);
+                self.bump();
+                Ok(a)
+            }
             Outcome::Crashed => {
                 *g = None; // dead: every later call is `Error::Backend`
                 Err(Error::Backend { reason: "the handle crashed mid-apply (test hook)".into() })

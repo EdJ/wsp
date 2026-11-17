@@ -122,8 +122,8 @@ impl Events for SqliteStore {
         self.with_conn(|c| Ok(EventId(head_of(c)?)))
     }
 
-    fn wait_for(&self, _after: EventId, _timeout: Duration) -> Result<EventId> {
-        Err(Error::Backend { reason: "leg events".into() })
+    fn wait_for(&self, after: EventId, timeout: Duration) -> Result<EventId> {
+        self.wait_events(after, timeout)
     }
 }
 

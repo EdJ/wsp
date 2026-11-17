@@ -7,6 +7,7 @@
 //! write shares), `leases` (`Leases` and `Claims`), `reads` (`Reads`, `Events`, `Texts`).
 
 mod apply;
+mod events;
 mod leases;
 mod reads;
 mod schema;
@@ -49,6 +50,7 @@ pub struct SqliteStore {
     path: PathBuf,
     domain: Option<Arc<dyn Domain + Send + Sync>>,
     hook: AtomicU8,
+    wake: Arc<events::Wake>,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -64,7 +66,19 @@ impl SqliteStore {
         let conn = Connection::open(&path).map_err(be)?;
         schema::pragmas(&conn)?;
         schema::init(&conn)?;
-        Ok(SqliteStore { conn: Mutex::new(Some(conn)), path, domain: Some(domain), hook: AtomicU8::new(LIVE) })
+        let wake = events::wake_for(&path);
+        Ok(SqliteStore { conn: Mutex::new(Some(conn)), path, domain: Some(domain), hook: AtomicU8::new(LIVE), wake })
+    }
+
+    /// Opens the store file at `path` read-only (4.6's fallback): reads, `snapshot()`,
+    /// `events_after`, `head` and `wait_for` work; every write is an `Error::Backend`.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .map_err(be)?;
+        conn.busy_timeout(Duration::from_secs(10)).map_err(be)?;
+        let wake = events::wake_for(&path);
+        Ok(SqliteStore { conn: Mutex::new(Some(conn)), path, domain: None, hook: AtomicU8::new(LIVE), wake })
     }
 
     /// The file this handle is on.
@@ -103,11 +117,16 @@ impl SqliteStore {
 
     /// Runs `f` in one `BEGIN IMMEDIATE ... COMMIT`; an `Err` rolls back.
     pub(crate) fn tx<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let mut g = self.lock();
-        let conn = g.as_mut().ok_or_else(crashed)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(be)?;
-        let out = f(&tx)?;
-        tx.commit().map_err(be)?;
+        self.domain_or_err()?;
+        let out = {
+            let mut g = self.lock();
+            let conn = g.as_mut().ok_or_else(crashed)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(be)?;
+            let out = f(&tx)?;
+            tx.commit().map_err(be)?;
+            out
+        };
+        self.bump();
         Ok(out)
     }
 }

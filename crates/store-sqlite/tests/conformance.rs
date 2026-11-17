@@ -94,3 +94,48 @@ fn no_pub_line_names_rusqlite_or_connection() {
     }
     assert!(bad.is_empty(), "rusqlite types on the public surface (D1):\n{}", bad.join("\n"));
 }
+
+#[test]
+fn case_5_event_order() {
+    case_event_order(&SqliteHarness).unwrap();
+}
+
+#[test]
+fn case_7_wakeups() {
+    case_wakeups(&SqliteHarness).unwrap();
+}
+
+#[test]
+fn case_8_crash() {
+    case_crash(&SqliteHarness).unwrap();
+}
+
+#[test]
+fn a_read_only_handle_reads_while_another_applies_and_is_refused_itself() {
+    use wsp_store_contract::*;
+    let w = SqliteHarness.fresh();
+    let ro = SqliteStore::open_read_only(w.path()).unwrap();
+    let writer = std::thread::spawn(move || {
+        for i in 0..20 {
+            let cmd = Command::RowAdd { project: ProjectId("ro".into()), title: format!("t{i}"), fields: Default::default() };
+            w.apply(cmd, IdempotencyKey(format!("ro-{i}")), Principal::Wsp("test".into())).unwrap();
+        }
+    });
+    let mut last = 0;
+    while !writer.is_finished() {
+        let (state, at) = ro.snapshot().unwrap();
+        assert!(at.0 >= last);
+        last = at.0;
+        assert!(state.rows.len() as u64 <= at.0);
+        assert!(ro.events_after(EventId(0), usize::MAX).unwrap().len() as u64 >= at.0);
+    }
+    writer.join().unwrap();
+    assert_eq!(ro.head().unwrap().0, 20);
+    assert_eq!(ro.events_after(EventId(0), usize::MAX).unwrap().len(), 20);
+    assert_eq!(ro.wait_for(EventId(5), std::time::Duration::from_millis(10)).unwrap().0, 20);
+    let cmd = Command::RowAdd { project: ProjectId("ro".into()), title: "x".into(), fields: Default::default() };
+    match ro.apply(cmd, IdempotencyKey("ro-refused".into()), Principal::Wsp("test".into())) {
+        Err(Error::Backend { reason }) => assert!(reason.contains("read-only"), "{reason}"),
+        other => panic!("a read-only apply answered {other:?}"),
+    }
+}
