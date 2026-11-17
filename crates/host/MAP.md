@@ -17,10 +17,19 @@ holds the rule; it walks the path dependencies, so a dependency reached through 
   `DELIVERY_PENDING`, `reads_kind`, `read_json` and `str_of`, moved down with the code that uses them
 - `src/tcp.rs`: `Tcp`, the TCP carrier of `wsp-host-api`'s `Connection` (3.4). It frames newline-delimited
   JSON with a 16 MB line cap and a write timeout of three beats, and offers `dial`, `try_clone` (a second handle
-  to send on) and `shutdown`. The manager serves on it, and wire's client (wsp-025) will dial with it
+  to send on), `recv_line` (a line undecoded, for the manager's first) and `shutdown`. The manager serves on it, and wire's client (wsp-025) will dial with it
 - `src/facts.rs`: the beat's host facts (`read`, `assemble`) turned into `wsp-host-api`'s `HostFacts`, with
   their parsers. Three asks of `InProcess` per reading: `sysctls` (load, swap, the kernel's memory pressure
   level), `disks_free` (one `df` for every volume) and `thermal`
+- `src/hooks.rs`: the manager's hooks endpoint (wsp-023). `report` is the hook command's half: under
+  `WSP_HOST=manager` it dials the manager on loopback (`WSP_MANAGER_ADDR`, default `127.0.0.1:7487`), sends one
+  `hook.post` line with the token read from `<exec_dir>/manager.token` (`WSP_MANAGER_DIR`), and reads one
+  `hook.taken` or `hook.refused` line; anything else is `Sent::Unanswered`, and wire's `report_to` writes the
+  hook log instead. `Fold` is the manager's half: `UserPromptSubmit` is `turn began` (with the order
+  `awaiting` named), `PostToolUse` is `seat.spent` (the burn tally), and `Stop` is `seat.spent`, `seat.said`,
+  `seat.did` (`turn_of`'s digest, the transcript's `(host, path)`) and `turn ended`. `a_childs` moved down from
+  `place_super`. The post is a host-local line beside 3.2's frames, not a `Message`: no M1 group changes
+  `wsp-host-api`
 - `src/port.rs` — `Seat`, `State`, `Refusal`, `Delivery`, `Result`: the words the methods answer in
 - `src/shed.rs` — what a spawned seat must not inherit (`CHILD_MARKER`, `shed`, `KEPT`, `PI_SESSION`, `shed_keys`)
 - `src/price.rs` — the price table and `cost`/`cost_of`, which the burn tally prices each request with

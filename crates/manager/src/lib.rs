@@ -15,6 +15,9 @@
 //! - it beats every [`BEAT_SECS`] on its own timer with the host's facts, read
 //!   once per beat through `wsp-host` for every client, and drops a client it
 //!   has not heard for [`MISSED_BEATS`](wsp_host_api::MISSED_BEATS) beats (3.4);
+//! - it takes the hooks its seats post ([`wsp_host::hooks`]: loopback, the
+//!   token) and journals what they say: `turn`, `seat.said`, `seat.spent` and
+//!   `seat.did` (wsp-023);
 //! - it logs to `<exec_dir>/log/` ([`log`]).
 //!
 //! It depends on `wsp-host-api`, `wsp-base` and `wsp-host`, and on nothing of
@@ -45,11 +48,11 @@ pub use journal::Journal;
 
 /// The port a manager listens on unless told otherwise. A machine record that
 /// names another port (wsp-024, wsp-025) overrides it.
-pub const DEFAULT_PORT: u16 = 7487;
+pub const DEFAULT_PORT: u16 = wsp_host::hooks::PORT;
 /// This build's version, as `hello` reports it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Under `<exec_dir>`: the token, the journal, the lock and the log directory.
-pub const TOKEN_FILE: &str = "manager.token";
+pub const TOKEN_FILE: &str = wsp_host::hooks::TOKEN_FILE;
 pub const JOURNAL_FILE: &str = "journal.jsonl";
 pub const LOCK_FILE: &str = "manager.lock";
 pub const LOG_DIR: &str = "log";
@@ -165,6 +168,9 @@ pub(crate) struct Shared {
     /// The last beat sent, queued again for a client just after its `hello`,
     /// so a one-shot call has the host's facts without waiting out a period.
     pub(crate) last_beat: Mutex<Option<Frame>>,
+    /// Hooks into events; held across a post's emits, so one seat's events
+    /// are journalled in the order its hooks arrived.
+    pub(crate) hooks: Mutex<wsp_host::hooks::Fold>,
 }
 
 impl Shared {
@@ -245,6 +251,7 @@ impl Manager {
             journal.head().map_or("none".into(), |EventId(n)| n.to_string()),
         ));
 
+        let (cfg_dir, host_id) = (cfg.exec_dir.clone(), cfg.host.clone());
         let shared = Arc::new(Shared {
             cfg,
             token,
@@ -255,6 +262,7 @@ impl Manager {
             stopping: AtomicBool::new(false),
             wake: (Mutex::new(false), Condvar::new()),
             last_beat: Mutex::new(None),
+            hooks: Mutex::new(wsp_host::hooks::Fold::new(&cfg_dir, host_id)),
         });
 
         let mut threads = Vec::new();
@@ -276,6 +284,12 @@ impl Manager {
     /// of wsp-022 are its callers; until then, tests.
     pub fn emit(&self, msg: Message) -> std::io::Result<EventId> {
         self.shared.emit(msg)
+    }
+
+    /// The next turn `seat` begins is `order`'s, and its `turn` says so. The
+    /// order delivery of wsp-022 is its caller; until then, tests.
+    pub fn awaiting(&self, seat: wsp_host_api::SeatId, order: wsp_host_api::OrderId) {
+        self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).awaiting(seat, order);
     }
 
     /// The journal's newest id.

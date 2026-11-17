@@ -1,5 +1,7 @@
 //! One client's connection: the `hello` and its token, then requests, beats
-//! and the subscription until the client leaves or misses its beats.
+//! and the subscription until the client leaves or misses its beats. Or a
+//! seat's hook: one post ([`wsp_host::hooks`]) on a connection of its own,
+//! folded into events, answered and closed.
 //!
 //! Two threads per client: this one reads and answers, and a writer sends
 //! whatever is queued for the client (answers, the journal's events, the
@@ -11,6 +13,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
+use wsp_host::hooks::{self, Post};
 use wsp_host::Tcp;
 use wsp_host_api::{
     ConnError, Connection, Frame, Hello, ManagerHello, Message, OrderRefused, OrderFail, Refusal, Refused,
@@ -32,7 +35,13 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream) {
     let peer = conn.peer().map_or("?".into(), |p| p.to_string());
     let patience = shared.cfg.beat * MISSED_BEATS;
 
-    let (req, hello) = match conn.recv(patience) {
+    let first = match first(&mut conn, patience) {
+        Ok(Some(First::Post(post))) => return hook(&shared, conn, &peer, post),
+        Ok(Some(First::Frame(f))) => Ok(Some(f)),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
+    };
+    let (req, hello) = match first {
         Ok(Some(Frame { req, msg: Message::Hello(Hello::Wsp(h)), .. })) => (req, h),
         Ok(Some(f)) => {
             let _ = conn.send(&refused(f.req, Refusal::Malformed, "the first frame must be hello"));
@@ -84,6 +93,58 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream) {
     if !shared.stopping.load(Ordering::SeqCst) {
         shared.log.line(&format!("{peer}: {why}"));
     }
+}
+
+/// What a connection says first: a frame, or a seat's hook.
+enum First {
+    Frame(Frame),
+    Post(Result<Post, String>),
+}
+
+fn first(conn: &mut Tcp, patience: std::time::Duration) -> Result<Option<First>, ConnError> {
+    let Some(line) = conn.recv_line(patience)? else { return Ok(None) };
+    let v: serde_json::Value = serde_json::from_slice(&line).map_err(|e| ConnError::Malformed(e.to_string()))?;
+    if let Some(post) = Post::read(&v) {
+        return Ok(Some(First::Post(post)));
+    }
+    serde_json::from_value(v).map(|f| Some(First::Frame(f))).map_err(|e| ConnError::Malformed(e.to_string()))
+}
+
+/// One hook: check its token, fold it, journal and send what it says, and
+/// answer how many events it made. A refusal is logged; a hook taken is not,
+/// since a busy seat posts several a minute and the journal holds them.
+fn hook(shared: &Shared, mut conn: Tcp, peer: &str, post: Result<Post, String>) {
+    let answer = match post {
+        Err(why) => {
+            shared.log.line(&format!("{peer}: a malformed hook post: {why}"));
+            hooks::refused(&why)
+        }
+        Ok(post) if post.token != shared.token.0 => {
+            shared.log.line(&format!("{peer}: closed, a hook post for {} carried the wrong token", post.seat.0));
+            hooks::refused("wrong token")
+        }
+        Ok(post) => {
+            let mut fold = shared.hooks.lock().unwrap_or_else(|e| e.into_inner());
+            match fold.fold(&post, crate::now()) {
+                Err(why) => {
+                    shared.log.line(&format!("{peer}: a {} hook for {} was not folded: {why}", post.hook, post.seat.0));
+                    hooks::refused(&why)
+                }
+                Ok(events) => {
+                    let mut n = 0;
+                    for msg in events {
+                        match shared.emit(msg) {
+                            Ok(_) => n += 1,
+                            Err(e) => shared.log.line(&format!("a {} hook's event was not journalled: {e}", post.hook)),
+                        }
+                    }
+                    hooks::taken(n)
+                }
+            }
+        }
+    };
+    let _ = conn.send_line(&format!("{answer}\n"));
+    conn.shutdown();
 }
 
 /// Check the client's `hello`; answer and log a refusal.

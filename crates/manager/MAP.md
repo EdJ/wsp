@@ -13,7 +13,9 @@ It runs no seats yet: wsp-022 adds them, and nothing in wsp dials it until wsp-0
 - `src/serve.rs`: one client's connection. The `hello` and its token come first: a wrong token is answered
   `refused unauthorised` and then closed, as is a first frame that is not a `hello`. Then come requests, the
   subscription, and the drop after `MISSED_BEATS` silent beats. Two threads per client: one reads and
-  answers, the other writes whatever is queued
+  answers, the other writes whatever is queued. A connection whose first line is a `hook.post`
+  (`wsp_host::hooks`) is a seat's hook instead: its token is checked, it is folded into events that are
+  journalled and sent, it is answered `hook.taken {events}` or `hook.refused {why}`, and it is closed (wsp-023)
 - `src/journal.rs`: `<exec_dir>/journal.jsonl`. One frame per line. Ids run from 1 per manager. A torn last line
   is cut at open. `after(from)` serves `subscribe`
 - `src/token.rs`: `<exec_dir>/manager.token`, made at first start (32 random bytes as hex, mode 0600) and
@@ -25,13 +27,15 @@ It runs no seats yet: wsp-022 adds them, and nothing in wsp dials it until wsp-0
 ## In `<exec_dir>`
 
 `manager.token` (0600), `manager.lock` (the pid; held with `flock` for the manager's life), `journal.jsonl`,
-`log/manager.log`.
+`log/manager.log`, and `seats/<seat>/` for the hooks' fold: `burn.json` (the tally `seat.spent` reports) and
+`session.json` (the session standing in the seat, which tells a nested session's hooks apart).
 
 ## Ordering
 
 The journal's mutex is held while an event is appended and sent to the subscribers. It is also held while a new
 subscriber's replay is queued. So an event is never sent twice, and none falls between the replay and the live
-stream. Locks are always taken in this order: journal, then clients, then `last_beat`.
+stream. Locks are always taken in this order: hooks, journal, then clients, then `last_beat`. The hooks' fold
+is held across one post's emits, so a seat's events are journalled in the order its hooks arrived.
 
 ## Choices beyond the plan
 
