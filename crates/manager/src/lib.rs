@@ -1,7 +1,7 @@
 //! `wsp-manager`: the agent manager (`docs/agent-manager.md`, step M1 of 6.2;
 //! wsp-021); see `MAP.md`.
 //!
-//! One long-lived process per host. This much of it, before it runs seats:
+//! One long-lived process per host:
 //! - it listens on TCP, on loopback and the host's tailnet addresses and
 //!   nothing else (d1 Q5), and refuses to start while another manager answers
 //!   its port or holds its `<exec_dir>` (2.4);
@@ -18,13 +18,19 @@
 //! - it takes the hooks its seats post ([`wsp_host::hooks`]: loopback, the
 //!   token) and journals what they say: `turn`, `seat.said`, `seat.spent` and
 //!   `seat.did` (wsp-023);
-//! - it logs to `<exec_dir>/log/` ([`log`]).
+//! - it logs to `<exec_dir>/log/` ([`log`]);
+//! - it runs seats (wsp-022, [`seats`]): `seat.spawn` keyed by `(row,
+//!   attempt)`, forking one compound-sup per seat; `seat.stop`; orders through
+//!   compound-sup's `deliver <id>`; `seats` and `seat.read`; seat epochs; and
+//!   on restart the seat table rebuilt from the sessions in `<exec_dir>/run`,
+//!   with an order in flight asked again under its id (2.5, 3.3).
 //!
 //! It depends on `wsp-host-api`, `wsp-base` and `wsp-host`, and on nothing of
 //! `wsp-store` (2.3 R1, d1 Q3).
 
 pub mod journal;
 pub mod log;
+pub mod seats;
 mod serve;
 pub mod token;
 
@@ -72,7 +78,16 @@ pub struct Config {
     pub beat: Duration,
     /// Paths whose volumes the beat reports disk free for.
     pub volumes: Vec<PathBuf>,
+    /// The compound-sup it forks; `None` finds the installed one
+    /// (`$COMPOUND_SUP`, `PATH`, `~/.local/bin`). A test names its fake.
+    pub sup: Option<PathBuf>,
+    /// How many seats it runs or starts at once, as `hello`'s capacity says;
+    /// a spawn past it is refused `full`.
+    pub seats: u32,
 }
+
+/// The seats a manager admits unless told otherwise.
+pub const DEFAULT_SEATS: u32 = 32;
 
 impl Config {
     /// Loopback on [`DEFAULT_PORT`], a 10 s beat, disk free for `exec_dir`'s volume.
@@ -84,6 +99,8 @@ impl Config {
             port: DEFAULT_PORT,
             beat: Duration::from_secs(BEAT_SECS),
             volumes: vec![exec_dir.to_path_buf()],
+            sup: None,
+            seats: DEFAULT_SEATS,
         }
     }
 }
@@ -171,19 +188,41 @@ pub(crate) struct Shared {
     /// Hooks into events; held across a post's emits, so one seat's events
     /// are journalled in the order its hooks arrived.
     pub(crate) hooks: Mutex<wsp_host::hooks::Fold>,
+    /// The seats it runs, their keys and epochs, and the orders it was asked.
+    /// Taken before the journal, never while holding it.
+    pub(crate) seats: Mutex<seats::Table>,
 }
 
 impl Shared {
     /// Journal `msg`, then send it to every subscriber.
     pub(crate) fn emit(&self, msg: Message) -> std::io::Result<EventId> {
+        self.emit_for(msg, None)
+    }
+
+    /// Journal `msg`, then send it to every subscriber, and to whoever asked
+    /// for it with their `req`: once, whether or not they subscribe.
+    pub(crate) fn emit_for(&self, msg: Message, asker: Option<&seats::Asker>) -> std::io::Result<EventId> {
         let mut journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         let frame = journal.append(msg)?;
         let id = frame.id.expect("the journal ids every frame");
         let clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
-        for c in clients.values().filter(|c| c.subscribed) {
+        let asking = asker.and_then(|a| a.out.as_ref().and(a.client));
+        for (_, c) in clients.iter().filter(|(n, c)| c.subscribed && Some(**n) != asking) {
             let _ = c.out.send(frame.clone());
         }
+        if let Some(a) = asker {
+            a.send_frame(frame);
+        }
         Ok(id)
+    }
+
+    /// compound-sup's run directory: the seats' session sockets.
+    pub(crate) fn run_dir(&self) -> PathBuf {
+        self.cfg.exec_dir.join(seats::RUN_DIR)
+    }
+
+    pub(crate) fn capacity(&self) -> Capacity {
+        Capacity { seats: self.cfg.seats, build: 0, check: 0 }
     }
 }
 
@@ -263,7 +302,10 @@ impl Manager {
             wake: (Mutex::new(false), Condvar::new()),
             last_beat: Mutex::new(None),
             hooks: Mutex::new(wsp_host::hooks::Fold::new(&cfg_dir, host_id)),
+            seats: Mutex::new(Default::default()),
         });
+        let _ = fs::create_dir_all(shared.run_dir());
+        seats::adopt(&shared);
 
         let mut threads = Vec::new();
         for l in listeners {
@@ -281,7 +323,7 @@ impl Manager {
     }
 
     /// Journal an event and send it to every subscriber. The seat operations
-    /// of wsp-022 are its callers; until then, tests.
+    /// journal their own; this is for tests.
     pub fn emit(&self, msg: Message) -> std::io::Result<EventId> {
         self.shared.emit(msg)
     }
@@ -295,6 +337,11 @@ impl Manager {
     /// The journal's newest id.
     pub fn head(&self) -> Option<EventId> {
         self.shared.journal.lock().unwrap_or_else(|e| e.into_inner()).head()
+    }
+
+    /// The seats it runs now, with their epochs.
+    pub fn seats(&self) -> Vec<wsp_host_api::SeatEpoch> {
+        self.shared.seats.lock().unwrap_or_else(|e| e.into_inner()).epochs()
     }
 
     /// How many clients have said a good `hello` and are still connected.
@@ -320,7 +367,9 @@ impl Manager {
     }
 
     /// Stop listening, close every client and the beat, and release the
-    /// `<exec_dir>`. The journal is left as it is, for the next start.
+    /// `<exec_dir>`. The journal is left as it is, for the next start, and so
+    /// are the seats: compound-sup outlives its manager, and the next start
+    /// adopts them. An order still being asked is asked again then.
     pub fn stop(self) {
         self.shared.stopping.store(true, Ordering::SeqCst);
         {
@@ -429,10 +478,6 @@ fn beat(shared: Arc<Shared>) {
         let _ = cv.wait_timeout_while(woken, shared.cfg.beat, |w| !*w);
     }
 }
-
-/// What a manager admits at once. It runs no seats and no jobs yet (wsp-022,
-/// M3), so it admits none, and says so.
-pub(crate) const CAPACITY: Capacity = Capacity { seats: 0, build: 0, check: 0 };
 
 #[cfg(test)]
 mod tests {
