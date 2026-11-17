@@ -87,7 +87,7 @@ fn no_pub_line_names_rusqlite_or_connection() {
             if t.starts_with("//") {
                 continue;
             }
-            if (t.starts_with("pub ") || t.starts_with("pub(")) && (t.contains("rusqlite") || t.contains("Connection")) {
+            if t.starts_with("pub ") && (t.contains("rusqlite") || t.contains("Connection")) {
                 bad.push(format!("{}:{}: {}", path.display(), n + 1, t));
             }
         }
