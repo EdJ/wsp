@@ -4123,22 +4123,28 @@ fn checking(lists: &[crate::model::Worklist], tasks: &[Task]) -> std::collection
         .collect()
 }
 
-/// How long `cycle.log` may be quiet before [`daemon_by_log`] says so: the
-/// daemon ticks once a minute, the same bound `daemon::dead` reads it by.
-const DAEMON_QUIET_SECS: u64 = 60;
+/// How old the daemon's tick stamp may be before [`daemon_by_stamp`] says it
+/// is not ticking: the loop comes round every 20 s and stamps at the top of a
+/// pass, so two minutes is a pass that has not started for several ticks, not
+/// a slow one.
+const DAEMON_QUIET_SECS: i64 = 120;
 
 /// `wip`'s dead-daemon heading without the process table, under
-/// `WSP_HOST=manager` (`docs/agent-manager.md` 4.3: no `ps`): `cycle.log`
-/// quiet past [`DAEMON_QUIET_SECS`] on a machine whose manager answered.
-fn daemon_by_log(state: &std::path::Path, heard: bool) -> Option<String> {
+/// `WSP_HOST=manager` (`docs/agent-manager.md` 4.3: no `ps`): the stamp the
+/// daemon writes every tick ([`crate::daemon::TICK_STAMP`]) older than
+/// [`DAEMON_QUIET_SECS`] on a machine whose manager answered. Not `cycle.log`
+/// (wsp-035): the tick writes that only when it has something to say, so an
+/// idle fleet's log read as a dead daemon. No stamp at all says nothing — a
+/// daemon from before the stamp is not called dead.
+fn daemon_by_stamp(state: &std::path::Path, heard: bool, now: i64) -> Option<String> {
     if !heard {
         return None;
     }
-    let quiet = std::fs::metadata(state.join("cycle.log")).ok()?.modified().ok()?.elapsed().ok()?;
-    (quiet.as_secs() > DAEMON_QUIET_SECS).then(|| {
+    let quiet = now - crate::daemon::last_tick(state)?;
+    (quiet > DAEMON_QUIET_SECS).then(|| {
         format!(
-            "the daemon is not ticking — cycle.log has been silent for {} (`wsp install --daemon` loads it)",
-            util::duration_human(quiet.as_secs() as i64)
+            "the daemon is not ticking — its last tick was {} ago (`wsp install --daemon` loads it)",
+            util::duration_human(quiet)
         )
     })
 }
@@ -4193,7 +4199,7 @@ impl Wip {
                 &counts,
             );
             let memory = crate::memory::of_rss(&store.state, agents, bindings, &rss);
-            Probed { shells, memory, daemon: daemon_by_log(&store.state, heard), disk: crate::disk::loud_of(store, &disks) }
+            Probed { shells, memory, daemon: daemon_by_stamp(&store.state, heard, util::epoch_secs()), disk: crate::disk::loud_of(store, &disks) }
         });
         if !unheard.is_empty() {
             let line = format!("unreachable: {} — its seats are not read, not gone", unheard.join("; "));
@@ -6877,6 +6883,41 @@ mod tests {
         let store = Store::open();
         store.ensure_dirs().unwrap();
         (env, store)
+    }
+
+    /// wsp-035: under `WSP_HOST=manager`, `wip` reads the daemon by the stamp
+    /// it writes every tick, not by `cycle.log` — which an idle tick never
+    /// writes, so a fleet with nothing to say read as a dead daemon.
+    #[test]
+    fn an_idle_daemon_that_ticks_is_not_called_dead_and_a_stale_tick_stamp_is() {
+        let (_env, store) = scratch("daemon-stamp");
+        let t0 = util::epoch_secs();
+        // The one line the log gets, at the start; nothing after.
+        std::fs::write(store.state.join("cycle.log"), format!("{} daemon up\n", util::now_iso())).unwrap();
+
+        // No stamp yet — a daemon from before it — says nothing.
+        assert_eq!(daemon_by_stamp(&store.state, true, t0 + 3600), None);
+
+        // Ten minutes of ticks with nothing to log: never not ticking.
+        for now in (t0..=t0 + 600).step_by(20) {
+            crate::daemon::stamp_tick(&store.state, now);
+            assert_eq!(daemon_by_stamp(&store.state, true, now + 19), None, "ticking at +{}s", now - t0);
+        }
+        assert_eq!(
+            std::fs::read_to_string(store.state.join("cycle.log")).unwrap().lines().count(),
+            1,
+            "the log stayed quiet the whole time"
+        );
+
+        // A stamp older than the bound is a daemon that has stopped ticking.
+        let last = t0 + 600;
+        assert_eq!(daemon_by_stamp(&store.state, true, last + DAEMON_QUIET_SECS), None, "at the bound");
+        let said = daemon_by_stamp(&store.state, true, last + DAEMON_QUIET_SECS + 1).expect("past the bound");
+        assert!(said.contains("not ticking"), "{said}");
+        assert!(!said.contains("cycle.log"), "{said}");
+
+        // A machine whose manager did not answer is not judged at all.
+        assert_eq!(daemon_by_stamp(&store.state, false, last + 3600), None);
     }
 
     /// `wsp-523`: a fan-out to a list nobody knows is refused before anything is

@@ -23,6 +23,26 @@ use crate::tunnel::Supervisor;
 
 const TICK: Duration = Duration::from_secs(20);
 
+/// The file in `<state>` the daemon writes at the top of every pass of its
+/// loop, holding the epoch second the pass began (wsp-035). `cycle.log` is
+/// written only when a tick has something to say, so an idle fleet's log is
+/// quiet for hours under a daemon that is ticking; this is written whether or
+/// not anything happens, and is what `wip` under `WSP_HOST=manager` (no `ps`)
+/// reads the daemon's liveness by.
+pub(crate) const TICK_STAMP: &str = "daemon.tick";
+
+/// Write [`TICK_STAMP`] as of `now`. Best effort: a stamp that could not be
+/// written is a daemon that reads as quiet, which is said, never a tick lost.
+pub(crate) fn stamp_tick(state: &Path, now: i64) {
+    let _ = std::fs::write(state.join(TICK_STAMP), format!("{now}\n"));
+}
+
+/// The epoch second of the last pass [`stamp_tick`] recorded, or `None` where
+/// no daemon new enough to write one has run against this store.
+pub(crate) fn last_tick(state: &Path) -> Option<i64> {
+    std::fs::read_to_string(state.join(TICK_STAMP)).ok()?.trim().parse().ok()
+}
+
 /// The stamp we are now running under, if it is not the one we started with.
 ///
 /// `None` for `started_as` is a daemon that could not read its own path at
@@ -568,6 +588,9 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // work, and is left out of it.
         wsp_base::calls::tick_begin();
         crate::place_compound::tick_deliver_budget(true);
+        // The liveness stamp, at the top of the pass so a slow pass still
+        // reads as ticking (wsp-035).
+        stamp_tick(&store.state, crate::util::epoch_secs());
         wsp_base::calls::phase("standing");
         // Whatever this process spawned and nothing waited for is a `<defunct>`
         // entry until the daemon exits, which is days (wsp-664).
