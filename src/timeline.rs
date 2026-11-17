@@ -206,6 +206,9 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
         // waited on, by whom and why, not nothing the logs name (`wsp-645`:
         // wsp-635's 65m between its check and the verifier's spawn).
         format!("{PARKED_LIST} — {}", park.words())
+    } else if let Some((_, _, why)) = (span > TICK + HAND_OFF && who == i.id).then(|| capped_reopen(i, from, to)).flatten() {
+        // The log has the reopen and the cap: that is what the step waited on.
+        why
     } else if span <= HAND_OFF {
         "the hand-off (a poke and a spawn)".into()
     } else if span <= TICK + HAND_OFF {
@@ -218,6 +221,55 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
 
 /// The cause of a stretch a person's park of the whole list covered.
 pub(crate) const PARKED_LIST: &str = "the list parked";
+
+/// The cause of the stretch from a leg's seat ending to the leg's close
+/// (`wsp-016`): the seat came up, worked and ended, and the leg's line stayed
+/// `running` with nobody in it. Not work.
+pub(crate) const LEG_SEAT_ENDED: &str = "a leg's seat ended, the leg not closed";
+
+/// The cause of the stretch from a reopen of a row at the leg cap to the next
+/// seat on it (`wsp-016`, the case in `wsp-011`): no rework leg can be added and
+/// the run seats no member, so nothing runs until a person starts one.
+pub(crate) const CAPPED_REOPEN: &str = "reopened at the leg cap with no member seated";
+
+/// The seat that came up for the row at `up` (its `session-learned`), and when
+/// it ended, where the cycle log says: the time its exit was accepted, or the
+/// line that ended it.
+fn seat_ended_after(i: &Inputs, up: i64) -> Option<(String, i64)> {
+    let pane = i.kind("session-learned", &i.id).into_iter().find(|(t, _)| *t == up).and_then(|(_, d)| d["pane"].as_str().map(str::to_string))?;
+    let exit = format!("{} ", crate::ending::EXIT_ENDED);
+    let named = format!(", {pane})");
+    let ended = format!("ended {pane}");
+    let at = i.cycle.iter().filter(|(t, _)| *t >= up).find_map(|(t, l)| {
+        if let Some((_, rest)) = l.split_once(&exit) {
+            let (at, tail) = rest.split_once(" (")?;
+            let accepted = util::epoch_of(at);
+            // The exit was accepted before the line that ended its seat.
+            let when = if accepted >= up && accepted <= *t { accepted } else { *t };
+            return tail.split_once(')').is_some_and(|(who, _)| format!(", {who})").ends_with(&named)).then_some(when);
+        }
+        (l == &ended || l.starts_with(&format!("{ended},"))).then_some(*t)
+    })?;
+    Some((pane, at))
+}
+
+/// The first reopen of the row at the leg cap inside `from..to`: the reopen,
+/// where the stretch with no member seated ends (the next claim or seat up,
+/// else `to`), and its cause. A second reopen before a seat is the same wait.
+fn capped_reopen(i: &Inputs, from: i64, to: i64) -> Option<(i64, i64, String)> {
+    if i.legs.iter().filter(|l| !l.skipped).count() < crate::legs::MAX_LEGS {
+        return None;
+    }
+    let id = i.id.as_str();
+    let at = i.events.iter().filter(|(t, k, d)| (k == "task-reopen" || k == "task-reopened") && d["id"] == id && *t >= from && *t < to).map(|(t, _, _)| *t).min()?;
+    let seated = i.events.iter().filter(|(t, k, d)| (k == "task-claimed" || k == "session-learned") && d["id"] == id && *t >= at).map(|(t, _, _)| *t).min();
+    let end = seated.map_or(to, |s| s.min(to));
+    let until = match seated.filter(|s| *s <= to) {
+        Some(s) => format!("until a seat was claimed at {}", clock(s)),
+        None => format!("still unseated at {}", clock(to)),
+    };
+    Some((at, end, format!("{CAPPED_REOPEN} — reopened at {} at the {}-leg cap: no rework leg could be added and the run seats no member, {until}", clock(at), crate::legs::MAX_LEGS)))
+}
 
 /// Seconds of `from..to` a park covers.
 fn parked_within(p: &Park, from: i64, to: i64) -> i64 {
@@ -615,7 +667,22 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             None => format!("leg {}", leg.name),
         };
         if let Some(f) = finished {
-            out.push(Phase::work(label, s, f));
+            // A leg runs only while its seat is alive: a seat that ended before
+            // the leg was closed leaves the rest of the leg's line `running`
+            // with nobody in it (wsp-001's `finish`: cpd-121 ended at its Stop,
+            // the line read `running` an hour more).
+            match up.and_then(|u| seat_ended_after(i, u)).filter(|(_, e)| *e < f) {
+                Some((seat, e)) => {
+                    out.push(Phase::work(label, s, e));
+                    out.push(Phase::gap(
+                        format!("leg {}: its seat {seat} ended at {}, the leg not closed", leg.name, clock(e)),
+                        e,
+                        f,
+                        format!("{LEG_SEAT_ENDED} — {seat} ended at {} (not work)", util::iso_at(e)),
+                    ));
+                }
+                None => out.push(Phase::work(label, s, f)),
+            }
             done.push((leg.name.clone(), f));
             last_end = Some(last_end.map_or(f, |e| e.max(f)));
             if let (Some(b), Some((closed, _, d))) = (baton_at, done_event) {
@@ -643,7 +710,21 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let review = reviews.iter().copied().rev().find(|r| verdicts.iter().any(|v| v >= r)).or_else(|| reviews.last().copied());
     if let (Some(r), Some(e)) = (review, last_end) {
         if r > e {
-            out.push(Phase::gap("after the last leg → review typed", e, r, "the row's own seat finishing (not wsp)".into()));
+            let finishing = || "the row's own seat finishing (not wsp)".to_string();
+            match capped_reopen(i, e, r).filter(|(at, end, _)| end > at) {
+                // A reopen at the leg cap in it: from the reopen to the next seat
+                // nobody was on the row, and the log says why (`wsp-016`).
+                Some((at, end, why)) => {
+                    if at > e {
+                        out.push(Phase::gap("after the last leg → reopened", e, at, finishing()));
+                    }
+                    out.push(Phase::gap("reopened at the leg cap → a seat started", at, end, why));
+                    if r > end {
+                        out.push(Phase::gap("seat started → review typed", end, r, finishing()));
+                    }
+                }
+                None => out.push(Phase::gap("after the last leg → review typed", e, r, finishing())),
+            }
         }
     }
     let verdict = verdicts.iter().copied().find(|t| review.is_none_or(|r| *t >= r));
@@ -2190,6 +2271,78 @@ mod tests {
         let leg = ph.iter().find(|p| p.label.starts_with("leg a (no seat")).expect("the leg is named");
         assert!(leg.gap && leg.seconds() > 0, "{leg:?}");
         assert!(!ph.iter().any(|p| !p.gap && p.label.starts_with("leg a")), "{ph:?}");
+    }
+
+    /// A leg whose seat came up, worked and ended before the leg was closed
+    /// (`wsp-016`): the leg is work up to the seat's end, and the rest is a gap
+    /// named for the seat and when it ended.
+    #[test]
+    fn a_leg_whose_seat_ended_before_its_close_is_work_to_the_end_then_a_gap() {
+        let mut i = row();
+        for e in i.events.iter_mut().filter(|(t, k, _)| *t == 200 && k == "session-learned") {
+            e.2 = json!({"id": "r-1", "pane": "cpd-121"});
+        }
+        i.cycle.push((250, format!("r-1: {} {} (member, cpd-121), no pid of it running and its tree kept", crate::ending::EXIT_ENDED, util::iso_at(240))));
+        i.cycle.sort_by_key(|(t, _)| *t);
+        let ph = build(&i);
+        let work = ph.iter().find(|p| !p.gap && p.label.starts_with("leg a")).expect("the leg's work");
+        assert_eq!((work.start, work.end), (190, 240), "{ph:?}");
+        let gap = ph.iter().find(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with(LEG_SEAT_ENDED))).expect("the stretch after the seat is named");
+        assert_eq!((gap.start, gap.end), (240, 300));
+        let why = gap.waiting_for.as_deref().unwrap();
+        assert!(why.contains("cpd-121") && why.contains(&util::iso_at(240)), "{why}");
+    }
+
+    /// A seat that ended after the leg was closed changes nothing.
+    #[test]
+    fn a_leg_whose_seat_ended_after_its_close_is_work_to_the_close() {
+        let mut i = row();
+        for e in i.events.iter_mut().filter(|(t, k, _)| *t == 200 && k == "session-learned") {
+            e.2 = json!({"id": "r-1", "pane": "cpd-121"});
+        }
+        i.cycle.push((302, "ended cpd-121, which ran leg a of r-1".into()));
+        i.cycle.sort_by_key(|(t, _)| *t);
+        let ph = build(&i);
+        let work = ph.iter().find(|p| !p.gap && p.label.starts_with("leg a")).expect("the leg's work");
+        assert_eq!((work.start, work.end), (190, 300));
+        assert!(!ph.iter().any(|p| p.waiting_for.as_deref().is_some_and(|w| w.starts_with(LEG_SEAT_ENDED))), "{ph:?}");
+    }
+
+    /// wsp-004 (`wsp-016`, the case in `wsp-011`): a row at the 8-leg cap is
+    /// reopened, no rework leg can be added and no member is seated, so the
+    /// step does not run. The log has the reopen: that is what it waited on,
+    /// not nothing the logs name.
+    #[test]
+    fn a_reopen_at_the_leg_cap_with_no_member_seated_is_named_from_the_log() {
+        let mut i = row();
+        i.legs = (0..crate::legs::MAX_LEGS).map(|n| LegIn { name: format!("l{n}"), ..Default::default() }).collect();
+        i.events.push(ev(1000, "task-reopen", json!({"id": "r-1"})));
+        let why = wait_name(&i, 990, 1545, "r-1");
+        assert!(why.starts_with(CAPPED_REOPEN) && why.contains("still unseated"), "{why}");
+        i.events.push(ev(1500, "task-claimed", json!({"id": "r-1"})));
+        let why = wait_name(&i, 990, 1545, "r-1");
+        assert!(why.starts_with(CAPPED_REOPEN) && why.contains(&format!("claimed at {}", clock(1500))), "{why}");
+        // Under the cap a reopen adds a rework leg and the run starts it: not this case.
+        i.legs.truncate(3);
+        assert!(wait_name(&i, 990, 1545, "r-1").starts_with("nothing the logs"));
+    }
+
+    /// The stretch after the last leg that holds a capped reopen: from the reopen
+    /// to the next seat it is named for the reopen, not the seat finishing.
+    #[test]
+    fn a_capped_reopen_after_the_last_leg_is_split_out_of_the_seat_finishing() {
+        let mut i = row();
+        i.legs.extend((1..crate::legs::MAX_LEGS).map(|n| LegIn { name: format!("l{n}"), skipped: false, after: vec!["x".into()] }));
+        // Only leg a starts; the review comes late, after a reopen and a claim.
+        i.events.retain(|(_, k, _)| k != "task-review" && k != "task-verified");
+        i.events.push(ev(400, "task-reopened", json!({"id": "r-1"})));
+        i.events.push(ev(700, "task-claimed", json!({"id": "r-1"})));
+        i.events.push(ev(800, "task-review", json!({"id": "r-1"})));
+        let ph = build(&i);
+        let capped = ph.iter().find(|p| p.waiting_for.as_deref().is_some_and(|w| w.starts_with(CAPPED_REOPEN))).expect("the reopen is named");
+        assert_eq!((capped.start, capped.end), (400, 700), "{ph:?}");
+        assert!(ph.iter().any(|p| p.gap && (p.start, p.end) == (300, 400)), "{ph:?}");
+        assert!(ph.iter().any(|p| p.gap && (p.start, p.end) == (700, 800)), "{ph:?}");
     }
 
     #[test]
