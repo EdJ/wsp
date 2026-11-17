@@ -1162,10 +1162,16 @@ fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut
         }
     }
 
-    match ask_wire_version(&sup) {
-        Some(v) if v != WIRE_VERSION => problems.push(format!(
-            "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup speaks {v} — bump WIRE_VERSION in \
-             src/place_compound.rs to match crates/supervisor/src/proto.rs (compound-026)"
+    // A current build answers the range it accepts (`OLDEST VERSION`), and
+    // a WIRE_VERSION inside it is answered, not refused: wsp sends no
+    // fallback, so staying at an older accepted version is what keeps it
+    // speaking to an older compound-sup too. Only a constant outside the
+    // range is the refusal compound-026 was filed for.
+    match ask_wire_range(&sup) {
+        Some((lo, hi)) if !(lo..=hi).contains(&WIRE_VERSION) => problems.push(format!(
+            "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup accepts {} — bump WIRE_VERSION in \
+             src/place_compound.rs to match crates/supervisor/src/proto.rs (compound-026)",
+            if lo == hi { hi.to_string() } else { format!("{lo}..={hi}") }
         )),
         Some(_) => {}
         None => notes.push(format!(
@@ -1175,14 +1181,23 @@ fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut
     }
 }
 
-/// `compound-sup wire-version` → its VERSION, or `None` if the installed
-/// binary predates that verb (an older build, not a broken one) or will not
-/// answer at all. A current build prints the accepted range `OLDEST VERSION`;
-/// VERSION is the last token. An older build prints a bare number, which is
-/// the same token.
-fn ask_wire_version(bin: &std::path::Path) -> Option<u32> {
+/// `compound-sup wire-version` → the range it accepts, or `None` if the
+/// installed binary predates that verb (an older build, not a broken one) or
+/// will not answer at all. A current build prints `OLDEST VERSION`; an older
+/// one prints a bare number, which accepts only that — the same rule
+/// `far::readiness` applies to a far machine's compound-sup.
+fn ask_wire_range(bin: &std::path::Path) -> Option<(u32, u32)> {
     let out = Command::new(bin).arg("wire-version").stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).split_whitespace().last()?.parse().ok()).flatten()
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let nums: Vec<u32> = text.split_whitespace().map(|t| t.parse().ok()).collect::<Option<_>>()?;
+    match nums[..] {
+        [v] => Some((v, v)),
+        [lo, hi] if lo <= hi => Some((lo, hi)),
+        _ => None,
+    }
 }
 
 fn dial(socket: &PathBuf, timeout: Duration) -> Result<UnixStream> {
@@ -3991,7 +4006,7 @@ mod tests {
     #[test]
     fn wire_health_catches_wsps_own_constant_going_stale() {
         let other = WIRE_VERSION + 1;
-        for (i, reply) in [format!("9 {other}"), other.to_string()].iter().enumerate() {
+        for (i, reply) in [format!("{other} {}", other + 1), other.to_string()].iter().enumerate() {
             let scratch = Scratch::new(&format!("wire-stale-const-{i}"));
             let sup = fake_sup(&scratch.root, Some(reply));
             let (mut problems, mut notes) = (Vec::new(), Vec::new());
@@ -4002,6 +4017,18 @@ mod tests {
             assert!(problems[0].contains("place_compound.rs"), "{}", problems[0]);
             assert!(notes.is_empty(), "{notes:?}");
         }
+    }
+
+    /// A compound-sup newer than wsp that still accepts wsp's version: wsp is
+    /// answered, so nothing is wrong (the shape a fresh install showed as ✗).
+    #[test]
+    fn wire_health_is_quiet_when_wsps_version_is_inside_the_accepted_range() {
+        let scratch = Scratch::new("wire-in-range");
+        let sup = fake_sup(&scratch.root, Some(&format!("{WIRE_VERSION} {}", WIRE_VERSION + 5)));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     /// An installed `compound-sup` old enough to predate the `wire-version`
