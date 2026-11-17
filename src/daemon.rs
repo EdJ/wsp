@@ -90,6 +90,11 @@ fn adopt_carried_over() {
     eprintln!("wsp daemon: waiting on {} child(ren) from before the reload: {}", kids.len(), named.join("; "));
 }
 
+/// Is the per-tick reaper turned off (`WSP_NO_REAP` set, not empty, not `0`)?
+fn reaper_off() -> bool {
+    std::env::var_os("WSP_NO_REAP").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Is there nothing at all for the daemon to run for?
 ///
 /// Read this before touching the herdr-only gate it replaces: the gate used
@@ -732,7 +737,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // entry until the daemon exits, which is days (wsp-664).
         // Only children it knows nothing waits on are taken (wsp-667); one it
         // knows nothing of is named, so the spawn that leaks it can be found.
-        let reap = wsp_base::calls::reap_defunct();
+        // `WSP_NO_REAP=1` turns it off, for the run that shows nothing is left
+        // to it: an hour with no reaper and no `<defunct>` child (wsp-667 d1).
+        let reap = match reaper_off() {
+            true => Default::default(),
+            false => wsp_base::calls::reap_defunct(),
+        };
         for (pid, line) in &reap.reaped {
             eprintln!("wsp daemon: reaped defunct child {pid}, nothing was waiting on it: {line}");
         }
