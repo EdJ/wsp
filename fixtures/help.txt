@@ -258,14 +258,14 @@ AGENTS
                                     has every backtick in it run. The binary
                                     stays the positional: `--from` is where the
                                     sentence comes from, not the build
-  wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own herdr session,
+  wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own backend session,
                                     store and state — and the exports to use it;
                                     inside it `wsp` is the binary you ran
   wsp sandbox --run "cmd" [--keep]  …or run one thing in it and take it down
-  wsp sandbox --fake [--stage F]    …or with no herdr at all: a backend that
+  wsp sandbox --fake [--stage F]    …or with no backend at all: a backend that
                                     answers the socket out of a state you write
                                     down, so wsp can be driven through the ones
-                                    a real herdr cannot be put in
+                                    a real backend cannot be put in
   wsp scratch [-n]                  the scratch of closed rows ($WSP_SCRATCH and
                                     ~/.cache/<row-id>): list with sizes, then
                                     remove what the row did not keep
@@ -721,13 +721,13 @@ PLUMBING
   wsp kanban|board [<proj>] [--done]  the work as todo/doing/review/done columns;
                                     K in the panel opens it in a tab
   wsp panel install [--all]         split it into a workspace, or all of them —
-                                    the way it works without a herdr that draws
+                                    the way it works without a backend that draws
                                     the sidebar itself; skipped automatically
                                     while `wsp surface` is running
   wsp panel uninstall [-w ws]       take it back out
   wsp surface                       the panel for a host that owns the cells:
                                     one JSON object per line each way, frames
-                                    out. Started by herdr, not by a person
+                                    out. Started by backend, not by a person
   wsp daemon [-v]                   cycle, repair and attention loop (launchd)
   wsp daemon reload                 put the launchd job back when no daemon
                                     answers; the primary seat's, refused if one does
