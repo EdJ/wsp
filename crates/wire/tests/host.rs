@@ -87,6 +87,7 @@ deliver)
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then echo "no session at $sock" >&2; exit 1; fi
   text=$(cat)
   echo "$id $text" >> "$d/typed"
+  case "$text" in *slow*) sleep 2 ;; esac
   case "$text" in *busy*) ans="failed $id busy" ;; *) ans="delivered $id" ;; esac
   echo "$ans" > "$d/$id"
   cat "$d/$id"
@@ -570,6 +571,46 @@ fn a_spawn_under_a_silent_manager_is_host_silent_not_hung() {
     }
     assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
     assert_eq!(compound.root(&seat), None, "nothing was started in this process in the manager's place");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The manager gone after `seat.started` and before the first order's
+/// `order.acked` (wsp-033): the seat runs, so the start stands, with its
+/// record, and only the order is left open: unanswered at the spawn, and a
+/// later wait says the host is silent rather than that nothing started.
+#[test]
+fn a_spawn_whose_manager_drops_after_seat_started_keeps_the_seat_and_leaves_the_order_open() {
+    let (dir, sup) = place("odrop");
+    let sweep = Sweep::default();
+    let m = manager(&dir, &sup, 0);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let compound = Compound { host: &tcp, ..Compound::at(dir.join("seats")) };
+    let seat = opened(&compound, &dir);
+    // The fake types a `slow` order two seconds late: the manager is stopped
+    // once the seat is forked, inside that gap, so no ack is ever sent.
+    let order = FirstOrder { order: new_order_id(&seat), text: "slow work".into() };
+    let spawns = dir.join("exec").join(wsp_manager::seats::RUN_DIR).join("spawns");
+    let stopper = std::thread::spawn(move || {
+        wait_until("the seat forked", || spawns.exists());
+        std::thread::sleep(Duration::from_millis(300));
+        m.stop();
+    });
+    let start = Instant::now();
+    let heard = compound.start_ordered(&seat, &agent(0), &order, Duration::from_secs(20));
+    stopper.join().unwrap();
+    assert_eq!(heard, Some(Ok(Heard::Unanswered)), "the seat started; only its order is unconfirmed");
+    assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
+    let pid = compound.root(&seat).expect("the seat's record is kept");
+    sweep.add(pid);
+
+    // A later wait on the order: the manager is still gone, which is said.
+    match compound.await_order(&seat, &order.order, Duration::from_secs(2)) {
+        Some(Err(Refusal::Unreachable(why))) => assert!(why.starts_with("host silent"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(compound.root(&seat), Some(pid), "and the record stands after it");
+    drop(tcp);
+    drop(sweep);
     let _ = fs::remove_dir_all(&dir);
 }
 

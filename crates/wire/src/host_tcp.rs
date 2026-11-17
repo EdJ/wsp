@@ -589,14 +589,28 @@ impl Host for Tcp {
         let sub = Subscription::at_head(self.addr, self.token.clone(), self.role, &self.version)?;
         let session = self.spawn_with(spawn, Some(order.clone()), wait)?;
         self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(order.order.0.clone(), (spawn.seat.to_string(), sub));
-        let heard = self.await_order(&order.order, wait.saturating_sub(start.elapsed()))?;
+        // `seat.started` is heard: the seat runs, whatever the subscription
+        // does next. One that cannot be held (the manager went while its ack
+        // was awaited) leaves the order unanswered, never the start undone:
+        // an error here would drop a running seat's session and its record.
+        // The watch is kept, so a later `await_order` asks again from the last
+        // id heard and says why if it still cannot.
+        let heard = self.await_order(&order.order, wait.saturating_sub(start.elapsed())).unwrap_or(Heard::Unanswered);
         Ok((session, heard))
     }
     fn await_order(&self, order: &OrderId, wait: Duration) -> Result<Heard> {
         let Some((seat, mut sub)) = self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(&order.0) else {
             return Err(Refusal::Backend(format!("order {} was not sent by this process's seat.spawn", order.0)));
         };
-        let heard = heard_of(&mut sub, &seat, order, wait)?;
+        let heard = match heard_of(&mut sub, &seat, order, wait) {
+            Ok(heard) => heard,
+            Err(e) => {
+                // Not heard, not lost: the order is still the seat's, and a
+                // manager that comes back answers it from the journal.
+                self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(order.0.clone(), (seat, sub));
+                return Err(e);
+            }
+        };
         match heard {
             Heard::Unanswered => {
                 self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(order.0.clone(), (seat, sub));

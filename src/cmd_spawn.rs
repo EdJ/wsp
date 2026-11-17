@@ -7463,14 +7463,14 @@ mod tests {
     /// failure: under a manager the order rides the spawn.
     struct Hears {
         starts: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<crate::place::Heard>>>,
-        later: std::cell::RefCell<std::collections::VecDeque<crate::place::Heard>>,
+        later: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<crate::place::Heard>>>,
         sent: std::cell::RefCell<Vec<(Option<crate::place::Key>, crate::place::FirstOrder)>>,
         polls: std::cell::Cell<u32>,
         pressed: std::cell::Cell<u32>,
     }
 
     impl Hears {
-        fn of(starts: Vec<crate::place::Result<crate::place::Heard>>, later: Vec<crate::place::Heard>) -> Hears {
+        fn of(starts: Vec<crate::place::Result<crate::place::Heard>>, later: Vec<crate::place::Result<crate::place::Heard>>) -> Hears {
             Hears {
                 starts: std::cell::RefCell::new(starts.into()),
                 later: std::cell::RefCell::new(later.into()),
@@ -7493,7 +7493,7 @@ mod tests {
             Some(self.starts.borrow_mut().pop_front().expect("a start the script did not expect"))
         }
         fn await_order(&self, _: &Seat, _: &crate::place::OrderId, _: Duration) -> Option<crate::place::Result<crate::place::Heard>> {
-            Some(Ok(self.later.borrow_mut().pop_front().unwrap_or(crate::place::Heard::Unanswered)))
+            Some(self.later.borrow_mut().pop_front().unwrap_or(Ok(crate::place::Heard::Unanswered)))
         }
         fn nudge(&self, _: &Seat) -> crate::place::Result<()> {
             self.pressed.set(self.pressed.get() + 1);
@@ -7615,7 +7615,7 @@ mod tests {
     fn an_unanswered_order_under_a_manager_is_pressed_then_said_as_no_ack() {
         use crate::place::Heard;
         let dial = util::Dial::new();
-        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![Heard::Unanswered, Heard::Unanswered]);
+        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![Ok(Heard::Unanswered), Ok(Heard::Unanswered)]);
         match ordering(&place, &dial) {
             Some(Err(Unordered::Unanswered(e))) => {
                 assert!(e.contains("no order.acked came for its work order"), "{e}");
@@ -7626,9 +7626,31 @@ mod tests {
         assert_eq!(place.pressed.get(), PRESSES);
         assert_eq!(place.polls.get(), 0);
 
-        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![Heard::Acked]);
+        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![Ok(Heard::Acked)]);
         assert_eq!(ordering(&place, &dial), Some(Ok(())));
         assert_eq!(place.pressed.get(), 1, "one press, then the ack");
+        assert_eq!(place.polls.get(), 0);
+    }
+
+    /// The manager gone after `seat.started` and before `order.acked`
+    /// (wsp-033): the host says the order unanswered, not the start failed, and
+    /// a later wait that cannot reach the manager is the order unconfirmed —
+    /// `Unanswered`, which keeps the seat and the claim and owes nothing —
+    /// never `Start`, "did not start", and never a second spawn.
+    #[test]
+    fn a_manager_lost_after_seat_started_leaves_the_order_unconfirmed_not_the_seat_unstarted() {
+        use crate::place::Heard;
+        let dial = util::Dial::new();
+        let silent = || Err(Refusal::Unreachable("host silent: the manager at 127.0.0.1:1 did not answer".into()));
+        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![silent()]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Unanswered(e))) => {
+                assert!(e.contains("cpd-26's work order went unheard"), "{e}");
+                assert!(e.contains("host silent"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(place.sent.borrow().len(), 1, "a started seat is not spawned again");
         assert_eq!(place.polls.get(), 0);
     }
 
