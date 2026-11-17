@@ -260,8 +260,13 @@ against every backend. A backend is done when it passes, with no exceptions file
 10. **Text.** `set_text` with a stale `Rev` is refused (no lost edit of Ed's prose).
 
 How a backend runs them (wsp-047): it implements `wsp_store_conformance::Harness` (open a store with a domain, open
-more handles on it, arm the crash hook, reopen) and calls each `case_x(&harness)` from its own tests. The suite's
-`MemStore` passes them first, and each of its `Knobs` breaks one guarantee to show the matching case fails.
+more handles on it, arm the crash hook, reopen). Each case is a `pub fn case_x<H: Harness>(&H) -> CaseResult` in
+`wsp_store_conformance::cases`, and a backend's tests call them one by one, `case_crash(&harness).unwrap()`, one
+`#[test]` each; a broken guarantee is an `Err(CaseFailure)` naming the case and what it saw. The suite's `MemStore`
+passes them first, in the crate's `tests/mem.rs`, and each of its `Knobs` breaks one guarantee to show the matching
+case fails (ignored idempotency key: 2; skipped fence: 4; a gap in event ids: 5; half a command written: 8). Case 9
+runs on the suite's `TestDomain` and its illegal transitions, staged until `wsp-machines` exists; it then takes
+section 3's tables.
 
 ### 2.4 The SQLite schema behind it (sketch)
 

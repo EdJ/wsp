@@ -11,8 +11,11 @@
 //! tests match on `case` (and may read `broken`); a backend's tests `unwrap()`,
 //! which prints the failure.
 //!
-//! Cases 1-4, 9 and 10 come with wsp-047's leg `state`; 5-8 and the bite tests
-//! (each [`Knobs`](crate::mem::Knobs) makes its case fail) with leg `events`.
+//! The cases, one file each: 1 `case_atomicity`, 2 `case_idempotency`,
+//! 3 `case_lease_exclusivity`, 4 `case_fencing`, 5 `case_event_order`,
+//! 6 `case_snapshot`, 7 `case_wakeups`, 8 `case_crash`, 9 `case_machine_guards`,
+//! 10 `case_text`. Each [`Knobs`](crate::mem::Knobs) field makes its case fail
+//! (`tests/mem.rs`, the bite tests).
 
 use std::fmt;
 
@@ -23,18 +26,26 @@ use wsp_store_contract::{
 use crate::domain::{claim_lease, verb};
 
 mod atomicity;
+mod crash;
 mod fencing;
 mod guards;
 mod idempotency;
 mod leases;
+mod order;
+mod snapshot;
 mod text;
+mod wakeups;
 
 pub use atomicity::case_atomicity;
+pub use crash::case_crash;
 pub use fencing::case_fencing;
 pub use guards::case_machine_guards;
 pub use idempotency::case_idempotency;
 pub use leases::case_lease_exclusivity;
+pub use order::case_event_order;
+pub use snapshot::case_snapshot;
 pub use text::case_text;
+pub use wakeups::case_wakeups;
 
 /// A guarantee of 2.3 the backend broke: which case, and what it saw.
 #[derive(Clone, PartialEq, Eq)]

@@ -95,7 +95,7 @@ fn the_crash_hook_stops_an_apply_and_reopen_shows_what_was_written() {
     }
 }
 
-// 2.3's cases against MemStore, one test each (wsp-047 leg `state`).
+// 2.3's cases against MemStore, one test each.
 mod cases {
     use wsp_store_conformance::cases::*;
     use wsp_store_conformance::MemHarness;
@@ -121,6 +121,26 @@ mod cases {
     }
 
     #[test]
+    fn case_5_event_order() {
+        case_event_order(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
+    fn case_6_snapshot() {
+        case_snapshot(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
+    fn case_7_wakeups() {
+        case_wakeups(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
+    fn case_8_crash() {
+        case_crash(&MemHarness::default()).unwrap();
+    }
+
+    #[test]
     fn case_9_machine_guards() {
         case_machine_guards(&MemHarness::default()).unwrap();
     }
@@ -128,5 +148,48 @@ mod cases {
     #[test]
     fn case_10_text() {
         case_text(&MemHarness::default()).unwrap();
+    }
+}
+
+// The cases bite: each knob breaks one guarantee, and its case then fails.
+// Only the matching case is asserted: a knob may break others too (`gap_in_ids`
+// hides events cases 1, 2, 4, 9 and 10 read back).
+mod bites {
+    use wsp_store_conformance::cases::*;
+    use wsp_store_conformance::{Knobs, MemHarness};
+
+    /// `got` is case `case`'s failure, at the guarantee the knob breaks (its text holds one of
+    /// `at`), not in the case's setup.
+    fn fails(case: u8, at: &[&str], got: CaseResult, knobs: Knobs) {
+        match got {
+            Err(f) if f.case == case && at.iter().any(|a| f.broken.contains(a)) => {
+                eprintln!("{knobs:?} bites as expected: {f}")
+            }
+            other => panic!("under {knobs:?}, case {case} should fail at {at:?}; it answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignore_idempotency_fails_case_2() {
+        let knobs = Knobs { ignore_idempotency: true, ..Knobs::default() };
+        fails(2, &["answered differently", "should write once"], case_idempotency(&MemHarness::with(knobs)), knobs);
+    }
+
+    #[test]
+    fn skip_fence_fails_case_4() {
+        let knobs = Knobs { skip_fence: true, ..Knobs::default() };
+        fails(4, &["should be refused"], case_fencing(&MemHarness::with(knobs)), knobs);
+    }
+
+    #[test]
+    fn gap_in_ids_fails_case_5() {
+        let knobs = Knobs { gap_in_ids: true, ..Knobs::default() };
+        fails(5, &["strictly increasing", "skipped"], case_event_order(&MemHarness::with(knobs)), knobs);
+    }
+
+    #[test]
+    fn write_half_fails_case_8() {
+        let knobs = Knobs { write_half: true, ..Knobs::default() };
+        fails(8, &["neither nothing nor the whole", "half a row.claim"], case_crash(&MemHarness::with(knobs)), knobs);
     }
 }
