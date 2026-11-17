@@ -293,51 +293,6 @@ pub fn task_scope(task: &Task) -> String {
     task.id.clone()
 }
 
-/// Every scope a label of ours might be wearing, today's first: the id, then
-/// the composed shapes claims wrote before it.
-///
-/// Nothing renames the world. Every pane and workspace named before this
-/// change carries `<project>/<n>`, and both ends of the naming pair ask one
-/// question of a label — [`named_after_task`], to take the work's name back
-/// off a released pane, and [`pane_rename`], to put the right one on. A
-/// matcher that knew only the id form would answer no to both: a pane claimed
-/// yesterday would keep its unresolvable name until somebody typed a new one,
-/// and `release` would leave the work's name on an agent holding nothing,
-/// which is the bug [`unname_after_task`] exists to prevent.
-///
-/// Two projects, because the shape was composed from wherever the task sat at
-/// the time: where it is now, and where its id was numbered. The bare ident is
-/// what a task with no project got.
-///
-/// The old shapes are ambiguous — that is the defect — so `batch/077` could be
-/// two tasks. It costs nothing here: both callers ask this about a pane or a
-/// workspace already bound to the task, so the only question is whether *this*
-/// name was written for *this* binding, and a name never written by any claim
-/// still matches none of the shapes.
-fn scopes_of(task: &Task) -> Vec<String> {
-    let ident = task.id.rsplit('-').next().unwrap_or(&task.id).to_string();
-    let numbered_in = task.id.rsplit_once('-').map(|(p, _)| p.to_string());
-    let mut out = vec![task_scope(task)];
-    for p in [task.project.clone(), numbered_in].into_iter().flatten() {
-        let legacy = format!("{p}/{ident}");
-        if !p.is_empty() && !out.contains(&legacy) {
-            out.push(legacy);
-        }
-    }
-    if !out.contains(&ident) {
-        out.push(ident);
-    }
-    out
-}
-
-/// The scope a label of ours is wearing, or `None` if the label is not one of
-/// ours. Anchored at the front and taking the separator with it, so a scope
-/// only ever matches where a claim would have written one.
-fn scope_worn(label: &str, task: &Task) -> Option<String> {
-    let label = label.trim();
-    scopes_of(task).into_iter().find(|s| label.starts_with(&format!("{s} ·")))
-}
-
 /// The name a task lends the workspace and pane holding it, or `None` if it
 /// lends none.
 ///
@@ -380,16 +335,6 @@ fn said_full(task: &Task, said: &str) -> Option<String> {
     }
     Some(format!("{} · {said}", task_scope(task)))
 }
-
-/// What a pane wears once the work has been taken back off it.
-///
-/// A word rather than nothing. A pane with no label of ours falls back to its
-/// terminal title — the prompt an agent announced itself with and never
-/// revises — so blanking a released pane leaves the agents panel saying,
-/// confidently, that it is still on the thing it just handed back. This says
-/// the one fact that is certainly true about it, and it is the fact you are
-/// reading that list to find: nobody has given this agent anything.
-pub(crate) const UNASSIGNED_LABEL: &str = "unassigned";
 
 /// A name for a pane holding no task, which is the only kind that has to be
 /// checked for a name of ours.
@@ -472,74 +417,6 @@ pub(crate) fn sentence(said: &BTreeMap<String, Value>, pane: &str, held: Option<
     let task = entry.get("task").and_then(|t| t.as_str());
     let said = entry.get("said").and_then(|s| s.as_str()).filter(|s| !s.is_empty())?;
     (task == held).then(|| said.to_string())
-}
-
-/// Whether a name is one this task's claim put there.
-///
-/// Two shapes wear the same scope and only one of them is the title. `claim`
-/// writes [`task_label`], and every `wsp say` since has written a
-/// [`said_label`] over it — the same `render-047 ·` in front, a different
-/// sentence behind. Matching the title alone meant that an agent which had
-/// said anything at all kept the work's name for ever after handing it back,
-/// which is every agent that follows the brief.
-///
-/// The scope is what wsp owns and the only part of either shape that is not a
-/// sentence somebody chose: it is the task's id, and nothing a person types by
-/// hand looks like it. So the scope is what is recognised, and a name that
-/// does not carry it is somebody else's and is left alone.
-fn named_after_task(label: &str, task: &Task) -> bool {
-    scope_worn(label, task).is_some()
-}
-
-/// What [`name_bound`] should rename a bound pane to, or `None` to leave the
-/// name it is wearing.
-///
-/// The bug this exists to stop: `name_bound` used to rename whenever the label
-/// differed from [`task_label`], and a sentence differs from the title by
-/// construction — so every `reconcile` erased every agent's `wsp say`, on every
-/// daemon start, silently. The status line each agent keeps for everyone else's
-/// benefit was destroyed by a maintenance verb, and the cost lands on a person,
-/// who has to interrupt an agent to ask what it is doing. That is the exact cost
-/// `wsp say` was built to remove.
-///
-/// So the question is [`named_after_task`]'s, not equality's: *is this a name of
-/// ours for this task*. That is the same question [`unname_after_task`] already
-/// asks at the other end of the pair, and asking it here is what makes the two
-/// halves of the mechanism agree. `name_bound` still does the whole job it was
-/// written for — a pane wearing `claude`, or a name from before any of this
-/// existed, or nothing, carries no scope and is renamed.
-///
-/// The trade: a pane wearing the *old* title after `wsp edit --title` also
-/// carries the right scope, so reconcile no longer refreshes it. It cannot be
-/// told from a sentence — one field holds both, which is the argument for moving
-/// `say` off the label entirely (robustness-026). It is the cheaper half of the
-/// trade: the workspace below is untouched and still takes the new title, and a
-/// workspace is where "what is this work" is read; the pane answers "what is
-/// happening in there now", and a sentence is a better answer to that than a
-/// title. `claim` and `wsp say --clear` both write the new title back.
-///
-/// The name it answers with is the whole one; [`name_bound`] cuts it for the
-/// wire. `full` is what the pane's label was cut from, when the store kept it —
-/// carried in so a rename reads the sentence at full length and puts it back at
-/// full length. Take it from the label instead and reconcile quietly cuts the
-/// sentence a second time, wearing down what an agent said one rewrite at a
-/// time, which is a slower version of the erasure this function was written to
-/// stop.
-fn pane_rename(pane_label: &str, full: Option<&str>, task: &Task) -> Option<String> {
-    match scope_worn(pane_label, task) {
-        Some(worn) if worn == task_scope(task) => None,
-        // Ours, in a shape that names nothing. Only the scope is wrong, so
-        // only the scope is rewritten and the sentence behind it is carried
-        // across — it is the agent's, and it is newer than anything reconcile
-        // knows. Writing the title back here would be the erasure this
-        // function exists to stop, arriving by the other door.
-        Some(worn) => {
-            let wearing = full.unwrap_or(pane_label);
-            let said = wearing.trim().strip_prefix(&format!("{worn} ·")).unwrap_or("").trim();
-            said_full(task, said).or_else(|| task_full(task))
-        }
-        None => task_full(task),
-    }
 }
 
 /// `wsp flag <id> "why"` — an agent raises a hand about one task.
@@ -3394,11 +3271,8 @@ pub struct Reconciled {
 /// workspace id can: it comes back from that machine's own herdr already
 /// qualified. The id is the routing key everywhere else in this design; it is
 /// the routing key here too.
-fn machine_of(id: &str) -> &str {
-    match id.rsplit_once('@') {
-        Some((_, m)) if !m.is_empty() => m,
-        _ => "",
-    }
+fn machine_of(_id: &str) -> &str {
+    ""
 }
 
 /// Which machines actually answered, and with how many workspaces.
@@ -3486,76 +3360,6 @@ pub(crate) fn answered_by_machine<'a>(
 /// `workspace_id` directly.
 pub(crate) fn may_reap(answered: &std::collections::BTreeMap<&str, usize>, id: &str) -> bool {
     !id.is_empty() && answered.contains_key(machine_of(id))
-}
-
-/// [`may_reap`], asked of the machine a **seat record** names rather than of an id's
-/// `@mb2` suffix: `machine` is the record's own field (`""` is this machine), and
-/// `census` is who was asked and what came back.
-///
-/// The same rule, one comparison of two names with nothing parsed
-/// ([`answered_by_machine`]'s doc says where this was always going): a machine
-/// that *answered* is believed, even holding nothing — a far machine that
-/// rebooted answers with an empty census, and that is when its claims are reaped
-/// — and one that is silent ([`crate::place::Census::silent`]) or was never asked
-/// is not. `docs/remote-agents.md` section 3.
-pub(crate) fn may_reap_on(census: &crate::place::Census, machine: &str) -> bool {
-    census.answered(machine)
-}
-
-/// What herdr answered with, and the one question a seat record asks of it.
-///
-/// Four lists rather than two because [`may_reap`] is asked twice and of
-/// different evidence — see [`Census::nobody_in`].
-pub(crate) struct Census<'a> {
-    pub(crate) workspaces: &'a [&'a str],
-    pub(crate) panes: &'a [&'a str],
-    pub(crate) heard_workspaces: &'a std::collections::BTreeMap<&'a str, usize>,
-    pub(crate) heard_panes: &'a std::collections::BTreeMap<&'a str, usize>,
-}
-
-impl Census<'_> {
-    /// Is the agent that took this seat gone?
-    ///
-    /// **Two tests, because a seat empties two ways and only one of them was
-    /// ever checked.** The workspace closing is the tidy one — a night ending,
-    /// a set of rooms retired — and it is what this loop was written for. The
-    /// commoner one is the pane going while the room stands: a crash, a machine
-    /// restart, a session ending, `wsp despawn --pane … --force`. worklist-035
-    /// drove it on `796c2d2` — the `acc` seat's pane ended at 20:15:38, and
-    /// nine minutes later `wsp flag acc-006` still answered *raised to the acc
-    /// governor · w1 · x there lowers it*, with nobody at w1:p2 and nobody
-    /// there for nine minutes. `governors.json` had carried the pane the whole
-    /// time; nothing had ever compared it against the census.
-    ///
-    /// **Each half is guarded by its own evidence.** `may_reap`'s rule is that
-    /// only a machine that *spoke* gets its records examined, and the two
-    /// listings are two separate speakings: a herdr that answered
-    /// `workspace.list` and failed `pane.list` would, on one shared guard,
-    /// empty every seat on the machine out of an empty answer. That is the
-    /// exact failure `may_reap` exists to prevent, so it is asked twice.
-    ///
-    /// A record naming no pane is left to the workspace test alone.
-    /// `wsp govern -w` writes one, naming a room the process was not standing
-    /// in, and a seat with no address is not evidence of an empty one.
-    pub(crate) fn nobody_in(&self, workspace: &str, pane: &str) -> bool {
-        let room_gone = may_reap(self.heard_workspaces, workspace)
-            && !self.workspaces.contains(&workspace);
-        let pane_gone = !pane.is_empty()
-            && may_reap(self.heard_panes, pane)
-            && !self.panes.contains(&pane);
-        room_gone || pane_gone
-    }
-}
-
-/// Whether the seat holding this task sits on a far machine that is silent now:
-/// the machine read off the **seat record** (`place_compound::seat_machine`), not
-/// off any id, and asked of [`crate::far::silent_machines`]' census.
-fn claim_on_silent_machine(store: &Store, task_id: &str) -> bool {
-    let Some(far) = crate::far::silent_machines(&store.machines(), &store.machines_live()) else { return false };
-    store.panes_for_task(task_id).iter().any(|pane| {
-        let machine = crate::place_compound::seat_machine(store, pane);
-        !machine.is_empty() && !may_reap_on(&far, &machine) && far.unheard().any(|(m, _)| m == machine)
-    })
 }
 
 pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
@@ -8200,51 +8004,6 @@ mod tests {
         assert_eq!(r["state"], "unreachable");
     }
 
-    /// `may_reap` by machine: a machine that answered is believed even when it
-    /// holds nothing (a far machine that rebooted), a silent one and one nobody
-    /// asked are not — and the machine is the **seat record's**, so a compound
-    /// seat id that names no machine is judged by the machine its record names.
-    #[test]
-    fn may_reap_on_a_machine_believes_an_empty_answer_and_not_a_silent_one() {
-        use crate::place::{Census, Refusal};
-        let heard_empty = Census::heard("mb2", vec![]);
-        assert!(may_reap_on(&heard_empty, "mb2"), "a reboot answers with nothing, and the rule is unchanged");
-        let silent = Census::silent("mb2", Refusal::Unreachable("no route".into()));
-        assert!(!may_reap_on(&silent, "mb2"), "silence is not mb2 being empty");
-        assert!(!may_reap_on(&Census::heard("", vec![]), "mb2"), "nobody asked mb2");
-        assert!(may_reap_on(&Census::heard("", vec![]).and(silent), ""), "this machine answered");
-    }
-
-    /// `reconcile --reap` leaves a claim whose seat sits on a silent machine
-    /// alone, and the machine is read off the seat's record and not off the
-    /// claim's or the seat's id; with the machine heard the same claim is
-    /// examined like any other.
-    #[test]
-    fn a_claim_on_a_silent_machine_is_left_alone_and_one_on_a_heard_machine_is_not() {
-        let env = util::isolated("reap-silent");
-        let store = Store::at(env.home(), env.state());
-        store.ensure_dirs().unwrap();
-        store.save_machine(&crate::model::Machine::new("mb2", "mb2")).unwrap();
-        let seat_dir = store.state.join("compound-seats").join("cpd-7");
-        std::fs::create_dir_all(&seat_dir).unwrap();
-        std::fs::write(seat_dir.join("seat.json"), json!({ "machine": "mb2" }).to_string()).unwrap();
-        let near = store.state.join("compound-seats").join("cpd-8");
-        std::fs::create_dir_all(&near).unwrap();
-        std::fs::write(near.join("seat.json"), json!({}).to_string()).unwrap();
-        store.set_binding("cpd-7", json!({ "task_id": "t-far" }));
-        store.set_binding("cpd-8", json!({ "task_id": "t-near" }));
-
-        let down = crate::store::MachineLive { reachable: false, heard: util::iso_at(util::epoch_secs() - 300), ..Default::default() };
-        store.set_machine_live("mb2", &down);
-        assert!(claim_on_silent_machine(&store, "t-far"), "the seat record names mb2 and mb2 is silent");
-        assert!(!claim_on_silent_machine(&store, "t-near"), "a local seat is never held by a far silence");
-        assert!(!claim_on_silent_machine(&store, "t-nobody"), "and a task no seat holds is nobody's");
-
-        let up = crate::store::MachineLive { reachable: true, heard: util::now_iso(), last_seen: util::now_iso(), ..Default::default() };
-        store.set_machine_live("mb2", &up);
-        assert!(!claim_on_silent_machine(&store, "t-far"), "heard again: the reap examines it like any other");
-    }
-
     /// A seat that reads unreachable is never `Gone` to the check that reaps on
     /// a bound seat: nothing is known about it, so nothing is done.
     #[test]
@@ -8262,67 +8021,6 @@ mod tests {
         assert!(matches!(bound_state("cpd-9", &[], &answered_by_machine(["cpd-9"])), Bound::Gone), "a seat absent from an answering machine is still gone");
     }
 
-    /// The fault worklist-035 was filed on, at the line that decides it: a
-    /// seat empties when its *pane* goes, and the room it was in usually
-    /// outlives it.
-    ///
-    /// Driven on `796c2d2` — the `acc` seat's pane was ended at 20:15:38 and
-    /// nine minutes later `wsp flag acc-006` still answered *raised to the acc
-    /// governor · w1*. `w1` was open the whole time, which is why the old test
-    /// — is the workspace still listed — never fired.
-    #[test]
-    fn a_seat_whose_pane_is_gone_is_empty_even_where_its_workspace_stands() {
-        let heard_ws = answered_by_machine(["w1"]);
-        let heard_panes = answered_by_machine(["w1:p1"]);
-        let census = Census {
-            workspaces: &["w1"],
-            panes: &["w1:p1"],
-            heard_workspaces: &heard_ws,
-            heard_panes: &heard_panes,
-        };
-
-        assert!(census.nobody_in("w1", "w1:p2"), "the pane is gone and w1 is still open");
-        assert!(!census.nobody_in("w1", "w1:p1"), "the agent that took it is still sitting there");
-        assert!(census.nobody_in("w9", "w9:p1"), "and the whole room going is still the whole room going");
-        assert!(
-            !census.nobody_in("w1", ""),
-            "a record with no pane on it — `wsp govern -w` — has nothing to compare",
-        );
-    }
-
-    /// Each half on its own evidence, which is what stops this emptying the
-    /// store out of a half-answer.
-    ///
-    /// A herdr that listed its workspaces and failed to list its panes is the
-    /// shape that would have done it: one shared guard would read "no panes" as
-    /// "every pane is gone" and stand down every seat on the machine. That is
-    /// the failure `may_reap` was written for, so it is asked twice — see
-    /// [`Census::nobody_in`].
-    #[test]
-    fn a_pane_listing_that_answered_with_nothing_empties_no_seat() {
-        let heard_ws = answered_by_machine(["w1"]);
-        let heard_panes = answered_by_machine(std::iter::empty());
-        let census = Census {
-            workspaces: &["w1"],
-            panes: &[],
-            heard_workspaces: &heard_ws,
-            heard_panes: &heard_panes,
-        };
-        assert!(!census.nobody_in("w1", "w1:p2"), "nothing was heard about panes, so nothing is known");
-
-        // And the other way round: panes answered, workspaces did not.
-        let heard_ws = answered_by_machine(std::iter::empty());
-        let heard_panes = answered_by_machine(["w1:p1"]);
-        let census = Census {
-            workspaces: &[],
-            panes: &["w1:p1"],
-            heard_workspaces: &heard_ws,
-            heard_panes: &heard_panes,
-        };
-        assert!(!census.nobody_in("w9", "w1:p1"), "the room is unheard-of and the pane is right there");
-        assert!(census.nobody_in("w9", "w9:p1"), "the pane listing is enough on its own");
-    }
-
     /// The generalisation, not a second rule beside the old one: `reap` used to
     /// refuse outright when herdr answered with nothing at all, for exactly
     /// this reason, on the one machine there was. That case still holds.
@@ -8331,52 +8029,6 @@ mod tests {
         let answered = answered_by_machine(std::iter::empty());
         assert!(!may_reap(&answered, "w0"));
         assert!(!may_reap(&answered, ""), "a claim too old to carry a workspace id either");
-    }
-
-    /// `compound-124`: the same drop `compound-123` fixed in `sync`, reached
-    /// through a different field. A compound claim's `workspace_id` is empty
-    /// — `cmd_agent::claim` falls back to `""` for a seat no herdr workspace
-    /// backs, which is every compound seat — and `machine_of("")` reads as
-    /// the same local bucket herdr's own workspaces fall in. The bug this
-    /// test reproduces first: once herdr had answered with even one local
-    /// workspace of its own, that used to be read as evidence a compound
-    /// claim's workspace — which never existed to begin with — had closed,
-    /// and `reconcile --reap` would hand the task off as "workspace closed"
-    /// out from under a live compound seat. `may_reap` now refuses an empty
-    /// id outright, the same refusal `Census::nobody_in`'s `pane_gone` was
-    /// already making for an empty pane.
-    #[test]
-    fn a_compound_claims_missing_workspace_id_is_not_reaped_by_herdrs_local_answer() {
-        // Herdr has answered, and with a workspace of its own — the ordinary
-        // case on a machine that also runs a herdr pane or two, and exactly
-        // what used to be enough to call a compound claim's absent workspace
-        // "closed".
-        let answered = answered_by_machine(["w0"]);
-
-        assert!(
-            !may_reap(&answered, ""),
-            "the bug this row fixed: herdr answering locally at all used to be \
-             taken as proof that a compound claim's workspace — which never \
-             existed — had closed"
-        );
-
-        // The same guard reached through `Census::nobody_in`, which is what
-        // reconcile's workspace-vacate path actually calls: an empty
-        // workspace on a governor record reads exactly the same way, and
-        // must not stand a compound-hosted governor down the moment herdr
-        // has answered about anything of its own.
-        let heard_panes = answered_by_machine(std::iter::empty());
-        let census = Census {
-            workspaces: &["w0"],
-            panes: &[],
-            heard_workspaces: &answered,
-            heard_panes: &heard_panes,
-        };
-        assert!(
-            !census.nobody_in("", ""),
-            "a governor record with no workspace and no pane — compound's shape \
-             — has nothing for this reap to compare against"
-        );
     }
 
     /// The two names an unscoped pane may not take. `install` treats any pane
@@ -8497,131 +8149,6 @@ mod tests {
             !task_label(&moved).unwrap().contains("batch/077"),
             "the composed name is the one the CLI rejects"
         );
-    }
-
-    /// What a release is entitled to take back. The bug it fixes: `u` on an
-    /// agent that had ever run `wsp say` left the pane wearing the work — the
-    /// name matched the sentence, not the title, so the old test for "is this
-    /// ours" said no and the agents panel went on showing a task and a project
-    /// for somebody holding neither.
-    #[test]
-    fn a_release_takes_back_the_scope_and_nothing_else() {
-        let mut t = Task::new("When unassigning an agent via u", "render-047");
-        t.project = Some("render".into());
-
-        // Both shapes a claim leaves behind: the title it wrote, and whatever
-        // has been said over it since.
-        assert!(named_after_task(&task_label(&t).unwrap(), &t));
-        assert!(named_after_task(
-            &on_the_wire(&said_full(&t, "reading how release names panes").unwrap()),
-            &t
-        ));
-
-        // Somebody else's name, and another task's. Neither is ours to take.
-        assert!(!named_after_task("Trance Video", &t));
-        assert!(!named_after_task("", &t));
-        let mut other = Task::new("something else entirely", "render-030");
-        other.project = Some("render".into());
-        assert!(!named_after_task(&task_label(&other).unwrap(), &t));
-
-        // The scope is the whole id: the same number under another project is
-        // a different piece of work.
-        let mut elsewhere = Task::new("same number, another project", "robustness-047");
-        elsewhere.project = Some("robustness".into());
-        assert!(!named_after_task(&task_label(&t).unwrap(), &elsewhere));
-    }
-
-    /// What a release has to take back off panes named before the label was
-    /// the id — which is every pane and workspace standing when this shipped.
-    /// Missing them would leave an agent holding nothing wearing the work,
-    /// which is the whole reason [`unname_after_task`] exists.
-    #[test]
-    fn a_release_still_recognises_the_names_written_before_the_id_was_the_label() {
-        let mut moved = Task::new("a pane's label names a task that does not exist", "wsp-077");
-        moved.project = Some("batch".into());
-
-        // Composed where it is now, and composed where it was numbered: the
-        // same claim wrote both, on either side of the move.
-        assert!(named_after_task("batch/077 · a pane's label names a task…", &moved));
-        assert!(named_after_task("wsp/077 · a pane's label names a task…", &moved));
-        // And the bare form an unfiled task's claim wrote.
-        assert!(named_after_task("077 · a pane's label names a task…", &moved));
-
-        // Still nobody else's. A number that is not this task's is not ours by
-        // any of the shapes.
-        assert!(!named_after_task("batch/078 · something else", &moved));
-        assert!(!named_after_task("Trance Video", &moved));
-    }
-
-    /// The other half of the same transition: reconcile has to *replace* the
-    /// old shape, or a name that resolves to nothing outlives the fix. What it
-    /// must not do is take the sentence with it — the scope is what was wrong.
-    #[test]
-    fn reconcile_rewrites_a_composed_name_and_keeps_what_the_agent_said() {
-        let mut moved = Task::new("a pane's label names a task that does not exist", "wsp-077");
-        moved.project = Some("batch".into());
-
-        assert_eq!(
-            pane_rename("batch/077 · reading rows.rs for ident_of", None, &moved),
-            Some("wsp-077 · reading rows.rs for ident_of".to_string())
-        );
-        // Nothing said yet, so the title is what there is to put back.
-        assert_eq!(pane_rename("batch/077 · ", None, &moved), task_full(&moved));
-        // Already the id. Reconcile has nothing to do, sentence or not.
-        assert_eq!(pane_rename("wsp-077 · reading rows.rs", None, &moved), None);
-    }
-
-    /// And it rewrites the scope on the sentence the store kept, not on the
-    /// forty-four characters of it herdr was given.
-    ///
-    /// The defect this is the guard for is a slow one: reconcile read the
-    /// sentence off the label, so every rewrite put back what was already cut
-    /// and the ellipsis crept left. An agent's status line would wear down to
-    /// nothing over a week of daemon restarts, and nothing would look broken at
-    /// any single step.
-    #[test]
-    fn reconcile_rewrites_the_scope_on_the_whole_sentence() {
-        let mut moved = Task::new("a pane's label names a task that does not exist", "wsp-077");
-        moved.project = Some("batch".into());
-
-        let said = "reading rows.rs for what places a pane against a project";
-        let full = format!("batch/077 · {said}");
-        let wire = on_the_wire(&full);
-        assert!(wire.ends_with('…'), "the label herdr holds is the cut one");
-
-        assert_eq!(
-            pane_rename(&wire, Some(&full), &moved),
-            Some(format!("wsp-077 · {said}")),
-            "the scope is what was wrong, and the sentence comes through whole"
-        );
-    }
-
-    /// The defect: `reconcile` renamed on any label that differed from the
-    /// title, and a sentence always differs — so a routine maintenance verb
-    /// wiped every agent's `wsp say`, silently, and the panel went back to
-    /// reading as a row of titles nobody had said anything about.
-    #[test]
-    fn reconcile_leaves_a_sentence_where_the_agent_put_it() {
-        let mut t = Task::new("The three-module partition: core records", "robustness-083");
-        t.project = Some("robustness".into());
-
-        // What an agent is saying right now. Reconcile has no business here:
-        // the sentence is newer than anything reconcile knows.
-        let said = said_full(&t, "reading place.rs for what the port owes say").unwrap();
-        assert_eq!(pane_rename(&on_the_wire(&said), Some(&said), &t), None);
-
-        // The name the claim wrote, and still wearing it. Nothing to do.
-        assert_eq!(pane_rename(&task_label(&t).unwrap(), None, &t), None);
-
-        // The cases name_bound exists for, all intact: a pane from before any
-        // of this, one whose claim-time rename was dropped on a slow socket,
-        // and one still wearing the task it was moved off.
-        assert_eq!(pane_rename("claude", None, &t), task_full(&t));
-        assert_eq!(pane_rename("", None, &t), task_full(&t));
-        let mut old = Task::new("something else entirely", "robustness-030");
-        old.project = Some("robustness".into());
-        let stale = said_full(&old, "still on the old one").unwrap();
-        assert_eq!(pane_rename(&stale, None, &t), task_full(&t));
     }
 
     /// The compatibility rule `--model` itself keeps, at the other end of it: a

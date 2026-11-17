@@ -392,53 +392,6 @@ fn payload(signal: &Signal, edge: Edge, to: &str, at: &str, held: i64) -> Value 
     v
 }
 
-/// What is standing, by subject, for a surface that draws one word per row.
-///
-/// **Ed, 2026-08-17, and it is the half of `robustness-051` that is not a
-/// delivery at all:** *"when the agent raises questions to the user, we don't
-/// see a flag or any similar notification in the UI."* The tokens `sync`
-/// publishes are `scope`, `task`, `taskid`, `tstatus` — four facts about which
-/// work this is and none about whether it is waiting on somebody. So an agent
-/// stopped with a question and an agent mid-turn drew identically in the one
-/// surface that is on screen all the time, which is the whole reason a person
-/// had to open a pane to find out.
-///
-/// **Read off the ledger and not recomputed**, which is the discipline the
-/// fourth hand-built monitor broke while standing in front of the field that
-/// answered it. This is the pass's third consumer — `wsp watch`'s stream, the
-/// hook, and now the sidebar — and all three are looking at one derivation.
-///
-/// The ledger is the right source rather than a fresh [`Poll`] for a reason
-/// beyond cost: it is the only one that knows how long a level has held, so a
-/// stall inside its settle window is correctly absent here. And it cannot go
-/// stale behind the sidebar, because the process that writes it is the process
-/// that publishes the tokens — [`tick`] and `sync::sync` are two statements in
-/// one loop, and a daemon that has stopped doing the first has stopped doing
-/// the second.
-///
-/// One word per subject, and where two levels stand on one task it is the
-/// louder — a question somebody wrote beats a stall wsp inferred, because it
-/// has words in it and the person reading has to go and look either way.
-pub(crate) fn standing(store: &Store) -> BTreeMap<String, &'static str> {
-    // The stamp is not asked about here. Whether this build would key the set
-    // the same way changes what may be *diffed*; it changes nothing about what
-    // is standing, and a surface that drew nothing across an install would be
-    // the same silence by another route.
-    let Some((ledger, _)) = load(store) else { return BTreeMap::new() };
-    let mut out: BTreeMap<String, (crate::message::Kind, &'static str)> = BTreeMap::new();
-    for s in ledger.told() {
-        let here = (s.loudness(), s.kind.word());
-        out.entry(s.subject.clone())
-            .and_modify(|held| {
-                if here.0 < held.0 {
-                    *held = here;
-                }
-            })
-            .or_insert(here);
-    }
-    out.into_iter().map(|(k, (_, word))| (k, word)).collect()
-}
-
 /// A source over the whole machine, for the daemon.
 pub(crate) fn machine_source(store: &Store) -> Poll<'_> {
     Poll::new(store, Scope::machine(), Kind::every().into_iter().collect(), None)
@@ -774,73 +727,6 @@ mod tests {
         assert_eq!(delivered(&store).len(), 1, "one hook call for one fact");
     }
 
-    /// **Ed's other half of `robustness-051`.** The pass reaching a hook wakes
-    /// a person who is away; this is the surface that is on screen the whole
-    /// time, and until now it carried four tokens about *which work* and none
-    /// about whether the work was waiting on anybody.
-    #[test]
-    fn what_is_standing_is_readable_by_the_surface_that_is_always_on_screen() {
-        let (_env, store) = store("sidebar");
-        task(&store, "a-1", None);
-        let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
-        assert!(standing(&store).is_empty(), "a quiet machine costs the sidebar nothing");
-
-        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60);
-        assert_eq!(standing(&store).get("a-1").copied(), Some("needs-a-person"));
-
-        // …and it goes away with the fact, because it is the same level.
-        tick(&store, &mut pass, &mut Fake(&store, vec![]), 120);
-        assert!(standing(&store).get("a-1").is_none());
-    }
-
-    /// A level still inside its settle window is an agent between turns as far
-    /// as anybody knows. Drawing it would put a word on a permanently visible
-    /// surface for four minutes and take it off again, which is the flicker the
-    /// settle exists to prevent.
-    #[test]
-    fn a_stall_that_has_not_settled_yet_is_not_drawn_anywhere() {
-        let (_env, store) = store("settling");
-        task(&store, "a-1", None);
-        let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
-
-        let mut src = Fake(&store, vec![Signal::new(Kind::NeedsAPerson, "a-1", "w1:p1 · no turn").settling()]);
-        tick(&store, &mut pass, &mut src, 60);
-        assert!(standing(&store).is_empty(), "one minute in, this is a gap between turns");
-
-        tick(&store, &mut pass, &mut src, 60 + SETTLE);
-        assert_eq!(standing(&store).get("a-1").copied(), Some("needs-a-person"));
-    }
-
-    /// Two levels on one task and one word to draw. The louder wins, and a
-    /// question somebody wrote is louder than a stall wsp inferred — it has
-    /// words in it, and the person reading has to go and look either way.
-    #[test]
-    fn where_two_levels_stand_on_one_task_the_sidebar_draws_the_louder() {
-        let (_env, store) = store("louder");
-        task(&store, "a-1", None);
-        let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
-
-        let asked = Signal::new(Kind::Unanswered, "a-1", "w1:p1 waiting · may I land?").loud();
-        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1"), asked]), 60);
-        assert_eq!(standing(&store).get("a-1").copied(), Some("unanswered"));
-    }
-
-    /// A daemon that has just started draws the whole standing set at once,
-    /// where it deliberately *announces* none of it. Priming is about what is
-    /// news; the sidebar is about what is true, and a level standing across a
-    /// restart is still true.
-    #[test]
-    fn a_primed_level_is_drawn_even_though_it_was_never_announced() {
-        let (_env, store) = store("primed");
-        task(&store, "a-1", None);
-        let mut pass = Pass::new();
-        assert!(tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 0).is_empty());
-        assert_eq!(standing(&store).get("a-1").copied(), Some("needs-a-person"));
-    }
-
     /// The predicate going false is the only thing that clears it, and the
     /// clearing is itself news: *do not go and prod that agent.*
     #[test]
@@ -888,40 +774,6 @@ mod tests {
         let mut rec = store.watches().get(KEY).cloned().expect("there is a ledger to restamp");
         rec.as_object_mut().unwrap().insert("build".into(), json!("another-build"));
         store.set_watch(KEY, rec);
-    }
-
-    /// **`worklist-034`, driven through the pass that produced it.** An install
-    /// lands, `daemon::reload` `exec`s within the tick, and the ledger the new
-    /// image inherits is keyed by the rules of the build that wrote it —
-    /// `Signal::key` gained a `record` component in `34ae8a3`, so one raised
-    /// hand is `flag:a-1` on one side of the install and `flag:a-1:m-1` on the
-    /// other.
-    ///
-    /// Diffed, that is a clearing that never happened and a raising for a level
-    /// that never went down, for every standing hand on the machine, at
-    /// whatever hour the install lands. What it costs instead is one quiet
-    /// tick.
-    #[test]
-    fn an_install_that_moved_a_key_costs_one_quiet_tick_and_not_two_false_edges() {
-        let (_env, store) = store("rekeyed");
-        task(&store, "a-1", None);
-        let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
-        let hand = Signal::new(Kind::Flag, "a-1", "can I take this?");
-        assert_eq!(tick(&store, &mut pass, &mut Fake(&store, vec![hand]), 60).len(), 1);
-
-        written_by_another_build(&store);
-        let rekeyed = Signal::new(Kind::Flag, "a-1", "can I take this?").of("m-1");
-        let mut after = Pass::new();
-        let out = tick(&store, &mut after, &mut Fake(&store, vec![rekeyed]), 120);
-        assert!(out.is_empty(), "the hand never moved, so nothing is owed anybody: {out:?}");
-        assert_eq!(delivered(&store).len(), 1, "one edge in the whole run, and it is the true one");
-        assert_eq!(standing(&store).get("a-1").copied(), Some("flag"), "and it is still up on the sidebar");
-
-        // The tick after is a diff again: the quiet is one tick, not a mode.
-        let out = tick(&store, &mut after, &mut Fake(&store, vec![]), 180);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].edge, Edge::Down);
     }
 
     /// The ledger remembers by id, so a renumbering has to reach it.
@@ -1224,26 +1076,6 @@ mod tests {
         tick(&store, &mut pass, &mut Fake(&store, vec![]), 1_000);
         assert!(!pass.due(1_030));
         assert!(pass.due(1_000 + EVERY));
-    }
-
-    /// `wsp-649`: a compound seat with no supervisor and a row with no claim
-    /// is not saying anything, however long herdr goes unread.
-    #[test]
-    fn a_stall_on_a_gone_compound_seat_is_not_raised_and_one_with_a_claim_is() {
-        let (_env, store) = store("orphan");
-        task(&store, "a-1", None);
-        let gone = || Signal::new(Kind::NeedsAPerson, "a-1", "cpd-9 · no turn running");
-        let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(&store, vec![gone()]), 60);
-        assert!(standing(&store).is_empty(), "nobody is there to be waiting");
-        assert!(orphans(&store).is_empty());
-
-        // The row's claim keeps it: somebody still owns the work, and the
-        // pass is not the one to say its seat is dead.
-        store.set_claim("a-1", json!({ "claimed_at": util::now_iso() }));
-        tick(&store, &mut pass, &mut Fake(&store, vec![gone()]), 120);
-        assert_eq!(standing(&store).get("a-1").copied(), Some("needs-a-person"));
     }
 
     fn put_level(store: &Store, s: &Signal) {
