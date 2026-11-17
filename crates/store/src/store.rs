@@ -2317,6 +2317,28 @@ impl Store {
         });
     }
 
+    /// The file the daemon writes at the top of every pass of its loop,
+    /// holding the epoch second the pass began (wsp-035). `cycle.log` is
+    /// written only when a tick has something to say, so an idle fleet's log
+    /// is quiet for hours under a daemon that is ticking; this is written
+    /// whether or not anything happens, and is what `wip` under
+    /// `WSP_HOST=manager` (no `ps`) reads the daemon's liveness by. A plain
+    /// file, not a field of `daemon.json`: written every tick, it takes no lock.
+    pub const DAEMON_TICK: &'static str = "daemon.tick";
+
+    /// Stamp [`Store::DAEMON_TICK`] as of `now`. Best effort: a stamp that
+    /// could not be written is a daemon that reads as quiet, which is said,
+    /// never a tick lost.
+    pub fn stamp_daemon_tick(&self, now: i64) {
+        let _ = std::fs::write(self.state_file(Self::DAEMON_TICK), format!("{now}\n"));
+    }
+
+    /// The epoch second of the last pass the daemon stamped, or `None` where no
+    /// daemon new enough to write one has run against this store.
+    pub fn daemon_tick(&self) -> Option<i64> {
+        std::fs::read_to_string(self.state_file(Self::DAEMON_TICK)).ok()?.trim().parse().ok()
+    }
+
     /// Where a store with nothing said about it keeps its state. The daemon
     /// needs it to read another process's environment the way [`Store::open`]
     /// read its own — a `wsp daemon` with no `WSP_STATE` is on this one.
