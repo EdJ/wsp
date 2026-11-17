@@ -902,6 +902,31 @@ manager stopped, `unreachable` names it as host silent, still with none of those
 - None of this polls `state` or reads a screen. Under `inproc`, `start_ordered` is `None` and the old start,
   `wait_ready` and `hand_over` run unchanged.
 
+#### Group 5: spawn, despawn and tell through the manager (wsp-026, 2026-11-17)
+
+Under `WSP_HOST=manager`, `spawn`, `despawn` and `tell` go through the manager's messages and events. Under `inproc`
+nothing changes. The old code is deleted later, by the contract row.
+- **spawn** sends `seat.spawn` with the first order and waits by subscription for `seat.started`, then
+  `order.acked`. It makes no `state` poll and no render. A silent manager is "host silent", never the in-process
+  host in its place.
+- **despawn** sends `seat.stop` and waits for `seat.stopped`. Its report names the pids the manager ended
+  (`Host::end` returns `Ended{pids, exit}`), and the json adds `ended_pids` only then. A seat the manager does not
+  run, or a silent manager, is said plainly; the seat's record stays.
+- **tell** sends `order.deliver`. A silent manager, or an unreachable census, holds the tell (wake.rs's hold,
+  unchanged). The flush delivers it once the manager answers, and the order id kept beside the hold means a re-ask
+  is typed once.
+- **The key** is the real `(row, attempt)` (group 4): the same key on a retry after a lost reply, the next attempt
+  when a start did not survive.
+
+Tests:
+- `crates/wire/tests/host.rs`, on a loopback manager with the fake compound-sup:
+  `spawns_under_one_key_over_tcp_give_one_seat_and_another_attempt_another`,
+  `a_spawn_under_manager_carries_its_order_and_hears_it_acked_with_no_poll_and_no_render`,
+  `a_stop_under_manager_reports_the_pids_seat_stopped_names`,
+  `a_tell_under_manager_is_delivered_and_a_silent_manager_is_unreachable_then_delivered_on_return`.
+- `cmd_spawn::tests::despawn_under_a_manager_asks_the_manager_and_a_silent_one_keeps_the_claim`.
+- `cmd_agent::tests::a_tell_to_a_silent_manager_is_held_and_the_flush_keeps_it`.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the
