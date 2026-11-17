@@ -236,7 +236,7 @@ fn ctl(args: &[&str]) -> Result<(), String> {
         return Ok(());
     }
     let why = String::from_utf8_lossy(&out.stderr);
-    let why = why.lines().next().unwrap_or("").trim();
+    let why = why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     Err(format!(
         "systemctl --user {} failed: {}",
         args.first().copied().unwrap_or(""),
