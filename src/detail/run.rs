@@ -10,7 +10,6 @@ use crate::resolve::Index;
 use crate::store::Store;
 use crate::util;
 
-use super::editors::{close_editors, Closing, MAX_COLUMNS};
 use super::render::{frame, Ctx};
 use super::{get_focus, Focus, Placed};
 
@@ -65,7 +64,6 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     let mut quit = false;
     let mut reload = false;
     // Panes a previous W could not get rid of. A second W closes them outright.
-    let mut stuck: Vec<String> = Vec::new();
     // Half of a key chain: `d` waiting for the column to put details in.
     let mut pending: Option<&'static str> = None;
     let Ok(mut tty) = std::fs::File::open("/dev/tty") else { return 1 };
@@ -138,7 +136,7 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
                         _ => "Decisions",
                     });
                     let s = pending.unwrap().to_lowercase();
-                    footer(&format!("{s} → which column? 1–{MAX_COLUMNS}"), Style::Accent);
+                    footer(&format!("{s} → which column? 1–{}", crate::model::PROSE.len()), Style::Accent);
                 }
                 // A digit with no section in front of it is the column count.
                 // Same keys, two meanings, disambiguated by what came before —
@@ -179,24 +177,6 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
                 }
                 Key::Char('g') | Key::Home => off = 0,
                 Key::Char('G') | Key::End => off = usize::MAX,
-                Key::Char('W') => {
-                    let outcome = close_editors(&stuck);
-                    let msg = match outcome {
-                        Closing::Done(m) => {
-                            stuck.clear();
-                            m
-                        }
-                        Closing::Stuck(panes) => {
-                            let names: Vec<&str> =
-                                panes.iter().map(|p| p.as_str()).collect();
-                            stuck = panes.clone();
-                            format!("{} would not close — W again to force", names.join(" "))
-                        }
-                    };
-                    footer(&msg, Style::Accent);
-                    // Force a repaint once they are gone.
-                    seen = None;
-                }
                 _ => {}
             }
         }

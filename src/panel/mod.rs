@@ -19,7 +19,6 @@
 
 pub(crate) use crate::base::labels::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
-mod install;
 mod keys;
 mod render;
 mod rows;
@@ -35,8 +34,6 @@ pub(crate) use keys::{apply_input, Effect, Input, View};
 /// `wsp panel` and its subcommands.
 pub fn verb(store: &crate::store::Store, args: &crate::Args) -> i32 {
     match args.rest.first().map(|s| s.as_str()) {
-        Some("install") => install(store, args),
-        Some("uninstall" | "remove") => uninstall(store, args),
         Some("storyboard") => crate::story::run(args),
         // `--full` is the panel `Z` opens in a tab: the same panel, at the
         // width of the workspace, and quit rather than kept.
@@ -205,10 +202,6 @@ pub(crate) use verbs::{follow, inspect, pop_out, run_wsp};
 // wording for a work order, however it was handed over — see
 // [`verbs::tell_claimed`].
 pub(crate) use verbs::{send_tell, tell_claimed, Tell};
-pub use install::{install, uninstall};
-// The record of which pane holds the panel is keyed on a workspace, so it is
-// swept where the other workspace-keyed records are — see `install::reap_panels`
-// for why that is `reconcile --reap` and not `sync`.
 pub use run::run;
 // The same panel, drawn by a host that owns the cells — herdr's forked sidebar
 // today. See `surface.rs` for why the frame is built here and not there.

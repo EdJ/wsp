@@ -24,12 +24,10 @@
 //! painted to a terminal, handed to the panel as a page, or dropped into the
 //! storyboard, and none of the three can drift apart on colour.
 //!
-//! Three parts, split where the work splits: [`render`] draws a task or a
-//! project, [`editors`] gets the pair of editors a pop-out opened to go, and
-//! [`run`] is the pane itself. What stays here is the seam between the panel
+//! Two parts, split where the work splits: [`render`] draws a task or a
+//! project, [`run`] is the pane itself. What stays here is the seam between the panel
 //! and the view — where one leaves a target and the other picks it up.
 
-mod editors;
 mod render;
 mod run;
 
