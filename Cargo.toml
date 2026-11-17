@@ -26,7 +26,6 @@ wsp-base = { path = "crates/base", features = ["test-support"] }
 wsp-store = { path = "crates/store", features = ["test-support"] }
 wsp-wire = { path = "crates/wire", features = ["test-support"] }
 wsp-trees = { path = "crates/trees", features = ["test-support"] }
-wsp-manager = { path = "crates/manager" }
 wsp-host-api = { path = "crates/host-api" }
 
 [profile.release]
