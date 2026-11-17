@@ -2409,8 +2409,17 @@ pub(crate) fn secs_of_seat(store: &Store, seat: &str, since: &str) -> Option<(i6
 }
 
 /// The stalled shell commands in the end of a seat's transcript (`wsp-397`),
-/// open ones counted to `now`. Claude Code's transcript only.
-pub(crate) fn stuck_of_seat(store: &Store, seat: &str, now: i64) -> Vec<crate::stuck::Stall> {
+/// open ones counted to `now`. Claude Code's transcript only. Under
+/// `WSP_HOST=manager` it is the manager's `seat.stuck` as folded
+/// ([`crate::fold::stall`]) instead, its start kept at the `recorded` one
+/// when the command is the same.
+pub(crate) fn stuck_of_seat(store: &Store, seat: &str, now: i64, recorded: Option<(&str, i64)>) -> Vec<crate::stuck::Stall> {
+    if crate::fold::under_manager() {
+        // The manager's `seat.stuck` as folded (wsp-028): no transcript read.
+        let Some(r) = crate::fold::stall(store, seat, now, recorded) else { return Vec::new() };
+        let kind = crate::stuck::classify(&r.command).unwrap_or(crate::stuck::Kind::TimedOut);
+        return vec![crate::stuck::Stall { kind, command: r.command, at: r.at, secs: r.secs, open: r.open }];
+    }
     let Some((kind, session, cwd)) = session_of_seat(store, seat) else { return Vec::new() };
     if kind != "claude" {
         return Vec::new();
