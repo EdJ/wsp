@@ -6,8 +6,8 @@
 //! - **the post** ([`report`]): the hook command (`wsp report <hook>`) dials
 //!   its host's manager on loopback, sends one [`POST`] line carrying the
 //!   manager token, the seat, its epoch, the hook's name and its payload, and
-//!   reads one answer line. When `WSP_HOST` is not `manager` ([`Dial::Inproc`],
-//!   the default until wsp-029), or the manager does not answer, it says so
+//!   reads one answer line. When `WSP_HOST` is `inproc` ([`Dial::Inproc`]; the
+//!   default is `manager` since wsp-029), or the manager does not answer, it says so
 //!   ([`Sent`]) and the caller appends to the seat's hook log as before;
 //! - **the fold** ([`Fold`]): the manager turns a post, and the transcript it
 //!   names, into the journal's events: `turn` began (with the order it was
@@ -44,7 +44,7 @@ use crate::tcp::Tcp;
 pub const PORT: u16 = 7487;
 /// The token's file under the manager's `<exec_dir>`.
 pub const TOKEN_FILE: &str = "manager.token";
-/// `inproc` (the default) or `manager`: whether the hook posts at all.
+/// `manager` (the default, wsp-029) or `inproc`: whether the hook posts at all.
 pub const HOST_ENV: &str = "WSP_HOST";
 /// The manager's address, `127.0.0.1:`[`PORT`] when unset.
 pub const ADDR_ENV: &str = "WSP_MANAGER_ADDR";
@@ -88,9 +88,9 @@ pub fn epoch_from_env() -> Epoch {
 /// Where a hook goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dial {
-    /// `WSP_HOST` unset or `inproc`: the seat's hook log, as at M0.
+    /// `WSP_HOST=inproc`: the seat's hook log, as at M0.
     Inproc,
-    /// `WSP_HOST=manager`: the manager at `addr`, greeted with the token in
+    /// `WSP_HOST` unset or `manager`: the manager at `addr`, greeted with the token in
     /// `token_file`.
     Manager { addr: SocketAddr, token_file: PathBuf },
 }
@@ -98,11 +98,16 @@ pub enum Dial {
 impl Dial {
     /// [`HOST_ENV`], [`ADDR_ENV`] and [`DIR_ENV`], read.
     pub fn from_env() -> Dial {
-        if std::env::var(HOST_ENV).ok().as_deref().map(str::trim) != Some("manager") {
+        Dial::of(std::env::var(HOST_ENV).ok().as_deref(), std::env::var(ADDR_ENV).ok().as_deref())
+    }
+
+    /// [`HOST_ENV`] and [`ADDR_ENV`] as given: only `inproc` keeps the hook
+    /// off the wire, so unset is the manager (wsp-029).
+    pub fn of(host: Option<&str>, addr: Option<&str>) -> Dial {
+        if host.map(str::trim) == Some("inproc") {
             return Dial::Inproc;
         }
-        let addr = std::env::var(ADDR_ENV)
-            .ok()
+        let addr = addr
             .and_then(|a| a.trim().parse().ok())
             .unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT));
         Dial::Manager { addr, token_file: manager_dir().join(TOKEN_FILE) }
@@ -458,6 +463,16 @@ fn clip(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unset_wsp_host_posts_to_the_manager() {
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT);
+        assert!(matches!(Dial::of(None, None), Dial::Manager { addr, .. } if addr == loopback));
+        assert!(matches!(Dial::of(Some(""), None), Dial::Manager { .. }));
+        assert!(matches!(Dial::of(Some("manager"), Some("127.0.0.1:9")), Dial::Manager { addr, .. } if addr.port() == 9));
+        assert_eq!(Dial::of(Some("inproc"), None), Dial::Inproc);
+        assert_eq!(Dial::of(Some(" inproc\n"), None), Dial::Inproc);
+    }
 
     #[test]
     fn a_post_crosses_as_one_line_and_a_frame_is_not_one() {

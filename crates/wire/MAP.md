@@ -10,7 +10,7 @@ and `serde_json`. The root re-exports each module at its old path (`crate::place
 - `host` — the `Host` trait, `LOCAL`, and the adapter: `host::InProcess` wraps `wsp-host`'s, each method calling
   the one of the same name; everything else of `wsp_host::inproc` is re-exported here (wsp-020)
 - `host_tcp` — `host::Tcp`, the second `Host`: each moved method as its 3.2 message to the manager the local
-  record names, the rest in-process; `WSP_HOST=inproc|manager` (`Choice`, `chosen`; default `inproc`); "host
+  record names, the rest in-process; `WSP_HOST=inproc|manager` (`Choice`, `chosen`; default `manager` since wsp-029); "host
   silent" when no `hello` comes back within 1 s; `Subscription`, `subscribe {from}` with the last id kept per
   host in `<state>/manager/<host>.last` (wsp-025). `tests/host.rs` holds both implementations to one contract
 - `launchd` — the daemon's agent and the manager's (`<label>.manager`, wsp-024)

@@ -33,6 +33,14 @@
 //!   for it. A seat the journal has running whose session is gone is reported
 //!   `seat.stopped`. An order still in `<exec_dir>/orders/` is asked again under
 //!   the same id, unless the journal already holds its answer.
+//! - **Adoption from the in-process host** (wsp-029, 6.2). A labelled session in
+//!   one of `Config::inproc_runs` that answers `vitals` and that the journal
+//!   does not have is a seat started in-process before the switch: it is
+//!   adopted at start under the next epoch, its compound-sup's pid read from
+//!   one `ps`, and its `seat.started` journalled, so it is told and stopped
+//!   as a seat this manager started. The reverse needs nothing here: a seat
+//!   this manager started is a compound-sup session the in-process host
+//!   reaches by its socket and stops by its group.
 //! - **`seats`** answers from the table, `compound-sup vitals` per seat and one
 //!   `ps` for every seat's rss and shells; it renders no screen. `seat.read` is
 //!   the one render, for a person's peek.
@@ -55,7 +63,7 @@ use wsp_host::inproc::{self, Spawn, Stop};
 use wsp_host::{Delivery, InProcess, Refusal as HostRefusal, Seat as HostSeat};
 use wsp_host_api::{
     At, Epoch, Frame, Gate, Key, Message, OrderAcked, OrderCancel, OrderDeliver, OrderDelivered, OrderFail,
-    OrderId, OrderRefused, Refusal, Refused, ReqId, SeatEpoch, SeatId, SeatRead, SeatRefused, SeatRow,
+    OrderId, OrderRefused, Refusal, Refused, ReqId, RowId, SeatEpoch, SeatId, SeatRead, SeatRefused, SeatRow,
     SeatScreen, SeatSpawn, SeatStarted, SeatState, SeatStop, SeatStopped, SeatsList, TurnEdge, Workdir,
 };
 
@@ -817,22 +825,41 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
         }
     }
 
-    // The sessions, by their labels.
+    // The sessions, by their labels: its own run directory's, and the
+    // in-process host's, where a seat started before the switch stands.
     let sup = sup_path(shared);
     let mut sessions: BTreeMap<SeatId, PathBuf> = BTreeMap::new();
-    for entry in fs::read_dir(shared.run_dir()).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
-            continue;
-        }
-        let Ok(label) = fs::read_to_string(path.with_extension("label")) else { continue };
-        let seat = SeatId(label.trim().to_string());
-        if !live.contains_key(&seat) {
-            shared.log.line(&format!("{}: labelled {}, which the journal has not running here; left alone", path.display(), seat.0));
-            continue;
-        }
-        if sup.as_deref().and_then(|s| vitals(s, &path)).is_some() {
-            sessions.insert(seat, path);
+    let mut strays: BTreeMap<SeatId, PathBuf> = BTreeMap::new();
+    let mut twice: std::collections::BTreeSet<SeatId> = std::collections::BTreeSet::new();
+    let own = shared.run_dir();
+    for dir in std::iter::once(&own).chain(&shared.cfg.inproc_runs) {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+                continue;
+            }
+            let Ok(label) = fs::read_to_string(path.with_extension("label")) else { continue };
+            let seat = SeatId(label.trim().to_string());
+            if seat.0.is_empty() || sessions.contains_key(&seat) || twice.contains(&seat) {
+                continue;
+            }
+            if !live.contains_key(&seat) && *dir == own {
+                shared.log.line(&format!("{}: labelled {}, which the journal has not running here; left alone", path.display(), seat.0));
+                continue;
+            }
+            if sup.as_deref().and_then(|s| vitals(s, &path)).is_none() {
+                continue;
+            }
+            if live.contains_key(&seat) {
+                sessions.insert(seat, path);
+            } else if let Some(first) = strays.remove(&seat) {
+                // Two sessions under one label (a bare shell not yet replaced):
+                // which is the seat is not this scan's to guess.
+                shared.log.line(&format!("seat {}: {} and {} both answer; left alone", seat.0, first.display(), path.display()));
+                twice.insert(seat);
+            } else {
+                strays.insert(seat, path);
+            }
         }
     }
     let mut gone = Vec::new();
@@ -841,25 +868,44 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
             Some(socket) => {
                 let render = started.sockets.get(1).map(PathBuf::from);
                 shared.log.line(&format!("seat {} adopted (epoch {}, pid {}, {})", seat.0, started.epoch.0, started.pid, socket.display()));
-                t.seats.insert(
-                    seat.clone(),
-                    Running {
-                        key: started.key.clone(),
-                        epoch: started.epoch,
-                        pid: started.pid,
-                        socket,
-                        render,
-                        spec: adopted_spec(&started),
-                        started,
-                        stopping: None,
-                        exit: None,
-                        turn: None,
-                        last_turn: None,
-                        last_word: None,
-                    },
-                );
+                t.seats.insert(seat.clone(), running(started, socket, render));
             }
             None => gone.push(started),
+        }
+    }
+    // Started by the in-process host, so not in the journal: adopted under a
+    // new epoch, and its `seat.started` journalled, so the next restart joins
+    // it by label as it does its own.
+    let mut found = Vec::new();
+    if !strays.is_empty() {
+        let ps = host(shared).table("pid=,command=", false).unwrap_or_default();
+        let name = sup.as_deref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        for (seat, socket) in strays {
+            let pid = match sup_of(&ps, &name, &seat)[..] {
+                [pid] => pid,
+                [] => {
+                    shared.log.line(&format!("{}: seat {} answers, and no compound-sup of it is running; left alone", socket.display(), seat.0));
+                    continue;
+                }
+                ref pids => {
+                    shared.log.line(&format!("{}: seat {} has compound-sups {pids:?}; left alone", socket.display(), seat.0));
+                    continue;
+                }
+            };
+            let epoch = Epoch(t.epochs.get(&seat).map_or(1, |e| e.0 + 1));
+            let render = socket.with_extension("rsock");
+            let started = SeatStarted {
+                key: Key { row: RowId(seat.0.clone()), attempt: 0 },
+                seat: seat.clone(),
+                epoch,
+                pid,
+                sockets: vec![socket.display().to_string(), render.display().to_string()],
+            };
+            shared.log.line(&format!("seat {} adopted from the in-process host (epoch {}, pid {pid}, {})", seat.0, epoch.0, socket.display()));
+            t.epochs.insert(seat.clone(), epoch);
+            t.keys.insert(started.key.clone(), KeyState::Running(seat.clone()));
+            t.seats.insert(seat, running(started.clone(), socket, Some(render)));
+            found.push(started);
         }
     }
     // Asked and not answered before the restart.
@@ -886,32 +932,60 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
     for started in gone {
         // Put back so `ended` finds it: it ended while the manager was down.
         let mut t = table(shared);
-        t.seats.insert(
-            started.seat.clone(),
-            Running {
-                key: started.key.clone(),
-                epoch: started.epoch,
-                pid: started.pid,
-                socket: started.sockets.first().map(PathBuf::from).unwrap_or_default(),
-                render: None,
-                spec: adopted_spec(&started),
-                started: started.clone(),
-                stopping: None,
-                exit: None,
-                turn: None,
-                last_turn: None,
-                last_word: None,
-            },
-        );
+        let socket = started.sockets.first().map(PathBuf::from).unwrap_or_default();
+        t.seats.insert(started.seat.clone(), running(started.clone(), socket, None));
         drop(t);
         shared.log.line(&format!("seat {} (epoch {}) ended while the manager was down", started.seat.0, started.epoch.0));
         ended(shared, &started.seat, started.epoch, vec![], vec![]);
+    }
+    for started in found {
+        emit(shared, Message::SeatStarted(started), &[]);
     }
     for o in again {
         shared.log.line(&format!("order {} to {}: asked again under the same id", o.order.0, o.seat.0));
         let shared = shared.clone();
         std::thread::spawn(move || ask(&shared, o));
     }
+}
+
+/// A seat found running at start, as the table holds it.
+fn running(started: SeatStarted, socket: PathBuf, render: Option<PathBuf>) -> Running {
+    Running {
+        key: started.key.clone(),
+        epoch: started.epoch,
+        pid: started.pid,
+        socket,
+        render,
+        spec: adopted_spec(&started),
+        started,
+        stopping: None,
+        exit: None,
+        turn: None,
+        last_turn: None,
+        last_word: None,
+    }
+}
+
+/// The compound-sups that run `seat`, from a `pid=,command=` table: the
+/// processes whose command is `<sup> spawn … --label <seat>`. compound-sup
+/// daemonizes once and never forks again, so its pid leads the session's
+/// group for its whole life; the in-process host stops it by that group. One
+/// is the seat's; more is a seat this scan cannot tell apart.
+fn sup_of(ps: &str, sup: &str, seat: &SeatId) -> Vec<u32> {
+    ps.lines().filter_map(|line| {
+        let mut words = line.split_whitespace();
+        let pid = words.next()?.parse().ok()?;
+        // Its own flags only: the agent's argv after `--` names no seat.
+        let words: Vec<&str> = words.take_while(|w| *w != "--").collect();
+        let is_sup = words.iter().take_while(|w| **w != "spawn").any(|w| {
+            let base = w.rsplit('/').next().unwrap_or(w);
+            base == "compound-sup" || (!sup.is_empty() && base == sup)
+        });
+        let spawns = words.contains(&"spawn");
+        let labelled = words.windows(2).any(|w| w[0] == "--label" && w[1] == seat.0);
+        (is_sup && spawns && labelled).then_some(pid)
+    })
+    .collect()
 }
 
 /// An adopted seat's spawn arguments are not in the journal; a retry of its
@@ -950,5 +1024,21 @@ mod tests {
         let rows = rows(ps);
         assert_eq!(measure(&rows, 10), ((1000 + 2000 + 100 + 50) * 1024, 2));
         assert_eq!(measure(&rows, 99), (0, 0));
+    }
+
+    #[test]
+    fn an_in_process_seat_is_found_by_its_supervisors_label() {
+        let ps = "  10 /usr/local/bin/compound-sup spawn --label cpd-1 --agent claude -- claude\n  \
+                  11 claude --label cpd-2\n  \
+                  12 /bin/sh /tmp/wm-x.sup spawn --label cpd-2 --cwd / -- sleep 1\n  \
+                  13 /usr/local/bin/compound-sup spawn --label cpd-10 -- claude\n  \
+                  14 /usr/local/bin/compound-sup spawn --cwd / -- claude --label cpd-4\n";
+        assert_eq!(sup_of(ps, "", &SeatId("cpd-1".into())), vec![10]);
+        assert_eq!(sup_of(ps, "wm-x.sup", &SeatId("cpd-2".into())), vec![12]);
+        assert_eq!(sup_of(ps, "", &SeatId("cpd-2".into())), Vec::<u32>::new());
+        assert_eq!(sup_of(ps, "", &SeatId("cpd-3".into())), Vec::<u32>::new());
+        let twice = format!("{ps}  15 /usr/local/bin/compound-sup spawn --label cpd-1 -- sh\n");
+        assert_eq!(sup_of(&twice, "", &SeatId("cpd-1".into())), vec![10, 15], "both, for the caller to refuse");
+        assert_eq!(sup_of(ps, "", &SeatId("cpd-4".into())), Vec::<u32>::new(), "a label in the agent's argv is not the session's");
     }
 }
