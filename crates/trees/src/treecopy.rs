@@ -1164,11 +1164,13 @@ mod tests {
 
     /// The stand-in: drops ssh's options and the host, joins what is left and
     /// hands it to a shell — which is all the real one does with a command.
+    /// The far side is another machine: it gets no git config of this one's
+    /// (a global `commit.gpgsign` here would make its commits ask for a key).
     fn stand_in(dir: &Path) -> String {
         let p = dir.join("fake-ssh");
         fs::write(
             &p,
-            "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nexec sh -c \"$*\"\n",
+            "#!/bin/sh\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nexec sh -c \"$*\"\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -1195,7 +1197,7 @@ mod tests {
         let far_root = root.0.join("far");
         fs::create_dir_all(&seat).unwrap();
         fs::create_dir_all(&far_root).unwrap();
-        run(&seat, "git init -q -b master . && git config user.name Seat && git config user.email s@x");
+        run(&seat, "git init -q -b master . && git config user.name Seat && git config user.email s@x && git config commit.gpgsign false");
         run(&seat, "mkdir -p src sub/deep target/debug node_modules/x .venv logs && echo one > src/a.rs && echo two > src/b.rs && echo deep > sub/deep/c.txt && printf '#!/bin/sh\\n' > run.sh && chmod +x run.sh && ln -s src/a.rs link && echo junk > target/debug/out && echo n > node_modules/x/i.js && echo v > .venv/v && echo l > build.log && echo 'target/' > .gitignore");
         run(&seat, "git add -A && git commit -q -m base && git branch trunk-ahead && echo more > src/more.rs && git add -A && git commit -q -m ahead && git branch trunk && git reset -q --hard HEAD~1");
         let state = root.0.join("state");
@@ -1457,7 +1459,7 @@ mod tests {
             let r = rig(if tar { "am-tar" } else { "am-rsync" }, tar);
             r.copy.copy_up("trunk").unwrap();
             let far = r.far();
-            run(&far, "git config user.name Agent && git config user.email a@far && echo c1 > src/a.rs && git commit -qam 'first change' && echo c2 > src/new.rs && git add -A && git commit -qm 'second change' && echo uncommitted > src/b.rs");
+            run(&far, "git config user.name Agent && git config user.email a@far && git config commit.gpgsign false && echo c1 > src/a.rs && git commit -qam 'first change' && echo c2 > src/new.rs && git add -A && git commit -qm 'second change' && echo uncommitted > src/b.rs");
             // A checkpoint ran first and dirtied the seat's tree with the same files.
             let cp = r.copy.copy_back().unwrap();
             assert_eq!(cp.copied.len(), 3);
@@ -1487,7 +1489,7 @@ mod tests {
     fn a_failed_am_leaves_the_files_to_come_back() {
         let r = rig("am-fail", false);
         r.copy.copy_up("trunk").unwrap();
-        run(&r.far(), "git config user.name A && git config user.email a@f && echo agent-a > src/a.rs && git commit -qam c && echo agent-b > src/b.rs");
+        run(&r.far(), "git config user.name A && git config user.email a@f && git config commit.gpgsign false && echo agent-a > src/a.rs && git commit -qam c && echo agent-b > src/b.rs");
         r.copy.copy_back().unwrap();
         // The seat's HEAD moves under the checkpoint: a.rs is committed as the
         // checkpoint left it, so the agent's patch no longer applies.
@@ -1516,7 +1518,7 @@ mod tests {
     fn carrying_commits_refuses_to_touch_a_path_the_seat_changed() {
         let r = rig("am-stale", false);
         r.copy.copy_up("trunk").unwrap();
-        run(&r.far(), "git config user.name A && git config user.email a@f && echo agent > src/a.rs && git commit -qam c");
+        run(&r.far(), "git config user.name A && git config user.email a@f && git config commit.gpgsign false && echo agent > src/a.rs && git commit -qam c");
         run(&r.seat, "echo person > src/a.rs");
         let e = r.copy.carry_commits().unwrap_err();
         assert!(e.contains("src/a.rs"), "{e}");
@@ -1582,7 +1584,7 @@ mod tests {
         let r = rig("review-commit", false);
         r.copy.copy_up("trunk").unwrap();
         let head = run(&r.seat, "git rev-parse HEAD");
-        run(&r.far(), "git config user.name Agent && git config user.email a@far && echo c1 > src/a.rs && echo made > src/new.rs && git add -A && git commit -qm 'the far change'");
+        run(&r.far(), "git config user.name Agent && git config user.email a@far && git config commit.gpgsign false && echo c1 > src/a.rs && echo made > src/new.rs && git add -A && git commit -qm 'the far change'");
         assert!(!r.seat.join("src/new.rs").exists());
         sync_before(&r.copy).unwrap();
         assert_eq!(fs::read_to_string(r.seat.join("src/a.rs")).unwrap(), "c1\n");
