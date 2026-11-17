@@ -6690,10 +6690,20 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         }
         let missing = store.git_identity_missing();
         if !missing.is_empty() {
-            problems.push(format!(
-                "store git sets no repo-local {} — commits can fail on a machine with no global identity; `wsp init` fills them (repo-local only)",
-                missing.join(", ")
-            ));
+            if args.has("fix") {
+                let filled = store.git_ensure_identity();
+                notes.push(format!("store git: set repo-local {} (nothing else changed)", filled.join(", ")));
+            } else if store.git_can_commit() {
+                notes.push(format!(
+                    "store git sets no repo-local {} (commits work through the global identity); `wsp doctor --fix` sets only those",
+                    missing.join(", ")
+                ));
+            } else {
+                problems.push(format!(
+                    "store git has no identity to commit as and sets no repo-local {} — every store write fails to commit; `wsp doctor --fix` sets only those (repo-local, never the global config)",
+                    missing.join(", ")
+                ));
+            }
         }
     }
 
@@ -7501,7 +7511,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
                 order: 150,
-                text: r##"  wsp doctor                        integrity check"##,
+                text: r##"  wsp doctor [--fix]                integrity check; --fix sets the store git's
+                                    missing repo-local identity, nothing else"##,
             },
         ],
     },

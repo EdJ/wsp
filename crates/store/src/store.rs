@@ -3569,7 +3569,7 @@ use wsp_base::calls::Command;
         );
         if identity_refused(&said) {
             eprintln!(
-                "wsp: git has no identity to commit as in this store; `wsp init` gives it its own ({GIT_NAME} <{GIT_EMAIL}>, repo-local only), then the change commits with the next write"
+                "wsp: git has no identity to commit as in this store; `wsp doctor --fix` gives it its own ({GIT_NAME} <{GIT_EMAIL}>, repo-local only, nothing else changed) and `git -C {} commit -a` then commits what is on disk", util::contract(&self.root)
             );
         }
     }
@@ -3586,6 +3586,10 @@ use wsp_base::calls::Command;
         let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(&self.root)
+            // A wsp run from a hook or a git alias inherits the repo it was
+            // called from; the store is the one this means.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             // The commit procedure has agents working through a private index.
             // A wsp command run from inside one would otherwise stage into it
             // and be committed later, by hand, as part of somebody's patch.
@@ -3614,6 +3618,12 @@ use wsp_base::calls::Command;
             })
             .map(|(key, _)| *key)
             .collect()
+    }
+
+    /// Whether git, run in the store, has an identity to commit as — its own,
+    /// the user's global one, or the environment's.
+    pub fn git_can_commit(&self) -> bool {
+        self.git(&[OsStr::new("var"), OsStr::new("GIT_COMMITTER_IDENT")]).is_some()
     }
 
     /// Give the store its own committer identity and unsigned commits, for the

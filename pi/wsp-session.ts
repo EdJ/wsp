@@ -152,11 +152,26 @@ export default function (pi) {
     }
   });
 
-  // The prompt is only on this event; the ack goes before the turn is said to
-  // have begun, as Claude's hook orders them.
+  // What the person (or `compound-sup deliver`) typed, before pi expands it
+  // (templates, @files): that is the text a delivery waits to see submitted.
+  // `before_agent_start`'s `prompt` is the expanded text and is the fallback
+  // for a run that did not come through the editor (RPC, sendUserMessage).
+  let typed: string | undefined;
+  pi.on("input", (event) => {
+    if (typeof event?.text === "string") {
+      typed = event.text;
+    }
+  });
+
+  // The ack goes before the turn is said to have begun, as Claude's hook
+  // orders them.
   pi.on("before_agent_start", (event) => {
-    if (event?.messageType === "user" && typeof event?.prompt === "string") {
-      submitted(event.prompt);
+    if (event?.messageType === "user") {
+      const text = typed ?? event?.prompt;
+      typed = undefined;
+      if (typeof text === "string") {
+        submitted(text);
+      }
     }
   });
 
@@ -179,6 +194,21 @@ export default function (pi) {
     tool("PreToolUse", ctx);
   });
   pi.on("tool_execution_end", (_event, ctx) => {
+    tool("PostToolUse", ctx);
+  });
+  // One tool that runs for ten minutes, or a model that streams for five,
+  // says nothing between its start and its end but these. Same throttle, same
+  // meaning: still here, still working.
+  pi.on("tool_execution_update", (_event, ctx) => {
+    tool("PreToolUse", ctx);
+  });
+  pi.on("message_update", (_event, ctx) => {
+    tool("PreToolUse", ctx);
+  });
+  pi.on("turn_start", (_event, ctx) => {
+    tool("PreToolUse", ctx);
+  });
+  pi.on("turn_end", (_event, ctx) => {
     tool("PostToolUse", ctx);
   });
 
