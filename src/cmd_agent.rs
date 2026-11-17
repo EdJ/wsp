@@ -6424,6 +6424,12 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
+    crate::mirror::api_health(
+        &store.state,
+        crate::daemon::running(&store.state).as_deref(),
+        &mut problems,
+        &mut notes,
+    );
     // And whether far machines have gone silent: their seats are held, not
     // gone, and say so in the daemon's own manner (`wsp-145`).
     notes.extend(crate::far::Silence::read(store).line);

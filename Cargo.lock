@@ -239,7 +239,9 @@ name = "wsp"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "wsp-api",
  "wsp-base",
+ "wsp-client",
  "wsp-host",
  "wsp-host-api",
  "wsp-manager",

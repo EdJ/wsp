@@ -326,6 +326,54 @@ pub(crate) fn loud(running: Option<&[u32]>, backend_up: bool) -> Option<String> 
     }
 }
 
+/// The tailnet addresses `tailscale ip` names. The manager's parse
+/// (`wsp_manager::tailnet_addrs`), copied: the root links neither the manager
+/// nor the host crate outside tests.
+fn tailnet_addrs() -> Vec<std::net::IpAddr> {
+    let out = std::process::Command::new("tailscale").arg("ip").output().ok().filter(|o| o.status.success());
+    let Some(out) = out else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<std::net::IpAddr>().ok())
+        .filter(|ip| wsp_server::allowed(ip) && !ip.is_loopback())
+        .collect()
+}
+
+/// What `start_api` started; ended with the daemon.
+pub(crate) struct Api {
+    _server: Option<wsp_server::Server>,
+    _mirror: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+}
+
+/// Open `state.db`, serve it, and start the mirror thread. Each failure is one
+/// `cycle.log` line and the rest goes on.
+pub(crate) fn start_api(store: &Store) -> Option<Api> {
+    if crate::mirror::api_off() {
+        return None;
+    }
+    let say = |line: String| wsp_store::store::log_line(store, &line);
+    let db: wsp_server::SharedStore =
+        match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), std::sync::Arc::new(wsp_server::Mirror)) {
+            Ok(db) => std::sync::Arc::new(db),
+            Err(e) => {
+                say(format!("api: state.db did not open ({e:?}); the daemon runs without the API"));
+                return None;
+            }
+        };
+    let mut cfg = wsp_server::Config::new(&store.state);
+    cfg.port = crate::mirror::api_port();
+    cfg.addrs = tailnet_addrs();
+    let server = match wsp_server::Server::start(db.clone(), cfg) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            say(format!("api: the server did not start ({e}); the mirror runs on"));
+            None
+        }
+    };
+    let mirror = Some(crate::mirror::start(store, db));
+    Some(Api { _server: server, _mirror: mirror })
+}
+
 /// What `doctor` says about the daemon: that there is one, that there are two,
 /// or that there is none.
 ///
@@ -508,6 +556,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // not paced by the tick (`docs/agent-manager.md` 3.4; wsp-028): each is
     // folded into the store's files as it comes. Under `inproc`, nothing.
     let _fold = crate::fold::start(store);
+
+    // The state core's database, its API and the mirror of the files into it
+    // (wsp-075). Beside everything else the daemon does; `WSP_API=off` starts
+    // none of it, and nothing here ends the run.
+    let _api = start_api(store);
 
     // Every executor's ssh master, held open on this machine. Inert until
     // somebody runs `wsp machine add`; see `crate::tunnel`.

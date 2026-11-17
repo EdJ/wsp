@@ -21,6 +21,8 @@ wsp-host-api = { path = "crates/host-api" }
 wsp-store-contract = { path = "crates/store-contract" }
 wsp-server = { path = "crates/server" }
 wsp-store-sqlite = { path = "crates/store-sqlite" }
+wsp-api = { path = "crates/api" }
+wsp-client = { path = "crates/client" }
 
 [dev-dependencies]
 wsp-manager = { path = "crates/manager" }

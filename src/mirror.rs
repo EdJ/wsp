@@ -22,6 +22,11 @@
 //! and [`diff`] never names one in `gone`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use wsp_server::SharedStore;
+use wsp_store_contract::IdempotencyKey;
 
 use wsp_server::mirror::subject_of;
 use wsp_store::caption;
@@ -429,6 +434,143 @@ fn diff_where(before: &BTreeMap<Subject, Entity>, now: Vec<Entity>, owns: impl F
     }
     let gone = before.keys().filter(|s| owns(s) && !seen.contains(*s)).cloned().collect();
     Command::Mirror { put, gone }
+}
+
+/// `WSP_API=off`: no database, no server, no mirror.
+pub(crate) fn api_off() -> bool {
+    std::env::var("WSP_API").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
+}
+
+/// The port the API listens on: `WSP_API_PORT` (tests and a machine whose 7488
+/// is taken), else [`wsp_server::DEFAULT_PORT`].
+pub(crate) fn api_port() -> u16 {
+    std::env::var("WSP_API_PORT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(wsp_server::DEFAULT_PORT)
+}
+
+/// What `doctor` says of the API: nothing under `WSP_API=off`; a note when
+/// there is no `api.json` and no daemon; a problem when `api.json` names an
+/// address that does not answer; else the head id.
+pub(crate) fn api_health(state: &std::path::Path, running: Option<&[u32]>, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    if api_off() {
+        return;
+    }
+    if !state.join(wsp_api::LISTEN_FILE).exists() {
+        if running.is_some_and(|r| r.is_empty()) {
+            notes.push("no API: no api.json and no daemon running".into());
+        } else {
+            problems.push("the daemon runs but wrote no api.json (the API did not start; see cycle.log)".into());
+        }
+        return;
+    }
+    match wsp_client::Client::dial(state, wsp_store_contract::Principal::Wsp("doctor".into()), std::time::Duration::from_secs(2)) {
+        Ok(c) => notes.push(format!("API answers (head event {})", c.head().0)),
+        Err(why) => problems.push(format!("api.json names an address that does not answer: {why}")),
+    }
+}
+
+/// The machine name `read_rows_etc` marks `Transport::Local`.
+pub const LOCAL: &str = "local";
+
+/// What moves a half: the stamp, plus (for the rows half) the mtimes of the two
+/// state files neither stamp covers, `claims.json` and `machines.json`.
+fn stamp_of(store: &Store, half: Half) -> (u64, [Option<std::time::SystemTime>; 2]) {
+    match half {
+        Half::Attention => (store.attention_stamp(), [None, None]),
+        Half::RowsEtc => {
+            let m = |n: &str| std::fs::metadata(store.state_file(n)).ok().and_then(|m| m.modified().ok());
+            (store.fingerprint(), [m("claims.json"), m("machines.json")])
+        }
+    }
+}
+
+fn read_half(store: &Store, half: Half) -> Vec<Entity> {
+    match half {
+        Half::RowsEtc => read_rows_etc(store, LOCAL),
+        Half::Attention => read_attention(store),
+    }
+}
+
+/// What `state` already holds of `half`, keyed by subject.
+fn held(state: &c::State, half: Half) -> BTreeMap<Subject, Entity> {
+    let mut all: Vec<Entity> = Vec::new();
+    match half {
+        Half::RowsEtc => {
+            all.extend(state.rows.values().cloned().map(Entity::Row));
+            all.extend(state.lists.values().cloned().map(Entity::List));
+            all.extend(state.claims.values().cloned().map(Entity::Claim));
+            all.extend(state.machines.values().cloned().map(Entity::Machine));
+        }
+        Half::Attention => all.extend(state.asks.values().cloned().map(Entity::Ask)),
+    }
+    all.into_iter().map(|e| (subject_of(&e), e)).collect()
+}
+
+/// Start the mirror thread: once a second it reads the two stamps, and when
+/// one moves (and at start) re-reads that half, diffs against what it last
+/// applied for it, and applies one `Command::Mirror` if that is not empty. The
+/// first pass diffs against `db.snapshot()`, so a restart re-puts nothing
+/// unchanged. A refusal or backend error is one line in `cycle.log`.
+pub fn start(store: &Store, db: SharedStore) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
+    let (root, state) = (store.root.clone(), store.state.clone());
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let handle = std::thread::Builder::new()
+        .name("mirror".into())
+        .spawn(move || {
+            let store = Store::at(root, state);
+            let say = |line: String| wsp_store::store::log_line(&store, &format!("mirror: {line}"));
+            let mut seq = 0u64;
+            let mut stamps: [Option<(u64, [Option<std::time::SystemTime>; 2])>; 2] = [None, None];
+            let mut last: [Option<BTreeMap<Subject, Entity>>; 2] = [None, None];
+            while !flag.load(Ordering::SeqCst) {
+                for (i, half) in [Half::RowsEtc, Half::Attention].into_iter().enumerate() {
+                    let now_stamp = stamp_of(&store, half);
+                    if stamps[i] == Some(now_stamp) {
+                        continue;
+                    }
+                    let before = match last[i].take() {
+                        Some(b) => b,
+                        None => match db.snapshot() {
+                            Ok((s, _)) => held(&s, half),
+                            Err(e) => {
+                                say(format!("cannot read the database: {e:?}"));
+                                last[i] = None;
+                                continue;
+                            }
+                        },
+                    };
+                    let now = read_half(&store, half);
+                    let cmd = diff_half(&before, now.clone(), half);
+                    let empty = matches!(&cmd, Command::Mirror { put, gone } if put.is_empty() && gone.is_empty());
+                    if !empty {
+                        seq += 1;
+                        let key = IdempotencyKey(format!(
+                            "mirror:{}:{}:{seq}",
+                            std::process::id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0)
+                        ));
+                        if let Err(e) = db.apply(cmd, key, Principal::Wsp("mirror".into())) {
+                            say(format!("{half:?}: not applied: {e:?}"));
+                            last[i] = Some(before);
+                            continue;
+                        }
+                    }
+                    last[i] = Some(now.iter().map(|e| (subject_of(e), e.clone())).collect());
+                    stamps[i] = Some(now_stamp);
+                }
+                for _ in 0..10 {
+                    if flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        })
+        .expect("the mirror thread starts");
+    (handle, stop)
 }
 
 #[cfg(test)]
