@@ -3670,13 +3670,30 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
 /// the ending of a pane that is still the seated custodian, and that must only
 /// ever exist while a confirmed successor stands ready to inherit.
 pub fn rotate(store: &Store, args: &Args) -> i32 {
-    // The successor OPENS a seat, which is a spawn — so it opens wherever a
-    // spawn would, through the same one-copy choice (`compound-091`). It used
-    // to name backend here, which meant `--compound` was honoured by every verb
-    // that starts an agent except the one that replaces a custodian.
-    rotate_on(backend(args).as_ref(), store, args, &Patience::default(), &|scope| {
-        arrange_ending(store, scope, args)
-    })
+    rotate_ending(store, args, &|scope| arrange_ending(store, scope, args))
+}
+
+/// [`rotate`] with its step 4 stated, so a test runs the verb's own choice of
+/// host and records the ending rather than starting the helper that would end
+/// the test runner's seat.
+///
+/// The successor OPENS a seat, which is a spawn — so it opens wherever a spawn
+/// would, through the same one-copy choice (`compound-091`). **Through
+/// [`spawn_backend`], as [`reseat`] is** (`wsp-041`, after `wsp-036`): under
+/// `WSP_HOST=manager` the successor is the manager's `seat.spawn`, journalled
+/// and in `wip`'s census. [`backend`] is the in-process host whatever
+/// `WSP_HOST` says. A manager that does not answer is the rotation refused
+/// before anything is recorded, and the caller still seated.
+fn rotate_ending(store: &Store, args: &Args, end: &dyn Fn(&str) -> Result<(), String>) -> i32 {
+    let place = match spawn_backend(args) {
+        Ok(place) => place,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            eprintln!("wsp: nothing moved - the seat is still yours");
+            return 1;
+        }
+    };
+    rotate_on(place.as_ref(), store, args, &Patience::default(), end)
 }
 
 /// [`rotate`] against a stated backend and clock, which is the shape every test
@@ -3711,6 +3728,11 @@ fn rotate_on(
 /// seat is somebody else, possibly mid-turn on something it was told, so the
 /// helper waits for it to stop turning — [`END_WHEN_IDLE`].
 pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
+    rotate_on_behalf_ending(store, scope, &|scope| arrange_ending_when_idle(store, scope))
+}
+
+/// [`rotate_on_behalf`] with its ending stated, for [`rotate_ending`]'s reason.
+fn rotate_on_behalf_ending(store: &Store, scope: &str, end: &dyn Fn(&str) -> Result<(), String>) -> i32 {
     let governors = store.governors();
     let Some(seat) = crate::governors::seat_of_scope(scope, &governors) else {
         println!("wsp: nobody holds the {scope} seat - nothing to rotate");
@@ -3748,9 +3770,17 @@ pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
             ("effort", effort.as_deref().unwrap_or_default()),
         ],
     );
-    rotate_as(backend(&args).as_ref(), store, &args, &Patience::default(), &|scope| {
-        arrange_ending_when_idle(store, scope)
-    }, Hand::Predecessor(me))
+    // Through [`spawn_backend`], for [`rotate_ending`]'s reason (`wsp-041`):
+    // the run's rotation is a spawn under `WSP_HOST` like any other.
+    let place = match spawn_backend(&args) {
+        Ok(place) => place,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            eprintln!("wsp: nothing moved - {me} still holds the {scope} seat");
+            return 1;
+        }
+    };
+    rotate_as(place.as_ref(), store, &args, &Patience::default(), end, Hand::Predecessor(me))
 }
 
 /// Set on the `--ending` helper [`rotate_on_behalf`] starts: wait until the
@@ -10669,5 +10699,131 @@ mod tests {
             assert_eq!(order.contains("split it if larger"), told, "{who}: {order}");
             assert!(!order.contains('\n') && order.is_ascii(), "{who}: one ASCII line");
         }
+    }
+
+    // ---- wsp-041: under the manager, a rotation is the manager's seat -------
+
+    /// **`wsp-041`: both rotations open the successor through the Host `wsp
+    /// spawn` does.** `wsp-036` moved a governor reseat onto [`spawn_backend`];
+    /// `rotate` and the run's rotation still named [`backend`], so under
+    /// `WSP_HOST=manager` a rotated governor's successor started on the
+    /// in-process host, out of the manager's journal and out of `wip`. Here a
+    /// governor is seated through a loopback manager (`wsp spawn --govern`),
+    /// the run's rotation replaces it, and then the verb, run from that
+    /// successor's own seat, replaces the successor: each successor is the
+    /// manager's `seat.spawn`, run by it, and read by `wip`'s census. Modelled
+    /// on repair's
+    /// `a_governor_reseat_under_the_manager_is_its_seat_spawn_and_reads_in_wips_census`,
+    /// whose fake compound-sup it runs.
+    #[test]
+    fn a_rotated_governors_successor_under_the_manager_is_its_seat_spawn_and_reads_in_wips_census() {
+        use crate::repair::tests::{Inproc, FAKE_SUP};
+        let env = util::isolated("rotate-mgr");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_SEAT_ID");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let _inproc = Inproc;
+        rooted(&store, "p");
+
+        let exec = env.path("x");
+        std::fs::create_dir_all(&exec).unwrap();
+        let sup = env.path("sup");
+        std::fs::write(&sup, FAKE_SUP.replace("__OWNER__", &std::process::id().to_string())).unwrap();
+        std::fs::set_permissions(&sup, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut cfg = wsp_manager::Config::new(&exec, "test-host");
+        cfg.port = 0;
+        cfg.sup = Some(sup);
+        let m = wsp_manager::Manager::start(cfg).expect("the manager starts on loopback");
+        let token = std::fs::read_to_string(exec.join(wsp_manager::TOKEN_FILE)).unwrap();
+        let local = crate::manager::Local {
+            host: "test-host".into(),
+            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: m.addrs()[0].port(),
+            exec_dir: exec.clone(),
+        };
+        crate::manager::write_record(&store.state, &local, token.trim()).unwrap();
+        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
+
+        let ended = std::cell::RefCell::new(Vec::<String>::new());
+        let end = |scope: &str| -> Result<(), String> {
+            ended.borrow_mut().push(scope.to_string());
+            Ok(())
+        };
+        let pane = || store.governors()["p"]["pane"].as_str().unwrap_or_default().to_string();
+        // Claude Code's hook, played, as repair's test plays it: every seat
+        // with an agent on its record has its turn posted to the manager at
+        // the epoch the manager started it under, once per epoch.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let dial = wsp_host::hooks::Dial::Manager { addr: m.addrs()[0], token_file: exec.join(wsp_manager::TOKEN_FILE) };
+        let (first, behalf, own) = std::thread::scope(|s| {
+            s.spawn(|| {
+                let seats = store.state.join(crate::place_compound::SEATS);
+                let mut posted = std::collections::BTreeSet::new();
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    for dir in std::fs::read_dir(&seats).into_iter().flatten().flatten().map(|e| e.path()) {
+                        let rec: serde_json::Value = std::fs::read_to_string(dir.join("seat.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                        let seat = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let Some(epoch) = m.seats().into_iter().find(|r| r.seat.0 == seat).map(|r| r.epoch) else { continue };
+                        if rec.get("agent").is_some() && !posted.contains(&(seat.clone(), epoch.0)) {
+                            let payload = json!({ "session_id": format!("sess-{seat}") });
+                            if let wsp_host::hooks::Sent::Taken(_) = wsp_host::hooks::report(&dial, &seat, epoch, "UserPromptSubmit", &payload) {
+                                posted.insert((seat, epoch.0));
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+            let run = || {
+                // The governor the rotations replace, seated through the manager.
+                let code = spawn(&store, &Args::synth("spawn", &[], &[("project", "p"), ("govern", "true")]));
+                let first = (code, pane());
+                if code != 0 || first.1.is_empty() {
+                    return (first, (1, String::new()), (1, String::new()));
+                }
+                // The run's rotation, at a barrier: the predecessor off the record.
+                let code = rotate_on_behalf_ending(&store, "p", &end);
+                let behalf = (code, pane());
+                if code != 0 {
+                    return (first, behalf, (1, String::new()));
+                }
+                // The verb, from the seat it hands over.
+                std::env::set_var("WSP_SEAT_ID", &behalf.1);
+                let code = rotate_ending(&store, &Args::synth("govern", &["p"], &[("rotate", "true")]), &end);
+                std::env::remove_var("WSP_SEAT_ID");
+                (first, behalf, (code, pane()))
+            };
+            let out = run();
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            out
+        });
+        let said = || {
+            let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+            format!("handover.log:\n{}\nmanager.log:\n{}", read(store.handover_log()), read(m.log_path()))
+        };
+        assert_eq!(first.0, 0, "the governor was seated: {}", said());
+        assert_eq!(behalf.0, 0, "the run's rotation seated a successor: {}", said());
+        assert_eq!(own.0, 0, "the verb's rotation seated a successor: {}", said());
+        assert!(first.1 != behalf.1 && behalf.1 != own.1, "each rotation moved the seat: {first:?} {behalf:?} {own:?}");
+        assert_eq!(*ended.borrow(), vec!["p".to_string(), "p".to_string()], "each predecessor's ending was arranged");
+
+        let spawns = std::fs::read_to_string(exec.join(wsp_manager::seats::RUN_DIR).join("spawns")).unwrap_or_default();
+        let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        for (who, seat) in [("the run's rotation", &behalf.1), ("the verb", &own.1)] {
+            // The manager took the seat.spawn and forked it: it runs the seat.
+            assert!(spawns.lines().any(|l| l.starts_with(&format!("{seat} "))), "{who}: the manager forked {seat}: {spawns:?}");
+            assert!(m.seats().iter().any(|s| &s.seat.0 == seat), "{who}: the manager runs {seat}: {:?}", m.seats());
+            // And `wip`'s census, which asks the manager, reads it.
+            assert!(reading.rows.contains_key(seat), "{who}: wip's census reads {seat}: {:?}", reading.rows.keys().collect::<Vec<_>>());
+        }
+
+        // Every seat ended through the manager, as `wsp despawn` would.
+        let place = crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION")).unwrap();
+        for seat in [&first.1, &behalf.1, &own.1] {
+            let _ = crate::place::Place::stop(&place, &crate::place::Seat::new(seat));
+        }
+        m.stop();
     }
 }

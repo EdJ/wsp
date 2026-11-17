@@ -2959,7 +2959,7 @@ impl Seats for Absent {
     /// becomes a sleeping session of its own (ended with this test process at
     /// the latest), and appends `<label> <pid>` to `<run>/spawns`; `deliver`
     /// answers `delivered`. No agent is ever started.
-    const FAKE_SUP: &str = r#"#!/bin/sh
+    pub(crate) const FAKE_SUP: &str = r#"#!/bin/sh
 OWNER=__OWNER__
 verb=$1; shift
 case "$verb" in
@@ -3008,7 +3008,7 @@ esac
 
     /// `WSP_HOST` back to the isolated default however the test ends: unset
     /// would be the manager, which nothing after this test stands up.
-    struct Inproc;
+    pub(crate) struct Inproc;
     impl Drop for Inproc {
         fn drop(&mut self) {
             std::env::set_var(wsp_wire::host_tcp::ENV, "inproc");
