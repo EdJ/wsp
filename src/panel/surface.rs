@@ -93,13 +93,13 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::herdr::{Pane, Workspace};
+use crate::live::{Pane, Workspace};
 use crate::input::Key;
 use crate::live::{self, Live};
 use crate::store::Store;
 
 use super::render::{rgb_of, Line, Style};
-use super::run::{event_loop, Msg, Outcome, Screen, Where};
+use super::run::{Msg, Screen};
 
 /// The wire version this build speaks. Bumped only when a change is not
 /// backwards compatible; most additions are not, because unknown messages are
@@ -507,16 +507,9 @@ fn read_host(
             // message with neither list is still an answer — a host with no
             // panes at all is a herdr somebody just closed everything in.
             Some("live") => {
-                let workspaces = message
-                    .get("workspaces")
-                    .and_then(Value::as_array)
-                    .map(|rows| rows.iter().map(crate::herdr::parse_workspace).collect())
-                    .unwrap_or_default();
-                let panes = message
-                    .get("panes")
-                    .and_then(Value::as_array)
-                    .map(|rows| rows.iter().map(crate::herdr::parse_pane).collect())
-                    .unwrap_or_default();
+                // No parser for a host's rows: no host runs herdr.
+                let workspaces: Vec<Workspace> = Vec::new();
+                let panes: Vec<Pane> = Vec::new();
                 if let Ok(mut running) = running.lock() {
                     running.here = Some((workspaces, panes));
                 }
@@ -634,87 +627,9 @@ fn stop(why: &str) -> ! {
 }
 
 /// Run the panel against a host on stdin and stdout.
-pub fn run(store: &Store) -> i32 {
-    if !crate::herdr::available() {
-        eprintln!("wsp: no herdr socket");
-        return 1;
-    }
-    // The conversion's tidy-up, on a thread of its own: closing somebody else's
-    // dead panes is not what the person watching this sidebar come up is
-    // waiting for, and it must not be able to delay the first frame.
-    {
-        let state = store.state.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(SETTLE);
-            match super::install::sweep_husks(&state) {
-                0 => {}
-                n => eprintln!("wsp surface: closed {n} panel pane(s) an older wsp left behind"),
-            }
-        });
-    }
-    let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
-    let running = Arc::new(Mutex::new(Running::default()));
-    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
-    {
-        let tx = tx.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if tx.send(Msg::Tick).is_err() {
-                return;
-            }
-        });
-    }
-    {
-        let host = Arc::clone(&host);
-        let running = Arc::clone(&running);
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            read_host(std::io::stdin().lock(), host, running, tx);
-            stop("the host closed its end");
-        });
-    }
-    // Subscribing to herdr's event stream is what a panel does to find out
-    // that something changed, and a surface whose host pushes the answer
-    // outright has no use for it: the stream's job was to say *look again*,
-    // and there is nothing left to look at. `pane.updated` alone is two events
-    // a second per working agent, each one a full pane parsed out of JSON, and
-    // each one used to mark the panel dirty and buy a full refetch on the next
-    // tick — which is where most of what this task removed actually went.
-    //
-    // So it is started only for a host that turns out not to push. Waiting is
-    // the way to tell, because the message that says so is the one that never
-    // comes; see [`TOLD_BY`].
-    {
-        let running = Arc::clone(&running);
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(TOLD_BY);
-            if running.lock().is_ok_and(|running| running.here.is_none()) {
-                super::run::spawn_events(tx);
-            }
-        });
-    }
-    // No thread for "the machines the host cannot speak for": herdr no longer
-    // fans out to other machines (`herdr::each`), so `Running::far` stays empty
-    // and a far machine's seats are not drawn from here.
-
-    // No workspace and no pane: that is what a surface *is*, and it is said
-    // here rather than read from the environment, which is herdr's and belongs
-    // to whatever pane herdr itself was started from. What a key acts *on* is
-    // resolved from the workspace on screen at the moment it is pressed — see
-    // `stage` in [`super::verbs`].
-    let mut screen =
-        Wire { host, running, last: String::new(), frame_file: frame_path(&store.state) };
-    match event_loop(store, &tx, &rx, &Where::nowhere(), false, &mut screen) {
-        // Exit, where a panel re-execs. The host is already watching for a
-        // surface that ended and already starts another; re-execing here would
-        // be a second way to do the same thing, and the one the host cannot
-        // see. Reached with the loop finished and the last frame flushed, so
-        // what the host has on screen when its own sidebar takes over is a
-        // whole frame rather than half of one.
-        Outcome::Reload => stop("the wsp binary changed on disk, exiting for a new one"),
-        Outcome::Quit => 0,
-    }
+pub fn run(_store: &Store) -> i32 {
+    eprintln!("wsp: no herdr socket");
+    1
 }
 
 #[cfg(test)]

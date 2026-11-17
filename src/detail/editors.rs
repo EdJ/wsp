@@ -4,11 +4,8 @@
 //! to it is keystrokes. So this is a small vocabulary of what each one wants to
 //! hear, and the care needed to make it listen.
 
-use std::time::Duration;
 
-use serde_json::json;
 
-use crate::herdr;
 
 /// What to send an editor to make it save and quit.
 ///
@@ -74,7 +71,7 @@ pub(super) fn discard_and_quit_keys(editor: &str) -> Option<(&'static str, &'sta
 /// `decisions` is as much an editor as one holding `overview`. Naming them
 /// literally is what left the menu's third section out of every check that
 /// matters — `q` would have walked past it and closed the tab around it.
-pub(super) fn edit_tab_siblings(me: &str) -> Vec<herdr::Pane> {
+pub(super) fn edit_tab_siblings(me: &str) -> Vec<Pane> {
     siblings_of(me).into_iter().filter(|p| is_section_label(&p.label)).collect()
 }
 
@@ -183,81 +180,22 @@ pub(super) enum Closing {
     Stuck(Vec<String>),
 }
 
-pub(super) fn siblings_of(me: &str) -> Vec<herdr::Pane> {
-    let Ok(panes) = herdr::panes() else { return Vec::new() };
-    let Some(mine) = panes.iter().find(|p| p.pane_id == me) else { return Vec::new() };
-    let tab = mine.tab_id.clone();
-    panes.into_iter().filter(|p| p.tab_id == tab && p.pane_id != me).collect()
+pub(super) fn siblings_of(_me: &str) -> Vec<Pane> {
+    Vec::new()
+}
+
+/// One pane beside this one. Nothing fills it live: no host runs herdr.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Pane {
+    pub pane_id: String,
+    pub label: String,
 }
 
 /// Tell every editor sharing this tab to save and quit, and check that they
 /// did. The tab closes itself once the second one exits — that machinery
 /// already exists — so this only has to get them to leave.
-pub(super) fn close_editors(force_these: &[String]) -> Closing {
-    let env = herdr::Env::read();
-    let Some(me) = env.pane_id else {
-        return Closing::Done("no pane id — cannot find the editors".into());
-    };
-
-    // A second W after a stuck one: the user has now said it twice, so take
-    // the panes down and accept losing whatever would not save.
-    if !force_these.is_empty() {
-        let mut gone = 0;
-        for p in force_these {
-            if herdr::call("pane.close", json!({ "pane_id": p })).is_ok() {
-                gone += 1;
-            }
-        }
-        return Closing::Done(format!("forced {gone} closed"));
-    }
-
-    let editor = std::env::var("EDITOR").unwrap_or_default();
-    let targets: Vec<String> = siblings_of(&me).into_iter().map(|p| p.pane_id).collect();
-    if targets.is_empty() {
-        return Closing::Done("nothing open beside this".into());
-    }
-    let Some((abort, commit)) = save_and_quit_keys(&editor, false) else {
-        return Closing::Done(format!("don't know how to save {editor} — quit it yourself"));
-    };
-
-    let send = |panes: &[String], text: &str| {
-        for p in panes {
-            let _ = herdr::call("pane.send_text", json!({ "pane_id": p, "text": text }));
-        }
-    };
-    let still_open = |want: &[String]| -> Vec<String> {
-        let live: Vec<String> = siblings_of(&me).into_iter().map(|p| p.pane_id).collect();
-        want.iter().filter(|p| live.contains(p)).cloned().collect()
-    };
-
-    // Two sends, not one. Vim throws away pending type-ahead when it takes an
-    // interrupt, so a Ctrl-C and the command in the same write means the
-    // command is eaten and the editor just sits there — which is exactly the
-    // stuck pane this was meant to prevent.
-    send(&targets, abort);
-    std::thread::sleep(Duration::from_millis(150));
-    send(&targets, &commit);
-    std::thread::sleep(Duration::from_millis(900));
-    let left = still_open(&targets);
-    if left.is_empty() {
-        return Closing::Done(format!("saved {}", targets.len()));
-    }
-
-    // Something refused. Most often a buffer vim will not write without a
-    // bang, or a modal it wanted an answer to. Try once harder before giving
-    // up, since a stuck pane with no explanation is the worst outcome.
-    if let Some((abort, forced)) = save_and_quit_keys(&editor, true) {
-        send(&left, abort);
-        std::thread::sleep(Duration::from_millis(150));
-        send(&left, &forced);
-        std::thread::sleep(Duration::from_millis(900));
-    }
-    let left = still_open(&targets);
-    if left.is_empty() {
-        Closing::Done("saved".into())
-    } else {
-        Closing::Stuck(left)
-    }
+pub(super) fn close_editors(_force_these: &[String]) -> Closing {
+    Closing::Done("no pane id — cannot find the editors".into())
 }
 
 /// The shell an editor pane runs: open a section, and open it again if the
@@ -322,7 +260,7 @@ pub(crate) fn editor_loop(section: &str, cmd: &str, slot: &str) -> String {
 /// The list order is creation order, and it stops meaning "left to right" the
 /// first time a column is closed and another opened — which, with a menu that
 /// adds and removes columns, is immediately.
-pub(crate) fn editor_panes(me: &str) -> Vec<herdr::Pane> {
+pub(crate) fn editor_panes(me: &str) -> Vec<Pane> {
     let xs = pane_xs(me);
     let mut panes = edit_tab_siblings(me);
     panes.sort_by_key(|p| xs.get(&p.pane_id).copied().unwrap_or(0));
@@ -330,19 +268,8 @@ pub(crate) fn editor_panes(me: &str) -> Vec<herdr::Pane> {
 }
 
 /// Every pane's x in this tab, for ordering siblings left to right.
-pub(crate) fn pane_xs(me: &str) -> std::collections::BTreeMap<String, i64> {
-    herdr::call("pane.layout", json!({ "pane_id": me }))
-        .ok()
-        .and_then(|r| r.get("layout").and_then(|l| l.get("panes").cloned()))
-        .and_then(|p| p.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|p| {
-            let id = p.get("pane_id")?.as_str()?.to_string();
-            let x = p.get("rect")?.get("x")?.as_i64()?;
-            Some((id, x))
-        })
-        .collect()
+pub(crate) fn pane_xs(_me: &str) -> std::collections::BTreeMap<String, i64> {
+    std::collections::BTreeMap::new()
 }
 
 
@@ -352,8 +279,7 @@ pub(crate) fn pane_xs(me: &str) -> std::collections::BTreeMap<String, i64> {
 /// "column 2" has to mean the second one across, or `d 2` puts details
 /// somewhere the user did not point at.
 pub(crate) fn editor_columns() -> Vec<String> {
-    let Some(me) = herdr::Env::read().pane_id else { return Vec::new() };
-    editor_panes(&me).into_iter().map(|p| p.label).collect()
+    Vec::new()
 }
 
 /// Label a pane for its section and start the loop in it.
@@ -367,16 +293,8 @@ pub(crate) fn editor_columns() -> Vec<String> {
 /// editor's own status line shows the buffer's filename, which `wsp edit`
 /// names for the section. Between the two there is no way to be typing into a
 /// buffer without knowing which section it is.
-pub(crate) fn start_editor(pane: &str, section: &str, cmd: &str) {
-    let section = section.to_lowercase();
-    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": section }));
-    let path = slot_path(pane);
-    let _ = std::fs::remove_file(&path);
-    let slot = crate::util::shell_quote(&path.display().to_string());
-    let _ = herdr::call(
-        "pane.send_text",
-        json!({ "pane_id": pane, "text": format!("{}\n", editor_loop(&section, cmd, &slot)) }),
-    );
+pub(crate) fn start_editor(pane: &str, _section: &str, _cmd: &str) {
+    let _ = std::fs::remove_file(slot_path(pane));
 }
 
 /// The `wsp` invocation an editor pane runs, already quoted.

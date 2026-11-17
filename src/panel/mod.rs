@@ -205,11 +205,10 @@ pub(crate) use verbs::{follow, inspect, pop_out, run_wsp};
 // wording for a work order, however it was handed over — see
 // [`verbs::tell_claimed`].
 pub(crate) use verbs::{send_tell, tell_claimed, Tell};
-pub use install::{install, install_if_adopted, uninstall};
+pub use install::{install, uninstall};
 // The record of which pane holds the panel is keyed on a workspace, so it is
 // swept where the other workspace-keyed records are — see `install::reap_panels`
 // for why that is `reconcile --reap` and not `sync`.
-pub(crate) use install::reap_panels;
 pub use run::run;
 // The same panel, drawn by a host that owns the cells — herdr's forked sidebar
 // today. See `surface.rs` for why the frame is built here and not there.
