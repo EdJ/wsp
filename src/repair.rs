@@ -1859,7 +1859,10 @@ fn retry_undelivered_tells(store: &Store, seats: &dyn Seats) {
         if crate::waiting::reading(Some(State::Idle), asks, &seats.shells(&[&seat]), &seat, &t.id).is_some() {
             continue;
         }
-        let told = crate::cmd_task::deliver_as(store, &t.id, &format!("wsp sent {} back: {reason}", t.id));
+        // `--anyway`, because this pass has read the seat idle with nobody
+        // waiting on it — the look `wsp tell` asks for before it types at a seat
+        // that cannot vouch for itself (`wsp-658`).
+        let told = crate::cmd_task::deliver_insisting(store, &t.id, &format!("wsp sent {} back: {reason}", t.id));
         // **A pending delivery is asked again, not counted as a refusal**
         // (`wsp-469`): the backend's "still pending after 30s, asked again next
         // tick under the same id" is a seat busy past the wait, not a seat that
@@ -4501,6 +4504,27 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
         assert!(member_told().iter().all(|(_, t)| !t.contains("sent m-1 back")), "delivered once, not every tick");
+    }
+
+    /// `wsp-658`, fixed in `wsp-659`: compounding-695 and -671 sat idle at an
+    /// empty prompt for 5-10 minutes after a rebase send-back, the run reading
+    /// them idle and `wsp tell` refusing them as unable to vouch for a prompt;
+    /// `--anyway` by hand delivered. The run's retry is that look, so it says
+    /// `--anyway`: typed on the first idle tick, and the seat is not ended.
+    #[test]
+    fn a_send_back_to_an_idle_seat_tell_cannot_vouch_for_is_typed_on_the_first_idle_tick() {
+        let (_env, store) = in_flight("unvouchedtell");
+        let mut t = store.find_task("m-1").unwrap();
+        crate::log::note(&store, &mut t, "sent back: wsp's rebase at ae627c58 does not apply cleanly").unwrap();
+        note_tell_pending(&store, "m-1");
+        let _ = (member_told(), ended());
+        crate::cycle::tests::TELL_UNVOUCHED.with(|r| r.set(true));
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        crate::cycle::tests::TELL_UNVOUCHED.with(|r| r.set(false));
+        let told = member_told();
+        assert!(told.iter().any(|(id, t)| id == "m-1" && t.contains("does not apply cleanly")), "{told:?}");
+        assert!(ended().is_empty(), "the seat took it, so it is not ended");
+        assert!(undelivered_reason(&store.find_task("m-1").unwrap()).is_none(), "and nothing is owed");
     }
 
     #[test]

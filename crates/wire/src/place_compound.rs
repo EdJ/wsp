@@ -1312,6 +1312,32 @@ fn deliver_through(sup: &Path, session: &Path, dir: &Path, seat: &Seat, text: &s
     answer
 }
 
+/// **A supervisor's refusal of a seat wsp reads as empty and at its prompt is
+/// typed past, on the same tick** (`wsp-659`). `wsp-634` retried the `deliver`
+/// verb, and a supervisor that refuses an idle seat with an empty composer (its
+/// hook never fired, so it reads the seat as holding other text) answers
+/// `failed … refused` to every retry: governors read "refused 5 ticks running"
+/// and were ended for it, the sentence never landing. When the answer took
+/// nothing (`refused`, `no composer`) and this backend's own read of the
+/// composer is *empty* — not unreadable, not holding text — the sentence goes
+/// by the typed path instead, and is `Unconfirmed` like any typed tell, so the
+/// wake path waits for the turn that confirms it. Any other answer, or a
+/// composer that holds text or cannot be read, is the supervisor's answer.
+fn past_a_refusal(
+    answer: Result<Delivery>,
+    holds_text: impl FnOnce() -> Option<bool>,
+    type_it: impl FnOnce() -> Result<()>,
+) -> Result<Delivery> {
+    let took_nothing = |why: &str| ["refused", "no composer", "no_composer"].iter().any(|r| why.contains(r));
+    match &answer {
+        Err(Refusal::Failed(why)) if took_nothing(why) && holds_text() == Some(false) => match type_it() {
+            Ok(()) => Ok(Delivery::Unconfirmed),
+            Err(_) => answer,
+        },
+        _ => answer,
+    }
+}
+
 /// Whether this seat's supervisor is one that can be asked to `deliver`: the
 /// seat was spawned for it by this wsp. A record from before (every seat
 /// already running) has no such mark and keeps the typed path.
@@ -1922,7 +1948,11 @@ impl Place for Compound<'_> {
         if let (Some(sup), Some(session), Ok(rec)) = (compound_sup_binary(), self.socket_of(seat), self.record(seat)) {
             if delivers(&rec) {
                 let dir = self.dir_of(seat)?;
-                return deliver_through(&sup, &session, &dir, seat, text, DELIVER_WAIT);
+                let answer = deliver_through(&sup, &session, &dir, seat, text, DELIVER_WAIT);
+                return past_a_refusal(answer, || self.typed(seat), || {
+                    let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
+                    type_and_submit(&socket, text)
+                });
             }
         }
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
@@ -2465,6 +2495,35 @@ mod tests {
 
         script_sup(&scratch, "echo \"delivered $3\"");
         assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "tell", wait), Ok(Delivery::Acked));
+    }
+
+    /// wsp-659: an idle governor whose supervisor refuses every `deliver` took
+    /// the tell on no tick at all — 634's retry asked the same refusing verb
+    /// again. A refusal on a composer this backend reads as empty is typed past
+    /// on the first tick; a composer holding text, or one that cannot be read,
+    /// keeps the refusal, and an answer that is not a refusal is never retyped.
+    #[test]
+    fn a_refused_delivery_to_an_empty_composer_is_typed_on_the_first_tick() {
+        let typed = std::cell::Cell::new(0);
+        let type_it = || {
+            typed.set(typed.get() + 1);
+            Ok(())
+        };
+        let refused = || Err(Refusal::Failed("cpd-1: refused".into()));
+        assert_eq!(past_a_refusal(refused(), || Some(false), type_it), Ok(Delivery::Unconfirmed));
+        assert_eq!(typed.get(), 1, "typed, once");
+        let no_composer = Err(Refusal::Failed("cpd-1: no composer".into()));
+        assert_eq!(past_a_refusal(no_composer, || Some(false), type_it), Ok(Delivery::Unconfirmed));
+
+        assert_eq!(past_a_refusal(refused(), || Some(true), type_it), refused(), "text in the composer is not typed over");
+        assert_eq!(past_a_refusal(refused(), || None, type_it), refused(), "an unread composer is not typed at");
+        let busy = Err(Refusal::Failed("cpd-1: timeout".into()));
+        assert_eq!(past_a_refusal(busy.clone(), || Some(false), type_it), busy, "a failure that may have typed is not retyped");
+        assert_eq!(past_a_refusal(Ok(Delivery::Acked), || Some(false), type_it), Ok(Delivery::Acked));
+        assert_eq!(typed.get(), 2, "only the two refusals on an empty composer were typed");
+
+        let dial_fails = || Err(Refusal::NoSeat(Seat::new("cpd-1")));
+        assert_eq!(past_a_refusal(refused(), || Some(false), dial_fails), refused(), "a type that fails keeps the answer");
     }
 
     /// wsp-477, the verifier's block 3: a wait that runs out is an answer that is

@@ -538,11 +538,44 @@ const HELD_TELL: &str = "held-tell:";
 /// refused before it comes here, and [`flush_held_tells`] drops what is left for
 /// a seat that has gone for good.
 pub(crate) fn hold_tell(store: &Store, seat: &str, text: &str) -> usize {
+    hold_tell_for(store, seat, text, None)
+}
+
+/// [`hold_tell`], naming the row the seat holds (`wsp-659`): a seat that ends
+/// with tells still held for it has them offered to the row's next seat, and
+/// the row is how that seat is found once the old one's binding is gone.
+pub(crate) fn hold_tell_for(store: &Store, seat: &str, text: &str, row: Option<&str>) -> usize {
     let at = util::epoch_secs();
     store.update_watch(&held_key(seat), |rec| {
         Spool::append(rec, vec![Spooled::of(at, Line::Note(crate::cmd_watch::Class::Message, text.to_string()))]);
+        if let (Some(row), Some(o)) = (row.filter(|r| !r.is_empty()), rec.as_object_mut()) {
+            o.insert("row".into(), json!(row));
+        }
     });
     held_tells(store, seat).len()
+}
+
+/// How many tells each seat has held for it, queued for its next idle or for
+/// its link (`wsp-659`): what `wsp wip` draws as `· N tells queued`. Seats with
+/// none are left out.
+pub(crate) fn queued_tells(store: &Store) -> BTreeMap<String, usize> {
+    store
+        .watch_keys(HELD_TELL)
+        .into_iter()
+        .filter_map(|key| {
+            let seat = key[HELD_TELL.len()..].to_string();
+            let n = held_tells(store, &seat).len();
+            (n > 0).then_some((seat, n))
+        })
+        .collect()
+}
+
+/// The row a seat's held tells were for, if the tell named one.
+fn held_row(store: &Store, seat: &str) -> Option<String> {
+    store
+        .watch(&held_key(seat))
+        .and_then(|rec| rec.get("row").and_then(Value::as_str).map(str::to_string))
+        .filter(|r| !r.is_empty())
 }
 
 /// What is held for this seat, oldest first.
@@ -577,9 +610,21 @@ pub(crate) fn flush_held_tells(
         }
         match read(&seat) {
             Seen::Missing => {
+                // **Not dropped in silence** (`wsp-659`): the seat ended with
+                // these unread, so each is offered to the row's next seat if one
+                // is up, and said back to whoever sent it either way.
+                let row = held_row(store, &seat);
+                let next = row.as_deref().and_then(|r| store.panes_for_task(r).into_iter().find(|p| *p != seat));
                 settle_key(store, &key, &held.iter().map(|(q, _)| *q).collect::<Vec<_>>());
-                for _ in &held {
-                    store.log_event("agent-told-settled", json!({ "pane": seat, "how": "dropped", "at": util::epoch_secs() }));
+                for (_, text) in &held {
+                    if let Some(next) = &next {
+                        hold_tell_for(store, next, text, row.as_deref());
+                    }
+                    store.log_event(
+                        "agent-told-settled",
+                        json!({ "pane": seat, "how": "dropped", "offered": next, "at": util::epoch_secs() }),
+                    );
+                    undelivered(store, &seat, row.as_deref(), next.as_deref(), text);
                 }
                 dropped += held.len();
             }
@@ -597,6 +642,42 @@ pub(crate) fn flush_held_tells(
         }
     }
     (sent, dropped)
+}
+
+/// A held tell whose seat ended before it was read, said back to its sender
+/// (`wsp-659`): a line in `cycle.log`, and the sentence to the sender's own
+/// post — the primary's or a governor's spool, a seat's held tells, or the
+/// person's list — so nothing the person's seat sends is lost without a word.
+fn undelivered(store: &Store, seat: &str, row: Option<&str>, next: Option<&str>, text: &str) {
+    let from = crate::cmd_agent::speaker(text).unwrap_or("person").to_string();
+    let words = util::truncate(crate::cmd_agent::undressed(text), 120);
+    let whose = row.map(|r| format!(" ({r})")).unwrap_or_default();
+    let fate = match (next, row) {
+        (Some(n), _) => format!("offered to the row's next seat {n}"),
+        (None, Some(r)) => format!("no seat holds {r} now — `wsp tell seat:{r} -` sends it again"),
+        (None, None) => "nobody is left to read it".to_string(),
+    };
+    let said = format!("your tell to {seat}{whose} was not delivered — the seat ended with it unread; {fate}. It said: {words}");
+    crate::store::log_line(store, &format!("told {seat}: undelivered, the seat ended with it held — {fate}; said back to {from}"));
+    let at = util::epoch_secs();
+    let spool = |scope: &str| {
+        store.update_watch(&key_for(scope), |rec| {
+            Spool::append(rec, vec![Spooled::of(at, Line::Note(crate::cmd_watch::Class::Message, format!("wsp says: {said}")))]);
+        });
+    };
+    match crate::address::parse(&from) {
+        Some(crate::address::Address::Primary) => spool(crate::governors::PRIMARY),
+        Some(crate::address::Address::Governor(scope)) => spool(&scope),
+        Some(crate::address::Address::Seat(r)) if store.panes_for_task(&r).first().is_some() => {
+            let pane = store.panes_for_task(&r).remove(0);
+            hold_tell_for(store, &pane, &format!("wsp says: {said}"), Some(&r));
+        }
+        _ => {
+            use crate::message::{self, About, Kind, Message, Party};
+            let about = row.map(|r| About::Task(r.to_string())).unwrap_or(About::Nothing);
+            let _ = message::raise(store, &Message::new(Party::wsp(), Kind::Note, &said).about(about));
+        }
+    }
 }
 
 fn settle_key(store: &Store, key: &str, seqs: &[u64]) {
@@ -2775,5 +2856,102 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let mut fails = |_: &str, _: &str| false;
         assert_eq!(flush_held_tells(&store, &read, &mut fails), (0, 0));
         assert_eq!(held_tells(&store, "cpd-9").iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+    }
+
+    /// `wsp-659` item 1: a tell to a seat mid-turn was refused ("look first,
+    /// then `--anyway`") and nothing was kept, so the primary's sentence was lost
+    /// unless retried by hand. Now it is queued on the seat's held tells, the
+    /// sender is told so, nothing is typed into the turn, and the seat's next
+    /// idle takes it — with a second tell queued behind it, in order.
+    #[test]
+    fn a_tell_to_a_working_seat_is_queued_and_typed_at_its_next_idle_in_order() {
+        use crate::fake::{Fake, Spot, Stage};
+        use crate::place::State;
+        let env = util::isolated("wake-queued-tell");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_task(&crate::model::Task::new("wsp-700 a row mid-turn", "wsp-700")).unwrap();
+        store.set_binding("w1:p5", json!({ "pane": "w1:p5", "task_id": "wsp-700" }));
+        let mut stage = Stage::new();
+        let mut spot = Spot::agent("w1:p5", "claude", "wsp-700", State::Working);
+        spot.space = "w1".into();
+        stage.put(spot);
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let typed = || told_count(&fake);
+        let before = typed();
+        let first = crate::Args::synth("tell", &["wsp-700", "the ninth finding: the bar is too tall"], &[]);
+        assert_eq!(crate::cmd_agent::tell(&store, &first), 0, "queued is a success the sender is told about");
+        let second = crate::Args::synth("tell", &["wsp-700", "and the tenth"], &[]);
+        assert_eq!(crate::cmd_agent::tell(&store, &second), 0);
+        assert_eq!(typed(), before, "nothing typed into the turn");
+
+        let held = held_tells(&store, "w1:p5");
+        assert_eq!(held.len(), 2, "{held:?}");
+        assert!(held[0].1.contains("the ninth finding") && held[1].1.contains("the tenth"), "in the order sent: {held:?}");
+        assert!(held[0].1.contains(" says: "), "dressed, so the seat reads who speaks: {}", held[0].1);
+        assert_eq!(held_row(&store, "w1:p5").as_deref(), Some("wsp-700"), "the row is kept for the seat's successor");
+        let told = store.events_of("agent-told");
+        assert!(told.iter().all(|e| e["queued"] == json!(true)), "{told:?}");
+        assert_eq!(queued_tells(&store).get("w1:p5"), Some(&2), "what `wsp wip` draws as queued");
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(log.contains("queued for its next idle"), "{log}");
+
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let mut send = |_: &str, text: &str| {
+            sent.borrow_mut().push(text.to_string());
+            true
+        };
+        assert_eq!(flush_held_tells(&store, &|_| Seen::Is(State::Working), &mut send), (0, 0), "still mid-turn");
+        assert_eq!(flush_held_tells(&store, &|_| Seen::Is(State::Idle), &mut send), (2, 0), "its next idle");
+        assert!(sent.borrow()[0].contains("ninth") && sent.borrow()[1].contains("tenth"));
+        assert!(held_tells(&store, "w1:p5").is_empty());
+        assert!(queued_tells(&store).is_empty(), "and wip draws nothing queued");
+    }
+
+    /// `wsp-659` item 2: the primary's tell to compounding-698's seat was
+    /// pending when the seat was ended, and was lost with nothing said. A held
+    /// tell whose seat has gone is said back to its sender — the primary's spool,
+    /// a governor's, the person's list — and offered to the row's next seat
+    /// when one is up.
+    #[test]
+    fn a_tell_held_for_a_seat_that_ends_is_said_back_to_its_sender_and_offered_to_the_rows_next_seat() {
+        let env = util::isolated("wake-held-ended");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let from_primary = crate::cmd_agent::dressed("primary", "m-1", "rebase onto the trunk first", true);
+        hold_tell_for(&store, "cpd-5808", &from_primary, Some("compounding-698"));
+        let mut send = |_: &str, _: &str| true;
+        let gone = |_: &str| Seen::Missing;
+        assert_eq!(flush_held_tells(&store, &gone, &mut send), (0, 1));
+
+        let owed = messages_held(&store, crate::governors::PRIMARY);
+        assert_eq!(owed.len(), 1, "the primary is told: {owed:?}");
+        assert!(owed[0].2.contains("not delivered") && owed[0].2.contains("cpd-5808"), "{}", owed[0].2);
+        assert!(owed[0].2.contains("rebase onto the trunk first"), "and what it said: {}", owed[0].2);
+        assert!(!owed[0].2.contains("reply: wsp tell"), "the footer is not said back: {}", owed[0].2);
+        assert!(owed[0].2.contains("wsp tell seat:compounding-698"), "and how to send it again: {}", owed[0].2);
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(log.contains("told cpd-5808: undelivered") && log.contains("said back to primary"), "{log}");
+
+        // The row has a seat again: the tell is offered to it, and the sender told so.
+        store.set_binding("cpd-5900", json!({ "pane": "cpd-5900", "task_id": "compounding-698" }));
+        let from_gov = crate::cmd_agent::dressed("governor:compounding", "m-2", "land it after the check", true);
+        hold_tell_for(&store, "cpd-5809", &from_gov, Some("compounding-698"));
+        assert_eq!(flush_held_tells(&store, &gone, &mut send), (0, 1));
+        let offered = held_tells(&store, "cpd-5900");
+        assert_eq!(offered.len(), 1, "{offered:?}");
+        assert!(offered[0].1.contains("land it after the check"));
+        let gov = messages_held(&store, "compounding");
+        assert!(gov.iter().any(|(_, _, t)| t.contains("offered to the row's next seat cpd-5900")), "{gov:?}");
+
+        // From a shell, the person's: an item on their list.
+        hold_tell(&store, "cpd-5810", &crate::cmd_agent::dressed("person", "m-3", "stop for the night", false));
+        let still = |seat: &str| if seat == "cpd-5900" { Seen::Is(crate::place::State::Working) } else { Seen::Missing };
+        assert_eq!(flush_held_tells(&store, &still, &mut send), (0, 1));
+        let items = crate::message::raised(&store);
+        assert!(items.iter().any(|m| m.text.contains("cpd-5810") && m.text.contains("stop for the night")), "{items:?}");
     }
 }

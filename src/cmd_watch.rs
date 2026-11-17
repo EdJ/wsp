@@ -2503,6 +2503,7 @@ impl Source for Poll<'_> {
             // Read for state, never published, for `mandates`' reason.
             spawned: Default::default(),
             unsent: Default::default(),
+            queued: Default::default(),
             refusing: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
@@ -4739,6 +4740,7 @@ mod tests {
             spawned_by: None,
             leg: None,
             unsent: false,
+            queued: 0,
             dropped: false,
             full_suite: false,
             stuck: None,
@@ -5808,6 +5810,7 @@ mod tests {
             spawned_by: None,
             leg: None,
             unsent: false,
+            queued: 0,
             dropped: false,
             full_suite: false,
             stuck: None,

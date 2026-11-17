@@ -1557,6 +1557,20 @@ pub(crate) enum Told {
 /// ends a seat that was never asked twice (the verdict path of the same
 /// mistake `cmd_message`'s held answers made, `wsp-469`).
 pub(crate) fn deliver_as(store: &Store, id: &str, line: &str) -> Told {
+    deliver_with(store, id, line, false)
+}
+
+/// [`deliver_as`] for a caller that has itself read the seat as idle at a
+/// prompt nobody is answering, and so says `--anyway` as a person who has looked
+/// would (`wsp-658`): the run's retry of a send-back. Without it, a seat the run
+/// reads idle and `wsp tell` reads as unable to vouch for itself (a compound
+/// seat whose last hook is stale and whose screen did not answer) was refused
+/// every idle tick and sat at an empty prompt until somebody typed `--anyway`.
+pub(crate) fn deliver_insisting(store: &Store, id: &str, line: &str) -> Told {
+    deliver_with(store, id, line, true)
+}
+
+fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
     // Nothing to tell: a row nobody is holding has no pane, and saying so
     // would be noise on every reopen of finished work.
     if store.panes_for_task(id).is_empty() {
@@ -1571,13 +1585,20 @@ pub(crate) fn deliver_as(store: &Store, id: &str, line: &str) -> Told {
             if crate::cycle::tests::TELL_REFUSED.with(|r| r.get()) {
                 return Told::No;
             }
+            if !anyway && crate::cycle::tests::TELL_UNVOUCHED.with(|r| r.get()) {
+                return Told::No;
+            }
             crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), line.to_string())));
         }
         return Told::Yes;
     }
     let Ok(exe) = std::env::current_exe() else { return Told::No };
+    let mut argv = vec!["tell", id, "-"];
+    if anyway {
+        argv.push("--anyway");
+    }
     let mut child = match wsp_base::calls::Command::new(exe)
-        .args(["tell", id, "-"])
+        .args(&argv)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())

@@ -5408,6 +5408,10 @@ pub(crate) mod tests {
         pub(crate) static DESPAWN_FAILS: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and a member's seat takes no tell on this thread (`deliver` is false).
         pub(crate) static TELL_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set, and a member's seat reads unvouched to `wsp tell` on this thread: a
+        /// tell without `--anyway` is refused (`deliver_as` is `No`), one with it lands
+        /// (`wsp-658`: idle to the run, `cannot say whether it is at a prompt` to the verb).
+        pub(crate) static TELL_UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Set, and a member's seat answers every tell "delivery still pending" on this
         /// thread (`deliver_as` is `Pending`), ahead of [`TELL_REFUSED`].
         pub(crate) static TELL_PENDING_BACKEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

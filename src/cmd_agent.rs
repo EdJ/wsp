@@ -1636,6 +1636,43 @@ fn tell_seat(
         return 1;
     }
 
+    // **A busy seat is queued for, not refused** (`wsp-659`). A tell to a seat
+    // mid-turn was answered "look first, then `--anyway`" and delivered
+    // nothing, so the primary's — the person's — sentence was lost unless
+    // somebody retried it by hand. It waits in the seat's held-tell spool and
+    // [`crate::wake::flush_held_tells`] types it at the seat's next idle, in
+    // order; a seat that ends first has it said back to the sender. And a tell
+    // to a seat that already has tells queued queues behind them, whatever the
+    // seat reads now, so the order they were sent in is the order they land.
+    let queued = crate::wake::held_tells(store, &seat).len();
+    if !args.has("anyway") && (queues_for_idle(row.state) || (queued > 0 && row.state != State::Unknown)) {
+        let row_id = store
+            .bindings()
+            .get(&seat)
+            .and_then(|b| b.get("task_id").and_then(Value::as_str).map(str::to_string))
+            .filter(|t| !t.is_empty())
+            .or_else(|| (!addressed).then(|| addressee_id(store, needle, &what)));
+        let n = crate::wake::hold_tell_for(store, &seat, &said, row_id.as_deref());
+        store.log_event(
+            "agent-told",
+            json!({
+                "target": addressee_id(store, needle, &what), "pane": seat, "chars": text.len(),
+                "id": message_id(&seat, text), "from": from, "re": re, "text": text, "held": true,
+                "queued": true, "at": util::epoch_secs(), "turn": false,
+            }),
+        );
+        crate::store::log_line(store, &format!("told {what}: queued for its next idle ({n} waiting), from {from}"));
+        let word = format!(
+            "{what} is {} — queued ({n} waiting), typed at its next idle; if the seat ends first you are told",
+            row.state.as_str()
+        );
+        match args.json() {
+            true => println!("{}", json!({ "held": true, "queued": true, "pane": seat, "waiting": n })),
+            false => println!("{} {word}", p.yellow("…")),
+        }
+        return 0;
+    }
+
     // A seat that cannot vouch for itself refuses rather than typing into
     // whatever is on screen (`compound-097`), and this is the way past it for
     // somebody who has looked. Named here as well as refused below, because a
@@ -1677,6 +1714,35 @@ pub(crate) fn dressed(from: &str, id: &str, text: &str, reply: bool) -> String {
         true => format!("{opened} [from {from} · reply: wsp tell {from} --re {id} -]"),
         false => opened,
     }
+}
+
+/// Who a [`dressed`] sentence says is speaking: the word before its first
+/// ` says: `, read back so a tell held and never read can be said back to its
+/// sender (`wsp-659`). `None` for text that was not dressed.
+pub(crate) fn speaker(said: &str) -> Option<&str> {
+    let (who, _) = said.split_once(" says: ")?;
+    (!who.is_empty() && !who.contains(char::is_whitespace)).then_some(who)
+}
+
+/// A [`dressed`] sentence's own words: the opener and the reply footer taken
+/// off, for saying back to its sender what it was.
+pub(crate) fn undressed(said: &str) -> &str {
+    let body = match speaker(said) {
+        Some(_) => said.split_once(" says: ").map_or(said, |(_, b)| b),
+        None => said,
+    };
+    match body.rfind(" [from ") {
+        Some(i) if body.ends_with(" -]") => &body[..i],
+        _ => body,
+    }
+}
+
+/// Whether a seat reading this state is busy with something that ends of
+/// itself — a turn, or the agent coming up — so a tell to it is queued for its
+/// next idle rather than refused (`wsp-659`). Not `Blocked` (a person must
+/// answer first) and not `Unknown` (nothing says it will ever read idle).
+pub(crate) fn queues_for_idle(state: State) -> bool {
+    matches!(state, State::Working | State::Starting)
 }
 
 /// The id a `--re` names, if this store knows the message: one a tell left on
@@ -4472,6 +4538,9 @@ pub(crate) struct Wip {
     /// tick (`wsp-386`) — [`crate::repair::unsent_seats`]. Drawn as `typed, not
     /// sent` in place of `idle`.
     pub unsent: std::collections::BTreeSet<String>,
+    /// Tells queued for a seat's next idle, or held for its link (`wsp-659`):
+    /// seat -> how many. Drawn as `· N tells queued`; published as `queued`.
+    pub queued: std::collections::BTreeMap<String, usize>,
     /// Seats whose supervisor has answered `failed` to a tell, tick after tick
     /// (`wsp-634`): pane → (ticks, the last reason). Drawn as `refusing delivery`,
     /// which is what is true when `typed, not sent` is not — nothing was typed.
@@ -4619,6 +4688,7 @@ impl Wip {
             since,
             spawned: store.spawned(),
             unsent: crate::repair::unsent_seats(store),
+            queued: crate::wake::queued_tells(store),
             refusing: {
                 let governors = store.governors();
                 crate::refusals::refusing(store)
@@ -4807,6 +4877,8 @@ pub(crate) struct WipRow {
     /// The prompt holds text that was typed and never submitted, for more than
     /// a tick (`wsp-386`). Drawn as `typed, not sent`; published as `unsent`.
     pub(crate) unsent: bool,
+    /// Tells queued for this seat's next idle (`wsp-659`). Published as `queued`.
+    pub(crate) queued: usize,
     /// The seat's first work order was sent again and no turn started on it
     /// (`wsp-420`). Drawn as `order not received`; published as `dropped`.
     pub(crate) dropped: bool,
@@ -5204,6 +5276,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             spawned_by,
             leg: leg.cloned(),
             unsent,
+            queued: w.queued.get(seat).copied().unwrap_or(0),
             dropped,
             full_suite: w.full_suite.contains(seat),
             stuck,
@@ -5354,7 +5427,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "role": r.role.json(),
             "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
             "spawned_by": r.spawned_by,
-            "unsent": r.unsent, "dropped": r.dropped, "full_suite": r.full_suite, "stuck": r.stuck.map(|(k, secs)| json!({ "kind": k.key(), "word": k.word(), "secs": secs })), "was_governor": r.was_governor, "closed_row": r.closed_row,
+            "unsent": r.unsent, "queued": r.queued, "dropped": r.dropped, "full_suite": r.full_suite, "stuck": r.stuck.map(|(k, secs)| json!({ "kind": k.key(), "word": k.word(), "secs": secs })), "was_governor": r.was_governor, "closed_row": r.closed_row,
             "leg": r.leg.as_ref().map(|s| json!({
                 "name": s.leg.name, "after": s.after, "index": s.index, "of": s.of,
             })),
@@ -5541,6 +5614,14 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             let flag = match r.full_suite {
                 true => format!("{flag} {}", p.yellow(&format!("· {FULL_SUITE_WORD}"))).trim_start().to_string(),
                 false => flag,
+            };
+            // What is waiting for this seat's next idle (`wsp-659`): a tell sent
+            // to it mid-turn, queued rather than refused.
+            let flag = match r.queued {
+                0 => flag,
+                n => format!("{flag} {}", p.yellow(&format!("· {n} {} queued", if n == 1 { "tell" } else { "tells" })))
+                    .trim_start()
+                    .to_string(),
             };
             let flag = match r.stuck {
                 Some((kind, secs)) => {
@@ -9397,6 +9478,7 @@ mod tests {
             since: Default::default(),
             spawned: Default::default(),
             unsent: Default::default(),
+            queued: Default::default(),
             refusing: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
@@ -9623,6 +9705,7 @@ mod tests {
             since: Default::default(),
             spawned: Default::default(),
             unsent: Default::default(),
+            queued: Default::default(),
             refusing: Default::default(),
             dropped: Default::default(),
             full_suite: Default::default(),
