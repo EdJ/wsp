@@ -3,7 +3,9 @@
 The protocol between wsp and the agent manager on each host (`docs/agent-manager.md` section 3, step M0).
 A contract crate under `docs/components.md` R2: types, one trait and constants, no IO. Depends on `serde`
 alone (`serde_json` only for the `test-support` pair) and on nothing in the workspace, so the manager binary
-never pulls in `wsp-store`. Nothing in wsp uses it yet.
+never pulls in `wsp-store`. Used by `wsp-host` (the TCP carrier, the beat's facts, the hooks' post),
+`wsp-manager` (wsp-021: the process that serves it) and `wsp-wire` (`manager`'s record and `doctor`'s hello,
+wsp-024; `host_tcp`, the `Host` over the connection and the subscription, wsp-025).
 
 ## Holds
 
