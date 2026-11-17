@@ -679,12 +679,29 @@ fn a_stop_under_manager_reports_the_pids_seat_stopped_names() {
     assert!(ended.contains(&pid), "the manager's pids name the session: {ended:?} vs {pid}");
     assert_eq!(despawner.root(&seat), None, "the seat's record went with it");
 
-    // A seat the manager does not run: said, not a silent success.
-    let ghost = Seat::new("cpd-nobody");
-    match other.end(ghost.as_str(), Stop { group: 1, watch: None, grace: Duration::from_millis(10), poll: Duration::from_millis(10), clock: &Wall }) {
-        Err(Refusal::Backend(why)) => assert!(why.contains("does not run"), "{why}"),
-        other => panic!("{other:?}"),
+    // A seat the manager does not run (wsp-040): a terminal this process
+    // opened and nothing started in under the manager. It is ended in-process,
+    // and its record goes, rather than refused and left holding its claim.
+    let bare = opened(&despawner, &dir);
+    let bare_pid = despawner.root(&bare);
+    let sweep = Sweep::default();
+    if let Some(pid) = bare_pid {
+        sweep.add(pid);
     }
+    despawner.end(&bare).expect("an unmanaged seat ends in-process");
+    assert_eq!(despawner.root(&bare), None, "the unmanaged seat's record went with it");
+    if let Some(pid) = bare_pid {
+        let gone = (0..100).any(|_| {
+            let dead = !InProcess::with_sup(&sup).is_alive(pid);
+            if !dead {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            dead
+        });
+        assert!(gone, "the unmanaged seat's group was ended: {pid}");
+    }
+    drop(sweep);
+    let ghost = Seat::new("cpd-nobody");
 
     drop((spawner, other));
     m.stop();

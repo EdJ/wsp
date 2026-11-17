@@ -109,8 +109,9 @@ pub trait Host: Sync {
     fn stop(&self, stop: Stop<'_>);
     /// [`Host::stop`] of `seat`, and what ended: the manager's own `seat.stopped`
     /// (its `ended` pids and `exit`) where the host is the manager, the group
-    /// this process signalled otherwise. A manager that does not run `seat`, or
-    /// does not answer, is an error and never a stop that went well.
+    /// this process signalled otherwise. A manager that does not answer is an
+    /// error and never a stop that went well; one that answers it does not run
+    /// `seat` leaves it to the in-process stop.
     fn end(&self, _seat: &str, stop: Stop<'_>) -> Result<Ended> {
         let group = stop.group;
         self.stop(stop);

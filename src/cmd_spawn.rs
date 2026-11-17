@@ -1560,17 +1560,35 @@ fn wait_ready(
 }
 
 /// The key `seat.spawn` carries for a row: the row's id and the number of
-/// attempts it already has, so a second spawn of the same row is a new key. The
-/// count is the log's "started by pane" lines (what `cmd_attempts::attempts_of`
-/// reads its seat starts from, which a lower component may not call). `None` for a seat with no row (a bare shell, a
-/// rotation without a task): the host then keys it by its own freshly minted
-/// seat id at attempt 0, which no other spawn can share.
+/// seats the row has already had, so every spawn of the same row is a new key.
+/// The count is the seat starts its log records: a member's `claimed by pane`
+/// lines and a leg's or piece's `started by pane` (what
+/// `cmd_attempts::attempts_of` reads its attempts from, which a lower component
+/// may not call). Read **before** this spawn writes its own start, so a row's
+/// first seat is attempt 0 and a row reopened after one ended seat is attempt 1
+/// (wsp-040: counting the leg lines alone keyed every member seat after a
+/// reopen at attempt 0, and the manager refused it as a key that already ran).
+/// `None` for a seat with no row (a bare shell, a rotation without a task): the
+/// host then keys it by its own freshly minted seat id at attempt 0, which no
+/// other spawn can share.
 fn spawn_key(store: &Store, row: Option<&str>) -> Option<crate::place::Key> {
     let t = store.find_task(row?)?;
-    let attempt = t
-        .section("Log")
-        .map_or(0, |log| log.lines().filter(|l| l.contains(" started by pane ")).count()) as u32;
+    let attempt = t.section("Log").map_or(0, |log| log.lines().filter(|l| seat_start(l)).count()) as u32;
     Some(crate::place::Key { row: crate::place::RowId(t.id.clone()), attempt })
+}
+
+/// Whether a log line records a seat starting on the row: `- <date> claimed by
+/// pane …`, `- <date> leg <name> started by pane …` or `- <date> piece <n>
+/// started by pane …`. The sentence only, so a note quoting one is not one.
+fn seat_start(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("- ") else { return false };
+    let Some((_, said)) = rest.split_once(' ') else { return false };
+    let head = said.split(" · ").next().unwrap_or("");
+    if head.starts_with("claimed by pane ") {
+        return true;
+    }
+    let seat_line = head.strip_prefix("leg ").or_else(|| head.strip_prefix("piece "));
+    seat_line.and_then(|h| h.split_once(' ')).is_some_and(|(_, said)| said.starts_with("started by pane "))
 }
 
 /// Start an agent in a seat, and try again if it does not survive the attempt.
@@ -1886,14 +1904,33 @@ fn confirm_turn(
 /// Why a start that carried its first order did not end in a turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Unordered {
-    /// No `seat.started`: the manager refused the seat, or is silent.
+    /// No `seat.started`, and the host silent: the seat may start yet.
     Start(String),
+    /// No `seat.started`, and the host answered: it refused the seat on the
+    /// last attempt's key, so nothing will start in it (wsp-040).
+    Denied(String),
     /// Started, and the host answered the order `order.refused`: it is not
     /// held anywhere, so it is owed to the repair tick as a tell is.
     Refused(String),
     /// Started, and no `order.acked` within the patience: the manager still
     /// holds the order and asks again under its id, so nothing is owed.
     Unanswered(String),
+}
+
+/// A seat the host refused to start in, taken down: the terminal `open` put
+/// up is stopped, and when the spawn claimed the row for it (`member`) the
+/// claim is released, so no seat is left standing with nothing in it and the
+/// row is free to be seated again. A seat already gone is the same outcome.
+fn denied(place: &dyn Place, store: &Store, seat: &Seat, member: bool) {
+    match place.stop(seat) {
+        Ok(()) | Err(Refusal::NoSeat(_)) => eprintln!("wsp: closed {seat}, which nothing will start in"),
+        Err(e) => eprintln!("wsp: {seat} could not be closed: {e} — `wsp despawn --pane {seat}`"),
+    }
+    if member {
+        let _ = cmd_agent::release_pane(store, seat.as_str());
+        crate::lapse::seat_ended(store, seat.as_str());
+        store.end_agents_in(seat.as_str());
+    }
 }
 
 /// `start_agent` and `confirm_turn` in one message, under a host that has
@@ -1928,7 +1965,7 @@ fn start_ordered(
         let heard = match place.start_ordered(seat, &agent, &order, within)? {
             Ok(heard) => heard,
             Err(Refusal::Unreachable(why)) => return Some(Err(Unordered::Start(why))),
-            Err(e) if left == 0 => return Some(Err(Unordered::Start(e.to_string()))),
+            Err(e) if left == 0 => return Some(Err(Unordered::Denied(e.to_string()))),
             Err(e) => {
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
                 eprintln!("wsp: trying {seat} again in {}s", backoff.as_secs());
@@ -2982,6 +3019,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // left standing either way: it is a terminal in the right tree, which is
     // what you would have opened by hand, and closing something that already
     // has a shell in it to tidy up after a refusal is a worse trade.
+    // The spawn's key, read before the claim below writes this seat's start
+    // into the log (`spawn_key`). A verifier is not one of the row's attempts:
+    // keyed by the row it would share the key of the member seat after it, so
+    // the host mints it one of its own.
+    let key = match verifying {
+        true => None,
+        false => spawn_key(store, work.task.as_deref()),
+    };
     let claimed = match &work.task {
         // No claim: the member's own claim is its agent's, and a verifier is
         // somebody else. The pass is the record, and it gets the seat now —
@@ -3291,7 +3336,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // read-only verbs that do it (compounding-614).
         let row_tags = work.task.as_deref().and_then(|t| store.find_task(t)).map(|t| t.tags).unwrap_or_default();
         spawn_args.extend(crate::cmd_role::retro_spawn_args(&kind, verifying, &row_tags, &store.state));
-        let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args, key: spawn_key(store, work.task.as_deref()) };
+        let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args, key };
         let far_start = args.get("on").is_some();
         // Two waits, and they are different questions: `start` comes back when
         // the agent exists, `wait_ready` when it will listen. Both are inside
@@ -3321,6 +3366,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 ordered = true;
                 told = true;
             }
+            // The manager said no: nothing is coming to the seat, so the
+            // terminal it opened is closed and a member's claim let go, and
+            // the row can be seated again (wsp-040: an empty terminal held
+            // the claim of a row the manager would never start).
+            Some(Err(Unordered::Denied(e))) => {
+                eprintln!("wsp: {kind} did not start in {seat}: {e}");
+                let member = claimed && !verifying && leg_name.is_none() && piece_rec.is_none();
+                denied(place, store, &seat, member);
+            }
             Some(Err(Unordered::Start(e))) => {
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
                 if let Some(text) = &order {
@@ -3343,7 +3397,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                     }
                     // The manager still asks under its id: owing it too
                     // would send it twice.
-                    Unordered::Unanswered(e) | Unordered::Start(e) => {
+                    Unordered::Unanswered(e) | Unordered::Start(e) | Unordered::Denied(e) => {
                         eprintln!("wsp: agent started but not working on it: {e}");
                     }
                 }
@@ -4139,7 +4193,7 @@ fn rotate_as(
     let (started, handed) = match in_args {
         false => match start_ordered(place, &spawn, &agent, &kind, &text, wait) {
             Some(Ok(())) => (Ok(()), Some(Ok(()))),
-            Some(Err(Unordered::Start(e))) => (Err(e), None),
+            Some(Err(Unordered::Start(e) | Unordered::Denied(e))) => (Err(e), None),
             Some(Err(Unordered::Refused(e) | Unordered::Unanswered(e))) => (Ok(()), Some(Err(e))),
             None => (start_agent(place, how, &spawn, &agent, &kind, wait), None),
         },
@@ -7591,7 +7645,7 @@ mod tests {
         let refused = || Err(Refusal::Backend("the manager refused seat cpd-26: Full 4 seats run here".into()));
         let place = Hears::of(vec![refused(), refused(), refused()], vec![]);
         match ordering(&place, &dial) {
-            Some(Err(Unordered::Start(e))) => assert!(e.contains("refused seat cpd-26"), "{e}"),
+            Some(Err(Unordered::Denied(e))) => assert!(e.contains("refused seat cpd-26"), "{e}"),
             other => panic!("{other:?}"),
         }
         let attempts: Vec<u32> = place.sent.borrow().iter().map(|(k, _)| k.as_ref().unwrap().attempt).collect();
@@ -8613,6 +8667,102 @@ mod tests {
         fn here(&self) -> Option<Seat> {
             None
         }
+    }
+
+    /// `wsp-040`: the key's attempt is the seats the row's log has already had,
+    /// read before this spawn's own claim. A row with one ended seat and a
+    /// reopen is attempt 1, not 0 again (the manager refused 0 as a key that
+    /// had already run). Leg and piece starts count; a note quoting a claim,
+    /// and wsp's own `started by` line, do not.
+    #[test]
+    fn a_reopened_row_with_one_ended_seat_is_keyed_at_attempt_1() {
+        let store = seat("key-reopen");
+        let mut t = crate::model::Task::new("reopened", "t-1");
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        assert_eq!(spawn_key(&store, Some("t-1")).map(|k| k.attempt), Some(0), "a row's first seat");
+
+        t.log("started by wsp: m1-fixes group 1");
+        t.log("claimed by pane cpd-243 · spawned at opus/high · packet 8279");
+        t.log("wsp: started by this run m1-fixes group 1");
+        t.log("released after 4m · ran opus-5-5/high · 30 turns");
+        t.log("review: summary: done");
+        t.log("sent back: the row's case is different; it was claimed by pane cpd-243 and ended");
+        store.save_task(&t).unwrap();
+        let key = spawn_key(&store, Some("t-1")).expect("a row's key");
+        assert_eq!(key.row.0, "t-1");
+        assert_eq!(key.attempt, 1, "one ended seat and a reopen");
+
+        t.log("leg scout started by pane cpd-244 · spawned at sonnet/medium");
+        t.log("leg scout ended after 2m");
+        t.log("piece 1 started by pane cpd-245");
+        store.save_task(&t).unwrap();
+        assert_eq!(spawn_key(&store, Some("t-1")).map(|k| k.attempt), Some(3), "legs and pieces are seats too");
+        assert_eq!(spawn_key(&store, None), None, "no row, no key");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A backend that remembers which seats it was told to stop, and has
+    /// nothing else to say.
+    struct Stops(std::cell::RefCell<Vec<String>>);
+
+    impl Place for Stops {
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("the seat is open")
+        }
+        fn stop(&self, seat: &Seat) -> crate::place::Result<()> {
+            self.0.borrow_mut().push(seat.as_str().to_string());
+            Ok(())
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("a refused seat is not started")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("a refused seat is not told")
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            Ok(State::Empty)
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("nothing waited for")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// `wsp-040`: a spawn the manager refuses leaves no seat standing. The
+    /// terminal `open` put up is stopped, and the member's claim on it is let
+    /// go, so the row can be seated again; a seat with no claim (a verifier,
+    /// a leg) is stopped and nothing of the row's is touched.
+    #[test]
+    fn a_seat_the_manager_refused_is_closed_and_its_claim_let_go() {
+        let store = seat("denied");
+        let mut task = crate::model::Task::new("refused", "t-1");
+        task.status_raw = "doing".into();
+        store.save_task(&task).unwrap();
+        store.set_agent("a-1", json!({ "seat": "cpd-248", "started": "2026-11-17T18:54:00Z" }));
+        store.set_binding("cpd-248", json!({ "task_id": "t-1", "pane_id": "cpd-248" }));
+        store.set_claim("t-1", json!({ "agent_id": "a-1", "claimed_at": "2026-11-17T18:54:01Z" }));
+
+        let place = Stops(Default::default());
+        denied(&place, &store, &Seat::new("cpd-248"), true);
+        assert_eq!(*place.0.borrow(), vec!["cpd-248".to_string()], "the terminal it opened was closed");
+        assert!(store.panes_for_task("t-1").is_empty(), "no seat is bound to the row");
+        assert!(!store.claims().contains_key("t-1"), "the claim was let go");
+
+        // Not a member: the seat goes, a claim that is somebody else's stays.
+        store.set_agent("a-2", json!({ "seat": "cpd-250", "started": "2026-11-17T19:00:00Z" }));
+        store.set_binding("cpd-250", json!({ "task_id": "t-1", "pane_id": "cpd-250" }));
+        store.set_claim("t-1", json!({ "agent_id": "a-2", "claimed_at": "2026-11-17T19:00:01Z" }));
+        let place = Stops(Default::default());
+        denied(&place, &store, &Seat::new("cpd-251"), false);
+        assert_eq!(*place.0.borrow(), vec!["cpd-251".to_string()]);
+        assert!(store.claims().contains_key("t-1"), "the member's claim is untouched");
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 
     /// `wsp-603`, the first done-when: a spawn whose readiness retry brings up a

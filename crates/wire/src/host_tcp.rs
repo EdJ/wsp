@@ -638,11 +638,14 @@ impl Host for Tcp {
     }
     /// By seat, so a `despawn` in a process that started nothing finds the seat
     /// in the manager's own list: the manager's pids, or the plain reason it
-    /// could not say.
+    /// could not say. A seat the manager answers it does not run is ended
+    /// in-process (wsp-040): a terminal this process opened and the manager
+    /// refused to start in, or a seat started before the manager, is still a
+    /// group here, and refusing to end it kept its claim with nothing on it.
     fn end(&self, seat: &str, stop: Stop<'_>) -> Result<Ended> {
         match self.epoch_of(seat)? {
             Some(epoch) => self.stop_seat(seat, epoch, stop.grace, stop.grace + MARGIN),
-            None => Err(Refusal::Backend(format!("the manager at {} does not run {seat}", self.addr))),
+            None => self.local.end(seat, stop),
         }
     }
     fn stop_soon(&self, group: u32) {
