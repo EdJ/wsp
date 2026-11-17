@@ -5197,10 +5197,6 @@ pub(crate) fn read_pane_text(_pane: &str) -> Option<String> {
 pub(crate) enum Peeked {
     /// A pane to read, and what to call it in the header.
     At(String, String),
-    /// The panel, when the panel is not a pane: `wsp surface`, drawn into a
-    /// host's sidebar rect. It carries no pane id because it has none, so the
-    /// frame comes off disk rather than off a screen read.
-    Surface,
     /// The needle named something real that nothing is currently on. Carries
     /// the hint, which names what is *missing* rather than what was asked for:
     /// "no view pane" is a fact you can act on, "nothing to peek at for view"
@@ -5226,11 +5222,6 @@ pub(crate) struct Holder {
 /// is a panel in every workspace and the one you mean is almost always yours,
 /// but peeking at another workspace's is a real thing to want.
 ///
-/// `surface` is whether a `wsp surface` is drawing the sidebar on this
-/// machine. A fact about processes rather than about panes, so it is handed in
-/// for the same reason the rest of this is a function: what "the panel" means
-/// under the fork is a rule with a test, and asking a process list is not.
-///
 /// The task lookup arrives as a closure rather than a value because it is only
 /// reached by the last arm. `find_task("")` matches every open task by suffix,
 /// so resolving it up front to hand in would be a fuzzy search over the whole
@@ -5239,7 +5230,6 @@ pub(crate) fn peek_target(
     panes: &[Pane],
     here: Option<&str>,
     me: Option<&str>,
-    surface: bool,
     needle: &str,
     seated: impl Fn(&str) -> bool,
     holder: impl FnOnce(&str) -> Option<Holder>,
@@ -5261,17 +5251,12 @@ pub(crate) fn peek_target(
         // The common case, and the reason there is a default at all: "what
         // does the sidebar look like right now".
         //
-        // A surface wins outright rather than being tried second. Where a
-        // surface runs, the sidebar *is* the surface — a child of its host,
-        // in no workspace — and a panel pane standing beside one is either a husk an
-        // older wsp left or somebody deliberately comparing the two, which is
-        // what `panel install` says when it makes one. Either way it is not
-        // what the person is looking at, and it stays reachable by its pane id.
-        "" | "panel" if surface => Peeked::Surface,
+        // The common case, and the reason there is a default at all: "what
+        // does the sidebar look like right now".
         "" | "panel" => named(
             mine(crate::panel::PANEL_LABEL),
             "the panel",
-            "no panel in this workspace — `wsp panel install`",
+            "no panel in this workspace — run `wsp panel` in a pane",
         ),
         "view" | "detail" => named(
             mine(crate::panel::VIEW_LABEL),
@@ -5316,7 +5301,6 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
         &panes,
         here.as_deref(),
         None,
-        crate::daemon::surface_drawing(&store.state),
         &needle,
         compound_holds,
         |n| {
@@ -5328,7 +5312,6 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
         },
     ) {
         Peeked::At(pane, what) => (pane, what),
-        Peeked::Surface => return peek_surface(store, args),
         Peeked::Nothing(hint) => {
             eprintln!("wsp: {hint}");
             return 1;
@@ -5386,83 +5369,6 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
 
     let p = Paint::new();
     println!("{}", p.dim(&format!("{what}  ({pane})")));
-    if text.trim().is_empty() {
-        println!("{}", p.dim("(nothing on it)"));
-    } else {
-        println!("{}", text.trim_end());
-    }
-    0
-}
-
-/// The sidebar, when the sidebar is a surface.
-///
-/// The whole of `peek`'s job is to put the picture a person is looking at in
-/// front of an agent that cannot see it, and every other target reaches that
-/// picture by asking the backend to read a seat. A surface has no pane, so it leaves
-/// each frame it draws beside the bindings instead, and this prints that — see
-/// `panel::surface_frame`, which carries the argument for why it is the frame
-/// the host was handed rather than a fresh one drawn here.
-///
-/// Two things go in the header that a pane's does not, and both are about
-/// whether to trust what follows. The **cells** it was built for, because half
-/// of what this is used to find is a row costing more of them than it should;
-/// and the **age**, because a surface writes only frames that changed, so a
-/// stamp from ten minutes ago means the picture has not moved — which is
-/// either a quiet machine or exactly the bug being looked for, and the reader
-/// is the one who can tell those apart.
-///
-/// `--source` and `--lines` are not read here. They reach back through what has
-/// scrolled past a pane, and there is no scrollback behind a surface: one
-/// frame is all there has ever been.
-fn peek_surface(store: &Store, args: &Args) -> i32 {
-    let Some(frame) = crate::panel::surface_frame(&store.state) else {
-        // A running surface with no frame on disk is a wsp older than this
-        // build, or one that has not painted yet — a tick settles either — and
-        // saying so is more use than falling back to a pane nobody is looking
-        // at.
-        eprintln!(
-            "wsp: a surface is drawing the sidebar but has left no frame — an older wsp, or it has not painted yet"
-        );
-        return 1;
-    };
-    let age = util::since(&frame.at);
-    let text = frame.lines.join("\n");
-
-    if args.json() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                // Null rather than absent: a reader that keys on `text` should
-                // not have to know which kind of panel answered, and one that
-                // does care is told outright.
-                "pane": Value::Null,
-                "surface": true,
-                "what": "the surface",
-                "source": "frame",
-                "cols": frame.cols,
-                "rows": frame.rows,
-                "at": frame.at,
-                "age": age,
-                "text": text,
-                // A frame is the whole picture by construction: there is no
-                // scrollback behind a surface to have cut anything out of.
-                "truncated": false,
-            }))
-            .unwrap_or_default()
-        );
-        return 0;
-    }
-
-    let p = Paint::new();
-    println!(
-        "{}",
-        p.dim(&format!(
-            "the surface  ({}×{}, drawn {} ago)",
-            frame.cols,
-            frame.rows,
-            util::duration_human(age)
-        ))
-    );
     if text.trim().is_empty() {
         println!("{}", p.dim("(nothing on it)"));
     } else {
@@ -9696,7 +9602,6 @@ mod tests {
     fn at(p: Peeked) -> (String, String) {
         match p {
             Peeked::At(pane, what) => (pane, what),
-            Peeked::Surface => panic!("the surface, which has no pane"),
             Peeked::Nothing(hint) => panic!("nothing: {hint}"),
             Peeked::Unknown => panic!("unknown"),
         }
@@ -9712,18 +9617,18 @@ mod tests {
             labelled("w2:p9", "w2", crate::panel::PANEL_LABEL),
             labelled("w2:p8", "w2", crate::panel::VIEW_LABEL),
         ];
-        assert_eq!(at(peek_target(&panes, Some("w2"), None, false, "", none_seated, no_task)).0, "w2:p9");
-        assert_eq!(at(peek_target(&panes, Some("w1"), None, false, "panel", none_seated, no_task)).0, "w1:p9");
+        assert_eq!(at(peek_target(&panes, Some("w2"), None, "", none_seated, no_task)).0, "w2:p9");
+        assert_eq!(at(peek_target(&panes, Some("w1"), None, "panel", none_seated, no_task)).0, "w1:p9");
 
         // A workspace with no panel of its own falls through to one that has.
-        assert_eq!(at(peek_target(&panes, Some("w7"), None, false, "panel", none_seated, no_task)).0, "w1:p9");
+        assert_eq!(at(peek_target(&panes, Some("w7"), None, "panel", none_seated, no_task)).0, "w1:p9");
         // …and so does a caller with no workspace at all, which is what a
         // shell outside any seat is.
-        assert_eq!(at(peek_target(&panes, None, None, false, "panel", none_seated, no_task)).0, "w1:p9");
+        assert_eq!(at(peek_target(&panes, None, None, "panel", none_seated, no_task)).0, "w1:p9");
 
         // The view is a different surface with a different label, and asking
         // for it from a workspace that has none finds the one that exists.
-        assert_eq!(at(peek_target(&panes, Some("w1"), None, false, "view", none_seated, no_task)).0, "w2:p8");
+        assert_eq!(at(peek_target(&panes, Some("w1"), None, "view", none_seated, no_task)).0, "w2:p8");
     }
 
     /// Missing is named as what is missing, not as what was asked for: "no view
@@ -9733,44 +9638,18 @@ mod tests {
     #[test]
     fn a_target_that_is_not_open_says_how_to_open_it() {
         let none: Vec<Pane> = Vec::new();
-        let hint = |needle: &str| match peek_target(&none, Some("w1"), None, false, needle, none_seated, no_task) {
+        let hint = |needle: &str| match peek_target(&none, Some("w1"), None, needle, none_seated, no_task) {
             Peeked::Nothing(h) => h,
             _ => panic!("expected nothing for {needle}"),
         };
-        assert!(hint("").contains("wsp panel install"));
-        assert!(hint("panel").contains("wsp panel install"));
+        assert!(hint("").contains("wsp panel"));
+        assert!(hint("panel").contains("wsp panel"));
         assert!(hint("view").contains("↵` on a row in the panel"));
         assert!(hint("board").contains("wsp wip"));
 
         // A needle nothing recognises is a different answer again: the target
         // does not exist, rather than existing and being empty.
-        assert!(matches!(peek_target(&none, None, None, false, "banana", none_seated, no_task), Peeked::Unknown));
-    }
-
-    /// Under the fork the sidebar is not a pane, so `peek panel` has to mean
-    /// the thing on the screen rather than the thing wearing the label. A
-    /// panel pane standing beside a running surface is a husk or a deliberate
-    /// comparison, and neither is what the person is looking at.
-    #[test]
-    fn a_running_surface_is_what_the_panel_means_and_a_pane_only_without_one() {
-        let panes = vec![labelled("w1:p9", "w1", crate::panel::PANEL_LABEL)];
-        let panel = |surface| peek_target(&panes, Some("w1"), None, surface, "panel", none_seated, no_task);
-        assert!(matches!(panel(true), Peeked::Surface));
-        assert_eq!(at(panel(false)).0, "w1:p9");
-
-        // The bare needle is the same question, and the ordinary state under
-        // the fork is that there is no panel pane to fall back to at all —
-        // where the answer used to be advice to install one.
-        let none: Vec<Pane> = Vec::new();
-        assert!(matches!(peek_target(&none, Some("w1"), None, true, "", none_seated, no_task), Peeked::Surface));
-
-        // Nothing else moves. A surface is one panel, not a new way to name
-        // panes, and the view and the board are panes as they were.
-        assert_eq!(at(peek_target(&panes, None, None, true, "w1:p9", none_seated, no_task)).1, "pane w1:p9");
-        assert!(matches!(
-            peek_target(&none, Some("w1"), None, true, "view", none_seated, no_task),
-            Peeked::Nothing(_)
-        ));
+        assert!(matches!(peek_target(&none, None, None, "banana", none_seated, no_task), Peeked::Unknown));
     }
 
     /// A pane id is taken literally, but only if a pane wears it — otherwise it
@@ -9779,13 +9658,13 @@ mod tests {
     #[test]
     fn a_pane_id_is_only_a_pane_id_if_a_pane_has_it() {
         let panes = vec![labelled("w1:p3", "w1", "")];
-        assert_eq!(at(peek_target(&panes, None, None, false, "w1:p3", none_seated, no_task)).1, "pane w1:p3");
-        assert!(matches!(peek_target(&panes, None, None, false, "w9:p1", none_seated, no_task), Peeked::Unknown));
+        assert_eq!(at(peek_target(&panes, None, None, "w1:p3", none_seated, no_task)).1, "pane w1:p3");
+        assert!(matches!(peek_target(&panes, None, None, "w9:p1", none_seated, no_task), Peeked::Unknown));
 
         // `me` is this pane, whatever was reported — and a caller nothing has
         // told about itself has no `me` to look at.
-        assert_eq!(at(peek_target(&panes, None, Some("w1:p3"), false, "me", none_seated, no_task)).0, "w1:p3");
-        assert!(matches!(peek_target(&panes, None, None, false, "me", none_seated, no_task), Peeked::Nothing(_)));
+        assert_eq!(at(peek_target(&panes, None, Some("w1:p3"), "me", none_seated, no_task)).0, "w1:p3");
+        assert!(matches!(peek_target(&panes, None, None, "me", none_seated, no_task), Peeked::Nothing(_)));
     }
 
     /// `wsp-156`: a compound seat is `cpd-N` — no colon, and never in a host's
@@ -9795,14 +9674,14 @@ mod tests {
     fn a_seat_is_a_seat_because_its_backend_holds_it_not_because_of_how_it_is_spelled() {
         let panes = vec![labelled("w1:p3", "w1", "")];
         let held = |n: &str| n == "cpd-347";
-        assert_eq!(at(peek_target(&panes, None, None, false, "cpd-347", held, no_task)).0, "cpd-347");
+        assert_eq!(at(peek_target(&panes, None, None, "cpd-347", held, no_task)).0, "cpd-347");
         assert!(
-            matches!(peek_target(&panes, None, None, false, "cpd-348", held, no_task), Peeked::Unknown),
+            matches!(peek_target(&panes, None, None, "cpd-348", held, no_task), Peeked::Unknown),
             "a seat nothing holds falls through to the task search like any other needle"
         );
         // The keywords stay keywords: `me` and `panel` are not a seat a
         // backend could be asked about.
-        assert!(matches!(peek_target(&panes, None, None, false, "me", |_| true, no_task), Peeked::Nothing(_)));
+        assert!(matches!(peek_target(&panes, None, None, "me", |_| true, no_task), Peeked::Nothing(_)));
     }
 
     /// A task names whichever pane is holding it, which is how you look at what
@@ -9818,14 +9697,14 @@ mod tests {
                 panes: vec!["w4:p1".into()],
             })
         };
-        let (pane, what) = at(peek_target(&panes, None, None, false, "001", none_seated, held));
+        let (pane, what) = at(peek_target(&panes, None, None, "001", none_seated, held));
         assert_eq!(pane, "w4:p1");
         assert!(what.starts_with("t-001 — the seam under the panel"), "{what}");
 
         let unheld = |_: &str| {
             Some(Holder { id: "t-002".into(), title: "nobody is on it".into(), panes: Vec::new() })
         };
-        assert!(matches!(peek_target(&panes, None, None, false, "002", none_seated, unheld), Peeked::Nothing(_)));
+        assert!(matches!(peek_target(&panes, None, None, "002", none_seated, unheld), Peeked::Nothing(_)));
     }
 
 

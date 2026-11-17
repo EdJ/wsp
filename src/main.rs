@@ -1700,8 +1700,8 @@ mod tests {
     }
 
     /// A verb the help splits into subcommands answers for its subcommands and
-    /// for nothing else. `panel storyboard` takes flags `panel` does not, and
-    /// borrowing `panel`'s list would refuse them; `show <id>` is not a
+    /// for nothing else. An unlisted `project` subcommand takes flags `project`
+    /// does not, and borrowing `project`'s list would refuse them; `show <id>` is not a
     /// subcommand at all and must still be answered by `show`.
     #[test]
     fn a_subject_is_a_subcommand_only_where_the_help_says_so() {
@@ -1713,7 +1713,7 @@ mod tests {
         assert_eq!(key(&["project", "add", "x"]).as_deref(), Some("project add"));
         assert_eq!(key(&["show", "worklist-038"]).as_deref(), Some("show"));
         assert_eq!(key(&["panel"]).as_deref(), Some("panel"));
-        assert_eq!(key(&["panel", "storyboard"]), None, "storyboard borrowed panel's flags");
+        assert_eq!(key(&["project", "nonesuch"]), None, "an unlisted subcommand borrowed project's flags");
     }
 
     /// An alias the help spells differently — `list` for `ls` — has no entry,

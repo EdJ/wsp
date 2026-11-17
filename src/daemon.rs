@@ -180,8 +180,7 @@ fn is_daemon(rest: &str) -> bool {
 }
 
 /// Is this `ps -E` line `wsp <sub>`? The same reading, for a subcommand that
-/// is not the daemon — see [`surface_drawing`], which is the other long-lived
-/// wsp process on a machine.
+/// is not the daemon.
 fn is_wsp(rest: &str, sub: &str) -> bool {
     let mut words = argv(rest);
     // `-v` and anything after it are somebody's flags, not our business.
@@ -249,33 +248,6 @@ fn daemons(all: &[(u32, u32, String)], me: u32, state: &Path) -> Vec<u32> {
         .filter(|(_, _, rest)| is_daemon(rest) && for_store(rest, state))
         .map(|(pid, _, _)| *pid)
         .collect()
-}
-
-/// Is a `wsp surface` drawing this store's sidebar?
-///
-/// The question `panel install` and its auto-install have to ask, and the
-/// answer that keeps the two surfaces from running at once: a surface *is* the
-/// panel on that screen, so splitting a second one into a pane is the old way
-/// arriving beside the new one — and it arrives by stealing the screen, which
-/// is `fork-002`.
-///
-/// Asked of the process list rather than of a marker wsp writes, because the
-/// fact wanted is "is one running now", and a file saying so outlives the
-/// process that wrote it — through a crash, or a fork
-/// somebody has stopped running. There is nothing to go stale here.
-///
-/// Ancestors are **not** excluded, and [`running`] no longer excludes them
-/// either: the caller is usually a `wsp` the surface itself started — the
-/// plugin hook under a workspace the sidebar's `O` created — and the surface being our own parent
-/// is the case this exists to catch rather than the case to filter out.
-///
-/// A `ps` that will not answer reads as "no surface", which is the same way
-/// round as before this existed: an unanswerable process list should not stop
-/// a panel being installed on a machine that has no fork on it at all.
-pub(crate) fn surface_drawing(state: &Path) -> bool {
-    crate::base::procs::processes()
-        .iter()
-        .any(|(_, _, rest)| is_wsp(rest, "surface") && for_store(rest, state))
 }
 
 /// Has anything on this machine that wants a daemon answered?
