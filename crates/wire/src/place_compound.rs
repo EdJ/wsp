@@ -205,6 +205,16 @@ impl Compound<'static> {
         Compound::at(Store::open().state.join(SEATS))
     }
 
+    /// The one a spawn places work on: its host is `WSP_HOST`'s
+    /// ([`crate::host::chosen`]), the in-process host by default. A manager
+    /// that does not answer is [`host::HostError::Silent`], "host silent",
+    /// and never this process's host in its place.
+    pub fn chosen(version: &str) -> std::result::Result<Compound<'static>, host::HostError> {
+        let state = Store::open().state;
+        let host = host::chosen(&state, version)?;
+        Ok(Compound { host, ..Compound::at(state.join(SEATS)) })
+    }
+
     /// One rooted anywhere — a test's temporary directory.
     pub fn at(root: PathBuf) -> Compound<'static> {
         Compound {
@@ -1008,7 +1018,21 @@ impl Compound<'_> {
     /// decides what else changed (`start` adds `agent`; `open` adds
     /// nothing) and writes it.
     fn spawn_sup(&self, seat: &Seat, rec: &Value, key: Option<&wsp_host_api::Key>, program: &str, args: &[String]) -> Result<Value> {
-        let host::Session { pid, socket, render } = self.host.spawn_session(&Self::spawn_of(seat, rec, key, program, args))?;
+        self.spawn_sup_by(seat, rec, key, program, args, &mut |s| self.host.spawn_session(s))
+    }
+
+    /// [`Compound::spawn_sup`], the host asked by `spawn`: its plain
+    /// `seat.spawn`, or one carrying the first order ([`Place::start_ordered`]).
+    fn spawn_sup_by(
+        &self,
+        seat: &Seat,
+        rec: &Value,
+        key: Option<&wsp_host_api::Key>,
+        program: &str,
+        args: &[String],
+        spawn: &mut dyn FnMut(&host::Spawn<'_>) -> Result<host::Session>,
+    ) -> Result<Value> {
+        let host::Session { pid, socket, render } = spawn(&Self::spawn_of(seat, rec, key, program, args))?;
         let mut rec = rec.clone();
         rec["pid"] = json!(pid);
         rec["socket"] = json!(socket.display().to_string());
@@ -1017,6 +1041,39 @@ impl Compound<'_> {
         }
         rec["started_at"] = json!(util::now_iso());
         Ok(rec)
+    }
+
+    /// A local seat's start, its `seat.spawn` asked of the host by `spawn`:
+    /// a seat holding a bare terminal is replaced, one holding an agent is
+    /// refused, and the record is written with what started.
+    fn start_here(
+        &self,
+        seat: &Seat,
+        rec: Value,
+        agent: &Agent,
+        spawn: &mut dyn FnMut(&host::Spawn<'_>) -> Result<host::Session>,
+    ) -> Result<()> {
+        let dir = self.dir_of(seat)?;
+        if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
+            if self.host.alive(&[pid as u32]).contains(&(pid as u32)) {
+                if rec.get("agent").is_some() {
+                    return Err(Refusal::Backend(format!("{seat} already has a session running")));
+                }
+                self.end_process(seat, &rec);
+            }
+        }
+        let (program, argv) = (crate::place::above().command)(&agent.kind, &agent.args);
+        let mut told = rec.clone();
+        told["agent"] = json!({ "kind": agent.kind });
+        let mut rec = self.spawn_sup_by(seat, &told, agent.key.as_ref(), &program, &argv, spawn)?;
+        rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
+        // wsp-477: spawned with `--agent`, so its supervisor can `deliver`.
+        if reads_kind(&agent.kind) {
+            rec["deliver"] = json!(true);
+        }
+        write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
+            .map_err(|e| Refusal::Backend(e.to_string()))?;
+        Ok(())
     }
 
     /// The `seat.spawn` this seat's record asks for: the agent kind its
@@ -1389,30 +1446,37 @@ impl Place for Compound<'_> {
     /// unchanged.
     fn start(&self, seat: &Seat, agent: &Agent) -> Result<()> {
         let rec = self.record(seat)?;
-        let dir = self.dir_of(seat)?;
         if !str_of(&rec, "machine").is_empty() {
             return self.start_far(seat, &rec, agent);
         }
-        if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
-            if self.host.alive(&[pid as u32]).contains(&(pid as u32)) {
-                if rec.get("agent").is_some() {
-                    return Err(Refusal::Backend(format!("{seat} already has a session running")));
-                }
-                self.end_process(seat, &rec);
-            }
+        self.start_here(seat, rec, agent, &mut |s| self.host.spawn_session(s))
+    }
+
+    /// `seat.spawn` with the first order, and its answer heard as the
+    /// manager's events (4.3): a host with no events (in-process), or a far
+    /// seat (M2's), is `None` and nothing is started.
+    fn start_ordered(&self, seat: &Seat, agent: &Agent, order: &crate::place::FirstOrder, wait: Duration) -> Option<Result<crate::place::Heard>> {
+        if !self.host.hears_orders() {
+            return None;
         }
-        let (program, argv) = (crate::place::above().command)(&agent.kind, &agent.args);
-        let mut told = rec.clone();
-        told["agent"] = json!({ "kind": agent.kind });
-        let mut rec = self.spawn_sup(seat, &told, agent.key.as_ref(), &program, &argv)?;
-        rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
-        // wsp-477: spawned with `--agent`, so its supervisor can `deliver`.
-        if reads_kind(&agent.kind) {
-            rec["deliver"] = json!(true);
+        let rec = match self.record(seat) {
+            Ok(rec) => rec,
+            Err(e) => return Some(Err(e)),
+        };
+        if !str_of(&rec, "machine").is_empty() {
+            return None;
         }
-        write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
-            .map_err(|e| Refusal::Backend(e.to_string()))?;
-        Ok(())
+        let mut heard = crate::place::Heard::Unanswered;
+        let started = self.start_here(seat, rec, agent, &mut |s| {
+            let (session, h) = self.host.spawn_ordered(s, order, wait)?;
+            heard = h;
+            Ok(session)
+        });
+        Some(started.map(|()| heard))
+    }
+
+    fn await_order(&self, _seat: &Seat, order: &crate::place::OrderId, wait: Duration) -> Option<Result<crate::place::Heard>> {
+        self.host.hears_orders().then(|| self.host.await_order(order, wait))
     }
 
     /// Paste the sentence, press Enter, disconnect — see the module docs'

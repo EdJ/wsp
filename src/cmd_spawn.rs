@@ -1880,6 +1880,110 @@ fn confirm_turn(
     }
 }
 
+/// Why a start that carried its first order did not end in a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unordered {
+    /// No `seat.started`: the manager refused the seat, or is silent.
+    Start(String),
+    /// Started, and the host answered the order `order.refused`: it is not
+    /// held anywhere, so it is owed to the repair tick as a tell is.
+    Refused(String),
+    /// Started, and no `order.acked` within the patience: the manager still
+    /// holds the order and asks again under its id, so nothing is owed.
+    Unanswered(String),
+}
+
+/// `start_agent` and `confirm_turn` in one message, under a host that has
+/// events to wait by (`WSP_HOST=manager`, `docs/agent-manager.md` 4.3):
+/// `seat.spawn` carries the work order as its first order, and the answer is
+/// heard as `seat.started`, then `order.acked` (or `order.refused`,
+/// `seat.refused`) — never read off [`Place::state`] or a screen. `None`: the
+/// backend has no such host, nothing was started, and the caller goes the old
+/// way (start, [`wait_ready`], [`hand_over`]).
+///
+/// [`Patience`] keeps its meaning. `ready` and `taken` together are how long
+/// the seat and its order's ack may take, since an ack is a turn begun and so
+/// readiness as well: running out of them is what "never became ready for
+/// input" was, said as the event that did not come. `nudges` are presses of
+/// submit on an order still unanswered, each followed by `taken` more of
+/// listening. `attempts` and `backoff` retry a start the manager refused,
+/// under the next attempt's key; a silent host is not retried, it is said.
+fn start_ordered(
+    place: &dyn Place,
+    spawn: &crate::agent_commands::Spawn,
+    agent: &Agent,
+    kind: &str,
+    text: &str,
+    wait: &Patience,
+) -> Option<Result<(), Unordered>> {
+    let seat = spawn.seat;
+    let mut agent = agent.clone();
+    let mut backoff = wait.backoff;
+    let within = wait.ready + wait.taken;
+    for left in (0..=wait.attempts).rev() {
+        let order = crate::place::FirstOrder { order: crate::place::new_order_id(seat), text: text.to_string() };
+        let heard = match place.start_ordered(seat, &agent, &order, within)? {
+            Ok(heard) => heard,
+            Err(Refusal::Unreachable(why)) => return Some(Err(Unordered::Start(why))),
+            Err(e) if left == 0 => return Some(Err(Unordered::Start(e.to_string()))),
+            Err(e) => {
+                eprintln!("wsp: {kind} did not start in {seat}: {e}");
+                eprintln!("wsp: trying {seat} again in {}s", backoff.as_secs());
+                if let Some(key) = agent.key.as_mut() {
+                    key.attempt += 1;
+                }
+                wait.clock.rest(backoff);
+                backoff *= wait.steeper;
+                continue;
+            }
+        };
+        return Some(heard_over(place, seat, kind, &order.order, heard, within, wait));
+    }
+    Some(Err(Unordered::Start(format!("{kind} was never started in {seat}"))))
+}
+
+/// [`hand_over`]'s loop on what the host said rather than on what a poll
+/// reads: acked is taken, refused is said, and unanswered is pressed and
+/// listened for again, `nudges` times.
+fn heard_over(
+    place: &dyn Place,
+    seat: &Seat,
+    kind: &str,
+    order: &crate::place::OrderId,
+    mut heard: crate::place::Heard,
+    within: Duration,
+    wait: &Patience,
+) -> Result<(), Unordered> {
+    use crate::place::Heard;
+    let mut waited = within;
+    for pressed in 0..=wait.nudges {
+        match heard {
+            Heard::Acked => return Ok(()),
+            Heard::Refused(why) => return Err(Unordered::Refused(format!("{seat} did not take the work order: {why}"))),
+            Heard::Unanswered => {}
+        }
+        if pressed == wait.nudges {
+            break;
+        }
+        match place.nudge(seat) {
+            Ok(()) => {}
+            Err(Refusal::Unsupported(_)) => break,
+            Err(e) => return Err(Unordered::Unanswered(format!("{seat} did not take the work order: {e}"))),
+        }
+        heard = match place.await_order(seat, order, wait.taken) {
+            Some(Ok(h)) => h,
+            Some(Err(e)) => return Err(Unordered::Unanswered(format!("{seat}'s work order went unheard: {e}"))),
+            None => Heard::Unanswered,
+        };
+        waited += wait.taken;
+    }
+    Err(Unordered::Unanswered(format!(
+        "{kind} started in {seat} and no order.acked came for its work order within {}s: \
+         the manager holds it and asks again under its id",
+        waited.as_secs()
+    )))
+}
+
 /// Say how to reach an agent a spawn could not, where the kind knows a way.
 ///
 /// The failure this softens is measured rather than imagined: `spawn`'s work
@@ -2101,10 +2205,31 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
     // this and printed a backend sentence for a backend fact; a backend that is not
     // answering now says so from the call that wanted it, which arrives at the
     // same moment and names what it stopped.
+    let place = match spawn_backend(args) {
+        Ok(place) => place,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
     if args.has("primary") {
-        return seat_primary(backend(args).as_ref(), &crate::cycle::Fleet, store, args);
+        return seat_primary(place.as_ref(), &crate::cycle::Fleet, store, args);
     }
-    place_work(backend(args).as_ref(), store, args)
+    place_work(place.as_ref(), store, args)
+}
+
+/// [`backend`] for a spawn: compound's host is `WSP_HOST`'s
+/// ([`crate::host::chosen`]; the in-process host by default), so under
+/// `manager` the seat is `seat.spawn`'s and its first order is heard acked.
+/// A manager that does not answer is the error, "host silent", and never the
+/// in-process host in its place.
+fn spawn_backend(args: &Args) -> Result<Box<dyn Place>, String> {
+    match chosen(args) {
+        Chosen::Headless => Ok(backend(args)),
+        Chosen::Compound => crate::place_compound::Compound::chosen(crate::VERSION)
+            .map(|c| Box::new(c) as Box<dyn Place>)
+            .map_err(|e| e.to_string()),
+    }
 }
 
 /// The project whose root the primary interface stands in, absent `--cwd`.
@@ -3168,7 +3293,49 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 _ => {}
             }
         }
-        match start_agent(place, how, &spawn, &agent, &kind, &spawn_patience(far_start)) {
+        // Under a host with events (`WSP_HOST=manager`) a work order that is
+        // told rather than put in argv goes in the `seat.spawn` itself, and
+        // the spawn waits for it to be heard taken (4.3): no readiness poll,
+        // no screen read, no look for a turn. `None` is the in-process host.
+        let heard = match (&order, in_args) {
+            (Some(text), false) => start_ordered(place, &spawn, &agent, &kind, text, &spawn_patience(far_start)),
+            _ => None,
+        };
+        match heard {
+            Some(Ok(())) => {
+                started = Some(kind.clone());
+                ordered = true;
+                told = true;
+            }
+            Some(Err(Unordered::Start(e))) => {
+                eprintln!("wsp: {kind} did not start in {seat}: {e}");
+                if let Some(text) = &order {
+                    crate::repair::owe_first_order(store, seat.as_str(), text, 0);
+                }
+                unreached(how, place, &spawn);
+            }
+            Some(Err(why)) => {
+                started = Some(kind.clone());
+                ordered = true;
+                match why {
+                    // Answered and not taken: nobody holds it now, so it is
+                    // owed to the repair tick as a failed tell is.
+                    Unordered::Refused(e) => {
+                        eprintln!("wsp: agent started but not working on it: {e}");
+                        if let Some(text) = &order {
+                            crate::repair::owe_first_order(store, seat.as_str(), text, 1);
+                        }
+                        eprintln!("wsp: send it again with `wsp tell {seat} -`");
+                    }
+                    // The manager still asks under its id: owing it too
+                    // would send it twice.
+                    Unordered::Unanswered(e) | Unordered::Start(e) => {
+                        eprintln!("wsp: agent started but not working on it: {e}");
+                    }
+                }
+                unreached(how, place, &spawn);
+            }
+            None => match start_agent(place, how, &spawn, &agent, &kind, &spawn_patience(far_start)) {
             Ok(()) => {
                 started = Some(kind.clone());
                 // A task gives an agent something to be told, and so — since
@@ -3235,6 +3402,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 }
                 unreached(how, place, &spawn);
             }
+        },
         }
     }
 
@@ -3952,8 +4120,18 @@ fn rotate_as(
 
     // Step 2. Started, then heard from: a turn running is the only evidence
     // that the handover was taken, and everything after this point depends on
-    // it having been.
-    if let Err(e) = start_agent(place, how, &spawn, &agent, &kind, wait) {
+    // it having been. Under a host with events the order goes in the
+    // `seat.spawn` and both are heard rather than polled for (4.3).
+    let (started, handed) = match in_args {
+        false => match start_ordered(place, &spawn, &agent, &kind, &text, wait) {
+            Some(Ok(())) => (Ok(()), Some(Ok(()))),
+            Some(Err(Unordered::Start(e))) => (Err(e), None),
+            Some(Err(Unordered::Refused(e) | Unordered::Unanswered(e))) => (Ok(()), Some(Err(e))),
+            None => (start_agent(place, how, &spawn, &agent, &kind, wait), None),
+        },
+        true => (start_agent(place, how, &spawn, &agent, &kind, wait), None),
+    };
+    if let Err(e) = started {
         eprintln!("wsp: {kind} did not start in {seat}: {e}");
         if vacant {
             // No `unreached` line: it says `wsp tell` will reach the agent if
@@ -3968,7 +4146,8 @@ fn rotate_as(
         return 1;
     }
     if !in_args {
-        if let Err(e) = confirm_turn(place, how, &spawn, &text, wait) {
+        let handed = handed.unwrap_or_else(|| confirm_turn(place, how, &spawn, &text, wait));
+        if let Err(e) = handed {
             eprintln!("wsp: agent started but not working on it: {e}");
             if vacant {
                 // **Not "send the order again", and not "has the order in its
@@ -7240,6 +7419,182 @@ mod tests {
         let e = handing_over(&dropped, &util::Dial::new()).unwrap_err();
         assert!(e.ends_with("its prompt is empty: the work order was dropped"), "{e}");
         assert!(repair_line(&dropped, &seat).contains("`wsp tell w3M:p1 -`"), "the pane, not the task");
+    }
+
+    /// A backend whose host has events (`WSP_HOST=manager`), scripted: what
+    /// each `seat.spawn` with its first order is heard to come to, and what
+    /// each later wait hears. Every reading a poll would take (`state`, the
+    /// prompt off the screen) is counted, and a `tell` or plain `start` is a
+    /// failure: under a manager the order rides the spawn.
+    struct Hears {
+        starts: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<crate::place::Heard>>>,
+        later: std::cell::RefCell<std::collections::VecDeque<crate::place::Heard>>,
+        sent: std::cell::RefCell<Vec<(Option<crate::place::Key>, crate::place::FirstOrder)>>,
+        polls: std::cell::Cell<u32>,
+        pressed: std::cell::Cell<u32>,
+    }
+
+    impl Hears {
+        fn of(starts: Vec<crate::place::Result<crate::place::Heard>>, later: Vec<crate::place::Heard>) -> Hears {
+            Hears {
+                starts: std::cell::RefCell::new(starts.into()),
+                later: std::cell::RefCell::new(later.into()),
+                sent: std::cell::RefCell::new(Vec::new()),
+                polls: std::cell::Cell::new(0),
+                pressed: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Place for Hears {
+        fn start_ordered(
+            &self,
+            _: &Seat,
+            agent: &Agent,
+            order: &crate::place::FirstOrder,
+            _: Duration,
+        ) -> Option<crate::place::Result<crate::place::Heard>> {
+            self.sent.borrow_mut().push((agent.key.clone(), order.clone()));
+            Some(self.starts.borrow_mut().pop_front().expect("a start the script did not expect"))
+        }
+        fn await_order(&self, _: &Seat, _: &crate::place::OrderId, _: Duration) -> Option<crate::place::Result<crate::place::Heard>> {
+            Some(Ok(self.later.borrow_mut().pop_front().unwrap_or(crate::place::Heard::Unanswered)))
+        }
+        fn nudge(&self, _: &Seat) -> crate::place::Result<()> {
+            self.pressed.set(self.pressed.get() + 1);
+            Ok(())
+        }
+        fn typed(&self, _: &Seat) -> Option<bool> {
+            self.polls.set(self.polls.get() + 1);
+            None
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            self.polls.set(self.polls.get() + 1);
+            Ok(State::Idle)
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("under a manager the work order goes in seat.spawn, not a later tell")
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("under a manager the start carries its order")
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("the seat is open")
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("a spawn that fails leaves the seat standing")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("a spawn is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("the host's subscription is its own")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    fn ordering(place: &dyn Place, dial: &util::Dial) -> Option<Result<(), Unordered>> {
+        let seat = Seat::new("cpd-26");
+        let spawn = crate::agent_commands::Spawn {
+            full: false,
+            subagents: false,
+            packet: false,
+            name: "wsp-026",
+            seat: &seat,
+            model: None,
+            effort: None,
+            order: None,
+            resume: None,
+            brief: None,
+        };
+        let key = crate::place::Key { row: crate::place::RowId("wsp-026".into()), attempt: 0 };
+        let agent = Agent { kind: "claude".into(), name: "wsp-026".into(), args: vec![], key: Some(key) };
+        start_ordered(place, &spawn, &agent, "claude", "the work order", &retrying(dial))
+    }
+
+    /// Under `manager` the spawn is one message and two events: the order goes
+    /// in `seat.spawn`, `order.acked` is heard, and nothing reads the seat's
+    /// state or its screen, nor waits on the clock (4.3).
+    #[test]
+    fn under_a_manager_the_order_rides_the_spawn_and_its_ack_is_heard_without_a_poll() {
+        use crate::place::Heard;
+        let dial = util::Dial::new();
+        let place = Hears::of(vec![Ok(Heard::Acked)], vec![]);
+        assert_eq!(ordering(&place, &dial), Some(Ok(())));
+        let sent = place.sent.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.text, "the work order", "the work order is the spawn's first order");
+        assert!(sent[0].1.order.0.starts_with("cpd-26-first-"), "{:?}", sent[0].1.order);
+        assert_eq!(place.polls.get(), 0, "no state poll and no screen read");
+        assert_eq!(place.pressed.get(), 0);
+        assert_eq!(dial.elapsed(), Duration::ZERO, "nothing slept");
+
+        // The in-process host has no events: nothing is started, and the
+        // caller goes the old way.
+        let old = Composer::of(Some(0), true);
+        assert_eq!(ordering(&old, &dial), None);
+        assert!(old.heard.borrow().is_empty());
+    }
+
+    /// A refusal is said, worded, at once: the order's (`order.refused`),
+    /// the seat's (`seat.refused`, retried under the next attempt's key and
+    /// then said), and a silent manager's (said, never retried).
+    #[test]
+    fn a_refused_or_silent_spawn_under_a_manager_is_reported_not_hung() {
+        use crate::place::Heard;
+        let dial = util::Dial::new();
+
+        let place = Hears::of(vec![Ok(Heard::Refused("cpd-26: busy".into()))], vec![]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Refused(e))) => assert!(e.contains("did not take the work order: cpd-26: busy"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!((place.polls.get(), place.pressed.get()), (0, 0), "a refusal is not pressed at");
+
+        let refused = || Err(Refusal::Backend("the manager refused seat cpd-26: Full 4 seats run here".into()));
+        let place = Hears::of(vec![refused(), refused(), refused()], vec![]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Start(e))) => assert!(e.contains("refused seat cpd-26"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        let attempts: Vec<u32> = place.sent.borrow().iter().map(|(k, _)| k.as_ref().unwrap().attempt).collect();
+        assert_eq!(attempts, [0, 1, 2], "each retry is the next attempt's key");
+        let ids: std::collections::BTreeSet<String> = place.sent.borrow().iter().map(|(_, o)| o.order.0.clone()).collect();
+        assert_eq!(ids.len(), 3, "and each start a new order, never the last one's answer");
+        assert_eq!(place.polls.get(), 0);
+
+        let silent = Hears::of(vec![Err(Refusal::Unreachable("host silent: the manager at 127.0.0.1:1 did not answer".into()))], vec![]);
+        match ordering(&silent, &dial) {
+            Some(Err(Unordered::Start(e))) => assert!(e.starts_with("host silent"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(silent.sent.borrow().len(), 1, "a silent host is said, not retried");
+    }
+
+    /// No answer is the patience running out, kept from `hand_over`: submit is
+    /// pressed `nudges` times, each followed by `taken` of listening, and an ack
+    /// heard after a press is a turn taken. Never a poll.
+    #[test]
+    fn an_unanswered_order_under_a_manager_is_pressed_then_said_as_no_ack() {
+        use crate::place::Heard;
+        let dial = util::Dial::new();
+        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![Heard::Unanswered, Heard::Unanswered]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Unanswered(e))) => {
+                assert!(e.contains("no order.acked came for its work order"), "{e}");
+                assert!(e.contains("the manager holds it"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(place.pressed.get(), PRESSES);
+        assert_eq!(place.polls.get(), 0);
+
+        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![Heard::Acked]);
+        assert_eq!(ordering(&place, &dial), Some(Ok(())));
+        assert_eq!(place.pressed.get(), 1, "one press, then the ack");
+        assert_eq!(place.polls.get(), 0);
     }
 
     /// The healthy handover, and the assertion is that nothing else happens: an

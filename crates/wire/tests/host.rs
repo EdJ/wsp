@@ -8,6 +8,12 @@
 //! subscription keeps its place per host and resubscribes `from` it after the
 //! manager drops the connection.
 //!
+//! Then a spawn under `manager` (wsp-026, 4.3): `seat.spawn` carries the
+//! work order as its first order, and `seat.started` and `order.acked` are
+//! heard by subscription, with no `state` poll and no render (counted on a
+//! wrapper of each); a refused or silent spawn is said, not hung. Under
+//! `inproc` the backend has no such wait, and starts as before.
+//!
 //! Nothing here spawns claude: the fake's sessions are a sleeping process
 //! group each, ended by the contract's stop, by [`Sweep`], or with this test
 //! process at the latest.
@@ -20,12 +26,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeSet;
+use std::io::BufRead;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use serde_json::Value;
 use wsp_base::util::Wall;
 use wsp_host_api::{At, Epoch, EventId, Key, Message, RowId, Role, SeatId, SeatSaid, Token};
 use wsp_manager::{Config, Manager, TOKEN_FILE};
-use wsp_wire::host::{self, Choice, Host, HostError, InProcess, Spawn, Stop, Subscription, Tcp, LOCAL};
+use wsp_wire::host::{self, Choice, Forked, Headless, Host, HostError, InProcess, Session, Spawn, Stop, Subscription, Tcp, LOCAL};
 use wsp_wire::manager::{install_record, Local};
-use wsp_wire::place::{Delivery, Refusal, Seat};
+use wsp_wire::place::{
+    new_order_id, Agent, Census, Delivery, Event, FirstOrder, Heard, Order, OrderId, Place, Refusal, Result as PResult, Seat, State,
+};
+use wsp_wire::place_compound::Compound;
 
 /// compound-sup as far as a seat's spawn, delivery and stop use it. `spawn`
 /// prints the handshake and becomes the session itself, in a session and
@@ -230,6 +244,351 @@ fn spawns_under_one_key_over_tcp_give_one_seat_and_another_attempt_another() {
     assert_eq!(spawns(&run), 2);
     drop(tcp);
     m.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A host that counts what a poll for readiness would ask of it: the
+/// renderer's screen and its reading of it. Everything else is the host it
+/// wraps.
+struct Counting<'h> {
+    inner: &'h dyn Host,
+    renders: AtomicU32,
+}
+
+impl Counting<'_> {
+    fn renders(&self) -> u32 {
+        self.renders.load(Ordering::SeqCst)
+    }
+}
+
+impl Host for Counting<'_> {
+    fn hears_orders(&self) -> bool {
+        self.inner.hears_orders()
+    }
+    fn spawn_ordered(&self, spawn: &Spawn<'_>, order: &FirstOrder, wait: Duration) -> PResult<(Session, Heard)> {
+        self.inner.spawn_ordered(spawn, order, wait)
+    }
+    fn await_order(&self, order: &OrderId, wait: Duration) -> PResult<Heard> {
+        self.inner.await_order(order, wait)
+    }
+
+    fn spawn_session(&self, spawn: &Spawn<'_>) -> PResult<Session> {
+        self.inner.spawn_session(spawn)
+    }
+    fn spawn_headless(&self, spawn: &Headless<'_>) -> PResult<Forked> {
+        self.inner.spawn_headless(spawn)
+    }
+    fn stop(&self, stop: Stop<'_>) {
+        self.inner.stop(stop)
+    }
+    fn stop_soon(&self, group: u32) {
+        self.inner.stop_soon(group)
+    }
+    fn clear_socket(&self, socket: &Path, sidecars: &[&str]) {
+        self.inner.clear_socket(socket, sidecars)
+    }
+    fn unlink(&self, path: &Path) {
+        self.inner.unlink(path)
+    }
+    fn alive(&self, pids: &[u32]) -> BTreeSet<u32> {
+        self.inner.alive(pids)
+    }
+    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
+        self.inner.started(pid)
+    }
+    fn shells(&self) -> Option<String> {
+        self.inner.shells()
+    }
+    fn seat_memory(&self) -> Option<String> {
+        self.inner.seat_memory()
+    }
+    fn disk_free(&self, path: &Path) -> Option<String> {
+        self.inner.disk_free(path)
+    }
+    fn disk_use(&self, path: &Path) -> Option<String> {
+        self.inner.disk_use(path)
+    }
+    fn load(&self) -> Option<String> {
+        self.inner.load()
+    }
+    fn thermal(&self) -> Option<String> {
+        self.inner.thermal()
+    }
+    fn memory_pressure(&self) -> Option<String> {
+        self.inner.memory_pressure()
+    }
+    fn swap(&self) -> Option<String> {
+        self.inner.swap()
+    }
+    fn pageouts(&self) -> Option<String> {
+        self.inner.pageouts()
+    }
+    fn idle(&self) -> Option<String> {
+        self.inner.idle()
+    }
+    fn tree_of(&self, root: u32) -> Vec<u32> {
+        self.inner.tree_of(root)
+    }
+    fn table(&self, columns: &str, env: bool) -> Option<String> {
+        self.inner.table(columns, env)
+    }
+    fn rows_of(&self, pids: &[u32], columns: &str) -> Option<String> {
+        self.inner.rows_of(pids, columns)
+    }
+    fn signal(&self, pids: &[u32], sig: &str) -> Option<bool> {
+        self.inner.signal(pids, sig)
+    }
+    fn signal_group(&self, group: u32, sig: &str) {
+        self.inner.signal_group(group, sig)
+    }
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
+        self.inner.cwds(pids)
+    }
+    fn answers(&self, socket: &Path) -> bool {
+        self.inner.answers(socket)
+    }
+    fn read_screen(&self, render: &Path) -> PResult<String> {
+        self.renders.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_screen(render)
+    }
+    fn screen_state(&self, render: &Path, kind: &str) -> Option<State> {
+        self.renders.fetch_add(1, Ordering::SeqCst);
+        self.inner.screen_state(render, kind)
+    }
+    fn osc_title(&self, socket: &Path) -> Option<String> {
+        self.renders.fetch_add(1, Ordering::SeqCst);
+        self.inner.osc_title(socket)
+    }
+    fn can_deliver(&self) -> bool {
+        self.inner.can_deliver()
+    }
+    fn deliver(&self, session: &Path, id: &str, text: &str, wait: Duration, seat: &Seat) -> PResult<Delivery> {
+        self.inner.deliver(session, id, text, wait, seat)
+    }
+    fn type_in(&self, render: &Path, text: &str) -> PResult<()> {
+        self.inner.type_in(render, text)
+    }
+    fn press_enter(&self, render: &Path) -> PResult<()> {
+        self.inner.press_enter(render)
+    }
+    fn append_line(&self, file: &Path, line: &str) -> PResult<()> {
+        self.inner.append_line(file, line)
+    }
+    fn said(&self, dir: &Path) -> Value {
+        self.inner.said(dir)
+    }
+    fn say(&self, dir: &Path, said: &Value) {
+        self.inner.say(dir, said)
+    }
+    fn log_hook(&self, dir: &Path, line: &Value) {
+        self.inner.log_hook(dir, line)
+    }
+    fn quiet_since(&self, dir: &Path) -> Option<i64> {
+        self.inner.quiet_since(dir)
+    }
+    fn tally(&self, dir: &Path, payload: &Value) {
+        self.inner.tally(dir, payload)
+    }
+    fn bank(&self, dir: &Path) {
+        self.inner.bank(dir)
+    }
+    fn burn_under(&self, root: &Path) -> Vec<(String, Value)> {
+        self.inner.burn_under(root)
+    }
+    fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
+        self.inner.transcript_of(session, cwd)
+    }
+    fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
+        self.inner.pi_session_of(session, cwd)
+    }
+    fn read_transcript(&self, file: &Path) -> Option<Box<dyn BufRead>> {
+        self.inner.read_transcript(file)
+    }
+    fn transcript_bytes(&self, file: &Path) -> Option<Vec<u8>> {
+        self.inner.transcript_bytes(file)
+    }
+    fn transcript_tail(&self, file: &Path, bytes: u64) -> Option<String> {
+        self.inner.transcript_tail(file, bytes)
+    }
+    fn opencode_export(&self, session: &str) -> Option<Vec<u8>> {
+        self.inner.opencode_export(session)
+    }
+    fn opencode_newest(&self, session: &str) -> Option<Vec<Value>> {
+        self.inner.opencode_newest(session)
+    }
+    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
+        self.inner.turn_began(dir, since)
+    }
+    fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+        self.inner.wire_health(problems, notes)
+    }
+}
+
+/// A place that counts the readings a readiness or turn poll takes: its
+/// `state`, and the prompt read off its screen. Everything else is the place
+/// it wraps.
+struct Polls<'p> {
+    inner: &'p dyn Place,
+    polls: AtomicU32,
+}
+
+impl Polls<'_> {
+    fn polls(&self) -> u32 {
+        self.polls.load(Ordering::SeqCst)
+    }
+}
+
+impl Place for Polls<'_> {
+    fn open(&self, o: &Order) -> PResult<Seat> {
+        self.inner.open(o)
+    }
+    fn here(&self) -> Option<Seat> {
+        self.inner.here()
+    }
+    fn start(&self, s: &Seat, a: &Agent) -> PResult<()> {
+        self.inner.start(s, a)
+    }
+    fn start_ordered(&self, s: &Seat, a: &Agent, o: &FirstOrder, w: Duration) -> Option<PResult<Heard>> {
+        self.inner.start_ordered(s, a, o, w)
+    }
+    fn await_order(&self, s: &Seat, o: &OrderId, w: Duration) -> Option<PResult<Heard>> {
+        self.inner.await_order(s, o, w)
+    }
+    fn tell(&self, s: &Seat, t: &str) -> PResult<Delivery> {
+        self.inner.tell(s, t)
+    }
+    fn nudge(&self, s: &Seat) -> PResult<()> {
+        self.inner.nudge(s)
+    }
+    fn typed(&self, s: &Seat) -> Option<bool> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        self.inner.typed(s)
+    }
+    fn stop(&self, s: &Seat) -> PResult<()> {
+        self.inner.stop(s)
+    }
+    fn state(&self, s: &Seat) -> PResult<State> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        self.inner.state(s)
+    }
+    fn census(&self) -> PResult<Census> {
+        self.inner.census()
+    }
+    fn watch(&self, f: &mut dyn FnMut(Event) -> bool) -> PResult<()> {
+        self.inner.watch(f)
+    }
+}
+
+fn agent(attempt: u32) -> Agent {
+    Agent { kind: "claude".into(), name: "wsp-026".into(), args: vec![], key: Some(Key { row: RowId("wsp-026".into()), attempt }) }
+}
+
+fn opened(place: &dyn Place, dir: &Path) -> Seat {
+    place.open(&Order { label: "wsp-026".into(), cwd: Some(dir.display().to_string()), ..Order::default() }).expect("a seat")
+}
+
+/// Every order the fake compound-sup was asked to type, as `<id> <text>`.
+fn typed_under(run: &Path) -> Vec<String> {
+    fs::read_dir(run)
+        .map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "orders")).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| fs::read_to_string(e.path().join("typed")).ok())
+        .flat_map(|t| t.lines().map(str::to_string).collect::<Vec<_>>())
+        .collect()
+}
+
+/// `WSP_HOST=manager`: the spawn is `seat.spawn` with the work order in it,
+/// and the order's `order.acked` is heard on a subscription. No `state` is
+/// polled and no screen is rendered on the way.
+#[test]
+fn a_spawn_under_manager_carries_its_order_and_hears_it_acked_with_no_poll_and_no_render() {
+    let (dir, sup) = place("ord");
+    let m = manager(&dir, &sup, 0);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let host = Counting { inner: &tcp, renders: AtomicU32::new(0) };
+    let compound = Compound { host: &host, ..Compound::at(dir.join("seats")) };
+    let place = Polls { inner: &compound, polls: AtomicU32::new(0) };
+
+    let seat = opened(&place, &dir);
+    let order = FirstOrder { order: new_order_id(&seat), text: "go and do it".into() };
+    let start = Instant::now();
+    assert_eq!(place.start_ordered(&seat, &agent(0), &order, Duration::from_secs(20)), Some(Ok(Heard::Acked)));
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    assert_eq!(place.polls(), 0, "no state poll, no prompt read");
+    assert_eq!(host.renders(), 0, "no screen rendered");
+
+    // The manager typed it, once, under the id the spawn carried: it went in
+    // the seat.spawn, not a later tell.
+    let run = dir.join("exec").join(wsp_manager::seats::RUN_DIR);
+    let typed = typed_under(&run);
+    assert_eq!(typed, vec![format!("{} go and do it", order.order.0)], "{typed:?}");
+
+    // An order the work refuses is heard refused, worded, and not hung on.
+    let busy = opened(&place, &dir);
+    let order = FirstOrder { order: new_order_id(&busy), text: "busy now".into() };
+    let start = Instant::now();
+    match place.start_ordered(&busy, &agent(1), &order, Duration::from_secs(20)) {
+        Some(Ok(Heard::Refused(why))) => assert_eq!(why, format!("{busy}: busy")),
+        other => panic!("{other:?}"),
+    }
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+
+    // A seat the manager refuses (the key already runs another seat) is the
+    // spawn's error, said at once.
+    let twin = opened(&place, &dir);
+    let order = FirstOrder { order: new_order_id(&twin), text: "go".into() };
+    match place.start_ordered(&twin, &agent(0), &order, Duration::from_secs(20)) {
+        Some(Err(Refusal::Backend(why))) => assert!(why.contains("the manager refused seat") && why.contains("Duplicate"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(place.polls(), 0);
+    assert_eq!(host.renders(), 0);
+
+    for s in [&seat, &busy, &twin] {
+        let _ = place.stop(s);
+    }
+    drop(tcp);
+    m.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A manager that does not answer is "host silent" from the spawn, within
+/// the second `SILENT` allows, and nothing is started in this process instead.
+#[test]
+fn a_spawn_under_a_silent_manager_is_host_silent_not_hung() {
+    let (dir, sup) = place("osil");
+    let tcp = Tcp::with_local(SocketAddr::from(([127, 0, 0, 1], free_port())), Token("t".into()), Role::Cli, "test", InProcess::with_sup(&sup));
+    let compound = Compound { host: &tcp, ..Compound::at(dir.join("seats")) };
+    let seat = opened(&compound, &dir);
+    let order = FirstOrder { order: new_order_id(&seat), text: "go".into() };
+    let start = Instant::now();
+    match compound.start_ordered(&seat, &agent(0), &order, Duration::from_secs(20)) {
+        Some(Err(Refusal::Unreachable(why))) => assert!(why.starts_with("host silent"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+    assert_eq!(compound.root(&seat), None, "nothing was started in this process in the manager's place");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `WSP_HOST=inproc`: the backend has no events to wait by, so it starts
+/// nothing on `start_ordered` and the spawn goes the old way, which starts.
+#[test]
+fn a_spawn_in_process_has_no_ordered_start_and_starts_as_before() {
+    let (dir, sup) = place("oin");
+    let sweep = Sweep::default();
+    let inproc = InProcess::with_sup(&sup);
+    let compound = Compound { host: &inproc, ..Compound::at(dir.join("seats")) };
+    let seat = opened(&compound, &dir);
+    let order = FirstOrder { order: new_order_id(&seat), text: "go".into() };
+    assert_eq!(compound.start_ordered(&seat, &agent(0), &order, Duration::from_secs(5)), None);
+    compound.start(&seat, &agent(0)).expect("the old way starts");
+    let pid = compound.root(&seat).expect("a session pid");
+    sweep.add(pid);
+    assert!(inproc.is_alive(pid));
+    let _ = compound.stop(&seat);
     drop(sweep);
     let _ = fs::remove_dir_all(&dir);
 }
