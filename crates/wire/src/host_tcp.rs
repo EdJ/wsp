@@ -327,6 +327,11 @@ struct Known {
     epoch: Epoch,
     pid: u32,
     render: Option<PathBuf>,
+    /// The journal id of this start's `seat.started`, as the spawn's answer
+    /// carried it: what [`Host::await_up`] subscribes after, so it hears this
+    /// start's first turn or its stop and nothing before (wsp-037). `None`
+    /// where the answer carried none (a journal that could not be written).
+    started: Option<EventId>,
 }
 
 /// The [`Host`] over a connection to the host's manager.
@@ -344,11 +349,6 @@ pub struct Tcp {
     /// The first orders sent with a `seat.spawn` whose answer is not heard
     /// yet, by order id: the seat, and the subscription that will hear it.
     waiting: Mutex<BTreeMap<String, (String, Subscription)>>,
-    /// The seats a plain `seat.spawn` started whose start is not judged yet,
-    /// by seat: the subscription, opened before the spawn, that hears its
-    /// first turn or its `seat.stopped` (wsp-037). One per seat; a later
-    /// start of the same seat replaces it.
-    starting: Mutex<BTreeMap<String, Subscription>>,
 }
 
 impl Tcp {
@@ -369,7 +369,6 @@ impl Tcp {
             next_req: Mutex::new(0),
             known: Mutex::new(BTreeMap::new()),
             waiting: Mutex::new(BTreeMap::new()),
-            starting: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -403,6 +402,12 @@ impl Tcp {
     /// `done` says one ends the exchange, for at most `wait`. A connection the
     /// manager closed is reopened once, before anything was sent on it.
     fn ask(&self, msg: Message, wait: Duration, done: impl Fn(&Message) -> bool) -> std::result::Result<Vec<Message>, HostError> {
+        Ok(self.ask_frames(msg, wait, done)?.into_iter().map(|f| f.msg).collect())
+    }
+
+    /// [`Tcp::ask`], keeping each answer's frame: a journalled answer carries
+    /// its event id.
+    fn ask_frames(&self, msg: Message, wait: Duration, done: impl Fn(&Message) -> bool) -> std::result::Result<Vec<Frame>, HostError> {
         let req = {
             let mut n = self.next_req.lock().unwrap_or_else(|e| e.into_inner());
             *n += 1;
@@ -437,7 +442,7 @@ impl Tcp {
             match live.conn.recv(left.min(Duration::from_secs(BEAT_SECS))) {
                 Ok(Some(f)) if f.req == Some(req) => {
                     let end = done(&f.msg) || matches!(f.msg, Message::Refused(_));
-                    said.push(f.msg);
+                    said.push(f);
                     if end {
                         return Ok(said);
                     }
@@ -522,17 +527,20 @@ impl Tcp {
             gate: Gate::None,
             first_order: first,
         });
-        let said = self.ask(msg, wait, |m| matches!(m, Message::SeatStarted(_) | Message::SeatRefused(_)))?;
-        match said.into_iter().last() {
-            Some(Message::SeatStarted(s)) => {
+        let said = self.ask_frames(msg, wait, |m| matches!(m, Message::SeatStarted(_) | Message::SeatRefused(_)))?;
+        let Some(Frame { id, msg, .. }) = said.into_iter().last() else {
+            return Err(Refusal::Backend(format!("no seat.started for {} within {}s", spawn.seat, wait.as_secs())));
+        };
+        match msg {
+            Message::SeatStarted(s) => {
                 let socket = s.sockets.first().map(PathBuf::from).unwrap_or_default();
                 let render = s.sockets.get(1).map(PathBuf::from);
-                let known = Known { epoch: s.epoch, pid: s.pid, render: render.clone() };
+                let known = Known { epoch: s.epoch, pid: s.pid, render: render.clone(), started: id };
                 self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(spawn.seat.to_string(), known);
                 Ok(Session { pid: s.pid, socket, render })
             }
-            Some(Message::SeatRefused(r)) => Err(Refusal::Backend(format!("the manager refused seat {}: {:?} {}", r.seat.0, r.why, r.detail))),
-            Some(Message::Refused(r)) => Err(Refusal::Backend(format!("the manager refused the spawn: {:?} {}", r.why, r.detail))),
+            Message::SeatRefused(r) => Err(Refusal::Backend(format!("the manager refused seat {}: {:?} {}", r.seat.0, r.why, r.detail))),
+            Message::Refused(r) => Err(Refusal::Backend(format!("the manager refused the spawn: {:?} {}", r.why, r.detail))),
             _ => Err(Refusal::Backend(format!("no seat.started for {} within {}s", spawn.seat, wait.as_secs()))),
         }
     }
@@ -587,24 +595,25 @@ fn argv_of(spawn: &Spawn<'_>) -> Vec<String> {
 impl Host for Tcp {
     // ---- seat.spawn / seat.started
     fn spawn_session(&self, spawn: &Spawn<'_>) -> Result<Session> {
-        // Subscribed before the spawn, as `spawn_ordered` is, so the start's
-        // first turn or its stop cannot come before the watch on it. A watch
-        // that cannot be opened costs the spawn nothing: `await_up` then has
-        // only `seat.started` to go by.
-        let sub = Subscription::at_head(self.addr, self.token.clone(), self.role, &self.version).ok();
-        let session = self.spawn_with(spawn, None, SPAWN_WAIT)?;
-        if let Some(sub) = sub {
-            self.starting.lock().unwrap_or_else(|e| e.into_inner()).insert(spawn.seat.to_string(), sub);
-        }
-        Ok(session)
+        // On the one connection, and nothing held open after it: the start's
+        // `seat.started` carries its journal id, and `await_up` subscribes
+        // after that id, so the start's first turn or its stop is replayed to
+        // it however late it asks (wsp-037). A spawn no `await_up` follows (a
+        // bare shell `open` starts, a start that errs after) leaves no watch.
+        self.spawn_with(spawn, None, SPAWN_WAIT)
     }
     fn await_up(&self, seat: &str, by_turn: bool, wait: Duration) -> Result<Up> {
-        let sub = self.starting.lock().unwrap_or_else(|e| e.into_inner()).remove(seat);
         // `seat.started` was the spawn's own answer: that is the seat up, and
         // where readiness is not a turn there is nothing more to hear.
-        let (true, Some(mut sub)) = (by_turn, sub) else { return Ok(Up::Ready) };
-        let epoch = self.known.lock().unwrap_or_else(|e| e.into_inner()).get(seat).map(|k| k.epoch);
-        let ours = |s: &SeatId, e: Epoch| s.0 == seat && epoch.is_none_or(|k| k == e);
+        if !by_turn {
+            return Ok(Up::Ready);
+        }
+        let known = self.known.lock().unwrap_or_else(|e| e.into_inner()).get(seat).map(|k| (k.epoch, k.started));
+        // Not started by this process, or its `seat.started` carried no id to
+        // replay after: there is nothing to hear it by but that answer.
+        let Some((epoch, Some(started))) = known else { return Ok(Up::Ready) };
+        let mut sub = Subscription::after(self.addr, self.token.clone(), self.role, &self.version, started)?;
+        let ours = |s: &SeatId, e: Epoch| s.0 == seat && e == epoch;
         let deadline = Instant::now() + wait;
         let up = loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -956,6 +965,28 @@ impl Subscription {
             version: version.to_string(),
             conn: None,
             last: hello.journal_head,
+            handed: None,
+            subscribed: 0,
+        };
+        sub.subscribe_on(conn)?;
+        Ok(sub)
+    }
+
+    /// A watch for one CLI call that hears what came after event `from`,
+    /// replayed from the journal where it already happened: a start's events
+    /// after its own `seat.started` (wsp-037). Kept in memory, as
+    /// [`Subscription::at_head`]'s is.
+    pub fn after(addr: SocketAddr, token: Token, role: Role, version: &str, from: EventId) -> std::result::Result<Subscription, HostError> {
+        let (conn, hello) = open(addr, &token, role, version, Some(from))?;
+        let mut sub = Subscription {
+            addr,
+            token,
+            host: hello.host.0.clone(),
+            state: None,
+            role,
+            version: version.to_string(),
+            conn: None,
+            last: Some(from),
             handed: None,
             subscribed: 0,
         };

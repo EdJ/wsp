@@ -715,6 +715,95 @@ fn a_stop_under_manager_reports_the_pids_seat_stopped_names() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// wsp-037: under the manager a start is judged by its events, as
+/// `Tcp::await_up` hears them, never by a state read just after `seat.started`
+/// (which a healthy seat failed, and was stopped and started again at epoch 2).
+/// A plain spawn holds nothing open after it: `await_up` subscribes after the
+/// start's own `seat.started`, so what came before it asked is replayed.
+#[test]
+fn under_manager_await_up_hears_a_start_by_its_first_turn_its_stop_or_neither() {
+    use wsp_host::hooks::{report, Dial, Sent};
+    use wsp_wire::place::Up;
+
+    let (dir, sup) = place("up");
+    let sweep = Sweep::default();
+    let m = manager(&dir, &sup, 0);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let dial = Dial::Manager { addr: m.addrs()[0], token_file: dir.join("exec").join(TOKEN_FILE) };
+    let args = vec!["-c".to_string(), "true".to_string()];
+    let spawn = |seat: &'static str, attempt: u32| Spawn {
+        key: Key { row: RowId(format!("wsp-u-{seat}")), attempt },
+        seat,
+        kind: Some("claude".into()),
+        cwd: dir.display().to_string(),
+        env: BTreeMap::new(),
+        program: "sh",
+        args: &args,
+    };
+    let epoch_of = |seat: &str| tcp.seats().unwrap().into_iter().find(|r| r.seat.0 == seat).map(|r| r.epoch).expect("the manager runs it");
+    let run = dir.join("exec").join(wsp_manager::seats::RUN_DIR);
+    let spawns_of = |seat: &str| fs::read_to_string(run.join("spawns")).unwrap_or_default().lines().filter(|l| l.split(' ').next() == Some(seat)).count();
+    let wait = Duration::from_secs(5);
+
+    // Without `by_turn`, `seat.started` is the seat up: nothing to hear.
+    let plain = tcp.spawn_session(&spawn("cpd-u0", 0)).expect("the seat starts");
+    sweep.add(plain.pid);
+    assert_eq!(m.clients(), 1, "a plain spawn holds no second connection open");
+    assert_eq!(tcp.await_up("cpd-u0", false, wait), Ok(Up::Ready));
+    assert_eq!(m.clients(), 1, "and asks nothing more");
+
+    // With it: the first turn begun, posted by the seat's hook before anyone
+    // asked, is ready. One spawn, one `seat.started`, no `seat.stop`.
+    let up = tcp.spawn_session(&spawn("cpd-u1", 0)).expect("the seat starts");
+    sweep.add(up.pid);
+    let epoch = epoch_of("cpd-u1");
+    let payload = serde_json::json!({ "session_id": "sess-u1" });
+    assert_eq!(report(&dial, "cpd-u1", epoch, "UserPromptSubmit", &payload), Sent::Taken(1));
+    assert_eq!(tcp.await_up("cpd-u1", true, wait), Ok(Up::Ready));
+    assert_eq!(spawns_of("cpd-u1"), 1, "started once");
+    assert!(tcp.is_alive(up.pid), "the healthy start is left running");
+    let mut all = Subscription::after(m.addrs()[0], token(&dir), Role::Cli, "test", EventId(0)).unwrap();
+    let mut started = 0;
+    let mut stopped = 0;
+    while let Some(f) = all.next(Duration::from_millis(300)).unwrap() {
+        match f.msg {
+            Message::SeatStarted(s) if s.seat.0 == "cpd-u1" => started += 1,
+            Message::SeatStopped(s) if s.seat.0 == "cpd-u1" => stopped += 1,
+            _ => {}
+        }
+    }
+    drop(all);
+    assert_eq!((started, stopped), (1, 0), "one seat.started, epoch {epoch:?}, and no seat.stopped");
+
+    // A start that exits before its first turn is the start that died.
+    let dies = tcp.spawn_session(&spawn("cpd-u2", 0)).expect("the seat starts");
+    sweep.add(dies.pid);
+    // The pid itself, not its group: the fake may not have called setsid yet.
+    let killed = std::process::Command::new("kill").args(["-KILL", &dies.pid.to_string()]).status().unwrap();
+    assert!(killed.success());
+    assert_eq!(tcp.await_up("cpd-u2", true, wait), Ok(Up::Stopped));
+
+    // Silence is neither, at the wait: a turn for another seat, or for an
+    // earlier start of this one, is not this start's.
+    let mute = tcp.spawn_session(&spawn("cpd-u3", 0)).expect("the seat starts");
+    sweep.add(mute.pid);
+    let mute_epoch = epoch_of("cpd-u3");
+    assert_eq!(report(&dial, "cpd-u1", epoch, "Stop", &payload), Sent::Taken(1));
+    assert_eq!(report(&dial, "cpd-u1", epoch, "UserPromptSubmit", &payload), Sent::Taken(1), "cpd-u1's next turn begins");
+    // Whatever the manager makes of a hook under an epoch it never started,
+    // it is not this start's first turn.
+    let _ = report(&dial, "cpd-u3", Epoch(mute_epoch.0 + 7), "UserPromptSubmit", &payload);
+    let start = Instant::now();
+    assert_eq!(tcp.await_up("cpd-u3", true, Duration::from_millis(600)), Ok(Up::Unready));
+    assert!(start.elapsed() >= Duration::from_millis(600), "waited the whole wait: {:?}", start.elapsed());
+    assert!(tcp.is_alive(mute.pid), "judging it touches nothing");
+
+    drop(tcp);
+    m.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A port nothing listens on: bound, then let go.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
