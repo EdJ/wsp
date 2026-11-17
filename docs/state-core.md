@@ -641,6 +641,76 @@ i5.
 - `wsp-api` (4.1's envelope) is not in step 0. It belongs to step 1's breakdown, where whether it reuses
   `wsp-host-api`'s `Connection` is decided.
 
+### Step 1's breakdown (wsp-069, 2026-11-17)
+
+The list is `s1-state-core`, at status init, not started. Per d1 it runs after step 0's list is complete (and so after
+M3). It follows wsp-018's rules: expand, then contract; a cut that cannot be staged is one row run as legs; every row's
+checks build the workspace and test each crate it touches, with budgets of at least 120 s per cargo step. It also follows
+wsp-068's recommendation: rows on one seam never share a group, and each overview names its seam and files.
+
+**What step 1 is, as amended.** The daemon opens `state.db` through `wsp-store-sqlite` and keeps a **mirror** in it. The
+mirror is a projection, never the owner of any state, and it is built from two sources:
+- the managers' events, applied by src/fold.rs (wsp-028) beside the files it already writes;
+- the store's files (rows, claims, lists, asks, machines), re-read by the daemon when `Store::fingerprint` or
+  `attention_stamp` moves. The daemon checks these in process once a second, with no child.
+
+Files stay the truth. The API serves the mirror's reads and `subscribe` over TCP on loopback and the tailnet (D19).
+web-chrome's census wakes on its events, not on the `wsp stamp` poll, and `wip --json` reads through it. Nothing is deleted
+in step 1, because both rollbacks (the host's poll and the CLI's files) must stay one flag away. The contract half comes
+with steps 2–4, when the machines own what the mirror only copies.
+
+| group | kind | row | tier | what | creates / changes · seam |
+|---|---|---|---|---|---|
+| 1 | contract | wsp-070 | opus high | The contract carries the mirror: `Command::Mirror { put, gone }`, `mirror.put`/`mirror.gone`, and `fields` on `Seat`, `List`, `Group`, `Ask`. `TestDomain` refuses `mirror` | crates/store-contract, crates/store-conformance/src/domain.rs, docs/components.md · the contract's types |
+| 2 | contract | wsp-071 | opus high | `wsp-api`: 4.1's envelope, the read verbs and `subscribe`, `hello`/`welcome` with `api.token`, `api.json` for where it listens, `Principal`'s text form, its own `Connection` (types only) | creates crates/api; Cargo.toml, Cargo.lock, tests/layering.rs, docs/components.md · the API's wire types |
+| 3 | components | wsp-072 | opus high | `SqliteStore` implements `Store` and passes all ten cases of 2.3, plus `open_read_only`. Three legs: `apply`, `leases`, `events` | crates/store-sqlite; Cargo.lock, tests/layering.rs, docs/components.md · the SQLite backend |
+| 4 | components | wsp-073 | opus high | `wsp-server`: TCP on loopback and the tailnet, `hello`, the read verbs, `subscribe` with beats, commands `refused unsupported`, and `mirror::Mirror`, the domain step 1 runs | creates crates/server; Cargo.toml, Cargo.lock, tests/layering.rs, docs/components.md · the server's socket and subscribe loop |
+| 5 | components | wsp-074 | sonnet high | `wsp-client`: dial from `api.json`, `Silent` never a hang, request by id, and subscribe with reconnect, de-duplication and `Resumed` | creates crates/client; Cargo.toml, Cargo.lock, tests/layering.rs, docs/components.md · the wire's client side |
+| 6 | wiring | wsp-075 | opus high | The daemon opens `state.db`, starts the server (`WSP_API=off` is the rollback), applies the mirror per manager event in fold.rs, and re-mirrors the files on a fingerprint move. Doctor reports the API. Three legs: `project`, `serve`, `fold` | creates src/mirror.rs, tests/mirror.rs; src/daemon.rs, src/fold.rs, src/main.rs, Cargo.toml, Cargo.lock, tests/layering.rs · the daemon's start-up and the manager fold |
+| 7 | wiring | wsp-076 | opus high | `Wip::from_api`: `wip --json` from one `state`, byte-identical to the files path (a test), no child, files as the fallback within 200 ms, `WSP_READ=files` | src/cmd_agent.rs, Cargo.toml, Cargo.lock, tests/wip_api.rs · wip's read path |
+| 7 | wiring | wsp-078 | opus high | **compound-react**: web-chrome's `feed.rs` subscribes through `wsp-client` and rings the census `Gate` per subject (row → tasks, ask → flags, seat/claim/order → agents, list → worklists, machine → machines). `WEB_CHROME_FEED=poll` is the rollback, and a silent API falls back to the poll | spikes/web-chrome/src-tauri/{src/feed.rs, src/main.rs, Cargo.toml, Cargo.lock} · web-chrome's census wake-up |
+| 8 | insitu | wsp-077 | sonnet high | The measure, after a day on the installed trunk and app, written here as "Step 1's result" | this section |
+
+**Why the groups are serial.** Groups 2–7 each change Cargo.lock, and groups 2, 4 and 5 each add a member on
+Cargo.toml's one `members` line, and groups 1–6 each edit docs/components.md. In parallel they would conflict at land. wsp-073's tests run over `MemStore`, so in
+principle it does not need wsp-072. Group 7 is the only shared group. Its two rows are in different repositories, with
+no file and no seam in common.
+
+**The stops.** After group 6: wsp-078 must sit in a project whose root is compound-react. After group 7: the person
+installs the trunk and web-chrome's app, and a day passes on both before the measure.
+
+**Found while planning.**
+- **web-chrome's polling is host-core's `wsp stamp` loop**, not the reads. `push_census` (src-tauri/src/main.rs) runs
+  `host_core::poll::spawn`, one `wsp stamp` every 2–5 s. Each stamp that moves rings census.rs's `Gate`, whose reads are
+  `wsp` children (`ls --json --all`, the flags read, `wip --json`, the worklists read, `machine ls --json`). So the
+  smallest change that takes polling to 0 is to ring the same gate from `subscribe`. The census's reads, parsers and host-core
+  stay as they are (d3: Ed expects no compound change; host-core is shared with the gpui window).
+- **wsp has no project `compound`** (`wsp project show compound`: no project matching). wsp-078 is filed under `wsp`
+  until the person makes one. Its tree is /Users/jesper/src/private/compound-react.
+- **The contract cannot write a projection.** Its 19 commands are 4.2's verbs, each with section 3's guards, so step 1's
+  mirror needs one contract change (wsp-070, R5) rather than a backdoor in the SQLite crate. A write path outside the
+  contract would make the server depend on `wsp-store-sqlite`, which section 6 forbids.
+- **The daemon already folds the managers' events** (src/fold.rs, wsp-028) on a thread of its own. The mirror hangs off
+  that fold, so the amendment's "folding the managers' events, not files written by probes" costs no second subscription.
+
+**Left for the person** (the review note on wsp-069, each with a recommended answer):
+- (1) The API's transport. Recommended: TCP on loopback and the tailnet with one token per instance, as the manager does
+  (D19, agent-manager 3.4). `$WSP_STATE/api.json` names where it listens and stands for 4.1's `api.sock`, with no unix
+  socket path.
+- (2) Whether `wsp-api` reuses `wsp-host-api`'s `Connection`. Recommended: no. wsp-api declares its own trait over its own
+  `Frame`, with the same framing rule copied. host-api's trait is typed to the manager's `Frame`, and making it generic
+  changes the manager's contract (R5) for no caller's gain.
+- (3) How the mirror is written. Recommended: one contract command, `mirror`, decided by the server's `Mirror` domain and
+  removed entity by entity at steps 2–4, plus `fields` maps for what wip's json needs and the typed fields lack.
+- (4) Output compatibility (Q5) and the CLI's fallback (Q4). Recommended: `wip --json` byte-compatible through step 1,
+  proven by a test, with the files as the fallback while they are the truth. The read-only database fallback of 4.6 (c)
+  waits for step 4.
+- (5) A wsp project for compound-react (`wsp project add`, root /Users/jesper/src/private/compound-react), and
+  `wsp mv wsp-078` into it. Needed by the stop after group 6.
+- (6) Whether web-chrome later folds `State` itself (4.4's `store` half) rather than re-reading on each event.
+  Recommended: not in step 1. Re-reading on events already takes polling to 0. Folding means new parsers in compound for
+  the contract's entities, which belongs with step 4, when `--json` may change shape.
+
 ---
 
 ## 8. Resilience and scale
