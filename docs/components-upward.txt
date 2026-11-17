@@ -67,7 +67,6 @@ legs -> main: Args  # engine -> top
 memory -> cmd_spawn: local_backends  # base -> seats
 memory -> place: *, Seat, Seated, State  # base -> wire
 packet -> main: Args  # engine -> top
-panel -> daemon: surface_drawing  # surface -> top
 panel -> main: Args  # surface -> top
 repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats
