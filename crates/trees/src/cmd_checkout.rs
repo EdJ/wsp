@@ -1188,23 +1188,10 @@ pub fn closed_lines(out: &Swept) -> Vec<String> {
 /// every tree this run checks is kept on it rather than some trees seeing the
 /// error and others silently not.
 pub fn who_is_standing() -> Result<Vec<(String, String)>, String> {
-    let herdr_seen: Result<Vec<(String, String)>, String> = match crate::herdr::available_now() {
-        false => Ok(Vec::new()),
-        true => crate::herdr::panes()
-            .map(|ps| ps.into_iter().map(|p| (p.pane_id, p.cwd)).collect())
-            .map_err(|e| format!("herdr did not say who is standing in it: {e}")),
-    };
-    let compound_seen: Result<Vec<(String, String)>, String> = crate::place_compound::Compound::new()
+    crate::place_compound::Compound::new()
         .census()
         .map(|c| c.seats().map(|s| (s.seat.as_str().to_string(), s.cwd.clone())).collect())
-        .map_err(|e| format!("compound did not say who is standing in it: {e}"));
-    match (herdr_seen, compound_seen) {
-        (Ok(mut rows), Ok(more)) => {
-            rows.extend(more);
-            Ok(rows)
-        }
-        (Err(why), _) | (_, Err(why)) => Err(why),
-    }
+        .map_err(|e| format!("compound did not say who is standing in it: {e}"))
 }
 
 /// Who is still in a tree, which is everything about a sweep that is not git's
@@ -4183,36 +4170,6 @@ mod tests {
             .of("t-9", &wt)
             .expect("a compound seat standing in the tree was not seen — the herdr-only bug this row fixed");
         assert!(why.contains(seat.as_str()), "the reason did not name the seat standing there: {why}");
-    }
-
-    /// The direction to fail in, and it is the whole design: a herdr that is
-    /// there and will not answer is not evidence that nobody is standing in
-    /// the tree, so it must keep every tree it is asked about rather than let
-    /// one go on the strength of a backend that never actually answered.
-    #[test]
-    fn an_unreadable_herdr_keeps_a_tree_it_never_actually_asked_about() {
-        let env = util::isolated("occupied-unreadable");
-        let dir = env.path("repo");
-        std::fs::create_dir_all(&dir).unwrap();
-        repo(&dir);
-        let wt = checkout_dir(&dir, "t-10");
-        ensure(&dir, &wt, "t-10", "master").unwrap();
-
-        let fake = crate::fake::Fake::bind(env.path("herdr.sock"), crate::fake::Stage::new()).unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-        // Accepts the connection and hangs up without a word — `available_now`
-        // sees a live socket, `panes()` gets nothing back.
-        fake.goes(crate::fake::Quiet::HangsUp);
-
-        let store = Store::open();
-        let why = Occupied::now(&store)
-            .of("t-10", &wt)
-            .expect("a backend that would not answer was read as nobody being there");
-        assert!(
-            why.starts_with("herdr did not say"),
-            "the reason must name the backend that refused, not invent a seat: {why}"
-        );
     }
 
     /// Which of the three came back, for a panic message that names it.

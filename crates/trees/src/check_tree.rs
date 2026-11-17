@@ -284,13 +284,8 @@ pub fn running_in(dir: &Path) -> Vec<u32> {
 }
 
 /// The backends of `all` that answer on this machine now.
-fn here_of(all: &[Box<dyn Place>; 2]) -> Vec<&dyn Place> {
-    let herdr_here = crate::herdr::available_now();
-    all.iter()
-        .zip(crate::place::LOCAL_BACKEND_NAMES)
-        .filter(|(_, name)| *name != "herdr" || herdr_here)
-        .map(|(b, _)| b.as_ref())
-        .collect()
+fn here_of(all: &[Box<dyn Place>]) -> Vec<&dyn Place> {
+    all.iter().map(|b| b.as_ref()).collect()
 }
 
 /// Every process of every live seat here, and this process's ancestors: what
