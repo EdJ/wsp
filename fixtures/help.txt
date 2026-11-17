@@ -250,6 +250,13 @@ AGENTS
                                     is not, its pid untouched if it is right. An
                                     install that cannot leave the daemon running
                                     exits 1 and `wsp wip` says so
+  wsp install → ~/Library/LaunchAgents/com.wsp.manager.plist
+                                    …and puts `wsp-manager` beside wsp (the one
+                                    built beside it), writes and loads its agent
+                                    (KeepAlive, 5 s throttle, log in its
+                                    <exec_dir>/log/) and copies its token into
+                                    <state>/manager/local.secret. `wsp install
+                                    --uninstall-manager` unloads and removes it
   wsp install --why - | --why --from FILE
                                     …with the reason read from a stream or a
                                     file, where a shell never sees it — it is
