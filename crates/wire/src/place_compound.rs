@@ -24,7 +24,7 @@
 //! Claude Code fires the same lifecycle hooks whether its stdin is a `tail
 //! -f` or a real pty — a hook does not know what is on the other end of its
 //! stdio — so [`crate::place_super::said_by`], [`crate::util::alive`]
-//! and [`crate::place_super::tally_burn`] are reused verbatim rather than
+//! and [`crate::host::tally_burn`] are reused verbatim rather than
 //! copied. What differs is only what a seat *records*: a `compound-sup`
 //! socket and pid instead of a `tail`/agent process pair. Two directories,
 //! two [`Place`] implementors, one hook vocabulary — `wsp report` (below)
@@ -125,22 +125,31 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use wsp_base::calls::Command;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::host::{self, Host};
 use crate::place::{self, Agent, Census, Delivery, Event, Order, Place, Refusal, Result, Seat, Seated, State};
-use crate::util::alive;
-use crate::place_super::{read_json, signal_group, str_of, tally_burn};
+use crate::place_super::{read_json, str_of};
+// The OS halves moved to [`crate::host`]. The fixtures below that start and
+// end real supervisors for a test, and the tests that drive the moved helpers
+// by name, reach them from here.
 #[cfg(any(test, feature = "test-support"))]
-use crate::place_super::said_by;
+use {crate::host::signal_group, crate::util::alive, wsp_base::calls::Command};
+#[cfg(test)]
+use {
+    crate::host::{
+        b64, compound_render_binary, compound_sup_binary, dial, find_sup, read_deliver, recv_line, send, sup_command,
+        wire_health_of, InProcess, CLOSE_AFTER_SECS, DIAL_TIMEOUT, HOOKS_FILE, SAID_FILE,
+    },
+    crate::place_super::said_by,
+    std::net::Shutdown,
+    std::os::unix::net::UnixStream,
+    std::process::Stdio,
+    std::time::Instant,
+};
 use crate::store::{write_atomic, Store};
 use crate::util::{self, Clock};
 
@@ -177,6 +186,9 @@ pub struct Compound<'a> {
     /// How a far machine is reached, for a seat opened `--on` one
     /// (`docs/remote-agents.md` section 2). Ssh; a test passes a script.
     pub far: &'a dyn crate::far::Wire,
+    /// Every OS operation a seat needs on this machine: processes, sockets,
+    /// the renderer, delivery, hook files (`docs/agent-manager.md` 6.2, M0).
+    pub host: &'a dyn Host,
 }
 
 impl Compound<'static> {
@@ -193,6 +205,7 @@ impl Compound<'static> {
             insist: false,
             clock: &util::Wall,
             far: &crate::far::Ssh,
+            host: &host::LOCAL,
         }
     }
 
@@ -222,21 +235,20 @@ impl Compound<'static> {
 impl Compound<'_> {
     /// Every seat's burn record under this backend's root, seat id attached.
     ///
-    /// The tally is not this backend's — `heard` calls [`tally_burn`] verbatim,
+    /// The tally is not this backend's — `heard` calls [`crate::host::tally_burn`] verbatim,
     /// the same call `place_super` makes, so the records are the same shape
     /// either way. The *reader* was, and that is what `wsp-116` is: `wsp burn`
     /// asked `place_super` alone, whose root is a different directory, so it
     /// reported no burn at all for a fleet that was entirely this backend's.
-    /// See [`crate::place_super::burn_under`], which is the shared half and
+    /// See [`crate::host::burn_under`], which is the shared half and
     /// says why the root has to be a parameter.
     pub fn burn(&self) -> Vec<(String, Value)> {
-        crate::place_super::burn_under(&self.root)
+        self.host.burn_under(&self.root)
     }
 }
 
 const SEATS: &str = "compound-seats";
 const SEAT_FILE: &str = "seat.json";
-const SAID_FILE: &str = "said.json";
 
 /// Every hook this seat has ever been heard from, oldest first, one JSON line
 /// each — `compound-107`'s answer to the question `said.json` alone cannot
@@ -252,7 +264,7 @@ const SAID_FILE: &str = "said.json";
 /// holding one `SessionStart` record; only this file tells them apart, and
 /// only if it was already running when the seat needed it — a governor
 /// cannot go back and ask a hook to have logged itself after the fact.
-const HOOKS_FILE: &str = "hooks.jsonl";
+// HOOKS_FILE: see crate::host::HOOKS_FILE, which writes it.
 
 /// How long a hook's word stays evidence about NOW (`compound-097`).
 ///
@@ -279,75 +291,14 @@ const SEAT_PREFIX: &str = "cpd-";
 /// before it prints the third line, and a spawn that is going to fail (a
 /// bad cwd, a missing program) says so on the same stdout rather than
 /// hanging — so the bound is a safety net, not the expected path.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// Moved to crate::host with the code that waits on it.
 
 /// How long a `tell` or `state`-adjacent dial waits for the socket to
 /// accept. A live session answers `Attach` in well under a millisecond
 /// (it is a local accept, not a wire round trip); this is room for a
 /// session under load, not an expected wait.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+// Moved to crate::host with the code that waits on it.
 
-/// Where `compound-sup` lives: `$COMPOUND_SUP` when it names a file, else
-/// `PATH`, else `~/.local/bin/compound-sup`, else beside the running `wsp`.
-///
-/// A set-but-missing `$COMPOUND_SUP` falls through rather than failing, and a
-/// caller whose `PATH` lacks `~/.local/bin` (a seat's shell running `advance`)
-/// still finds the binary the daemon's own `PATH` has (`wsp-602`).
-fn compound_sup_binary() -> Option<PathBuf> {
-    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from));
-    find_sup(
-        std::env::var_os("COMPOUND_SUP"),
-        std::env::var_os("PATH"),
-        std::env::var_os("HOME").map(PathBuf::from),
-        exe_dir,
-    )
-}
-
-fn find_sup(
-    var: Option<std::ffi::OsString>,
-    path: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
-    exe_dir: Option<PathBuf>,
-) -> Option<PathBuf> {
-    if let Some(p) = var.map(PathBuf::from).filter(|p| p.is_file()) {
-        return Some(p);
-    }
-    if let Some(path) = path {
-        if let Some(p) = std::env::split_paths(&path).map(|d| d.join("compound-sup")).find(|p| p.is_file()) {
-            return Some(p);
-        }
-    }
-    let local = home.filter(|h| !h.as_os_str().is_empty()).map(|h| h.join(".local/bin/compound-sup"));
-    local.into_iter().chain(exe_dir.map(|d| d.join("compound-sup"))).find(|p| p.is_file())
-}
-
-/// Where `compound-render` lives: `$COMPOUND_RENDER`, `PATH`, or beside
-/// whichever `compound-sup` this process is already using.
-///
-/// The third door matters more than it looks (`compound-136`): the two
-/// binaries are always built together into one `cargo build --target-dir`
-/// (`compound-sup`'s own `renderer_binary_path` takes the identical
-/// shortcut, one process over — they land beside each other by construction,
-/// not by convention this file invented), so an operator or a test that has
-/// only ever had to point wsp at `$COMPOUND_SUP` keeps working without
-/// learning a second variable.
-fn compound_render_binary() -> Option<PathBuf> {
-    // A test's stand-in, per thread so no other test meets it.
-    #[cfg(test)]
-    if let Some(p) = tests::RENDER.with(|r| r.borrow().clone()) {
-        return Some(p);
-    }
-    if let Some(p) = std::env::var_os("COMPOUND_RENDER") {
-        let p = PathBuf::from(p);
-        return p.is_file().then_some(p);
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        if let Some(p) = std::env::split_paths(&path).map(|d| d.join("compound-render")).find(|p| p.is_file()) {
-            return Some(p);
-        }
-    }
-    compound_sup_binary()?.parent().map(|d| d.join("compound-render")).filter(|p| p.is_file())
-}
 
 /// How long after a start [`Compound::at_trust_prompt`] looks: the prompt is the
 /// first thing Claude Code draws, and the work order follows within seconds.
@@ -466,7 +417,7 @@ impl Compound<'_> {
 
     fn said(&self, seat: &Seat) -> Value {
         match self.dir_of(seat) {
-            Ok(dir) => read_json(&dir.join(SAID_FILE)),
+            Ok(dir) => self.host.said(&dir),
             Err(_) => json!({}),
         }
     }
@@ -529,7 +480,7 @@ impl Compound<'_> {
         if !dir.is_dir() {
             return;
         }
-        let was = read_json(&dir.join(SAID_FILE));
+        let was = self.host.said(&dir);
         // A nested session's hook, not the seat's (`wsp-364`): logged as a
         // child's, so the trail shows it arrived, and kept out of `said.json`.
         if crate::place_super::a_childs(&was, payload) {
@@ -542,8 +493,8 @@ impl Compound<'_> {
                 false => str_of(payload, key),
             }
         };
-        let _ = write_atomic(
-            &dir.join(SAID_FILE),
+        self.host.say(
+            &dir,
             &json!({
                 "state": state.as_str(),
                 "hook": hook,
@@ -551,17 +502,16 @@ impl Compound<'_> {
                 "at": util::now_iso(),
                 "session_id": keep("session_id"),
                 "transcript_path": keep("transcript_path"),
-            })
-            .to_string(),
+            }),
         );
         self.append_hooks_log(&dir, hook, state);
-        tally_burn(&dir, payload);
+        self.host.tally(&dir, payload);
         // `wsp-637`: an agent that has left for good takes its pane with it.
         if hook == "SessionEnd" && leaves_for_good(payload) {
             if let Ok(rec) = self.record(seat) {
                 if rec.get("agent").is_some() && str_of(&rec, "machine").is_empty() {
                     if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
-                        close_pane_soon(pid as u32);
+                        self.host.stop_soon(pid as u32);
                     }
                 }
             }
@@ -580,16 +530,11 @@ impl Compound<'_> {
     /// (`wsp-364`). Readers of the trail that look at `hook` and `state` alone
     /// must skip a line with `child` set: it is not the seat's.
     fn append_hooks_log_as(&self, dir: &std::path::Path, hook: &str, state: State, child: Option<&str>) {
-        use std::io::Write;
         let mut line = json!({ "at": util::now_iso(), "hook": hook, "state": state.as_str() });
         if let Some(session) = child {
             line["child"] = json!(session);
         }
-        if let Ok(mut f) =
-            fs::OpenOptions::new().create(true).append(true).open(dir.join(HOOKS_FILE))
-        {
-            let _ = writeln!(f, "{line}");
-        }
+        self.host.log_hook(dir, &line);
     }
 
     /// Whether this seat's `compound-sup` still holds its pid, per the same
@@ -613,7 +558,7 @@ impl Compound<'_> {
             if self.far.silent_for(&str_of(rec, "machine")).is_some() {
                 return State::Unreachable;
             }
-            if UnixStream::connect(&socket).is_err() {
+            if !self.host.answers(Path::new(&socket)) {
                 // The forward answers no more, which is what a tunnel that has
                 // dropped looks like for the first lease of a link cut, while the
                 // machine still reads ready. Ask the link before calling it a death.
@@ -723,7 +668,7 @@ impl Compound<'_> {
             .iter()
             .filter_map(|(_, r)| r.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32))
             .collect();
-        let running = alive(&pids);
+        let running = self.host.alive(&pids);
         seats
             .iter()
             .map(|(seat, rec)| {
@@ -807,30 +752,7 @@ impl Compound<'_> {
 
     pub fn read_screen(&self, seat: &Seat) -> Result<String> {
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
-        let render = compound_render_binary().ok_or_else(|| {
-            Refusal::Backend("compound-render not found — set $COMPOUND_RENDER or put it on PATH".into())
-        })?;
-        let out = Command::new(&render)
-            .args(["screen"])
-            .arg(&socket)
-            .output()
-            .map_err(|e| Refusal::Backend(e.to_string()))?;
-        if !out.status.success() {
-            return Err(Refusal::Backend(String::from_utf8_lossy(&out.stderr).trim().to_string()));
-        }
-        let raw = String::from_utf8_lossy(&out.stdout);
-        let mut lines: Vec<&str> = raw.lines().collect();
-        if lines.last().is_some_and(|l| l.starts_with("osc_title ")) {
-            lines.pop();
-        }
-        if lines.last().is_some_and(|l| l.starts_with("size ")) {
-            lines.pop();
-        }
-        Ok(lines
-            .into_iter()
-            .map(|l| l.split_once('|').map_or(l, |(_, t)| t))
-            .collect::<Vec<_>>()
-            .join("\n"))
+        self.host.read_screen(&socket)
     }
 
     /// The floor under a hook's word, not a replacement for it
@@ -906,19 +828,7 @@ impl Compound<'_> {
     /// rate.
     fn screen_state(&self, seat: &Seat, kind: &str) -> Option<State> {
         let socket = self.render_socket_of(seat)?;
-        let render = compound_render_binary()?;
-        let out = Command::new(&render).args(["state"]).arg(&socket).arg(kind).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        match String::from_utf8_lossy(&out.stdout).lines().next()? {
-            "idle" => Some(State::Idle),
-            "working" => Some(State::Working),
-            "blocked" => Some(State::Blocked),
-            // "unknown", or a shape this backend does not recognise yet —
-            // read the same as no answer at all rather than guessed at.
-            _ => Some(State::Unknown),
-        }
+        self.host.screen_state(&socket, kind)
     }
 
     /// The child's last OSC window/tab title, straight off `compound-sup
@@ -930,12 +840,7 @@ impl Compound<'_> {
     /// idle.
     fn vitals_osc_title(&self, seat: &Seat) -> Option<String> {
         let socket = self.socket_of(seat)?;
-        let sup = compound_sup_binary()?;
-        let out = Command::new(&sup).args(["vitals"]).arg(&socket).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix("osc_title ").map(str::to_string))
+        self.host.osc_title(&socket)
     }
 }
 
@@ -980,43 +885,6 @@ fn title_state(kind: &str, osc_title: &str) -> Option<State> {
     None
 }
 
-/// `compound-sup`'s four-line handshake since `compound-101`'s split — `sup
-/// <pid>`, `pid <pid>`, `socket <path>`, `render <path>` — read with a
-/// deadline off a background thread so a supervisor that never prints one (a
-/// bad build, a hung `zig` toolchain, anything short of the ordinary path)
-/// cannot hang [`Place::start`] rather than refuse it.
-///
-/// Only `socket` and `render` are parsed; `sup`'s pid is `Command::spawn`'s
-/// own answer already, and `pid` is read from the record this same call
-/// writes. Reads up to four lines rather than stopping the instant `render`
-/// is seen, so an even older, pre-split `compound-sup` — three lines, no
-/// `render` — still hands back its socket rather than timing out waiting for
-/// a fourth line that binary will never print.
-fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Option<(PathBuf, Option<PathBuf>)> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut socket = None;
-        let mut render = None;
-        for _ in 0..4 {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                break;
-            }
-            let line = line.trim();
-            if let Some(path) = line.strip_prefix("socket ") {
-                socket = Some(PathBuf::from(path));
-            } else if let Some(path) = line.strip_prefix("render ") {
-                render = Some(PathBuf::from(path));
-                break;
-            }
-        }
-        // Best effort: a receiver that has already timed out is a send
-        // nobody reads, not an error.
-        let _ = tx.send(socket.map(|s| (s, render)));
-    });
-    rx.recv_timeout(timeout).ok().flatten()
-}
 
 // ---------------------------------------------------------------------------
 // The wire, read rather than depended on. See the module docs' "The wire is
@@ -1050,14 +918,14 @@ fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Optio
 /// file did not know existed. A wire-version-aware wsp calling a verb that
 /// had moved would have failed exactly the same way a stale `WIRE_VERSION`
 /// does — refused loudly, but for the wrong stated reason — so this bump
-/// came with [`compound_render_binary`], [`Compound::render_socket_of`] and
+/// came with [`crate::host::compound_render_binary`], [`Compound::render_socket_of`] and
 /// every call site that used to dial `compound-sup` for a screen-shaped
 /// answer moving to dial `compound-render` instead. v8 is *not* purely
 /// additive the way v7 was: it is a new socket with a smaller `Body` on the
 /// old one, which is exactly the "whole shape" `compound` d2 says a version
 /// bump claims, and every caller in this file was re-checked against it
 /// rather than assumed compatible.
-const WIRE_VERSION: u32 = 9;
+pub(crate) const WIRE_VERSION: u32 = 9;
 
 /// The wire version this wsp speaks, for the far-machine checks that compare it
 /// with what a machine's `compound-sup` answers (`far`, `spawn --on`, `doctor`).
@@ -1078,7 +946,7 @@ pub fn wire_version() -> u32 {
 /// that needs nothing from either source tree. The September one was this
 /// constant itself going stale against a `proto.rs` bump the wsp repository
 /// never reads — caught by asking the installed `compound-sup` what it
-/// actually speaks, the same way [`compound_sup_binary`]'s callers already
+/// actually speaks, the same way [`crate::host::compound_sup_binary`]'s callers already
 /// ask it for `state` rather than trusting a guess.
 ///
 /// Both are notes until they are not: no `compound-sup` on this machine is
@@ -1089,137 +957,9 @@ pub fn wire_version() -> u32 {
 /// binaries would be `robustness-090` d1's forbidden act wearing a doctor
 /// badge, so this only ever says what is wrong and the verb that fixes it.
 pub fn wire_health(problems: &mut Vec<String>, notes: &mut Vec<String>) {
-    let Some(sup) = compound_sup_binary() else {
-        notes.push(
-            "compound-sup not found ($COMPOUND_SUP or PATH) — nothing to check about the compound wire".into(),
-        );
-        return;
-    };
-    wire_health_of(&sup, problems, notes);
+    host::LOCAL.wire_health(problems, notes)
 }
 
-/// [`wire_health`], given the binary rather than finding it — split out so a
-/// test can point this at a fake script instead of racing every other test in
-/// this process over `$COMPOUND_SUP` (`wsp-env-breaks-cargo-test`'s lesson,
-/// one door over: a global is a global whether it names a store or a binary).
-fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut Vec<String>) {
-    // Follow the PATH symlink to the real binary, whose directory is the
-    // cargo workspace's own `target/<profile>/` — where `host` lands too,
-    // built by the same `cargo build` that builds this one. Not a path this
-    // file invented: `scripts/supervisor_outlives_host_rebuild.sh` in the
-    // compound repository already names both binaries at that convention.
-    let real = fs::canonicalize(sup).unwrap_or_else(|_| sup.to_path_buf());
-    if let Some(dir) = real.parent() {
-        let host = dir.join("host");
-        if let (Ok(hm), Ok(sm)) =
-            (fs::metadata(&host).and_then(|m| m.modified()), fs::metadata(&real).and_then(|m| m.modified()))
-        {
-            if hm > sm {
-                problems.push(format!(
-                    "{} is newer than {} — a host-only rebuild (`cargo run -p host`) leaves compound-sup stale, \
-                     and its version refusal will name the session rather than the build — `cargo build` rebuilds both (compound-026)",
-                    util::contract(&host),
-                    util::contract(&real),
-                ));
-            }
-        }
-    }
-
-    match ask_wire_version(&sup) {
-        Some(v) if v != WIRE_VERSION => problems.push(format!(
-            "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup speaks {v} — bump WIRE_VERSION in \
-             src/place_compound.rs to match crates/supervisor/src/proto.rs (compound-026)"
-        )),
-        Some(_) => {}
-        None => notes.push(format!(
-            "{} does not answer `wire-version` — wsp cannot check its WIRE_VERSION ({WIRE_VERSION}) against it (compound-026)",
-            util::contract(&sup),
-        )),
-    }
-}
-
-/// `compound-sup wire-version` → its VERSION, or `None` if the installed
-/// binary predates that verb (an older build, not a broken one) or will not
-/// answer at all. A current build prints the accepted range `OLDEST VERSION`;
-/// VERSION is the last token. An older build prints a bare number, which is
-/// the same token.
-fn ask_wire_version(bin: &std::path::Path) -> Option<u32> {
-    let out = Command::new(bin).arg("wire-version").stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).split_whitespace().last()?.parse().ok()).flatten()
-}
-
-fn dial(socket: &PathBuf, timeout: Duration) -> Result<UnixStream> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match UnixStream::connect(socket) {
-            Ok(s) => return Ok(s),
-            Err(e) if Instant::now() >= deadline => {
-                return Err(Refusal::Backend(format!("no answer from {}: {e}", socket.display())))
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
-}
-
-fn send(stream: &mut UnixStream, body: Value) -> std::io::Result<()> {
-    let mut line = json!({ "ver": WIRE_VERSION }).as_object().unwrap().clone();
-    line.extend(body.as_object().cloned().unwrap_or_default());
-    let mut bytes = serde_json::to_vec(&line)?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes)
-}
-
-/// One reply line, or `None` on EOF/timeout — a compound session that
-/// answers nothing within the read timeout is read the same way a `tell`
-/// with no watcher already reads: as `Unconfirmed`, not as a hang.
-fn recv_line(stream: &mut UnixStream, timeout: Duration) -> Option<Value> {
-    let _ = stream.set_read_timeout(Some(timeout));
-    let mut reader = BufReader::new(stream.try_clone().ok()?);
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => serde_json::from_str(&line).ok(),
-    }
-}
-
-/// Standard base64, matching `supervisor::proto`'s local encoder — the wire
-/// carries `Input`'s bytes this way and there is no third-party dependency
-/// worth pulling in for one field.
-fn b64(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
-/// Type at a session and press Enter — [`Place::tell`], stripped of the
-/// hook-state bookkeeping so a test can drive it against a bare listener.
-///
-/// **No `Attach`, and that is the whole of `compound-229`.** Since
-/// `compound-117` the renderer answers `Input`, `Key`, `Mouse`, `Screen`
-/// and `ReadSelection` to *every* connection and refuses `Attach` to a
-/// second one — "busy: a client is already attached" — so a window holding
-/// the pane made every `wsp tell` fail, focused or not, and `wsp` was the
-/// one that could have been holding the lock out. The pre-117 comment here
-/// said the wire refuses any other frame from an unclaimed connection; that
-/// stopped being true at `compound-117` and this file kept the attach for
-/// months after it. Only the frame stream and `Resize` still want the
-/// attach, and this backend never reads frames or resizes anything.
-fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
-    let mut stream = dial(socket, DIAL_TIMEOUT)?;
-    send(&mut stream, json!({ "input": { "bytes": b64(text.as_bytes()) } }))
-        .map_err(|e| Refusal::Backend(e.to_string()))?;
-    press_enter(&mut stream)?;
-    let _ = stream.shutdown(Shutdown::Both);
-    Ok(())
-}
 
 /// How long one tick waits on a `deliver` before leaving it pending (wsp-477).
 /// compound's `deliver` waits for a busy seat to go idle (minutes) and for an
@@ -1261,49 +1001,12 @@ fn delivery_id(dir: &Path, text: &str) -> String {
     id
 }
 
-/// `compound-sup deliver <socket> <id>` with the text on stdin, and its
-/// one-line answer read: `delivered <id>` is [`Delivery::Acked`], `failed <id>
-/// <why>` is [`Refusal::Failed`] (wsp-477). The id is the sup's key for
-/// "exactly once": it is kept in the seat's directory until an answer is read,
-/// so a wait that ran out is asked again, not doubled.
-///
-/// The wait is bounded by `wait`: past it the call is left pending (an error
-/// that is not [`Refusal::Failed`], so nothing is escalated and nothing is
-/// stamped as typed) and the next tick asks again.
-fn deliver_through(sup: &Path, session: &Path, dir: &Path, seat: &Seat, text: &str, wait: Duration) -> Result<Delivery> {
+/// A sentence delivered under the id this seat keeps for it (wsp-477): the id
+/// is wsp's and stays in the seat's directory until an answer is read, so a
+/// wait that ran out is asked again, not doubled. The asking is the host's.
+fn deliver_through(host: &dyn Host, session: &Path, dir: &Path, seat: &Seat, text: &str, wait: Duration) -> Result<Delivery> {
     let id = delivery_id(dir, text);
-    let mut child = Command::new(sup)
-        .arg("deliver")
-        .arg(session)
-        .arg(&id)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| Refusal::Backend(format!("compound-sup deliver: {e}")))?;
-    let pid = child.id();
-    if let Some(mut stdin) = child.stdin.take() {
-        let said = text.to_string();
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(said.as_bytes());
-        });
-    }
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let out = match rx.recv_timeout(wait) {
-        Ok(out) => out.map_err(|e| Refusal::Backend(format!("compound-sup deliver: {e}")))?,
-        Err(_) => {
-            let _ = Command::new("kill").arg(pid.to_string()).stderr(Stdio::null()).status();
-            return Err(Refusal::Backend(format!(
-                "{seat}: {DELIVERY_PENDING} after {}s, asked again next tick under the same id",
-                wait.as_secs()
-            )));
-        }
-    };
-    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    let answer = read_deliver(&stdout, &stderr, out.status.success(), &id, seat);
+    let answer = host.deliver(session, &id, text, wait, seat);
     // An answer read is the end of that id: `failed` asked again under it would
     // only be answered `failed` again, and a retry is a new delivery.
     if matches!(answer, Ok(Delivery::Acked) | Err(Refusal::Failed(_)) | Err(Refusal::NoSeat(_))) {
@@ -1319,102 +1022,8 @@ fn delivers(rec: &Value) -> bool {
     rec.get("deliver").and_then(Value::as_bool) == Some(true)
 }
 
-/// The answer to a `deliver`, as a function of what it printed.
-fn read_deliver(stdout: &str, stderr: &str, ok: bool, id: &str, seat: &Seat) -> Result<Delivery> {
-    let line = stdout.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-    let mut words = line.splitn(3, ' ');
-    match (words.next(), words.next()) {
-        (Some("delivered"), Some(got)) if got == id => Ok(Delivery::Acked),
-        (Some("failed"), Some(got)) if got == id => {
-            Err(Refusal::Failed(format!("{seat}: {}", words.next().unwrap_or("no reason given").trim())))
-        }
-        // No session to ask: the seat is gone, which is its own answer.
-        _ if stderr.starts_with("no session at") => Err(Refusal::NoSeat(seat.clone())),
-        _ if ok => Err(Refusal::Backend(format!("compound-sup deliver answered `{line}`, which is neither delivered nor failed"))),
-        _ => Err(Refusal::Backend(format!(
-            "compound-sup deliver: {}",
-            [line, stderr.trim()].iter().find(|s| !s.is_empty()).unwrap_or(&"no answer")
-        ))),
-    }
-}
-
-/// The submit key, as the render wire names it.
-///
-/// One definition, because a work order that is typed and not submitted and a
-/// rescue press that presses a different key are the same defect wearing
-/// different clothes, and this file had the sequence inline once already.
-fn press_enter(stream: &mut UnixStream) -> Result<()> {
-    send(
-        stream,
-        json!({ "key": { "event": {
-            "action": "press",
-            "key": "enter",
-            "mods": { "shift": false, "ctrl": false, "alt": false, "cmd": false },
-            "unshifted_codepoint": 0,
-        }}}),
-    )
-    .map_err(|e| Refusal::Backend(e.to_string()))
-}
 
 impl Compound<'_> {
-    /// The `compound-sup spawn` command for a seat, not yet run.
-    ///
-    /// A function of its own so what it stands in is asserted without a
-    /// supervisor: `wsp-388`.
-    fn sup_command(sup: &Path, seat: &Seat, rec: &Value, program: &str, args: &[String]) -> Command {
-        let mut cmd = Command::new(sup);
-        cmd.arg("spawn").args(["--label", seat.as_str()]);
-        // wsp-477: the kind the supervisor reads a composer for, which its
-        // `deliver` needs — a seat spawned without one answers `failed`.
-        if let Some(kind) = rec.get("agent").map(|a| str_of(a, "kind")).filter(|k| reads_kind(k)) {
-            cmd.args(["--agent", &kind]);
-        }
-        let cwd = str_of(rec, "cwd");
-        if !cwd.is_empty() {
-            cmd.args(["--cwd", &cwd]);
-        }
-        // `wsp-432`: a supervisor a TEST starts belongs to the test process
-        // (`compound-129`: it ends when this pid does, panic or abort
-        // included) and stands in a run directory of its own, never the
-        // person's `~/.compound/run`. Here and nowhere else, so a new test
-        // cannot start one without both.
-        #[cfg(any(test, feature = "test-support"))]
-        test_sups::tie_to_this_test(&mut cmd);
-        cmd.arg("--").arg(program).args(args);
-
-        let env: BTreeMap<String, String> = rec
-            .get("env")
-            .and_then(|e| e.as_object())
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Onto compound-sup's own environment, which its pty child inherits
-        // in turn — the same "override, never replace" contract
-        // `place_super::child_env` keeps, for the same reason: an empty
-        // value is the only strip a spawned process's env accepts.
-        for (k, v) in &env {
-            match v.is_empty() {
-                true => cmd.env_remove(k),
-                false => cmd.env(k, v),
-            };
-        }
-        for k in place::shed_keys() {
-            cmd.env_remove(k);
-        }
-
-        // The supervisor stands nowhere. It used to keep the cwd of whoever ran
-        // `wsp spawn`, so a seat opened from inside a check's tree had a
-        // supervisor "in" that tree, and ending the check took it for the
-        // check's own (`wsp-388`). The agent's directory is `--cwd`, above.
-        if !cwd.is_empty() {
-            cmd.current_dir("/");
-        }
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
-        cmd
-    }
 
     /// `compound-sup spawn --label <seat> …` and nothing more: no `--socket`
     /// (see the module docs on why this backend does not mint into
@@ -1428,31 +1037,7 @@ impl Compound<'_> {
     /// decides what else changed (`start` adds `agent`; `open` adds
     /// nothing) and writes it.
     fn spawn_sup(&self, seat: &Seat, rec: &Value, program: &str, args: &[String]) -> Result<Value> {
-        let Some(sup) = compound_sup_binary() else {
-            return Err(Refusal::Backend(
-                "compound-sup not found — set $COMPOUND_SUP or put it on PATH".into(),
-            ));
-        };
-
-        let mut cmd = Self::sup_command(&sup, seat, rec, program, args);
-        let mut child = cmd.spawn().map_err(|e| Refusal::Backend(format!("{} did not start: {e}", sup.display())))?;
-        let pid = child.id();
-        #[cfg(any(test, feature = "test-support"))]
-        test_sups::note(pid, seat);
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            return Err(Refusal::Backend("compound-sup gave no handshake pipe".into()));
-        };
-        // The child is daemonized (setsid) and outlives this process by
-        // design — dropped rather than waited on, same as
-        // `crates/host/src/sessions.rs::Panes::open`.
-        drop(child);
-
-        let Some((socket, render)) = read_handshake(stdout, HANDSHAKE_TIMEOUT) else {
-            signal_group(pid, "KILL");
-            return Err(Refusal::Backend("compound-sup never announced a socket".into()));
-        };
-
+        let host::Session { pid, socket, render } = self.host.spawn_session(&Self::spawn_of(seat, rec, program, args))?;
         let mut rec = rec.clone();
         rec["pid"] = json!(pid);
         rec["socket"] = json!(socket.display().to_string());
@@ -1461,6 +1046,24 @@ impl Compound<'_> {
         }
         rec["started_at"] = json!(util::now_iso());
         Ok(rec)
+    }
+
+    /// The `seat.spawn` this seat's record asks for: the agent kind its
+    /// supervisor reads a composer for, its directory and its environment.
+    fn spawn_of<'s>(seat: &'s Seat, rec: &Value, program: &'s str, args: &'s [String]) -> host::Spawn<'s> {
+        let env: BTreeMap<String, String> = rec
+            .get("env")
+            .and_then(|e| e.as_object())
+            .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
+            .unwrap_or_default();
+        host::Spawn {
+            seat: seat.as_str(),
+            kind: rec.get("agent").map(|a| str_of(a, "kind")),
+            cwd: str_of(rec, "cwd"),
+            env,
+            program,
+            args,
+        }
     }
 
     /// Start an agent on the machine this seat's record names
@@ -1483,7 +1086,7 @@ impl Compound<'_> {
         }
         let up = |key: &str| {
             let s = str_of(rec, key);
-            !s.is_empty() && UnixStream::connect(&s).is_ok()
+            !s.is_empty() && self.host.answers(Path::new(&s))
         };
         if rec.get("agent").is_some() && up("socket") {
             return Err(bad(format!("{seat} already has a session running")));
@@ -1531,7 +1134,7 @@ impl Compound<'_> {
         if let Some(render) = &hs.render {
             if let Err(e) = self.far.forward(&m, "forward", &rsock, render) {
                 let _ = self.far.forward(&m, "cancel", &sock, &hs.socket);
-                let _ = fs::remove_file(&sock);
+                self.host.unlink(&sock);
                 return Err(close(format!("forwarding {name}'s {render} failed: {e}")));
             }
         }
@@ -1630,7 +1233,7 @@ impl Compound<'_> {
             if let Some(m) = &m {
                 let _ = self.far.forward(m, "cancel", Path::new(&local), &far);
             }
-            let _ = fs::remove_file(&local);
+            self.host.unlink(Path::new(&local));
         }
         Ok(())
     }
@@ -1642,35 +1245,15 @@ impl Compound<'_> {
     /// ([`Place::start`] replacing a bare terminal, `compound-081`).
     fn end_process(&self, seat: &Seat, rec: &Value) {
         if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32) {
-            signal_group(pid, "TERM");
-            let deadline = self.clock.now() + self.linger;
-            while alive(&[pid]).contains(&pid) {
-                if self.clock.now() >= deadline {
-                    signal_group(pid, "KILL");
-                    break;
-                }
-                self.clock.rest(self.poll);
-            }
+            self.host.stop(host::Stop { group: pid, watch: Some(pid), grace: self.linger, poll: self.poll, clock: self.clock });
         }
-        // `compound-sup` unlinks its own socket on the way out of its run
-        // loop, but installs no `SIGTERM` handler — measured, not assumed —
-        // so a signalled exit skips that cleanup and leaves the headstone
-        // `compound-028` d2 already named the remedy for: connect, and an
-        // `ECONNREFUSED` says nothing is listening, which is what licenses
-        // removing the file rather than a process.
+        // A signalled `compound-sup` skips its own unlink, and so does a
+        // signalled renderer: each leaves a headstone the host clears.
         if let Some(socket) = self.socket_of(seat) {
-            if socket.exists() && UnixStream::connect(&socket).is_err() {
-                let _ = fs::remove_file(&socket);
-                let _ = fs::remove_file(socket.with_extension("label"));
-            }
+            self.host.clear_socket(&socket, &["label"]);
         }
-        // The renderer unlinks its own `.rsock` on a clean exit
-        // (`compound-101`), but a signalled one skips that the same way the
-        // durable half's does — same headstone, same remedy, one socket over.
         if let Some(render) = self.render_socket_of(seat) {
-            if render.exists() && UnixStream::connect(&render).is_err() {
-                let _ = fs::remove_file(&render);
-            }
+            self.host.clear_socket(&render, &[]);
         }
     }
 }
@@ -1681,30 +1264,6 @@ pub(crate) fn leaves_for_good(payload: &Value) -> bool {
     !matches!(str_of(payload, "reason").as_str(), "clear" | "resume" | "compact")
 }
 
-/// Ends the pane of a seat whose agent has left: the supervisor, its shell and
-/// the renderer, a few seconds on so the agent finishes its own exit. Detached
-/// and in its own group, because the hook that calls it runs under the very
-/// group it ends. The daemon's sweep (`ended_panes`) is the backstop for an ending
-/// that never said `SessionEnd`.
-fn close_pane_soon(sup: u32) {
-    if sup == std::process::id() {
-        return;
-    }
-    let script = format!("sleep {CLOSE_AFTER_SECS}; kill -TERM -- -{sup}; sleep 2; kill -KILL -- -{sup}");
-    let _ = Command::new("sh")
-        .args(["-c", &script])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-}
-
-/// Seconds an exited agent's pane stays before it is closed.
-const CLOSE_AFTER_SECS: u32 = 2;
-
-/// The forwards the seats on `machine` should have, as `(local socket, far
-/// socket)`, read from the seat records. What the tunnel supervisor re-adds when
 /// a machine's ControlMaster comes back: a master that died took its forwards
 /// with it (`docs/remote-agents.md` section 2).
 pub fn forwards_for(store: &Store, machine: &str) -> Vec<(PathBuf, String)> {
@@ -1741,7 +1300,7 @@ pub fn supervised(store: &Store, seat: &str) -> bool {
         return true;
     }
     match rec.get("pid").and_then(|p| p.as_u64()) {
-        Some(pid) if pid > 0 => alive(&[pid as u32]).contains(&(pid as u32)),
+        Some(pid) if pid > 0 => host::LOCAL.alive(&[pid as u32]).contains(&(pid as u32)),
         _ => false,
     }
 }
@@ -1870,7 +1429,7 @@ impl Place for Compound<'_> {
             return self.start_far(seat, &rec, agent);
         }
         if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
-            if alive(&[pid as u32]).contains(&(pid as u32)) {
+            if self.host.alive(&[pid as u32]).contains(&(pid as u32)) {
                 if rec.get("agent").is_some() {
                     return Err(Refusal::Backend(format!("{seat} already has a session running")));
                 }
@@ -1919,14 +1478,14 @@ impl Place for Compound<'_> {
         // by [`Place::start`] with `--agent`): a supervisor built before
         // compound-999 drops the connection on a `Deliver` frame, and every seat
         // already running is one. Those keep the typed path below.
-        if let (Some(sup), Some(session), Ok(rec)) = (compound_sup_binary(), self.socket_of(seat), self.record(seat)) {
+        if let (true, Some(session), Ok(rec)) = (self.host.can_deliver(), self.socket_of(seat), self.record(seat)) {
             if delivers(&rec) {
                 let dir = self.dir_of(seat)?;
-                return deliver_through(&sup, &session, &dir, seat, text, DELIVER_WAIT);
+                return deliver_through(self.host, &session, &dir, seat, text, DELIVER_WAIT);
             }
         }
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
-        type_and_submit(&socket, text)?;
+        self.host.type_in(&socket, text)?;
         // Typed rather than watched: this backend has not read the reply
         // that would let it say more, so `Unconfirmed` is the honest answer
         // `place.rs` asks for from a backend that delivered without seeing
@@ -1954,15 +1513,12 @@ impl Place for Compound<'_> {
     /// unreachable.
     ///
     /// No `Attach`, for the same reason and by the same argument as
-    /// [`type_and_submit`] — this is the same conversation with nothing typed
+    /// [`crate::host::type_and_submit`] — this is the same conversation with nothing typed
     /// in it, so it inherits the `compound-117` answer rather than keeping a
     /// second copy of the attach the first one dropped.
     fn nudge(&self, seat: &Seat) -> Result<()> {
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
-        let mut stream = dial(&socket, DIAL_TIMEOUT)?;
-        press_enter(&mut stream)?;
-        let _ = stream.shutdown(Shutdown::Both);
-        Ok(())
+        self.host.press_enter(&socket)
     }
 
     /// Claude Code's prompt, read off the renderer's screen — see [`composer`].
@@ -1994,7 +1550,7 @@ impl Place for Compound<'_> {
         // gone and nobody asked it to stop) is filed; this is the one seat
         // this call just ended.
         self.end_process(seat, &rec);
-        crate::place_super::bank_burn(&dir);
+        self.host.bank(&dir);
         fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
         Ok(())
     }
@@ -2003,11 +1559,11 @@ impl Place for Compound<'_> {
         let rec = self.record(seat)?;
         let pids: Vec<u32> =
             rec.get("pid").and_then(|p| p.as_u64()).map(|p| vec![p as u32]).unwrap_or_default();
-        Ok(self.state_of(seat, &rec, &alive(&pids)))
+        Ok(self.state_of(seat, &rec, &self.host.alive(&pids)))
     }
 
     fn quiet_since(&self, seat: &Seat) -> Option<i64> {
-        crate::place_super::last_written(&self.dir_of(seat).ok()?)
+        self.host.quiet_since(&self.dir_of(seat).ok()?)
     }
 
     fn stopped(&self, seat: &Seat) -> Option<crate::place::Stopped> {
@@ -2017,7 +1573,7 @@ impl Place for Compound<'_> {
     /// `compound-sup` leads the group and the agent is its pty's child, so the
     /// tree under the recorded pid is the agent and its work.
     fn pids(&self, seat: &Seat) -> Option<Vec<u32>> {
-        Some(crate::place_super::tree_of(self.root(seat)?))
+        Some(self.host.tree_of(self.root(seat)?))
     }
 
     fn root(&self, seat: &Seat) -> Option<u32> {
@@ -2027,7 +1583,7 @@ impl Place for Compound<'_> {
     fn turn_began_since(&self, seat: &Seat, since: i64) -> Option<bool> {
         let dir = self.dir_of(seat).ok()?;
         // No log is *cannot say*, not *no turn*: a seat that predates the file.
-        let log = fs::read_to_string(dir.join(HOOKS_FILE)).ok();
+        let log = self.host.hook_log(&dir);
         // A far seat's hooks fire over there and write nothing here, so a log
         // that shows no turn is *cannot say* for it, not *no turn*: the caller
         // then reads the seat's live state, which a far screen answers
@@ -2059,7 +1615,7 @@ impl Place for Compound<'_> {
             // Silent by its lease, or its forward refusing behind a link that is
             // down: either way a reap has no empty answer to believe.
             let socket = str_of(&rec, "socket");
-            let cut = !socket.is_empty() && UnixStream::connect(&socket).is_err() && self.far.link_down(&machine);
+            let cut = !socket.is_empty() && !self.host.answers(Path::new(&socket)) && self.far.link_down(&machine);
             if cut || self.far.silent_for(&machine).is_some() {
                 silent.insert(machine);
             }
@@ -2204,7 +1760,7 @@ impl Drop for StopsOnDrop {
 ///
 /// 212 sessions stood at once on 2026-11-06, opened by `cargo test` through the
 /// real `compound-sup` into the person's `~/.compound/run` and never closed.
-/// Two rules, both kept by [`Compound::sup_command`], the one place a
+/// Two rules, both kept by [`crate::host::sup_command`], the one place a
 /// supervisor's command is built: it is `--ephemeral <this pid>`, and it runs
 /// with `COMPOUND_RUN_DIR` at a directory of this process's own. The third is
 /// a check: a supervisor a test started and left running when the test's
@@ -2430,18 +1986,18 @@ mod tests {
         let wait = Duration::from_secs(20);
 
         let (sup, said, _) = script_sup(&scratch, "echo \"delivered $3\"");
-        assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "go and do it", wait), Ok(Delivery::Acked));
+        assert_eq!(deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "go and do it", wait), Ok(Delivery::Acked));
         assert_eq!(fs::read_to_string(&said).unwrap(), "go and do it", "the sentence reaches the supervisor whole");
 
         script_sup(&scratch, "echo \"failed $3 no composer\"; exit 1");
         assert_eq!(
-            deliver_through(&sup, &session, &scratch.root, &seat, "go", wait),
+            deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "go", wait),
             Err(Refusal::Failed("cpd-1: no composer".into()))
         );
 
         // An answer about some other delivery is not this one's receipt.
         script_sup(&scratch, "echo 'delivered someone-else'");
-        assert!(matches!(deliver_through(&sup, &session, &scratch.root, &seat, "go", wait), Err(Refusal::Backend(_))));
+        assert!(matches!(deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "go", wait), Err(Refusal::Backend(_))));
     }
 
     /// wsp-634: a supervisor that refuses an idle seat with an empty composer
@@ -2457,14 +2013,14 @@ mod tests {
 
         let (sup, _, asked) = script_sup(&scratch, "echo \"failed $3 refused\"; exit 1");
         let refused = Err(Refusal::Failed("cpd-1: refused".into()));
-        assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "tell", wait), refused);
+        assert_eq!(deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "tell", wait), refused);
         let first = fs::read_to_string(&asked).unwrap();
-        assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "tell", wait), refused);
+        assert_eq!(deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "tell", wait), refused);
         let second = fs::read_to_string(&asked).unwrap();
         assert_ne!(first, second, "a failed id is not asked again: its answer would be `failed` again");
 
         script_sup(&scratch, "echo \"delivered $3\"");
-        assert_eq!(deliver_through(&sup, &session, &scratch.root, &seat, "tell", wait), Ok(Delivery::Acked));
+        assert_eq!(deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "tell", wait), Ok(Delivery::Acked));
     }
 
     /// wsp-477, the verifier's block 3: a wait that runs out is an answer that is
@@ -2477,20 +2033,20 @@ mod tests {
 
         let (sup, _, asked) = script_sup(&scratch, "sleep 8; echo \"delivered $3\"");
         let t = Instant::now();
-        let r = deliver_through(&sup, &session, &scratch.root, &seat, "go", Duration::from_millis(2500));
+        let r = deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "go", Duration::from_millis(2500));
         assert!(t.elapsed() < Duration::from_secs(6), "bounded, not the sup's own wait");
         assert!(matches!(&r, Err(Refusal::Backend(w)) if w.contains("pending")), "{r:?}");
         let first = fs::read_to_string(&asked).unwrap();
 
         script_sup(&scratch, "echo \"delivered $3\"");
         assert_eq!(
-            deliver_through(&sup, &session, &scratch.root, &seat, "go", Duration::from_secs(20)),
+            deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "go", Duration::from_secs(20)),
             Ok(Delivery::Acked)
         );
         assert_eq!(fs::read_to_string(&asked).unwrap(), first, "the same sentence, the same id");
 
         assert_eq!(
-            deliver_through(&sup, &session, &scratch.root, &seat, "go", Duration::from_secs(20)),
+            deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "go", Duration::from_secs(20)),
             Ok(Delivery::Acked)
         );
         assert_ne!(fs::read_to_string(&asked).unwrap(), first, "an answered id is spent: the next tell is new");
@@ -2509,7 +2065,7 @@ mod tests {
     fn an_agent_seat_is_spawned_with_the_kind_its_supervisor_delivers_to() {
         let rec = json!({ "agent": { "kind": "claude" } });
         let args = |rec: &Value| -> Vec<String> {
-            Compound::sup_command(Path::new("compound-sup"), &Seat::new("cpd-1"), rec, "claude", &[])
+            sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), rec, "claude", &[]))
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect()
@@ -2532,7 +2088,7 @@ mod tests {
     #[test]
     fn the_supervisor_is_started_standing_nowhere_and_the_agent_where_it_was_told() {
         let rec = json!({ "cwd": "/tmp/somewhere" });
-        let cmd = Compound::sup_command(Path::new("compound-sup"), &Seat::new("cpd-1"), &rec, "cat", &[]);
+        let cmd = sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), &rec, "cat", &[]));
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.windows(2).any(|w| w == ["--cwd", "/tmp/somewhere"]), "{args:?}");
@@ -2543,7 +2099,7 @@ mod tests {
     #[test]
     fn a_supervisor_a_test_starts_is_ephemeral_and_runs_outside_the_persons_compound_dir() {
         let rec = json!({ "cwd": "/tmp/somewhere" });
-        let cmd = Compound::sup_command(Path::new("compound-sup"), &Seat::new("cpd-1"), &rec, "cat", &[]);
+        let cmd = sup_command(Path::new("compound-sup"), &Compound::spawn_of(&Seat::new("cpd-1"), &rec, "cat", &[]));
         test_sups::tied(&cmd).unwrap();
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let sep = args.iter().position(|a| a == "--").unwrap();
@@ -3122,11 +2678,7 @@ mod tests {
         assert_ne!(place.state(&seat).unwrap(), State::Starting, "opencode fires no hooks to wait for");
     }
 
-    thread_local! {
-        /// A stand-in `compound-render` for this thread's calls to
-        /// [`compound_render_binary`].
-        pub(super) static RENDER: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-    }
+    use crate::host::RENDER;
 
     /// **A far seat's screen is its readiness, and its turn is read off its
     /// state** (wsp-589). The far agent's hooks fire over there and write
