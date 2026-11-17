@@ -1651,7 +1651,7 @@ fn tell_seat(
             .get(&seat)
             .and_then(|b| b.get("task_id").and_then(Value::as_str).map(str::to_string))
             .filter(|t| !t.is_empty())
-            .or_else(|| (!addressed).then(|| addressee_id(store, needle, &what)));
+            .or_else(|| store.find_task(needle).filter(|_| !addressed).map(|t| t.id));
         let n = crate::wake::hold_tell_for(store, &seat, &said, row_id.as_deref());
         store.log_event(
             "agent-told",
