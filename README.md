@@ -2537,8 +2537,7 @@ wsp resolves: by what you call the thing. No argument is the panel, because that
 is the question nine times in ten.
 
 Two things it does not do. It shows what is on the pane *now*, not what happened
-when a key was pressed — `backend pane wait-output` is the tool for that, and it
-is a different one. And it cannot press the key: a person still makes the
+when a key was pressed. And it cannot press the key: a person still makes the
 gesture, and what changes is that the agent can see the result rather than be
 told it.
 

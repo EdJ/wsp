@@ -1205,10 +1205,8 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::Refetch
         }
         // `q` and Esc both mean "put away what is in front of me", and the
-        // panel itself is never that. It is installed furniture in every
-        // workspace, so quitting it by a stray keystroke costs a reinstall and
-        // buys nothing — `ctrl-c` still does it, and `wsp panel uninstall` is
-        // the deliberate way. The map goes first, then the detail pane.
+        // panel itself is never that: `ctrl-c` is what quits it. The map goes
+        // first, then the detail pane.
         Key::Char('q') | Key::Esc if view.help => {
             view.help = false;
             Effect::None
