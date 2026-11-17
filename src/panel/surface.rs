@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::store::Store;
-
 
 /// Where that file sits: beside the bindings and the daemon marker, because it
 /// is machine state of exactly their kind — true only while a process is up,
@@ -70,12 +68,6 @@ pub(crate) fn last_frame(state: &Path) -> Option<Frame> {
         at: record.get("at").and_then(Value::as_str).unwrap_or_default().to_string(),
         lines,
     })
-}
-
-/// Run the panel against a host on stdin and stdout.
-pub fn run(_store: &Store) -> i32 {
-    eprintln!("wsp: no backend socket");
-    1
 }
 
 #[cfg(test)]

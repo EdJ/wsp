@@ -602,12 +602,6 @@ driving, and a shell sitting in a project is a fact about that project — the
 earlier version asked for agents only and so could see one pane out of
 twenty-two.
 
-```sh
-wsp panel install            # split it into the workspace you're standing in
-wsp panel install --all      # …or every one of them
-wsp panel uninstall
-```
-
 The panel, the view and the daemon all watch their own binary and re-exec when
 it changes, so `wsp install` reaches every long-lived process within a tick.
 `exec` rather than a respawn: the pane, its pty and its place in the layout all
@@ -745,9 +739,8 @@ and gives them back when you press `F` again.
 
 `q` and `esc` both mean "put away what is in front of me": the key map first,
 then a search, then the detail pane. Neither quits the panel — it is installed
-furniture in every workspace, so losing one to a stray keystroke costs a
-reinstall and buys nothing. `ctrl-c` still quits, and `wsp panel uninstall` is
-the deliberate way out.
+furniture in every workspace, so losing one to a stray keystroke buys
+nothing. `ctrl-c` still quits, and is the deliberate way out.
 
 `?` docks the key map under the tree, and `?` or `esc` puts it away — a footer
 line fits four of the two dozen keys, which is worse than showing none, because
@@ -2543,16 +2536,11 @@ and picking through the JSON, so the target resolves the way everything else in
 wsp resolves: by what you call the thing. No argument is the panel, because that
 is the question nine times in ten.
 
-Under the fork the panel is not a pane. `wsp surface` is a child of backend drawn
-into the sidebar rect, belonging to no workspace, with nothing for `pane.read`
-to read — so it leaves each frame it draws beside the bindings, and `wsp peek
-panel` prints that. Deliberately the frame the host was *handed*, rather than a
-fresh one drawn on demand from the same store: a fresh one answers what the
-sidebar would show, at a size and a cursor position peek would have to invent,
-and a picture that has stopped moving is a whole class of bug for something that
-draws from pushed events. The header carries the cells it was built for and how
-old it is, which are the two facts that say whether to trust it. With no surface
-running the panel is a pane again and nothing changes.
+A panel drawn into a sidebar rect is not a pane, with nothing for `pane.read`
+to read — so a surface that draws it leaves each frame beside the bindings, and
+`wsp peek panel` prints that. The header carries the cells it was built for and
+how old it is, which are the two facts that say whether to trust it. With no
+surface drawing, the panel is a pane and nothing changes.
 
 Two things it does not do. It shows what is on the pane *now*, not what happened
 when a key was pressed — `backend pane wait-output` is the tool for that, and it

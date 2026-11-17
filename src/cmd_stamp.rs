@@ -650,7 +650,7 @@ mod tests {
         let agents = agents_of(&c);
         assert!(agents.heard(), "a far machine's silence is not the local census's");
         let silent: Vec<&str> = agents.silent.iter().map(|(m, _)| m.as_str()).collect();
-        assert_eq!(silent, ["gpu", "backend", "mb2", "rack"], "each under its own name; `fine` answered");
+        assert_eq!(silent, ["backend", "gpu", "mb2", "rack"], "each under its own name; `fine` answered");
         assert!(!silent.contains(&""), "filed under this machine, a host stops drawing its workspace");
         let mb2 = agents.silent.iter().find(|(m, _)| m == "mb2").unwrap();
         assert!(mb2.1.contains("Connection refused"), "and why: {mb2:?}");
