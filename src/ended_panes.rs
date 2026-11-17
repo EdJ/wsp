@@ -56,7 +56,7 @@ pub(crate) fn find(
         let Some(cwd) = cwd_of(sup.pid).filter(|c| in_row_tree(c)) else { continue };
         let kids: Vec<&Proc> = procs.iter().filter(|p| p.ppid == sup.pid).collect();
         let shells: Vec<&&Proc> = kids.iter().filter(|p| SHELLS.contains(&base(&p.command).trim_start_matches('-'))).collect();
-        let renders: Vec<&&Proc> = kids.iter().filter(|p| crate::place_compound::RENDER_NAMES[0] == base(&p.command)).collect();
+        let renders: Vec<&&Proc> = kids.iter().filter(|p| crate::place_compound::RENDER_NAMES.contains(&base(&p.command))).collect();
         let [shell] = shells.as_slice() else { continue };
         if kids.len() != shells.len() + renders.len() || procs.iter().any(|p| p.ppid == shell.pid) {
             continue;

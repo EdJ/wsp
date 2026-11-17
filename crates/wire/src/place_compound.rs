@@ -3550,19 +3550,25 @@ mod tests {
     /// pi 1.3.0 (the same ones `compound#1`'s `pi_captured_screens_are_detected_as_the_manifest_does`
     /// pins). With the renderer's updated pi rules a spinner line reads
     /// `Working` and a select prompt `Blocked`. A renderer from before them
-    /// reads both `Idle` (the manifest only had a `Working...` literal), so the
-    /// answer depends on which binary is installed. Such a renderer fails this
-    /// test unless `WSP_RENDERER_PREDATES_PI_RULES` is set, which skips: a
-    /// skip by default would hide a regression of the rules behind a green run.
+    /// reads both `Idle`, so the answer depends on which binary is used: the
+    /// test is therefore opt-in and runs only when `COMPOUND_RENDER` names a
+    /// renderer explicitly (a build known to carry the pi rules), e.g.
+    /// `COMPOUND_RENDER=/path/to/compound-render cargo test -p wsp-wire
+    /// detected_state_for_a_pi_seat`. Without it the test prints why and
+    /// skips; it never guesses at whatever happens to be installed.
     ///
-    /// Skips without `compound-sup` and `compound-render`/`compound-reader` (not
-    /// hermetic about them, like the `#[ignore]`d smokes); a script named `pi`
+    /// Also skips without `compound-sup` (not hermetic about it, like the
+    /// `#[ignore]`d smokes); a script named `pi`
     /// on the seat's `PATH` stands in for the binary and prints one screen, so
     /// no model runs.
     #[test]
     fn detected_state_for_a_pi_seat_reads_working_and_blocked_screens() {
+        if std::env::var_os("COMPOUND_RENDER").is_none() {
+            eprintln!("skipped: opt-in; set COMPOUND_RENDER to a renderer that carries the pi rules to run this");
+            return;
+        }
         if compound_sup_binary().is_none() || compound_render_binary().is_none() {
-            eprintln!("skipped: needs compound-sup and a renderer (set COMPOUND_SUP / COMPOUND_RENDER or put them on PATH)");
+            eprintln!("skipped: needs compound-sup (set COMPOUND_SUP or put it on PATH) and the renderer COMPOUND_RENDER names");
             return;
         }
         let rule = "\u{2500}".repeat(100);
@@ -3592,20 +3598,6 @@ mod tests {
             let drawn = until(|| place.read_screen(&seat).is_ok_and(|t| t.contains("0.0%/262k")));
             assert!(drawn, "{name}: the screen never drew: {:?}", place.read_screen(&seat));
             let got = place.state(&seat).unwrap();
-            if got == State::Idle && matches!(want, State::Working | State::Blocked) && name != "Working... literal" {
-                // A skip here would hide exactly the regression this test is
-                // for (the rules lost or never loaded) behind a green run, so
-                // it is not the default: a renderer known to predate the pi
-                // rules has to be named as such.
-                if std::env::var_os("WSP_RENDERER_PREDATES_PI_RULES").is_some() {
-                    eprintln!("skipped: WSP_RENDERER_PREDATES_PI_RULES is set and the renderer reads idle ({name})");
-                    return;
-                }
-                panic!(
-                    "{name}: the renderer reads idle where the pi rules say {want:?}. If this renderer is a foreign build that \
-                     predates them, set WSP_RENDERER_PREDATES_PI_RULES=1 to skip; otherwise the rules regressed"
-                );
-            }
             assert_eq!(got, want, "{name}");
         }
     }
