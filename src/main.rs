@@ -84,6 +84,7 @@ mod cmd_worklist;
 mod cycle;
 mod daemon;
 mod fold;
+mod mirror;
 mod detail;
 mod did;
 mod draw;
