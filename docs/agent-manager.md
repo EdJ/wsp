@@ -929,6 +929,33 @@ Tests:
 - `cmd_spawn::tests::despawn_under_a_manager_asks_the_manager_and_a_silent_one_keeps_the_claim`.
 - `cmd_agent::tests::a_tell_to_a_silent_manager_is_held_and_the_flush_keeps_it`.
 
+#### M3's breakdown (wsp-042, 2026-11-17)
+
+The list is `m3-agent-manager`, at status init. It is planned on top of M1 alone, because no far machine is registered and M2 is not available. It follows wsp-018's three rules:
+- expand, then contract. A job runner is added beside today's in-process runs, behind `WSP_JOBS=inproc|manager`, which defaults to `inproc`. Callers move one area at a time. The old spawns and the sweeps are deleted last;
+- a removal that cannot be staged is one row run as legs;
+- every row's checks build the workspace and test every crate it touches, with at least 120 s per cargo test step.
+
+Each row's overview names the files it changes.
+
+| group | kind | rows | what |
+|---|---|---|---|
+| 1 | contract | wsp-044 | host-api completes the job contract, which a contract row must do (R5). It adds where a job runs (a place on the tree's host, never a path on wsp's machine), keys unique per run (wsp-040's lesson), `hung_after_secs`, the env prefix rule of 3.2, `job.output`, a `jobs` request, `detach` (an undetached job ends with its connection), and the throttle's facts on the beat (d1 Q11). |
+| 2 | components | wsp-049 | `crates/host/src/jobs.rs`, the runner that both the manager and the in-process host link. Each job gets its own process group, a log, timeout and hung bounds, the group killed on every end (wsp-453), an exit file for an end nobody heard, and re-adoption by pid and start time. facts.rs reads the new facts. |
+| 3 | components | wsp-050 | The manager serves `job.*`: keyed runs, a hard cap per class, events journalled, `job.stop` on its own pgid only, and re-adoption on restart. |
+| 4 | wiring | wsp-051 | `Host::run_job`, `stop_job` and `jobs` on `host::Tcp` (waiting by subscription, never by a poll) and on `InProcess`. `WSP_JOBS` is independent of `WSP_HOST`. |
+| 5 | wiring | wsp-052, wsp-053, wsp-054, wsp-055 | Callers move under `manager`, one row per area: `throttle run` (its output streamed, ^C as `job.stop`, slots from `jobs`, admission from the beat); `check`'s `run_step` and its locks; `verify`'s cargo, listing and `--alone`; barrier runs and warm.rs's cleanup. The barrier row rests on check's. |
+| 6 | contract | wsp-056 | `WSP_JOBS` defaults to `manager`, and `wsp install` writes the job capacities. Stop: a live day on the installed trunk. |
+| 7 | contract | wsp-057 | Contract, as legs: delete check_tree's sweep, leaked_agents, the slot probes, the direct spawns of tree work, Host methods left with no caller, and warm.rs's allowed line. host_seam loses "tree work excepted". Stop: install, then a day. |
+| 8 | insitu | wsp-058 | The M3 line's measure, written here as "M3's result": `lsof` and `ps` at 0 on the wsp side, every kill matched to a pgid the manager started, wsp-478-kind incidents at 0 over a week, `throttle run`'s wall no worse, and spawn p50 no worse than 9.4 s. |
+
+What M1's live defects taught, carried into the rows:
+- **A caller that goes around the seam.** In M1 the governor's reseat and rotation did this (wsp-036, wsp-041). Every caller row is asked to `grep` for all callers, and the contract row makes that a guard test.
+- **A key reused after a reopen** (wsp-040). Job keys are unique per run.
+- **Liveness judged from a state read that is not yet true** (wsp-037). Jobs are waited on by subscription.
+
+**Assumes M2:** nothing M3 builds. Rows placed on the i5 keep today's ssh path, and their builds and checks keep running in-process there, because the i5 has no manager. So the M3 measure covers the Mac's wsp only. Under T1 (d1 Q6), the tree's host is the Mac for every job.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the
