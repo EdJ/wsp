@@ -98,7 +98,7 @@ cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 
 | component | modules |
 |---|---|
 | `base` | `base`, `util`, `calls`, `fm`, `input`, `risk`, `memory`, `choices` |
-| `host` | `facts`, `hooks`, `inproc`, `port`, `price`, `shed`, `tcp`, `test_sups` |
+| `host` | `facts`, `hooks`, `inproc`, `jobs`, `port`, `price`, `shed`, `tcp`, `test_sups` |
 | `store` | `model`, `checks`, `caption`, `store`, `resolve`, `message`, `lapse`, `sharing`, `cmd_migrate`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags` |
 | `wire` | `herdr`, `place`, `place_herdr`, `place_compound`, `place_super`, `host`, `host_tcp`, `artefact`, `cmd_mandate`, `tunnel`, `far`, `launchd`, `systemd`, `manager`, `detect_override`, `fake` |
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `at_stop`, `gc` |
