@@ -1,48 +1,22 @@
-//! The processes on this machine, as `ps` lists them.
+//! The processes on this machine, as `ps` lists them: the reading of its
+//! output. The `ps` itself is the host's (`wsp_wire::host::Host::table`, and
+//! its `processes` and `parents`), so this module runs nothing.
 
-use crate::calls::Command;
-
-/// Every process this machine is running, as `(pid, ppid, the rest of the
+/// A `ps -A -E -o pid=,ppid=,command=` table as `(pid, ppid, the rest of the
 /// line)` — where "the rest" includes the environment.
 ///
-/// `ps -E` is how a process's environment is readable without a dependency or a
-/// `/proc`, and the environment is the only place a plugin's child says which
-/// backend started it: its command line is `wsp daemon`, identical to the live
-/// one's. `ppid` comes back in the same call so the ancestors of this process
-/// can be ruled out of anything we are about to kill — a shell whose command
-/// line happens to mention the session is not a child of it.
-///
-/// Shared with `daemon`, which asks the same output the same two
-/// questions — what is running, and which store its environment points it at —
-/// and would otherwise keep a second copy of the parsing that was already
-/// silently wrong once (see [`ps_line`]).
-pub fn processes() -> Vec<(u32, u32, String)> {
-    let Ok(out) = Command::new("ps")
-        .args(["-A", "-E", "-o", "pid=,ppid=,command="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(ps_line)
-        .collect()
+/// Shared by everything that asks the same output the same two questions —
+/// what is running, and which store its environment points it at — which would
+/// otherwise keep second copies of the parsing that was already silently wrong
+/// once (see [`ps_line`]).
+pub fn read_processes(table: &str) -> Vec<(u32, u32, String)> {
+    table.lines().filter_map(ps_line).collect()
 }
 
-/// Every process as `(pid, ppid, "")`: the parent links alone, for a caller that
-/// only walks [`ancestors`]. Without `-E` the table is a fifth of the work to
-/// read, and an environment is what a caller of [`processes`] is there for.
-pub fn parents() -> Vec<(u32, u32, String)> {
-    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output() else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
+/// A `ps -A -o pid=,ppid=` table as `(pid, ppid, "")`: the parent links alone,
+/// for a caller that only walks [`ancestors`].
+pub fn read_parents(table: &str) -> Vec<(u32, u32, String)> {
+    table
         .lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace().map(|x| x.parse::<u32>().ok());

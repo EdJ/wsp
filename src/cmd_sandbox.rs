@@ -91,7 +91,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::base::procs::{ancestors, processes};
+use crate::base::procs::ancestors;
+use crate::host::{Host, LOCAL};
 use crate::store::Store;
 use crate::util;
 use crate::Args;
@@ -360,7 +361,7 @@ fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
 /// `wsp sandbox rm` can have the session name on its own command line, and `ps
 /// -E` puts the command and the environment in one field.
 fn session_children(root: &Path, name: &str) -> Vec<u32> {
-    let all = processes();
+    let all = LOCAL.processes();
     children_of(&all, root, name)
 }
 
@@ -471,7 +472,7 @@ fn sandboxes_named_in(rest: &str, root: &Path) -> Vec<String> {
 /// stray daemon up, because it asked backend what sessions existed and a session
 /// is not the only thing a sandbox creates.
 fn sessions_with_processes(root: &Path) -> Vec<(String, usize)> {
-    let all = processes();
+    let all = LOCAL.processes();
     let mine = ancestors(&all);
     let mut out: Vec<(String, usize)> = Vec::new();
     for (pid, _, rest) in &all {
@@ -504,12 +505,7 @@ fn kill(pids: &[u32], signal: &str) {
     if pids.is_empty() {
         return;
     }
-    let mut c = Command::new("kill");
-    c.arg(signal);
-    for p in pids {
-        c.arg(p.to_string());
-    }
-    let _ = c.stdout(Stdio::null()).stderr(Stdio::null()).status();
+    LOCAL.signal(pids, signal);
 }
 
 /// Stop it, reap what it started, and delete it. Best-effort throughout: what
@@ -540,13 +536,13 @@ fn stop_session(root: &Path, name: &str) -> (bool, usize) {
         if fresh.is_empty() {
             break;
         }
-        kill(&fresh, "-STOP");
+        kill(&fresh, "STOP");
         children.extend(fresh);
     }
     if !children.is_empty() {
-        kill(&children, "-TERM");
+        kill(&children, "TERM");
         // TERM stays pending on a stopped process until it runs again.
-        kill(&children, "-CONT");
+        kill(&children, "CONT");
         // A daemon in the middle of a sync has a store lock and a socket read
         // to finish. Long enough to let it, short enough that a teardown is
         // still something you wait for.
@@ -557,8 +553,8 @@ fn stop_session(root: &Path, name: &str) -> (bool, usize) {
             }
         }
         let left = session_children(root, name);
-        kill(&left, "-STOP");
-        kill(&left, "-KILL");
+        kill(&left, "STOP");
+        kill(&left, "KILL");
     }
 
     let _ = backend(&["session", "delete", name]);
