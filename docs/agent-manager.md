@@ -355,6 +355,12 @@ The base is state-core 5.1's message table. The changes follow from the manager 
 | `beat` | both | every 10 s on each side's own timer. The manager adds host facts (load, memory pressure, swap, disk free per volume, thermal state) and per-seat RSS. | `df` ×24.6, `sysctl`, `pmset`, `vm_stat`, `memory_pressure` per tick; the far beat |
 | `events` / `subscribe` | W → M | `from` id | — |
 
+**What crosses in `seat.spawn`'s environment** (wsp-026 d1). The agent spec carries env *names*, and the manager
+fills them from its own environment. The values wsp mints for each seat, such as its row and its store, are not in
+the manager's environment and are not secret. They cross as an `env -u K -- K=V` prefix on the argv. A secret, such
+as a token or a key, never goes in that prefix: it is a name the manager fills, and a secret found in the prefix is
+a defect.
+
 The manager does **not** decide anything that is wsp's to decide. It does not choose a seat, pick a row, end a seat
 of its own accord (except at the gate's existing rule, section 5), hold a tell, or judge a check's output. It does
 refuse a malformed or duplicate command, and every refusal it makes carries a reason.
