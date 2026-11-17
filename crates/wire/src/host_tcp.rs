@@ -11,6 +11,9 @@
 //! | `deliver` (a seat the manager runs) | `order.deliver` | `order.delivered`, `order.acked` / `order.refused` |
 //! | `read_screen` (a seat it started) | `seat.read` | `seat.screen` |
 //! | `can_deliver`, `wire_health` | `hello` | the manager's `hello` |
+//! | `run_job` | `job.run` | `job.started`, `job.output`, `job.ended` / `refused` |
+//! | `stop_job` | `job.stop` | `job.ended` / `refused` |
+//! | `jobs` | `jobs` | `jobs.list` |
 //!
 //! [`Tcp::seats`] asks `seats`. Everything else stays in-process under both
 //! choices, as M1 leaves it: the process table, signals and working
@@ -32,6 +35,17 @@
 //!
 //! **Choosing** is `WSP_HOST=inproc|manager` ([`Choice`], [`chosen`]); the
 //! default is `manager` since wsp-029, and `WSP_HOST=inproc` is 6.2's rollback.
+//! Tree jobs are chosen apart, by `WSP_JOBS=inproc|manager` ([`JobsChoice`],
+//! [`jobs_chosen`]; `inproc` until M3's callers have moved), so they roll back
+//! on their own.
+//!
+//! **A job** (M3, wsp-051) runs on a connection of its own: it subscribes
+//! from the journal's head, then sends `job.run`, so the connection owns the
+//! job (its `job.output` comes there, and an undetached job ends with it) and
+//! `job.started` and `job.ended` are heard as they happen, never by asking
+//! `jobs` (wsp-037). A dropped connection is dialled again and subscribed
+//! from the last id it heard, and the same `job.run` is sent again, its key
+//! unchanged, so the manager hands the job over rather than running it twice.
 //!
 //! [`Subscription`] is the daemon's half: `subscribe {from}` with the last
 //! event id it heard of this host, kept in `<state>/manager/<host>.last`, and
@@ -50,12 +64,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use wsp_host_api::{
-    AgentSpec, At, Beat, ConnError, Connection, Epoch, EventId, Frame, Gate, Hello, ManagerHello, Message,
-    HostFacts, OrderDeliver, OrderFail, OrderId, Refusal as Why, ReqId, Role, SeatId, SeatRead, SeatRow, SeatSpawn,
+    AgentSpec, At, Beat, ConnError, Connection, Epoch, EventId, Frame, Gate, Hello, JobEnded, JobKey, JobOutput, JobRow,
+    JobRun, JobStop, Jobs, ManagerHello, Message, HostFacts, OrderDeliver, OrderFail, OrderId, Refusal as Why, ReqId, Role, SeatId, SeatRead, SeatRow, SeatSpawn,
     SeatState, SeatStop, Seats, SeatsList, Subscribe, Token, TurnEdge, Workdir, WspHello, BEAT_SECS, MISSED_BEATS, PROTOCOL,
 };
 
-use crate::host::{Ended, Forked, Headless, Host, InProcess, Session, Spawn, Stop};
+use crate::host::{Ended, Forked, Headless, Host, InProcess, JobError, Session, Spawn, Stop, JOB_GRACE};
 /// What a `seats` reply carries, for a caller that reads it (`wip`).
 pub use wsp_host_api::{DiskFree, HostFacts as Facts, SeatRow as Row};
 use crate::manager::{self, Local};
@@ -69,6 +83,8 @@ pub const SPAWN_WAIT: Duration = Duration::from_secs(30);
 const MARGIN: Duration = Duration::from_secs(5);
 /// The environment variable that chooses the host.
 pub const ENV: &str = "WSP_HOST";
+/// The environment variable that chooses the host tree jobs run on.
+pub const JOBS_ENV: &str = "WSP_JOBS";
 
 // ---------------------------------------------------------------- errors
 
@@ -84,6 +100,8 @@ pub enum HostError {
     Refused { why: Why, detail: String },
     /// `WSP_HOST` names neither choice.
     Choice(String),
+    /// `WSP_JOBS` names neither choice.
+    JobsChoice(String),
 }
 
 impl std::fmt::Display for HostError {
@@ -101,6 +119,7 @@ impl std::fmt::Display for HostError {
             ),
             HostError::Refused { why, detail } => write!(f, "the manager refused wsp's hello: {why:?} {detail}"),
             HostError::Choice(v) => write!(f, "{ENV}={v} is neither `inproc` nor `manager`"),
+            HostError::JobsChoice(v) => write!(f, "{JOBS_ENV}={v} is neither `inproc` nor `manager`"),
         }
     }
 }
@@ -167,6 +186,53 @@ pub fn choose(choice: Choice, state: &Path, version: &str) -> std::result::Resul
 /// [`choose`] by `$WSP_HOST`.
 pub fn chosen(state: &Path, version: &str) -> std::result::Result<&'static dyn Host, HostError> {
     choose(Choice::from_env()?, state, version)
+}
+
+/// `WSP_JOBS`: which host tree jobs run on ([`Host::run_job`]). Independent
+/// of `WSP_HOST`, so jobs roll back on their own (6.2's M3 rollback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JobsChoice {
+    /// `wsp-host`'s runner in this process: the default until M3's callers
+    /// have moved, and the rollback after.
+    #[default]
+    Inproc,
+    /// `job.run` to the manager the local machine record names. A manager that
+    /// does not answer is "host silent", and the job is not run here instead.
+    Manager,
+}
+
+impl JobsChoice {
+    /// `None` and the empty string are the default, [`JobsChoice::Inproc`].
+    pub fn parse(value: Option<&str>) -> std::result::Result<JobsChoice, HostError> {
+        match value.map(str::trim) {
+            None | Some("") | Some("inproc") => Ok(JobsChoice::Inproc),
+            Some("manager") => Ok(JobsChoice::Manager),
+            Some(other) => Err(HostError::JobsChoice(other.to_string())),
+        }
+    }
+
+    /// What `$WSP_JOBS` says.
+    pub fn from_env() -> std::result::Result<JobsChoice, HostError> {
+        JobsChoice::parse(std::env::var(JOBS_ENV).ok().as_deref())
+    }
+}
+
+/// The host `choice` runs jobs on: the in-process runner, its files under
+/// `<state>/inproc`; or the manager's [`Tcp`], the one [`choose`] makes (so a
+/// silent manager is [`HostError::Silent`] here, and nothing runs).
+pub fn choose_jobs(choice: JobsChoice, state: &Path, version: &str) -> std::result::Result<&'static dyn Host, HostError> {
+    static INPROC: OnceLock<InProcess> = OnceLock::new();
+    match choice {
+        JobsChoice::Inproc => Ok(INPROC.get_or_init(|| InProcess::new().with_jobs(&state.join("inproc"), &crate::util::home()))),
+        JobsChoice::Manager => choose(Choice::Manager, state, version),
+    }
+}
+
+/// [`choose_jobs`] by `$WSP_JOBS`, read once per process as the `Tcp` is
+/// made once: a process's jobs do not change host under it.
+pub fn jobs_chosen(state: &Path, version: &str) -> std::result::Result<&'static dyn Host, HostError> {
+    static READ: OnceLock<std::result::Result<JobsChoice, HostError>> = OnceLock::new();
+    choose_jobs(READ.get_or_init(JobsChoice::from_env).clone()?, state, version)
 }
 
 // ---------------------------------------------------------------- the census
@@ -546,6 +612,48 @@ impl Tcp {
     }
 }
 
+// ---------------------------------------------------------------- jobs
+
+/// How long a job's dropped connection is dialled again before the manager is
+/// silent: as long as a subscription bears a manager it does not hear.
+fn rejoin_patience() -> Duration {
+    Duration::from_secs(BEAT_SECS) * MISSED_BEATS
+}
+
+impl Tcp {
+    fn fresh_req(&self) -> ReqId {
+        let mut n = self.next_req.lock().unwrap_or_else(|e| e.into_inner());
+        *n += 1;
+        ReqId(*n)
+    }
+
+    /// A connection for one job: dialled, subscribed from `from` (the
+    /// journal's head on the first), and the job's `job.run` sent on it. The
+    /// id it subscribed from comes back with it.
+    fn job_conn(&self, from: Option<EventId>, run: &Frame) -> std::result::Result<(wsp_host::Tcp, Option<EventId>), HostError> {
+        let (mut conn, hello) = open(self.addr, &self.token, self.role, &self.version, from)?;
+        let from = from.or(hello.journal_head);
+        let silent = |why: String| HostError::Silent { addr: self.addr, why };
+        let sub = Frame { id: None, req: None, msg: Message::Subscribe(Subscribe { from }) };
+        conn.send(&sub).map_err(|e| silent(format!("it did not take subscribe: {e:?}")))?;
+        conn.send(run).map_err(|e| silent(format!("it did not take job.run: {e:?}")))?;
+        Ok((conn, from))
+    }
+
+    /// [`Tcp::job_conn`] again after a drop, from the last id heard, dialled
+    /// until [`rejoin_patience`] is out (a manager restarting is a moment
+    /// with nothing listening).
+    fn job_rejoin(&self, from: Option<EventId>, run: &Frame) -> std::result::Result<(wsp_host::Tcp, Option<EventId>), HostError> {
+        let start = Instant::now();
+        loop {
+            match self.job_conn(from, run) {
+                Err(HostError::Silent { .. }) if start.elapsed() < rejoin_patience() => std::thread::sleep(Duration::from_millis(200)),
+                other => return other,
+            }
+        }
+    }
+}
+
 /// Read `sub` for `order`'s answer up to `wait`: `order.acked`, `order.refused`
 /// (worded as the in-process host words compound-sup's reason), or the seat
 /// stopping first. Everything else on the subscription is someone else's.
@@ -885,6 +993,109 @@ impl Host for Tcp {
     }
 
     // ---- hello
+    // ---- job.run / job.stop / jobs
+    fn run_job(&self, run: &JobRun, sink: &mut dyn FnMut(&JobOutput)) -> std::result::Result<JobEnded, JobError> {
+        // Built once: a resend after a reopen is this same frame, its key
+        // unchanged, so the manager hands the job over and never runs it twice.
+        let frame = Frame { id: None, req: Some(self.fresh_req()), msg: Message::JobRun(run.clone()) };
+        let req = frame.req;
+        let (mut conn, mut last) = self.job_conn(None, &frame).map_err(JobError::Silent)?;
+        // The manager ends the job at its timeout and kills it within the
+        // grace: past that and a margin, no end is coming.
+        let bound = Duration::from_secs(run.timeout_secs).checked_add(JOB_GRACE + MARGIN * 2);
+        let deadline = bound.and_then(|b| Instant::now().checked_add(b));
+        let patience = rejoin_patience();
+        let (mut heard, mut sent) = (Instant::now(), Instant::now());
+        // The offset of the last output handed on, so a chunk is handed once.
+        let mut handed: Option<u64> = None;
+        let mut rejoined = false;
+        // A `duplicate` to a resend: the job ended while this was away, and
+        // the journal's replay of its `job.ended` may come just after.
+        let mut duplicate: Option<(Instant, String)> = None;
+        let unheard = |why: String| JobError::Unanswered(format!("job {}: {why}, from the manager at {}", run.key.job, self.addr));
+        loop {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                conn.shutdown();
+                return Err(unheard(format!("no job.ended within {}s of its timeout", (JOB_GRACE + MARGIN * 2).as_secs())));
+            }
+            if let Some((at, detail)) = &duplicate {
+                if at.elapsed() >= MARGIN {
+                    conn.shutdown();
+                    return Err(JobError::Refused { why: Why::Duplicate, detail: detail.clone() });
+                }
+            }
+            let mut dropped = heard.elapsed() >= patience;
+            if !dropped {
+                // Our own beat, so a long job is not dropped as a silent client.
+                if sent.elapsed() >= Duration::from_secs(BEAT_SECS) {
+                    let _ = conn.send(&beat_frame());
+                    sent = Instant::now();
+                }
+                match conn.recv(Duration::from_secs(1)) {
+                    Ok(Some(f)) => {
+                        heard = Instant::now();
+                        if let Some(id) = f.id {
+                            last = last.max(Some(id));
+                        }
+                        match f.msg {
+                            Message::JobEnded(e) if e.key == run.key => {
+                                conn.shutdown();
+                                return Ok(e);
+                            }
+                            Message::JobOutput(o) if o.key == run.key => {
+                                if handed.is_some_and(|h| o.from <= h) {
+                                    continue;
+                                }
+                                handed = Some(o.from);
+                                sink(&o);
+                            }
+                            Message::Refused(r) if f.req == req => {
+                                if r.why == Why::Duplicate && rejoined {
+                                    duplicate.get_or_insert((Instant::now(), r.detail));
+                                    continue;
+                                }
+                                conn.shutdown();
+                                return Err(JobError::Refused { why: r.why, detail: r.detail });
+                            }
+                            // `job.started`: it runs, and its end is what is
+                            // waited for. Anything else is someone else's.
+                            _ => {}
+                        }
+                    }
+                    Ok(None) | Err(ConnError::Malformed(_)) => {}
+                    Err(_) => dropped = true,
+                }
+            }
+            if dropped {
+                conn.shutdown();
+                (conn, last) = self.job_rejoin(last, &frame).map_err(JobError::Silent)?;
+                (heard, sent, rejoined) = (Instant::now(), Instant::now(), true);
+            }
+        }
+    }
+    fn stop_job(&self, key: &JobKey, wait: Duration) -> std::result::Result<JobEnded, JobError> {
+        let msg = Message::JobStop(JobStop { key: key.clone() });
+        let said = self.ask(msg, wait, |m| matches!(m, Message::JobEnded(e) if e.key == *key)).map_err(JobError::Silent)?;
+        match said.into_iter().last() {
+            Some(Message::JobEnded(e)) => Ok(e),
+            Some(Message::Refused(r)) => Err(JobError::Refused { why: r.why, detail: r.detail }),
+            _ => Err(JobError::Unanswered(format!(
+                "no job.ended for {} within {}s of its job.stop, from the manager at {}",
+                key.job,
+                wait.as_secs(),
+                self.addr
+            ))),
+        }
+    }
+    fn jobs(&self) -> std::result::Result<Vec<JobRow>, JobError> {
+        let said = self.ask(Message::Jobs(Jobs {}), SPAWN_WAIT, |m| matches!(m, Message::JobsList(_))).map_err(JobError::Silent)?;
+        match said.into_iter().next() {
+            Some(Message::JobsList(l)) => Ok(l.jobs),
+            Some(Message::Refused(r)) => Err(JobError::Refused { why: r.why, detail: r.detail }),
+            _ => Err(JobError::Silent(HostError::Silent { addr: self.addr, why: format!("no answer to `jobs` within {}s", SPAWN_WAIT.as_secs()) })),
+        }
+    }
+
     fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
         match self.hello() {
             Ok(m) => {

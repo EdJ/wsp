@@ -44,15 +44,23 @@
 //! they need a fact (a pid's liveness, when it started) their callers pass the
 //! host's answer in: `sharing::Alive`, `checks::StartOf`.
 //!
-//! Not in the host yet: tree work's jobs (section 1.3, which stays wsp's), the
-//! far machine's ssh (`far.rs`'s [`crate::far::Wire`], M2's subject), and the
+//! Tree work's jobs (M3, wsp-051) are [`Host::run_job`], [`Host::stop_job`]
+//! and [`Host::jobs`]: `job.run`, `job.stop` and `jobs` on [`Tcp`], and
+//! `wsp-host`'s runner in this process on [`InProcess`]. `WSP_JOBS=inproc|manager`
+//! chooses between them ([`choose_jobs`], [`jobs_chosen`]; `inproc` by
+//! default), apart from `WSP_HOST`. Nothing calls them yet; the callers move
+//! at M3's group 5.
+//!
+//! Not in the host yet: the far machine's ssh (`far.rs`'s [`crate::far::Wire`], M2's subject), and the
 //! doctor's checks of installed hook snippets, which read config rather than a
 //! seat.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -65,7 +73,72 @@ pub use wsp_host::inproc::*;
 
 /// M1's second implementation, over the manager's connection (wsp-025), and
 /// `WSP_HOST`'s choice between the two.
-pub use crate::host_tcp::{choose, chosen, Choice, HostError, Subscription, Tcp};
+pub use crate::host_tcp::{choose, choose_jobs, chosen, jobs_chosen, Choice, HostError, JobsChoice, Subscription, Tcp};
+
+/// What a tree job is, as `job.run` carries it, and what comes back
+/// (`docs/agent-manager.md` 3.2): the trait's job methods take and give these,
+/// so a call is its message under either host.
+pub use wsp_host_api::{At, HostDir, HostId, JobAt, JobClass, JobEnded, JobKey, JobOutput, JobRow, JobRun, JobState, RowId, Tree};
+
+/// How long a stopped job has between `TERM` and `KILL`: the manager's
+/// default (`--job-grace`), kept the same in-process.
+pub const JOB_GRACE: Duration = Duration::from_secs(5);
+/// The most of a job's output handed to a sink at once, as the manager sends it.
+const JOB_CHUNK: usize = 64 * 1024;
+
+/// A job's key, built once per run by its caller and sent unchanged however
+/// often the job is asked for: a retry, and a resend after a reopen, are the
+/// same key, so the job runs once. `job` must be unique per run (wsp-040): a
+/// reopened row starts its attempts again, so it carries what makes this run
+/// this one (`verify:clippy@3`).
+pub fn job_key(row: &str, attempt: u32, job: &str) -> JobKey {
+    JobKey { row: RowId(row.to_string()), attempt, job: job.to_string() }
+}
+
+/// Why a job was not run, or its end not heard.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobError {
+    /// The manager did not answer: "host silent". The job was not run in this
+    /// process in its place.
+    Silent(HostError),
+    /// The host refused it, in the manager's words (`full`, `duplicate`,
+    /// `no_tree`, `no_job`, `malformed`, `failed`); the in-process host
+    /// refuses in the same words.
+    Refused { why: wsp_host_api::Refusal, detail: String },
+    /// Asked, and no end came within the wait.
+    Unanswered(String),
+}
+
+impl std::fmt::Display for JobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobError::Silent(e) => write!(f, "{e}"),
+            JobError::Refused { why, detail } => write!(f, "the job was refused: {why:?} {detail}"),
+            JobError::Unanswered(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for JobError {}
+
+impl From<JobError> for crate::place::Refusal {
+    fn from(e: JobError) -> crate::place::Refusal {
+        match e {
+            JobError::Silent(e) => crate::place::Refusal::from(e),
+            other => crate::place::Refusal::Backend(other.to_string()),
+        }
+    }
+}
+
+fn refused(why: wsp_host_api::Refusal, detail: impl Into<String>) -> JobError {
+    JobError::Refused { why, detail: detail.into() }
+}
+
+/// Where the in-process host keeps its jobs' files when it is not told:
+/// `~/.local/state/wsp/inproc`, beside the manager's exec dir.
+pub fn default_exec() -> PathBuf {
+    crate::util::home().join(".local/state/wsp/inproc")
+}
 
 /// What a stop ended, as `seat.stopped` says it (`docs/agent-manager.md` 3.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -287,25 +360,73 @@ pub trait Host: Sync {
     // ---- hello
     /// What the doctor says about the installed `compound-sup`'s wire.
     fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>);
+
+    // ---- job.run / job.started / job.output / job.ended (M3, wsp-051)
+    // `WSP_JOBS` chooses the host a job runs on ([`choose_jobs`]), apart from
+    // `WSP_HOST`, so jobs roll back on their own.
+    /// `job.run`, and the job's `job.ended` once it has ended: its exit, or
+    /// that it timed out or hung, and its log. What it writes meanwhile goes
+    /// to `sink` as `job.output`, in order. `run.key` is the caller's, built
+    /// once per run ([`job_key`]): asked again, it is the same job, never a
+    /// second run, and its end once it has one. A manager that does not answer
+    /// is [`JobError::Silent`], and nothing runs in this process instead.
+    fn run_job(&self, run: &JobRun, _sink: &mut dyn FnMut(&JobOutput)) -> std::result::Result<JobEnded, JobError> {
+        Err(refused(wsp_host_api::Refusal::Unsupported, format!("this host runs no jobs ({})", run.key.job)))
+    }
+    /// `job.stop`: `TERM` to the job's own group, `KILL` once [`JOB_GRACE`]
+    /// is out, and its `job.ended` within `wait`. A job that has ended is
+    /// answered with its end; one this host never ran is refused `no_job`.
+    fn stop_job(&self, key: &JobKey, _wait: Duration) -> std::result::Result<JobEnded, JobError> {
+        Err(refused(wsp_host_api::Refusal::Unsupported, format!("this host runs no jobs ({})", key.job)))
+    }
+    /// `jobs`: the job table, running and ended.
+    fn jobs(&self) -> std::result::Result<Vec<JobRow>, JobError> {
+        Err(refused(wsp_host_api::Refusal::Unsupported, "this host runs no jobs"))
+    }
 }
 
 /// The host this process is: `wsp-host`'s [`wsp_host::InProcess`], reached
 /// only through [`Host`]. A newtype rather than the type itself, so a caller
 /// still names the trait to ask it anything, as it did before the move, and a
 /// second implementation (M1's `host::Tcp`) can stand where this one does.
-pub struct InProcess(wsp_host::InProcess);
+///
+/// It also runs tree jobs here (`WSP_JOBS=inproc`, the default and M3's
+/// rollback): `wsp-host`'s runner ([`wsp_host::jobs`]), the code the manager
+/// runs them with, so a job's files, bounds and end are the same under both.
+/// Its job table is this process's; a key that ran before in another process
+/// is found by the runner's files under the exec dir and never run again.
+pub struct InProcess {
+    host: wsp_host::InProcess,
+    /// Where the runner keeps a job's files (`<exec>/jobs/<key>.*`); `None`
+    /// is [`default_exec`].
+    exec: Option<PathBuf>,
+    /// What a job's `dir` is under, as the manager's `--tree-root`; `None` is
+    /// the home directory, the manager's default.
+    tree_root: Option<PathBuf>,
+    jobs: Mutex<BTreeMap<JobKey, Arc<Slot>>>,
+}
 
 /// The in-process host every backend gets unless a test hands it another.
 pub static LOCAL: InProcess = InProcess::new();
 
 impl InProcess {
     pub const fn new() -> InProcess {
-        InProcess(wsp_host::InProcess::new())
+        InProcess { host: wsp_host::InProcess::new(), exec: None, tree_root: None, jobs: Mutex::new(BTreeMap::new()) }
     }
 
     /// One whose `compound-sup` is this file — a test's script.
     pub fn with_sup(sup: &Path) -> InProcess {
-        InProcess(wsp_host::InProcess::with_sup(sup))
+        InProcess { host: wsp_host::InProcess::with_sup(sup), ..InProcess::new() }
+    }
+
+    /// The same, its jobs' files under `exec` and their `dir`s under
+    /// `tree_root`.
+    pub fn with_jobs(self, exec: &Path, tree_root: &Path) -> InProcess {
+        InProcess { exec: Some(exec.to_path_buf()), tree_root: Some(tree_root.to_path_buf()), ..self }
+    }
+
+    fn exec_dir(&self) -> PathBuf {
+        self.exec.clone().unwrap_or_else(default_exec)
     }
 }
 
@@ -318,150 +439,370 @@ impl Default for InProcess {
 /// The adapter: each method is `wsp-host`'s in-process method of the same name.
 impl Host for InProcess {
     fn spawn_session(&self, spawn: &Spawn<'_>) -> Result<Session> {
-        self.0.spawn_session(spawn)
+        self.host.spawn_session(spawn)
     }
     fn spawn_headless(&self, spawn: &Headless<'_>) -> Result<Forked> {
-        self.0.spawn_headless(spawn)
+        self.host.spawn_headless(spawn)
     }
     fn stop(&self, stop: Stop<'_>) {
-        self.0.stop(stop)
+        self.host.stop(stop)
     }
     fn stop_soon(&self, group: u32) {
-        self.0.stop_soon(group)
+        self.host.stop_soon(group)
     }
     fn clear_socket(&self, socket: &Path, sidecars: &[&str]) {
-        self.0.clear_socket(socket, sidecars)
+        self.host.clear_socket(socket, sidecars)
     }
     fn unlink(&self, path: &Path) {
-        self.0.unlink(path)
+        self.host.unlink(path)
     }
     fn alive(&self, pids: &[u32]) -> BTreeSet<u32> {
-        self.0.alive(pids)
+        self.host.alive(pids)
     }
     fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
-        self.0.started(pid)
+        self.host.started(pid)
     }
     fn shells(&self) -> Option<String> {
-        self.0.shells()
+        self.host.shells()
     }
     fn seat_memory(&self) -> Option<String> {
-        self.0.seat_memory()
+        self.host.seat_memory()
     }
     fn disk_free(&self, path: &Path) -> Option<String> {
-        self.0.disk_free(path)
+        self.host.disk_free(path)
     }
     fn disk_use(&self, path: &Path) -> Option<String> {
-        self.0.disk_use(path)
+        self.host.disk_use(path)
     }
     fn load(&self) -> Option<String> {
-        self.0.load()
+        self.host.load()
     }
     fn thermal(&self) -> Option<String> {
-        self.0.thermal()
+        self.host.thermal()
     }
     fn memory_pressure(&self) -> Option<String> {
-        self.0.memory_pressure()
+        self.host.memory_pressure()
     }
     fn swap(&self) -> Option<String> {
-        self.0.swap()
+        self.host.swap()
     }
     fn pageouts(&self) -> Option<String> {
-        self.0.pageouts()
+        self.host.pageouts()
     }
     fn idle(&self) -> Option<String> {
-        self.0.idle()
+        self.host.idle()
     }
     fn tree_of(&self, root: u32) -> Vec<u32> {
-        self.0.tree_of(root)
+        self.host.tree_of(root)
     }
     fn table(&self, columns: &str, env: bool) -> Option<String> {
-        self.0.table(columns, env)
+        self.host.table(columns, env)
     }
     fn rows_of(&self, pids: &[u32], columns: &str) -> Option<String> {
-        self.0.rows_of(pids, columns)
+        self.host.rows_of(pids, columns)
     }
     fn signal(&self, pids: &[u32], sig: &str) -> Option<bool> {
-        self.0.signal(pids, sig)
+        self.host.signal(pids, sig)
     }
     fn signal_group(&self, group: u32, sig: &str) {
-        self.0.signal_group(group, sig)
+        self.host.signal_group(group, sig)
     }
     fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
-        self.0.cwds(pids)
+        self.host.cwds(pids)
     }
     fn answers(&self, socket: &Path) -> bool {
-        self.0.answers(socket)
+        self.host.answers(socket)
     }
     fn read_screen(&self, render: &Path) -> Result<String> {
-        self.0.read_screen(render)
+        self.host.read_screen(render)
     }
     fn screen_state(&self, render: &Path, kind: &str) -> Option<State> {
-        self.0.screen_state(render, kind)
+        self.host.screen_state(render, kind)
     }
     fn osc_title(&self, socket: &Path) -> Option<String> {
-        self.0.osc_title(socket)
+        self.host.osc_title(socket)
     }
     fn can_deliver(&self) -> bool {
-        self.0.can_deliver()
+        self.host.can_deliver()
     }
     fn deliver(&self, session: &Path, id: &str, text: &str, wait: Duration, seat: &Seat) -> Result<Delivery> {
-        self.0.deliver(session, id, text, wait, seat)
+        self.host.deliver(session, id, text, wait, seat)
     }
     fn type_in(&self, render: &Path, text: &str) -> Result<()> {
-        self.0.type_in(render, text)
+        self.host.type_in(render, text)
     }
     fn press_enter(&self, render: &Path) -> Result<()> {
-        self.0.press_enter(render)
+        self.host.press_enter(render)
     }
     fn append_line(&self, file: &Path, line: &str) -> Result<()> {
-        self.0.append_line(file, line)
+        self.host.append_line(file, line)
     }
     fn said(&self, dir: &Path) -> Value {
-        self.0.said(dir)
+        self.host.said(dir)
     }
     fn say(&self, dir: &Path, said: &Value) {
-        self.0.say(dir, said)
+        self.host.say(dir, said)
     }
     fn log_hook(&self, dir: &Path, line: &Value) {
-        self.0.log_hook(dir, line)
+        self.host.log_hook(dir, line)
     }
     fn quiet_since(&self, dir: &Path) -> Option<i64> {
-        self.0.quiet_since(dir)
+        self.host.quiet_since(dir)
     }
     fn tally(&self, dir: &Path, payload: &Value) {
-        self.0.tally(dir, payload)
+        self.host.tally(dir, payload)
     }
     fn bank(&self, dir: &Path) {
-        self.0.bank(dir)
+        self.host.bank(dir)
     }
     fn burn_under(&self, root: &Path) -> Vec<(String, Value)> {
-        self.0.burn_under(root)
+        self.host.burn_under(root)
     }
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
-        self.0.transcript_of(session, cwd)
+        self.host.transcript_of(session, cwd)
     }
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
-        self.0.pi_session_of(session, cwd)
+        self.host.pi_session_of(session, cwd)
     }
     fn read_transcript(&self, file: &Path) -> Option<Box<dyn BufRead>> {
-        self.0.read_transcript(file)
+        self.host.read_transcript(file)
     }
     fn transcript_bytes(&self, file: &Path) -> Option<Vec<u8>> {
-        self.0.transcript_bytes(file)
+        self.host.transcript_bytes(file)
     }
     fn transcript_tail(&self, file: &Path, bytes: u64) -> Option<String> {
-        self.0.transcript_tail(file, bytes)
+        self.host.transcript_tail(file, bytes)
     }
     fn opencode_export(&self, session: &str) -> Option<Vec<u8>> {
-        self.0.opencode_export(session)
+        self.host.opencode_export(session)
     }
     fn opencode_newest(&self, session: &str) -> Option<Vec<Value>> {
-        self.0.opencode_newest(session)
+        self.host.opencode_newest(session)
     }
     fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
-        self.0.turn_began(dir, since)
+        self.host.turn_began(dir, since)
     }
     fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
-        self.0.wire_health(problems, notes)
+        self.host.wire_health(problems, notes)
+    }
+
+    fn run_job(&self, run: &JobRun, sink: &mut dyn FnMut(&JobOutput)) -> std::result::Result<JobEnded, JobError> {
+        use wsp_host::jobs as runner;
+        let (exec, file) = (self.exec_dir(), runner::file_key(&run.key));
+        let host_id = host_of(&run.at);
+        let mut table = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = table.get(&run.key).cloned() {
+            drop(table);
+            if !slot.same_run(run) {
+                return Err(refused(wsp_host_api::Refusal::Duplicate, format!("job {} was already run with other arguments", slot.name())));
+            }
+            // A retry: the same job, its end once it has one.
+            return Ok(slot.wait(None).expect("waited without a bound"));
+        }
+        // Run before, here or by another process: its end, never a second run.
+        let log = runner::log_path(&exec, &file);
+        if let Some(end) = runner::read_end(&exec, &file) {
+            return Ok(end.ended(run.key.clone(), host_id, &log));
+        }
+        let job = match runner::recorded(&exec, &file) {
+            Some(rec) => match runner::adopt(&self.host, &exec, &file, rec.pid, &rec.started) {
+                runner::Adopted::Running(job) => job,
+                runner::Adopted::Ended(end) => return Ok(end.ended(run.key.clone(), host_id, &log)),
+                runner::Adopted::Lost => return Ok(runner::End::default().ended(run.key.clone(), host_id, &log)),
+            },
+            None => {
+                if run.argv.is_empty() {
+                    return Err(refused(wsp_host_api::Refusal::Malformed, "a job needs an argv"));
+                }
+                let cwd = self.place(&run.at).map_err(|why| refused(wsp_host_api::Refusal::NoTree, why))?;
+                let spec = runner::Spec {
+                    key: &file,
+                    argv: &run.argv,
+                    cwd: &cwd,
+                    timeout: Duration::from_secs(run.timeout_secs),
+                    hung_after: run.hung_after_secs.map(Duration::from_secs),
+                };
+                runner::start(&self.host, &exec, &spec)
+                    .map_err(|e| refused(wsp_host_api::Refusal::Failed, format!("the job could not be started: {e}")))?
+            }
+        };
+        let slot = Arc::new(Slot {
+            run: run.clone(),
+            pgid: job.pgid(),
+            started: At(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+            stop: AtomicBool::new(false),
+            end: Mutex::new(None),
+            ended: Condvar::new(),
+        });
+        table.insert(run.key.clone(), slot.clone());
+        drop(table);
+        Ok(self.watch(&slot, job, host_id, sink))
+    }
+    fn stop_job(&self, key: &JobKey, wait: Duration) -> std::result::Result<JobEnded, JobError> {
+        use wsp_host::jobs as runner;
+        let slot = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned();
+        if let Some(slot) = slot {
+            slot.stop.store(true, Ordering::SeqCst);
+            return slot.wait(Some(wait)).ok_or_else(|| {
+                JobError::Unanswered(format!("job {} did not end within {}s of its stop", slot.name(), wait.as_secs()))
+            });
+        }
+        // Not this process's: what the runner's files say of it.
+        let (exec, file) = (self.exec_dir(), runner::file_key(key));
+        let log = runner::log_path(&exec, &file);
+        let here = HostId(String::new());
+        if let Some(end) = runner::read_end(&exec, &file) {
+            return Ok(end.ended(key.clone(), here, &log));
+        }
+        let Some(rec) = runner::recorded(&exec, &file) else {
+            return Err(refused(wsp_host_api::Refusal::NoJob, format!("this host runs no job {}", file)));
+        };
+        let end = match runner::adopt(&self.host, &exec, &file, rec.pid, &rec.started) {
+            runner::Adopted::Running(mut job) => self.end_group(&mut job),
+            runner::Adopted::Ended(end) => end,
+            runner::Adopted::Lost => runner::End::default(),
+        };
+        Ok(end.ended(key.clone(), here, &log))
+    }
+    fn jobs(&self) -> std::result::Result<Vec<JobRow>, JobError> {
+        let table = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(table
+            .values()
+            .map(|s| JobRow {
+                key: s.run.key.clone(),
+                class: s.run.class,
+                pgid: s.pgid,
+                started: s.started,
+                state: match s.end.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                    true => JobState::Ended,
+                    false => JobState::Running,
+                },
+            })
+            .collect())
+    }
+}
+
+/// A job this process runs, in its table: what was asked, and its end once
+/// it has one, for a retry or a stop to wait on.
+struct Slot {
+    run: JobRun,
+    pgid: u32,
+    started: At,
+    stop: AtomicBool,
+    end: Mutex<Option<JobEnded>>,
+    ended: Condvar,
+}
+
+impl Slot {
+    fn name(&self) -> String {
+        wsp_host::jobs::file_key(&self.run.key)
+    }
+
+    /// Whether `other` asks for the same run: a retry, not another job.
+    fn same_run(&self, other: &JobRun) -> bool {
+        self.run.class == other.class && self.run.argv == other.argv && self.run.at == other.at
+    }
+
+    /// The job's end, waited for up to `wait` (for ever when `None`).
+    fn wait(&self, wait: Option<Duration>) -> Option<JobEnded> {
+        let deadline = wait.and_then(|w| Instant::now().checked_add(w));
+        let mut end = self.end.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(e) = end.as_ref() {
+                return Some(e.clone());
+            }
+            end = match deadline {
+                None => self.ended.wait(end).unwrap_or_else(|e| e.into_inner()),
+                Some(d) => {
+                    let left = d.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    self.ended.wait_timeout(end, left).unwrap_or_else(|e| e.into_inner()).0
+                }
+            };
+        }
+    }
+}
+
+/// The host a job's place names, which its log is named on.
+fn host_of(at: &JobAt) -> HostId {
+    match at {
+        JobAt::Tree(t) => t.host.clone(),
+        JobAt::Dir(d) => d.host.clone(),
+    }
+}
+
+impl InProcess {
+    /// The directory a job runs in, or why it may not: the manager's rule
+    /// (`no_tree`), with this process's tree root. A row's `tree` is not
+    /// placed until Q6, as the manager does not place it.
+    fn place(&self, at: &JobAt) -> std::result::Result<PathBuf, String> {
+        let dir = match at {
+            JobAt::Tree(t) => return Err(format!("row {}'s tree is not placed until Q6 (T1 holds); name it as a dir under the tree root", t.row.0)),
+            JobAt::Dir(d) => d,
+        };
+        if dir.escapes() {
+            return Err(format!("{:?} falls outside the tree root", dir.path));
+        }
+        let root = self.tree_root.clone().unwrap_or_else(crate::util::home);
+        let root = root.canonicalize().map_err(|e| format!("the tree root {} cannot be read: {e}", root.display()))?;
+        let path = root.join(&dir.path).canonicalize().map_err(|e| format!("{:?} under the tree root: {e}", dir.path))?;
+        if !path.starts_with(&root) {
+            return Err(format!("{:?} leads outside the tree root", dir.path));
+        }
+        if !path.is_dir() {
+            return Err(format!("{:?} is not a directory", dir.path));
+        }
+        Ok(path)
+    }
+
+    /// Watch `job` to its end, as the manager's watcher does: its output to
+    /// `sink`, a stop carried out, and its end handed to the slot's waiters.
+    fn watch(&self, slot: &Slot, mut job: wsp_host::jobs::Job, host_id: HostId, sink: &mut dyn FnMut(&JobOutput)) -> JobEnded {
+        let key = &slot.run.key;
+        let mut from = 0u64;
+        let end = loop {
+            from = hand_on(&job, key, from, sink);
+            if let Some(end) = job.poll(&self.host) {
+                break end;
+            }
+            if slot.stop.load(Ordering::SeqCst) {
+                break self.end_group(&mut job);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        hand_on(&job, key, from, sink);
+        let ended = end.ended(key.clone(), host_id, &job.log);
+        *slot.end.lock().unwrap_or_else(|e| e.into_inner()) = Some(ended.clone());
+        slot.ended.notify_all();
+        ended
+    }
+
+    /// `job.stop`'s end: `TERM` to the job's own group, then `KILL` once
+    /// [`JOB_GRACE`] is out.
+    fn end_group(&self, job: &mut wsp_host::jobs::Job) -> wsp_host::jobs::End {
+        self.host.signal_group(job.pgid(), "TERM");
+        let until = Instant::now() + JOB_GRACE;
+        while Instant::now() < until {
+            if let Some(end) = job.poll(&self.host) {
+                return wsp_host::jobs::End { stopped: true, ..end };
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        job.stop(&self.host)
+    }
+}
+
+/// What `job` wrote since `from`, handed to `sink` as `job.output`; the
+/// offset it got to.
+fn hand_on(job: &wsp_host::jobs::Job, key: &JobKey, mut from: u64, sink: &mut dyn FnMut(&JobOutput)) -> u64 {
+    loop {
+        let Ok((text, next)) = job.output(from, JOB_CHUNK) else { return from };
+        if next == from {
+            return from;
+        }
+        sink(&JobOutput { key: key.clone(), from, text });
+        from = next;
     }
 }

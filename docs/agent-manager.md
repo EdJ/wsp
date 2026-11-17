@@ -1028,6 +1028,32 @@ Tests (`tests/jobs.rs`) run a loopback manager with `sh` jobs under a scratch tr
   while it was down, one was re-adopted), starts nothing again, and resumes events `from` the last id;
 - `jobs` lists each job as running or ended.
 
+#### M3 group 4: `Host::run_job` (wsp-051, 2026-11-17)
+
+The `Host` trait (crates/wire/src/host.rs) gains `run_job`, `stop_job` and `jobs`. They take and give host-api's own
+`JobRun`, `JobEnded`, `JobOutput` and `JobRow`, and fail with a `JobError`: silent, refused in the manager's words
+(`full`, `duplicate`, `no_tree`, `no_job`), or unanswered. Nothing calls them yet. The callers move in group 5.
+- **`host::Tcp`** runs each job on its own connection. It subscribes from the journal's head and then sends `job.run`,
+  so that connection owns the job. `job.output` goes to the caller's sink, and `job.started` and `job.ended` are
+  heard as they happen, never by polling `jobs` (wsp-037). If the connection drops, it dials again for up to
+  `BEAT_SECS × MISSED_BEATS`, subscribes from the last id it heard, and sends the same frame with its key unchanged.
+  The manager hands the job over and does not run it again. `stop_job` and `jobs` go over the CLI's one connection.
+- **`host::InProcess`** runs wsp-host's runner here (`with_jobs(exec, tree_root)`; by default
+  `~/.local/state/wsp/inproc` and the home directory). It places a `dir` by the manager's rule, uses the same 5 s
+  grace between `TERM` and `KILL`, and keeps a job table per process. A key the runner's files show already ran
+  gets back that run's end and is not run again.
+- **`WSP_JOBS=inproc|manager`** is read once per process (`host::jobs_chosen`). The default is `inproc`. `manager`
+  is the same `Tcp` that `WSP_HOST` uses, but the two variables are independent. A silent manager is "host silent",
+  and the job is not run in-process instead.
+- **Keys** come from `host::job_key(row, attempt, job)`, built once per run by the caller. `job` must be unique per
+  run (wsp-040).
+
+Tests (crates/wire/tests/host.rs) hold both hosts to one job contract on a loopback manager. A job's exit and output
+come back. One key sent twice runs once, and the next attempt runs again. A stop ends the group and its background
+child. A timeout says `timed_out`, and a `dir` outside the root is refused `no_tree`. They also check that a silent
+manager is "host silent" within a second with nothing run, that `WSP_JOBS` is chosen independently of `WSP_HOST`,
+and that a job whose manager restarts mid-run is resent under its key and runs once.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the

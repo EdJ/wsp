@@ -14,6 +14,12 @@
 //! wrapper of each); a refused or silent spawn is said, not hung. Under
 //! `inproc` the backend has no such wait, and starts as before.
 //!
+//! Then tree jobs (M3, wsp-051): `InProcess` and `Tcp` held to one job
+//! contract (a job's exit and output come back, one key runs once, a stop ends
+//! the group, a timeout says so), a silent manager is "host silent" with
+//! nothing run, `WSP_JOBS` chooses apart from `WSP_HOST`, and a job whose
+//! manager restarts is resent under its key and runs once.
+//!
 //! Nothing here spawns claude: the fake's sessions are a sleeping process
 //! group each, ended by the contract's stop, by [`Sweep`], or with this test
 //! process at the latest.
@@ -34,7 +40,11 @@ use serde_json::Value;
 use wsp_base::util::Wall;
 use wsp_host_api::{At, Epoch, EventId, Key, Message, RowId, Role, SeatId, SeatSaid, SeatState, Token};
 use wsp_manager::{Config, Manager, TOKEN_FILE};
-use wsp_wire::host::{self, Choice, Forked, Headless, Host, HostError, InProcess, Session, Spawn, Stop, Subscription, Tcp, LOCAL};
+use wsp_host_api::Refusal as ApiRefusal;
+use wsp_wire::host::{
+    self, Choice, Forked, Headless, Host, HostDir, HostError, HostId, InProcess, JobAt, JobClass, JobError, JobKey, JobOutput, JobRun,
+    JobState, JobsChoice, Session, Spawn, Stop, Subscription, Tcp, LOCAL,
+};
 use wsp_wire::manager::{install_record, Local};
 use wsp_wire::place::{
     new_order_id, Agent, Census, Delivery, Event, FirstOrder, Heard, Order, OrderId, Place, Refusal, Result as PResult, Seat, State,
@@ -1175,5 +1185,227 @@ fn with_inproc_again_a_seat_the_manager_started_is_adopted_by_its_socket() {
     after.stop(&seat).expect("stopped in-process");
     wait_until("the session ended", || !inproc.is_alive(pid));
     drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- jobs (M3, wsp-051)
+
+/// A tree root for one test's jobs, with the directory they run in (`w`),
+/// and the place `job.run` names it by: a `dir` under that root on
+/// `test-host`, as the manager places it (T1).
+fn job_place(dir: &Path) -> (PathBuf, JobAt) {
+    let root = dir.join("trees");
+    fs::create_dir_all(root.join("w")).unwrap();
+    (root, JobAt::Dir(HostDir { host: HostId("test-host".into()), path: "w".into() }))
+}
+
+fn job(key: JobKey, at: &JobAt, script: &str, timeout_secs: u64) -> JobRun {
+    JobRun {
+        key,
+        class: JobClass::Check,
+        argv: vec!["sh".into(), "-c".into(), script.into()],
+        at: at.clone(),
+        timeout_secs,
+        hung_after_secs: None,
+        detach: false,
+    }
+}
+
+/// A manager whose tree root is `root`, for jobs.
+fn job_manager(dir: &Path, root: &Path, port: u16) -> Manager {
+    let mut cfg = Config::new(&dir.join("exec"), "test-host");
+    cfg.port = port;
+    cfg.tree_root = root.to_path_buf();
+    start(cfg)
+}
+
+/// The job contract: what a caller may rely on from either host. `tag`
+/// keeps each host's keys its own (a key is unique per run).
+fn job_contract(host: &dyn Host, root: &Path, at: &JobAt, tag: &str) {
+    let row = format!("wsp-051-{tag}");
+    let w = root.join("w");
+
+    // A job runs, and its exit and its output come back: the output to the
+    // sink as it was written, and the whole of it in the log `job.ended` names.
+    let run = job(host::job_key(&row, 0, "run@1"), at, "echo hello; echo more >&2; exit 3", 30);
+    let mut out = String::new();
+    let ended = host.run_job(&run, &mut |o: &JobOutput| out.push_str(&o.text)).expect("the job runs");
+    assert_eq!(ended.key, run.key);
+    assert_eq!(ended.exit, Some(3), "{ended:?}");
+    assert!(!ended.timed_out && !ended.hung, "{ended:?}");
+    assert!(out.contains("hello") && out.contains("more"), "{out:?}");
+    let log = fs::read_to_string(&ended.log.path).unwrap();
+    assert!(log.contains("hello") && log.contains("more"), "{log:?}");
+
+    // One key sent twice runs once: the second is answered with the first's end.
+    let once = job(host::job_key(&row, 0, "once@1"), at, "echo x >> count; echo ran", 30);
+    let first = host.run_job(&once, &mut |_| {}).expect("the job runs");
+    let again = host.run_job(&once, &mut |_| {}).expect("asked again, it is answered");
+    assert_eq!(first.exit, Some(0));
+    assert_eq!(again.exit, Some(0));
+    assert_eq!(fs::read_to_string(w.join("count")).unwrap().lines().count(), 1, "the job ran once");
+    // The next attempt is another key, and runs.
+    let next = JobRun { key: host::job_key(&row, 1, "once@1"), ..once.clone() };
+    assert_eq!(host.run_job(&next, &mut |_| {}).expect("the next attempt runs").exit, Some(0));
+    assert_eq!(fs::read_to_string(w.join("count")).unwrap().lines().count(), 2, "another attempt is another run");
+
+    // A stop ends the job's group, its background child with it.
+    let bg = w.join("bg");
+    let long = job(host::job_key(&row, 0, "stop@1"), at, "sleep 300 & echo $! > bg; sleep 300", 600);
+    let started = Instant::now();
+    std::thread::scope(|s| {
+        let running = s.spawn(|| host.run_job(&long, &mut |_| {}));
+        wait_until("the job's background child written", || fs::read_to_string(&bg).is_ok_and(|t| t.ends_with('\n')));
+        let child: u32 = fs::read_to_string(&bg).unwrap().trim().parse().unwrap();
+        assert!(LOCAL.is_alive(child));
+        let listed = host.jobs().expect("the job table");
+        let row = listed.iter().find(|r| r.key == long.key).expect("the job is listed");
+        assert_eq!(row.state, JobState::Running);
+        let stopped = host.stop_job(&long.key, Duration::from_secs(15)).expect("the stop is answered with its end");
+        assert_eq!(stopped.key, long.key);
+        assert_eq!(stopped.exit, None, "{stopped:?}");
+        assert!(!stopped.timed_out, "{stopped:?}");
+        let ran = running.join().unwrap().expect("the run is answered with its end");
+        assert_eq!(ran.exit, None, "{ran:?}");
+        wait_until("the background child gone with its group", || !LOCAL.is_alive(child));
+        assert!(LOCAL.alive(&[row.pgid]).is_empty(), "the group {} is gone", row.pgid);
+        let listed = host.jobs().expect("the job table");
+        assert_eq!(listed.iter().find(|r| r.key == long.key).map(|r| r.state), Some(JobState::Ended));
+    });
+    assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+
+    // A stop of an ended job is its end; of a key never run, `no_job`.
+    let ended_again = host.stop_job(&run.key, Duration::from_secs(5)).expect("an ended job's end");
+    assert_eq!(ended_again.exit, Some(3));
+    match host.stop_job(&host::job_key(&row, 0, "never@1"), Duration::from_secs(5)) {
+        Err(JobError::Refused { why: ApiRefusal::NoJob, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+
+    // A job past its timeout says it timed out, and is ended.
+    let slow = job(host::job_key(&row, 0, "slow@1"), at, "sleep 30", 1);
+    let start = Instant::now();
+    let ended = host.run_job(&slow, &mut |_| {}).expect("the job is ended at its timeout");
+    assert!(ended.timed_out, "{ended:?}");
+    assert_eq!(ended.exit, None, "{ended:?}");
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+
+    // A place outside the tree root is refused `no_tree`, and nothing runs.
+    let out = JobAt::Dir(HostDir { host: HostId("test-host".into()), path: "../elsewhere".into() });
+    match host.run_job(&job(host::job_key(&row, 0, "out@1"), &out, "touch ran", 30), &mut |_| {}) {
+        Err(JobError::Refused { why: ApiRefusal::NoTree, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_in_process_host_holds_the_job_contract() {
+    let (dir, _) = place("jinproc");
+    let (root, at) = job_place(&dir);
+    let host = InProcess::new().with_jobs(&dir.join("exec"), &root);
+    job_contract(&host, &root, &at, "inproc");
+    // It ran here, with the runner's files under its own exec dir.
+    assert!(dir.join("exec").join("jobs").is_dir());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_tcp_host_holds_the_job_contract_on_a_loopback_manager() {
+    let (dir, _) = place("jtcp");
+    let (root, at) = job_place(&dir);
+    let m = job_manager(&dir, &root, 0);
+    // Its in-process half has jobs of its own, which must stay empty.
+    let local = InProcess::new().with_jobs(&dir.join("local"), &root);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", local);
+    job_contract(&tcp, &root, &at, "tcp");
+    // It went through the manager: its runner's files, and none here.
+    assert!(dir.join("exec").join("jobs").is_dir());
+    assert!(!dir.join("local").exists(), "nothing ran in this process");
+    drop(tcp);
+    m.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A manager that does not answer is "host silent" within the second, and the
+/// job is not run in this process in its place.
+#[test]
+fn a_job_under_a_silent_manager_is_host_silent_and_runs_nowhere() {
+    let (dir, _) = place("jsil");
+    let (root, at) = job_place(&dir);
+    let local = InProcess::new().with_jobs(&dir.join("local"), &root);
+    let tcp = Tcp::with_local(SocketAddr::from(([127, 0, 0, 1], free_port())), Token("t".into()), Role::Cli, "test", local);
+    let run = job(host::job_key("wsp-051-sil", 0, "touch@1"), &at, "touch ran", 30);
+    let start = Instant::now();
+    match tcp.run_job(&run, &mut |_| {}) {
+        Err(JobError::Silent(e)) => assert!(e.to_string().starts_with("host silent"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(start.elapsed() <= Duration::from_millis(1500), "{:?}", start.elapsed());
+    assert!(!root.join("w").join("ran").exists(), "nothing ran");
+    assert!(!dir.join("local").exists(), "nothing ran in this process in the manager's place");
+    assert!(matches!(tcp.stop_job(&run.key, Duration::from_secs(1)), Err(JobError::Silent(_))));
+    assert!(matches!(tcp.jobs(), Err(JobError::Silent(_))));
+
+    // A mute listener is silent too, within the second.
+    let mute = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = Tcp::new(mute.local_addr().unwrap(), Token("t".into()), Role::Cli, "test");
+    let start = Instant::now();
+    assert!(matches!(tcp.run_job(&run, &mut |_| {}), Err(JobError::Silent(_))));
+    assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+    assert!(!root.join("w").join("ran").exists(), "nothing ran");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `WSP_JOBS` chooses the jobs' host apart from `WSP_HOST`: `inproc` by
+/// default, and `manager` is the manager's `Tcp`, silent when it is.
+#[test]
+fn wsp_jobs_chooses_apart_from_wsp_host_and_defaults_to_inproc() {
+    let (dir, _) = place("jchoice");
+    assert_eq!(JobsChoice::parse(None), Ok(JobsChoice::Inproc));
+    assert_eq!(JobsChoice::parse(Some("")), Ok(JobsChoice::Inproc));
+    assert_eq!(JobsChoice::default(), JobsChoice::Inproc);
+    assert_eq!(JobsChoice::parse(Some("inproc")), Ok(JobsChoice::Inproc));
+    assert_eq!(JobsChoice::parse(Some("manager")), Ok(JobsChoice::Manager));
+    let bad = JobsChoice::parse(Some("tcp")).err().expect("neither choice");
+    assert!(matches!(bad, HostError::JobsChoice(_)));
+    assert!(bad.to_string().starts_with("WSP_JOBS=tcp"), "{bad}");
+    // Defaults differ: seats go to the manager, jobs stay in-process.
+    assert_eq!(Choice::default(), Choice::Manager);
+
+    let state = dir.join("state");
+    record(&state, &dir.join("exec"), free_port());
+    assert!(host::choose_jobs(JobsChoice::Inproc, &state, "test").is_ok(), "in-process asks nobody");
+    let err = host::choose_jobs(JobsChoice::Manager, &state, "test").err().expect("no manager answers");
+    assert!(matches!(err, HostError::Silent { .. }), "{err:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The connection drops mid-job (the manager restarted): `run_job` dials
+/// again, subscribes from the last id it heard, and sends the same `job.run`,
+/// its key unchanged. The manager re-adopted the job and hands it over; it
+/// ran once, and its end comes back to the one call.
+#[test]
+fn a_job_whose_manager_restarts_is_resent_under_its_key_and_runs_once() {
+    let (dir, _) = place("jre");
+    let (root, at) = job_place(&dir);
+    let port = free_port();
+    let m = job_manager(&dir, &root, port);
+    let tcp = Tcp::new(SocketAddr::from(([127, 0, 0, 1], port)), token(&dir), Role::Cli, "test");
+    let run = JobRun { detach: true, ..job(host::job_key("wsp-051-re", 0, "re@1"), &at, "echo x >> count; sleep 2; echo done", 60) };
+    let count = root.join("w").join("count");
+    std::thread::scope(|s| {
+        let running = s.spawn(|| {
+            let mut out = String::new();
+            tcp.run_job(&run, &mut |o: &JobOutput| out.push_str(&o.text)).map(|e| (e, out))
+        });
+        wait_until("the job started", || count.exists());
+        m.stop();
+        let m = job_manager(&dir, &root, port);
+        let (ended, out) = running.join().unwrap().expect("the end comes back across the restart");
+        assert_eq!(ended.exit, Some(0), "{ended:?}");
+        assert!(out.contains("done"), "{out:?}");
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1, "it ran once");
+        m.stop();
+    });
     let _ = fs::remove_dir_all(&dir);
 }
