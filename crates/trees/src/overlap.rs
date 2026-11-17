@@ -25,7 +25,6 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use crate::herdr;
 use crate::model::Task;
 use crate::resolve::{self, Index};
 use crate::store::Store;
@@ -138,7 +137,7 @@ impl Standing {
     /// dead and every session started beside it would be told all was well.
     pub fn needs_you(&self) -> bool {
         self.agent
-            && crate::place_herdr::of_word(&self.state).stopped()
+            && matches!(self.state.trim(), "idle" | "done" | "blocked")
             && self.task.as_ref().map(|t| t.status() == crate::model::Status::Doing).unwrap_or(false)
     }
 
@@ -160,12 +159,32 @@ impl Standing {
     }
 }
 
+/// A pane someone is standing in: the fields the reckoning reads. It was
+/// herdr's pane record; herdr is gone (wsp-120), and nothing fills it live.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Pane {
+    pub pane_id: String,
+    pub label: String,
+    pub workspace_id: String,
+    pub agent: String,
+    pub agent_status: String,
+    pub cwd: String,
+    pub title: String,
+}
+
+/// A workspace's id and the label it is drawn under.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Workspace {
+    pub id: String,
+    pub label: String,
+}
+
 /// Everything the reckoning reads, taken in rather than fetched — so a test can
 /// stand six panes in a fabricated tree with no herdr and no store, the same
 /// bargain [`crate::panel`] makes with its `Snapshot`.
 pub struct World {
-    pub panes: Vec<herdr::Pane>,
-    pub workspaces: Vec<herdr::Workspace>,
+    pub panes: Vec<Pane>,
+    pub workspaces: Vec<Workspace>,
     pub tasks: Vec<Task>,
     pub index: Index,
     pub pins: BTreeMap<String, String>,
@@ -177,16 +196,12 @@ pub struct World {
 }
 
 impl World {
-    /// The live join: herdr for what exists, the store for who holds what.
+    /// The live join: the store for who holds what. The panes came from herdr
+    /// alone, and herdr is gone (wsp-120), so no pane is live here.
     pub fn live(store: &Store) -> World {
-        let (panes, workspaces) = if herdr::available() {
-            (herdr::panes().unwrap_or_default(), herdr::workspaces().unwrap_or_default())
-        } else {
-            (Vec::new(), Vec::new())
-        };
         World {
-            panes,
-            workspaces,
+            panes: Vec::new(),
+            workspaces: Vec::new(),
             tasks: store.tasks(),
             index: Index::new(store.projects()),
             pins: store.pins(),
@@ -255,7 +270,7 @@ pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standin
         let id = w.bindings.get(pane)?.get("task_id")?.as_str()?;
         w.tasks.iter().find(|t| t.id == id)
     };
-    let project_of = |p: &herdr::Pane| {
+    let project_of = |p: &Pane| {
         let agent = crate::store::Store::agent_in_seat_from_map(&w.agents_held, &p.pane_id);
         resolve::resolve(
             &w.index,
@@ -359,8 +374,8 @@ mod tests {
     use super::*;
     use crate::model::Project;
 
-    fn pane(id: &str, ws: &str, cwd: &str) -> herdr::Pane {
-        herdr::Pane {
+    fn pane(id: &str, ws: &str, cwd: &str) -> Pane {
+        Pane {
             pane_id: id.into(),
             workspace_id: ws.into(),
             cwd: cwd.into(),
@@ -370,7 +385,7 @@ mod tests {
         }
     }
 
-    fn world(panes: Vec<herdr::Pane>) -> World {
+    fn world(panes: Vec<Pane>) -> World {
         let mut wsp = Project::new("wsp");
         wsp.roots = vec!["/home/ed/claude/wsp".into()];
         let mut vst = Project::new("vst");

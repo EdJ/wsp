@@ -276,10 +276,7 @@ pub fn agent_key() -> String {
             return util::slugify(v.trim());
         }
     }
-    match crate::herdr::Env::read().workspace_id {
-        Some(ws) if !ws.trim().is_empty() => util::slugify(ws.trim()),
-        _ => "solo".to_string(),
-    }
+    "solo".to_string()
 }
 
 /// Where an agent standing in the *trunk* keeps its build tree: under the state
@@ -1303,9 +1300,9 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         // one is "herdr did not answer, so this half was skipped" and the other
         // is "there is nothing here". Said out loud in both branches — a
         // preview more candid than the act would be the wrong way round.
-        let live: Option<Vec<String>> = all
-            .then(|| crate::herdr::workspaces().ok().map(|w| w.into_iter().map(|x| x.id).collect()))
-            .flatten();
+        // The live workspaces were herdr's to list, and herdr is gone
+        // (wsp-120): nothing answers, which is the `None` above.
+        let live: Option<Vec<String>> = None;
         let residue: Vec<String> = if !all {
             Vec::new()
         } else if dry {
