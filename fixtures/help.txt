@@ -739,6 +739,11 @@ PLUMBING
                                     ledger: by day and model, today/7d/30d,
                                     by project and list, and the cost per row
                                     landed (a verifier's holds) in those days
+  wsp calls --incidents [--since 7d] [--json]
+                                    how often wsp acted on a guess, by kind
+                                    (who owns a process, is a seat alive, was an
+                                    order taken, has a seat ended), from
+                                    cycle.log and events.jsonl
   wsp throttle [off|on|auto] [--json]
                                     how builds are held back for the person at
                                     the machine: niced, capped in jobs, and a
