@@ -32,19 +32,22 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::Value;
 use wsp_base::util::Wall;
-use wsp_host_api::{At, Epoch, EventId, Key, Message, RowId, Role, SeatId, SeatSaid, Token};
+use wsp_host_api::{At, Epoch, EventId, Key, Message, RowId, Role, SeatId, SeatSaid, SeatState, Token};
 use wsp_manager::{Config, Manager, TOKEN_FILE};
 use wsp_wire::host::{self, Choice, Forked, Headless, Host, HostError, InProcess, Session, Spawn, Stop, Subscription, Tcp, LOCAL};
 use wsp_wire::manager::{install_record, Local};
 use wsp_wire::place::{
     new_order_id, Agent, Census, Delivery, Event, FirstOrder, Heard, Order, OrderId, Place, Refusal, Result as PResult, Seat, State,
 };
+use wsp_host::test_sups;
 use wsp_wire::place_compound::Compound;
 
 /// compound-sup as far as a seat's spawn, delivery and stop use it. `spawn`
 /// prints the handshake and becomes the session itself, in a session and
 /// process group of its own (as compound-sup daemonizes), so its pid is the
-/// group a stop names under either host. `deliver <id>` answers once per id;
+/// group a stop names under either host; its command still reads
+/// `<sup> spawn --label <seat>`, as compound-sup's does, which is how a
+/// manager finds the pid of a seat it adopts (wsp-029). `deliver <id>` answers once per id;
 /// a text with `busy` fails `busy`.
 const FAKE_SUP: &str = r#"#!/bin/sh
 OWNER=__OWNER__
@@ -69,7 +72,7 @@ spawn)
   echo "$label $$" >> "$run/spawns"
   echo "$*" > "$run/$name.argv"
   printf 'sup %s\npid %s\nsocket %s\nrender %s\n' "$$" "$$" "$run/$name.sock" "$run/$name.rsock"
-  exec perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' sh -c "trap 'exit 0' TERM; while kill -0 $OWNER 2>/dev/null; do sleep 0.2; done" </dev/null >/dev/null 2>&1
+  exec perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' sh -c "trap 'exit 0' TERM; while kill -0 $OWNER 2>/dev/null; do sleep 0.2; done" "$0" spawn --label "$label" </dev/null >/dev/null 2>&1
   ;;
 vitals)
   pid=$(cat "$1" 2>/dev/null)
@@ -695,9 +698,12 @@ fn wsp_host_manager_with_no_manager_running_is_host_silent() {
     let state = dir.join("state");
     record(&state, &dir.join("exec"), free_port());
 
-    // The default is in-process, and asks nobody.
-    assert_eq!(Choice::parse(None), Ok(Choice::Inproc));
+    // The default is the manager (wsp-029); `inproc` is the rollback, and asks nobody.
+    assert_eq!(Choice::parse(None), Ok(Choice::Manager));
+    assert_eq!(Choice::parse(Some("")), Ok(Choice::Manager));
+    assert_eq!(Choice::default(), Choice::Manager);
     assert_eq!(Choice::parse(Some("manager")), Ok(Choice::Manager));
+    assert_eq!(Choice::parse(Some("inproc")), Ok(Choice::Inproc));
     assert!(matches!(Choice::parse(Some("tcp")), Err(HostError::Choice(_))));
     assert!(host::choose(Choice::Inproc, &state, "test").is_ok());
 
@@ -822,5 +828,107 @@ fn a_tell_under_manager_is_delivered_and_a_silent_manager_is_unreachable_then_de
     let _ = again.stop(&seat);
     drop(back);
     m.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// wsp-029, 6.2: a seat the in-process host started before the switch is in
+/// the manager's `seats` once the manager starts (its table rebuilt from the
+/// session sockets, the in-process run directory's among them), and is told
+/// and stopped through the manager as a seat of its own.
+#[test]
+fn a_seat_started_in_process_is_adopted_by_the_manager_then_told_and_stopped_through_it() {
+    let (dir, sup) = place("adin");
+    let sweep = Sweep::default();
+    let inproc = InProcess::with_sup(&sup);
+    let before = Compound { host: &inproc, ..Compound::at(dir.join("seats")).insisting() };
+    let seat = opened(&before, &dir);
+    before.start(&seat, &agent(0)).expect("the seat starts in-process");
+    let pid = before.root(&seat).expect("a session pid");
+    sweep.add(pid);
+    assert_eq!(before.tell(&seat, &format!("{seat} before the switch")), Ok(Delivery::Acked));
+    // The bare shell `open` stood in the seat ends a moment after `start`
+    // replaced it; until then two sessions carry the label, and a manager
+    // adopts neither (it does not guess). A seat at the switch is long started.
+    let spawns = test_sups::run_dir().join("spawns");
+    let others = || -> Vec<u32> {
+        let text = fs::read_to_string(&spawns).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| l.split_once(' ').filter(|(label, _)| *label == seat.as_str()).and_then(|(_, p)| p.trim().parse().ok()))
+            .filter(|p| *p != pid)
+            .collect()
+    };
+    assert!(!others().is_empty(), "open's bare shell was spawned under the label");
+    wait_until("the bare shell ended", || others().iter().all(|p| !inproc.is_alive(*p)));
+
+    // The switch: the manager starts, and reads the in-process host's run
+    // directory as well as its own.
+    let mut cfg = Config::new(&dir.join("exec"), "test-host");
+    cfg.port = 0;
+    cfg.sup = Some(sup.clone());
+    cfg.inproc_runs = vec![test_sups::run_dir()];
+    let m = Manager::start(cfg).expect("the manager starts on loopback");
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let after = Compound { host: &tcp, ..Compound::at(dir.join("seats")).insisting() };
+    assert!(after.hosted());
+
+    let rows = tcp.seats().expect("the manager answers seats");
+    let row = rows.iter().find(|r| r.seat.0 == seat.as_str()).unwrap_or_else(|| panic!("{seat} adopted: {rows:?}"));
+    assert_eq!((row.epoch, row.state), (Epoch(1), SeatState::Idle), "{row:?}");
+
+    // Told through the manager: `order.deliver`, typed into the same session.
+    assert_eq!(after.tell(&seat, &format!("{seat} after the switch")), Ok(Delivery::Acked));
+    let typed = typed_under(&test_sups::run_dir());
+    for said in ["before", "after"] {
+        let n = typed.iter().filter(|t| t.ends_with(&format!(" {seat} {said} the switch"))).count();
+        assert_eq!(n, 1, "{said}: {typed:?}");
+    }
+
+    // Stopped through it: `seat.stop` ends the session's group.
+    let ended = after.end(&seat).expect("the manager stops it");
+    assert!(ended.contains(&pid), "the manager's pids name the session: {ended:?} vs {pid}");
+    assert!(!inproc.is_alive(pid));
+    assert!(tcp.seats().unwrap().iter().all(|r| r.seat.0 != seat.as_str()), "gone from seats");
+
+    drop(tcp);
+    m.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// wsp-029, 6.2's rollback: with `WSP_HOST=inproc` again, a seat the manager
+/// started (compound-sup outlives the manager) is adopted by its socket, the
+/// one its record holds, and keeps working: told in this process, and
+/// stopped by its group.
+#[test]
+fn with_inproc_again_a_seat_the_manager_started_is_adopted_by_its_socket() {
+    let (dir, sup) = place("adout");
+    let sweep = Sweep::default();
+    let m = manager(&dir, &sup, 0);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let before = Compound { host: &tcp, ..Compound::at(dir.join("seats")).insisting() };
+    let seat = opened(&before, &dir);
+    let order = FirstOrder { order: new_order_id(&seat), text: "go".into() };
+    assert_eq!(before.start_ordered(&seat, &agent(0), &order, Duration::from_secs(20)), Some(Ok(Heard::Acked)));
+    let pid = before.root(&seat).expect("the session pid");
+    sweep.add(pid);
+
+    // The rollback: the manager is gone, and the host is this process's.
+    assert_eq!(Choice::parse(Some("inproc")), Ok(Choice::Inproc));
+    drop(tcp);
+    m.stop();
+    let inproc = InProcess::with_sup(&sup);
+    let after = Compound { host: &inproc, ..Compound::at(dir.join("seats")).insisting() };
+    assert!(!after.hosted());
+    assert!(inproc.is_alive(pid), "the seat outlived its manager");
+    assert!(after.state(&seat).expect("its record").is_running());
+
+    assert_eq!(after.tell(&seat, "after the rollback"), Ok(Delivery::Acked));
+    let run = dir.join("exec").join(wsp_manager::seats::RUN_DIR);
+    let typed = typed_under(&run);
+    assert_eq!(typed.iter().filter(|t| t.ends_with(" after the rollback")).count(), 1, "{typed:?}");
+
+    after.stop(&seat).expect("stopped in-process");
+    wait_until("the session ended", || !inproc.is_alive(pid));
+    drop(sweep);
     let _ = fs::remove_dir_all(&dir);
 }

@@ -21,7 +21,9 @@ It runs seats and their orders (wsp-022). Nothing in wsp dials it until wsp-025.
   per seat itself; `seat.stop` with its grace; `order.deliver` and `order.cancel` through `compound-sup deliver
   <id>`; `seats` (vitals per seat, one `ps` for rss and shells, no render); `seat.read` (the one render); seat
   epochs; and `adopt`, which rebuilds the table at start from `<exec_dir>/run` and the journal, and asks an
-  order in flight again under its id
+  order in flight again under its id; and adopts a seat the in-process host started (wsp-029), a labelled
+  session in `Config::inproc_runs` (`--inproc-run`, default compound's run dir) whose one compound-sup `ps`
+  names, under the next epoch with its `seat.started` journalled
 - `src/journal.rs`: `<exec_dir>/journal.jsonl`. One frame per line. Ids run from 1 per manager. A torn last line
   is cut at open. `after(from)` serves `subscribe`
 - `src/token.rs`: `<exec_dir>/manager.token`, made at first start (32 random bytes as hex, mode 0600) and

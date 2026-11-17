@@ -18,7 +18,8 @@
 //! manager reports them as events, which the daemon folds at group 5), the
 //! host facts as their probes' own text (the beat carries `HostFacts`, not the
 //! text), headless seats (no compound-sup), typing at a renderer, and any seat
-//! the manager does not run (one started in-process: adoption is wsp-029's).
+//! the manager does not run until it adopts it (wsp-029: at the manager's start,
+//! from the in-process host's run directory).
 //! `Tcp` itself reaches no OS: its in-process half is [`InProcess`].
 //!
 //! **One connection per CLI call** (3.4): opened at the first message, kept
@@ -30,7 +31,7 @@
 //! a backend with no seats).
 //!
 //! **Choosing** is `WSP_HOST=inproc|manager` ([`Choice`], [`chosen`]); the
-//! default is `inproc` until wsp-029 (6.2's rollback names `WSP_HOST=inproc`).
+//! default is `manager` since wsp-029, and `WSP_HOST=inproc` is 6.2's rollback.
 //!
 //! [`Subscription`] is the daemon's half: `subscribe {from}` with the last
 //! event id it heard of this host, kept in `<state>/manager/<host>.last`, and
@@ -117,19 +118,22 @@ impl From<HostError> for Refusal {
 /// `WSP_HOST`: which implementation of [`Host`] this process asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Choice {
-    /// [`crate::host::LOCAL`]: the host run in this process, as at M0.
-    #[default]
+    /// [`crate::host::LOCAL`]: the host run in this process, as at M0; 6.2's
+    /// rollback. It adopts a seat the manager started by the record's socket
+    /// and pid, as one of its own.
     Inproc,
-    /// [`Tcp`] to the manager the local machine record names.
+    /// [`Tcp`] to the manager the local machine record names: the default
+    /// since wsp-029.
+    #[default]
     Manager,
 }
 
 impl Choice {
-    /// `None` and the empty string are the default, [`Choice::Inproc`].
+    /// `None` and the empty string are the default, [`Choice::Manager`].
     pub fn parse(value: Option<&str>) -> std::result::Result<Choice, HostError> {
         match value.map(str::trim) {
-            None | Some("") | Some("inproc") => Ok(Choice::Inproc),
-            Some("manager") => Ok(Choice::Manager),
+            None | Some("") | Some("manager") => Ok(Choice::Manager),
+            Some("inproc") => Ok(Choice::Inproc),
             Some(other) => Err(HostError::Choice(other.to_string())),
         }
     }

@@ -84,6 +84,11 @@ pub struct Config {
     /// How many seats it runs or starts at once, as `hello`'s capacity says;
     /// a spawn past it is refused `full`.
     pub seats: u32,
+    /// The run directories of seats it did not start: the in-process host's
+    /// (`$COMPOUND_RUN_DIR`, else `~/.compound/run`). At start, a labelled
+    /// session there that answers is adopted (wsp-029, 6.2), as one under its
+    /// own `<exec_dir>/run` is. Empty in [`Config::new`]: a test names its own.
+    pub inproc_runs: Vec<PathBuf>,
 }
 
 /// The seats a manager admits unless told otherwise.
@@ -101,6 +106,7 @@ impl Config {
             volumes: vec![exec_dir.to_path_buf()],
             sup: None,
             seats: DEFAULT_SEATS,
+            inproc_runs: Vec::new(),
         }
     }
 }

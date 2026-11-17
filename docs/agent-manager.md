@@ -548,7 +548,7 @@ taken with `wsp calls` over a day before and a day after, and its incident count
 | step | what | measure: done when | rollback |
 |---|---|---|---|
 | **M0. herdr out, seam named** | wsp-120 (4.4). `host-api` holds the types of 3.2. Every OS-touching call outside tree work goes through one `Host` trait (`crates/wire/src/host.rs`, its methods grouped by the messages of 3.2). Its only implementation is **in-process** (`host::InProcess`): today's code, behind the trait. The seat operations of place_compound.rs and place_super.rs are behind it first (wsp-005), then the transcript and hook-log reads, grouped as `seat.did` and `turn` (wsp-007), and the host facts (wsp-006): `df`/`du`, per-seat memory and running shells (`ps`), the throttle's `sysctl`, `pmset`, `vm_stat`, `memory_pressure` and `ioreg`, pid liveness and a check run's `lstart`. Layers below wire (base, store) ask nothing themselves: their callers pass the host's answer in. `wsp calls --incidents`. | `grep` finds no `ps`, `lsof`, `kill`, render, transcript or fact probe outside the in-process host (tree work excepted). Spawn p50 ≤ 9.4 s, `wip` CPU no worse, tick no slower. Herdr references → 0. | Revert. It is a pure move plus deletions, behind the same tests. |
-| **M1. The manager on the Mac** | The in-process host becomes the `wsp-manager` process under launchd. wsp dials it on TCP (3.4). Hooks report to it, and the journal and subscription are in use. The daemon folds events. `wip` reads `seats`. compound's host keeps polling `wip --json`, which is now cheap. | **ps** per tick 37.5 → ≤ 1. **renders** per tick 59.5 → 0. **`df`** 24.6 → 0. **lsof** in `wip` → 0. `wip` < 0.2 CPU-s per call (from 2.9). Host polling CPU-s per day 25,268 → under 2,500. Spawn p50 no worse than 9.4 s. wsp-411-kind incidents → 0 over a week. A manager kill -9 mid-turn loses no seat and no order (a scripted proof, 10×). | `WSP_HOST=inproc`: the same code linked into wsp, as at M0. Seats started by the manager stay alive (compound-sup is durable), and the in-process host adopts them by socket. |
+| **M1. The manager on the Mac** | The in-process host becomes the `wsp-manager` process under launchd. wsp dials it on TCP (3.4). Hooks report to it, and the journal and subscription are in use. The daemon folds events. `wip` reads `seats`. compound's host keeps polling `wip --json`, which is now cheap. | **ps** per tick 37.5 → ≤ 1. **renders** per tick 59.5 → 0. **`df`** 24.6 → 0. **lsof** in `wip` → 0. `wip` < 0.2 CPU-s per call (from 2.9). Host polling CPU-s per day 25,268 → under 2,500. Spawn p50 no worse than 9.4 s. wsp-411-kind incidents → 0 over a week. A manager kill -9 mid-turn loses no seat and no order (a scripted proof, 10×). | `WSP_HOST=inproc`: the same code linked into wsp, as at M0. Seats started by the manager stay alive (compound-sup is durable), and the in-process host adopts them by socket. `WSP_HOST` is `manager` when unset (wsp-029); a manager's start adopts the seats the in-process host started, from compound's run directory. |
 | **M2. The i5 under its own manager** | The same binary on the i5. wsp dials it over the tailnet. The beat becomes the heartbeat. Per-seat forwards and tunnel.rs's masters go, and the far half of the copy moves into the manager. | **ssh** runs per day 147 → install and tree bytes only. A far seat working through a slowed tick never reads unreachable (a wsp-639 sandbox reproduction plus a week live). The far manifest of compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s). `spawn --on` p50 no worse. | A machine field `transport: ssh`, which keeps the v1 path compiled until a fortnight passes on `manager`. |
 | **M3. Tree jobs under the manager** | `throttle run`, `check`, `verify`'s checks and barrier runs become `job.run` on the tree's host (the Mac). The throttle admits by the manager's facts. check_tree's sweep, the slot probes and leaked_agents go. | **lsof** → 0 and **ps** → 0 on the wsp side. Every `kill` is by a manager, on a pgid it started. wsp-478-kind incidents → 0 over a week. `throttle run`'s wall per build no worse. | Jobs fall back to wsp running them in-process behind a flag. The sweep is restored with them. |
 | **M4. Trees placed (if Q6 says T2)** | `tree.checkout` and `tree.land` on every host's manager, a fenced push to the trunk, per-host warm targets, and the barrier's host named. | A list runs with members on two hosts and no copy-up or copy-back. Land conflicts are refused by the push and never overwritten. Cold-build cost on the i5 is measured against remote-agents' early proof. | Rows placed on the Mac only (T1), which is the state at M3. |
@@ -820,13 +820,14 @@ machine record names (`<state>/manager/local.json` and its secret file, wsp-024)
   - the process table, signals and working directories (tree work's until M3);
   - hook files and transcripts (the manager reports them as events, which group 5 folds);
   - the fact probes' text (the beat carries `HostFacts`, not text);
-  - headless seats, typing at a renderer, and any seat the manager does not run (adoption is wsp-029's).
+  - headless seats, typing at a renderer, and any seat the manager does not run (one started in-process is
+    adopted at the manager's next start, wsp-029).
 - **One connection per process (3.4).** It opens at the first message, and is reopened once if the manager
   closed it. The client beats during a long wait.
 - **Heard or silent.** A manager that does not answer `hello` within 1 s is `HostError::Silent`, whose message
   begins "host silent". Through the trait it is `Refusal::Unreachable`, never an empty answer.
 - **`WSP_HOST=inproc|manager`.** `host::chosen` reads it, and `host::choose` takes the choice as an argument.
-  The default stays `inproc`. Nothing calls them yet: callers move in group 5.
+  The default stayed `inproc` until wsp-029 made it `manager`. Nothing calls them yet: callers move in group 5.
 - **The spawn's key is real; its env is the 3.2 rule.** `Spawn` carries `key: (row, attempt)`, and `Tcp`
   sends it as is, built once per spawn so `ask`'s one reopen resends the same key. wsp builds it in
   `cmd_spawn::spawn_key` from the row's id and the count of its log's "started by pane" lines, puts it on
@@ -878,7 +879,8 @@ unchanged. Both share the store half (`Wip::gathered`); they differ only in what
 - **Left for later:**
   - the throttle line still reads load and thermal in process (`sysctl`, `pmset`), because the facts carry
     neither the 5-minute load nor the speed-limit percent it words;
-  - a seat started in-process is not in the manager's answer until adoption (wsp-029);
+  - a seat started in-process is not in the manager's answer until the manager's next start adopts it
+    (wsp-029);
   - the manager's `shells` count does not apply `Shells`' settled, work and quiet bounds.
 
 `tests/wip_manager.rs` runs the `wsp` binary's `wip --json` against a loopback manager with one seat (fake

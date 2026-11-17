@@ -22,7 +22,7 @@ holds the rule; it walks the path dependencies, so a dependency reached through 
   their parsers. Three asks of `InProcess` per reading: `sysctls` (load, swap, the kernel's memory pressure
   level), `disks_free` (one `df` for every volume) and `thermal`
 - `src/hooks.rs`: the manager's hooks endpoint (wsp-023). `report` is the hook command's half: under
-  `WSP_HOST=manager` it dials the manager on loopback (`WSP_MANAGER_ADDR`, default `127.0.0.1:7487`), sends one
+  `WSP_HOST=manager` (or unset, wsp-029) it dials the manager on loopback (`WSP_MANAGER_ADDR`, default `127.0.0.1:7487`), sends one
   `hook.post` line with the token read from `<exec_dir>/manager.token` (`WSP_MANAGER_DIR`), and reads one
   `hook.taken` or `hook.refused` line; anything else is `Sent::Unanswered`, and wire's `report_to` writes the
   hook log instead. `Fold` is the manager's half: `UserPromptSubmit` is `turn began` (with the order
