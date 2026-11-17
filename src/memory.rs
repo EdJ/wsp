@@ -117,9 +117,16 @@ fn warn_mb_from(env: Option<&str>, file: Option<&str>) -> u64 {
 
 /// The idle panes among `agents`, measured. `bindings` names a seat's task.
 ///
-/// Asks the process table once, and not at all with no idle seat. Under test
-/// there is no table to ask: tests hand one to [`of`].
-pub(crate) fn read(state: &Path, agents: &[Seated], bindings: &BTreeMap<String, Value>) -> IdleMemory {
+/// Asks the process table once, through `ps` (the caller's Host's
+/// `seat_memory`, passed in because the Host sits a layer above this module),
+/// and not at all with no idle seat. Under test there is no table to ask:
+/// tests hand one to [`of`].
+pub(crate) fn read(
+    state: &Path,
+    agents: &[Seated],
+    bindings: &BTreeMap<String, Value>,
+    ps: impl FnOnce() -> Option<String>,
+) -> IdleMemory {
     let seats: Vec<(String, String)> = agents
         .iter()
         .filter(|a| a.state == State::Idle)
@@ -142,7 +149,7 @@ pub(crate) fn read(state: &Path, agents: &[Seated], bindings: &BTreeMap<String, 
             backends.iter().find_map(|b| b.root(&seat)).map(|pid| (s.clone(), pid))
         })
         .collect();
-    match crate::host::Host::seat_memory(&crate::host::LOCAL) {
+    match ps() {
         Some(ps) => of(&ps, &seats, &roots, warn_kb),
         None => IdleMemory { warn_kb, unread: seats.len(), ..IdleMemory::default() },
     }

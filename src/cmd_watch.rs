@@ -4318,7 +4318,7 @@ fn idle_memory(store: &Store) -> crate::memory::IdleMemory {
         .filter_map(|b| b.census().ok())
         .flat_map(|c| c.seats().cloned().collect::<Vec<_>>())
         .collect();
-    crate::memory::read(&store.state, &agents, &store.bindings())
+    crate::memory::read(&store.state, &agents, &store.bindings(), || crate::host::Host::seat_memory(&crate::host::LOCAL))
 }
 
 fn status(store: &Store, args: &Args) -> i32 {
