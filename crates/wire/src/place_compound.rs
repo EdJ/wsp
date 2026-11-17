@@ -2471,11 +2471,15 @@ mod tests {
         for (_, _, seat, reason, _) in &held {
             place.heard(seat, "SessionEnd", State::Gone, &json!({ "session_id": "a", "reason": reason }));
         }
+        // The pane that goes on is judged at the moment the one that leaves
+        // would have been killed by, counted from the hook rather than from
+        // the end of the other wait, so the two waits overlap.
+        let judged_at = std::time::Instant::now() + std::time::Duration::from_secs(CLOSE_AFTER_SECS as u64 + 3);
         for (pid, _, _, reason, closed) in &held {
             match closed {
                 true => assert!(until(|| alive(&[*pid]).is_empty()), "{reason}: the pane outlived the agent"),
                 false => {
-                    std::thread::sleep(std::time::Duration::from_secs(CLOSE_AFTER_SECS as u64 + 3));
+                    std::thread::sleep(judged_at.saturating_duration_since(std::time::Instant::now()));
                     assert!(alive(&[*pid]).contains(pid), "{reason}: a pane that goes on was closed");
                 }
             }
