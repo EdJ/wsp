@@ -326,7 +326,12 @@ pub(crate) fn sample_rss(state: &Path, rss: &BTreeMap<String, u64>, now: i64) {
 fn bank(state: &Path, read: &[(String, u64)], now: i64) {
     let path = state.join(SEAT_MEMORY_FILE);
     let prev = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
-    let _ = crate::store::write_atomic_unsynced(&path, &fold(prev, read, now).to_string());
+    // Written beside and renamed over, so a report never reads half a file.
+    // The daemon is the one writer; this layer sits below the store's helper.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, fold(prev, read, now).to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// The file with `read` (seat, KB) sampled at `now` folded in.
