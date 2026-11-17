@@ -2442,10 +2442,7 @@ impl Source for Poll<'_> {
         // can say which source a governor is blind through — `compound-064`,
         // `compound-115`, arriving here as its third place.
         let census = cmd_agent::fleet_census(&probe);
-        let panes = match &probe {
-            Probe::Up { panes, .. } => panes.clone(),
-            _ => Vec::new(),
-        };
+        let panes: Vec<cmd_agent::Pane> = Vec::new();
         // Every seat, empty ones included: `wip` drops a seat with nothing in
         // it because `wip` is about who is working, and (d) below must not,
         // because "a seat is there and its agent is not" is exactly what it has
