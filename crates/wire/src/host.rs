@@ -92,7 +92,10 @@ pub trait Host: Sync {
     /// `seat.spawn` carrying its first order, then `seat.started` and that
     /// order's `order.acked` / `order.refused` waited for as the host's events
     /// (`docs/agent-manager.md` 4.3): the seat within `wait`, the order's answer
-    /// within what is left of it. The in-process host has no events.
+    /// within what is left of it. Once `seat.started` is heard the session is
+    /// the answer: an order's answer that could not be heard (the events
+    /// dropped) is [`crate::place::Heard::Unanswered`], never an error that
+    /// would lose a running seat. The in-process host has no events.
     fn spawn_ordered(&self, _spawn: &Spawn<'_>, _order: &crate::place::FirstOrder, _wait: Duration) -> Result<(Session, crate::place::Heard)> {
         Err(crate::place::Refusal::Unsupported("a spawn that carries its first order"))
     }
