@@ -2911,6 +2911,40 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         assert!(queued_tells(&store).is_empty(), "and wip draws nothing queued");
     }
 
+    /// `wsp-659`, the verifier's note: the queue path returns before
+    /// `already_sent`, so the same tell sent twice to a working seat was queued
+    /// twice and typed twice. It is held once; `--again` holds it again, and a
+    /// different sentence still queues behind it.
+    #[test]
+    fn the_same_tell_sent_twice_to_a_working_seat_is_queued_once() {
+        use crate::fake::{Fake, Spot, Stage};
+        use crate::place::State;
+        let env = util::isolated("wake-queued-twice");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_task(&crate::model::Task::new("wsp-701 a row mid-turn", "wsp-701")).unwrap();
+        store.set_binding("w1:p6", json!({ "pane": "w1:p6", "task_id": "wsp-701" }));
+        let mut stage = Stage::new();
+        let mut spot = Spot::agent("w1:p6", "claude", "wsp-701", State::Working);
+        spot.space = "w1".into();
+        stage.put(spot);
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let tell = |words: &str, flags: &[(&str, &str)]| {
+            crate::cmd_agent::tell(&store, &crate::Args::synth("tell", &["wsp-701", words], flags))
+        };
+        assert_eq!(tell("rebase onto the trunk", &[]), 0);
+        assert_eq!(tell("rebase onto the trunk", &[]), 0, "a repeat is no failure");
+        assert_eq!(held_tells(&store, "w1:p6").len(), 1, "but it is held once");
+        assert_eq!(tell("and then rerun the checks", &[]), 0);
+        assert_eq!(held_tells(&store, "w1:p6").len(), 2, "a different sentence still queues");
+        assert_eq!(tell("rebase onto the trunk", &[("again", "")]), 0);
+        assert_eq!(held_tells(&store, "w1:p6").len(), 3, "`--again` queues it anyway");
+        drop(fake);
+    }
+
     /// `wsp-659` item 2: the primary's tell to compounding-698's seat was
     /// pending when the seat was ended, and was lost with nothing said. A held
     /// tell whose seat has gone is said back to its sender — the primary's spool,

@@ -1644,8 +1644,26 @@ fn tell_seat(
     // order; a seat that ends first has it said back to the sender. And a tell
     // to a seat that already has tells queued queues behind them, whatever the
     // seat reads now, so the order they were sent in is the order they land.
-    let queued = crate::wake::held_tells(store, &seat).len();
+    let held = crate::wake::held_tells(store, &seat);
+    let queued = held.len();
     if !args.has("anyway") && (queues_for_idle(row.state) || (queued > 0 && row.state != State::Unknown)) {
+        // The same sentence already waiting is not queued again: this path
+        // returns before [`Sent::already_sent`], so a retry of a tell that was
+        // queued would otherwise land twice. `--again` queues it anyway, as it
+        // sends anyway below.
+        if !args.has("again") && held.iter().any(|(_, h)| *h == said) {
+            match args.json() {
+                true => println!(
+                    "{}",
+                    json!({ "held": true, "queued": true, "pane": seat, "waiting": queued, "already": true })
+                ),
+                false => println!(
+                    "{} {what} has that sentence queued already ({queued} waiting) — not queued twice; `--again` queues it anyway",
+                    p.dim("·")
+                ),
+            }
+            return 0;
+        }
         let row_id = store
             .bindings()
             .get(&seat)
