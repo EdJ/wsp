@@ -703,6 +703,21 @@ fn rusqlite_is_the_sqlite_crates_alone_and_that_crate_links_no_store_wire_host_o
     );
 }
 
+/// `wsp-store-conformance`, the suite of 2.3, depends on `wsp-store-contract` and `wsp-testkit`
+/// and on nothing else of the workspace, directly or through them, its own tests included: no
+/// backend, so never `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `wsp-host` or `wsp-manager`
+/// (`docs/state-core.md` section 6; wsp-047). A backend's tests depend on the suite, not the other
+/// way round. (`rusqlite` is held off by the test above.)
+#[test]
+fn the_conformance_suite_links_the_contract_and_the_test_kit_only() {
+    const MAY: &[&str] = &["wsp-store-contract", "wsp-testkit"];
+    let bad = beyond(&reached_from(&root().join("crates/store-conformance"), "wsp-store-conformance"), MAY);
+    assert!(
+        bad.is_empty(),
+        "wsp-store-conformance must link only {MAY:?} of the workspace (docs/state-core.md section 6):\n{bad}"
+    );
+}
+
 #[test]
 fn the_rusqlite_reader_finds_each_manifest_form_and_not_a_lookalike() {
     assert!(declares("[dependencies]\nrusqlite = \"0.32\"\n", "rusqlite"));

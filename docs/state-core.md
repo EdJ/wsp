@@ -259,6 +259,10 @@ against every backend. A backend is done when it passes, with no exceptions file
    and no event is written.
 10. **Text.** `set_text` with a stale `Rev` is refused (no lost edit of Ed's prose).
 
+How a backend runs them (wsp-047): it implements `wsp_store_conformance::Harness` (open a store with a domain, open
+more handles on it, arm the crash hook, reopen) and calls each `case_x(&harness)` from its own tests. The suite's
+`MemStore` passes them first, and each of its `Knobs` breaks one guarantee to show the matching case fails.
+
 ### 2.4 The SQLite schema behind it (sketch)
 
 The SQL need not be portable (D1). This sketch shows that the contract fits SQLite and costs little. It is not the

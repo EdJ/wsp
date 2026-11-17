@@ -293,6 +293,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsp-store-conformance"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-store-contract",
+]
+
+[[package]]
 name = "wsp-store-contract"
 version = "0.1.0"
 dependencies = [
