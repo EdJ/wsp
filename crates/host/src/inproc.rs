@@ -297,6 +297,32 @@ impl InProcess {
         succeeded(Command::new("df").args(["-Pk"]).arg(path))
     }
 
+    /// `df -Pk` of every path in one ask: a header, then a row per path.
+    pub fn disks_free(&self, paths: &[&Path]) -> Option<String> {
+        if paths.is_empty() {
+            return None;
+        }
+        // A path that does not exist fails its row and the status, not the others.
+        let out = Command::new("df").arg("-Pk").args(paths).stderr(Stdio::null()).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// `sysctl` of several names in one ask, as `name: value` lines. A name
+    /// this host lacks is missing from the answer, not a failure of the rest.
+    pub fn sysctls(&self, names: &[&str]) -> Option<String> {
+        let out = Command::new("sysctl").args(names).stderr(Stdio::null()).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// This host's tailnet addresses, as `tailscale ip` gives them, one per
+    /// line; `None` when no tailscale answers.
+    pub fn tailnet_ips(&self) -> Option<String> {
+        const APP: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+        ["tailscale", APP]
+            .into_iter()
+            .find_map(|bin| succeeded(Command::new(bin).arg("ip").stderr(Stdio::null())))
+    }
+
     pub fn disk_use(&self, path: &Path) -> Option<String> {
         let out = Command::new("du").args(["-sk"]).arg(path).output().ok()?;
         Some(String::from_utf8_lossy(&out.stdout).into_owned())

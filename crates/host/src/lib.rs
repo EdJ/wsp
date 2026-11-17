@@ -11,12 +11,15 @@
 //! [`InProcess`], and the wire re-exports what moved down here at its old
 //! paths.
 
+pub mod facts;
 pub mod inproc;
 pub mod port;
 pub mod price;
 pub mod shed;
+pub mod tcp;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_sups;
 
 pub use inproc::InProcess;
 pub use port::{Delivery, Refusal, Result, Seat, State};
+pub use tcp::Tcp;

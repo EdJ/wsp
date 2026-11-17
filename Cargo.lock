@@ -117,6 +117,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "wsp-base",
+ "wsp-host-api",
 ]
 
 [[package]]
@@ -125,6 +126,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "wsp-manager"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-base",
+ "wsp-host",
+ "wsp-host-api",
 ]
 
 [[package]]

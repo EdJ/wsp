@@ -700,6 +700,59 @@ under `crates/host/src/` and nowhere else. Run with the exclusion lifted, it fin
 `crates/host/src/inproc.rs`, and none in the wire. `host-api` is not a dependency yet. It joins when the
 manager's messages are spoken here (group 2 and after).
 
+#### Group 2: the manager process (wsp-021, 2026-11-17)
+
+`crates/manager` (`wsp-manager`) depends on `wsp-host-api`, `wsp-base` and `wsp-host`, and on nothing of the
+store. `tests/layering.rs` (`the_manager_links_no_store_and_no_wire`) holds that rule. `wsp-host` gained two things
+that the manager and wire's client will share:
+- `Tcp`, the TCP carrier of `Connection` (3.4): newline-delimited JSON, a 16 MB line cap, and a write timeout of
+  three beats;
+- `facts`, the beat's `HostFacts`, read in three asks (one `sysctl` for load, swap and the kernel's memory
+  pressure level, one `df` for every volume, and `pmset` for the thermal state).
+
+`wsp-host` now depends on `wsp-host-api`. Nothing in wsp dials the manager yet.
+
+What the process does, as section 2 and section 3 ask:
+- **It listens on loopback and the tailnet's addresses, and nothing else.** `allowed` admits `127.0.0.0/8`, `::1`,
+  `100.64.0.0/10` and `fd7a:115c:a1e0::/48`, and refuses anything else before it creates a file. The tailnet
+  addresses come from `tailscale ip`, or from `--tailnet ADDR`. Without either, the manager serves on loopback
+  alone and logs that it does. The default port is 7487.
+- **It makes its token at first start.** The token is `<exec_dir>/manager.token`, 32 random bytes as hex, mode
+  0600. A token file that was widened is narrowed back to 0600 and logged. A `hello` with the wrong token is
+  answered `refused unauthorised` and the connection is closed. So is a first frame that is not a `hello`.
+- **It answers `hello`** with the host id, version, protocol, compound-sup and compound-render wire range
+  (`WIRE_VERSION` both ways), journal head, seats (none) and capacity. Capacity is 0/0/0 until it runs seats and
+  jobs. The last beat is queued straight after the `hello`, so a one-shot call has the host's facts without
+  waiting out a period.
+- **It journals every event before sending it.** `<exec_dir>/journal.jsonl` holds one frame per line, with ids
+  that run from 1 per manager. A torn last line is cut at open. `subscribe {from}` replays every event after
+  `from` and then follows live. The journal's mutex is held across both the append-and-send and the
+  replay-and-register, so no event is sent twice or falls between them. `Manager::emit` is the one way in, and
+  its callers are wsp-022's seat operations.
+- **It beats every 10 s on its own timer.** The facts are read once per beat for all clients. A fact the host does
+  not answer is sent at its quiet value and logged, because `HostFacts` has no "unknown". A client that is
+  silent for three beats is dropped.
+- **It refuses to start while another manager answers its port.** It first dials its own port with its own token,
+  and names whatever answers: a manager, a manager with another token, or something else. A bind that finds the
+  port in use is refused the same way. It also refuses while another manager holds `<exec_dir>/manager.lock`
+  (`flock`), since two managers on one journal would both number events.
+- **It logs to `<exec_dir>/log/manager.log`**, rotated once past 10 MB.
+
+Seat verbs are answered rather than ignored: `seat.spawn` gets `seat.refused unsupported`, `order.*` gets
+`order.refused no_seat`, `seat.stop` and `seat.read` get `refused no_seat`, and `job.*` and `tree.*` get
+`refused unsupported`.
+
+Tests (`cargo test -p wsp-manager`, `tests/manager.rs`) run a manager on an ephemeral loopback port. They check
+that:
+- a `hello` with no token, or the wrong one, is closed, and one with the token is answered;
+- reconnecting `from` N gives exactly the events after N, also across a restart on the same port;
+- a second manager refuses both the port and the `<exec_dir>`;
+- the beat carries the facts;
+- a client silent for three beats is dropped.
+
+The binary was also run by hand on loopback. Its `hello` and its beat, with this Mac's load, memory, swap, disk
+and thermal state, came back to a Python client.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the

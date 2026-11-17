@@ -1,9 +1,8 @@
 # wsp-host
 
 The in-process host (`docs/agent-manager.md` section 6.2, M1 group 1; wsp-020): every OS operation a seat
-needs, run in this process. Depends on `wsp-base` and `serde_json`, and on nothing of `wsp-store`,
-`wsp-store-contract` or `wsp-wire`, so the agent manager can link it (2.3, R1). `wsp-host-api` joins when the
-manager's messages are spoken here. `tests/layering.rs` (`the_host_crate_links_neither_the_store_nor_the_wire`)
+needs, run in this process. Depends on `wsp-base`, `wsp-host-api` and `serde_json`, and on nothing of
+`wsp-store`, `wsp-store-contract` or `wsp-wire`, so the agent manager links it (2.3, R1; wsp-021). `tests/layering.rs` (`the_host_crate_links_neither_the_store_nor_the_wire`)
 holds the rule; it walks the path dependencies, so a dependency reached through another crate counts too.
 
 ## Holds
@@ -16,6 +15,12 @@ holds the rule; it walks the path dependencies, so a dependency reached through 
   the wire), the burn tally (`tally_burn`, `bank_burn`, `burn_under`), and the transcript readers
   (`claude_transcript`, `pi_session_file`, `opencode_rows`, `captured`). Also `WIRE_VERSION`,
   `DELIVERY_PENDING`, `reads_kind`, `read_json` and `str_of`, moved down with the code that uses them
+- `src/tcp.rs`: `Tcp`, the TCP carrier of `wsp-host-api`'s `Connection` (3.4). It frames newline-delimited
+  JSON with a 16 MB line cap and a write timeout of three beats, and offers `dial`, `try_clone` (a second handle
+  to send on) and `shutdown`. The manager serves on it, and wire's client (wsp-025) will dial with it
+- `src/facts.rs`: the beat's host facts (`read`, `assemble`) turned into `wsp-host-api`'s `HostFacts`, with
+  their parsers. Three asks of `InProcess` per reading: `sysctls` (load, swap, the kernel's memory pressure
+  level), `disks_free` (one `df` for every volume) and `thermal`
 - `src/port.rs` — `Seat`, `State`, `Refusal`, `Delivery`, `Result`: the words the methods answer in
 - `src/shed.rs` — what a spawned seat must not inherit (`CHILD_MARKER`, `shed`, `KEPT`, `PI_SESSION`, `shed_keys`)
 - `src/price.rs` — the price table and `cost`/`cost_of`, which the burn tally prices each request with
@@ -42,5 +47,5 @@ names one of the free functions above past the trait (`wsp_host::inproc::tree_of
 
 ## Tests
 
-This crate's code is tested where its callers are: `cargo test -p wsp-wire` (`place_compound`,
+`tcp` and `facts` have their own unit tests (`cargo test -p wsp-host`). The rest of this crate's code is tested where its callers are: `cargo test -p wsp-wire` (`place_compound`,
 `place_super`) and the root's `cmd_spawn::`. `cargo build -p wsp-host` alone shows that it links no store.

@@ -7,12 +7,13 @@ description = "The in-process host: every OS operation a seat needs (processes, 
 [lib]
 path = "src/lib.rs"
 
-# wsp-base, and wsp-host-api when the manager's messages are spoken here: never
-# wsp-store or wsp-wire (tests/layering.rs,
+# wsp-base and wsp-host-api (the TCP carrier and the beat's facts speak its
+# types): never wsp-store or wsp-wire (tests/layering.rs,
 # `the_host_crate_links_neither_the_store_nor_the_wire`).
 [dependencies]
 serde_json = "1"
 wsp-base = { path = "../base" }
+wsp-host-api = { path = "../host-api" }
 
 [features]
 # `test_sups`, and the per-thread stand-in `compound-render`, for the tests of

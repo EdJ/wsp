@@ -533,44 +533,67 @@ fn path_deps(manifest: &Path, dev: bool) -> BTreeMap<String, PathBuf> {
     out
 }
 
-/// `wsp-host`, the in-process host, is what the agent manager links, and the
-/// manager links nothing of the store (`docs/agent-manager.md` 2.3, R1;
-/// `docs/components.md` R1). So the crate depends on `wsp-base` (and
-/// `wsp-host-api`, once it speaks the manager's messages) and on nothing else
-/// of the workspace, directly or through them, its own tests included: never
-/// `wsp-store`, `wsp-store-contract` or `wsp-wire` (wsp-020).
-#[test]
-fn the_host_crate_links_neither_the_store_nor_the_wire() {
-    let root = root();
-    let host = root.join("crates/host/Cargo.toml");
-    let text = fs::read_to_string(&host).unwrap();
-    assert!(text.lines().any(|l| l.trim() == "name = \"wsp-host\""), "crates/host is no longer the package wsp-host");
-
-    const MAY: &[&str] = &["wsp-base", "wsp-host-api"];
-    const NEVER: &[&str] = &["wsp-store", "wsp-store-contract", "wsp-wire", "wsp-trees", "wsp-testkit", "wsp"];
-    // Every workspace crate the host reaches, and by which path.
+/// Every workspace crate the package at `dir` reaches through its path
+/// dependencies, its own dev-dependencies included, each with the chain that
+/// reaches it.
+fn reached_from(dir: &Path, name: &str) -> BTreeMap<String, Vec<String>> {
+    let manifest = dir.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    assert!(
+        text.lines().any(|l| l.trim() == format!("name = \"{name}\"")),
+        "{} is no longer the package {name}",
+        dir.display()
+    );
     let mut reached: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut stack: Vec<(PathBuf, Vec<String>, bool)> = vec![(host, vec!["wsp-host".into()], true)];
+    let mut stack: Vec<(PathBuf, Vec<String>, bool)> = vec![(manifest, vec![name.into()], true)];
     while let Some((manifest, via, dev)) = stack.pop() {
-        for (name, dir) in path_deps(&manifest, dev).into_iter().filter(|(n, _)| n != "wsp-host") {
+        for (dep, at) in path_deps(&manifest, dev).into_iter().filter(|(n, _)| n != name) {
             let mut chain = via.clone();
-            chain.push(name.clone());
-            if reached.insert(name.clone(), chain.clone()).is_none() {
-                stack.push((dir.join("Cargo.toml"), chain, false));
+            chain.push(dep.clone());
+            if reached.insert(dep.clone(), chain.clone()).is_none() {
+                stack.push((at.join("Cargo.toml"), chain, false));
             }
         }
     }
-    println!("wsp-host reaches: {:?}", reached.keys().collect::<Vec<_>>());
-    let bad: Vec<String> = reached
+    println!("{name} reaches: {:?}", reached.keys().collect::<Vec<_>>());
+    reached
+}
+
+/// The chains in `reached` that end in a crate not in `may`.
+fn beyond(reached: &BTreeMap<String, Vec<String>>, may: &[&str]) -> String {
+    reached
         .iter()
-        .filter(|(n, _)| NEVER.contains(&n.as_str()) || !MAY.contains(&n.as_str()))
+        .filter(|(n, _)| !may.contains(&n.as_str()))
         .map(|(_, chain)| format!("  {}\n", chain.join(" -> ")))
-        .collect();
+        .collect()
+}
+
+/// `wsp-host`, the in-process host, is what the agent manager links, and the
+/// manager links nothing of the store (`docs/agent-manager.md` 2.3, R1;
+/// `docs/components.md` R1). So the crate depends on `wsp-base` and
+/// `wsp-host-api` (whose types its TCP carrier and the beat's facts speak) and
+/// on nothing else of the workspace, directly or through them, its own tests
+/// included: never `wsp-store`, `wsp-store-contract` or `wsp-wire` (wsp-020).
+#[test]
+fn the_host_crate_links_neither_the_store_nor_the_wire() {
+    const MAY: &[&str] = &["wsp-base", "wsp-host-api"];
+    let bad = beyond(&reached_from(&root().join("crates/host"), "wsp-host"), MAY);
     assert!(
         bad.is_empty(),
         "wsp-host must link only {MAY:?} of the workspace (the agent manager links it and nothing of the store; \
-         docs/agent-manager.md 2.3, docs/components.md R1):\n{}",
-        bad.concat()
+         docs/agent-manager.md 2.3, docs/components.md R1):\n{bad}"
+    );
+}
+
+/// `wsp-manager`, the agent manager, depends on `wsp-host-api`, `wsp-base` and
+/// `wsp-host`, and on nothing of the store or the wire (2.3 R1, d1 Q3; wsp-021).
+#[test]
+fn the_manager_links_no_store_and_no_wire() {
+    const MAY: &[&str] = &["wsp-base", "wsp-host", "wsp-host-api"];
+    let bad = beyond(&reached_from(&root().join("crates/manager"), "wsp-manager"), MAY);
+    assert!(
+        bad.is_empty(),
+        "wsp-manager must link only {MAY:?} of the workspace (docs/agent-manager.md 2.3 R1):\n{bad}"
     );
 }
 
