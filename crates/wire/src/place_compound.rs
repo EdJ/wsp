@@ -420,18 +420,36 @@ fn turn_in_log(log: &str, since: i64) -> bool {
 /// box and not the screen is read. Claude Code's greyed suggestion in an empty
 /// prompt (`Try "…"`) reads as text on a screen with no colour in it, and is
 /// not.
+///
+/// A seat Claude Code runs under a session name draws that name in the box's
+/// top rule (`──── primary-delivery-cpd-5893 ─`), so a rule is a line of `─`
+/// or two runs of it with one short label between (`wsp-659`): read as bare
+/// rules only, that box had one rule, the composer read `None`, and the
+/// refusal fallback never typed at an idle governor.
 fn composer(screen: &str) -> Option<bool> {
     let lines: Vec<&str> = screen.lines().collect();
-    let rule = |l: &str| {
-        let t = l.trim();
-        let n = t.chars().count();
-        n >= 20 && t.chars().filter(|c| *c == '─').count() * 10 >= n * 9
-    };
-    let rules: Vec<usize> = (0..lines.len()).filter(|&i| rule(lines[i])).collect();
+    let rules: Vec<usize> = (0..lines.len()).filter(|&i| is_rule(lines[i])).collect();
     let [.., top, bottom] = rules[..] else { return None };
     let held: String = lines[top + 1..bottom].iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
     let held = held.trim_start_matches(['❯', '>']).trim();
     Some(!held.is_empty() && !held.starts_with("Try \""))
+}
+
+/// A horizontal rule of Claude Code's prompt box — see [`composer`]: at least
+/// 20 wide, and either nearly all `─` or a run of `─` (half the line or more),
+/// one label with no `─` in it, and `─` again to the end.
+fn is_rule(l: &str) -> bool {
+    let t = l.trim();
+    let n = t.chars().count();
+    let dashes = t.chars().filter(|c| *c == '─').count();
+    if n < 20 {
+        return false;
+    }
+    if dashes * 10 >= n * 9 {
+        return true;
+    }
+    let label = t.trim_matches('─').trim();
+    t.starts_with('─') && t.ends_with('─') && dashes * 2 >= n && !label.is_empty() && !label.contains('─') && !label.contains('❯')
 }
 
 impl Compound<'_> {
@@ -3260,6 +3278,44 @@ mod tests {
         let queued = format!("⏺ working\n  ⎿ the barrier is open — start group 2\n{rule}\n❯ \n{rule}\n");
         assert_eq!(composer(&queued), Some(false), "queued above the box is not in it");
         assert_eq!(composer("$ claude\nWelcome to Claude Code"), None, "no prompt drawn yet");
+    }
+
+    /// The idle governor's screen as `wsp peek` read it off cpd-5893 while its
+    /// supervisor answered `refused` (`wsp-659`, the verifier's block): Claude
+    /// Code draws the session name in the box's top rule, and a reader that took
+    /// only bare rules found one rule and said `None`.
+    fn named_session_screen(inside: &str) -> String {
+        let top = format!("{} primary-delivery-cpd-5893 ─", "─".repeat(52));
+        let bottom = "─".repeat(80);
+        format!("⏺ Waiting on group 1.\n\n{top}\n{inside}\n{bottom}\n  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+    }
+
+    #[test]
+    fn a_prompt_box_whose_top_rule_carries_the_session_name_is_read() {
+        assert_eq!(composer(&named_session_screen("❯ ")), Some(false), "empty");
+        assert_eq!(composer(&named_session_screen("❯ wsp tell seat:wsp-659 -")), Some(true), "holding text");
+        let other = format!("{} sidebar-width-cpd-5900 ─", "─".repeat(55));
+        assert_eq!(composer(&format!("{other}\n❯\n{}\n", "─".repeat(80))), Some(false), "cpd-5900's frame");
+        assert!(!is_rule("── a sentence that happens to start with a dash and ends ─"), "prose is no rule");
+        assert!(!is_rule("─── short ──"), "too narrow to be the box");
+    }
+
+    /// Item 3 through the real read, not a stub: a `refused` answer to a seat
+    /// whose screen is the labelled empty box is typed past; the same box with
+    /// text in it keeps the refusal.
+    #[test]
+    fn a_refusal_at_a_named_sessions_empty_box_is_typed_past() {
+        let typed = std::cell::Cell::new(0);
+        let type_it = || {
+            typed.set(typed.get() + 1);
+            Ok(())
+        };
+        let refused = || Err(Refusal::Failed("cpd-5893: refused".into()));
+        let empty = named_session_screen("❯ ");
+        assert_eq!(past_a_refusal(refused(), || composer(&empty), type_it), Ok(Delivery::Unconfirmed));
+        let held = named_session_screen("❯ half a sentence");
+        assert_eq!(past_a_refusal(refused(), || composer(&held), type_it), refused());
+        assert_eq!(typed.get(), 1, "typed at the empty box only");
     }
 
     /// **A hook's word expires, and the guard it feeds comes back with it**
