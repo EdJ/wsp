@@ -295,9 +295,9 @@ pub struct Left {
 }
 
 /// Hosts and servers: a process of one of these names is never the tree's to
-/// stop, whatever its working directory (`wsp-478`: the herdr server and a
+/// stop, whatever its working directory (`wsp-478`: the backend server and a
 /// `wsp` were TERMed for standing in a finished tree they were started from).
-const HOSTS: &[&str] = &["herdr", "wsp", "ssh", "sshd", "ssh-agent", "mosh-server", "tmux", "screen"];
+const HOSTS: &[&str] = &["wsp", "ssh", "sshd", "ssh-agent", "mosh-server", "tmux", "screen"];
 
 /// A server a tree builds and runs itself: spared where it is installed, and
 /// the tree's to stop where its executable lives under the tree
@@ -417,7 +417,7 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     // stopping it sends the row back with exit 137. Asked before the executable
     // and the tool names, so a node under a node, or an esbuild under the tree's
     // `node_modules`, is spared as the cargo is. Only a `wsp` is asked, the nearest
-    // host above; a pane's herdr does not spare what it holds.
+    // host above; a pane's backend does not spare what it holds.
     if let Some(wsp) = wsp_above(ppid, in_tree, table) {
         return Verdict::Spare(format!("it descends from a running wsp, pid {wsp}: a check runs in this tree"));
     }
@@ -441,7 +441,7 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     }
     // Up through its parents, to the first that decides it: a host makes it
     // the host's; one that stood in the tree makes it the tree's. Further up is
-    // not asked: every pane has a herdr above it.
+    // not asked: every pane has a backend above it.
     let mut at = ppid;
     for _ in 0..table.len() {
         if at <= 1 {
@@ -1068,11 +1068,11 @@ mod tests {
         verdict(pid, Path::new("/r/.worktrees/c-1"), in_tree, table)
     }
 
-    /// `wsp-478`: the herdr server and a `wsp` stood in a finished tree by
+    /// `wsp-478`: the backend server and a `wsp` stood in a finished tree by
     /// working directory alone and were TERMed.
     #[test]
-    fn a_herdr_or_wsp_standing_in_a_finished_tree_is_spared() {
-        let table = [proc(31702, 1, "/opt/homebrew/bin/herdr"), proc(23862, 1, "/Users/e/.local/bin/wsp")];
+    fn a_backend_or_wsp_standing_in_a_finished_tree_is_spared() {
+        let table = [proc(31702, 1, "/opt/homebrew/bin/tmux"), proc(23862, 1, "/Users/e/.local/bin/wsp")];
         for pid in [31702, 23862] {
             assert!(matches!(judged(pid, &[31702, 23862], &table), Verdict::Spare(_)), "{pid}");
         }
@@ -1118,7 +1118,7 @@ mod tests {
             proc(85319, 1, "/Users/e/Applications/web-chrome.app/Contents/MacOS/web-chrome"),
             proc(85320, 85319, "/usr/local/bin/helper"),
             proc(85321, 85320, "/usr/local/bin/node"),
-            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(60, 1, "/opt/homebrew/bin/tmux"),
             proc(61, 60, "/bin/sh"),
             proc(62, 61, "/usr/local/bin/node"),
         ];
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn a_cargo_that_a_wsp_check_started_in_a_finished_tree_is_spared() {
         let table = [
-            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(60, 1, "/opt/homebrew/bin/tmux"),
             proc(61, 60, "/bin/sh"),
             proc(19582, 61, "/usr/local/bin/wsp"),
             proc(20694, 19582, "/Users/e/.cargo/bin/cargo"),
@@ -1150,7 +1150,7 @@ mod tests {
             let v = judged(pid, &all, &table);
             assert!(matches!(&v, Verdict::Spare(_)), "{pid}: {v:?}");
         }
-        assert_eq!(judged(62, &all, &table), Verdict::Stop, "a cargo only under a pane's herdr is still the tree's");
+        assert_eq!(judged(62, &all, &table), Verdict::Stop, "a cargo only under a pane's backend is still the tree's");
     }
 
     /// `wsp-653`: the process table at 04:22:45Z, a web-chrome row's `npx vitest`
@@ -1158,7 +1158,7 @@ mod tests {
     #[test]
     fn everything_a_wsp_check_runs_in_a_finished_tree_is_spared_whatever_runs_it() {
         let table = [
-            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(60, 1, "/opt/homebrew/bin/tmux"),
             proc(61, 60, "/bin/sh"),
             proc(85802, 61, "/usr/local/bin/wsp"),
             proc(85960, 85802, "/bin/sh"),
@@ -1177,20 +1177,20 @@ mod tests {
             assert!(matches!(&v, Verdict::Spare(_)), "{pid}: {v:?}");
         }
         for pid in [70, 71] {
-            assert_eq!(judged(pid, &all, &table), Verdict::Stop, "{pid}: a node only under a pane's herdr is still the tree's");
+            assert_eq!(judged(pid, &all, &table), Verdict::Stop, "{pid}: a node only under a pane's backend is still the tree's");
         }
     }
 
     #[test]
     fn what_a_host_started_is_the_hosts() {
-        let table = [proc(30, 1, "/opt/homebrew/bin/herdr"), proc(31, 30, "/usr/bin/some-pane")];
+        let table = [proc(30, 1, "/opt/homebrew/bin/tmux"), proc(31, 30, "/usr/bin/some-pane")];
         assert!(matches!(judged(31, &[30, 31], &table), Verdict::Spare(_)));
     }
 
     #[test]
     fn sorting_a_tree_splits_what_it_started_from_what_only_stands_there() {
         let lsof = "p31702\nn/r/.worktrees/c-1\np40\nn/r/.worktrees/c-1/web\n";
-        let table = [proc(31702, 1, "/opt/homebrew/bin/herdr"), proc(40, 1, "/usr/local/bin/vite")];
+        let table = [proc(31702, 1, "/opt/homebrew/bin/tmux"), proc(40, 1, "/usr/local/bin/vite")];
         let lefts = vec![Left { row: "c-1".into(), tree: "/r/.worktrees/c-1".into(), pids: vec![31702, 40], spared: vec![] }];
         let out = sorted(lsof, lefts, &table);
         assert_eq!(out[0].pids, vec![40]);

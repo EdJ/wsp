@@ -26,7 +26,7 @@ pub struct Seat {
     ///
     /// No longer display-only, which is worklist-035 — [`governs`] carries the
     /// argument. It can still go stale, and what answers that is
-    /// [`crate::cmd_agent::reconcile`] vacating a slot whose pane herdr no
+    /// [`crate::cmd_agent::reconcile`] vacating a slot whose pane backend no
     /// longer lists, plus the re-take `wsp resume` and a custodian's own
     /// `wsp govern` both perform. Empty where the record was written for a room
     /// the process was not standing in (`wsp govern -w`).
@@ -63,7 +63,7 @@ pub struct Seat {
 
 /// One record, if it belongs to this machine.
 ///
-/// A workspace id is herdr's and means nothing on another host — the same
+/// A workspace id is backend's and means nothing on another host — the same
 /// reason a claim and a mandate each carry one. A seat on another machine is
 /// not a seat you can reach, so it reads as no seat rather than as a wrong one.
 /// The seat on a scope, from the governors record.

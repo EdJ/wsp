@@ -4230,7 +4230,7 @@ fn seated(store: &Store, args: &Args) -> Option<Worklist> {
     // `-w` names a room this process is not standing in, so its own pane says
     // nothing about who is sitting there — the same rule `wsp govern` applies
     // to the pane it stamps on the record. With no `-w`, off `my_pane()` and
-    // not `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID` (`compound-105`): a
+    // not `WSP_BACKEND_WORKSPACE_ID`/`WSP_BACKEND_PANE_ID` (`compound-105`): a
     // compound-hosted seat has neither, only the one string `my_pane()`
     // already resolves either way.
     let who = match args.get("workspace") {
@@ -8616,11 +8616,11 @@ mod tests {
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
         assert_eq!(flagged(&store, &["add", "run", "wl-004"], &[("group", "2")]), 0);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
-        let herdr = std::env::var_os("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_PANE_ID");
+        let backend = std::env::var_os("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
         assert_eq!(flagged(&store, &["add", "run", "wl-005"], &[("group", "2")]), 0);
-        if let Some(h) = herdr {
-            std::env::set_var("HERDR_PANE_ID", h);
+        if let Some(h) = backend {
+            std::env::set_var("WSP_BACKEND_PANE_ID", h);
         }
         let w = store.worklist("run").unwrap();
         let groups = w.groups();
@@ -8782,8 +8782,8 @@ mod tests {
     /// its barrier reads each row against that row's own done-when.
     #[test]
     fn a_non_blocking_follow_up_becomes_the_next_group_ahead_of_a_planned_one() {
-        // `--next` goes on to `go_with`, whose sweep asks herdr who is standing
-        // in each tree, so this one needs a herdr of its own — it passed only
+        // `--next` goes on to `go_with`, whose sweep asks backend who is standing
+        // in each tree, so this one needs a backend of its own — it passed only
         // while another test's guard happened to be up in the same process.
         let _env = util::isolated("followup-next");
         let store = scratch("followup-next");
@@ -8822,8 +8822,8 @@ mod tests {
     /// and the check is told it still ends with `go` or `hold`.
     #[test]
     fn a_follow_up_groups_barrier_is_refused_more_and_its_findings_reach_the_governor() {
-        // `--next` goes on to `go_with`, whose sweep asks herdr who is standing
-        // in each tree, so this one needs a herdr of its own.
+        // `--next` goes on to `go_with`, whose sweep asks backend who is standing
+        // in each tree, so this one needs a backend of its own.
         let _env = util::isolated("followup-round");
         let store = scratch("followup-round");
         task(&store, "wl-001", "review");
@@ -9327,8 +9327,8 @@ mod tests {
     /// A store of its own **and** an environment of its own, which the verbs
     /// above do not need and the verbs below do.
     ///
-    /// `go` reaches `cmd_checkout::Occupied::now`, which asks herdr who is
-    /// standing in a tree — and on a machine where herdr is answering, that is
+    /// `go` reaches `cmd_checkout::Occupied::now`, which asks backend who is
+    /// standing in a tree — and on a machine where backend is answering, that is
     /// a test talking to whoever is working today. `util::isolated` points the
     /// socket at nothing and the store at a directory of its own; it holds an
     /// environment lock, so these run one at a time, which is the price of the
@@ -9356,7 +9356,7 @@ mod tests {
     /// set one.
     ///
     /// Like `running`, this isolates the environment too: landing reads real
-    /// worktrees under the repository, and the verbs around them ask herdr who
+    /// worktrees under the repository, and the verbs around them ask backend who
     /// is standing where.
     fn grounded(tag: &str) -> (util::Isolated, Store, std::path::PathBuf) {
         let env = util::isolated(&format!("wlground-{tag}"));
@@ -10987,7 +10987,7 @@ mod tests {
         projects(&store, &[("wsp", None)]);
         in_project(&store, "i-1", None);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
-        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
         assert_eq!(run(&store, &["new", "run", "r"]), 0);
         assert_eq!(home_of(&store, "run"), None, "nothing to read a home off");
         assert_eq!(run(&store, &["add", "run", "i-1"]), 0);

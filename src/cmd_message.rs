@@ -953,7 +953,7 @@ struct Caller {
 /// environment, and an agent that lies about it can pass; nothing here can stop
 /// that. What it stops is the case `wsp-233` was filed for: a governor closing
 /// the loop on Ed's behalf because it was the one in the conversation. A person
-/// at a shell passes, in a herdr pane or out of one. `--as-person` is for Ed
+/// at a shell passes, in a backend pane or out of one. `--as-person` is for Ed
 /// typing `! wsp answer …` into an agent's own pane, which inherits that pane's
 /// environment, and it is a statement an agent would have to make falsely
 /// rather than a default it fell into.
@@ -1495,7 +1495,7 @@ fn open(store: &Store, args: &Args) -> i32 {
 ///
 /// **The task first, and the pane it was asked from second**, which is the
 /// whole reason [`crate::message::Waiting`] holds both: *the pane can go and
-/// the task cannot.* A pane id is the most perishable identifier herdr has — it
+/// the task cannot.* A pane id is the most perishable identifier backend has — it
 /// dies with its workspace and one cascade of `pane.exited` once cleared every
 /// binding on this machine at a stroke — so a question open long enough to be
 /// worth answering is a question whose pane may have been reused. Reading the
@@ -1614,12 +1614,12 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
         receipt(false, false, "the hook holding the agent's dialog carries the answer — nothing is typed at the pane");
         return 0;
     }
-    // Asked of every backend wsp can spawn onto (`compound-091`), not herdr
+    // Asked of every backend wsp can spawn onto (`compound-091`), not backend
     // alone — the same fold `wsp tell` makes since `compound-077` and for the
-    // same reason: a seat is a herdr pane, a compound seat, or nothing this
+    // same reason: a seat is a backend pane, a compound seat, or nothing this
     // machine knows, and only the census that made it can say which. This verb
-    // used to gate on `herdr::available()` and then scan `herdr::panes()`, so
-    // an answer addressed to a compound-hosted agent was filed as "no herdr
+    // used to gate on `backend::available()` and then scan `backend::panes()`, so
+    // an answer addressed to a compound-hosted agent was filed as "no backend
     // socket" and never delivered, on a machine where the agent was running.
     let backends = crate::place::local_backends();
     let Some((place, found)) = crate::cmd_agent::locate_seat(&backends, &pane) else {
@@ -1638,7 +1638,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // that goes idle on an answered question is sitting still for nothing until
     // a person relays it by hand. So the reply is held on its own record and
     // the daemon's repair tick types it at the first idle — [`deliver_held`].
-    // Asked of the port's own `State` rather than herdr's screen-scraped one,
+    // Asked of the port's own `State` rather than backend's screen-scraped one,
     // so the gate holds for whichever backend answered.
     if !found.state.will_take_a_prompt() {
         let why = match crate::waiting::on_screen(found.state) {
@@ -1887,11 +1887,11 @@ fn addressed(store: &Store, task: &crate::model::Task) -> String {
 /// it, because a question asked from a seat still has to be answered back into
 /// the workspace the seat is sitting in.
 pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
-    // Off `my_pane()` and not `HERDR_WORKSPACE_ID`: after `compound-092` there
+    // Off `my_pane()` and not `WSP_BACKEND_WORKSPACE_ID`: after `compound-092` there
     // is no workspace to ask, only the seat, and `my_pane()` is already the
-    // one place that picks it — a supervisor's `WSP_SEAT_ID` first, herdr's
-    // `HERDR_PANE_ID` after — so a caller outside herdr is not told it is
-    // nobody just because this file used to reach for herdr's own variable.
+    // one place that picks it — a supervisor's `WSP_SEAT_ID` first, backend's
+    // `WSP_BACKEND_PANE_ID` after — so a caller outside backend is not told it is
+    // nobody just because this file used to reach for backend's own variable.
     let pane = crate::place::my_pane();
     let scope = pane
         .as_deref()
@@ -1900,12 +1900,12 @@ pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
         (Some(scope), _) => (Party::seat(&scope), pane.clone()),
         (None, Some(p)) => (
             // The workspace here is a byline's, for a panel to jump to — not a
-            // decision, so herdr's own variable is still the honest source for
+            // decision, so backend's own variable is still the honest source for
             // it, and empty (as it is under any other backend) is correct.
             Party::pane(p, ""),
             pane.clone(),
         ),
-        // Outside herdr entirely, which is a person at a shell. The fallback is
+        // Outside backend entirely, which is a person at a shell. The fallback is
         // the honest one rather than a convenience: unattributed is a human.
         (None, None) => (Party::Human, None),
     }
@@ -2187,8 +2187,8 @@ mod tests {
 
     /// **The inversion `wsp-095` Part 4 is for**: today, unattributed text
     /// reads as Ed, so attributed text has to be a seat or an agent and
-    /// unattributed text a person. wsp cannot make herdr attribute a keystroke
-    /// — that is herdr's — so what wsp can do is carry the sender *in the
+    /// unattributed text a person. wsp cannot make backend attribute a keystroke
+    /// — that is backend's — so what wsp can do is carry the sender *in the
     /// payload*, and this is the one place the payload is composed.
     ///
     /// The dated instance: `worklist-004`'s question was answered by text that
@@ -2290,7 +2290,7 @@ mod tests {
 
     /// `Waiting` holds a pane **and** a task because *the pane can go and the
     /// task cannot*, and this is the one call that spends the second field. A
-    /// pane id is the most perishable identifier herdr has — one cascade of
+    /// pane id is the most perishable identifier backend has — one cascade of
     /// `pane.exited` once cleared every binding on this machine at a stroke —
     /// so a question open long enough to be worth answering is one whose pane
     /// may since have been reused. Typing an answer at whoever is standing

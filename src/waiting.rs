@@ -12,7 +12,7 @@
 //! The two sources:
 //!
 //! - **The screen.** [`State::Blocked`] — a permission or trust prompt holding
-//!   the keyboard. That is the backend's reading and not this module's: herdr
+//!   the keyboard. That is the backend's reading and not this module's: backend
 //!   scrapes it, and compound asks `compound-render`'s detector, whose opencode
 //!   rule matches opencode 1.18's `△ Permission required` dialog (checked live
 //!   against a real one on 2026-10-06). A prompt is waiting on **a person**,

@@ -54,7 +54,7 @@
 //! keystrokes land*, and `core-019` is where this path was found not asking it.
 //! A wake is delivered by typing at a pane, and there are three states in which
 //! that is not a delivery: a pane stopped on a permission dialog takes the text
-//! *into the dialog*, an agent still coming up refuses it, and a pane herdr
+//! *into the dialog*, an agent still coming up refuses it, and a pane backend
 //! cannot be asked about may not hold an agent at all. `cmd_agent::tell` has
 //! refused all three since robustness-083; this path asked only
 //! `turn_in_flight`, which is `Working` and nothing else. It asks
@@ -894,7 +894,7 @@ fn unseated(store: &Store, scope: &str) -> String {
 /// **This is `core-019` question 3, and the answer is that it rides the wake
 /// rather than the work order.** Nothing in `cmd_spawn::work_order`, `wsp
 /// brief` or the handbook says a governor's session may receive prompts nobody
-/// typed, and a wake arrives through `Kind::tell` — herdr typing at the pane —
+/// typed, and a wake arrives through `Kind::tell` — backend typing at the pane —
 /// so it is indistinguishable from Ed at a keyboard. That is a strange thing to
 /// meet unexplained, and the obvious repair is a clause in the custodian work
 /// order.
@@ -963,7 +963,7 @@ impl Sink for Tell<'_> {
         // The gate: one state read, two questions, and both of them are about
         // a transport that delivers by *typing at a pane*.
         // [`agent_commands::Kind::queue_is_the_agents`] is that transport
-        // named — its docs open on `Place::tell`, herdr typing — so a kind
+        // named — its docs open on `Place::tell`, backend typing — so a kind
         // carrying a queue of its own pays for neither question.
         //
         // **Mid-turn is the durability half.** `core-021` d2: not corruption —
@@ -972,19 +972,19 @@ impl Sink for Tell<'_> {
         // while the spool does not.
         //
         // **Asked of `agent.get` and not of the census row `occupant` hands
-        // back.** `herdr::panes` is `pane.list`, and the whole reason
-        // `Herdr::census` makes two calls is that `pane.list` alone cannot tell
+        // back.** `backend::panes` is `pane.list`, and the whole reason
+        // `Backend::census` makes two calls is that `pane.list` alone cannot tell
         // a starting agent from an idle one — so a status read off that row is
         // not a reading of whether a turn is in flight. Driven 2026-08-21: with
         // the row's status the gate never fired once, and four wakes were
         // delivered into an agent that `agent.get` reported as `working`
-        // throughout. `place_herdr::turning` carries the same warning for the
+        // throughout. `place_backend::turning` carries the same warning for the
         // same reason.
         //
         // **And where the keystrokes land is the other half**, which
         // [`crate::place::State::turn_in_flight`] does not answer: it is
         // `Working` and nothing else, so this path would type into a permission
-        // dialog, into an agent still coming up, and into a pane herdr could
+        // dialog, into an agent still coming up, and into a pane backend could
         // not be asked about — the three `cmd_agent::tell` has refused since
         // robustness-083. The module docs carry it; the question is
         // [`crate::place::State::will_take_a_prompt`], and asking the wider one
@@ -1048,7 +1048,7 @@ impl Sink for Tell<'_> {
 
         // The gate, asked only when the answer is *not* already known and the
         // only thing left to do is type. [`agent_commands::Kind::queue_is_the_agents`]
-        // is that transport named — its docs open on `Place::tell`, herdr typing
+        // is that transport named — its docs open on `Place::tell`, backend typing
         // — so a kind carrying a queue of its own pays for neither question.
         //
         // **Mid-turn is the durability half.** `core-021` d2: not corruption —
@@ -1057,26 +1057,26 @@ impl Sink for Tell<'_> {
         // while the spool does not.
         //
         // **Asked of `agent.get` and not of the census row `occupant` hands
-        // back.** `herdr::panes` is `pane.list`, and the whole reason
-        // `Herdr::census` makes two calls is that `pane.list` alone cannot tell
+        // back.** `backend::panes` is `pane.list`, and the whole reason
+        // `Backend::census` makes two calls is that `pane.list` alone cannot tell
         // a starting agent from an idle one — so a status read off that row is
         // not a reading of whether a turn is in flight. Driven 2026-08-21: with
         // the row's status the gate never fired once, and four wakes were
         // delivered into an agent that `agent.get` reported as `working`
-        // throughout. `place_herdr::turning` carries the same warning for the
+        // throughout. `place_backend::turning` carries the same warning for the
         // same reason.
         //
         // **And where the keystrokes land is the other half**, which
         // [`crate::place::State::turn_in_flight`] does not answer: it is
         // `Working` and nothing else, so this path would type into a permission
-        // dialog, into an agent still coming up, and into a pane herdr could
+        // dialog, into an agent still coming up, and into a pane backend could
         // not be asked about — the three `cmd_agent::tell` has refused since
         // robustness-083. The module docs carry it; the question is
         // [`crate::place::State::will_take_a_prompt`], and asking the wider one
         // costs nothing this path was not already paying, because refusing is
         // the ordinary answer here.
         if how.queue_is_the_agents() {
-            // `State::Unknown` when herdr could not be asked, which
+            // `State::Unknown` when backend could not be asked, which
             // [`held_because`] refuses — an absence is not a fact, least of all
             // the fact that somebody is there to read this.
             //
@@ -1111,7 +1111,7 @@ impl Sink for Tell<'_> {
 }
 
 /// What the seat's supervisor answers to the next tell, scripted by a test
-/// (`wsp-634`): the one thing a fake herdr cannot say, because `failed refused`
+/// (`wsp-634`): the one thing a fake backend cannot say, because `failed refused`
 /// is `compound-sup deliver`'s own word. Empty in every other test, and in the
 /// binary there is nothing here at all.
 #[cfg(test)]
@@ -1338,7 +1338,7 @@ mod tests {
     /// and at-most-once is affordable for a hook and not for a reader that is
     /// asleep.
     ///
-    /// There is no herdr in a test, so nothing can be delivered: what is left
+    /// There is no backend in a test, so nothing can be delivered: what is left
     /// on disk is exactly what would survive the process dying mid-send.
     #[test]
     fn what_the_pass_produced_is_on_disk_before_anything_is_attempted() {
@@ -1905,7 +1905,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         // The two the old gate let through, named so a revert has to argue with
         // this rather than with a list.
         assert!(!State::Blocked.turn_in_flight(), "which is why the old gate delivered into a modal");
-        assert!(!State::Unknown.turn_in_flight(), "and into a pane herdr could not be asked about");
+        assert!(!State::Unknown.turn_in_flight(), "and into a pane backend could not be asked about");
 
         // And each refusal reads as its own repair: a person at a keyboard, a
         // spawn, and a reporter that could not be asked are three different
@@ -1920,7 +1920,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
 
     /// **A governor is told what woke it, and it is told on the wake.**
     ///
-    /// `core-019` question 3. A wake arrives through `Kind::tell` — herdr
+    /// `core-019` question 3. A wake arrives through `Kind::tell` — backend
     /// typing at the pane — so it is indistinguishable from a person at a
     /// keyboard, and nothing in the custodian work order, the brief or the
     /// handbook says a governor's session may receive prompts nobody typed.
@@ -1995,7 +1995,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     // ---- one path to a governor, and a turn for a receipt --------------------
 
     /// A store with one task in one project and a seat on that project, and the
-    /// fake herdr behind it.
+    /// fake backend behind it.
     ///
     /// **The project is what the seat is taken on and not the worklist**, because
     /// `cycle`'s walk falls back to the first member's project and that is the
@@ -2012,11 +2012,11 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         // The asker is an agent, not a person at a shell, and the pane it is in
         // is named rather than left to the environment: `wsp ask` refuses a
         // question that does not say who is waiting on it, and `my_pane()` reads
-        // `HERDR_PANE_ID`, which every other test in this binary also writes.
+        // `WSP_BACKEND_PANE_ID`, which every other test in this binary also writes.
         // A member holding the task is the whole of what makes this a member's
         // question — an answer goes home to the asker's task, so this is what
         // the return path is built on.
-        std::env::set_var("HERDR_PANE_ID", "w1:p2");
+        std::env::set_var("WSP_BACKEND_PANE_ID", "w1:p2");
         store.set_binding("w1:p2", json!({ "pane": "w1:p2", "task_id": "wsp-146" }));
 
         let mut spot = Spot::agent("w1:p1", "claude", "demo", state);
@@ -2024,7 +2024,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let mut stage = Stage::new();
         stage.put(spot);
         cmd_govern::take(&store, "demo", "w1", "w1:p1").unwrap();
-        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let fake = Fake::bind(env.path("backend.sock"), stage).expect("a socket");
         let (k, v) = fake.socket_env();
         std::env::set_var(k, v);
         (env, store, fake)

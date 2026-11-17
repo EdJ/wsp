@@ -7,7 +7,7 @@
 //! cannot work correctly without, in the order it needs them, short enough that
 //! nobody is tempted to turn it off.
 //!
-//! It never fails. A store with nothing in it, a herdr that is not answering, a
+//! It never fails. A store with nothing in it, a backend that is not answering, a
 //! pane belonging to no project: each of those is a shorter brief, not an
 //! error. A hook that errors on a fresh machine is a hook people delete.
 
@@ -293,7 +293,7 @@ fn mentioned(text: &str, out: &mut Vec<String>) {
 /// Everything the brief reads, gathered into one value.
 ///
 /// The same bargain [`crate::panel::Snapshot`] makes, and the one this file's
-/// header has been claiming all along: "a store with nothing in it, a herdr
+/// header has been claiming all along: "a store with nothing in it, a backend
 /// that is not answering, a pane belonging to no project: each of those is a
 /// shorter brief, not an error." That is three promises about states nobody
 /// can arrange on demand, in the one command every session starts with, and
@@ -346,7 +346,7 @@ pub(crate) struct Briefing {
     /// Why wsp could not end that pane, once it has tried.
     /// [`crate::cmd_govern::ending_failed`].
     pub ending_failed: Option<String>,
-    /// This process's directory, contracted. herdr reports the shell's, which
+    /// This process's directory, contracted. backend reports the shell's, which
     /// is stale the moment anyone `cd`s.
     pub cwd: Option<String>,
     /// The machine's daemon, when it has none — [`crate::daemon::loud`]'s one
@@ -382,7 +382,7 @@ pub(crate) fn seat_faults(store: &Store) -> Option<String> {
 /// Where a brief is *for*, when that is not where the process is.
 ///
 /// [`Briefing::live`] answers "where am I" out of the process environment:
-/// herdr's `WSP_*`, [`cmd_agent::my_pane`], the working directory. That is the
+/// backend's `WSP_*`, [`cmd_agent::my_pane`], the working directory. That is the
 /// right question for a session-start hook and the wrong one for `wsp spawn`,
 /// which composes a brief for a seat it has just opened and is about to start
 /// an agent in. Composed with `live`, that brief would carry the *spawning*
@@ -396,7 +396,7 @@ pub(crate) struct At<'a> {
     /// the caller has already done the resolution `-p` and the cwd chain would
     /// redo differently from over here.
     pub project: Option<&'a str>,
-    /// The seat, in herdr's spelling. It exists by the time this is asked —
+    /// The seat, in backend's spelling. It exists by the time this is asked —
     /// `spawn` opens the seat before it starts anything in it — so this is a
     /// real pane id and not a guess.
     pub pane: Option<&'a str>,
@@ -467,7 +467,7 @@ impl Briefing {
         // The same two-step read [`Briefing::at`] makes, for the same reason:
         // a rotation's successor reads its brief from its `SessionStart` hook,
         // which runs before the slot moves to it. Off `my_pane()` rather than
-        // `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID` — `cmd_message::whoami`'s reason,
+        // `WSP_BACKEND_WORKSPACE_ID`/`WSP_BACKEND_PANE_ID` — `cmd_message::whoami`'s reason,
         // here too: this is a decision and not a display, so the port's own
         // answer to *where am I* is the one it is asked with.
         let pane = cmd_agent::my_pane();
@@ -521,7 +521,7 @@ impl Briefing {
 /// [`crate::place::seat_query`]'s order.
 ///
 /// Both readings used to ask only when there was a room, and a room here is
-/// `HERDR_WORKSPACE_ID`. A compound seat has none, so after a rotation the
+/// `WSP_BACKEND_WORKSPACE_ID`. A compound seat has none, so after a rotation the
 /// successor's brief said `coordinating here` while governors.json named it
 /// the seat, and `wsp govern` agreed with the file (`wsp-128`). One match, the
 /// same exact-pane one `govern` and `despawn` make, so the brief and the record
@@ -577,7 +577,7 @@ pub(crate) struct Brief {
     pub others: Vec<overlap::Standing>,
     pub hidden: usize,
     /// Whether this brief is an agent going looking, and whether it found
-    /// anything — the one thing the brief tells herdr rather than the reader.
+    /// anything — the one thing the brief tells backend rather than the reader.
     /// `None` when the question does not apply.
     pub looking: Option<bool>,
     /// The seat that answers for work here, and whether this pane is it.
@@ -1807,7 +1807,7 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
     let depth = Depth::of(args);
 
     // Before the rendering because it is a fact about the pane, not about how
-    // the brief is printed: `--json` looks the same to herdr as a person does.
+    // the brief is printed: `--json` looks the same to backend as a person does.
     if let Some(found) = r.looking {
         cmd_agent::say_looking(store, r.project.as_deref(), found);
     }
@@ -2182,7 +2182,7 @@ mod tests {
     }
 
     /// And when there is one, it is one line naming the project rather than the
-    /// workspace: an agent does not address a raised hand at a herdr id, it
+    /// workspace: an agent does not address a raised hand at a backend id, it
     /// raises it on a task and the chain decides where that lands.
     #[test]
     fn a_seat_above_this_pane_is_named_in_one_line() {
@@ -2315,12 +2315,12 @@ mod tests {
         assert!(!text.contains("once your first turn starts"), "that condition is behind it: {text}");
     }
 
-    /// **`wsp-128`, the seat line.** A compound seat has no herdr workspace,
+    /// **`wsp-128`, the seat line.** A compound seat has no backend workspace,
     /// and the brief asked what a pane governs only when it had one. A
     /// successor that governors.json named as the seat, and that `wsp govern`
     /// agreed was the seat, read `compound · coordinating here` in its brief.
     #[test]
-    fn a_seat_with_no_herdr_workspace_reads_as_the_seat_it_holds() {
+    fn a_seat_with_no_backend_workspace_reads_as_the_seat_it_holds() {
         let mut b = briefing();
         b.workspace = None;
         b.pane = Some("cpd-106".into());
@@ -2443,11 +2443,11 @@ mod tests {
         assert_eq!(r.open.iter().map(|(t, _)| t.id.as_str()).collect::<Vec<_>>(), ["t-005"]);
     }
 
-    /// A herdr that is not answering is a shorter brief too. The durable half
+    /// A backend that is not answering is a shorter brief too. The durable half
     /// — where you are, what you claimed, what is open — is the store's, and
     /// none of it needs a socket.
     #[test]
-    fn no_herdr_costs_the_brief_the_other_agents_and_nothing_else() {
+    fn no_backend_costs_the_brief_the_other_agents_and_nothing_else() {
         let mut b = briefing();
         b.world.panes.clear();
         b.world.workspaces.clear();

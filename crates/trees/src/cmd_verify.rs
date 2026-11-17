@@ -260,7 +260,7 @@ pub use crate::base::git::{git, git_ok, toplevel};
 /// not (`robustness-084`). It is that an agent is a workspace and not a pane: it
 /// splits, it opens a shell beside itself, and `wsp verify` run from any of them
 /// is the same agent asking for the same tree. Keyed on the pane, every split
-/// would be a cold build. Outside herdr there is no workspace, and `solo` is
+/// would be a cold build. Outside backend there is no workspace, and `solo` is
 /// honest: one shell at a terminal gets one tree and shares it with the next.
 ///
 /// A reissued workspace id therefore inherits the previous occupant's warm tree,
@@ -300,17 +300,17 @@ pub fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
 /// that named them, so no agent alive can name one to remove it — 9.6G in 30 of
 /// them on 2026-08-17 — and the arrangement that made them is gone.
 ///
-/// `live` is the workspace ids herdr reported, and `None` is herdr not
+/// `live` is the workspace ids backend reported, and `None` is backend not
 /// answering. That distinction is the whole guard, and it is the same one
 /// [`crate::cmd_agent::may_reap`] makes for the same reason: silence is not
-/// evidence that the work stopped. A herdr that is down, or slow, reports
+/// evidence that the work stopped. A backend that is down, or slow, reports
 /// nothing, which looks exactly like a machine with no agents on it — and this
 /// would then delete the tree every running agent is mid-build in. So `None`
-/// removes nothing at all, and an empty list is only believed when herdr said
+/// removes nothing at all, and an empty list is only believed when backend said
 /// it.
 ///
 /// Passed in rather than read here so the judgement can be tested without a
-/// live herdr, which is the one thing that would make it untestable and it is
+/// live backend, which is the one thing that would make it untestable and it is
 /// the only thing here worth testing.
 ///
 /// Directories only. A stale `git worktree` registration left behind is pruned
@@ -323,7 +323,7 @@ pub fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
 /// The judgement is [`stale_build_dirs`] and this is the removal of what it
 /// picked. Split for `worklist-051`: a preview computed *beside* the act is a
 /// second opinion about a directory listing crossed with a live workspace list,
-/// and the one run where the two would disagree is the run where herdr changed
+/// and the one run where the two would disagree is the run where backend changed
 /// its answer between them. Asking once and removing that answer is the only
 /// arrangement where the preview cannot be wrong about the act.
 fn clear_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<String> {
@@ -344,9 +344,9 @@ fn clear_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<
 /// preview and the act both print it and a directory listing arrives in
 /// whatever order the filesystem felt like.
 ///
-/// `None` for `live` is herdr not answering, and it is the guard rather than an
+/// `None` for `live` is backend not answering, and it is the guard rather than an
 /// error path: see [`clear_build_dirs`] above. It matters twice as much to the
-/// preview, because "herdr is silent, so nothing here would go" and "there is
+/// preview, because "backend is silent, so nothing here would go" and "there is
 /// no residue" are the same empty list and very much not the same fact — which
 /// is why the caller says which one it got rather than printing a bare zero.
 fn stale_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<PathBuf> {
@@ -383,7 +383,7 @@ fn keyed_on(name: &str, workspace: &str) -> bool {
 /// the guard rather than the mechanism. That one asks which workspaces are
 /// alive and removes everything else, which is right for a sweep and wrong for
 /// a single ending: it would make `wsp despawn` reach every dead workspace's
-/// residue on a list that is only as good as herdr's last answer. This one is
+/// residue on a list that is only as good as backend's last answer. This one is
 /// told the workspace whose last pane has just been closed, so the only tree it
 /// can touch is one that provably has no owner left.
 ///
@@ -1297,10 +1297,10 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         //
         // `live` is kept rather than folded into the call because `None` and
         // `Some([])` produce the same empty residue and are not the same fact:
-        // one is "herdr did not answer, so this half was skipped" and the other
+        // one is "backend did not answer, so this half was skipped" and the other
         // is "there is nothing here". Said out loud in both branches — a
         // preview more candid than the act would be the wrong way round.
-        // The live workspaces were herdr's to list, and herdr is gone
+        // The live workspaces were backend's to list, and backend is gone
         // (wsp-120): nothing answers, which is the `None` above.
         let live: Option<Vec<String>> = None;
         let residue: Vec<String> = if !all {
@@ -1310,7 +1310,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         } else {
             clear_build_dirs(store, live.as_deref(), &dir)
         };
-        let herdr_silent = all && live.is_none();
+        let backend_silent = all && live.is_none();
         if json_out {
             println!(
                 "{}",
@@ -1321,7 +1321,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                     "also_paths": residue,
                     "warm": warm,
                     "warm_paths": warm_paths,
-                    "herdr_silent": herdr_silent,
+                    "backend_silent": backend_silent,
                     "dry_run": dry,
                 })
             );
@@ -1360,11 +1360,11 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                     println!("  {}", p.dim(path));
                 }
             }
-            if herdr_silent {
+            if backend_silent {
                 println!(
                     "{}",
                     p.yellow(&format!(
-                        "herdr did not answer, so nothing left by earlier workspaces {}",
+                        "backend did not answer, so nothing left by earlier workspaces {}",
                         if dry { "is listed" } else { "was removed" }
                     ))
                 );
@@ -1976,16 +1976,16 @@ bench::b: benchmark
     /// same agent wanting the same warm tree.
     #[test]
     fn the_build_tree_is_this_agents_and_not_this_panes() {
-        // `WSP_AGENT` and `HERDR_WORKSPACE_ID` are what every caller of
+        // `WSP_AGENT` and `WSP_BACKEND_WORKSPACE_ID` are what every caller of
         // `agent_key` reads, and this test removes one of them — so a test in
         // another thread asking which agent it is would be answered by this
         // one's teardown. Bare rather than `isolated`: `Store::at` is explicit
-        // here and nothing reaches a herdr.
+        // here and nothing reaches a backend.
         let _env = util::env_lock();
         std::env::set_var("WSP_AGENT", "w1");
         assert_eq!(agent_key(), "w1");
         std::env::set_var("WSP_AGENT", "  ");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         assert_eq!(agent_key(), "solo");
         std::env::remove_var("WSP_AGENT");
 
@@ -2143,14 +2143,14 @@ bench::b: benchmark
         let dir = scratch_dir("one-key");
         let store = Store::at(dir.join("store"), dir.join("state"));
         let build = store.state.join("build");
-        for t in ["wsp-w2x", "herdr-w2x", "wsp-w2y", "my-wsp-w2x"] {
+        for t in ["wsp-w2x", "backend-w2x", "wsp-w2y", "my-wsp-w2x"] {
             std::fs::create_dir_all(build.join(t).join("tree")).unwrap();
         }
 
         let gone = clear_build_key(&store, "w2x");
         assert_eq!(gone.len(), 3, "the wrong trees went: {gone:?}");
         assert!(!build.join("wsp-w2x").exists());
-        assert!(!build.join("herdr-w2x").exists(), "a workspace can build more than one repository");
+        assert!(!build.join("backend-w2x").exists(), "a workspace can build more than one repository");
         assert!(!build.join("my-wsp-w2x").exists(), "the workspace was matched as part of the repo name");
         assert!(build.join("wsp-w2y").exists(), "another workspace lost the tree it was building in");
 
@@ -2160,14 +2160,14 @@ bench::b: benchmark
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The one line standing between a herdr that is down and every running
-    /// agent losing the tree it is mid-build in. A herdr that cannot be reached
+    /// The one line standing between a backend that is down and every running
+    /// agent losing the tree it is mid-build in. A backend that cannot be reached
     /// reports no workspaces, which looks exactly like a machine with nothing
     /// running on it — so `None` removes nothing, and an empty list is believed
-    /// only because herdr said it. The same judgement `may_reap` makes, and for
+    /// only because backend said it. The same judgement `may_reap` makes, and for
     /// the same reason.
     #[test]
-    fn a_herdr_that_did_not_answer_is_not_a_machine_with_no_agents_on_it() {
+    fn a_backend_that_did_not_answer_is_not_a_machine_with_no_agents_on_it() {
         let dir = scratch_dir("silence");
         let store = Store::at(dir.join("store"), dir.join("state"));
         let build = store.state.join("build");
@@ -2175,11 +2175,11 @@ bench::b: benchmark
 
         assert!(
             clear_build_dirs(&store, None, Path::new("/nowhere")).is_empty(),
-            "silence from herdr was read as nothing running"
+            "silence from backend was read as nothing running"
         );
-        assert!(build.join("wsp-w2x").exists(), "a tree went on herdr saying nothing");
+        assert!(build.join("wsp-w2x").exists(), "a tree went on backend saying nothing");
 
-        // Said, and meant: an empty answer from a herdr that answered is a
+        // Said, and meant: an empty answer from a backend that answered is a
         // machine with no agents on it, and its trees are residue.
         assert_eq!(clear_build_dirs(&store, Some(&[]), Path::new("/nowhere")).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2193,7 +2193,7 @@ bench::b: benchmark
     ///
     /// This is the strongest case for a dry run in the whole of `worklist-051`
     /// and the fixture says why in three directories. What `--all` matches is a
-    /// listing of a directory nobody types crossed with herdr's live workspace
+    /// listing of a directory nobody types crossed with backend's live workspace
     /// list — a wildcard over two things the caller cannot see from where they
     /// are standing. And the removal *does not name what it took*: it prints a
     /// count. So the preview is not a convenience here, it is the only place
@@ -2231,13 +2231,13 @@ bench::b: benchmark
         expected.sort();
         assert_eq!(said_names, expected, "the preview printed a directory listing in filesystem order");
 
-        // And herdr's silence reaches the preview as it reaches the act:
+        // And backend's silence reaches the preview as it reaches the act:
         // nothing named, because nothing would go. The caller is told which of
         // the two it got by `verify` rather than by this, which is why the
         // empty list is not enough on its own.
         assert!(
             stale_build_dirs(&store, None, &mine).is_empty(),
-            "silence from herdr was previewed as a machine with no agents on it"
+            "silence from backend was previewed as a machine with no agents on it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

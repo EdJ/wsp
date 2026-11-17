@@ -14,9 +14,9 @@
 //! other three:
 //!
 //! - **The daemon is covered.** The copy installs a *binary*; nothing told the
-//!   machine to run the daemon that uses it. That used to be herdr's
+//!   machine to run the daemon that uses it. That used to be backend's
 //!   `[[startup]]`, so the daemon's lifetime was tied to a terminal emulator's,
-//!   and when herdr stopped being on this machine the daemon stopped with it —
+//!   and when backend stopped being on this machine the daemon stopped with it —
 //!   silently, because nothing in wsp said *why* the unattended pass had
 //!   stopped. `wsp install` now writes and loads a launchd user agent; see
 //!   [`crate::launchd`] for the plist and [`launcher`] for the four ways it
@@ -580,7 +580,7 @@ fn carried_by(dst: &Path) -> Option<String> {
 /// What `doctor` says about the binary every pane re-execs into.
 ///
 /// Notes rather than problems, all of them, and the reason is the same one
-/// `cmd_agent::seat_health` gives for not calling a machine without herdr broken: being
+/// `cmd_agent::seat_health` gives for not calling a machine without backend broken: being
 /// a few commits behind is the ordinary state of an installed binary between
 /// one deliberate install and the next, and a check that shows red every hour
 /// of every day is a check that gets skipped along with the ones that mean
@@ -1065,7 +1065,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
     let dst = args.get("to").map(|s| util::expand(&s)).unwrap_or_else(default_dest);
 
     // A sandbox is the one place this verb cannot be exercised honestly. `wsp
-    // sandbox` hands an instance its own store, state and herdr session so that
+    // sandbox` hands an instance its own store, state and backend session so that
     // a verb which writes can be run for real — and what this one writes is the
     // single file no sandbox has a copy of. Without `--to` it would reach
     // straight out of the sandbox and replace the binary every live pane
@@ -1488,7 +1488,7 @@ fn exit_for(agent: &Value) -> i32 {
 /// pi has no hooks to merge a snippet into; its hooks are an extension file,
 /// and a file this verb can simply put there. The Claude Code snippet stays by
 /// hand because `settings.json` is somebody's whole configuration, and this is
-/// one file under a name of its own beside herdr's.
+/// one file under a name of its own beside backend's.
 ///
 /// The copy written is the one `bin` carries, asked for with `wsp agent
 /// pi-extension` — the binary just installed, or under `-n` the one that would
@@ -1567,8 +1567,8 @@ fn pi_extension(bin: &Path, dst: &Path, dry: bool, json_out: bool, p: &util::Pai
 /// Write and load the launchd agent that keeps `wsp daemon` alive.
 ///
 /// **A second job this verb does not have a flag for**, and every choice below
-/// follows from that. `wsp-145` replaced herdr's `[[startup]]` — a machine whose
-/// herdr had gone had no daemon at all, silently, for a week — and an install is
+/// follows from that. `wsp-145` replaced backend's `[[startup]]` — a machine whose
+/// backend had gone had no daemon at all, silently, for a week — and an install is
 /// the one moment on this machine where somebody has said out loud that what is
 /// on disk is what they want running. A flag would make the half that matters
 /// optional, and the failure it prevents is invisible: `wsp watch --status`
@@ -1579,7 +1579,7 @@ fn pi_extension(bin: &Path, dst: &Path, dry: bool, json_out: bool, p: &util::Pai
 ///
 /// - **Not a sandbox.** `WSP_HOME`/`WSP_STATE` make a complete wsp instance and
 ///   nothing else; the daemon this would start would be pointed at the live
-///   store and the live herdr, and would sync and reap against both. Same
+///   store and the live backend, and would sync and reap against both. Same
 ///   refusal as the copy above it, same reason, and it is the same check
 ///   `crate::launchd::sandboxed` makes for everything else that must not reach
 ///   out of one.

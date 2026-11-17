@@ -2,7 +2,7 @@
 //! same way [`crate::place_super`] observes a headless one.
 //!
 //! The fourth implementor of `place.rs` (`compound-064`, `compound` d7/d9).
-//! `place_herdr` types at a shell inside a multiplexer; `place_super` forks a
+//! `place_backend` types at a shell inside a multiplexer; `place_super` forks a
 //! process with no terminal at all; this one asks `compound-sup` — the
 //! resident supervisor `~/claude/compound` builds, one process per session,
 //! full libghostty rendering into an IOSurface — to open a real pty and
@@ -30,7 +30,7 @@
 //! two [`Place`] implementors, one hook vocabulary — `wsp report` (below)
 //! is what keeps a hook from having to know which one it landed in.
 //!
-//! herdr's screen-scraped `Blocked` state has no equivalent in
+//! backend's screen-scraped `Blocked` state has no equivalent in
 //! `place_super`'s headless world (robustness-051: a headless agent's denied
 //! tool call never fires `PermissionRequest`, because there is no prompt to
 //! run before). **A pty changes that.** An agent hosted here can genuinely
@@ -639,7 +639,7 @@ impl Compound<'_> {
         }
         let said = self.said(seat);
         // **A hook's word is evidence about the moment it was written, and
-        // this backend has no second source** (`compound-097`). herdr watches
+        // this backend has no second source** (`compound-097`). backend watches
         // a pty and can answer about NOW; compound answers from the last hook
         // that fired, so a record that has not been refreshed says what was
         // true then and nothing about since.
@@ -770,7 +770,7 @@ impl Compound<'_> {
     ///
     /// Not on [`Place`]: reading a pane is the observe half `place.rs`'s
     /// module docs put outside this port, which is why `wsp peek` already
-    /// calls herdr's `pane.read` directly rather than through a trait method
+    /// calls backend's `pane.read` directly rather than through a trait method
     /// — this is that seam's compound answer, called the same way. Named in
     /// `compound-111`: with no read of any kind, `compound-sup screen
     /// <socket>` (as it was before the split), typed by a person, was "the
@@ -889,7 +889,7 @@ impl Compound<'_> {
     }
 
     /// Shells to `compound-render state <render-socket> <kind>` —
-    /// `compound-109`'s verb, wrapping the ported half of herdr's
+    /// `compound-109`'s verb, wrapping the ported half of backend's
     /// agent-detection engine — exactly as [`Compound::read_screen`] shells
     /// to `compound-render screen`: this backend does not link compound's
     /// crates, so this is a wire read the same way that one is, not a
@@ -940,7 +940,7 @@ impl Compound<'_> {
 }
 
 /// `compound-113`'s two OSC-title rules — `osc_title_working` and
-/// `osc_title_idle` in `vendor/herdr-detection/manifests/claude.toml`,
+/// `osc_title_idle` in `vendor/backend-detection/manifests/claude.toml`,
 /// ported rather than shelled to, because there is no CLI verb for "classify
 /// this string" and spawning a process to run a two-line regex would be a
 /// strange place to draw that line. **A floor under `screen_state`'s answer,
@@ -1082,7 +1082,7 @@ pub fn wire_version() -> u32 {
 /// ask it for `state` rather than trusting a guess.
 ///
 /// Both are notes until they are not: no `compound-sup` on this machine is
-/// not a problem — the herdr backend needs none of this — and a
+/// not a problem — the backend backend needs none of this — and a
 /// `compound-sup` that cannot answer `wire-version` yet is an older binary,
 /// not a broken one. What one function should never do is fix either: a
 /// version check that started rebuilding or restarting somebody else's
@@ -1802,7 +1802,7 @@ pub fn reads_kind(kind: &str) -> bool {
 
 impl Place for Compound<'_> {
     /// Mints the seat's record, then — `compound-081` — puts a real shell in
-    /// its pty, the same way herdr's `open` leaves a person looking at a
+    /// its pty, the same way backend's `open` leaves a person looking at a
     /// prompt rather than a blank pane: **agents and command lines**, Ed's
     /// own words for what this port has to cover, and a bare `wsp spawn`
     /// giving a task record with nothing to attach to was the half that
@@ -3442,7 +3442,7 @@ mod tests {
     /// pi 1.3.0 (the same ones `compound#1`'s `pi_captured_screens_are_detected_as_the_manifest_does`
     /// pins). **A working or blocked pi reads `Idle` here**: the vendored
     /// `pi.toml` only has a `Working...` literal, so pi's spinner line and its
-    /// select prompt match nothing. That is a gap in herdr's manifest, not in
+    /// select prompt match nothing. That is a gap in backend's manifest, not in
     /// this backend; when a manifest sync closes it this test fails and the
     /// row moves.
     ///
@@ -3578,7 +3578,7 @@ mod tests {
     }
 
     /// `compound-111`: `wsp peek` had no way to read a compound seat at all —
-    /// "herdr would not read cpd-2" — and the workaround all week was a
+    /// "backend would not read cpd-2" — and the workaround all week was a
     /// person typing `compound-sup screen <socket>` by hand. This is that
     /// call, against a real session, proving the text a person would have
     /// read on their own screen comes back through [`Compound::read_screen`]

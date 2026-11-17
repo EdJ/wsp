@@ -498,7 +498,7 @@ pub(crate) fn send_tell(t: &Tell) -> Result<(), String> {
     }
 }
 
-/// What herdr's word for an agent's status says.
+/// What backend's word for an agent's status says.
 fn of_word(status: &str) -> State {
     match status.trim() {
         "working" => State::Working,
@@ -515,7 +515,7 @@ fn of_word(status: &str) -> State {
 /// it, and the sentence then sits in the prompt unsent — which looks exactly
 /// like an agent that read the instruction and ignored it.
 fn type_line(_pane: &str, _text: &str) -> Result<(), String> {
-    Err("no herdr socket".to_string())
+    Err("no backend socket".to_string())
 }
 
 /// Empty an agent's context, and wait for the session that replaces it where
@@ -525,7 +525,7 @@ fn type_line(_pane: &str, _text: &str) -> Result<(), String> {
 /// `agent.prompt --wait` spent five seconds on one and answered
 /// `agent_prompt_stalled` — "no observed state change" — with the clear long
 /// since done, and the status either side of it was the same word. What does
-/// change is the agent's session: herdr learns the id from Claude Code's own
+/// change is the agent's session: backend learns the id from Claude Code's own
 /// `SessionStart` hook, so a new one appearing here means the clear has landed
 /// *and* the session that replaced it has started its hooks, which is the same
 /// moment `wsp brief` is being read into it.
@@ -552,7 +552,7 @@ fn clear_agent(pane: &str, clear: &Clear) -> Result<(), String> {
 /// it. Both end in the same place — a sentence in a pane.
 ///
 /// A pane that resolves to no project is the common case rather than the odd
-/// one, and refusing there made `f` useless: herdr reports where a pane's
+/// one, and refusing there made `f` useless: backend reports where a pane's
 /// *shell* started, which for every agent launched from `~/claude` is the
 /// parent of the checkout it actually works in — one directory above every
 /// project root there is. So the fallback is to ask, and the answer is
@@ -820,7 +820,7 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
 /// that workspace's, and `↵` puts the detail pane beside itself; asking any
 /// other question would be answering about somewhere it is not.
 ///
-/// A surface is in none — herdr's sidebar belongs to no workspace, which is
+/// A surface is in none — backend's sidebar belongs to no workspace, which is
 /// the property the fork exists to get — so what it acts on is the workspace
 /// **on screen**: the one the reader is looking at as they press the key. That
 /// is the same answer a person would give if asked where they expected the
@@ -828,21 +828,21 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
 /// real workspace rather than needing somewhere new to put things.
 ///
 /// Asked here, at the key, and never carried. Which workspace is on screen is
-/// the fastest-moving fact herdr has, and a surface outlives all of them; one
+/// the fastest-moving fact backend has, and a surface outlives all of them; one
 /// resolved when the sidebar started would be right until the first click
 /// elsewhere and quietly wrong after that, splitting panes into a workspace
 /// nobody is looking at.
 ///
-/// It does move under you. Measured 2026-08-18 against the live server: herdr
+/// It does move under you. Measured 2026-08-18 against the live server: backend
 /// raises `workspace.focused` on its own — an agent coming back, a hover on
 /// its own sidebar — and the focused workspace changed twice in a few minutes
 /// with nobody typing. That is not a reason to hold one instead. A workspace
-/// herdr has put on screen *is* what the reader is looking at, so opening
+/// backend has put on screen *is* what the reader is looking at, so opening
 /// there is right by the same argument; and the alternative, a workspace
 /// chosen when the sidebar started, is wrong in exactly the cases this one is
 /// right in.
 ///
-/// `None` means herdr has no workspace at all — its start screen — and the
+/// `None` means backend has no workspace at all — its start screen — and the
 /// callers say so rather than guessing at one.
 pub(super) fn stage(self_ws: Option<&str>) -> Option<String> {
     self_ws.map(str::to_string)
@@ -867,14 +867,14 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, _me: Option<&str>
 ///
 /// `cols` of `None` gives the room back.
 ///
-/// `false` is a host with no rect to hand over — a tty panel, or a herdr from
+/// `false` is a host with no rect to hand over — a tty panel, or a backend from
 /// before this existed. The caller keeps whatever it did before; for `Z` that
 /// is [`open_full`], and the asking is what makes the tab a fallback rather
 /// than the design.
 ///
 /// **This is the seam every later expansion goes through.** A board is the same
 /// request with a different number and a different thing drawn in the room;
-/// neither is a new message, a new host, or a herdr release. If a second
+/// neither is a new message, a new host, or a backend release. If a second
 /// function ever appears beside this one, the wire has grown a verb and the
 /// argument above has been lost.
 ///
@@ -905,12 +905,12 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, _me: Option<&str>
 /// The difference is not cosmetic. An overlay implies the host is composing two
 /// things and needs to know which is on top; a page is the host handing over
 /// columns and not knowing what goes in them, which is exactly why this cost no
-/// herdr release. The wire carries a number and never a reason, and "page" is
+/// backend release. The wire carries a number and never a reason, and "page" is
 /// the word on this side for what the number is *for*.
 ///
 /// [`PAGE_MIN`]: super::render::PAGE_MIN
 pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usize>) -> bool {
-    // Zero is how the wire spells giving it back; see herdr's `wsp_sidebar`.
+    // Zero is how the wire spells giving it back; see backend's `wsp_sidebar`.
     if !screen.ask_width(cols.unwrap_or(0)) {
         return false;
     }
@@ -921,7 +921,7 @@ pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usiz
 /// Where `Z` goes next: **sidebar, half the screen, the whole page, sidebar**.
 ///
 /// Three widths through the one seam above, which is what [`expand`] was built
-/// for — a third state is a third number and cost herdr nothing.
+/// for — a third state is a third number and cost backend nothing.
 ///
 /// # The third state is the kanban's, not a second one that looks like it
 ///
@@ -993,8 +993,8 @@ pub(super) fn cycle(now: Option<usize>, widest: Option<usize>) -> Option<usize> 
 /// the rect can now be asked for it — see [`expand`] — and `Z` in a sidebar
 /// widens the sidebar rather than opening anything. What is here is what
 /// happens when there is nobody to ask: a tty panel, which is its pane's size,
-/// and a herdr too old to have said it takes widths. Both still open the tree,
-/// which is what makes the wsp half of this shippable against a herdr that has
+/// and a backend too old to have said it takes widths. Both still open the tree,
+/// which is what makes the wsp half of this shippable against a backend that has
 /// not been rebuilt — and there is no version of the sidebar's `Z` where the
 /// key does nothing.
 pub(super) fn open_full(self_ws: Option<&str>) -> String {
@@ -1014,7 +1014,7 @@ pub(super) fn open_full(self_ws: Option<&str>) -> String {
 /// is columns of cards across a workspace and a sidebar is one column of
 /// anything — but the sidebar can now ask to stop being one, so `K` draws the
 /// board in place and this is what happens when there is nobody to ask: a tty
-/// panel, which is its pane's size, and a herdr too old to have said it takes
+/// panel, which is its pane's size, and a backend too old to have said it takes
 /// widths. See [`expand`], and [`super::run::Screen::ask_width`].
 ///
 /// The `wsp kanban` it runs is built from the same [`Scope`] the page would
@@ -1239,7 +1239,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // mean: the ways out, as a list. It used to say "nothing to close ·
         // ctrl-c quits the panel", which was true and was also the whole
         // problem — the panel is the sidebar now, that sentence named the one
-        // exit that takes the sidebar down with it, and herdr's own menu, which
+        // exit that takes the sidebar down with it, and backend's own menu, which
         // is where the way out of the *terminal* used to live, is what the fork
         // replaced.
         //
@@ -2186,7 +2186,7 @@ mod tests {
         assert_eq!(view.mode, Mode::Browse);
     }
 
-    /// robustness-083's shape: herdr's `blocked` means a dialog holds the
+    /// robustness-083's shape: backend's `blocked` means a dialog holds the
     /// keyboard, so text typed at the pane goes *to the dialog*. A clear sent
     /// there could select an answer nobody chose.
     #[test]
@@ -2299,7 +2299,7 @@ mod tests {
         );
     }
 
-    /// A screen with nobody to ask: what a tty panel is, and what a herdr from
+    /// A screen with nobody to ask: what a tty panel is, and what a backend from
     /// before widths existed looks like from in here.
     struct Silent;
 
@@ -2373,7 +2373,7 @@ mod tests {
     /// is prose laid out to a measure and stops needing columns at [`PAGE_MIN`];
     /// a board is four titles side by side and has no width that is enough, so
     /// it asks past the end and takes what the host has. Neither reason is on
-    /// the wire, which is why the second one cost no herdr release.
+    /// the wire, which is why the second one cost no backend release.
     #[test]
     fn a_board_asks_for_every_column_there_is_and_a_task_page_for_a_measure() {
         use super::super::render::{PAGE_MIN, WHOLE_SCREEN};
@@ -2483,7 +2483,7 @@ mod tests {
     }
 
     /// The board's number has to survive the crossing. `cols` is a `u16` on the
-    /// wire — see herdr's `wsp_sidebar` — and a request that does not fit is not
+    /// wire — see backend's `wsp_sidebar` — and a request that does not fit is not
     /// a request that gets clamped, it is a message the host cannot parse at
     /// all: `K` would go quiet, on the hosts that support it, and only there.
     #[test]
@@ -2503,7 +2503,7 @@ mod tests {
     /// screen: it is looking at its own workspace's panes, and answering about
     /// the one somebody has just clicked into would split a pane in a tree it
     /// is not drawing. The laziness here is the whole of that guarantee — with
-    /// no herdr to ask, this test only passes because the question is not put.
+    /// no backend to ask, this test only passes because the question is not put.
     #[test]
     fn a_panel_acts_on_its_own_workspace_and_not_on_whichever_is_focused() {
         assert_eq!(stage(Some("w4")).as_deref(), Some("w4"));

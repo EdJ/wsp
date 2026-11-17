@@ -127,7 +127,7 @@
 //! its project's seat and cleans up after tasks in lanes rooted in other
 //! repositories. Run from the `wsp` seat, `wsp checkout fork-009 --rm` looked
 //! under `~/claude/wsp`, found nothing, printed `no tree for fork-009` and
-//! exited 0 — while the tree stood in `~/claude/herdr/.worktrees/fork-009`.
+//! exited 0 — while the tree stood in `~/claude/backend/.worktrees/fork-009`.
 //! Two survived that way on 2026-08-18 and were found by a `git worktree list`
 //! run for an unrelated reason; both happened to be clean.
 //!
@@ -139,7 +139,7 @@
 //!
 //! Only the *looking* widens. A tree is still made in the first candidate, so
 //! `checkout` in a repository puts the tree in that repository, because a task
-//! can genuinely be worked in two at once — `fork-006` had one tree in herdr for
+//! can genuinely be worked in two at once — `fork-006` had one tree in backend for
 //! its UI and one in wsp for the panel, on the day this was written — and where
 //! you are standing is the only statement of which you meant.
 //!
@@ -276,7 +276,7 @@ impl Flow {
 
 /// The working tree a path is in, when it is one of ours.
 ///
-/// A pure path rule on purpose: `overlap` calls it for every pane herdr reports,
+/// A pure path rule on purpose: `overlap` calls it for every pane backend reports,
 /// on every `wsp brief`, and asking git which worktree owns a path costs a
 /// process each time. The layout is ours to define, so the answer is already in
 /// the path — everything up to and including the component after `.worktrees`.
@@ -934,7 +934,7 @@ pub struct Swept {
 ///
 /// - `busy` is the world outside git — a claim still held, a pane standing in
 ///   the tree, the caller's own cwd — and comes in as a closure so the rule can
-///   be tested without a store or a live herdr, the same bargain [`stale`]
+///   be tested without a store or a live backend, the same bargain [`stale`]
 ///   makes with `closed`.
 /// - Uncommitted work stops the removal even though a closed task means the
 ///   tree is finished with. What a branch holds comes back with `wsp checkout`;
@@ -1180,8 +1180,8 @@ pub fn closed_lines(out: &Swept) -> Vec<String> {
 /// a census, not a lookup, so a `Place` object gains nothing a raw
 /// `(id, cwd)` pair doesn't already have.
 ///
-/// **A herdr that is not there answers nothing**, so its half of the merge is
-/// simply empty when the socket is down. A herdr that IS there and errors, or
+/// **A backend that is not there answers nothing**, so its half of the merge is
+/// simply empty when the socket is down. A backend that IS there and errors, or
 /// a compound census that errors, is a different fact — the direction to fail
 /// in is `sync.rs:41`'s: silence is not evidence that nobody is standing in
 /// the tree, so either error becomes the one `Err` for the whole merge, and
@@ -1201,8 +1201,8 @@ pub fn who_is_standing() -> Result<Vec<(String, String)>, String> {
 /// barrier are looking at the same directories and two answers to "is anybody
 /// in there" is how a tree comes to be taken out from under somebody. Three
 /// facts in the order they are sure: the caller's own cwd, a seat
-/// [`who_is_standing`] reports standing in the tree — herdr or compound, not
-/// herdr alone — and a claim still held.
+/// [`who_is_standing`] reports standing in the tree — backend or compound, not
+/// backend alone — and a claim still held.
 ///
 /// All three refuse in the safe direction — they keep a tree that could have
 /// gone — and none of them can be made wrong by a backend having a bad moment;
@@ -1285,7 +1285,7 @@ pub enum Tree {
 ///
 /// `standing` is the world outside git — the caller's own cwd, a pane in the
 /// tree — and comes in as a closure for the reason [`sweep`]'s `busy` does: the
-/// rule is worth testing and a live herdr is not worth needing in order to test
+/// rule is worth testing and a live backend is not worth needing in order to test
 /// it.
 pub fn discard(
     repos: Vec<PathBuf>,
@@ -4145,7 +4145,7 @@ mod tests {
 
     /// **`compound-120`**, proved the way the barrier asked for it: not a unit
     /// test standing in for a backend, a real one. `Occupied::now` used to ask
-    /// `herdr::panes()` and nothing else, so a compound seat standing in a
+    /// `backend::panes()` and nothing else, so a compound seat standing in a
     /// tree was invisible to it and the tree read as empty — exactly the same
     /// bug `compound-111` fixed in `despawn`'s tree check, in a second copy.
     #[test]
@@ -4168,7 +4168,7 @@ mod tests {
 
         let why = Occupied::now(&store)
             .of("t-9", &wt)
-            .expect("a compound seat standing in the tree was not seen — the herdr-only bug this row fixed");
+            .expect("a compound seat standing in the tree was not seen — the backend-only bug this row fixed");
         assert!(why.contains(seat.as_str()), "the reason did not name the seat standing there: {why}");
     }
 
@@ -4199,7 +4199,7 @@ mod tests {
         assert_eq!(tree_for(&bare.display().to_string(), "t-5"), None, "a directory git does not know");
     }
 
-    /// `overlap` asks this about every pane herdr reports, so it has to be a
+    /// `overlap` asks this about every pane backend reports, so it has to be a
     /// path rule and it has to get the trunk case right: a worktree nested under
     /// the root is *not* inside the trunk, however much the prefix says so.
     #[test]

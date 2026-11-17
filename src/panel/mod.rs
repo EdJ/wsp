@@ -1,12 +1,12 @@
 //! `wsp panel` — the sidebar replacement.
 //!
-//! herdr's sidebar lists workspaces (really: open folders) and, beneath them,
-//! agents — a view that falls out of how herdr is built rather than how work is
+//! backend's sidebar lists workspaces (really: open folders) and, beneath them,
+//! agents — a view that falls out of how backend is built rather than how work is
 //! organised. This panel inverts that: the spine is the project tree, tasks
 //! hang off projects, and agents attach to tasks. A workspace is only ever a
 //! destination, never a heading.
 //!
-//! It keeps the two things herdr's sidebar is genuinely good at — live agent
+//! It keeps the two things backend's sidebar is genuinely good at — live agent
 //! status and jumping to a terminal — by subscribing to the same event stream
 //! and calling `workspace.focus`/`pane.focus` on Enter.
 //!
@@ -59,7 +59,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Plumbing,
                 order: 40,
                 text: r##"  wsp panel install [--all]         split it into a workspace, or all of them —
-                                    the way it works without a herdr that draws
+                                    the way it works without a backend that draws
                                     the sidebar itself; skipped automatically
                                     while `wsp surface` is running"##,
             },
@@ -72,7 +72,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     },
     // The same panel, drawn by a host that owns the cells rather than by a
     // terminal: JSON in on stdin, frames out on stdout. Not for people —
-    // herdr's forked sidebar spawns it.
+    // backend's forked sidebar spawns it.
     crate::verbs::Verb {
         names: &["surface"],
         run: |store, _| surface(store),
@@ -82,7 +82,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 order: 60,
                 text: r##"  wsp surface                       the panel for a host that owns the cells:
                                     one JSON object per line each way, frames
-                                    out. Started by herdr, not by a person"##,
+                                    out. Started by backend, not by a person"##,
             },
         ],
     },
@@ -189,7 +189,7 @@ pub(crate) fn full_text_for_test(ui: &Ui, i: usize) -> String {
 }
 pub(crate) use rows::{collect, refetch_into, RowKind, Snapshot, Target, Ui};
 // The board is a second surface over the same facts, so it takes its glyphs and
-// its join of "what herdr says" with "what the store holds" from here rather
+// its join of "what backend says" with "what the store holds" from here rather
 // than keeping a copy. A second table of marks would drift the first time
 // either gained a state.
 pub(crate) use rows::{agent_state, status_mark, word as agent_word, AgentState};
@@ -203,11 +203,11 @@ pub(crate) use verbs::{follow, inspect, pop_out, run_wsp};
 // [`verbs::tell_claimed`].
 pub(crate) use verbs::{send_tell, tell_claimed, Tell};
 pub use run::run;
-// The same panel, drawn by a host that owns the cells — herdr's forked sidebar
+// The same panel, drawn by a host that owns the cells — backend's forked sidebar
 // today. See `surface.rs` for why the frame is built here and not there.
 pub use surface::run as surface;
 // And the frame it last drew, left on disk for a reader with no pipe to it —
-// `wsp peek panel`, which under the fork has no pane to ask herdr about. Named
+// `wsp peek panel`, which under the fork has no pane to ask backend about. Named
 // for the surface out here, where `frame` already means the panel's own
 // renderer and would not say whose.
 pub(crate) use surface::last_frame as surface_frame;

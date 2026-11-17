@@ -2,9 +2,9 @@
 //!
 //! # What this replaces, and what it was costing
 //!
-//! `wsp daemon` was started by herdr's `[[startup]]` — one line in
-//! `herdr-plugin/herdr-plugin.toml`, and the whole of how a machine got a
-//! daemon. herdr is gone on this machine, so the daemon is gone with it:
+//! `wsp daemon` was started by backend's `[[startup]]` — one line in
+//! the removed plugin manifest, and the whole of how a machine got a
+//! daemon. backend is gone on this machine, so the daemon is gone with it:
 //! `wsp watch --status` read `ticked 6d23h ago, the process is gone`, every
 //! wake spool was still holding, and nothing anywhere said *why*. The first
 //! symptom is silence, and silence from a watchdog is the one silence nobody
@@ -32,7 +32,7 @@
 //! from `/etc/paths`, and a launchd job does not run a login shell. The second
 //! backend is found by `PATH` (`place_compound::Compound`'s census), so a
 //! daemon launched without one is a daemon that cannot see half of this fleet.
-//! `executor/herdr-server.plist` argues the same thing for the executor's
+//! `executor/backend-server.plist` argues the same thing for the executor's
 //! plugins; this is the same argument, one file nearer the trunk.
 //!
 //! # What an install does about a job that is already there
@@ -54,10 +54,10 @@
 //!
 //! # Why a second daemon is still turned away
 //!
-//! herdr's `[[startup]]` is not being removed here, only demoted: a machine
-//! where `wsp install` has never run still gets a daemon when herdr starts, and
+//! backend's `[[startup]]` is not being removed here, only demoted: a machine
+//! where `wsp install` has never run still gets a daemon when backend starts, and
 //! that is the safety net for the machine this lands on. So launchd's job and
-//! herdr's can both be pointed at the same store, and `crate::daemon`'s one-
+//! backend's can both be pointed at the same store, and `crate::daemon`'s one-
 //! daemon-per-store rule is what makes that safe rather than a second copy of
 //! t-260817-052. Nothing here coordinates with it, and nothing here should: the
 //! refusal names the pid and `launchd` stays down, which is the outcome the
@@ -66,7 +66,7 @@
 //! # Why `KeepAlive` is not `true`
 //!
 //! Because `wsp daemon` exits **0** when it declines to run — a second daemon
-//! on one store is not a failure, and herdr's startup hook used to rely on
+//! on one store is not a failure, and backend's startup hook used to rely on
 //! that. A plain `<true/>` would restart it immediately, it would decline
 //! again, and launchd would spend the rest of the day running `wsp daemon` in a
 //! loop. `SuccessfulExit: false` restarts a crash and a `kill -9` and leaves a
@@ -83,7 +83,7 @@ use crate::util;
 
 /// The job's name in launchd and in `~/Library/LaunchAgents`.
 ///
-/// Not `edjames.wsp`, which is the herdr plugin's id: this is a different
+/// Not `edjames.wsp`, which is the backend plugin's id: this is a different
 /// mechanism on a machine that may have several logins, and a launchd label is
 /// what `launchctl print` and `bootout` take, so it has to be the string in the
 /// plist and nowhere else.
@@ -106,7 +106,7 @@ pub fn plist_path() -> PathBuf {
 /// makes before it will replace a binary a sandbox does not own. Both exist
 /// because `WSP_HOME` and `WSP_STATE` make a complete wsp instance and nothing
 /// else: the daemon this writes would be pointed at `~/wsp` and at a socket
-/// belonging to the live herdr, and would then sync and reap against it, which
+/// belonging to the live backend, and would then sync and reap against it, which
 /// is the leak `robustness-021` was filed for. A throwaway `WSP_HOME` is the
 /// most common way that happens.
 pub fn sandboxed() -> bool {
@@ -119,7 +119,7 @@ pub fn sandboxed() -> bool {
 
 /// The same rule over values handed in, so it can be asked without the test
 /// mutating this process's environment. `WSP_HOME` and `WSP_STATE` are the two
-/// that make a complete wsp instance; `WSP_BIN` is what `herdr-plugin/run.sh`
+/// that make a complete wsp instance; `WSP_BIN` is what the launcher
 /// checks before `~/.local/bin/wsp`, and its presence means the same thing here
 /// — somebody handed this process a wsp that is not the machine's.
 fn sandboxed_in(home: Option<&OsStr>, state: Option<&OsStr>, bin: Option<&OsStr>) -> bool {
@@ -253,7 +253,7 @@ pub fn plan(want: &str, path: &Path) -> Plan {
 
 /// The `gui/$UID` domain, which is where a user agent belongs.
 ///
-/// `gui` rather than `system` for the reason `executor/herdr-server.plist`
+/// `gui` rather than `system` for the reason `executor/backend-server.plist`
 /// gives: it is the login session, and it is the only domain from which an
 /// agent can reach the login keychain. `$UID` is asked of `id` rather than the
 /// environment, because `UID` is a bash export and this has to work the same
@@ -872,7 +872,7 @@ mod tests {
     }
 
     /// A sandbox writes nothing and loads nothing. Its daemon would be pointed
-    /// at `~/wsp` and the live herdr's socket, and would then sync and reap
+    /// at `~/wsp` and the live backend's socket, and would then sync and reap
     /// against both — which is the leak `robustness-021` was filed for, and the
     /// one thing `WSP_HOME` makes easy to do by accident.
     ///

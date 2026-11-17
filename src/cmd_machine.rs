@@ -1,13 +1,13 @@
 //! `wsp machine` — the machines agents can be run on.
 //!
 //! A machine here is an *executor*: a second box the seat drives, running a
-//! headless herdr and nothing of ours. Nobody sits at it, it holds no store and
+//! headless backend and nothing of ours. Nobody sits at it, it holds no store and
 //! no state, and its `wsp` is a shim that runs this machine's. So a machine
 //! record is small on purpose — a name, an ssh alias, and enough about the box
 //! to recognise it in a list.
 //!
 //! The name is load-bearing in a way a project slug is not: it is the suffix on
-//! a host-qualified id, `w0:p3@mb2`, which is how every herdr call finds the
+//! a host-qualified id, `w0:p3@mb2`, which is how every backend call finds the
 //! right socket. See [`crate::model::valid_machine_name`].
 //!
 //! Nothing here dials anything, and `add` deliberately does not test the
@@ -153,14 +153,14 @@ pub fn add(store: &Store, args: &Args) -> i32 {
 ///
 /// The same bargain [`crate::panel::Snapshot`] and [`crate::overlap::World`]
 /// make, and for the same reason: this view joins a file the store holds with
-/// an answer herdr gives, and while it did both itself the only way to see a
+/// an answer backend gives, and while it did both itself the only way to see a
 /// frame was to have a daemon, a tunnel and a second box. The three states it
 /// exists to tell apart — never reported, answered and stopped, answering — are
 /// exactly the ones nobody can stand up on demand.
 pub(crate) struct Fleet {
     pub machines: Vec<Machine>,
     pub live: BTreeMap<String, MachineLive>,
-    /// Every agent there is, `@machine`-qualified. Empty when herdr is not
+    /// Every agent there is, `@machine`-qualified. Empty when backend is not
     /// answering, which is a machines list without the agents on it rather than
     /// no machines list — the durable half of a machine is a file and does not
     /// need a socket to be read.
@@ -183,7 +183,7 @@ pub(crate) struct Fleet {
 
 impl Fleet {
     /// The live join: the store for what machines exist and what the daemon
-    /// last saw, herdr for who is on them.
+    /// last saw, backend for who is on them.
     pub(crate) fn live(store: &Store) -> Fleet {
         Fleet {
             machines: store.machines(),
@@ -229,7 +229,7 @@ fn seat_cap_line(cap: Option<usize>, working: &[String]) -> String {
     }
 }
 
-/// One agent's row, with only the fields the machines list reads. herdr's own
+/// One agent's row, with only the fields the machines list reads. backend's own
 /// record is gone (wsp-120); nothing fills this live.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Pane {
@@ -251,7 +251,7 @@ struct Standing {
 
 /// Every agent there is, partitioned by the machine it is on.
 ///
-/// A partition of one list rather than a query per machine: [`herdr::agents`]
+/// A partition of one list rather than a query per machine: [`backend::agents`]
 /// already fans out and comes back `@machine`-qualified, so where each one is
 /// is written on it. `""` is this seat.
 fn standing(f: &Fleet) -> Vec<Standing> {
@@ -541,8 +541,8 @@ pub fn set(store: &Store, args: &Args) -> i32 {
             // One release of a name nobody but this repository ever typed, kept
             // because it is in the README's executor section and the error it
             // would otherwise get names every field except the one you meant.
-            "herdr_sock" => {
-                eprintln!("wsp: `herdr_sock` is now `backend_at` — a machine records where its backend listens, whichever backend that is");
+            "backend_sock" => {
+                eprintln!("wsp: `backend_sock` is now `backend_at` — a machine records where its backend listens, whichever backend that is");
                 return 2;
             }
             "os" => m.os = v.to_string(),
@@ -809,7 +809,7 @@ fn show_seat(store: &Store, args: &Args) -> i32 {
 /// Read off the ids and not the claim's `host`, for the reason
 /// `cmd_agent::machine_of` gives: a far agent's claims record the seat's host.
 pub(crate) fn held_on(_store: &Store, _name: &str) -> Vec<(String, String)> {
-    // No id carries a machine now that herdr's `@machine` qualifier is gone.
+    // No id carries a machine now that backend's `@machine` qualifier is gone.
     Vec::new()
 }
 
@@ -1250,19 +1250,19 @@ mod tests {
                 agent("w0:p6", "claude", "idle", "reading sync.rs"),
             ],
             bindings,
-            tasks: vec![crate::model::Task::new("lift the machines view off herdr", "t-001")],
+            tasks: vec![crate::model::Task::new("lift the machines view off backend", "t-001")],
             seat: "seat-under-test".into(),
             seat_cap: None,
             seat_working: Vec::new(),
         }
     }
 
-    /// herdr not answering costs the list its agents and nothing else. This is
+    /// backend not answering costs the list its agents and nothing else. This is
     /// the distinction the whole executor design is built around — "unreachable"
     /// is not "answering with nothing" — and the durable half of a machine is a
     /// file, which does not need a socket to be read.
     #[test]
-    fn no_herdr_is_a_machines_list_without_the_agents_on_it() {
+    fn no_backend_is_a_machines_list_without_the_agents_on_it() {
         let mut f = fleet();
         f.agents.clear();
         let out = list_lines(&f, &plain());

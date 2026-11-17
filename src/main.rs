@@ -1,8 +1,8 @@
-//! wsp — workspace and task control plane for herdr.
+//! wsp — workspace and task control plane for agent teams.
 //!
 //! Durable facts (projects, tags, tasks) live in `~/wsp` as Markdown + git.
-//! Live facts (panes, agent status) come from herdr's socket. This binary
-//! joins them, and pushes the join back into herdr's sidebar as metadata
+//! Live facts (panes, agent status) come from backend's socket. This binary
+//! joins them, and pushes the join back into backend's sidebar as metadata
 //! tokens.
 
 use std::collections::{HashMap, HashSet};
@@ -246,7 +246,7 @@ const LOOKS_FIRST: &str =
 ///   living inside the verb that removes, kept in step with it by nothing.
 /// - **A set that is not knowable ahead of the act is refused with the reason
 ///   on the verb.** `despawn` alone, and its argument is in
-///   [`crate::cmd_spawn::despawn`]: every step is conditioned on herdr's answer
+///   [`crate::cmd_spawn::despawn`]: every step is conditioned on backend's answer
 ///   to the last one, so a preview is a report of what would be *attempted* —
 ///   which is a different sentence from what would happen, on exactly the runs
 ///   that matter.
@@ -451,7 +451,7 @@ fn signpost(verb: &str) -> &'static [&'static str] {
     // what they were asked, rather than leaving it to be looked up.
     match verb {
         "despawn" => &[
-            "Ending an agent is a run of steps across herdr, each one decided by",
+            "Ending an agent is a run of steps across backend, each one decided by",
             "the last one's answer, so what it would do is not knowable until it",
             "does it. For the half that is a directory: `wsp checkout <id> --rm -n`.",
         ],
@@ -473,7 +473,7 @@ fn signpost(verb: &str) -> &'static [&'static str] {
 ///
 /// Three commands do not. `init` is what makes one. `doctor` reports on the
 /// store's state, and "there isn't one" is the most useful thing it can say.
-/// And `panel storyboard` reads neither the store nor herdr — it builds its
+/// And `panel storyboard` reads neither the store nor backend — it builds its
 /// fixtures itself, which is the whole claim in `story.rs`'s header: "the
 /// frames come out the same on a laptop with nothing running".
 ///
@@ -988,7 +988,7 @@ fn help_text() -> String {
     // hand is a sixth class away from telling them something false.
     let classes = cmd_watch::Class::every().map(|c| c.word()).join(", ");
     format!(
-        "{} {} — workspace and task control plane for herdr\n\n{}\n\n{}",
+        "{} {} — workspace and task control plane for agent teams\n\n{}\n\n{}",
         p.bold("wsp"),
         version(),
         registry::help_sections(&|s| p.bold(s), &classes),
@@ -1192,7 +1192,7 @@ mod tests {
         // process-wide resource, one lock, and this was one of the last three
         // places still relying on nobody else happening to look
         // (`robustness-074`). Bare rather than `isolated` because nothing under
-        // it reaches a store or a herdr.
+        // it reaches a store or a backend.
         let _env = crate::util::env_lock();
         std::env::remove_var("WSP_TERSE");
         assert!(!super::Args::synth("brief", &[], &[]).terse());
@@ -1519,7 +1519,7 @@ mod tests {
     /// Asserted on the parse rather than by calling `say`, because the failure
     /// was upstream of it: `say` was not on [`LITERAL_AFTER`], so `--from` was
     /// a flag to be swallowed and `-` was never a stream to anybody. Calling
-    /// `say` needs a herdr pane and would test the store, which the handbook
+    /// `say` needs a backend pane and would test the store, which the handbook
     /// forbids; this tests the seam the bug was actually at.
     #[test]
     fn say_takes_its_prose_off_a_stream_like_every_other_prose_verb() {

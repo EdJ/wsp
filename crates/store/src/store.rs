@@ -189,7 +189,7 @@ fn stamp_of(m: &fs::Metadata) -> Option<Stamp> {
 /// [`Machine`]; see `Store::machines_live` for why the halves are apart.
 ///
 /// A struct rather than a bare `Value` because four different things read this
-/// — the tunnel supervisor that writes it, `herdr::call` picking a socket, the
+/// — the tunnel supervisor that writes it, `backend::call` picking a socket, the
 /// panel, and the reap guard that must not mistake unreachable for empty — and
 /// a field name mistyped in one of them would read as `false` rather than as
 /// an error.
@@ -314,7 +314,7 @@ impl Store {
     pub fn open() -> Store {
         // The default store is the developer's own, at `~/wsp`, and a test that
         // opens it is reading whoever is working today — which is how two tests
-        // of a fake herdr backend came to fail on a laptop being switched on.
+        // of a fake backend backend came to fail on a laptop being switched on.
         // The argument, and the helper, are in [`crate::util::isolated`];
         // this is the line that makes a test that reads the live store
         // impossible to write by accident rather than merely discouraged. It
@@ -559,7 +559,7 @@ impl Store {
     /// no faster parse to write. The cost is the reading.
     ///
     /// It is paid four times a second in the panel somebody is looking at.
-    /// Every herdr `pane.updated` marks that panel dirty — two a second per
+    /// Every backend `pane.updated` marks that panel dirty — two a second per
     /// working agent — and its 250 ms gate then rebuilds the frame from a
     /// fresh reading of all 285 files. That is what "the panel feels laggy"
     /// was, and the focused panel measured 4.1% of a core against 1.2% for the
@@ -2088,7 +2088,7 @@ impl Store {
     //
     // Three agents ran in this tree on 2026-08-15 and the window is a
     // millisecond wide, so this has probably already happened and been read as
-    // "herdr lost my claim". A lock file makes the whole cycle indivisible.
+    // "backend lost my claim". A lock file makes the whole cycle indivisible.
 
     fn lock_path(&self) -> PathBuf {
         self.state.join(".lock")
@@ -2296,12 +2296,12 @@ impl Store {
     // ---- claims -----------------------------------------------------------
     //
     // A binding says which *pane* is on a task, and a pane is the most
-    // perishable identifier herdr has: it dies with its workspace, and one
+    // perishable identifier backend has: it dies with its workspace, and one
     // cascade of `pane.exited` once cleared every binding on this machine at a
     // stroke.
     //
     // A claim says which *workspace* the task is being worked in, keyed on
-    // things herdr persists in its own session file: the workspace id, and as a
+    // things backend persists in its own session file: the workspace id, and as a
     // fallback its label and cwd. The fallback is load-bearing in both
     // directions — it finds a workspace rebuilt under a new id, and it is the
     // only thing that can tell a workspace apart from a later one that was
@@ -2332,7 +2332,7 @@ impl Store {
     // A row here is not a claim to work: an agent with a row and no claim is
     // exactly what `cmd_govern::occupant` is going to look for when it stops
     // asking which workspace somebody is in — *unassigned* is a fact about
-    // wsp's own record, where "the same workspace" was a fact about herdr's
+    // wsp's own record, where "the same workspace" was a fact about backend's
     // furniture.
 
     /// agent id -> agent record
@@ -2573,7 +2573,7 @@ impl Store {
     // rides the brief instead, like every other fact a successor needs, and it
     // is cleared by `despawn` when the pane it names actually goes.
     //
-    // State rather than store: a pane id is herdr's and dies with the session,
+    // State rather than store: a pane id is backend's and dies with the session,
     // the same argument the seat record itself makes.
 
     /// scope -> handover record: `{from, to, since}`, plus `{failed,
@@ -2951,7 +2951,7 @@ impl Store {
     // ---- what a pane is called, at full length ----------------------------
     //
     // A label on the wire is cut to `cmd_agent::LABEL_MAX`, and the rule is
-    // right: a herdr sidebar is 26 columns, and a paragraph is not a name. What
+    // right: a backend sidebar is 26 columns, and a paragraph is not a name. What
     // was wrong is that the cut copy was the *only* copy — the pane label, the
     // workspace name and the `task` token all held 44 characters and the store
     // held nothing longer, so `panel --full`, which has a hundred columns to
@@ -2974,9 +2974,9 @@ impl Store {
     //
     // **And the sentence itself, which is not a statement about a label.**
     // `said` is what the agent typed and `task` is the task its seat held when
-    // it did (absent when it held none). It used to be kept only once herdr
+    // it did (absent when it held none). It used to be kept only once backend
     // had taken the name, which read the record as a reading of what one
-    // renderer drew — so on a seat no herdr names, which since `compound-112`
+    // renderer drew — so on a seat no backend names, which since `compound-112`
     // is every seat on the ordinary machine, `wsp say` refused and the
     // sentence went nowhere (wsp-115, wsp-122). The two halves are two facts
     // with two invalidations, and neither writer touches the other's keys:
@@ -3068,7 +3068,7 @@ impl Store {
     // binding with no task in it is a state every reader of bindings —
     // `doctor`'s quiet sweep, `reconcile`, a room's rename — would have to
     // learn to skip. Where a claim is made, `spawn` copies the record onto it,
-    // which is what carries it to a new seat across a herdr restart
+    // which is what carries it to a new seat across a backend restart
     // (`cmd_agent::reconcile`) and a `wsp resume`.
 
     /// seat -> `{ seat, scope }`: the seat a `wsp spawn` was run from, and
@@ -3108,7 +3108,7 @@ impl Store {
 
     // ---- since when a seat has been in its state -----------------------
     //
-    // `wsp-250`. herdr numbers a state change (`state_change_seq`) and does
+    // `wsp-250`. backend numbers a state change (`state_change_seq`) and does
     // not date it, and compound's seat directory dates only its last write, so
     // nothing on the port says when a seat began its turn or stopped. wsp
     // dates it itself, the first time a census it reads sees the change: every
@@ -3122,7 +3122,7 @@ impl Store {
     /// same state.
     ///
     /// `from` is the source a seat was read from — a backend, and the machine
-    /// when it is not this one (`herdr`, `herdr@mb2`, `compound`) — and is
+    /// when it is not this one (`backend`, `backend@mb2`, `compound`) — and is
     /// what decides whether a seat missing from `seen` is gone: its entry is
     /// dropped only when `answered` says its own source answered this reading
     /// without it. A far machine that was silent, or not asked at all because
@@ -3230,16 +3230,16 @@ impl Store {
     //
     // Nothing here dials anything. The daemon's tunnel supervisor is the only
     // writer (wsp-045); everybody else — the panel, the machines view,
-    // `herdr::call` picking a socket — reads what it last wrote. A reader that
+    // `backend::call` picking a socket — reads what it last wrote. A reader that
     // probed for itself would be a second opinion on reachability, and two
     // opinions is exactly the ambiguity that makes an offline machine look
     // like an empty one.
 
-    /// Where the daemon forwards a machine's herdr socket to.
+    /// Where the daemon forwards a machine's backend socket to.
     ///
     /// Named here rather than by whoever gets there first, because the process
     /// that creates it (the daemon) and the process that connects to it (any
-    /// `herdr::call` on an `@machine` id) are different processes that never
+    /// `backend::call` on an `@machine` id) are different processes that never
     /// speak — a convention each spelled out for itself would be a bug nobody
     /// could see. Under the state dir and not `/tmp`, so it goes when the
     /// state does.
@@ -3248,7 +3248,7 @@ impl Store {
     /// macOS, and `~/.local/state/wsp/sock/<name>.sock` leaves room for a long
     /// home directory and a long machine name without either being the thing
     /// that breaks.
-    // Unused until the tunnel supervisor lands (wsp-045) and `herdr::call`
+    // Unused until the tunnel supervisor lands (wsp-045) and `backend::call`
     // learns to route on `@machine` (wsp-046). Here now because it is the
     // agreement between those two, and an agreement written down after the
     // fact is one that was guessed at twice.
@@ -3782,7 +3782,7 @@ mod tests {
 
     /// The daemon marker is state and not work: a daemon starting must not look
     /// to every panel on the machine like something changed in the store, or
-    /// every herdr restart would repaint twenty-two of them for nothing. And it
+    /// every backend restart would repaint twenty-two of them for nothing. And it
     /// keys on the state directory, which is what makes a sandbox's daemon and
     /// the live one two daemons rather than a fight — the argument is in
     /// [`crate::daemon`].

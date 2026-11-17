@@ -260,7 +260,7 @@ impl Standing {
     /// where it is finished or where the status word already says it.
     ///
     /// Nothing about the agent: who is standing on it is the claim's to say,
-    /// and this module never asks herdr.
+    /// and this module never asks backend.
     pub fn note(&self) -> String {
         match &self.landing {
             Some(Landing::Ahead { commits, trunk }) => {
@@ -1358,7 +1358,7 @@ impl Repos {
     ///
     /// **Every root, not the first.** `compound-127`'s bug was this call
     /// answering the wrong repository and doing it silently — `root_of` took
-    /// the project's first root, so every barrier on `herdr-audit` scanned
+    /// the project's first root, so every barrier on `backend-audit` scanned
     /// `~/claude/compound`'s reflog for work that landed in `~/claude/wsp`.
     /// `landing` and `touched` both already loop a task's id over every name
     /// it has had (`branches`, below) to find the branch a renumbering left
@@ -2660,7 +2660,7 @@ mod tests {
         std::fs::write(other.join("kept.txt"), "one\n").unwrap();
         git_run(&other, &["add", "kept.txt"]);
         git_run(&other, &["commit", "--quiet", "-m", "first"]);
-        let mut p = Project::new("herdr");
+        let mut p = Project::new("backend");
         p.roots = vec![other.display().to_string()];
         store.save_project(&p).unwrap();
 
@@ -2670,7 +2670,7 @@ mod tests {
         assert_eq!(position(&store, &w, Reading::Landed).at, Some(1), "unlanded where it was");
 
         let mut t = store.task("wsp-1").unwrap();
-        t.project = Some("herdr".into());
+        t.project = Some("backend".into());
         store.save_task(&t).unwrap();
         committed(&other, "wsp-1");
 
@@ -2691,7 +2691,7 @@ mod tests {
     /// `root_of`'s bug was silent: it took the first root and searched only
     /// that repository's reflog, so `compound-12N`'s land in `~/claude/wsp`
     /// went unread against `~/claude/compound`'s history and every barrier on
-    /// `herdr-audit` reported the group unlanded and unreadable. This is the
+    /// `backend-audit` reported the group unlanded and unreadable. This is the
     /// same shape with the order of `p.roots` chosen so the naive first-root
     /// read fails: were `landing` or `touched` still asking only `roots[0]`,
     /// `at_barrier` below would stay false and `commit` would stay `None`.
@@ -2730,7 +2730,7 @@ mod tests {
         assert!(t.overlap.unread.is_empty(), "the member's land was found, not reported as unread");
         assert!(
             t.landed[0].commit.is_some(),
-            "commit read back off the second root's reflog, the account `herdr-audit` could not get"
+            "commit read back off the second root's reflog, the account `backend-audit` could not get"
         );
     }
 

@@ -326,9 +326,9 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
         ),
         (
             "In the header, and among the agents",
-            "herdr says working or idle and nothing more. What an idle agent is \
+            "backend says working or idle and nothing more. What an idle agent is \
              waiting for comes from the task in its hands, which is the half \
-             the store knows — so the same two states from herdr become four \
+             the store knows — so the same two states from backend become four \
              different answers here. One mark per agent, what wants you first, \
              what is free next: there is nothing to do about an agent that is \
              working. Each mark is clickable and goes to that terminal.",
@@ -338,7 +338,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Accent, g::WORKING)], "working", "running"),
                 mark(&[(Style::Muted, g::IDLE)], "spare", "stopped, holding nothing — a person's worth of attention going spare"),
                 mark(&[(Style::Accent, g::SEAT)], "coordinating", "stopped, and in a project's governor slot — a governor is idle between the agents it starts, which is most of the night, and none of that idleness is you being the blocker"),
-                mark(&[(Style::Dim, g::QUIET)], "quiet", "herdr says neither, usually an agent that has not spoken since it started"),
+                mark(&[(Style::Dim, g::QUIET)], "quiet", "backend says neither, usually an agent that has not spoken since it started"),
                 mark(&[(Style::Dim, g::MORE), (Style::Plain, " "), (Style::Dim, "11")], "too many to draw", "the strip is clipped, never the count beside it — click the ⋯ for the rest"),
             ],
         ),
@@ -679,7 +679,7 @@ pub(super) fn card_lines(card: &super::rows::Card, w: usize, room: usize) -> Vec
 /// The word in the footer that opens the menu, and the whole of what a click
 /// has to land on.
 ///
-/// herdr's own sidebar keeps its menu behind exactly this: the word `menu`,
+/// backend's own sidebar keeps its menu behind exactly this: the word `menu`,
 /// right-aligned in the sidebar's footer strip. Copied rather than invented,
 /// and copied as a word rather than as a hamburger — `≡` is already
 /// [`glyph::NOTES`] here and means "something is written", and a panel with one
@@ -763,7 +763,7 @@ pub(super) fn menu_lines(menu: &super::keys::Menu, w: usize) -> Vec<Line> {
 /// Which row of the menu a click at `x`,`y` landed on.
 ///
 /// The border is not a row and answers `None`: a click on the frame of a box is
-/// a click that missed, and the row nearest it is `quit herdr`.
+/// a click that missed, and the row nearest it is `quit backend`.
 pub(super) fn menu_at(
     menu: &super::keys::Menu,
     w: usize,
@@ -1494,7 +1494,7 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Accent, "machines");
     }
-    // And the door, at the right-hand edge, where herdr keeps its own. Fitted
+    // And the door, at the right-hand edge, where backend keeps its own. Fitted
     // rather than appended: the counts are what give way if a pane is narrow
     // enough for the two to meet, because a count that is one column short is
     // still a count and a menu that is one column short is not a door.

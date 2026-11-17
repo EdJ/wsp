@@ -6,8 +6,8 @@
 /// **Not a thing wsp writes.** The module docs say why the arrow points the
 /// other way: the backend puts this in the seat's environment, because the
 /// backend is the only party that knows the seat's name at the moment the
-/// environment is fixed. herdr has its own name for the same string and
-/// `place_herdr` reads that instead; this is the convention for a supervisor or
+/// environment is fixed. backend has its own name for the same string and
+/// `place_backend` reads that instead; this is the convention for a supervisor or
 /// a runtime arriving without one, so that not every new backend invents a
 /// variable and every adapter has to learn it.
 ///

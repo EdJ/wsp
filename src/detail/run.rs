@@ -32,7 +32,7 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     panel::stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
     // No event stream here: the view is a reader, and a second subscriber per
-    // workspace would double herdr's fan-out for a pane that can wait. Instead
+    // workspace would double backend's fan-out for a pane that can wait. Instead
     // poll often and do nothing unless something moved — reading the target
     // and stat-ing the store is cheap, re-reading every task file is not.
     let started_as = crate::util::exe_stamp();

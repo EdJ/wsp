@@ -1326,7 +1326,7 @@ pub struct Machine {
     /// Where this machine's backend listens, in whatever words that backend
     /// uses. [`crate::place`]'s term, and opaque here for the same reason a
     /// [`crate::place::Seat`] is: nothing in the model reads it, and the
-    /// adapter is the only thing entitled to know what it means. For herdr it
+    /// adapter is the only thing entitled to know what it means. For backend it
     /// is an absolute path *on that machine* — what `ssh -L <here>:<there>`
     /// forwards — and for a backend reached over TCP it would be a host and a
     /// port without anything here changing.
@@ -1337,9 +1337,9 @@ pub struct Machine {
     /// daemon's tick.
     ///
     /// Empty means *the backend's own default*, and the backend supplies it:
-    /// `place_herdr::mirrored_socket` is herdr's, the mirrored-path assumption
+    /// `place_backend::mirrored_socket` is backend's, the mirrored-path assumption
     /// that is right while paths mirror and is exactly what a Linux executor
-    /// breaks. It used to be defaulted here, which put a `crate::herdr` call in
+    /// breaks. It used to be defaulted here, which put a `crate::backend` call in
     /// the file that is meant to be nothing but durable entities (robustness-019).
     pub backend_at: String,
     /// Where trees and per-row state live on the far side
@@ -1471,7 +1471,7 @@ impl Machine {
             // twice.
             ssh: doc.opt("ssh").unwrap_or_else(|| name.clone()),
             name,
-            // No default, and no reading of the old `herdr_sock` key either: a
+            // No default, and no reading of the old `backend_sock` key either: a
             // fallback here would be this file naming a backend again, which is
             // the whole of what robustness-019 was about. Nothing on disk carries
             // the old key — the field was a day old and no store had a machines

@@ -281,7 +281,7 @@ pub(crate) struct Ctx {
 
 impl Ctx {
     pub(crate) fn live(store: &Store) -> Ctx {
-        // A herdr that is not answering costs the agent marks and nothing
+        // A backend that is not answering costs the agent marks and nothing
         // else. The durable half is the board.
         Ctx::of(store, live::panes())
     }
@@ -289,7 +289,7 @@ impl Ctx {
     /// The same, with the census handed in.
     ///
     /// For the board drawn as a page inside the panel, where the loop is
-    /// already holding what herdr is running — pushed to it, in a surface,
+    /// already holding what backend is running — pushed to it, in a surface,
     /// rather than asked for. A page repainting four times a second must not
     /// reopen the socket `fork-001` closed; see [`crate::detail::Ctx::page`],
     /// which takes it for the same reason.
@@ -372,7 +372,7 @@ pub(crate) fn collect(ctx: &Ctx, scope: &Scope, show_done: bool) -> Board {
             status: t.status(),
             priority: t.priority(),
             project: t.project.clone(),
-            // The two halves the panel already joins: what herdr says the pane
+            // The two halves the panel already joins: what backend says the pane
             // is doing, and what the store says it is holding while it does it.
             agent: pane.map(|p| crate::panel::agent_state(&p.state, Some(t.status()), p.seat.is_some())),
             pane: pane.map(|p| p.pane.clone()),
@@ -463,7 +463,7 @@ impl Board {
     /// is most likely to be read for — you look at the columns to decide what
     /// happens next, and this is who could do it.
     ///
-    /// `Quiet` is deliberately absent. herdr says neither working nor idle, so
+    /// `Quiet` is deliberately absent. backend says neither working nor idle, so
     /// nothing here is going to advertise it as capacity.
     pub(crate) fn spare(&self) -> Vec<&Agent> {
         self.agents.iter().filter(|a| a.state == AgentState::Spare).collect()
@@ -681,7 +681,7 @@ mod tests {
             vec![
                 // What the custodian's pane wears from its first `wsp say`: the
                 // sentence alone, with nothing in front of it.
-                pane("w2:p1", "w2", "restarted after herdr died; 02 is next"),
+                pane("w2:p1", "w2", "restarted after backend died; 02 is next"),
                 pane("w1:p1", "w1", "Verb UI"),
             ],
             &governors,
