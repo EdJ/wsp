@@ -517,6 +517,14 @@ pub fn a_childs(was: &Value, payload: &Value) -> bool {
     theirs != seats
 }
 
+/// Whether a hook is only a sign of life: a tool began or ended. It changes no
+/// state ([`said_by`] is `None` for both), but a seat that is `working` and says
+/// so again is a record that is still fresh. Claude Code's `PostToolUse` and the
+/// pi extension's tool events both land here.
+pub fn is_activity(hook: &str) -> bool {
+    matches!(hook.trim(), "PreToolUse" | "PostToolUse")
+}
+
 /// What a hook says the agent needs, written to `said.json` beside the state it
 /// is read as (`wsp-301`): `PermissionRequest` and `Elicitation` are `Working`
 /// to [`said_by`] because `State` has no word for *waiting on a person*, so the
@@ -717,7 +725,8 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
     // state; it is only ever here to close a question (`wsp-302`).
     let state = said_by(&hook);
     let closes = (place::above().closes)(&hook);
-    if state.is_none() && !closes {
+    let activity = is_activity(&hook);
+    if state.is_none() && !closes && !activity {
         return 0;
     }
     let payload: Value = match args.has("payload") {
@@ -737,7 +746,16 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
     if closes {
         (place::above().heard)(store, &hook, &payload);
     }
-    let Some(state) = state else { return 0 };
+    let Some(state) = state else {
+        // A tool ran: the seat is alive, and if it was working it still is.
+        if activity {
+            let compound = crate::place_compound::Compound::new();
+            if compound.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
+                compound.touched(&seat, &payload);
+            }
+        }
+        return 0;
+    };
     // `--hold SECS` is the other thing this verb does for a hook: not saying
     // what happened but waiting on the person (`wsp-301`), and the only time
     // it prints anything. It is its own hook entry with its own long timeout,
@@ -2922,14 +2940,23 @@ mod tests {
         let sent: Vec<&str> = PI_EXTENSION
             .split("report(\"")
             .skip(1)
+            .chain(PI_EXTENSION.split("tool(\"").skip(1))
             .filter_map(|rest| rest.split('"').next())
             .collect();
         for hook in ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "SessionEnd"] {
             assert!(sent.contains(&hook), "{hook} is not sent by pi/wsp-session.ts: {sent:?}");
         }
-        for hook in &sent {
-            assert!(said_by(hook).is_some(), "pi/wsp-session.ts sends {hook}, which `wsp report` ignores");
+        for hook in ["PreToolUse", "PostToolUse"] {
+            assert!(sent.contains(&hook), "{hook} is not sent by pi/wsp-session.ts: {sent:?}");
         }
+        for hook in &sent {
+            assert!(
+                said_by(hook).is_some() || is_activity(hook),
+                "pi/wsp-session.ts sends {hook}, which `wsp report` ignores"
+            );
+        }
+        // A pi's `UserPromptSubmit` is also what acknowledges `compound-sup deliver`.
+        assert!(PI_EXTENSION.contains("compound-sup") && PI_EXTENSION.contains("submitted"));
         // And the guard comes first: a seat-less pi is silent.
         assert!(PI_EXTENSION.contains("process.env.WSP_SEAT_ID"));
     }
