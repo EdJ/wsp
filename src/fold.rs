@@ -355,11 +355,14 @@ pub(crate) fn did_since(store: &Store, seat: &str, since: i64) -> Option<crate::
 /// the seat after it was heard. Its start is the heard time less the seconds
 /// it had waited, kept at the one already recorded for the same command so a
 /// later report of the same stall is not a new one.
-pub(crate) fn stalls(store: &Store, seat: &str, recorded: Option<(&str, i64)>) -> Vec<crate::stuck::Stall> {
-    let Some(host) = folded_host(store) else { return Vec::new() };
+///
+/// The report only: what shape the command is, and so the `Stall`, is the
+/// seats' to say ([`crate::cmd_agent::stuck_of_seat`]), not the fold's.
+pub(crate) fn stall(store: &Store, seat: &str, now: i64, recorded: Option<(&str, i64)>) -> Option<Reported> {
+    let host = folded_host(store)?;
     let s = &read(&stuck_path(&store.state, &host))[seat];
     let (Some(command), Some(waited), Some(heard)) = (s["command"].as_str(), s["waited_secs"].as_i64(), s["heard"].as_i64()) else {
-        return Vec::new();
+        return None;
     };
     let mut at = heard - waited;
     if let Some((was, then)) = recorded {
@@ -370,9 +373,20 @@ pub(crate) fn stalls(store: &Store, seat: &str, recorded: Option<(&str, i64)>) -
     // A turn edge folded after the report: the call it was in has returned.
     let edge = seat_dir(store, seat).map(|d| LOCAL.said(&d)).and_then(|v| v["at"].as_str().map(util::epoch_of));
     let open = edge.is_none_or(|e| e <= heard);
-    let kind = crate::stuck::classify(command).unwrap_or(crate::stuck::Kind::TimedOut);
-    let secs = if open { (util::epoch_secs() - at).max(waited) } else { waited };
-    vec![crate::stuck::Stall { kind, command: command.to_string(), at, secs, open }]
+    let secs = if open { (now - at).max(waited) } else { waited };
+    Some(Reported { command: command.to_string(), at, secs, open })
+}
+
+/// A seat's stall as the manager reported it and the fold kept it ([`stall`]).
+pub(crate) struct Reported {
+    /// The command, as the report gave it.
+    pub command: String,
+    /// When the call started, epoch seconds.
+    pub at: i64,
+    /// Seconds it held: to now while open, else what the report said it waited.
+    pub secs: i64,
+    /// No turn edge folded since the report.
+    pub open: bool,
 }
 
 // ---------------------------------------------------------------- the thread

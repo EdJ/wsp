@@ -811,7 +811,7 @@ pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (
 /// ([`crate::stuck::classify`]), so a loop on a real build is left alone.
 ///
 /// **Under `WSP_HOST=manager`** (wsp-028) the stall is the manager's `seat.stuck`
-/// as folded ([`crate::fold::stalls`]): no transcript is read and no `ps` run.
+/// as folded ([`crate::fold::stall`]): no transcript is read and no `ps` run.
 /// The shell is the manager's to end; until the protocol carries that ask, the
 /// seat is told and the shell left.
 pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
@@ -820,14 +820,17 @@ pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
         return stuck_tick_with(
             store,
             seats,
-            &|seat| crate::fold::stalls(store, seat, before.get(seat).map(|h| (h.command.as_str(), h.at))),
+            &|seat| {
+                let recorded = before.get(seat).map(|h| (h.command.as_str(), h.at));
+                crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), recorded)
+            },
             &|_| Vec::new(),
         );
     }
     stuck_tick_with(
         store,
         seats,
-        &|seat| crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs()),
+        &|seat| crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), None),
         &|seat| crate::waiting::end_self_waits(seat, &crate::stuck::Kind::is_self_wait),
     );
 }
