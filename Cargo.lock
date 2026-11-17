@@ -173,6 +173,8 @@ dependencies = [
  "serde_json",
  "wsp-base",
  "wsp-host",
+ "wsp-host-api",
+ "wsp-manager",
  "wsp-store",
  "wsp-testkit",
 ]

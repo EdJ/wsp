@@ -120,7 +120,7 @@ impl InProcess {
         InProcess { sup: Some(sup.to_path_buf()) }
     }
 
-    fn sup(&self) -> Option<PathBuf> {
+    pub fn sup(&self) -> Option<PathBuf> {
         self.sup.clone().or_else(compound_sup_binary)
     }
 }
