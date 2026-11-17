@@ -443,7 +443,9 @@ fn ended(shared: &Shared, seat: &SeatId, epoch: Epoch, gone: Vec<u32>, mut to: V
         return;
     }
     let Running { key, exit, stopping, render, .. } = t.seats.remove(seat).expect("found just above");
-    t.keys.insert(key, KeyState::Ended(seat.clone(), epoch));
+    if keyed(&key) {
+        t.keys.insert(key, KeyState::Ended(seat.clone(), epoch));
+    }
     if let Some(waiters) = stopping {
         to.extend(waiters);
     }
@@ -803,12 +805,16 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
             Message::SeatStarted(s) => {
                 let e = t.epochs.entry(s.seat.clone()).or_insert(s.epoch);
                 *e = (*e).max(s.epoch);
-                t.keys.insert(s.key.clone(), KeyState::Running(s.seat.clone()));
+                if keyed(&s.key) {
+                    t.keys.insert(s.key.clone(), KeyState::Running(s.seat.clone()));
+                }
                 live.insert(s.seat.clone(), s);
             }
             Message::SeatStopped(s) => {
                 if let Some(started) = live.get(&s.seat).filter(|l| l.epoch == s.epoch) {
-                    t.keys.insert(started.key.clone(), KeyState::Ended(s.seat.clone(), s.epoch));
+                    if keyed(&started.key) {
+                        t.keys.insert(started.key.clone(), KeyState::Ended(s.seat.clone(), s.epoch));
+                    }
                     live.remove(&s.seat);
                 }
             }
@@ -875,7 +881,9 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
     }
     // Started by the in-process host, so not in the journal: adopted under a
     // new epoch, and its `seat.started` journalled, so the next restart joins
-    // it by label as it does its own.
+    // it by label as it does its own. Its row is not the manager's to know:
+    // the key goes out empty, so the daemon's fold writes no binding and no
+    // claim for it, and no spawn's key is held for it.
     let mut found = Vec::new();
     if !strays.is_empty() {
         let ps = host(shared).table("pid=,command=", false).unwrap_or_default();
@@ -895,7 +903,7 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
             let epoch = Epoch(t.epochs.get(&seat).map_or(1, |e| e.0 + 1));
             let render = socket.with_extension("rsock");
             let started = SeatStarted {
-                key: Key { row: RowId(seat.0.clone()), attempt: 0 },
+                key: adopted_key(),
                 seat: seat.clone(),
                 epoch,
                 pid,
@@ -903,7 +911,6 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
             };
             shared.log.line(&format!("seat {} adopted from the in-process host (epoch {}, pid {pid}, {})", seat.0, epoch.0, socket.display()));
             t.epochs.insert(seat.clone(), epoch);
-            t.keys.insert(started.key.clone(), KeyState::Running(seat.clone()));
             t.seats.insert(seat, running(started.clone(), socket, Some(render)));
             found.push(started);
         }
@@ -986,6 +993,18 @@ fn sup_of(ps: &str, sup: &str, seat: &SeatId) -> Vec<u32> {
         (is_sup && spawns && labelled).then_some(pid)
     })
     .collect()
+}
+
+/// The key an adopted seat goes out under: no row, since the in-process host
+/// that started it kept its row in the daemon's store, not in a key.
+fn adopted_key() -> Key {
+    Key { row: RowId(String::new()), attempt: 0 }
+}
+
+/// Whether `key` names a spawn: an adopted seat's names none, and is not held
+/// in the key table, where every adopted seat's would be the same key.
+fn keyed(key: &Key) -> bool {
+    !key.row.0.is_empty()
 }
 
 /// An adopted seat's spawn arguments are not in the journal; a retry of its

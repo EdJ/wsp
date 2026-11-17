@@ -900,6 +900,16 @@ fn a_seat_started_in_process_is_adopted_by_the_manager_then_told_and_stopped_thr
     let rows = tcp.seats().expect("the manager answers seats");
     let row = rows.iter().find(|r| r.seat.0 == seat.as_str()).unwrap_or_else(|| panic!("{seat} adopted: {rows:?}"));
     assert_eq!((row.epoch, row.state), (Epoch(1), SeatState::Idle), "{row:?}");
+    // Its `seat.started` is journalled with no row: the manager cannot know
+    // it, and the daemon's fold claims nothing for an empty one.
+    let journal = fs::read_to_string(dir.join("exec").join(wsp_manager::JOURNAL_FILE)).unwrap();
+    let keys: Vec<Value> = journal
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|f| f["type"] == "seat.started" && f["seat"] == seat.as_str())
+        .map(|f| f["key"].clone())
+        .collect();
+    assert_eq!(keys, vec![serde_json::json!({ "row": "", "attempt": 0 })], "{journal}");
 
     // Told through the manager: `order.deliver`, typed into the same session.
     assert_eq!(after.tell(&seat, &format!("{seat} after the switch")), Ok(Delivery::Acked));
