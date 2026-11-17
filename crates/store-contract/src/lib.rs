@@ -1,13 +1,37 @@
 //! `wsp-store-contract`: what the other components may name of the records
 //! without depending on the store (`docs/components.md` R2, cut `c5`). Types,
-//! traits and constants only; no logic.
+//! traits and constants only; no logic and no IO. See `MAP.md`.
 //!
-//! Today that is the constants: the record schema, the section names of a
-//! task, a project and a worklist, a machine's default lease, and the group
-//! policy words. The types (`Task`, `Project`, `Worklist`, `Machine`) carry
-//! inherent methods, which Rust keeps in the crate that defines the type, so
-//! they stay in `wsp-store` until a row of their own splits the data from the
-//! methods. Every change to this crate is a change to the contract (R5).
+//! The constants below are today's file store's: the record schema, the section
+//! names of a task, a project and a worklist, a machine's default lease, and the
+//! group policy words. Its types (`Task`, `Project`, `Worklist`, `Machine`)
+//! carry inherent methods, which Rust keeps in the crate that defines the type,
+//! so they stay in `wsp-store`.
+//!
+//! The modules are the state core's contract (docs/state-core.md sections 2.1,
+//! 2.2, 3, 4.2 and 4.3; wsp-046): the ids, the entities and their states, the
+//! events, the commands, the refusals, subscribe's frames, the `Domain` that
+//! validates a command, and the `Store` trait family a backend implements.
+//! Nothing in wsp uses them yet. Every change to this crate is a change to the
+//! contract (R5).
+
+pub mod command;
+pub mod domain;
+pub mod entity;
+pub mod event;
+pub mod id;
+pub mod refusal;
+pub mod store;
+pub mod subscribe;
+
+pub use command::{Applied, Block, Command, Fence, ReleaseTo, Verdict};
+pub use domain::Domain;
+pub use entity::*;
+pub use event::{Draft, Event, EventKind, Subject};
+pub use id::*;
+pub use refusal::{Error, Refusal, Result};
+pub use store::{Claims, Commands, Events, Leases, Reads, RowFilter, SeatFilter, Store, Texts};
+pub use subscribe::{Feed, Subscribe, BEAT_SECS, MISSED_BEATS};
 
 pub const SCHEMA: &str = "1";
 

@@ -1,0 +1,178 @@
+//! Commands (docs/state-core.md sections 2.2 and 4.2): one variant per command
+//! verb of 4.2, tagged by its verb, with its arguments beside it, as 4.1's
+//! envelope carries them (`"verb": "row.claim", "args": {...}`).
+//!
+//! A command issued under a lease carries a [`Fence`], and `apply` refuses it
+//! with [`Refusal::Stale`](crate::Refusal::Stale) when the lease's token has
+//! moved on (2.2). Which command is legal in which state is the domain's
+//! ([`Domain::decide`](crate::Domain::decide)), not this crate's.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::entity::AskKind;
+use crate::event::Subject;
+use crate::id::*;
+
+/// A lease and the token the writer holds it at (2.2, 8.2).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Fence {
+    pub lease: LeaseName,
+    pub token: Token,
+}
+
+/// What `apply` returns: the new events' ids, in commit order. A repeated key
+/// returns the first `Applied` and writes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Applied {
+    pub events: Vec<EventId>,
+}
+
+/// Block or unblock (3.3: `block` → `blocked`, `unblock` → the state before).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Block {
+    On { reason: String },
+    Off,
+}
+
+/// What a verifier found (3.3: `holds` → `done`, `blocks` → `sent_back`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Landed at this commit.
+    Holds { commit: String },
+    /// Sent back, and why.
+    Blocks { reason: String },
+}
+
+/// Where a held group is released to (3.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseTo {
+    Barrier,
+    Running,
+}
+
+/// One command: a verb of 4.2 and its arguments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", content = "args")]
+pub enum Command {
+    /// Add a row; the domain names it.
+    #[serde(rename = "row.add")]
+    RowAdd {
+        project: ProjectId,
+        title: String,
+        #[serde(default)]
+        fields: BTreeMap<String, String>,
+    },
+    /// Set (`Some`) or remove (`None`) a row's fields.
+    #[serde(rename = "row.edit")]
+    RowEdit {
+        row: RowId,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        fields: BTreeMap<String, Option<String>>,
+    },
+    /// `todo` or `sent_back` → `doing`, under the row's claim.
+    #[serde(rename = "row.claim")]
+    RowClaim {
+        row: RowId,
+        seat: SeatId,
+        fence: Fence,
+    },
+    /// `doing` → `review`, at a commit, under a current claim.
+    #[serde(rename = "row.review")]
+    RowReview {
+        row: RowId,
+        commit: String,
+        fence: Fence,
+    },
+    #[serde(rename = "row.block")]
+    RowBlock { row: RowId, block: Block },
+    #[serde(rename = "row.park")]
+    RowPark { row: RowId },
+    /// A verifier's verdict, under `verify:<row>`; landing itself is an effect
+    /// whose result comes back as this command.
+    #[serde(rename = "row.land")]
+    RowLand {
+        row: RowId,
+        verdict: Verdict,
+        fence: Fence,
+    },
+    /// `planned` → `running`.
+    #[serde(rename = "list.go")]
+    ListGo { list: ListId },
+    /// Hold a group, or the list's running group when none is named.
+    #[serde(rename = "list.hold")]
+    ListHold {
+        list: ListId,
+        #[serde(default)]
+        group: Option<u32>,
+        reason: String,
+    },
+    /// A held group → `barrier` or `running`.
+    #[serde(rename = "list.release")]
+    ListRelease {
+        list: ListId,
+        group: u32,
+        to: ReleaseTo,
+    },
+    /// Ask for a seat; `(row, attempt)` is the spawn's idempotency key (3.2).
+    #[serde(rename = "seat.spawn")]
+    SeatSpawn {
+        #[serde(default)]
+        row: Option<RowId>,
+        #[serde(default)]
+        attempt: u32,
+        #[serde(default)]
+        machine: Option<MachineName>,
+        kind: String,
+        #[serde(default)]
+        model: Option<String>,
+    },
+    /// A live seat → `ending`; by the claim's holder (fenced) or the person.
+    #[serde(rename = "seat.end")]
+    SeatEnd {
+        seat: SeatId,
+        #[serde(default)]
+        fence: Option<Fence>,
+    },
+    /// Remove a seat's record; `lost` says it was `lost` and is given up (3.2).
+    #[serde(rename = "seat.despawn")]
+    SeatDespawn {
+        seat: SeatId,
+        #[serde(default)]
+        lost: bool,
+    },
+    /// Queue an order for a seat.
+    #[serde(rename = "order.send")]
+    OrderSend { to: SeatId, text: String },
+    #[serde(rename = "order.cancel")]
+    OrderCancel { order: OrderId },
+    /// Raise an ask, a note or a flag.
+    #[serde(rename = "ask.raise")]
+    AskRaise {
+        kind: AskKind,
+        #[serde(default)]
+        to: Option<Principal>,
+        #[serde(default)]
+        about: Option<Subject>,
+        text: String,
+    },
+    #[serde(rename = "ask.answer")]
+    AskAnswer { ask: AskId, text: String },
+    #[serde(rename = "ask.ack")]
+    AskAck { ask: AskId },
+    /// Record a machine, or change how it is reached or what it reported.
+    #[serde(rename = "machine.set")]
+    MachineSet {
+        name: MachineName,
+        #[serde(default)]
+        transport: Option<crate::entity::Transport>,
+        #[serde(default)]
+        facts: BTreeMap<String, String>,
+    },
+}
