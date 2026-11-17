@@ -384,8 +384,12 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     crate::disk::tidy(store);
     // And the build holds of processes that died, and the load warning's edges
     // (`wsp-331`).
+    // Under `WSP_HOST=manager`, over the beat's facts as folded (wsp-028).
     wsp_base::calls::phase("sweep:throttle");
-    crate::throttle::tidy(store);
+    match crate::fold::under_manager() {
+        true => crate::throttle::tidy_given(store, crate::fold::facts(store).map(|f| throttle_given(&f))),
+        false => crate::throttle::tidy(store),
+    }
     // And a cold build for a tip that has none, while the person is away (`wsp-342`).
     wsp_base::calls::phase("sweep:cold");
     crate::cold::when_away(store, &crate::cycle::launch_out);
@@ -397,9 +401,13 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     wsp_base::calls::phase("stand-down");
     crate::stand_down::tick(store, seats);
     // And text typed at a governor's or a member's prompt and never sent
-    // (`wsp-386`): counted here, drawn by `wsp wip`.
-    wsp_base::calls::phase("repair:unsent");
-    unsent_tick(store, seats);
+    // (`wsp-386`): counted here, drawn by `wsp wip`. Not under
+    // `WSP_HOST=manager`, whose `order.refused` is the cause and is folded
+    // (wsp-028): no screen is read for it, and the phase is not marked.
+    if !crate::fold::under_manager() {
+        wsp_base::calls::phase("repair:unsent");
+        unsent_tick(store, seats);
+    }
     // And a governor whose supervisor has refused every tell for [`crate::refusals::REFUSED_TICKS`]
     // ticks running (`wsp-634`): ended, so the pass below seats a successor.
     wsp_base::calls::phase("repair:refusing");
@@ -426,6 +434,22 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // list a pass (`wsp-384`).
     wsp_base::calls::phase("pickup");
     crate::pickup::tick(store);
+}
+
+/// A beat's facts as the throttle reads them. A thermal state is the top of
+/// its band of `CPU_Speed_Limit` (`wsp_host::facts::parse_thermal`'s bands).
+pub(crate) fn throttle_given(f: &wsp_host_api::HostFacts) -> crate::throttle::Given {
+    use wsp_host_api::Thermal;
+    crate::throttle::Given {
+        load1: f.load_centi as f64 / 100.0,
+        cores: f.cpus as usize,
+        speed_limit: Some(match f.thermal {
+            Thermal::Nominal => 100,
+            Thermal::Fair => 99,
+            Thermal::Serious => 79,
+            Thermal::Critical => 49,
+        }),
+    }
 }
 
 /// The step on every running list: what the tick does first, and again once an
@@ -785,7 +809,21 @@ pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (
 /// returns now and the telling, which names the pid ended, is the next thing
 /// the seat reads. A pid found before the loop is not that shape
 /// ([`crate::stuck::classify`]), so a loop on a real build is left alone.
+///
+/// **Under `WSP_HOST=manager`** (wsp-028) the stall is the manager's `seat.stuck`
+/// as folded ([`crate::fold::stalls`]): no transcript is read and no `ps` run.
+/// The shell is the manager's to end; until the protocol carries that ask, the
+/// seat is told and the shell left.
 pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
+    if crate::fold::under_manager() {
+        let before = held_all(store);
+        return stuck_tick_with(
+            store,
+            seats,
+            &|seat| crate::fold::stalls(store, seat, before.get(seat).map(|h| (h.command.as_str(), h.at))),
+            &|_| Vec::new(),
+        );
+    }
     stuck_tick_with(
         store,
         seats,

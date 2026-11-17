@@ -1475,6 +1475,23 @@ impl View {
         }
     }
 
+    /// [`View::read`] with the machine's facts handed in ([`Given`]): the
+    /// person's idle time is not read, so `auto` reads as in force.
+    pub fn given(state: &Path, g: Given) -> View {
+        let settings = Settings::load(state);
+        let in_force = in_force(settings.mode, None, settings.away_minutes);
+        View {
+            settings,
+            idle: None,
+            in_force,
+            cores: g.cores.max(1),
+            load: Some((g.load1, g.load1, g.load1)),
+            thermal: g.speed_limit,
+            builds: builds(state, &alive),
+            shims: shim_dir(state),
+        }
+    }
+
     pub fn load_warning(&self) -> bool {
         self.load.is_some_and(|(one, five, _)| load_high(one, five, self.cores))
     }
@@ -1702,7 +1719,33 @@ pub fn tidy(store: &Store) {
         return;
     }
     reap(&store.state, &alive);
-    let v = View::read(&store.state);
+    warn(store, &View::read(&store.state));
+}
+
+/// The facts a manager's beat carries, in place of this process's own
+/// `sysctl` and `pmset` (`docs/agent-manager.md` 4.3; wsp-028).
+#[derive(Clone, Copy, Debug)]
+pub struct Given {
+    /// The one-minute load. The beat carries no five-minute one, so the
+    /// warning's "for a while" is the one-minute load alone here.
+    pub load1: f64,
+    pub cores: usize,
+    /// The thermal state as a `CPU_Speed_Limit`: the top of its band.
+    pub speed_limit: Option<u32>,
+}
+
+/// [`tidy`] over `given` rather than a reading of its own: no `sysctl`, no
+/// `pmset`, no `ioreg`. Under test as well, because nothing here probes.
+pub fn tidy_given(store: &Store, given: Option<Given>) {
+    if !cfg!(test) {
+        reap(&store.state, &alive);
+    }
+    // Nothing folded yet is no reading, and no warning edge either way.
+    let Some(g) = given else { return };
+    warn(store, &View::given(&store.state, g));
+}
+
+fn warn(store: &Store, v: &View) {
     let warning = v.warning(store.seat_cap());
     if warning.is_some() != WARNED.swap(warning.is_some(), Ordering::SeqCst) {
         match warning {

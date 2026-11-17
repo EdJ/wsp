@@ -658,17 +658,28 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // daemon stderr line nobody has attached to would be a second place to
         // look for the same answer.
         if repair_pass.due(now) {
-            store.steady(|| crate::repair::tick(store, &crate::cycle::Fleet, &mut repair_pass));
-            // A pane whose seat has ended, its agent gone (`wsp-637`).
-            wsp_base::calls::phase("sweep:ended-panes");
-            store.steady(|| crate::ended_panes::tidy(store));
-            // Answered retro questions plan their list (`wsp-472`); idempotent.
-            wsp_base::calls::phase("retro");
-            store.steady(|| crate::retro_series::sweep(store));
+            repairs(store, &crate::cycle::Fleet, &mut repair_pass);
         }
 
         wsp_base::calls::tick_end();
     }
+}
+
+/// The repair pass, and the sweeps after it, as one tick runs them.
+///
+/// **Under `WSP_HOST=manager`** (wsp-028, `docs/agent-manager.md` 4.3) the
+/// manager's `seat.stopped` is the cause `sweep:ended-panes` looked for, and it
+/// is folded ([`crate::fold`]): the phase does not run, and is not marked.
+fn repairs(store: &Store, seats: &dyn crate::cycle::Seats, pass: &mut crate::repair::Pass) {
+    store.steady(|| crate::repair::tick(store, seats, pass));
+    // A pane whose seat has ended, its agent gone (`wsp-637`).
+    if !crate::fold::under_manager() {
+        wsp_base::calls::phase("sweep:ended-panes");
+        store.steady(|| crate::ended_panes::tidy(store));
+    }
+    // Answered retro questions plan their list (`wsp-472`); idempotent.
+    wsp_base::calls::phase("retro");
+    store.steady(|| crate::retro_series::sweep(store));
 }
 
 /// The verbs this module answers to, each with the help it carries. `main` and
@@ -939,5 +950,233 @@ mod tests {
             Some((101, 1_800_000_000)),
             "a reinstall inside the same second was not noticed"
         );
+    }
+
+    /// The tick under `WSP_HOST=manager` and under `inproc` (wsp-028, leg 2).
+    mod tick_by_host {
+        use super::super::repairs;
+        use crate::fold;
+        use crate::place::State;
+        use crate::store::Store;
+        use crate::util;
+        use serde_json::Value;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        use wsp_host_api::{
+            At, Beat, DiskFree, Epoch, Frame, HostFacts, Key, MemoryPressure, Message, OrderFail, OrderId, OrderRefused, RowId,
+            SeatDid, SeatId, SeatStarted, SeatStopped, SeatStuck, Thermal, Turn, TurnEdge, FileRef, HostId,
+        };
+        use wsp_manager::{Config, Manager, TOKEN_FILE};
+
+        const HOST: &str = "tick-host";
+        /// The probes a tick under the manager runs none of.
+        const PROBES: &[&str] = &["ps", "df", "compound-render", "lsof", "sysctl", "vm_stat", "memory_pressure", "pmset", "ioreg"];
+        const WAIT: &str = "until ! pgrep -f 'cargo test'; do sleep 5; done";
+
+        /// `WSP_HOST` for one test, put back however it ends. Taken after
+        /// [`util::isolated`], whose lock it is held under.
+        struct HostVar;
+        impl HostVar {
+            fn set(v: &str) -> HostVar {
+                std::env::set_var(wsp_wire::host_tcp::ENV, v);
+                HostVar
+            }
+        }
+        impl Drop for HostVar {
+            fn drop(&mut self) {
+                std::env::remove_var(wsp_wire::host_tcp::ENV);
+            }
+        }
+
+        /// The stuck seat mid-turn; every other seat unreadable.
+        struct Seats;
+        impl crate::cycle::Seats for Seats {
+            fn state(&self, seat: &str) -> Option<State> {
+                (seat == "cpd-t1").then_some(State::Working)
+            }
+        }
+
+        fn ms(secs: i64) -> At {
+            At(secs as u64 * 1000)
+        }
+
+        fn started(seat: &str, row: &str) -> Message {
+            Message::SeatStarted(SeatStarted {
+                key: Key { row: RowId(row.into()), attempt: 1 },
+                seat: SeatId(seat.into()),
+                epoch: Epoch(1),
+                pid: 4242,
+                sockets: vec![],
+            })
+        }
+
+        /// A manager on loopback, the machine record naming it, and the
+        /// daemon's fold thread on it; its first beat (its own probes, in this
+        /// process) folded before anything is counted.
+        fn manager(store: &Store, exec: &std::path::Path) -> (Manager, std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+            let mut cfg = Config::new(exec, HOST);
+            cfg.port = 0;
+            cfg.beat = Duration::from_secs(3600);
+            let m = Manager::start(cfg).expect("the manager starts on loopback");
+            let token = std::fs::read_to_string(exec.join(TOKEN_FILE)).unwrap();
+            let local = crate::manager::Local {
+                host: HOST.into(),
+                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: m.addrs()[0].port(),
+                exec_dir: exec.to_path_buf(),
+            };
+            crate::manager::write_record(&store.state, &local, token.trim()).unwrap();
+            let (thread, stop) = fold::start(store).expect("under WSP_HOST=manager with a record, the fold runs");
+            let start = Instant::now();
+            while !fold::beat_path(&store.state, HOST).exists() {
+                assert!(start.elapsed() < Duration::from_secs(10), "no beat folded within 10s");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            (m, thread, stop)
+        }
+
+        /// The scripted stream, folded by the daemon's thread: a seat started,
+        /// mid-turn, its digest, stuck on itself, an order refused; a second
+        /// seat started and stopped. Then the beat the sweeps read: one volume
+        /// low, the load over the line.
+        fn script(store: &Store, m: &Manager) {
+            let now = util::epoch_secs();
+            let t1 = SeatId("cpd-t1".into());
+            let msgs = vec![
+                started("cpd-t1", "wsp-t1"),
+                Message::Turn(Turn { seat: t1.clone(), epoch: Epoch(1), edge: TurnEdge::Began, at: ms(now - 100), order: None }),
+                Message::SeatDid(SeatDid {
+                    seat: t1.clone(),
+                    epoch: Epoch(1),
+                    at: ms(now - 90),
+                    digest: "- **ran:** cargo test fold:: · failed → passed\n- **read:** src/fold.rs".into(),
+                    transcript: FileRef { host: HostId(HOST.into()), path: "/t.jsonl".into() },
+                }),
+                Message::SeatStuck(SeatStuck { seat: t1.clone(), epoch: Epoch(1), command: WAIT.into(), waited_secs: 80 }),
+                Message::OrderRefused(OrderRefused { order: OrderId("o-1".into()), seat: t1.clone(), why: OrderFail::Refused }),
+                started("cpd-t2", "wsp-t2"),
+                Message::SeatStopped(SeatStopped { seat: SeatId("cpd-t2".into()), epoch: Epoch(1), exit: Some(0), ended: vec![4243], renderer_left: false }),
+            ];
+            let last = msgs.into_iter().map(|msg| m.emit(msg).unwrap()).last().unwrap();
+            let start = Instant::now();
+            while fold::read_folded(&store.state, HOST) != Some(last) {
+                assert!(start.elapsed() < Duration::from_secs(10), "the stream was not folded within 10s");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let facts = HostFacts {
+                load_centi: 4000,
+                cpus: 4,
+                memory: MemoryPressure::Normal,
+                swap_used_bytes: 0,
+                disks: vec![DiskFree { volume: "/Volumes/Scripted".into(), free_bytes: 10 << 30, total_bytes: 100 << 30 }],
+                thermal: Thermal::Nominal,
+            };
+            let beat = Frame { id: None, req: None, msg: Message::Beat(Beat { at: ms(now), host: Some(facts), seats: vec![] }) };
+            assert!(fold::fold(store, HOST, &beat));
+        }
+
+        /// One tick of the repair pass and its sweeps, as the daemon runs it;
+        /// its line in the call log.
+        fn tick(store: &Store) -> Value {
+            wsp_base::calls::tick_begin();
+            wsp_base::calls::phase("standing");
+            repairs(store, &Seats, &mut crate::repair::Pass::new());
+            wsp_base::calls::tick_end();
+            let ticks: Vec<Value> = wsp_base::calls::read_all(&store.state)
+                .into_iter()
+                .filter(|l| l["k"] == "tick" && l["phases"].get("retro").is_some())
+                .collect();
+            assert_eq!(ticks.len(), 1, "{ticks:?}");
+            ticks.into_iter().next().unwrap()
+        }
+
+        fn cycle_log(store: &Store) -> String {
+            std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default()
+        }
+
+        /// wsp-028's second leg, its done-when: under `manager` the tick runs
+        /// against a loopback manager's scripted events; no `ps`, render or
+        /// `df` (nor the throttle's probes) is in the call log for it;
+        /// `repair:unsent` and `sweep:ended-panes` do not run; and disk,
+        /// throttle, ending and stuck read the folded facts.
+        #[test]
+        fn under_the_manager_the_tick_reads_the_folded_events_and_probes_nothing() {
+            let env = util::isolated("tick-manager");
+            let _host = HostVar::set("manager");
+            let store = Store::open();
+            let exec = env.state().join("exec");
+            let (m, thread, stop) = manager(&store, &exec);
+            script(&store, &m);
+
+            let line = tick(&store);
+            for probe in PROBES {
+                assert!(line["children"].get(probe).is_none(), "{probe} ran: {}", line["children"]);
+            }
+            for gone in ["repair:unsent", "sweep:ended-panes"] {
+                assert!(line["phases"].get(gone).is_none(), "{gone} ran: {}", line["phases"]);
+            }
+            for kept in ["sweep:disk", "sweep:throttle", "ending:verification", "repair:refusing", "retro"] {
+                assert!(line["phases"].get(kept).is_some(), "{kept} did not run: {}", line["phases"]);
+            }
+
+            // sweep:throttle: the beat's load, 40 on 4 cores, is over the line.
+            let log = cycle_log(&store);
+            assert!(log.contains("load is 40.0 (1m)") && log.contains("on 4 cores"), "{log}");
+            // sweep:disk: the beat's volume, and only it.
+            let disks = crate::disk::read(&store, crate::disk::LOW, false);
+            assert_eq!(disks.iter().map(|d| (d.volume.as_str(), d.low())).collect::<Vec<_>>(), [("/Volumes/Scripted", true)]);
+            // The stuck tick: the manager's `seat.stuck`, recorded and said.
+            let stuck = crate::repair::stuck_seats(&store);
+            assert_eq!(stuck.get("cpd-t1").map(|(k, _)| *k), Some(crate::stuck::Kind::SelfWait), "{stuck:?}");
+            assert!(log.contains("cpd-t1: a command has been") && log.contains(WAIT), "{log}");
+            // ending:verification: the seat's digest, not a transcript.
+            let did = crate::cmd_agent::did_of_seat(&store, "cpd-t1", &util::iso_at(util::epoch_secs() - 600)).expect("the digest is read");
+            assert_eq!((did.ran.len(), did.ran[0].last(), did.read.files.len()), (1, crate::did::Outcome::Passed, 1));
+            assert!(crate::cmd_agent::did_of_seat(&store, "cpd-t1", &util::now_iso()).is_none(), "a digest before `since` is not read");
+
+            // A second tick: the stall is the same one, said once.
+            tick_again(&store);
+            assert_eq!(cycle_log(&store).matches("cpd-t1: a command has been").count(), 1, "{}", cycle_log(&store));
+
+            stop.store(true, Ordering::SeqCst);
+            m.stop();
+            let _ = thread.join();
+        }
+
+        /// The second tick, its line left uncounted by [`tick`]'s filter.
+        fn tick_again(store: &Store) {
+            wsp_base::calls::tick_begin();
+            repairs(store, &Seats, &mut crate::repair::Pass::new());
+            wsp_base::calls::tick_end();
+        }
+
+        /// The same tick under `inproc` runs as before: `repair:unsent` and
+        /// `sweep:ended-panes` run, and what a manager folded is not read.
+        #[test]
+        fn under_inproc_the_tick_runs_as_before_and_reads_nothing_folded() {
+            let _env = util::isolated("tick-inproc");
+            let _host = HostVar::set("inproc");
+            let store = Store::open();
+            assert!(fold::start(&store).is_none(), "no fold under inproc");
+            // Files a manager would have left: none of them is read here.
+            let facts = HostFacts {
+                load_centi: 4000,
+                cpus: 4,
+                memory: MemoryPressure::Normal,
+                swap_used_bytes: 0,
+                disks: vec![DiskFree { volume: "/Volumes/Scripted".into(), free_bytes: 10 << 30, total_bytes: 100 << 30 }],
+                thermal: Thermal::Nominal,
+            };
+            let beat = Frame { id: None, req: None, msg: Message::Beat(Beat { at: At(1), host: Some(facts), seats: vec![] }) };
+            assert!(fold::fold(&store, HOST, &beat));
+            assert!(fold::facts(&store).is_none());
+
+            let line = tick(&store);
+            for ran in ["repair:unsent", "sweep:ended-panes", "sweep:disk", "sweep:throttle", "ending:verification", "retro"] {
+                assert!(line["phases"].get(ran).is_some(), "{ran} did not run: {}", line["phases"]);
+            }
+            assert!(!cycle_log(&store).contains("load is 40.0"), "{}", cycle_log(&store));
+            assert!(crate::disk::read(&store, crate::disk::LOW, false).iter().all(|d| d.volume != "/Volumes/Scripted"));
+        }
     }
 }

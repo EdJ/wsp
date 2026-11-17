@@ -295,6 +295,86 @@ fn apply(store: &Store, host: &str, msg: &Message) {
     }
 }
 
+// ---------------------------------------------------------------- what the tick reads
+//
+// Under `WSP_HOST=manager` the tick's phases read what was folded above, and
+// probe nothing (`docs/agent-manager.md` 4.3; wsp-028's second leg):
+// `sweep:disk` and `sweep:throttle` read [`facts`], `ending:verification`
+// reads [`did_since`] and the stuck tick reads [`stalls`]. A fact not folded
+// yet is no fact: nothing here falls back to the probe it replaces.
+
+/// `WSP_HOST=manager`: the manager's events are the cause, and the phases
+/// they replace do not run.
+pub fn under_manager() -> bool {
+    matches!(crate::host::Choice::from_env(), Ok(crate::host::Choice::Manager))
+}
+
+/// The host whose manager is folded, under `WSP_HOST=manager` with a machine
+/// record; `None` otherwise.
+fn folded_host(store: &Store) -> Option<String> {
+    if !under_manager() {
+        return None;
+    }
+    crate::manager::read_record(&store.state).map(|(local, _)| local.host)
+}
+
+/// The host facts of the newest beat folded, under `WSP_HOST=manager`.
+pub fn facts(store: &Store) -> Option<wsp_host_api::HostFacts> {
+    let host = folded_host(store)?;
+    serde_json::from_value(read(&beat_path(&store.state, &host))["beat"]["host"].clone()).ok()
+}
+
+/// What a seat did since `since` (epoch seconds), out of the `seat.did`
+/// digests folded for it: every digest line in [`crate::did`]'s own shape
+/// (`- **ran:** …`, `- **drove:** …`, `- **read:** …`) taken in. `None` when no digest of the
+/// seat since then says anything in that shape: a digest that is a summary
+/// (`asked: …; tools: …`) names no command and no outcome, and a reading made
+/// up from it would say the seat ran nothing.
+pub(crate) fn did_since(store: &Store, seat: &str, since: i64) -> Option<crate::did::Did> {
+    let host = folded_host(store)?;
+    let text = std::fs::read_to_string(did_path(&store.state, &host)).ok()?;
+    let from = (since.max(0) as u64).saturating_mul(1000);
+    let mut did = crate::did::Did::default();
+    let mut any = false;
+    for d in text.lines().filter_map(|l| serde_json::from_str::<wsp_host_api::SeatDid>(l).ok()) {
+        if d.seat.0 != seat || d.at.0 < from {
+            continue;
+        }
+        for (key, body) in d.digest.lines().filter_map(crate::did::split_line) {
+            if key != "checked" {
+                did.absorb(key, body);
+                any = true;
+            }
+        }
+    }
+    any.then_some(did)
+}
+
+/// The seat's stall as the manager reported it (`seat.stuck`), for the stuck
+/// tick in place of the transcript's: open while no turn edge was folded for
+/// the seat after it was heard. Its start is the heard time less the seconds
+/// it had waited, kept at the one already recorded for the same command so a
+/// later report of the same stall is not a new one.
+pub(crate) fn stalls(store: &Store, seat: &str, recorded: Option<(&str, i64)>) -> Vec<crate::stuck::Stall> {
+    let Some(host) = folded_host(store) else { return Vec::new() };
+    let s = &read(&stuck_path(&store.state, &host))[seat];
+    let (Some(command), Some(waited), Some(heard)) = (s["command"].as_str(), s["waited_secs"].as_i64(), s["heard"].as_i64()) else {
+        return Vec::new();
+    };
+    let mut at = heard - waited;
+    if let Some((was, then)) = recorded {
+        if was == command && (then - at).abs() <= 10 {
+            at = then;
+        }
+    }
+    // A turn edge folded after the report: the call it was in has returned.
+    let edge = seat_dir(store, seat).map(|d| LOCAL.said(&d)).and_then(|v| v["at"].as_str().map(util::epoch_of));
+    let open = edge.is_none_or(|e| e <= heard);
+    let kind = crate::stuck::classify(command).unwrap_or(crate::stuck::Kind::TimedOut);
+    let secs = if open { (util::epoch_secs() - at).max(waited) } else { waited };
+    vec![crate::stuck::Stall { kind, command: command.to_string(), at, secs, open }]
+}
+
 // ---------------------------------------------------------------- the thread
 
 /// One ask of the subscription, and its frame folded. `Ok(true)` when a frame

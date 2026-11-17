@@ -443,7 +443,14 @@ fn record(state: &Path, volume: &str, found: &[Removable]) {
 }
 
 /// The volumes the project roots are on, deduplicated, with free space.
+///
+/// Under `WSP_HOST=manager`, the volumes of the newest beat folded (the
+/// manager reads the ones it was configured with, the project roots'), and no
+/// `df` here; none before a beat is folded (wsp-028).
 fn volumes(store: &Store) -> Vec<(String, u64)> {
+    if crate::fold::under_manager() {
+        return crate::fold::facts(store).map(|f| f.disks.into_iter().map(|d| (d.volume, d.free_bytes)).collect()).unwrap_or_default();
+    }
     let mut seen = BTreeSet::new();
     crate::check_tree::repos(store)
         .iter()
