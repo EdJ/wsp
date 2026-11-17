@@ -51,7 +51,8 @@ fn pid_of(file: &Path) -> Option<u32> {
 }
 
 pub fn alive(pid: u32) -> bool {
-    crate::host::LOCAL.probe(pid)
+    // Could not ask reads as not alive, as it did before the Host.
+    crate::host::LOCAL.probe(pid).unwrap_or(false)
 }
 
 fn loose_in(git: &Path) -> usize {

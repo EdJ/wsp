@@ -157,8 +157,11 @@ pub trait Host: Sync {
     /// when `ps` would not run.
     fn rows_of(&self, pids: &[u32], columns: &str) -> Option<String>;
     /// `kill -<sig>` to every pid of `pids` (`"0"` only asks), and whether it
-    /// reached them all. An empty list sends nothing and answers `false`.
-    fn signal(&self, pids: &[u32], sig: &str) -> bool;
+    /// reached them all. `None` when `kill` would not run: "could not ask" is
+    /// not "not there", and a caller that breaks something on the answer (a
+    /// tree lock's dead holder) must keep it on `None`. An empty list sends
+    /// nothing and answers `Some(false)`.
+    fn signal(&self, pids: &[u32], sig: &str) -> Option<bool>;
     /// `sig` to a whole process group, by its leader's id — never this
     /// process's own group.
     fn signal_group(&self, group: u32, sig: &str);
@@ -167,8 +170,12 @@ pub trait Host: Sync {
     fn cwds(&self, pids: Option<&[u32]>) -> Option<String>;
 
     /// Whether `pid` is running: `kill -0`, which a zombie still answers.
-    fn probe(&self, pid: u32) -> bool {
-        pid != 0 && self.signal(&[pid], "0")
+    /// `None` when `kill` would not run, as [`Host::signal`].
+    fn probe(&self, pid: u32) -> Option<bool> {
+        match pid {
+            0 => Some(false),
+            _ => self.signal(&[pid], "0"),
+        }
     }
     /// Every process as `(pid, ppid, the rest of the line)`, where the rest
     /// includes the environment.
@@ -420,17 +427,18 @@ impl Host for InProcess {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    fn signal(&self, pids: &[u32], sig: &str) -> bool {
+    fn signal(&self, pids: &[u32], sig: &str) -> Option<bool> {
         if pids.is_empty() {
-            return false;
+            return Some(false);
         }
-        Command::new("kill")
+        let status = Command::new("kill")
             .arg(format!("-{sig}"))
             .args(pids.iter().map(u32::to_string))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+            .ok()?;
+        Some(status.success())
     }
 
     fn signal_group(&self, group: u32, sig: &str) {
