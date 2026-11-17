@@ -1560,13 +1560,16 @@ fn wait_ready(
 }
 
 /// The key `seat.spawn` carries for a row: the row's id and the number of
-/// attempts it already has (`cmd_attempts::attempts_of`), so a second spawn of
-/// the same row is a new key. `None` for a seat with no row (a bare shell, a
+/// attempts it already has, so a second spawn of the same row is a new key. The
+/// count is the log's "started by pane" lines (what `cmd_attempts::attempts_of`
+/// reads its seat starts from, which a lower component may not call). `None` for a seat with no row (a bare shell, a
 /// rotation without a task): the host then keys it by its own freshly minted
 /// seat id at attempt 0, which no other spawn can share.
 fn spawn_key(store: &Store, row: Option<&str>) -> Option<crate::place::Key> {
     let t = store.find_task(row?)?;
-    let attempt = crate::cmd_attempts::attempts_of(&t).len() as u32;
+    let attempt = t
+        .section("Log")
+        .map_or(0, |log| log.lines().filter(|l| l.contains(" started by pane ")).count()) as u32;
     Some(crate::place::Key { row: crate::place::RowId(t.id.clone()), attempt })
 }
 
@@ -2226,7 +2229,7 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
 fn spawn_backend(args: &Args) -> Result<Box<dyn Place>, String> {
     match chosen(args) {
         Chosen::Headless => Ok(backend(args)),
-        Chosen::Compound => crate::place_compound::Compound::chosen(crate::VERSION)
+        Chosen::Compound => crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION"))
             .map(|c| Box::new(c) as Box<dyn Place>)
             .map_err(|e| e.to_string()),
     }
@@ -2428,7 +2431,7 @@ pub(crate) fn insisting_backends() -> [Box<dyn Place>; 1] {
 /// is `WSP_HOST`'s, so under `manager` the sentence is `order.deliver`. A host
 /// that does not answer is the error, and the caller holds the tell.
 pub(crate) fn told_backends(insist: bool) -> Result<[Box<dyn Place>; 1], crate::host::HostError> {
-    let c = crate::place_compound::Compound::chosen(crate::VERSION)?;
+    let c = crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION"))?;
     Ok([Box::new(match insist {
         true => c.insisting(),
         false => c,
