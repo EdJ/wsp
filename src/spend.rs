@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use crate::cmd_attempts::attempts_of;
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 const DAY: i64 = 86_400;
 const WINDOW: i64 = 30;
