@@ -344,8 +344,17 @@ impl Command {
         note_child(&self.name, 1, t.elapsed());
         r.map(|c| {
             held().lock().unwrap_or_else(|e| e.into_inner()).insert(c.id());
-            Child { inner: Some(c), name: self.name.clone(), started: Instant::now(), waited: false }
+            Child { inner: Some(c), name: self.name.clone(), line: self.line(), started: Instant::now(), waited: false }
         })
+    }
+    /// The program and its arguments, as one short line for a log.
+    fn line(&self) -> String {
+        let mut s = self.inner.get_program().to_string_lossy().into_owned();
+        for a in self.inner.get_args() {
+            s.push(' ');
+            s.push_str(&a.to_string_lossy());
+        }
+        clip(s)
     }
 }
 
@@ -367,20 +376,50 @@ impl std::fmt::Debug for Command {
 pub struct Child {
     inner: Option<std::process::Child>,
     name: String,
+    /// What it runs, for the line the reaper writes if it is ever the one to
+    /// collect it.
+    line: String,
     started: Instant,
     waited: bool,
 }
 
+fn clip(mut s: String) -> String {
+    if s.chars().count() > 160 {
+        s = s.chars().take(159).collect::<String>() + "…";
+    }
+    s
+}
+
+fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The pids of children this process started through [`Command`] and has not
 /// finished with: a `Child` still held, or one handed to its reaping thread.
-/// [`reap_defunct`] leaves these to their owner.
 fn held() -> &'static Mutex<std::collections::HashSet<u32>> {
     static HELD: std::sync::OnceLock<Mutex<std::collections::HashSet<u32>>> = std::sync::OnceLock::new();
     HELD.get_or_init(Default::default)
 }
 
+/// The children this process knows are its own and that nothing waits on, by
+/// pid, with what each runs: the only ones [`reap_defunct`] may wait for.
+/// One gets here when no thread could be started to wait on it.
+fn orphans() -> &'static Mutex<BTreeMap<u32, String>> {
+    static ORPHANS: std::sync::OnceLock<Mutex<BTreeMap<u32, String>>> = std::sync::OnceLock::new();
+    ORPHANS.get_or_init(Default::default)
+}
+
 fn let_go(pid: u32) {
-    held().lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+    lock(held()).remove(&pid);
+}
+
+/// Wait for `pid` on a thread of its own, so it is reaped whenever it ends and
+/// nobody blocks on it; with no thread to be had, leave it to [`reap_defunct`].
+fn wait_aside(pid: u32, line: String, wait: impl FnOnce() + Send + 'static) {
+    let spawned = std::thread::Builder::new().name("reap".into()).spawn(wait);
+    if spawned.is_err() {
+        lock(orphans()).insert(pid, line);
+    }
 }
 
 impl Drop for Child {
@@ -396,14 +435,12 @@ impl Drop for Child {
             let_go(pid);
             return;
         }
-        let spawned = std::thread::Builder::new().name("reap".into()).spawn(move || {
+        // Out of `held` first: if no thread starts, the pid is an orphan, and
+        // a pid is never in both.
+        let_go(pid);
+        wait_aside(pid, std::mem::take(&mut self.line), move || {
             let _ = inner.wait();
-            let_go(pid);
         });
-        if spawned.is_err() {
-            // No thread to wait on it: [`reap_defunct`] collects it once it ends.
-            let_go(pid);
-        }
     }
 }
 
@@ -411,35 +448,132 @@ extern "C" {
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
 }
 
-/// Wait for every `<defunct>` child of this process that nothing is waiting
-/// for, and say how many that was.
+/// Every child of this process, by pid, with its command line.
 ///
-/// The belt to [`Child`]'s braces: a daemon lives for days, so one spawn that
-/// is neither waited on nor wrapped (a `std::process::Command` dropped, a
-/// thread that failed to start) is a zombie for as long as it runs. Called once
-/// a tick. Only a child already defunct is waited on, and never one a live
-/// [`Child`] still holds, so no wait of its own is robbed of its status.
-pub fn reap_defunct() -> usize {
+/// For [`adopt`] at a daemon's start: an `exec` keeps the process and its
+/// children and drops every thread, so the reaping threads of the image before
+/// a reload are gone, and what they were waiting on is waited on by nothing.
+pub fn children() -> Vec<(u32, String)> {
     let me = std::process::id();
-    let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,stat="]).output() else { return 0 };
-    let mut reaped = 0;
+    // Spawned rather than `output()`, for its pid: `ps` is a child of this
+    // process too, and is on its own list.
+    let ps = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(ps) = ps else { return Vec::new() };
+    let itself = ps.id();
+    let Ok(out) = ps.wait_with_output() else { return Vec::new() };
+    let mut kids = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim_start();
+        let Some((pid, rest)) = line.split_once(char::is_whitespace) else { continue };
+        let rest = rest.trim_start();
+        let (ppid, cmd) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else { continue };
+        if ppid == me && pid != itself {
+            kids.push((pid, clip(cmd.trim().to_string())));
+        }
+    }
+    kids
+}
+
+/// Take on children this process has but no `Child` of this image holds,
+/// waiting for each on a thread as a dropped [`Child`] is.
+///
+/// **wsp-667.** The daemon's 155 `<defunct>` children were its agents'
+/// `compound-sup`s: each is dropped to a reaping thread when it starts, lives
+/// as long as its agent, and every install `exec`s the daemon into the new
+/// binary, which ends those threads. Each sup alive at a reload was a zombie
+/// from the moment its agent exited. The new image adopts them here, before it
+/// starts anything of its own. Never pass a child some thread waits on.
+pub fn adopt(kids: &[(u32, String)]) {
+    for (pid, line) in kids {
+        let pid = *pid;
+        wait_aside(pid, line.clone(), move || {
+            let mut status = 0;
+            while unsafe { waitpid(pid as i32, &mut status, 0) } == -1
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {}
+        });
+    }
+}
+
+/// What one pass of [`reap_defunct`] did and saw.
+#[derive(Debug, Default)]
+pub struct Reaped {
+    /// Orphans waited for now, with what each ran.
+    pub reaped: Vec<(u32, String)>,
+    /// Defunct children this process holds no record of, defunct at the last
+    /// pass too, and said once: a spawn that nothing waits on. Not waited for.
+    /// What `ps` has for a zombie's name, which on macOS is only `<defunct>`.
+    pub strays: Vec<(u32, String)>,
+}
+
+/// Wait for every orphan (a child of this process it knows it started and that
+/// nothing waits on) that has ended, and name any defunct child it knows
+/// nothing of.
+///
+/// The belt to [`Child`]'s braces, called once a daemon tick. **Only an
+/// orphan is waited on, by its pid** — never `waitpid(-1)`, and never a child
+/// merely seen `<defunct>`: one started by `output()` or `status()` is
+/// defunct while its caller is still reading its pipes, and is in no set here,
+/// and taking it fails that caller with `ECHILD` (wsp-667). Such a child is
+/// reported instead, once it has stayed defunct across two passes, so a spawn
+/// that leaks shows up by name and is fixed where it is made.
+pub fn reap_defunct() -> Reaped {
+    let mut done = Reaped::default();
+    {
+        let mut orphans = lock(orphans());
+        orphans.retain(|&pid, line| {
+            let mut status = 0;
+            match unsafe { waitpid(pid as i32, &mut status, 1) } {
+                0 => true,
+                r if r == pid as i32 => {
+                    done.reaped.push((pid, std::mem::take(line)));
+                    false
+                }
+                _ => false,
+            }
+        });
+    }
+    done.strays = strays();
+    done
+}
+
+/// Defunct children of this process held by nothing here, seen on the last
+/// pass as well, and not said before.
+fn strays() -> Vec<(u32, String)> {
+    static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    static TOLD: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let me = std::process::id();
+    let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,stat=,comm="]).output() else {
+        return Vec::new();
+    };
+    let mut now = Vec::new();
+    let mut said = Vec::new();
+    let held = lock(held()).clone();
+    let orphans: Vec<u32> = lock(orphans()).keys().copied().collect();
+    let mut seen = lock(&SEEN);
+    let mut told = lock(&TOLD);
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let mut f = line.split_whitespace();
         let (Some(pid), Some(ppid), Some(stat)) = (f.next(), f.next(), f.next()) else { continue };
         let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else { continue };
-        if ppid != me || !stat.starts_with('Z') {
+        if ppid != me || !stat.starts_with('Z') || held.contains(&pid) || orphans.contains(&pid) {
             continue;
         }
-        let mine = held().lock().unwrap_or_else(|e| e.into_inner());
-        if mine.contains(&pid) {
-            continue;
-        }
-        let mut status = 0;
-        if unsafe { waitpid(pid as i32, &mut status, 1) } == pid as i32 {
-            reaped += 1;
+        now.push(pid);
+        if seen.contains(&pid) && !told.contains(&pid) {
+            said.push((pid, f.collect::<Vec<_>>().join(" ")));
         }
     }
-    reaped
+    told.retain(|p| now.contains(p));
+    told.extend(said.iter().map(|(p, _)| *p));
+    *seen = now;
+    said
 }
 
 impl Child {
@@ -1118,28 +1252,105 @@ mod tests {
         }
     }
 
-    /// A child nobody holds and nobody waits for (a `std` spawn that was
-    /// dropped) is collected by [`reap_defunct`], and a held one is not.
-    #[test]
-    fn a_defunct_child_nobody_holds_is_reaped_and_a_held_one_is_left() {
-        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
-        fn state(pid: u32) -> String {
-            let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
+    fn ps_state(pid: u32) -> String {
+        let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn until(what: &str, mut ok: impl FnMut() -> bool) {
+        let t = Instant::now();
+        while !ok() {
+            assert!(t.elapsed() < Duration::from_secs(10), "{what}");
+            std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A defunct child nothing here knows of (a `std` spawn that was dropped)
+    /// is named once it stays defunct over two passes, and is not waited for:
+    /// it may be a waiter's. A held one is neither named nor taken.
+    #[test]
+    fn a_defunct_child_nobody_holds_is_named_and_left_and_a_held_one_is_left() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let stray = std::process::Command::new("true").spawn().unwrap();
         let stray_pid = stray.id();
         std::mem::forget(stray);
         let mut held_one = Command::new("true").spawn().unwrap();
-        let t = Instant::now();
-        while !(state(stray_pid).starts_with('Z') && state(held_one.id()).starts_with('Z')) {
-            assert!(t.elapsed() < Duration::from_secs(10), "never defunct");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(reap_defunct() >= 1);
-        assert_eq!(state(stray_pid), "", "the stray is still defunct");
-        assert!(state(held_one.id()).starts_with('Z'), "a held child was waited on behind its owner's back");
+        until("never defunct", || ps_state(stray_pid).starts_with('Z') && ps_state(held_one.id()).starts_with('Z'));
+        let first = reap_defunct();
+        assert!(!first.strays.iter().any(|(p, _)| *p == stray_pid), "named on its first pass: {first:?}");
+        let second = reap_defunct();
+        let named: Vec<_> = second.strays.iter().filter(|(p, _)| *p == stray_pid).collect();
+        assert_eq!(named.len(), 1, "{second:?}");
+        assert!(!reap_defunct().strays.iter().any(|(p, _)| *p == stray_pid), "named twice");
+        assert!(ps_state(stray_pid).starts_with('Z'), "a child nothing here owns was waited on");
+        assert!(!second.strays.iter().any(|(p, _)| *p == held_one.id()), "a held child was named a stray");
+        assert!(ps_state(held_one.id()).starts_with('Z'), "a held child was waited on behind its owner's back");
         assert!(held_one.wait().unwrap().success(), "the owner's own wait lost its status");
+        // Its own owner, standing in for the one that never was.
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(stray_pid as i32, &mut status, 0) }, stray_pid as i32);
+    }
+
+    /// An orphan, a child this process knows it started and nothing waits on,
+    /// is what the reaper takes, and says what it ran.
+    #[test]
+    fn an_orphan_is_reaped_with_its_command_line() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        std::mem::forget(c);
+        lock(orphans()).insert(pid, "true --orphan".into());
+        until("never defunct", || ps_state(pid).starts_with('Z'));
+        let r = reap_defunct();
+        assert!(r.reaped.contains(&(pid, "true --orphan".to_string())), "{r:?}");
+        assert_eq!(ps_state(pid), "", "the orphan is still defunct");
+        assert!(!lock(orphans()).contains_key(&pid));
+    }
+
+    /// **wsp-667: the source.** An `exec` keeps the children and ends the
+    /// threads that were waiting on them, so a reloaded daemon's agents were
+    /// zombies once they ended. Adopted, one is waited on when it ends, whether
+    /// it had already ended or not.
+    #[test]
+    fn a_child_carried_over_an_exec_is_adopted_and_reaped_when_it_ends() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let spawn = |args: &[&str]| {
+            let c = std::process::Command::new(args[0]).args(&args[1..]).spawn().unwrap();
+            let pid = c.id();
+            std::mem::forget(c);
+            pid
+        };
+        let ended = spawn(&["true"]);
+        let running = spawn(&["sleep", "0.3"]);
+        until("never defunct", || ps_state(ended).starts_with('Z'));
+        let found = children();
+        assert!(!found.iter().any(|(_, l)| l.starts_with("ps -axo")), "ps listed itself: {found:?}");
+        let mine: Vec<_> = found.iter().filter(|(p, _)| *p == ended || *p == running).cloned().collect();
+        assert_eq!(mine.len(), 2, "{found:?}");
+        assert!(mine.iter().any(|(p, l)| *p == running && l.contains("sleep 0.3")), "{mine:?}");
+        adopt(&mine);
+        until("an adopted child stayed defunct", || ps_state(ended).is_empty() && ps_state(running).is_empty());
+    }
+
+    /// **wsp-667: the reaper never robs a waiter.** `output()` waits on its
+    /// child only once the pipes close, so a child whose own child still holds
+    /// stdout is `<defunct>` for as long as that grandchild runs, with its
+    /// waiter blocked behind it and in no set this module keeps. The reaper of
+    /// wsp-664 waited on every unheld defunct child, took this one, and the
+    /// `output()` came back `ECHILD`.
+    #[test]
+    fn the_reaper_leaves_a_child_an_output_caller_is_waiting_on() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let caller = std::thread::spawn(|| Command::new("sh").args(["-c", "(sleep 1) & exit 0"]).output());
+        // The `sh` exits at once and is defunct while `sleep` holds the pipe.
+        std::thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(500) {
+            reap_defunct();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let out = caller.join().unwrap().expect("the output() caller lost its child to the reaper");
+        assert!(out.status.success(), "{out:?}");
     }
 
     #[test]

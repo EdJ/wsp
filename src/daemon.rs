@@ -74,6 +74,22 @@ fn reload(verbose: bool) -> std::io::Error {
 }
 
 
+/// Wait on the children a reload carried over, and say which they were.
+///
+/// The daemon's 155 `<defunct>` children (wsp-667) were agents' `compound-sup`s:
+/// each is handed to a reaping thread when it starts and lives as long as its
+/// agent, and an install `exec`s the daemon, which keeps the children and ends
+/// the threads. A daemon started fresh has none, and says nothing.
+fn adopt_carried_over() {
+    let kids = wsp_base::calls::children();
+    if kids.is_empty() {
+        return;
+    }
+    wsp_base::calls::adopt(&kids);
+    let named: Vec<String> = kids.iter().map(|(pid, line)| format!("{pid} {line}")).collect();
+    eprintln!("wsp daemon: waiting on {} child(ren) from before the reload: {}", kids.len(), named.join("; "));
+}
+
 /// Is there nothing at all for the daemon to run for?
 ///
 /// Read this before touching the herdr-only gate it replaces: the gate used
@@ -588,6 +604,9 @@ pub(crate) fn dead(state: &Path, running: Option<&[u32]>, backend_up: bool) -> O
 pub fn run(store: &Store, verbose: bool) -> i32 {
     // Its own record is one line per tick (`wsp-481`), not one for the process.
     wsp_base::calls::quiet();
+    // Before anything is spawned: a child here already is one the image before
+    // an `exec`-reload started, whose reaping thread the exec ended (wsp-667).
+    adopt_carried_over();
     if let Some(why) = misdirected(
         std::env::var("HERDR_SESSION").ok().as_deref(),
         std::env::var("HERDR_SOCKET_PATH").ok().as_deref(),
@@ -711,9 +730,14 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         wsp_base::calls::phase("standing");
         // Whatever this process spawned and nothing waited for is a `<defunct>`
         // entry until the daemon exits, which is days (wsp-664).
-        let reaped = wsp_base::calls::reap_defunct();
-        if verbose && reaped > 0 {
-            eprintln!("wsp daemon: reaped {reaped} defunct child(ren)");
+        // Only children it knows nothing waits on are taken (wsp-667); one it
+        // knows nothing of is named, so the spawn that leaks it can be found.
+        let reap = wsp_base::calls::reap_defunct();
+        for (pid, line) in &reap.reaped {
+            eprintln!("wsp daemon: reaped defunct child {pid}, nothing was waiting on it: {line}");
+        }
+        for (pid, name) in &reap.strays {
+            eprintln!("wsp daemon: child {pid} ({name}) is defunct and nothing in wsp holds it — a spawn that is never waited on; left for its owner");
         }
 
         // Both of the next two checks are here, at the top, because it is the
