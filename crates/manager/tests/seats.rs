@@ -30,7 +30,8 @@ const WAIT: Duration = Duration::from_secs(10);
 /// compound-sup as far as the manager uses it: `spawn` (a handshake, a
 /// `.label` sidecar, a plain file for a socket), `vitals`, and `deliver <id>`
 /// at most once per id (an ask while one is pending waits for its answer). A
-/// text with `slow` takes two seconds; one with `busy` fails `busy`.
+/// text with `slow` takes two seconds; one with `busy` fails `busy`. `vitals`
+/// of a socket with a `<socket>.hang` beside it never returns.
 const FAKE_SUP: &str = r#"#!/bin/sh
 OWNER=__OWNER__
 verb=$1; shift
@@ -59,6 +60,7 @@ spawn)
   printf 'sup %s\npid %s\nsocket %s\nrender %s\n' "$pid" "$pid" "$run/$name.sock" "$run/$name.rsock"
   ;;
 vitals)
+  if [ -f "$1.hang" ]; then sleep 1000 & wait; fi
   pid=$(cat "$1" 2>/dev/null)
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     echo "renderer_attached false"; echo "output_at 0"
@@ -593,4 +595,45 @@ fn a_manager_killed_mid_order_restarts_with_its_seat_and_answers_the_order_once(
         other => panic!("the adopted seat stops, got {other:?}"),
     }
     assert!(!alive(s.pid));
+}
+
+/// wsp-061: a `compound-sup vitals` that never returns (on the Mac, one stuck
+/// in dyld loading an unapproved build) once held adoption, and so the whole
+/// manager, for good. Now adoption ends within the bound, adopts the seat that
+/// answers, logs the other as unreadable and leaves it, not ended; and the
+/// manager serves.
+#[test]
+fn a_vitals_that_never_returns_leaves_its_seat_unadopted_and_the_manager_serves() {
+    let (dir, sup) = place("hang");
+    let _sweep = Sweep::new(&dir);
+    let m = start(&dir, &sup);
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+    let Message::SeatStarted(a) = c.ask(spawn_msg("wsp-5", 1, "cpd-a", &dir)) else { panic!("cpd-a started") };
+    let Message::SeatStarted(b) = c.ask(spawn_msg("wsp-6", 1, "cpd-b", &dir)) else { panic!("cpd-b started") };
+    drop(c);
+    m.stop();
+
+    let hung = PathBuf::from(&b.sockets[0]);
+    let marker = hung.with_extension("sock.hang");
+    fs::write(&marker, "").unwrap();
+    let began = Instant::now();
+    let m = start(&dir, &sup);
+    let took = began.elapsed();
+    assert!(took < Duration::from_secs(6), "adoption ended within the bound, not {took:?}");
+    let adopted: Vec<(String, Epoch)> = m.seats().into_iter().map(|e| (e.seat.0, e.epoch)).collect();
+    assert_eq!(adopted, vec![("cpd-a".to_string(), a.epoch)], "the seat that answers is adopted, the other is not");
+
+    let log = fs::read_to_string(m.log_path()).unwrap();
+    assert!(log.contains(&format!("{}: unreadable: compound-sup vitals gave no answer within 2s", hung.display())), "{log}");
+    assert!(log.contains("seat cpd-b (epoch 1): its session"), "{log}");
+    assert!(!log.contains("seat cpd-b stopped") && !log.contains("seat cpd-b (epoch 1) ended"), "unreadable is not ended: {log}");
+
+    let (mut c, hello) = Client::new(m.addrs()[0], &dir);
+    assert_eq!(hello.seats.iter().map(|e| e.seat.0.as_str()).collect::<Vec<_>>(), vec!["cpd-a"]);
+    let Message::SeatsList(list) = c.ask(Message::Seats(Seats {})) else { panic!("seats is answered seats.list") };
+    assert_eq!(list.seats.iter().map(|r| (r.seat.0.as_str(), r.state)).collect::<Vec<_>>(), vec![("cpd-a", SeatState::Idle)]);
+
+    fs::remove_file(&marker).unwrap();
+    assert!(matches!(c.ask(stop_msg("cpd-a", a.epoch.0)), Message::SeatStopped(_)));
+    m.stop();
 }

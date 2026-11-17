@@ -52,13 +52,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc, MutexGuard};
 use std::time::Duration;
 
-use wsp_base::calls::Command;
 use wsp_host::inproc::{self, Spawn, Stop};
 use wsp_host::{Delivery, InProcess, Refusal as HostRefusal, Seat as HostSeat};
 use wsp_host_api::{
@@ -674,10 +672,44 @@ pub(crate) fn cancel(shared: &Shared, asker: Asker, c: OrderCancel) {
 
 // ---------------------------------------------------------------- seats and seat.read
 
-/// `compound-sup vitals <socket>`: its lines when the session answers.
-fn vitals(sup: &Path, socket: &Path) -> Option<String> {
-    let out = Command::new(sup).arg("vitals").arg(socket).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// What `compound-sup vitals <socket>` said of a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Vitals {
+    /// It answers, with these lines.
+    Answers(String),
+    /// compound-sup says no session answers there.
+    Silent,
+    /// compound-sup could not be asked, or gave no answer within
+    /// [`inproc::VITALS_WAIT`] (wsp-061): nothing is known of the session, so
+    /// it is neither adopted nor taken for ended.
+    Unreadable,
+}
+
+/// `compound-sup vitals <socket>`, bounded by [`inproc::VITALS_WAIT`]; a
+/// probe that ran out is logged, naming the socket and the bound.
+fn vitals(shared: &Shared, sup: &Path, socket: &Path) -> Vitals {
+    match inproc::vitals(sup, socket, inproc::VITALS_WAIT) {
+        Ok(Some(lines)) => Vitals::Answers(lines),
+        Ok(None) => Vitals::Silent,
+        Err(e) => {
+            shared.log.line(&format!(
+                "{}: unreadable: compound-sup vitals gave no answer within {}s ({e}); left as it is",
+                socket.display(),
+                inproc::VITALS_WAIT.as_secs()
+            ));
+            Vitals::Unreadable
+        }
+    }
+}
+
+/// [`vitals`] of each socket, asked at once: one probe that hangs costs the
+/// bound once, not once per seat. `None` where there is no compound-sup.
+fn vitals_all(shared: &Shared, sup: Option<&Path>, sockets: &[&Path]) -> Vec<Vitals> {
+    let Some(sup) = sup else { return sockets.iter().map(|_| Vitals::Silent).collect() };
+    std::thread::scope(|s| {
+        let probes: Vec<_> = sockets.iter().map(|socket| s.spawn(move || vitals(shared, sup, socket))).collect();
+        probes.into_iter().map(|p| p.join().unwrap_or(Vitals::Unreadable)).collect()
+    })
 }
 
 /// `ps -A -o pid=,ppid=,rss=,comm=`, read.
@@ -752,11 +784,12 @@ pub(crate) fn list(shared: &Shared, asker: Asker) {
     let looks: Vec<Look> = looks.into_iter().zip(heard).map(|(l, h)| Look { turn: h.or(l.turn), ..l }).collect();
     let ps = if looks.is_empty() { Vec::new() } else { host(shared).table("pid=,ppid=,rss=,comm=", false).map(|t| rows(&t)).unwrap_or_default() };
     let sup = sup_path(shared);
+    let probed = vitals_all(shared, sup.as_deref(), &looks.iter().map(|l| l.socket.as_path()).collect::<Vec<_>>());
     let mut seats = Vec::new();
-    for l in looks {
-        let answers = sup.as_deref().and_then(|s| vitals(s, &l.socket)).is_some();
+    for (l, said) in looks.into_iter().zip(probed) {
+        let answers = matches!(said, Vitals::Answers(_));
         let running = ps.iter().any(|r| r.0 == l.pid);
-        if !answers && !running && !l.stopping && !ps.is_empty() {
+        if said == Vitals::Silent && !running && !l.stopping && !ps.is_empty() {
             // Its session is gone and nothing said so: it ended.
             ended(shared, &l.seat, l.epoch, vec![], vec![]);
             continue;
@@ -846,7 +879,10 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
     let mut sessions: BTreeMap<SeatId, PathBuf> = BTreeMap::new();
     let mut strays: BTreeMap<SeatId, PathBuf> = BTreeMap::new();
     let mut twice: std::collections::BTreeSet<SeatId> = std::collections::BTreeSet::new();
+    // A seat whose session could not be read: neither adopted nor ended.
+    let mut unreadable: BTreeMap<SeatId, PathBuf> = BTreeMap::new();
     let own = shared.run_dir();
+    let mut candidates: Vec<(SeatId, PathBuf)> = Vec::new();
     for dir in std::iter::once(&own).chain(&shared.cfg.inproc_runs) {
         for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
             let path = entry.path();
@@ -855,26 +891,40 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
             }
             let Ok(label) = fs::read_to_string(path.with_extension("label")) else { continue };
             let seat = SeatId(label.trim().to_string());
-            if seat.0.is_empty() || sessions.contains_key(&seat) || twice.contains(&seat) {
+            if seat.0.is_empty() {
                 continue;
             }
             if !live.contains_key(&seat) && *dir == own {
                 shared.log.line(&format!("{}: labelled {}, which the journal has not running here; left alone", path.display(), seat.0));
                 continue;
             }
-            if sup.as_deref().and_then(|s| vitals(s, &path)).is_none() {
+            candidates.push((seat, path));
+        }
+    }
+    // Asked at once and each bounded (wsp-061): one compound-sup that never
+    // answers costs the bound once, and adoption still ends.
+    let probed = vitals_all(shared, sup.as_deref(), &candidates.iter().map(|(_, p)| p.as_path()).collect::<Vec<_>>());
+    for ((seat, path), said) in candidates.into_iter().zip(probed) {
+        if sessions.contains_key(&seat) || twice.contains(&seat) {
+            continue;
+        }
+        match said {
+            Vitals::Answers(_) => {}
+            Vitals::Silent => continue,
+            Vitals::Unreadable => {
+                unreadable.entry(seat).or_insert(path);
                 continue;
             }
-            if live.contains_key(&seat) {
-                sessions.insert(seat, path);
-            } else if let Some(first) = strays.remove(&seat) {
-                // Two sessions under one label (a bare shell not yet replaced):
-                // which is the seat is not this scan's to guess.
-                shared.log.line(&format!("seat {}: {} and {} both answer; left alone", seat.0, first.display(), path.display()));
-                twice.insert(seat);
-            } else {
-                strays.insert(seat, path);
-            }
+        }
+        if live.contains_key(&seat) {
+            sessions.insert(seat, path);
+        } else if let Some(first) = strays.remove(&seat) {
+            // Two sessions under one label (a bare shell not yet replaced):
+            // which is the seat is not this scan's to guess.
+            shared.log.line(&format!("seat {}: {} and {} both answer; left alone", seat.0, first.display(), path.display()));
+            twice.insert(seat);
+        } else {
+            strays.insert(seat, path);
         }
     }
     let mut gone = Vec::new();
@@ -885,7 +935,15 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
                 shared.log.line(&format!("seat {} adopted (epoch {}, pid {}, {})", seat.0, started.epoch.0, started.pid, socket.display()));
                 t.seats.insert(seat.clone(), running(started, socket, render));
             }
-            None => gone.push(started),
+            None => match unreadable.get(&seat) {
+                Some(socket) => shared.log.line(&format!(
+                    "seat {} (epoch {}): its session {} is unreadable; left unadopted, and not taken for ended",
+                    seat.0,
+                    started.epoch.0,
+                    socket.display()
+                )),
+                None => gone.push(started),
+            },
         }
     }
     // Started by the in-process host, so not in the journal: adopted under a
