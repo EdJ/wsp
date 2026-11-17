@@ -635,3 +635,81 @@ fn the_parser_reads_use_lists_paths_and_skips_comments_strings_and_tests() {
     assert_eq!(s("util"), ["*", "a", "b"]);
     assert_eq!(s("main"), ["Args"]);
 }
+
+/// Every `Cargo.toml` of the workspace: the root's and each member's.
+fn manifests() -> Vec<PathBuf> {
+    let root = root();
+    let mut out = vec![root.join("Cargo.toml")];
+    let mut dirs: Vec<PathBuf> = fs::read_dir(root.join("crates")).unwrap().map(|e| e.unwrap().path()).collect();
+    dirs.sort();
+    out.extend(dirs.into_iter().map(|d| d.join("Cargo.toml")).filter(|m| m.exists()));
+    out
+}
+
+/// True when the manifest declares `dep` as a dependency of any kind: `dep = …` under a
+/// dependencies section, or a `[…dependencies.dep]` table, `[target.….…]` forms included.
+fn declares(manifest: &str, dep: &str) -> bool {
+    let mut in_deps = false;
+    for line in manifest.lines() {
+        let l = line.split('#').next().unwrap().trim();
+        if let Some(h) = l.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            let h = h.trim();
+            if h.ends_with(&format!("dependencies.{dep}")) || h.ends_with(&format!("dependencies.\"{dep}\"")) {
+                return true;
+            }
+            in_deps = h.ends_with("dependencies");
+        } else if in_deps {
+            if let Some((name, _)) = l.split_once('=') {
+                if name.trim().trim_matches('"') == dep {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// D2 (`docs/state-core.md` section 6) admits `rusqlite` as the second external dependency, in
+/// `wsp-store-sqlite` only: no other manifest of the workspace names it, and the crate's own
+/// manifest does, pinned exactly with `bundled`. The crate also links none of `wsp-store`,
+/// `wsp-wire`, `wsp-host` or `wsp-manager`, directly or through its path dependencies; the
+/// contract and `wsp-base` may join at step 1 (wsp-045).
+#[test]
+fn rusqlite_is_the_sqlite_crates_alone_and_that_crate_links_no_store_wire_host_or_manager() {
+    let sqlite = root().join("crates/store-sqlite/Cargo.toml");
+    let mut holders = vec![];
+    for m in manifests() {
+        if declares(&fs::read_to_string(&m).unwrap(), "rusqlite") {
+            holders.push(m.strip_prefix(root()).unwrap().to_path_buf());
+        }
+    }
+    assert_eq!(
+        holders,
+        [PathBuf::from("crates/store-sqlite/Cargo.toml")],
+        "rusqlite is a dependency of wsp-store-sqlite only (D2, docs/state-core.md section 6)"
+    );
+    let text = fs::read_to_string(&sqlite).unwrap();
+    assert!(
+        text.lines().any(|l| l.contains("rusqlite") && l.contains("\"=") && l.contains("bundled")),
+        "wsp-store-sqlite pins rusqlite exactly (`=`) with `bundled`"
+    );
+
+    const MAY: &[&str] = &["wsp-base", "wsp-store-contract"];
+    let bad = beyond(&reached_from(&root().join("crates/store-sqlite"), "wsp-store-sqlite"), MAY);
+    assert!(
+        bad.is_empty(),
+        "wsp-store-sqlite must link only {MAY:?} of the workspace, never wsp-store, wsp-wire, wsp-host or \
+         wsp-manager (docs/state-core.md section 6):\n{bad}"
+    );
+}
+
+#[test]
+fn the_rusqlite_reader_finds_each_manifest_form_and_not_a_lookalike() {
+    assert!(declares("[dependencies]\nrusqlite = \"0.32\"\n", "rusqlite"));
+    assert!(declares("[dev-dependencies]\nrusqlite = { version = \"0.32\" }\n", "rusqlite"));
+    assert!(declares("[target.'cfg(unix)'.dependencies]\n\"rusqlite\" = \"0.32\"\n", "rusqlite"));
+    assert!(declares("[dependencies.rusqlite]\nversion = \"0.32\"\n", "rusqlite"));
+    assert!(!declares("[dependencies]\nrusqlite-extra = \"1\"\n", "rusqlite"));
+    assert!(!declares("[package]\nname = \"rusqlite\"\n", "rusqlite"));
+    assert!(!declares("[dependencies]\n# rusqlite = \"0.32\"\n", "rusqlite"));
+}

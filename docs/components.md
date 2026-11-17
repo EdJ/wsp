@@ -146,9 +146,10 @@ not a structure problem (row `c0-fixtures` below).
 | `wsp-testkit` | `crates/testkit` | `c1` (wsp-408) | the git repository fixture (`repo`, `repo_at`, `git`); the store-backed half is in `crates/store/src/testkit.rs` (a `wsp-testkit` that depended on `wsp-store` would give the store's own unit tests a second `Store`) | its `lib.rs` |
 | `wsp-store` | `crates/store` | `c5` (wsp-412) | `model`, `store`, `resolve`, `message`, `lapse`, `sharing`, `checks`, `caption`, `governors`, `agent_kind`, `log`, `decisions`, `tags`, `verbs`; the store-backed test kit | `crates/store/MAP.md` |
 | `wsp-store-contract` | `crates/store-contract` | `c5` (wsp-412) | the constants the records name (`SCHEMA`, the section lists, `DEFAULT_LEASE`, the policy words); the types stay in `wsp-store` while they carry inherent methods | its `lib.rs` |
+| `wsp-store-sqlite` | `crates/store-sqlite` | state-core step 0 (wsp-045) | the SQLite backend of the state store (docs/state-core.md section 6). Step 0 holds only the bundled SQLite (`sqlite_version()`) and its smoke tests (version >= 3.35, `RETURNING`, `json_extract`, WAL); no schema and no `Store` yet. **The one crate that depends on `rusqlite`** (D2), pinned exactly and `bundled`, its C compiled through `.cargo/cc-wrap`. Exposes no `rusqlite` type (D1). **Links no `wsp-store`, `wsp-wire`, `wsp-host` or `wsp-manager`**: `tests/layering.rs` walks its path dependencies | `crates/store-sqlite/MAP.md` |
 
 `disk` and `memory` are mapped to `base` in the layering table but stay in the root package: each reaches up
-(`cmd_checkout`, `place`). Dependencies are `serde_json` only; the members are path dependencies in the workspace.
+(`cmd_checkout`, `place`). Dependencies are `serde_json` only (and `rusqlite`, in `wsp-store-sqlite` alone: D2); the members are path dependencies in the workspace.
 The test count is `cargo test --workspace -- --list` = 2756 at `c1` (2754 `#[test]`, the same before and after, plus
 the two layering tests); the 2534 above is the figure of 5 Nov.
 
@@ -313,7 +314,9 @@ worth the churn, and the plan stops at six crates.
 Hazards the order is built around: the cut rows touch every file in flight (rename detection is the only protection,
 hence pure moves and `git mv`); `tests/`-style paths in checks (`wsp check` scripts in each project's `## Checks`,
 and the `affected` key) must name the new paths in the same row; and **`serde_json` stays the only external
-dependency**, a workspace's members are not dependencies in the sense of that rule, and the commit should say so.
+dependency**, with one amendment: **D2 (docs/state-core.md section 6) admits `rusqlite`** as the second, in
+`wsp-store-sqlite` only, pinned exactly and `bundled`; `tests/layering.rs` fails when any other manifest names it. A
+workspace's members are not dependencies in the sense of that rule, and the commit should say so.
 A single binary linked from the members costs nothing at start-up (`robustness-077`).
 
 ## 6. The maps, and how the brief points at them

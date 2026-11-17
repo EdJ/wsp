@@ -1,0 +1,14 @@
+[package]
+name = "wsp-store-sqlite"
+version = "0.1.0"
+edition = "2021"
+description = "The SQLite backend of the state store (docs/state-core.md section 6); step 0 holds only the bundled SQLite and its smoke tests"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# D2 (docs/state-core.md): the second external dependency, in this crate only. Pinned exactly so a
+# SQLite bump is a row of its own; `bundled` compiles SQLite from source (through `.cargo/cc-wrap`),
+# so the version does not depend on the OS's.
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
