@@ -564,8 +564,7 @@ pub(crate) fn row_let_go(store: &Store, row: &str, seats: &[String]) {
 /// seat is taken to be, a local one is looked for in the backends' census. Here
 /// and not asked of `cmd_spawn`, which is a layer above the rows that call this.
 fn seat_stands(seat: &str) -> bool {
-    crate::herdr::host_of(seat).is_some()
-        || crate::place::local_backends()
+    crate::place::local_backends()
             .iter()
             .any(|b| b.census().is_ok_and(|c| c.seats().any(|s| s.seat.as_str() == seat)))
 }

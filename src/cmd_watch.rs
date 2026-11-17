@@ -170,7 +170,6 @@ use serde_json::{json, Value};
 
 use crate::cmd_agent::{self, Bound, Probe, Wip};
 use crate::cmd_govern;
-use crate::herdr;
 use crate::model::{Status, Task};
 use crate::place::State;
 use crate::resolve::Index;
@@ -4254,10 +4253,7 @@ fn drain(store: &Store, spec: &Spec) -> i32 {
 /// at. A watch started outside a pane has only its pid, which is still enough
 /// to answer the one question the register exists for.
 fn watch_key() -> String {
-    match herdr::Env::read().pane_id {
-        Some(p) if !p.is_empty() => p,
-        _ => format!("pid:{}", std::process::id()),
-    }
+    format!("pid:{}", std::process::id())
 }
 
 fn register(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, written: &[Spooled]) {
