@@ -682,6 +682,12 @@ mod tests {
             swap_used_bytes: 0,
             disks: vec![DiskFree { volume: "/".into(), free_bytes: 10, total_bytes: 100 }],
             thermal: Thermal::Fair,
+            load5_centi: None,
+            load15_centi: None,
+            speed_limit_pct: None,
+            hid_idle_secs: None,
+            free_memory_bytes: None,
+            pageouts: None,
         };
         let beat = Frame { id: None, req: None, msg: Message::Beat(Beat { at: At(2), host: Some(facts), seats: vec![] }) };
         assert!(fold(&store, HOST, &beat));

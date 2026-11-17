@@ -236,7 +236,7 @@ fn answer(shared: &Arc<Shared>, id: u64, out: &Sender<Frame>, frame: Frame) {
             let (shared, asker) = (shared.clone(), asker());
             std::thread::spawn(move || seats::read(&shared, asker, r));
         }
-        Message::JobRun(_) | Message::JobStop(_) => {
+        Message::JobRun(_) | Message::JobStop(_) | Message::Jobs(_) => {
             let _ = out.send(refused(req, Refusal::Unsupported, "this manager runs no jobs yet (M3)"));
         }
         Message::TreeCheckout(_) | Message::TreeLand(_) | Message::TreeCopy(_) => {
@@ -258,7 +258,9 @@ fn answer(shared: &Arc<Shared>, id: u64, out: &Sender<Frame>, frame: Frame) {
         | Message::SeatsList(_)
         | Message::SeatScreen(_)
         | Message::JobStarted(_)
-        | Message::JobEnded(_) => {
+        | Message::JobEnded(_)
+        | Message::JobOutput(_)
+        | Message::JobsList(_) => {
             let _ = out.send(refused(req, Refusal::Malformed, "a manager's message, not one wsp sends"));
         }
     }

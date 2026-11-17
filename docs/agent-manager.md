@@ -349,10 +349,12 @@ The base is state-core 5.1's message table. The changes follow from the manager 
 | `seat.stuck` | M → W | seat, the command, how long it has waited on itself | `stuck_tick`'s `ps` |
 | `seats` | W → M (request) | — ; the reply has per seat: state, epoch, rss, shells, last turn, last word | `wip`'s `ps`, `lsof` and renders |
 | `seat.read` | W → M (request) | seat; the reply is the screen text | `peek` (a person asked for it, never a tick) |
-| `job.run` / `job.stop` | W → M | key, class (`build` or `check`), argv, tree `(row, host)`, timeout | `throttle run`'s slots, check's own kill on timeout, check_tree's sweep |
-| `job.started` / `job.ended` | M → W | key, pgid / exit, log ref, CPU-s | slot liveness probes, `kill -0` |
+| `job.run` / `job.stop` | W → M | key `(row, attempt, job)`, `job` unique per run; class (`build` or `check`), argv (with the env prefix), where: a tree `(row, host)` or a dir `(host, path)` under the host's tree root; timeout; `hung_after_secs` (optional); `detach` | `throttle run`'s slots, check's own kill on timeout and on hung (wsp-609), check_tree's sweep |
+| `job.started` / `job.ended` | M → W | key, pgid / exit, timed out, hung, log ref, CPU-s | slot liveness probes, `kill -0` |
+| `job.output` | M → W, to the asking connection only | key, `from` (byte offset in the log), text; not journalled, and the log ref stays the whole log | `throttle run`'s and `verify`'s own echo of cargo |
+| `jobs` | W → M (request) | — ; the reply `jobs.list` has per job: key, class, pgid, start, `running` or `ended` | the slot probes |
 | `tree.checkout` / `tree.land` / `tree.copy` | W → M | only under T2 or T3 (1.3); listed so they are reserved | — |
-| `beat` | both | every 10 s on each side's own timer. The manager adds host facts (load, memory pressure, swap, disk free per volume, thermal state) and per-seat RSS. | `df` ×24.6, `sysctl`, `pmset`, `vm_stat`, `memory_pressure` per tick; the far beat |
+| `beat` | both | every 10 s on each side's own timer. The manager adds host facts (load, memory pressure, swap, disk free per volume, thermal state) and per-seat RSS, and the throttle's facts, each optional both ways (wsp-044): 5- and 15-minute load, speed-limit percent, HID idle seconds, free memory, pageouts. | `df` ×24.6, `sysctl`, `pmset`, `vm_stat`, `memory_pressure` per tick; the far beat |
 | `events` / `subscribe` | W → M | `from` id | — |
 
 **What crosses in `seat.spawn`'s environment** (wsp-026 d1). The agent spec carries env *names*, and the manager
@@ -360,6 +362,27 @@ fills them from its own environment. The values wsp mints for each seat, such as
 the manager's environment and are not secret. They cross as an `env -u K -- K=V` prefix on the argv. A secret, such
 as a token or a key, never goes in that prefix: it is a name the manager fills, and a secret found in the prefix is
 a defect.
+
+**Jobs** (wsp-044, M3 group 1). What the job rows above leave to the types, decided:
+
+- *Where a job runs.* A job runs in a row's tree, named `"tree": {row, host}` as before, or in a place that is no
+  row's: a check tree (`checks/…`), a barrier's tree (`barrier/…/tree`), a warm target. That place is
+  `"dir": {host, path}`, where `path` is relative to the host's tree root, never a path on wsp's machine. The
+  manager refuses `no_tree` for a path that falls outside that root: absolute, climbing above it with `..`, or
+  absent. `HostDir::escapes` is the lexical half of that check. The two sit where `tree` sat, so a `job.run` from
+  before this row still decodes.
+- *The key.* `JobKey.job` names one run, not a kind of job. A retry of the same run sends the same key, and a new run
+  sends a new one: the caller appends the run's own mark (`check@1763400000000`). wsp-040's reopened row reused
+  `(row, 0)` and was refused, which is why the name alone is not enough. A job with no row, such as a barrier's, puts
+  `<list>#<group>` in `row` (`m3-agent-manager#1`) and the barrier's round in `attempt`.
+- *The bounds.* `timeout_secs` ends a job after that long whatever it does (`timed_out`). `hung_after_secs`, when
+  given, ends it after that long with no output and no CPU (check.rs's wsp-609 bound; `hung`).
+- *The environment.* The rule of `seat.spawn`, above: values wsp mints cross as the argv's `env -u K -- K=V` prefix,
+  and a secret never does.
+- *Ownership.* A job that is not `detach`ed is stopped when the connection that asked for it closes, so a
+  `throttle run` killed with its agent leaves no build behind. `job.output` goes to that connection and no other.
+
+The manager refuses `job.run`, `job.stop` and `jobs` as `unsupported` until M3's group 3 serves them.
 
 The manager does **not** decide anything that is wsp's to decide. It does not choose a seat, pick a row, end a seat
 of its own accord (except at the gate's existing rule, section 5), hold a tell, or judge a check's output. It does

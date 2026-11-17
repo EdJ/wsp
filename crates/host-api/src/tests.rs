@@ -60,7 +60,7 @@ fn request(req: u64, msg: Message) -> Frame {
 /// new variant does not compile until it has an arm; give it the next ordinal
 /// and bump this, and [`every_message_round_trips`] fails until the table has
 /// a frame of it.
-const VARIANTS: usize = 31;
+const VARIANTS: usize = 34;
 
 fn ordinal(m: &Message) -> (usize, &'static str) {
     match m {
@@ -94,6 +94,9 @@ fn ordinal(m: &Message) -> (usize, &'static str) {
         Message::Beat(_) => (27, "beat"),
         Message::Subscribe(_) => (28, "subscribe"),
         Message::Refused(_) => (29, "refused"),
+        Message::JobOutput(_) => (30, "job.output"),
+        Message::Jobs(_) => (31, "jobs"),
+        Message::JobsList(_) => (32, "jobs.list"),
     }
 }
 
@@ -101,7 +104,7 @@ fn ordinal(m: &Message) -> (usize, &'static str) {
 /// count and the table must hold both.
 fn coverage(f: &Frame) -> usize {
     match &f.msg {
-        Message::Hello(Hello::Manager(_)) => 30,
+        Message::Hello(Hello::Manager(_)) => 33,
         m => ordinal(m).0,
     }
 }
@@ -343,8 +346,10 @@ fn table() -> Vec<Frame> {
                 key: job_key(),
                 class: JobClass::Check,
                 argv: vec!["cargo".into(), "test".into()],
-                tree: tree(),
+                at: JobAt::Tree(tree()),
                 timeout_secs: 1800,
+                hung_after_secs: Some(600),
+                detach: false,
             }),
         ),
         request(9, Message::JobStop(JobStop { key: job_key() })),
@@ -361,6 +366,7 @@ fn table() -> Vec<Frame> {
                 key: job_key(),
                 exit: None,
                 timed_out: true,
+                hung: false,
                 log: FileRef {
                     host: host(),
                     path: "/exec/jobs/wsp-002.log".into(),
@@ -407,6 +413,12 @@ fn table() -> Vec<Frame> {
                     total_bytes: 1 << 40,
                 }],
                 thermal: Thermal::Fair,
+                load5_centi: None,
+                load15_centi: None,
+                speed_limit_pct: None,
+                hid_idle_secs: None,
+                free_memory_bytes: None,
+                pageouts: None,
             }),
             seats: vec![SeatRss {
                 seat: seat(),
@@ -424,7 +436,262 @@ fn table() -> Vec<Frame> {
                 detail: "tree.checkout before Q6".into(),
             }),
         ),
+        // From here on, what wsp-044 added; appended so the indices above hold.
+        request(
+            13,
+            Message::JobRun(JobRun {
+                key: JobKey {
+                    row: RowId("m3-agent-manager#1".into()),
+                    attempt: 0,
+                    job: "verify:clippy@1763400000000".into(),
+                },
+                class: JobClass::Build,
+                argv: [
+                    "env",
+                    "-u",
+                    "WSP_ROW",
+                    "--",
+                    "WSP_ROW=wsp-044",
+                    "cargo",
+                    "clippy",
+                ]
+                .map(String::from)
+                .to_vec(),
+                at: JobAt::Dir(HostDir {
+                    host: host(),
+                    path: "barrier/m3-agent-manager/1/tree".into(),
+                }),
+                timeout_secs: 3600,
+                hung_after_secs: None,
+                detach: true,
+            }),
+        ),
+        request(
+            8,
+            Message::JobOutput(JobOutput {
+                key: job_key(),
+                from: 4096,
+                text: "   Compiling wsp-host-api v0.1.0\n".into(),
+            }),
+        ),
+        request(14, Message::Jobs(Jobs {})),
+        request(
+            14,
+            Message::JobsList(JobsList {
+                jobs: vec![
+                    JobRow {
+                        key: job_key(),
+                        class: JobClass::Check,
+                        pgid: 5150,
+                        started: At(1_763_400_000_000),
+                        state: JobState::Running,
+                    },
+                    JobRow {
+                        key: JobKey {
+                            row: row(),
+                            attempt: 1,
+                            job: "build@2".into(),
+                        },
+                        class: JobClass::Build,
+                        pgid: 5100,
+                        started: At(1_763_399_000_000),
+                        state: JobState::Ended,
+                    },
+                ],
+            }),
+        ),
+        event(
+            72,
+            Message::JobEnded(JobEnded {
+                key: job_key(),
+                exit: None,
+                timed_out: false,
+                hung: true,
+                log: FileRef {
+                    host: host(),
+                    path: "/exec/jobs/wsp-002.log".into(),
+                },
+                cpu_ms: 3_000,
+            }),
+        ),
+        frame(Message::Beat(Beat {
+            at: At(7),
+            host: Some(HostFacts {
+                load_centi: 431,
+                cpus: 10,
+                memory: MemoryPressure::Normal,
+                swap_used_bytes: 0,
+                disks: vec![],
+                thermal: Thermal::Serious,
+                load5_centi: Some(380),
+                load15_centi: Some(290),
+                speed_limit_pct: Some(62),
+                hid_idle_secs: Some(1_200),
+                free_memory_bytes: Some(3 << 30),
+                pageouts: Some(81_234),
+            }),
+            seats: vec![],
+        })),
     ]
+}
+
+/// The frames wsp-044 added, by their place in [`table`].
+const DIR_RUN: usize = 35;
+const OUTPUT: usize = 36;
+const LIST: usize = 38;
+const FULL_BEAT: usize = 40;
+
+/// wsp-044's messages and fields, as they are spelled on the wire.
+#[test]
+fn job_wire_spelling_is_pinned() {
+    assert_eq!(
+        serde_json::to_value(&table()[DIR_RUN]).unwrap(),
+        json!({
+            "req": 13,
+            "type": "job.run",
+            "key": {"row": "m3-agent-manager#1", "attempt": 0, "job": "verify:clippy@1763400000000"},
+            "class": "build",
+            "argv": ["env", "-u", "WSP_ROW", "--", "WSP_ROW=wsp-044", "cargo", "clippy"],
+            "dir": {"host": "mac", "path": "barrier/m3-agent-manager/1/tree"},
+            "timeout_secs": 3600,
+            "detach": true
+        }),
+        "a dir sits beside the fields, where `tree` did; no hung bound is left out"
+    );
+    let row_run = serde_json::to_value(&table()[23]).unwrap();
+    assert_eq!(row_run["tree"], json!({"row": "wsp-002", "host": "mac"}));
+    assert_eq!(row_run["hung_after_secs"], 600);
+    assert_eq!(row_run["detach"], false);
+
+    assert_eq!(
+        serde_json::to_value(&table()[OUTPUT]).unwrap(),
+        json!({
+            "req": 8,
+            "type": "job.output",
+            "key": {"row": "wsp-002", "attempt": 2, "job": "check"},
+            "from": 4096,
+            "text": "   Compiling wsp-host-api v0.1.0\n"
+        })
+    );
+    let list = serde_json::to_value(&table()[LIST]).unwrap();
+    assert_eq!(list["type"], "jobs.list");
+    assert_eq!(list["jobs"][0]["state"], "running");
+    assert_eq!(list["jobs"][1]["state"], "ended");
+    assert_eq!(list["jobs"][0]["started"], 1_763_400_000_000u64);
+
+    let host = &serde_json::to_value(&table()[FULL_BEAT]).unwrap()["host"];
+    assert_eq!(host["load5_centi"], 380);
+    assert_eq!(host["load15_centi"], 290);
+    assert_eq!(host["speed_limit_pct"], 62);
+    assert_eq!(host["hid_idle_secs"], 1_200);
+    assert_eq!(host["free_memory_bytes"], 3u64 << 30);
+    assert_eq!(host["pageouts"], 81_234);
+    let bare = serde_json::to_value(&table()[31]).unwrap();
+    assert!(
+        bare["host"].get("load5_centi").is_none(),
+        "an unread throttle fact is left out, not sent as null: {bare}"
+    );
+}
+
+/// Frames as a peer from before wsp-044 wrote them: no place but `tree`, no
+/// hung bound, no `detach`, no `hung`, no throttle facts. They still decode.
+#[test]
+fn frames_from_before_the_job_contract_decode() {
+    let run: Frame = serde_json::from_str(
+        r#"{"req":8,"type":"job.run","key":{"row":"wsp-002","attempt":2,"job":"check"},"class":"check","argv":["cargo","test"],"tree":{"row":"wsp-002","host":"mac"},"timeout_secs":1800}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        run.msg,
+        Message::JobRun(JobRun {
+            key: job_key(),
+            class: JobClass::Check,
+            argv: vec!["cargo".into(), "test".into()],
+            at: JobAt::Tree(tree()),
+            timeout_secs: 1800,
+            hung_after_secs: None,
+            detach: false,
+        })
+    );
+
+    let ended: Frame = serde_json::from_str(
+        r#"{"id":71,"type":"job.ended","key":{"row":"wsp-002","attempt":2,"job":"check"},"timed_out":true,"log":{"host":"mac","path":"/l"},"cpu_ms":5}"#,
+    )
+    .unwrap();
+    match ended.msg {
+        Message::JobEnded(e) => assert!(e.timed_out && !e.hung && e.exit.is_none()),
+        m => panic!("decoded as {m:?}"),
+    }
+
+    let beat: Frame = serde_json::from_str(
+        r#"{"type":"beat","at":6,"host":{"load_centi":431,"cpus":10,"memory":"warn","swap_used_bytes":0,"disks":[],"thermal":"fair"}}"#,
+    )
+    .unwrap();
+    let Message::Beat(Beat { host: Some(h), .. }) = beat.msg else {
+        panic!("no facts in {beat:?}")
+    };
+    assert_eq!(h.load_centi, 431);
+    assert_eq!(
+        (h.load5_centi, h.load15_centi, h.speed_limit_pct),
+        (None, None, None)
+    );
+    assert_eq!(
+        (h.hid_idle_secs, h.free_memory_bytes, h.pageouts),
+        (None, None, None)
+    );
+
+    let newer: Frame = serde_json::from_str(
+        r#"{"type":"job.run","key":{"row":"r","attempt":0,"job":"j@1"},"class":"build","argv":["make"],"dir":{"host":"mac","path":"checks/x"},"timeout_secs":1,"priority":"later"}"#,
+    )
+    .unwrap();
+    match newer.msg {
+        Message::JobRun(r) => assert_eq!(
+            r.at,
+            JobAt::Dir(HostDir {
+                host: host(),
+                path: "checks/x".into()
+            })
+        ),
+        m => panic!("decoded as {m:?}"),
+    }
+
+    assert!(
+        serde_json::from_str::<Frame>(
+            r#"{"type":"job.run","key":{"row":"r","attempt":0,"job":"j"},"class":"build","argv":[],"timeout_secs":1}"#
+        )
+        .is_err(),
+        "a job.run that says nowhere to run does not decode"
+    );
+}
+
+/// The lexical half of "outside the tree root": the manager refuses these
+/// before it looks at the disk.
+#[test]
+fn a_dir_outside_the_tree_root_is_seen() {
+    let at = |p: &str| HostDir {
+        host: host(),
+        path: p.into(),
+    };
+    for inside in [
+        "checks/wsp-044",
+        "barrier/m3-agent-manager/1/tree",
+        "./checks/x",
+        "checks/x/../y",
+        "a//b/",
+    ] {
+        assert!(!at(inside).escapes(), "{inside} is inside");
+    }
+    for outside in [
+        "",
+        "/Users/x/src",
+        "..",
+        "../other",
+        "checks/../..",
+        "a/../../b",
+        "\\server\\x",
+    ] {
+        assert!(at(outside).escapes(), "{outside:?} is outside");
+    }
 }
 
 #[test]

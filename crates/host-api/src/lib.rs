@@ -109,9 +109,22 @@ pub struct Key {
     pub attempt: u32,
 }
 
-/// The idempotency key of `job.run`: the row's [`Key`] and the job's name
-/// within that attempt (`build`, `check`, `verify:clippy`, …), since one
-/// attempt runs several jobs and each must be retried without running twice.
+/// The idempotency key of `job.run`: the row's [`Key`] and a name for this
+/// one *run* of a job, since one attempt runs several jobs and each must be
+/// retried without running twice.
+///
+/// **`job` is unique per run, not per name.** A retry of the same run after a
+/// lost reply sends the same key and gets the same answer; a new run sends a
+/// new `job`, even of the same check in the same tree. The caller makes it
+/// unique by appending the run's own mark to the name (`check@1763400000000`,
+/// `verify:clippy@3`). The name alone is not enough: a reopened row starts its
+/// attempts again, and wsp-040's reopened row sent `(row, 0)` a second time
+/// and was refused as a duplicate.
+///
+/// **A job with no row** (a barrier's check, a warm target) carries the list
+/// and the group where the row would stand: `row` is `<list>#<group>`
+/// (`m3-agent-manager#1`), the group's ordinal as the barrier ran it, and
+/// `attempt` is the barrier's round on that group (0 for the first).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct JobKey {
     pub row: RowId,
@@ -126,6 +139,47 @@ pub struct JobKey {
 pub struct Tree {
     pub row: RowId,
     pub host: HostId,
+}
+
+/// A directory on a host that is no row's tree: a check tree (`checks/…`), a
+/// barrier's tree (`barrier/…/tree`), a warm target. Like [`Tree`] it is never
+/// a path on wsp's machine: `path` is relative to the host's tree root, the
+/// directory under which the manager keeps every tree it runs jobs in, with
+/// `/` between its parts.
+///
+/// The manager refuses (`no_tree`) a `path` that falls outside that root: an
+/// absolute one, or one whose `..` parts climb above it ([`HostDir::escapes`]
+/// is the lexical half of that check), or one that is not there.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HostDir {
+    pub host: HostId,
+    pub path: String,
+}
+
+impl HostDir {
+    /// Whether `path`, read without touching the disk, falls outside the
+    /// tree root: it is empty, absolute, or climbs above the root with `..`.
+    /// A link inside the root that points out of it is the manager's to
+    /// catch when it resolves the path; this cannot see one.
+    pub fn escapes(&self) -> bool {
+        if self.path.is_empty() || self.path.starts_with('/') || self.path.starts_with('\\') {
+            return true;
+        }
+        let mut depth: i64 = 0;
+        for part in self.path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return true;
+                    }
+                }
+                _ => depth += 1,
+            }
+        }
+        false
+    }
 }
 
 /// A file on a host: a transcript or a job's log. wsp reads it through the
@@ -235,6 +289,16 @@ pub enum Message {
     /// M → W: a job ended.
     #[serde(rename = "job.ended")]
     JobEnded(JobEnded),
+    /// M → W: output a running job wrote, sent only to the connection that
+    /// asked for the job and never journalled.
+    #[serde(rename = "job.output")]
+    JobOutput(JobOutput),
+    /// W → M request: the manager's job table. Answered by `jobs.list`.
+    #[serde(rename = "jobs")]
+    Jobs(Jobs),
+    /// M → W: the answer to `jobs`.
+    #[serde(rename = "jobs.list")]
+    JobsList(JobsList),
 
     /// W → M, reserved for trees placed with the agents (1.3, T2/T3). No
     /// manager answers it before Q6 is decided; it refuses `unsupported`.
@@ -255,7 +319,7 @@ pub enum Message {
     Subscribe(Subscribe),
 
     /// M → W: a command or request with no refusal of its own (`seat.stop`,
-    /// `job.run`, `tree.*`, a malformed or unauthorised frame) was refused.
+    /// `job.run`, `jobs`, `tree.*`, a malformed or unauthorised frame) was refused.
     /// Its `req` names what was refused.
     #[serde(rename = "refused")]
     Refused(Refused),
@@ -617,13 +681,45 @@ pub struct SeatScreen {
 
 // ---------------------------------------------------------------- jobs
 
+/// `job.run`. Idempotent on `key` (see [`JobKey`]: unique per run).
+///
+/// **The environment** is the rule of `seat.spawn`'s (3.2, wsp-026 d1). The
+/// values wsp mints for a job cross on the argv, as an `env -u K -- K=V …`
+/// prefix in front of the command. A secret never crosses: not in that prefix
+/// and not anywhere else in the frame, and one found there is a defect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRun {
     pub key: JobKey,
     pub class: JobClass,
     pub argv: Vec<String>,
-    pub tree: Tree,
+    /// Where it runs: on the wire `"tree": {row, host}` or `"dir": {host,
+    /// path}`, beside the other fields.
+    #[serde(flatten)]
+    pub at: JobAt,
+    /// The job is ended this many seconds after it started, whatever it is
+    /// doing, and its `job.ended` says `timed_out`.
     pub timeout_secs: u64,
+    /// The job is ended once it has written no output and spent no CPU for
+    /// this many seconds (check.rs's wsp-609 bound), and its `job.ended` says
+    /// `hung`. Absent: no such bound, and from a client older than the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hung_after_secs: Option<u64>,
+    /// Whether the job outlives the connection that asked for it. A job that
+    /// is not detached is stopped when that connection closes, so a `throttle
+    /// run` killed with its agent leaves no build behind. Its `job.output`
+    /// goes to that connection either way, while it is open.
+    #[serde(default)]
+    pub detach: bool,
+}
+
+/// Where a job runs: a row's tree, or a directory under the host's tree root
+/// that belongs to no row. A frame from before [`HostDir`] carried only
+/// `tree`, and still decodes as [`JobAt::Tree`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobAt {
+    Tree(Tree),
+    Dir(HostDir),
 }
 
 /// The admission class: the throttle's slots become the manager's (1.3).
@@ -654,9 +750,57 @@ pub struct JobEnded {
     pub exit: Option<i32>,
     #[serde(default)]
     pub timed_out: bool,
+    /// It was ended by `hung_after_secs`: no output and no CPU for that long.
+    #[serde(default)]
+    pub hung: bool,
+    /// The whole log. `job.output` is a view of it while the job runs.
     pub log: FileRef,
     /// CPU time the job's process group spent, in milliseconds.
     pub cpu_ms: u64,
+}
+
+/// `job.output`: what a running job wrote, so `throttle run` and `verify`
+/// can echo it live. The [`JobEnded::log`] stays the whole of it; this is
+/// sent to the connection that asked for the job and to no other, and is not
+/// journalled, so a client that was not listening reads the log instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobOutput {
+    pub key: JobKey,
+    /// The byte offset in the job's log at which `text` begins. The next
+    /// `job.output` starts where this one ends; a gap means some was not
+    /// sent, and the log holds it.
+    pub from: u64,
+    /// The bytes written, decoded as UTF-8 with anything that is not
+    /// replaced, so a chunk is always text.
+    pub text: String,
+}
+
+/// `jobs` carries nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Jobs {}
+
+/// The answer to `jobs`: the job table, running and recently ended. It is
+/// what a caller reads where it used to probe the throttle's slots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobsList {
+    pub jobs: Vec<JobRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRow {
+    pub key: JobKey,
+    pub class: JobClass,
+    /// The job's process group.
+    pub pgid: u32,
+    pub started: At,
+    pub state: JobState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Running,
+    Ended,
 }
 
 // ---------------------------------------------------------------- trees (reserved)
@@ -684,6 +828,11 @@ pub struct Beat {
 
 /// The facts wsp used to read with `df`, `sysctl`, `pmset`, `vm_stat` and
 /// `memory_pressure` per tick.
+///
+/// The fields after `thermal` are the throttle's (d1 Q11: wsp keeps the
+/// decision and reads its facts from the beat). Each is optional both ways:
+/// absent from an older manager's beat, ignored by an older wsp, and absent
+/// when this host could not read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFacts {
     /// The one-minute load average, in hundredths.
@@ -693,6 +842,26 @@ pub struct HostFacts {
     pub swap_used_bytes: u64,
     pub disks: Vec<DiskFree>,
     pub thermal: Thermal,
+    /// The five-minute load average, in hundredths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load5_centi: Option<u32>,
+    /// The fifteen-minute load average, in hundredths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load15_centi: Option<u32>,
+    /// `pmset -g therm`'s `CPU_Speed_Limit`, in percent: 100 when no limit
+    /// is recorded. `thermal` is this, banded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_limit_pct: Option<u32>,
+    /// Seconds since the person last touched a keyboard or pointer (HID idle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hid_idle_secs: Option<u64>,
+    /// Memory free now, in bytes (`vm_stat`'s free pages times the page size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_memory_bytes: Option<u64>,
+    /// Pages written out to swap since boot (`vm_stat`'s `Pageouts`), a
+    /// counter: the throttle reads its rise between beats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageouts: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,7 +932,7 @@ pub enum Refusal {
     NoSeat,
     /// No such job.
     NoJob,
-    /// No such tree on this host.
+    /// No such tree on this host, or a [`HostDir`] outside its tree root.
     NoTree,
     /// Capacity is full for that class.
     Full,

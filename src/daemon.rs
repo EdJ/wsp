@@ -1122,6 +1122,12 @@ mod tests {
                 swap_used_bytes: 0,
                 disks: vec![DiskFree { volume: "/Volumes/Scripted".into(), free_bytes: 10 << 30, total_bytes: 100 << 30 }],
                 thermal: Thermal::Nominal,
+                load5_centi: None,
+                load15_centi: None,
+                speed_limit_pct: None,
+                hid_idle_secs: None,
+                free_memory_bytes: None,
+                pageouts: None,
             };
             let beat = Frame { id: None, req: None, msg: Message::Beat(Beat { at: ms(now), host: Some(facts), seats: vec![] }) };
             assert!(fold::fold(store, HOST, &beat));
@@ -1218,6 +1224,12 @@ mod tests {
                 swap_used_bytes: 0,
                 disks: vec![DiskFree { volume: "/Volumes/Scripted".into(), free_bytes: 10 << 30, total_bytes: 100 << 30 }],
                 thermal: Thermal::Nominal,
+                load5_centi: None,
+                load15_centi: None,
+                speed_limit_pct: None,
+                hid_idle_secs: None,
+                free_memory_bytes: None,
+                pageouts: None,
             };
             let beat = Frame { id: None, req: None, msg: Message::Beat(Beat { at: At(1), host: Some(facts), seats: vec![] }) };
             assert!(fold::fold(&store, HOST, &beat));

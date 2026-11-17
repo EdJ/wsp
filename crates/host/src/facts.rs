@@ -3,9 +3,14 @@
 //! state, read in three asks of [`InProcess`] (one `sysctl`, one `df`, one
 //! `pmset`) and turned into `wsp-host-api`'s [`HostFacts`].
 //!
-//! [`HostFacts`] has no "unknown" in its fields, so a fact this host does not
-//! answer is reported at its quiet value (load 0, memory `normal`, swap 0,
+//! [`HostFacts`] has no "unknown" in its first fields, so a fact this host does
+//! not answer is reported at its quiet value (load 0, memory `normal`, swap 0,
 //! thermal `nominal`) and named in [`Read::missing`] for the reader's log.
+//!
+//! The throttle's facts (wsp-044) are optional. The five- and fifteen-minute
+//! load and the speed limit come out of the same answers; HID idle, free
+//! memory and pageouts need asks this reading does not make yet, and are
+//! `None` until the row that serves the throttle adds them.
 
 use std::path::{Path, PathBuf};
 
@@ -36,13 +41,16 @@ pub fn read(host: &InProcess, volumes: &[PathBuf]) -> Read {
 /// The facts out of the three answers.
 pub fn assemble(sysctl: &str, df: &str, pmset: Option<&str>) -> Read {
     let mut missing = Vec::new();
-    let load_centi = match sysctl_value(sysctl, "vm.loadavg").and_then(parse_load1) {
-        Some(l) => (l * 100.0).round() as u32,
+    let loads = sysctl_value(sysctl, "vm.loadavg").map(parse_loads).unwrap_or_default();
+    let centi = |l: f64| (l * 100.0).round() as u32;
+    let load_centi = match loads.first() {
+        Some(&l) => centi(l),
         None => {
             missing.push("load");
             0
         }
     };
+    let (load5_centi, load15_centi) = (loads.get(1).copied().map(centi), loads.get(2).copied().map(centi));
     let swap_used_bytes = match sysctl_value(sysctl, "vm.swapusage").and_then(parse_swap_used) {
         Some(b) => b,
         None => {
@@ -61,15 +69,29 @@ pub fn assemble(sysctl: &str, df: &str, pmset: Option<&str>) -> Read {
     if disks.is_empty() {
         missing.push("disks");
     }
-    let thermal = match pmset {
-        Some(out) => parse_thermal(out),
+    let (thermal, speed_limit_pct) = match pmset {
+        Some(out) => (parse_thermal(out), Some(parse_speed_limit(out).unwrap_or(100))),
         None => {
             missing.push("thermal");
-            Thermal::Nominal
+            (Thermal::Nominal, None)
         }
     };
     let cpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
-    Read { facts: HostFacts { load_centi, cpus, memory, swap_used_bytes, disks, thermal }, missing }
+    let facts = HostFacts {
+        load_centi,
+        cpus,
+        memory,
+        swap_used_bytes,
+        disks,
+        thermal,
+        load5_centi,
+        load15_centi,
+        speed_limit_pct,
+        hid_idle_secs: None,
+        free_memory_bytes: None,
+        pageouts: None,
+    };
+    Read { facts, missing }
 }
 
 /// The value of `name` in `sysctl`'s `name: value` lines.
@@ -79,7 +101,17 @@ pub fn sysctl_value<'a>(out: &'a str, name: &str) -> Option<&'a str> {
 
 /// The one-minute load out of `{ 0.50 0.40 0.30 }`.
 pub fn parse_load1(s: &str) -> Option<f64> {
-    s.split(|c: char| c.is_whitespace() || c == '{' || c == '}').find(|w| !w.is_empty())?.parse().ok()
+    parse_loads(s).first().copied()
+}
+
+/// The one-, five- and fifteen-minute loads out of `{ 0.50 0.40 0.30 }`, as
+/// many as read in order (none, if the first does not).
+pub fn parse_loads(s: &str) -> Vec<f64> {
+    s.split(|c: char| c.is_whitespace() || c == '{' || c == '}')
+        .filter(|w| !w.is_empty())
+        .take(3)
+        .map_while(|w| w.parse().ok())
+        .collect()
 }
 
 /// Swap used, in bytes, out of `total = 1024.00M  used = 43.19M  free = …`.
@@ -110,18 +142,21 @@ pub fn parse_pressure(s: &str) -> Option<MemoryPressure> {
 /// limit recorded, or 100, is nominal; the rest is banded (80 and over fair,
 /// 50 and over serious, below that critical).
 pub fn parse_thermal(out: &str) -> Thermal {
-    let limit = out
-        .lines()
-        .find(|l| l.trim_start().starts_with("CPU_Speed_Limit"))
-        .and_then(|l| l.split('=').nth(1))
-        .and_then(|v| v.trim().parse::<u32>().ok());
-    match limit {
+    match parse_speed_limit(out) {
         None => Thermal::Nominal,
         Some(n) if n >= 100 => Thermal::Nominal,
         Some(n) if n >= 80 => Thermal::Fair,
         Some(n) if n >= 50 => Thermal::Serious,
         Some(_) => Thermal::Critical,
     }
+}
+
+/// `pmset -g therm`'s `CPU_Speed_Limit`, in percent, if one is recorded.
+pub fn parse_speed_limit(out: &str) -> Option<u32> {
+    out.lines()
+        .find(|l| l.trim_start().starts_with("CPU_Speed_Limit"))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<u32>().ok())
 }
 
 /// `df -Pk`'s rows, one per volume (a volume named twice is listed once).
@@ -160,6 +195,9 @@ mod tests {
         let r = assemble(SYSCTL, DF, Some(PMSET));
         assert!(r.missing.is_empty(), "{:?}", r.missing);
         assert_eq!(r.facts.load_centi, 247);
+        assert_eq!((r.facts.load5_centi, r.facts.load15_centi), (Some(210), Some(198)));
+        assert_eq!(r.facts.speed_limit_pct, Some(100), "no limit recorded is 100");
+        assert_eq!((r.facts.hid_idle_secs, r.facts.free_memory_bytes, r.facts.pageouts), (None, None, None));
         assert_eq!(r.facts.memory, MemoryPressure::Warn);
         assert_eq!(r.facts.swap_used_bytes, (43.19f64 * 1024.0 * 1024.0).round() as u64);
         assert_eq!(r.facts.thermal, Thermal::Nominal);
@@ -182,6 +220,15 @@ mod tests {
         let r = assemble("", "", None);
         assert_eq!(r.missing, vec!["load", "swap", "memory", "disks", "thermal"]);
         assert_eq!(r.facts.load_centi, 0);
+        assert_eq!((r.facts.load5_centi, r.facts.load15_centi, r.facts.speed_limit_pct), (None, None, None));
+    }
+
+    #[test]
+    fn a_speed_limit_is_carried_as_read() {
+        let r = assemble(SYSCTL, DF, Some("CPU_Speed_Limit \t= 62\n"));
+        assert_eq!(r.facts.speed_limit_pct, Some(62));
+        assert_eq!(r.facts.thermal, Thermal::Serious);
+        assert_eq!(parse_loads("{ 1.00 }"), vec![1.0], "a short answer gives what it has");
     }
 
     #[test]
