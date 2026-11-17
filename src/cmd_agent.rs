@@ -2150,7 +2150,7 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
 /// backend, take whichever one's census names this seat" `Wip::live` already
 /// does, one seat at a time instead of the whole list.
 pub(crate) fn locate_seat<'a>(
-    backends: &'a [Box<dyn Place>; 2],
+    backends: &'a [Box<dyn Place>; 1],
     seat: &str,
 ) -> Option<(&'a Box<dyn Place>, crate::place::Seated)> {
     backends.iter().find_map(|b| {

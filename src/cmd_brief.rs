@@ -16,7 +16,6 @@ use serde_json::json;
 use crate::cmd_agent::{self, current_project};
 use crate::cmd_govern;
 use crate::cmd_mandate;
-use crate::herdr;
 use crate::model::Task;
 use crate::overlap;
 use crate::resolve;
@@ -464,7 +463,6 @@ impl Briefing {
     /// brief.
     pub(crate) fn live(store: &Store, args: &Args) -> Briefing {
         let world = overlap::World::live(store);
-        let env = herdr::Env::read();
         let governors = store.governors();
         // The same two-step read [`Briefing::at`] makes, for the same reason:
         // a rotation's successor reads its brief from its `SessionStart` hook,
@@ -473,7 +471,7 @@ impl Briefing {
         // here too: this is a decision and not a display, so the port's own
         // answer to *where am I* is the one it is asked with.
         let pane = cmd_agent::my_pane();
-        let governed = held(&governors, env.workspace_id.as_deref(), pane.as_deref());
+        let governed = held(&governors, None, pane.as_deref());
         let handovers = store.handovers();
         let incoming = cmd_govern::incoming(&handovers, pane.as_deref());
         let ending_failed =
@@ -495,7 +493,7 @@ impl Briefing {
                 true => None,
                 false => current_project(store, args, &world.index).unwrap_or(None),
             },
-            mandate: cmd_mandate::current(store, agent.as_deref(), env.workspace_id.as_deref()),
+            mandate: cmd_mandate::current(store, agent.as_deref(), None),
             lists: crate::worklist::Running::read(store).as_ref().clone(),
             seat_at,
             governors,
@@ -507,7 +505,7 @@ impl Briefing {
             // no seat opened believing it held nothing, which is the whole of
             // what a `SessionStart` brief exists to prevent.
             pane,
-            workspace: env.workspace_id,
+            workspace: None,
             incoming,
             ending_failed,
             cwd: std::env::current_dir().ok().map(|c| util::contract(&c)),

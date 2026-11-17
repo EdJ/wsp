@@ -122,10 +122,7 @@ fn default_dest() -> PathBuf {
 /// wants the durable name, and this is a sentence about something happening
 /// right now, which wants the precise one.
 fn who() -> String {
-    match crate::herdr::Env::read().pane_id {
-        Some(p) if !p.trim().is_empty() => p,
-        _ => agent_key(),
-    }
+    agent_key()
 }
 
 // ---- the lock ----------------------------------------------------------

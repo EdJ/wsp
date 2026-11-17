@@ -38,7 +38,6 @@ use crate::cmd_govern;
 pub(crate) use crate::place::local_backends;
 use crate::leg_seat;
 use crate::place::{Agent, Order, Place, Refusal, Seat, State};
-use crate::place_herdr::Herdr;
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Clock, Paint};
@@ -1147,9 +1146,6 @@ fn attention_gate(store: &Store, args: &Args, kind: &str, task: Option<&str>) ->
     if how.program().is_none() {
         return Ok(());
     }
-    if args.has("herdr") && !args.has("compound") {
-        return Err(format!("--kind {kind} cannot run on herdr, whose agent catalogue is closed — drop `--herdr` (compound is the default) or use `--headless`"));
-    }
     if args.has("verify") || args.has("govern") || args.has("leg") || args.has("piece") {
         return Err(format!("--kind {kind} runs a plain member's row, not a verifier, a leg, a piece or a governor"));
     }
@@ -2153,7 +2149,7 @@ fn seat_primary(place: &dyn Place, seats: &dyn crate::cycle::Seats, store: &Stor
         .collect();
     let mut flags: Vec<(&str, &str)> = vec![("govern", "true")];
     flags.extend(valued.iter().map(|(k, v)| (*k, v.as_str())));
-    for b in ["herdr", "headless", "compound", "json", "focus", "full", "subagents"] {
+    for b in ["headless", "compound", "json", "focus", "full", "subagents"] {
         if args.has(b) {
             flags.push((b, "true"));
         }
@@ -2229,7 +2225,6 @@ fn seat_primary(place: &dyn Place, seats: &dyn crate::cycle::Seats, store: &Stor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Chosen {
     Headless,
-    Herdr,
     Compound,
 }
 
@@ -2237,10 +2232,9 @@ pub(crate) fn chosen(args: &Args) -> Chosen {
     // `--compound` is still accepted and still means compound; since the flip
     // it names the default rather than departing from it, so every script and
     // work order written during the migration keeps working.
-    match (args.has("headless"), args.has("herdr") && !args.has("compound")) {
-        (true, _) => Chosen::Headless,
-        (false, true) => Chosen::Herdr,
-        (false, false) => Chosen::Compound,
+    match args.has("headless") {
+        true => Chosen::Headless,
+        false => Chosen::Compound,
     }
 }
 
@@ -2258,7 +2252,6 @@ pub(crate) fn chosen(args: &Args) -> Chosen {
 pub(crate) fn backend_flag(c: Chosen) -> Option<(&'static str, &'static str)> {
     match c {
         Chosen::Headless => Some(("headless", "true")),
-        Chosen::Herdr => Some(("herdr", "true")),
         Chosen::Compound => None,
     }
 }
@@ -2272,18 +2265,6 @@ pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
     // They would have gone on passing had this copy drifted.
     match chosen(args) {
         Chosen::Headless => Box::new(crate::place_super::Supervisor::new()),
-        // **The default is compound** (`compound-112`), and `--herdr` is what
-        // asks for the fork by name. It was the other way round until the
-        // fleet had run a fortnight of agents on compound without one: the
-        // flag every spawn on `chrome-port`, `compound-parity`, `herdr-out`
-        // and `native-window` had to carry was `--compound`, which is the
-        // definition of a default pointing the wrong way.
-        //
-        // Reversible in one line, which is why it is a default and not a
-        // deletion. `place_herdr` stays, `--herdr` selects it, and
-        // `--on <machine>` still reaches another machine's. What changes is
-        // only what you get when you say nothing.
-        Chosen::Herdr => Box::new(Herdr::new()),
         Chosen::Compound => Box::new(crate::place_compound::Compound::new()),
     }
 }
@@ -2296,8 +2277,8 @@ pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
 /// fleet keeps the safe backend by construction and cannot acquire the unsafe
 /// one by passing the wrong bool. herdr is unchanged: it watches a pty and can
 /// answer about now, so it has nothing to insist past.
-pub(crate) fn insisting_backends() -> [Box<dyn Place>; 2] {
-    [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new().insisting())]
+pub(crate) fn insisting_backends() -> [Box<dyn Place>; 1] {
+    [Box::new(crate::place_compound::Compound::new().insisting())]
 }
 
 fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
@@ -4230,7 +4211,7 @@ fn arrange_ending(store: &Store, scope: &str, args: &Args) -> Result<(), String>
     let err = log.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = wsp_base::calls::Command::new(exe);
     cmd.args(["govern", scope, "--ending"]);
-    for flag in ["herdr", "compound", "headless"] {
+    for flag in ["compound", "headless"] {
         if args.has(flag) {
             cmd.arg(format!("--{flag}"));
         }
@@ -4486,65 +4467,18 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
 /// `wsp despawn` that does it; "lost" is a claim about a machine, and a verb
 /// that let it be made of one that is answering would release live work.
 fn despawn_lost(store: &Store, args: &Args) -> i32 {
-    let p = Paint::new();
     let index = Index::new(store.projects());
-    let (seat, task) = match seat_of(store, args, &index, None) {
-        Ok(v) => v,
+    let seat = match seat_of(store, args, &index, None) {
+        Ok((seat, _)) => seat,
         Err(e) => {
             eprintln!("wsp: {e}");
             return 2;
         }
     };
-    let Some(machine) = crate::herdr::host_of(seat.as_str()).map(str::to_string) else {
-        eprintln!("wsp: {seat} is on this seat, not on a machine that is gone — `wsp despawn` ends it; --lost is for a far seat");
-        return 2;
-    };
-    let (_, ended) = cmd_agent::release_pane(store, seat.as_str());
-    crate::lapse::seat_ended(store, seat.as_str());
-    store.end_agents_in(seat.as_str());
-    let task = ended.or(task);
-    crate::attention::seat_gone(store, task.as_deref(), Some(seat.as_str()));
-    for subject in task.iter() {
-        let _ = std::fs::remove_file(brief_path(store, subject));
-    }
-    let mut far = None;
-    if let Some(id) = &task {
-        if let Some(mut t) = store.task(id) {
-            if t.status() == crate::model::Status::Doing {
-                t.set_status(crate::model::Status::Todo);
-            }
-            let _ = crate::log::note(store, &mut t, &format!("lost with {machine} (seat {seat}) — the last checkpoint is in the seat's worktree"));
-        }
-        if let Some(mut m) = store.machine(&machine) {
-            let at = match m.exec_dir.trim_end_matches('/') {
-                "" => "its exec_dir".to_string(),
-                d => format!("{d}/trees/{id}"),
-            };
-            if !m.body.is_empty() && !m.body.ends_with('\n') {
-                m.body.push('\n');
-            }
-            m.body.push_str(&format!(
-                "- {} lost {id} (seat {seat}): its copy, if it returns, is at {at} — never read automatically\n",
-                util::now_iso()
-            ));
-            let _ = store.save_machine(&m);
-            far = Some(at);
-        }
-        store.log_event("task-lost", json!({ "id": id, "seat": seat.as_str(), "machine": machine }));
-    }
-    store.git_commit(&format!("wsp: despawn --lost {}", task.as_deref().unwrap_or(seat.as_str())));
-    if args.json() {
-        println!("{}", json!({ "seat": seat.as_str(), "machine": machine, "task": task, "far_copy": far, "tree": "kept" }));
-    } else {
-        match &task {
-            Some(t) => println!("  {}", p.dim(&format!("released {t} — back to todo; its worktree on the seat is kept as it was"))),
-            None => println!("  {}", p.dim("it was holding nothing")),
-        }
-        if let Some(at) = far {
-            println!("  {}", p.dim(&format!("{machine}'s copy ({at}) is named in its notes, and is not read")));
-        }
-    }
-    0
+    // A far seat was told by its `@machine` suffix, which only herdr wrote; no
+    // seat carries one now, so every seat is this one's.
+    eprintln!("wsp: {seat} is on this seat, not on a machine that is gone — `wsp despawn` ends it; --lost is for a far seat");
+    2
 }
 
 /// Which pane is running this despawn, and what it holds the seat of.
@@ -4686,14 +4620,10 @@ fn swept_up(
         None => Tree::Absent,
     };
 
-    // Only once herdr says the workspace has actually gone. A seat with
-    // siblings leaves its workspace standing, and a build tree keyed on a live
-    // workspace belongs to whoever is still in it.
-    let gone = |ws: &str| crate::herdr::workspaces().map(|all| !all.iter().any(|w| w.id == ws));
-    let builds = match workspace {
-        Some(ws) if gone(ws).unwrap_or(false) => crate::cmd_verify::clear_build_key(store, ws),
-        _ => Vec::new(),
-    };
+    // A build tree was released only once herdr said its workspace had gone,
+    // and herdr's list never answers now: none is.
+    let _ = workspace;
+    let builds = Vec::new();
     // And the row's finished legs' trees (wsp-297): the row's own is taken on
     // its rule above, and these on theirs, which wants the leg's branch merged.
     let legs = match task.filter(|_| !keep) {
@@ -4707,12 +4637,9 @@ fn swept_up(
 /// [`crate::treecopy::Copy::clear`] on the machine the row was copied to, with
 /// the far trust entry removed in the same ending. `None` for a row that was
 /// never copied, which is every local one.
-fn far_cleared(store: &Store, seat: &str, row: &str, tree: Option<std::path::PathBuf>) -> Option<crate::treecopy::Cleared> {
+fn far_cleared(store: &Store, _seat: &str, row: &str, tree: Option<std::path::PathBuf>) -> Option<crate::treecopy::Cleared> {
     let rec = crate::treecopy::record_of(store, row)?;
-    let m = crate::herdr::host_of(seat)
-        .and_then(|h| store.machine(h))
-        .filter(|m| m.ssh == rec.host)
-        .or_else(|| store.machines().into_iter().find(|m| m.ssh == rec.host));
+    let m = store.machines().into_iter().find(|m| m.ssh == rec.host);
     let Some(m) = m else {
         return Some(crate::treecopy::Cleared {
             done: Vec::new(),
@@ -4808,7 +4735,7 @@ fn closed_row_seat(store: &Store, task: &str) -> Option<String> {
 /// the question, and a seat already gone says so), a local one is looked for
 /// in the backends' census.
 pub(crate) fn seat_is_live(seat: &str) -> bool {
-    crate::herdr::host_of(seat).is_some() || cmd_agent::locate_seat(&crate::place::local_backends(), seat).is_some()
+    cmd_agent::locate_seat(&crate::place::local_backends(), seat).is_some()
 }
 
 /// `me` is which seat this process is standing in, passed in rather than read
@@ -4918,7 +4845,7 @@ fn end_work(
     // has gone cannot say which one it was in. herdr's room by name and not
     // the target's: the tidy below releases a build tree only once herdr says
     // the workspace has gone, which is a question about herdr's rooms alone.
-    let workspace = Herdr::new().room(&seat);
+    let workspace: Option<String> = None;
 
     // Which backend actually holds this seat, asked rather than guessed
     // (`compound-091`'s fold, over `local_backends()`, same as `wsp tell` and
@@ -5141,10 +5068,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Agents,
                 order: 270,
                 text: r##"  wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
-                 [--model <m>] [--effort <e>] [--subagents] [--herdr]
+                 [--model <m>] [--effort <e>] [--subagents]
                                     open a workspace on it and claim it there;
-                                    in a compound session by default — --herdr
-                                    opens it in the fork instead, and
+                                    in a compound session by default, or
                                     --headless in a supervisor with no terminal
                                     at all. --agent starts an agent in it too. --focus
                                     to go there, --on to run it on another
@@ -5331,13 +5257,9 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     }
 
     fn census(&self) -> Option<Vec<(String, String)>> {
-        let herdr_here = crate::herdr::available_now();
         let mut heard = false;
         let mut out = Vec::new();
-        for (backend, name) in crate::place::local_backends().into_iter().zip(crate::place::LOCAL_BACKEND_NAMES) {
-            if name == "herdr" && !herdr_here {
-                continue;
-            }
+        for backend in crate::place::local_backends() {
             if let Ok(census) = backend.census() {
                 heard = true;
                 out.extend(census.seats().map(|s| (s.seat.as_str().to_string(), s.label.clone())));
@@ -5350,13 +5272,8 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 impl crate::cycle::Fleet {
     /// The backends that could hold this seat: every local one, less herdr when
     /// no herdr is running here to hold it. See [`Fleet`].
-    pub(crate) fn here(seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {
-        let herdr_here = crate::herdr::split_host(seat).1.is_some() || crate::herdr::available_now();
-        crate::place::local_backends()
-            .into_iter()
-            .zip(crate::place::LOCAL_BACKEND_NAMES)
-            .filter(move |(_, name)| *name != "herdr" || herdr_here)
-            .map(|(b, _)| b)
+    pub(crate) fn here(_seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {
+        crate::place::local_backends().into_iter()
     }
 
     /// A compound opencode seat reading `Working` that opencode's own database
@@ -5421,7 +5338,6 @@ mod tests {
             Args::parse(argv)
         };
         assert_eq!(chosen(&args(&[])), Chosen::Compound, "the default since compound-112");
-        assert_eq!(chosen(&args(&["--herdr"])), Chosen::Herdr, "--herdr asks for the fork by name");
         assert_eq!(
             chosen(&args(&["--compound"])),
             Chosen::Compound,
@@ -5431,11 +5347,6 @@ mod tests {
             chosen(&args(&["--headless"])),
             Chosen::Headless,
             "headless is unchanged and still wins"
-        );
-        assert_eq!(
-            chosen(&args(&["--headless", "--herdr"])),
-            Chosen::Headless,
-            "a seat with no terminal cannot also be a pane in one"
         );
     }
 
@@ -5447,7 +5358,7 @@ mod tests {
     /// backend a spawn chose, the claim it makes chooses the same.
     #[test]
     fn the_claim_a_spawn_makes_reads_the_backend_the_spawn_opened_the_seat_on() {
-        for c in [Chosen::Headless, Chosen::Herdr, Chosen::Compound] {
+        for c in [Chosen::Headless, Chosen::Compound] {
             let flags: Vec<(&str, &str)> = backend_flag(c).into_iter().collect();
             assert_eq!(
                 chosen(&Args::synth("claim", &["t-1"], &flags)),
@@ -8725,36 +8636,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// A seat on a machine that is not coming back is let go of by name: the
-    /// claim goes, the row is todo, the worktree is not touched, the far copy is
-    /// written into the machine's notes — and a local seat is refused, with the
-    /// claim where it was.
+    /// A local seat is refused `--lost`, with the claim where it was.
     #[test]
-    fn despawn_lost_releases_a_far_seat_and_refuses_a_local_one() {
+    fn despawn_lost_refuses_a_local_seat() {
         let _env = no_backend();
         let store = seat("despawn-lost");
-        let mut m = crate::model::Machine::new("mb2", "mb2");
-        m.exec_dir = "/far/exec".into();
-        store.save_machine(&m).unwrap();
-        working(&store, "t-260816-095", "w1:p1@mb2");
         working(&store, "t-260816-096", "w1:p2");
-        let tree = store.root.join("tree-095");
-        std::fs::create_dir_all(&tree).unwrap();
-        std::fs::write(tree.join("checkpoint"), "x").unwrap();
 
         let local = despawn_lost(&store, &Args::synth("despawn", &["096"], &[("lost", "true")]));
         assert_eq!(local, 2, "a local seat is refused");
         assert!(store.claims().contains_key("t-260816-096"), "and its claim stays");
         assert!(store.bindings().contains_key("w1:p2"));
-
-        let far = despawn_lost(&store, &Args::synth("despawn", &["095"], &[("lost", "true")]));
-        assert_eq!(far, 0);
-        assert!(!store.claims().contains_key("t-260816-095"), "the claim is released");
-        assert!(store.panes_for_task("t-260816-095").is_empty());
-        assert_eq!(store.task("t-260816-095").unwrap().status(), crate::model::Status::Todo);
-        assert!(tree.join("checkpoint").exists(), "the worktree is kept");
-        let body = store.machine("mb2").unwrap().body;
-        assert!(body.contains("/far/exec/trees/t-260816-095") && body.contains("never read"), "{body}");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }

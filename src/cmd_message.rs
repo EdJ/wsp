@@ -102,7 +102,6 @@
 use serde_json::json;
 
 use crate::choices::Choices;
-use crate::herdr;
 use crate::message::{self, About, Kind, Landed, Message, Party, Shape, Waiting};
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -1903,7 +1902,7 @@ pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
             // The workspace here is a byline's, for a panel to jump to — not a
             // decision, so herdr's own variable is still the honest source for
             // it, and empty (as it is under any other backend) is correct.
-            Party::pane(p, herdr::Env::read().workspace_id.as_deref().unwrap_or_default()),
+            Party::pane(p, ""),
             pane.clone(),
         ),
         // Outside herdr entirely, which is a person at a shell. The fallback is
@@ -1921,8 +1920,7 @@ pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
 /// writing one log line has no other reason to touch.
 pub(crate) fn caller(store: &Store) -> String {
     let pane = crate::place::seat_from_env()
-        .map(|s| s.to_string())
-        .or_else(|| herdr::Env::read().pane_id.filter(|p| !p.is_empty()));
+        .map(|s| s.to_string());
     match pane {
         Some(p) => crate::place::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
         None => "person".into(),
@@ -1962,8 +1960,7 @@ pub(crate) fn sender_of(
 /// reads it.
 pub(crate) fn sender(store: &Store) -> String {
     let pane = crate::place::seat_from_env()
-        .map(|s| s.to_string())
-        .or_else(|| herdr::Env::read().pane_id.filter(|p| !p.is_empty()));
+        .map(|s| s.to_string());
     sender_of(&store.governors(), &store.bindings(), pane.as_deref())
 }
 

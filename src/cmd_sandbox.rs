@@ -255,7 +255,7 @@ fn path_with(shim: &Path, current: Option<&str>) -> String {
 }
 
 fn herdr(args: &[&str]) -> Result<String, String> {
-    let out = Command::new(crate::herdr::herdr_bin())
+    let out = Command::new("herdr")
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -311,7 +311,7 @@ fn session(name: &str) -> Option<(bool, PathBuf)> {
 /// starts the processes.
 fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
     let name = &sb.name;
-    let mut c = Command::new(crate::herdr::herdr_bin());
+    let mut c = Command::new("herdr");
     c.args(["--session", name, "server"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

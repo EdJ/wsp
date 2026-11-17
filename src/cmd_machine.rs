@@ -21,9 +21,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::far::{self, Readiness, readiness};
-use crate::herdr;
 use crate::model::{valid_machine_name, Machine, Task};
-use crate::place_herdr;
 use crate::store::{MachineLive, Store};
 use crate::util::{self, Paint};
 use crate::Args;
@@ -104,7 +102,6 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     // than left empty for the tunnel to fill in: a command is allowed to know
     // which backend it is adding a machine for, and a record that says where it
     // forwards is one a person can correct with `set` before the first dial.
-    m.backend_at = place_herdr::mirrored_socket();
     m.os = args.get("os").unwrap_or_default();
     m.arch = args.get("arch").unwrap_or_default();
     if let Some(note) = args.get("note") {
@@ -167,7 +164,7 @@ pub(crate) struct Fleet {
     /// answering, which is a machines list without the agents on it rather than
     /// no machines list — the durable half of a machine is a file and does not
     /// need a socket to be read.
-    pub agents: Vec<herdr::Pane>,
+    pub agents: Vec<Pane>,
     pub bindings: BTreeMap<String, Value>,
     pub tasks: Vec<Task>,
     /// This seat's hostname, in the snapshot rather than read where it is
@@ -191,10 +188,7 @@ impl Fleet {
         Fleet {
             machines: store.machines(),
             live: store.machines_live(),
-            agents: match herdr::available() {
-                true => herdr::agents().unwrap_or_default(),
-                false => Vec::new(),
-            },
+            agents: Vec::new(),
             bindings: store.bindings(),
             tasks: store.tasks(),
             seat: util::hostname(),
@@ -235,6 +229,16 @@ fn seat_cap_line(cap: Option<usize>, working: &[String]) -> String {
     }
 }
 
+/// One agent's row, with only the fields the machines list reads. herdr's own
+/// record is gone (wsp-120); nothing fills this live.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Pane {
+    pub pane_id: String,
+    pub agent: String,
+    pub agent_status: String,
+    pub title: String,
+}
+
 /// One agent, as a machines list wants it: which pane, what it is, what it is
 /// holding.
 struct Standing {
@@ -261,7 +265,7 @@ fn standing(f: &Fleet) -> Vec<Standing> {
                 .and_then(|t| t.as_str())
                 .and_then(|id| f.tasks.iter().find(|t| t.id == id));
             Standing {
-                machine: herdr::host_of(&a.pane_id).unwrap_or("").to_string(),
+                machine: String::new(),
                 pane: a.pane_id.clone(),
                 agent: match a.agent.is_empty() {
                     true => "a shell".into(),
@@ -436,7 +440,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // is usually wrong about, and a blank line here would send you looking for
     // the answer somewhere there isn't one.
     match m.backend_at.is_empty() {
-        true => println!("backend   {}", p.dim(&format!("{} — the backend's default", place_herdr::mirrored_socket()))),
+        true => println!("backend   {}", p.dim("the backend's default")),
         false => println!("backend   {}", m.backend_at),
     }
     // Where the far side keeps its things, said whether or not it is set: an
@@ -804,24 +808,9 @@ fn show_seat(store: &Store, args: &Args) -> i32 {
 ///
 /// Read off the ids and not the claim's `host`, for the reason
 /// `cmd_agent::machine_of` gives: a far agent's claims record the seat's host.
-pub(crate) fn held_on(store: &Store, name: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for (seat, b) in store.bindings() {
-        if crate::herdr::host_of(&seat) != Some(name) {
-            continue;
-        }
-        if let Some(task) = b.get("task_id").and_then(|t| t.as_str()) {
-            out.push((task.to_string(), seat));
-        }
-    }
-    for (task, c) in store.claims() {
-        let ws = c.get("workspace_id").and_then(|t| t.as_str()).unwrap_or("");
-        if crate::herdr::host_of(ws) == Some(name) && !out.iter().any(|(t, _)| *t == task) {
-            out.push((task, ws.to_string()));
-        }
-    }
-    out.sort();
-    out
+pub(crate) fn held_on(_store: &Store, _name: &str) -> Vec<(String, String)> {
+    // No id carries a machine now that herdr's `@machine` qualifier is gone.
+    Vec::new()
 }
 
 /// `wsp machine retire <name>`: say the machine is not coming back, and list
@@ -1211,8 +1200,8 @@ mod tests {
 
     // ---- the whole view, offline -----------------------------------------
 
-    fn agent(pane: &str, agent: &str, state: &str, title: &str) -> herdr::Pane {
-        herdr::Pane {
+    fn agent(pane: &str, agent: &str, state: &str, title: &str) -> Pane {
+        Pane {
             pane_id: pane.to_string(),
             agent: agent.to_string(),
             agent_status: state.to_string(),
@@ -1327,29 +1316,6 @@ mod tests {
 
     fn scratch(tag: &str) -> Store {
         crate::testkit::store(tag)
-    }
-
-    /// `retire` changes the status, lists every row held on the machine (by the
-    /// seat id's suffix) and releases none of them; `rm` without `--force` is
-    /// the same verb.
-    #[test]
-    fn retire_lists_the_held_rows_and_changes_the_status() {
-        let store = scratch("machine-retire");
-        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
-        store.set_binding("w1:p1@mb2", json!({ "task_id": "t-1", "pane_id": "w1:p1@mb2" }));
-        store.set_binding("w1:p2", json!({ "task_id": "t-2", "pane_id": "w1:p2" }));
-        store.set_claim("t-3", json!({ "workspace_id": "w9@mb2" }));
-        store.set_claim("t-1", json!({ "workspace_id": "w1@mb2" }));
-
-        assert_eq!(held_on(&store, "mb2"), vec![("t-1".into(), "w1:p1@mb2".into()), ("t-3".into(), "w9@mb2".into())]);
-        assert_eq!(retire(&store, &Args::synth("machine", &["retire", "mb2"], &[])), 0);
-        assert!(!store.machine("mb2").unwrap().is_active(), "it is retired");
-        assert!(store.bindings().contains_key("w1:p1@mb2"), "and nothing is released");
-        assert!(store.claims().contains_key("t-3"));
-
-        store.save_machine(&Machine::new("mb3", "mb3")).unwrap();
-        assert_eq!(rm(&store, &Args::synth("machine", &["rm", "mb3"], &[])), 0);
-        assert!(!store.machine("mb3").unwrap().is_active(), "rm without --force is retire");
     }
 
     /// Setting it, clearing it, and the one value that is refused.

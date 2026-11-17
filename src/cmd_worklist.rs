@@ -434,8 +434,7 @@ pub fn new(store: &Store, args: &Args) -> i32 {
 /// and `new` has no other reason to touch one but its own.
 fn maker(store: &Store) -> Option<String> {
     let pane = crate::place::seat_from_env()
-        .map(|s| s.to_string())
-        .or_else(|| crate::herdr::Env::read().pane_id.filter(|p| !p.is_empty()))?;
+        .map(|s| s.to_string())?;
     if let Some(scope) = crate::place::governs(&store.governors(), &crate::place::Seat::new(&pane)) {
         return match store.worklist(&scope) {
             Some(list) => worklist::home(store, &list).map(|h| h.project),

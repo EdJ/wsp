@@ -3,7 +3,6 @@
 use serde_json::json;
 
 use crate::cmd_agent::{claim_line, current_project, worked_line};
-use crate::herdr;
 use crate::message::{self, Ask, Message, Shape};
 use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
@@ -2663,9 +2662,6 @@ pub fn prio(store: &Store, args: &Args) -> i32 {
 pub(crate) struct Backlog {
     pub tasks: Vec<Task>,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
-    /// Every pane herdr knows about — a binding to a pane that no longer
-    /// exists is stale rather than a holder.
-    pub panes: Vec<herdr::Pane>,
     /// This pane. A `doing` task in the caller's own hand is precisely the
     /// caller's next piece of work, so it is not "taken".
     pub me: Option<String>,
@@ -2679,8 +2675,7 @@ impl Backlog {
             // chosen is read in full before it is printed.
             tasks: store.task_heads().iter().map(|h| h.bodiless()).collect(),
             bindings: store.bindings(),
-            panes: if herdr::available() { herdr::panes().unwrap_or_default() } else { Vec::new() },
-            me: crate::herdr::Env::read().pane_id,
+            me: None,
         }
     }
 }
@@ -2716,7 +2711,7 @@ pub(crate) fn pick(b: &Backlog, scope_ids: Option<&[String]>) -> Pick {
     // agents set going at once would otherwise all be handed the same task and
     // all three bounce.
     let taken = |t: &Task| {
-        !crate::cmd_agent::live_holders(&b.bindings, &b.panes, &t.id, b.me.as_deref()).is_empty()
+        !crate::cmd_agent::live_holders(&b.bindings, &[], &t.id, b.me.as_deref()).is_empty()
     };
 
     let mut candidates: Vec<Task> = b
@@ -2778,7 +2773,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         // than a moment. This pane stays like this until somebody hands it
         // something, so of the two labels `say_looking` writes, this is the one
         // that is still on screen when a person comes looking.
-        crate::cmd_agent::say_looking(store, &b.panes, scope.as_deref(), false);
+        crate::cmd_agent::say_looking(store, &[], scope.as_deref(), false);
 
         if args.json() {
             println!("null");
@@ -2794,7 +2789,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
 
     // Named, but not yet taken up: the claim is the agent's next move and the
     // reading of the task comes in between. The claim renames over this.
-    crate::cmd_agent::say_looking(store, &b.panes, scope.as_deref(), true);
+    crate::cmd_agent::say_looking(store, &[], scope.as_deref(), true);
 
     if args.json() {
         println!("{}", t.json());
@@ -4781,10 +4776,6 @@ pub(crate) mod tests {
         t
     }
 
-    fn live_pane(id: &str) -> herdr::Pane {
-        herdr::Pane { pane_id: id.to_string(), agent: "claude".into(), ..Default::default() }
-    }
-
     /// Four open tasks, one of them in another agent's hand.
     fn backlog() -> Backlog {
         let mut bindings = std::collections::BTreeMap::new();
@@ -4799,7 +4790,6 @@ pub(crate) mod tests {
                 open_task("t-006", "not yet, deliberately", "parked", "high"),
             ],
             bindings,
-            panes: vec![live_pane("w1:p1"), live_pane("w2:p1")],
             me: Some("w1:p1".into()),
         }
     }
@@ -4819,41 +4809,6 @@ pub(crate) mod tests {
         // And it is not one of the excuses either: `nothing actionable` names
         // what it stepped over, and a parked task was stepped over by nobody.
         assert_eq!(nothing_because(&p), "");
-    }
-
-    /// The failure this filter exists to stop: three idle agents set going at
-    /// once, all handed the same task, all three bounced off `claim`. Writable
-    /// now because the pick takes its inputs in — before this it needed two
-    /// live agents with a binding between them.
-    #[test]
-    fn next_does_not_name_work_another_live_agent_is_holding() {
-        let p = pick(&backlog(), None);
-        assert_eq!(p.task.map(|t| t.id), Some("t-001".to_string()));
-        assert_eq!(p.held, 1, "and it says how many it stepped over");
-
-        // The holder's own pane asking gets it back: a `doing` task in the
-        // caller's hand is precisely the caller's next piece of work.
-        let mut mine = backlog();
-        mine.me = Some("w2:p1".into());
-        let p = pick(&mine, None);
-        assert_eq!(p.task.map(|t| t.id), Some("t-002".to_string()), "doing outranks todo, and it is mine");
-        assert_eq!(p.held, 0);
-    }
-
-    /// A binding to a pane herdr no longer reports is stale, not a holder —
-    /// which is the state a re-claim exists to clear. A pane that is a person
-    /// at a terminal is not a holder either; they can be asked to move.
-    #[test]
-    fn a_dead_pane_is_not_holding_anything() {
-        let mut gone = backlog();
-        gone.panes.retain(|p| p.pane_id != "w2:p1");
-        let p = pick(&gone, None);
-        assert_eq!(p.task.map(|t| t.id), Some("t-002".to_string()), "the binding outlived the pane");
-        assert_eq!(p.held, 0);
-
-        let mut shell = backlog();
-        shell.panes[1].agent = String::new();
-        assert_eq!(pick(&shell, None).held, 0, "a shell is a person, who can be asked");
     }
 
     /// `review` outranks `doing` and `todo`, so leaving it in the candidates

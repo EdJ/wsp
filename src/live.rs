@@ -54,7 +54,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::herdr;
 use crate::model::Status;
 
 /// A pane, as a view knows one.
@@ -180,7 +179,7 @@ impl AgentRef {
     /// spells the machine as an `@machine` suffix, and only the herdr adapter
     /// knows that spelling.
     pub(crate) fn machine(&self) -> &str {
-        crate::herdr::host_of(&self.pane).unwrap_or("")
+        ""
     }
 
     /// There is an agent in this pane and no turn is running in it.
@@ -196,7 +195,13 @@ impl AgentRef {
     /// five words, not the one the panel and `wip` used to test for. See it for
     /// what the other two cost.
     pub(crate) fn stopped(&self) -> bool {
-        self.agent && crate::place_herdr::of_word(&self.state).stopped()
+        let state = match self.state.trim() {
+            "working" => crate::place::State::Working,
+            "idle" | "done" => crate::place::State::Idle,
+            "blocked" => crate::place::State::Blocked,
+            _ => crate::place::State::Unknown,
+        };
+        self.agent && state.stopped()
     }
 
     /// What to call it — see [`pane_name`], and [`AgentRef::full`] for the
@@ -318,10 +323,29 @@ impl Live {
 /// because a pane carries the name of the workspace it stands in and only the
 /// workspace list has it.
 pub(crate) fn read() -> Live {
-    of(
-        herdr::workspaces().unwrap_or_default(),
-        herdr::panes().unwrap_or_default(),
-    )
+    of(Vec::new(), Vec::new())
+}
+
+/// One row of what was running, with only the fields [`of`] reads. herdr's own
+/// record is gone (wsp-120); nothing fills this live.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Pane {
+    pub pane_id: String,
+    pub label: String,
+    pub workspace_id: String,
+    pub agent: String,
+    pub agent_status: String,
+    pub cwd: String,
+    pub title: String,
+    pub focused: bool,
+}
+
+/// One workspace row, as [`Pane`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Workspace {
+    pub id: String,
+    pub label: String,
+    pub focused: bool,
 }
 
 /// The same reading, from rows somebody already has.
@@ -333,7 +357,7 @@ pub(crate) fn read() -> Live {
 /// second — see `panel::surface`. The rows are herdr's either way, parsed by
 /// the same [`crate::herdr::parse_pane`], and the join below is the one this
 /// file exists to be the only copy of.
-pub(crate) fn of(workspaces: Vec<herdr::Workspace>, panes: Vec<herdr::Pane>) -> Live {
+pub(crate) fn of(workspaces: Vec<Workspace>, panes: Vec<Pane>) -> Live {
     let label = |id: &str| -> String {
         workspaces.iter().find(|w| w.id == id).map(|w| w.label.clone()).unwrap_or_default()
     };

@@ -166,11 +166,9 @@ use serde_json::Value;
 use crate::agent_commands;
 use crate::cmd_govern;
 use crate::cmd_spawn;
-use crate::herdr;
 use crate::input::{Key, Keys};
 use crate::model::Status;
 use crate::place::{Agent, Order, Place, Seat};
-use crate::place_herdr::Herdr;
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -310,22 +308,11 @@ fn of_row(row: &Value) -> Option<Thread> {
         seat_of,
         session,
         cwd: text(row, "cwd"),
-        host: herdr::host_of(&pane).unwrap_or(&util::hostname()).to_string(),
+        host: util::hostname(),
         workspace: text(row, "workspace"),
         kind: cmd_spawn::kind_or_default(&text(row, "kind")),
         from: Source::Census,
     })
-}
-
-/// Whether a row of the last census is one herdr is already answering for.
-///
-/// A session herdr holds needs nothing from wsp: the agent survived, or has
-/// been brought back, or is *about to be* — and offering any of the three would
-/// start a second copy of a live conversation. Compared on the session id
-/// rather than the pane, because a pane id does not survive a herdr restart and
-/// the session is precisely the thing that does.
-fn herdr_holds(held: &[String], t: &Thread) -> bool {
-    held.iter().any(|s| *s == t.session)
 }
 
 /// The census that is on offer: the one a restart interrupted if the daemon
@@ -370,16 +357,10 @@ fn offered(store: &Store) -> Vec<Value> {
 /// An unreachable herdr answers nothing rather than everything: with no listing
 /// there is no evidence any of these agents is gone, and offering to resume a
 /// machine's worth of live sessions is the one failure this list must not have.
-pub fn resumable(store: &Store) -> Vec<Thread> {
-    let Ok(panes) = herdr::panes() else { return Vec::new() };
-    let held: Vec<String> =
-        panes.into_iter().map(|p| p.session_id).filter(|s| !s.is_empty()).collect();
-    offered(store)
-        .iter()
-        .filter_map(of_row)
-        .filter(|t| !herdr_holds(&held, t))
-        .filter(Thread::here)
-        .collect()
+pub fn resumable(_store: &Store) -> Vec<Thread> {
+    // The listing that said which sessions were already held was herdr's, and
+    // with herdr gone there is none: nothing is offered.
+    Vec::new()
 }
 
 // ---- what is no longer true -----------------------------------------------
@@ -742,16 +723,6 @@ fn needs_a_seat_wsp_opened(kind: &str) -> bool {
 /// a seat is for and `wsp brief` reads it, which is why `order`'s doc calls the
 /// environment exact for the life of a session rather than durable. A
 /// permission policy has no such second copy, which is the whole difference.
-fn somewhere_to_stand(t: &Thread) -> Option<Seat> {
-    if t.workspace.is_empty() || needs_a_seat_wsp_opened(&t.kind) {
-        return None;
-    }
-    let panes = herdr::panes().ok()?;
-    panes
-        .iter()
-        .find(|p| p.workspace_id == t.workspace && p.agent.is_empty())
-        .map(|p| Seat::new(&p.pane_id))
-}
 
 /// Start the agent, record the assignment, and say where it went.
 ///
@@ -786,9 +757,8 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
             .and_then(|task| crate::cmd_agent::task_label(&task))
             .unwrap_or_else(|| t.what.clone()),
     };
-    let (seat, opened) = match somewhere_to_stand(t) {
-        Some(seat) => (seat, false),
-        None => {
+    let (seat, opened) = {
+        {
             let order = Order {
                 label,
                 cwd: (!t.cwd.is_empty()).then(|| t.cwd.clone()),
@@ -840,7 +810,7 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
                     // here and the same one the original spawn made.
                     t.seat_of.is_some(),
                 ),
-                on: herdr::host_of(&t.workspace).map(|m| m.to_string()),
+                on: None,
                 show: false,
             };
             (place.open(&order).map_err(|e| e.to_string())?, true)
@@ -1434,63 +1404,8 @@ fn lower_hand(store: &Store, task: &str) {
 /// not following a restart — and, since `resumable` started reading `pane.list`,
 /// silent on every restart herdr resumed everything from.
 pub fn ask_on_startup(store: &Store) -> usize {
-    let waiting = resumable(store);
-    if waiting.is_empty() {
-        return 0;
-    }
-    // Held before anything else, because the first `sync` after this overwrites
-    // the roster with what is running *now* — nothing — and the offer would
-    // have a life of one tick. Written even if the terminal below cannot be
-    // opened: the question then waits for `wsp resume` typed by hand, which is
-    // the failure mode this whole path is allowed to have.
-    if store.held().is_empty() {
-        store.set_held(store.roster());
-    }
-    // Before the terminal, and unconditionally: the hand is the half of this
-    // that works when no window can be opened at all.
-    raise_hands(store, &waiting);
-    let order = Order {
-        label: format!("resume {}?", waiting.len()),
-        cwd: None,
-        // No occupant: what this seat is for is `wsp resume` at a shell, and
-        // no agent is started in it. Configuring a runtime nobody is launching
-        // would be a variable in a shell a person is about to type in.
-        env: cmd_spawn::seat_env(None, None, None, false),
-        on: None,
-        show: false,
-    };
-    let place = Herdr::new();
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "wsp".into());
-    match place.open(&order) {
-        Ok(seat) => match herdr::call(
-            "pane.send_text",
-            serde_json::json!({
-                "pane_id": seat.as_str(),
-                "text": format!("exec {} resume\n", util::shell_quote(&exe)),
-            }),
-        ) {
-            Ok(_) => {
-                eprintln!(
-                    "wsp daemon: {} agent(s) did not come back — waiting in {seat}, and flagged",
-                    waiting.len()
-                );
-                waiting.len()
-            }
-            Err(e) => {
-                eprintln!("wsp daemon: opened {seat} to ask about {} resumable agent(s), but could not type in it: {e}", waiting.len());
-                0
-            }
-        },
-        Err(e) => {
-            eprintln!(
-                "wsp daemon: {} agent(s) can be resumed, but no terminal could be opened to ask: {e}",
-                waiting.len()
-            );
-            0
-        }
-    }
+    let _ = store;
+    0
 }
 
 /// The verbs this module answers to, each with the help it carries. `main` and
@@ -1916,36 +1831,12 @@ mod tests {
         };
         assert_eq!(t.by_hand(), None);
         assert!(t.by_hand_says().contains("codex"), "{}", t.by_hand_says());
-        let e = bring_back(&store, &crate::place_herdr::Herdr::new(), cmd_spawn::Chosen::Herdr, &t).unwrap_err();
+        let e = bring_back(&store, &Opens(std::cell::RefCell::new(Vec::new())), cmd_spawn::Chosen::Compound, &t).unwrap_err();
         assert!(e.contains("codex"), "{e}");
         assert!(
             store.claims().get("t-1").is_none(),
             "and it refused before it took a claim or opened anything"
         );
-    }
-
-    /// The boundary Ed drew: the offer is the last census, and an agent herdr
-    /// is answering for is not part of it.
-    ///
-    /// The middle row is the one this was widened for. `restored` is a session
-    /// hanging on a pane herdr has brought back but not yet started — it is in
-    /// `pane.list` and not in `agent.list`, and offering it would put a second
-    /// copy of a live conversation on the screen a few seconds before the first
-    /// one arrived.
-    #[test]
-    fn what_is_offered_is_the_last_census_minus_what_herdr_holds() {
-        let held = vec!["alive".to_string(), "restored".to_string()];
-        let rows: Vec<Thread> = [
-            row("render-061", "gone"),
-            row("render-019", "alive"),
-            row("render-020", "restored"),
-        ]
-        .iter()
-        .filter_map(of_row)
-        .collect();
-        let offered: Vec<&Thread> = rows.iter().filter(|t| !herdr_holds(&held, t)).collect();
-        assert_eq!(offered.len(), 1, "{offered:?}");
-        assert_eq!(offered[0].what, "render-061");
     }
 
     /// Every hand this file raised is up, and it stands *beside* the one the
