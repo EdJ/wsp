@@ -1809,7 +1809,7 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
     // Before the rendering because it is a fact about the pane, not about how
     // the brief is printed: `--json` looks the same to herdr as a person does.
     if let Some(found) = r.looking {
-        cmd_agent::say_looking(store, &b.world.panes, r.project.as_deref(), found);
+        cmd_agent::say_looking(store, r.project.as_deref(), found);
     }
 
     match args.json() {
