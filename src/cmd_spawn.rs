@@ -1676,6 +1676,7 @@ fn start_agent(
     // new key: the manager refuses a stopped key as `duplicate` (6.2 group 3).
     // Built once per pass, never per send, so the host's one reopen resends it.
     let mut agent = agent.clone();
+    let mut ran = None;
     for left in (0..=wait.attempts).rev() {
         let why = match place
             .start(seat, &agent)
@@ -1685,6 +1686,9 @@ fn start_agent(
             Ok(()) => return Ok(()),
             Err(why) => why,
         };
+        if let Some(said) = refused_again(&mut ran, &why) {
+            return Err(said);
+        }
         if left == 0 {
             return Err(why);
         }
@@ -1705,6 +1709,33 @@ fn start_agent(
     }
     // Unreachable: the loop runs at least once and every path out of it returns.
     Err(format!("{kind} was never started in {seat}"))
+}
+
+/// The key a manager refused a start under as one that already ran: `cpd-9/0`
+/// out of `… Duplicate key cpd-9/0 already ran seat cpd-9 (epoch 1), which has
+/// stopped` (`seat.refused`'s detail as [`crate::place::Refusal::Backend`]
+/// carries it). `None` for any other failure.
+fn ran_key(why: &str) -> Option<&str> {
+    let (_, rest) = why.split_once("Duplicate key ")?;
+    let (key, rest) = rest.split_once(' ')?;
+    rest.starts_with("already ran").then_some(key)
+}
+
+/// wsp-063: a start refused as a key that already ran, refused so again under
+/// the **same** key, is not tried a third time. Every retry goes out under a
+/// fresh key (a row's `attempt + 1` here; a keyless seat's next attempt minted
+/// by the place, `Compound::seat_key`), so the same key refused twice is a
+/// retry that cannot change anything. Before this a key-less seat kept
+/// `<seat>/0` on every retry and the run retried the same refused start. The
+/// answer is said once, with the key, and the loop stops. `ran` is the key the
+/// last start was refused under.
+fn refused_again(ran: &mut Option<String>, why: &str) -> Option<String> {
+    let key = ran_key(why)?;
+    if ran.as_deref() == Some(key) {
+        return Some(format!("{why}; refused again under key {key}, so it was not tried again"));
+    }
+    *ran = Some(key.to_string());
+    None
 }
 
 /// Wait until a seat will take an agent again, or say why it will not.
@@ -1995,6 +2026,7 @@ fn start_ordered(
     let mut agent = agent.clone();
     let mut backoff = wait.backoff;
     let within = wait.ready + wait.taken;
+    let mut ran = None;
     for left in (0..=wait.attempts).rev() {
         let order = crate::place::FirstOrder { order: crate::place::new_order_id(seat), text: text.to_string() };
         let heard = match place.start_ordered(seat, &agent, &order, within)? {
@@ -2002,6 +2034,9 @@ fn start_ordered(
             Err(Refusal::Unreachable(why)) => return Some(Err(Unordered::Start(why))),
             Err(e) if left == 0 => return Some(Err(Unordered::Denied(e.to_string()))),
             Err(e) => {
+                if let Some(said) = refused_again(&mut ran, &e.to_string()) {
+                    return Some(Err(Unordered::Denied(said)));
+                }
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
                 eprintln!("wsp: trying {seat} again in {}s", backoff.as_secs());
                 if let Some(key) = agent.key.as_mut() {
@@ -7276,6 +7311,99 @@ mod tests {
         assert_eq!(place.starts.get(), 2, "the first start died and the second was made");
     }
 
+    /// A seat whose starts the manager answers from a script, the keys each
+    /// start went out under kept, and its state read off `reads`.
+    struct Refuses {
+        said: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<()>>>,
+        keys: std::cell::RefCell<Vec<Option<crate::place::Key>>>,
+        reads: Reads,
+    }
+
+    impl Refuses {
+        fn of(said: Vec<crate::place::Result<()>>, reads: Vec<crate::place::Result<State>>) -> Refuses {
+            Refuses { said: std::cell::RefCell::new(said.into()), keys: std::cell::RefCell::new(Vec::new()), reads: Reads::of(reads) }
+        }
+    }
+
+    impl Place for Refuses {
+        fn start(&self, _: &Seat, agent: &Agent) -> crate::place::Result<()> {
+            self.keys.borrow_mut().push(agent.key.clone());
+            self.said.borrow_mut().pop_front().expect("a start the script did not expect")
+        }
+        fn state(&self, seat: &Seat) -> crate::place::Result<State> {
+            self.reads.state(seat)
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("a start sends no work order")
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("a retry stays in the seat it was given")
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("a retry does not end the seat")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("a retry is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("a retry does not subscribe")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// The manager's `seat.refused` for a key that already ran, as the Tcp
+    /// host words it.
+    fn ran_as(key: &str) -> crate::place::Result<()> {
+        let seat = key.split('/').next().unwrap();
+        Err(Refusal::Backend(format!(
+            "the manager refused seat {seat}: Duplicate key {key} already ran seat {seat} (epoch 1), which has stopped"
+        )))
+    }
+
+    #[test]
+    fn ran_key_reads_the_key_of_an_already_ran_refusal_and_nothing_else() {
+        let said = |r: crate::place::Result<()>| r.unwrap_err().to_string();
+        assert_eq!(ran_key(&said(ran_as("cpd-9/0"))), Some("cpd-9/0"));
+        assert_eq!(ran_key(&said(ran_as("wsp-038/1"))), Some("wsp-038/1"));
+        assert_eq!(ran_key("the manager refused seat cpd-9: Duplicate key cpd-9/1 is already starting seat cpd-9"), None);
+        assert_eq!(ran_key("the manager refused seat cpd-9: Full 4 seats run here"), None);
+        assert_eq!(ran_key("claude started and then stopped in cpd-9"), None);
+    }
+
+    /// wsp-063: a key-less seat (a verifier's, a governor's) whose start was
+    /// refused as a key that already ran is started again, and the retry that
+    /// goes out under the seat's next key (minted by the place) starts.
+    #[test]
+    fn a_keyless_start_refused_as_already_ran_is_retried_and_starts() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Refuses::of(vec![ran_as("cpd-9/0"), Ok(())], vec![Ok(State::Empty), Ok(State::Idle)]);
+        assert_eq!(starting(&place, &alive, &Seat::new("cpd-9"), &retrying(&dial)), Ok(()));
+        assert_eq!(place.keys.borrow().len(), 2, "refused once, started on the retry");
+    }
+
+    /// wsp-063: and a retry refused again under the **same** key is not tried
+    /// a third time: it is said once, with the key, and the start stops,
+    /// rather than the run retrying the same refused start.
+    #[test]
+    fn a_start_refused_twice_under_the_same_key_is_not_retried_again() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Refuses::of(vec![ran_as("cpd-9/0"), ran_as("cpd-9/0"), Ok(())], vec![Ok(State::Empty)]);
+        let why = starting(&place, &alive, &Seat::new("cpd-9"), &retrying(&dial)).unwrap_err();
+        assert_eq!(place.keys.borrow().len(), 2, "two starts, never the third the patience allows");
+        assert!(why.contains("refused again under key cpd-9/0, so it was not tried again"), "{why}");
+        assert_eq!(why.matches("refused again").count(), 1, "said once: {why}");
+
+        // Refused under a fresh key each time is a retry that may yet start:
+        // the patience, not this rule, ends it.
+        let place = Refuses::of(vec![ran_as("cpd-9/1"), ran_as("cpd-9/2"), Ok(())], vec![Ok(State::Empty), Ok(State::Empty), Ok(State::Idle)]);
+        assert_eq!(starting(&place, &alive, &Seat::new("cpd-9"), &retrying(&dial)), Ok(()));
+        assert_eq!(place.keys.borrow().len(), 3);
+    }
+
     /// A manager-hosted seat (`WSP_HOST=manager`), faked: each `start` is a
     /// `seat.spawn` and each `stop` a `seat.stop`, counted; what the events say
     /// of a start is scripted; and a state read says what one said just after
@@ -7830,6 +7958,16 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(silent.sent.borrow().len(), 1, "a silent host is said, not retried");
+
+        // wsp-063: refused as a key that already ran, and again under that
+        // same key: said once with the key, and not sent a third time.
+        let ran = || Err(Refusal::Backend("the manager refused seat cpd-26: Duplicate key cpd-26/0 already ran seat cpd-26 (epoch 1), which has stopped".into()));
+        let place = Hears::of(vec![ran(), ran(), Ok(Heard::Acked)], vec![]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Denied(e))) => assert!(e.contains("refused again under key cpd-26/0, so it was not tried again"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(place.sent.borrow().len(), 2, "the same key refused twice is not sent a third time");
     }
 
     /// No answer is the patience running out, kept from `hand_over`: submit is
