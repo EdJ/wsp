@@ -83,6 +83,7 @@ mod wake;
 mod cmd_worklist;
 mod cycle;
 mod daemon;
+mod fold;
 mod detail;
 mod did;
 mod draw;

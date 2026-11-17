@@ -255,7 +255,7 @@ impl Compound<'_> {
     }
 }
 
-const SEATS: &str = "compound-seats";
+pub const SEATS: &str = "compound-seats";
 const SEAT_FILE: &str = "seat.json";
 
 /// Every hook this seat has ever been heard from, oldest first, one JSON line
