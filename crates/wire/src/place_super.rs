@@ -189,7 +189,11 @@ use std::time::Duration;
 use crate::host::{self, Host};
 /// Moved to [`crate::host`] with the rest of the OS half; named here still for
 /// the callers that reach a seat's processes by this path.
-pub use crate::host::{one_ps, signal_group, tree_of, SPENT_FILE};
+pub use crate::host::{one_ps, SPENT_FILE};
+/// The tests that read a process tree and end a group by hand. Product code
+/// asks [`Host`] (`tests/host_seam.rs`).
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::host::{signal_group, tree_of};
 #[cfg(test)]
 use crate::host::{burn_under, u_at, BURN_FILE};
 
