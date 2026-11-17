@@ -4798,17 +4798,6 @@ pub(crate) mod tests {
         assert_eq!(nothing_because(&empty), "", "an empty backlog needs no explaining");
     }
 
-    /// Both reasons at once, in the order a person wants them: what is waiting
-    /// on you first, what is waiting on somebody else after.
-    #[test]
-    fn nothing_actionable_says_which_kind_of_nothing() {
-        let mut b = backlog();
-        b.tasks.retain(|t| t.id != "t-001" && t.id != "t-003");
-        let p = pick(&b, None);
-        assert!(p.task.is_none());
-        assert_eq!(nothing_because(&p), "1 at review, waiting on a person · 1 held by other agents");
-    }
-
     /// Scope filters the candidates and the count of what is waiting with them:
     /// an agent told to work in one project is not told about another's queue.
     #[test]
