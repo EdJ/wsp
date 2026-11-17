@@ -341,12 +341,20 @@ fn compound_render_binary() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
-    if let Some(path) = std::env::var_os("PATH") {
-        if let Some(p) = std::env::split_paths(&path).map(|d| d.join("compound-render")).find(|p| p.is_file()) {
-            return Some(p);
-        }
-    }
-    compound_sup_binary()?.parent().map(|d| d.join("compound-render")).filter(|p| p.is_file())
+    find_render(std::env::var_os("PATH"), compound_sup_binary().and_then(|s| s.parent().map(PathBuf::from)))
+}
+
+/// What the renderer binary is called: `compound-render`, and `compound-reader`
+/// where compound has split its renderer from its reader and kept only the
+/// latter name. Both answer the same `screen` and `state` verbs. Without this a
+/// machine that has only the new name reads every seat's screen as "cannot
+/// read", and a seat whose hooks have aged past [`VOUCH_SECS`] reads `unknown`.
+const RENDER_NAMES: [&str; 2] = ["compound-render", "compound-reader"];
+
+fn find_render(path: Option<std::ffi::OsString>, beside_sup: Option<PathBuf>) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path.iter().flat_map(std::env::split_paths).collect();
+    dirs.extend(beside_sup);
+    RENDER_NAMES.iter().find_map(|name| dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()))
 }
 
 /// How long after a start [`Compound::at_trust_prompt`] looks: the prompt is the
@@ -3139,6 +3147,22 @@ mod tests {
 
         let _ = write_atomic(&dir.join(SEAT_FILE), &started(now, "opencode"));
         assert_ne!(place.state(&seat).unwrap(), State::Starting, "opencode fires no hooks to wait for");
+    }
+
+    /// The renderer is found under either of its names, the old one first.
+    #[test]
+    fn the_renderer_is_found_as_compound_render_or_compound_reader() {
+        let dir = std::env::temp_dir().join(format!("wsp-render-names-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = Some(std::env::join_paths([&dir]).unwrap());
+        assert_eq!(find_render(path.clone(), None), None);
+        fs::write(dir.join("compound-reader"), "").unwrap();
+        assert_eq!(find_render(path.clone(), None), Some(dir.join("compound-reader")));
+        assert_eq!(find_render(None, Some(dir.clone())), Some(dir.join("compound-reader")), "beside the supervisor too");
+        fs::write(dir.join("compound-render"), "").unwrap();
+        assert_eq!(find_render(path, None), Some(dir.join("compound-render")), "the old name wins");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// **A tool hook keeps a working seat fresh and nothing else** (the pi
