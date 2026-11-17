@@ -3506,7 +3506,8 @@ mod tests {
     fn a_tree_whose_target_was_removed_is_seeded_again() {
         let (repo, tree, sha) = trunk_with_target("reseed", true);
         checkout_started(&repo, &tree, &sha).unwrap();
-        std::fs::remove_dir_all(tree.join("target")).unwrap();
+        // Only macOS seeded one to remove; elsewhere there is none to take away.
+        let _ = std::fs::remove_dir_all(tree.join("target"));
         let start = checkout_started(&repo, &tree, &sha).unwrap();
         // macOS clones it; elsewhere the seed says why not and the tree is honestly cold.
         assert_eq!(start.target, if cfg!(target_os = "macos") { "cloned" } else { "cold" }, "{:?}", start.seed);
