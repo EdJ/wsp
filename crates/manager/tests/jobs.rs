@@ -544,3 +544,61 @@ fn a_key_run_again_after_its_prune_is_readopted_running_across_a_restart() {
     assert_eq!(fs::read_to_string(&e.log.path).unwrap(), "second\n");
     m.stop();
 }
+
+#[test]
+fn a_rerun_whose_start_was_not_journalled_is_readopted_running_not_paired_with_the_old_end() {
+    let (dir, root) = place("rerun-crash");
+    let _sweep = Sweep::new(&dir);
+    let mut cfg = config(&dir, &root);
+    cfg.job_retention = Duration::from_secs(1);
+    let m = Manager::start(cfg.clone()).expect("the manager starts");
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+
+    // The first run ends and is journalled; past the retention the key runs again.
+    started(c.ask(run_msg("check@w", JobClass::Check, "echo first", false)));
+    c.hear_until(WAIT, |c| c.ended("check@w") == 1);
+    let old = c.events.iter().find(|f| matches!(&f.msg, Message::JobEnded(_))).cloned().expect("the first job.ended");
+    std::thread::sleep(Duration::from_millis(1500));
+    let pgid = started(c.ask(run_msg("check@w", JobClass::Check, "sleep 3; echo second", true)));
+    drop(c);
+    m.stop();
+
+    // The window wsp-064 closes: the runner wrote the rerun's .job, and the
+    // manager died before journalling its job.started. Cut that frame, so the
+    // old run's job.ended is the key's last frame in the journal.
+    let journal = dir.join(wsp_manager::JOURNAL_FILE);
+    let text = fs::read_to_string(&journal).unwrap();
+    let mut cut = 0;
+    let kept: String = text
+        .lines()
+        .filter(|l| {
+            let f: Frame = serde_json::from_str(l).unwrap();
+            let rerun = matches!(&f.msg, Message::JobStarted(s) if s.key == key("check@w") && s.pgid == pgid);
+            cut += rerun as usize;
+            !rerun
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(cut, 1, "the rerun's job.started was journalled once: {text}");
+    fs::write(&journal, kept).unwrap();
+    let last = fs::read_to_string(&journal).unwrap().lines().map(|l| serde_json::from_str::<Frame>(l).unwrap()).filter(|f| {
+        matches!(&f.msg, Message::JobStarted(s) if s.key == key("check@w"))
+            || matches!(&f.msg, Message::JobEnded(e) if e.key == key("check@w"))
+    }).last();
+    assert_eq!(last.map(|f| (f.id, f.msg)), Some((old.id, old.msg.clone())), "the old run's job.ended is the key's last frame");
+    assert!(dir.join("jobs/wsp-050+0+check@w.job").exists() && alive(pgid), "the rerun's .job is on disk, and it runs");
+
+    let m = Manager::start(cfg).expect("the manager starts again");
+    assert_eq!(m.jobs(), vec![(key("check@w"), pgid, true)], "the rerun is re-adopted running, not taken as ended");
+    let (mut c, _) = Client::new(m.addrs()[0], &dir);
+    match c.ask(run_msg("check@w", JobClass::Check, "sleep 3; echo second", true)) {
+        Message::JobStarted(s) => assert_eq!(s.pgid, pgid, "a retry gets the rerun's job.started"),
+        other => panic!("a retry is answered the rerun's job.started, not the old end: {other:?}"),
+    }
+    c.hear_until(WAIT, |c| c.ended("check@w") == 1);
+    let end = c.events.iter().find(|f| matches!(&f.msg, Message::JobEnded(_))).cloned().expect("the rerun's end is reported");
+    assert!(end.id > old.id, "a new job.ended, after the old one: {end:?} vs {old:?}");
+    let Message::JobEnded(e) = &end.msg else { unreachable!() };
+    assert_eq!(fs::read_to_string(&e.log.path).unwrap(), "second\n");
+    m.stop();
+}

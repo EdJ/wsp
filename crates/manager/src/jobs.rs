@@ -45,6 +45,16 @@
 //!   new run: nothing of the old one is left to refuse it by. The old run's
 //!   `job.ended` stays in the journal, so a start joins a key to the end that
 //!   follows its latest `job.started`, never an earlier run's.
+//! - **A rerun's place in the journal (wsp-064).** The runner writes
+//!   `<key>.job` before the manager can journal `job.started` (its pgid is
+//!   known only once the job is spawned), so a manager killed between the two
+//!   leaves a rerun whose key's last frame is the old run's `job.ended`. Of
+//!   wsp-064's two ways, this takes the second: a start treats the run on disk
+//!   as newer than any end before it, the order read from the journal, whose
+//!   frames carry no time. The `.run` holds the journal's head when it was
+//!   written (`after_event`), before the runner starts, and a start counts
+//!   only the key's `job.started` and `job.ended` past that id. A `.run`
+//!   without it, from before wsp-064, is joined as before.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -55,7 +65,7 @@ use std::time::{Duration, Instant, SystemTime};
 use wsp_host::jobs::{self as runner, Adopted, End, Job, Spec};
 use wsp_host::InProcess;
 use wsp_host_api::{
-    At, Frame, JobAt, JobClass, JobEnded, JobKey, JobOutput, JobRow, JobRun, JobStarted, JobState, JobStop, JobsList,
+    At, EventId, Frame, JobAt, JobClass, JobEnded, JobKey, JobOutput, JobRow, JobRun, JobStarted, JobState, JobStop, JobsList,
     Message, Refusal, Refused,
 };
 
@@ -64,6 +74,9 @@ use crate::Shared;
 
 /// Under `<exec_dir>/jobs`, beside the runner's files: what was asked.
 const RUN_EXT: &str = "run";
+/// The field of a `.run` beside the [`JobRun`]: the journal's head when it
+/// was written.
+const AFTER_FIELD: &str = "after_event";
 /// How often a job's watcher looks at it and sends its output.
 const TICK: Duration = Duration::from_millis(100);
 /// The most of a log one `job.output` carries.
@@ -121,6 +134,23 @@ fn exec_dir(shared: &Shared) -> &Path {
 
 fn run_path(shared: &Shared, file: &str) -> PathBuf {
     runner::jobs_dir(exec_dir(shared)).join(format!("{file}.{RUN_EXT}"))
+}
+
+/// A `.run`'s text: `r`, and the journal's head `after` it was written at.
+fn asked_text(r: &JobRun, after: Option<EventId>) -> Vec<u8> {
+    let mut v = serde_json::to_value(r).unwrap_or_default();
+    if let (Some(obj), Some(id)) = (v.as_object_mut(), after) {
+        obj.insert(AFTER_FIELD.into(), id.0.into());
+    }
+    serde_json::to_vec(&v).unwrap_or_default()
+}
+
+/// What a `.run` holds: the run asked, and the journal's head it was written
+/// at (absent from one written before wsp-064).
+fn read_asked(bytes: &[u8]) -> Option<(JobRun, Option<EventId>)> {
+    let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let after = v.as_object_mut()?.remove(AFTER_FIELD).and_then(|a| a.as_u64()).map(EventId);
+    Some((serde_json::from_value(v).ok()?, after))
 }
 
 fn name(key: &JobKey) -> String {
@@ -230,9 +260,11 @@ pub(crate) fn run(shared: &Arc<Shared>, asker: Asker, r: JobRun) {
         Err(why) => return refuse(&asker, Refusal::NoTree, why),
     };
     // What was asked goes to disk before the job starts, so a restart knows
-    // every job the runner's record names.
+    // every job the runner's record names, with the journal's head: a frame
+    // of this key at or before it is an earlier run's (wsp-064).
+    let head = shared.journal.lock().unwrap_or_else(|e| e.into_inner()).head();
     let written = fs::create_dir_all(runner::jobs_dir(exec_dir(shared)))
-        .and_then(|()| fs::write(run_path(shared, &file), serde_json::to_vec(&r).unwrap_or_default()));
+        .and_then(|()| fs::write(run_path(shared, &file), asked_text(&r, head)));
     if let Err(e) = written {
         return refuse(&asker, Refusal::Failed, format!("the job's record could not be written: {e}"));
     }
@@ -485,18 +517,18 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
         if path.extension().and_then(|x| x.to_str()) != Some(RUN_EXT) {
             continue;
         }
-        match fs::read(&path).ok().and_then(|b| serde_json::from_slice::<JobRun>(&b).ok()) {
-            Some(r) => asked.push(r),
+        match fs::read(&path).ok().and_then(|b| read_asked(&b)) {
+            Some(a) => asked.push(a),
             None => shared.log.line(&format!("{} could not be read; its job is not adopted", path.display())),
         }
     }
     if asked.is_empty() {
         return;
     }
-    let (started, ended) = journalled(shared, asked.iter().map(|r| r.key.clone()).collect());
+    let (started, ended) = journalled(shared, asked.iter().map(|(r, _)| r.key.clone()).collect());
     let host = InProcess::new();
     let mut t = table(shared);
-    for r in asked {
+    for (r, after) in asked {
         let file = runner::file_key(&r.key);
         let key = r.key.clone();
         let Some(record) = runner::recorded(exec_dir(shared), &file) else {
@@ -510,8 +542,8 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
             run: r,
             pgid: record.pid,
             started: at,
-            started_frame: started.get(&key).cloned(),
-            ended: ended.get(&key).cloned(),
+            started_frame: this_run(started.get(&key), after),
+            ended: this_run(ended.get(&key), after),
             ended_at: None,
             owner: None,
             stopping: None,
@@ -550,6 +582,12 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
         }
     }
     prune(shared, &mut t);
+}
+
+/// `frame`, if it is past `after`, the journal's head when this run's `.run`
+/// was written: one at or before it is an earlier run's (wsp-064).
+fn this_run(frame: Option<&Frame>, after: Option<EventId>) -> Option<Frame> {
+    frame.filter(|f| after.is_none() || f.id > after).cloned()
 }
 
 /// The journalled `job.started` and `job.ended` of each of `keys`' latest

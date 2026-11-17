@@ -1033,6 +1033,15 @@ What M1's live defects taught, carried into the rows:
   each key is joined to the end that follows its latest `job.started`, and an earlier run's end counts for
   nothing. Without this rule, a rerun the restart found running would be taken as ended: it would not be watched,
   and a retry would be answered the old exit.
+  That rule alone leaves a window (wsp-064). The runner writes `<key>.job` before the manager can journal
+  `job.started`, because the pgid is known only once the job is spawned. A manager killed between the two leaves a
+  rerun whose last frame for its key is the old run's `job.ended`. wsp-064 offered two fixes and takes the second:
+  at start, a run on disk counts as newer than any end journalled before it. The journal's order stands in for the
+  end's time, because frames carry no time. Before the runner starts, the manager writes the journal's head into the
+  `.run` (as `after_event`, beside the `JobRun`). At start it counts only the key's `job.started` and `job.ended`
+  frames past that id. So the rerun is re-adopted running, and its `job.started` is journalled at that start. The
+  first fix, journalling `job.started` before `.job`, would mean splitting the runner's start in `wsp-host`. A
+  `.run` written before wsp-064 has no head and is joined as before.
 
 Tests (`tests/jobs.rs`) run a loopback manager with `sh` jobs under a scratch tree root. They check that:
 - two `job.run`s under one key run once, and a third connection's retry takes the job over;
@@ -1047,6 +1056,9 @@ Tests (`tests/jobs.rs`) run a loopback manager with `sh` jobs under a scratch tr
   client connected, the beat then removes its four files and its row (wsp-062);
 - a key run again after its prune, with the manager stopped and started while the rerun is running, is re-adopted
   as running. Its retry gets the new `job.started`, and its own end is reported with a new id (wsp-062).
+- a rerun whose `job.started` never reached the journal is re-adopted as running at the next start, not paired with
+  the old run's `job.ended`, which is the key's last frame. Its retry is answered `job.started`, and its own end is
+  reported after the old one (wsp-064).
 
 #### M3 group 4: `Host::run_job` (wsp-051, 2026-11-17)
 
