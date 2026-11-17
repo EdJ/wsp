@@ -824,6 +824,38 @@ fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_f
     assert!(extra.is_empty(), "wsp-server depends on serde_json, the api and the contract alone, not {extra:?}");
 }
 
+/// `wsp-client`, the state core's client, speaks the protocol and nothing else: its normal
+/// dependencies are `wsp-api` and `wsp-store-contract`, so that web-chrome, which links it by path,
+/// links no more of wsp than that (`docs/state-core.md` section 6; wsp-074). Its tests may also
+/// reach `wsp-server` and `wsp-store-conformance` (a loopback server over `MemStore`), never the
+/// store, the wire, the host, the manager or the sqlite crate. Its one external dependency is
+/// `serde_json`.
+#[test]
+fn the_client_links_the_api_and_the_contract_only_and_the_server_in_tests_alone() {
+    let dir = root().join("crates/client");
+    let normal: Vec<String> = path_deps(&dir.join("Cargo.toml"), false).into_keys().collect();
+    assert_eq!(normal, ["wsp-api", "wsp-store-contract"], "wsp-client's normal dependencies are the api and the contract");
+
+    const MAY: &[&str] = &["wsp-api", "wsp-store-contract", "wsp-server", "wsp-store-conformance"];
+    let bad = beyond(&reached_from(&dir, "wsp-client"), MAY);
+    assert!(
+        bad.is_empty(),
+        "wsp-client must link only {MAY:?} of the workspace, its tests included (docs/state-core.md section 6):\n{bad}"
+    );
+
+    let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
+    let extra: Vec<&String> = named
+        .iter()
+        .filter(|d| !["serde_json", "wsp-api", "wsp-store-contract", "wsp-server", "wsp-store-conformance"].contains(&d.as_str()))
+        .collect();
+    assert!(extra.is_empty(), "wsp-client depends on serde_json, the api and the contract alone, not {extra:?}");
+
+    // The server is a dev-dependency: a normal dependency would link it into web-chrome.
+    let manifest = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+    let before_dev = manifest.split("[dev-dependencies]").next().unwrap();
+    assert!(!before_dev.contains("wsp-server"), "wsp-server is a dev-dependency of wsp-client, never a normal one");
+}
+
 #[test]
 fn the_dependency_lister_reads_each_manifest_form() {
     let m = "[package]\nname = \"x\"\n\n[dependencies]\nserde = { version = \"1\" }\n\"serde_json\" = \"1\"\n\
