@@ -1629,6 +1629,18 @@ impl Place for Compound<'_> {
         self.host.hears_orders().then(|| self.host.await_order(order, wait))
     }
 
+    /// A local seat's start under a host with events, judged by them: a far
+    /// seat (M2's) has none here, and is polled as before.
+    fn await_up(&self, seat: &Seat, by_turn: bool, wait: Duration) -> Option<Result<crate::place::Up>> {
+        if !self.host.hears_orders() {
+            return None;
+        }
+        if self.record(seat).is_ok_and(|rec| !str_of(&rec, "machine").is_empty()) {
+            return None;
+        }
+        Some(self.host.await_up(seat.as_str(), by_turn, wait))
+    }
+
     /// Paste the sentence, press Enter, disconnect — see the module docs'
     /// "`tell`, and why it need not hold a pipe open".
     ///

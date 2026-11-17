@@ -444,6 +444,19 @@ pub enum Heard {
     Unanswered,
 }
 
+/// What a host's events say of an agent [`Place::start`] just put in a seat
+/// (wsp-037): heard, never read off [`Place::state`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Up {
+    /// Ready: `seat.started` heard, and where readiness is a turn, its first
+    /// turn begun.
+    Ready,
+    /// `seat.stopped` for this start before it was ready.
+    Stopped,
+    /// Neither within the wait.
+    Unready,
+}
+
 /// A fresh id for a first order: the seat, the time and a counter, so a
 /// re-start of the same seat is a new order and never the answer to the last.
 pub fn new_order_id(seat: &Seat) -> OrderId {
@@ -741,6 +754,19 @@ pub trait Place {
     /// [`Place::start_ordered`] sent: after a [`Place::nudge`], say. `None`
     /// where this backend has no events to wait by.
     fn await_order(&self, _seat: &Seat, _order: &OrderId, _wait: Duration) -> Option<Result<Heard>> {
+        None
+    }
+
+    /// What the host's events say of the agent [`Place::start`] just put in
+    /// `seat`, waited for up to `wait`: ready (`seat.started`, and with
+    /// `by_turn` its first turn begun), stopped, or neither (wsp-037). A state
+    /// read just after a manager's `seat.started` is not yet true, and a start
+    /// judged by one was taken for dead, stopped and started again.
+    ///
+    /// `None` where this backend has no events to wait by: the caller polls
+    /// [`Place::state`] as before. `Err` is the events not heard (the host
+    /// went), which says nothing about the seat.
+    fn await_up(&self, _seat: &Seat, _by_turn: bool, _wait: Duration) -> Option<Result<Up>> {
         None
     }
 

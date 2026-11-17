@@ -52,14 +52,14 @@ use serde_json::Value;
 use wsp_host_api::{
     AgentSpec, At, Beat, ConnError, Connection, Epoch, EventId, Frame, Gate, Hello, ManagerHello, Message,
     HostFacts, OrderDeliver, OrderFail, OrderId, Refusal as Why, ReqId, Role, SeatId, SeatRead, SeatRow, SeatSpawn,
-    SeatState, SeatStop, Seats, SeatsList, Subscribe, Token, Workdir, WspHello, BEAT_SECS, MISSED_BEATS, PROTOCOL,
+    SeatState, SeatStop, Seats, SeatsList, Subscribe, Token, TurnEdge, Workdir, WspHello, BEAT_SECS, MISSED_BEATS, PROTOCOL,
 };
 
 use crate::host::{Ended, Forked, Headless, Host, InProcess, Session, Spawn, Stop};
 /// What a `seats` reply carries, for a caller that reads it (`wip`).
 pub use wsp_host_api::{DiskFree, HostFacts as Facts, SeatRow as Row};
 use crate::manager::{self, Local};
-use crate::place::{Census, Delivery, FirstOrder, Heard, Refusal, Result, Seat, State};
+use crate::place::{Census, Delivery, FirstOrder, Heard, Refusal, Result, Seat, State, Up};
 
 /// How long a manager has to answer `hello` before it is silent.
 pub const SILENT: Duration = Duration::from_secs(1);
@@ -344,6 +344,11 @@ pub struct Tcp {
     /// The first orders sent with a `seat.spawn` whose answer is not heard
     /// yet, by order id: the seat, and the subscription that will hear it.
     waiting: Mutex<BTreeMap<String, (String, Subscription)>>,
+    /// The seats a plain `seat.spawn` started whose start is not judged yet,
+    /// by seat: the subscription, opened before the spawn, that hears its
+    /// first turn or its `seat.stopped` (wsp-037). One per seat; a later
+    /// start of the same seat replaces it.
+    starting: Mutex<BTreeMap<String, Subscription>>,
 }
 
 impl Tcp {
@@ -364,6 +369,7 @@ impl Tcp {
             next_req: Mutex::new(0),
             known: Mutex::new(BTreeMap::new()),
             waiting: Mutex::new(BTreeMap::new()),
+            starting: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -581,7 +587,39 @@ fn argv_of(spawn: &Spawn<'_>) -> Vec<String> {
 impl Host for Tcp {
     // ---- seat.spawn / seat.started
     fn spawn_session(&self, spawn: &Spawn<'_>) -> Result<Session> {
-        self.spawn_with(spawn, None, SPAWN_WAIT)
+        // Subscribed before the spawn, as `spawn_ordered` is, so the start's
+        // first turn or its stop cannot come before the watch on it. A watch
+        // that cannot be opened costs the spawn nothing: `await_up` then has
+        // only `seat.started` to go by.
+        let sub = Subscription::at_head(self.addr, self.token.clone(), self.role, &self.version).ok();
+        let session = self.spawn_with(spawn, None, SPAWN_WAIT)?;
+        if let Some(sub) = sub {
+            self.starting.lock().unwrap_or_else(|e| e.into_inner()).insert(spawn.seat.to_string(), sub);
+        }
+        Ok(session)
+    }
+    fn await_up(&self, seat: &str, by_turn: bool, wait: Duration) -> Result<Up> {
+        let sub = self.starting.lock().unwrap_or_else(|e| e.into_inner()).remove(seat);
+        // `seat.started` was the spawn's own answer: that is the seat up, and
+        // where readiness is not a turn there is nothing more to hear.
+        let (true, Some(mut sub)) = (by_turn, sub) else { return Ok(Up::Ready) };
+        let epoch = self.known.lock().unwrap_or_else(|e| e.into_inner()).get(seat).map(|k| k.epoch);
+        let ours = |s: &SeatId, e: Epoch| s.0 == seat && epoch.is_none_or(|k| k == e);
+        let deadline = Instant::now() + wait;
+        let up = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Up::Unready;
+            }
+            let Some(f) = sub.next(left)? else { continue };
+            match f.msg {
+                Message::Turn(t) if t.edge == TurnEdge::Began && ours(&t.seat, t.epoch) => break Up::Ready,
+                Message::SeatStopped(s) if ours(&s.seat, s.epoch) => break Up::Stopped,
+                _ => {}
+            }
+        };
+        sub.close();
+        Ok(up)
     }
     fn hears_orders(&self) -> bool {
         true

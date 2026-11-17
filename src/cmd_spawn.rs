@@ -1529,6 +1529,22 @@ fn wait_ready(
     // that turn running (`wsp-476`), watched to the same deadline. Idle here is
     // the window before it starts, and a folder-trust prompt reads blocked.
     let by_turn = spawn.order.is_some() && how.order_in_args() && how.turn_marks_ready();
+    // Under a host with events (`WSP_HOST=manager`) the start is judged by
+    // them, never by a state read (wsp-037): one just after `seat.started` is
+    // not yet true, and every seat the manager started was taken for dead,
+    // stopped and started again at epoch 2. Events that cannot be heard say
+    // nothing of the seat, which `seat.started` already said runs.
+    if let Some(up) = place.await_up(seat, by_turn, wait.ready) {
+        return match up {
+            Ok(crate::place::Up::Ready) => Ok(()),
+            Ok(crate::place::Up::Stopped) => Err(format!("{kind} started and then stopped in {seat}")),
+            Ok(crate::place::Up::Unready) => Err(format!("{kind} started but never became ready for input")),
+            Err(e) => {
+                eprintln!("wsp: {kind} started in {seat}; its first turn was not heard: {e}");
+                Ok(())
+            }
+        };
+    }
     loop {
         match place.state(seat) {
             Ok(s) if by_turn && s.turn_in_flight() => return Ok(()),
@@ -7193,7 +7209,7 @@ mod tests {
         }
     }
 
-    fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
+    fn starting(place: &dyn Place, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
         let spawn =
             crate::agent_commands::Spawn { full: false, subagents: false, packet: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None, brief: None };
         let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new(), key: None };
@@ -7221,6 +7237,94 @@ mod tests {
         );
         assert_eq!(starting(&place, &dead, &Seat::new("w64:p1"), &retrying(&dial)), Ok(()));
         assert_eq!(place.starts.get(), 2, "the first start died and the second was made");
+    }
+
+    /// A manager-hosted seat (`WSP_HOST=manager`), faked: each `start` is a
+    /// `seat.spawn` and each `stop` a `seat.stop`, counted; what the events say
+    /// of a start is scripted; and a state read says what one said just after
+    /// `seat.started` on 2026-11-17 — an empty seat, which is not yet true.
+    struct Manages {
+        spawns: std::cell::Cell<u32>,
+        stops: std::cell::Cell<u32>,
+        polls: std::cell::Cell<u32>,
+        ups: std::cell::RefCell<std::collections::VecDeque<crate::place::Up>>,
+        asked: std::cell::RefCell<Vec<bool>>,
+    }
+
+    impl Manages {
+        fn of(ups: Vec<crate::place::Up>) -> Manages {
+            Manages {
+                spawns: std::cell::Cell::new(0),
+                stops: std::cell::Cell::new(0),
+                polls: std::cell::Cell::new(0),
+                ups: std::cell::RefCell::new(ups.into()),
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Place for Manages {
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            self.spawns.set(self.spawns.get() + 1);
+            Ok(())
+        }
+        fn await_up(&self, _: &Seat, by_turn: bool, _: Duration) -> Option<crate::place::Result<crate::place::Up>> {
+            self.asked.borrow_mut().push(by_turn);
+            Some(Ok(self.ups.borrow_mut().pop_front().expect("a start the script did not expect")))
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            self.polls.set(self.polls.get() + 1);
+            Ok(State::Empty)
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            self.stops.set(self.stops.get() + 1);
+            Ok(())
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("a start sends no work order")
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("a start stays in the seat it was given")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("a start is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("the host's subscription is its own")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// wsp-037: under the manager a seat that comes up normally is started
+    /// once — one `seat.spawn`, no `seat.stop` — because its start is judged by
+    /// the manager's events, and the state read that called it empty (and so
+    /// dead, and so started again at epoch 2) is never taken.
+    #[test]
+    fn under_a_manager_a_seat_that_comes_up_is_started_once() {
+        let blind = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Manages::of(vec![crate::place::Up::Ready]);
+        assert_eq!(starting(&place, &blind, &Seat::new("cpd-242"), &retrying(&dial)), Ok(()));
+        assert_eq!(place.spawns.get(), 1, "one seat.spawn");
+        assert_eq!(place.stops.get(), 0, "no seat.stop");
+        assert_eq!(place.polls.get(), 0, "nothing read the seat's state");
+        assert_eq!(*place.asked.borrow(), vec![false], "no order in argv: seat.started is ready");
+    }
+
+    /// And a start the manager says stopped is still the start that did not
+    /// survive: said as such, and retried as before.
+    #[test]
+    fn under_a_manager_a_start_heard_stopped_is_the_one_that_died() {
+        let blind = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Manages::of(vec![crate::place::Up::Stopped]);
+        let wait = Patience { attempts: 0, ..retrying(&dial) };
+        let why = starting(&place, &blind, &Seat::new("cpd-243"), &wait).unwrap_err();
+        assert!(why.contains("started and then stopped in cpd-243"), "{why}");
+        assert_eq!(place.spawns.get(), 1);
+        assert_eq!(place.polls.get(), 0, "heard, not read");
     }
 
     /// And the seat that will not clear is the one a retry must leave alone.

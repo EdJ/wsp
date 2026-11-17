@@ -103,6 +103,14 @@ pub trait Host: Sync {
     fn await_order(&self, _order: &crate::place::OrderId, _wait: Duration) -> Result<crate::place::Heard> {
         Err(crate::place::Refusal::Unsupported("an order's answer heard as an event"))
     }
+    /// What became of the agent [`Host::spawn_session`] started in `seat`,
+    /// heard as the host's events within `wait`: `seat.started` was the
+    /// spawn's own answer, so without `by_turn` it is ready; with it, ready is
+    /// its first `turn` begun, and `seat.stopped` first is a start that did not
+    /// survive (wsp-037). The in-process host has no events.
+    fn await_up(&self, _seat: &str, _by_turn: bool, _wait: Duration) -> Result<crate::place::Up> {
+        Err(crate::place::Refusal::Unsupported("a start heard as an event"))
+    }
 
     // ---- seat.stop / seat.stopped
     /// `TERM` to the group, `KILL` after the grace.
