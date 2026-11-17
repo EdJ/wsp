@@ -2,7 +2,7 @@
 name = "wsp"
 version = "0.1.0"
 edition = "2021"
-description = "Workspace and task control plane for herdr"
+description = "Workspace and task control plane for agent teams"
 
 [[bin]]
 name = "wsp"

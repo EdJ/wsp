@@ -24,7 +24,6 @@ mod render;
 mod rows;
 mod run;
 mod shared;
-mod surface;
 mod verbs;
 
 pub(crate) use keys::{apply_input, Effect, Input, View};
@@ -174,8 +173,3 @@ pub(crate) use verbs::{follow, inspect, pop_out, run_wsp};
 // [`verbs::tell_claimed`].
 pub(crate) use verbs::{send_tell, tell_claimed, Tell};
 pub use run::run;
-// And the frame it last drew, left on disk for a reader with no pipe to it —
-// `wsp peek panel`, which under the fork has no pane to ask backend about. Named
-// for the surface out here, where `frame` already means the panel's own
-// renderer and would not say whose.
-pub(crate) use surface::last_frame as surface_frame;

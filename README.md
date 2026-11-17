@@ -2536,12 +2536,6 @@ and picking through the JSON, so the target resolves the way everything else in
 wsp resolves: by what you call the thing. No argument is the panel, because that
 is the question nine times in ten.
 
-A panel drawn into a sidebar rect is not a pane, with nothing for `pane.read`
-to read — so a surface that draws it leaves each frame beside the bindings, and
-`wsp peek panel` prints that. The header carries the cells it was built for and
-how old it is, which are the two facts that say whether to trust it. With no
-surface drawing, the panel is a pane and nothing changes.
-
 Two things it does not do. It shows what is on the pane *now*, not what happened
 when a key was pressed — `backend pane wait-output` is the tool for that, and it
 is a different one. And it cannot press the key: a person still makes the
