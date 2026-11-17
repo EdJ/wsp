@@ -651,6 +651,25 @@ How each was taken:
 **Carried into M1's breakdown, first:** wsp-010. It covers the features herdr fed that nothing feeds now: overlap's
 live panes and verify's `--rm --all` sweep.
 
+#### M1's breakdown (wsp-019, 2026-11-17)
+
+The list is `m1-agent-manager`, at status init. It follows wsp-018's three rules: expand, then contract; a cut that
+cannot be staged is one row run as legs; every row's checks build and test every crate it touches.
+
+| group | kind | rows | what |
+|---|---|---|---|
+| 1 | contract | wsp-020, wsp-010 | The in-process host's OS code moves into a store-free crate, `crates/host` (`wsp-host`), which wire re-exports. wsp-010 re-feeds or deletes what herdr fed. |
+| 2 | components | wsp-021 | `crates/manager` (`wsp-manager`): TCP, `hello` and its token, the journal and `subscribe {from}`, the beat. No seats yet. |
+| 3 | contract | wsp-022, wsp-023, wsp-024 | The manager serves seats and orders, with keys, epochs and adoption on restart. Hooks report to it. `wsp install` puts it under launchd. |
+| 4 | wiring | wsp-025 | `host::Tcp`, the `Host` over the connection, behind `WSP_HOST=inproc\|manager`, with the default left at `inproc`. |
+| 5 | wiring | wsp-026, wsp-027, wsp-028 | Callers move under `manager`: spawn, despawn and tell; `wip` reads `seats`; the daemon subscribes and folds (as legs). |
+| 6 | contract | wsp-029 | `WSP_HOST` defaults to `manager`, and seats are adopted both ways. Stop: a live day on the installed trunk. |
+| 7 | contract | wsp-030 | Contract: wsp deletes the polls, sweeps and inference files the events replaced, as legs. Stop: install, then a day. |
+| 8 | insitu | wsp-031 | The M1 line's measure and the scripted `kill -9` proof, written here as "M1's result". |
+
+host-api already holds 3.2's types and the `Connection` trait (wsp-002), so no group changes the contract crate. A
+gap found on the way is a row of its own (components.md R5).
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the
