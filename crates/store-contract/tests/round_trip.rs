@@ -187,6 +187,24 @@ fn commands() -> Vec<Command> {
     ]
 }
 
+/// `FENCED_VERBS` is exactly the verbs whose `args` carry a `fence` (wsp-065):
+/// `commands()` holds every variant (the table above), so a fenced verb added
+/// later fails here until the table lists it, and a listed verb that lost its
+/// fence fails too.
+#[test]
+fn fenced_verbs_are_exactly_the_commands_carrying_a_fence() {
+    let mut carrying = BTreeSet::new();
+    for c in commands() {
+        let v = serde_json::to_value(&c).unwrap();
+        if v["args"].get("fence").is_some() {
+            carrying.insert(as_str(&v["verb"]));
+        }
+    }
+    let listed: BTreeSet<String> = FENCED_VERBS.iter().map(|v| v.to_string()).collect();
+    assert_eq!(carrying, listed);
+    assert_eq!(STORE_INSTANCE, "store");
+}
+
 #[test]
 fn every_command_round_trips_under_its_verb() {
     table(&commands(), COMMANDS, command, |v| as_str(&v["verb"]));

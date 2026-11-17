@@ -22,6 +22,8 @@ pub trait Domain {
     fn decide(&self, state: &State, cmd: &Command, by: &Principal) -> Result<Vec<Draft>, Refusal>;
 
     /// `state` after `event`. Total: an event the domain does not know leaves
-    /// the state as it was.
+    /// the state as it was. It folds the events a store writes itself too
+    /// (`lease.*`, `claim.*`, `text.set`; their payloads are in the `store`
+    /// module's docs), since `snapshot()` is the fold of the whole log.
     fn evolve(&self, state: State, event: &Event) -> State;
 }

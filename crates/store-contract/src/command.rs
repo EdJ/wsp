@@ -4,8 +4,17 @@
 //!
 //! A command issued under a lease carries a [`Fence`], and `apply` refuses it
 //! with [`Refusal::Stale`](crate::Refusal::Stale) when the lease's token has
-//! moved on (2.2). Which command is legal in which state is the domain's
-//! ([`Domain::decide`](crate::Domain::decide)), not this crate's.
+//! moved on (2.2), before `decide` runs. Which command is legal in which state
+//! is the domain's ([`Domain::decide`](crate::Domain::decide)), not this crate's.
+//!
+//! **A command's fence** (wsp-065). The contract has no accessor (an accessor
+//! is logic, R2); it names the fence by a rule and a table instead. A fenced
+//! verb carries its fence as the argument named `fence`, and no other argument
+//! has that name, so on the wire a command is fenced when `args.fence` is
+//! present and not `null`. [`FENCED_VERBS`] lists those verbs, and
+//! `tests/round_trip.rs` holds the table to the variants, so a fifth fenced
+//! verb does not pass until it is in the table. A backend may match the verbs
+//! or read `args.fence`; it checks the table in its own tests either way.
 
 use std::collections::BTreeMap;
 
@@ -22,8 +31,13 @@ pub struct Fence {
     pub token: Token,
 }
 
+/// The verbs whose `args` carry a `fence` (`seat.end`'s may be `null`: the
+/// person's has none), which `apply` checks before `decide` (2.2).
+pub const FENCED_VERBS: &[&str] = &["row.claim", "row.review", "row.land", "seat.end"];
+
 /// What `apply` returns: the new events' ids, in commit order. A repeated key
-/// returns the first `Applied` and writes nothing.
+/// returns the first `Applied` and writes nothing; a refusal is no result and
+/// records no key ([`Commands::apply`](crate::Commands::apply)).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Applied {
     pub events: Vec<EventId>,

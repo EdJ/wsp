@@ -24,13 +24,15 @@ pub mod refusal;
 pub mod store;
 pub mod subscribe;
 
-pub use command::{Applied, Block, Command, Fence, ReleaseTo, Verdict};
+pub use command::{Applied, Block, Command, Fence, ReleaseTo, Verdict, FENCED_VERBS};
 pub use domain::Domain;
 pub use entity::*;
 pub use event::{Draft, Event, EventKind, Subject};
 pub use id::*;
 pub use refusal::{Error, Refusal, Result};
-pub use store::{Claims, Commands, Events, Leases, Reads, RowFilter, SeatFilter, Store, Texts};
+pub use store::{
+    Claims, Commands, Events, Leases, Reads, RowFilter, SeatFilter, Store, Texts, STORE_INSTANCE,
+};
 pub use subscribe::{Feed, Subscribe, BEAT_SECS, MISSED_BEATS};
 
 pub const SCHEMA: &str = "1";
