@@ -6305,7 +6305,21 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // WIRE_VERSION against what the installed compound-sup actually speaks,
     // and the host binary beside it against a build that only touched one of
     // the two — the two shapes `compound-026` was filed for.
-    crate::place_compound::wire_health(&mut problems, &mut notes);
+    //
+    // On a machine with a manager (`wsp install`, wsp-024) the local half is the
+    // manager's own answer: it says hello with the token, its version is wsp's,
+    // and compound-sup's wire is inside the range it names. Without a local
+    // record there is no manager to ask, and the older check of compound-sup
+    // stands in.
+    if !crate::manager::health(
+        &store.state,
+        crate::manager::installed_sup().as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        &mut problems,
+        &mut notes,
+    ) {
+        crate::place_compound::wire_health(&mut problems, &mut notes);
+    }
     // And the same wire, asked of every machine the seat drives: one line each
     // (`docs/remote-agents.md` section 2), so a far compound-sup that is behind
     // is said before a spawn is refused on it.

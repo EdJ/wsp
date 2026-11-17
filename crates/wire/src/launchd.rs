@@ -372,8 +372,15 @@ fn ensure_as(
     state: &Path,
     path_var: &str,
 ) -> Result<Done, String> {
-    let want = plist_as(label, bin, state, path_var);
-    let change = plan(&want, path);
+    ensure_text(label, path, &plist_as(label, bin, state, path_var), false)
+}
+
+/// Write `want` at `path` if it is not already there, and make sure `label` is
+/// loaded from it. `restart` is for a binary that was replaced under a job whose
+/// plist did not change: the job is kicked so the new file runs, which is the
+/// one case [`ensure`] leaves alone on purpose (the daemon re-`exec`s itself).
+fn ensure_text(label: &str, path: &Path, want: &str, restart: bool) -> Result<Done, String> {
+    let change = plan(want, path);
     let domain = domain()?;
     let target = format!("{domain}/{label}");
 
@@ -388,11 +395,22 @@ fn ensure_as(
     // is held to.
     let was_loaded = loaded(&target);
     if change == Plan::Unchanged && was_loaded {
+        if restart {
+            let out = Command::new("launchctl")
+                .args(["kickstart", "-k", &target])
+                .output()
+                .map_err(|e| format!("cannot run launchctl: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("launchctl kickstart failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            settle(&target, Duration::from_secs(15))?;
+            return Ok(Done { path: path.to_path_buf(), wrote: false, loaded: true });
+        }
         return Ok(Done { path: path.to_path_buf(), wrote: false, loaded: false });
     }
 
     if change == Plan::Write {
-        crate::store::write_atomic(path, &want)
+        crate::store::write_atomic(path, want)
             .map_err(|e| format!("cannot write {}: {e}", util::contract(path)))?;
     }
     // Booted out only when it is there to be booted out: a job that is not
@@ -415,6 +433,147 @@ fn ensure_as(
     bootstrap_retrying(&domain, path, 6, Duration::from_secs(1))?;
     settle(&target, Duration::from_secs(8))?;
     Ok(Done { path: path.to_path_buf(), wrote: change == Plan::Write, loaded: true })
+}
+
+// ---- the manager's agent (docs/agent-manager.md 2.4; wsp-024) ----------------
+
+/// The manager's job: `<label>.manager`, beside the daemon's `com.wsp.daemon`.
+pub const MANAGER_LABEL: &str = "com.wsp.manager";
+
+/// How long launchd waits before restarting a manager that keeps dying (2.4).
+/// Shorter than the daemon's: the manager owns no seat's life, and a client is
+/// waiting on its port.
+pub const MANAGER_THROTTLE: u32 = 5;
+
+/// Where the manager's plist goes under `home`. A function of `home` rather
+/// than of the environment, so a test writes into a temp HOME.
+pub fn manager_plist_path_in(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents").join(format!("{MANAGER_LABEL}.plist"))
+}
+
+pub fn manager_plist_path() -> PathBuf {
+    manager_plist_path_in(&util::home())
+}
+
+/// The manager's launchd log: `<exec_dir>/log/launchd.log`, beside the
+/// manager's own `manager.log`. It holds what the process says before its own
+/// log is open, and what it says as it dies.
+pub fn manager_log(exec_dir: &Path) -> PathBuf {
+    exec_dir.join("log").join("launchd.log")
+}
+
+/// The manager's plist as text. `KeepAlive` is a plain `true`, unlike the
+/// daemon's: the manager has no clean exit to leave alone, and a manager that
+/// declines to start (another one answers its port) is restarted every
+/// [`MANAGER_THROTTLE`] seconds until the other is gone, which is what 2.4
+/// asks for.
+///
+/// `--port` is written out, so the machine record and the process cannot
+/// disagree about it.
+pub fn manager_plist(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> String {
+    let arg = |s: &str| format!("    <string>{}</string>", escape(s));
+    let log = manager_log(exec_dir);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{MANAGER_LABEL}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+{bin}
+    <string>--exec-dir</string>
+{exec_dir}
+    <string>--port</string>
+    <string>{port}</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>{MANAGER_THROTTLE}</integer>
+
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+{path}
+  </dict>
+
+  <key>StandardOutPath</key>
+{log}
+  <key>StandardErrorPath</key>
+{log}
+</dict>
+</plist>
+"#,
+        bin = arg(&bin.display().to_string()),
+        exec_dir = arg(&exec_dir.display().to_string()),
+        path = arg(path_var),
+        log = arg(&log.display().to_string()),
+    )
+}
+
+/// Write the manager's plist at `path` and make its log directory, without
+/// loading anything. What a test calls, and the first half of
+/// [`ensure_manager`].
+pub fn write_manager_plist(path: &Path, bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> Result<bool, String> {
+    let want = manager_plist(bin, exec_dir, port, path_var);
+    let _ = std::fs::create_dir_all(exec_dir.join("log"));
+    if plan(&want, path) == Plan::Unchanged {
+        return Ok(false);
+    }
+    crate::store::write_atomic(path, &want).map_err(|e| format!("cannot write {}: {e}", util::contract(path)))?;
+    Ok(true)
+}
+
+/// Write the manager's plist if it differs and load the job. `restarted` says
+/// the binary beside it was just replaced, so a job that is already right is
+/// kicked to run it.
+pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, path_var: &str, restarted: bool) -> Result<Done, String> {
+    let _ = std::fs::create_dir_all(exec_dir.join("log"));
+    ensure_text(
+        MANAGER_LABEL,
+        &manager_plist_path(),
+        &manager_plist(bin, exec_dir, port, path_var),
+        restarted,
+    )
+}
+
+/// Unload the manager's job and remove its plist. Nothing to unload and
+/// nothing to remove is success; the second value says whether there was a
+/// plist.
+pub fn remove_manager() -> Result<bool, String> {
+    let path = manager_plist_path();
+    let target = format!("{}/{MANAGER_LABEL}", domain()?);
+    if loaded(&target) {
+        let _ = Command::new("launchctl")
+            .arg("bootout")
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        wait_gone(&target, Duration::from_secs(15));
+        if loaded(&target) {
+            return Err(format!("{MANAGER_LABEL} is still loaded after bootout"));
+        }
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot remove {}: {e}", util::contract(&path))),
+    }
 }
 
 /// Put the machine's daemon job back: `bootstrap` when launchd no longer has
@@ -595,6 +754,34 @@ mod tests {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
+
+    /// The manager's plist, written for a temp HOME and read back as text:
+    /// launchd is never asked (wsp-024). The label, a plain `KeepAlive`, the
+    /// 5 s throttle, the binary and the log under `<exec_dir>/log/`.
+    #[test]
+    fn the_managers_plist_is_written_under_a_temp_home_and_names_what_2_4_asks() {
+        let home = scratch("manager-home");
+        let exec = home.join(".local/state/wsp-manager");
+        let bin = home.join(".local/bin/wsp-manager");
+        let path = manager_plist_path_in(&home);
+        assert!(path.starts_with(&home));
+        assert!(path.ends_with("Library/LaunchAgents/com.wsp.manager.plist"));
+
+        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, "/usr/bin:/bin"), Ok(true));
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert!(got.contains("<key>Label</key>\n  <string>com.wsp.manager</string>"), "{got}");
+        assert!(got.contains("<key>KeepAlive</key>\n  <true/>"), "{got}");
+        assert!(got.contains("<key>ThrottleInterval</key>\n  <integer>5</integer>"), "{got}");
+        assert!(got.contains("<key>LimitLoadToSessionType</key>\n  <string>Aqua</string>"), "{got}");
+        assert!(got.contains(&format!("<string>{}</string>\n    <string>--exec-dir</string>", bin.display())), "{got}");
+        let log = exec.join("log/launchd.log");
+        assert_eq!(got.matches(&format!("<string>{}</string>", log.display())).count(), 2, "{got}");
+        assert!(exec.join("log").is_dir(), "the log's directory is made, or launchd cannot open the log");
+        assert!(got.contains("<string>7487</string>"), "{got}");
+
+        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, "/usr/bin:/bin"), Ok(false), "a second write is no write");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-launchd-{}-{}", name, std::process::id()));

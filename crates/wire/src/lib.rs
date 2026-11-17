@@ -8,6 +8,7 @@ pub mod fake;
 pub mod far;
 pub mod host;
 pub mod launchd;
+pub mod manager;
 pub mod place;
 pub mod systemd;
 pub mod place_compound;

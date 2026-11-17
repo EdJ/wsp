@@ -1,6 +1,6 @@
 # wsp-wire
 
-The `Place` port and its backends (`docs/components.md`, cut `c4`). Depends on `wsp-base`, `wsp-host`, `wsp-store`
+The `Place` port and its backends (`docs/components.md`, cut `c4`). Depends on `wsp-base`, `wsp-host`, `wsp-host-api` (the manager's `hello`), `wsp-store`
 and `serde_json`. The root re-exports each module at its old path (`crate::place`, `crate::far`, …).
 
 ## Holds
@@ -9,7 +9,8 @@ and `serde_json`. The root re-exports each module at its old path (`crate::place
 - `place_compound`, `place_super` — the two real backends; `tunnel`, `far` — the sockets and ssh they use
 - `host` — the `Host` trait, `LOCAL`, and the adapter: `host::InProcess` wraps `wsp-host`'s, each method calling
   the one of the same name; everything else of `wsp_host::inproc` is re-exported here (wsp-020)
-- `launchd`
+- `launchd` — the daemon's agent and the manager's (`<label>.manager`, wsp-024)
+- `manager` — wsp's side of the manager on this machine: the local record and secret file `wsp install` writes, and `doctor`'s hello probe
 - `fake` — the fake backend (also served by `wsp sandbox`); it moved here with `Rect`, because the backends' own tests bind it
 
 ## Does not hold
