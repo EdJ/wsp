@@ -160,7 +160,7 @@ impl Standing {
 }
 
 /// A pane someone is standing in: the fields the reckoning reads. It was
-/// backend's pane record; backend is gone (wsp-120), and nothing fills it live.
+/// backend's pane record; it is now a compound seat, filled by [`panes_of`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Pane {
     pub pane_id: String,
@@ -196,11 +196,15 @@ pub struct World {
 }
 
 impl World {
-    /// The live join: the store for who holds what. The panes came from backend
-    /// alone, and backend is gone (wsp-120), so no pane is live here.
+    /// The live join: the store for who holds what, and compound's seat list
+    /// for who is standing where. A census that cannot be taken leaves the
+    /// panes empty, which is what overlap said before it had a feed at all:
+    /// it reports nobody rather than guess.
     pub fn live(store: &Store) -> World {
+        use crate::place::Place;
+        let panes = crate::place_compound::Compound::new().census().map(|c| panes_of(&c)).unwrap_or_default();
         World {
-            panes: Vec::new(),
+            panes,
             workspaces: Vec::new(),
             tasks: store.tasks(),
             index: Index::new(store.projects()),
@@ -210,6 +214,28 @@ impl World {
             agents_held: store.agents_held(),
         }
     }
+}
+
+/// The panes a census reports: one per seat that is still there.
+///
+/// A seat that has gone is not standing anywhere, so it is left out; a plain
+/// terminal (`Empty`) stays, with no agent, because a shell in a tree can
+/// overwrite files as well as an agent can. The seat id is the pane id, and
+/// compound has no workspaces, so `workspace_id` is empty.
+pub fn panes_of(census: &crate::place::Census) -> Vec<Pane> {
+    census
+        .seats()
+        .filter(|s| s.state != crate::place::State::Gone)
+        .map(|s| Pane {
+            pane_id: s.seat.as_str().to_string(),
+            label: s.label.clone(),
+            workspace_id: String::new(),
+            agent: if s.state == crate::place::State::Empty { String::new() } else { s.agent.kind.clone() },
+            agent_status: s.state.as_str().to_string(),
+            cwd: s.cwd.clone(),
+            title: String::new(),
+        })
+        .collect()
 }
 
 /// The deepest declared project root containing `cwd`, if any.
@@ -400,6 +426,39 @@ mod tests {
             claims: BTreeMap::new(),
             agents_held: BTreeMap::new(),
         }
+    }
+
+    /// The feed: a compound census with a seat in it becomes a pane overlap
+    /// sees, a seat that has gone does not, and a shell with no agent in it is
+    /// still company.
+    #[test]
+    fn a_live_seat_in_the_census_is_a_pane_standing_beside_us() {
+        use crate::place::{Agent, Census, Seat, Seated, State};
+        let seated = |id: &str, cwd: &str, state: State| Seated {
+            seat: Seat::new(id),
+            cwd: cwd.into(),
+            agent: Agent { kind: "claude".into(), ..Default::default() },
+            state,
+            ..Default::default()
+        };
+        let census = Census::heard(
+            "",
+            vec![
+                seated("cpd-1", "/home/ed/claude/wsp", State::Working),
+                seated("cpd-2", "/home/ed/claude/wsp/src", State::Idle),
+                seated("cpd-3", "/home/ed/claude/wsp", State::Gone),
+                seated("cpd-4", "/home/ed/claude/wsp", State::Empty),
+            ],
+        );
+        let panes = panes_of(&census);
+        assert_eq!(panes.len(), 3, "a gone seat is still standing");
+        let w = world(panes);
+        let out = standing_beside(&w, "cpd-1", None);
+        let ids: Vec<&str> = out.iter().map(|s| s.pane.as_str()).collect();
+        assert_eq!(ids, vec!["cpd-2", "cpd-4"]);
+        let idle = out.iter().find(|s| s.pane == "cpd-2").unwrap();
+        assert!(idle.agent && idle.state == "idle" && idle.relation.is_near());
+        assert!(!out.iter().find(|s| s.pane == "cpd-4").unwrap().agent, "a shell is not an agent");
     }
 
     /// The failure this exists for: two panes in one directory, neither

@@ -651,6 +651,13 @@ How each was taken:
 **Carried into M1's breakdown, first:** wsp-010. It covers the features herdr fed that nothing feeds now: overlap's
 live panes and verify's `--rm --all` sweep.
 
+*wsp-010, decided:* both are re-fed, neither deleted. Overlap's `World::live` takes its panes from compound's census
+(`overlap::panes_of`: a seat that has gone is not standing, a shell with no agent still is). Verify's `--rm --all`
+residue sweep takes its live keys from the same census (`cmd_verify::live_keys`: the held seats, and `solo`); a census
+that did not answer removes nothing. Tests: `a_live_seat_in_the_census_is_a_pane_standing_beside_us` and
+`the_residue_sweep_is_fed_by_the_seats_compound_holds`. Left for the far-seat paths wsp-001 named (the `machine`
+reads): they still treat every seat as local.
+
 #### M1's breakdown (wsp-019, 2026-11-17)
 
 The list is `m1-agent-manager`, at status init. It follows wsp-018's three rules: expand, then contract; a cut that

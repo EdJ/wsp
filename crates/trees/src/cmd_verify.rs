@@ -299,7 +299,29 @@ pub fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
     store.state.join("build").join(format!("{}-{}", util::slugify(name), key))
 }
 
-/// Remove the build trees under the state directory that no live workspace
+/// The keys a build tree may still be named for: the seats compound holds, and
+/// the `solo` key of a shell that is no seat at all.
+///
+/// `None` is compound not answering, which is the guard [`clear_build_dirs`]
+/// describes: a census that was not taken is not a machine with nothing on it.
+fn live_keys() -> Option<Vec<String>> {
+    use crate::place::Place;
+    let census = crate::place_compound::Compound::new().census().ok()?;
+    keys_of(&census)
+}
+
+/// [`live_keys`] off a census already taken, so a test can stand seats without
+/// a compound.
+fn keys_of(census: &crate::place::Census) -> Option<Vec<String>> {
+    if !census.answered("") {
+        return None;
+    }
+    let mut keys: Vec<String> = census.seats().map(|s| s.seat.as_str().to_string()).collect();
+    keys.push("solo".to_string());
+    Some(keys)
+}
+
+/// Remove the build trees under the state directory that no live seat
 /// owns, and say which went.
 ///
 /// The residue of keying on the workspace. Those trees outlived the workspaces
@@ -1303,12 +1325,12 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         //
         // `live` is kept rather than folded into the call because `None` and
         // `Some([])` produce the same empty residue and are not the same fact:
-        // one is "backend did not answer, so this half was skipped" and the other
+        // one is "compound did not answer, so this half was skipped" and the other
         // is "there is nothing here". Said out loud in both branches — a
         // preview more candid than the act would be the wrong way round.
-        // The live workspaces were backend's to list, and backend is gone
-        // (wsp-120): nothing answers, which is the `None` above.
-        let live: Option<Vec<String>> = None;
+        // The live keys are compound's seat list now: a build tree is keyed on
+        // the agent that built in it, and a seat is that agent while it is held.
+        let live: Option<Vec<String>> = if all { live_keys() } else { None };
         let residue: Vec<String> = if !all {
             Vec::new()
         } else if dry {
@@ -1349,7 +1371,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 }
             }
             if !residue.is_empty() {
-                println!("{did} {} left by earlier workspaces", residue.len());
+                println!("{did} {} left by earlier seats", residue.len());
             }
             if warm > 0 {
                 let cold = if dry { "would be cold" } else { "is cold" };
@@ -1370,7 +1392,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 println!(
                     "{}",
                     p.yellow(&format!(
-                        "backend did not answer, so nothing left by earlier workspaces {}",
+                        "compound did not answer, so nothing left by earlier seats {}",
                         if dry { "is listed" } else { "was removed" }
                     ))
                 );
@@ -2133,6 +2155,32 @@ bench::b: benchmark
         // Nothing to clear is not an error: `--rm --all` is a thing you run
         // without first checking whether there is anything to run it on.
         assert!(clear_build_dirs(&store, Some(&live), Path::new("/nowhere")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The feed for the residue sweep: a seat compound holds keeps its tree,
+    /// the shell's `solo` key is never residue, and a census nobody answered
+    /// is no list at all — so the sweep sees a live seat and a residue, and
+    /// removes nothing on silence.
+    #[test]
+    fn the_residue_sweep_is_fed_by_the_seats_compound_holds() {
+        use crate::place::{Census, Refusal, Seat, Seated, State};
+        let dir = scratch_dir("seat-feed");
+        let store = Store::at(dir.join("store"), dir.join("state"));
+        let build = store.state.join("build");
+        for t in ["wsp-cpd-1", "wsp-cpd-2", "wsp-solo"] {
+            std::fs::create_dir_all(build.join(t).join("tree")).unwrap();
+        }
+        let seated = Seated { seat: Seat::new("cpd-1"), state: State::Working, ..Default::default() };
+        let live = keys_of(&Census::heard("", vec![seated])).expect("an answered census is a list");
+
+        let said = stale_build_dirs(&store, Some(&live), Path::new("/nowhere"));
+        assert_eq!(said, vec![build.join("wsp-cpd-2")], "the residue is the tree no seat holds");
+        assert_eq!(clear_build_dirs(&store, Some(&live), Path::new("/nowhere")).len(), 1);
+        assert!(build.join("wsp-cpd-1").exists(), "a live seat lost the tree it was building in");
+        assert!(build.join("wsp-solo").exists(), "a shell's tree was taken for residue");
+
+        assert!(keys_of(&Census::silent("", Refusal::Unreachable("down".into()))).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
