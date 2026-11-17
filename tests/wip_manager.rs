@@ -140,7 +140,7 @@ fn wip_under_the_manager_runs_no_probe_and_a_stopped_manager_reads_silent() {
     // One seat the manager runs.
     let tcp = Tcp::new(local.socket(), token, wsp_host_api::Role::Cli, "test");
     let args: Vec<String> = vec![];
-    let spawn = Spawn { seat: "cpd-wm1", kind: None, cwd: dir.display().to_string(), env: BTreeMap::new(), program: "true", args: &args };
+    let spawn = Spawn { key: wsp_host_api::Key { row: wsp_host_api::RowId("wsp-027".into()), attempt: 0 }, seat: "cpd-wm1", kind: None, cwd: dir.display().to_string(), env: BTreeMap::new(), program: "true", args: &args };
     let session = tcp.spawn_session(&spawn).expect("the manager spawns the seat");
 
     // Under the manager: the seat, and no probe.
