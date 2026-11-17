@@ -4,6 +4,7 @@
 //! ```text
 //! wsp-manager [--exec-dir DIR] [--host ID] [--port N]
 //!             [--tailnet ADDR]... [--no-tailnet] [--volume PATH]...
+//!             [--compound-sup PATH] [--seats N]
 //! ```
 //!
 //! It binds loopback and this host's tailnet addresses (from `tailscale ip`,
@@ -16,7 +17,7 @@ use std::process::ExitCode;
 
 use wsp_manager::{tailnet_addrs, Config, Manager, DEFAULT_PORT};
 
-const USAGE: &str = "usage: wsp-manager [--exec-dir DIR] [--host ID] [--port N] [--tailnet ADDR]... [--no-tailnet] [--volume PATH]...";
+const USAGE: &str = "usage: wsp-manager [--exec-dir DIR] [--host ID] [--port N] [--tailnet ADDR]... [--no-tailnet] [--volume PATH]... [--compound-sup PATH] [--seats N]";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -41,6 +42,8 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     let mut tailnet: Vec<IpAddr> = Vec::new();
     let mut no_tailnet = false;
     let mut volumes = Vec::new();
+    let mut sup = None;
+    let mut seats = None;
     let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
@@ -51,6 +54,8 @@ fn run(argv: Vec<String>) -> Result<(), String> {
             "--tailnet" => tailnet.push(value()?.parse().map_err(|e| format!("--tailnet: {e}"))?),
             "--no-tailnet" => no_tailnet = true,
             "--volume" => volumes.push(wsp_base::util::expand(&value()?)),
+            "--compound-sup" => sup = Some(wsp_base::util::expand(&value()?)),
+            "--seats" => seats = Some(value()?.parse().map_err(|e| format!("--seats: {e}"))?),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -62,6 +67,10 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     let host = host.unwrap_or_else(wsp_base::util::hostname);
     let mut cfg = Config::new(&exec_dir, &host);
     cfg.port = port;
+    cfg.sup = sup;
+    if let Some(n) = seats {
+        cfg.seats = n;
+    }
     if !volumes.is_empty() {
         cfg.volumes.extend(volumes);
     }

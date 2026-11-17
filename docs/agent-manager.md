@@ -753,6 +753,47 @@ that:
 The binary was also run by hand on loopback. Its `hello` and its beat, with this Mac's load, memory, swap, disk
 and thermal state, came back to a Python client.
 
+#### Group 3: the manager serves seats and orders (wsp-022, 2026-11-17)
+
+`crates/manager/src/seats.rs` holds the seat table. The manager now answers 3.2's seat messages over `wsp-host`'s
+in-process code, instead of refusing them.
+- **`seat.spawn`, keyed by `(row, attempt)`.** The manager forks `compound-sup spawn --label <seat>` itself, with
+  `COMPOUND_RUN_DIR` set to `<exec_dir>/run`, so every seat's sockets and `.label` sidecar sit under the manager's
+  own directory. A retry of the key gets the same `seat.started`. A spawn that arrives while the key is still
+  forking waits for that same answer, so one key never starts two agents. These are refused `duplicate`: a key
+  whose seat already stopped, a key running another seat or other arguments, and a seat id already running under
+  another key. `gate: required` is refused `unsupported`, because local seats are not gated (d1 Q12). A `tree`
+  workdir is refused `no_tree` until Q6 places trees on hosts. The agent's env names are filled from the
+  manager's own environment.
+- **`seat.stop`** signals the session's process group (`TERM`, then `KILL` after `grace`). It answers
+  `seat.stopped` with the pids of the seat's tree that ended. A supervisor the manager is parent of and that
+  exits unasked is reported `seat.stopped` with its status.
+- **Seat epochs.** There is one epoch per start of a seat id. Epochs are counted from the journal, so they run on
+  across a restart. A `seat.stop` or `order.deliver` naming an older epoch is refused `stale_epoch`, with the
+  seat's epoch in the reason.
+- **Orders go through `compound-sup deliver <socket> <id>`.** The order is written to `<exec_dir>/orders/`
+  before compound-sup is asked, and the file is removed only after the answer is journalled. A `delivered`
+  answer becomes `order.delivered`, `order.acked` and a `turn` that began, because compound-sup says `delivered`
+  only once the agent's `UserPromptSubmit` hook has said the turn began. A `failed <why>` answer becomes
+  `order.refused` with compound-sup's `FailWhy`. An order asked again gets the same answer and is never typed a
+  second time. The ack's `turn_began` is the time the manager read the answer, and a turn's end is not heard,
+  until hooks report to the manager (wsp-023).
+- **`seats`** takes one `ps` for every seat's rss and shells, plus a `compound-sup vitals` per seat, and renders
+  no screen. **`seat.read`** is the one render.
+- **Restart (2.5).** At start the table is rebuilt from the `*.sock` files in `<exec_dir>/run`. Each socket is
+  joined by its `.label` to the journal's last `seat.started` for that seat, and kept if `vitals` answers. A seat
+  the journal has running but whose session is gone is reported `seat.stopped`. An order left in
+  `<exec_dir>/orders/` is asked again under its id, unless the journal already holds its answer.
+- **Capacity** is `--seats`, 32 by default. A spawn past it is refused `full`.
+
+Tests (`tests/seats.rs`) use a fake compound-sup: a shell script with plain files for sockets and a sleeping
+process group for each session. Nothing spawns claude. They check that:
+- two spawns with one key give one seat;
+- a stop or an order naming a stale epoch is refused;
+- an order answers delivered, then acked;
+- the `wsp-manager` binary, killed with SIGKILL mid-order and restarted, still lists the seat, answers the order
+  once (typed once), and resumes events `from` the last id.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the

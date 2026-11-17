@@ -16,11 +16,12 @@ use std::time::Instant;
 use wsp_host::hooks::{self, Post};
 use wsp_host::Tcp;
 use wsp_host_api::{
-    ConnError, Connection, Frame, Hello, ManagerHello, Message, OrderRefused, OrderFail, Refusal, Refused,
-    SeatRefused, SeatsList, WireRange, WspHello, MISSED_BEATS, PROTOCOL,
+    ConnError, Connection, Frame, Hello, ManagerHello, Message, Refusal, Refused, SeatEpoch, WireRange, WspHello,
+    MISSED_BEATS, PROTOCOL,
 };
 
-use crate::{Client, Shared, CAPACITY, VERSION};
+use crate::seats::{self, Asker};
+use crate::{Client, Shared, VERSION};
 
 fn reply(req: Option<wsp_host_api::ReqId>, msg: Message) -> Frame {
     Frame { id: None, req, msg }
@@ -70,8 +71,10 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream) {
     let Ok(closer) = conn.try_clone() else { return conn.shutdown() };
     let id = shared.next_client.fetch_add(1, Ordering::SeqCst);
     {
+        // The seats before the journal: the table is never taken under it.
+        let running = shared.seats.lock().unwrap_or_else(|e| e.into_inner()).epochs();
         let journal = shared.journal.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = out.send(reply(req, Message::Hello(Hello::Manager(manager_hello(&shared, journal.head())))));
+        let _ = out.send(reply(req, Message::Hello(Hello::Manager(manager_hello(&shared, journal.head(), running)))));
         let mut clients = shared.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(beat) = shared.last_beat.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             let _ = out.send(beat);
@@ -169,7 +172,7 @@ fn admitted(shared: &Shared, conn: &mut Tcp, peer: &str, req: Option<wsp_host_ap
     true
 }
 
-fn manager_hello(shared: &Shared, head: Option<wsp_host_api::EventId>) -> ManagerHello {
+fn manager_hello(shared: &Shared, head: Option<wsp_host_api::EventId>, seats: Vec<SeatEpoch>) -> ManagerHello {
     let wire = WireRange { min: wsp_host::inproc::WIRE_VERSION, max: wsp_host::inproc::WIRE_VERSION };
     ManagerHello {
         host: shared.cfg.host.clone(),
@@ -178,13 +181,13 @@ fn manager_hello(shared: &Shared, head: Option<wsp_host_api::EventId>) -> Manage
         compound_sup: wire,
         compound_render: wire,
         journal_head: head,
-        seats: vec![],
-        capacity: CAPACITY,
+        seats,
+        capacity: shared.capacity(),
     }
 }
 
 /// Read and answer the client until it leaves; the reason it left.
-fn follow(shared: &Shared, conn: &mut Tcp, id: u64, out: &Sender<Frame>) -> String {
+fn follow(shared: &Arc<Shared>, conn: &mut Tcp, id: u64, out: &Sender<Frame>) -> String {
     let patience = shared.cfg.beat * MISSED_BEATS;
     let mut heard = Instant::now();
     loop {
@@ -211,30 +214,27 @@ fn follow(shared: &Shared, conn: &mut Tcp, id: u64, out: &Sender<Frame>) -> Stri
     }
 }
 
-const NO_SEATS: &str = "this manager runs no seats yet (wsp-022)";
-
-fn answer(shared: &Shared, id: u64, out: &Sender<Frame>, frame: Frame) {
+fn answer(shared: &Arc<Shared>, id: u64, out: &Sender<Frame>, frame: Frame) {
     let req = frame.req;
-    let send = |msg: Message| {
-        let _ = out.send(reply(req, msg));
-    };
+    let asker = || Asker { client: Some(id), out: Some(out.clone()), req };
     match frame.msg {
         Message::Beat(_) => {}
         Message::Subscribe(s) => subscribe(shared, id, out, s.from),
-        Message::Seats(_) => send(Message::SeatsList(SeatsList { seats: vec![] })),
         Message::Hello(_) => {
             let _ = out.send(refused(req, Refusal::Malformed, "hello was already said"));
         }
-        Message::SeatSpawn(s) => send(Message::SeatRefused(SeatRefused {
-            key: s.key,
-            seat: s.seat,
-            why: Refusal::Unsupported,
-            detail: NO_SEATS.into(),
-        })),
-        Message::OrderDeliver(o) => send(Message::OrderRefused(OrderRefused { order: o.order, seat: o.seat, why: OrderFail::NoSeat })),
-        Message::OrderCancel(o) => send(Message::OrderRefused(OrderRefused { order: o.order, seat: o.seat, why: OrderFail::NoSeat })),
-        Message::SeatStop(_) | Message::SeatRead(_) => {
-            let _ = out.send(refused(req, Refusal::NoSeat, NO_SEATS));
+        Message::SeatSpawn(s) => seats::spawn(shared, asker(), s),
+        Message::SeatStop(s) => seats::stop(shared, asker(), s),
+        Message::OrderDeliver(o) => seats::deliver(shared, asker(), o),
+        Message::OrderCancel(o) => seats::cancel(shared, asker(), o),
+        // A thread each: `ps`, vitals and a render are not the reader's to wait on.
+        Message::Seats(_) => {
+            let (shared, asker) = (shared.clone(), asker());
+            std::thread::spawn(move || seats::list(&shared, asker));
+        }
+        Message::SeatRead(r) => {
+            let (shared, asker) = (shared.clone(), asker());
+            std::thread::spawn(move || seats::read(&shared, asker, r));
         }
         Message::JobRun(_) | Message::JobStop(_) => {
             let _ = out.send(refused(req, Refusal::Unsupported, "this manager runs no jobs yet (M3)"));
