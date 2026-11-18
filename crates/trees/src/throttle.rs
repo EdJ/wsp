@@ -160,6 +160,9 @@ pub struct Settings {
     /// [`HOT_JOBS`]), kept under whatever `slots` and `jobs` a hand set.
     pub hot_slots: Option<usize>,
     pub hot_jobs: Option<usize>,
+    /// Checks, verifier builds and barrier runs at once machine-wide
+    /// (`wsp-668`). `None` is half the cores, between 2 and 8.
+    pub checks: Option<usize>,
     /// Tool name to the variable that caps its parallelism. Edited by hand in
     /// the file; the default is cargo.
     pub tools: BTreeMap<String, String>,
@@ -175,6 +178,7 @@ impl Default for Settings {
             thermal_below: THERMAL_BELOW,
             hot_slots: None,
             hot_jobs: None,
+            checks: None,
             tools: default_tools(),
         }
     }
@@ -204,6 +208,7 @@ impl Settings {
         }
         s.hot_slots = v.get("hot_slots").and_then(Value::as_u64).map(|n| n.max(1) as usize);
         s.hot_jobs = v.get("hot_jobs").and_then(Value::as_u64).map(|n| n.max(1) as usize);
+        s.checks = v.get("checks").and_then(Value::as_u64).map(|n| n.max(1) as usize);
         if let Some(t) = v.get("tools").and_then(Value::as_object) {
             let tools: BTreeMap<String, String> =
                 t.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect();
@@ -224,6 +229,7 @@ impl Settings {
             "thermal_below": self.thermal_below,
             "hot_slots": self.hot_slots,
             "hot_jobs": self.hot_jobs,
+            "checks": self.checks,
             "tools": self.tools,
         });
         crate::store::write_atomic(&settings_path(state), &serde_json::to_string_pretty(&v).unwrap_or_default())
@@ -259,6 +265,18 @@ impl Settings {
         match hot {
             true => self.hot_jobs.unwrap_or_else(|| self.jobs.map_or(HOT_JOBS, |j| j.min(HOT_JOBS))),
             false => self.job_cap(cores),
+        }
+    }
+
+    /// Checks, verifier builds and barrier runs at once (`wsp-668`): the seat
+    /// cap holds agents only, and each wide group starts its members' checks
+    /// beside them. While the clock is limited the count is held to the hot
+    /// slots, so a machine that has more cores than it can cool runs fewer.
+    pub fn check_slots_at(&self, cores: usize, hot: bool) -> usize {
+        let cool = self.checks.unwrap_or_else(|| (cores / 2).clamp(2, 8));
+        match hot {
+            true => cool.min(self.hot_slots.unwrap_or(HOT_SLOTS)).max(1),
+            false => cool,
         }
     }
 
@@ -1285,6 +1303,16 @@ pub fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
 /// anything to wait for (`auto`, with the person gone), looked at every ten
 /// polls rather than each because it may cost a process.
 fn wait_for(ctx: &Ctx, what: &str, attempt: &mut dyn FnMut() -> Taken, lifted: Option<&dyn Fn() -> bool>) -> Hold {
+    wait_loop(ctx.say, ctx.poll, what, attempt, lifted)
+}
+
+fn wait_loop(
+    say: &dyn Fn(&str),
+    poll: Duration,
+    what: &str,
+    attempt: &mut dyn FnMut() -> Taken,
+    lifted: Option<&dyn Fn() -> bool>,
+) -> Hold {
     let mut waited = Duration::ZERO;
     let mut next_say = Duration::ZERO;
     let mut polls = 0u32;
@@ -1298,18 +1326,98 @@ fn wait_for(ctx: &Ctx, what: &str, attempt: &mut dyn FnMut() -> Taken, lifted: O
                 Value::Null => "another build".to_string(),
                 v => who(&v),
             };
-            (ctx.say)(&format!(
+            say(&format!(
                 "wsp: waiting for {what} — held by {by}. Queued, not failed; this is wsp's build throttle (`wsp throttle` shows it, `wsp throttle off` lifts the slots, not the one-build-per-tree hold)"
             ));
             next_say = waited + Duration::from_secs(60);
         }
-        std::thread::sleep(ctx.poll);
-        waited += ctx.poll;
+        std::thread::sleep(poll);
+        waited += poll;
         polls += 1;
         if polls % 10 == 0 && lifted.is_some_and(|l| l()) {
             return Hold { path: PathBuf::new() };
         }
     }
+}
+
+/// What a check, a verifier's build or a barrier run reads to take a slot
+/// (`wsp-668`), so it can be made against a fake.
+pub struct CheckGate<'a> {
+    pub state: &'a Path,
+    pub cores: usize,
+    pub task: String,
+    pub cmd: String,
+    pub dir: PathBuf,
+    /// `CPU_Speed_Limit` now, read at each try: it moves with the work.
+    pub thermal: &'a dyn Fn() -> Option<u32>,
+    pub alive: &'a dyn Fn(u32) -> bool,
+    pub say: &'a dyn Fn(&str),
+    pub poll: Duration,
+}
+
+fn check_path(state: &Path, n: usize) -> PathBuf {
+    builds_dir(state).join(format!("check-{n}"))
+}
+
+fn waiting_path(state: &Path) -> PathBuf {
+    builds_dir(state).join(format!("waiting-{}-{}", std::process::id(), WAITS.fetch_add(1, Ordering::SeqCst)))
+}
+
+static WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The slot for a check step now: in the process's own state directory, read
+/// from the machine. Not under test without a `WSP_STATE` of its own, where
+/// the live directory is not the test's to hold.
+pub fn check_slot_now(dir: &Path, command: &str) -> Hold {
+    let state = match std::env::var_os("WSP_STATE") {
+        Some(v) => PathBuf::from(v),
+        None if cfg!(test) => return Hold { path: PathBuf::new() },
+        None => Store::default_state(),
+    };
+    let say = |m: &str| eprintln!("{m}");
+    take_check_slot(&CheckGate {
+        state: &state,
+        cores: cores(),
+        task: std::env::var("WSP_TASK").unwrap_or_default(),
+        cmd: command.chars().take(80).collect(),
+        dir: dir.to_path_buf(),
+        thermal: &speed_limit,
+        alive: &alive,
+        say: &say,
+        poll: Duration::from_secs(1),
+    })
+}
+
+/// A check slot, waited for when none is free, released when the hold drops.
+/// The slots are the machine's, not a tree's: a check in any tree takes one,
+/// and they are not the build slots a `cargo` takes inside it, so a check that
+/// runs `cargo test` does not wait on itself. `off` lifts the cap on a cool
+/// machine; a limited clock holds it in every mode.
+pub fn take_check_slot(g: &CheckGate) -> Hold {
+    let settings = Settings::load(g.state);
+    let hot = || settings.is_hot((g.thermal)());
+    if settings.mode == Mode::Off && !hot() {
+        return Hold { path: PathBuf::new() };
+    }
+    let rec = record(&g.task, &g.cmd, &[], &tree_of(&g.dir));
+    let mut grab = || {
+        // Read at each try: a wait that began cool ends hot.
+        let n = settings.check_slots_at(g.cores, hot());
+        let mut seen = Value::Null;
+        for i in 0..n {
+            match take(&check_path(g.state, i), &rec, g.alive) {
+                Taken::Yours(h) => return Taken::Yours(h),
+                Taken::HeldBy(v) => seen = v,
+            }
+        }
+        Taken::HeldBy(seen)
+    };
+    if let Taken::Yours(h) = grab() {
+        return h;
+    }
+    // Waiting is on the record too, so `wsp wip` names what queues.
+    let _waiting = take(&waiting_path(g.state), &rec, g.alive);
+    wait_loop(g.say, g.poll, "a check slot", &mut grab, Some(&|| settings.mode == Mode::Off && !hot()))
 }
 
 fn finish(mut cmd: Command, nice: Option<i32>) -> i32 {
@@ -1459,7 +1567,16 @@ pub struct View {
     /// `pmset`.
     pub thermal: Option<u32>,
     pub builds: Vec<Build>,
+    /// The check slots in use and the checks queued for one (`wsp-668`).
+    pub checks: Checks,
     pub shims: PathBuf,
+}
+
+/// Who holds the check slots, by slot, and who waits for one.
+#[derive(Clone, Debug, Default)]
+pub struct Checks {
+    pub running: Vec<(usize, Value)>,
+    pub waiting: Vec<Value>,
 }
 
 impl View {
@@ -1478,6 +1595,7 @@ impl View {
             load: load_average(),
             thermal: speed_limit(),
             builds: builds(state, &alive),
+            checks: checks(state, &alive),
             shims: shim_dir(state),
         }
     }
@@ -1565,6 +1683,12 @@ impl View {
                 if s.jobs_at(self.cores, true) == 1 { "" } else { "s" },
             ));
         }
+        let hot = self.hot();
+        out.push(format!(
+            "  checks: {} at once machine-wide{}",
+            s.check_slots_at(self.cores, hot),
+            if hot { " (the clock is limited)" } else { "" }
+        ));
         out.push("  always: one cargo build per tree".into());
         out.push(format!("  shims: {} (first on every spawned seat's PATH)", util::contract(&self.shims)));
         if let Some((a, b, c)) = self.load {
@@ -1587,6 +1711,12 @@ impl View {
                 }
             }
         }
+        for (n, h) in &self.checks.running {
+            out.push(format!("  check slot {}/{}  {}", n + 1, s.check_slots_at(self.cores, hot), who(h)));
+        }
+        for h in &self.checks.waiting {
+            out.push(format!("  waiting for a check slot  {}", who(h)));
+        }
         out.join("\n")
     }
 
@@ -1601,7 +1731,15 @@ impl View {
             ),
         };
         let thermal = self.thermal_cell().map_or(String::new(), |c| format!(" · {c}"));
-        format!("throttle: {}{thermal}{building}", self.force_line())
+        let slots = self.settings.check_slots_at(self.cores, self.hot());
+        let mut checks = format!(" · check slots {}/{slots}", self.checks.running.len());
+        if !self.checks.waiting.is_empty() {
+            checks.push_str(&format!(
+                ", waiting: {}",
+                self.checks.waiting.iter().map(who).collect::<Vec<_>>().join("; ")
+            ));
+        }
+        format!("throttle: {}{thermal}{checks}{building}", self.force_line())
     }
 
     fn load_sentence(&self) -> String {
@@ -1642,6 +1780,25 @@ fn builds(state: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<Build> {
             None => out.push(Build { holder: h, slot: Some(n) }),
         }
     }
+    out
+}
+
+fn checks(state: &Path, alive: &dyn Fn(u32) -> bool) -> Checks {
+    let mut out = Checks::default();
+    for e in fs::read_dir(builds_dir(state)).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(v) = fs::read_to_string(e.path()).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
+        if !alive(holder_pid(&v)) {
+            continue;
+        }
+        if let Some(n) = name.strip_prefix("check-").and_then(|n| n.parse::<usize>().ok()) {
+            out.running.push((n, v));
+        } else if name.starts_with("waiting-") && !name.ends_with(".reclaim") {
+            out.waiting.push(v);
+        }
+    }
+    out.running.sort_by_key(|(n, _)| *n);
+    out.waiting.sort_by_key(|v| v.get("since").and_then(Value::as_i64).unwrap_or(0));
     out
 }
 
@@ -1754,7 +1911,7 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
         ["set", pairs @ ..] if !pairs.is_empty() => {
             for p in pairs {
                 let Some((k, v)) = p.split_once('=') else {
-                    eprintln!("wsp: `{p}` is not k=v — slots=N jobs=N hot-slots=N hot-jobs=N hot-below=PERCENT away=MINUTES; `auto` for the counts");
+                    eprintln!("wsp: `{p}` is not k=v — slots=N jobs=N checks=N hot-slots=N hot-jobs=N hot-below=PERCENT away=MINUTES; `auto` for the counts");
                     return 2;
                 };
                 let n = || v.parse::<usize>().ok().filter(|n| *n > 0);
@@ -1779,6 +1936,11 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
                         Some(n) => s.hot_jobs = Some(n),
                         None => return bad(k, v),
                     },
+                    ("checks", "auto") => s.checks = None,
+                    ("checks", _) => match n() {
+                        Some(n) => s.checks = Some(n),
+                        None => return bad(k, v),
+                    },
                     ("hot-below", _) => match v.parse::<u32>() {
                         Ok(n) if n <= 100 => s.thermal_below = n,
                         _ => return bad(k, v),
@@ -1788,7 +1950,7 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
                         Err(_) => return bad(k, v),
                     },
                     _ => {
-                        eprintln!("wsp: no throttle setting `{k}` — slots, jobs, away, hot-slots, hot-jobs, hot-below");
+                        eprintln!("wsp: no throttle setting `{k}` — slots, jobs, checks, away, hot-slots, hot-jobs, hot-below");
                         return 2;
                     }
                 }
@@ -2722,6 +2884,7 @@ mod tests {
             load: Some((20.0, 18.0, 10.0)),
             thermal: None,
             builds: builds(&t.state(), &|p| p == me),
+            checks: Checks::default(),
             shims: PathBuf::from("/s"),
         };
         assert_eq!(v.builds.len(), 1, "one build, holding a tree and a slot");
@@ -2747,7 +2910,8 @@ mod tests {
                 load: Some((1.0, 1.0, 1.0)),
                 thermal: None,
                 builds: vec![],
-                shims: PathBuf::from("/s"),
+                checks: Checks::default(),
+            shims: PathBuf::from("/s"),
             };
             assert!(v.status_line().starts_with(want), "{m:?}: {}", v.status_line());
             assert!(!v.load_warning(), "the line shows with no load warning up");
@@ -2764,6 +2928,7 @@ mod tests {
             load: None,
             thermal: None,
             builds: vec![Build { holder: rec_for(1), slot: Some(0) }],
+            checks: Checks::default(),
             shims: PathBuf::from("/s"),
         };
         assert!(v.status_line().contains(" · building: wsp-9 `cargo test`"), "{}", v.status_line());
@@ -2780,9 +2945,96 @@ mod tests {
                 load: Some((30.0, 25.0, 20.0)),
                 thermal: None,
                 builds: vec![],
-                shims: PathBuf::from("/s"),
+                checks: Checks::default(),
+            shims: PathBuf::from("/s"),
             };
             assert!(v.load_warning() && v.render().contains("hold off heavy runs"), "{m:?}");
         }
+    }
+
+    fn gate<'a>(
+        state: &'a Path,
+        thermal: &'a dyn Fn() -> Option<u32>,
+        alive: &'a dyn Fn(u32) -> bool,
+        say: &'a dyn Fn(&str),
+    ) -> CheckGate<'a> {
+        CheckGate {
+            state,
+            cores: 8,
+            task: "wsp-9".into(),
+            cmd: "sleep 1".into(),
+            dir: state.to_path_buf(),
+            thermal,
+            alive,
+            say,
+            poll: Duration::from_millis(10),
+        }
+    }
+
+    #[test]
+    fn a_fifth_check_waits_for_one_of_four_slots_on_a_limited_clock_and_starts_when_one_ends() {
+        let t = crate::util::isolated("throttle-check-slots");
+        let state = t.state();
+        Settings { checks: Some(4), ..Settings::default() }.save(&state).unwrap();
+        let (thermal, say) = (|| Some(40u32), |_: &str| {});
+        let here = |_: u32| true;
+        let mut holds: Vec<Hold> = (0..4).map(|_| take_check_slot(&gate(&state, &thermal, &here, &say))).collect();
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (state, started) = (state.clone(), started.clone());
+            std::thread::spawn(move || {
+                let (thermal, say, here) = (|| Some(40u32), |_: &str| {}, |_: u32| true);
+                let h = take_check_slot(&gate(&state, &thermal, &here, &say));
+                started.store(true, Ordering::SeqCst);
+                drop(h);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!started.load(Ordering::SeqCst), "the fifth check started with four running");
+        let seen = checks(&state, &here);
+        assert_eq!(seen.running.len(), 4, "{seen:?}");
+        assert_eq!(seen.waiting.len(), 1, "the fifth is named as waiting: {seen:?}");
+        holds.pop();
+        waiter.join().unwrap();
+        assert!(started.load(Ordering::SeqCst), "it started when a slot was freed");
+        assert!(checks(&state, &here).waiting.is_empty(), "and is no longer waiting");
+    }
+
+    #[test]
+    fn the_check_slots_shrink_with_the_clock_and_off_lifts_them_on_a_cool_machine() {
+        let s = Settings::default();
+        assert_eq!(s.check_slots_at(8, false), 4);
+        assert_eq!(s.check_slots_at(16, false), 8);
+        assert_eq!(s.check_slots_at(16, true), HOT_SLOTS, "a limited clock holds the count down");
+        assert_eq!(s.check_slots_at(2, true), 2.min(HOT_SLOTS));
+        let t = crate::util::isolated("throttle-check-off");
+        let state = t.state();
+        Settings { mode: Mode::Off, checks: Some(1), ..Settings::default() }.save(&state).unwrap();
+        let (cool, hot, say, here) = (|| Some(100u32), || Some(30u32), |_: &str| {}, |_: u32| true);
+        let _a = take_check_slot(&gate(&state, &cool, &here, &say));
+        let _b = take_check_slot(&gate(&state, &cool, &here, &say));
+        assert!(checks(&state, &here).running.is_empty(), "off on a cool machine takes no slot");
+        let _c = take_check_slot(&gate(&state, &hot, &here, &say));
+        assert_eq!(checks(&state, &here).running.len(), 1, "a limited clock holds it in every mode");
+    }
+
+    #[test]
+    fn the_view_names_the_check_slots_and_what_waits_on_them() {
+        let v = View {
+            settings: Settings { checks: Some(4), ..Settings::default() },
+            idle: Some(1),
+            in_force: true,
+            cores: 8,
+            load: None,
+            thermal: Some(40),
+            builds: vec![],
+            checks: Checks { running: vec![(0, rec_for(1)), (1, rec_for(1))], waiting: vec![rec_for(1)] },
+            shims: PathBuf::from("/s"),
+        };
+        let line = v.status_line();
+        assert!(line.contains("check slots 2/4, waiting: wsp-9 `cargo test`"), "{line}");
+        let out = v.render();
+        assert!(out.contains("checks: 4 at once machine-wide (the clock is limited)"), "{out}");
+        assert!(out.contains("check slot 2/4") && out.contains("waiting for a check slot"), "{out}");
     }
 }

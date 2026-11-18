@@ -1213,6 +1213,11 @@ pub(crate) struct Ran {
 /// Run one step in `dir`, its output to `log`, killed with its process group
 /// at the limit.
 pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
+    // `wsp-668`: a check, a verifier's build and a barrier run all come through
+    // here, and take one of the machine's check slots before they start: the
+    // seat cap holds agents, not what a wide group starts beside them. The wait
+    // is not the step's time, and the slot is let go when the step ends.
+    let _slot = (!step.command.trim().is_empty()).then(|| crate::throttle::check_slot_now(dir, &step.command));
     let start = Instant::now();
     let failed = |why: String| Ran {
         step: step.clone(),
@@ -2635,6 +2640,34 @@ mod tests {
 
     fn sh(command: &str, limit: u64) -> Step {
         Step { name: "s".into(), command: command.into(), limit: Duration::from_secs(limit), of: Of::Project, on: Vec::new(), barrier: false, end: false }
+    }
+
+    /// `wsp-668`: six members' checks at once under two check slots run two at
+    /// a time. The slot count is the settings', so a throttled clock cannot
+    /// make it more.
+    #[test]
+    fn six_checks_at_once_run_no_more_than_the_check_slots_at_a_time() {
+        let iso = crate::util::isolated("check-slots-six");
+        crate::throttle::Settings { checks: Some(2), ..Default::default() }.save(&iso.state()).unwrap();
+        let (dir, _) = scratch_log("slots-six");
+        let marks = dir.join("marks");
+        let step = sh(&format!("echo + >> {m}; sleep 0.4; echo - >> {m}", m = marks.display()), 60);
+        let threads: Vec<_> = (0..6)
+            .map(|i| {
+                let (dir, step) = (dir.clone(), step.clone());
+                std::thread::spawn(move || run_step(&dir, &step, &dir.join(format!("log{i}"))))
+            })
+            .collect();
+        for t in threads {
+            assert_eq!(t.join().unwrap().done, Done::Passed);
+        }
+        let (mut now, mut most) = (0i32, 0i32);
+        for l in std::fs::read_to_string(&marks).unwrap().lines() {
+            now += if l == "+" { 1 } else { -1 };
+            most = most.max(now);
+        }
+        assert_eq!(now, 0);
+        assert!(most <= 2 && most >= 1, "{most} checks at once under 2 slots");
     }
 
     #[test]
