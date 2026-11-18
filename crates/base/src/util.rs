@@ -748,18 +748,25 @@ pub fn hostname() -> String {
     // writes with this, and a `hostname` child per stamp was a fork and an exec
     // per seat per minute in the daemon, for an answer that does not change
     // under a running process — the daemon `exec`s itself on every install.
+    // And read with gethostname(3), what the `hostname` program prints, not
+    // by running it (wsp-076): `wip` through the API runs no child, and its
+    // render compares each claim's host with this one.
     static ASKED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ASKED
-        .get_or_init(|| {
-            crate::calls::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "localhost".into())
-        })
-        .clone()
+    ASKED.get_or_init(|| gethostname().filter(|s| !s.is_empty()).unwrap_or_else(|| "localhost".into())).clone()
+}
+
+fn gethostname() -> Option<String> {
+    extern "C" {
+        fn gethostname(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is ours and its length is passed; one byte is kept
+    // back so the name is NUL-terminated even when it was cut.
+    if unsafe { gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).trim().to_string())
 }
 
 pub fn home() -> PathBuf {

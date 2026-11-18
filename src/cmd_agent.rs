@@ -4321,12 +4321,12 @@ impl Wip {
     /// seat-since and finished-wip.json.
     ///
     /// **It runs no child**: no `ps`, `lsof`, `df`, render, `git` or `wsp`.
-    /// So the probes are the files path's values with nothing running — no
-    /// disk or load warning, no shells, memory with no rss — the throttle's
-    /// line is read without the machine (no idle time, load or clock), a
-    /// waiter's pid is taken to stand, and the dead-daemon heading is the
-    /// tick stamp's (the daemon has just answered, so a stamp gone stale is
-    /// the one thing left to say).
+    /// So the probes are the files path's values with nothing running — the
+    /// disks from the managers' last beats, no load warning, no shells, memory
+    /// with no rss — the throttle's line is read without the machine (no
+    /// idle time, load or clock), a waiter's pid is taken to stand, and the
+    /// dead-daemon heading is the tick stamp's (the daemon has just answered,
+    /// so a stamp gone stale is the one thing left to say).
     pub(crate) fn from_api(store: &Store, state: &wsp_store_contract::State) -> Wip {
         let tasks: Vec<Task> = state
             .rows
@@ -4373,11 +4373,19 @@ impl Wip {
             agents,
             since,
         };
+        // The hosts' disks as the managers' last beats carried them (wsp-076),
+        // where `from_managers` reads the same beat off the `seats` reply.
+        let disks: Vec<crate::host_tcp::DiskFree> = state
+            .machines
+            .values()
+            .filter_map(|m| serde_json::from_str::<Vec<crate::host_tcp::DiskFree>>(m.facts.get("disks")?).ok())
+            .flatten()
+            .collect();
         Wip::gathered(store, read, |agents, bindings| Probed {
             shells: crate::waiting::Shells::counted(std::iter::empty(), &BTreeMap::new()),
             memory: crate::memory::of_rss(&store.state, agents, bindings, &BTreeMap::new()),
             daemon: daemon_by_stamp(store.daemon_tick(), true, util::epoch_secs()),
-            disk: None,
+            disk: crate::disk::loud_of(store, &disks),
             load: None,
             throttle: Some(throttle_unprobed(store)),
         })
