@@ -88,6 +88,11 @@ fn take(path: &Path) -> Option<Held> {
 /// Whether the holder of `path` is gone. This process's own pid is a live
 /// holder: a step that asks for its own list again is answered by the mark.
 fn stale(path: &Path) -> bool {
+    stale_by(path, |pid| crate::host::Host::signal(&crate::host::LOCAL, &[pid], "0"))
+}
+
+/// `alive(pid)` is `kill -0`'s answer: `Some(true)` reached, `Some(false)` not there, `None` could not ask.
+fn stale_by(path: &Path, alive: impl Fn(u32) -> Option<bool>) -> bool {
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut it = text.split_whitespace();
     let pid = it.next().and_then(|p| p.parse::<u32>().ok());
@@ -105,29 +110,8 @@ fn stale(path: &Path) -> bool {
     if pid == std::process::id() {
         return false;
     }
-    // `kill -0` that could not run reads as stale, as it always has.
-    !crate::host::Host::signal(&crate::host::LOCAL, &[pid], "0").unwrap_or(false)
-}
-
-/// Stub for the red commit: the old body, probing through `alive`.
-fn stale_by(path: &Path, alive: impl Fn(u32) -> Option<bool>) -> bool {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    let mut it = text.split_whitespace();
-    let pid = it.next().and_then(|p| p.parse::<u32>().ok());
-    let at = it.next().and_then(|a| a.parse::<i64>().ok());
-    let (Some(pid), Some(at)) = (pid, at) else {
-        return fs::metadata(path)
-            .and_then(|m| m.modified())
-            .map(|t| t.elapsed().unwrap_or_default().as_secs() > 60)
-            .unwrap_or(false);
-    };
-    if util::epoch_secs() - at > STALE_AFTER {
-        return true;
-    }
-    if pid == std::process::id() {
-        return false;
-    }
-    !alive(pid).unwrap_or(false)
+    // A `kill -0` that could not run keeps the lock: "could not ask" is not "not there" (host.rs `signal`; wsp-663).
+    !alive(pid).unwrap_or(true)
 }
 
 /// Step `list` with its lock held: `step(0)` first, then `step(n)` once for
