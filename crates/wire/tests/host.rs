@@ -26,15 +26,16 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::net::{SocketAddr, TcpListener};
+use std::io::Write;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use std::collections::BTreeSet;
 use std::io::BufRead;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use serde_json::Value;
 use wsp_base::util::Wall;
@@ -616,17 +617,29 @@ fn a_spawn_whose_manager_drops_after_seat_started_keeps_the_seat_and_leaves_the_
     let (dir, sup) = place("odrop");
     let sweep = Sweep::default();
     let m = manager(&dir, &sup, 0);
-    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    // The spawner dials the manager through a relay, which sees the moment
+    // `seat.started` is handed to the spawner's own connection.
+    let relay = Relay::to(m.addrs()[0]);
+    let tcp = Tcp::with_local(relay.addr, token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
     let compound = Compound { host: &tcp, ..Compound::at(dir.join("seats")) };
     let seat = opened(&compound, &dir);
     // The fake types a `slow` order two seconds late: the manager is stopped
-    // once the seat is forked, inside that gap, so no ack is ever sent.
+    // once `seat.started` has reached the spawner, inside that gap, so no ack
+    // is ever sent. Not a fixed time after the fork (wsp-081): under load the
+    // manager's answer came later than that, and the spawn heard no start at
+    // all. Nor once the manager has journalled it: its stop shuts every
+    // connection at once, and an answer still queued for one is lost.
     let order = FirstOrder { order: new_order_id(&seat), text: "slow work".into() };
-    let spawns = dir.join("exec").join(wsp_manager::seats::RUN_DIR).join("spawns");
+    let (started, closed) = (relay.started.clone(), relay.closed.clone());
     let stopper = std::thread::spawn(move || {
-        wait_until("the seat forked", || spawns.exists());
-        std::thread::sleep(Duration::from_millis(300));
+        let since = Instant::now();
+        while !started.load(Ordering::SeqCst) {
+            assert!(since.elapsed() < Duration::from_secs(20), "seat.started did not reach the spawner within 20s");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         m.stop();
+        // Nothing answers at the manager's address now: a dial is refused.
+        closed.store(true, Ordering::SeqCst);
     });
     let start = Instant::now();
     let heard = compound.start_ordered(&seat, &agent(0), &order, Duration::from_secs(20));
@@ -998,6 +1011,76 @@ fn despawn_of_a_seat_the_manager_does_not_run_ends_it_in_process() {
     m.stop();
     drop(sweep);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A loopback relay in front of a manager, frame line for frame line, so a
+/// test can see what was handed to its client: `started` is set once the
+/// `seat.started` answering a `seat.spawn` that carried a first order is
+/// written to the connection that asked (a terminal's own start, which
+/// carries none, does not count, nor a subscription's journalled copy).
+/// `closed` stops it taking connections, so a dial after it is refused as
+/// the manager's would be. A side that ends is passed on as an end (a FIN,
+/// after what was already written), never as lost data.
+struct Relay {
+    addr: SocketAddr,
+    started: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+}
+
+impl Relay {
+    fn to(manager: SocketAddr) -> Relay {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (started, closed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (seen, stop) = (started.clone(), closed.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let client = match listener.accept() {
+                    Ok((c, _)) => c,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                client.set_nonblocking(false).unwrap();
+                let Ok(upstream) = TcpStream::connect(manager) else { continue };
+                // The `req` of each `seat.spawn` on this connection with a first order.
+                let ordered: Arc<Mutex<BTreeSet<u64>>> = Arc::default();
+                let asked = ordered.clone();
+                relay_lines(client.try_clone().unwrap(), upstream.try_clone().unwrap(), move |f| {
+                    if f["type"] == "seat.spawn" && !f["first_order"].is_null() {
+                        asked.lock().unwrap().extend(f["req"].as_u64());
+                    }
+                });
+                let seen = seen.clone();
+                relay_lines(upstream, client, move |f| {
+                    if f["type"] == "seat.started" && f["req"].as_u64().is_some_and(|r| ordered.lock().unwrap().contains(&r)) {
+                        seen.store(true, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        Relay { addr, started, closed }
+    }
+}
+
+/// Copy `from` to `to` a line at a time, handing each frame to `on` once it
+/// is written, and pass `from`'s end on as `to`'s write side shut.
+fn relay_lines(from: TcpStream, mut to: TcpStream, on: impl Fn(&Value) + Send + 'static) {
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(from);
+        let mut line = String::new();
+        while matches!(lines.read_line(&mut line), Ok(n) if n > 0) {
+            if to.write_all(line.as_bytes()).is_err() {
+                break;
+            }
+            on(&serde_json::from_str(&line).unwrap_or(Value::Null));
+            line.clear();
+        }
+        let _ = to.shutdown(std::net::Shutdown::Write);
+    });
 }
 
 /// A port nothing listens on: bound, then let go.
