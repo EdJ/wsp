@@ -574,7 +574,7 @@ taken with `wsp calls` over a day before and a day after, and its incident count
 | **M1. The manager on the Mac** | The in-process host becomes the `wsp-manager` process under launchd. wsp dials it on TCP (3.4). Hooks report to it, and the journal and subscription are in use. The daemon folds events. `wip` reads `seats`. compound's host keeps polling `wip --json`, which is now cheap. | **ps** per tick 37.5 → ≤ 1. **renders** per tick 59.5 → 0. **`df`** 24.6 → 0. **lsof** in `wip` → 0. `wip` < 0.2 CPU-s per call (from 2.9). Host polling CPU-s per day 25,268 → under 2,500. Spawn p50 no worse than 9.4 s. wsp-411-kind incidents → 0 over a week. A manager kill -9 mid-turn loses no seat and no order (a scripted proof, 10×). | `WSP_HOST=inproc`: the same code linked into wsp, as at M0. Seats started by the manager stay alive (compound-sup is durable), and the in-process host adopts them by socket. `WSP_HOST` is `manager` when unset (wsp-029); a manager's start adopts the seats the in-process host started, from compound's run directory. |
 | **M2. The i5 under its own manager** | The same binary on the i5. wsp dials it over the tailnet. The beat becomes the heartbeat. Per-seat forwards and tunnel.rs's masters go, and the far half of the copy moves into the manager. | **ssh** runs per day 147 → install and tree bytes only. A far seat working through a slowed tick never reads unreachable (a wsp-639 sandbox reproduction plus a week live). The far manifest of compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s). `spawn --on` p50 no worse. | A machine field `transport: ssh`, which keeps the v1 path compiled until a fortnight passes on `manager`. |
 | **M3. Tree jobs under the manager** | `throttle run`, `check`, `verify`'s checks and barrier runs become `job.run` on the tree's host (the Mac). The throttle admits by the manager's facts. check_tree's sweep, the slot probes and leaked_agents go. | **lsof** → 0 and **ps** → 0 on the wsp side. Every `kill` is by a manager, on a pgid it started. wsp-478-kind incidents → 0 over a week. `throttle run`'s wall per build no worse. | Jobs fall back to wsp running them in-process behind a flag. The sweep is restored with them. |
-| **M4. Trees placed (if Q6 says T2)** | `tree.checkout` and `tree.land` on every host's manager, a fenced push to the trunk, per-host warm targets, and the barrier's host named. | A list runs with members on two hosts and no copy-up or copy-back. Land conflicts are refused by the push and never overwritten. Cold-build cost on the i5 is measured against remote-agents' early proof. | Rows placed on the Mac only (T1), which is the state at M3. |
+| **M4. Trees placed (T2, Ed 2026-11-18; see "M3 under T2")** | `tree.checkout` and `tree.land` on every host's manager, a fenced push to the trunk, per-host warm targets, and the barrier's host named. | A list runs with members on two hosts and no copy-up or copy-back. Land conflicts are refused by the push and never overwritten. Cold-build cost on the i5 is measured against remote-agents' early proof. | Rows placed on the Mac only (T1), which is the state at M3. |
 
 Spawn p50 is the guard rail at every step: a step that makes it worse than 9.4 s, measured the same way, does not
 finish.
@@ -1086,6 +1086,81 @@ child. A timeout says `timed_out`, and a `dir` outside the root is refused `no_t
 manager is "host silent" within a second with nothing run, that `WSP_JOBS` is chosen independently of `WSP_HOST`,
 and that a job whose manager restarts mid-run is resent under its key and runs once.
 
+#### M3 under T2 (wsp-093, 2026-11-18)
+
+Ed answered Q6 on 2026-11-18 (relayed by Jesper; the full set is on his wsp-652): **trees go straight to T2.**
+Trees live with the agents on each host, and a land is a fenced push to a trunk remote. This replaces d1's "Q6 T1
+now". His other answers change nothing here. There is one manager per host over compound-sup, wsp dials the managers,
+and wsp keeps the throttle decision (Q11). The renderer answer needs no row either: the manager starts no renderer, it
+reads the render socket from compound-sup's handshake and reports it with the seat's sockets.
+
+Groups 1-4 (wsp-044, -049, -050, -051) already hold under T2. A job's place is host-api's `JobAt`: a `Tree {row,
+host}` or a `HostDir {host, path}` relative to that host's tree root. Neither is a path on wsp's machine, and
+`tree.checkout` and `tree.land` are reserved verbs. What T2 changes is *which host* a place names, and that trees are
+made and landed by that host's manager.
+
+**Which host's manager runs a job.** The tree's host, which is the agent's host. A row's host is chosen once, when its
+seat is spawned (`spawn --on`, the Mac by default), and the store keeps it with the row. Every job for the row goes to
+that host's manager, and the `host` in its `JobAt` is that host:
+- `throttle run` is called by the agent's shell, so it already runs on the tree's host. Its job goes to the manager on
+  the host the shim runs on, over loopback, at the shim's cwd relative to that host's tree root. wsp's admission code
+  runs in the shim and reads that host's beat. Slots are per host.
+- `wsp check` and `verify`'s builds run on the row's host, in trees made there.
+- A barrier runs on the list's barrier host. By default that is the trunk's host (remote-agents' rule that "the
+  barrier stays here"), and a list may name another.
+- wsp picks the connection by the `JobAt`'s host. While the Mac's manager is the only one (until M2), a row on a host
+  with no manager keeps today's in-process path there, as wsp-042 said for the i5.
+
+**How check, verify and barrier find the tree.** Through one function, never by joining a path. The callers in group
+5 take a job's place from `place_of(row | barrier, kind)`, with kind one of `work`, `check`, `verify` and `barrier`. It
+answers a `JobAt` and makes the tree if it is not there. In M3 it makes check, verify and barrier trees in-process
+on the Mac, as today, and answers a `HostDir` on the Mac. At M4 its body becomes `tree.checkout` on the place's host,
+whose manager makes the tree from that host's clone of the trunk (the row's own branch is already there) and answers
+the `HostDir`. The callers do not move twice. A barrier tree is the trunk at the group's tip, fetched from the trunk
+remote by the barrier host's manager. Locks and run starts are read from the job table of the manager on the tree's
+host, by key, not with `kill -0`.
+
+**Land as a fenced push.** `land` (cmd_checkout.rs:2666) is no local fast-forward under T2. It becomes `tree.land
+{row, expect}` on the row's host:
+1. `wsp verified --holds` records the trunk head `H` that the verdict was read on. Today it already rebases on the
+   trunk and reruns the checks where the trunk moved.
+2. The row's host's manager fetches the trunk remote and checks that the row's tip descends from `H`. Then it pushes
+   `<tip>:refs/heads/<trunk>` with `--force-with-lease=refs/heads/<trunk>:H`.
+3. The remote's ref update is a compare-and-swap, so two hosts cannot both land on `H`. A push that is refused
+   because the trunk moved lands nothing. The row is rebased on the new head, its checks are rerun where the trunk
+   moved, and it is pushed again under the new lease. Nothing is ever pushed without a lease, and nothing is
+   overwritten.
+4. The push's answer (`H` to the new head, the commits it carried) is journalled as `tree.landed` and folded into the
+   store. That is the landing record. `Landings` (cmd_checkout.rs:1438) reads the trunk's reflog today, and a bare
+   trunk on another host has no reflog the store can read. So `placed` reads the store's record, and the reflog only
+   for lands made before T2.
+
+Each host's trunk-tracking ref moves at its next fetch, which the manager runs at every spawn and every land. The
+person's checkout becomes a clone that pulls. The trunk must be a bare repository, because git refuses a push to the
+branch a non-bare checkout has out.
+
+**What is left for M4.** M4 is no longer "if Q6 says T2". It is `tree.checkout` and `tree.remove` on every host's
+manager (the body of `place_of`), `tree.land` as above with the landing record, the trunk remote, the barrier's
+sweep of member trees as `tree.remove` sent to each member's host (worklist.rs:1211 `sweep`), every host's manager
+sweeping its own trees, warm targets per host, and `wsp checkout` by a person. remote-agents' copy (treecopy.rs) is
+retired there, once no host takes copies. M4 needs a second manager to measure (M2), and it is broken down at M3's
+end, as d1 Q14 says for every step.
+
+**Groups 5-8 under T2.** Each row's overview carries a "Under T2 (wsp-093)" paragraph:
+
+| group | row | under T2 |
+|---|---|---|
+| 5 | wsp-052 throttle run | **Kept, with a note.** It is local by construction. The job goes to the shim's own host's manager, admission reads that host's beat, and slots are per host. |
+| 5 | wsp-053 check | **Rewritten.** The check tree's place comes from `place_of`, and jobs are routed by the `JobAt`'s host. Lock and start liveness are read from that host's job table. A test pins that no job place is built from a path on wsp's machine. |
+| 5 | wsp-054 verify | **Rewritten** as wsp-053. Verify runs on the row's host, and warm-tree locks are per host. Land is not in this row (M4). |
+| 5 | wsp-055 barrier | **Rewritten.** The barrier tree comes from `place_of` on the list's barrier host (default: the trunk's host). The barrier's sweep stays as it is until M4. |
+| 6 | wsp-056 default | **Kept, with a note.** Every host's install writes its own capacities and tree root. The tree root has to cover the trees the manager will make at M4, not only the project roots of today. |
+| 7 | wsp-057 contract | **Kept, with a note.** The `place_of` seam stays. treecopy.rs is not deleted here (M4). |
+| 8 | wsp-058 measure | **Kept, with a note.** The measure is the Mac's alone, because the Mac's manager is the only one. |
+
+The questions this leaves are put to the person on wsp-093: where the trunk remote lives, where a row's verify
+runs, where the landing record is kept, and when M4 is broken down.
+
 ### 6.3 How this reorders state-core section 7
 
 The manager steps go **first**, before state-core's step 0. They need no store and no server, and they take out the
@@ -1121,6 +1196,7 @@ The amended table is in docs/state-core.md section 7.
    with land as a fenced push to a trunk remote; this reverses 2026-11-05's "copied, not pushed git to git" for far
    rows) or T3 (copies everywhere, the trunk on one host) (1.3)? The recommendation is T1 now, with M3's jobs and
    M4's verbs reserved so that T2 changes placement only.
+   **Answered 2026-11-18 by Ed: T2.** See 6.2, "M3 under T2".
 7. **Tree bytes under T1.** Should copy-up and copy-back stay rsync over ssh, or become a `tree.copy` stream in the
    protocol so that ssh is left for install only?
 8. **The agent's own `wsp` calls on a far host.** Keep the shim's ssh until the server's network API (recommended),
