@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 use crate::host::Host;
 use std::process::Stdio;
 use wsp_base::calls::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -1926,7 +1926,11 @@ pub fn health(store: &Store, notes: &mut Vec<String>) {
     }
 }
 
-static WARNED: AtomicBool = AtomicBool::new(false);
+/// Whether the load warning is up, per store (keyed by its state directory),
+/// so [`warn`] logs only the edge. Per store rather than one flag for the
+/// process: tests that each open their own isolated store in one test binary
+/// do not see each other's edge (wsp-116).
+static WARNED: std::sync::Mutex<BTreeMap<PathBuf, bool>> = std::sync::Mutex::new(BTreeMap::new());
 
 /// The daemon's half: drop holds whose process is gone, and log the load
 /// warning when it starts and when it clears. Not under test; [`reap`] and
@@ -1964,7 +1968,11 @@ pub fn tidy_given(store: &Store, given: Option<Given>) {
 
 fn warn(store: &Store, v: &View) {
     let warning = v.warning(store.seat_cap());
-    if warning.is_some() != WARNED.swap(warning.is_some(), Ordering::SeqCst) {
+    let was = {
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        warned.insert(store.state.clone(), warning.is_some()).unwrap_or(false)
+    };
+    if warning.is_some() != was {
         match warning {
             Some(w) => crate::store::log_line(store, &w),
             None => crate::store::log_line(store, "load and clock are back under the warning line"),
@@ -3080,7 +3088,7 @@ mod tests {
         let (thermal, say) = (|| Some(40u32), |_: &str| {});
         let here = |_: u32| true;
         let mut holds: Vec<Hold> = (0..4).map(|_| take_check_slot(&gate(&state, &thermal, &here, &say))).collect();
-        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waiter = {
             let (state, started) = (state.clone(), started.clone());
             std::thread::spawn(move || {
