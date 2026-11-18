@@ -305,28 +305,38 @@ pub fn distinctive(name: &str) -> bool {
         || name.as_bytes().windows(2).any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
 }
 
-/// Whether the files a packet names miss what its brief describes: the brief
-/// names things ([`subject`]) and not one of them is in any file the packet
-/// names that can be read under `root` (none at all, too). When the brief has
-/// [`distinctive`] names, only those are judged, so a common word in backticks
-/// cannot clear a row (wsp-016's `running` and `finish` were in src/cycle.rs a
-/// hundred times each; its `wall_buckets` was in none of its files). A brief
-/// that names nothing gives nothing to miss, and a row with no packet is not
-/// spawned short: both keep the narrow order.
+/// Whether the files a packet names miss what its brief describes, read from
+/// the files it names that can be read under `root` (the governor's rule after
+/// wsp-039's second block):
+///
+/// - When the brief has [`distinctive`] names, only those are judged, and the
+///   files miss when **any one** of them is in none of the files. A common word
+///   in backticks cannot clear a row (wsp-016's `running` and `finish` were in
+///   src/cycle.rs a hundred times each), and one name found does not clear the
+///   rest (a file with `wall_buckets` but not `legs_running_seconds` misses).
+/// - Otherwise the plain names are judged, and the files miss when not one of
+///   them is in any file.
+///
+/// A brief that names nothing gives nothing to miss, and a row with no packet is
+/// not spawned short: both keep the narrow order.
 pub fn misses_subject(t: &Task, root: &Path) -> bool {
     if of(t).is_none() {
         return false;
     }
-    let mut names = subject(t);
-    if names.iter().any(|n| distinctive(n)) {
-        names.retain(|n| distinctive(n));
-    }
+    let names = subject(t);
     if names.is_empty() {
         return false;
     }
     let bodies: Vec<String> = named_files(t).iter().filter_map(|f| std::fs::read_to_string(root.join(f)).ok()).collect();
-    let last = |n: &str| n.rsplit("::").next().unwrap_or(n).to_string();
-    !names.iter().any(|n| bodies.iter().any(|b| b.contains(&last(n))))
+    let found = |n: &String| {
+        let last = n.rsplit("::").next().unwrap_or(n);
+        bodies.iter().any(|b| b.contains(last))
+    };
+    let code: Vec<&String> = names.iter().filter(|n| distinctive(n)).collect();
+    match code.is_empty() {
+        false => code.into_iter().any(|n| !found(n)),
+        true => !names.iter().any(found),
+    }
 }
 
 // ---- a leg's packet ---------------------------------------------------------------
@@ -1104,6 +1114,7 @@ A test over a leg record whose seat ended at T and whose line stays `running` to
             ("src/cycle.rs", "// a leg is running until its finish\npub fn running() -> bool { true }\npub fn finish() {}\n"),
             ("src/cmd_agent.rs", "pub fn agent() { let running = 1; let _ = running; }\n"),
             ("src/wallbuckets.rs", "pub fn wall_buckets() {}\n"),
+            ("src/legs.rs", "pub fn wall_buckets() {}\npub fn legs_running_seconds() {}\n"),
         ]);
         let row = |likely: &str| {
             let mut t = Task::default();
@@ -1123,7 +1134,12 @@ A test over a leg record whose seat ended at T and whose line stays `running` to
         assert!(o.contains(SEARCH_RULE) && !o.contains(NARROW), "{o}");
         assert_eq!(build(&missed, &dir).unwrap().matches(SEARCH_RULE).count(), 1);
 
-        let right = row("src/cycle.rs (identifier), src/wallbuckets.rs (named)");
+        let half = row("src/cycle.rs (identifier), src/wallbuckets.rs (named)");
+        assert!(misses_subject(&half, &dir), "wall_buckets is held; legs_running_seconds is in none of them");
+        assert!(order_for(&half, &dir, Flow::of(true)).contains(SEARCH_RULE));
+        assert_eq!(build(&half, &dir).unwrap().matches(SEARCH_RULE).count(), 1);
+
+        let right = row("src/cycle.rs (identifier), src/wallbuckets.rs (named), src/legs.rs (identifier)");
         assert!(!misses_subject(&right, &dir));
         assert_eq!(order_for(&right, &dir, Flow::of(true)), order("wsp-016", Flow::of(true)));
         assert!(!build(&right, &dir).unwrap().contains(SEARCH_RULE));
