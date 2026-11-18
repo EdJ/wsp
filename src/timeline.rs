@@ -124,7 +124,7 @@ pub(crate) fn list_parks(store: &Store, list: &str) -> Vec<Park> {
 }
 
 /// The events of the kinds named, off the event log, for any list.
-fn list_events(store: &Store, kinds: &[&str]) -> Vec<(i64, String, Value)> {
+pub(crate) fn list_events(store: &Store, kinds: &[&str]) -> Vec<(i64, String, Value)> {
     let mut ev: Vec<(i64, String, Value)> = Vec::new();
     if let Ok(text) = std::fs::read_to_string(store.state_file("events.jsonl")) {
         for line in text.lines().filter(|l| kinds.iter().any(|k| l.contains(&format!("\"{k}\"")))) {

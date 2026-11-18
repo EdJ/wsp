@@ -43,6 +43,30 @@ use crate::store::Store;
 use crate::util::{self, Clock, Paint};
 use crate::Args;
 
+/// A barrier check's seat opened with no check to go on (`wsp-089`): nothing
+/// names it, so nothing would end it, and it stood in the check's tree for
+/// thirteen hours after the barrier passed, the sweep keeping the tree for it.
+/// It is ended here, its stretch goes on the log as `barrier-check-orphaned`
+/// for effort.json's standing seats, and the check's tree goes with it unless
+/// a check has been opened on the group since.
+fn orphan_check_seat(place: &dyn Place, store: &Store, list: &str, at: usize, seat: &Seat, opened_at: &str) {
+    let stopped = place.stop(seat).is_ok();
+    store.log_event(
+        "barrier-check-orphaned",
+        json!({ "id": list, "group": at, "seat": seat.as_str(), "opened": opened_at, "ended": util::now_iso(), "stopped": stopped }),
+    );
+    let name = crate::barrier::subject(list, at);
+    match crate::check_tree::discard(store, &name, &|_| None) {
+        Tree::Removed { path, .. } => {
+            crate::store::log_line(store, &format!("removed barrier check tree {path}: {seat} opened on it with no check to go on, and was ended"));
+        }
+        Tree::Kept { path, why } => {
+            crate::store::log_line(store, &format!("kept barrier check tree {path} after ending {seat}: {why}"));
+        }
+        Tree::Absent => {}
+    }
+}
+
 /// How an agent came by the work it is being told about — and it is the one
 /// thing that changes what the work order should say.
 ///
@@ -3084,6 +3108,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
         crate::piece_seat::record_tree(store, task, pc.n, &piece_prepared);
     }
+    let opened_at = util::now_iso();
     let seat = match place.open(&order) {
         Ok(v) => v,
         Err(e) => {
@@ -3206,8 +3231,9 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         },
     };
     if let (Some((list, at)), false) = (&checking, claimed) {
+        orphan_check_seat(place, store, list, *at, &seat, &opened_at);
         eprintln!(
-            "wsp: opened {seat} — but no check is open on group {at} of {list}, so no agent was started; \
+            "wsp: opened {seat} — but no check is open on group {at} of {list}, so no agent was started and {seat} was ended; \
              `wsp worklist advance {list}` opens one when it is owed"
         );
         return 1;
@@ -8985,6 +9011,50 @@ mod tests {
         for bad in [&[("agent", "true"), ("check", "1"), ("govern", "true")][..], &[("agent", "true"), ("check", "x")][..]] {
             assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["run"], bad)), 2, "{bad:?}");
         }
+    }
+
+    /// `wsp-089`. A check spawned on a barrier that has already passed with no
+    /// agent finds no check to go on: the seat it opened is ended there and
+    /// then, its stretch goes on the log for effort.json, and the check's tree
+    /// is taken in the same step — not left for the sweep to keep for a seat
+    /// standing in it, which it did for thirteen hours.
+    #[test]
+    fn a_check_spawn_with_no_check_to_go_on_ends_its_seat_and_takes_its_tree() {
+        let _guard = no_backend();
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
+        let store = seat("check-orphan");
+        let repo = store.root.join("repo");
+        wsp_testkit::repo_at(&repo, &[(".gitignore", "target/\n.worktrees/\n")], "first");
+        let tree = repo.join(".worktrees").join(crate::barrier::subject("run", 1));
+        wsp_testkit::git(&repo, &["worktree", "add", "--quiet", "--detach", &tree.display().to_string()]);
+        let mut core = Project::new("core");
+        core.roots = vec![repo.display().to_string()];
+        store.save_project(&core).unwrap();
+        let mut m = crate::model::Task::new("a member", "t-1");
+        m.project = Some("core".into());
+        m.status_raw = crate::model::Status::Review.as_str().into();
+        store.save_task(&m).unwrap();
+        let mut w = crate::model::Worklist::new("run", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["t-1".into()], stop: "it builds".into(), ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        // The barrier opens and passes with no agent ever seated on it.
+        assert!(crate::barrier::open(&store, &w, 1, None, None, &|_| false).is_some());
+        assert_eq!(crate::barrier::settle(&store, "run", 1, crate::barrier::State::Passes), None, "no seat was on it");
+
+        let place = Twinned(std::cell::RefCell::new(Vec::new()));
+        let flags = [("agent", "true"), ("check", "1"), ("kind", "opencode"), ("no-tree", "true")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["run"], &flags)), 1, "no check is open, so no agent");
+        assert_eq!(*place.0.borrow(), vec!["w9:p2".to_string()], "the seat it opened is ended");
+        assert_eq!(crate::barrier::seat_of(&store, "w9:p2"), None, "and no check names it");
+        assert!(!tree.exists(), "the check's tree is taken in the same step");
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(log.contains("removed barrier check tree") && !log.contains("kept barrier check tree"), "{log}");
+        let ev = crate::timeline::list_events(&store, &["barrier-check-orphaned"]);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!((ev[0].2["id"].as_str(), ev[0].2["group"].as_u64(), ev[0].2["seat"].as_str()), (Some("run"), Some(1), Some("w9:p2")));
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 
     /// The whole of robustness-010, at the one line where it happens.

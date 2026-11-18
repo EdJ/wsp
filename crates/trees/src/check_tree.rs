@@ -753,6 +753,35 @@ pub fn sweep_of(store: &Store, only: Option<&str>, standing: &dyn Fn(&Path) -> O
     out
 }
 
+/// Who of `census` — `(seat, label, cwd)` — stands in `dir`, the tree of a
+/// check that is over: the check's own seats, which nothing else will end
+/// (`wsp-089`: one opened with no check to go on stood thirteen hours after
+/// its barrier passed, and the sweep kept the tree for it every tick), and the
+/// first other seat as the reason to keep the tree. A seat is the check's own
+/// by its label, `<list> · barrier <N>`, never by its cwd: other seats stand in
+/// a check's tree by cwd too (`wsp-388`). `ended` are seats already ended.
+pub fn standing_in(
+    census: &[(String, String, String)],
+    dir: &Path,
+    check: Option<(&str, usize)>,
+    ended: &[String],
+) -> (Vec<String>, Option<String>) {
+    let dir = util::real(&dir.display().to_string());
+    let own_label = check.map(|(list, at)| format!("{list} · barrier {at}"));
+    let mut own = Vec::new();
+    for (seat, label, cwd) in census.iter().filter(|(id, _, _)| !ended.contains(id)) {
+        if !util::real(cwd).starts_with(&dir) {
+            continue;
+        }
+        let label = label.trim().trim_start_matches('(').trim_end_matches(')');
+        match &own_label {
+            Some(l) if label == l || label.strip_prefix(l.as_str()).is_some_and(|r| r.starts_with(" ·")) => own.push(seat.clone()),
+            _ => return (own, Some(format!("{seat} is standing in it"))),
+        }
+    }
+    (own, None)
+}
+
 /// The kept trees already said in `cycle.log` by this process, with why: a
 /// kept tree is found again every tick, and said again only when the reason
 /// changes or the daemon starts over.
@@ -771,16 +800,31 @@ pub fn tidy(store: &Store, ended: &[String]) {
     }
     // Asked once, and only once a tree has been found to ask it about.
     let seen = std::cell::OnceCell::new();
+    let backend = crate::place_compound::Compound::new();
     let standing = |dir: &Path| -> Option<String> {
-        let dir = util::real(&dir.display().to_string());
-        match seen.get_or_init(cmd_checkout::who_is_standing) {
-            Ok(rows) => rows
-                .iter()
-                .filter(|(id, _)| !ended.contains(id))
-                .find(|(_, cwd)| util::real(cwd).starts_with(&dir))
-                .map(|(id, _)| format!("{id} is standing in it")),
-            Err(why) => Some(why.clone()),
+        let census = seen.get_or_init(|| {
+            backend
+                .census()
+                .map(|c| c.seats().map(|s| (s.seat.as_str().to_string(), s.label.clone(), s.cwd.clone())).collect::<Vec<_>>())
+                .map_err(|e| format!("compound did not say who is standing in it: {e}"))
+        });
+        let rows = match census {
+            Ok(rows) => rows,
+            Err(why) => return Some(why.clone()),
+        };
+        // The sweep asks only of a tree whose check is over.
+        let check = dir.file_name().and_then(|n| named(store, &n.to_string_lossy()));
+        let (own, other) = standing_in(rows, dir, check.as_ref().map(|(l, at)| (l.as_str(), *at)), ended);
+        if other.is_some() {
+            return other;
         }
+        for seat in own {
+            match backend.stop(&crate::place::Seat::new(&seat)) {
+                Ok(()) => crate::store::log_line(store, &format!("ended {seat}, a barrier check seat left standing in {} after its check was over", util::contract(dir))),
+                Err(e) => return Some(format!("{seat}, its check's own seat, is standing in it and would not end: {e}")),
+            }
+        }
+        None
     };
     let found = believing(|| sweep(store, &standing));
     for tree in found {
@@ -1264,6 +1308,25 @@ mod tests {
         assert_eq!(out[0].spared.len(), 1);
         assert_eq!(out[0].spared[0].0, 31702);
         assert!(spared_line(&out[0], 31702, &out[0].spared[0].1).starts_with("spared 31702 in finished row c-1"));
+    }
+
+    /// `wsp-089`. In a tree whose check is over, the check's own seat — by its
+    /// label — is named for ending and keeps nothing; another seat standing
+    /// there by cwd keeps the tree, as it always did.
+    #[test]
+    fn a_passed_checks_own_seat_is_ended_and_another_keeps_the_tree() {
+        let dir = Path::new("/nowhere/r/.worktrees/run-check-1");
+        let at = |s: &str, l: &str, c: &str| (s.to_string(), l.to_string(), c.to_string());
+        let own = [at("w9:p2", "run · barrier 1", "/nowhere/r/.worktrees/run-check-1"), at("w1:p1", "t-9", "/elsewhere")];
+        assert_eq!(standing_in(&own, dir, Some(("run", 1)), &[]), (vec!["w9:p2".to_string()], None));
+        let wrapped = [at("w9:p2", "(run · barrier 1 · opus)", "/nowhere/r/.worktrees/run-check-1/sub")];
+        assert_eq!(standing_in(&wrapped, dir, Some(("run", 1)), &[]).0, vec!["w9:p2".to_string()]);
+        let tenth = [at("w9:p3", "run · barrier 10", "/nowhere/r/.worktrees/run-check-1")];
+        assert_eq!(standing_in(&tenth, dir, Some(("run", 1)), &[]), (vec![], Some("w9:p3 is standing in it".to_string())), "barrier 10 is not 1's");
+        let member = [at("w2:p1", "t-1", "/nowhere/r/.worktrees/run-check-1")];
+        assert_eq!(standing_in(&member, dir, Some(("run", 1)), &[]).1.as_deref(), Some("w2:p1 is standing in it"));
+        assert_eq!(standing_in(&member, dir, Some(("run", 1)), &["w2:p1".to_string()]), (vec![], None), "an ended seat is nobody");
+        assert_eq!(standing_in(&own, dir, None, &[]).1.as_deref(), Some("w9:p2 is standing in it"), "no check named: nothing is ended");
     }
 
     /// With no backend answering there is nothing to tell a seat from a
