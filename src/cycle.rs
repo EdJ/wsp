@@ -484,10 +484,42 @@ pub(crate) fn launch_out(store: &Store, argv: &[&str]) {
 /// one. The event flags are what the trigger saw, and they only decide what a
 /// governor is told: the steps themselves are read off the store.
 pub fn advance(store: &Store, args: &Args) -> i32 {
+    // A wake [`wake_after`] scheduled: slept here, before any lock or step, so
+    // the wait holds nothing.
+    if let Some(secs) = args.get("after").and_then(|a| a.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_secs(secs.min(WAKE_CAP_SECS)));
+    }
     cap_deliveries();
     // Everything an advance does spawns or tells, so none of it carries on
     // past a busy state lock (`wsp-663`, `docs/step-lock.md`).
     crate::store::strictly(|| advance_in(store, args))
+}
+
+/// The longest `--after` an `advance` sleeps: well past the longest backoff
+/// (two minutes), so a wake that names more is a mistake and not a plan.
+const WAKE_CAP_SECS: u64 = 10 * 60;
+
+/// The event a [`wake_after`] advance carries. Any event keeps it off the bare
+/// form, which is a person asking again and forgives what gave up.
+const RETRY_EVENT: &str = "retry";
+
+/// A start that failed was told "starting it again in `secs`": step `list`
+/// once that wait is over, so the promise holds (`wsp-087`).
+///
+/// **The retry used to come on the daemon's next pass**: m1-fixes-3's wsp-079
+/// was told "in 30 s" at 09:36:11 and started again at 09:37:25, the next tick
+/// after the wait, 44 s late. The backoff gates ([`crate::starts::held`] and
+/// the check entry's wait) free a start once *more* than `secs` have passed,
+/// so the wake is one second after the wait, never on its edge. A detached
+/// process like every other step [`launch`] starts, and the daemon's tick
+/// still steps the list too: whichever comes first starts it, and the step
+/// lock keeps it to one.
+fn wake_after(store: &Store, list: &str, secs: i64) {
+    let after = (secs.max(0) + 1).to_string();
+    let argv = ["worklist", "advance", list, "--event", RETRY_EVENT, "--after", after.as_str()];
+    #[cfg(test)]
+    tests::WAKES.with(|w| w.borrow_mut().push(argv.iter().map(|a| a.to_string()).collect()));
+    launch(store, &argv);
 }
 
 /// How long an `advance` waits on one `compound-sup deliver` (`wsp-666`).
@@ -4046,8 +4078,10 @@ pub(crate) fn check_start_failed(store: &Store, w: &Worklist, at: usize, why: &s
         check_gave_up(store, w, at, u.tries, &why);
         return;
     }
-    let wait = crate::barrier::span(crate::barrier::wait_after(u.tries).unwrap_or_default());
+    let secs = crate::barrier::wait_after(u.tries).unwrap_or_default();
+    let wait = crate::barrier::span(secs);
     log_line(store, &format!("{} group {at}: its check did not start on try {} of {} — {ended}; starting it again in {wait}", w.id, u.tries, crate::barrier::TRIES));
+    wake_after(store, &w.id, secs);
     tell(store, w, &format!(
         "The {} run's barrier check on group {at} did not start (try {} of {}): {why}. \
          wsp ended the pane it left and starts the check again in {wait}.",
@@ -4169,8 +4203,10 @@ fn member_start_failed(store: &Store, list: &str, id: &str, why: &str) {
         start_gave_up(store, w.as_ref(), id, id, m.tries, &why, &format!("`wsp worklist advance {list}`"));
         return;
     }
-    let wait = crate::barrier::span(m.again_in.unwrap_or_default());
+    let secs = m.again_in.unwrap_or_default();
+    let wait = crate::barrier::span(secs);
     log_line(store, &format!("{list}: {id} did not start on try {} of {} — starting it again in {wait}", m.tries, crate::barrier::TRIES));
+    wake_after(store, list, secs);
     if let Some(w) = &w {
         tell(store, w, &format!(
             "wsp could not start an agent on {id} in the {list} run (try {} of {}): {why}. \
@@ -5631,6 +5667,9 @@ pub(crate) mod tests {
         /// Set, and the next step on this thread runs it once it holds its list:
         /// the advances that arrive while a step runs.
         pub(crate) static DURING_STEP: std::cell::Cell<Option<fn(&Store, &Worklist)>> = const { std::cell::Cell::new(None) };
+        /// The wakes a failed start scheduled on this thread (`wsp-087`), as
+        /// the argv [`wake_after`] launches: a process a test cannot run.
+        pub(crate) static WAKES: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
     }
 
     fn spawned() -> Vec<(String, String)> {
@@ -7847,6 +7886,59 @@ fn only_a_working_screen_is_ever_overruled() {
         age_check(&store, 60 * 60);
         step(&store, &w, &Fixed::new(&[("cpd-10", State::Working)]));
         assert!(spawned().is_empty() && drained(&ENDED).is_empty(), "a check that is running is left alone");
+    }
+
+    /// The wake a failed start on `run` scheduled, as [`wake_after`] launches it.
+    fn woken_after(secs: &str) -> Vec<String> {
+        ["worklist", "advance", "run", "--event", RETRY_EVENT, "--after", secs].iter().map(|a| a.to_string()).collect()
+    }
+
+    /// wsp-087, m1-fixes-3's wsp-079: a member's start failed "never ready",
+    /// the run said "starting it again in 30 s", and the retry came on the
+    /// daemon's next pass, 74 s later. The failure now schedules a step for one
+    /// second after the delay its line named, and that step finds the start free.
+    #[test]
+    fn a_member_start_never_ready_is_retried_at_the_delay_its_line_names() {
+        let (_env, store) = scratch("start-wake");
+        task(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let _ = (drained(&SAID), drained(&WAKES));
+        FAIL.with(|f| *f.borrow_mut() = Some("claude started but never became ready for input within 60 s (no seat.started heard)".into()));
+        step(&store, &w, &Blind);
+        FAIL.with(|f| *f.borrow_mut() = None);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "the start that failed");
+
+        let said = drained(&SAID);
+        let line = said.iter().find(|l| l.contains("m-1 did not start on try 1 of 3")).unwrap_or_else(|| panic!("{said:?}"));
+        assert!(line.ends_with("starting it again in 30 s"), "{line}");
+        assert_eq!(drained(&WAKES), vec![woken_after("31")], "a step for just past the delay the line named, not the next pass");
+
+        age_start(&store, "m-1", 29);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "inside the 30 s it is still held");
+        age_start(&store, "m-1", 31);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "the woken step starts it again");
+    }
+
+    /// And the barrier check's seat, the other start the run retries on a told
+    /// delay: the same wake, and the step at it finds the entry due.
+    #[test]
+    fn a_check_start_never_ready_is_retried_at_the_delay_its_line_names() {
+        let (_env, store, w) = barrier_open("checkwake");
+        check_seated(&store, 1, "cpd-9");
+        let _ = (drained(&SAID), drained(&WAKES), drained(&TOLD));
+        check_start_failed(&store, &w, 1, "claude started but never became ready for input within 60 s (last read Idle)");
+        let said = drained(&SAID);
+        assert!(said.iter().any(|l| l.contains("its check did not start on try 1 of 3") && l.ends_with("starting it again in 30 s")), "{said:?}");
+        assert_eq!(drained(&WAKES), vec![woken_after("31")]);
+
+        age_check(&store, 29);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "inside the 30 s it waits");
+        age_check(&store, 31);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("run · barrier 1".to_string(), "claude".into())], "the woken step starts it again");
     }
 
     #[test]
