@@ -835,7 +835,7 @@ pub struct Message {
     pub answered_by: Option<String>,
     pub relayed_by: Option<String>,
     /// When the person did the `--then` step of an answered `--of` ask
-    /// (`"step_done_at"`), written by `wsp answer <id> --done`. Its own field:
+    /// (`"step_done_at"`), written by `wsp answer <id> --step-done`. Its own field:
     /// `seen` is "read, still raised" and says nothing about the step.
     pub step_done_at: Option<String>,
 }
@@ -1596,7 +1596,7 @@ pub fn relay(store: &Store, id: &str, answered_by: &str, relayed_by: &str) -> Re
 }
 
 /// The `--then` step of an answered `--of` ask is done (`wsp answer <id>
-/// --done`): records `step_done_at`. Refused unless the party has answered.
+/// --step-done`): records `step_done_at`. Refused unless the party has answered.
 pub fn step_done(store: &Store, id: &str) -> Result<Message, Refused> {
     store.locked(|| {
         let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;

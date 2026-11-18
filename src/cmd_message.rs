@@ -809,10 +809,10 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
-    if args.has("done") {
+    if args.has("step-done") {
         // `wsp-098`: the --then step of an answered --of ask is done.
         if q.of.is_none() || q.answered_by.is_none() {
-            eprintln!("wsp: {} is not an answered ask --of anyone; --done marks its step", q.id);
+            eprintln!("wsp: {} is not an answered ask --of anyone; --step-done marks its step", q.id);
             return 2;
         }
         return match message::step_done(store, &q.id) {
@@ -3787,7 +3787,7 @@ mod tests {
         assert_eq!(j["verb"], "answer");
         let typed: Vec<String> = j["args"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
         let refs: Vec<&str> = typed.iter().map(String::as_str).collect();
-        let flags: Vec<(&str, &str)> = vec![("done", "")];
+        let flags: Vec<(&str, &str)> = vec![("step-done", ""), ("as-person", "")];
         let positional: Vec<&str> = refs.iter().copied().filter(|x| !x.starts_with("--")).collect();
         assert_eq!(answer(&store, &crate::Args::synth("answer", &positional, &flags)), 0);
         assert!(store.message(&id).unwrap().step_done_at.is_some());

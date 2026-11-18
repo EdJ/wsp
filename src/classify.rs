@@ -410,7 +410,7 @@ pub fn of(item: Item) -> Option<Attention> {
             } else if field("answered_by").is_empty() || field("step_done") == "true" {
                 None
             } else {
-                let args = vec![a.id.0.clone(), "--done".to_string()];
+                let args = vec![a.id.0.clone(), "--step-done".to_string()];
                 let then = field("then");
                 let then = if then.is_empty() { "do the step" } else { then };
                 Some(Attention::needs_you(then.to_string()).with(Action {
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!((a.kind, a.text.as_str()), (Kind::NeedsYou, "tell the customer"));
         let j = a.action.unwrap().json();
         assert_eq!(j["verb"], "answer");
-        assert_eq!(j["args"], serde_json::json!(["m-1", "--done"]));
+        assert_eq!(j["args"], serde_json::json!(["m-1", "--step-done"]));
         assert_eq!(j["sentence"], "none");
         let labels: Vec<_> = j["buttons"].as_array().unwrap().iter().map(|b| b["label"].as_str().unwrap()).collect();
         assert_eq!(labels, ["Done"]);
