@@ -2122,6 +2122,33 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
             .collect()
     }
 
+    /// A compound seat the census reads as `state`, holding `task`: the double
+    /// `cmd_watch`'s tests use for a seat in the current census (a real seat
+    /// of the in-process host, its record naming an agent and this process as
+    /// the pid, and the state its last hook said). The first of the pair ends
+    /// the supervisor `open` started when it drops.
+    fn compound_seat_in(
+        store: &Store,
+        task: &str,
+        state: crate::place::State,
+    ) -> (String, crate::place_compound::EndsOnDrop) {
+        use crate::place::Place;
+        let compound = crate::place_compound::Compound::new();
+        let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
+        let dir = compound.dir_of(&seat).unwrap();
+        let mut rec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
+        let ends = crate::place_compound::EndsOnDrop(rec["pid"].as_u64().expect("a live pid") as u32);
+        rec["pid"] = json!(std::process::id());
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
+        std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
+        let hook = if state == crate::place::State::Working { "UserPromptSubmit" } else { "Stop" };
+        compound.heard(&seat, hook, state, &json!({}));
+        store.save_task(&crate::model::Task::new(&format!("{task} a row mid-turn"), task)).unwrap();
+        store.set_binding(seat.as_str(), json!({ "pane": seat.as_str(), "task_id": task }));
+        (seat.as_str().to_string(), ends)
+    }
+
     fn told_count(fake: &crate::fake::Fake) -> usize {
         fake.asked().iter().filter(|a| a.verb == crate::fake::Verb::Tell).count()
     }
@@ -2311,39 +2338,30 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     /// sender is told so, nothing is typed into the turn, and the seat's next
     /// idle takes it — with a second tell queued behind it, in order.
     #[test]
-    #[ignore = "its working seat is the retired backend's Fake, which no census reads since wsp-001; wants a compound seat"]
     fn a_tell_to_a_working_seat_is_queued_and_typed_at_its_next_idle_in_order() {
-        use crate::fake::{Fake, Spot, Stage};
         use crate::place::State;
         let env = util::isolated("wake-queued-tell");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
-        store.save_task(&crate::model::Task::new("wsp-700 a row mid-turn", "wsp-700")).unwrap();
-        store.set_binding("w1:p5", json!({ "pane": "w1:p5", "task_id": "wsp-700" }));
-        let mut stage = Stage::new();
-        let mut spot = Spot::agent("w1:p5", "claude", "wsp-700", State::Working);
-        spot.space = "w1".into();
-        stage.put(spot);
-        let fake = Fake::bind(env.path("backend.sock"), stage).expect("a socket");
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
+        let (seat, _ends) = compound_seat_in(&store, "wsp-700", State::Working);
+        // A tell typed into the turn logs `agent-told` without `queued`.
+        let delivered = || store.events_of("agent-told").iter().filter(|e| e["queued"] != json!(true)).count();
+        assert_eq!(delivered(), 0);
 
-        let typed = || told_count(&fake);
-        let before = typed();
         let first = crate::Args::synth("tell", &["wsp-700", "the ninth finding: the bar is too tall"], &[]);
         assert_eq!(crate::cmd_agent::tell(&store, &first), 0, "queued is a success the sender is told about");
         let second = crate::Args::synth("tell", &["wsp-700", "and the tenth"], &[]);
         assert_eq!(crate::cmd_agent::tell(&store, &second), 0);
-        assert_eq!(typed(), before, "nothing typed into the turn");
+        assert_eq!(delivered(), 0, "nothing typed into the turn");
 
-        let held = held_tells(&store, "w1:p5");
+        let held = held_tells(&store, &seat);
         assert_eq!(held.len(), 2, "{held:?}");
         assert!(held[0].1.contains("the ninth finding") && held[1].1.contains("the tenth"), "in the order sent: {held:?}");
         assert!(held[0].1.contains(" says: "), "dressed, so the seat reads who speaks: {}", held[0].1);
-        assert_eq!(held_row(&store, "w1:p5").as_deref(), Some("wsp-700"), "the row is kept for the seat's successor");
+        assert_eq!(held_row(&store, &seat).as_deref(), Some("wsp-700"), "the row is kept for the seat's successor");
         let told = store.events_of("agent-told");
         assert!(told.iter().all(|e| e["queued"] == json!(true)), "{told:?}");
-        assert_eq!(queued_tells(&store).get("w1:p5"), Some(&2), "what `wsp wip` draws as queued");
+        assert_eq!(queued_tells(&store).get(seat.as_str()), Some(&2), "what `wsp wip` draws as queued");
         let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
         assert!(log.contains("queued for its next idle"), "{log}");
 
@@ -2355,7 +2373,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         assert_eq!(flush_held_tells(&store, &|_| Seen::Is(State::Working), &mut send), (0, 0), "still mid-turn");
         assert_eq!(flush_held_tells(&store, &|_| Seen::Is(State::Idle), &mut send), (2, 0), "its next idle");
         assert!(sent.borrow()[0].contains("ninth") && sent.borrow()[1].contains("tenth"));
-        assert!(held_tells(&store, "w1:p5").is_empty());
+        assert!(held_tells(&store, &seat).is_empty());
         assert!(queued_tells(&store).is_empty(), "and wip draws nothing queued");
     }
 
@@ -2364,34 +2382,23 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     /// twice and typed twice. It is held once; `--again` holds it again, and a
     /// different sentence still queues behind it.
     #[test]
-    #[ignore = "its working seat is the retired backend's Fake, which no census reads since wsp-001; wants a compound seat"]
     fn the_same_tell_sent_twice_to_a_working_seat_is_queued_once() {
-        use crate::fake::{Fake, Spot, Stage};
         use crate::place::State;
         let env = util::isolated("wake-queued-twice");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
-        store.save_task(&crate::model::Task::new("wsp-701 a row mid-turn", "wsp-701")).unwrap();
-        store.set_binding("w1:p6", json!({ "pane": "w1:p6", "task_id": "wsp-701" }));
-        let mut stage = Stage::new();
-        let mut spot = Spot::agent("w1:p6", "claude", "wsp-701", State::Working);
-        spot.space = "w1".into();
-        stage.put(spot);
-        let fake = Fake::bind(env.path("backend.sock"), stage).expect("a socket");
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
+        let (seat, _ends) = compound_seat_in(&store, "wsp-701", State::Working);
 
         let tell = |words: &str, flags: &[(&str, &str)]| {
             crate::cmd_agent::tell(&store, &crate::Args::synth("tell", &["wsp-701", words], flags))
         };
         assert_eq!(tell("rebase onto the trunk", &[]), 0);
         assert_eq!(tell("rebase onto the trunk", &[]), 0, "a repeat is no failure");
-        assert_eq!(held_tells(&store, "w1:p6").len(), 1, "but it is held once");
+        assert_eq!(held_tells(&store, &seat).len(), 1, "but it is held once");
         assert_eq!(tell("and then rerun the checks", &[]), 0);
-        assert_eq!(held_tells(&store, "w1:p6").len(), 2, "a different sentence still queues");
+        assert_eq!(held_tells(&store, &seat).len(), 2, "a different sentence still queues");
         assert_eq!(tell("rebase onto the trunk", &[("again", "")]), 0);
-        assert_eq!(held_tells(&store, "w1:p6").len(), 3, "`--again` queues it anyway");
-        drop(fake);
+        assert_eq!(held_tells(&store, &seat).len(), 3, "`--again` queues it anyway");
     }
 
     /// `wsp-659` item 2: the primary's tell to compounding-698's seat was
