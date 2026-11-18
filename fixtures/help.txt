@@ -640,7 +640,13 @@ WORKLISTS
                                     `go` passes the barrier; `wsp reopen` of a
                                     member the check held on is the other: the
                                     run goes back to that group, reseats the
-                                    member and checks the barrier afresh
+                                    member and checks the barrier afresh.
+                                    --until WHEN (a time, or 24h/2d from now),
+                                    --on <row>… and --for "the person's act"
+                                    say what the hold waits on, so it is not
+                                    shown as needing the person before that is
+                                    all that is left; on a held list they
+                                    re-describe the wait, with no reason
   wsp worklist followup <slug> <task>… --blocking|--next --from FILE
                                     the barrier check's verdict with up to four
                                     rows attached: --blocking holds, and they
