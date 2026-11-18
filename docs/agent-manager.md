@@ -1092,9 +1092,10 @@ Ed answered Q6 on 2026-11-18 (relayed by Jesper; the full set is on his wsp-652)
 Trees live with the agents on each host, and a land is a fenced push to a trunk remote. **d1's Q6 ("T1 now",
 2026-11-17) is superseded by this answer**, for M3 groups 5-8 and for M4. The source is Ed's answers as relayed by
 Jesper and recorded on wsp-093's overview. d1's other answers stand, Q14 included. The person confirms the
-supersession at wsp-093's review and records the project decision. His other answers change nothing here. There is one manager per host over compound-sup, wsp dials the managers,
-and wsp keeps the throttle decision (Q11). The renderer answer needs no row either: the manager starts no renderer, it
-reads the render socket from compound-sup's handshake and reports it with the seat's sockets.
+supersession at wsp-093's review and records the project decision. Ed's other answers change nothing here. There
+is one manager per host over compound-sup, wsp dials the managers, and wsp keeps the throttle decision (Q11). The
+renderer answer needs no row either: the manager starts no renderer, it reads the render socket from compound-sup's
+handshake and reports it with the seat's sockets.
 
 Groups 1-4 (wsp-044, -049, -050, -051) already hold under T2. A job's place is host-api's `JobAt`: a `Tree {row,
 host}` or a `HostDir {host, path}` relative to that host's tree root. Neither is a path on wsp's machine, and
@@ -1173,7 +1174,7 @@ person confirms or changes them at wsp-093's review:
 - **M4 is broken down at M3's end**, after wsp-058, as d1 Q14 says. Groups 5-8 go ahead as amended.
 
 **No row in groups 5-8 needs `tree.checkout` or `tree.land` to meet its done-when.** At M3 the Mac is the tree's host
-for every row. So `place_of` makes check, verify and barrier trees on the Mac in-process, and every job is keyed by
+for every row. So `place_of` makes check, verify and barrier trees on the Mac in-process, and every job is named by
 `(row, host)`. No row in groups 5-8 lands. Land stays today's local fast-forward until M4's fenced push. So no verb is
 pulled into M3.
 
