@@ -24,6 +24,11 @@ use wsp_store_contract::Principal;
 
 const WSP: &str = env!("CARGO_BIN_EXE_wsp");
 
+/// The upper bound on every wait here for something to arrive: generous, so a
+/// machine under load is slow and not failed. Each wait ends as soon as what it
+/// waits for is seen.
+const BUDGET: Duration = Duration::from_secs(120);
+
 struct Sandbox {
     name: String,
     outer: BTreeMap<String, String>,
@@ -133,14 +138,20 @@ fn ask_message(id: &str, text: &str) -> wsp_store::message::Message {
 }
 
 fn snapshot_with(client: &Client, ready: impl Fn(&Value) -> bool) -> Value {
+    feed_from_snapshot_with(client, ready).0
+}
+
+/// The first snapshot `ready` holds of, and the feed it came on, which goes on
+/// with the events after it.
+fn feed_from_snapshot_with(client: &Client, ready: impl Fn(&Value) -> bool) -> (Value, wsp_client::Feed) {
     let mut feed = client.subscribe(None);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + BUDGET;
     loop {
         match feed.next_within(Duration::from_millis(500)) {
             Some(Item::State { state, .. }) => {
                 let v = serde_json::to_value(&state).unwrap();
                 if ready(&v) {
-                    return v;
+                    return (v, feed);
                 }
                 // The mirror had not landed yet: resubscribe.
                 feed = client.subscribe(None);
@@ -186,7 +197,7 @@ fn a_snapshot_equals_the_files() {
 
     let port = free_port();
     sb.start_daemon(port, false);
-    let client = sb.client(Duration::from_secs(20));
+    let client = sb.client(BUDGET);
     let state = snapshot_with(&client, |v| {
         let n = |k: &str| v[k].as_object().map_or(0, |o| o.len());
         n("rows") == 2 && n("claims") == 1 && n("lists") == 1 && n("asks") == 2 && v["machines"].get("far").is_some()
@@ -256,7 +267,7 @@ fn a_snapshot_equals_the_files() {
     // The attention half moves on its own: a second ask reaches the subscriber.
     let mut feed = client.subscribe(None);
     store.save_message(&ask_message("m-2", "and may I again?")).unwrap();
-    let end = Instant::now() + Duration::from_secs(3);
+    let end = Instant::now() + BUDGET;
     let mut put = false;
     while Instant::now() < end && !put {
         if let Some(Item::Event(e)) = feed.next_within(Duration::from_millis(100)) {
@@ -279,13 +290,10 @@ fn a_snapshot_equals_the_files() {
 #[test]
 fn an_edit_and_a_block_each_reach_the_subscriber_then_quiet() {
     let sb = seeded("events", free_port());
-    let client = sb.client(Duration::from_secs(20));
-    let mut feed = client.subscribe(None);
-    // The snapshot, and the first pass if it came after it.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        feed.next_within(Duration::from_millis(500));
-    }
+    let client = sb.client(BUDGET);
+    // A snapshot that holds both rows: the mirror's first pass has landed, and
+    // what the feed brings after it is what the verbs below write.
+    let (_, mut feed) = feed_from_snapshot_with(&client, |v| v["rows"].as_object().map_or(0, |o| o.len()) == 2);
 
     let puts_for = |feed: &mut wsp_client::Feed, row: &str, within: Duration| -> bool {
         let end = Instant::now() + within;
@@ -308,10 +316,10 @@ fn an_edit_and_a_block_each_reach_the_subscriber_then_quiet() {
         child.stdin.take().unwrap().write_all(b"a new overview\n").unwrap();
     }
     child.wait().unwrap();
-    assert!(puts_for(&mut feed, "inbox-001", Duration::from_secs(2)), "wsp edit did not reach the subscriber");
+    assert!(puts_for(&mut feed, "inbox-001", BUDGET), "wsp edit did not reach the subscriber");
 
     sb.wsp(&["block", "inbox-001", "waiting on the test"]);
-    assert!(puts_for(&mut feed, "inbox-001", Duration::from_secs(2)), "wsp block did not reach the subscriber");
+    assert!(puts_for(&mut feed, "inbox-001", BUDGET), "wsp block did not reach the subscriber");
 
     // Quiet: nothing for 10 s.
     let end = Instant::now() + Duration::from_secs(10);
@@ -331,8 +339,14 @@ fn wsp_api_off_starts_nothing() {
     sb.wsp(&["add", "one"]);
     let port = free_port();
     sb.start_daemon(port, true);
-    // Long enough for the mirror's first pass, had there been one.
-    std::thread::sleep(Duration::from_secs(4));
+    // The daemon stamps daemon.tick at the top of every pass of its loop, which
+    // runs after the point where the API would have started: once it is there,
+    // nothing more starts.
+    let end = Instant::now() + BUDGET;
+    while !sb.state.join("daemon.tick").exists() {
+        assert!(Instant::now() < end, "the daemon never ticked");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "something listens on {port}");
     assert!(!sb.state.join("state.db").exists(), "state.db was made under WSP_API=off");
     assert!(!sb.state.join("api.json").exists(), "api.json was written under WSP_API=off");

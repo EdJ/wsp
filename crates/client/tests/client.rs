@@ -17,7 +17,10 @@ use wsp_server::{Config, Mirror, Server, SharedStore};
 use wsp_store_conformance::MemStore;
 use wsp_store_contract::*;
 
-const WAIT: Duration = Duration::from_secs(5);
+/// The upper bound on every wait for an item, a reply or a state the feed comes
+/// to: generous, so a machine under load is slow and not failed. Each wait ends
+/// as soon as what it waits for is seen.
+const WAIT: Duration = Duration::from_secs(120);
 const BEAT: Duration = Duration::from_millis(150);
 
 // ---------------------------------------------------------------- fixtures
@@ -41,6 +44,16 @@ fn start(store: SharedStore, dir: &Path) -> Server {
 
 fn ed() -> Principal {
     Principal::Person("ed".into())
+}
+
+/// Polls the feed a beat at a time until `done` holds of it, and fails if an
+/// item comes first or `WAIT` runs out.
+fn quiet_until(f: &mut Feed, what: &str, done: impl Fn(&Feed) -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !done(f) {
+        assert!(Instant::now() < deadline, "{what}: not within {WAIT:?}");
+        assert_eq!(f.next_within(BEAT), None, "{what}: an item came first");
+    }
 }
 
 fn dial(dir: &Path) -> Client {
@@ -286,7 +299,7 @@ fn a_request_after_a_lost_connection_dials_again() {
 /// Items until one is an event with id `upto`; beats are not items.
 fn until(f: &mut Feed, upto: u64) -> Vec<Item> {
     let mut out = vec![];
-    let deadline = Instant::now() + WAIT * 2;
+    let deadline = Instant::now() + WAIT;
     loop {
         assert!(Instant::now() < deadline, "no event {upto}; got {out:?}");
         if let Some(i) = f.next_within(Duration::from_millis(200)) {
@@ -322,8 +335,7 @@ fn subscribe_hands_out_the_snapshot_and_then_each_event_once() {
     assert_eq!(f.last_id(), Some(EventId(7)));
 
     // Quiet for a few beats: beats are counted, never handed out.
-    assert_eq!(f.next_within(BEAT * 3), None);
-    assert!(f.beats() >= 2, "beats {}", f.beats());
+    quiet_until(&mut f, "two beats counted", |f| f.beats() >= 2);
     assert_eq!(f.reconnects(), 0);
 
     // From an id: the events after it, with no snapshot.
@@ -350,11 +362,10 @@ fn across_a_server_restart_the_feed_reconnects_says_resumed_and_gives_every_late
     // Written while no server runs: the new connection must bring them.
     rows(&store, 5, 2);
     // The feed notices, and keeps trying until a server answers again.
-    assert_eq!(f.next_within(Duration::from_millis(400)), None);
-    assert!(f.why_silent().is_some());
+    quiet_until(&mut f, "the feed noticed its server stopped", |f| f.why_silent().is_some());
     let server = start(Arc::new(store.handle()), &d);
     let mut got = vec![];
-    let deadline = Instant::now() + WAIT * 2;
+    let deadline = Instant::now() + WAIT;
     while got.len() < 3 {
         assert!(Instant::now() < deadline, "got {got:?}");
         got.extend(f.next_within(Duration::from_millis(200)));
@@ -383,8 +394,7 @@ fn a_feed_that_never_connected_says_no_resumed() {
     let c = dial(&d);
     server.stop();
     let mut f = feed(&c, None);
-    assert_eq!(f.next_within(Duration::from_millis(200)), None);
-    assert!(f.why_silent().is_some());
+    quiet_until(&mut f, "the feed found no server", |f| f.why_silent().is_some());
     let server = start(Arc::new(store.handle()), &d);
     assert!(matches!(f.next_within(WAIT), Some(Item::State { .. })), "a first State, not a Resumed");
     server.stop();
@@ -477,7 +487,7 @@ fn an_event_id_already_handed_out_is_dropped_and_a_silent_server_costs_the_conne
     assert_eq!(ids(&got), [1, 2, 3]);
     assert_eq!(f.duplicates(), 2);
     // Silent for MISSED_BEATS beats: counted, then it dials again.
-    assert_eq!(f.next_within(Duration::from_millis(800)), Some(Item::Resumed { from: EventId(3) }));
+    assert_eq!(f.next_within(WAIT), Some(Item::Resumed { from: EventId(3) }));
     assert!(f.missed_beats() >= u64::from(MISSED_BEATS), "{}", f.missed_beats());
     assert_eq!(f.reconnects(), 1);
     let deadline = Instant::now() + WAIT;

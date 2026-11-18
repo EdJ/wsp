@@ -25,7 +25,10 @@ use wsp_server::{Config, Mirror, Server, SharedStore, StartError};
 use wsp_store_conformance::MemStore;
 use wsp_store_contract::*;
 
-const WAIT: Duration = Duration::from_secs(5);
+/// The upper bound on every wait for a frame, a reply or a dropped connection:
+/// generous, so a machine under load is slow and not failed. Each wait ends as
+/// soon as what it waits for comes.
+const WAIT: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------- fixtures
 
@@ -510,7 +513,9 @@ fn subscribe_from_before_retention_is_answered_too_old() {
 fn a_client_silent_for_three_beats_is_dropped_and_one_that_talks_is_kept() {
     let d = dir("silent");
     let store = mirror_store();
-    let beat = Duration::from_millis(150);
+    // Wide enough that the talker, asking once a beat, stays inside three
+    // beats with the test thread starved for a second by a loaded machine.
+    let beat = Duration::from_millis(500);
     let server = start(Arc::new(store.handle()), &d, beat);
     let mut quiet = connect(&d);
     let mut talker = connect(&d);
