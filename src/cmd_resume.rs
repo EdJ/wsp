@@ -626,6 +626,8 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
                 ),
                 on: None,
                 show: false,
+                // The resumed agent goes in next (wsp-079).
+                agent_next: true,
             };
             (place.open(&order).map_err(|e| e.to_string())?, true)
         }

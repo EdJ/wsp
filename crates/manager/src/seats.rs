@@ -160,6 +160,11 @@ impl Table {
     pub(crate) fn epochs(&self) -> Vec<SeatEpoch> {
         self.seats.values().map(|s| SeatEpoch { seat: s.started.seat.clone(), epoch: s.epoch }).collect()
     }
+
+    /// The epoch `seat` runs at, if it runs here.
+    pub(crate) fn running(&self, seat: &SeatId) -> Option<Epoch> {
+        self.seats.get(seat).map(|s| s.epoch)
+    }
 }
 
 fn table(shared: &Shared) -> MutexGuard<'_, Table> {
@@ -247,7 +252,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>, asker: Asker, s: SeatSpawn) {
 
     let shared = shared.clone();
     std::thread::spawn(move || {
-        let forked = fork(&shared, &s);
+        let forked = fork(&shared, &s, epoch);
         let mut t = table(&shared);
         let waiters = match t.keys.remove(&s.key) {
             Some(KeyState::Spawning { waiters, .. }) => waiters,
@@ -346,13 +351,20 @@ struct Forked {
 }
 
 /// `compound-sup spawn --label <seat> … -- <argv>`, run here, its handshake read.
-fn fork(shared: &Shared, s: &SeatSpawn) -> Result<Forked, String> {
+///
+/// The seat's environment carries its epoch ([`wsp_host::hooks::EPOCH_ENV`]):
+/// its hooks post it, and the `turn` they journal is this start's. Without it
+/// every hook posted epoch 0, and a spawn waiting on its seat's first turn at
+/// the epoch `seat.started` named heard none and stopped a working seat as
+/// never ready (wsp-079).
+fn fork(shared: &Shared, s: &SeatSpawn, epoch: Epoch) -> Result<Forked, String> {
     let sup = sup_path(shared).ok_or("compound-sup not found: set $COMPOUND_SUP or put it on PATH")?;
     let Workdir::Cwd(cwd) = &s.workdir else { unreachable!("refused before forking") };
     let (program, args) = s.agent.argv.split_first().expect("refused before forking");
     let mut env: BTreeMap<String, String> =
         s.agent.env.iter().filter_map(|name| std::env::var(name).ok().map(|v| (name.clone(), v))).collect();
     env.insert(wsp_base::base::seat::SEAT_ENV.into(), s.seat.0.clone());
+    env.insert(wsp_host::hooks::EPOCH_ENV.into(), epoch.0.to_string());
     let spawn = Spawn { key: s.key.clone(), seat: &s.seat.0, kind: Some(s.agent.kind.clone()), cwd: cwd.clone(), env, program, args };
     let mut cmd = inproc::sup_command(&sup, &spawn);
     // After `sup_command`, so this run directory is the one it uses.

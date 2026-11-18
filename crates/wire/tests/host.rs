@@ -81,6 +81,7 @@ spawn)
   printf '%s' "$label" > "$run/$name.label"
   echo "$label $$" >> "$run/spawns"
   echo "$*" > "$run/$name.argv"
+  printf '%s' "${WSP_SEAT_EPOCH:-0}" > "$run/$name.epoch"
   printf 'sup %s\npid %s\nsocket %s\nrender %s\n' "$$" "$$" "$run/$name.sock" "$run/$name.rsock"
   exec perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' sh -c "trap 'exit 0' TERM; while kill -0 $OWNER 2>/dev/null; do sleep 0.2; done" "$0" spawn --label "$label" </dev/null >/dev/null 2>&1
   ;;
@@ -808,6 +809,88 @@ fn under_manager_await_up_hears_a_start_by_its_first_turn_its_stop_or_neither() 
     assert!(start.elapsed() >= Duration::from_millis(600), "waited the whole wait: {:?}", start.elapsed());
     assert!(tcp.is_alive(mute.pid), "judging it touches nothing");
 
+    drop(tcp);
+    m.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// wsp-079: the live day's start, on a manager beating every 200ms. A seat an
+/// agent goes into opens with no shell, so the agent is its one epoch; the
+/// fake claude in it stays unready past three beats, then posts its first
+/// turn under the epoch its environment carries, as a real hook does. The
+/// spawner's own connection keeps beating while `await_up` listens, so the
+/// manager drops nothing, and the late seat is judged ready: one
+/// `seat.started` at epoch 1, no `seat.stopped`. A hook that names no epoch
+/// is the running start's.
+#[test]
+fn under_manager_a_seat_ready_after_three_beats_is_one_epoch_judged_ready_and_its_spawner_kept() {
+    use wsp_host::hooks::{report, Dial, Sent};
+    use wsp_host_api::MISSED_BEATS;
+    use wsp_wire::place::Up;
+
+    let (dir, sup) = place("late");
+    let sweep = Sweep::default();
+    let beat = Duration::from_millis(200);
+    let mut cfg = Config::new(&dir.join("exec"), "test-host");
+    cfg.port = 0;
+    cfg.sup = Some(sup.clone());
+    cfg.beat = beat;
+    let m = start(cfg);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup)).with_beat(beat / 2);
+    let compound = Compound { host: &tcp, ..Compound::at(dir.join("seats")) };
+    let dial = Dial::Manager { addr: m.addrs()[0], token_file: dir.join("exec").join(TOKEN_FILE) };
+    let run = dir.join("exec").join(wsp_manager::seats::RUN_DIR);
+    let order = |label: &str| Order { label: label.into(), cwd: Some(dir.display().to_string()), agent_next: true, ..Order::default() };
+
+    let seat = compound.open(&order("wsp-079")).expect("a seat");
+    assert_eq!(compound.root(&seat), None, "no shell first: the agent is the seat's first start");
+    compound.start(&seat, &agent(0)).expect("the agent starts");
+    let pid = compound.root(&seat).expect("the agent's pid");
+    sweep.add(pid);
+
+    // The fake claude: unready for twice the manager's three beats, then its
+    // first turn, under the epoch the manager put in its environment.
+    let late = beat * MISSED_BEATS * 2;
+    let epoch_file = run.join(format!("s{pid}.epoch"));
+    let (name, hook) = (seat.to_string(), dial.clone());
+    let fake = std::thread::spawn(move || {
+        std::thread::sleep(late);
+        let epoch: u64 = fs::read_to_string(&epoch_file).expect("the seat's environment").trim().parse().expect("an epoch");
+        (epoch, report(&hook, &name, Epoch(epoch), "UserPromptSubmit", &serde_json::json!({ "session_id": "sess-079" })))
+    });
+    let since = Instant::now();
+    assert_eq!(compound.await_up(&seat, true, Duration::from_secs(10)), Some(Ok(Up::Ready)), "the late seat is judged ready");
+    assert!(since.elapsed() >= late, "it was unready past three beats: {:?}", since.elapsed());
+    let (epoch, sent) = fake.join().unwrap();
+    assert_eq!((epoch, sent), (1, Sent::Taken(1)), "the seat's environment carried epoch 1");
+    assert!(tcp.is_alive(pid), "the ready seat is left running");
+
+    let log = fs::read_to_string(dir.join("exec").join(wsp_manager::LOG_DIR).join(wsp_manager::log::FILE)).unwrap_or_default();
+    assert!(!log.contains("dropped"), "no client dropped while the spawner waited: {log}");
+    let journal = fs::read_to_string(dir.join("exec").join(wsp_manager::JOURNAL_FILE)).unwrap();
+    let of_seat = |kind: &str| -> Vec<Value> {
+        journal
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|f| f["type"] == kind && f["seat"] == seat.as_str())
+            .map(|f| f["epoch"].clone())
+            .collect()
+    };
+    assert_eq!(of_seat("seat.started"), vec![serde_json::json!(1)], "one start, at epoch 1: {journal}");
+    assert!(of_seat("seat.stopped").is_empty(), "nothing stopped: {journal}");
+
+    // A seat whose hook names no epoch (one started before its environment
+    // carried it): its turn is the running start's.
+    let bare = compound.open(&order("wsp-079 bare")).expect("a seat");
+    compound.start(&bare, &agent(1)).expect("the agent starts");
+    sweep.add(compound.root(&bare).expect("its pid"));
+    assert_eq!(report(&dial, bare.as_str(), Epoch(0), "UserPromptSubmit", &serde_json::json!({ "session_id": "sess-0" })), Sent::Taken(1));
+    assert_eq!(compound.await_up(&bare, true, Duration::from_secs(5)), Some(Ok(Up::Ready)));
+
+    for s in [&seat, &bare] {
+        let _ = compound.end(s);
+    }
     drop(tcp);
     m.stop();
     drop(sweep);

@@ -132,7 +132,17 @@ fn hook(shared: &Shared, mut conn: Tcp, peer: &str, post: Result<Post, String>) 
             shared.log.line(&format!("{peer}: closed, a hook post for {} carried the wrong token", post.seat.0));
             hooks::refused("wrong token")
         }
-        Ok(post) => {
+        Ok(mut post) => {
+            // A hook that names no epoch (a seat started before its epoch was
+            // in its environment, or adopted under a new one) is the start
+            // that runs: its turn is that start's, which a spawn waiting on
+            // it listens for (wsp-079). The seats before the hooks, as
+            // everywhere: the table is never taken under the fold.
+            if post.epoch.0 == 0 {
+                if let Some(epoch) = shared.seats.lock().unwrap_or_else(|e| e.into_inner()).running(&post.seat) {
+                    post.epoch = epoch;
+                }
+            }
             let mut fold = shared.hooks.lock().unwrap_or_else(|e| e.into_inner());
             match fold.fold(&post, crate::now()) {
                 Err(why) => {

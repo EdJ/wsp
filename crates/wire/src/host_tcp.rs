@@ -415,6 +415,10 @@ pub struct Tcp {
     /// The first orders sent with a `seat.spawn` whose answer is not heard
     /// yet, by order id: the seat, and the subscription that will hear it.
     waiting: Mutex<BTreeMap<String, (String, Subscription)>>,
+    /// How often this process beats on each connection it holds:
+    /// [`BEAT_SECS`], or a test's shorter beat against a manager beating
+    /// faster (wsp-079).
+    beat: Duration,
 }
 
 impl Tcp {
@@ -435,7 +439,16 @@ impl Tcp {
             next_req: Mutex::new(0),
             known: Mutex::new(BTreeMap::new()),
             waiting: Mutex::new(BTreeMap::new()),
+            beat: Duration::from_secs(BEAT_SECS),
         }
+    }
+
+    /// The same, beating every `beat` rather than every [`BEAT_SECS`]: for a
+    /// test whose manager beats faster, so a wait longer than its three beats
+    /// takes milliseconds, not half a minute.
+    pub fn with_beat(mut self, beat: Duration) -> Tcp {
+        self.beat = beat;
+        self
     }
 
     /// The manager the local machine record under `state` names.
@@ -454,6 +467,38 @@ impl Tcp {
     pub fn hello(&self) -> std::result::Result<ManagerHello, HostError> {
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         Ok(self.connected(&mut live)?.hello.clone())
+    }
+
+    /// A beat on this process's own connection, when one is open and a beat
+    /// is due, and whatever the manager queued on it read off. Said while a
+    /// wait listens on a subscription of its own (a start's first turn, its
+    /// first order's ack): the connection that asked is otherwise silent for
+    /// all of it, and the manager dropped it after three beats, so a spawn
+    /// that waited past them was judged on a connection already gone
+    /// (wsp-079).
+    fn beat_live(&self) {
+        let mut guard = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(live) = guard.as_mut() else { return };
+        if live.sent.elapsed() < self.beat {
+            return;
+        }
+        if live.conn.send(&beat_frame()).is_err() {
+            // Closed under us: the next ask dials again, as it would anyway.
+            *guard = None;
+            return;
+        }
+        live.sent = Instant::now();
+        // The manager's own beats and late answers, so they do not pile up.
+        loop {
+            match live.conn.recv(Duration::from_millis(1)) {
+                Ok(Some(_)) | Err(ConnError::Malformed(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    *guard = None;
+                    break;
+                }
+            }
+        }
     }
 
     fn connected<'a>(&self, live: &'a mut Option<Live>) -> std::result::Result<&'a mut Live, HostError> {
@@ -501,11 +546,11 @@ impl Tcp {
                 return Ok(said);
             }
             // Our own beat, so a long wait is not dropped as a silent client.
-            if live.sent.elapsed() >= Duration::from_secs(BEAT_SECS) {
+            if live.sent.elapsed() >= self.beat {
                 let _ = live.conn.send(&beat_frame());
                 live.sent = Instant::now();
             }
-            match live.conn.recv(left.min(Duration::from_secs(BEAT_SECS))) {
+            match live.conn.recv(left.min(self.beat)) {
                 Ok(Some(f)) if f.req == Some(req) => {
                     let end = done(&f.msg) || matches!(f.msg, Message::Refused(_));
                     said.push(f);
@@ -657,14 +702,16 @@ impl Tcp {
 /// Read `sub` for `order`'s answer up to `wait`: `order.acked`, `order.refused`
 /// (worded as the in-process host words compound-sup's reason), or the seat
 /// stopping first. Everything else on the subscription is someone else's.
-fn heard_of(sub: &mut Subscription, seat: &str, order: &OrderId, wait: Duration) -> Result<Heard> {
+fn heard_of(sub: &mut Subscription, seat: &str, order: &OrderId, wait: Duration, beat: &dyn Fn()) -> Result<Heard> {
+    let step = sub.beat;
     let deadline = Instant::now() + wait;
     loop {
+        beat();
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Ok(Heard::Unanswered);
         }
-        let Some(f) = sub.next(left)? else { continue };
+        let Some(f) = sub.next(left.min(step))? else { continue };
         match f.msg {
             Message::OrderAcked(a) if a.order == *order => return Ok(Heard::Acked),
             Message::OrderRefused(r) if r.order == *order => return Ok(Heard::Refused(format!("{seat}: {}", fail_word(r.why)))),
@@ -721,14 +768,18 @@ impl Host for Tcp {
         // replay after: there is nothing to hear it by but that answer.
         let Some((epoch, Some(started))) = known else { return Ok(Up::Ready) };
         let mut sub = Subscription::after(self.addr, self.token.clone(), self.role, &self.version, started)?;
+        sub.beat = self.beat;
         let ours = |s: &SeatId, e: Epoch| s.0 == seat && e == epoch;
         let deadline = Instant::now() + wait;
         let up = loop {
+            // The connection that spawned keeps beating while this listens on
+            // its own subscription, so the manager never drops it (wsp-079).
+            self.beat_live();
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break Up::Unready;
             }
-            let Some(f) = sub.next(left)? else { continue };
+            let Some(f) = sub.next(left.min(self.beat))? else { continue };
             match f.msg {
                 Message::Turn(t) if t.edge == TurnEdge::Began && ours(&t.seat, t.epoch) => break Up::Ready,
                 Message::SeatStopped(s) if ours(&s.seat, s.epoch) => break Up::Stopped,
@@ -745,7 +796,8 @@ impl Host for Tcp {
         let start = Instant::now();
         // Subscribed before the spawn is sent, from the journal's head as it
         // stands: the order's answer cannot come before the watch on it.
-        let sub = Subscription::at_head(self.addr, self.token.clone(), self.role, &self.version)?;
+        let mut sub = Subscription::at_head(self.addr, self.token.clone(), self.role, &self.version)?;
+        sub.beat = self.beat;
         let session = self.spawn_with(spawn, Some(order.clone()), wait)?;
         self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(order.order.0.clone(), (spawn.seat.to_string(), sub));
         // `seat.started` is heard: the seat runs, whatever the subscription
@@ -761,7 +813,7 @@ impl Host for Tcp {
         let Some((seat, mut sub)) = self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(&order.0) else {
             return Err(Refusal::Backend(format!("order {} was not sent by this process's seat.spawn", order.0)));
         };
-        let heard = match heard_of(&mut sub, &seat, order, wait) {
+        let heard = match heard_of(&mut sub, &seat, order, wait, &|| self.beat_live()) {
             Ok(heard) => heard,
             Err(e) => {
                 // Not heard, not lost: the order is still the seat's, and a
@@ -1027,7 +1079,7 @@ impl Host for Tcp {
             let mut dropped = heard.elapsed() >= patience;
             if !dropped {
                 // Our own beat, so a long job is not dropped as a silent client.
-                if sent.elapsed() >= Duration::from_secs(BEAT_SECS) {
+                if sent.elapsed() >= self.beat {
                     let _ = conn.send(&beat_frame());
                     sent = Instant::now();
                 }
@@ -1139,6 +1191,8 @@ pub struct Subscription {
     handed: Option<EventId>,
     /// How many times it subscribed (the first, and each after a drop).
     pub subscribed: u32,
+    /// How often it beats: [`BEAT_SECS`], or the [`Tcp`]'s that opened it.
+    pub beat: Duration,
 }
 
 impl Subscription {
@@ -1156,6 +1210,7 @@ impl Subscription {
             last: read_last(state, host),
             handed: None,
             subscribed: 0,
+            beat: Duration::from_secs(BEAT_SECS),
         }
     }
 
@@ -1178,6 +1233,7 @@ impl Subscription {
             last: hello.journal_head,
             handed: None,
             subscribed: 0,
+            beat: Duration::from_secs(BEAT_SECS),
         };
         sub.subscribe_on(conn)?;
         Ok(sub)
@@ -1200,6 +1256,7 @@ impl Subscription {
             last: Some(from),
             handed: None,
             subscribed: 0,
+            beat: Duration::from_secs(BEAT_SECS),
         };
         sub.subscribe_on(conn)?;
         Ok(sub)
@@ -1261,7 +1318,7 @@ impl Subscription {
                 self.conn = None;
                 return Ok(None);
             }
-            if sent.elapsed() >= Duration::from_secs(BEAT_SECS) {
+            if sent.elapsed() >= self.beat {
                 let _ = conn.send(&beat_frame());
                 *sent = Instant::now();
             }
@@ -1269,7 +1326,7 @@ impl Subscription {
             if left.is_zero() {
                 return Ok(None);
             }
-            match conn.recv(left.min(Duration::from_secs(BEAT_SECS))) {
+            match conn.recv(left.min(self.beat)) {
                 Ok(Some(f)) => {
                     *heard = Instant::now();
                     match f.id {

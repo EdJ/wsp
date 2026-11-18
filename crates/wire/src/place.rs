@@ -400,6 +400,16 @@ pub struct Order {
     /// which is the same rule read from the other end, and stays true wherever
     /// the flag ends up living.
     pub show: bool,
+    /// Whether an agent is started into the seat straight after it opens
+    /// (`spawn`, a rotation, a resume), rather than the seat being a terminal
+    /// a person works in.
+    ///
+    /// Under a host with events (`WSP_HOST=manager`) such a seat runs no bare
+    /// shell first (wsp-079): the shell was the seat's epoch 1, the agent's
+    /// start stopped it and ran epoch 2, so every healthy start read as a stop
+    /// and a restart. The agent is the seat's first and only start. `false` by
+    /// default, so an `open` with no opinion still holds a shell.
+    pub agent_next: bool,
 }
 
 /// Which agent to start, and what to call it.

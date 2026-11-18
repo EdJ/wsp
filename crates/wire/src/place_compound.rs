@@ -1606,6 +1606,12 @@ impl Place for Compound<'_> {
         write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
             .map_err(|e| Refusal::Backend(e.to_string()))?;
 
+        // Under the manager, a seat an agent goes into next starts that agent
+        // as its one epoch: a shell first was epoch 1, stopped for the agent's
+        // epoch 2, and every healthy start read as a restart (wsp-079).
+        if order.agent_next && self.host.hears_orders() {
+            return Ok(seat);
+        }
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
         if let Ok(rec) = self.spawn_sup(&seat, &rec, None, &shell, &[]) {
             let _ = write_atomic(&dir.join(SEAT_FILE), &rec.to_string());

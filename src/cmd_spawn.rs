@@ -774,6 +774,8 @@ fn order(
     agent: Option<Occupant<'_>>,
     custodian: bool,
 ) -> Order {
+    // An agent goes in next: under the manager, no shell first (wsp-079).
+    let agent_next = agent.is_some();
     Order {
         label: work.label.clone(),
         cwd: cwd.map(|c| c.to_string()),
@@ -785,6 +787,7 @@ fn order(
         ),
         on: on.map(|m| m.to_string()),
         show,
+        agent_next,
     }
 }
 
