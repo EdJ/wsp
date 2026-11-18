@@ -2149,10 +2149,6 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         (seat.as_str().to_string(), ends)
     }
 
-    fn told_count(fake: &crate::fake::Fake) -> usize {
-        fake.asked().iter().filter(|a| a.verb == crate::fake::Verb::Tell).count()
-    }
-
     fn delivered_to(store: &Store, scope: &str) -> usize {
         store
             .watches()
