@@ -823,6 +823,17 @@ pub struct Message {
     /// cleared when it times out; a waiter killed mid-wait leaves it set, and
     /// [`Awaited::pid`] is how a reader tells that one from a live wait.
     pub awaited: Option<Awaited>,
+    /// **A decision waiting on a named other party** (`wsp-098`): `wsp ask <row>
+    /// --of ed`, written `"of": "ed"`. An ask from the person to somebody with
+    /// no access to this store; `None` is every other question. Lower-case.
+    pub of: Option<String>,
+    /// The step the answer unlocks, written `"then"`: what is owed once the
+    /// party has answered, and the action of the item then. Only with `of`.
+    pub then: Option<String>,
+    /// On an answered `--of` ask: who answered (`"answered_by": "ed"`) and who
+    /// typed it in for them (`"relayed_by": "person"`).
+    pub answered_by: Option<String>,
+    pub relayed_by: Option<String>,
 }
 
 /// A `wsp ask --wait` in progress, as the question records it.
@@ -864,6 +875,10 @@ impl Message {
             caption: None,
             choices: None,
             awaited: None,
+            of: None,
+            then: None,
+            answered_by: None,
+            relayed_by: None,
         }
     }
 
@@ -1156,6 +1171,11 @@ impl Message {
         if let Some(a) = &self.awaited {
             v["awaited"] = json!({ "pid": a.pid, "at": a.at });
         }
+        for (k, f) in [("of", &self.of), ("then", &self.then), ("answered_by", &self.answered_by), ("relayed_by", &self.relayed_by)] {
+            if let Some(x) = f {
+                v[k] = Value::from(x.as_str());
+            }
+        }
         // How it ended, once it has (`wsp-308`): the same `{how, by, kind,
         // reason, at, answer}` `wsp yours --json` carries, so `wsp ask <id>
         // --json` of a closed question says why without a reader walking `via`.
@@ -1227,6 +1247,10 @@ impl Message {
                 let pid = u32::try_from(a.get("pid").and_then(Value::as_u64)?).ok()?;
                 Some(Awaited { pid, at: a.get("at").and_then(Value::as_str).unwrap_or_default().to_string() })
             }),
+            of: v.get("of").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
+            then: v.get("then").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
+            answered_by: v.get("answered_by").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
+            relayed_by: v.get("relayed_by").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
         }
     }
 
@@ -1548,6 +1572,18 @@ pub fn await_by(store: &Store, id: &str, waiter: Awaited) -> Result<Message, Ref
             return Err(Refused::NotOpen(m.state_raw.clone()));
         }
         m.awaited = Some(waiter);
+        store.save_message(&m)?;
+        Ok(m)
+    })
+}
+
+/// Record on an answered `--of` ask who answered and who typed it in
+/// (`wsp-098`). Under the lock, after [`answer`] closed it.
+pub fn relay(store: &Store, id: &str, answered_by: &str, relayed_by: &str) -> Result<Message, Refused> {
+    store.locked(|| {
+        let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        m.answered_by = Some(answered_by.to_string());
+        m.relayed_by = Some(relayed_by.to_string());
         store.save_message(&m)?;
         Ok(m)
     })

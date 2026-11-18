@@ -133,10 +133,63 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     ask_with(store, args, &RealClock)
 }
 
+/// `wsp ask <row> --of <name> "…" --then "<step>"` (`wsp-098`) — a decision
+/// waiting on a named other party, who has no access to this store.
+///
+/// Recorded as an ask from the person (`from: human`) with `of: <name>`
+/// (lower-case) and `then: <step>`. Open, it is follow-up; once `wsp answer
+/// <id> --as <name>` closes it, it is needs-you with `then` as its action.
+/// Nobody is woken: no seat is asked. A reader tells it from a seat's ask by
+/// the `of` field; open or answered by `state`, and `answered_by` /
+/// `relayed_by` once answered.
+fn ask_of(store: &Store, args: &Args) -> i32 {
+    let name = args.get("of").unwrap_or_default().trim().to_lowercase();
+    if name.is_empty() {
+        eprintln!("wsp: --of takes the name of the party asked, e.g. `--of ed`");
+        return 2;
+    }
+    let then = args.get("then").unwrap_or_default().trim().to_string();
+    if then.is_empty() {
+        eprintln!("wsp: an ask --of {name} needs --then \"<step>\": what is done once {name} has answered");
+        return 2;
+    }
+    let Some(row) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp ask <row> --of <name> \"…\" --then \"<step>\"");
+        return 2;
+    };
+    let task = match store.task_or_why(&row) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let text = match crate::cmd_agent::prose(args, 1) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let mut q = Message::question(Party::Human, Kind::Note, &text, Waiting::new("", &task.id)).about(About::Task(task.id.clone()));
+    q.of = Some(name.clone());
+    q.then = Some(then);
+    if let Err(e) = message::raise(store, &q) {
+        eprintln!("wsp: {e}");
+        return 1;
+    }
+    if args.json() {
+        println!("{}", json!({ "id": q.id, "about": task.id, "of": name, "then": q.then }));
+    } else {
+        println!("? {}  asked of {name} · waiting · `wsp answer {} --as {name} \"…\"` records the reply", q.id, q.id);
+    }
+    0
+}
+
 /// [`ask`] with the clock a `--wait` reads passed in, so a test can be time.
 fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     if args.has("cancel") {
         return cancel(store, args);
+    }
+    if args.has("of") || args.has("then") {
+        return ask_of(store, args);
     }
     let Some(needle) = args.rest.first().cloned() else {
         return open(store, args);
@@ -793,6 +846,28 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)) || an_agent_process(|k| std::env::var_os(k)),
         as_person: args.has("as-person"),
     };
+    // `--as <name>` (`wsp-098`): the named party's reply, typed in by the person.
+    let relayed = args.get("as").map(|a| a.trim().to_lowercase());
+    if let Some(name) = &relayed {
+        if q.of.as_deref() != Some(name.as_str()) {
+            match &q.of {
+                Some(of) => eprintln!("wsp: {} was asked of {of}, not {name}", q.id),
+                None => eprintln!("wsp: {} is not an ask --of anyone; --as is for one", q.id),
+            }
+            return 2;
+        }
+        if giving_up {
+            eprintln!("wsp: --as records a reply; to drop the ask, `wsp ask --cancel {}`", q.id);
+            return 2;
+        }
+        if let Err(why) = the_person(&caller) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    } else if q.of.is_some() && !giving_up {
+        eprintln!("wsp: {} was asked of {} — type their reply with `--as {}`", q.id, q.of.as_deref().unwrap_or_default(), q.of.as_deref().unwrap_or_default());
+        return 2;
+    }
     let me = match closer(store, &q, me, &caller) {
         Ok(me) => me,
         Err(why) => {
@@ -809,13 +884,19 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         (false, None) => message::answer(store, &q.id, &me, &text),
         (true, _) => message::abandon(store, &q.id, &me, &text),
     };
-    let closed = match closed {
+    let mut closed = match closed {
         Ok(c) => c,
         Err(e) => {
             eprintln!("wsp: {e}");
             return 1;
         }
     };
+    if let Some(name) = &relayed {
+        match message::relay(store, &closed.question.id, name, "person") {
+            Ok(m) => closed.question = m,
+            Err(e) => eprintln!("wsp: answered, but could not record who answered: {e}"),
+        }
+    }
 
     // The record is written by here and nothing below can unwrite it, which is
     // why the exit code is 0 for every delivery outcome except a refusal a
@@ -3619,5 +3700,42 @@ mod tests {
             t.set_status(crate::model::Status::Doing);
             store.save_task(&t).unwrap();
         }
+    }
+
+    /// `wsp-098`: a decision waiting on a named party is an ask from the person
+    /// with `of` and `then`; refused without `--then`; `wsp answer --as` closes
+    /// it naming the answerer and the person as the relayer.
+    #[test]
+    fn an_ask_of_a_named_party_is_recorded_and_answered_as_them() {
+        let _env = util::isolated("ask-of");
+        let store = scratch("ask-of");
+        task(&store, "lone-1");
+        let n = |store: &Store| message::all(store).len();
+
+        let bare = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed")]);
+        assert_eq!(ask(&store, &bare), 2, "no --then is refused");
+        assert_eq!(n(&store), 0, "and nothing is recorded");
+
+        let asked = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "Ed"), ("then", "merge the bump")]);
+        assert_eq!(ask(&store, &asked), 0);
+        let q = message::all(&store).pop().unwrap();
+        assert_eq!((q.of.as_deref(), q.then.as_deref()), (Some("ed"), Some("merge the bump")));
+        assert_eq!(q.from, Party::Human, "an ask from the person");
+        assert!(q.is_open() && q.answered_by.is_none());
+        assert_eq!(q.about, About::Task("lone-1".into()));
+
+        let plain = answer_args(&q.id, &[], &["yes"]);
+        assert_eq!(answer(&store, &plain), 2, "an --of ask is answered --as its party");
+        let wrong = answer_args(&q.id, &[("as", "bob")], &["yes"]);
+        assert_eq!(answer(&store, &wrong), 2);
+        assert!(store.message(&q.id).unwrap().is_open());
+
+        assert_eq!(answer(&store, &answer_args(&q.id, &[("as", "ed")], &["yes, keep it"])), 0);
+        let after = store.message(&q.id).unwrap();
+        assert_eq!(after.state_raw, "answered");
+        assert_eq!((after.answered_by.as_deref(), after.relayed_by.as_deref()), (Some("ed"), Some("person")));
+        let j = after.to_json();
+        assert_eq!((j["of"].as_str(), j["answered_by"].as_str(), j["relayed_by"].as_str()), (Some("ed"), Some("ed"), Some("person")));
+        assert_eq!(after.closing().map(|h| h.by.clone()), Some(Party::Human));
     }
 }
