@@ -907,7 +907,7 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
     // claim for it, and no spawn's key is held for it.
     let mut found = Vec::new();
     if !strays.is_empty() {
-        let ps = host(shared).table("pid=,command=", false).unwrap_or_default();
+        let ps = host(shared).table("pid=,ppid=,command=", false).unwrap_or_default();
         let name = sup.as_deref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         for (seat, socket) in strays {
             let pid = match sup_of(&ps, &name, &seat)[..] {
@@ -994,26 +994,36 @@ fn running(started: SeatStarted, socket: PathBuf, render: Option<PathBuf>) -> Ru
     }
 }
 
-/// The compound-sups that run `seat`, from a `pid=,command=` table: the
-/// processes whose command is `<sup> spawn … --label <seat>`. compound-sup
-/// daemonizes once and never forks again, so its pid leads the session's
-/// group for its whole life; the in-process host stops it by that group. One
-/// is the seat's; more is a seat this scan cannot tell apart.
+/// The compound-sups that run `seat`, from a `pid=,ppid=,command=` table:
+/// the processes whose command is `<sup> spawn … --label <seat>`. compound-sup
+/// daemonizes once, so its pid leads the session's group for its whole life;
+/// the in-process host stops it by that group. One is the seat's; more is a
+/// seat this scan cannot tell apart.
+///
+/// A match whose parent is a match is not a second session (wsp-081): a child
+/// the sup has forked and not yet `exec`ed carries the sup's own command line
+/// until it does. Under load that window is wide enough for one `ps` to land in
+/// it, and a seat was then refused as having two compound-sups, its own and its
+/// own fork.
 fn sup_of(ps: &str, sup: &str, seat: &SeatId) -> Vec<u32> {
-    ps.lines().filter_map(|line| {
-        let mut words = line.split_whitespace();
-        let pid = words.next()?.parse().ok()?;
-        // Its own flags only: the agent's argv after `--` names no seat.
-        let words: Vec<&str> = words.take_while(|w| *w != "--").collect();
-        let is_sup = words.iter().take_while(|w| **w != "spawn").any(|w| {
-            let base = w.rsplit('/').next().unwrap_or(w);
-            base == "compound-sup" || (!sup.is_empty() && base == sup)
-        });
-        let spawns = words.contains(&"spawn");
-        let labelled = words.windows(2).any(|w| w[0] == "--label" && w[1] == seat.0);
-        (is_sup && spawns && labelled).then_some(pid)
-    })
-    .collect()
+    let found: Vec<(u32, u32)> = ps
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let pid = words.next()?.parse().ok()?;
+            let ppid = words.next()?.parse().ok()?;
+            // Its own flags only: the agent's argv after `--` names no seat.
+            let words: Vec<&str> = words.take_while(|w| *w != "--").collect();
+            let is_sup = words.iter().take_while(|w| **w != "spawn").any(|w| {
+                let base = w.rsplit('/').next().unwrap_or(w);
+                base == "compound-sup" || (!sup.is_empty() && base == sup)
+            });
+            let spawns = words.contains(&"spawn");
+            let labelled = words.windows(2).any(|w| w[0] == "--label" && w[1] == seat.0);
+            (is_sup && spawns && labelled).then_some((pid, ppid))
+        })
+        .collect();
+    found.iter().filter(|(_, ppid)| !found.iter().any(|(pid, _)| pid == ppid)).map(|(pid, _)| *pid).collect()
 }
 
 /// The key an adopted seat goes out under: no row, since the in-process host
@@ -1068,17 +1078,22 @@ mod tests {
 
     #[test]
     fn an_in_process_seat_is_found_by_its_supervisors_label() {
-        let ps = "  10 /usr/local/bin/compound-sup spawn --label cpd-1 --agent claude -- claude\n  \
-                  11 claude --label cpd-2\n  \
-                  12 /bin/sh /tmp/wm-x.sup spawn --label cpd-2 --cwd / -- sleep 1\n  \
-                  13 /usr/local/bin/compound-sup spawn --label cpd-10 -- claude\n  \
-                  14 /usr/local/bin/compound-sup spawn --cwd / -- claude --label cpd-4\n";
+        let ps = "  10   1 /usr/local/bin/compound-sup spawn --label cpd-1 --agent claude -- claude\n  \
+                  11  10 claude --label cpd-2\n  \
+                  12   1 /bin/sh /tmp/wm-x.sup spawn --label cpd-2 --cwd / -- sleep 1\n  \
+                  13   1 /usr/local/bin/compound-sup spawn --label cpd-10 -- claude\n  \
+                  14   1 /usr/local/bin/compound-sup spawn --cwd / -- claude --label cpd-4\n";
         assert_eq!(sup_of(ps, "", &SeatId("cpd-1".into())), vec![10]);
         assert_eq!(sup_of(ps, "wm-x.sup", &SeatId("cpd-2".into())), vec![12]);
         assert_eq!(sup_of(ps, "", &SeatId("cpd-2".into())), Vec::<u32>::new());
         assert_eq!(sup_of(ps, "", &SeatId("cpd-3".into())), Vec::<u32>::new());
-        let twice = format!("{ps}  15 /usr/local/bin/compound-sup spawn --label cpd-1 -- sh\n");
+        let twice = format!("{ps}  15   1 /usr/local/bin/compound-sup spawn --label cpd-1 -- sh\n");
         assert_eq!(sup_of(&twice, "", &SeatId("cpd-1".into())), vec![10, 15], "both, for the caller to refuse");
         assert_eq!(sup_of(ps, "", &SeatId("cpd-4".into())), Vec::<u32>::new(), "a label in the agent's argv is not the session's");
+        // wsp-081: the sup's fork, caught before its `exec`, reads as the sup.
+        let forking = format!("{ps}  16  10 /usr/local/bin/compound-sup spawn --label cpd-1 --agent claude -- claude\n");
+        assert_eq!(sup_of(&forking, "", &SeatId("cpd-1".into())), vec![10], "its own fork is not a second sup");
+        let both = format!("{twice}  16  15 /usr/local/bin/compound-sup spawn --label cpd-1 -- sh\n");
+        assert_eq!(sup_of(&both, "", &SeatId("cpd-1".into())), vec![10, 15], "two sups still refused, a fork of either aside");
     }
 }
