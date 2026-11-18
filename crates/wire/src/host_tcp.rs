@@ -173,21 +173,50 @@ impl Choice {
 /// The host `choice` names, for this machine's `state` dir: the in-process
 /// host, or a [`Tcp`] that has already heard the manager's `hello` (so a
 /// manager that is not there is [`HostError::Silent`] here, before any seat is
-/// asked anything). The `Tcp` is made once per process: one connection per
-/// CLI call.
+/// asked anything). The `Tcp` is made once per state dir and per manager:
+/// one connection per CLI call, and in a long-lived process (the daemon's
+/// flush of held tells asks here each cycle) the record is read again on
+/// every call, so a manager restarted on a new port or with a new token is
+/// dialled where it is now, never at the address the first call read
+/// (wsp-112). A `Tcp` the record no longer names has its connection closed.
 pub fn choose(choice: Choice, state: &Path, version: &str) -> std::result::Result<&'static dyn Host, HostError> {
-    static MANAGER: OnceLock<Tcp> = OnceLock::new();
     match choice {
         Choice::Inproc => Ok(&crate::host::LOCAL),
-        Choice::Manager => {
-            if let Some(tcp) = MANAGER.get() {
-                return Ok(tcp);
-            }
-            let tcp = Tcp::from_record(state, Role::Cli, version)?;
-            tcp.hello()?;
-            Ok(MANAGER.get_or_init(|| tcp))
+        Choice::Manager => Ok(manager_for(state, version)?),
+    }
+}
+
+/// The [`Tcp`] to the manager `state`'s record names now: the one made for
+/// it before while the record still names the same address and token, else a
+/// new one that has heard `hello`. Each is leaked once, as the `&'static`
+/// a [`Host`] is handed out as; a manager restarted many times in one
+/// process's life is a handful of small structs, its connections closed.
+fn manager_for(state: &Path, version: &str) -> std::result::Result<&'static Tcp, HostError> {
+    static MANAGERS: OnceLock<Mutex<BTreeMap<PathBuf, &'static Tcp>>> = OnceLock::new();
+    let managers = MANAGERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let (local, token): (Local, Token) =
+        manager::read_record(state).ok_or_else(|| HostError::NoRecord(manager::record_path(state)))?;
+    let addr = local.socket();
+    if let Some(tcp) = managers.lock().unwrap_or_else(|e| e.into_inner()).get(state) {
+        if tcp.addr == addr && tcp.token == token {
+            return Ok(tcp);
         }
     }
+    // Dialled outside the lock: a silent manager costs its own caller, not
+    // another state dir's.
+    let tcp = Tcp::new(addr, token, Role::Cli, version);
+    tcp.hello()?;
+    let mut map = managers.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(had) = map.get(state) {
+        if had.addr == tcp.addr && had.token == tcp.token {
+            // Another thread made it first; this one's connection closes as it drops.
+            return Ok(had);
+        }
+        *had.live.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    let tcp: &'static Tcp = Box::leak(Box::new(tcp));
+    map.insert(state.to_path_buf(), tcp);
+    Ok(tcp)
 }
 
 /// [`choose`] by `$WSP_HOST`.

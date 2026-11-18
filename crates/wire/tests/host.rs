@@ -1193,6 +1193,58 @@ fn wsp_host_manager_with_no_manager_running_is_host_silent() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A manager restarted on a new port, with a new token (wsp-112): the daemon
+/// asks `choose` every cycle, and the next call dials the manager where the
+/// record says it is now, not the address the first call read; a call for
+/// another state dir is a connection of its own, never the first one's.
+#[test]
+fn choose_dials_a_manager_restarted_on_a_new_port_and_keeps_none_across_state_dirs() {
+    let (dir, sup) = place("restart");
+    let sweep = Sweep::default();
+    let state = dir.join("state");
+    let first_dir = dir.join("one");
+    let m1 = manager(&first_dir, &sup, 0);
+    install_record(&state, &Local::new(&first_dir.join("exec"), m1.addrs()[0].port()), Duration::from_secs(5)).unwrap();
+    let first = host::choose(Choice::Manager, &state, "test").expect("the first manager answers");
+    wait_until("the first manager's client", || m1.clients() == 1);
+    let again = host::choose(Choice::Manager, &state, "test").expect("the same manager answers");
+    assert!(std::ptr::addr_eq(first, again), "an unchanged record is the same connection");
+    assert_eq!(m1.clients(), 1, "no second connection to the same manager");
+
+    // Restarted: the old one gone, the new one on another port with its own
+    // token, and the record rewritten as `wsp install` does.
+    m1.stop();
+    let second_dir = dir.join("two");
+    let m2 = manager(&second_dir, &sup, 0);
+    assert_ne!(token(&first_dir), token(&second_dir), "a new exec dir makes a new token");
+    install_record(&state, &Local::new(&second_dir.join("exec"), m2.addrs()[0].port()), Duration::from_secs(5)).unwrap();
+    let next = host::choose(Choice::Manager, &state, "test").expect("the restarted manager answers at its new port");
+    assert!(!std::ptr::addr_eq(first, next), "a new address and token is a new connection");
+    wait_until("the restarted manager's client", || m2.clients() == 1);
+
+    // The next call reaches the new manager: its seat is the new one's.
+    let seat = format!("cpd-r{}", std::process::id());
+    let args = vec!["-c".to_string(), "true".to_string()];
+    let spawn = Spawn { key: Key { row: RowId("wsp-112".into()), attempt: 0 }, seat: &seat, kind: None, cwd: dir.display().to_string(), env: BTreeMap::new(), program: "sh", args: &args };
+    let session = next.spawn_session(&spawn).expect("the restarted manager starts the seat");
+    sweep.add(session.pid);
+    let spawns = fs::read_to_string(second_dir.join("exec").join(wsp_manager::seats::RUN_DIR).join("spawns")).unwrap();
+    assert!(spawns.lines().any(|l| l.starts_with(&format!("{seat} "))), "{spawns}");
+    assert!(!first_dir.join("exec").join(wsp_manager::seats::RUN_DIR).join("spawns").exists(), "nothing reached the old manager");
+
+    // Another state dir naming the same manager is a connection of its own.
+    let other = dir.join("other-state");
+    install_record(&other, &Local::new(&second_dir.join("exec"), m2.addrs()[0].port()), Duration::from_secs(5)).unwrap();
+    let theirs = host::choose(Choice::Manager, &other, "test").expect("the same manager answers another state dir");
+    assert!(!std::ptr::addr_eq(next, theirs), "each state dir has its own connection");
+    wait_until("the second state dir's client", || m2.clients() == 2);
+
+    next.stop(Stop { group: session.pid, watch: Some(session.pid), grace: Duration::from_secs(2), poll: Duration::from_millis(50), clock: &Wall });
+    m2.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn said(m: &Manager, n: u64) -> EventId {
     m.emit(Message::SeatSaid(SeatSaid { seat: SeatId("cpd-s".into()), epoch: Epoch(1), at: At(n), text: format!("word {n}") })).unwrap()
 }
