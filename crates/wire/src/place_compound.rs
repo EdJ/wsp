@@ -1266,6 +1266,53 @@ pub fn deliver_wait() -> Duration {
     }
 }
 
+/// **What the daemon's tick may spend waiting on `deliver`s, in all** (`wsp-665`).
+/// The tick is one thread: every `compound-sup deliver` it asked sat out its
+/// whole [`DELIVER_WAIT`] against a seat that was busy or slow to acknowledge,
+/// and with four to eight asked per tick (every owed governor, every held
+/// answer, every send-back) that was 74–132 s of a 190 s tick in the 11-17
+/// `calls.jsonl`, all of it `compound-sup` children aging to 30.0 s. The ask
+/// is unchanged and so is its answer: past the wait it is left pending and
+/// asked again next tick under the same id, which the supervisor answers once.
+/// A tick only waits less. `wsp tell` from a person's shell keeps the 30 s.
+const TICK_DELIVER_BUDGET: Duration = Duration::from_secs(12);
+/// One ask's share of it: long enough for a seat that is ready to say so.
+const TICK_DELIVER_EACH: Duration = Duration::from_secs(5);
+/// The least an ask waits once the budget is spent: the supervisor has to be
+/// handed the words and answer a seat that took them at once.
+const TICK_DELIVER_LEAST: Duration = Duration::from_millis(1500);
+
+/// What is left of this tick's budget, `None` outside the daemon's tick.
+static TICK_DELIVER: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
+
+/// The daemon calls this as a tick begins (`Some`) and when it ends (`None`).
+pub fn tick_deliver_budget(on: bool) {
+    *TICK_DELIVER.lock().unwrap_or_else(|e| e.into_inner()) = on.then_some(TICK_DELIVER_BUDGET);
+}
+
+/// How long the next `deliver` may wait. Pure in what is left.
+fn deliver_wait_of(left: Option<Duration>) -> Duration {
+    match left {
+        None => DELIVER_WAIT,
+        Some(left) => DELIVER_WAIT.min(TICK_DELIVER_EACH).min(left.max(TICK_DELIVER_LEAST)),
+    }
+}
+
+/// The wait for this ask, and what it took off the tick's budget once it is over.
+fn deliver_waited<T>(ask: impl FnOnce(Duration) -> T) -> T {
+    let left = *TICK_DELIVER.lock().unwrap_or_else(|e| e.into_inner());
+    let began = Instant::now();
+    // a process that capped its deliveries (wsp-666) keeps the cap
+    let out = ask(deliver_wait_of(left).min(deliver_wait()));
+    if let Some(left) = left {
+        let mut g = TICK_DELIVER.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some() {
+            *g = Some(left.saturating_sub(began.elapsed()));
+        }
+    }
+    out
+}
+
 /// The seat's file naming the delivery still being asked about, so the next
 /// tick asks again under the same id (the sup answers an id asked again with
 /// the same answer: exactly once).
@@ -1987,7 +2034,7 @@ impl Place for Compound<'_> {
         if let (Some(sup), Some(session), Ok(rec)) = (compound_sup_binary(), self.socket_of(seat), self.record(seat)) {
             if delivers(&rec) {
                 let dir = self.dir_of(seat)?;
-                let answer = deliver_through(&sup, &session, &dir, seat, text, deliver_wait());
+                let answer = deliver_waited(|wait| deliver_through(&sup, &session, &dir, seat, text, wait));
                 return past_a_refusal(answer, || self.typed(seat), || {
                     let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
                     type_and_submit(&socket, text)
@@ -2486,6 +2533,39 @@ mod tests {
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
         fs::rename(&tmp, &sup).unwrap();
         (sup, said, asked)
+    }
+
+    /// `wsp-665`: outside the daemon's tick a `deliver` waits its 30 s; inside
+    /// it, one ask waits 5 s at most and the tick's asks together about 12 s,
+    /// and an ask after the budget is spent still waits long enough to be heard.
+    #[test]
+    fn a_tick_waits_on_deliveries_less_than_a_person_does() {
+        let s = Duration::from_secs;
+        let table = [
+            (None, s(30), "no tick: a person's `wsp tell` keeps the wait"),
+            (Some(s(12)), s(5), "the first ask of a tick"),
+            (Some(s(3)), s(3), "what is left of the budget is what an ask gets"),
+            (Some(Duration::ZERO), TICK_DELIVER_LEAST, "spent: still long enough for a seat that is ready"),
+        ];
+        for (left, want, why) in table {
+            assert_eq!(deliver_wait_of(left), want, "{why}");
+        }
+    }
+
+    /// The budget is taken down by what each ask waited, and only in a tick.
+    #[test]
+    fn what_an_ask_waits_comes_off_the_ticks_budget() {
+        tick_deliver_budget(true);
+        let got = deliver_waited(|w| {
+            std::thread::sleep(Duration::from_millis(60));
+            w
+        });
+        let left = TICK_DELIVER.lock().unwrap().unwrap();
+        tick_deliver_budget(false);
+        assert_eq!(got, TICK_DELIVER_EACH);
+        assert!(left <= TICK_DELIVER_BUDGET - Duration::from_millis(60), "{left:?}");
+        assert!(TICK_DELIVER.lock().unwrap().is_none(), "the end of a tick clears it");
+        assert_eq!(deliver_waited(|w| w), deliver_wait(), "and a caller outside a tick waits as before");
     }
 
     /// wsp-477: a tell on a seat whose supervisor can be asked is its `deliver`

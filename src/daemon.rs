@@ -737,6 +737,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // per phase, so a slow phase shows up by name. The sleep above is not
         // work, and is left out of it.
         wsp_base::calls::tick_begin();
+        crate::place_compound::tick_deliver_budget(true);
         wsp_base::calls::phase("standing");
         // Whatever this process spawned and nothing waited for is a `<defunct>`
         // entry until the daemon exits, which is days (wsp-664).
@@ -884,6 +885,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             store.steady(|| crate::retro_series::sweep(store));
         }
 
+        crate::place_compound::tick_deliver_budget(false);
         wsp_base::calls::tick_end();
     }
 }
