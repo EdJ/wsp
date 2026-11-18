@@ -1207,7 +1207,7 @@ fn deliver_through(host: &dyn Host, session: &Path, dir: &Path, seat: &Seat, tex
 /// hook never fired, so it reads the seat as holding other text) answers
 /// `failed … refused` to every retry: governors read "refused 5 ticks running"
 /// and were ended for it, the sentence never landing. When the answer took
-/// nothing (`refused`, `no composer`) and this backend's own read of the
+/// nothing (`refused`, `no composer`, in any of its spellings) and this backend's own read of the
 /// composer is *empty* — not unreadable, not holding text — the sentence goes
 /// by the typed path instead, and is `Unconfirmed` like any typed tell, so the
 /// wake path waits for the turn that confirms it. Any other answer, or a
@@ -1217,7 +1217,7 @@ fn past_a_refusal(
     holds_text: impl FnOnce() -> Option<bool>,
     type_it: impl FnOnce() -> Result<()>,
 ) -> Result<Delivery> {
-    let took_nothing = |why: &str| ["refused", "no composer", "no_composer"].iter().any(|r| why.contains(r));
+    let took_nothing = |why: &str| ["refused", "no composer", "no_composer", "no-composer"].iter().any(|r| why.contains(r));
     match &answer {
         Err(Refusal::Failed(why)) if took_nothing(why) && holds_text() == Some(false) => match type_it() {
             Ok(()) => Ok(Delivery::Unconfirmed),
