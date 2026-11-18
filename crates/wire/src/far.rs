@@ -2094,10 +2094,13 @@ mod tests {
         let sh = |cmd: &str| assert!(std::process::Command::new("sh").arg("-c").arg(cmd).status().unwrap().success(), "{cmd}");
         let lease = root.join("lease");
 
-        // Spawned with its first lease: the first call passes without waiting.
+        // Spawned with its first lease: the first call passes without waiting. The
+        // lease is long (30 s) so a gate that held the call would visibly wait it
+        // out; passing well inside it (10 s) is "at once" with room for a loaded
+        // machine's exec latency (2.79 s seen under the full workspace run, wsp-670).
         sh(&format!("{}true", first_lease_command(&m, "cpd-1")));
-        let (code, took) = run_gate(&bin, &root, "cpd-1", "3");
-        assert_eq!((code, took < Duration::from_secs(1)), (0, true), "fresh first lease passes at once ({took:?})");
+        let (code, took) = run_gate(&bin, &root, "cpd-1", "30");
+        assert_eq!((code, took < Duration::from_secs(10)), (0, true), "fresh first lease passes at once, not after the 30 s lease ({took:?})");
 
         // No lease yet, the beat delayed ~1s: held, then passing.
         std::fs::create_dir_all(&lease).unwrap();
