@@ -706,7 +706,9 @@ mod tests {
 
     #[test]
     fn only_an_exit_one_with_nothing_printed_from_ps_is_a_pid_that_is_gone() {
-        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026\n"), Ok(Some("Tue_Nov_4_11:19:05_2026".into())));
+        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Ss\n"), Ok(Some("Tue_Nov_4_11:19:05_2026".into())));
+        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Z+\n"), Ok(None), "a defunct process is gone");
+        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Zs\n"), Ok(None));
         assert_eq!(ps_says(Some(1), b""), Ok(None), "no such process");
         assert_eq!(ps_says(Some(1), b"\n"), Ok(None));
         assert_eq!(ps_says(None, b""), Err(()), "killed by a signal says nothing of the pid");
@@ -754,6 +756,34 @@ mod tests {
         assert!(!me.gone());
         let none = Run { pid: 4_000_000, started: me.started.clone() };
         assert!(none.gone());
+    }
+
+    /// A run whose process has died and is not reaped is still a pid with a
+    /// start time; it reads as gone, so the barrier is retaken.
+    #[test]
+    fn a_run_whose_pid_is_defunct_reads_as_gone() {
+        let mut child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let stat = || {
+            let o = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        while !stat().starts_with('Z') && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(stat().starts_with('Z'), "the child is a zombie until it is waited on");
+        let (_env, store) = scratch("zombie-run");
+        let _w = list(&store, &[&["m-1"]]);
+        // the start it had while it lived: ps still gives one for a zombie
+        let o = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().unwrap();
+        let started = String::from_utf8_lossy(&o.stdout).split_whitespace().collect::<Vec<_>>().join("_");
+        let run = Run { pid, started };
+        assert!(run.gone(), "a defunct pid is not a run that is going");
+        let (_, retake) = running_with(&store, run);
+        assert!(run_died(&store.worklist("run").unwrap().groups()[0]));
+        assert!(matches!(retake(), Some(o) if o.retaken && o.died == Some(pid)));
+        child.wait().unwrap();
     }
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {

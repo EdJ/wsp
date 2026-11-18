@@ -141,11 +141,14 @@ impl Run {
 
 /// When process `pid` started, as `ps` says it, or `None` where there is none.
 fn start_of(pid: u32) -> Result<Option<String>, ()> {
-    let out = wsp_base::calls::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
+    let out = wsp_base::calls::Command::new("ps").args(["-o", "lstart=,stat=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
     ps_says(out.status.code(), &out.stdout)
 }
 
-/// What a finished `ps -o lstart= -p <pid>` says. It says there is no such
+/// What a finished `ps -o lstart=,stat= -p <pid>` says. A defunct (zombie)
+/// process, its `stat` starting with `Z`, still has a pid and a start time but
+/// is no run: it reads as no process at all, so a barrier whose run died
+/// unreaped is not waited on forever. It says there is no such
 /// process by exiting 1 with nothing on stdout (stderr is free text, and a pid
 /// too large for the system gets a complaint there with the same exit). Any
 /// other end — killed by a signal, or another exit status — says nothing about
@@ -157,7 +160,12 @@ pub fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
         return Err(());
     }
     let s = String::from_utf8_lossy(stdout);
-    let s = s.split_whitespace().collect::<Vec<_>>().join("_");
+    let mut words = s.split_whitespace().collect::<Vec<_>>();
+    let Some(stat) = words.pop() else { return Ok(None) };
+    if stat.starts_with('Z') {
+        return Ok(None);
+    }
+    let s = words.join("_");
     Ok((!s.is_empty()).then_some(s))
 }
 
