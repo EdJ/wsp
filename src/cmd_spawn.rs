@@ -4990,23 +4990,17 @@ fn swept_up(
             // session kept running there rewrote the tree after the removal and
             // left the next seat a half-made one (`wsp-498`).
             let dir = cmd_checkout::tree_of(cmd_checkout::candidates(store, &cwd, t), t);
-            let left = dir.as_deref().map(crate::cmd_role::left_in).unwrap_or_default();
-            let tree = cmd_checkout::discard(cmd_checkout::candidates(store, &cwd, t), t, &standing);
-            if let (Tree::Removed { path, .. }, Some(dir)) = (&tree, &dir) {
-                let (term, kill) = crate::cmd_role::end_pids(&left);
-                if !term.is_empty() {
-                    let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
-                    crate::store::log_line(
-                        store,
-                        &format!("despawn {seat} ({t}): ended what stood in the removed tree {path}: TERM {}{}", list(&term), if kill.is_empty() { String::new() } else { format!(", KILL {}", list(&kill)) }),
-                    );
-                    // Whatever it wrote between the removal and its end is not a tree.
-                    if dir.exists() && !dir.join(".git").exists() {
-                        let _ = std::fs::remove_dir_all(dir);
+            let discard = || cmd_checkout::discard(cmd_checkout::candidates(store, &cwd, t), t, &standing);
+            match &dir {
+                Some(dir) => {
+                    let (tree, said) = take_tree(dir, &discard, &LiveTree, standing(dir).is_none());
+                    for line in said {
+                        crate::store::log_line(store, &format!("despawn {seat} ({t}): {line}"));
                     }
+                    tree
                 }
+                None => discard(),
             }
-            tree
         }
         // A seat holding nothing names no tree. There is no path from a seat to
         // a checkout except through the task, and guessing one from the pane's
@@ -5025,6 +5019,81 @@ fn swept_up(
         _ => Vec::new(),
     };
     Leftovers { tree, legs, builds, far }
+}
+
+/// What stands in a seat's tree, and the stop for it. The live answers are
+/// [`crate::cmd_role::left_in`] and [`crate::cmd_role::end_pids`], which read
+/// nothing under `cfg(test)`; a test brings its own (`wsp-085`).
+trait InTree {
+    /// The pids the seat started that stand in `dir`.
+    fn left_in(&self, dir: &std::path::Path) -> Vec<u32>;
+    /// `TERM`, then `KILL` for what is left: what was signalled, each way.
+    fn end(&self, pids: &[u32]) -> (Vec<u32>, Vec<u32>);
+}
+
+struct LiveTree;
+
+impl InTree for LiveTree {
+    fn left_in(&self, dir: &std::path::Path) -> Vec<u32> {
+        crate::cmd_role::left_in(dir)
+    }
+    fn end(&self, pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        crate::cmd_role::end_pids(pids)
+    }
+}
+
+/// A seat's own tree taken away: **what the seat left running in it stopped
+/// first**, then the tree discarded, then anything that wrote in it during the
+/// removal stopped and its remnant removed — or the tree kept, with the pid
+/// that still holds it named. Returns the tree and the lines for `cycle.log`.
+///
+/// **Stopped before, not only after** (`wsp-085`). `wsp-498` ended what stood
+/// in a tree only once the tree read `Removed`, so a process still writing in
+/// it — the case the run's "Directory not empty — the tree is in use: a
+/// process still writes in it" names — was never stopped, and that refusal
+/// named no pid. Its writes are also what made a tree read as uncommitted
+/// work and be kept. `nobody_else` is that no other seat stands in the tree:
+/// what runs in a tree somebody is still using is theirs, and is not touched.
+///
+/// [`cmd_checkout::remove`] reports nothing of a removal that half failed, so
+/// a `Removed` tree whose directory is still there is the failure, read here.
+/// A remnant with a `.git` in it is left: that is a tree again, and possibly
+/// the next seat's.
+fn take_tree(dir: &std::path::Path, discard: &dyn Fn() -> Tree, inside: &dyn InTree, nobody_else: bool) -> (Tree, Vec<String>) {
+    let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+    let signalled = |(term, kill): (Vec<u32>, Vec<u32>)| match kill.is_empty() {
+        true => format!("TERM {}", list(&term)),
+        false => format!("TERM {}, KILL {}", list(&term), list(&kill)),
+    };
+    let mut said = Vec::new();
+    let path = util::contract(dir);
+    if nobody_else {
+        let left = inside.left_in(dir);
+        if !left.is_empty() {
+            said.push(format!("stopped what still ran in its tree {path} before removing it: {}", signalled(inside.end(&left))));
+        }
+    }
+    let tree = discard();
+    let Tree::Removed { path, .. } = &tree else { return (tree, said) };
+    if !dir.exists() {
+        return (tree, said);
+    }
+    let late = inside.left_in(dir);
+    if !late.is_empty() && nobody_else {
+        said.push(format!("ended what wrote in the tree {path} during its removal: {}", signalled(inside.end(&late))));
+    }
+    let err = match dir.join(".git").exists() {
+        true => Some("it is a tree again (it has a .git)".to_string()),
+        false => std::fs::remove_dir_all(dir).err().map(|e| e.to_string()).filter(|_| dir.exists()),
+    };
+    let Some(err) = err else { return (tree, said) };
+    let holds = inside.left_in(dir);
+    let why = match holds.is_empty() {
+        true => format!("could not be removed: {err}"),
+        false => format!("could not be removed: {err} — pid {} still writes in it", list(&holds)),
+    };
+    said.push(format!("kept {path}: {why}"));
+    (Tree::Kept { path: path.clone(), why }, said)
 }
 
 /// A far row's copy, ended with its seat (`docs/remote-agents.md` section 3):
@@ -11009,5 +11078,128 @@ mod tests {
             let _ = crate::place::Place::stop(&place, &crate::place::Seat::new(seat));
         }
         m.stop();
+    }
+
+    /// A process standing in a seat's tree, writing into it while it lives:
+    /// what [`take_tree`] reads and stops (`wsp-085`). `stubborn` outlives
+    /// every signal; `late` is not there at first and starts writing during
+    /// the removal.
+    struct Writer {
+        dir: std::path::PathBuf,
+        alive: std::cell::Cell<bool>,
+        stubborn: bool,
+        late: bool,
+        signalled: std::cell::RefCell<Vec<u32>>,
+    }
+
+    const WRITER: u32 = 4242;
+
+    impl Writer {
+        fn new(tag: &str, alive: bool, stubborn: bool, late: bool) -> Writer {
+            let dir = std::env::temp_dir().join(format!("wsp-085-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+            Writer { dir, alive: std::cell::Cell::new(alive), stubborn, late, signalled: std::cell::RefCell::new(Vec::new()) }
+        }
+
+        /// What `cmd_checkout::remove` does — every removal tried, none of
+        /// it answered — with this writer putting a file back while it lives.
+        fn discard(&self) -> Tree {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            if self.late {
+                self.alive.set(true);
+            }
+            if self.alive.get() {
+                std::fs::create_dir_all(self.dir.join("target")).unwrap();
+                std::fs::write(self.dir.join("target/out.log"), "still writing").unwrap();
+            }
+            Tree::Removed { path: util::contract(&self.dir), kept: None }
+        }
+    }
+
+    impl InTree for Writer {
+        fn left_in(&self, dir: &std::path::Path) -> Vec<u32> {
+            match self.alive.get() && dir == self.dir {
+                true => vec![WRITER],
+                false => Vec::new(),
+            }
+        }
+        fn end(&self, pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+            self.signalled.borrow_mut().extend_from_slice(pids);
+            if !self.stubborn {
+                self.alive.set(false);
+            }
+            (pids.to_vec(), Vec::new())
+        }
+    }
+
+    /// The first done-when item of `wsp-085`: a process still writing in a
+    /// seat's tree is stopped by the end **before** the tree is removed, and the
+    /// tree is gone afterwards.
+    #[test]
+    fn a_process_still_writing_in_a_seat_tree_is_stopped_before_the_tree_is_removed() {
+        let w = Writer::new("writes", true, false, false);
+        let saw_alive = std::cell::Cell::new(None);
+        let discard = || {
+            saw_alive.set(Some(w.alive.get()));
+            w.discard()
+        };
+        let (tree, said) = take_tree(&w.dir, &discard, &w, true);
+        assert_eq!(*w.signalled.borrow(), vec![WRITER], "the writer is signalled");
+        assert_eq!(saw_alive.get(), Some(false), "and stopped before the removal began");
+        assert!(matches!(tree, Tree::Removed { .. }), "the tree reads removed");
+        assert!(!w.dir.exists(), "and is gone");
+        assert!(said.iter().any(|l| l.contains("before removing it") && l.contains("TERM 4242")), "{said:?}");
+    }
+
+    /// One that starts writing during the removal is ended after it, and the
+    /// remnant it wrote is removed: a `Removed` tree whose directory is still
+    /// there is the failure `cmd_checkout::remove` does not report.
+    #[test]
+    fn a_process_that_writes_during_the_removal_is_ended_and_its_remnant_removed() {
+        let w = Writer::new("late", false, false, true);
+        let (tree, said) = take_tree(&w.dir, &|| w.discard(), &w, true);
+        assert_eq!(*w.signalled.borrow(), vec![WRITER]);
+        assert!(matches!(tree, Tree::Removed { .. }) && !w.dir.exists(), "the remnant went too");
+        assert!(said.iter().any(|l| l.contains("during its removal") && l.contains("4242")), "{said:?}");
+    }
+
+    /// One that will not stop: the tree is kept, and why names the pid that
+    /// holds it — not a bare "Directory not empty".
+    #[test]
+    fn a_tree_held_by_a_process_that_will_not_stop_is_kept_naming_its_pid() {
+        let w = Writer::new("stubborn", true, true, false);
+        // A remnant that cannot be removed: a read-only directory under it.
+        let (tree, said) = take_tree(&w.dir, &|| {
+            let t = w.discard();
+            let locked = w.dir.join("target");
+            let _ = std::fs::write(locked.join("held"), "");
+            let mut perm = std::fs::metadata(&locked).unwrap().permissions();
+            perm.set_readonly(true);
+            std::fs::set_permissions(&locked, perm).unwrap();
+            t
+        }, &w, true);
+        let locked = w.dir.join("target");
+        let mut perm = std::fs::metadata(&locked).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        std::fs::set_permissions(&locked, perm).unwrap();
+        let _ = std::fs::remove_dir_all(&w.dir);
+        match tree {
+            Tree::Kept { why, .. } => assert!(why.contains("pid 4242 still writes in it"), "{why}"),
+            _ => panic!("a tree that would not go reads kept"),
+        }
+        assert!(said.iter().any(|l| l.starts_with("kept ") && l.contains("4242")), "{said:?}");
+    }
+
+    /// What runs in a tree another seat still stands in is that seat's: not
+    /// read, not signalled.
+    #[test]
+    fn what_runs_in_a_tree_another_seat_stands_in_is_not_stopped() {
+        let w = Writer::new("shared", true, false, false);
+        let (_, said) = take_tree(&w.dir, &|| Tree::Kept { path: util::contract(&w.dir), why: "cpd-9 is standing in it".into() }, &w, false);
+        assert!(w.signalled.borrow().is_empty() && said.is_empty(), "{said:?}");
+        let _ = std::fs::remove_dir_all(&w.dir);
     }
 }
