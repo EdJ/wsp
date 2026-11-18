@@ -1705,21 +1705,6 @@ fn launcher(
 /// both there at one commit — or, when it is not there, built from `tree`.
 /// With no `src` (`--daemon`) the one already beside `dst` is used. A manager
 /// replaced under a job whose plist did not change is kicked to run it.
-/// The line `wsp install` prints once the manager's launcher is in place; `kind`
-/// is what the launcher is on this OS (`launchd::MANAGER_KIND`,
-/// `systemd::MANAGER_KIND`).
-fn manager_installed_line(p: &crate::util::Paint, path: &Path, wrote: bool, loaded: bool, restarted: bool, kind: &str) -> String {
-    format!(
-        "{} {} · {} — the manager is {kind} now, and it comes back on its own",
-        p.green("✓"),
-        util::contract(path),
-        match (wrote, loaded, restarted) {
-            (_, true, _) => "loaded, and it is running now",
-            _ => "already loaded",
-        },
-    )
-}
-
 fn manager_agent(
     store: &Store,
     src: Option<&Path>,
@@ -1781,6 +1766,21 @@ fn manager_agent(
         Err(why) => json!({"installed": false, "label": b::MANAGER_LABEL,
                            "path": util::contract(&path), "error": why}),
     }
+}
+
+/// The line `wsp install` prints once the manager's launcher is in place; `kind`
+/// is what the launcher is on this OS (`launchd::MANAGER_KIND`,
+/// `systemd::MANAGER_KIND`).
+fn manager_installed_line(p: &crate::util::Paint, path: &Path, wrote: bool, loaded: bool, restarted: bool, kind: &str) -> String {
+    format!(
+        "{} {} · {} — the manager is {kind} now, and it comes back on its own",
+        p.green("✓"),
+        util::contract(path),
+        match (wrote, loaded, restarted) {
+            (_, true, _) => "loaded, and it is running now",
+            _ => "already loaded",
+        },
+    )
 }
 
 /// Copy the `wsp-manager` that was built beside `src` to `dst`, building it
