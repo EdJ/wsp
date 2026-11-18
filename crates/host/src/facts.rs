@@ -243,7 +243,7 @@ mod tests {
         kern.memorystatus_vm_pressure_level: 2\n";
     const DF: &str = "Filesystem     1024-blocks      Used Available Capacity  Mounted on\n\
         /dev/disk3s1s1   482797652  13436052 203818460     7%    /\n\
-        /dev/disk5s1    1953378304 900000000 1053378304    46%    /Volumes/Crucial X9\n\
+        /dev/disk5s1    1953378304 900000000 1053378304    46%    /Volumes/External Disk\n\
         /dev/disk3s1s1   482797652  13436052 203818460     7%    /\n";
     const PMSET: &str = "Note: No thermal warning level has been recorded\n\
         Note: No performance warning level has been recorded\n";
@@ -264,7 +264,7 @@ mod tests {
             vec![
                 DiskFree { volume: "/".into(), free_bytes: 203818460 * 1024, total_bytes: 482797652 * 1024 },
                 DiskFree {
-                    volume: "/Volumes/Crucial X9".into(),
+                    volume: "/Volumes/External Disk".into(),
                     free_bytes: 1053378304 * 1024,
                     total_bytes: 1953378304 * 1024
                 },
