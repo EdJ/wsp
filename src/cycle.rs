@@ -484,9 +484,25 @@ pub(crate) fn launch_out(store: &Store, argv: &[&str]) {
 /// one. The event flags are what the trigger saw, and they only decide what a
 /// governor is told: the steps themselves are read off the store.
 pub fn advance(store: &Store, args: &Args) -> i32 {
+    cap_deliveries();
     // Everything an advance does spawns or tells, so none of it carries on
     // past a busy state lock (`wsp-663`, `docs/step-lock.md`).
     crate::store::strictly(|| advance_in(store, args))
+}
+
+/// How long an `advance` waits on one `compound-sup deliver` (`wsp-666`).
+///
+/// **`advance` is a step, not a patient pass.** Its tells (a verdict, a
+/// barrier, a start) went through the same 30 s `deliver` wait the daemon's
+/// tick has, so a seat that would not take the order held the step for the
+/// whole of it: 201 `compound-sup` children in 3 days of `calls.jsonl` under
+/// `worklist advance`, 4442 s, p95 30015 ms — the `DELIVER_WAIT` to the
+/// millisecond. A delivery that outlasts this is left pending under its id and
+/// the daemon's tick asks again, so nothing is lost by not sitting through it.
+const ADVANCE_DELIVER_CAP: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn cap_deliveries() {
+    crate::place_compound::cap_deliver_wait(ADVANCE_DELIVER_CAP);
 }
 
 fn advance_in(store: &Store, args: &Args) -> i32 {
@@ -9090,6 +9106,20 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(advance(&store, &args), 0);
         assert!(drained(&ENDED).is_empty(), "already gone");
         assert!(drained(&SAID).iter().any(|l| l.contains("already gone")));
+    }
+
+    /// `wsp-666`: an advance does not sit the daemon's 30 s on a `deliver` to a
+    /// supervisor that never answers — the wait it makes is the cap, under the
+    /// 5 s the done-when allows a `compound-sup` child, and the whole path is
+    /// the place's own pending-and-asked-again (`a_capped_process_leaves_a_delivery_pending_at_the_cap`).
+    #[test]
+    fn an_advance_caps_its_deliver_wait_well_under_the_daemons() {
+        let (_env, store) = scratch("advance-cap");
+        let args = Args::synth("worklist", &["advance", "run"], &[("end-check", "gone")]);
+        assert_eq!(advance(&store, &args), 0);
+        let wait = crate::place_compound::deliver_wait();
+        assert_eq!(wait, ADVANCE_DELIVER_CAP);
+        assert!(wait < std::time::Duration::from_secs(5), "{wait:?}");
     }
 
     /// `wsp-662`: a task's trigger steps the list that holds it and no other,

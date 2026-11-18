@@ -1245,6 +1245,27 @@ fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
 /// sit through either.
 const DELIVER_WAIT: Duration = Duration::from_secs(30);
 
+/// A ceiling on [`DELIVER_WAIT`] for this process, in milliseconds; 0 is none
+/// (`wsp-666`). `wsp worklist advance` is a step, not a tick's patient pass: it
+/// sat the whole 30 s on a `deliver` to a seat that would not take the order
+/// (six calls, ~22 s a call over three days of calls.jsonl), when the answer
+/// it needs is only "left pending". A pending delivery is asked again under
+/// the same id, so a short wait loses nothing.
+static DELIVER_CAP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cap every `deliver` this process makes at `cap`; see [`DELIVER_CAP_MS`].
+pub fn cap_deliver_wait(cap: Duration) {
+    DELIVER_CAP_MS.store(cap.as_millis().max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long a `deliver` waits here: [`DELIVER_WAIT`], or the cap if lower.
+pub fn deliver_wait() -> Duration {
+    match DELIVER_CAP_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => DELIVER_WAIT,
+        ms => DELIVER_WAIT.min(Duration::from_millis(ms)),
+    }
+}
+
 /// The seat's file naming the delivery still being asked about, so the next
 /// tick asks again under the same id (the sup answers an id asked again with
 /// the same answer: exactly once).
@@ -1966,7 +1987,7 @@ impl Place for Compound<'_> {
         if let (Some(sup), Some(session), Ok(rec)) = (compound_sup_binary(), self.socket_of(seat), self.record(seat)) {
             if delivers(&rec) {
                 let dir = self.dir_of(seat)?;
-                let answer = deliver_through(&sup, &session, &dir, seat, text, DELIVER_WAIT);
+                let answer = deliver_through(&sup, &session, &dir, seat, text, deliver_wait());
                 return past_a_refusal(answer, || self.typed(seat), || {
                     let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
                     type_and_submit(&socket, text)
@@ -2571,6 +2592,24 @@ mod tests {
             Ok(Delivery::Acked)
         );
         assert_ne!(fs::read_to_string(&asked).unwrap(), first, "an answered id is spent: the next tell is new");
+    }
+
+    /// wsp-666: a process that capped its deliveries waits the cap on a supervisor
+    /// that never answers, not the 30 s, and the delivery is left pending.
+    #[test]
+    fn a_capped_process_leaves_a_delivery_pending_at_the_cap() {
+        let scratch = Scratch::new("deliver-cap");
+        let (seat, session) = (Seat::new("cpd-1"), scratch.root.join("s.sock"));
+        let (sup, _, _) = script_sup(&scratch, "sleep 20; echo \"delivered $3\"");
+        assert_eq!(deliver_wait(), DELIVER_WAIT, "uncapped, the patient wait");
+        cap_deliver_wait(Duration::from_millis(500));
+        let wait = deliver_wait();
+        DELIVER_CAP_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(wait, Duration::from_millis(500));
+        let t = Instant::now();
+        let r = deliver_through(&sup, &session, &scratch.root, &seat, "go", wait);
+        assert!(t.elapsed() < Duration::from_secs(5), "not the sup's own wait: {:?}", t.elapsed());
+        assert!(matches!(&r, Err(Refusal::Backend(w)) if w.contains(DELIVERY_PENDING)), "{r:?}");
     }
 
     /// wsp-477, the verifier's block 1: only a seat spawned for it is delivered
