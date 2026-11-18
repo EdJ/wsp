@@ -4905,6 +4905,31 @@ mod tests {
         crate::testkit::store(tag)
     }
 
+    /// A store whose git children run git itself, not whatever wraps it on
+    /// PATH. The fleet's shim (`~/.local/state/wsp/shims/git`) runs
+    /// `git -c commit.gpgsign=false`, and a `-c` beats every config file and
+    /// `GIT_CONFIG_*` a test sets, so a test about signing never sees its own
+    /// signing config. Git's exec-path holds the real binary (`git-core/git`):
+    /// put first on the children's PATH, it is what `git` resolves to there,
+    /// whatever sits in front of it in the process's own PATH. Asked once,
+    /// through whatever `git` is; without a `git` there, PATH is left alone.
+    fn real_git(store: Store) -> Store {
+        static PATH: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+        let path = PATH.get_or_init(|| {
+            let out = std::process::Command::new("git").arg("--exec-path").output().ok()?;
+            let dir = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            if !out.status.success() || !dir.join("git").is_file() {
+                return None;
+            }
+            let rest = std::env::var_os("PATH").unwrap_or_default();
+            std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&rest))).ok()
+        });
+        match path {
+            Some(p) => store.with_git_env("PATH", Some(p.as_os_str())),
+            None => store,
+        }
+    }
+
     /// A store whose git children see a machine with no git identity at all:
     /// an empty global config, no system config, no identity in the
     /// environment, and no identity guessed from the machine. Set on the
@@ -4918,7 +4943,7 @@ mod tests {
     /// assert is never written; a test that sets `GIT_CONFIG_KEY_0` itself
     /// replaces it.
     fn without_identity(store: Store, home: &std::path::Path, global: &std::path::Path) -> Store {
-        let mut store = store
+        let mut store = real_git(store)
             .with_git_env("HOME", Some(home.as_os_str()))
             .with_git_env("GIT_CONFIG_GLOBAL", Some(global.as_os_str()))
             .with_git_env("GIT_CONFIG_NOSYSTEM", Some(std::ffi::OsStr::new("1")))
@@ -4995,7 +5020,7 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(env.home().join("store")).unwrap();
-        let store = Store::at(env.home().join("store"), env.state())
+        let store = real_git(Store::at(env.home().join("store"), env.state()))
             .with_git_env("HOME", Some(env.state().as_os_str()))
             .with_git_env("GIT_CONFIG_GLOBAL", Some(global.as_os_str()))
             .with_git_env("GIT_CONFIG_NOSYSTEM", Some(std::ffi::OsStr::new("1")));
