@@ -4521,16 +4521,7 @@ fn wip_tasks(store: &Store) -> Vec<Task> {
     store.tasks_read_where(wip_reads_in_full)
 }
 
-/// [`wip_tasks`]'s predicate: whether `wip` reads this task's body. Shared with
-/// the mirror (`crate::mirror::rows`), which carries the file's text for
-/// exactly these.
-pub(crate) fn wip_reads_in_full(h: &wsp_store::model::TaskHead) -> bool {
-    h.status().is_open()
-        || h.has_section(crate::verification::SECTION)
-        || h.has_section(crate::legs::SECTION)
-        || h.has_section(crate::pieces::SECTION)
-        || h.tags.iter().any(|t| t == crate::verification::VERIFY_TAG || t == crate::cycle::BARRIER_TAG)
-}
+pub(crate) use crate::mirror::wip_reads_in_full;
 
 /// How long a seat must have been gone, with nothing held, before `wip` stops
 /// drawing it. A day: a machine read at the start of the morning still shows

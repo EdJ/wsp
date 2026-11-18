@@ -164,7 +164,7 @@ fn placements(lists: &[Worklist]) -> BTreeMap<String, GroupId> {
 ///
 /// **And the record itself, verbatim** (wsp-076), so [`task_of`] rebuilds the
 /// `Task` `wip` reads with the store's own parser: `body` is the task file's
-/// text for every task `texts` holds (those [`crate::cmd_agent::wip_reads_in_full`]
+/// text for every task `texts` holds (those [`wip_reads_in_full`]
 /// says `wip` opens), and `head` is the [`TaskHead`] as the store's index keeps
 /// it (`TaskHead::to_json`) for the rest, which `wip` reads bodiless.
 pub fn rows(
@@ -246,7 +246,7 @@ pub fn task_of(row: &c::Row) -> Option<Task> {
 pub fn texts_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, String> {
     tasks
         .iter()
-        .filter(|t| crate::cmd_agent::wip_reads_in_full(&TaskHead::of(t)))
+        .filter(|t| wip_reads_in_full(&TaskHead::of(t)))
         .filter_map(|t| Some((t.id.clone(), std::fs::read_to_string(store.task_path(&t.id)).ok()?)))
         .collect()
 }
@@ -790,6 +790,17 @@ pub fn start(store: &Store, db: SharedStore) -> (std::thread::JoinHandle<()>, Ar
     (handle, stop)
 }
 
+/// [`wip_tasks`]'s predicate: whether `wip` reads this task's body. Shared with
+/// the mirror (`crate::mirror::rows`), which carries the file's text for
+/// exactly these.
+pub(crate) fn wip_reads_in_full(h: &wsp_store::model::TaskHead) -> bool {
+    h.status().is_open()
+        || h.has_section(crate::verification::SECTION)
+        || h.has_section(crate::legs::SECTION)
+        || h.has_section(crate::pieces::SECTION)
+        || h.tags.iter().any(|t| t == crate::verification::VERIFY_TAG || t == crate::cycle::BARRIER_TAG)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,7 +957,7 @@ mod tests {
         t.body = "## Overview\n\nsome prose\n\n## Log\n\n- 2026-11-18 a line\n".into();
         s.save_task(&t).unwrap();
         let es = read_rows_etc(&s, "here");
-        let wip = s.tasks_read_where(crate::cmd_agent::wip_reads_in_full);
+        let wip = s.tasks_read_where(wip_reads_in_full);
         for id in ["wsp-1", "wsp-2", "wsp-3", "wsp-4", "wsp-5"] {
             let row = row_of(&es, id);
             let files = wip.iter().find(|t| t.id == id).unwrap();
