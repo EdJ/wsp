@@ -1642,16 +1642,29 @@ impl View {
     /// [`View::read`] with the machine's facts handed in ([`Given`]): the
     /// person's idle time is not read, so `auto` reads as in force.
     pub fn given(state: &Path, g: Given) -> View {
+        View::of_beat(state, g, None, &alive)
+    }
+
+    /// [`View::given`] with the person's idle time handed in as well (a beat's
+    /// `hid_idle_secs`, read under `auto` only, as [`View::read`] reads it),
+    /// and each build holder's liveness asked of `alive`: for `wip` through
+    /// the API, which reads the machine from the manager's beat and runs no
+    /// child (wsp-076).
+    pub fn of_beat(state: &Path, g: Given, idle_secs: Option<u64>, alive: &dyn Fn(u32) -> bool) -> View {
         let settings = Settings::load(state);
-        let in_force = in_force(settings.mode, None, settings.away_minutes);
+        let idle = match settings.mode {
+            Mode::Auto => idle_secs,
+            _ => None,
+        };
+        let in_force = in_force(settings.mode, idle, settings.away_minutes);
         View {
             settings,
-            idle: None,
+            idle,
             in_force,
             cores: g.cores.max(1),
             load: Some((g.load1, g.load1, g.load1)),
             thermal: g.speed_limit,
-            builds: builds(state, &alive),
+            builds: builds(state, alive),
             shims: shim_dir(state),
         }
     }

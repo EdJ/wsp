@@ -4323,11 +4323,12 @@ impl Wip {
     /// **It runs no child**: no `ps`, `lsof`, `df`, render, `git` or `wsp`.
     /// The moment readings are no part of the snapshot: the seats' rss and
     /// shells and the host's disks and load come from the managers' `seats`
-    /// replies, as under [`Wip::from_managers`]. The throttle's line is read
-    /// without the machine (no idle time, load or clock), a waiter's pid is
-    /// taken to stand, and the dead-daemon heading is the tick stamp's (the
-    /// daemon has just answered, so a stamp gone stale is the one thing left
-    /// to say).
+    /// replies, as under [`Wip::from_managers`]. The throttle's line reads the
+    /// person's idle time, the clock and the cores from the local manager's
+    /// beat; a build holder's pid and a waiter's are asked of kill(2) by
+    /// syscall ([`util::pid_runs`]); and the dead-daemon heading is the tick
+    /// stamp's (the daemon has just answered, so a stamp gone stale is the one
+    /// thing left to say).
     pub(crate) fn from_api(store: &Store, state: &wsp_store_contract::State) -> Wip {
         let tasks: Vec<Task> = state
             .rows
@@ -4370,7 +4371,7 @@ impl Wip {
             spawned,
             lists,
             messages,
-            alive: Box::new(|_| true),
+            alive: Box::new(util::pid_runs),
             agents,
             since,
         };
@@ -4382,7 +4383,9 @@ impl Wip {
         let rss: BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
         let counts: BTreeMap<String, u32> = reading.rows.iter().map(|(s, r)| (s.clone(), r.shells)).collect();
         let disks: Vec<crate::host_tcp::DiskFree> = reading.facts.values().flat_map(|f| f.disks.iter().cloned()).collect();
-        let load = reading.facts.get("").and_then(|f| load_of_facts(store, f));
+        let here = reading.facts.get("");
+        let load = here.and_then(|f| load_of_facts(store, f));
+        let throttle = throttle_of_facts(store, here);
         Wip::gathered(store, read, |agents, bindings| Probed {
             shells: crate::waiting::Shells::counted(
                 agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),
@@ -4392,7 +4395,7 @@ impl Wip {
             daemon: daemon_by_stamp(store.daemon_tick(), true, util::epoch_secs()),
             disk: crate::disk::loud_of(store, &disks),
             load,
-            throttle: Some(throttle_unprobed(store)),
+            throttle: Some(throttle),
         })
     }
 
@@ -4463,12 +4466,23 @@ impl Wip {
     }
 }
 
-/// [`crate::throttle::status_line`] without reading the machine, for
-/// [`Wip::from_api`]: no `ioreg` for the person's idle time (so `auto` reads
-/// as in force), no `sysctl` load, no `pmset` clock.
-fn throttle_unprobed(store: &Store) -> String {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    crate::throttle::View::given(&store.state, crate::throttle::Given { load1: 0.0, cores, speed_limit: None }).status_line()
+/// [`crate::throttle::status_line`] from the local manager's beat rather than
+/// `ioreg`, `pmset` and a `kill` per build holder, for [`Wip::from_api`]: the
+/// person's idle time (so `auto` is in force or away as on the files path),
+/// the clock and the cores as the beat read them, each holder's pid asked of
+/// kill(2). With no beat the idle time is unreadable, as where `ioreg` fails.
+///
+/// The beat says 100 where `pmset` records no `CPU_Speed_Limit`, which the
+/// files path reads as no clock at all (Apple silicon prints none): an
+/// unlimited clock draws no cell here, so the two lines agree where it does.
+fn throttle_of_facts(store: &Store, f: Option<&crate::host_tcp::Facts>) -> String {
+    let given = crate::throttle::Given {
+        load1: 0.0,
+        cores: f.map(|f| f.cpus as usize).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)),
+        speed_limit: f.and_then(|f| f.speed_limit_pct).filter(|&p| p < 100),
+    };
+    let idle = f.and_then(|f| f.hid_idle_secs);
+    crate::throttle::View::of_beat(&store.state, given, idle, &util::pid_runs).status_line()
 }
 
 /// [`crate::throttle::loud`] from a manager's host facts rather than `sysctl`
@@ -4480,7 +4494,7 @@ fn load_of_facts(store: &Store, f: &crate::host_tcp::Facts) -> Option<String> {
     let five = f.load5_centi.map(centi).unwrap_or(one);
     let fifteen = f.load15_centi.map(centi).unwrap_or(five);
     let given = crate::throttle::Given { load1: one, cores: f.cpus as usize, speed_limit: f.speed_limit_pct };
-    let mut view = crate::throttle::View::given(&store.state, given);
+    let mut view = crate::throttle::View::of_beat(&store.state, given, None, &util::pid_runs);
     view.load = Some((one, five, fifteen));
     view.warning(store.seat_cap())
 }

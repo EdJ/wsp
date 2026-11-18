@@ -16,10 +16,14 @@
 //! 4. `WSP_READ=files` never dials: `api.json` names a listener that counts
 //!    what it accepts, and it accepts nothing.
 //!
-//! The machine's own readings are pinned where the store lets them be: the
-//! throttle is `on`, so neither path reads the person's idle time. The seats'
-//! rss and shells and the host's disks come from the manager's `seats` reply on
-//! both paths.
+//! 1 and 2 run twice, with the throttle `on` and on its default `auto`, and a
+//! live build holder in a slot (what every shimmed cargo build leaves): the
+//! throttle line names the build on both paths, and under `auto` says in force
+//! or away by the person's idle time, read by `ioreg` on the files path and
+//! from the manager's beat under api. The idle seconds may move between the
+//! two reads, so their number alone is masked; the in-force/away word is
+//! compared. The seats' rss and shells and the host's disks come from the
+//! manager's `seats` reply on both paths.
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -251,7 +255,9 @@ fn masked(out: &Output) -> String {
             skipping = !line.starts_with("  }");
             continue;
         }
-        if line.starts_with("  \"load\": ") {
+        if line.starts_with("  \"throttle\": ") {
+            lines.push(idle_masked(line));
+        } else if line.starts_with("  \"load\": ") {
             lines.push("  \"load\": <masked>".to_string());
         } else if let Some(rest) = line.strip_prefix("  \"idle_memory\": ") {
             skipping = rest == "{";
@@ -261,6 +267,23 @@ fn masked(out: &Output) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// The throttle line with the person's idle seconds masked (`idle 3s`, `away
+/// 2h`): the files path reads them from `ioreg` at its call and the api path
+/// from the manager's last beat, so the number may move between the two; the
+/// in-force/away word around it is kept.
+fn idle_masked(line: &str) -> String {
+    let mut out = line.to_string();
+    for (open, close) in [("(idle ", ")"), ("away ", " (back")] {
+        if let Some(i) = out.find(open) {
+            let from = i + open.len();
+            if let Some(n) = out[from..].find(close) {
+                out.replace_range(from..from + n, "<n>");
+            }
+        }
+    }
+    out
 }
 
 /// Every child the call line counted, by name.
@@ -282,6 +305,34 @@ fn counting_listener() -> (String, Arc<AtomicUsize>) {
         }
     });
     (addr, n)
+}
+
+/// 1 and 2 under one throttle mode: the same bytes both ways once the mirror
+/// has caught up (the files are the truth, and the mirror follows them within
+/// a pass), no child under api on any try, and the throttle line, idle
+/// seconds masked, the same on both paths and naming the live build.
+fn same_both_ways(sb: &Sandbox, mode: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (api, files) = loop {
+        let (api, _, children) = sb.wip("api");
+        let (files, _, _) = sb.wip("files");
+        assert_eq!(ran(&children), Vec::<String>::new(), "wip under api with the throttle {mode} ran {children}");
+        assert!(api.stderr.is_empty(), "wip under api fell back: {}", String::from_utf8_lossy(&api.stderr));
+        if masked(&api) == masked(&files) || Instant::now() > deadline {
+            break (api, files);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(masked(&api), masked(&files), "wip --json with the throttle {mode}, under api (left) and files (right), the moment readings masked");
+    let line = |o: &Output| serde_json::from_slice::<Value>(&o.stdout).unwrap()["throttle"].as_str().unwrap_or_default().to_string();
+    let (a, f) = (line(&api), line(&files));
+    assert_eq!(idle_masked(&a), idle_masked(&f), "the throttle line with the throttle {mode}");
+    assert!(a.starts_with(&format!("throttle: {mode} — ")), "the throttle line under api: {a}");
+    assert!(a.contains(" · building: ") && a.contains("`cargo build`"), "the live build under api: {a}");
+    // Where ioreg reads the idle time for the files path, the beat carries it.
+    if mode == "auto" && !f.contains("unreadable") {
+        assert!(!a.contains("unreadable"), "the beat's idle time went unread under api: {a} (files: {f})");
+    }
 }
 
 #[test]
@@ -325,9 +376,12 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     // An open ask, from the seat below, which waits on it.
     store.save_message(&ask_message("m-1", "may I?", SEAT, &doing)).unwrap();
 
-    // The machine's readings that the store pins: the throttle is on, so
-    // neither path reads the person's idle time.
-    std::fs::write(sb.state.join("throttle.json"), r#"{"mode":"on"}"#).unwrap();
+    // A live build holder in a slot, as every shimmed cargo build leaves one:
+    // this test's own pid. No `since`, so its line does not tick between reads.
+    let builds = sb.state.join("builds");
+    std::fs::create_dir_all(&builds).unwrap();
+    let holder = serde_json::json!({ "pid": std::process::id(), "task": doing, "cmd": "cargo build", "tree": sb.dir.display().to_string() });
+    std::fs::write(builds.join("slot-0"), holder.to_string()).unwrap();
 
     // The loopback manager, on record in the sandbox's state.
     let sup = sb.dir.join("sup");
@@ -385,26 +439,18 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
             && v["claims"].get(&doing).is_some()
     });
 
-    // 1. The same bytes both ways, once the mirror has caught up: the files
-    // are the truth, and the mirror follows them within a pass.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let (api, files) = loop {
-        let (api, _, children) = sb.wip("api");
-        let (files, _, _) = sb.wip("files");
-        // 2. Under api the call ran no child, on every try.
-        assert_eq!(ran(&children), Vec::<String>::new(), "wip under api ran {children}");
-        assert!(api.stderr.is_empty(), "wip under api fell back: {}", String::from_utf8_lossy(&api.stderr));
-        if masked(&api) == masked(&files) || Instant::now() > deadline {
-            break (api, files);
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    };
-    assert_eq!(masked(&api), masked(&files), "wip --json under api (left) and files (right), the moment readings masked");
+    // 1 and 2, with the throttle on (neither path reads the idle time) and
+    // on its default auto (both do, from ioreg and from the beat).
+    for mode in ["on", "auto"] {
+        std::fs::write(sb.state.join("throttle.json"), serde_json::json!({ "mode": mode }).to_string()).unwrap();
+        same_both_ways(&sb, mode);
+    }
+    // The seat as wip draws it under api.
+    let (api, _, _) = sb.wip("api");
     let json: Value = serde_json::from_slice(&api.stdout).unwrap();
     // The idle seat's rss came live from the manager under api too.
     let panes = json["idle_memory"]["panes"].as_array().cloned().unwrap_or_default();
     assert!(panes.iter().any(|p| p["seat"] == SEAT && p["kb"].as_u64().is_some_and(|k| k > 0)), "the seat's rss under api: {json}");
-    let _ = files;
     assert!(json.to_string().contains(SEAT), "the manager's seat is in wip: {json}");
     let agent = json["agents"].as_array().and_then(|a| a.iter().find(|a| a["pane"] == SEAT)).cloned().unwrap_or_default();
     assert!(!agent["waiting"].is_null(), "the seat waits on its open ask: {agent}");
