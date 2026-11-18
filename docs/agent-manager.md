@@ -1091,7 +1091,8 @@ and that a job whose manager restarts mid-run is resent under its key and runs o
 Ed answered Q6 on 2026-11-18 (relayed by Jesper; the full set is on his wsp-652): **trees go straight to T2.**
 Trees live with the agents on each host, and a land is a fenced push to a trunk remote. **d1's Q6 ("T1 now",
 2026-11-17) is superseded by this answer**, for M3 groups 5-8 and for M4. The source is Ed's answers as relayed by
-Jesper and recorded on wsp-093's overview. Jesper confirmed it on 2026-11-18 (below). d1's other answers stand, Q14
+Jesper and recorded on wsp-093's overview. Jesper confirmed it on 2026-11-18 (below), provisionally, pending Ed's
+confirmation. d1's other answers stand, Q14
 included. Recording the project decision is his to do. Ed's other answers change nothing here. There
 is one manager per host over compound-sup, wsp dials the managers, and wsp keeps the throttle decision (Q11). The
 renderer answer needs no row either: the manager starts no renderer, it reads the render socket from compound-sup's
@@ -1162,9 +1163,11 @@ end, as d1 Q14 says for every step.
 | 7 | wsp-057 contract | **Kept, with a note.** The `place_of` seam stays. treecopy.rs is not deleted here (M4). |
 | 8 | wsp-058 measure | **Kept, with a note.** The measure is the Mac's alone, because the Mac's manager is the only one. |
 
-**Jesper's answers (2026-11-18, about 15:27Z, every one the recommended option).** He gave them in the m3-t2-plan
-pane, to a question put to him directly, and the governor relayed them. They replace the answers the governor seat
-gave earlier (ask m-dmyftmwv5200-pacf40), which were not the person's:
+**Jesper's answers (2026-11-18, about 15:27Z, every one the recommended option): provisional, pending Ed's
+confirmation.** He gave them in the m3-t2-plan pane, to a question put to him directly, and the governor relayed them.
+They replace the answers the governor seat gave earlier (ask m-dmyftmwv5200-pacf40), which were not the person's.
+Ed owns this architecture, so they stand only until he confirms or changes them. If he changes one, 6.2 and the
+affected rows among wsp-052..058 are amended to match:
 - **d1's Q6 is superseded.** T2 replaces "T1 now".
 - **The trunk remote** is a bare repository per project on the Mac, reached over ssh on the tailnet (1.3, "What T2
   costs", item 1). The Mac stays the trunk's host and the barrier's default host, and the person's checkout becomes
