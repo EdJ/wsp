@@ -250,6 +250,20 @@ fn seat_entity(store: &Store, db: &SharedStore, host: &str, seat: &str, state: S
     if let Some(Value::Object(b)) = store.bindings().get(seat) {
         scalars(b, &["task_id", "pane_id", "host", "epoch"], &mut fields);
     }
+    // The records whole, and the census row as the files path builds it
+    // (wsp-076). No event and no `seats` reply carries the label, cwd, agent
+    // or session: the census reads them off the seat's own record and
+    // `said.json` (`Compound::seated_as`), and so does this, by the same fn.
+    // The state word is the event's.
+    let census = match state {
+        SeatState::Working => crate::place::State::Working,
+        SeatState::Idle => crate::place::State::Idle,
+        SeatState::Gone | SeatState::Ending | SeatState::Lost => crate::place::State::Gone,
+        _ => crate::place::State::Starting,
+    };
+    let seated = Compound::at(store.state.join(crate::place_compound::SEATS)).seated_as(&Seat::new(seat), census);
+    let spawned = (!rec.is_empty()).then(|| Value::Object(rec.clone()));
+    crate::mirror::seat_records(&mut fields, store.bindings().get(seat), spawned.as_ref(), &seated);
     let started = rec.get("started").and_then(Value::as_object);
     let row = started
         .and_then(|s| s.get("row"))
@@ -316,6 +330,13 @@ fn mirror_of(store: &Store, db: &SharedStore, host: &str, msg: &Message) -> Opti
         }
         Message::SeatStopped(s) => {
             put_cmd(vec![Entity::Seat(seat_entity(store, db, host, &s.seat.0, SeatState::Gone))])
+        }
+        Message::Turn(t) => {
+            let state = match t.edge {
+                TurnEdge::Began => SeatState::Working,
+                TurnEdge::Ended => SeatState::Idle,
+            };
+            put_cmd(vec![Entity::Seat(seat_entity(store, db, host, &t.seat.0, state))])
         }
         Message::OrderDelivered(o) => put_cmd(vec![order_entity(db, host, &o.order.0, &o.seat.0, OrderState::Delivered)]),
         Message::OrderAcked(o) => put_cmd(vec![order_entity(db, host, &o.order.0, &o.seat.0, OrderState::Acknowledged)]),

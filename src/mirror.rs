@@ -31,7 +31,7 @@ use wsp_store_contract::IdempotencyKey;
 use wsp_server::mirror::subject_of;
 use wsp_store::caption;
 use wsp_store::message::{About, Message, Party, Shape, State};
-use wsp_store::model::{self, Machine as MachineFile, Status, Task, Worklist, WorklistStatus};
+use wsp_store::model::{self, Machine as MachineFile, Status, Task, TaskHead, Worklist, WorklistStatus};
 use wsp_store::store::{MachineLive, Store};
 use wsp_store_contract as c;
 use wsp_store_contract::{
@@ -161,7 +161,18 @@ fn placements(lists: &[Worklist]) -> BTreeMap<String, GroupId> {
 /// `status` (the file's word), `prio`, `tags`, `caption`, `parent`, `after`,
 /// `refs`, `created`, `updated`. The seat is the claim's; the group is the
 /// list's placement. `before_block` and `commit` are not in the files (None).
-pub fn rows(tasks: &[Task], claims: &BTreeMap<String, serde_json::Value>, lists: &[Worklist]) -> Vec<Entity> {
+///
+/// **And the record itself, verbatim** (wsp-076), so [`task_of`] rebuilds the
+/// `Task` `wip` reads with the store's own parser: `body` is the task file's
+/// text for every task `texts` holds (those [`crate::cmd_agent::wip_reads_in_full`]
+/// says `wip` opens), and `head` is the [`TaskHead`] as the store's index keeps
+/// it (`TaskHead::to_json`) for the rest, which `wip` reads bodiless.
+pub fn rows(
+    tasks: &[Task],
+    claims: &BTreeMap<String, serde_json::Value>,
+    lists: &[Worklist],
+    texts: &BTreeMap<String, String>,
+) -> Vec<Entity> {
     let place = placements(lists);
     tasks
         .iter()
@@ -177,6 +188,14 @@ pub fn rows(tasks: &[Task], claims: &BTreeMap<String, serde_json::Value>, lists:
             put(&mut f, "refs", &t.refs.join(","));
             put(&mut f, "created", &t.created);
             put(&mut f, "updated", &t.updated);
+            match texts.get(&t.id) {
+                Some(text) => {
+                    f.insert(BODY.into(), text.clone());
+                }
+                None => {
+                    f.insert(HEAD.into(), TaskHead::of(t).to_json().to_string());
+                }
+            }
             Entity::Row(c::Row {
                 id: RowId(t.id.clone()),
                 project: ProjectId(model::project_of(t).unwrap_or_default()),
@@ -189,6 +208,34 @@ pub fn rows(tasks: &[Task], claims: &BTreeMap<String, serde_json::Value>, lists:
                 fields: f,
             })
         })
+        .collect()
+}
+
+/// A row's `fields` key holding the task file's text.
+pub const BODY: &str = "body";
+/// A row's `fields` key holding the task's head, for a task `wip` reads bodiless.
+pub const HEAD: &str = "head";
+
+/// The `Task` a row was projected from, as `wip`'s own reading makes it: the
+/// store's task parser over `body` (what `Store::tasks_read_where` does for a
+/// task it reads in full), else `TaskHead::from_json(head).bodiless()` (what it
+/// does for the rest). `None` for a row with neither (one no mirror of this
+/// build wrote).
+pub fn task_of(row: &c::Row) -> Option<Task> {
+    if let Some(text) = row.fields.get(BODY) {
+        return Some(Task::from_doc(&wsp_base::fm::parse(text), &row.id.0));
+    }
+    let head: serde_json::Value = serde_json::from_str(row.fields.get(HEAD)?).ok()?;
+    TaskHead::from_json(&head).map(|h| h.bodiless())
+}
+
+/// The file text of every task `wip` reads in full, by id: the bodies
+/// [`rows`] carries.
+pub fn texts_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, String> {
+    tasks
+        .iter()
+        .filter(|t| crate::cmd_agent::wip_reads_in_full(&TaskHead::of(t)))
+        .filter_map(|t| Some((t.id.clone(), std::fs::read_to_string(store.task_path(&t.id)).ok()?)))
         .collect()
 }
 
@@ -301,6 +348,7 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
             put(&mut f, "at", &m.at);
             put(&mut f, "scope", m.about.scope().unwrap_or(""));
             put(&mut f, "reply_to", m.reply_to.as_deref().unwrap_or(""));
+            f.insert(RECORD.into(), m.to_json().to_string());
             let to = match (&m.for_seat, m.for_person) {
                 (Some(s), _) => Some(Principal::Seat(SeatId(s.clone()))),
                 (None, true) => Some(Principal::Person("person".into())),
@@ -325,13 +373,14 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
         for k in ["pane", "workspace", "at", "reason"] {
             put(&mut f, k, v.get(k).and_then(|x| x.as_str()).unwrap_or(""));
         }
+        f.insert(RECORD.into(), v.to_string());
         let text = ["text", "message", "reason"]
             .iter()
             .find_map(|k| v.get(k).and_then(|x| x.as_str()))
             .unwrap_or("")
             .to_string();
         Entity::Ask(c::Ask {
-            id: AskId(format!("flag:{task}")),
+            id: AskId(format!("{FLAG_PREFIX}{task}")),
             kind: AskKind::Flag,
             from: Principal::Seat(SeatId(
                 v.get("pane").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).unwrap_or(task).to_string(),
@@ -345,6 +394,30 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
         })
     }));
     out
+}
+
+/// An ask's `fields` key holding its record: a message as `messages.json`
+/// keeps it (`Message::to_json`), a flag as `flags.json` does.
+pub const RECORD: &str = "record";
+/// The id prefix of a legacy flag's ask.
+pub const FLAG_PREFIX: &str = "flag:";
+
+/// The message an ask was projected from, by the store's own reader
+/// (`Message::from_json`, as `Store::messages` reads it). `None` for a flag or
+/// an ask without a record.
+pub fn message_of(ask: &c::Ask) -> Option<Message> {
+    if ask.kind == AskKind::Flag {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(ask.fields.get(RECORD)?).ok()?;
+    Some(Message::from_json(&ask.id.0, &v))
+}
+
+/// The task and `flags.json` record a flag's ask was projected from, as
+/// `Store::flags` returns them.
+pub fn flag_of(ask: &c::Ask) -> Option<(String, serde_json::Value)> {
+    let task = ask.id.0.strip_prefix(FLAG_PREFIX).filter(|_| ask.kind == AskKind::Flag)?;
+    Some((task.to_string(), serde_json::from_str(ask.fields.get(RECORD)?).ok()?))
 }
 
 /// Machine records and their live facts → `Entity::Machine`. The transport is
@@ -387,12 +460,114 @@ pub fn machines(files: &[MachineFile], live: &BTreeMap<String, MachineLive>, loc
         .collect()
 }
 
+// ---------------------------------------------------------------- seats
+
+/// A seat's `fields` key holding its `bindings.json` record (JSON text).
+pub const BINDING: &str = "binding";
+/// A seat's `fields` key holding its `spawned.json` record (JSON text).
+pub const SPAWNED: &str = "spawned";
+/// A seat's `fields` keys for what builds a `place::Seated`: the label, the
+/// working directory, the agent (`{kind, name, args}` as JSON text), the
+/// census state word (`place::State::as_str`) and the session id.
+pub const LABEL: &str = "label";
+pub const CWD: &str = "cwd";
+pub const AGENT: &str = "agent";
+pub const CENSUS: &str = "census";
+pub const SESSION: &str = "session";
+
+fn set(m: &mut BTreeMap<String, String>, k: &str, v: &str) {
+    match v.trim().is_empty() {
+        true => {
+            m.remove(k);
+        }
+        false => {
+            m.insert(k.to_string(), v.to_string());
+        }
+    }
+}
+
+/// Writes a seat's records onto its `fields`, each replacing what was there
+/// and removed where there is none: the whole binding and spawned records,
+/// and `seated`'s label, cwd, agent, state word and session — the census row
+/// the files path builds (`Compound::seated_as`).
+pub fn seat_records(
+    fields: &mut BTreeMap<String, String>,
+    binding: Option<&serde_json::Value>,
+    spawned: Option<&serde_json::Value>,
+    seated: &crate::place::Seated,
+) {
+    set(fields, BINDING, &binding.map(|v| v.to_string()).unwrap_or_default());
+    set(fields, SPAWNED, &spawned.map(|v| v.to_string()).unwrap_or_default());
+    set(fields, LABEL, &seated.label);
+    set(fields, CWD, &seated.cwd);
+    let a = &seated.agent;
+    let agent = match a.kind.is_empty() && a.name.is_empty() && a.args.is_empty() {
+        true => String::new(),
+        false => serde_json::json!({ "kind": a.kind, "name": a.name, "args": a.args }).to_string(),
+    };
+    set(fields, AGENT, &agent);
+    set(fields, CENSUS, seated.state.as_str());
+    set(fields, SESSION, &seated.session);
+}
+
+fn json_field(seat: &c::Seat, k: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(seat.fields.get(k)?).ok()
+}
+
+/// The seat's `bindings.json` record, as [`seat_records`] carried it.
+pub fn binding_of(seat: &c::Seat) -> Option<serde_json::Value> {
+    json_field(seat, BINDING)
+}
+
+/// The seat's `spawned.json` record, as [`seat_records`] carried it.
+pub fn spawned_of(seat: &c::Seat) -> Option<serde_json::Value> {
+    json_field(seat, SPAWNED)
+}
+
+/// The census row a seat's `fields` carry, built as `Compound::seated` builds
+/// it from the seat's record (the agent's `key` is never read there either).
+/// A state word this build does not know is `Unknown`.
+pub fn seated_of(seat: &c::Seat) -> crate::place::Seated {
+    use crate::place::{Agent, Seat, Seated, State};
+    let f = |k: &str| seat.fields.get(k).cloned().unwrap_or_default();
+    let agent = json_field(seat, AGENT).unwrap_or_default();
+    let s = |k: &str| agent.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let state = match f(CENSUS).as_str() {
+        "empty" => State::Empty,
+        "starting" => State::Starting,
+        "idle" => State::Idle,
+        "working" => State::Working,
+        "blocked" => State::Blocked,
+        "gone" => State::Gone,
+        "unreachable" => State::Unreachable,
+        _ => State::Unknown,
+    };
+    Seated {
+        seat: Seat::new(seat.id.0.clone()),
+        label: f(LABEL),
+        cwd: f(CWD),
+        agent: Agent {
+            kind: s("kind"),
+            name: s("name"),
+            key: None,
+            args: agent
+                .get("args")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+        },
+        state,
+        session: f(SESSION),
+    }
+}
+
 /// Reads the fingerprint half: tasks, claims, worklists, machines.
 pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
     let tasks = store.tasks();
     let claims_file = store.claims();
     let worklists = store.worklists();
-    let mut out = rows(&tasks, &claims_file, &worklists);
+    let texts = texts_of(store, &tasks);
+    let mut out = rows(&tasks, &claims_file, &worklists, &texts);
     out.extend(claims(&claims_file));
     out.extend(lists(&worklists, &tasks));
     out.extend(machines(&store.machines(), &store.machines_live(), local));
@@ -719,5 +894,91 @@ mod tests {
         assert!(held.contains_key(&Subject::Machine(MachineName("far".into()))));
         let Command::Mirror { gone, .. } = diff_half(&held, read_rows_etc(&s, LOCAL), Half::RowsEtc) else { panic!() };
         assert!(gone.iter().all(|g| !matches!(g, Subject::Machine(_))), "{gone:?}");
+    }
+
+    fn row_of(es: &[Entity], id: &str) -> c::Row {
+        match key(es).remove(&Subject::Row(RowId(id.into()))) {
+            Some(Entity::Row(r)) => r,
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+
+    /// A row rebuilds the `Task` `wip` reads, for a task it opens (the file's
+    /// text through the store's parser) and for one it reads bodiless (the
+    /// index's head), and each is what `wip_tasks`'s reading of the files gives.
+    #[test]
+    fn a_task_round_trips_row_to_task_equal_to_the_files() {
+        let s = seed("mirror-task");
+        let mut t = s.task("wsp-2").unwrap();
+        t.body = "## Overview\n\nsome prose\n\n## Log\n\n- 2026-11-18 a line\n".into();
+        s.save_task(&t).unwrap();
+        let es = read_rows_etc(&s, "here");
+        let wip = s.tasks_read_where(crate::cmd_agent::wip_reads_in_full);
+        for id in ["wsp-1", "wsp-2", "wsp-3", "wsp-4", "wsp-5"] {
+            let row = row_of(&es, id);
+            let files = wip.iter().find(|t| t.id == id).unwrap();
+            let open = id != "wsp-5";
+            assert_eq!(row.fields.contains_key(BODY), open, "{id} body");
+            assert_eq!(row.fields.contains_key(HEAD), !open, "{id} head");
+            let back = task_of(&row).expect("a task");
+            assert_eq!(format!("{back:?}"), format!("{files:?}"), "{id}");
+        }
+        assert!(task_of(&row_of(&es, "wsp-2")).unwrap().body.contains("some prose"));
+        let text = std::fs::read_to_string(s.task_path("wsp-2")).unwrap();
+        assert_eq!(row_of(&es, "wsp-2").fields[BODY], text, "the file's text, verbatim");
+    }
+
+    /// An ask carries its message's record, and the store's reader rebuilds the
+    /// same message from it; a flag carries its `flags.json` record.
+    #[test]
+    fn a_message_and_a_flag_round_trip_through_record() {
+        let s = seed("mirror-record");
+        let a = key(&read_attention(&s));
+        let Entity::Ask(q) = &a[&Subject::Ask(AskId("m-1".into()))] else { panic!() };
+        let files = s.messages().remove("m-1").unwrap();
+        assert_eq!(message_of(q), Some(files));
+        let Entity::Ask(f) = &a[&Subject::Ask(AskId("flag:wsp-4".into()))] else { panic!() };
+        assert_eq!(message_of(f), None);
+        let want = s.flags().remove("wsp-4").unwrap();
+        assert_eq!(flag_of(f), Some(("wsp-4".to_string(), want)));
+    }
+
+    /// A seat carries its binding and spawned records whole, and the census row.
+    #[test]
+    fn a_seat_carries_binding_spawned_and_its_census_row() {
+        use crate::place::{Agent, Seat, Seated, State};
+        let binding = json!({ "task_id": "wsp-2", "pane_id": "p-1", "host": "here", "epoch": 3 });
+        let spawned = json!({ "kind": "claude", "started": { "row": "wsp-2", "attempt": 1, "pid": 42 } });
+        let seated = Seated {
+            seat: Seat::new("cpd-2"),
+            label: "cpd-2".into(),
+            cwd: "/tmp/tree".into(),
+            agent: Agent { kind: "claude".into(), name: "a-2".into(), key: None, args: vec!["--model".into(), "opus".into()] },
+            state: State::Working,
+            session: "sess-1".into(),
+        };
+        let mut seat = c::Seat {
+            id: SeatId("cpd-2".into()),
+            machine: MachineName("here".into()),
+            kind: "claude".into(),
+            model: None,
+            state: c::SeatState::Working,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: None,
+            fields: BTreeMap::from([("task_id".to_string(), "wsp-2".to_string())]),
+        };
+        seat_records(&mut seat.fields, Some(&binding), Some(&spawned), &seated);
+        assert_eq!(binding_of(&seat), Some(binding));
+        assert_eq!(spawned_of(&seat), Some(spawned));
+        assert_eq!(seat.fields["task_id"], "wsp-2", "what was there stands");
+        let back = seated_of(&seat);
+        assert_eq!(format!("{back:?}"), format!("{seated:?}"));
+        // A binding that ends goes from the fields.
+        seat_records(&mut seat.fields, None, None, &Seated { seat: Seat::new("cpd-2"), state: State::Gone, ..Default::default() });
+        assert_eq!((binding_of(&seat), spawned_of(&seat)), (None, None));
+        assert_eq!(seated_of(&seat).state, State::Gone);
+        assert!(!seat.fields.contains_key(LABEL) && !seat.fields.contains_key(AGENT));
     }
 }
