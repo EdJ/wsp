@@ -1705,6 +1705,21 @@ fn launcher(
 /// both there at one commit — or, when it is not there, built from `tree`.
 /// With no `src` (`--daemon`) the one already beside `dst` is used. A manager
 /// replaced under a job whose plist did not change is kicked to run it.
+/// The line `wsp install` prints once the manager's launcher is in place; `kind`
+/// is what the launcher is on this OS (`launchd::MANAGER_KIND`,
+/// `systemd::MANAGER_KIND`).
+fn manager_installed_line(p: &crate::util::Paint, path: &Path, wrote: bool, loaded: bool, restarted: bool, kind: &str) -> String {
+    format!(
+        "{} {} · {} — the manager is {kind} now, and it comes back on its own",
+        p.green("✓"),
+        util::contract(path),
+        match (wrote, loaded, restarted) {
+            (_, true, _) => "loaded, and it is running now",
+            _ => "already loaded",
+        },
+    )
+}
+
 fn manager_agent(
     store: &Store,
     src: Option<&Path>,
@@ -1754,16 +1769,7 @@ fn manager_agent(
 
     if !json_out {
         match &done {
-            Ok((d, restarted)) => println!(
-                "{} {} · {} — the manager is {} now, and it comes back on its own",
-                p.green("✓"),
-                util::contract(&d.path),
-                match (d.wrote, d.loaded, restarted) {
-                    (_, true, _) => "loaded, and it is running now",
-                    _ => "already loaded",
-                },
-                b::MANAGER_KIND
-            ),
+            Ok((d, restarted)) => println!("{}", manager_installed_line(p, &d.path, d.wrote, d.loaded, *restarted, b::MANAGER_KIND)),
             Err(why) => println!("{} the manager is not running — {why} (`wsp install --daemon` tries again)", p.red("✗")),
         }
     }
@@ -1959,6 +1965,21 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 
 #[cfg(test)]
 mod tests {
+    /// The Linux arm of `wsp install` says what the manager's launcher is: a
+    /// systemd user unit there, a launchd agent on macOS. Pure, so both are
+    /// read on either OS.
+    #[test]
+    fn the_install_line_names_the_launcher_of_the_os() {
+        let p = crate::util::Paint::new();
+        let path = std::path::Path::new("/nonexistent/wsp-manager.service");
+        let linux = manager_installed_line(&p, path, true, true, false, crate::systemd::MANAGER_KIND);
+        assert!(linux.contains("the manager is a systemd user unit now"), "{linux}");
+        assert!(linux.contains("loaded, and it is running now"), "{linux}");
+        let mac = manager_installed_line(&p, path, false, false, false, crate::launchd::MANAGER_KIND);
+        assert!(mac.contains("the manager is a launchd agent now"), "{mac}");
+        assert!(mac.contains("already loaded"), "{mac}");
+    }
+
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
 

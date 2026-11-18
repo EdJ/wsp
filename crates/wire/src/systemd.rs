@@ -546,6 +546,15 @@ pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, path_var: &str
     )
 }
 
+/// [`decide`] for the manager: a unit whose text did not change but whose binary
+/// was just replaced (`restarted`) is restarted to run it, unless sandboxed.
+pub fn manager_step(change: &Plan, active: bool, sandboxed: bool, restarted: bool) -> Step {
+    match decide(change, active, sandboxed) {
+        Step::Nothing if restarted && !sandboxed => Step::Restart,
+        step => step,
+    }
+}
+
 /// Write the manager's unit if it differs and make sure it is enabled and
 /// running: [`ensure`]'s steps for [`MANAGER_LABEL`]. `restarted` says the
 /// binary beside it was just replaced, so a running unit whose text did not
@@ -565,10 +574,7 @@ pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, path_var: &str, re
         check_version(v.as_deref().map_err(|e| e.as_str()))?;
     }
     let linger = linger();
-    let step = match decide(&change, active(MANAGER_LABEL), sandboxed) {
-        Step::Nothing if restarted && !sandboxed => Step::Restart,
-        step => step,
-    };
+    let step = manager_step(&change, active(MANAGER_LABEL), sandboxed, restarted);
     if step == Step::Nothing {
         return Ok(Done { path, wrote: false, loaded: false, linger });
     }
@@ -610,6 +616,16 @@ pub fn remove_manager() -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_manager_binary_restarts_a_unit_whose_text_did_not_change() {
+        use Plan::{Unchanged, Write};
+        assert_eq!(manager_step(&Unchanged, true, false, true), Step::Restart, "the new binary must run");
+        assert_eq!(manager_step(&Unchanged, true, false, false), Step::Nothing);
+        assert_eq!(manager_step(&Unchanged, true, true, true), Step::Nothing, "a sandbox does nothing");
+        assert_eq!(manager_step(&Write, true, false, false), Step::Restart);
+        assert_eq!(manager_step(&Unchanged, false, false, true), Step::Start, "a stopped unit starts, not restarts");
+    }
 
     #[test]
     fn the_managers_unit_names_what_2_4_asks() {
