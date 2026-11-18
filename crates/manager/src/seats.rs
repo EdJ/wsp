@@ -767,7 +767,10 @@ pub(crate) fn list(shared: &Shared, asker: Asker) {
     let mut seats = Vec::new();
     for l in looks {
         let answers = sup.as_deref().and_then(|s| vitals(s, &l.socket)).is_some();
-        let running = ps.iter().any(|r| r.0 == l.pid);
+        // A pid that runs is not the session's once its socket file is gone:
+        // after a restart the number is reused (wsp-094), and a seat read
+        // `starting` on it would stay so for good.
+        let running = ps.iter().any(|r| r.0 == l.pid) && (l.socket.as_os_str().is_empty() || l.socket.exists());
         if !answers && !running && !l.stopping && !ps.is_empty() {
             // Its session is gone and nothing said so: it ended.
             ended(shared, &l.seat, l.epoch, vec![], vec![]);

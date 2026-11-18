@@ -287,6 +287,39 @@ fn seat_entity(store: &Store, db: &SharedStore, host: &str, seat: &str, state: S
     }
 }
 
+/// The daemon's sweep of seats that are gone with nothing to say (wsp-094):
+/// each tick, the state core's seats that `wip` would not draw
+/// ([`crate::cmd_agent::mute_seats`]: gone and holding nothing, and either
+/// ended by a despawn, with no sentence and no agent on record, or gone past
+/// `GONE_FOR`) are mirrored gone, and their `spawned.json` and
+/// `seat-since.json` entries dropped. What a machine restart leaves — every
+/// seat that ran, ended by the fold and named for good — clears on the first
+/// tick; one that said something, a day after it was first seen gone.
+/// Returns the seats forgotten.
+pub fn sweep_mute(store: &Store, db: &SharedStore) -> Vec<String> {
+    let Ok((state, _)) = db.snapshot() else { return Vec::new() };
+    let seats: Vec<crate::place::Seated> = state.seats.values().map(crate::mirror::seated_of).collect();
+    let mute = crate::cmd_agent::mute_seats(store, &seats);
+    if mute.is_empty() {
+        return mute;
+    }
+    let gone: Vec<c::Subject> = mute.iter().map(|s| c::Subject::Seat(SeatId(s.clone()))).collect();
+    let key = format!("sweep:mute:{}:{}", util::epoch_secs(), mute.join(","));
+    let cmd = Command::Mirror { put: Vec::new(), gone };
+    if let Err(e) = db.apply(cmd, IdempotencyKey(key), Principal::Wsp("daemon".into())) {
+        wsp_store::store::log_line(store, &format!("sweep: {} gone seats not forgotten in the state core: {e:?}", mute.len()));
+        return Vec::new();
+    }
+    store.forget_seats(&mute);
+    let shown: Vec<&str> = mute.iter().take(8).map(String::as_str).collect();
+    let more = if mute.len() > shown.len() { format!(" and {} more", mute.len() - shown.len()) } else { String::new() };
+    wsp_store::store::log_line(
+        store,
+        &format!("sweep: forgot {} gone seat(s) with nothing to say: {}{more}", mute.len(), shown.join(" ")),
+    );
+    mute
+}
+
 fn put_cmd(put: Vec<Entity>) -> Command {
     Command::Mirror { put, gone: Vec::new() }
 }
@@ -371,6 +404,8 @@ fn apply(store: &Store, host: &str, msg: &Message) {
                 _ => serde_json::Map::new(),
             };
             rec.remove("refused");
+            // A new start of the id: a despawn's end was the last one's (wsp-094).
+            rec.remove("ended");
             // Without a row, the row and attempt the record already has stand.
             let prior = rec.get("started").filter(|_| row.is_none());
             let (row_was, attempt) = match prior {
@@ -1032,5 +1067,81 @@ mod mirror_tests {
         fold_into(&store, Some(&db), "h", &started);
         fold_into(&store, Some(&db), "h", &stopped);
         assert_eq!(db.head().unwrap(), head, "the same keys write nothing");
+    }
+
+    /// wsp-094: after a machine restart the manager journalled every seat
+    /// stopped and the fold put each gone; nothing ever forgot them. The tick's
+    /// sweep forgets a gone seat with nothing to say — in the state core and in
+    /// `spawned.json` and `seat-since.json` — keeps one that said something,
+    /// forgets a seat mirrored before the census word was carried, and a
+    /// second sweep finds nothing.
+    #[test]
+    fn the_sweep_forgets_seats_a_restart_left_gone_with_nothing_to_say() {
+        let env = util::isolated("fold-sweep-mute");
+        let store = Store::open();
+        let db = open(&env.state());
+        let mut id = 0;
+        for seat in ["cpd-r1", "cpd-r2"] {
+            let s = SeatId(seat.into());
+            id += 1;
+            let started = SeatStarted { key: Key { row: RowId(String::new()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 19479, sockets: vec![] };
+            assert!(fold_into(&store, Some(&db), "h", &frame(id, Message::SeatStarted(started))));
+            id += 1;
+            let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
+            assert!(fold_into(&store, Some(&db), "h", &frame(id, Message::SeatStopped(stopped))));
+        }
+        store.set_sentence("cpd-r2", "stopped at the barrier", None);
+        // As a build before the census word mirrored it: gone, and nothing else.
+        let old = c::Seat {
+            id: c::SeatId("cpd-r3".into()),
+            machine: MachineName("h".into()),
+            kind: "claude".into(),
+            model: None,
+            state: SeatState::Gone,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: Some(1),
+            fields: BTreeMap::from([("epoch".to_string(), "1".to_string())]),
+        };
+        db.apply(put_cmd(vec![Entity::Seat(old)]), IdempotencyKey("old".into()), Principal::Wsp("test".into())).unwrap();
+        assert!(store.spawned().contains_key("cpd-r1"), "the fold recorded the start");
+        assert!(read(&store.state.join("seat-since.json")).get("cpd-r1").is_some(), "and dated the gone");
+
+        let mut forgot = sweep_mute(&store, &db);
+        forgot.sort();
+        assert_eq!(forgot, ["cpd-r1", "cpd-r3"]);
+        let seats = db.snapshot().unwrap().0.seats;
+        assert!(!seats.contains_key(&c::SeatId("cpd-r1".into())) && !seats.contains_key(&c::SeatId("cpd-r3".into())), "{seats:?}");
+        assert!(seats.contains_key(&c::SeatId("cpd-r2".into())), "it said something");
+        assert!(!store.spawned().contains_key("cpd-r1"));
+        assert!(store.spawned().contains_key("cpd-r2"));
+        assert!(read(&store.state.join("seat-since.json")).get("cpd-r1").is_none());
+        assert!(sweep_mute(&store, &db).is_empty(), "nothing left to forget");
+
+        // A day after it was first seen gone, the one that said something goes too.
+        let day_ago = util::epoch_secs() - crate::cmd_agent::GONE_FOR - 60;
+        let mut since = read(&store.state.join("seat-since.json"));
+        since["cpd-r2"]["since"] = json!(util::iso_at(day_ago));
+        write(&store.state.join("seat-since.json"), &since);
+        assert_eq!(sweep_mute(&store, &db), ["cpd-r2"]);
+    }
+
+    /// A despawn of a gone seat that said something ends its record, and the
+    /// next sweep forgets it at once.
+    #[test]
+    fn the_sweep_forgets_a_despawned_seat_at_once() {
+        let env = util::isolated("fold-sweep-despawned");
+        let store = Store::open();
+        let db = open(&env.state());
+        let s = SeatId("cpd-d1".into());
+        let started = SeatStarted { key: Key { row: RowId(String::new()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 1, sockets: vec![] };
+        fold_into(&store, Some(&db), "h", &frame(1, Message::SeatStarted(started)));
+        let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
+        fold_into(&store, Some(&db), "h", &frame(2, Message::SeatStopped(stopped)));
+        store.set_sentence("cpd-d1", "stopped at the barrier", None);
+        assert!(sweep_mute(&store, &db).is_empty(), "it said something");
+        store.end_spawned("cpd-d1", util::epoch_secs());
+        assert_eq!(sweep_mute(&store, &db), ["cpd-d1"]);
     }
 }

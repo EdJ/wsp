@@ -594,3 +594,39 @@ fn a_manager_killed_mid_order_restarts_with_its_seat_and_answers_the_order_once(
     }
     assert!(!alive(s.pid));
 }
+
+/// wsp-094: a seat whose session socket is gone while a process still runs
+/// under its pid (after a restart the number is reused) is ended, not read
+/// `starting` for good: the `seats` reply leaves it out and `seat.stopped` is
+/// journalled. And after a manager restart, such a seat is not adopted.
+#[test]
+fn a_seat_whose_socket_is_gone_under_a_reused_pid_is_ended_not_starting() {
+    let (dir, sup) = place("reused");
+    let mut sweep = Sweep::new(&dir);
+    let port = free_port();
+    sweep.manager = Some(run_manager(&dir, &sup, port));
+    let (mut c, _) = reach(port, &dir);
+    c.subscribe(None);
+    let Message::SeatStarted(a) = c.ask(spawn_msg("wsp-94", 1, "cpd-ra", &dir)) else { panic!("started") };
+    let Message::SeatStarted(b) = c.ask(spawn_msg("wsp-94", 2, "cpd-rb", &dir)) else { panic!("started") };
+
+    // In the manager's life: the socket goes, the pid runs on.
+    fs::remove_file(&a.sockets[0]).unwrap();
+    assert!(alive(a.pid), "the pid still runs, as a reused one would");
+    let Message::SeatsList(list) = c.ask(Message::Seats(Seats {})) else { panic!("seats.list") };
+    let listed: Vec<&str> = list.seats.iter().map(|r| r.seat.0.as_str()).collect();
+    assert_eq!(listed, ["cpd-rb"], "a seat with no socket is not listed starting: {list:?}");
+    c.hear_until(WAIT, |ev| ev.iter().any(|f| matches!(&f.msg, Message::SeatStopped(s) if s.seat.0 == "cpd-ra")));
+    assert!(c.events.iter().any(|f| matches!(&f.msg, Message::SeatStopped(s) if s.seat.0 == "cpd-ra")), "seat.stopped journalled");
+
+    // Across a restart: the manager killed, the other seat's socket gone too.
+    let mut m = sweep.manager.take().unwrap();
+    m.kill().unwrap();
+    m.wait().unwrap();
+    fs::remove_file(&b.sockets[0]).unwrap();
+    sweep.manager = Some(run_manager(&dir, &sup, port));
+    let (mut back, hello) = reach(port, &dir);
+    assert!(hello.seats.is_empty(), "nothing adopted: {:?}", hello.seats);
+    let Message::SeatsList(list) = back.ask(Message::Seats(Seats {})) else { panic!("seats.list") };
+    assert!(list.seats.is_empty(), "the restarted manager lists neither: {list:?}");
+}

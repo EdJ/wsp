@@ -750,6 +750,14 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             }
         }
 
+        // Seats gone with nothing to say leave the state core and the files
+        // that name them, every tick (wsp-094): what a machine restart left
+        // clears on the first tick after it.
+        if let Some(api) = &_api {
+            wsp_base::calls::phase("sweep:mute-seats");
+            store.steady(|| crate::fold::sweep_mute(store, &api.db));
+        }
+
         // **The run's own steps, and the repairs, on the same timer** — `wsp-147`.
         //
         // On a timer for the reason the attention pass is: a member whose

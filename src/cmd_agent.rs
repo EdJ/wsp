@@ -4413,6 +4413,8 @@ impl Wip {
         let now = util::epoch_secs();
         let verifying = crate::verification::seats(&tasks);
         let checking = checking(&lists, &tasks);
+        let said = store.said();
+        let spawned_file = store.spawned();
         let agents = agents
             .into_iter()
             .filter(|(s, quiet)| {
@@ -4420,7 +4422,10 @@ impl Wip {
                     || governs_seat(&governors, s.seat.as_str())
                     || verifying.contains_key(s.seat.as_str())
                     || checking.contains_key(s.seat.as_str());
-                !forgotten(s.state, *quiet, now, held)
+                // A census that dates nothing (the API's, the manager's) is
+                // dated by when this machine first saw the seat in its state.
+                let quiet = quiet.or_else(|| since.get(s.seat.as_str()).map(|t| util::epoch_of(t)).filter(|t| *t > 0));
+                !forgotten(s.state, quiet, now, held) && !mute(s, held, said.get(s.seat.as_str()), ended_by_despawn(&spawned_file, s.seat.as_str()))
             })
             .map(|(s, _)| s)
             .collect::<Vec<_>>();
@@ -4434,7 +4439,7 @@ impl Wip {
             governors,
             agents,
             agents_held,
-            said: store.said(),
+            said,
             daemon,
             disk,
             load,
@@ -4555,6 +4560,74 @@ pub(crate) const GONE_FOR: i64 = 24 * 60 * 60;
 /// returns the moment a claim or a binding does.
 pub(crate) fn forgotten(state: State, quiet_since: Option<i64>, now: i64, held: bool) -> bool {
     state == State::Gone && !held && quiet_since.map(|at| now.saturating_sub(at) > GONE_FOR).unwrap_or(false)
+}
+
+/// Whether a census row is a gone seat with nothing to say (wsp-094): it
+/// holds nothing, and either a despawn ended it (`ended`, its `spawned.json`
+/// record's end) or it left no sentence in `said.json` and no agent is on
+/// record for it — the row would draw its id and the word `gone` and nothing
+/// else. Dropped from the reading at once, not after [`GONE_FOR`]: the day is
+/// kept so a morning still shows what an agent was doing when it stopped, and
+/// of this seat there is nothing to show. A machine restart leaves a fleet of
+/// these in the state core's mirror.
+pub(crate) fn mute(seat: &crate::place::Seated, held: bool, said: Option<&Value>, ended: bool) -> bool {
+    let sentence = said.and_then(|e| e.get("said")).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+    let blank = !sentence && seat.agent.kind.is_empty() && seat.agent.name.is_empty();
+    seat.state == State::Gone && !held && (ended || blank)
+}
+
+/// Whether `spawned` (the `spawned.json` file) says a despawn ended `seat`.
+fn ended_by_despawn(spawned: &BTreeMap<String, Value>, seat: &str) -> bool {
+    spawned.get(seat).and_then(|r| r.get("ended")).is_some()
+}
+
+/// The seats among `seats` that `wip` no longer draws, read against the
+/// store as `wip` reads it: [`mute`], and [`forgotten`] dated by when this
+/// machine first saw each gone (`seat-since.json`). What the daemon's sweep
+/// forgets (wsp-094).
+pub(crate) fn mute_seats(store: &Store, seats: &[crate::place::Seated]) -> Vec<String> {
+    if !seats.iter().any(|s| s.state == State::Gone) {
+        return Vec::new();
+    }
+    let now = util::epoch_secs();
+    let since: BTreeMap<String, i64> = std::fs::read_to_string(store.state.join("seat-since.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, e)| Some((k, util::epoch_of(e.get("since")?.as_str()?))))
+                .filter(|(_, t)| *t > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    // The cheap half first, as if nothing held them: the tasks are read only
+    // when some seat would be dropped but for what it holds.
+    let (said, spawned) = (store.said(), store.spawned());
+    let dropped = |s: &crate::place::Seated, held: bool| {
+        let seat = s.seat.as_str();
+        mute(s, held, said.get(seat), ended_by_despawn(&spawned, seat)) || forgotten(s.state, since.get(seat).copied(), now, held)
+    };
+    let maybe: Vec<&crate::place::Seated> = seats.iter().filter(|s| dropped(s, false)).collect();
+    if maybe.is_empty() {
+        return Vec::new();
+    }
+    let tasks = wip_tasks(store);
+    let (bindings, claims, agents_held, governors) = (store.bindings(), store.claims(), store.agents_held(), store.governors());
+    let lists = store.worklists();
+    let (verifying, checking) = (crate::verification::seats(&tasks), checking(&lists, &tasks));
+    maybe
+        .into_iter()
+        .filter(|s| {
+            let seat = s.seat.as_str();
+            let held = holding(&tasks, &bindings, &claims, &agents_held, seat).is_some()
+                || governs_seat(&governors, seat)
+                || verifying.contains_key(seat)
+                || checking.contains_key(seat);
+            dropped(s, held)
+        })
+        .map(|s| s.seat.as_str().to_string())
+        .collect()
 }
 
 /// The open task a seat still holds, by its binding or by a claim its agent
@@ -9534,6 +9607,51 @@ mod tests {
 
         store.save_task(&wip_task("t-001", "work", Some("wsp"), "done")).unwrap();
         assert!(Wip::live(&store).agents.is_empty(), "a binding to finished work holds nothing");
+    }
+
+    /// wsp-094: after a machine restart the state core holds every seat that
+    /// ran, ended by the fold with no census word. Through the API, `wip`
+    /// reads such a seat as gone (not unknown) and does not draw it once it
+    /// has nothing to say; a gone seat that said something, or whose agent is
+    /// on record, is still news, and one holding something (here a governor slot) is kept.
+    #[test]
+    fn wip_through_the_api_drops_a_seat_a_restart_ended_with_nothing_to_say() {
+        use wsp_store_contract as c;
+        let _env = util::isolated("wip-api-restart");
+        let store = Store::open();
+        let seat = |id: &str, fields: &[(&str, &str)]| c::Seat {
+            id: c::SeatId(id.into()),
+            machine: c::MachineName("here".into()),
+            kind: "claude".into(),
+            model: None,
+            state: c::SeatState::Gone,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: Some(19479),
+            fields: fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        };
+        let mut state = c::State::default();
+        for s in [
+            seat("cpd-1000", &[("epoch", "1")]),
+            seat("cpd-1001", &[("epoch", "1"), ("census", "gone")]),
+            seat("cpd-1002", &[("census", "gone")]),
+            seat("cpd-1003", &[("census", "gone"), ("agent", r#"{"kind":"claude","name":"t-1","args":[]}"#)]),
+            seat("cpd-1004", &[]),
+        ] {
+            state.seats.insert(s.id.clone(), s);
+        }
+        store.set_sentence("cpd-1002", "stopped on the barrier", None);
+        store.set_governor("wsp", json!({ "workspace": "cpd-1004", "pane": "cpd-1004", "host": util::hostname() }));
+
+        let w = Wip::from_api(&store, &state);
+        let drawn: BTreeMap<&str, State> = w.agents.iter().map(|s| (s.seat.as_str(), s.state)).collect();
+        assert!(!drawn.contains_key("cpd-1000"), "no census word, nothing to say: {drawn:?}");
+        assert!(!drawn.contains_key("cpd-1001"), "gone, nothing to say: {drawn:?}");
+        assert_eq!(drawn.get("cpd-1002"), Some(&State::Gone), "it said something: {drawn:?}");
+        assert_eq!(drawn.get("cpd-1003"), Some(&State::Gone), "its agent is on record: {drawn:?}");
+        assert_eq!(drawn.get("cpd-1004"), Some(&State::Gone), "it holds the governor's slot: {drawn:?}");
+        assert!(drawn.values().all(|s| *s != State::Unknown), "{drawn:?}");
     }
 
     #[test]

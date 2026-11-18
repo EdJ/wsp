@@ -5264,8 +5264,13 @@ fn end_work(
             ended_pids = pids;
             true
         }
-        // Already gone. The first half of the verb is done, however it happened.
-        Err(Refusal::NoSeat(_)) => false,
+        // Already gone. The first half of the verb is done, however it happened;
+        // its record says so, so `wip` stops drawing it and the daemon's sweep
+        // forgets it (wsp-094) — a seat a restart left had nothing else to end.
+        Err(Refusal::NoSeat(_)) => {
+            store.end_spawned(seat.as_str(), util::epoch_secs());
+            false
+        }
         Err(e) => {
             eprintln!("wsp: {seat} is still standing, so nothing was released: {e}");
             return 1;
@@ -9467,6 +9472,44 @@ mod tests {
 
         assert!(store.agents_held()["a-1"]["ended"].is_string(), "the record kept an agent that is gone");
         assert!(store.watches()["daemon"]["ledger"].as_object().unwrap().is_empty(), "the stall outlived the seat");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// wsp-094: `wsp despawn --pane <seat> --force` on a seat a machine
+    /// restart left (its manager runs no such seat) used to answer "already
+    /// gone" and change nothing, and `wip` went on drawing it. Its record now
+    /// says it ended, and `wip` through the API stops drawing it — even with
+    /// its agent on record, which alone keeps a gone seat drawn for a day.
+    #[test]
+    fn despawn_of_a_seat_a_restart_left_ends_its_record_and_wip_stops_drawing_it() {
+        use wsp_store_contract as c;
+        let _env = no_backend();
+        let store = seat("stop-restart");
+        let mut state = c::State::default();
+        let mut gone = c::Seat {
+            id: c::SeatId("cpd-1000".into()),
+            machine: c::MachineName("here".into()),
+            kind: "claude".into(),
+            model: None,
+            state: c::SeatState::Gone,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: Some(19479),
+            fields: Default::default(),
+        };
+        gone.fields.insert(crate::mirror::AGENT.into(), r#"{"kind":"claude","name":"t-1","args":[]}"#.into());
+        state.seats.insert(gone.id.clone(), gone);
+        let drawn = |store: &Store| crate::cmd_agent::Wip::from_api(store, &state).agents.iter().any(|s| s.seat.as_str() == "cpd-1000");
+        assert!(drawn(&store), "gone a moment ago with its agent on record is still drawn");
+
+        let place = Ends::refusing(Refusal::NoSeat(Seat::new("cpd-1000")));
+        let tidied = Tidied::default();
+        let args = Args::synth("despawn", &[], &[("pane", "cpd-1000"), ("force", "")]);
+        assert_eq!(end_work(&place, &store, &args, Caller::default(), &tidied.f()), 0);
+
+        assert!(store.spawned()["cpd-1000"]["ended"]["at"].is_i64(), "{:?}", store.spawned());
+        assert!(!drawn(&store), "despawned and holding nothing: not drawn");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 

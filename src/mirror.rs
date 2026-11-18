@@ -565,14 +565,22 @@ pub fn seated_of(seat: &c::Seat) -> crate::place::Seated {
     let f = |k: &str| seat.fields.get(k).cloned().unwrap_or_default();
     let agent = json_field(seat, AGENT).unwrap_or_default();
     let s = |k: &str| agent.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let state = match f(CENSUS).as_str() {
-        "empty" => State::Empty,
-        "starting" => State::Starting,
-        "idle" => State::Idle,
-        "working" => State::Working,
-        "blocked" => State::Blocked,
-        "gone" => State::Gone,
-        "unreachable" => State::Unreachable,
+    // The seat's own state first where it has ended: a `gone` the fold wrote
+    // stands over any word the census row carried before it. A seat with no
+    // census word (one mirrored before wsp-076 carried it) reads its own
+    // state, never Unknown (wsp-094).
+    let state = match (seat.state, f(CENSUS).as_str()) {
+        (c::SeatState::Gone | c::SeatState::Ending | c::SeatState::Lost, _) => State::Gone,
+        (_, "empty") => State::Empty,
+        (_, "starting") => State::Starting,
+        (_, "idle") => State::Idle,
+        (_, "working") => State::Working,
+        (_, "blocked") => State::Blocked,
+        (_, "gone") => State::Gone,
+        (_, "unreachable") => State::Unreachable,
+        (c::SeatState::Idle, "") => State::Idle,
+        (c::SeatState::Working, "") => State::Working,
+        (c::SeatState::Requested | c::SeatState::Spawning | c::SeatState::Started, "") => State::Starting,
         _ => State::Unknown,
     };
     Seated {
@@ -1024,5 +1032,31 @@ mod tests {
         assert_eq!((binding_of(&seat), spawned_of(&seat)), (None, None));
         assert_eq!(seated_of(&seat).state, State::Gone);
         assert!(!seat.fields.contains_key(LABEL) && !seat.fields.contains_key(AGENT));
+    }
+
+    /// wsp-094: a seat the fold ended before the census row was carried (no
+    /// `census` field, only its own state `gone`) reads gone, not unknown; and
+    /// its own `gone` stands over a census word left from before it ended.
+    #[test]
+    fn a_gone_seat_with_no_census_word_reads_gone_not_unknown() {
+        use crate::place::State;
+        let mut seat = c::Seat {
+            id: SeatId("cpd-1000".into()),
+            machine: MachineName("here".into()),
+            kind: "claude".into(),
+            model: None,
+            state: c::SeatState::Gone,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: Some(19479),
+            fields: BTreeMap::from([("epoch".to_string(), "1".to_string()), ("host".to_string(), "here".to_string())]),
+        };
+        assert_eq!(seated_of(&seat).state, State::Gone);
+        seat.fields.insert(CENSUS.into(), "idle".into());
+        assert_eq!(seated_of(&seat).state, State::Gone, "its own end stands over an older census word");
+        seat.fields.remove(CENSUS);
+        seat.state = c::SeatState::Working;
+        assert_eq!(seated_of(&seat).state, State::Working, "no word: its own state");
     }
 }

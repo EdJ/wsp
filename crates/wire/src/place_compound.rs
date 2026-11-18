@@ -688,6 +688,20 @@ impl Compound<'_> {
             if !running.contains(&(pid as u32)) {
                 return State::Gone;
             }
+            // A pid that runs is not the session's after a restart: the number
+            // is reused (wsp-094). The session is its socket, and one whose
+            // socket file is gone is gone, whatever runs under its old pid.
+            // Past the start window only, so a socket not bound yet is not read
+            // as a death.
+            let socket = str_of(rec, "socket");
+            let started = util::epoch_of(&str_of(rec, "started_at"));
+            if rec.get("agent").is_some()
+                && !socket.is_empty()
+                && util::epoch_secs().saturating_sub(started) > STARTING_WINDOW
+                && !Path::new(&socket).exists()
+            {
+                return State::Gone;
+            }
         }
         // No agent recorded: `compound-081`'s bare terminal — a pty with a
         // shell in it and nothing this backend watches for hooks.
@@ -741,6 +755,13 @@ impl Compound<'_> {
                 return self.detected_state(seat, rec).filter(|s| *s != State::Unknown).unwrap_or(State::Starting);
             }
             return State::Starting;
+        }
+        // A `SessionEnd` is the agent's last word, and any hook after it would
+        // have replaced it: it is not a moment's evidence that ages, and a
+        // screen read past it (a dead renderer after a restart) says nothing
+        // but Unknown (wsp-094).
+        if str_of(&said, "state") == "gone" && at >= started {
+            return State::Gone;
         }
         if at == 0 || util::epoch_secs().saturating_sub(at) > VOUCH_SECS {
             return self.detected_state(seat, rec).unwrap_or(State::Unknown);
@@ -2544,6 +2565,41 @@ mod tests {
         far.silent.set(false);
         assert_eq!(place.state(&seat).unwrap(), State::Gone, "back to the ordinary reading when the machine is heard");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// After a restart (wsp-094): the seat's compound-sup pid is another
+    /// process now (this test's own, which runs), its socket file is gone and
+    /// its last hook is long past. It reads gone, not unknown — by the socket,
+    /// and by a last `SessionEnd` where the socket is still on disk.
+    #[test]
+    fn a_seat_whose_pid_was_reused_and_socket_is_gone_reads_gone_after_a_restart() {
+        let scratch = Scratch::new("restart");
+        let place = scratch.place();
+        let seat = Seat::new("cpd-1000");
+        let dir = place.dir_of(&seat).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let long_ago = util::iso_at(util::epoch_secs() - 3 * 3600);
+        let rec = json!({
+            "pid": std::process::id(),
+            "socket": scratch.root.join("run").join("gone.sock").display().to_string(),
+            "started_at": long_ago,
+            "agent": { "kind": "claude", "name": "t-1", "args": [] },
+        });
+        write_atomic(&dir.join(SEAT_FILE), &rec.to_string()).unwrap();
+        assert_eq!(place.state(&seat).unwrap(), State::Gone, "a reused pid and no socket is a session gone");
+        let row = place.census().unwrap().seats().find(|r| r.seat == seat).cloned().expect("drawn");
+        assert_eq!(row.state, State::Gone, "the census says gone, not unknown");
+
+        // The socket file left behind, and the agent's last word a SessionEnd.
+        let sock = scratch.root.join("run").join("stale.sock");
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        fs::write(&sock, "").unwrap();
+        let mut rec = rec;
+        rec["socket"] = json!(sock.display().to_string());
+        write_atomic(&dir.join(SEAT_FILE), &rec.to_string()).unwrap();
+        let said = json!({ "state": "gone", "hook": "SessionEnd", "at": util::iso_at(util::epoch_secs() - 3600) });
+        write_atomic(&dir.join(SAID_FILE), &said.to_string()).unwrap();
+        assert_eq!(place.state(&seat).unwrap(), State::Gone, "its SessionEnd was its last word");
     }
 
     /// The first lease of a link cut: the forward refuses at once, the machine

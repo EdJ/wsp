@@ -3198,6 +3198,39 @@ impl Store {
         dropped
     }
 
+    /// Mark `seat`'s record ended at `at` (wsp-094): `wsp despawn` on a seat
+    /// that is already gone, so the reading stops drawing it and the daemon's
+    /// sweep forgets it. A seat with no record gets one holding only the end.
+    /// The next `seat.started` of the same id clears it.
+    pub fn end_spawned(&self, seat: &str, at: i64) {
+        self.update_json("spawned.json", |s| {
+            let rec = s.entry(seat.to_string()).or_insert_with(|| json!({}));
+            if !rec.is_object() {
+                *rec = json!({});
+            }
+            rec["ended"] = json!({ "at": at });
+        });
+    }
+
+    /// Forget every trace of `seats` that keeps them in a reading
+    /// (wsp-094): their `spawned.json` and `seat-since.json` entries. For
+    /// seats that are gone with nothing to say; `seat-memory.json` is a
+    /// report's record over thirty days and is not touched.
+    pub fn forget_seats(&self, seats: &[String]) -> usize {
+        if seats.is_empty() {
+            return 0;
+        }
+        let mut dropped = 0;
+        for file in ["spawned.json", "seat-since.json"] {
+            self.update_json(file, |m| {
+                let before = m.len();
+                m.retain(|k, _| !seats.contains(k));
+                dropped += before - m.len();
+            });
+        }
+        dropped
+    }
+
     // ---- since when a seat has been in its state -----------------------
     //
     // `wsp-250`. backend numbers a state change (`state_change_seq`) and does
