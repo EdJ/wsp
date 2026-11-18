@@ -84,6 +84,11 @@ pub(crate) struct Inputs {
     /// The stretches a person parked the row's whole list (`worklist-parked` to
     /// `worklist-resumed`), which no row's own log says.
     pub parks: Vec<Park>,
+    /// The stretches the row's list stood held (`worklist-held` to the
+    /// `worklist-go` or `worklist-resumed` that took it back), `(start, end,
+    /// why)`: inside a barrier's check seat, a person's step and not the seat's
+    /// work (`wsp-090`).
+    pub holds: Vec<(i64, i64, String)>,
 }
 
 /// One park of a list, from its park event to the resume that took it back.
@@ -110,16 +115,45 @@ impl Park {
 
 /// The parks of a list, read off the event log.
 pub(crate) fn list_parks(store: &Store, list: &str) -> Vec<Park> {
+    parks_of(&list_events(store, &["worklist-parked", "worklist-resumed"]), list, util::epoch_secs())
+}
+
+/// The events of the kinds named, off the event log, for any list.
+fn list_events(store: &Store, kinds: &[&str]) -> Vec<(i64, String, Value)> {
     let mut ev: Vec<(i64, String, Value)> = Vec::new();
     if let Ok(text) = std::fs::read_to_string(store.state_file("events.jsonl")) {
-        for line in text.lines().filter(|l| l.contains("\"worklist-parked\"") || l.contains("\"worklist-resumed\"")) {
+        for line in text.lines().filter(|l| kinds.iter().any(|k| l.contains(&format!("\"{k}\"")))) {
             let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
             if let (Some(ts), Some(kind)) = (v["ts"].as_str(), v["kind"].as_str()) {
                 ev.push((util::epoch_of(ts), kind.to_string(), v["data"].clone()));
             }
         }
     }
-    parks_of(&ev, list, util::epoch_secs())
+    ev
+}
+
+/// The holds of `list` in an event log's lines, in order, `(start, end, why)`:
+/// from a `worklist-held` to the first `worklist-go` or `worklist-resumed`
+/// after it; one with neither after it runs to `now`. A hold taken again while
+/// held is the same hold.
+pub(crate) fn holds_of(events: &[(i64, String, Value)], list: &str, now: i64) -> Vec<(i64, i64, String)> {
+    let mut at: Vec<&(i64, String, Value)> = events.iter().filter(|(_, k, d)| matches!(k.as_str(), "worklist-held" | "worklist-go" | "worklist-resumed") && d["id"].as_str() == Some(list)).collect();
+    at.sort_by_key(|e| e.0);
+    let mut out: Vec<(i64, i64, String)> = Vec::new();
+    let mut open: Option<(i64, String)> = None;
+    for (t, kind, d) in at {
+        if kind == "worklist-held" {
+            if open.is_none() {
+                open = Some((*t, d["why"].as_str().unwrap_or_default().trim().to_string()));
+            }
+        } else if let Some((s, why)) = open.take() {
+            out.push((s, *t, why));
+        }
+    }
+    if let Some((s, why)) = open {
+        out.push((s, now.max(s), why));
+    }
+    out
 }
 
 /// The parks of `list` in an event log's lines, in order. A park with no resume
@@ -861,7 +895,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                         if u > *e {
                             out.push(Phase::gap(format!("barrier {at} run ended → check seat started"), *e, u, wait_name(i, *e, u, &who)).shared());
                         }
-                        out.push(Phase::work(format!("barrier {at} check seat → settled (follow-ups added)"), u, d).shared());
+                        out.extend(check_seat(i, format!("barrier {at} check seat → settled (follow-ups added)"), u, d, &list, *at));
                     }
                 }
                 prev = *e;
@@ -873,7 +907,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                     out.push(Phase::gap(format!("barrier {at} run ended → check seat started"), end, b, wait_name(i, end, b, &who)).shared());
                 }
                 if let Some(p) = pass.filter(|p| *p >= b) {
-                    out.push(Phase::work(format!("barrier {at} check seat → passed"), b, p).shared());
+                    out.extend(check_seat(i, format!("barrier {at} check seat → passed"), b, p, &list, *at));
                 }
             } else if let Some(p) = pass.filter(|p| *p >= end) {
                 out.push(Phase::work(format!("barrier {at} run ended → passed"), end, p).shared());
@@ -889,6 +923,45 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     out.sort_by_key(|p| (p.start, p.end));
     out
 }
+
+/// A barrier's check seat from `from` to `to`, less the stretches its list
+/// stood held inside it (`wsp-090`): a check that holds the barrier for a
+/// person's step has done its work, and the night until a person's `go` is the
+/// group waiting on that step under its own cause, not the check seat's time
+/// (s0-state-core's barrier 3 booked 741 min as its check seat, 23 of them the
+/// seat's).
+fn check_seat(i: &Inputs, label: String, from: i64, to: i64, list: &str, at: usize) -> Vec<Phase> {
+    let hhmm = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
+    let mut out = Vec::new();
+    let mut cur = from;
+    for (a, b, why) in i.holds.iter().filter(|(a, b, _)| *b > from && *a < to) {
+        let (a, b) = ((*a).max(cur), (*b).min(to));
+        if b <= a {
+            continue;
+        }
+        if a > cur {
+            out.push(Phase::work(label.clone(), cur, a).shared());
+        }
+        let why: String = why.chars().take(200).collect();
+        let until = if b < to { format!("started again at {}", hhmm(b)) } else { "still held at the pass".to_string() };
+        let cause = format!(
+            "{}{HELD_FOR_STEP} — barrier {at} of {list} held at {}, {until}{}",
+            crate::wallbuckets::BARRIER_HOLD,
+            hhmm(a),
+            if why.is_empty() { String::new() } else { format!(": {why}") }
+        );
+        out.push(Phase::gap(format!("barrier {at} held → started again"), a, b, cause).shared());
+        cur = b;
+    }
+    if to > cur || out.is_empty() {
+        out.push(Phase::work(label, cur, to).shared());
+    }
+    out
+}
+
+/// What a barrier's hold is booked under, after [`crate::wallbuckets::BARRIER_HOLD`]:
+/// the list held inside its check seat, for a person's step (`wsp-090`).
+pub(crate) const HELD_FOR_STEP: &str = "held for a person's step";
 
 /// The row's own check runs that began with a review inside `from..to`: each
 /// review typed there, with the `task-checked` that ended its run before the
@@ -1146,7 +1219,9 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             .collect();
     }
     if let Some(l) = &list {
-        i.parks = list_parks(store, l);
+        let ev = list_events(store, &["worklist-parked", "worklist-resumed", "worklist-held", "worklist-go"]);
+        i.parks = parks_of(&ev, l, util::epoch_secs());
+        i.holds = holds_of(&ev, l, util::epoch_secs());
     }
     i.group = group;
     // The seats a cap line named as holders, and when they ended.
@@ -2516,6 +2591,54 @@ mod tests {
         assert_eq!(g.barrier_run, 223 + 10, "{g:?}");
         assert!(g.waits.iter().any(|((_, c), s)| c.starts_with(crate::wallbuckets::BARRIER_HOLD) && c.contains("m-abc") && *s >= 2500), "{g:?}");
         assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+    }
+
+    /// s0-state-core's barrier 3 (`wsp-090`): its check seat held the barrier
+    /// for a person's step at 21:10 on 11-17 and a person started it again at
+    /// 09:30 on 11-18; effort.json booked the night as the check seat, 741 min
+    /// of it, where the seat's own time was 23. Here the seat works 1260 s,
+    /// holds for 718 min, and passes 121 s after the `go`.
+    #[test]
+    fn a_barrier_held_for_a_persons_step_inside_its_check_seat_is_waiting_on_the_hold_not_the_check_seat() {
+        let mut i = row();
+        i.group = Some(("list".into(), 3, vec!["r-1".into()]));
+        let (seat, held, go) = (1010, 1010 + 1260, 1010 + 1260 + 718 * 60);
+        i.cycle.push((1000, "list group 3: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 60s".into()));
+        i.cycle.push((seat, "spawn list --agent --check 3 --kind claude".into()));
+        i.cycle.push((go + 121, "tell list: Barrier 3 of list passed".into()));
+        let evs = vec![
+            (held, "worklist-held".to_string(), json!({"id": "list", "why": "the migration needs a person to run it on the box"})),
+            (held + 5, "worklist-held".to_string(), json!({"id": "other", "why": "not this list"})),
+            (go, "worklist-go".to_string(), json!({"id": "list", "passed": null, "started": true})),
+        ];
+        i.holds = holds_of(&evs, "list", 99_999_999);
+        assert_eq!(i.holds, vec![(held, go, "the migration needs a person to run it on the box".to_string())]);
+        let ph = build(&i);
+        let hold = ph.iter().find(|p| p.label == "barrier 3 held → started again").unwrap_or_else(|| panic!("{ph:?}"));
+        assert!(hold.gap && hold.shared && (hold.start, hold.end) == (held, go), "{hold:?}");
+        let why = hold.waiting_for.as_deref().unwrap_or_default();
+        assert!(why.starts_with(crate::wallbuckets::BARRIER_HOLD) && why.contains(HELD_FOR_STEP) && why.contains("barrier 3 of list") && why.contains("the migration"), "{why}");
+        let seats: Vec<i64> = ph.iter().filter(|p| p.shared && !p.gap && p.label.contains("check seat")).map(|p| p.seconds()).collect();
+        assert_eq!(seats, vec![1260, 121], "the seat before the hold and after the go: {ph:?}");
+
+        let r1 = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), ..Default::default() };
+        let g = crate::wallbuckets::group_wall(&[r1], None, Some(go + 121)).unwrap();
+        assert_eq!(g.seconds("check_seat"), 10 + 1260 + 121, "the wait for the seat, its work, and the go to the pass: {g:?}");
+        let waited: i64 = g.waits.iter().filter(|((_, c), _)| c.contains(HELD_FOR_STEP) && c.contains("barrier 3 of list")).map(|(_, s)| s).sum();
+        assert_eq!(waited, 718 * 60, "the hold is its own waiting cause: {g:?}");
+        assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+    }
+
+    #[test]
+    fn a_hold_with_no_go_after_it_runs_to_now_and_a_second_hold_while_held_is_the_same() {
+        let evs = vec![
+            (10, "worklist-held".to_string(), json!({"id": "l", "why": "a"})),
+            (20, "worklist-held".to_string(), json!({"id": "l", "why": "b"})),
+            (30, "worklist-resumed".to_string(), json!({"id": "l"})),
+            (40, "worklist-go".to_string(), json!({"id": "l"})),
+            (50, "worklist-held".to_string(), json!({"id": "l", "why": "c"})),
+        ];
+        assert_eq!(holds_of(&evs, "l", 90), vec![(10, 30, "a".to_string()), (50, 90, "c".to_string())]);
     }
 
     #[test]
