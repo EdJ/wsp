@@ -686,7 +686,7 @@ installs the trunk and web-chrome's app, and a day passes on both before the mea
   smallest change that takes polling to 0 is to ring the same gate from `subscribe`. The census's reads, parsers and host-core
   stay as they are (d3: Ed expects no compound change; host-core is shared with the gpui window).
 - **wsp has no project `compound`** (`wsp project show compound`: no project matching). wsp-078 is filed under `wsp`
-  until the person makes one. Its tree is /Users/jesper/src/private/compound-react.
+  until the person makes one. Its tree is the machine's compound-react checkout.
 - **The contract cannot write a projection.** Its 19 commands are 4.2's verbs, each with section 3's guards, so step 1's
   mirror needs one contract change (wsp-070, R5) rather than a backdoor in the SQLite crate. A write path outside the
   contract would make the server depend on `wsp-store-sqlite`, which section 6 forbids.
@@ -705,7 +705,7 @@ installs the trunk and web-chrome's app, and a day passes on both before the mea
 - (4) Output compatibility (Q5) and the CLI's fallback (Q4). Recommended: `wip --json` byte-compatible through step 1,
   proven by a test, with the files as the fallback while they are the truth. The read-only database fallback of 4.6 (c)
   waits for step 4.
-- (5) A wsp project for compound-react (`wsp project add`, root /Users/jesper/src/private/compound-react), and
+- (5) A wsp project for compound-react (`wsp project add`, rooted at the compound-react checkout), and
   `wsp mv wsp-078` into it. Needed by the stop after group 6.
 - (6) Whether web-chrome later folds `State` itself (4.4's `store` half) rather than re-reading on each event.
   Recommended: not in step 1. Re-reading on events already takes polling to 0. Folding means new parsers in compound for
