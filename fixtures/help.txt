@@ -766,7 +766,15 @@ PLUMBING
                                     …what a thermally limited machine (the
                                     `pmset -g therm` CPU_Speed_Limit under
                                     PERCENT) is held to, in every mode
-  wsp doctor                        integrity check
+  wsp doctor [--fix | --fix-identity]
+                                    integrity check. --fix-identity only repairs a
+                                    store git that cannot commit: sets the
+                                    missing repo-local user.name/user.email and,
+                                    only if signing is what fails,
+                                    commit.gpgsign=false (repo-local, never the
+                                    global config). --fix does that too, and
+                                    folds stray sections back in task bodies and
+                                    clears stale gc state in the repos
   wsp say "…" | - | --from FILE     say where you have got to, on your pane;
                                     `--clear` takes the label off again. Prose
                                     through a stream, the spelling every other

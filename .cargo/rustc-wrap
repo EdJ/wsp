@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # The rustc wrapper `.cargo/config.toml` names: sccache when this machine has it, the bare compiler
 # when it does not. cargo calls it as `rustc-wrap <rustc> <args...>`. Copied from compound's
 # `.cargo/rustc-wrap` (compound-965) without its target seed and its vendored-crate step; what each
@@ -26,7 +26,7 @@ for a in "$@"; do
     prev="$a"
 done
 
-if [ -n "$pm" ] && [ -n "$crate" ]; then
+if [ -n "$pm" ] && [ -n "$crate" ] && [ "$(uname -s)" = Darwin ]; then
     set -- "$@" -C "link-arg=-Wl,-install_name,@rpath/lib${crate}${extra}.dylib" -C link-arg=-Wl,-S
 fi
 # A registry crate that reads env!("OUT_DIR") has the tree's path in sccache's key (the

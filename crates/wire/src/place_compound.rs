@@ -321,16 +321,14 @@ fn find_sup(
     local.into_iter().chain(exe_dir.map(|d| d.join("compound-sup"))).find(|p| p.is_file())
 }
 
-/// Where `compound-render` lives: `$COMPOUND_RENDER`, `PATH`, or beside
-/// whichever `compound-sup` this process is already using.
+/// Where the renderer lives: `$COMPOUND_RENDER`, else beside whichever
+/// `compound-sup` this process is already using, else `PATH`.
 ///
-/// The third door matters more than it looks (`compound-136`): the two
-/// binaries are always built together into one `cargo build --target-dir`
-/// (`compound-sup`'s own `renderer_binary_path` takes the identical
-/// shortcut, one process over — they land beside each other by construction,
-/// not by convention this file invented), so an operator or a test that has
-/// only ever had to point wsp at `$COMPOUND_SUP` keeps working without
-/// learning a second variable.
+/// Beside the supervisor comes first (`compound-136`): the two binaries are
+/// built together into one `cargo build --target-dir` (`compound-sup`'s own
+/// `renderer_binary_path` takes the identical shortcut, one process over), so
+/// the renderer next to the supervisor is the one that speaks its wire. A
+/// stray one earlier on `PATH` is the fallback, not the answer.
 fn compound_render_binary() -> Option<PathBuf> {
     // A test's stand-in, per thread so no other test meets it.
     #[cfg(test)]
@@ -341,12 +339,22 @@ fn compound_render_binary() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
-    if let Some(path) = std::env::var_os("PATH") {
-        if let Some(p) = std::env::split_paths(&path).map(|d| d.join("compound-render")).find(|p| p.is_file()) {
-            return Some(p);
-        }
-    }
-    compound_sup_binary()?.parent().map(|d| d.join("compound-render")).filter(|p| p.is_file())
+    find_render(std::env::var_os("PATH"), compound_sup_binary().and_then(|s| s.parent().map(PathBuf::from)))
+}
+
+/// What the renderer binary is called, first guess first. The supervisor
+/// starts `compound-render` on macOS and `compound-reader` on Linux, where
+/// compound split its renderer from its reader and kept only the latter name;
+/// both answer the same `screen` and `state` verbs. Without the second name a
+/// Linux machine reads every seat's screen as "cannot read", and a seat whose
+/// hooks have aged past [`VOUCH_SECS`] reads `unknown`.
+pub const RENDER_NAMES: [&str; 2] =
+    if cfg!(target_os = "macos") { ["compound-render", "compound-reader"] } else { ["compound-reader", "compound-render"] };
+
+fn find_render(path: Option<std::ffi::OsString>, beside_sup: Option<PathBuf>) -> Option<PathBuf> {
+    let beside = beside_sup.into_iter();
+    let dirs: Vec<PathBuf> = beside.chain(path.iter().flat_map(std::env::split_paths)).collect();
+    dirs.iter().find_map(|d| RENDER_NAMES.iter().map(|name| d.join(name)).find(|p| p.is_file()))
 }
 
 /// How long after a start [`Compound::at_trust_prompt`] looks: the prompt is the
@@ -586,6 +594,32 @@ impl Compound<'_> {
         }
     }
 
+    /// A sign of life from a tool hook (`PreToolUse`/`PostToolUse`): a seat
+    /// whose record says `working` has it re-dated, so a turn that runs tools
+    /// for longer than [`VOUCH_SECS`] does not age into the screen fallback.
+    /// Any other record is left alone: a tool hook that arrives after `Stop`
+    /// must not make an idle seat read working, and a nested session's is not
+    /// the seat's (`wsp-364`).
+    pub fn touched(&self, seat: &Seat, payload: &Value) {
+        let Ok(dir) = self.dir_of(seat) else { return };
+        let mut was = read_json(&dir.join(SAID_FILE));
+        if str_of(&was, "state") != "working" || crate::place_super::a_childs(&was, payload) {
+            return;
+        }
+        let (was_at, was_hook) = (str_of(&was, "at"), str_of(&was, "hook"));
+        was["at"] = json!(util::now_iso());
+        // `heard` writes this file whole and does not lock. Look again just
+        // before the rename and give up if a hook said something in between:
+        // a `Stop` that landed in that gap must not be overwritten with a
+        // working record. What is left is a window of microseconds, and its
+        // worst case is one late refresh.
+        let now = read_json(&dir.join(SAID_FILE));
+        if str_of(&now, "at") != was_at || str_of(&now, "hook") != was_hook {
+            return;
+        }
+        let _ = write_atomic(&dir.join(SAID_FILE), &was.to_string());
+    }
+
     /// Append one line to [`HOOKS_FILE`]. Best-effort, like everything else a
     /// hook touches — a write that fails here must not be the write that
     /// fails the hook, and a reader missing one line is a smaller loss than a
@@ -684,7 +718,10 @@ impl Compound<'_> {
         let started = util::epoch_of(&str_of(rec, "started_at"));
         let kind = rec.get("agent").map(|a| str_of(a, "kind")).unwrap_or_default();
         // Claude-only: the start window is a fact about Claude Code's hooks; a
-        // data kind has none and must not be taken for it.
+        // data kind has none and must not be taken for it. pi is left to its
+        // screen: its extension may not be installed, and a seat held Starting
+        // for want of a hook that never comes is worse than one read off the
+        // screen a little early.
         if kind == "claude" && started > 0 && at < started && util::epoch_secs() - started < STARTING_WINDOW {
             // A far seat's hooks fire on the far machine and never write this
             // seat's `said.json`, so the window would hold it `Starting` for its
@@ -826,7 +863,7 @@ impl Compound<'_> {
     pub fn read_screen(&self, seat: &Seat) -> Result<String> {
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
         let render = compound_render_binary().ok_or_else(|| {
-            Refusal::Backend("compound-render not found — set $COMPOUND_RENDER or put it on PATH".into())
+            Refusal::Backend("no renderer (compound-render or compound-reader) found beside compound-sup or on PATH — set $COMPOUND_RENDER".into())
         })?;
         let out = Command::new(&render)
             .args(["screen"])
@@ -1143,12 +1180,31 @@ fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut
         }
     }
 
-    match ask_wire_version(&sup) {
-        Some(v) if v != WIRE_VERSION => problems.push(format!(
-            "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup speaks {v} — bump WIRE_VERSION in \
-             src/place_compound.rs to match crates/supervisor/src/proto.rs (compound-026)"
+    // A current build answers the range it accepts (`OLDEST VERSION`), and
+    // a WIRE_VERSION inside it is answered, not refused: wsp sends no
+    // fallback, so staying at an older accepted version is what keeps it
+    // speaking to an older compound-sup too. Only a constant outside the
+    // range is the refusal compound-026 was filed for.
+    match ask_wire_range(&sup) {
+        Some(Ok((lo, hi))) if !(lo..=hi).contains(&WIRE_VERSION) => {
+            let range = if lo == hi { hi.to_string() } else { format!("{lo}..={hi}") };
+            problems.push(if WIRE_VERSION > hi {
+                format!(
+                    "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup accepts {range} — compound-sup is \
+                     behind: rebuild and reinstall it from a compound commit that speaks {WIRE_VERSION} (compound-026)"
+                )
+            } else {
+                format!(
+                    "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup accepts {range} — bump WIRE_VERSION in \
+                     src/place_compound.rs to match crates/supervisor/src/proto.rs (compound-026)"
+                )
+            })
+        }
+        Some(Ok(_)) => {}
+        Some(Err(said)) => problems.push(format!(
+            "{} answered `wire-version` with {said:?}, which is not a version range — wsp cannot check its WIRE_VERSION ({WIRE_VERSION}) against it (compound-026)",
+            util::contract(&sup),
         )),
-        Some(_) => {}
         None => notes.push(format!(
             "{} does not answer `wire-version` — wsp cannot check its WIRE_VERSION ({WIRE_VERSION}) against it (compound-026)",
             util::contract(&sup),
@@ -1156,14 +1212,18 @@ fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut
     }
 }
 
-/// `compound-sup wire-version` → its VERSION, or `None` if the installed
-/// binary predates that verb (an older build, not a broken one) or will not
-/// answer at all. A current build prints the accepted range `OLDEST VERSION`;
-/// VERSION is the last token. An older build prints a bare number, which is
-/// the same token.
-fn ask_wire_version(bin: &std::path::Path) -> Option<u32> {
+/// `compound-sup wire-version` → the range it accepts (`Ok`), what it said
+/// if that is not a range (`Err`), or `None` if the installed binary predates
+/// that verb (an older build, not a broken one) or will not answer at all. A
+/// current build prints `OLDEST VERSION`; an older one a bare number, which
+/// accepts only that. Parsed by `far::parse_wire`, the rule far machines get.
+fn ask_wire_range(bin: &std::path::Path) -> Option<std::result::Result<(u32, u32), String>> {
     let out = Command::new(bin).arg("wire-version").stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).split_whitespace().last()?.parse().ok()).flatten()
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(crate::far::parse_wire(&text).ok_or(text))
 }
 
 fn dial(socket: &PathBuf, timeout: Duration) -> Result<UnixStream> {
@@ -1802,7 +1862,7 @@ fn close_pane_soon(sup: u32) {
     if sup == std::process::id() {
         return;
     }
-    let script = format!("sleep {CLOSE_AFTER_SECS}; kill -TERM -- -{sup}; sleep 2; kill -KILL -- -{sup}");
+    let script = format!("sleep {CLOSE_AFTER_SECS}; kill -s TERM -- -{sup}; sleep 2; kill -s KILL -- -{sup}");
     let _ = Command::new("sh")
         .args(["-c", &script])
         .process_group(0)
@@ -3318,6 +3378,77 @@ mod tests {
         assert_ne!(place.state(&seat).unwrap(), State::Starting, "opencode fires no hooks to wait for");
     }
 
+    /// The renderer is found under either of its names, the old one first.
+    #[test]
+    fn the_renderer_is_found_as_compound_render_or_compound_reader() {
+        let tmp = std::env::temp_dir().join(format!("wsp-render-names-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let (path_dir, sup_dir) = (tmp.join("path"), tmp.join("sup"));
+        fs::create_dir_all(&path_dir).unwrap();
+        fs::create_dir_all(&sup_dir).unwrap();
+        let path = Some(std::env::join_paths([&path_dir]).unwrap());
+        let [first, second] = RENDER_NAMES;
+        assert_eq!(find_render(path.clone(), None), None);
+        fs::write(path_dir.join(second), "").unwrap();
+        assert_eq!(find_render(path.clone(), None), Some(path_dir.join(second)), "either name is found");
+        fs::write(path_dir.join(first), "").unwrap();
+        assert_eq!(find_render(path.clone(), None), Some(path_dir.join(first)), "this OS's name wins");
+        fs::write(sup_dir.join(second), "").unwrap();
+        assert_eq!(
+            find_render(path, Some(sup_dir.clone())),
+            Some(sup_dir.join(second)),
+            "beside the supervisor beats PATH, whatever the name"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// **A tool hook keeps a working seat fresh and nothing else** (the pi
+    /// extension's tool events, Claude's `PostToolUse`). A seat whose last word
+    /// is two minutes old reads off the screen; a tool that ran a second ago
+    /// makes it a second old again. An idle record is not made working by a
+    /// straggler, and a nested session's tool is not the seat's.
+    #[test]
+    fn a_tool_hook_refreshes_a_working_record_and_only_a_working_one() {
+        let scratch = Scratch::new("touched");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
+        let now = util::epoch_secs();
+        let _ = write_atomic(
+            &dir.join(SEAT_FILE),
+            &json!({
+                "pid": std::process::id(),
+                "started_at": util::iso_at(now - 1000),
+                "agent": { "kind": "pi", "name": "a", "args": [] },
+            })
+            .to_string(),
+        );
+        let said = |state: &str, age: i64| {
+            let _ = write_atomic(
+                &dir.join(SAID_FILE),
+                &json!({ "state": state, "hook": "UserPromptSubmit", "at": util::iso_at(now - age), "session_id": "s1" })
+                    .to_string(),
+            );
+        };
+        // Working, but the word is older than VOUCH_SECS: refreshed.
+        said("working", VOUCH_SECS + 60);
+        place.touched(&seat, &json!({ "session_id": "s1" }));
+        assert_eq!(place.state(&seat).unwrap(), State::Working, "a tool ran: the record is fresh");
+
+        // Idle stays idle (and stale stays stale).
+        said("idle", VOUCH_SECS + 60);
+        place.touched(&seat, &json!({ "session_id": "s1" }));
+        let at = util::epoch_of(&str_of(&place.said(&seat), "at"));
+        assert!(now - at > VOUCH_SECS, "an idle record is not re-dated");
+
+        // Another session's tool is not the seat's.
+        said("working", VOUCH_SECS + 60);
+        place.touched(&seat, &json!({ "session_id": "other" }));
+        let at = util::epoch_of(&str_of(&place.said(&seat), "at"));
+        assert!(now - at > VOUCH_SECS, "a nested session's tool is not the seat's");
+    }
+
     thread_local! {
         /// A stand-in `compound-render` for this thread's calls to
         /// [`compound_render_binary`].
@@ -3674,19 +3805,27 @@ mod tests {
 
     /// What `state()` says for a pi seat, pinned against screens captured from
     /// pi 1.3.0 (the same ones `compound#1`'s `pi_captured_screens_are_detected_as_the_manifest_does`
-    /// pins). **A working or blocked pi reads `Idle` here**: the vendored
-    /// `pi.toml` only has a `Working...` literal, so pi's spinner line and its
-    /// select prompt match nothing. That is a gap in herdr's manifest, not in
-    /// this backend; when a manifest sync closes it this test fails and the
-    /// row moves.
+    /// pins). With the renderer's updated pi rules a spinner line reads
+    /// `Working` and a select prompt `Blocked`. A renderer from before them
+    /// reads both `Idle`, so the answer depends on which binary is used: the
+    /// test is therefore opt-in and runs only when `COMPOUND_RENDER` names a
+    /// renderer explicitly (a build known to carry the pi rules), e.g.
+    /// `COMPOUND_RENDER=/path/to/compound-render cargo test -p wsp-wire
+    /// detected_state_for_a_pi_seat`. Without it the test prints why and
+    /// skips; it never guesses at whatever happens to be installed.
     ///
-    /// Skips without `compound-sup` and `compound-render` (not hermetic about
-    /// them, like the `#[ignore]`d smokes); a script named `pi` on the seat's
-    /// `PATH` stands in for the binary and prints one screen, so no model runs.
+    /// Also skips without `compound-sup` (not hermetic about it, like the
+    /// `#[ignore]`d smokes); a script named `pi`
+    /// on the seat's `PATH` stands in for the binary and prints one screen, so
+    /// no model runs.
     #[test]
-    fn detected_state_for_a_pi_seat_reads_the_manifest_not_the_truth() {
+    fn detected_state_for_a_pi_seat_reads_working_and_blocked_screens() {
+        if std::env::var_os("COMPOUND_RENDER").is_none() {
+            eprintln!("skipped: opt-in; set COMPOUND_RENDER to a renderer that carries the pi rules to run this");
+            return;
+        }
         if compound_sup_binary().is_none() || compound_render_binary().is_none() {
-            eprintln!("skipped: needs compound-sup and compound-render (set COMPOUND_SUP / COMPOUND_RENDER or put them on PATH)");
+            eprintln!("skipped: needs compound-sup (set COMPOUND_SUP or put it on PATH) and the renderer COMPOUND_RENDER names");
             return;
         }
         let rule = "\u{2500}".repeat(100);
@@ -3694,10 +3833,8 @@ mod tests {
         let cases = [
             ("idle editor", "\u{2580}\u{2580}\u{2588}  v1.3.0\nescape interrupt \u{b7} ctrl+c/ctrl+d clear/exit", State::Idle),
             ("Working... literal", "Working...", State::Working),
-            // pi is working, the manifest says idle
-            ("spinner and Working", "122. One hundred and twenty-two\n\n\u{2500}\u{2500} \u{2826} Working \u{2500}\u{2500}", State::Idle),
-            // pi is blocked on a prompt, the manifest says idle
-            ("select prompt", " Allow this command?  rm -rf build/\n\n \u{2192} Yes\n   No\n\n \u{2191}\u{2193} navigate  enter select  escape/ctrl+c cancel", State::Idle),
+            ("spinner and Working", "122. One hundred and twenty-two\n\n\u{2500}\u{2500} \u{2826} Working \u{2500}\u{2500}", State::Working),
+            ("select prompt", " Allow this command?  rm -rf build/\n\n \u{2192} Yes\n   No\n\n \u{2191}\u{2193} navigate  enter select  escape/ctrl+c cancel", State::Blocked),
         ];
         for (name, body, want) in cases {
             let scratch = Scratch::new("pi-detect");
@@ -3717,7 +3854,8 @@ mod tests {
             place.start(&seat, &Agent { kind: "pi".into(), name: "pi".into(), args: vec![] }).expect("started");
             let drawn = until(|| place.read_screen(&seat).is_ok_and(|t| t.contains("0.0%/262k")));
             assert!(drawn, "{name}: the screen never drew: {:?}", place.read_screen(&seat));
-            assert_eq!(place.state(&seat).unwrap(), want, "{name}");
+            let got = place.state(&seat).unwrap();
+            assert_eq!(got, want, "{name}");
         }
     }
 
@@ -4110,7 +4248,7 @@ mod tests {
     #[test]
     fn wire_health_catches_wsps_own_constant_going_stale() {
         let other = WIRE_VERSION + 1;
-        for (i, reply) in [format!("9 {other}"), other.to_string()].iter().enumerate() {
+        for (i, reply) in [format!("{other} {}", other + 1), other.to_string()].iter().enumerate() {
             let scratch = Scratch::new(&format!("wire-stale-const-{i}"));
             let sup = fake_sup(&scratch.root, Some(reply));
             let (mut problems, mut notes) = (Vec::new(), Vec::new());
@@ -4121,6 +4259,41 @@ mod tests {
             assert!(problems[0].contains("place_compound.rs"), "{}", problems[0]);
             assert!(notes.is_empty(), "{notes:?}");
         }
+    }
+
+    /// A compound-sup newer than wsp that still accepts wsp's version: wsp is
+    /// answered, so nothing is wrong (the shape a fresh install showed as ✗).
+    #[test]
+    fn wire_health_is_quiet_when_wsps_version_is_inside_the_accepted_range() {
+        let scratch = Scratch::new("wire-in-range");
+        let sup = fake_sup(&scratch.root, Some(&format!("{WIRE_VERSION} {}", WIRE_VERSION + 5)));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// compound-sup behind wsp: the fix is a compound-sup rebuild, not wsp's
+    /// constant; and an answer that is not a range is a problem, not a note.
+    #[test]
+    fn wire_health_names_the_side_that_is_behind_and_refuses_a_garbled_answer() {
+        let scratch = Scratch::new("wire-sup-behind");
+        let sup = fake_sup(&scratch.root, Some(&format!("{} {}", WIRE_VERSION - 2, WIRE_VERSION - 1)));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("compound-sup is behind"), "{}", problems[0]);
+        assert!(!problems[0].contains("bump WIRE_VERSION"), "{}", problems[0]);
+        for (i, reply) in [format!("{} {}", WIRE_VERSION + 5, WIRE_VERSION), format!("9 {WIRE_VERSION} x")].iter().enumerate() {
+            let scratch = Scratch::new(&format!("wire-garbled-{i}"));
+            let sup = fake_sup(&scratch.root, Some(reply));
+            let (mut problems, mut notes) = (Vec::new(), Vec::new());
+            wire_health_of(&sup, &mut problems, &mut notes);
+            assert_eq!(problems.len(), 1, "{reply:?}: {problems:?}");
+            assert!(problems[0].contains("not a version range"), "{}", problems[0]);
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     /// An installed `compound-sup` old enough to predate the `wire-version`

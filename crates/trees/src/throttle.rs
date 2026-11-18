@@ -667,8 +667,40 @@ fn mem_free() -> Option<u32> {
     if cfg!(test) {
         return None;
     }
+    #[cfg(target_os = "linux")]
+    {
+        return parse_meminfo_free(&std::fs::read_to_string("/proc/meminfo").ok()?);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
     let out = Command::new("memory_pressure").stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| parse_mem_free(&String::from_utf8_lossy(&out.stdout))).flatten()
+    }
+}
+
+/// One `/proc/meminfo` field in kB.
+fn meminfo_kb(meminfo: &str, key: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':')?.split_whitespace().next()?.parse().ok())
+}
+
+/// Linux: percent of memory available, `MemAvailable / MemTotal`.
+pub fn parse_meminfo_free(meminfo: &str) -> Option<u32> {
+    let total = meminfo_kb(meminfo, "MemTotal")?;
+    let avail = meminfo_kb(meminfo, "MemAvailable")?;
+    (total > 0).then(|| (avail * 100 / total).min(100) as u32)
+}
+
+/// Linux: swap in MB, `(used, total)`, out of `/proc/meminfo`. No swap is
+/// `(0, 0)`, as macOS reports it.
+pub fn parse_meminfo_swap(meminfo: &str) -> Option<(u32, u32)> {
+    let total = meminfo_kb(meminfo, "SwapTotal")?;
+    let free = meminfo_kb(meminfo, "SwapFree")?;
+    Some((((total.saturating_sub(free)) / 1024) as u32, (total / 1024) as u32))
+}
+
+/// Linux: pages swapped out since boot (4 KB), `pswpout` in `/proc/vmstat`.
+pub fn parse_vmstat_pageouts(vmstat: &str) -> Option<u64> {
+    vmstat.lines().find_map(|l| l.strip_prefix("pswpout ")?.trim().parse().ok())
 }
 
 /// Swap in MB, `(used, total)`, out of `sysctl vm.swapusage`:
@@ -709,16 +741,30 @@ fn swap_now() -> Option<(u32, u32)> {
     if cfg!(test) {
         return None;
     }
+    #[cfg(target_os = "linux")]
+    {
+        return parse_meminfo_swap(&std::fs::read_to_string("/proc/meminfo").ok()?);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
     let out = Command::new("sysctl").args(["-n", "vm.swapusage"]).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| parse_swapusage(&String::from_utf8_lossy(&out.stdout))).flatten()
+    }
 }
 
 fn pageouts_now() -> Option<u64> {
     if cfg!(test) {
         return None;
     }
+    #[cfg(target_os = "linux")]
+    {
+        return parse_vmstat_pageouts(&std::fs::read_to_string("/proc/vmstat").ok()?);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
     let out = Command::new("vm_stat").stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| parse_pageouts(&String::from_utf8_lossy(&out.stdout))).flatten()
+    }
 }
 
 /// The last memory sample and the rates taken from it, in `mem.json`.
@@ -2017,6 +2063,15 @@ fn bad(k: &str, v: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn linux_proc_readers() {
+        let mi = "MemTotal:       16000000 kB\nMemAvailable:    4000000 kB\nSwapTotal:       2097152 kB\nSwapFree:        1048576 kB\n";
+        assert_eq!(parse_meminfo_free(mi), Some(25));
+        assert_eq!(parse_meminfo_swap(mi), Some((1024, 2048)));
+        assert_eq!(parse_vmstat_pageouts("pswpin 3\npswpout 4242\n"), Some(4242));
+        assert_eq!(parse_meminfo_free(""), None);
+    }
+
     use super::*;
     use std::cell::RefCell;
 

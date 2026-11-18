@@ -6359,6 +6359,8 @@ fn store_uncommitted(root: &std::path::Path) -> Vec<String> {
         .arg("-C")
         .arg(root)
         .args(["status", "--porcelain"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .stderr(std::process::Stdio::null())
         .output()
@@ -6394,7 +6396,11 @@ pub(crate) enum Probe {
 
 impl Probe {
     pub(crate) fn live() -> Probe {
-        if !herdr::available() {
+        // Not the process-cached `available()`: that latches the first answer
+        // any caller in the process got, which in a test binary is whichever
+        // test asked first (a fake herdr bound later was then "not found").
+        // `doctor` asks once per invocation, so the connect costs nothing.
+        if !herdr::available_now() {
             return Probe::Down;
         }
         match herdr::agents() {
@@ -6786,6 +6792,22 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     } else {
         if let Some(w) = uncommitted_warning(&store_uncommitted(&store.root)) {
             warnings.push(w);
+        }
+        // Only a store git cannot commit in has anything to repair: a store
+        // whose commits work (global identity, signing, environment) is left
+        // as it is, and `--fix` and `--fix-identity` both leave it so.
+        if let Some(fault) = store.git_commit_fault() {
+            if args.has("fix") || args.has("fix-identity") {
+                match store.git_ensure_identity() {
+                    Ok(filled) if filled.is_empty() => problems.push(format!("store git: {fault}; nothing the repo can set repairs it")),
+                    Ok(filled) => notes.push(format!("store git: {fault}; set repo-local {} (nothing else changed)", filled.join(", "))),
+                    Err(e) => problems.push(format!("store git: {fault}; could not repair it: {e}")),
+                }
+            } else {
+                problems.push(format!(
+                    "store git cannot commit: {fault} — every store write fails to commit; `wsp doctor --fix-identity` sets the missing repo-local user.name/user.email and, only if signing is what fails, commit.gpgsign=false (repo-local, never the global config)"
+                ));
+            }
         }
     }
 
@@ -7593,7 +7615,15 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
                 order: 150,
-                text: r##"  wsp doctor                        integrity check"##,
+                text: r##"  wsp doctor [--fix | --fix-identity]
+                                    integrity check. --fix-identity only repairs a
+                                    store git that cannot commit: sets the
+                                    missing repo-local user.name/user.email and,
+                                    only if signing is what fails,
+                                    commit.gpgsign=false (repo-local, never the
+                                    global config). --fix does that too, and
+                                    folds stray sections back in task bodies and
+                                    clears stale gc state in the repos"##,
             },
         ],
     },

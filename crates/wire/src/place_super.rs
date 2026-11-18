@@ -517,6 +517,14 @@ pub fn a_childs(was: &Value, payload: &Value) -> bool {
     theirs != seats
 }
 
+/// Whether a hook is only a sign of life: a tool began or ended. It changes no
+/// state ([`said_by`] is `None` for both), but a seat that is `working` and says
+/// so again is a record that is still fresh. Claude Code's `PostToolUse` and the
+/// pi extension's tool events both land here.
+pub fn is_activity(hook: &str) -> bool {
+    matches!(hook.trim(), "PreToolUse" | "PostToolUse")
+}
+
 /// What a hook says the agent needs, written to `said.json` beside the state it
 /// is read as (`wsp-301`): `PermissionRequest` and `Elicitation` are `Working`
 /// to [`said_by`] because `State` has no word for *waiting on a person*, so the
@@ -717,7 +725,8 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
     // state; it is only ever here to close a question (`wsp-302`).
     let state = said_by(&hook);
     let closes = (place::above().closes)(&hook);
-    if state.is_none() && !closes {
+    let activity = is_activity(&hook);
+    if state.is_none() && !closes && !activity {
         return 0;
     }
     let payload: Value = match args.has("payload") {
@@ -737,7 +746,16 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
     if closes {
         (place::above().heard)(store, &hook, &payload);
     }
-    let Some(state) = state else { return 0 };
+    let Some(state) = state else {
+        // A tool ran: the seat is alive, and if it was working it still is.
+        if activity {
+            let compound = crate::place_compound::Compound::new();
+            if compound.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
+                compound.touched(&seat, &payload);
+            }
+        }
+        return 0;
+    };
     // `--hold SECS` is the other thing this verb does for a hook: not saying
     // what happened but waiting on the person (`wsp-301`), and the only time
     // it prints anything. It is its own hook entry with its own long timeout,
@@ -2982,15 +3000,139 @@ mod tests {
         let sent: Vec<&str> = PI_EXTENSION
             .split("report(\"")
             .skip(1)
+            .chain(PI_EXTENSION.split("tool(\"").skip(1))
             .filter_map(|rest| rest.split('"').next())
             .collect();
         for hook in ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "SessionEnd"] {
             assert!(sent.contains(&hook), "{hook} is not sent by pi/wsp-session.ts: {sent:?}");
         }
-        for hook in &sent {
-            assert!(said_by(hook).is_some(), "pi/wsp-session.ts sends {hook}, which `wsp report` ignores");
+        for hook in ["PreToolUse", "PostToolUse"] {
+            assert!(sent.contains(&hook), "{hook} is not sent by pi/wsp-session.ts: {sent:?}");
         }
+        for hook in &sent {
+            assert!(
+                said_by(hook).is_some() || is_activity(hook),
+                "pi/wsp-session.ts sends {hook}, which `wsp report` ignores"
+            );
+        }
+        // A pi's `UserPromptSubmit` is also what acknowledges `compound-sup deliver`.
+        assert!(PI_EXTENSION.contains("compound-sup") && PI_EXTENSION.contains("submitted"));
         // And the guard comes first: a seat-less pi is silent.
         assert!(PI_EXTENSION.contains("process.env.WSP_SEAT_ID"));
+    }
+
+    /// Runs the extension under `node` against a fake `pi` and a `wsp` that
+    /// logs what it is told, and returns the hooks reported, in order.
+    /// `None` when there is no `node` here (the extension is TypeScript run as
+    /// plain ESM with its types stripped, which a current node does itself).
+    fn run_extension(script: &str) -> Option<(Vec<String>, Vec<String>)> {
+        if Command::new("node").arg("--version").output().is_err() {
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("wsp-pi-ext-{}-{}", std::process::id(), script.len()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let log = dir.join("log");
+        let wsp = dir.join("bin/wsp");
+        fs::write(&wsp, format!("#!/bin/sh\ncat >/dev/null\necho \"$2\" >> '{}'\n", log.display())).unwrap();
+        fs::set_permissions(&wsp, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // A `compound-sup` that records the prompt it is told was submitted.
+        let sup = dir.join("bin/compound-sup");
+        fs::write(&sup, format!("#!/bin/sh\ncat > '{}'/$$\n", dir.join("sup").display())).unwrap();
+        fs::set_permissions(&sup, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        fs::create_dir_all(dir.join("sup")).unwrap();
+        fs::create_dir_all(dir.join("state/compound-seats/t:1")).unwrap();
+        fs::write(dir.join("state/compound-seats/t:1/seat.json"), r#"{"socket":"/s"}"#).unwrap();
+        fs::write(dir.join("ext.ts"), PI_EXTENSION).unwrap();
+        fs::write(
+            dir.join("run.mjs"),
+            format!(
+                "import ext from './ext.ts';\n\
+                 const h = {{}}; const idle = {{ v: true }};\n\
+                 const pi = {{ on: (n, f) => {{ h[n] = f; }} }};\n\
+                 const ctx = {{ isIdle: () => idle.v }};\n\
+                 const fire = (n, e = {{}}) => h[n]?.(e, ctx);\n\
+                 const sleep = (t) => new Promise((r) => setTimeout(r, t));\n\
+                 ext(pi);\n{script}\nawait sleep(300);\n"
+            ),
+        )
+        .unwrap();
+        let out = Command::new("node")
+            .arg(dir.join("run.mjs"))
+            .env("PATH", format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
+            .env("WSP_SEAT_ID", "t:1")
+            .env_remove("PI_SESSION_ID")
+            .env("WSP_PI_THROTTLE_MS", "20")
+            .env("WSP_PI_HEARTBEAT_MS", "60")
+            .env("WSP_STATE", dir.join("state"))
+            .output()
+            .expect("node runs");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let hooks = fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+        let mut told: Vec<(std::time::SystemTime, String)> = fs::read_dir(dir.join("sup"))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let v: Value = serde_json::from_str(&fs::read_to_string(e.path()).ok()?).ok()?;
+                Some((e.metadata().ok()?.modified().ok()?, v["prompt"].as_str()?.to_string()))
+            })
+            .collect();
+        told.sort();
+        let sup = told.into_iter().map(|(_, p)| p).collect();
+        let _ = fs::remove_dir_all(&dir);
+        Some((hooks, sup))
+    }
+
+    /// A tool that says nothing for a long time still keeps the seat fresh: a
+    /// timer reports while the agent runs, and stops when it has settled.
+    #[test]
+    fn a_quiet_long_tool_is_kept_fresh_by_a_heartbeat_that_stops_when_the_agent_does() {
+        let Some((busy, _)) = run_extension("idle.v = false; fire('agent_start'); fire('tool_execution_start'); await sleep(500);") else {
+            return;
+        };
+        let beats = busy.iter().filter(|h| *h == "PreToolUse").count();
+        assert!(beats >= 3, "a quiet tool should be re-dated by a timer: {busy:?}");
+
+        let (done, _) = run_extension(
+            "idle.v = false; fire('agent_start'); await sleep(150); idle.v = true; fire('agent_settled'); await sleep(50);",
+        )
+        .unwrap();
+        let stop = done.iter().position(|h| h == "Stop").expect("Stop sent");
+        assert!(done[stop..].iter().all(|h| h == "Stop"), "nothing reports busy after the agent settled: {done:?}");
+    }
+
+    /// An input another extension handled, or one queued behind a running
+    /// turn, is never taken for the next prompt's text.
+    #[test]
+    fn the_pi_extension_does_not_carry_a_stale_input_into_the_next_prompt() {
+        // A handled input (no turn started), then a prompt that came another
+        // way: the ack names the second's text, not the first's.
+        let Some((_, acked)) = run_extension(
+            "fire('input', { text: 'handled elsewhere', source: 'interactive' });\n\
+             fire('agent_start'); fire('agent_settled');\n\
+             fire('before_agent_start', { messageType: 'user', prompt: 'second' });",
+        ) else {
+            return;
+        };
+        assert_eq!(acked, vec!["second"], "agent_start dropped the stale input");
+
+        // Typed while busy: acknowledged at once, and not held for the next.
+        let (_, mut acked) = run_extension(
+            "idle.v = false; fire('agent_start');\n\
+             fire('input', { text: 'queued', streamingBehavior: 'steer' });\n\
+             await sleep(100);\n\
+             fire('before_agent_start', { messageType: 'user', prompt: 'later' });",
+        )
+        .unwrap();
+        acked.sort(); // separate processes: the order they land in is not the test
+        assert_eq!(acked, vec!["later", "queued"], "{acked:?}");
+
+        // The ordinary prompt: what was typed, not the expansion.
+        let (_, acked) = run_extension(
+            "fire('input', { text: 'typed', source: 'interactive' });\n\
+             fire('before_agent_start', { messageType: 'user', prompt: 'expanded' });",
+        )
+        .unwrap();
+        assert_eq!(acked, vec!["typed"]);
     }
 }

@@ -14,7 +14,9 @@
 // | pi event                     | wsp report       | read as |
 // |------------------------------|------------------|---------|
 // | session_start                | SessionStart     | idle    |
-// | agent_start                  | UserPromptSubmit | working |
+// | agent_start                  | UserPromptSubmit | working (and a heartbeat while it runs) |
+// | before_agent_start (user)    | compound-sup submitted: the delivery's ack |
+// | tool_execution_start / _end  | PreToolUse / PostToolUse | still working (a sign of life) |
 // | agent_settled, and idle      | Stop             | idle    |
 // | ui_prompt_start              | PermissionRequest| working |
 // | ui_prompt_end                | what it was before the prompt |
@@ -34,6 +36,9 @@
 // nothing prints, and no handler waits on wsp except the last one.
 
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const seat = process.env.WSP_SEAT_ID;
 
@@ -45,6 +50,14 @@ const seat = process.env.WSP_SEAT_ID;
 // same reason. wsp sheds PI_SESSION_ID from a seat it starts (`place::shed`),
 // so a pi governor spawning a pi member does not trip this.
 const nested = !!process.env.PI_SESSION_ID;
+
+// Timings, overridable only so a test need not wait out real ones.
+function ms(name: string, fallback: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+const THROTTLE_MS = ms("WSP_PI_THROTTLE_MS", 5000);
+const HEARTBEAT_MS = ms("WSP_PI_HEARTBEAT_MS", 30000);
 
 function enabled() {
   return !!seat && !nested;
@@ -85,6 +98,32 @@ function run(hook: string, payload: Record<string, unknown>): Promise<void> {
   });
 }
 
+// What claude-code/wsp-session.sh's `submitted` does for a Claude seat: tell the
+// seat's supervisor the prompt was submitted, which acknowledges a
+// `compound-sup deliver` exactly once. The seat's session socket is in its
+// record, not its environment. Best-effort and silent like everything here: no
+// sup, no record, no socket, a seat on another machine — nothing to say.
+function submitted(prompt: string) {
+  try {
+    const state = process.env.WSP_STATE || join(homedir(), ".local", "state", "wsp");
+    const rec = JSON.parse(readFileSync(join(state, "compound-seats", seat as string, "seat.json"), "utf8"));
+    if (rec?.machine || typeof rec?.socket !== "string" || rec.socket.length === 0) {
+      return;
+    }
+    const child = spawn("compound-sup", ["submitted", rec.socket], { stdio: ["pipe", "ignore", "ignore"] });
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {}
+    }, 5000);
+    timer.unref?.();
+    child.on("error", () => clearTimeout(timer));
+    child.on("close", () => clearTimeout(timer));
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(JSON.stringify({ prompt }));
+  } catch {}
+}
+
 function report(hook: string, ctx: any): Promise<void> {
   // The session id is the one payload key wsp keeps from pi. Not
   // `transcript_path`: wsp reads that file as Claude Code's transcript to tally
@@ -117,20 +156,124 @@ export default function (pi) {
     // without another agent_start, so a turn already underway is said too.
     void report("SessionStart", ctx);
     if (ctx?.isIdle?.() === false) {
+      heartbeat(true, ctx);
       void report("UserPromptSubmit", ctx);
     }
   });
 
+  // What the person (or `compound-sup deliver`) typed, before pi expands it
+  // (templates, @files): that is the text a delivery waits to see submitted.
+  // `before_agent_start`'s `prompt` is the expanded text and is the fallback
+  // for a run that did not come through the editor (RPC, sendUserMessage).
+  //
+  // `typed` is only ever what the very next turn will start from, so it is
+  // kept narrowly. An input that never becomes that turn — one another
+  // extension handled, one pi queued behind a running turn — must not sit here
+  // to be taken for the next prompt's text:
+  //  - an input with `streamingBehavior` (steer / followUp) was typed while the
+  //    agent was busy. pi queues it and fires no before_agent_start for it, so
+  //    it is acknowledged now, as submitted — which it is — and never held;
+  //  - an input from an extension (`source: "extension"`) is not what a person
+  //    or a delivery typed;
+  //  - what is held expires (TYPED_TTL_MS) and is dropped at agent_start and
+  //    when the turn settles, so an input that another extension handled, and
+  //    that started no turn, is gone before the next one.
+  const TYPED_TTL_MS = 15000;
+  let typed: string | undefined;
+  let typedAt = 0;
+  pi.on("input", (event) => {
+    if (typeof event?.text !== "string" || event?.source === "extension") {
+      return;
+    }
+    if (event?.streamingBehavior) {
+      submitted(event.text);
+      return;
+    }
+    typed = event.text;
+    typedAt = Date.now();
+  });
+
+  // The ack goes before the turn is said to have begun, as Claude's hook
+  // orders them.
+  pi.on("before_agent_start", (event) => {
+    if (event?.messageType === "user") {
+      const fresh = typed !== undefined && Date.now() - typedAt < TYPED_TTL_MS;
+      const text = fresh ? typed : event?.prompt;
+      typed = undefined;
+      if (typeof text === "string") {
+        submitted(text);
+      }
+    }
+  });
+
+  // pi runs tools for minutes inside one turn and says nothing else while it
+  // does. A record that is not refreshed ages out after two minutes and the
+  // seat reads unknown, and `wsp tell` refuses it. A tool starting or ending is
+  // a sign of life; `wsp report` re-dates a working record and changes nothing
+  // else. Throttled: a burst of tool calls is one report, not a hundred
+  // processes.
+  let lastTool = 0;
+  function tool(hook: string, ctx: any) {
+    const now = Date.now();
+    if (now - lastTool < THROTTLE_MS) {
+      return;
+    }
+    lastTool = now;
+    void report(hook, ctx);
+  }
+  pi.on("tool_execution_start", (_event, ctx) => {
+    tool("PreToolUse", ctx);
+  });
+  pi.on("tool_execution_end", (_event, ctx) => {
+    tool("PostToolUse", ctx);
+  });
+  // One tool that runs for ten minutes, or a model that streams for five,
+  // says nothing between its start and its end but these. Same throttle, same
+  // meaning: still here, still working.
+  pi.on("tool_execution_update", (_event, ctx) => {
+    tool("PreToolUse", ctx);
+  });
+  pi.on("message_update", (_event, ctx) => {
+    tool("PreToolUse", ctx);
+  });
+  pi.on("turn_start", (_event, ctx) => {
+    tool("PreToolUse", ctx);
+  });
+  pi.on("turn_end", (_event, ctx) => {
+    tool("PostToolUse", ctx);
+  });
+
+  // A tool that says nothing for minutes (a `sleep`, a build with no output)
+  // fires no tool_execution_update, so none of the above refreshes the record
+  // and it ages out mid-turn. While the agent is running a timer says
+  // "still here" on its own; the same throttle, cleared when the agent has
+  // settled (not at agent_end: pi may retry or compact after it, still busy).
+  let beat: ReturnType<typeof setInterval> | undefined;
+  function heartbeat(on: boolean, ctx?: any) {
+    if (beat) {
+      clearInterval(beat);
+      beat = undefined;
+    }
+    if (on) {
+      beat = setInterval(() => tool("PreToolUse", ctx), HEARTBEAT_MS);
+      beat.unref?.();
+    }
+  }
+
   pi.on("agent_start", (_event, ctx) => {
+    typed = undefined;
+    heartbeat(true, ctx);
     void report("UserPromptSubmit", ctx);
   });
 
   // agent_settled, not agent_end: pi may still retry, compact or run queued
   // work after agent_end, and only settled means it will not carry on alone.
   pi.on("agent_settled", (_event, ctx) => {
+    typed = undefined;
     if (ctx?.isIdle?.() !== true) {
       return;
     }
+    heartbeat(false);
     void report("Stop", ctx);
   });
 
@@ -158,6 +301,7 @@ export default function (pi) {
   // last word reaches wsp before the process exits — bounded, because a quit
   // that hangs on wsp is worse than a seat that reads gone a tick late.
   pi.on("session_shutdown", async (event, ctx) => {
+    heartbeat(false);
     if (event?.reason !== "quit") {
       return;
     }
