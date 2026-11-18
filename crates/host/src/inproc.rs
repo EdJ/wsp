@@ -352,6 +352,17 @@ impl InProcess {
         succeeded(Command::new("sysctl").args(["-n", "vm.swapusage"]).stderr(Stdio::null()))
     }
 
+    /// `/proc/meminfo`: Linux's memory and swap figures; `None` where there is
+    /// no `/proc` (macOS answers through `sysctl` and `vm_stat`).
+    pub fn meminfo(&self) -> Option<String> {
+        fs::read_to_string("/proc/meminfo").ok()
+    }
+
+    /// `/proc/vmstat`: Linux's paging counters (`pswpout`); `None` off Linux.
+    pub fn vmstat(&self) -> Option<String> {
+        fs::read_to_string("/proc/vmstat").ok()
+    }
+
     pub fn pageouts(&self) -> Option<String> {
         succeeded(Command::new("vm_stat").stderr(Stdio::null()))
     }

@@ -7,6 +7,12 @@
 //! not answer is reported at its quiet value (load 0, memory `normal`, swap 0,
 //! thermal `nominal`) and named in [`Read::missing`] for the reader's log.
 //!
+//! On Linux the same facts come from `/proc` ([`assemble_linux`]): load from
+//! `/proc/loadavg`, swap and memory from `/proc/meminfo`, disks from the same
+//! `df`. Linux has no one thermal state to read, so thermal is missing there;
+//! the throttle's free memory and pageouts come from `/proc/meminfo` and
+//! `/proc/vmstat` ([`throttle_facts_linux`]).
+//!
 //! The throttle's facts (wsp-044) are optional. The five- and fifteen-minute
 //! load and the speed limit come out of the same answers; HID idle (`ioreg`)
 //! and free memory and pageouts (`vm_stat`) take two asks more (wsp-049), the
@@ -98,8 +104,67 @@ pub fn parse_pageouts(vm_stat: &str) -> Option<u64> {
 
 /// The facts out of the three answers.
 pub fn assemble(sysctl: &str, df: &str, pmset: Option<&str>) -> Read {
+    gather(
+        sysctl_value(sysctl, "vm.loadavg").map(parse_loads).unwrap_or_default(),
+        sysctl_value(sysctl, "vm.swapusage").and_then(parse_swap_used),
+        sysctl_value(sysctl, "kern.memorystatus_vm_pressure_level").and_then(parse_pressure),
+        df,
+        pmset.map(|out| (parse_thermal(out), Some(parse_speed_limit(out).unwrap_or(100)))),
+    )
+}
+
+/// The facts on Linux, out of `/proc/loadavg`, `/proc/meminfo` and `df -Pk`.
+pub fn assemble_linux(loadavg: &str, meminfo: &str, df: &str) -> Read {
+    let kb = |k: &str| meminfo_kb(meminfo, k);
+    let swap = match (kb("SwapTotal"), kb("SwapFree")) {
+        (Some(t), Some(f)) => Some(t.saturating_sub(f) * 1024),
+        _ => None,
+    };
+    let memory = match (kb("MemAvailable"), kb("MemTotal")) {
+        (Some(a), Some(t)) if t > 0 => Some(pressure_of_available(a, t)),
+        _ => None,
+    };
+    gather(parse_loads(loadavg), swap, memory, df, None)
+}
+
+/// A `/proc/meminfo` field in kB (`MemTotal:  16314496 kB`).
+pub fn meminfo_kb(meminfo: &str, key: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':')?.split_whitespace().next()?.parse().ok())
+}
+
+/// Linux's nearest to macOS's pressure level: how much of memory the kernel
+/// says is available without swapping. Under 5% is critical, under 15% warn.
+pub fn pressure_of_available(available_kb: u64, total_kb: u64) -> MemoryPressure {
+    match available_kb * 100 / total_kb {
+        0..5 => MemoryPressure::Critical,
+        5..15 => MemoryPressure::Warn,
+        _ => MemoryPressure::Normal,
+    }
+}
+
+/// [`throttle_facts`] on Linux: free memory is `MemAvailable` out of
+/// `/proc/meminfo` (what the throttle's own Linux reader, trees'
+/// `parse_meminfo_free`, calls free), pageouts are `pswpout` in `/proc/vmstat`,
+/// already in 4 KB pages. HID idle has no Linux answer and stays `None`.
+pub fn throttle_facts_linux(facts: &mut HostFacts, meminfo: Option<&str>, vmstat: Option<&str>) {
+    if let Some(kb) = meminfo.and_then(|m| meminfo_kb(m, "MemAvailable")) {
+        facts.free_memory_bytes = Some(kb * 1024);
+    }
+    if let Some(n) = vmstat.and_then(|v| v.lines().find_map(|l| l.strip_prefix("pswpout ")?.trim().parse().ok())) {
+        facts.pageouts = Some(n);
+    }
+}
+
+/// The facts out of what each OS read, a `None` being a fact not answered;
+/// `thermal` carries the speed limit with it.
+fn gather(
+    loads: Vec<f64>,
+    swap: Option<u64>,
+    memory: Option<MemoryPressure>,
+    df: &str,
+    thermal: Option<(Thermal, Option<u32>)>,
+) -> Read {
     let mut missing = Vec::new();
-    let loads = sysctl_value(sysctl, "vm.loadavg").map(parse_loads).unwrap_or_default();
     let centi = |l: f64| (l * 100.0).round() as u32;
     let load_centi = match loads.first() {
         Some(&l) => centi(l),
@@ -109,14 +174,14 @@ pub fn assemble(sysctl: &str, df: &str, pmset: Option<&str>) -> Read {
         }
     };
     let (load5_centi, load15_centi) = (loads.get(1).copied().map(centi), loads.get(2).copied().map(centi));
-    let swap_used_bytes = match sysctl_value(sysctl, "vm.swapusage").and_then(parse_swap_used) {
+    let swap_used_bytes = match swap {
         Some(b) => b,
         None => {
             missing.push("swap");
             0
         }
     };
-    let memory = match sysctl_value(sysctl, "kern.memorystatus_vm_pressure_level").and_then(parse_pressure) {
+    let memory = match memory {
         Some(m) => m,
         None => {
             missing.push("memory");
@@ -127,8 +192,8 @@ pub fn assemble(sysctl: &str, df: &str, pmset: Option<&str>) -> Read {
     if disks.is_empty() {
         missing.push("disks");
     }
-    let (thermal, speed_limit_pct) = match pmset {
-        Some(out) => (parse_thermal(out), Some(parse_speed_limit(out).unwrap_or(100))),
+    let (thermal, speed_limit_pct) = match thermal {
+        Some(t) => t,
         None => {
             missing.push("thermal");
             (Thermal::Nominal, None)
@@ -296,6 +361,45 @@ mod tests {
         assert_eq!(at(85), Thermal::Fair);
         assert_eq!(at(60), Thermal::Serious);
         assert_eq!(at(30), Thermal::Critical);
+    }
+
+    #[test]
+    fn linux_facts_come_from_proc() {
+        let meminfo = "MemTotal:       16000000 kB\nMemFree:  100 kB\nMemAvailable:    1600000 kB\n\
+            SwapTotal:       2097148 kB\nSwapFree:        2096124 kB\n";
+        let r = assemble_linux("1.25 0.80 0.50 2/345 6789\n", meminfo, DF);
+        assert_eq!(r.missing, vec!["thermal"], "Linux has no one thermal state");
+        assert_eq!(r.facts.load_centi, 125);
+        assert_eq!((r.facts.load5_centi, r.facts.load15_centi), (Some(80), Some(50)));
+        assert_eq!(r.facts.swap_used_bytes, 1024 * 1024);
+        assert_eq!(r.facts.memory, MemoryPressure::Warn, "10% available");
+        assert_eq!(r.facts.disks.len(), 2);
+        assert_eq!(pressure_of_available(4, 100), MemoryPressure::Critical);
+        assert_eq!(pressure_of_available(50, 100), MemoryPressure::Normal);
+        assert_eq!(assemble_linux("", "", "").missing, vec!["load", "swap", "memory", "disks", "thermal"]);
+    }
+
+    #[test]
+    fn the_throttle_facts_on_linux_are_read_out_of_meminfo_and_vmstat() {
+        let mut r = assemble_linux("0.5 0.4 0.3 1/200 99\n", "", DF);
+        let meminfo = "MemTotal: 16000000 kB\nMemAvailable:    1600000 kB\n";
+        throttle_facts_linux(&mut r.facts, Some(meminfo), Some("pgpgin 1\npswpout 4000\npswpin 2\n"));
+        assert_eq!(r.facts.free_memory_bytes, Some(1600000 * 1024));
+        assert_eq!(r.facts.pageouts, Some(4000));
+        assert_eq!(r.facts.hid_idle_secs, None);
+        let mut bare = assemble_linux("", "", "");
+        throttle_facts_linux(&mut bare.facts, Some("nothing"), None);
+        assert_eq!((bare.facts.free_memory_bytes, bare.facts.pageouts), (None, None));
+    }
+
+    /// The live host answers all its asks but thermal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_linux_answers_every_fact_but_thermal() {
+        let r = read(&InProcess::default(), &[std::env::temp_dir()]);
+        assert_eq!(r.missing, vec!["thermal"]);
+        assert!(r.facts.disks[0].total_bytes > 0);
+        assert!(r.facts.free_memory_bytes.is_some());
     }
 
     #[test]
