@@ -1158,8 +1158,13 @@ end, as d1 Q14 says for every step.
 | 7 | wsp-057 contract | **Kept, with a note.** The `place_of` seam stays. treecopy.rs is not deleted here (M4). |
 | 8 | wsp-058 measure | **Kept, with a note.** The measure is the Mac's alone, because the Mac's manager is the only one. |
 
-The questions this leaves are put to the person on wsp-093: where the trunk remote lives, where a row's verify
-runs, where the landing record is kept, and when M4 is broken down.
+**The person's answers (2026-11-18, on wsp-093, every one the recommended answer):**
+- **The trunk remote** is a bare repository per project on the Mac, reached over ssh on the tailnet. The Mac stays
+  the trunk's host and the barrier's default host, and the person's checkout becomes a clone that pulls.
+- **Verify runs on the row's host.** The verifier is spawned where the row's tree is, with no fetch and no copy.
+- **The landing record is the store's**, from the push's `tree.landed`. The reflog is read only for lands made
+  before T2.
+- **M4 is broken down at M3's end**, after wsp-058, as d1 Q14 says. Groups 5-8 go ahead as amended.
 
 ### 6.3 How this reorders state-core section 7
 
