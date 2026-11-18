@@ -2536,7 +2536,7 @@ mod tests {
         let commit = |n: &str| {
             fs::write(repo.join("src/lib.rs"), format!("// {n}\n")).unwrap();
             run(&["add", "-A"]);
-            run(&["commit", "--quiet", "-m", n]);
+            run(&["commit", "--quiet", "--no-gpg-sign", "-m", n]);
             git(&repo, &["rev-parse", "--short", "HEAD"]).unwrap().trim().to_string()
         };
         commit("one");
@@ -2670,7 +2670,7 @@ mod tests {
         let commit = |n: &str| {
             fs::write(repo.join("f.txt"), format!("{n}\n")).unwrap();
             run(&["add", "f.txt"]);
-            run(&["commit", "--quiet", "-m", n]);
+            run(&["commit", "--quiet", "--no-gpg-sign", "-m", n]);
             git(&repo, &["rev-parse", "--short", "HEAD"]).unwrap().trim().to_string()
         };
         let first = commit("one");
