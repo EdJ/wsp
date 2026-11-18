@@ -151,7 +151,8 @@ enum KeyState {
 }
 
 enum Order {
-    /// Handed to compound-sup and not yet answered.
+    /// Handed to compound-sup and not yet answered; `asked` is the last time
+    /// anyone asked for it (the first ask, a later one, or a restart's).
     InFlight { waiters: Vec<Asker>, asked: Instant },
     /// Answered: the answer, sent again to whoever asks again.
     Answered(Vec<Message>),
@@ -691,6 +692,9 @@ fn ask(shared: &Arc<Shared>, o: OrderDeliver) {
                 // Under the table's lock: a new ask under this id writes its
                 // record under it too, so this never takes that one away.
                 let _ = fs::remove_file(pending_path(shared, &o.order));
+                // Still under it, as `answered` does: after it, a new ask of
+                // this id could `awaiting` first and this would undo it.
+                shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).not_awaiting(&o.seat, &o.order);
             }
             gone
         },
@@ -718,7 +722,6 @@ fn ask(shared: &Arc<Shared>, o: OrderDeliver) {
         Asked::Answer(outcome) => answered(shared, &o, outcome),
         Asked::Stopping => {}
         Asked::Unasked => {
-            shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).not_awaiting(&o.seat, &o.order);
             shared.log.line(&format!("order {} to {}: dropped, nobody asked for it in {}s", o.order.0, o.seat.0, UNASKED.as_secs()));
         }
     }
@@ -1201,6 +1204,7 @@ mod tests {
         let both = format!("{twice}  16  15 /usr/local/bin/compound-sup spawn --label cpd-1 -- sh\n");
         assert_eq!(sup_of(&both, "", &SeatId("cpd-1".into())), vec![10, 15], "two sups still refused, a fork of either aside");
     }
+
     /// A clock the test winds: `rest` moves it and returns at once.
     struct Wound(std::cell::Cell<Instant>);
 
