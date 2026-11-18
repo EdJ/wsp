@@ -479,7 +479,7 @@ pub(crate) fn take(repo: &Path, dir: &Path, name: &str, row_dir: &Path, residue:
     if !contained(repo, name, &row) {
         return Tree::Kept { path, why: format!("its branch has commits {row} has not got — merged at the join that waits on it") };
     }
-    match crate::check_tree::litter(dir, residue) {
+    match crate::check_tree::litter_lately(dir, residue) {
         None => Tree::Kept { path, why: "git could not read it".into() },
         Some(found) if !found.is_empty() => Tree::Kept { path, why: crate::check_tree::holds_more(&found) },
         Some(_) => {
@@ -603,7 +603,7 @@ pub(crate) fn tidy(store: &Store, ended: &[String]) {
             Err(why) => Some(why.clone()),
         }
     };
-    for tree in sweep(store, &standing) {
+    for tree in crate::check_tree::believing(|| sweep(store, &standing)) {
         say(store, tree);
     }
 }

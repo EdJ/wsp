@@ -34,9 +34,10 @@
 //! goes with the member's work; `<member>-verify` names its brief and nothing
 //! on disk.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::cmd_checkout::{self, Tree, WORKTREES};
 use crate::cmd_verify::git;
@@ -151,6 +152,56 @@ pub fn litter(dir: &Path, residue: &Residue) -> Option<Vec<String>> {
             .map(|(_, p)| p.to_string())
             .collect(),
     )
+}
+
+/// How long a tree found to hold more than build output is believed before
+/// `git status` is asked about it again (`wsp-665`).
+const LITTER_RECHECK: Duration = Duration::from_secs(600);
+
+/// What `git status --ignored` found in each kept tree, and when. A kept tree is
+/// found again every tick and its answer is a full status of a worktree (0.3 s
+/// each on `compounding`'s 8,800 files, nine of them in a 200 s sample of the
+/// daemon): `sweep:check-trees` was 3.6 s of an idle full tick and 5.9 s of a
+/// busy one, almost all of it this. A tree somebody tidies by hand is taken at
+/// the next look past [`LITTER_RECHECK`]; one that is clean is never in here, so
+/// a finished check's tree still goes the tick it is found clean.
+static LITTER: Mutex<BTreeMap<PathBuf, (Instant, Vec<String>)>> = Mutex::new(BTreeMap::new());
+
+/// Whether this process is in the daemon's sweep, which is the only reader that
+/// believes a remembered answer: a verb, a `despawn` or a test that asks about a
+/// tree wants what is in it now.
+static BELIEVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run `f` (the tick's sweep of kept trees) with [`litter_lately`] remembering.
+pub fn believing<T>(f: impl FnOnce() -> T) -> T {
+    BELIEVING.store(true, std::sync::atomic::Ordering::SeqCst);
+    let out = f();
+    BELIEVING.store(false, std::sync::atomic::Ordering::SeqCst);
+    out
+}
+
+/// [`litter`], believed for [`LITTER_RECHECK`] when it found something and the
+/// daemon's sweep is asking.
+pub fn litter_lately(dir: &Path, residue: &Residue) -> Option<Vec<String>> {
+    match BELIEVING.load(std::sync::atomic::Ordering::SeqCst) {
+        true => litter_at(dir, Instant::now(), || litter(dir, residue)),
+        false => litter(dir, residue),
+    }
+}
+
+fn litter_at(dir: &Path, now: Instant, ask: impl FnOnce() -> Option<Vec<String>>) -> Option<Vec<String>> {
+    let mut seen = LITTER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, found)) = seen.get(dir) {
+        if now.saturating_duration_since(*at) < LITTER_RECHECK {
+            return Some(found.clone());
+        }
+    }
+    seen.remove(dir);
+    let found = ask();
+    if let Some(f) = found.as_ref().filter(|f| !f.is_empty()) {
+        seen.insert(dir.to_path_buf(), (now, f.clone()));
+    }
+    found
 }
 
 /// Why a tree is kept for what [`litter`] found in it.
@@ -625,7 +676,7 @@ fn take(store: &Store, repo: &Path, dir: &Path, residue: &Residue, standing: &dy
     if let Some(why) = standing(dir) {
         return Tree::Kept { path, why };
     }
-    match litter(dir, residue) {
+    match litter_lately(dir, residue) {
         None => Tree::Kept { path, why: "git could not read it".into() },
         Some(found) if !found.is_empty() => Tree::Kept { path, why: holds_more(&found) },
         Some(_) => {
@@ -745,7 +796,7 @@ pub fn tidy(store: &Store, ended: &[String]) {
             Err(why) => Some(why.clone()),
         }
     };
-    let found = sweep(store, &standing);
+    let found = believing(|| sweep(store, &standing));
     for tree in found {
         match tree {
             Tree::Removed { path, kept } => {
@@ -766,6 +817,31 @@ pub fn tidy(store: &Store, ended: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wsp-665`: a tree found to hold more than build output is not asked
+    /// about again for ten minutes, and one found clean is asked every time.
+    #[test]
+    fn a_kept_trees_litter_is_believed_for_ten_minutes_and_a_clean_one_not_at_all() {
+        let dir = PathBuf::from("/nowhere/wsp-665-litter");
+        let t0 = Instant::now();
+        let asked = std::cell::Cell::new(0);
+        let ask = |found: Vec<String>| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                Some(found)
+            }
+        };
+        let junk = || vec!["notes.txt".to_string()];
+        assert_eq!(litter_at(&dir, t0, ask(junk())), Some(junk()));
+        assert_eq!(litter_at(&dir, t0 + Duration::from_secs(300), ask(vec![])), Some(junk()), "believed");
+        assert_eq!(asked.get(), 1, "and not asked");
+        assert_eq!(litter_at(&dir, t0 + Duration::from_secs(601), ask(vec![])), Some(vec![]), "past ten minutes it is asked");
+        assert_eq!(asked.get(), 2);
+        assert_eq!(litter_at(&dir, t0 + Duration::from_secs(602), ask(vec![])), Some(vec![]), "a clean tree is never remembered");
+        assert_eq!(asked.get(), 3);
+        assert_eq!(litter_at(&dir, t0 + Duration::from_secs(603), || None), None, "git unable to read it is not remembered either");
+    }
     use crate::model::{Group, Project, Worklist};
     use wsp_base::calls::Command;
 
