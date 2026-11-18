@@ -614,21 +614,26 @@ enum Asked {
 }
 
 /// The gap after the `tries`-th run with no answer: 1 s, doubling, at most 60 s.
-fn ask_again_after(_tries: u32) -> Duration {
-    ASK_AGAIN
+fn ask_again_after(tries: u32) -> Duration {
+    ASK_AGAIN.saturating_mul(1u32 << tries.saturating_sub(1).min(6)).min(ASK_AGAIN_MOST)
 }
 
 /// A later ask for an order in flight: it waits with the others, and the
 /// order counts as asked about at `at` (wsp-109).
-fn joined(waiters: &mut Vec<Asker>, _asked: &mut Instant, asker: Asker, _at: Instant) {
+fn joined(waiters: &mut Vec<Asker>, asked: &mut Instant, asker: Asker, at: Instant) {
+    *asked = at;
     waiters.push(asker);
 }
 
 /// Take `order` out of the table when it is in flight and nobody has asked
 /// for it for [`UNASKED`] at `now`; `true` when it did. An answered order, or
 /// one not there, is left alone.
-fn forget_unasked(_t: &mut Table, _order: &OrderId, _now: Instant) -> bool {
-    false
+fn forget_unasked(t: &mut Table, order: &OrderId, now: Instant) -> bool {
+    let unasked = matches!(t.orders.get(order), Some(Order::InFlight { asked, .. }) if now.saturating_duration_since(*asked) >= UNASKED);
+    if unasked {
+        t.orders.remove(order);
+    }
+    unasked
 }
 
 /// Ask until compound-sup answers, the order goes unasked for [`UNASKED`], or
@@ -666,6 +671,8 @@ fn ask_until(
 
 /// Ask compound-sup until it answers, then answer. The id is its at-most-once
 /// key, so asking again (a wait that ran out, a restart) is the same order.
+/// Between runs with no answer the gap doubles from 1 s to 60 s, and an order
+/// nobody has asked about for 900 s is dropped with no answer (wsp-109).
 fn ask(shared: &Arc<Shared>, o: OrderDeliver) {
     let Some(sup) = sup_path(shared) else {
         shared.log.line(&format!("order {}: compound-sup not found; left for the next start", o.order.0));
@@ -674,31 +681,47 @@ fn ask(shared: &Arc<Shared>, o: OrderDeliver) {
     let seat = HostSeat::new(&o.seat.0);
     // The hook fires before compound-sup answers: tell the fold first.
     shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).awaiting(o.seat.clone(), o.order.clone());
-    let mut tries = 0u32;
-    let outcome = loop {
-        if shared.stopping.load(Ordering::SeqCst) {
-            return;
-        }
-        let socket = {
-            let t = table(shared);
-            t.seats.get(&o.seat).filter(|r| r.epoch == o.epoch).map(|r| r.socket.clone())
-        };
-        let Some(socket) = socket else { break Err(OrderFail::SessionGone) };
-        match inproc::deliver_with(&sup, &socket, &o.order.0, &o.text, DELIVER_WAIT, &seat) {
-            // `deliver_with` answers only `Acked` for compound-sup's `delivered`.
-            Ok(Delivery::Acked | Delivery::Started | Delivery::Unconfirmed) => break Ok(now()),
-            Err(HostRefusal::Failed(why)) => break Err(fail_of(&why)),
-            Err(HostRefusal::NoSeat(_)) => break Err(OrderFail::SessionGone),
-            Err(e) => {
-                tries += 1;
-                if tries == 1 || tries.is_multiple_of(30) {
-                    shared.log.line(&format!("order {}: no answer yet ({e}); asked again under the same id", o.order.0));
-                }
-                std::thread::sleep(ASK_AGAIN);
+    let asked = ask_until(
+        &Wall,
+        &|| shared.stopping.load(Ordering::SeqCst),
+        &mut |at| {
+            let mut t = table(shared);
+            let gone = forget_unasked(&mut t, &o.order, at);
+            if gone {
+                // Under the table's lock: a new ask under this id writes its
+                // record under it too, so this never takes that one away.
+                let _ = fs::remove_file(pending_path(shared, &o.order));
             }
+            gone
+        },
+        &mut || {
+            let socket = {
+                let t = table(shared);
+                t.seats.get(&o.seat).filter(|r| r.epoch == o.epoch).map(|r| r.socket.clone())
+            };
+            let Some(socket) = socket else { return Try::Answer(Err(OrderFail::SessionGone)) };
+            match inproc::deliver_with(&sup, &socket, &o.order.0, &o.text, DELIVER_WAIT, &seat) {
+                // `deliver_with` answers only `Acked` for compound-sup's `delivered`.
+                Ok(Delivery::Acked | Delivery::Started | Delivery::Unconfirmed) => Try::Answer(Ok(now())),
+                Err(HostRefusal::Failed(why)) => Try::Answer(Err(fail_of(&why))),
+                Err(HostRefusal::NoSeat(_)) => Try::Answer(Err(OrderFail::SessionGone)),
+                Err(e) => Try::NoAnswer(e.to_string()),
+            }
+        },
+        &mut |tries, why| {
+            if tries == 1 || tries.is_multiple_of(30) {
+                shared.log.line(&format!("order {}: no answer yet ({why}); asked again under the same id", o.order.0));
+            }
+        },
+    );
+    match asked {
+        Asked::Answer(outcome) => answered(shared, &o, outcome),
+        Asked::Stopping => {}
+        Asked::Unasked => {
+            shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).not_awaiting(&o.seat, &o.order);
+            shared.log.line(&format!("order {} to {}: dropped, nobody asked for it in {}s", o.order.0, o.seat.0, UNASKED.as_secs()));
         }
-    };
-    answered(shared, &o, outcome);
+    }
 }
 
 /// compound-sup's `failed <id> <why>`, its why read as an [`OrderFail`]; the
