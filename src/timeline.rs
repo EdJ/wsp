@@ -89,6 +89,11 @@ pub(crate) struct Inputs {
     /// why)`: inside a barrier's check seat, a person's step and not the seat's
     /// work (`wsp-090`).
     pub holds: Vec<(i64, i64, String)>,
+    /// The group's barrier check seats as their own readings have them, `(group,
+    /// opened, ended)`: `ended` is the seat's stop (its burn reading's `ended`,
+    /// what `standing_seats` reads), 0 where none is read. A hold written while
+    /// the seat was still open starts at that stop (`wsp-090`).
+    pub check_ends: Vec<(usize, i64, i64)>,
 }
 
 /// One park of a list, from its park event to the resume that took it back.
@@ -935,19 +940,22 @@ fn check_seat(i: &Inputs, label: String, from: i64, to: i64, list: &str, at: usi
     let mut out = Vec::new();
     let mut cur = from;
     for (a, b, why) in i.holds.iter().filter(|(a, b, _)| *b > from && *a < to) {
-        let (a, b) = ((*a).max(cur), (*b).min(to));
+        let (written, b) = ((*a).max(cur), (*b).min(to));
+        // The seat that wrote the hold stays the check seat until it stops.
+        let a = seat_stop(i, list, at, written, b).map_or(written, |e| e.max(written));
         if b <= a {
             continue;
         }
+        let stopped = if a > written { format!(" (the check seat stopped at {})", hhmm(a)) } else { String::new() };
         if a > cur {
             out.push(Phase::work(label.clone(), cur, a).shared());
         }
         let why: String = why.chars().take(200).collect();
         let until = if b < to { format!("started again at {}", hhmm(b)) } else { "still held at the pass".to_string() };
         let cause = format!(
-            "{}{HELD_FOR_STEP} — barrier {at} of {list} held at {}, {until}{}",
+            "{}{HELD_FOR_STEP} — barrier {at} of {list} held at {}{stopped}, {until}{}",
             crate::wallbuckets::BARRIER_HOLD,
-            hhmm(a),
+            hhmm(written),
             if why.is_empty() { String::new() } else { format!(": {why}") }
         );
         out.push(Phase::gap(format!("barrier {at} held → started again"), a, b, cause).shared());
@@ -958,6 +966,20 @@ fn check_seat(i: &Inputs, label: String, from: i64, to: i64, list: &str, at: usi
     }
     out
 }
+
+/// When the check seat open at `held` stopped, before `until`: the latest stop
+/// its reading records for a seat of barrier `at` opened by then, else the first
+/// `stopped in barrier check tree …<list>-check-<at>` line at or after `held`.
+/// `None`: no seat was open, or none is read to have stopped.
+fn seat_stop(i: &Inputs, list: &str, at: usize, held: i64, until: i64) -> Option<i64> {
+    let read = i.check_ends.iter().filter(|(g, o, e)| *g == at && *o <= held && *e > held).map(|(_, _, e)| *e).max();
+    let tree = format!("/{list}-check-{at}");
+    let line = || i.first_line(held, |l| l.starts_with(STOPPED_CHECK) && l.split(':').next().is_some_and(|p| p.ends_with(&tree)));
+    read.or_else(line).map(|e| e.min(until))
+}
+
+/// The line the sweep writes when it stops a barrier check tree's processes.
+const STOPPED_CHECK: &str = "stopped in barrier check tree ";
 
 /// What a barrier's hold is booked under, after [`crate::wallbuckets::BARRIER_HOLD`]:
 /// the list held inside its check seat, for a person's step (`wsp-090`).
@@ -1207,7 +1229,8 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             }
             let (ts, rest) = line.split_at(20);
             let rest = rest.trim_start();
-            if names(rest, id) || list.as_deref().is_some_and(|l| names(rest, l) && (rest.contains("barrier") || rest.contains("Barrier") || rest.contains("--check"))) {
+            let stopped = |l: &str| rest.starts_with(STOPPED_CHECK) && rest.contains(&format!("{l}-check-"));
+            if names(rest, id) || list.as_deref().is_some_and(|l| stopped(l) || (names(rest, l) && (rest.contains("barrier") || rest.contains("Barrier") || rest.contains("--check")))) {
                 i.cycle.push((util::epoch_of(ts), rest.to_string()));
             }
         }
@@ -1222,6 +1245,15 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
         let ev = list_events(store, &["worklist-parked", "worklist-resumed", "worklist-held", "worklist-go"]);
         i.parks = parks_of(&ev, l, util::epoch_secs());
         i.holds = holds_of(&ev, l, util::epoch_secs());
+        if let Some(w) = store.worklist(l) {
+            for (n, g) in w.groups().iter().enumerate() {
+                for c in &g.checks {
+                    let Some(pane) = c.pane.as_deref() else { continue };
+                    let ended = crate::cmd_burn::reading_in(&store.state, pane).and_then(|r| r["ended"].as_str().map(util::epoch_of)).filter(|t| *t > 0).unwrap_or(0);
+                    i.check_ends.push((n + 1, util::epoch_of(&c.at), ended));
+                }
+            }
+        }
     }
     i.group = group;
     // The seats a cap line named as holders, and when they ended.
@@ -2627,6 +2659,50 @@ mod tests {
         let waited: i64 = g.waits.iter().filter(|((_, c), _)| c.contains(HELD_FOR_STEP) && c.contains("barrier 3 of list")).map(|(_, s)| s).sum();
         assert_eq!(waited, 718 * 60, "the hold is its own waiting cause: {g:?}");
         assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+    }
+
+    /// s0-state-core's barrier 3 as it ran (`wsp-090`, sent back): the check
+    /// seat opened at 21:08:59, wrote its hold 77 s later, and stayed open until
+    /// the sweep stopped it at 21:32:03; a person's `go` at 09:30:02 passed it.
+    /// The seat is the check seat to its stop, and the hold runs from that stop.
+    fn fixture_shaped(by_reading: bool) -> (Vec<Phase>, crate::wallbuckets::GroupWall, i64, i64) {
+        let mut i = row();
+        i.group = Some(("s0-state-core".into(), 3, vec!["r-1".into()]));
+        let (seat, held, stop) = (1010, 1010 + 77, 1010 + 1384);
+        let go = stop + 43_079;
+        i.cycle.push((1000, "s0-state-core group 3: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 60s".into()));
+        i.cycle.push((seat, "spawn s0-state-core --agent --check 3 --kind claude".into()));
+        i.cycle.push((stop, "stopped in barrier check tree /c/trees/s0-state-core-check-3: TERM 3794".into()));
+        i.cycle.push((go, "tell s0-state-core: Barrier 3 of s0-state-core passed".into()));
+        if by_reading {
+            i.cycle.retain(|(_, l)| !l.starts_with(STOPPED_CHECK));
+            i.check_ends = vec![(2, 10, 900), (3, seat, stop)];
+        } else {
+            i.cycle.insert(0, (held + 10, "stopped in barrier check tree /c/trees/core-check-3: TERM 1".into()));
+        }
+        let evs = vec![
+            (held, "worklist-held".to_string(), json!({"id": "s0-state-core", "why": "a person runs the migration"})),
+            (go, "worklist-go".to_string(), json!({"id": "s0-state-core", "passed": 3, "started": true})),
+        ];
+        i.holds = holds_of(&evs, "s0-state-core", 99_999_999);
+        let ph = build(&i);
+        let r1 = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), ..Default::default() };
+        let g = crate::wallbuckets::group_wall(&[r1], None, Some(go)).unwrap();
+        (ph, g, stop, go)
+    }
+
+    #[test]
+    fn a_check_seat_open_past_the_hold_it_wrote_is_the_check_seat_to_its_stop_and_the_hold_runs_from_there() {
+        for by_reading in [false, true] {
+            let (ph, g, stop, go) = fixture_shaped(by_reading);
+            let hold = ph.iter().find(|p| p.label == "barrier 3 held → started again").unwrap_or_else(|| panic!("{ph:?}"));
+            assert_eq!((hold.start, hold.end), (stop, go), "the hold runs from the seat's stop to the go ({by_reading}): {ph:?}");
+            assert!(hold.waiting_for.as_deref().is_some_and(|w| w.contains(&format!("held at {}", &util::iso_at(1087)[11..16])) && w.contains("the check seat stopped at")), "{hold:?}");
+            assert_eq!(g.seconds("check_seat"), 10 + 1384, "the wait for the seat and the seat open, 21:08:59 → 21:32:03 ({by_reading}): {g:?}");
+            let waited: i64 = g.waits.iter().filter(|((_, c), _)| c.contains(HELD_FOR_STEP) && c.contains("barrier 3 of s0-state-core") && c.contains("the migration")).map(|(_, s)| s).sum();
+            assert_eq!(waited, 43_079, "about 718 min, its own cause ({by_reading}): {g:?}");
+            assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+        }
     }
 
     #[test]
