@@ -81,6 +81,13 @@ pub const SILENT: Duration = Duration::from_secs(1);
 pub const SPAWN_WAIT: Duration = Duration::from_secs(30);
 /// What a request's own answer may take past its stated wait.
 const MARGIN: Duration = Duration::from_secs(5);
+/// What an `order.deliver`'s answer may take past its stated wait (wsp-108).
+/// The manager answers only when compound-sup does, never "still pending", so
+/// any time past `wait` is dead time on the daemon's tick: [`MARGIN`]'s 5 s
+/// made each ask past wsp-665's budget 6.5 s, not 1.5 s (wsp-104). An answer
+/// that lands later is kept by the manager and replayed at once to the next
+/// tick's ask under the same id.
+const DELIVER_MARGIN: Duration = Duration::from_millis(250);
 /// The environment variable that chooses the host.
 pub const ENV: &str = "WSP_HOST";
 /// The environment variable that chooses the host tree jobs run on.
@@ -941,7 +948,7 @@ impl Host for Tcp {
             text: text.to_string(),
             now: false,
         });
-        let said = self.ask(msg, wait + MARGIN, |m| matches!(m, Message::OrderAcked(_) | Message::OrderRefused(_)))?;
+        let said = self.ask(msg, wait + DELIVER_MARGIN, |m| matches!(m, Message::OrderAcked(_) | Message::OrderRefused(_)))?;
         match said.last() {
             Some(Message::OrderAcked(_)) => Ok(Delivery::Acked),
             Some(Message::OrderRefused(r)) => match r.why {
