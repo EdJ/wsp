@@ -371,6 +371,23 @@ fn item_lines(text: &str, name: &str) -> Vec<usize> {
     out
 }
 
+/// The exit a bare `wsp review`'s words stand for, as [`validate`] reads it:
+/// the words as they are when they are an exit already (a `summary:` or
+/// `verdict:` first, as `$WSP_EXIT` is written), else the first line as the
+/// summary and the rest as the account, with `owed: nothing` when no `owed:`
+/// is there. The sections are left at their own lines, so a `done-when:` after
+/// a caption is read as `wsp submit` reads it (`wsp-137`).
+pub(crate) fn exit_of_review(account: &str) -> String {
+    let account = account.trim();
+    let first = account.lines().find(|l| !l.trim().is_empty()).and_then(section_heading);
+    if matches!(first, Some("summary" | "verdict")) {
+        return format!("{account}\n");
+    }
+    let (caption, rest) = account.split_once('\n').unwrap_or((account, ""));
+    let owed = if account.lines().any(|l| section_heading(l) == Some("owed")) { "" } else { "\n\nowed: nothing" };
+    format!("summary: {}\n\n{}{owed}\n", caption.trim(), rest.trim())
+}
+
 /// The line a heading `name:` is on.
 fn heading_line(text: &str, name: &str) -> Option<usize> {
     text.lines().position(|l| section_heading(l) == Some(name)).map(|i| i + 1)
@@ -1812,5 +1829,43 @@ mod tests {
         store.save_worklist(&w).unwrap();
         assert!(!crate::worklist::verified_by_a_run(&store, "wsp-101"));
         assert!(crate::cmd_task::exit_warnings(&store, &args, "did it").is_empty());
+    }
+
+    /// `wsp-137`, wsp-039's shape: one account, with its `done-when:` after a
+    /// caption (or after a `summary:` line, as `$WSP_EXIT` is written), read by
+    /// review's check and by `wsp submit --dry-run` — and the two agree. The
+    /// account comes in on a file, as `wsp review <id> --from FILE` reads it,
+    /// so a fold that loses its headings is caught here; a truly missing
+    /// `done-when:` still warns.
+    #[test]
+    fn reviews_check_and_submits_dry_run_read_one_account_alike() {
+        let (env, store, _tree) = member("submit-review-agree", ARTEFACTS);
+        let mut t = store.task("wsp-101").unwrap();
+        t.body = "## Overview\nDo the work.\n\nDone when:\n- the work is in work.txt\n".into();
+        store.save_task(&t).unwrap();
+        let review_of = |account: &str| {
+            let file = env.path("account.md");
+            std::fs::write(&file, account).unwrap();
+            let path = file.display().to_string();
+            let args = Args::synth("review", &["wsp-101", "--from", &path], &[]);
+            let (folded, kept, _) = crate::cmd_task::review_payload(&args, "usage").unwrap();
+            assert!(!folded.contains('\n'), "the log still gets one line");
+            crate::cmd_task::exit_warnings(&store, &args, &kept)
+        };
+        let submit_of = |exit: &str| dry_run(&store, closing::Kind::Member, "wsp-101", exit).err().unwrap_or_default();
+        let body = "It wrote work.txt and left nothing.\n\ndone-when:\n- held: the work is in work.txt — work.txt:1\n\nchecks:\n- unit (120s): true\n\nasks:\n- note: nothing to decide\n";
+        // The exit as written to $WSP_EXIT: the same file to both.
+        let exit = format!("summary: the work is in\n\n{body}\nowed: nothing\n");
+        assert_eq!(submit_of(&exit), Vec::<String>::new(), "submit takes it");
+        assert_eq!(review_of(&exit), Vec::<String>::new(), "and review warns of nothing");
+        // A caption first, the way a bare review is written.
+        let captioned = format!("wsp-101: the work is in\n\n{body}");
+        assert_eq!(review_of(&captioned), Vec::<String>::new(), "no false `no done-when:`");
+        assert_eq!(review_of(&captioned), submit_of(&exit_of_review(&captioned)));
+        // No done-when at all: both say so.
+        let bare = "wsp-101: the work is in\n\nIt wrote work.txt.\n";
+        let warned = review_of(bare);
+        assert!(warned.iter().any(|l| l.contains("no `done-when:`")), "{warned:#?}");
+        assert_eq!(warned, submit_of(&exit_of_review(bare)));
     }
 }

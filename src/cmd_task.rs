@@ -1753,12 +1753,12 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         }
         return 2;
     }
-    let (account, from) = match prose_payload(args, USAGE) {
+    let (account, kept, from) = match review_payload(args, USAGE) {
         Ok(v) => v,
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", account.len()));
-    for line in exit_warnings(store, args, &account) {
+    for line in exit_warnings(store, args, &kept) {
         eprintln!("wsp: warning (a run seat's review is read as an exit; `wsp submit` will refuse this) — {line}");
     }
     accept(store, args, &account, said.as_deref())
@@ -1772,10 +1772,27 @@ pub(crate) fn exit_warnings(store: &Store, args: &Args, account: &str) -> Vec<St
     if !crate::worklist::verified_by_a_run(store, &t.id) {
         return Vec::new();
     }
-    let (first, rest) = account.split_once('\n').unwrap_or((account, ""));
-    let text = format!("summary: {}\n\n{}\n\nowed: nothing\n", first.trim(), rest.trim());
+    let text = crate::cmd_submit::exit_of_review(account);
     let c = crate::cmd_submit::validate(store, &t, &text, args.get("anyway").as_deref());
     crate::cmd_submit::refusal_lines(&c)
+}
+
+/// A review's account twice, from one read: folded to the one line the log
+/// keeps, and with its lines kept for [`exit_warnings`], which reads its
+/// sections by their headings (`wsp-137`: folded, a stream's `done-when:` was
+/// gone, and every review from a run seat warned that it had none — at the
+/// line after the five a one-line account wraps to). Then where it came from.
+pub(crate) fn review_payload(args: &Args, usage: &str) -> Result<(String, String, Option<String>), i32> {
+    match payload_source(args.rest.get(1..).unwrap_or_default()) {
+        Some(src) => {
+            let (kept, named) = prose_read(&src, |raw| raw.trim().to_string())?;
+            Ok((fold(&kept), kept, Some(named)))
+        }
+        None => {
+            let (folded, _) = prose_payload(args, usage)?;
+            Ok((folded, args.text(1).trim().to_string(), None))
+        }
+    }
 }
 
 /// **The review core**: what `wsp review` does once it holds an account, and
