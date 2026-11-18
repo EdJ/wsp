@@ -302,6 +302,9 @@ const SEAT_FILE: &str = "seat.json";
 /// reachable in normal use — which is the right direction for it to fail in.
 const VOUCH_SECS: i64 = 120;
 const NEXT_FILE: &str = "next";
+/// The prefix of a seat directory moved aside because it would not go
+/// (`wsp-092`): a dot-name, so [`Compound::ids`] never reads it as a seat.
+const GONE: &str = ".gone-";
 const SEAT_PREFIX: &str = "cpd-";
 
 /// How long `start` waits for `compound-sup`'s handshake before giving up on
@@ -476,6 +479,58 @@ impl Compound<'_> {
             .map(|n| n + 1)
             .unwrap_or(1);
         counted.max(highest).max(1)
+    }
+
+    /// Remove an ended seat's directory, **tolerating the agent's last hooks
+    /// writing into it as it goes** (`wsp-092`). `Stop` and `SessionEnd` can
+    /// still be putting `said.json` or `hooks.jsonl` there as the session is
+    /// ended, and `remove_dir_all` then finds the directory not empty at its
+    /// last step: on 2026-11-18 that refused the end of `cpd-1025` and
+    /// `cpd-1026`, so their despawns kept the claims, and a rework leg sat
+    /// queued behind one for nine minutes.
+    ///
+    /// So a directory that filled up again (or came back) is tried a few
+    /// more times, and one that still will not go is moved aside to a
+    /// [`GONE`] dot-name, which [`Self::ids`] never reads as a seat. The
+    /// seat is ended either way: its agent has been signalled. Leftovers
+    /// are cleared here by the next end, once nothing writes into them.
+    /// Any other error refuses as before, and the seat is kept.
+    fn take_away(&self, dir: &Path) -> Result<()> {
+        self.clear_gone();
+        let mut last = None;
+        for _ in 0..5 {
+            match fs::remove_dir_all(dir) {
+                // A hook that passed its `is_dir` before the removal can still
+                // land after it; nothing it writes makes a directory, but
+                // asking is cheap.
+                Ok(()) if !dir.exists() => return Ok(()),
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => last = Some(e),
+                Err(e) => return Err(Refusal::Backend(e.to_string())),
+            }
+            self.clock.rest(self.poll);
+        }
+        let why = last.map_or_else(|| "it came back".to_string(), |e| e.to_string());
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let aside = dir.with_file_name(format!("{GONE}{name}-{}-{}", std::process::id(), util::epoch_nanos()));
+        match fs::rename(dir, &aside) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&aside);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Refusal::Backend(format!("{why}; and it could not be moved aside: {e}"))),
+        }
+    }
+
+    /// Every [`GONE`] directory under the root, removed where it will go.
+    fn clear_gone(&self) {
+        for e in fs::read_dir(&self.root).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().starts_with(GONE) {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
     }
 
     fn ids(&self) -> Vec<String> {
@@ -1781,7 +1836,7 @@ impl Place for Compound<'_> {
         let dir = self.dir_of(seat)?;
         if !str_of(&rec, "machine").is_empty() {
             self.stop_far(seat, &rec)?;
-            fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
+            self.take_away(&dir)?;
             return Ok(Vec::new());
         }
         // `compound-031` is where the general case (a session whose host is
@@ -1789,7 +1844,7 @@ impl Place for Compound<'_> {
         // this call just ended.
         let ended = self.end_process(seat, &rec)?;
         self.host.bank(&dir);
-        fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
+        self.take_away(&dir)?;
         Ok(ended)
     }
 
@@ -3865,5 +3920,77 @@ mod tests {
         assert!(why.contains("cpd-420") && why.contains("folder-trust prompt for /"), "{why}");
         assert!(why.contains("No, exit") && !why.contains("rsock"), "{why}");
         assert_eq!(trust_prompt(&Seat::new("cpd-1"), "> \n? for shortcuts"), None, "a composer is not a prompt");
+    }
+
+    /// `wsp-092`: a seat whose agent's last hooks are still writing into its
+    /// directory while it is ended still ends. On 2026-11-18 `cpd-1025` and
+    /// `cpd-1026` would not: `Stop` and `SessionEnd` put `said.json` and
+    /// `hooks.jsonl` back between `remove_dir_all` emptying the directory
+    /// and removing it, the end refused with "Directory not empty (os error
+    /// 66)", and the despawn kept the row's claim on a seat nobody stood in.
+    ///
+    /// The hook is the real one ([`Compound::heard`]), run in a loop from
+    /// another thread for as long as the directory is there, and on past
+    /// the end for a moment: a hook that lost the race must not bring the
+    /// seat back either. Twenty seats, because one end can miss the window.
+    #[test]
+    fn a_seat_whose_hooks_write_while_it_is_ended_still_ends_and_does_not_come_back() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let scratch = Scratch::new("hookrace");
+        let place = Compound { poll: Duration::from_millis(1), ..scratch.place() };
+        for n in 1..=20 {
+            let seat = Seat::new(format!("cpd-{n}"));
+            let dir = place.dir_of(&seat).unwrap();
+            fs::create_dir_all(&dir).unwrap();
+            write_atomic(&dir.join(SEAT_FILE), &json!({ "label": "t" }).to_string()).unwrap();
+            let (stop, wrote) = (AtomicBool::new(false), AtomicUsize::new(0));
+            let ended = std::thread::scope(|s| {
+                s.spawn(|| {
+                    let hook = Compound::at(scratch.root.clone());
+                    while !stop.load(Ordering::Relaxed) {
+                        hook.heard(&seat, "Stop", State::Idle, &json!({ "session_id": "s" }));
+                        wrote.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+                while wrote.load(Ordering::Relaxed) < 5 {
+                    std::thread::yield_now();
+                }
+                let ended = place.end(&seat);
+                std::thread::sleep(Duration::from_millis(20));
+                stop.store(true, Ordering::Relaxed);
+                ended
+            });
+            ended.unwrap_or_else(|e| panic!("{seat} was being written to as it ended, and still ends: {e}"));
+            assert!(!dir.exists(), "{seat}: a late hook does not bring the directory back");
+            assert!(place.record(&seat).is_err() && !place.ids().contains(&seat.to_string()), "{seat} is no seat any more");
+        }
+        // What was moved aside is cleared by a later end, once nothing writes into it.
+        let last = Seat::new("cpd-99");
+        fs::create_dir_all(place.dir_of(&last).unwrap()).unwrap();
+        place.end(&last).unwrap();
+        let left: Vec<_> = fs::read_dir(&scratch.root).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(left.iter().all(|n| !n.to_string_lossy().starts_with(GONE)), "leftovers cleared: {left:?}");
+    }
+
+    /// Any error but a directory that filled up again still refuses: the seat
+    /// is kept, so nothing reads a removal that did not happen as an ending.
+    #[test]
+    fn a_seat_whose_directory_will_not_go_for_another_reason_is_not_ended() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("stuck");
+        let place = scratch.place();
+        let seat = Seat::new("cpd-1");
+        let dir = place.dir_of(&seat).unwrap();
+        fs::create_dir_all(dir.join("held")).unwrap();
+        fs::write(dir.join("held").join("f"), "x").unwrap();
+        fs::set_permissions(dir.join("held"), fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = place.end(&seat);
+        let _ = fs::set_permissions(dir.join("held"), fs::Permissions::from_mode(0o755));
+        let root = wsp_base::calls::Command::new("id").arg("-u").output().is_ok_and(|o| o.stdout == b"0\n");
+        if !root {
+            let err = outcome.expect_err("a permission refusal is not an ending");
+            assert!(matches!(err, Refusal::Backend(_)), "{err}");
+            assert!(place.holds(&seat), "and the seat is kept");
+        }
     }
 }

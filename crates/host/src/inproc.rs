@@ -511,7 +511,7 @@ impl InProcess {
     }
 
     pub fn say(&self, dir: &Path, said: &Value) {
-        let _ = write_atomic(&dir.join(SAID_FILE), &said.to_string());
+        let _ = write_atomic_into(&dir.join(SAID_FILE), &said.to_string());
     }
 
     pub fn log_hook(&self, dir: &Path, line: &Value) {
@@ -1453,7 +1453,7 @@ pub fn tally_burn(dir: &PathBuf, payload: &Value) {
         }
     }
 
-    let _ = write_atomic(
+    let _ = write_atomic_into(
         &dir.join(BURN_FILE),
         &json!({
             "session_id": sid,
@@ -1755,8 +1755,17 @@ pub fn mangle(cwd: &str) -> String {
 /// `steady` passes, which walk the task, project and list directories and
 /// never a seat's.
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+    write_atomic_into(path, contents)
+}
+
+/// [`write_atomic`] into a directory that must already be there, and is not
+/// made: a seat's, written by a hook (`wsp-092`). A hook that checked the
+/// seat's directory and then lost the race with its end must not make the
+/// directory again, which would stand as a seat with no record in every
+/// census after. The write fails instead, as a hook's write may.
+pub(crate) fn write_atomic_into(path: &Path, contents: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
         ".{}.{}.tmp",
         path.file_name().and_then(|x| x.to_str()).unwrap_or("wsp"),

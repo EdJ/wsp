@@ -2540,11 +2540,56 @@ pub(crate) fn legs_owed(store: &Store, seats: &dyn Seats) -> Vec<String> {
     out
 }
 
+/// Whether a tick ends this seat now (`wsp-092`): one not tried yet, or one
+/// whose ending failed while the seat is still there. Until 2026-11-18 a failure
+/// was never tried again, and `cpd-1025`, whose end had lost a race with its own
+/// last hook, kept wsp-076's claim and its queued rework leg for nine minutes,
+/// until a person ended it by hand and it went at once.
+///
+/// **Not a seat positively gone** ([`Seats::absent`]): its pane closed and what
+/// failed was a pid that outlived it, which another despawn does not change.
+/// A backend that cannot be reached is not "gone", so that seat is tried again.
+pub(crate) fn end_due(ending: &crate::verification::Ending, seats: &dyn Seats, seat: &str) -> bool {
+    use crate::verification::Ending;
+    match ending {
+        Ending::Standing => true,
+        Ending::Failed(_) => !seats.absent(seat),
+        Ending::Ended => false,
+    }
+}
+
+/// Whether an ending is worth writing on its entry: not a failure after a
+/// failure, which is the same answer and would be a commit every tick.
+fn end_changed(was: &crate::verification::Ending, now: &crate::verification::Ending) -> bool {
+    use crate::verification::Ending;
+    !matches!((was, now), (Ending::Failed(_), Ending::Failed(_)))
+}
+
+/// What a log line of an ending adds when it was a retry's.
+fn again(was: &crate::verification::Ending) -> &'static str {
+    match was {
+        crate::verification::Ending::Failed(_) => ", on a later try",
+        _ => "",
+    }
+}
+
+/// How a failed ending's log line ends: what happens next.
+const TRIED_AGAIN: &str = "tried again each tick while the seat is there, and not said again";
+
+/// How a failed ending's tell ends.
+fn told_again(seat: &str) -> String {
+    format!(
+        "It is tried again each tick, quietly, while the seat is there — \
+         `wsp despawn --pane {seat}` if it will not go, and by pid if a process outlived it."
+    )
+}
+
 /// Every leg that is done and still seated, ended — once each, and never in a
 /// turn. The tick's half of ending a leg, as [`passes_finished`] is a verifier's:
 /// `wsp leg done` is the agent's own last act, and ending the seat inside that
 /// turn cuts it short. The outcome is written on the entry before anything can
-/// ask again, `ended` or `end failed: …`, and a failure is not retried.
+/// ask again, `ended` or `end failed: …`, and a failure is tried again on the
+/// next tick while the seat is still there ([`end_due`]), told once.
 ///
 /// **From `/`** ([`despawn_seat`]), so the tree a sibling stands in is not kept
 /// because the ending process is standing in it. Returns the seats it ended.
@@ -2554,7 +2599,7 @@ pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     for t in store.tasks_shared().iter().filter(|t| crate::legs::staged(t)) {
         for l in crate::legs::legs(t) {
             let Some(seat) = l.pane.clone() else { continue };
-            if l.state != crate::legs::State::Done || l.ending != Ending::Standing {
+            if l.state != crate::legs::State::Done || !end_due(&l.ending, seats, &seat) {
                 continue;
             }
             if seats.state(&seat).is_some_and(|s| s.turn_in_flight()) {
@@ -2572,7 +2617,7 @@ pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
                 Ok(()) => Ending::Ended,
                 Err(why) => Ending::Failed(why.clone()),
             };
-            let wrote = store.locked(|| {
+            let wrote = end_changed(&l.ending, &ending) && store.locked(|| {
                 let Some(mut row) = store.find_task(&t.id) else { return false };
                 let mut all = crate::legs::legs(&row);
                 let Some(q) = all.iter_mut().find(|q| q.name == l.name && q.pane.as_deref() == Some(seat.as_str())) else { return false };
@@ -2585,16 +2630,16 @@ pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
             }
             match outcome {
                 Ok(()) => {
-                    log_line(store, &format!("ended {seat}, which ran leg {} of {}", l.name, t.id));
+                    log_line(store, &format!("ended {seat}, which ran leg {} of {}{}", l.name, t.id, again(&l.ending)));
                     ended.push(seat);
                 }
+                Err(_) if l.ending != Ending::Standing => {}
                 Err(why) => {
-                    log_line(store, &format!("could not end {seat}, which ran leg {} of {}: {why} — not tried again", l.name, t.id));
+                    log_line(store, &format!("could not end {seat}, which ran leg {} of {}: {why} — {TRIED_AGAIN}", l.name, t.id));
                     if let Some(w) = list_of(store, t) {
                         tell(store, &w, &format!(
-                            "wsp could not end leg {} of {} in {seat}: {}. It is not tried again — \
-                             `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
-                            l.name, t.id, util::truncate(&why, 200)
+                            "wsp could not end leg {} of {} in {seat}: {}. {}",
+                            l.name, t.id, util::truncate(&why, 200), told_again(&seat)
                         ));
                     }
                 }
@@ -2988,7 +3033,7 @@ pub(crate) fn pieces_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     for t in store.tasks_shared().iter().filter(|t| crate::pieces::staged(t)) {
         for p in crate::pieces::record(t).pieces {
             let Some(seat) = p.pane.clone() else { continue };
-            if p.state != crate::pieces::State::Done || p.ending != Ending::Standing {
+            if p.state != crate::pieces::State::Done || !end_due(&p.ending, seats, &seat) {
                 continue;
             }
             if seats.state(&seat).is_some_and(|s| s.turn_in_flight()) {
@@ -3006,7 +3051,7 @@ pub(crate) fn pieces_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
                 Ok(()) => Ending::Ended,
                 Err(why) => Ending::Failed(why.clone()),
             };
-            let wrote = store.locked(|| {
+            let wrote = end_changed(&p.ending, &ending) && store.locked(|| {
                 let Some(mut row) = store.find_task(&t.id) else { return false };
                 let mut rec = crate::pieces::record(&row);
                 let Some(q) = rec.pieces.iter_mut().find(|q| q.n == p.n && q.pane.as_deref() == Some(seat.as_str())) else { return false };
@@ -3019,16 +3064,16 @@ pub(crate) fn pieces_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
             }
             match outcome {
                 Ok(()) => {
-                    log_line(store, &format!("ended {seat}, which ran piece {} of {}", p.n, t.id));
+                    log_line(store, &format!("ended {seat}, which ran piece {} of {}{}", p.n, t.id, again(&p.ending)));
                     ended.push(seat);
                 }
+                Err(_) if p.ending != Ending::Standing => {}
                 Err(why) => {
-                    log_line(store, &format!("could not end {seat}, which ran piece {} of {}: {why} — not tried again", p.n, t.id));
+                    log_line(store, &format!("could not end {seat}, which ran piece {} of {}: {why} — {TRIED_AGAIN}", p.n, t.id));
                     if let Some(w) = list_of(store, t) {
                         tell(store, &w, &format!(
-                            "wsp could not end piece {} of {} in {seat}: {}. It is not tried again — \
-                             `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
-                            p.n, t.id, util::truncate(&why, 200)
+                            "wsp could not end piece {} of {} in {seat}: {}. {}",
+                            p.n, t.id, util::truncate(&why, 200), told_again(&seat)
                         ));
                     }
                 }
@@ -4787,7 +4832,7 @@ pub(crate) fn passes_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     let owned = crate::ending::exit_owns(store);
     let due = |p: &crate::verification::Pass| p.state != State::Running && !p.pane.as_ref().is_some_and(|s| owned.contains(s));
     for t in store.tasks_shared().iter().filter(|t| t.body.contains("## Verification")) {
-        let done = passes(t).iter().any(|p| p.standing() && due(p));
+        let done = passes(t).iter().any(|p| p.pane.as_deref().is_some_and(|seat| end_due(&p.ending, seats, seat)) && due(p));
         if done {
             out.extend(end_passes(store, seats, &t.id, due));
         }
@@ -4799,15 +4844,18 @@ pub(crate) fn passes_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
 ///
 /// The outcome is written on the pass before anything else can ask again:
 /// `ended`, or `end failed: …`. A failure is said in `cycle.log` and told to
-/// the run's governor, and it is not retried — wsp-176 item 1, a verifier
-/// whose despawn failed was tried again every tick, each attempt a line and
-/// none of them a different answer. A seat that will not end is a person's to
-/// look at, and the entry is where they find which one.
+/// the run's governor **once** — wsp-176 item 1, a verifier whose despawn
+/// failed was tried again every tick, each attempt a line and none of them a
+/// different answer. It is still tried again, quietly, on the next tick while
+/// the seat is there ([`end_due`], `wsp-092`): a seat whose end failed on a
+/// passing race kept its claim, and a rework leg queued behind it, until a
+/// person ended it by hand.
 ///
 /// **Ended means gone, as for the member** (`wsp-193`): the seat's process
 /// tree is read before the despawn, and the pass is `ended` only once none of
-/// it is running. A pid still running after it is `end failed`, on the same
-/// once-only terms. A seat with no pid to confirm by is not ended at all —
+/// it is running. A pid still running after it is `end failed`, told on the
+/// same once-only terms; a pane that is gone is not tried again for it. A
+/// seat with no pid to confirm by is not ended at all —
 /// see [`crate::ending::verifier_pids`] — and stays standing to be asked again.
 ///
 /// Returns the seats it ended.
@@ -4827,7 +4875,10 @@ pub(crate) fn end_passes_keeping(
 ) -> Vec<String> {
     use crate::verification::{passes, write, Ending};
     let Some(t) = store.find_task(member) else { return Vec::new() };
-    let due: Vec<_> = passes(&t).into_iter().filter(|p| p.standing() && which(p)).collect();
+    let due: Vec<_> = passes(&t)
+        .into_iter()
+        .filter(|p| p.pane.as_deref().is_some_and(|seat| end_due(&p.ending, seats, seat)) && which(p))
+        .collect();
     let mut ended = Vec::new();
     for p in due {
         let Some(seat) = p.pane.clone() else { continue };
@@ -4855,7 +4906,7 @@ pub(crate) fn end_passes_keeping(
             Ok(()) => Ending::Ended,
             Err(why) => Ending::Failed(why.clone()),
         };
-        let wrote = store.locked(|| {
+        let wrote = end_changed(&p.ending, &ending) && store.locked(|| {
             let Some(mut t) = store.find_task(member) else { return false };
             let mut ps = passes(&t);
             let Some(q) = ps.iter_mut().find(|q| q.at == p.at && q.pane == p.pane) else { return false };
@@ -4870,17 +4921,18 @@ pub(crate) fn end_passes_keeping(
         }
         match outcome {
             Ok(()) => {
-                log_line(store, &format!("ended {seat}, which verified {member} ({})", p.state.as_str()));
+                log_line(store, &format!("ended {seat}, which verified {member} ({}){}", p.state.as_str(), again(&p.ending)));
                 ended.push(seat);
             }
+            Err(_) if p.ending != Ending::Standing => {}
             Err(why) => {
-                log_line(store, &format!("could not end {seat}, which verified {member}: {why} — not tried again"));
+                log_line(store, &format!("could not end {seat}, which verified {member}: {why} — {TRIED_AGAIN}"));
                 let list = store.find_task(member).and_then(|t| list_of(store, &t));
                 if let Some(w) = list {
                     tell(store, &w, &format!(
-                        "wsp could not end the verifier of {member} in {seat}: {}. It is not tried again — \
-                         `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
-                        util::truncate(&why, 200)
+                        "wsp could not end the verifier of {member} in {seat}: {}. {}",
+                        util::truncate(&why, 200),
+                        told_again(&seat)
                     ));
                 }
             }
@@ -6551,10 +6603,12 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// The other verdict. A verifier that blocked has said what has to change;
     /// its job is finished either way, and it is the member's agent who does the
-    /// changing. **And a seat that will not end is said once and left**: the
-    /// failure is on the pass and with the governor, and no tick tries again.
+    /// changing. **And a seat that will not end is said once and tried again
+    /// quietly** (`wsp-092`): the failure is on the pass and with the governor,
+    /// and the next tick ends it once the end goes through, so no claim is kept
+    /// on a seat whose end lost a passing race.
     #[test]
-    fn a_verifier_that_blocked_is_ended_by_a_tick_and_a_failed_ending_is_told_once_and_not_retried() {
+    fn a_verifier_that_blocked_is_ended_by_a_tick_and_a_failed_ending_is_told_once_and_tried_again() {
         use crate::repair::Pass;
         use crate::verification::{Ending, State as V};
 
@@ -6575,9 +6629,20 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(told.iter().filter(|t| t.contains("could not end the verifier of m-1")).count(), 1, "{told:?}");
 
         crate::repair::tick(&store, &Exits, &mut Pass::new());
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "the seat is still there, so the next tick tries again");
+        assert!(!drained(&TOLD).iter().any(|t| t.contains("could not end")), "and does not tell again");
+        assert!(matches!(&passes_on(&store, "m-1")[0].ending, Ending::Failed(_)), "still failed");
+        let lines = || std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert_eq!(lines().matches("could not end cpd-9").count(), 1, "nor log it again: {}", lines());
+
         END_FAIL.with(|f| *f.borrow_mut() = None);
-        assert!(drained(&ENDED).is_empty(), "a failed ending is not tried again every tick");
-        assert!(!drained(&TOLD).iter().any(|t| t.contains("could not end")), "nor told again");
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "the race is over and the end goes through");
+        assert_eq!(passes_on(&store, "m-1")[0].ending, Ending::Ended, "and the pass says so");
+        assert!(lines().contains("ended cpd-9, which verified m-1 (blocks), on a later try"), "{}", lines());
+
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
+        assert!(drained(&ENDED).is_empty(), "ended once: nothing is standing any more");
     }
 
     /// `wsp-325`: the seat's transcript is read when its pass is ended, and the

@@ -1766,8 +1766,11 @@ mod tests {
         );
         assert_eq!(drain(&TOLD).iter().filter(|t| t.contains("verifier of m-1") && t.contains("203")).count(), 1);
         drain(&DESPAWNED);
+        // The pane did close: every backend says so. Another despawn would not
+        // end pid 203, so it is not tried (`wsp-092` retries a seat still there).
+        seats.absent = vec!["cpd-2".into()];
         pass(&store, &seats);
-        assert!(!drain(&DESPAWNED).contains(&"cpd-2".to_string()), "a failure is not tried again every tick");
+        assert!(!drain(&DESPAWNED).contains(&"cpd-2".to_string()), "a failure on a gone pane is not tried again every tick");
         assert!(drain(&TOLD).iter().all(|t| !t.contains("verifier of m-1")), "nor told again");
     }
 
@@ -2311,6 +2314,10 @@ mod tests {
         f.survives = vec![202];
         exited(&store, "cpd-2", "m-1", "verifier");
         exits(&store, &f);
+        // The despawn did close the pane, and every backend says so: only pid
+        // 202 outlived it, which another despawn would not end (`wsp-092`
+        // retries a failed ending only while the seat is still there).
+        f.absent.push("cpd-2".into());
         exits(&store, &f);
         crate::cycle::passes_finished(&store, &f);
         assert_eq!(drain(&DESPAWNED), vec!["cpd-2".to_string()], "tried once");
