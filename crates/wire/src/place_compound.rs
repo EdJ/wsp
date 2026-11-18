@@ -307,6 +307,17 @@ const NEXT_FILE: &str = "next";
 const GONE: &str = ".gone-";
 const SEAT_PREFIX: &str = "cpd-";
 
+/// How [`Compound::take_away`] removed a seat's directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Took {
+    /// The first `remove_dir_all` took it.
+    AtOnce,
+    /// A later one did, after the directory filled up again: the try it was.
+    OnTry(u32),
+    /// None did, and it was moved aside to a [`GONE`] name.
+    Aside,
+}
+
 /// How long `start` waits for `compound-sup`'s handshake before giving up on
 /// it. Generous: the supervisor daemonizes, opens libghostty and binds a pty
 /// before it prints the third line, and a spawn that is going to fail (a
@@ -495,17 +506,20 @@ impl Compound<'_> {
     /// seat is ended either way: its agent has been signalled. Leftovers
     /// are cleared here by the next end, once nothing writes into them.
     /// Any other error refuses as before, and the seat is kept.
-    fn take_away(&self, dir: &Path) -> Result<()> {
+    ///
+    /// Says how it went, which only a test reads: the end does not care.
+    fn take_away(&self, dir: &Path) -> Result<Took> {
         self.clear_gone();
         let mut last = None;
-        for _ in 0..5 {
+        for n in 0..5 {
+            let took = if n == 0 { Took::AtOnce } else { Took::OnTry(n + 1) };
             match fs::remove_dir_all(dir) {
                 // A hook that passed its `is_dir` before the removal can still
                 // land after it; nothing it writes makes a directory, but
                 // asking is cheap.
-                Ok(()) if !dir.exists() => return Ok(()),
+                Ok(()) if !dir.exists() => return Ok(took),
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(took),
                 Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => last = Some(e),
                 Err(e) => return Err(Refusal::Backend(e.to_string())),
             }
@@ -517,9 +531,9 @@ impl Compound<'_> {
         match fs::rename(dir, &aside) {
             Ok(()) => {
                 let _ = fs::remove_dir_all(&aside);
-                Ok(())
+                Ok(Took::Aside)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Took::OnTry(6)),
             Err(e) => Err(Refusal::Backend(format!("{why}; and it could not be moved aside: {e}"))),
         }
     }
@@ -3922,17 +3936,16 @@ mod tests {
         assert_eq!(trust_prompt(&Seat::new("cpd-1"), "> \n? for shortcuts"), None, "a composer is not a prompt");
     }
 
-    /// `wsp-092`: a seat whose agent's last hooks are still writing into its
-    /// directory while it is ended still ends. On 2026-11-18 `cpd-1025` and
-    /// `cpd-1026` would not: `Stop` and `SessionEnd` put `said.json` and
-    /// `hooks.jsonl` back between `remove_dir_all` emptying the directory
-    /// and removing it, the end refused with "Directory not empty (os error
-    /// 66)", and the despawn kept the row's claim on a seat nobody stood in.
+    /// `wsp-092`, the hook's half: the real hook ([`Compound::heard`]), run in
+    /// a loop from another thread through a seat's end and on past it for a
+    /// moment, neither keeps the seat from ending nor **brings its directory
+    /// back** once it has gone. On 2026-11-18 `cpd-1025` and `cpd-1026` would
+    /// not end: "Directory not empty (os error 66)".
     ///
-    /// The hook is the real one ([`Compound::heard`]), run in a loop from
-    /// another thread for as long as the directory is there, and on past
-    /// the end for a moment: a hook that lost the race must not bring the
-    /// seat back either. Twenty seats, because one end can miss the window.
+    /// This one does not pin the removal's retry: the hook guards on the
+    /// directory being there and writes about one file a call, so the window
+    /// is narrow and trunk failed it about one run in nine. That is
+    /// [`a_seat_directory_that_keeps_gaining_files_while_it_is_removed_still_goes`]'s.
     #[test]
     fn a_seat_whose_hooks_write_while_it_is_ended_still_ends_and_does_not_come_back() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3964,12 +3977,79 @@ mod tests {
             assert!(!dir.exists(), "{seat}: a late hook does not bring the directory back");
             assert!(place.record(&seat).is_err() && !place.ids().contains(&seat.to_string()), "{seat} is no seat any more");
         }
-        // What was moved aside is cleared by a later end, once nothing writes into it.
-        let last = Seat::new("cpd-99");
-        fs::create_dir_all(place.dir_of(&last).unwrap()).unwrap();
-        place.end(&last).unwrap();
-        let left: Vec<_> = fs::read_dir(&scratch.root).unwrap().flatten().map(|e| e.file_name()).collect();
-        assert!(left.iter().all(|n| !n.to_string_lossy().starts_with(GONE)), "leftovers cleared: {left:?}");
+    }
+
+    /// `wsp-092`, the removal's half: a seat directory that keeps gaining new
+    /// files for the whole of its removal still goes, and the seat is gone
+    /// from every census. Two writers with no guard put a new file in every
+    /// few microseconds, so the last step of every `remove_dir_all` finds one:
+    /// trunk's single removal refuses here with "Directory not empty", and so
+    /// do all of [`Compound::take_away`]'s retries — it is the move aside that
+    /// ends these seats. (Checked by hand: with `take_away` cut back to a
+    /// plain `remove_dir_all` this failed 15 runs in 15; as written it took
+    /// every seat `Aside` and passed 15 in 15.) A hook's burst is shorter, and
+    /// a retry is what usually takes it; no test pins that.
+    #[test]
+    fn a_seat_directory_that_keeps_gaining_files_while_it_is_removed_still_goes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let scratch = Scratch::new("flood");
+        let place = Compound { poll: Duration::from_millis(1), ..scratch.place() };
+        let mut took = Vec::new();
+        for n in 1..=10 {
+            let seat = Seat::new(format!("cpd-{n}"));
+            let dir = place.dir_of(&seat).unwrap();
+            fs::create_dir_all(&dir).unwrap();
+            write_atomic(&dir.join(SEAT_FILE), &json!({ "label": "t" }).to_string()).unwrap();
+            let (stop, wrote) = (AtomicBool::new(false), AtomicUsize::new(0));
+            let outcome = std::thread::scope(|s| {
+                for w in 0..2 {
+                    let (dir, stop, wrote) = (&dir, &stop, &wrote);
+                    s.spawn(move || {
+                        let mut i = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            // `fs::write` makes no directory: once the seat's has
+                            // gone (or been moved aside) these fail, as a hook's would.
+                            if fs::write(dir.join(format!("late-{w}-{i}")), "x").is_ok() {
+                                wrote.fetch_add(1, Ordering::Relaxed);
+                            }
+                            i += 1;
+                        }
+                    });
+                }
+                while wrote.load(Ordering::Relaxed) < 50 {
+                    std::thread::yield_now();
+                }
+                let outcome = place.take_away(&dir);
+                stop.store(true, Ordering::Relaxed);
+                outcome
+            });
+            let how = outcome.unwrap_or_else(|e| panic!("{seat} kept gaining files as it was removed, and still goes: {e}"));
+            assert!(!dir.exists(), "{seat}: its directory is gone ({how:?})");
+            assert!(place.record(&seat).is_err() && !place.ids().contains(&seat.to_string()), "{seat} is no seat any more");
+            took.push(how);
+        }
+        assert!(
+            took.iter().any(|t| *t != Took::AtOnce),
+            "the flood made some removal retry or move aside, so this pins that path: {took:?}"
+        );
+    }
+
+    /// What was moved aside and would not go at once is cleared by a later end,
+    /// and is never read as a seat meanwhile (`wsp-092`).
+    #[test]
+    fn a_leftover_moved_aside_is_no_seat_and_a_later_end_clears_it() {
+        let scratch = Scratch::new("leftover");
+        let place = scratch.place();
+        let left = scratch.root.join(format!("{GONE}cpd-7-1-2"));
+        fs::create_dir_all(left.join("deep")).unwrap();
+        fs::write(left.join("said.json"), "{}").unwrap();
+        fs::write(left.join("deep").join("hooks.jsonl"), "{}\n").unwrap();
+        assert!(place.ids().iter().all(|id| !id.starts_with(GONE) && !id.contains("cpd-7")), "{:?}", place.ids());
+        let seat = Seat::new("cpd-8");
+        fs::create_dir_all(place.dir_of(&seat).unwrap()).unwrap();
+        place.end(&seat).unwrap();
+        assert!(!left.exists(), "the later end cleared the leftover");
+        assert!(!place.dir_of(&seat).unwrap().exists());
     }
 
     /// Any error but a directory that filled up again still refuses: the seat
