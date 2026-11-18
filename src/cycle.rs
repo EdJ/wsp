@@ -935,6 +935,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // fans out. With no cap the order changes nothing — each start is keyed on
     // its own record.
     let gone = |seat: &str| seats.absent(seat) || seats.state(seat) == Some(State::Gone);
+    let absent = |seat: &str| seats.absent(seat);
     for s in pos.members.iter().filter(|s| !barrier_only && s.owes_a_verifier()) {
         let Some(member) = store.find_task(&s.id) else { continue };
         // On the kind the work ran on — `wsp-134` d1 (C) — which in a
@@ -955,7 +956,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         if crate::check::gate(store, &member) == crate::check::Gate::Wait {
             continue;
         }
-        if let Some(opened) = open_verifier(store, &member, &on, &gone, &|| gate.admits(&label)) {
+        if let Some(opened) = open_verifier(store, &member, &on, &gone, &absent, &|| gate.admits(&label)) {
             // A member split into sub-tasks no run started (`wsp-311`): its
             // governor hears it once for each landing, as the pass opens.
             if !opened.again {
@@ -972,7 +973,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 ));
             }
             if let Some(seat) = &opened.superseded {
-                log_line(store, &format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id));
+                match opened.lost.as_deref() == Some(seat.as_str()) {
+                    true => log_line(store, &format!("{} group {at}: {}'s verifier seat {seat} still stands with its agent gone — ending it", w.id, member.id)),
+                    false => log_line(store, &format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id)),
+                }
                 end_passes(store, seats, &member.id, |p| p.state == crate::verification::State::Superseded);
             }
             if spawn(store, &member.id, &on, Undo::Verifier, (&w.id, &at.to_string())) {
@@ -3220,7 +3224,21 @@ pub(crate) fn retry_owed_land(store: &Store, list: &str, at: usize, member: &Tas
     log_line(store, &format!("{list} group {at}: {} {said}", member.id));
 }
 
-pub(crate) fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
+/// `gone` is a seat whose agent went without wsp; `absent` is one whose pane has
+/// closed too. Only the second has nothing left to end (`wsp-085`): on
+/// m1-fixes-3 wsp-080's verifier cpd-419 read `Gone` after one turn, its pass was
+/// written `ended` though its pane stood on in the member's tree, and so no
+/// ending ever came for it — not the next verifier's, not the list's close,
+/// which found it "standing in" wsp-080's tree. A seat still standing is
+/// superseded instead, and ended at once like any other.
+pub(crate) fn open_verifier(
+    store: &Store,
+    member: &Task,
+    on: &Policy,
+    gone: &dyn Fn(&str) -> bool,
+    absent: &dyn Fn(&str) -> bool,
+    admit: &dyn Fn() -> bool,
+) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::commit_of(member);
     let landed_again = |p: &v::Pass| match (&now_landing, &p.read) {
@@ -3254,12 +3272,16 @@ pub(crate) fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dy
                     return None;
                 }
                 own[i].state = State::Superseded;
+                // A dead agent in a pane that still stands is ended like a
+                // superseded one; only a closed pane has nothing left to end.
+                let closed = dead && own[i].pane.as_deref().is_some_and(absent);
                 if dead {
-                    // Nothing left to end: the seat went without wsp.
-                    own[i].ending = Ending::Ended;
                     lost = own[i].pane.clone();
                 }
-                superseded = own[i].pane.clone().filter(|_| !ended && !dead);
+                if closed {
+                    own[i].ending = Ending::Ended;
+                }
+                superseded = own[i].pane.clone().filter(|_| !ended && !closed);
             }
             Some(p) if p.state == State::Holds => {
                 if !landed_again(p) {
@@ -8097,6 +8119,43 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(ps[0].ending, Ending::Ended, "nothing is left to end, and nothing tries");
         assert!(drained(&ENDED).is_empty(), "a seat that went is not despawned");
         assert_eq!(spawned(), vec![("m-1 · verifying".to_string(), "claude".to_string())]);
+    }
+
+    /// **A verifier whose agent went but whose seat still stands is ended, not
+    /// written off** (`wsp-085`, m1-fixes-3 group 2). wsp-080's verifier cpd-419
+    /// read `Gone` after one turn and no verdict; its pass was written `ended`
+    /// as if its pane had closed, so nothing ever ended it, and the list closed
+    /// with cpd-419 still standing in wsp-080's tree. Now it is superseded and
+    /// ended at once, the fresh verifier's verdict is the row's record, and the
+    /// group's end finds nothing of it left to end.
+    #[test]
+    fn a_verifier_whose_agent_went_in_a_seat_still_standing_is_ended_and_the_next_one_verifies() {
+        use crate::verification::{Ending, State as V};
+        let (_env, store) = scratch("verifierdeadseat");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        crate::verification::name_seat(&store, "m-1", "cpd-419");
+        assert_eq!(spawned().len(), 1);
+        let _ = drained(&ENDED);
+
+        let _ = drained(&SAID);
+        step(&store, &w, &Fixed::new(&[("cpd-419", State::Gone)]));
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.iter().map(|p| p.state).collect::<Vec<_>>(), vec![V::Superseded, V::Running]);
+        assert_eq!(drained(&ENDED), vec!["cpd-419".to_string()], "the seat that still stands is ended at once");
+        assert_eq!(ps[0].ending, Ending::Ended, "by that ending, not written off");
+        assert_eq!(spawned(), vec![("m-1 · verifying".to_string(), "claude".to_string())], "and a fresh one starts");
+        let said = drained(&SAID);
+        assert!(said.iter().any(|l| l.contains("cpd-419 still stands with its agent gone")), "{said:?}");
+
+        crate::verification::name_seat(&store, "m-1", "cpd-1000");
+        crate::verification::record(&store, "m-1", V::Holds, "holds", Some("cpd-1000"), None).unwrap();
+        assert!(verified(&store.tasks(), "m-1"), "the restart's verdict is the row's verified record");
+
+        end_group(&store, &Fixed::new(&[("cpd-419", State::Gone), ("cpd-1000", State::Idle)]), &store.worklist("run").unwrap(), 1);
+        let ended = drained(&ENDED);
+        assert!(!ended.contains(&"cpd-419".to_string()), "nothing of the lost seat is left at close: {ended:?}");
     }
 
     /// A seat that is idle, has taken no turn, and answers what its prompt holds.

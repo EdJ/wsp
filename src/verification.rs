@@ -2036,7 +2036,7 @@ mod tests {
         assert!(t.body.contains(" could not verify · "), "the entry says so: {}", t.body);
         let tasks = vec![t.clone()];
         assert!(!verified(&tasks, "m-1") && blocked(&tasks, "m-1").is_none(), "neither a hold nor a block");
-        let opened = crate::cycle::open_verifier(&store, &t, &crate::model::Policy::parse("claude").unwrap(), &|_: &str| false, &|| true);
+        let opened = crate::cycle::open_verifier(&store, &t, &crate::model::Policy::parse("claude").unwrap(), &|_: &str| false, &|_: &str| false, &|| true);
         assert!(opened.is_some(), "the run owes a new verifier");
         let states: Vec<State> = passes(&store.find_task("m-1").unwrap()).iter().map(|p| p.state).collect();
         assert_eq!(states, vec![State::CouldNotVerify, State::Running]);

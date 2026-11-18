@@ -886,14 +886,23 @@ fn record_ended(store: &Store, id: &str, h: &Holds) {
     }
 }
 
-/// Why an ending failed, with "the tree is in use" where the error is only
-/// "Directory not empty" (`wsp-067`): the tree was being removed while
-/// something still wrote in it, and the bare error names neither.
+/// Why an ending failed, with what was not empty where the error is only
+/// "Directory not empty" (`wsp-067`), which names nothing.
+///
+/// **Not always the tree** (`wsp-085`). A despawn that answers "is still
+/// standing, so nothing was released" failed before any tree was touched: it
+/// is the backend's end, removing the seat's own directory while the agent's
+/// last hooks still wrote into it (`wsp-092` moves such a directory aside
+/// now). This said "the tree is in use" for cpd-413 and cpd-1000 on m1-fixes-3,
+/// and sent the reader to the member's tree for a cause that was never there.
 pub(crate) fn why_not_ended(why: &str) -> String {
-    if why.contains("Directory not empty") || why.contains("os error 66") || why.contains("os error 39") {
-        format!("{why} — the tree is in use: a process still writes in it, so it could not be removed")
+    if !(why.contains("Directory not empty") || why.contains("os error 66") || why.contains("os error 39")) {
+        return why.to_string();
+    }
+    if why.contains("still standing, so nothing was released") {
+        format!("{why} — the seat's own directory was written as it was removed (its agent's last hooks), so the seat was not ended; its tree was not touched")
     } else {
-        why.to_string()
+        format!("{why} — the tree is in use: a process still writes in it, so it could not be removed")
     }
 }
 
@@ -1193,6 +1202,9 @@ mod tests {
     fn an_ending_refused_with_directory_not_empty_says_the_tree_is_in_use() {
         let why = why_not_ended("could not remove tree: Directory not empty (os error 66)");
         assert!(why.contains("Directory not empty") && why.contains("the tree is in use"), "{why}");
+        // The backend's end, refused on the seat's own directory, is not the tree (`wsp-085`).
+        let why = why_not_ended("wsp: cpd-413 is still standing, so nothing was released: Directory not empty (os error 66)");
+        assert!(why.contains("the seat's own directory") && !why.contains("the tree is in use"), "{why}");
         assert_eq!(why_not_ended("no such seat"), "no such seat");
     }
     use crate::cycle::tests::{DESPAWN_FAILS, ENDED as DESPAWNED, SAID, TOLD};
