@@ -5686,8 +5686,18 @@ impl Wait {
     }
 }
 
+/// What `--until` reads, named in its refusal.
+const UNTIL_FORMS: &str = "2026-11-19T19:37Z, 2026-11-19T19:37:05Z, 2026-11-19T19:37+01:00 (or +0100), \
+                           a date 2026-11-19 (its midnight UTC), or 24h / 2d / 90m from now";
+
 /// `--until`: an ISO time, a date, or `<n>m|h|d` from `now`; written as
 /// [`util::iso_at`] writes a stamp.
+///
+/// The ISO forms are read strictly (`wsp-106`): `T` then `HH:MM`, optional
+/// `:SS`, then `Z` or an offset `±HH:MM` / `±HHMM`, or a plain date. Anything
+/// else — a time with no zone, a stray character — is refused naming the
+/// forms, never read as its date's midnight as the lenient [`util::epoch_of`]
+/// did with `2026-11-19T19:37Z`.
 fn until_of(said: &str, now: i64) -> Result<String, String> {
     let t = said.trim();
     let rel = t.char_indices().last().and_then(|(i, unit)| {
@@ -5700,12 +5710,61 @@ fn until_of(said: &str, now: i64) -> Result<String, String> {
         };
         Some(now + n * per)
     });
-    let at = rel.or_else(|| {
-        let ok = t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-';
-        Some(util::epoch_of(t)).filter(|e| ok && *e > 0)
-    });
-    at.map(util::iso_at)
-        .ok_or_else(|| format!("--until `{t}` is not a time: give 2026-11-19T15:15Z, a date, or 24h / 2d / 90m from now"))
+    rel.or_else(|| iso_instant(t))
+        .map(util::iso_at)
+        .ok_or_else(|| format!("--until `{t}` is not a time: give {UNTIL_FORMS}"))
+}
+
+/// An ISO 8601 instant in epoch seconds, or `None` for anything not exactly
+/// one of the forms [`until_of`] names.
+fn iso_instant(t: &str) -> Option<i64> {
+    let b = t.as_bytes();
+    let digits = |r: std::ops::Range<usize>| -> Option<i64> {
+        let s = t.get(r)?;
+        s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse().ok())?
+    };
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let (y, mo, d) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    let (hh, mm, ss, zone) = if b.len() == 10 {
+        (0, 0, 0, 0)
+    } else {
+        if !matches!(b[10], b'T' | b't') || b.len() < 17 || b[13] != b':' {
+            return None;
+        }
+        let (hh, mm) = (digits(11..13)?, digits(14..16)?);
+        let (ss, rest) = if b[16] == b':' { (digits(17..19)?, t.get(19..)?) } else { (0, &t[16..]) };
+        let zone = match rest.as_bytes() {
+            [b'Z' | b'z'] => 0,
+            [sign @ (b'+' | b'-'), ..] => {
+                let off = &rest[1..];
+                let (oh, om) = match off.len() {
+                    5 if off.as_bytes()[2] == b':' => (&off[0..2], &off[3..5]),
+                    4 => (&off[0..2], &off[2..4]),
+                    _ => return None,
+                };
+                let num = |s: &str| s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse::<i64>().ok())?;
+                let (oh, om) = (num(oh)?, num(om)?);
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                let secs = oh * 3_600 + om * 60;
+                if *sign == b'+' { secs } else { -secs }
+            }
+            _ => return None,
+        };
+        (hh, mm, ss, zone)
+    };
+    if !(1..=12).contains(&mo) || d < 1 || hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let wall = util::epoch_of(&format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z"));
+    // A day past its month's end (2026-02-30) rolls into the next month: refuse it.
+    if util::iso_at(wall).get(..10) != t.get(..10) {
+        return None;
+    }
+    Some(wall - zone).filter(|e| *e > 0)
 }
 
 pub(crate) fn hold_wait(args: &Args, now: i64) -> Result<Wait, String> {
@@ -10375,6 +10434,50 @@ mod tests {
         assert_eq!(until_of("90m", 0).unwrap(), util::iso_at(5_400));
         assert!(until_of("tomorrow", 0).is_err());
         assert!(until_of("0h", 0).is_err());
+    }
+
+    /// `wsp-106`: every ISO form reads as the instant meant — `19:37Z` was
+    /// stored as the date's midnight — and a form it does not take is refused
+    /// naming the ones it does.
+    #[test]
+    fn until_reads_each_iso_form_as_the_instant_meant_or_refuses_it_naming_the_forms() {
+        let reads = [
+            ("2026-11-19T19:37Z", "2026-11-19T19:37:00Z"),
+            ("2026-11-19T19:37:05Z", "2026-11-19T19:37:05Z"),
+            ("2026-11-19t19:37z", "2026-11-19T19:37:00Z"),
+            ("2026-11-19T19:37+01:00", "2026-11-19T18:37:00Z"),
+            ("2026-11-19T19:37:05+01:00", "2026-11-19T18:37:05Z"),
+            ("2026-11-19T19:37-0230", "2026-11-19T22:07:00Z"),
+            ("2026-11-19T00:30+02:00", "2026-11-18T22:30:00Z"),
+            ("2026-11-19T23:45-01:00", "2026-11-20T00:45:00Z"),
+            ("2026-11-19", "2026-11-19T00:00:00Z"),
+            ("  2026-11-19T19:37Z  ", "2026-11-19T19:37:00Z"),
+        ];
+        for (said, meant) in reads {
+            assert_eq!(until_of(said, 0).as_deref(), Ok(meant), "{said}");
+        }
+        let refused = [
+            "2026-11-19T19:37",       // no zone: whose 19:37?
+            "2026-11-19T19:37:05",    // no zone
+            "2026-11-19T19Z",         // no minutes
+            "2026-11-19T19:37:5Z",    // one-digit seconds
+            "2026-11-19T19:37:05.5Z", // fractions
+            "2026-11-19T24:00Z",
+            "2026-11-19T19:60Z",
+            "2026-11-19T19:37:60Z",
+            "2026-11-19T19:37+1:00",
+            "2026-11-19T19:37+01",
+            "2026-11-19T19:37+25:00",
+            "2026-11-19 19:37Z",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-11-19x",
+            "2026-1-19",
+        ];
+        for said in refused {
+            let e = until_of(said, 0).expect_err(said);
+            assert!(e.contains("2026-11-19T19:37Z") && e.contains("+01:00") && e.contains("24h"), "{said}: {e}");
+        }
     }
 
     /// `wsp-173`'s done-when: a person's pause at a barrier, and the way back
