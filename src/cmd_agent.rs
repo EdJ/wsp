@@ -5293,10 +5293,36 @@ fn answers_to(
     }
 }
 
+/// `wip --json`'s `attention`: the items that are no mirrored entity (seats),
+/// sorted by [`crate::classify`] on this read into `needs_you` and `follow_up`
+/// (`wsp-096`). Groups and asks carry the same answer as their own `attention`
+/// field in the mirror. Each entry is an object, `kind` and its id beside the
+/// classifier's `attention`, `text`, and `waiting_on` or `due`, so the `action`
+/// the next row adds is one more key. No seat is follow-up yet: one waiting on
+/// a named other party is `wsp-095`'s third sub-task.
+fn wip_attention(rows: &[WipRow]) -> serde_json::Value {
+    let (mut needs_you, mut follow_up) = (Vec::new(), Vec::new());
+    for r in rows {
+        let why = r.waiting.as_ref().filter(|w| w.owed()).map(|w| w.sentence());
+        let seat = crate::classify::Seat { needs_you: r.needs_you, task: &r.task_id, waiting: why.as_deref() };
+        let Some(a) = crate::classify::of(crate::classify::Item::Seat(seat)) else { continue };
+        let mut v = a.json();
+        v["kind"] = "seat".into();
+        v["pane"] = r.pane.as_str().into();
+        v["task"] = r.task_id.as_str().into();
+        match a.kind {
+            crate::classify::Kind::NeedsYou => needs_you.push(v),
+            crate::classify::Kind::FollowUp => follow_up.push(v),
+        }
+    }
+    json!({ "needs_you": needs_you, "follow_up": follow_up })
+}
+
 fn wip_json(w: &Wip) -> serde_json::Value {
     let rows = wip_rows(w);
     let (blocked, in_review, inbox) = wip_queues(w);
     json!({
+        "attention": wip_attention(&rows),
         "agents": rows.iter().map(|r| {
             json!({
             "project": r.project, "task": r.task, "task_id": r.task_id,
@@ -9861,6 +9887,34 @@ mod tests {
         assert_eq!(held["waiting"]["id"], "m-hold");
         assert_eq!(wip_json(&w)["needs_you"], 2, "it is counted beside the stopped member");
         assert_eq!(row(&w, "w3:p1")["needs_you"], false, "and another seat is not");
+    }
+
+    /// `wsp-096`. `wip --json`'s `attention` lists every seat that needs the
+    /// person, by the one classifier, with what it waits on; a working seat is
+    /// in neither list, and a seat that comes to need the person moves into
+    /// `needs_you` on the next read.
+    #[test]
+    fn wip_json_lists_the_seats_that_need_the_person_under_attention() {
+        let mut w = wip_world();
+        let listed = |w: &Wip, list: &str| -> Vec<serde_json::Value> {
+            wip_json(w)["attention"][list].as_array().unwrap().clone()
+        };
+        let panes = |v: &[serde_json::Value]| v.iter().map(|e| e["pane"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let flagged: Vec<String> = wip_rows(&w).iter().filter(|r| r.needs_you).map(|r| r.pane.clone()).collect();
+        assert_eq!(panes(&listed(&w, "needs_you")), flagged, "the same seats `needs_you` marks");
+        assert!(!panes(&listed(&w, "needs_you")).contains(&"w1:p1".to_string()), "working");
+        assert_eq!(listed(&w, "follow_up"), Vec::<serde_json::Value>::new());
+        w.asks = crate::waiting::Asks::held_one("w1:p1", "t-001", "m-hold");
+        let now = listed(&w, "needs_you");
+        let held = now.iter().find(|e| e["pane"] == "w1:p1").expect("held on a dialog, it needs you");
+        assert_eq!(held["kind"], "seat");
+        assert_eq!(held["attention"], "needs-you");
+        assert_eq!(held["task"], "t-001");
+        assert!(held["text"].as_str().unwrap().contains("m-hold"), "{held}");
+        assert!(held.get("action").is_none(), "the next row adds it");
+        for e in &now {
+            assert!(!e["text"].as_str().unwrap().is_empty(), "{e}");
+        }
     }
 
     /// `wsp-214`. A member idle at `doing` on its own background shell is drawn

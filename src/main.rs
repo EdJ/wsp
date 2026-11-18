@@ -86,6 +86,7 @@ mod daemon;
 mod fold;
 mod mirror;
 mod owed;
+mod classify;
 mod detail;
 mod did;
 mod draw;

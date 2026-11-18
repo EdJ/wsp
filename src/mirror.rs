@@ -259,7 +259,9 @@ pub fn texts_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, String> {
 /// list's all `Passed`. Group `fields`: caption, cap, stop, verdict, agent,
 /// kind, weight, together, and where it is `held` or `barrier` `owed` (`time`,
 /// `rows`, `check` or `person`), `owed_text`, and `until` or `on` (wsp-095:
-/// [`crate::owed`]). List `fields`: title, caption, status, project,
+/// [`crate::owed`]), and `attention` (`needs-you` or `follow-up`, absent for
+/// neither), `attention_text`, and `waiting_on` or `due` ([`crate::classify`],
+/// wsp-096). List `fields`: title, caption, status, project,
 /// prio, after, alone, created, planned, and `body`: the list file's text,
 /// verbatim, for each list `texts` holds (wsp-076), so [`list_of`] rebuilds
 /// the `Worklist` with the store's own parser — a list's groups and settings
@@ -329,6 +331,13 @@ fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeM
                             crate::owed::Owed::Rows(rows) => put(&mut f, "on", &rows.join(" ")),
                             _ => {}
                         }
+                        // `wsp-096`: needs-you or follow-up, from the one
+                        // classifier every reader asks; absent is neither.
+                        if let Some(a) = crate::classify::of(crate::classify::Item::Barrier(&owed)) {
+                            for (k, v) in a.fields() {
+                                put(&mut f, k, &v);
+                            }
+                        }
                     }
                     c::Group {
                         id: GroupId { list: ListId(w.id.clone()), n: ord as u32 },
@@ -379,7 +388,9 @@ fn about(a: &About) -> Option<Subject> {
 /// notification or signal is `Note`, and a flag (`flags.json`, keyed by task,
 /// id `flag:<task>`) is `Flag`. States by [`ask_state`]. `fields`: `shape`,
 /// `message_kind` (stop, direction, note, fyi), `state` (the file's word), `at`,
-/// `scope` for a scope the contract has no subject for, `reply_to`.
+/// `scope` for a scope the contract has no subject for, `reply_to`, and for an
+/// open question for the person `attention` = `needs-you` and `attention_text`
+/// ([`crate::classify`], wsp-096).
 pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde_json::Value>) -> Vec<Entity> {
     let mut out: Vec<Entity> = messages
         .values()
@@ -402,7 +413,7 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
                 _ => None,
             };
             let answer = m.closing().filter(|h| h.act == wsp_store::message::Act::Answered).map(|h| h.note.clone());
-            Entity::Ask(c::Ask {
+            let mut ask = c::Ask {
                 id: AskId(m.id.clone()),
                 kind,
                 from: principal(&m.from),
@@ -412,7 +423,14 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
                 state: ask_state(m.state()),
                 answer,
                 fields: f,
-            })
+            };
+            // `wsp-096`: an open question for the person needs you.
+            if let Some(a) = crate::classify::of(crate::classify::Item::Ask(&ask)) {
+                for (k, v) in a.fields() {
+                    put(&mut ask.fields, k, &v);
+                }
+            }
+            Entity::Ask(ask)
         })
         .collect();
     out.extend(flags.iter().map(|(task, v)| {
@@ -1018,9 +1036,74 @@ mod tests {
         let late = fields(3_000);
         assert_eq!(late.get("owed").map(String::as_str), Some("person"), "{late:?}");
         assert!(late["owed_text"].contains("wsp worklist go m1"));
+        // `wsp-096`: the same two reads, classified: follow-up due then, and
+        // needs-you after, with no write between them.
+        assert_eq!(early.get("attention").map(String::as_str), Some("follow-up"), "{early:?}");
+        assert_eq!(early.get("due"), Some(&wsp_base::util::iso_at(2_000)));
+        assert_eq!(early.get("attention_text"), early.get("owed_text"));
+        assert_eq!(late.get("attention").map(String::as_str), Some("needs-you"), "{late:?}");
+        assert!(late["attention_text"].contains("wsp worklist go m1"));
+        assert!(!late.contains_key("due"));
+        // Read in the other order, the answers are the same: nothing was kept.
+        assert_eq!(fields(3_000).get("attention").map(String::as_str), Some("needs-you"));
+        assert_eq!(fields(1_000).get("attention").map(String::as_str), Some("follow-up"));
         let es = lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), 1_000);
         assert_eq!(next_due(&es), Some(2_000));
         assert_eq!(next_due(&lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), 3_000)), None);
+    }
+
+    /// `wsp-096`: a group waiting on rows is follow-up and names them; one
+    /// whose check reads it, or a running one, carries no `attention`.
+    #[test]
+    fn a_group_waiting_on_rows_is_follow_up_and_one_its_check_reads_is_neither() {
+        let mut w = Worklist::new("m1", "m1");
+        w.set_status(WorklistStatus::Held);
+        w.set_groups(&[wsp_store::model::Group { members: vec!["a-1".into()], agent: "claude".into(), ..Default::default() }]);
+        w.held_on = vec!["wsp-093".into()];
+        let group = |w: &Worklist, settled: &dyn Fn(&str) -> bool| match &lists_with(std::slice::from_ref(w), settled, &BTreeMap::new(), 1_000)[0] {
+            Entity::List(l) => l.groups[0].fields.clone(),
+            _ => unreachable!(),
+        };
+        let held = group(&w, &|r| r == "a-1");
+        assert_eq!(held.get("attention").map(String::as_str), Some("follow-up"), "{held:?}");
+        assert_eq!(held.get("waiting_on").map(String::as_str), Some("wsp-093"));
+        assert_eq!(held.get("attention_text").map(String::as_str), Some("waiting on wsp-093"));
+        // Running, its members all landed: the run opens the check, so neither.
+        w.set_status(WorklistStatus::Running);
+        let barrier = group(&w, &|_| true);
+        assert_eq!(barrier.get("owed").map(String::as_str), Some("check"), "{barrier:?}");
+        assert!(!barrier.contains_key("attention"), "{barrier:?}");
+        let running = group(&w, &|_| false);
+        assert!(!running.contains_key("attention") && !running.contains_key("owed"), "{running:?}");
+    }
+
+    /// `wsp-096`: an open question for the person needs you; the same question
+    /// for a governor, a note, or an answered one carries no `attention`.
+    #[test]
+    fn an_open_question_for_the_person_carries_needs_you_and_others_carry_nothing() {
+        let from = || Party::Pane { pane: "cpd-2".into(), workspace: "w".into() };
+        let wait = || wsp_store::message::Waiting::new("cpd-2", "wsp-2");
+        let mut msgs = BTreeMap::new();
+        let mut person = Message::question(from(), Kind::Direction, "may I?", wait());
+        person.id = "m-p".into();
+        person.for_person = true;
+        let mut governor = Message::question(from(), Kind::Direction, "may I?", wait());
+        governor.id = "m-g".into();
+        governor.for_person = false;
+        governor.for_seat = Some("governor:wsp".into());
+        for m in [person, governor] {
+            msgs.insert(m.id.clone(), m);
+        }
+        let es = key(&asks(&msgs, &BTreeMap::new()));
+        let fields = |id: &str| match &es[&Subject::Ask(AskId(id.into()))] {
+            Entity::Ask(a) => a.fields.clone(),
+            _ => unreachable!(),
+        };
+        let p = fields("m-p");
+        assert_eq!(p.get("attention").map(String::as_str), Some("needs-you"), "{p:?}");
+        assert!(p["attention_text"].contains("wsp answer m-p"), "{p:?}");
+        assert!(!p.contains_key("due") && !p.contains_key("waiting_on"));
+        assert!(!fields("m-g").contains_key("attention"), "a governor's to answer");
     }
 
     #[test]
