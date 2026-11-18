@@ -500,6 +500,12 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
             put(&mut f, "at", &m.at);
             put(&mut f, "scope", m.about.scope().unwrap_or(""));
             put(&mut f, "reply_to", m.reply_to.as_deref().unwrap_or(""));
+            for (k, v) in [("of", &m.of), ("then", &m.then), ("answered_by", &m.answered_by), ("relayed_by", &m.relayed_by)] {
+                put(&mut f, k, v.as_deref().unwrap_or(""));
+            }
+            if m.seen {
+                put(&mut f, "step_done", "true");
+            }
             f.insert(RECORD.into(), m.to_json().to_string());
             let to = match (&m.for_seat, m.for_person) {
                 (Some(s), _) => Some(Principal::Seat(SeatId(s.clone()))),

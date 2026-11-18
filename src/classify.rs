@@ -392,6 +392,36 @@ pub fn of(item: Item) -> Option<Attention> {
             }
             Owed::Check => None,
         },
+        Item::Ask(a) if a.fields.get("of").is_some_and(|o| !o.is_empty()) => {
+            // `wsp-098`: an ask from the person to a named party (`--of`).
+            let of = a.fields.get("of").map(String::as_str).unwrap_or_default();
+            let name: String = of.chars().next().map(|c| c.to_uppercase().chain(of.chars().skip(1)).collect()).unwrap_or_default();
+            let field = |k: &str| a.fields.get(k).map(String::as_str).unwrap_or_default();
+            if a.kind != AskKind::Ask {
+                None
+            } else if a.state != AskState::Answered {
+                Some(Attention {
+                    kind: Kind::FollowUp,
+                    text: format!("waiting on {name}: {}", a.text),
+                    waiting_on: Vec::new(),
+                    due: None,
+                    action: None,
+                })
+            } else if field("answered_by").is_empty() || field("step_done") == "true" {
+                None
+            } else {
+                let args = vec![a.id.0.clone()];
+                let then = field("then");
+                let then = if then.is_empty() { "do the step" } else { then };
+                Some(Attention::needs_you(then.to_string()).with(Action {
+                    verb: "done".into(),
+                    args: args.clone(),
+                    sentence: Sentence::None,
+                    buttons: vec![Button::new("Done", "done", args, Sentence::None)],
+                    items: Vec::new(),
+                }))
+            }
+        }
         Item::Ask(a) => {
             let for_person = matches!(a.to, Some(Principal::Person(_)));
             let open = a.state != AskState::Answered;
@@ -433,6 +463,44 @@ mod tests {
 
     fn person() -> Option<Principal> {
         Some(Principal::Person("person".into()))
+    }
+
+    fn ask_of(state: AskState, extra: &[(&str, &str)]) -> Ask {
+        let mut a = ask(AskKind::Ask, None, state);
+        a.text = "ok to ship?".into();
+        a.fields.insert("of".into(), "ed".into());
+        a.fields.insert("then".into(), "tell the customer".into());
+        for (k, v) in extra {
+            a.fields.insert(k.to_string(), v.to_string());
+        }
+        a
+    }
+
+    #[test]
+    fn an_open_ask_of_a_named_party_is_follow_up_waiting_on_them() {
+        for state in [AskState::Raised, AskState::Acked] {
+            let a = of(Item::Ask(&ask_of(state, &[]))).unwrap();
+            assert_eq!((a.kind, a.text.as_str()), (Kind::FollowUp, "waiting on Ed: ok to ship?"));
+            assert!(a.action.is_none());
+        }
+    }
+
+    #[test]
+    fn an_answered_ask_of_a_named_party_needs_you_with_the_then_step_and_done() {
+        let a = of(Item::Ask(&ask_of(AskState::Answered, &[("answered_by", "ed")]))).unwrap();
+        assert_eq!((a.kind, a.text.as_str()), (Kind::NeedsYou, "tell the customer"));
+        let j = a.action.unwrap().json();
+        assert_eq!(j["verb"], "done");
+        assert_eq!(j["args"], serde_json::json!(["m-1"]));
+        assert_eq!(j["sentence"], "none");
+        let labels: Vec<_> = j["buttons"].as_array().unwrap().iter().map(|b| b["label"].as_str().unwrap()).collect();
+        assert_eq!(labels, ["Done"]);
+    }
+
+    #[test]
+    fn an_ask_of_a_named_party_whose_step_is_done_is_neither() {
+        let a = ask_of(AskState::Answered, &[("answered_by", "ed"), ("step_done", "true")]);
+        assert_eq!(of(Item::Ask(&a)), None);
     }
 
     #[test]
