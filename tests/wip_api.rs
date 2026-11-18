@@ -7,7 +7,9 @@
 //! ask and that seat. Then:
 //!
 //! 1. `wip --json` under `WSP_READ=api` and under `WSP_READ=files` print the
-//!    same bytes, once the mirror has caught up with the files;
+//!    same bytes, once the mirror has caught up with the files, but for the
+//!    two moment readings (`load`, `idle_memory`), which both paths read live
+//!    and which are checked well-formed and masked;
 //! 2. under `api` the call log holds no child for the call;
 //! 3. with the daemon stopped, `api` answers from the files within the dial's
 //!    budget, says so once on stderr, and prints what `files` prints;
@@ -15,9 +17,9 @@
 //!    what it accepts, and it accepts nothing.
 //!
 //! The machine's own readings are pinned where the store lets them be: the
-//! throttle is `on`, so neither path reads the person's idle time. The host's
-//! disks come from the manager's last beat on both paths (in its `seats` reply
-//! on the files path, through the mirror on the API's).
+//! throttle is `on`, so neither path reads the person's idle time. The seats'
+//! rss and shells and the host's disks come from the manager's `seats` reply on
+//! both paths.
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -227,6 +229,40 @@ fn snapshot_with(client: &Client, ready: impl Fn(&Value) -> bool) -> Value {
     }
 }
 
+/// The moment readings, which stay out of the contract (the person's decision
+/// on wsp-076): `load` and `idle_memory` are read live on both paths, so their
+/// values may move between two calls. Each is checked present and well-formed
+/// and masked in the text; every other byte is compared.
+fn masked(out: &Output) -> String {
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let json: Value = serde_json::from_str(&text).unwrap();
+    let load = &json["load"];
+    assert!(json.get("load").is_some(), "no load key: {json}");
+    assert!(load.is_null() || load.as_str().is_some_and(|l| l.starts_with("load is ")), "load is not a load line: {load}");
+    let mem = &json["idle_memory"];
+    assert!(
+        mem["over"].is_boolean() && mem["panes"].is_array() && mem["total_kb"].is_u64() && mem["unread"].is_u64() && mem["warn_kb"].is_u64(),
+        "idle_memory is not well-formed: {mem}"
+    );
+    let mut lines = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        if skipping {
+            skipping = !line.starts_with("  }");
+            continue;
+        }
+        if line.starts_with("  \"load\": ") {
+            lines.push("  \"load\": <masked>".to_string());
+        } else if let Some(rest) = line.strip_prefix("  \"idle_memory\": ") {
+            skipping = rest == "{";
+            lines.push("  \"idle_memory\": <masked>".to_string());
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    lines.join("\n")
+}
+
 /// Every child the call line counted, by name.
 fn ran(children: &Value) -> Vec<String> {
     children.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default()
@@ -302,7 +338,7 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     let mut cfg = Config::new(&exec, HOST);
     cfg.port = mport;
     cfg.sup = Some(sup);
-    // A beat a second: the beat carries the host's disks to the mirror.
+    // A beat a second: the `seats` reply carries the host's facts as the last beat read them.
     cfg.beat = Duration::from_secs(1);
     let manager = Manager::start(cfg).expect("the manager starts on loopback");
     let token = wsp_host_api::Token(std::fs::read_to_string(exec.join(TOKEN_FILE)).unwrap().trim().to_string());
@@ -358,14 +394,17 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
         // 2. Under api the call ran no child, on every try.
         assert_eq!(ran(&children), Vec::<String>::new(), "wip under api ran {children}");
         assert!(api.stderr.is_empty(), "wip under api fell back: {}", String::from_utf8_lossy(&api.stderr));
-        if api.stdout == files.stdout || Instant::now() > deadline {
+        if masked(&api) == masked(&files) || Instant::now() > deadline {
             break (api, files);
         }
         std::thread::sleep(Duration::from_millis(500));
     };
-    let (a, f) = (String::from_utf8_lossy(&api.stdout), String::from_utf8_lossy(&files.stdout));
-    assert_eq!(a, f, "wip --json under api (left) and files (right)");
+    assert_eq!(masked(&api), masked(&files), "wip --json under api (left) and files (right), the moment readings masked");
     let json: Value = serde_json::from_slice(&api.stdout).unwrap();
+    // The idle seat's rss came live from the manager under api too.
+    let panes = json["idle_memory"]["panes"].as_array().cloned().unwrap_or_default();
+    assert!(panes.iter().any(|p| p["seat"] == SEAT && p["kb"].as_u64().is_some_and(|k| k > 0)), "the seat's rss under api: {json}");
+    let _ = files;
     assert!(json.to_string().contains(SEAT), "the manager's seat is in wip: {json}");
     let agent = json["agents"].as_array().and_then(|a| a.iter().find(|a| a["pane"] == SEAT)).cloned().unwrap_or_default();
     assert!(!agent["waiting"].is_null(), "the seat waits on its open ask: {agent}");
@@ -379,7 +418,7 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     let said = String::from_utf8_lossy(&fell.stderr);
     assert_eq!(said.matches("wsp: wip reads the files").count(), 1, "the fallback is said once: {said}");
     assert_eq!(said.lines().count(), 1, "one line on stderr: {said}");
-    assert_eq!(String::from_utf8_lossy(&fell.stdout), String::from_utf8_lossy(&files.stdout), "the fallback's json");
+    assert_eq!(masked(&fell), masked(&files), "the fallback's json, the moment readings masked");
     assert!(
         fell_took < files_took + Duration::from_millis(200) + Duration::from_millis(300),
         "the fallback took {fell_took:?} against the files' {files_took:?}"

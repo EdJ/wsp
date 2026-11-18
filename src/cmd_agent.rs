@@ -4321,12 +4321,13 @@ impl Wip {
     /// seat-since and finished-wip.json.
     ///
     /// **It runs no child**: no `ps`, `lsof`, `df`, render, `git` or `wsp`.
-    /// So the probes are the files path's values with nothing running — the
-    /// disks from the managers' last beats, no load warning, no shells, memory
-    /// with no rss — the throttle's line is read without the machine (no
-    /// idle time, load or clock), a waiter's pid is taken to stand, and the
-    /// dead-daemon heading is the tick stamp's (the daemon has just answered,
-    /// so a stamp gone stale is the one thing left to say).
+    /// The moment readings are no part of the snapshot: the seats' rss and
+    /// shells and the host's disks and load come from the managers' `seats`
+    /// replies, as under [`Wip::from_managers`]. The throttle's line is read
+    /// without the machine (no idle time, load or clock), a waiter's pid is
+    /// taken to stand, and the dead-daemon heading is the tick stamp's (the
+    /// daemon has just answered, so a stamp gone stale is the one thing left
+    /// to say).
     pub(crate) fn from_api(store: &Store, state: &wsp_store_contract::State) -> Wip {
         let tasks: Vec<Task> = state
             .rows
@@ -4373,20 +4374,24 @@ impl Wip {
             agents,
             since,
         };
-        // The hosts' disks as the managers' last beats carried them (wsp-076),
-        // where `from_managers` reads the same beat off the `seats` reply.
-        let disks: Vec<crate::host_tcp::DiskFree> = state
-            .machines
-            .values()
-            .filter_map(|m| serde_json::from_str::<Vec<crate::host_tcp::DiskFree>>(m.facts.get("disks")?).ok())
-            .flatten()
-            .collect();
+        // The moment readings stay out of the contract (wsp-076, the person's
+        // decision): the seats' rss and shells and the host's disks and load
+        // come live from the managers' `seats` replies, the source
+        // `from_managers` reads them from, and no child runs for them.
+        let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        let rss: BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
+        let counts: BTreeMap<String, u32> = reading.rows.iter().map(|(s, r)| (s.clone(), r.shells)).collect();
+        let disks: Vec<crate::host_tcp::DiskFree> = reading.facts.values().flat_map(|f| f.disks.iter().cloned()).collect();
+        let load = reading.facts.get("").and_then(|f| load_of_facts(store, f));
         Wip::gathered(store, read, |agents, bindings| Probed {
-            shells: crate::waiting::Shells::counted(std::iter::empty(), &BTreeMap::new()),
-            memory: crate::memory::of_rss(&store.state, agents, bindings, &BTreeMap::new()),
+            shells: crate::waiting::Shells::counted(
+                agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),
+                &counts,
+            ),
+            memory: crate::memory::of_rss(&store.state, agents, bindings, &rss),
             daemon: daemon_by_stamp(store.daemon_tick(), true, util::epoch_secs()),
             disk: crate::disk::loud_of(store, &disks),
-            load: None,
+            load,
             throttle: Some(throttle_unprobed(store)),
         })
     }
@@ -4464,6 +4469,20 @@ impl Wip {
 fn throttle_unprobed(store: &Store) -> String {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     crate::throttle::View::given(&store.state, crate::throttle::Given { load1: 0.0, cores, speed_limit: None }).status_line()
+}
+
+/// [`crate::throttle::loud`] from a manager's host facts rather than `sysctl`
+/// and `pmset`, for [`Wip::from_api`]: the load averages and the clock as the
+/// manager's last beat read them.
+fn load_of_facts(store: &Store, f: &crate::host_tcp::Facts) -> Option<String> {
+    let centi = |c: u32| c as f64 / 100.0;
+    let one = centi(f.load_centi);
+    let five = f.load5_centi.map(centi).unwrap_or(one);
+    let fifteen = f.load15_centi.map(centi).unwrap_or(five);
+    let given = crate::throttle::Given { load1: one, cores: f.cpus as usize, speed_limit: f.speed_limit_pct };
+    let mut view = crate::throttle::View::given(&store.state, given);
+    view.load = Some((one, five, fifteen));
+    view.warning(store.seat_cap())
 }
 
 /// How long `wip` waits for the API before it reads the files (`docs/state-core.md`
