@@ -82,7 +82,7 @@ fn reload(verbose: bool) -> std::io::Error {
 /// child of whichever of those processes started it, and goes to pid 1 when
 /// that one exits. A daemon started fresh has none, and says nothing.
 fn adopt_carried_over(store: &Store) {
-    let kids = wsp_base::calls::children();
+    let kids = wsp_base::calls::children_of(crate::host::LOCAL.own_children());
     if kids.is_empty() {
         return;
     }
@@ -636,7 +636,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // to it: an hour with no reaper and no `<defunct>` child (wsp-667 d1).
         let reap = match reaper_off() {
             true => Default::default(),
-            false => wsp_base::calls::reap_defunct(),
+            false => wsp_base::calls::reap_defunct_with(|| crate::host::LOCAL.own_defunct()),
         };
         for (pid, line) in &reap.reaped {
             crate::store::log_line(store, &format!("daemon: reaped defunct child {pid}, nothing was waiting on it: {line}"));

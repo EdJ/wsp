@@ -4326,7 +4326,7 @@ impl Wip {
     /// replies, as under [`Wip::from_managers`]. The throttle's line reads the
     /// person's idle time, the clock and the cores from the local manager's
     /// beat; a build holder's pid and a waiter's are asked of kill(2) by
-    /// syscall ([`util::pid_runs`]); and the dead-daemon heading is the tick
+    /// syscall (`host::LOCAL.pid_runs`, wsp-111); and the dead-daemon heading is the tick
     /// stamp's (the daemon has just answered, so a stamp gone stale is the one
     /// thing left to say).
     pub(crate) fn from_api(store: &Store, state: &wsp_store_contract::State) -> Wip {
@@ -4371,7 +4371,7 @@ impl Wip {
             spawned,
             lists,
             messages,
-            alive: Box::new(util::pid_runs),
+            alive: Box::new(|pid| crate::host::LOCAL.pid_runs(pid)),
             agents,
             since,
         };
@@ -4487,7 +4487,7 @@ fn throttle_of_facts(store: &Store, f: Option<&crate::host_tcp::Facts>) -> Strin
         speed_limit: f.and_then(|f| f.speed_limit_pct).filter(|&p| p < 100),
     };
     let idle = f.and_then(|f| f.hid_idle_secs);
-    crate::throttle::View::of_beat(&store.state, given, idle, &util::pid_runs).status_line()
+    crate::throttle::View::of_beat(&store.state, given, idle, &|pid| crate::host::LOCAL.pid_runs(pid)).status_line()
 }
 
 /// [`crate::throttle::loud`] from a manager's host facts rather than `sysctl`
@@ -4499,7 +4499,7 @@ fn load_of_facts(store: &Store, f: &crate::host_tcp::Facts) -> Option<String> {
     let five = f.load5_centi.map(centi).unwrap_or(one);
     let fifteen = f.load15_centi.map(centi).unwrap_or(five);
     let given = crate::throttle::Given { load1: one, cores: f.cpus as usize, speed_limit: f.speed_limit_pct };
-    let mut view = crate::throttle::View::of_beat(&store.state, given, None, &util::pid_runs);
+    let mut view = crate::throttle::View::of_beat(&store.state, given, None, &|pid| crate::host::LOCAL.pid_runs(pid));
     view.load = Some((one, five, fifteen));
     view.warning(store.seat_cap())
 }

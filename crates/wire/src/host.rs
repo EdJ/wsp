@@ -428,6 +428,23 @@ impl InProcess {
     fn exec_dir(&self) -> PathBuf {
         self.exec.clone().unwrap_or_else(default_exec)
     }
+
+    // ---- this process's own children (wsp-111): not a seat's, so not the
+    // trait's and never a manager's; the daemon's reaper asks [`LOCAL`] and
+    // hands the tables to `wsp_base::calls`.
+    /// `ps -axo pid=,ppid=,command=` and that `ps`'s pid, for
+    /// `wsp_base::calls::children_of` at a daemon's start.
+    pub fn own_children(&self) -> Option<(u32, String)> {
+        self.host.own_children()
+    }
+    /// `ps -axo pid=,ppid=,stat=,comm=`, for `wsp_base::calls::reap_defunct_with`.
+    pub fn own_defunct(&self) -> Option<String> {
+        self.host.own_defunct()
+    }
+    /// kill(2) with signal 0, asked without running `kill` (wsp-076).
+    pub fn pid_runs(&self, pid: u32) -> bool {
+        self.host.pid_runs(pid)
+    }
 }
 
 impl Default for InProcess {

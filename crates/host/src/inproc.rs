@@ -389,6 +389,40 @@ impl InProcess {
         Some(table)
     }
 
+    /// This process's own children as a reloaded daemon adopts them (wsp-667,
+    /// `wsp_base::calls::children_of`): `ps -axo pid=,ppid=,command=`, and the
+    /// pid of that `ps`, which is a child of this process too and on its own
+    /// list. Spawned with `std`'s `Command`, not the counting wrapper, so the
+    /// `ps` is held by nothing here while it runs. `None` when it would not run.
+    pub fn own_children(&self) -> Option<(u32, String)> {
+        let ps = std::process::Command::new("ps")
+            .args(["-axo", "pid=,ppid=,command="])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let itself = ps.id();
+        let out = ps.wait_with_output().ok()?;
+        Some((itself, String::from_utf8_lossy(&out.stdout).into_owned()))
+    }
+
+    /// The table the daemon's reaper names defunct strays from (wsp-664/667,
+    /// `wsp_base::calls::reap_defunct_with`): `ps -axo pid=,ppid=,stat=,comm=`,
+    /// whatever its status. `None` when `ps` would not run.
+    pub fn own_defunct(&self) -> Option<String> {
+        let out = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,stat=,comm="]).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Whether `pid` runs and this process may signal it: kill(2) with signal 0,
+    /// what `kill -0 <pid>` answers, asked without running `kill` (wsp-076: `wip`
+    /// through the API runs no child). Pid 0 and pids past `i32` are no process —
+    /// kill(2) would read 0 as this process's group and a negative as another's.
+    pub fn pid_runs(&self, pid: u32) -> bool {
+        pid_runs(pid)
+    }
+
     pub fn rows_of(&self, pids: &[u32], columns: &str) -> Option<String> {
         if pids.is_empty() {
             return Some(String::new());
@@ -639,6 +673,19 @@ fn succeeded(cmd: &mut Command) -> Option<String> {
 /// the process table looking exactly like a running one. Reporting it as alive
 /// is the same class of defect as robustness-041 with the sign flipped: an agent
 /// declared healthy while its corpse cools.
+/// kill(2) with signal 0 to `pid`, for [`InProcess::pid_runs`]; moved from
+/// `wsp_base::util` (wsp-111), whose C declaration of `kill` was below the seam.
+pub(crate) fn pid_runs(pid: u32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, sig: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    match i32::try_from(pid) {
+        // SAFETY: signal 0 delivers nothing; it only checks the pid.
+        Ok(p) if p > 0 => unsafe { kill(p, 0) == 0 },
+        _ => false,
+    }
+}
+
 pub(crate) fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
     if pids.is_empty() {
         return std::collections::BTreeSet::new();
@@ -1105,6 +1152,20 @@ fn comm_as_run(table: &str, columns: &str, cmdline: impl Fn(u32) -> Option<Vec<u
 #[cfg(test)]
 mod comm_tests {
     use super::*;
+
+    /// `pid_runs` answers as `kill -0` does, by syscall: this process runs, a
+    /// reaped child does not, and pid 0 (this process's group to kill(2)) and
+    /// pids past `i32` are no process.
+    #[test]
+    fn a_pid_runs_by_syscall_as_kill_zero_answers() {
+        assert!(pid_runs(std::process::id()));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        assert!(!pid_runs(gone), "a reaped child does not run");
+        assert!(!pid_runs(0));
+        assert!(!pid_runs(u32::MAX));
+    }
 
     #[test]
     fn comm_is_the_name_a_process_was_run_under() {

@@ -769,21 +769,6 @@ fn gethostname() -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..end]).trim().to_string())
 }
 
-/// Whether `pid` runs and this process may signal it: kill(2) with signal 0,
-/// what `kill -0 <pid>` answers, asked without running `kill` (wsp-076: `wip`
-/// through the API runs no child). Pid 0 and pids past `i32` are no process —
-/// kill(2) would read 0 as this process's group and a negative as another's.
-pub fn pid_runs(pid: u32) -> bool {
-    extern "C" {
-        fn kill(pid: i32, sig: std::ffi::c_int) -> std::ffi::c_int;
-    }
-    match i32::try_from(pid) {
-        // SAFETY: signal 0 delivers nothing; it only checks the pid.
-        Ok(p) if p > 0 => unsafe { kill(p, 0) == 0 },
-        _ => false,
-    }
-}
-
 pub fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
@@ -1200,20 +1185,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
-
-    /// `pid_runs` answers as `kill -0` does, by syscall: this process runs, a
-    /// reaped child does not, and pid 0 (this process's group to kill(2)) and
-    /// pids past `i32` are no process.
-    #[test]
-    fn a_pid_runs_by_syscall_as_kill_zero_answers() {
-        assert!(pid_runs(std::process::id()));
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let gone = child.id();
-        child.wait().unwrap();
-        assert!(!pid_runs(gone), "a reaped child does not run");
-        assert!(!pid_runs(0));
-        assert!(!pid_runs(u32::MAX));
-    }
 
     /// `wsp add "-p" -p demo` reported "no such project `-p`", which sent the
     /// caller to their projects when the project was the one right word.
