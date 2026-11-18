@@ -584,7 +584,7 @@ p50 9.4 s.
 | **M2. The i5 under its own manager** | The heartbeat replaces the tick-paced beat. Per-seat ssh forwards and the tunnel go. | ssh for install and tree bytes only; no wsp-639 flap; far manifest < 15 s | machine `transport: ssh` |
 | **M3. Tree jobs under the manager** | check, build, verify and barrier processes run as manager jobs. check_tree's sweep and leaked_agents go. | lsof → 0; wsp-478-kind → 0 | jobs in-process behind a flag |
 | **M4. Trees placed** (only if Ed chooses T2, agent-manager Q6) | checkout and land on the agents' hosts, with a fenced push to the trunk | a list on two hosts with no copies | T1 (rows on the Mac) |
-| **0** (prep, could ride fleet-fixes' tail) | `rusqlite` behind the C-cached wrapper (section 9); the contract crate's types; the conformance suite against an in-memory fake | a cold tree builds SQLite in < 5 s from cache | nothing to roll back |
+| **0** (prep, could ride fleet-fixes' tail) | `rusqlite` behind the C-cached wrapper (section 9); the contract crate's types; the conformance suite against an in-memory fake | a cold tree builds SQLite in < 5 s from cache. **Met for SQLite's own build** (wsp-048, 2026-11-18): the `libsqlite3-sys` build script takes 1.2 s debug and 1.1 s release from cache. **Not met as the whole command's wall**: `cargo build -p wsp-store-sqlite` took 7.7 s debug and 6.1 s release at load 8–15 (section 9, "Step 0's result") | nothing to roll back |
 | **1. Server and store, read path; compound subscribes** | The daemon opens SQLite and **mirrors** today's files into it each tick (a projection; files still the truth). `api.sock` serves `state`/reads/`subscribe`. compound's host subscribes; `wip --json` reads through the API | host polling calls → 0; `wip --json` < 100 ms wall, < 0.1 CPU-s; no `ps`/`lsof` in read verbs; daemon tick no slower | the host goes back to `poll` (one flag); the CLI reads files |
 | **2. Orders machine** | Orders become commands; delivery via compound-sup's deliver verb and ack (wsp-477) under a `deliver:<seat>` lease; `repair:unsent` deleted | screen renders per tick → 0; `typed-unsent`/`first-orders`/`stuck-commands` files gone; incidents of "typed but unsent" and wait-loop stalls → 0 over a fortnight | `repair:unsent` restored behind a flag |
 | **3. Seats via executors, local and remote alike** | compound-sup speaks 5.1 locally and far; spawn/stop through it; beats carry machine facts; ps/lsof/cwd inference deleted (check_tree's `lsof`, `procs::processes` callers, `memory.rs` per call, `seat-since.json`) | `ps` per tick 34 → 0 (wsp side); `lsof` → 0; leaked/second-idle seats (wsp-411 kind) and wrong-owner kills (wsp-478 kind) → 0; spawn p50 7.2 s no worse | herdr/legacy `Place` backends stay compiled until the fortnight passes |
@@ -856,6 +856,77 @@ here. The debug profile compiles SQLite at `-O0` and will be cheaper, but it sho
 The alternative is no bundling: link macOS's system `libsqlite3`. That costs no C build at all, but the SQLite
 version is the OS's, which matters for `RETURNING` (3.35+) and JSON functions, and it differs on a far machine.
 Bundled plus cache is the safer default. This is Q12.
+
+### Step 0's result (wsp-048, 2026-11-18)
+
+**Method.** Both profiles were warmed in the row's own tree with `cargo build -p wsp-store-sqlite` (debug, then
+`--release`), so sccache held `sqlite3.c`'s object for each. The cold tree is a fresh `git worktree add` of the trunk
+(`2b2150c`) under `$WSP_SCRATCH` with an empty `target/` before every run. It is not `warm.rs`'s copy, so there is no
+`OUT_DIR`. Each run is `nice cargo build -p wsp-store-sqlite --timings` (plus `--release`), as section 9 did. Three
+runs per figure, p50 shown, the three in brackets. M4 Pro, 12 cores, macOS 27.2.1, rustc 1.100.0, sccache 0.19.0,
+`rusqlite` bundled with `libsqlite3-sys`. The build-script figure is the `libsqlite3-sys` `run-custom-build` unit as
+`--timings` reports it. The wall is the whole command, 49 units. Load is the 1-minute average at the start of the run.
+The fallback configs ran on an isolated sccache server (`SCCACHE_SERVER_PORT`, `SCCACHE_DIR`), so no other tree's
+server was stopped.
+
+| config | profile | `libsqlite3-sys` build script, p50 (runs) | whole command, wall p50 (runs) | load | C compile through sccache |
+|---|---|---|---|---|---|
+| **cached** (cc-wrap, sccache warm from another tree) | debug | **1.18 s** (1.04, 1.18, 1.75) | **7.7 s** (5.7, 7.7, 7.7) | 7.7–10.6 | hit in every run |
+| | release | **1.11 s** (0.38, 1.11, 1.11) | **6.1 s** (4.9, 6.1, 9.7) | 12.0–14.7 | hit in every run |
+| fallback: `COMPOUND_NO_SCCACHE=1` | debug | 2.47 s (2.22, 2.47, 3.51) | 9.7 s (9.2, 9.7, 9.9) | 16.9–20.8 | bypassed |
+| | release | 13.83 s (13.82, 13.83, 13.94) | 22.3 s (21.4, 22.3, 24.3) | 21.3–23.1 | bypassed |
+| fallback: sccache's server stopped (it starts a fresh, empty one) | debug | 3.49 s (2.47, 3.49, 3.53) | 12.9 s (11.4, 12.9, 14.0) | 21.6–23.1 | miss, 0 hits |
+| | release | 14.58 s (13.89, 14.58, 15.17) | 26.0 s (23.9, 26.0, 26.5) | 23.2–26.3 | miss, 0 hits |
+| fallback: server dead (port held by a listener that accepts and closes; sccache exits 2) | debug | 4.71 s (3.13, 4.71, 8.03) | 63.8 s (48.2, 63.8, 80.2) | 41.5–66.6 | exit 2, bare `cc` and `rustc` |
+| | release | 15.13 s (15.05, 15.13, 21.76) | 33.8 s (28.6, 33.8, 36.5) | 55.9–66.4 | exit 2, bare `cc` and `rustc` |
+| *before: wsp-043's scratch crate, no sccache* | debug | 2.0 s | 3.1 s | about 4 | none installed |
+| | release | 12.1 s | 12.7 s | about 4 | none installed |
+| *before: 2026-11-08, Ed's machine, `libsqlite3-sys` alone, release* | release | 27.6 CPU-s | 30.0–34.0 s (tree b with `cc`) vs 3.4 s (tree d, `sccache cc`) | not recorded | tree d: hit |
+
+Every config built (exit 0 in all 24 runs). All figures are in `$WSP_SCRATCH/logs` (`results*.jsonl`, one
+`--timings` html per run); they are not kept in the tree.
+
+**The < 5 s line, judged.**
+- *SQLite's own build, from cache: met, both profiles.* The build script takes 1.2 s in debug and 1.1 s in release,
+  against 2.5 s and 13.8 s with the cache bypassed in the same session. For release that is 12× less, and it is
+  inside the 3.4 s that section 9 measured on Ed's machine. The cached runs show a C hit and no C miss in every
+  release run and in 2 of 3 debug runs. The debug run that shows one C miss ran on sccache's shared server beside
+  other trees' builds, so the miss may be theirs; this run's build script took 1.18 s, which is a hit's time here (a
+  miss takes 2.5–3.5 s).
+- *The whole `cargo build -p wsp-store-sqlite` wall: not met.* It is 7.7 s in debug and 6.1 s in release at p50, with
+  one release run under 5 s (4.9 s). The build script is about 1 s of that. The rest is the other 48 units:
+  `serde_derive`, `zerocopy`, `hashbrown`, `wsp-store-contract` and `wsp-store-sqlite` itself, each a Rust compile
+  that sccache serves as a hit but that still passes through `rustc-wrap`, a client round trip and, for registry
+  crates with an `OUT_DIR`, a content hash of it. It is not SQLite, and a cache miss on the C compile does not
+  explain it. The first run of each cached profile also missed on Rust (7 debug, 14 release), the workspace crates
+  that this tree built at another path; later runs hit.
+- *Why the wall is not a clean comparison.* The runs were taken at load 8–15 (cached) and up to 67 (the dead-server
+  runs), where the before figures were taken at about 4. Other panes were building on this Mac, and the average
+  reached 99 afterwards, with `yes` loops among the busiest processes. The cache's effect shows in the build-script column, which does not
+  depend on how many other crates are queued. The wall does: debug's cached 7.7 s sits under the no-cache 9.7 s, but
+  the load was 8 against 17. The before figure of 3.1 s was also a scratch crate with only `rusqlite` and its
+  dependencies, not the 49 units `wsp-store-sqlite` brings in. So debug was never the case the cache helps (it
+  already built in under 5 s without one at load 4), and release is: 22.3 s without the cache and 6.1 s with it
+  (3.7×), at loads of 21 and 12.
+- Nothing was tuned to make a figure pass. A rerun at a quiet load would settle the wall; the machine did not
+  get quiet during this row.
+
+**The fallbacks.** Both build, and cc-wrap's rule (wsp-343) holds where it can be tested.
+- `COMPOUND_NO_SCCACHE=1` builds with the bare `cc` and `rustc`: 2.5 s and 13.8 s for the build script, in line with wsp-043's
+  12.1 s release figure for the same compile at a lower load.
+- A stopped server is not a failure for the client: `sccache cc` starts a new one. The row shows that case, a fresh
+  empty cache, so the C compile misses and costs what it costs without a cache (3.5 s, 14.6 s), plus a few seconds
+  of cold Rust misses.
+- A dead server, one that refuses or drops the connection, makes sccache exit 2, and both `cc-wrap` and `rustc-wrap`
+  fall back to the bare compiler. The build script is 4.7 s and 15.1 s. The walls (63.8 s and 33.8 s) were taken at
+  load 42–67 and say only that the build finishes; every rustc call pays a failed sccache call first.
+- **A hung server is not covered.** The first attempt at the dead-server case held the port with a listener that
+  accepted connections and never answered. The first debug run finished (exit 0) after 591 s, and the second sat for
+  over five minutes in `sccache … rustc-remap -vV` before it was stopped by hand. The fallback waits for sccache's
+  exit 2, and a server that is alive but not answering does not give one quickly. This was seen on one run at load
+  26, and the cause was not isolated. It is a risk for wsp-343's rule, not a change made by this row: an `RUSTC_WRAPPER`
+  that bounds the client's wait (a timeout around the sccache call) is the usual shape of a fix, and nothing here
+  adds it.
 
 ---
 
