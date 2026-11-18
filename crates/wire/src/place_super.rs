@@ -1833,7 +1833,7 @@ mod tests {
         // The agent exits on its own, and nobody calls `stop`.
         let exits = place.open(&Order::default()).unwrap();
         place
-            .start(&exits, &Agent { kind: "sh".into(), name: "t-2".into(), args: vec!["-c".into(), "exit 0".into()] })
+            .start(&exits, &Agent { kind: "sh".into(), name: "t-2".into(), args: vec!["-c".into(), "exit 0".into()], key: None })
             .expect("a process");
         let feed = feed_of(&exits);
         assert!(until(|| !alive(&[feed]).contains(&feed)), "an agent that exited left its tail");

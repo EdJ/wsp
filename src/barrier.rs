@@ -785,7 +785,7 @@ mod tests {
         let o = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().unwrap();
         let started = String::from_utf8_lossy(&o.stdout).split_whitespace().collect::<Vec<_>>().join("_");
         let run = Run { pid, started };
-        assert!(run.gone(), "a defunct pid is not a run that is going");
+        assert!(run.gone(&super::started), "a defunct pid is not a run that is going");
         let (_, retake) = running_with(&store, run);
         assert!(run_died(&store.worklist("run").unwrap().groups()[0]));
         assert!(matches!(retake(), Some(o) if o.retaken && o.died == Some(pid)));

@@ -263,7 +263,8 @@ pub(crate) fn sup_in_range(sup: Option<&Path>, range: WireRange, problems: &mut 
         notes.push("compound-sup not found ($COMPOUND_SUP or PATH) — nothing to check against the manager's wire range".into());
         return;
     };
-    match wsp_host::inproc::ask_wire_version(sup) {
+    // The VERSION it speaks is the top of the range it accepts.
+    match wsp_host::inproc::ask_wire_range(sup).and_then(Result::ok).map(|(_, v)| v) {
         Some(v) if v < range.min || v > range.max => problems.push(format!(
             "{} speaks wire {v}, outside the manager's range {}..{} — rebuild whichever is behind (`cargo build`, then `wsp install`)",
             util::contract(sup),

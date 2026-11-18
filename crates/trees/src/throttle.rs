@@ -1665,6 +1665,7 @@ impl View {
             load: Some((g.load1, g.load1, g.load1)),
             thermal: g.speed_limit,
             builds: builds(state, alive),
+            checks: checks(state, alive),
             shims: shim_dir(state),
         }
     }

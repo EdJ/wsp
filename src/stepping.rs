@@ -21,7 +21,6 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::util;
 
@@ -106,13 +105,8 @@ fn stale(path: &Path) -> bool {
     if pid == std::process::id() {
         return false;
     }
-    !Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(true)
+    // `kill -0` that could not run reads as stale, as it always has.
+    !crate::host::Host::signal(&crate::host::LOCAL, &[pid], "0").unwrap_or(false)
 }
 
 /// Step `list` with its lock held: `step(0)` first, then `step(n)` once for
