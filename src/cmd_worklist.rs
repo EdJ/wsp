@@ -5739,9 +5739,11 @@ fn iso_instant(t: &str) -> Option<i64> {
             [b'Z' | b'z'] => 0,
             [sign @ (b'+' | b'-'), ..] => {
                 let off = &rest[1..];
+                // `get`, never `[..]`: a byte count is no char boundary, and
+                // `+1é1` must be refused, not panic (wsp-106 verification).
                 let (oh, om) = match off.len() {
-                    5 if off.as_bytes()[2] == b':' => (&off[0..2], &off[3..5]),
-                    4 => (&off[0..2], &off[2..4]),
+                    5 if off.as_bytes()[2] == b':' => (off.get(0..2)?, off.get(3..5)?),
+                    4 => (off.get(0..2)?, off.get(2..4)?),
                     _ => return None,
                 };
                 let num = |s: &str| s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse::<i64>().ok())?;
@@ -10473,6 +10475,13 @@ mod tests {
             "2026-02-30",
             "2026-11-19x",
             "2026-1-19",
+            "2026-11-19T19:37+1é1",   // é straddles the offset's byte 2: refused, no panic
+            "2026-11-19T19:37+é1:00",
+            "2026-11-19T19:37+01:é",
+            "2026-11-19Té9:37Z",
+            "2026-11-19T19:37:éZ",
+            "2026-11-19T19:é7Z",
+            "é026-11-19",
         ];
         for said in refused {
             let e = until_of(said, 0).expect_err(said);
