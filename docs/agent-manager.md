@@ -1161,7 +1161,9 @@ end, as d1 Q14 says for every step.
 | 7 | wsp-057 contract | **Kept, with a note.** The `place_of` seam stays. treecopy.rs is not deleted here (M4). |
 | 8 | wsp-058 measure | **Kept, with a note.** The measure is the Mac's alone, because the Mac's manager is the only one. |
 
-**The person's answers (2026-11-18, on wsp-093, every one the recommended answer):**
+**The answers (2026-11-18, on wsp-093, every one the recommended answer).** These were put to the person. The
+m3-t2-plan governor seat answered them (ask m-dmyftmwv5200-pacf40), not the person. They stand as the plan until the
+person confirms or changes them at wsp-093's review:
 - **The trunk remote** is a bare repository per project on the Mac, reached over ssh on the tailnet (1.3, "What T2
   costs", item 1). The Mac stays the trunk's host and the barrier's default host, and the person's checkout becomes
   a clone that pulls. The alternative put to the person was the forge.
