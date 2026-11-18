@@ -595,17 +595,35 @@ pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, path_var: &str, re
 /// nothing to remove is success; the value says whether there was a unit file.
 pub fn remove_manager() -> Result<bool, String> {
     let path = manager_definition_path();
-    let had = path.exists();
-    if had || active(MANAGER_LABEL) {
+    remove_unit(path.exists(), || active(MANAGER_LABEL), ctl, || std::fs::remove_file(&path), &util::contract(&path))
+}
+
+/// [`remove_manager`]'s decisions, with what it does to the machine passed in
+/// (`active` asks the unit, `ctl` runs `systemctl --user`, `remove_file` drops
+/// the unit file), so they are tested without a systemd. `had` says the unit
+/// file existed.
+///
+/// - disable (and stop) when the file existed or the unit is active;
+/// - fail when the unit is still active afterwards;
+/// - a file already gone is fine, any other failure to remove it is not;
+/// - `daemon-reload` only when there was a file to forget.
+fn remove_unit(
+    had: bool,
+    mut active: impl FnMut() -> bool,
+    mut ctl: impl FnMut(&[&str]) -> Result<(), String>,
+    remove_file: impl FnOnce() -> std::io::Result<()>,
+    shown: &str,
+) -> Result<bool, String> {
+    if had || active() {
         ctl(&["disable", "--now", MANAGER_LABEL])?;
     }
-    if active(MANAGER_LABEL) {
+    if active() {
         return Err(format!("{MANAGER_LABEL} is still active after `systemctl --user disable --now`"));
     }
-    match std::fs::remove_file(&path) {
+    match remove_file() {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot remove {}: {e}", util::contract(&path))),
+        Err(e) => return Err(format!("cannot remove {shown}: {e}")),
     }
     if had {
         ctl(&["daemon-reload"])?;
@@ -616,6 +634,79 @@ pub fn remove_manager() -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_the_manager_disables_what_is_there_and_reloads_only_for_a_file() {
+        use std::cell::{Cell, RefCell};
+        use std::io::{Error, ErrorKind};
+        let disable = "disable --now wsp-manager";
+        // A machine: whether the unit runs (`disable --now` stops it unless
+        // `stuck`), and what `systemctl` was asked.
+        struct Machine {
+            running: Cell<bool>,
+            stuck: bool,
+            calls: RefCell<Vec<String>>,
+        }
+        impl Machine {
+            fn new(running: bool, stuck: bool) -> Machine {
+                Machine { running: Cell::new(running), stuck, calls: RefCell::new(Vec::new()) }
+            }
+            fn ctl(&self, a: &[&str]) -> Result<(), String> {
+                self.calls.borrow_mut().push(a.join(" "));
+                if a[0] == "disable" && !self.stuck {
+                    self.running.set(false);
+                }
+                Ok(())
+            }
+            fn remove(&self, had: bool, rm: impl FnOnce() -> std::io::Result<()>) -> Result<bool, String> {
+                remove_unit(had, || self.running.get(), |a| self.ctl(a), rm, "~/u.service")
+            }
+            fn said(&self) -> Vec<String> {
+                self.calls.borrow().clone()
+            }
+        }
+        let ok = || Ok(());
+        let gone = || Err(Error::from(ErrorKind::NotFound));
+
+        // A file and a running unit: disabled, file removed, reloaded, reported.
+        let m = Machine::new(true, false);
+        assert_eq!(m.remove(true, ok), Ok(true));
+        assert_eq!(m.said(), [disable, "daemon-reload"]);
+
+        // A file whose unit was never active: still disabled, and reloaded.
+        let m = Machine::new(false, false);
+        assert_eq!(m.remove(true, ok), Ok(true));
+        assert_eq!(m.said(), [disable, "daemon-reload"]);
+
+        // Nothing there at all: nothing run, and not a failure.
+        let m = Machine::new(false, false);
+        assert_eq!(m.remove(false, gone), Ok(false));
+        assert!(m.said().is_empty(), "{:?}", m.said());
+
+        // A running unit with no file: disabled, but no reload for a file never there.
+        let m = Machine::new(true, false);
+        assert_eq!(m.remove(false, gone), Ok(false));
+        assert_eq!(m.said(), [disable]);
+
+        // Still active afterwards: an error, and the file is left alone.
+        let m = Machine::new(true, true);
+        let removed = Cell::new(false);
+        let err = m
+            .remove(true, || {
+                removed.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.contains("still active"), "{err}");
+        assert!(!removed.get());
+        assert_eq!(m.said(), [disable]);
+
+        // A failure to remove the file other than "already gone" is heard.
+        let m = Machine::new(false, false);
+        let err = m.remove(true, || Err(Error::from(ErrorKind::PermissionDenied))).unwrap_err();
+        assert!(err.starts_with("cannot remove ~/u.service"), "{err}");
+        assert_eq!(m.said(), [disable], "no reload after a failed removal");
+    }
 
     #[test]
     fn a_replaced_manager_binary_restarts_a_unit_whose_text_did_not_change() {
