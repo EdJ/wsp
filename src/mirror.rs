@@ -167,6 +167,13 @@ fn placements(lists: &[Worklist]) -> BTreeMap<String, GroupId> {
 /// text for every task `texts` holds (those [`wip_reads_in_full`]
 /// says `wip` opens), and `head` is the [`TaskHead`] as the store's index keeps
 /// it (`TaskHead::to_json`) for the rest, which `wip` reads bodiless.
+///
+/// A row at review that is finished (`wsp-105`: verified, not reverted, no
+/// held barrier still judging it) carries `attention` = `needs-you`,
+/// `attention_text`, and `action` (`wsp done <id>`, Mark done), as groups and
+/// asks do. Where several are, each also carries [`ATTENTION_GROUP`] and
+/// `group_text`, and the first by id `group_action`: the one item
+/// [`crate::classify::finished`] makes of them, Mark all done and its items.
 pub fn rows(
     tasks: &[Task],
     claims: &BTreeMap<String, serde_json::Value>,
@@ -174,6 +181,8 @@ pub fn rows(
     texts: &BTreeMap<String, String>,
 ) -> Vec<Entity> {
     let place = placements(lists);
+    let finished = finished_rows(tasks, lists);
+    let group = (finished.len() > 1).then(|| finished_item(&finished)).flatten();
     tasks
         .iter()
         .map(|t| {
@@ -190,6 +199,20 @@ pub fn rows(
             put(&mut f, "updated", &t.updated);
             if let Some(claim) = claims.get(&t.id) {
                 f.insert(CLAIM.into(), claim.to_string());
+            }
+            if let Some(a) = finished.get(&t.id) {
+                for (k, v) in a.fields() {
+                    put(&mut f, k, &v);
+                }
+                if let Some(g) = &group {
+                    put(&mut f, ATTENTION_GROUP, "finished");
+                    put(&mut f, "group_text", &g.text);
+                    if finished.keys().next() == Some(&t.id) {
+                        if let Some(act) = &g.action {
+                            put(&mut f, "group_action", &act.json().to_string());
+                        }
+                    }
+                }
             }
             match texts.get(&t.id) {
                 Some(text) => {
@@ -268,10 +291,7 @@ pub fn texts_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, String> {
 /// the `Worklist` with the store's own parser — a list's groups and settings
 /// are more than its fields say.
 pub fn lists(lists: &[Worklist], tasks: &[Task], texts: &BTreeMap<String, String>) -> Vec<Entity> {
-    let done: BTreeSet<&str> =
-        tasks.iter().filter(|t| Status::parse(&t.status_raw) == Some(Status::Done)).map(|t| t.id.as_str()).collect();
-    let known: BTreeSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-    lists_with(lists, &|m| done.contains(m) || !known.contains(m), texts, wsp_base::util::epoch_secs())
+    lists_with(lists, &settled_in(tasks), texts, wsp_base::util::epoch_secs())
 }
 
 /// The `Worklist` a list was projected from, as `Store::worklists` reads it:
@@ -289,6 +309,86 @@ pub fn list_texts_of(store: &Store, lists: &[Worklist]) -> BTreeMap<String, Stri
         .collect()
 }
 
+/// A group's state from its list's file alone (what [`lists`] says of each).
+fn group_state(status: WorklistStatus, ord: usize, floor: usize, g: &model::Group, settled: &dyn Fn(&str) -> bool) -> ListState {
+    match status {
+        WorklistStatus::Draft => ListState::Pending,
+        WorklistStatus::Done => ListState::Passed,
+        _ if ord <= floor => ListState::Passed,
+        _ if ord > floor + 1 => ListState::Pending,
+        WorklistStatus::Held => ListState::Held,
+        _ if g.members.iter().all(|m| settled(m)) => ListState::Barrier,
+        _ => ListState::Running,
+    }
+}
+
+/// Whether a member counts as done for a barrier: done, or no longer held.
+fn settled_in(tasks: &[Task]) -> impl Fn(&str) -> bool + '_ {
+    let done: BTreeSet<&str> =
+        tasks.iter().filter(|t| Status::parse(&t.status_raw) == Some(Status::Done)).map(|t| t.id.as_str()).collect();
+    let known: BTreeSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    move |m| done.contains(m) || !known.contains(m)
+}
+
+/// Whether a row's log says its change was reverted (`wsp-105`): an entry
+/// (or a `note:`) that starts "reverted", as `wsp log <id> "reverted in
+/// <sha>"` writes one. The mirror runs no git, so a revert commit nobody
+/// noted on the row is not seen here.
+fn reverted(t: &Task) -> bool {
+    let Some(log) = t.section("Log") else { return false };
+    log.lines().any(|l| {
+        let Some((_, said)) = l.strip_prefix("- ").and_then(|r| r.split_once(' ')) else { return false };
+        let said = said.strip_prefix("note: ").unwrap_or(said);
+        said.to_ascii_lowercase().starts_with("reverted")
+    })
+}
+
+/// `wsp-105`: each row at review that is finished as [`crate::classify`]
+/// sorts it, by id: its newest verification holds, its change was not
+/// reverted, and no held or ready barrier's stop still judges it (a member of
+/// a group at `held` or `barrier`).
+pub(crate) fn finished_rows(tasks: &[Task], lists: &[Worklist]) -> BTreeMap<String, crate::classify::Attention> {
+    let settled = settled_in(tasks);
+    let mut judged: BTreeSet<String> = BTreeSet::new();
+    for w in lists {
+        let gs = w.groups();
+        let floor = model::crossed(&gs);
+        for (i, g) in gs.iter().enumerate() {
+            if matches!(group_state(w.status(), i + 1, floor, g, &settled), ListState::Held | ListState::Barrier) {
+                judged.extend(g.members.iter().cloned());
+            }
+        }
+    }
+    tasks
+        .iter()
+        .filter(|t| Status::parse(&t.status_raw) == Some(Status::Review))
+        .filter_map(|t| {
+            let row = crate::classify::Row {
+                id: &t.id,
+                review: true,
+                verified: crate::verification::verified(tasks, &t.id),
+                owes: reverted(t) || judged.contains(&t.id),
+            };
+            Some((t.id.clone(), crate::classify::of(crate::classify::Item::Row(row))?))
+        })
+        .collect()
+}
+
+/// The finished rows as the one item the person reads, built by
+/// [`crate::classify::finished`] alone: the mirror's rows and `wip --json`
+/// both print this, so the census and the CLI cannot disagree (`wsp-105`).
+pub(crate) fn finished_item(finished: &BTreeMap<String, crate::classify::Attention>) -> Option<crate::classify::Attention> {
+    crate::classify::finished(finished.iter().map(|(id, a)| (id.clone(), a.clone())).collect())
+}
+
+/// A finished row's key for the item it folds into, where there are several:
+/// `finished`. Beside it `group_text` ("N finished rows to close"), and
+/// `group_action`, the group's act as JSON, on **one** row only: the lowest id
+/// among the rows in the group, which is after both exclusions (a reverted
+/// row or one a held barrier judges is never it), not among all at review
+/// (`wsp-105`).
+pub const ATTENTION_GROUP: &str = "attention_group";
+
 fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeMap<String, String>, now: i64) -> Vec<Entity> {
     lists
         .iter()
@@ -301,15 +401,7 @@ fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeM
                 .enumerate()
                 .map(|(i, g)| {
                     let ord = i + 1;
-                    let state = match status {
-                        WorklistStatus::Draft => ListState::Pending,
-                        WorklistStatus::Done => ListState::Passed,
-                        _ if ord <= floor => ListState::Passed,
-                        _ if ord > floor + 1 => ListState::Pending,
-                        WorklistStatus::Held => ListState::Held,
-                        _ if g.members.iter().all(|m| settled(m)) => ListState::Barrier,
-                        _ => ListState::Running,
-                    };
+                    let state = group_state(status, ord, floor, g, settled);
                     let mut f = BTreeMap::new();
                     put(&mut f, "caption", &g.caption);
                     put(&mut f, "cap", &g.cap.map(|n| n.to_string()).unwrap_or_default());
@@ -1221,5 +1313,74 @@ mod tests {
         seat.fields.remove(CENSUS);
         seat.state = c::SeatState::Working;
         assert_eq!(seated_of(&seat).state, State::Working, "no word: its own state");
+    }
+    /// `wsp-105`. A row at review whose newest verification holds carries
+    /// `attention` = `needs-you`, the text, and the Mark done action JSON on its
+    /// own fields, where the census reads rows. Unverified, sent back, reverted,
+    /// or still judged by a held barrier: none of it. Two or more fold into
+    /// one item ("N finished rows to close", Mark all done on the first); one
+    /// alone carries no group.
+    #[test]
+    fn a_verified_row_at_review_carries_needs_you_and_mark_done_and_others_carry_nothing() {
+        use crate::verification::{record, State as V};
+        let s = store("mirror-finished");
+        for id in ["wsp-10", "wsp-11", "wsp-12", "wsp-13", "wsp-14", "wsp-16"] {
+            let mut t = Task::new(&format!("title of {id}"), id);
+            t.project = Some("wsp".into());
+            t.status_raw = "review".into();
+            if id == "wsp-10" {
+                t.log("reverted in a661ec8");
+            }
+            s.save_task(&t).unwrap();
+        }
+        for id in ["wsp-10", "wsp-11", "wsp-12", "wsp-16"] {
+            record(&s, id, V::Holds, "it holds", None, None).unwrap();
+        }
+        record(&s, "wsp-14", V::Blocks, "it does not hold", None, None).unwrap();
+        let mut back = s.find_task("wsp-14").unwrap();
+        back.status_raw = "review".into();
+        s.save_task(&back).unwrap();
+        let mut w = Worklist::new("held-a", "held");
+        w.set_status(WorklistStatus::Held);
+        w.set_groups(&[model::Group { members: vec!["wsp-16".into()], ..Default::default() }]);
+        s.save_worklist(&w).unwrap();
+
+        let read = |s: &Store| {
+            let tasks = s.tasks();
+            rows(&tasks, &BTreeMap::new(), &s.worklists(), &texts_of(s, &tasks))
+        };
+        let es = read(&s);
+        let f = |id: &str| row_of(&es, id).fields;
+        let done = |id: &str| json!({ "verb": "done", "args": [id], "sentence": "none", "buttons": [
+            { "label": "Mark done", "verb": "done", "args": [id], "sentence": "none" },
+        ] });
+        for id in ["wsp-11", "wsp-12"] {
+            let r = f(id);
+            assert_eq!(r.get("attention").map(String::as_str), Some("needs-you"), "{id}: {r:?}");
+            assert_eq!(r.get("attention_text").map(String::as_str), Some(crate::classify::FINISHED));
+            let action: serde_json::Value = serde_json::from_str(&r["action"]).unwrap();
+            assert_eq!(action, done(id));
+            assert_eq!(r.get(ATTENTION_GROUP).map(String::as_str), Some("finished"));
+            assert_eq!(r.get("group_text").map(String::as_str), Some("2 finished rows to close"));
+        }
+        let all: serde_json::Value = serde_json::from_str(&f("wsp-11")["group_action"]).unwrap();
+        assert_eq!(all["verb"], "group");
+        assert_eq!(all["buttons"][0]["each"], json!([["wsp-11"], ["wsp-12"]]));
+        assert_eq!(all["items"][1]["action"], done("wsp-12"));
+        // The lowest id in the group, after the exclusions: wsp-10 is lower and
+        // verified, but reverted, so it is wsp-11 that carries the group's act.
+        assert!(!f("wsp-10").contains_key("group_action") && !f("wsp-12").contains_key("group_action"));
+        assert_eq!(all["args"], json!(["wsp-11", "wsp-12"]));
+        for (id, why) in [("wsp-13", "unverified"), ("wsp-14", "sent back"), ("wsp-10", "reverted"), ("wsp-16", "a held barrier judges it")] {
+            let r = f(id);
+            assert!(!r.contains_key("attention") && !r.contains_key("action") && !r.contains_key(ATTENTION_GROUP), "{id} ({why}): {r:?}");
+        }
+
+        let mut closed = s.find_task("wsp-12").unwrap();
+        closed.status_raw = "done".into();
+        s.save_task(&closed).unwrap();
+        let alone = row_of(&read(&s), "wsp-11").fields;
+        assert_eq!(alone.get("attention").map(String::as_str), Some("needs-you"));
+        assert!(!alone.contains_key(ATTENTION_GROUP) && !alone.contains_key("group_action"), "one shows alone: {alone:?}");
     }
 }

@@ -5301,8 +5301,20 @@ fn answers_to(
 /// where the classifier gives one (`wsp-097`: no seat yet; a seat held on a
 /// dialog is acted on through that question). No seat is follow-up yet: one waiting on
 /// a named other party is `wsp-095`'s third sub-task.
-fn wip_attention(rows: &[WipRow]) -> serde_json::Value {
+///
+/// And the finished rows (`wsp-105`), as the one item the mirror's rows fold
+/// into: `kind` `finished`, `rows` their ids, and the item
+/// [`crate::mirror::finished_item`] makes ("N finished rows to close" with the
+/// group action, or one row alone with its Mark done).
+fn wip_attention(w: &Wip, rows: &[WipRow]) -> serde_json::Value {
     let (mut needs_you, mut follow_up) = (Vec::new(), Vec::new());
+    let finished = crate::mirror::finished_rows(&w.tasks, &w.lists);
+    if let Some(a) = crate::mirror::finished_item(&finished) {
+        let mut v = a.json();
+        v["kind"] = "finished".into();
+        v["rows"] = finished.keys().cloned().collect::<Vec<_>>().into();
+        needs_you.push(v);
+    }
     for r in rows {
         let why = r.waiting.as_ref().filter(|w| w.owed()).map(|w| w.sentence());
         let seat = crate::classify::Seat { needs_you: r.needs_you, task: &r.task_id, waiting: why.as_deref() };
@@ -5323,7 +5335,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
     let rows = wip_rows(w);
     let (blocked, in_review, inbox) = wip_queues(w);
     json!({
-        "attention": wip_attention(&rows),
+        "attention": wip_attention(w, &rows),
         "agents": rows.iter().map(|r| {
             json!({
             "project": r.project, "task": r.task, "task_id": r.task_id,
@@ -9888,6 +9900,40 @@ mod tests {
         assert_eq!(held["waiting"]["id"], "m-hold");
         assert_eq!(wip_json(&w)["needs_you"], 2, "it is counted beside the stopped member");
         assert_eq!(row(&w, "w3:p1")["needs_you"], false, "and another seat is not");
+    }
+
+    /// `wsp-105`, the governor's condition: `wip --json` prints the finished
+    /// rows as the one item the mirror's rows fold into, from the same
+    /// builder, so the census and the CLI cannot disagree.
+    #[test]
+    fn wip_json_lists_the_finished_rows_as_one_item_the_mirror_also_carries() {
+        use crate::verification::{record, State as V};
+        let s = crate::testkit::store("wip-finished");
+        for id in ["r-1", "r-2"] {
+            let mut t = Task::new(&format!("title of {id}"), id);
+            t.status_raw = "review".into();
+            s.save_task(&t).unwrap();
+            record(&s, id, V::Holds, "it holds", None, None).unwrap();
+        }
+        let mut w = wip_world();
+        let mut tasks: Vec<Task> = w.tasks.iter().cloned().collect();
+        tasks.extend(s.tasks());
+        w.tasks = std::rc::Rc::new(tasks);
+        let needs_you = wip_json(&w)["attention"]["needs_you"].as_array().unwrap().clone();
+        let item = needs_you.iter().find(|e| e["kind"] == "finished").expect("the finished rows are one item");
+        assert_eq!(item["rows"], json!(["r-1", "r-2"]));
+        assert_eq!(item["text"], "2 finished rows to close");
+        let mirrored = crate::mirror::rows(&w.tasks, &BTreeMap::new(), &w.lists, &BTreeMap::new());
+        let first = mirrored
+            .iter()
+            .find_map(|e| match e {
+                wsp_store_contract::Entity::Row(r) if r.id.0 == "r-1" => Some(r.fields.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let carried: serde_json::Value = serde_json::from_str(&first["group_action"]).unwrap();
+        assert_eq!(item["action"], carried, "one builder, one answer");
+        assert_eq!(needs_you.iter().filter(|e| e["kind"] == "finished").count(), 1);
     }
 
     /// `wsp-096`. `wip --json`'s `attention` lists every seat that needs the

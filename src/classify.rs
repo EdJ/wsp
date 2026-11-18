@@ -23,6 +23,13 @@
 //! - A seat `wip` reads as needing the person (stopped on its row, a dialog
 //!   up, held in `wsp ask --wait`) → needs-you.
 //!
+//! - A row at review whose newest verification holds, and that owes no step
+//!   but the person's close (`wsp-105`) → needs-you, with **Mark done**
+//!   (`wsp done <id>`). One unverified, sent back, reverted on the trunk, or
+//!   still judged by a held barrier's stop → neither. Several such rows are
+//!   one item, [`finished`]: "N finished rows to close", **Mark all done**,
+//!   and each row beneath with its own Mark done.
+//!
 //! A needs-you barrier or question carries the [`Action`] that does it
 //! (`wsp-097`); a follow-up carries none. A seat carries none yet: the act on a
 //! seat held on a dialog is that dialog's question, which carries one, and a
@@ -105,11 +112,14 @@ pub struct Button {
     /// JSON fed on stdin, for an answer only the JSON form can say (allowing
     /// for the session with the rule the prompt offered).
     pub stdin: Option<serde_json::Value>,
+    /// Run the command once per entry, each with these args in place of
+    /// `args`, in order: **Mark all done** (`wsp done` takes one row).
+    pub each: Vec<Vec<String>>,
 }
 
 impl Button {
     fn new(label: &str, verb: &str, args: Vec<String>, sentence: Sentence) -> Self {
-        Button { label: label.into(), verb: verb.into(), args, sentence, prefix: None, stdin: None }
+        Button { label: label.into(), verb: verb.into(), args, sentence, prefix: None, stdin: None, each: Vec::new() }
     }
 
     pub fn json(&self) -> serde_json::Value {
@@ -121,6 +131,9 @@ impl Button {
         }
         if let Some(i) = &self.stdin {
             v["stdin"] = i.clone();
+        }
+        if !self.each.is_empty() {
+            v["each"] = self.each.clone().into();
         }
         v
     }
@@ -140,12 +153,17 @@ impl Button {
 ///   **Allow**, **Allow for session** where the prompt offered a suggestion
 ///   (the JSON form on stdin, its first suggestion as the rule, which `wsp
 ///   answer` scopes to the session), and **Deny**.
+/// - A finished row (`wsp-105`): `done <id>`, no sentence, **Mark done**.
+/// - Several finished rows: `group <ids…>`, **Mark all done** (`done` once
+///   per row, [`Button::each`]), and `items`, each row with its own act.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Action {
     pub verb: String,
     pub args: Vec<String>,
     pub sentence: Sentence,
     pub buttons: Vec<Button>,
+    /// A group's members, by id, each with what it asks on its own.
+    pub items: Vec<(String, Attention)>,
 }
 
 impl Action {
@@ -160,7 +178,29 @@ impl Action {
                 Button::new("Pass", "worklist", go, Sentence::Needed),
                 Button::new("Hold", "worklist", hold, Sentence::Needed),
             ],
+            items: Vec::new(),
         }
+    }
+
+    /// A finished row: `wsp done <id>`, as it is.
+    fn done(id: &str) -> Self {
+        let args = vec![id.to_string()];
+        Action {
+            verb: "done".into(),
+            args: args.clone(),
+            sentence: Sentence::None,
+            buttons: vec![Button::new("Mark done", "done", args, Sentence::None)],
+            items: Vec::new(),
+        }
+    }
+
+    /// Several finished rows as one: Mark all done runs `wsp done` once per
+    /// row; `items` holds each row and its own Mark done.
+    fn group(items: Vec<(String, Attention)>) -> Self {
+        let ids: Vec<String> = items.iter().map(|(id, _)| id.clone()).collect();
+        let mut all = Button::new("Mark all done", "done", Vec::new(), Sentence::None);
+        all.each = ids.iter().map(|id| vec![id.clone()]).collect();
+        Action { verb: "group".into(), args: ids, sentence: Sentence::None, buttons: vec![all], items }
     }
 
     /// An open question for the person, by the choices its record carries.
@@ -173,7 +213,7 @@ impl Action {
             .and_then(|r| r.get("choices").cloned())
             .filter(|c| c.is_object());
         let Some(c) = choices else {
-            return Action { verb: "answer".into(), args: vec![id], sentence: Sentence::Needed, buttons: Vec::new() };
+            return Action { verb: "answer".into(), args: vec![id], sentence: Sentence::Needed, buttons: Vec::new(), items: Vec::new() };
         };
         let with = |more: &[&str]| -> Vec<String> {
             std::iter::once(id.clone()).chain(more.iter().map(|s| s.to_string())).collect()
@@ -205,7 +245,7 @@ impl Action {
                 other.prefix = several.then(|| format!("{name}="));
                 buttons.push(other);
             }
-            return Action { verb: "answer".into(), args: with(&["--choice"]), sentence: Sentence::None, buttons };
+            return Action { verb: "answer".into(), args: with(&["--choice"]), sentence: Sentence::None, buttons, items: Vec::new() };
         }
         buttons.push(Button::new("Allow", "answer", with(&["--choice", "allow"]), Sentence::None));
         let suggestion = c.get("suggestions").and_then(|s| s.as_array()).and_then(|s| s.first()).filter(|s| s.is_object());
@@ -215,14 +255,27 @@ impl Action {
             buttons.push(session);
         }
         buttons.push(Button::new("Deny", "answer", with(&["--choice", "deny"]), Sentence::None));
-        Action { verb: "answer".into(), args: vec![id], sentence: Sentence::None, buttons }
+        Action { verb: "answer".into(), args: vec![id], sentence: Sentence::None, buttons, items: Vec::new() }
     }
 
     pub fn json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "verb": self.verb, "args": self.args, "sentence": self.sentence.word(),
             "buttons": self.buttons.iter().map(Button::json).collect::<Vec<_>>(),
-        })
+        });
+        if !self.items.is_empty() {
+            v["items"] = self
+                .items
+                .iter()
+                .map(|(id, a)| {
+                    let mut i = a.json();
+                    i["id"] = id.as_str().into();
+                    i
+                })
+                .collect::<Vec<_>>()
+                .into();
+        }
+        v
     }
 }
 
@@ -281,6 +334,24 @@ pub struct Seat<'a> {
     pub waiting: Option<&'a str>,
 }
 
+/// A row as [`Item::Row`] reads it (`wsp-105`). The caller works out each
+/// fact from the store; this only sorts them.
+#[derive(Clone, Copy, Debug)]
+pub struct Row<'a> {
+    pub id: &'a str,
+    /// At `review`.
+    pub review: bool,
+    /// Its newest verification holds: not none, not one still reading, not
+    /// one that sent it back.
+    pub verified: bool,
+    /// It owes a step besides the person's close: its change was reverted on
+    /// the trunk, or a held barrier's stop still judges it.
+    pub owes: bool,
+}
+
+/// What a finished row says (`wsp-105`).
+pub const FINISHED: &str = "finished and verified: close it or send it back";
+
 /// Something that could involve the person.
 #[derive(Clone, Copy, Debug)]
 pub enum Item<'a> {
@@ -289,6 +360,18 @@ pub enum Item<'a> {
     Barrier(&'a str, &'a Owed),
     Ask(&'a Ask),
     Seat(Seat<'a>),
+    Row(Row<'a>),
+}
+
+/// The finished rows (each a row [`of`] calls needs-you, with its id) as the
+/// one item the person reads (`wsp-105`): none is `None`, one is that row
+/// alone, more are "N finished rows to close" with the group action.
+pub fn finished(rows: Vec<(String, Attention)>) -> Option<Attention> {
+    match rows.len() {
+        0 => None,
+        1 => rows.into_iter().next().map(|(_, a)| a),
+        n => Some(Attention::needs_you(format!("{n} finished rows to close")).with(Action::group(rows))),
+    }
 }
 
 /// Which of needs-you or follow-up `item` is, and what to say beside it;
@@ -323,6 +406,8 @@ pub fn of(item: Item) -> Option<Attention> {
                 (None, task) => format!("stopped on {task}: read its screen and tell it what is next, or end it"),
             })
         }),
+        Item::Row(r) => (r.review && r.verified && !r.owes)
+            .then(|| Attention::needs_you(FINISHED.to_string()).with(Action::done(r.id))),
     }
 }
 
@@ -549,5 +634,56 @@ mod tests {
         // And the other way: read late first, then early. Nothing was kept.
         assert_eq!(read(NOW + 3_601).unwrap().kind, Kind::NeedsYou);
         assert_eq!(read(NOW).unwrap().kind, Kind::FollowUp);
+    }
+    fn row(id: &str, verified: bool, owes: bool) -> Row<'_> {
+        Row { id, review: true, verified, owes }
+    }
+
+    /// `wsp-105`. A row at review whose newest verification holds needs you,
+    /// with `wsp done <id>` and Mark done, in wsp-097's shape. One unverified
+    /// or sent back (the caller reads both as not verified), one not at
+    /// review, and one that still owes a step are neither.
+    #[test]
+    fn a_verified_row_at_review_needs_you_with_mark_done_and_an_unverified_or_blocked_one_is_neither() {
+        let a = of(Item::Row(row("wsp-93", true, false))).unwrap();
+        assert_eq!((a.kind, a.text.as_str()), (Kind::NeedsYou, "finished and verified: close it or send it back"));
+        assert_eq!(
+            a.action.unwrap().json(),
+            serde_json::json!({ "verb": "done", "args": ["wsp-93"], "sentence": "none", "buttons": [
+                { "label": "Mark done", "verb": "done", "args": ["wsp-93"], "sentence": "none" },
+            ] })
+        );
+        assert_eq!(of(Item::Row(row("wsp-93", false, false))), None, "unverified, or its verifier sent it back");
+        assert_eq!(of(Item::Row(row("wsp-93", true, true))), None, "reverted, or a held barrier still judges it");
+        assert_eq!(of(Item::Row(Row { review: false, ..row("wsp-93", true, false) })), None, "not at review");
+    }
+
+    /// `wsp-105`, Jesper's scope: several finished rows are one item, "N
+    /// finished rows to close", whose Mark all done runs `wsp done` once per
+    /// row and whose items are each row with its own Mark done; one is that
+    /// row alone; none is nothing.
+    #[test]
+    fn finished_rows_are_one_group_with_mark_all_done_and_a_single_one_shows_alone() {
+        let each = |ids: &[&str]| -> Vec<(String, Attention)> {
+            ids.iter().map(|id| (id.to_string(), of(Item::Row(row(id, true, false))).unwrap())).collect()
+        };
+        assert_eq!(finished(Vec::new()), None);
+        assert_eq!(finished(each(&["wsp-1"])), of(Item::Row(row("wsp-1", true, false))), "alone");
+
+        let g = finished(each(&["wsp-1", "wsp-2"])).unwrap();
+        assert_eq!((g.kind, g.text.as_str()), (Kind::NeedsYou, "2 finished rows to close"));
+        let mark = |id: &str| serde_json::json!({ "verb": "done", "args": [id], "sentence": "none", "buttons": [
+            { "label": "Mark done", "verb": "done", "args": [id], "sentence": "none" },
+        ] });
+        assert_eq!(
+            g.action.unwrap().json(),
+            serde_json::json!({ "verb": "group", "args": ["wsp-1", "wsp-2"], "sentence": "none",
+                "buttons": [{ "label": "Mark all done", "verb": "done", "args": [], "sentence": "none",
+                              "each": [["wsp-1"], ["wsp-2"]] }],
+                "items": [
+                    { "id": "wsp-1", "attention": "needs-you", "text": FINISHED, "action": mark("wsp-1") },
+                    { "id": "wsp-2", "attention": "needs-you", "text": FINISHED, "action": mark("wsp-2") },
+                ] })
+        );
     }
 }
