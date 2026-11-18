@@ -76,8 +76,16 @@ if [ -z "${COMPOUND_NO_SCCACHE:-}" ]; then
             # Not `exec`: sccache exits 2 when it cannot reach or start its server ("failed to
             # execute compile", "failed to fill whole buffer"), which rustc itself does not do, and
             # a build must not depend on a cache server that died (wsp-343). Fall back to the compiler.
-            COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$root" \
-                "$candidate" "$here/rustc-remap" "$@"
+            # A server alive but never answering held `sccache rustc-remap -vV` 5+ min (wsp-083), and
+            # sccache 0.19 has no client timeout: `sccache-bound` probes the server while a call is
+            # slow and exits 2 when the probe goes unanswered; the compile itself is never bounded.
+            if command -v perl >/dev/null 2>&1; then
+                COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$root" \
+                    perl "$here/sccache-bound" "$candidate" "$here/rustc-remap" "$@"
+            else
+                COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$root" \
+                    "$candidate" "$here/rustc-remap" "$@"
+            fi
             rc=$?
             [ "$rc" = 2 ] || exit "$rc"
             break

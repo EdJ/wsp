@@ -9,7 +9,13 @@
 # - The same three places `rustc-wrap` looks for sccache.
 # - sccache exits 2 when it cannot reach or start its server; a build must not depend on a cache
 #   server that died (wsp-343), so the compile runs again with the bare `cc`.
+# - A server that is alive but never answers would hold the call forever (591 s for one cold
+#   build, wsp-083), and sccache 0.19 has no client timeout. The call runs under `sccache-bound`,
+#   which asks the server for its stats while a compile is slow and, when that goes unanswered,
+#   ends the call and exits 2 as for a dead server; the compile itself is never bounded. Without
+#   perl the call runs unbounded, as before.
 # - COMPOUND_NO_SCCACHE=1 bypasses sccache. An explicit CC in the environment overrides this file.
+here=$(dirname "$0")
 if [ -z "${COMPOUND_NO_SCCACHE:-}" ]; then
     for candidate in \
         "$(command -v sccache 2>/dev/null || true)" \
@@ -18,7 +24,11 @@ if [ -z "${COMPOUND_NO_SCCACHE:-}" ]; then
     do
         if [ -n "$candidate" ] && [ -x "$candidate" ]; then
             # Not `exec`: the exit code decides whether to fall back.
-            "$candidate" cc "$@"
+            if command -v perl >/dev/null 2>&1; then
+                perl "$here/sccache-bound" "$candidate" cc "$@"
+            else
+                "$candidate" cc "$@"
+            fi
             rc=$?
             [ "$rc" = 2 ] || exit "$rc"
             break

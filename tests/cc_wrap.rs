@@ -2,6 +2,11 @@
 //! and a fake `cc` on a PATH of their own. Each fake appends its name and arguments to a log and exits
 //! with the code its env var gives.
 //!
+//! Both wrappers run sccache under `.cargo/sccache-bound` (wsp-083): a fake that hangs on the compile
+//! and on `--show-stats` stands for a server that is alive and never answers, one that sleeps and
+//! then succeeds for a compile that is merely slow. Each run gets its own `TMPDIR`, where the
+//! bound writes down a wedged server.
+//!
 //! The wrapper also tries `/usr/local/bin/sccache` and `/opt/homebrew/bin/sccache`, so on a machine
 //! that has a real one there the "sccache missing" route cannot be reproduced; that test skips then.
 
@@ -9,6 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -31,26 +37,41 @@ impl Bin {
         let body = format!(
             "#!/bin/sh\necho \"{name} $*\" >> \"$FAKE_LOG\"\nexit \"${{{var}:-0}}\"\n"
         );
+        self.script(name, &body);
+    }
+    /// A fake `name` with `body` as its whole script.
+    fn script(&self, name: &str, body: &str) {
         let p = self.dir.join(name);
         fs::write(&p, body).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    /// A fake `sccache` whose server is alive and never answers: it logs, then sleeps past any
+    /// bound, on a compile and on `--show-stats` alike. `exec sleep` so a kill or an alarm ends it.
+    fn hung_sccache(&self) {
+        self.script("sccache", "#!/bin/sh\necho \"sccache $*\" >> \"$FAKE_LOG\"\nexec sleep 120\n");
+    }
     fn log(&self) -> String {
         fs::read_to_string(self.dir.join("log")).unwrap_or_default()
     }
-    /// Run the wrapper with `args`; returns (exit code, log lines).
+    /// Run `.cargo/cc-wrap` with `args`; returns (exit code, log lines).
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, Vec<String>) {
-        let wrap = root().join(".cargo/cc-wrap");
+        let (code, log, _) = self.run_wrap("cc-wrap", args, env);
+        (code, log)
+    }
+    /// Run `.cargo/<wrap>` with `args`; returns (exit code, log lines, stderr).
+    fn run_wrap(&self, wrap: &str, args: &[&str], env: &[(&str, &str)]) -> (i32, Vec<String>, String) {
+        let wrap = root().join(".cargo").join(wrap);
         assert!(wrap.exists(), "{} is missing", wrap.display());
         let mut c = Command::new("/bin/sh");
         // PATH: the fakes first, then only the directories `/bin/sh` itself needs.
         c.arg(&wrap).args(args).env("PATH", format!("{}:/usr/bin:/bin", self.dir.display())).env("FAKE_LOG", self.dir.join("log"));
-        c.env_remove("COMPOUND_NO_SCCACHE");
+        c.env_remove("COMPOUND_NO_SCCACHE").env("TMPDIR", &self.dir);
         for (k, v) in env {
             c.env(k, v);
         }
-        let code = c.status().unwrap().code().unwrap();
-        (code, self.log().lines().map(String::from).collect())
+        let out = c.output().unwrap();
+        let code = out.status.code().unwrap();
+        (code, self.log().lines().map(String::from).collect(), String::from_utf8_lossy(&out.stderr).into_owned())
     }
 }
 
@@ -126,4 +147,68 @@ fn exit_codes_pass_through_on_every_route() {
     b.fake("cc");
     let (code, _) = b.run(&["a.c"], &[("COMPOUND_NO_SCCACHE", "1"), ("FAKE_CC_EXIT", "3")]);
     assert_eq!(code, 3);
+}
+
+/// Short bounds so a hung fake costs the test about 3 s: 1 s before the probe, 1 s for it.
+const SHORT: [(&str, &str); 2] = [("COMPOUND_SCCACHE_WAIT", "1"), ("COMPOUND_SCCACHE_PROBE", "1")];
+
+#[test]
+fn a_hung_sccache_on_cc_wraps_route_falls_back_to_cc_and_says_so_once() {
+    let b = Bin::new("hung-cc");
+    b.hung_sccache();
+    b.fake("cc");
+    let t = Instant::now();
+    let (code, log, err) = b.run_wrap("cc-wrap", &["-c", "a.c"], &SHORT);
+    assert!(t.elapsed() < Duration::from_secs(20), "bounded: {:?}", t.elapsed());
+    assert_eq!(code, 0, "the fallback's exit code: {err}");
+    assert_eq!(log, ["sccache cc -c a.c", "sccache --show-stats", "cc -c a.c"]);
+    assert_eq!(err.matches("did not answer").count(), 1, "said once: {err}");
+
+    // The next compile in the same build does not wait on the wedged server again, nor say so again.
+    let t = Instant::now();
+    let (code, log, err) = b.run_wrap("cc-wrap", &["-c", "b.c"], &SHORT);
+    assert!(t.elapsed() < Duration::from_secs(1), "no second wait: {:?}", t.elapsed());
+    assert_eq!(code, 0);
+    assert_eq!(&log[3..], ["cc -c b.c"], "sccache skipped: {log:?}");
+    assert!(!err.contains("did not answer"), "{err}");
+}
+
+#[test]
+fn a_hung_sccache_on_rustc_wraps_route_falls_back_to_rustc() {
+    let b = Bin::new("hung-rustc");
+    b.hung_sccache();
+    b.fake("rustc");
+    let rustc = b.dir.join("rustc");
+    let t = Instant::now();
+    let (code, log, err) = b.run_wrap("rustc-wrap", &[rustc.to_str().unwrap(), "-vV"], &SHORT);
+    assert!(t.elapsed() < Duration::from_secs(20), "bounded: {:?}", t.elapsed());
+    assert_eq!(code, 0, "{err}");
+    let remap = root().join(".cargo/rustc-remap");
+    let remap = remap.to_str().unwrap();
+    assert_eq!(
+        log,
+        [format!("sccache {remap} -vV"), "sccache --show-stats".to_string(), "rustc -vV".to_string()]
+    );
+    assert_eq!(err.matches("did not answer").count(), 1, "{err}");
+}
+
+#[test]
+fn a_slow_compile_with_an_answering_server_runs_once_and_is_not_cut_short() {
+    let b = Bin::new("slow");
+    // The compile outlasts the 1 s wait three times over; the server answers `--show-stats` at once.
+    b.script(
+        "sccache",
+        "#!/bin/sh\necho \"sccache $*\" >> \"$FAKE_LOG\"\n\
+         [ \"$1\" = --show-stats ] && exit 0\nsleep 3\necho done >> \"$FAKE_LOG\"\nexit 0\n",
+    );
+    b.fake("cc");
+    let t = Instant::now();
+    let (code, log, err) = b.run_wrap("cc-wrap", &["-c", "sqlite3.c"], &SHORT);
+    assert!(t.elapsed() >= Duration::from_secs(3), "waited for the compile: {:?}", t.elapsed());
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(log.iter().filter(|l| l.as_str() == "sccache cc -c sqlite3.c").count(), 1, "once: {log:?}");
+    assert_eq!(log.last().map(String::as_str), Some("done"), "ran to its end: {log:?}");
+    assert!(log.iter().all(|l| !l.starts_with("cc ")), "never run again bare: {log:?}");
+    assert!(log.iter().any(|l| l == "sccache --show-stats"), "the server was asked: {log:?}");
+    assert!(!err.contains("did not answer"), "{err}");
 }
