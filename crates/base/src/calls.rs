@@ -1313,6 +1313,7 @@ mod tests {
     /// A child run through the wrapper is counted by program name, once per run,
     /// with its wall time; and a drain empties the accumulator.
     /// The accumulator is process-wide, so the tests that drain it take turns.
+    /// `close` drains it, so a test that closes a phase takes this too (wsp-132).
     static KIDS_TEST: Mutex<()> = Mutex::new(());
 
     /// **The daemon's leak.** A child dropped without a wait (the detached
@@ -1682,6 +1683,8 @@ mod tests {
 
     #[test]
     fn phases_add_when_a_name_comes_round_again() {
+        // `close` drains the process-wide tally: take turns (wsp-132).
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let mut t = Tick {
             at: 0,
             started: Instant::now(),
@@ -1703,10 +1706,11 @@ mod tests {
     }
 
     /// `wsp-665`: a phase says which programs it ran, and the tick's `children`
-    /// stays the sum of them. The test drains the process-wide tally, so it is
-    /// the only test that reads it.
+    /// stays the sum of them. The test drains the process-wide tally, so it
+    /// takes turns with the other tests that do (`KIDS_TEST`, wsp-132).
     #[test]
     fn a_phase_keeps_the_children_it_ran_and_the_tick_the_total() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let _ = drain_children();
         let mut t = Tick {
             at: 0,
