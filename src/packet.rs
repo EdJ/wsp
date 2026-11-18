@@ -295,16 +295,32 @@ pub fn subject(t: &Task) -> Vec<String> {
     out
 }
 
-/// Whether the files a packet names miss what its overview describes: the
-/// overview names things ([`subject`]) and not one of them is in any file the
-/// packet names that can be read under `root` (none at all, too). An overview
+/// A name only code spells: one with `_` or `::` in it, or a lower letter
+/// followed by a capital (`wall_buckets`, `Store::open`, `wallBuckets`). A
+/// plain word in backticks (`running`, `finish`) is in half the files of a
+/// tree, so it says nothing about whether these are the right ones.
+pub fn distinctive(name: &str) -> bool {
+    name.contains('_')
+        || name.contains("::")
+        || name.as_bytes().windows(2).any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+}
+
+/// Whether the files a packet names miss what its brief describes: the brief
+/// names things ([`subject`]) and not one of them is in any file the packet
+/// names that can be read under `root` (none at all, too). When the brief has
+/// [`distinctive`] names, only those are judged, so a common word in backticks
+/// cannot clear a row (wsp-016's `running` and `finish` were in src/cycle.rs a
+/// hundred times each; its `wall_buckets` was in none of its files). A brief
 /// that names nothing gives nothing to miss, and a row with no packet is not
 /// spawned short: both keep the narrow order.
 pub fn misses_subject(t: &Task, root: &Path) -> bool {
     if of(t).is_none() {
         return false;
     }
-    let names = subject(t);
+    let mut names = subject(t);
+    if names.iter().any(|n| distinctive(n)) {
+        names.retain(|n| distinctive(n));
+    }
     if names.is_empty() {
         return false;
     }
@@ -1064,6 +1080,68 @@ mod tests {
         assert!(!misses_subject(&right, &dir));
         assert_eq!(order_for(&right, &dir, Flow::of(true)), order("t-1", Flow::of(true)));
         assert!(!build(&right, &dir).unwrap().contains(SEARCH_RULE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-016's brief, verbatim: its Evidence and Done when carry `finish` and
+    /// `running` in backticks, words src/cycle.rs holds a hundred times each,
+    /// beside `wall_buckets` and `legs_running_seconds`, which none of its likely
+    /// files held. The common words must not clear it.
+    const WSP_016: &str = "## Evidence\n\
+effort.json books a leg that has no seat as working. wsp-001's `finish` leg (cpd-121) ended at its Stop at 06:39:28Z as a member exit, and the leg line read `running` until it was edited by hand about 07:45 (wsp-011 has the cause). For that hour nobody worked, yet group 1's wall_buckets say working 7774 s of 8974 s (without the park), of which legs_running_seconds 7178 s. The legs that ran took about 32 min of seat time. cpd-121 reads 14139 s on 35 turns. So the list's \"working 226m (80 %)\" holds about 65 min that was a stall, and the wall's biggest single cause reads as work.\n\
+The same wall also lists two stalls as \"nothing the logs name\": wsp-004's step did not run (545 s, the capped-reopen case in wsp-011) and wsp-001's (318 s), 14 min together, though the log says why.\n\
+Search: `wsp ls --all`, `wsp find --all` for \"legs running\", \"gap\", \"idle\", \"unclaimed\"; no open row covers the measurement (wsp-011 covers the stuck leg itself and has this noted).\n\
+\n\
+## Fix\n\
+In the wall buckets, count a leg as running only while its seat is alive (a binding, or a model call or tool in its transcript); a leg whose seat has ended is waiting, named \"a leg's seat ended, the leg not closed\" with the seat and the time it ended. And name the wsp-004-style gap where the log has a reopen at the leg cap with no member seated.\n\
+\n\
+## Done when\n\
+A test over a leg record whose seat ended at T and whose line stays `running` to T+60 min: the 60 min land in waiting with that cause, not in working or legs_running_seconds. Re-reading m0-agent-manager's effort.json gives group 1 working near 7774 s less about 3900 s.\n";
+
+    #[test]
+    fn wsp_016s_own_brief_is_not_cleared_by_a_common_word_its_files_hold() {
+        let dir = tree("wsp016", &[
+            ("src/cycle.rs", "// a leg is running until its finish\npub fn running() -> bool { true }\npub fn finish() {}\n"),
+            ("src/cmd_agent.rs", "pub fn agent() { let running = 1; let _ = running; }\n"),
+            ("src/wallbuckets.rs", "pub fn wall_buckets() {}\n"),
+        ]);
+        let row = |likely: &str| {
+            let mut t = Task::default();
+            t.id = "wsp-016".into();
+            t.title = "effort.json books a leg whose seat ended as working".into();
+            t.body = format!(
+                "{WSP_016}\n## {SECTION}\nCONTEXT PACK  wsp@43be8f17  built from 9 finished tasks  kind: routine\n\
+                 likely files  {likely}\nverify  cargo test cycle::\n"
+            );
+            t
+        };
+        let missed = row("src/cycle.rs (identifier), src/cmd_agent.rs (precedent)");
+        let names = subject(&missed);
+        assert!(["finish", "running", "wall_buckets", "legs_running_seconds"].iter().all(|n| names.contains(&n.to_string())), "{names:?}");
+        assert!(misses_subject(&missed, &dir), "`running` and `finish` are in src/cycle.rs; wall_buckets is not");
+        let o = order_for(&missed, &dir, Flow::of(true));
+        assert!(o.contains(SEARCH_RULE) && !o.contains(NARROW), "{o}");
+        assert_eq!(build(&missed, &dir).unwrap().matches(SEARCH_RULE).count(), 1);
+
+        let right = row("src/cycle.rs (identifier), src/wallbuckets.rs (named)");
+        assert!(!misses_subject(&right, &dir));
+        assert_eq!(order_for(&right, &dir, Flow::of(true)), order("wsp-016", Flow::of(true)));
+        assert!(!build(&right, &dir).unwrap().contains(SEARCH_RULE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_only_code_spells_is_distinctive_and_a_plain_word_is_not() {
+        for n in ["wall_buckets", "Store::open", "wallBuckets", "_x"] {
+            assert!(distinctive(n), "{n}");
+        }
+        for n in ["running", "finish", "Store", "WSP"] {
+            assert!(!distinctive(n), "{n}");
+        }
+        let dir = tree("plain", &[("src/cycle.rs", "pub fn running() {}\n")]);
+        let plain = retro("The leg line reads `running`.", "file: src/cycle.rs");
+        assert!(!misses_subject(&plain, &dir), "with nothing more specific named, a plain word still counts");
+        assert!(misses_subject(&retro("The leg line reads `finish`.", "file: src/cycle.rs"), &dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
