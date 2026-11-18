@@ -109,6 +109,27 @@ fn stale(path: &Path) -> bool {
     !crate::host::Host::signal(&crate::host::LOCAL, &[pid], "0").unwrap_or(false)
 }
 
+/// Stub for the red commit: the old body, probing through `alive`.
+fn stale_by(path: &Path, alive: impl Fn(u32) -> Option<bool>) -> bool {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut it = text.split_whitespace();
+    let pid = it.next().and_then(|p| p.parse::<u32>().ok());
+    let at = it.next().and_then(|a| a.parse::<i64>().ok());
+    let (Some(pid), Some(at)) = (pid, at) else {
+        return fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default().as_secs() > 60)
+            .unwrap_or(false);
+    };
+    if util::epoch_secs() - at > STALE_AFTER {
+        return true;
+    }
+    if pid == std::process::id() {
+        return false;
+    }
+    !alive(pid).unwrap_or(false)
+}
+
 /// Step `list` with its lock held: `step(0)` first, then `step(n)` once for
 /// each mark found as it finishes.
 ///
@@ -252,6 +273,41 @@ mod tests {
         assert!(file(&st, "run", "again").exists());
         assert_eq!(one_at_a_time(&st, "run", true, |n| vec![n]), Stepped::Ran { steps: 1, out: vec![0] }, "old, and broken");
         assert!(!file(&st, "run", "again").exists(), "the mark is answered by the step that broke it");
+        let _ = fs::remove_dir_all(&st);
+    }
+
+    /// A pid that is not this process, never probed for real: the probe is injected.
+    fn lock_of_another_pid(st: &Path) -> PathBuf {
+        let lock = file(st, "run", "lock");
+        let other = (std::process::id() as u64 + 1_000_000) as u32;
+        fs::write(&lock, format!("{other} {}\n", util::epoch_secs())).unwrap();
+        lock
+    }
+
+    /// `kill -0` that could not run keeps the lock: "could not ask" is not "not there".
+    #[test]
+    fn a_lock_whose_holder_cannot_be_asked_is_kept() {
+        let st = state("unasked");
+        let lock = lock_of_another_pid(&st);
+        assert!(!stale_by(&lock, |_| None), "a probe that could not run keeps the lock");
+        let _ = fs::remove_dir_all(&st);
+    }
+
+    /// `kill -0` that reaches nothing breaks the lock.
+    #[test]
+    fn a_lock_whose_holder_is_gone_is_stale() {
+        let st = state("gone");
+        let lock = lock_of_another_pid(&st);
+        assert!(stale_by(&lock, |_| Some(false)), "a holder that is not there is stale");
+        let _ = fs::remove_dir_all(&st);
+    }
+
+    /// `kill -0` that reaches the holder keeps the lock.
+    #[test]
+    fn a_lock_whose_holder_answers_is_kept() {
+        let st = state("answers");
+        let lock = lock_of_another_pid(&st);
+        assert!(!stale_by(&lock, |_| Some(true)), "a live holder keeps the lock");
         let _ = fs::remove_dir_all(&st);
     }
 }
