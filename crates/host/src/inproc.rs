@@ -662,19 +662,10 @@ fn succeeded(cmd: &mut Command) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Which of these pids are running, in one ask.
-///
-/// One `ps` rather than one `kill -0` each, because `Place::census` would
-/// otherwise fork once per seat. An empty list forks nothing.
-///
-/// **A zombie is not alive**, and that arm is not hypothetical. `wsp spawn`
-/// starts the agent and then polls its readiness from the same process, so an
-/// agent that dies in its first second is a child nobody has reaped and sits in
-/// the process table looking exactly like a running one. Reporting it as alive
-/// is the same class of defect as robustness-041 with the sign flipped: an agent
-/// declared healthy while its corpse cools.
 /// kill(2) with signal 0 to `pid`, for [`InProcess::pid_runs`]; moved from
 /// `wsp_base::util` (wsp-111), whose C declaration of `kill` was below the seam.
+/// Unlike [`alive`], it reports a zombie as running: kill(2) answers for any
+/// pid still in the process table.
 pub(crate) fn pid_runs(pid: u32) -> bool {
     extern "C" {
         fn kill(pid: i32, sig: std::ffi::c_int) -> std::ffi::c_int;
@@ -686,6 +677,17 @@ pub(crate) fn pid_runs(pid: u32) -> bool {
     }
 }
 
+/// Which of these pids are running, in one ask.
+///
+/// One `ps` rather than one `kill -0` each, because `Place::census` would
+/// otherwise fork once per seat. An empty list forks nothing.
+///
+/// **A zombie is not alive**, and that arm is not hypothetical. `wsp spawn`
+/// starts the agent and then polls its readiness from the same process, so an
+/// agent that dies in its first second is a child nobody has reaped and sits in
+/// the process table looking exactly like a running one. Reporting it as alive
+/// is the same class of defect as robustness-041 with the sign flipped: an agent
+/// declared healthy while its corpse cools.
 pub(crate) fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
     if pids.is_empty() {
         return std::collections::BTreeSet::new();
