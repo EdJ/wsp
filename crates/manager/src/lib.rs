@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wsp_host::Tcp;
 use wsp_host_api::{
@@ -68,6 +68,10 @@ pub const TOKEN_FILE: &str = wsp_host::hooks::TOKEN_FILE;
 pub const JOURNAL_FILE: &str = "journal.jsonl";
 pub const LOCK_FILE: &str = "manager.lock";
 pub const LOG_DIR: &str = "log";
+
+/// How long [`Manager::stop`] waits for its listeners' addresses to stop
+/// accepting once it has closed them (see [`Lock`] for why one may not).
+const RELEASE_WAIT: Duration = Duration::from_secs(5);
 
 /// What one manager is started with.
 #[derive(Debug, Clone)]
@@ -273,7 +277,7 @@ pub struct Manager {
     addrs: Vec<SocketAddr>,
     threads: Vec<JoinHandle<()>>,
     /// The `<exec_dir>` lock, held for the manager's life.
-    _lock: File,
+    _lock: Lock,
 }
 
 impl Manager {
@@ -409,7 +413,7 @@ impl Manager {
     }
 
     /// Stop listening, close every client and the beat, and release the
-    /// `<exec_dir>`. The journal is left as it is, for the next start, and so
+    /// `<exec_dir>` and the port: it returns once a restart can take both. The journal is left as it is, for the next start, and so
     /// are the seats: compound-sup outlives its manager, and the next start
     /// adopts them. An order still being asked is asked again then. Jobs are
     /// left running too, undetached ones included, and the next start
@@ -430,12 +434,44 @@ impl Manager {
         for t in self.threads {
             let _ = t.join();
         }
+        // The accept threads have closed the listeners, but a listening
+        // socket, like the lock, lives on in a process this one is spawning
+        // until its exec closes the copy, and `shutdown` does not stop a
+        // listening socket on macOS. A restart in this process would find
+        // the port answered by nothing that says hello, so wait until nothing
+        // accepts there (briefly: what holds a copy is one exec away).
+        let until = Instant::now() + RELEASE_WAIT;
+        for addr in &self.addrs {
+            while Instant::now() < until && TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         self.shared.log.line("stopped");
     }
 }
 
+/// `<exec_dir>/manager.lock`, taken: dropping it unlocks it, and then closes it.
+///
+/// The unlock is what lets the lock go. A `flock` belongs to the open file
+/// description, not to the fd, and lasts until its last reference closes. A
+/// process spawned by any thread of this process while the lock is open (the
+/// beat's `ps`, `sysctl` and the rest, a seat's compound-sup, a job, another
+/// test's manager) gets a reference in its copy of the fd table, which lives
+/// until its exec closes it (`O_CLOEXEC`; `posix_spawn` too). Closing ours
+/// alone would leave the lock held for that window, which a loaded machine
+/// stretches, and a manager restarted in this process would find it held,
+/// with this pid in it (wsp-080). `LOCK_UN` ends the lock for every
+/// reference at once.
+struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Take `<exec_dir>/manager.lock`, which one manager holds for its life.
-fn lock(dir: &Path) -> Result<File, StartError> {
+fn lock(dir: &Path) -> Result<Lock, StartError> {
     let path = dir.join(LOCK_FILE);
     let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)
         .map_err(|e| io("opening the lock", e))?;
@@ -449,7 +485,7 @@ fn lock(dir: &Path) -> Result<File, StartError> {
     }
     let _ = f.set_len(0);
     let _ = f.write_all(format!("{}\n", std::process::id()).as_bytes());
-    Ok(f)
+    Ok(Lock(f))
 }
 
 /// What answers at `addr`, if anything: dialled, greeted with this manager's
