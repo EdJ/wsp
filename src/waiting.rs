@@ -488,9 +488,15 @@ impl Asks {
     /// three reads taken once here: compound polls `wsp wip --json`, and a
     /// read of every project per open question is a cost paid on every poll.
     pub(crate) fn read(store: &Store) -> Asks {
+        Asks::of_messages(store, store.messages(), &|pid| crate::host::Host::is_alive(&crate::host::LOCAL, pid))
+    }
+
+    /// [`Asks::read`] over `messages` read elsewhere (`wip`'s API path reads
+    /// them from a `state` reply), with `alive` saying whether a waiter's pid
+    /// still runs.
+    pub(crate) fn of_messages(store: &Store, messages: BTreeMap<String, crate::message::Message>, alive: &dyn Fn(u32) -> bool) -> Asks {
         let mut asks = Asks::default();
-        let open: Vec<_> = store
-            .messages()
+        let open: Vec<_> = messages
             .into_values()
             .filter(|m| m.wants_answering() && !m.is_reply() && m.waiting.is_some())
             .collect();
@@ -523,7 +529,7 @@ impl Asks {
             // A wait stands only while its process does: a waiter killed with
             // Esc leaves the mark behind, and the seat is then at its prompt
             // like any asker.
-            if m.for_person && m.awaited.as_ref().is_some_and(|a| crate::host::Host::is_alive(&crate::host::LOCAL, a.pid)) {
+            if m.for_person && m.awaited.as_ref().is_some_and(|a| alive(a.pid)) {
                 if !w.pane.is_empty() {
                     asks.awaited_pane.insert(w.pane.clone(), m.id.clone());
                 }

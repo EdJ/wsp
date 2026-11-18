@@ -188,6 +188,9 @@ pub fn rows(
             put(&mut f, "refs", &t.refs.join(","));
             put(&mut f, "created", &t.created);
             put(&mut f, "updated", &t.updated);
+            if let Some(claim) = claims.get(&t.id) {
+                f.insert(CLAIM.into(), claim.to_string());
+            }
             match texts.get(&t.id) {
                 Some(text) => {
                     f.insert(BODY.into(), text.clone());
@@ -215,6 +218,15 @@ pub fn rows(
 pub const BODY: &str = "body";
 /// A row's `fields` key holding the task's head, for a task `wip` reads bodiless.
 pub const HEAD: &str = "head";
+/// A row's `fields` key holding its `claims.json` record (JSON text), verbatim:
+/// an `Entity::Claim` keeps the seat alone, and `wip` joins the record's
+/// `agent_id` and `agent_kind` (wsp-076).
+pub const CLAIM: &str = "claim";
+
+/// The `claims.json` record a row carries, as `Store::claims` returns it.
+pub fn claim_of(row: &c::Row) -> Option<serde_json::Value> {
+    serde_json::from_str(row.fields.get(CLAIM)?).ok()
+}
 
 /// The `Task` a row was projected from, as `wip`'s own reading makes it: the
 /// store's task parser over `body` (what `Store::tasks_read_where` does for a
@@ -246,15 +258,33 @@ pub fn texts_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, String> {
 /// those after it are `Pending`. A draft's groups are all `Pending`, a done
 /// list's all `Passed`. Group `fields`: caption, cap, stop, verdict, agent,
 /// kind, weight, together. List `fields`: title, caption, status, project,
-/// prio, after, alone, created, planned.
-pub fn lists(lists: &[Worklist], tasks: &[Task]) -> Vec<Entity> {
+/// prio, after, alone, created, planned, and `body`: the list file's text,
+/// verbatim, for each list `texts` holds (wsp-076), so [`list_of`] rebuilds
+/// the `Worklist` with the store's own parser — a list's groups and settings
+/// are more than its fields say.
+pub fn lists(lists: &[Worklist], tasks: &[Task], texts: &BTreeMap<String, String>) -> Vec<Entity> {
     let done: BTreeSet<&str> =
         tasks.iter().filter(|t| Status::parse(&t.status_raw) == Some(Status::Done)).map(|t| t.id.as_str()).collect();
     let known: BTreeSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-    lists_with(lists, &|m| done.contains(m) || !known.contains(m))
+    lists_with(lists, &|m| done.contains(m) || !known.contains(m), texts)
 }
 
-fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool) -> Vec<Entity> {
+/// The `Worklist` a list was projected from, as `Store::worklists` reads it:
+/// the store's parser over `body`. `None` for a list without one.
+pub fn list_of(list: &c::List) -> Option<Worklist> {
+    let text = list.fields.get(BODY)?;
+    Some(Worklist::from_doc(&wsp_base::fm::parse(text), &list.id.0))
+}
+
+/// The file text of every list, by id: the bodies [`lists`] carries.
+pub fn list_texts_of(store: &Store, lists: &[Worklist]) -> BTreeMap<String, String> {
+    lists
+        .iter()
+        .filter_map(|w| Some((w.id.clone(), std::fs::read_to_string(store.worklist_path(&w.id)).ok()?)))
+        .collect()
+}
+
+fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeMap<String, String>) -> Vec<Entity> {
     lists
         .iter()
         .map(|w| {
@@ -305,6 +335,9 @@ fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool) -> Vec<Entity>
             put(&mut f, "alone", &w.alone.map(|a| a.to_string()).unwrap_or_default());
             put(&mut f, "created", &w.created);
             put(&mut f, "planned", w.planned.as_deref().unwrap_or(""));
+            if let Some(text) = texts.get(&w.id) {
+                f.insert(BODY.into(), text.clone());
+            }
             Entity::List(c::List { id: ListId(w.id.clone()), state: list_state(status), groups, fields: f })
         })
         .collect()
@@ -569,7 +602,7 @@ pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
     let texts = texts_of(store, &tasks);
     let mut out = rows(&tasks, &claims_file, &worklists, &texts);
     out.extend(claims(&claims_file));
-    out.extend(lists(&worklists, &tasks));
+    out.extend(lists(&worklists, &tasks, &list_texts_of(store, &worklists)));
     out.extend(machines(&store.machines(), &store.machines_live(), local));
     out
 }

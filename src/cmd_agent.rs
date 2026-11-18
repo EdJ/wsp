@@ -3895,19 +3895,32 @@ fn silent_lines(store: &Store) -> Vec<String> {
 }
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
-    let manager = wip_reads_manager();
-    let w = match manager {
-        true => Wip::from_managers(store),
-        false => Wip::live(store),
+    // Through the API unless `WSP_READ=files`; a silent or failed dial reads
+    // the files and says why, once (wsp-076).
+    let api = match wip_reads_api() {
+        false => None,
+        true => match api_state(store) {
+            Ok(state) => Some(state),
+            Err(why) => {
+                eprintln!("wsp: wip reads the files: {why}");
+                None
+            }
+        },
+    };
+    let manager = api.is_none() && wip_reads_manager();
+    let w = match (&api, manager) {
+        (Some(state), _) => Wip::from_api(store, state),
+        (None, true) => Wip::from_managers(store),
+        (None, false) => Wip::live(store),
     };
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
     // wsp-384: the planned lists wsp started on its own, for a day after.
     let mut picked_up = crate::pickup::wip_lines(store);
     picked_up.extend(silent_lines(store));
-    match manager {
-        // No `ps` and no `lsof` under the manager (4.3): the finished trees
-        // as the daemon's last scan left them, and the ended panes are the
-        // daemon's to close.
+    match manager || api.is_some() {
+        // No `ps` and no `lsof` under the manager (4.3) or the API: the
+        // finished trees as the daemon's last scan left them, and the ended
+        // panes are the daemon's to close.
         true => picked_up.extend(crate::ending::finished_wip_lines_held(store)),
         false => {
             // wsp-453: a finished row's tree that still has processes.
@@ -4076,6 +4089,45 @@ struct Probed {
     memory: crate::memory::IdleMemory,
     daemon: Option<String>,
     disk: Option<String>,
+    /// The load warning and the throttle's line: both read the machine
+    /// (`sysctl`, `ioreg`) on the files path, and neither under the API.
+    load: Option<String>,
+    throttle: Option<String>,
+}
+
+/// The domain half of a reading, joined by [`Wip::gathered`]: from the files
+/// for [`Wip::live`] and [`Wip::from_managers`] ([`Gathering::files`]), from one
+/// `state` reply for [`Wip::from_api`] (wsp-076).
+struct Gathering {
+    tasks: Vec<Task>,
+    bindings: BTreeMap<String, Value>,
+    claims: BTreeMap<String, Value>,
+    spawned: BTreeMap<String, Value>,
+    lists: Vec<crate::model::Worklist>,
+    /// Every message, for the open questions ([`crate::waiting::Asks::of_messages`]),
+    /// and whether a waiter's pid still runs.
+    messages: BTreeMap<String, crate::message::Message>,
+    alive: Box<dyn Fn(u32) -> bool>,
+    /// The census, each gone seat with its quiet time where one is known.
+    agents: Vec<(crate::place::Seated, Option<i64>)>,
+    since: BTreeMap<String, String>,
+}
+
+impl Gathering {
+    /// The files' half, read as `wip` always has.
+    fn files(store: &Store, agents: Vec<(crate::place::Seated, Option<i64>)>, since: BTreeMap<String, String>) -> Gathering {
+        Gathering {
+            tasks: wip_tasks(store),
+            bindings: store.bindings(),
+            claims: store.claims(),
+            spawned: store.spawned(),
+            lists: store.worklists(),
+            messages: store.messages(),
+            alive: Box::new(|pid| crate::host::Host::is_alive(&crate::host::LOCAL, pid)),
+            agents,
+            since,
+        }
+    }
 }
 
 /// Note this census's seats against `seat-since.json` and say since when each
@@ -4194,13 +4246,21 @@ impl Wip {
                 })
             })
             .collect();
-        let mut w = Wip::gathered(store, seen.into_iter().map(|s| (s, None)).collect(), since, |agents, bindings| {
+        let read = Gathering::files(store, seen.into_iter().map(|s| (s, None)).collect(), since);
+        let mut w = Wip::gathered(store, read, |agents, bindings| {
             let shells = crate::waiting::Shells::counted(
                 agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),
                 &counts,
             );
             let memory = crate::memory::of_rss(&store.state, agents, bindings, &rss);
-            Probed { shells, memory, daemon: daemon_by_stamp(store.daemon_tick(), heard, util::epoch_secs()), disk: crate::disk::loud_of(store, &disks) }
+            Probed {
+                shells,
+                memory,
+                daemon: daemon_by_stamp(store.daemon_tick(), heard, util::epoch_secs()),
+                disk: crate::disk::loud_of(store, &disks),
+                load: crate::throttle::loud(store),
+                throttle: Some(crate::throttle::status_line(store)),
+            }
         });
         if !unheard.is_empty() {
             let line = format!("unreachable: {} — its seats are not read, not gone", unheard.join("; "));
@@ -4243,30 +4303,99 @@ impl Wip {
             &answered,
             util::epoch_secs(),
         );
-        Wip::gathered(store, agents, since, |agents, bindings| Probed {
+        Wip::gathered(store, Gathering::files(store, agents, since), |agents, bindings| Probed {
             shells: idle_members_shells(agents, bindings),
             memory: crate::memory::read(&store.state, agents, bindings, || crate::host::Host::seat_memory(&crate::host::LOCAL)),
             daemon: crate::daemon::dead(&store.state, crate::daemon::running(&store.state).as_deref(), heard),
             disk: crate::disk::loud(store),
+            load: crate::throttle::loud(store),
+            throttle: Some(crate::throttle::status_line(store)),
         })
     }
 
-    /// The store's half of a reading, joined to a census: `agents` with each
+    /// `wip` through the state core's API (wsp-076, `docs/state-core.md` 4.5):
+    /// rows, claims, lists, asks and seats from one `state` reply, the
+    /// projections' verbatim records rebuilt by `crate::mirror`'s `*_of`. What
+    /// is no part of the domain yet stays a file read, as on the files path:
+    /// projects, governors, mandates, refusals, pins, agents, said, worked,
+    /// seat-since and finished-wip.json.
+    ///
+    /// **It runs no child**: no `ps`, `lsof`, `df`, render, `git` or `wsp`.
+    /// So the probes are the files path's values with nothing running — no
+    /// disk or load warning, no shells, memory with no rss — the throttle's
+    /// line is read without the machine (no idle time, load or clock), a
+    /// waiter's pid is taken to stand, and the dead-daemon heading is the
+    /// tick stamp's (the daemon has just answered, so a stamp gone stale is
+    /// the one thing left to say).
+    pub(crate) fn from_api(store: &Store, state: &wsp_store_contract::State) -> Wip {
+        let tasks: Vec<Task> = state
+            .rows
+            .values()
+            .filter_map(crate::mirror::task_of)
+            .map(|t| {
+                let head = wsp_store::model::TaskHead::of(&t);
+                match wip_reads_in_full(&head) {
+                    true => t,
+                    false => head.bodiless(),
+                }
+            })
+            .collect();
+        let claims: BTreeMap<String, Value> = state
+            .claims
+            .keys()
+            .filter_map(|row| Some((row.0.clone(), crate::mirror::claim_of(state.rows.get(row)?)?)))
+            .collect();
+        let bindings: BTreeMap<String, Value> =
+            state.seats.values().filter_map(|s| Some((s.id.0.clone(), crate::mirror::binding_of(s)?))).collect();
+        let spawned: BTreeMap<String, Value> =
+            state.seats.values().filter_map(|s| Some((s.id.0.clone(), crate::mirror::spawned_of(s)?))).collect();
+        let lists: Vec<crate::model::Worklist> = state.lists.values().filter_map(crate::mirror::list_of).collect();
+        let messages: BTreeMap<String, Message> =
+            state.asks.values().filter_map(crate::mirror::message_of).map(|m| (m.id.clone(), m)).collect();
+        let agents: Vec<(crate::place::Seated, Option<i64>)> = state
+            .seats
+            .values()
+            .map(crate::mirror::seated_of)
+            .filter(|s| s.state != State::Empty)
+            .map(|s| (s, None))
+            .collect();
+        // No source answered in full, so no seat's clock is forgotten; each
+        // keeps the source the files path last noted it under.
+        let since = seat_clocks(store, agents.iter().map(|(s, _)| (s, None)), &BTreeSet::new(), util::epoch_secs());
+        let read = Gathering {
+            tasks,
+            bindings,
+            claims,
+            spawned,
+            lists,
+            messages,
+            alive: Box::new(|_| true),
+            agents,
+            since,
+        };
+        Wip::gathered(store, read, |agents, bindings| Probed {
+            shells: crate::waiting::Shells::counted(std::iter::empty(), &BTreeMap::new()),
+            memory: crate::memory::of_rss(&store.state, agents, bindings, &BTreeMap::new()),
+            daemon: daemon_by_stamp(store.daemon_tick(), true, util::epoch_secs()),
+            disk: None,
+            load: None,
+            throttle: Some(throttle_unprobed(store)),
+        })
+    }
+
+    /// The store's half of a reading, joined to a census: `read` with each
     /// gone seat's quiet time, and `probe` for what is read of the host.
     fn gathered(
         store: &Store,
-        agents: Vec<(crate::place::Seated, Option<i64>)>,
-        since: BTreeMap<String, String>,
+        read: Gathering,
         probe: impl FnOnce(&[crate::place::Seated], &BTreeMap<String, Value>) -> Probed,
     ) -> Wip {
-        let tasks = std::rc::Rc::new(wip_tasks(store));
-        let bindings = store.bindings();
-        let claims = store.claims();
+        let Gathering { tasks, bindings, claims, spawned, lists, messages, alive, agents, since } = read;
+        let tasks = std::rc::Rc::new(tasks);
         let governors = store.governors();
         let agents_held = store.agents_held();
         let now = util::epoch_secs();
         let verifying = crate::verification::seats(&tasks);
-        let lists = store.worklists();
         let checking = checking(&lists, &tasks);
         let agents = agents
             .into_iter()
@@ -4279,7 +4408,7 @@ impl Wip {
             })
             .map(|(s, _)| s)
             .collect::<Vec<_>>();
-        let Probed { shells, memory: idle_memory, daemon, disk } = probe(&agents, &bindings);
+        let Probed { shells, memory: idle_memory, daemon, disk, load, throttle } = probe(&agents, &bindings);
         Wip {
             tasks,
             index: Index::new(store.projects()),
@@ -4292,18 +4421,18 @@ impl Wip {
             said: store.said(),
             daemon,
             disk,
-            load: crate::throttle::loud(store),
-            throttle: Some(crate::throttle::status_line(store)),
+            load,
+            throttle,
             idle_memory,
             worked: store.worked(),
-            asks: crate::waiting::Asks::read(store),
+            asks: crate::waiting::Asks::of_messages(store, messages, &*alive),
             shells,
             mandates: store.mandates(),
             checking,
             check_on: crate::barrier::ran_on(&lists),
             lists,
             since,
-            spawned: store.spawned(),
+            spawned,
             unsent: crate::repair::unsent_seats(store),
             queued: crate::wake::queued_tells(store),
             refusing: {
@@ -4318,6 +4447,37 @@ impl Wip {
             stuck: crate::repair::stuck_seats(store),
             silent: crate::far::Silence::read(store),
         }
+    }
+}
+
+/// [`crate::throttle::status_line`] without reading the machine, for
+/// [`Wip::from_api`]: no `ioreg` for the person's idle time (so `auto` reads
+/// as in force), no `sysctl` load, no `pmset` clock.
+fn throttle_unprobed(store: &Store) -> String {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    crate::throttle::View::given(&store.state, crate::throttle::Given { load1: 0.0, cores, speed_limit: None }).status_line()
+}
+
+/// How long `wip` waits for the API before it reads the files (`docs/state-core.md`
+/// 4.6 (c)).
+const API_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Whether `wip` reads through the API: `WSP_READ=files` is the files path
+/// and never dials (step 1's rollback); unset, `api` or anything else dials.
+fn wip_reads_api() -> bool {
+    std::env::var("WSP_READ").map(|v| v.trim() != "files").unwrap_or(true)
+}
+
+/// One `state` through the API, dialled within [`API_BUDGET`], or why not:
+/// nothing answering (no daemon, one with no API, a refused token), a lost or
+/// late reply, or a refusal.
+fn api_state(store: &Store) -> Result<wsp_store_contract::State, String> {
+    let mut client = wsp_client::Client::dial(&store.state, wsp_store_contract::Principal::Wsp("wip".into()), API_BUDGET)
+        .map_err(|e| e.to_string())?;
+    match client.request("state", json!({})).map_err(|e| e.to_string())?.outcome {
+        wsp_api::Outcome::Ok(wsp_api::Answer::State { state, .. }) => Ok(state),
+        wsp_api::Outcome::Ok(_) => Err("`state` was answered with another verb's answer".into()),
+        wsp_api::Outcome::Err(f) => Err(format!("`state` was refused: {:?} {}", f.code, f.text).trim_end().to_string()),
     }
 }
 
