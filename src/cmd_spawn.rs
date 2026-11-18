@@ -1548,7 +1548,7 @@ fn wait_ready(
         return match up {
             Ok(crate::place::Up::Ready) => Ok(()),
             Ok(crate::place::Up::Stopped) => Err(format!("{kind} started and then stopped in {seat}")),
-            Ok(crate::place::Up::Unready) => Err(format!("{kind} started but never became ready for input")),
+            Ok(crate::place::Up::Unready) => Err(never_ready(kind, wait.ready, "no seat.started heard")),
             Err(e) => {
                 eprintln!("wsp: {kind} started in {seat}; its first turn was not heard: {e}");
                 Ok(())
@@ -1556,7 +1556,12 @@ fn wait_ready(
         };
     }
     loop {
-        match place.state(seat) {
+        let read = place.state(seat);
+        let saw = match &read {
+            Ok(s) => format!("{s:?}"),
+            Err(e) => format!("no answer: {e}"),
+        };
+        match read {
             Ok(s) if by_turn && s.turn_in_flight() => return Ok(()),
             Ok(s) if !by_turn && s.will_take_a_prompt() => return Ok(()),
             Ok(State::Empty) | Ok(State::Gone) => {
@@ -1579,10 +1584,18 @@ fn wait_ready(
             Ok(_) | Err(_) => empty_since = None,
         }
         if now() >= deadline {
-            return Err(format!("{kind} started but never became ready for input"));
+            return Err(never_ready(kind, wait.ready, &format!("last read {saw}")));
         }
         wait.clock.rest(wait.poll);
     }
+}
+
+/// The line a start that ran out of [`Patience::ready`] fails with (wsp-087):
+/// the sentence every reader matches on, then the wait that ran out and what
+/// was last seen of the seat, so "never ready" after 67 s reads as a timeout
+/// of a known length and not as a death.
+fn never_ready(kind: &str, ready: Duration, saw: &str) -> String {
+    format!("{kind} started but never became ready for input within {} s ({saw})", ready.as_secs())
 }
 
 /// The key `seat.spawn` carries for a row: the row's id and the number of
@@ -7567,6 +7580,36 @@ mod tests {
         assert!(why.contains("started and then stopped in cpd-243"), "{why}");
         assert_eq!(place.spawns.get(), 1);
         assert_eq!(place.polls.get(), 0, "heard, not read");
+    }
+
+    /// wsp-087: "never became ready for input" named no wait, so m1-fixes-3's
+    /// 67 s failure read as a death rather than a timeout of known length. The
+    /// line keeps its sentence, which readers match on, and adds the wait that
+    /// ran out and what was last seen: no `seat.started` under a manager.
+    #[test]
+    fn under_a_manager_a_start_never_ready_names_its_timeout() {
+        let blind = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Manages::of(vec![crate::place::Up::Unready]);
+        let wait = Patience { attempts: 0, ..retrying(&dial) };
+        let why = starting(&place, &blind, &Seat::new("cpd-401"), &wait).unwrap_err();
+        assert!(why.starts_with("claude started but never became ready for input"), "the sentence readers match: {why}");
+        assert!(why.contains("within 2 s"), "the wait that ran out: {why}");
+        assert!(why.contains("no seat.started heard"), "what was seen: {why}");
+    }
+
+    /// And the polled start (no events to wait by) says the same, with the
+    /// seat's last reading in place of the event that did not come.
+    #[test]
+    fn a_polled_start_never_ready_names_its_timeout_and_last_reading() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Restarts::of(vec![Ok(State::Working)]);
+        let wait = Patience { attempts: 0, ..retrying(&dial) };
+        let why = starting(&place, &alive, &Seat::new("w64:p1"), &wait).unwrap_err();
+        assert!(why.starts_with("claude started but never became ready for input"), "{why}");
+        assert!(why.contains("within 2 s"), "the wait that ran out: {why}");
+        assert!(why.contains("last read Working"), "what the seat last said: {why}");
     }
 
     /// And the seat that will not clear is the one a retry must leave alone.
