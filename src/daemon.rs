@@ -755,7 +755,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // clears on the first tick after it.
         if let Some(api) = &_api {
             wsp_base::calls::phase("sweep:mute-seats");
-            store.steady(|| crate::fold::sweep_mute(store, &api.db));
+            store.steady(|| crate::fold::sweep_mute(store, &api.db, |seats| crate::cmd_agent::mute_seats(store, seats)));
         }
 
         // **The run's own steps, and the repairs, on the same timer** — `wsp-147`.

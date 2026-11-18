@@ -289,17 +289,18 @@ fn seat_entity(store: &Store, db: &SharedStore, host: &str, seat: &str, state: S
 
 /// The daemon's sweep of seats that are gone with nothing to say (wsp-094):
 /// each tick, the state core's seats that `wip` would not draw
-/// ([`crate::cmd_agent::mute_seats`]: gone and holding nothing, and either
+/// (`cmd_agent::mute_seats`: gone and holding nothing, and either
 /// ended by a despawn, with no sentence and no agent on record, or gone past
 /// `GONE_FOR`) are mirrored gone, and their `spawned.json` and
 /// `seat-since.json` entries dropped. What a machine restart leaves — every
 /// seat that ran, ended by the fold and named for good — clears on the first
 /// tick; one that said something, a day after it was first seen gone.
-/// Returns the seats forgotten.
-pub fn sweep_mute(store: &Store, db: &SharedStore) -> Vec<String> {
+/// Returns the seats forgotten. `pick` is that reading, passed in by the
+/// daemon: it is `wip`'s, a layer above this one.
+pub fn sweep_mute(store: &Store, db: &SharedStore, pick: impl FnOnce(&[crate::place::Seated]) -> Vec<String>) -> Vec<String> {
     let Ok((state, _)) = db.snapshot() else { return Vec::new() };
     let seats: Vec<crate::place::Seated> = state.seats.values().map(crate::mirror::seated_of).collect();
-    let mute = crate::cmd_agent::mute_seats(store, &seats);
+    let mute = pick(&seats);
     if mute.is_empty() {
         return mute;
     }
@@ -1108,7 +1109,7 @@ mod mirror_tests {
         assert!(store.spawned().contains_key("cpd-r1"), "the fold recorded the start");
         assert!(read(&store.state.join("seat-since.json")).get("cpd-r1").is_some(), "and dated the gone");
 
-        let mut forgot = sweep_mute(&store, &db);
+        let mut forgot = sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s));
         forgot.sort();
         assert_eq!(forgot, ["cpd-r1", "cpd-r3"]);
         let seats = db.snapshot().unwrap().0.seats;
@@ -1117,14 +1118,14 @@ mod mirror_tests {
         assert!(!store.spawned().contains_key("cpd-r1"));
         assert!(store.spawned().contains_key("cpd-r2"));
         assert!(read(&store.state.join("seat-since.json")).get("cpd-r1").is_none());
-        assert!(sweep_mute(&store, &db).is_empty(), "nothing left to forget");
+        assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "nothing left to forget");
 
         // A day after it was first seen gone, the one that said something goes too.
         let day_ago = util::epoch_secs() - crate::cmd_agent::GONE_FOR - 60;
         let mut since = read(&store.state.join("seat-since.json"));
         since["cpd-r2"]["since"] = json!(util::iso_at(day_ago));
         write(&store.state.join("seat-since.json"), &since);
-        assert_eq!(sweep_mute(&store, &db), ["cpd-r2"]);
+        assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-r2"]);
     }
 
     /// A despawn of a gone seat that said something ends its record, and the
@@ -1140,8 +1141,8 @@ mod mirror_tests {
         let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
         fold_into(&store, Some(&db), "h", &frame(2, Message::SeatStopped(stopped)));
         store.set_sentence("cpd-d1", "stopped at the barrier", None);
-        assert!(sweep_mute(&store, &db).is_empty(), "it said something");
+        assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "it said something");
         store.end_spawned("cpd-d1", util::epoch_secs());
-        assert_eq!(sweep_mute(&store, &db), ["cpd-d1"]);
+        assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-d1"]);
     }
 }
