@@ -2638,9 +2638,37 @@ impl Worklist {
     /// The queue. Read out of the body every time rather than held beside it,
     /// so there is one copy of the membership and a hand-edit ahead of the
     /// work is simply read.
+    ///
+    /// **Parsed once per distinct body** (`wsp-665`). It is asked of every list
+    /// by every phase of the daemon's tick and by each row of the sweeps that
+    /// look a row up among the lists: 29,000 parses in one auto-close pass over
+    /// 166 rows and 175 lists, 25 of the pass's 34 s in a debug build. The
+    /// answer is a function of the body and the number the groups were last
+    /// made at, so that pair is the key; a list edited is another body and
+    /// parses again. Bounded, and per thread, so there is nothing to lock and
+    /// nothing a long-lived process can grow without end.
     pub fn groups(&self) -> Vec<Group> {
+        use std::hash::{Hash, Hasher};
+        thread_local! {
+            static PARSED: std::cell::RefCell<std::collections::HashMap<u64, Vec<Group>>> = Default::default();
+        }
+        const KEPT: usize = 1024;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.body.hash(&mut h);
+        self.groups_made.hash(&mut h);
+        let key = h.finish();
+        if let Some(hit) = PARSED.with(|c| c.borrow().get(&key).cloned()) {
+            return hit;
+        }
         let mut groups = parse_groups(&self.section("Groups").unwrap_or_default());
         number(&mut groups, self.groups_made);
+        PARSED.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= KEPT {
+                c.clear();
+            }
+            c.insert(key, groups.clone());
+        });
         groups
     }
 
@@ -2691,6 +2719,27 @@ pub fn project_of(t: &Task) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wsp-665`: the groups are parsed once per distinct body, and a list
+    /// edited, or numbered further, is read again and says what it now says.
+    #[test]
+    fn groups_are_remembered_per_body_and_an_edit_is_another_body() {
+        let mut w = Worklist::new("l", "a list");
+        w.set_groups(&[Group { members: vec!["p-001".into()], ..Default::default() }]);
+        let first = w.groups();
+        assert_eq!(first, w.groups(), "the same body says the same, from the memo");
+        assert_eq!(first.len(), 1);
+        w.set_groups(&[
+            Group { members: vec!["p-001".into()], ..Default::default() },
+            Group { members: vec!["p-002".into()], ..Default::default() },
+        ]);
+        assert_eq!(w.groups().len(), 2, "an edited body is read again");
+        let mut other = w.clone();
+        other.set_groups(&[Group { members: vec!["p-009".into()], ..Default::default() }]);
+        assert_eq!(w.groups().len(), 2, "and one list's memo is not another's");
+        assert_eq!(other.groups()[0].members, ["p-009"]);
+    }
+
 
     /// `wsp-240`: a caption survives the file both ways — in a task's and a
     /// worklist's front matter, and as a group's `caption:` line, which is

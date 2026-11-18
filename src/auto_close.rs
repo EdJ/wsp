@@ -28,6 +28,7 @@
 use crate::model::{Status, Task, WorklistStatus};
 use crate::store::Store;
 use crate::util;
+use crate::worklist::Repos;
 
 /// The tag `--hold-review` leaves: the person wants this row kept at review.
 pub(crate) const HOLD: &str = "hold-review";
@@ -63,7 +64,29 @@ pub(crate) fn hours(store: &Store, project: Option<&str>) -> Option<i64> {
 
 /// Why this row stays at review, or `Ok(())` when the run may close it. `now`
 /// is epoch seconds, so the quiet period is tested without a clock.
+#[cfg(test)]
 pub(crate) fn due(store: &Store, tasks: &[Task], t: &Task, now: i64) -> Result<(), String> {
+    due_in(store, tasks, &mut Pass::default(), t, now)
+}
+
+/// What a pass over every row at review reads once and keeps (`wsp-665`).
+///
+/// A row asked alone looked through every list's groups, parsed afresh, for
+/// its own id (175 lists × 166 rows, 29,000 parses: 25 of the 34 s the pass
+/// took in a debug build against the live store), read all the messages to keep
+/// the few about it (40 ms a row), and started a fresh [`Repos`], which asked
+/// git again what each project's roots resolve to (`rev-parse`, `worktree list`,
+/// the trunk's branch). One reading of each for the pass says the same.
+#[derive(Default)]
+struct Pass {
+    /// Each row's lists: id and status, from one walk of every list's groups.
+    on_lists: Option<std::collections::BTreeMap<String, Vec<(String, WorklistStatus)>>>,
+    repos: Option<Repos>,
+    /// Ids of the tasks something open is raised about.
+    open_about: Option<std::collections::BTreeSet<String>>,
+}
+
+fn due_in(store: &Store, tasks: &[Task], pass: &mut Pass, t: &Task, now: i64) -> Result<(), String> {
     if t.status() != Status::Review {
         return Err("it is not at review".into());
     }
@@ -77,9 +100,21 @@ pub(crate) fn due(store: &Store, tasks: &[Task], t: &Task, now: i64) -> Result<(
     if since == 0 || now - since < hours * 3600 {
         return Err(format!("it has not been quiet for {hours}h"));
     }
-    let lists: Vec<_> = store.worklists().into_iter().filter(|w| w.groups().iter().any(|g| g.members.iter().any(|m| *m == t.id))).collect();
-    if let Some(w) = lists.iter().find(|w| w.status() != WorklistStatus::Done) {
-        return Err(format!("{} is not complete", w.id));
+    let on_lists = pass.on_lists.get_or_insert_with(|| {
+        let mut m: std::collections::BTreeMap<String, Vec<(String, WorklistStatus)>> = Default::default();
+        for w in store.worklists() {
+            let mut members: Vec<String> = w.groups().iter().flat_map(|g| g.members.clone()).collect();
+            members.sort();
+            members.dedup();
+            for id in members {
+                m.entry(id).or_default().push((w.id.clone(), w.status()));
+            }
+        }
+        m
+    });
+    let lists = on_lists.get(&t.id).map(Vec::as_slice).unwrap_or_default();
+    if let Some((id, _)) = lists.iter().find(|(_, status)| *status != WorklistStatus::Done) {
+        return Err(format!("{id} is not complete"));
     }
     match crate::verification::latest(tasks, &t.id) {
         Some(p) if p.state == crate::verification::State::Holds => {}
@@ -87,10 +122,15 @@ pub(crate) fn due(store: &Store, tasks: &[Task], t: &Task, now: i64) -> Result<(
         None if !lists.is_empty() => return Err("it is on a list and was never verified".into()),
         None => {}
     }
-    if let Some(m) = crate::message::about_task(store, &t.id).into_iter().find(|m| m.is_open()) {
-        return Err(format!("{} is open about it", m.id));
+    let open = pass.open_about.get_or_insert_with(|| {
+        store.messages().into_values().filter(|m| m.is_open()).filter_map(|m| m.about.task().map(str::to_string)).collect()
+    });
+    if open.contains(&t.id) {
+        // Named as the message is, which a row asked alone finds by id.
+        let id = crate::message::about_task(store, &t.id).into_iter().find(|m| m.is_open()).map(|m| m.id).unwrap_or_default();
+        return Err(format!("{id} is open about it"));
     }
-    if !crate::after::landed(store, &mut None, &t.id) {
+    if !crate::after::landed(store, &mut pass.repos, &t.id) {
         return Err("its branch has commits the trunk lacks".into());
     }
     Ok(())
@@ -99,8 +139,12 @@ pub(crate) fn due(store: &Store, tasks: &[Task], t: &Task, now: i64) -> Result<(
 /// Every row [`due`] at `now`, in id order.
 pub(crate) fn rows_due(store: &Store, now: i64) -> Vec<String> {
     let tasks = store.tasks();
-    let mut out: Vec<String> =
-        tasks.iter().filter(|t| t.status() == Status::Review && due(store, &tasks, t, now).is_ok()).map(|t| t.id.clone()).collect();
+    let mut pass = Pass::default();
+    let mut out: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.status() == Status::Review && due_in(store, &tasks, &mut pass, t, now).is_ok())
+        .map(|t| t.id.clone())
+        .collect();
     out.sort();
     out
 }
@@ -223,6 +267,73 @@ mod tests {
 
     fn why(store: &Store) -> Result<(), String> {
         due(store, &store.tasks(), &row(store), util::epoch_secs())
+    }
+
+    /// `wsp-665`: the pass shares one read of the lists and one memo of the
+    /// trunks, and says what asking each row alone says — a row on an unfinished
+    /// list is kept and the others are not, whatever order they come in.
+    #[test]
+    fn the_pass_over_every_row_says_what_asking_each_row_alone_says() {
+        let (_env, store) = at_review("pass");
+        for n in 2..=4 {
+            let mut t = Task::new("a row", &format!("p-00{n}"));
+            t.project = Some("p".into());
+            t.set_status(Status::Review);
+            t.updated = util::iso_at(util::epoch_secs() - 3 * DAY);
+            store.save_task(&t).unwrap();
+        }
+        let mut w = Worklist::new("l", "a list");
+        w.set_groups(&[Group { members: vec!["p-003".into()], ..Default::default() }]);
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        let now = util::epoch_secs();
+        let tasks = store.tasks();
+        let alone: Vec<String> =
+            tasks.iter().filter(|t| due(&store, &tasks, t, now).is_ok()).map(|t| t.id.clone()).collect();
+        assert_eq!(alone, ["p-001", "p-002", "p-004"], "p-003 is on a list that is not complete");
+        assert_eq!(rows_due(&store, now), alone);
+    }
+
+    /// `wsp-665`'s before and after, on the live store and read-only: every row
+    /// at review asked alone (a fresh list read and a fresh trunk memo per row,
+    /// as the tick did) against the pass as it is now, with the wall time and
+    /// the git processes of each. Not run with the suite:
+    /// `cargo test auto_close::tests::the_pass_on_the_live_store -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads the live store, to measure"]
+    fn the_pass_on_the_live_store() {
+        // `Store::open` refuses the live store in a test, on purpose; this reads it and writes nothing.
+        let store = Store::at(util::home().join("wsp"), Store::default_state());
+        let now = util::epoch_secs();
+        let git = || wsp_base::calls::drain_children().0.get("git").map(|g| g.0).unwrap_or(0);
+        let lap = |what: &str, began: std::time::Instant| eprintln!("  {what}: {} ms", began.elapsed().as_millis());
+        // As the daemon runs it: inside one `steady`, the store is walked once.
+        let (before, after) = store.steady(|| {
+            let began = std::time::Instant::now();
+            let tasks = store.tasks();
+            lap(&format!("store.tasks() the first time ({} tasks)", tasks.len()), began);
+            let began = std::time::Instant::now();
+            let _ = store.tasks();
+            lap("store.tasks() the second time", began);
+            let _ = git();
+            let began = std::time::Instant::now();
+            let before: Vec<String> = tasks
+                .iter()
+                .filter(|t| t.status() == Status::Review && due(&store, &tasks, t, now).is_ok())
+                .map(|t| t.id.clone())
+                .collect();
+            let (before_ms, before_git) = (began.elapsed().as_millis(), git());
+            let began = std::time::Instant::now();
+            let after = rows_due(&store, now);
+            let (after_ms, after_git) = (began.elapsed().as_millis(), git());
+            eprintln!(
+                "auto-close pass over {} rows at review: before {before_ms} ms, {before_git} git · after {after_ms} ms, {after_git} git",
+                tasks.iter().filter(|t| t.status() == Status::Review).count(),
+            );
+            (before, after)
+        });
+        // Not asserted equal: the live store moves between the two passes (a message answered, a row landed).
+        eprintln!("  before due {before:?}, after due {after:?}");
     }
 
     fn verdict(store: &Store, state: State) {
