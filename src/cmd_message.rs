@@ -809,6 +809,23 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
+    if args.has("done") {
+        // `wsp-098`: the --then step of an answered --of ask is done.
+        if q.of.is_none() || q.answered_by.is_none() {
+            eprintln!("wsp: {} is not an answered ask --of anyone; --done marks its step", q.id);
+            return 2;
+        }
+        return match message::step_done(store, &q.id) {
+            Ok(_) => {
+                println!("{}: step done", q.id);
+                0
+            }
+            Err(e) => {
+                eprintln!("wsp: {e}");
+                1
+            }
+        };
+    }
     let giving_up = args.has("abandon");
     // A structured answer (`wsp-299`) is `--choice` or `--other`; the sentence
     // beside it, if any, is a deny's message, and otherwise there is none.
@@ -3737,5 +3754,43 @@ mod tests {
         let j = after.to_json();
         assert_eq!((j["of"].as_str(), j["answered_by"].as_str(), j["relayed_by"].as_str()), (Some("ed"), Some("ed"), Some("person")));
         assert_eq!(after.closing().map(|h| h.by.clone()), Some(Party::Human));
+    }
+
+    /// The answered `--of` ask's action, run as the button would, ends it; and a
+    /// `seen` mark while it is open never pre-empts the step (`wsp-098`).
+    #[test]
+    fn the_done_action_of_an_answered_ask_of_runs_and_ends_the_item() {
+        use crate::classify::{self, Item};
+        let _env = util::isolated("ask-of-done");
+        let store = scratch("ask-of-done");
+        task(&store, "lone-1");
+        let asked = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed"), ("then", "merge the bump")]);
+        assert_eq!(ask(&store, &asked), 0);
+        let id = message::all(&store).pop().unwrap().id;
+        let attention = |store: &Store| {
+            let msgs = store.messages();
+            let a = crate::mirror::asks(&msgs, &Default::default()).into_iter().find_map(|e| match e {
+                wsp_store_contract::Entity::Ask(a) => Some(a),
+                _ => None,
+            });
+            classify::of(Item::Ask(&a.unwrap()))
+        };
+        // looking at the card while open is not the step
+        let mut m = store.message(&id).unwrap();
+        m.seen = true;
+        store.save_message(&m).unwrap();
+        assert_eq!(answer(&store, &answer_args(&id, &[("as", "ed")], &["yes"])), 0);
+        let a = attention(&store).expect("seen while open: still needs-you once answered");
+        assert_eq!(a.text, "merge the bump");
+        // run the action's verb and args
+        let j = a.action.unwrap().json();
+        assert_eq!(j["verb"], "answer");
+        let typed: Vec<String> = j["args"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+        let refs: Vec<&str> = typed.iter().map(String::as_str).collect();
+        let flags: Vec<(&str, &str)> = vec![("done", "")];
+        let positional: Vec<&str> = refs.iter().copied().filter(|x| !x.starts_with("--")).collect();
+        assert_eq!(answer(&store, &crate::Args::synth("answer", &positional, &flags)), 0);
+        assert!(store.message(&id).unwrap().step_done_at.is_some());
+        assert_eq!(attention(&store), None, "neither once its step is done");
     }
 }

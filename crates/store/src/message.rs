@@ -834,6 +834,10 @@ pub struct Message {
     /// typed it in for them (`"relayed_by": "person"`).
     pub answered_by: Option<String>,
     pub relayed_by: Option<String>,
+    /// When the person did the `--then` step of an answered `--of` ask
+    /// (`"step_done_at"`), written by `wsp answer <id> --done`. Its own field:
+    /// `seen` is "read, still raised" and says nothing about the step.
+    pub step_done_at: Option<String>,
 }
 
 /// A `wsp ask --wait` in progress, as the question records it.
@@ -879,6 +883,7 @@ impl Message {
             then: None,
             answered_by: None,
             relayed_by: None,
+            step_done_at: None,
         }
     }
 
@@ -1171,7 +1176,7 @@ impl Message {
         if let Some(a) = &self.awaited {
             v["awaited"] = json!({ "pid": a.pid, "at": a.at });
         }
-        for (k, f) in [("of", &self.of), ("then", &self.then), ("answered_by", &self.answered_by), ("relayed_by", &self.relayed_by)] {
+        for (k, f) in [("of", &self.of), ("then", &self.then), ("answered_by", &self.answered_by), ("relayed_by", &self.relayed_by), ("step_done_at", &self.step_done_at)] {
             if let Some(x) = f {
                 v[k] = Value::from(x.as_str());
             }
@@ -1251,6 +1256,7 @@ impl Message {
             then: v.get("then").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
             answered_by: v.get("answered_by").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
             relayed_by: v.get("relayed_by").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
+            step_done_at: v.get("step_done_at").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
         }
     }
 
@@ -1585,6 +1591,19 @@ pub fn relay(store: &Store, id: &str, answered_by: &str, relayed_by: &str) -> Re
         m.answered_by = Some(answered_by.to_string());
         m.relayed_by = Some(relayed_by.to_string());
         store.save_message(&m)?;
+        Ok(m)
+    })
+}
+
+/// The `--then` step of an answered `--of` ask is done (`wsp answer <id>
+/// --done`): records `step_done_at`. Refused unless the party has answered.
+pub fn step_done(store: &Store, id: &str) -> Result<Message, Refused> {
+    store.locked(|| {
+        let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        if m.answered_by.is_some() && m.step_done_at.is_none() {
+            m.step_done_at = Some(util::now_iso());
+            store.save_message(&m)?;
+        }
         Ok(m)
     })
 }

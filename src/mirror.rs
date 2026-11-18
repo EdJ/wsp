@@ -503,7 +503,7 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
             for (k, v) in [("of", &m.of), ("then", &m.then), ("answered_by", &m.answered_by), ("relayed_by", &m.relayed_by)] {
                 put(&mut f, k, v.as_deref().unwrap_or(""));
             }
-            if m.seen {
+            if m.step_done_at.is_some() {
                 put(&mut f, "step_done", "true");
             }
             f.insert(RECORD.into(), m.to_json().to_string());
