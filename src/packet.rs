@@ -202,8 +202,8 @@ const NARROW: &str = "Read nothing the packet does not name.";
 /// What a seat whose packet misses its subject is told instead of [`NARROW`]
 /// (`wsp-039`): wsp-016's packet named the wrong files, its order forbade
 /// reading others, and the seat stopped to ask where the code was.
-pub const SEARCH_RULE: &str = "The files this packet names may not hold what its overview describes: \
-     read those first, and if the subject is not in them, search the tree for the overview's names \
+pub const SEARCH_RULE: &str = "The files this packet names may not hold what the row describes: \
+     read those first, and if the subject is not in them, search the tree for the names the row gives \
      (`git grep`) and read only what that search finds, then say in your exit which files outside \
      the packet you read and why.";
 
@@ -237,7 +237,7 @@ pub fn named_files(t: &Task) -> Vec<String> {
             out.extend(rest.split(',').filter_map(|f| f.split_whitespace().next()).map(|f| f.to_string()));
         }
     }
-    let prose = format!("{}\n{}\n{}", t.title, t.section("Overview").unwrap_or_default(), p.text);
+    let prose = format!("{}\n{}\n{}", t.title, brief(t), p.text);
     out.extend(prose.split_whitespace().filter_map(path_in));
     let mut seen = std::collections::HashSet::new();
     out.retain(|f| inside(f) && seen.insert(f.clone()));
@@ -258,11 +258,21 @@ fn path_in(word: &str) -> Option<String> {
     ok.then(|| w.to_string())
 }
 
-/// The names the row's overview is about: words in backticks that read as an
-/// identifier (`wall_bucket`, `Store::open`), and bare words with `_` or `::`
-/// in them. Commands, flags and paths are not names.
+/// The sections a row's brief is written in: an overview, or, for a row
+/// written from evidence (a retro row, wsp-016's shape), its evidence, fix and
+/// done-when, which carry the names where there is no overview at all.
+pub const BRIEF: &[&str] = &["Overview", "Evidence", "Fix", "Done when"];
+
+/// The row's brief: each of [`BRIEF`] it has, in that order.
+fn brief(t: &Task) -> String {
+    BRIEF.iter().filter_map(|s| t.section(s)).collect::<Vec<_>>().join("\n")
+}
+
+/// The names the row's brief is about ([`BRIEF`]): words in backticks that read
+/// as an identifier (`wall_bucket`, `Store::open`), and bare words with `_` or
+/// `::` in them. Commands, flags and paths are not names.
 pub fn subject(t: &Task) -> Vec<String> {
-    let overview = t.section("Overview").unwrap_or_default();
+    let overview = brief(t);
     let ident = |w: &str| {
         let w = w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
         let ok = w.len() >= 4
@@ -1017,6 +1027,43 @@ mod tests {
 
         assert!(!misses_subject(&retro("Make the size show.", "Make the size show."), &dir), "nothing named, nothing missed");
         assert!(misses_subject(&retro(overview, "The totals are wrong."), &dir), "a name and no file to hold it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-016's own shape: written from evidence, with no `## Overview`, its
+    /// names in `## Evidence` and `## Fix`, and a packet that is the context pack
+    /// alone. Its likely files lacked the names, so it is told it may search; the
+    /// same row with a likely file that holds them keeps the narrow order.
+    #[test]
+    fn a_row_written_from_evidence_with_no_overview_is_judged_on_its_evidence() {
+        let dir = tree("evidence", &[
+            ("src/cycle.rs", "pub fn cycle() {}\n"),
+            ("src/wallbuckets.rs", "pub fn wall_buckets() {}\npub fn legs_running_seconds() {}\n"),
+        ]);
+        let row = |likely: &str| {
+            let mut t = Task::default();
+            t.id = "t-1".into();
+            t.title = "Timing retro: legs are booked as wall".into();
+            t.body = format!(
+                "## Evidence\nwall_buckets books 3h of legs_running_seconds as wall.\n\n\
+                 ## Fix\nCount legs once in wall_buckets.\n\n## Done when\nA test shows it.\n\n\
+                 ## {SECTION}\nCONTEXT PACK  wsp@43be8f17  built from 9 finished tasks  kind: routine\n\
+                 likely files  {likely}\nverify  cargo test cycle::\n"
+            );
+            t
+        };
+        let missed = row("src/cycle.rs (identifier), src/cmd_agent.rs (precedent)");
+        assert!(missed.section("Overview").is_none());
+        assert!(subject(&missed).contains(&"wall_buckets".to_string()), "{:?}", subject(&missed));
+        assert!(misses_subject(&missed, &dir));
+        let o = order_for(&missed, &dir, Flow::of(true));
+        assert!(o.contains(SEARCH_RULE) && !o.contains(NARROW), "{o}");
+        assert_eq!(build(&missed, &dir).unwrap().matches(SEARCH_RULE).count(), 1);
+
+        let right = row("src/wallbuckets.rs (named), src/cycle.rs (identifier)");
+        assert!(!misses_subject(&right, &dir));
+        assert_eq!(order_for(&right, &dir, Flow::of(true)), order("t-1", Flow::of(true)));
+        assert!(!build(&right, &dir).unwrap().contains(SEARCH_RULE));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
