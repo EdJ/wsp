@@ -3386,7 +3386,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 Some(l) => crate::packet::leg_order(t, l, leg_last),
                 None => format!(
                     "{}{}",
-                    crate::packet::order(t, crate::cmd_checkout::Flow::of_task(store, t)),
+                    crate::packet::order_in(store, t, crate::cmd_checkout::Flow::of_task(store, t)),
                     sent_back_note(store, t)
                 ) + &crate::duplicate::moved_note(store, t, cwd.as_deref()),
             }),

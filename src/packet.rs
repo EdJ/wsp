@@ -195,6 +195,114 @@ pub fn order(task: &str, flow: crate::cmd_checkout::Flow) -> String {
     )
 }
 
+/// The narrow order's last sentence, which [`order_for`] swaps for
+/// [`SEARCH_RULE`] when the packet's files miss its subject.
+const NARROW: &str = "Read nothing the packet does not name.";
+
+/// What a seat whose packet misses its subject is told instead of [`NARROW`]
+/// (`wsp-039`): wsp-016's packet named the wrong files, its order forbade
+/// reading others, and the seat stopped to ask where the code was.
+pub const SEARCH_RULE: &str = "The files this packet names may not hold what its overview describes: \
+     read those first, and if the subject is not in them, search the tree for the overview's names \
+     (`git grep`) and read only what that search finds, then say in your exit which files outside \
+     the packet you read and why.";
+
+/// The order for a packet row, chosen on its packet: the narrow order when the
+/// files it names hold what its overview describes, else one that allows a
+/// bounded search and says to report it ([`SEARCH_RULE`]). A row not found is
+/// given the narrow order.
+pub fn order_in(store: &Store, task: &str, flow: crate::cmd_checkout::Flow) -> String {
+    match store.find_task(task) {
+        Some(t) => order_for(&t, &tree_root(store, &t), flow),
+        None => order(task, flow),
+    }
+}
+
+/// [`order_in`] for a row in hand, reading its named files under `root`.
+pub fn order_for(t: &Task, root: &Path, flow: crate::cmd_checkout::Flow) -> String {
+    let narrow = order(&t.id, flow);
+    match misses_subject(t, root) {
+        true => narrow.replace(NARROW, SEARCH_RULE),
+        false => narrow,
+    }
+}
+
+/// The files a packet names: its `file:` lines, the paths on its context pack's
+/// `likely files` line, and any path its prose or title spells out.
+pub fn named_files(t: &Task) -> Vec<String> {
+    let Some(p) = of(t) else { return Vec::new() };
+    let mut out: Vec<String> = p.files.clone();
+    for line in p.text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("likely files") {
+            out.extend(rest.split(',').filter_map(|f| f.split_whitespace().next()).map(|f| f.to_string()));
+        }
+    }
+    let prose = format!("{}\n{}\n{}", t.title, t.section("Overview").unwrap_or_default(), p.text);
+    out.extend(prose.split_whitespace().filter_map(path_in));
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|f| inside(f) && seen.insert(f.clone()));
+    out
+}
+
+/// A word that spells a path (`src/a.rs`, `(src/packet.rs:193`), bare.
+fn path_in(word: &str) -> Option<String> {
+    let w = word.trim_matches(|c: char| "`'\"()[]{}<>,;".contains(c));
+    let w = w.split(':').next().unwrap_or(w).trim_end_matches('.');
+    let (stem, ext) = w.rsplit_once('.')?;
+    let ok = w.contains('/')
+        && !w.contains("//")
+        && !stem.is_empty()
+        && (1..=5).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && w.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c));
+    ok.then(|| w.to_string())
+}
+
+/// The names the row's overview is about: words in backticks that read as an
+/// identifier (`wall_bucket`, `Store::open`), and bare words with `_` or `::`
+/// in them. Commands, flags and paths are not names.
+pub fn subject(t: &Task) -> Vec<String> {
+    let overview = t.section("Overview").unwrap_or_default();
+    let ident = |w: &str| {
+        let w = w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+        let ok = w.len() >= 4
+            && w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+            && !w.contains(":::");
+        ok.then(|| w.to_string())
+    };
+    let mut out: Vec<String> = overview.split('`').skip(1).step_by(2).filter(|s| !s.contains(char::is_whitespace) && !s.starts_with('-')).filter_map(ident).collect();
+    out.extend(
+        overview
+            .split('`')
+            .step_by(2)
+            .flat_map(|s| s.split_whitespace())
+            .filter(|w| path_in(w).is_none() && (w.contains('_') || w.contains("::")))
+            .filter_map(ident),
+    );
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|w| seen.insert(w.clone()));
+    out
+}
+
+/// Whether the files a packet names miss what its overview describes: the
+/// overview names things ([`subject`]) and not one of them is in any file the
+/// packet names that can be read under `root` (none at all, too). An overview
+/// that names nothing gives nothing to miss, and a row with no packet is not
+/// spawned short: both keep the narrow order.
+pub fn misses_subject(t: &Task, root: &Path) -> bool {
+    if of(t).is_none() {
+        return false;
+    }
+    let names = subject(t);
+    if names.is_empty() {
+        return false;
+    }
+    let bodies: Vec<String> = named_files(t).iter().filter_map(|f| std::fs::read_to_string(root.join(f)).ok()).collect();
+    let last = |n: &str| n.rsplit("::").next().unwrap_or(n).to_string();
+    !names.iter().any(|n| bodies.iter().any(|b| b.contains(&last(n))))
+}
+
 // ---- a leg's packet ---------------------------------------------------------------
 
 /// The order key a leg names its packet on: `packet: spikes/x/change-hint.md`,
@@ -335,7 +443,10 @@ fn inside(path: &str) -> bool {
 }
 
 pub fn build(t: &Task, root: &Path) -> Result<String, String> {
-    let Some(p) = of(t) else { return Err(format!("{} has no ## {SECTION} section", t.id)) };
+    let Some(mut p) = of(t) else { return Err(format!("{} has no ## {SECTION} section", t.id)) };
+    if misses_subject(t, root) {
+        p.text = format!("{}\n\n{SEARCH_RULE}", p.text).trim().to_string();
+    }
     let head = match owed(t) {
         Some(owed) => format!("# Packet · {} · {}\n\n{owed}\n## The original brief\nWhat the row first asked, for what it names. Whatever of it already landed is done.\n", t.id, t.title),
         None => format!("# Packet · {} · {}\n", t.id, t.title),
@@ -851,6 +962,70 @@ mod tests {
         assert!(o.contains("`wsp land wsp-9`") && o.contains("`wsp review wsp-9 "), "{o}");
         assert!(!o.contains("as your brief says"), "a short start carries almost no brief: {o}");
         assert!(o.is_ascii(), "a spawn once hung on one character");
+    }
+
+    /// A tree under the temp dir with `files` written in it, for the scope tests.
+    fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wsp-packet-{name}-{}", std::process::id()));
+        for (f, body) in files {
+            std::fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(f), body).unwrap();
+        }
+        dir
+    }
+
+    fn retro(overview: &str, packet: &str) -> Task {
+        let mut t = Task::default();
+        t.id = "t-1".into();
+        t.title = "Timing retro".into();
+        t.body = format!("## Overview\n{overview}\n\n## {SECTION}\n{packet}\n");
+        t
+    }
+
+    /// `wsp-039`: wsp-016's packet named files that did not hold its subject,
+    /// and its order forbade reading others. A row whose files miss what its
+    /// overview names is told it may search, bounded to what the search finds,
+    /// and to say so in its exit; a row whose files hold it keeps the narrow order.
+    #[test]
+    fn a_row_whose_files_miss_its_subject_may_search_and_report_it_and_a_right_one_stays_narrow() {
+        let dir = tree("scope", &[
+            ("src/a.rs", "pub fn a() {}\n"),
+            ("src/retro.rs", "pub fn retro() {}\n"),
+            ("src/wallbuckets.rs", "pub fn wall_bucket() {}\n"),
+        ]);
+        let overview = "The `wall_bucket` totals count a barrier twice.";
+        let missed = retro(overview, "file: src/a.rs\nlikely files  src/retro.rs (identifier), src/gone.rs (precedent)\nverify  cargo test retro::");
+        assert!(misses_subject(&missed, &dir));
+        let o = order_for(&missed, &dir, Flow::of(true));
+        assert!(o.contains(SEARCH_RULE) && !o.contains(NARROW), "{o}");
+        assert!(o.contains("search the tree") && o.contains("read only what that search finds") && o.contains("say in your exit"), "{o}");
+        assert!(o.contains("`wsp packet t-1`") && o.contains("`wsp review t-1 ") && !o.contains('\n') && o.is_ascii(), "{o}");
+        let printed = build(&missed, &dir).unwrap();
+        assert_eq!(printed.matches(SEARCH_RULE).count(), 1, "the print says it too: {printed}");
+
+        for right in [
+            retro(overview, "file: src/wallbuckets.rs\nverify  cargo test wallbuckets::"),
+            retro(overview, "likely files  src/wallbuckets.rs (named+identifier), src/a.rs (identifier)"),
+            retro("Seen in src/wallbuckets.rs:12: `wall_bucket` counts twice.", "file: src/a.rs"),
+            retro("Make the size show.", "file: src/a.rs"),
+        ] {
+            assert!(!misses_subject(&right, &dir), "{}", right.body);
+            let o = order_for(&right, &dir, Flow::of(true));
+            assert_eq!(o, order("t-1", Flow::of(true)), "the narrow order: {}", right.body);
+            assert!(!build(&right, &dir).unwrap().contains(SEARCH_RULE));
+        }
+
+        assert!(!misses_subject(&retro("Make the size show.", "Make the size show."), &dir), "nothing named, nothing missed");
+        assert!(misses_subject(&retro(overview, "The totals are wrong."), &dir), "a name and no file to hold it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_subject_is_the_overviews_names_not_its_commands_flags_or_paths() {
+        let t = retro("`wall_bucket` and `Store::open` in src/x.rs; run `cargo build --workspace` with `--full`; the seat_gone line.", "x");
+        assert_eq!(subject(&t), ["wall_bucket", "Store::open", "seat_gone"]);
+        let t = retro("See (src/packet.rs:193 and :318).", "likely files  src/b.rs (identifier), src/c.rs (precedent)\nfile: src/a.rs");
+        assert_eq!(named_files(&t), ["src/a.rs", "src/b.rs", "src/c.rs", "src/packet.rs"]);
     }
 
     /// `wsp-379`: the order and the banner are one decision. A verified member
